@@ -1,0 +1,263 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify tag signature via GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+          state=$(gh api "repos/${repo}/git/ref/tags/${tag}" \
+            --jq '.object.sha' \
+            | xargs -I{} gh api "repos/${repo}/git/tags/{}" \
+              --jq '.verification.verified')
+          if [ "$state" != "true" ]; then
+            echo "::error::Tag ${tag} is not signed by a verified identity"
+            exit 1
+          fi
+
+  build-debs:
+    needs: [verify-tag]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/build-debs debs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.arch }}
+          path: debs/*.deb
+
+  build-tarballs:
+    needs: [verify-tag]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            label: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            label: linux-aarch64
+          - runner: macos-latest
+            label: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/build-tarballs dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarballs-${{ matrix.label }}
+          path: dist/*.tar.gz
+
+  build-windows:
+    needs: [verify-tag]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+      - name: Build UI
+        shell: bash
+        run: |
+          cargo install wasm-pack
+          cd crates/browser
+          wasm-pack build --target web --release --out-dir pkg
+          cd ../..
+          cd js
+          pnpm install --frozen-lockfile
+          pnpm --filter @blit-sh/core run build
+          pnpm --filter @blit-sh/solid run build
+          pnpm --filter @blit-sh/ui run build
+      - name: Build release binaries
+        run: cargo build --release -p blit-cli -p blit-server -p blit-gateway -p blit-webrtc-forwarder
+      - name: Package zips
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for bin in blit blit-server blit-gateway blit-webrtc-forwarder; do
+            cp "target/release/${bin}.exe" "${bin}.exe"
+            7z a "dist/${bin}_${version}_windows_x86_64.zip" "${bin}.exe"
+            rm "${bin}.exe"
+          done
+          ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+
+  release:
+    needs: [build-debs, build-tarballs, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: debs
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: tarballs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: windows
+
+      - name: List artifacts
+        run: |
+          ls -lh debs/
+          ls -lh tarballs/
+          ls -lh windows/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            debs/*.deb
+            tarballs/*.tar.gz
+            windows/*.zip
+          generate_release_notes: true
+
+  publish-crates:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/publish-crates
+
+  publish-npm:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/publish-npm-packages --provenance --access public
+
+  update-homebrew:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew tap
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: indent-com/homebrew-tap
+          event-type: update
+          client-payload: '{"version": "${{ github.ref_name }}"}'
+
+  apt-repo:
+    needs: [build-debs, build-tarballs, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: debs
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: tarballs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: windows
+
+      - name: Import GPG key
+        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Build APT repo
+        run: |
+          sudo apt-get update && sudo apt-get install -y dpkg-dev
+
+          mkdir -p repo/pool repo/dists/stable/main/binary-amd64
+          mkdir -p repo/dists/stable/main/binary-arm64
+          cp debs/*.deb repo/pool/
+          cp .github/blit.gpg repo/blit.gpg
+
+          # Static binaries for direct download
+          mkdir -p repo/bin
+          for f in tarballs/*.tar.gz; do
+            cp "$f" repo/bin/
+          done
+          for f in windows/*.zip; do
+            cp "$f" repo/bin/
+          done
+
+          # Write version to /latest
+          echo "${GITHUB_REF_NAME#v}" > repo/latest
+
+          cp install.sh repo/index.html
+          cp install.ps1 repo/install.ps1
+          cp SKILL.md repo/SKILL.md
+
+          cd repo
+          dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
+          dpkg-scanpackages --arch arm64 pool > dists/stable/main/binary-arm64/Packages
+          gzip -k dists/stable/main/binary-amd64/Packages
+          gzip -k dists/stable/main/binary-arm64/Packages
+
+          cat > dists/stable/Release <<'RELEASE'
+          Origin: blit
+          Label: blit
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          RELEASE
+          sed -i 's/^          //' dists/stable/Release
+
+          apt-ftparchive release dists/stable >> dists/stable/Release
+          gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --armor --clearsign --output dists/stable/InRelease dists/stable/Release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+      - uses: actions/deploy-pages@v4

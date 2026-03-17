@@ -1,0 +1,27 @@
+---
+const embedCode = `<span class="text-[var(--hl-kw)]">import</span> { <span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span>, <span class="text-[var(--hl-fn)]">BlitTerminal</span>,
+         <span class="text-[var(--hl-fn)]">useBlitFocusedSession</span> } <span class="text-[var(--hl-kw)]">from</span> <span class="text-[var(--hl-str)]">'@blit-sh/react'</span>;
+<span class="text-[var(--hl-kw)]">import</span> { <span class="text-[var(--hl-fn)]">BlitWorkspace</span> } <span class="text-[var(--hl-kw)]">from</span> <span class="text-[var(--hl-str)]">'@blit-sh/core'</span>;
+
+<span class="text-[var(--hl-cm)] italic">// ● Create a workspace with a WebSocket connection</span>
+<span class="text-[var(--hl-kw)]">const</span> workspace = <span class="text-[var(--hl-kw)]">new</span> <span class="text-[var(--hl-fn)]">BlitWorkspace</span>({
+  wasm,
+  connections: [{
+    id: <span class="text-[var(--hl-str)]">"ws"</span>,
+    transport: { type: <span class="text-[var(--hl-str)]">"websocket"</span>, url, passphrase },
+  }],
+});
+
+<span class="text-[var(--hl-cm)] italic">// ● Render — that's it</span>
+&lt;<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span> <span class="text-[var(--hl-attr)]">workspace</span>={workspace}&gt;
+  &lt;<span class="text-[var(--hl-fn)]">BlitTerminal</span> <span class="text-[var(--hl-attr)]">sessionId</span>={<span class="text-[var(--hl-fn)]">useBlitFocusedSession</span>()?.id ?? <span class="text-[var(--hl-kw)]">null</span>} /&gt;
+&lt;/<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span>&gt;`;
+---
+
+<section class="py-10 border-t border-[var(--border)]">
+  <h2 class="text-lg font-bold tracking-tight mb-1 text-[var(--bright)]">
+    Drop into any React app
+  </h2>
+  <pre
+    class="bg-[var(--surface)] border border-[var(--border)] rounded-md p-4 mt-3 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={embedCode} /></pre>
+</section>

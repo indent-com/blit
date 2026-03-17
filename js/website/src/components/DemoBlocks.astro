@@ -1,0 +1,38 @@
+---
+const getStarted = `<span class="text-[var(--green)] select-none">$</span> curl -f https://install.blit.sh | sh
+<span class="text-[var(--green)] select-none">$</span> blit            # opens a browser
+<span class="text-[var(--green)] select-none">$</span> blit share      # share via WebRTC
+<span class="text-[var(--green)] select-none">$</span> blit --ssh host # remote terminal`;
+
+const agentApi = `<span class="text-[var(--green)] select-none">$</span> blit start -t build make -j8
+1
+<span class="text-[var(--green)] select-none">$</span> blit wait 1 --pattern 'BUILD OK'
+<span class="text-[var(--green)] select-none">$</span> blit show 1
+[100%] Built target app
+BUILD OK`;
+---
+
+<section class="grid grid-cols-2 gap-3 pb-10 max-md:grid-cols-1">
+  <div
+    class="bg-[var(--surface)] border border-[var(--border)] rounded-md overflow-hidden"
+  >
+    <div
+      class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] px-4 pt-2.5"
+    >
+      Get started
+    </div>
+    <pre
+      class="m-0 px-4 py-2.5 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={getStarted} /></pre>
+  </div>
+  <div
+    class="bg-[var(--surface)] border border-[var(--border)] rounded-md overflow-hidden"
+  >
+    <div
+      class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] px-4 pt-2.5"
+    >
+      Agent API
+    </div>
+    <pre
+      class="m-0 px-4 py-2.5 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={agentApi} /></pre>
+  </div>
+</section>

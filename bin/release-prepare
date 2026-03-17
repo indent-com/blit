@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/release-prepare <version>
+
+Runs bin/prepare-release to bump all version files and commit, pushes a
+release/<version> branch to origin, and opens a PR against main.
+EOF
+}
+
+die() {
+    echo "release-prepare: $*" >&2
+    exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+version="$1"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "version must look like 0.8.0"
+
+command -v gh >/dev/null 2>&1 || die "missing required command: gh"
+
+./bin/prepare-release "$version"
+
+branch="release/$version"
+git push origin "HEAD:refs/heads/$branch"
+
+gh pr create \
+    --base main \
+    --head "$branch" \
+    --title "release $version" \
+    --body "Automated release PR for v${version}."
+
+echo
+echo "Release PR created. After it merges, run:"
+echo "  ./bin/release-tag $version"

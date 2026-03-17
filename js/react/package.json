@@ -1,0 +1,80 @@
+{
+  "name": "@blit-sh/react",
+  "version": "0.20.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./hooks": {
+      "types": "./src/hooks/index.ts",
+      "default": "./src/hooks/index.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./hooks": {
+        "types": "./dist/hooks/index.d.ts",
+        "default": "./dist/hooks/index.js"
+      }
+    }
+  },
+  "description": "Low-latency terminal streaming — React components and hooks",
+  "homepage": "https://blit.sh",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/indent-com/blit.git",
+    "directory": "js/react"
+  },
+  "bugs": {
+    "url": "https://github.com/indent-com/blit/issues"
+  },
+  "keywords": [
+    "terminal",
+    "tty",
+    "react",
+    "streaming",
+    "webgl"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@blit-sh/core": "workspace:*",
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@blit-sh/core": "workspace:*",
+    "@testing-library/react": "^16",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "jsdom": "^29",
+    "react": "^19",
+    "react-dom": "^19",
+    "typescript": "^6",
+    "@vitest/coverage-v8": "^4",
+    "vitest": "^4"
+  },
+  "license": "MIT"
+}

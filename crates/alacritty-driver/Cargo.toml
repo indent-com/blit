@@ -1,0 +1,13 @@
+[package]
+name = "blit-alacritty"
+version = "0.20.0"
+edition.workspace = true
+description = "Alacritty terminal emulator driver for blit"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blit-remote = { workspace = true }
+alacritty_terminal = "0.25"
+regex = "1"

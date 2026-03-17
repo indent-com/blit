@@ -1,0 +1,38 @@
+[package]
+name = "blit-server"
+version = "0.20.0"
+edition.workspace = true
+description = "blit terminal multiplexer server"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "blit_server"
+path = "src/lib.rs"
+
+[dependencies]
+blit-remote = { workspace = true }
+blit-alacritty = { workspace = true }
+blit-compositor = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+memchr = "2"
+openh264 = "0.6"
+rav1e = { version = "0.7", default-features = false }
+ravif = { version = "0.11", default-features = false }
+rgb = "0.8"
+png = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }

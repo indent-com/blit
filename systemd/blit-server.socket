@@ -1,0 +1,10 @@
+[Unit]
+Description=blit terminal multiplexer socket
+Conflicts=blit.socket
+
+[Socket]
+ListenStream=%t/blit.sock
+SocketMode=0700
+
+[Install]
+WantedBy=sockets.target

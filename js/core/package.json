@@ -1,0 +1,99 @@
+{
+  "name": "@blit-sh/core",
+  "version": "0.20.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./transports": {
+      "types": "./src/transports/index.ts",
+      "default": "./src/transports/index.ts"
+    },
+    "./types": {
+      "types": "./src/types.ts",
+      "default": "./src/types.ts"
+    },
+    "./palettes": {
+      "types": "./src/palettes.ts",
+      "default": "./src/palettes.ts"
+    },
+    "./bsp": {
+      "types": "./src/bsp/index.ts",
+      "default": "./src/bsp/index.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./transports": {
+        "types": "./dist/transports/index.d.ts",
+        "default": "./dist/transports/index.js"
+      },
+      "./types": {
+        "types": "./dist/types.d.ts",
+        "default": "./dist/types.js"
+      },
+      "./palettes": {
+        "types": "./dist/palettes.d.ts",
+        "default": "./dist/palettes.js"
+      },
+      "./bsp": {
+        "types": "./dist/bsp/index.d.ts",
+        "default": "./dist/bsp/index.js"
+      }
+    }
+  },
+  "description": "Low-latency terminal streaming — framework-agnostic core",
+  "homepage": "https://blit.sh",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/indent-com/blit.git",
+    "directory": "js/core"
+  },
+  "bugs": {
+    "url": "https://github.com/indent-com/blit/issues"
+  },
+  "keywords": [
+    "terminal",
+    "tty",
+    "streaming",
+    "webgl",
+    "bsp"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@blit-sh/browser": ">=0.9.0"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4",
+    "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "jsdom": "^29.0.1",
+    "typescript": "^6",
+    "vitest": "^4"
+  },
+  "license": "MIT"
+}

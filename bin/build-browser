@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Build WASM module
+(cd crates/browser && wasm-pack build --target web --release --out-dir pkg)
+
+# Install JS dependencies and build UI
+(cd js && pnpm install --prefer-offline)
+(cd js/ui && pnpm run build)

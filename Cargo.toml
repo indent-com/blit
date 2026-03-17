@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/remote",
+    "crates/alacritty-driver",
+    "crates/server",
+    "crates/gateway",
+    "crates/browser",
+    "crates/cli",
+    "crates/fonts",
+    "crates/webserver",
+    "crates/webrtc-forwarder",
+    "crates/compositor",
+    "crates/proxy",
+    "crates/ssh",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/indent-com/blit"
+homepage = "https://blit.sh"
+
+[workspace.dependencies]
+blit-remote = { version = "0.20.0", path = "crates/remote" }
+blit-alacritty = { version = "0.20.0", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.20.0", path = "crates/fonts" }
+blit-webserver = { version = "0.20.0", path = "crates/webserver" }
+blit-server = { version = "0.20.0", path = "crates/server" }
+blit-proxy = { version = "0.20.0", path = "crates/proxy" }
+blit-webrtc-forwarder = { version = "0.20.0", path = "crates/webrtc-forwarder" }
+blit-compositor = { version = "0.20.0", path = "crates/compositor" }
+blit-ssh = { version = "0.20.0", path = "crates/ssh" }
+
+[patch.crates-io]
+alacritty_terminal = { git = "https://github.com/indent-com/alacritty.git", branch = "blit/emoji-width-fix" }
+smithay = { git = "https://github.com/indent-com/smithay.git", branch = "blit/add-keyboard-from-string" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+lto = false

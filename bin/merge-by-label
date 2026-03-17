@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/merge-by-label <label>
+
+Creates (or resets) a branch named merge/<label> based on the latest main,
+then merges every open PR that carries <label> on top of it.
+
+PRs are merged in ascending order by number. If any PR fails to merge
+cleanly the script aborts the merge, prints the offending PR, and exits
+non-zero so you can resolve it manually.
+
+Requires: git, gh (GitHub CLI, authenticated)
+EOF
+}
+
+die() {
+    echo "merge-by-label: $*" >&2
+    exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+label="$1"
+branch="merge/${label}"
+
+command -v gh >/dev/null 2>&1 || die "missing required command: gh"
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "must be run inside the git repository"
+
+pr_data=()
+mapfile -t pr_data < <(
+    gh pr list --label "$label" --state open \
+        --json number,headRefName \
+        --jq '.[] | "\(.number)\t\(.headRefName)"' \
+        | sort -n
+)
+
+if [[ ${#pr_data[@]} -eq 0 ]]; then
+    die "no open PRs found with label \"$label\""
+fi
+
+pr_numbers=()
+declare -A pr_heads
+for entry in "${pr_data[@]}"; do
+    n="${entry%%	*}"
+    ref="${entry#*	}"
+    pr_numbers+=("$n")
+    pr_heads[$n]="$ref"
+done
+
+echo "Found ${#pr_numbers[@]} open PR(s) with label \"$label\":"
+for n in "${pr_numbers[@]}"; do
+    echo "  #$n (${pr_heads[$n]})"
+done
+echo
+
+fetch_refspecs=("refs/heads/main:refs/remotes/origin/main")
+for n in "${pr_numbers[@]}"; do
+    fetch_refspecs+=("+refs/pull/$n/head:refs/heads/pr-$n")
+done
+
+echo "Fetching main + ${#pr_numbers[@]} PR head(s)…"
+git fetch origin --no-tags "${fetch_refspecs[@]}"
+echo
+
+stash_ref=""
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Stashing uncommitted changes…"
+    stash_ref="$(git stash create)"
+    git reset --hard HEAD
+fi
+
+previous_branch="$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD)"
+
+cleanup() {
+    echo "Restoring previous branch ($previous_branch)…"
+    git checkout "$previous_branch" 2>/dev/null || true
+    if [[ -n "$stash_ref" ]]; then
+        echo "Restoring stashed changes…"
+        git stash apply "$stash_ref" 2>/dev/null || true
+    fi
+    for n in "${pr_numbers[@]}"; do
+        git branch -D "pr-$n" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+
+echo "Resetting $branch to origin/main…"
+git checkout -B "$branch" origin/main
+
+merged=()
+for n in "${pr_numbers[@]}"; do
+    head_ref="${pr_heads[$n]}"
+
+    echo "Merging PR #$n ($head_ref)…"
+    if ! git merge "pr-$n" --no-edit -m "Merge PR #$n ($head_ref)"; then
+        git merge --abort
+        echo
+        die "PR #$n ($head_ref) failed to merge cleanly. Aborting."
+    fi
+
+    merged+=("$n")
+    echo "  ✓ PR #$n merged"
+    echo
+done
+
+echo "Pushing $branch to origin…"
+git push --force-with-lease origin "$branch"
+
+echo
+echo "Done. Branch $branch now contains main + ${#merged[@]} PR(s):"
+for n in "${merged[@]}"; do
+    echo "  #$n"
+done

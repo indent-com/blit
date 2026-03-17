@@ -1,0 +1,12 @@
+[Unit]
+Description=blit terminal multiplexer
+Requires=blit.socket
+
+[Service]
+Type=simple
+WorkingDirectory=~
+ExecStart=blit server
+Restart=no
+
+[Install]
+WantedBy=default.target

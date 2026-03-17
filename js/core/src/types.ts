@@ -1,0 +1,233 @@
+/** A terminal color palette. */
+export interface TerminalPalette {
+  id: string;
+  name: string;
+  /** true = dark background, false = light background. */
+  dark: boolean;
+  /** Default foreground color as [r, g, b] (0–255). */
+  fg: [number, number, number];
+  /** Default background color as [r, g, b] (0–255). */
+  bg: [number, number, number];
+  /** ANSI 16-color entries, indexed 0–15. */
+  ansi: Array<[number, number, number]>;
+}
+
+export interface BlitDebug {
+  log(msg: string, ...args: unknown[]): void;
+  warn(msg: string, ...args: unknown[]): void;
+  error(msg: string, ...args: unknown[]): void;
+}
+
+/** Connection lifecycle states. */
+export type ConnectionStatus =
+  | "connecting"
+  | "authenticating"
+  | "connected"
+  | "disconnected"
+  | "closed"
+  | "error";
+
+export type ConnectionId = string;
+export type SessionId = string;
+
+/**
+ * Transport abstraction for blit server communication.
+ * Implementations handle the underlying protocol (WebSocket, WebTransport, etc.)
+ * while consumers only deal with binary messages and status changes.
+ */
+export type BlitTransportEventMap = {
+  message: ArrayBuffer;
+  statuschange: ConnectionStatus;
+};
+
+export interface BlitTransportOptions {
+  /** Enable automatic reconnection on disconnect. Default: true. */
+  reconnect?: boolean;
+  /** Initial reconnect delay in ms. Default: 500. */
+  reconnectDelay?: number;
+  /** Maximum reconnect delay in ms. Default: 10000. */
+  maxReconnectDelay?: number;
+  /** Backoff multiplier for reconnect delay. Default: 1.5. */
+  reconnectBackoff?: number;
+  /** Timeout in ms to wait for the connection to be established. Default: none for WebSocket, 10000 for others. */
+  connectTimeoutMs?: number;
+}
+
+export interface BlitTransport {
+  /** Start connecting. Safe to call repeatedly. Call after registering listeners. */
+  connect(): void;
+  /** Send binary data to the server. */
+  send(data: Uint8Array): void;
+  /** Close the transport connection. */
+  close(): void;
+  /** Current connection status. */
+  readonly status: ConnectionStatus;
+  /** True when the server explicitly rejected authentication. */
+  readonly authRejected: boolean;
+  /** Last error message, if any. Cleared on successful connection. */
+  readonly lastError: string | null;
+  /** Register a listener for transport events. */
+  addEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
+  /** Remove a previously registered listener. */
+  removeEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  removeEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
+}
+
+/** A tracked terminal session. */
+export type BlitSession = {
+  id: SessionId;
+  connectionId: ConnectionId;
+  ptyId: number;
+  tag: string;
+  title: string | null;
+  command: string | null;
+  state: "creating" | "active" | "exited" | "closed";
+};
+
+export interface BlitConnectionSnapshot {
+  id: ConnectionId;
+  status: ConnectionStatus;
+  ready: boolean;
+  supportsRestart: boolean;
+  supportsCopyRange: boolean;
+  supportsCompositor: boolean;
+  retryCount: number;
+  /** Non-null when the last connection attempt failed with an explicit error message. */
+  error: string | null;
+  sessions: readonly BlitSession[];
+  focusedSessionId: SessionId | null;
+}
+
+export interface BlitWorkspaceSnapshot {
+  connections: readonly BlitConnectionSnapshot[];
+  sessions: readonly BlitSession[];
+  focusedSessionId: SessionId | null;
+  ready: boolean;
+}
+
+export interface BlitSearchResult {
+  sessionId: SessionId;
+  connectionId: ConnectionId;
+  score: number;
+  primarySource: number;
+  matchedSources: number;
+  scrollOffset: number | null;
+  context: string;
+}
+
+export type TransportConfig =
+  | {
+      type: "websocket";
+      url: string;
+      passphrase: string;
+      options?: BlitTransportOptions;
+    }
+  | {
+      type: "webtransport";
+      url: string;
+      passphrase: string;
+      options?: BlitTransportOptions & { certHash?: string };
+    }
+  | { type: "share"; hubUrl: string; passphrase: string; debug?: BlitDebug }
+  | { type: "custom"; transport: BlitTransport };
+
+export const DEFAULT_FONT = "ui-monospace, monospace";
+export const DEFAULT_FONT_SIZE = 13;
+
+/** Wire protocol constants: client-to-server message types. */
+export const C2S_INPUT = 0x00;
+/** Desired viewport size(s): repeated [pty_id:2][rows:2][cols:2] entries. `0x0` clears one. */
+export const C2S_RESIZE = 0x01;
+export const C2S_SCROLL = 0x02;
+export const C2S_ACK = 0x03;
+export const C2S_DISPLAY_RATE = 0x04;
+export const C2S_CLIENT_METRICS = 0x05;
+export const C2S_MOUSE = 0x06;
+export const C2S_RESTART = 0x07;
+export const C2S_CREATE = 0x10;
+export const C2S_FOCUS = 0x11;
+export const C2S_CLOSE = 0x12;
+export const C2S_SUBSCRIBE = 0x13;
+export const C2S_UNSUBSCRIBE = 0x14;
+export const C2S_SEARCH = 0x15;
+export const C2S_CREATE_AT = 0x16;
+export const C2S_CREATE_N = 0x17;
+export const C2S_CREATE2 = 0x18;
+export const C2S_KILL = 0x1a;
+export const C2S_COPY_RANGE = 0x1b;
+export const CREATE2_HAS_SRC_PTY = 1 << 0;
+export const CREATE2_HAS_COMMAND = 1 << 1;
+
+/** Wire protocol constants: server-to-client message types. */
+export const S2C_UPDATE = 0x00;
+export const S2C_CREATED = 0x01;
+export const S2C_CLOSED = 0x02;
+export const S2C_LIST = 0x03;
+export const S2C_TITLE = 0x04;
+export const S2C_SEARCH_RESULTS = 0x05;
+export const S2C_CREATED_N = 0x06;
+export const S2C_HELLO = 0x07;
+export const S2C_EXITED = 0x08;
+export const S2C_TEXT = 0x0a;
+
+export const C2S_SURFACE_INPUT = 0x20;
+export const C2S_SURFACE_POINTER = 0x21;
+export const C2S_SURFACE_POINTER_AXIS = 0x22;
+export const C2S_SURFACE_RESIZE = 0x23;
+export const C2S_SURFACE_FOCUS = 0x24;
+export const C2S_CLIPBOARD = 0x25;
+export const C2S_SURFACE_SUBSCRIBE = 0x28;
+export const C2S_SURFACE_UNSUBSCRIBE = 0x29;
+export const C2S_SURFACE_ACK = 0x2a;
+export const C2S_SURFACE_CLOSE = 0x2b;
+export const C2S_SURFACE_REQUEST_KEYFRAME = 0x2c;
+export const S2C_SURFACE_CREATED = 0x20;
+export const S2C_SURFACE_DESTROYED = 0x21;
+export const S2C_SURFACE_FRAME = 0x22;
+export const S2C_SURFACE_TITLE = 0x23;
+export const S2C_SURFACE_RESIZED = 0x24;
+export const S2C_CLIPBOARD_MSG = 0x25;
+export const S2C_SURFACE_APP_ID = 0x28;
+export const SURFACE_FRAME_FLAG_KEYFRAME = 1 << 0;
+export const SURFACE_FRAME_CODEC_MASK = 0b110;
+export const SURFACE_FRAME_CODEC_H264 = 0 << 1;
+export const SURFACE_FRAME_CODEC_AV1 = 1 << 1;
+export const SURFACE_FRAME_CODEC_PNG = 2 << 1;
+export const SURFACE_FRAME_CODEC_H265 = 3 << 1;
+
+/** Bitmask for client-supported codecs in C2S_SURFACE_RESIZE. 0 = accept anything. */
+export const CODEC_SUPPORT_H264 = 1 << 0;
+export const CODEC_SUPPORT_AV1 = 1 << 1;
+export const CODEC_SUPPORT_H265 = 1 << 2;
+
+export const PROTOCOL_VERSION = 1;
+export const FEATURE_CREATE_NONCE = 1 << 0;
+export const FEATURE_RESTART = 1 << 1;
+export const FEATURE_RESIZE_BATCH = 1 << 2;
+export const FEATURE_COPY_RANGE = 1 << 3;
+export const FEATURE_COMPOSITOR = 1 << 4;
+
+export type BlitSurface = {
+  sessionId: u16;
+  surfaceId: u16;
+  parentId: u16;
+  title: string;
+  appId: string;
+  width: number;
+  height: number;
+};
+
+type u16 = number;

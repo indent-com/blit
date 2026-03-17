@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/prepare-release <version>
+
+Bumps the repo release version, prints the changes since the latest v* tag,
+runs the server verification suite, and commits the result as:
+
+  release <version>
+EOF
+}
+
+die() {
+    echo "prepare-release: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+read_toml_version() {
+    perl -ne 'if (/^version = "([^"]+)"/) { print "$1\n"; exit 0 }' "$1"
+}
+
+read_toml_name() {
+    perl -ne 'if (/^name = "([^"]+)"/) { print "$1\n"; exit 0 }' "$1"
+}
+
+read_flake_version() {
+    perl -ne 'if (/^\s*version = "([^"]+)";$/) { print "$1\n"; exit 0 }' "$1"
+}
+
+ensure_clean_tree() {
+    local status
+    status="$(git status --porcelain)"
+    if [[ -n "$status" ]]; then
+        printf '%s\n' "$status" >&2
+        die "working tree must be clean"
+    fi
+}
+
+# Discover workspace member Cargo.toml paths from the root Cargo.toml.
+find_cargo_manifests() {
+    perl -ne '
+        if (/^\s*"([^"]+)"/) {
+            my $dir = $1;
+            print "$dir/Cargo.toml\n" if -f "$dir/Cargo.toml";
+        }
+    ' Cargo.toml
+}
+
+# Discover workspace crate names from member Cargo.toml files.
+find_workspace_crates() {
+    for manifest in $(find_cargo_manifests); do
+        read_toml_name "$manifest"
+    done
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+target_version="$1"
+[[ "$target_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "version must look like 0.8.0"
+
+require_cmd git
+require_cmd perl
+require_cmd node
+require_cmd cargo
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "must be run inside the git repository"
+ensure_clean_tree
+
+current_version="$(read_toml_version crates/remote/Cargo.toml)"
+[[ -n "$current_version" ]] || die "could not read current version from crates/remote/Cargo.toml"
+[[ "$target_version" != "$current_version" ]] || die "version is already $target_version"
+
+if git rev-parse -q --verify "refs/tags/v$target_version" >/dev/null 2>&1; then
+    die "tag v$target_version already exists"
+fi
+
+mapfile -t cargo_manifests < <(find_cargo_manifests)
+[[ ${#cargo_manifests[@]} -gt 0 ]] || die "no workspace members found"
+
+mapfile -t workspace_crates < <(find_workspace_crates)
+[[ ${#workspace_crates[@]} -gt 0 ]] || die "no workspace crates found"
+
+for file in "${cargo_manifests[@]}"; do
+    [[ "$(read_toml_version "$file")" == "$current_version" ]] \
+        || die "expected $file to be at version $current_version"
+done
+
+[[ "$(read_flake_version nix/common.nix)" == "$current_version" ]] \
+    || die "expected nix/common.nix to be at version $current_version"
+
+# Validate workspace dependency versions in root Cargo.toml
+ws_dep_versions=$(perl -ne 'print "$1\n" if /version = "([^"]+)", path/' Cargo.toml)
+for v in $ws_dep_versions; do
+    [[ "$v" == "$current_version" ]] \
+        || die "expected workspace dependency version $v in Cargo.toml to be $current_version"
+done
+
+# Validate JS package versions
+node - "$current_version" <<'NODE'
+const fs = require("fs");
+const expected = process.argv[2];
+
+for (const dir of ["js/core", "js/react", "js/solid"]) {
+  const pkg = JSON.parse(fs.readFileSync(`${dir}/package.json`, "utf8"));
+  if (pkg.version !== expected) {
+    console.error(`release: expected ${dir}/package.json to be at version ${expected}`);
+    process.exit(1);
+  }
+}
+NODE
+
+previous_tag="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+if [[ -n "$previous_tag" ]]; then
+    echo "Changes since $previous_tag:"
+    git log --oneline "$previous_tag"..HEAD
+    echo
+else
+    echo "No previous v* tag found."
+    echo
+fi
+
+for file in "${cargo_manifests[@]}"; do
+    FROM="$current_version" TO="$target_version" \
+        perl -0pi -e 's/^version = "\Q$ENV{FROM}\E"$/version = "$ENV{TO}"/m' "$file"
+done
+
+FROM="$current_version" TO="$target_version" \
+    perl -0pi -e 's/version = "\Q$ENV{FROM}\E";/version = "$ENV{TO}";/' nix/common.nix
+
+# Bump workspace dependency versions in root Cargo.toml
+FROM="$current_version" TO="$target_version" \
+    perl -pi -e 's/version = "\Q$ENV{FROM}\E", path/version = "$ENV{TO}", path/g' Cargo.toml
+
+# Bump JS package versions
+node - "$target_version" <<'NODE'
+const fs = require("fs");
+const version = process.argv[2];
+
+for (const dir of ["js/core", "js/react", "js/solid"]) {
+  const pkgPath = `${dir}/package.json`;
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  pkg.version = version;
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+}
+NODE
+
+for crate in "${workspace_crates[@]}"; do
+    CRATE="$crate" FROM="$current_version" TO="$target_version" \
+        perl -0pi -e 's/(name = "\Q$ENV{CRATE}\E"\nversion = ")\Q$ENV{FROM}\E(")/$1$ENV{TO}$2/g' Cargo.lock
+done
+
+for file in "${cargo_manifests[@]}"; do
+    [[ "$(read_toml_version "$file")" == "$target_version" ]] \
+        || die "failed to update $file to version $target_version"
+done
+
+[[ "$(read_flake_version nix/common.nix)" == "$target_version" ]] \
+    || die "failed to update nix/common.nix to version $target_version"
+
+# Verify workspace dependency versions in root Cargo.toml
+ws_dep_versions=$(perl -ne 'print "$1\n" if /version = "([^"]+)", path/' Cargo.toml)
+for v in $ws_dep_versions; do
+    [[ "$v" == "$target_version" ]] \
+        || die "failed to update workspace dependency version in Cargo.toml to $target_version"
+done
+
+# Verify JS versions
+node - "$target_version" <<'NODE'
+const fs = require("fs");
+const expected = process.argv[2];
+
+for (const dir of ["js/core", "js/react", "js/solid"]) {
+  const pkg = JSON.parse(fs.readFileSync(`${dir}/package.json`, "utf8"));
+  if (pkg.version !== expected) {
+    console.error(`release: failed to update ${dir}/package.json to version ${expected}`);
+    process.exit(1);
+  }
+}
+NODE
+
+for crate in "${workspace_crates[@]}"; do
+    CRATE="$crate" EXPECTED="$target_version" \
+        perl -0ne 'exit(!/name = "\Q$ENV{CRATE}\E"\nversion = "\Q$ENV{EXPECTED}\E"/)' Cargo.lock \
+        || die "failed to update Cargo.lock entry for $crate to version $target_version"
+done
+
+cargo test -p blit-server -- --nocapture
+
+# Stage all changed versioned files
+git add Cargo.toml Cargo.lock nix/common.nix js/core/package.json js/react/package.json js/solid/package.json js/pnpm-lock.yaml
+for file in "${cargo_manifests[@]}"; do
+    git add "$file"
+done
+
+git commit -m "release $target_version"
+
+echo
+echo "Created release commit:"
+git log -1 --oneline --decorate

@@ -1,0 +1,17 @@
+[package]
+name = "blit-webserver"
+version = "0.20.0"
+edition.workspace = true
+description = "Embedded web server for blit"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blit-fonts = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["sync", "time"] }
+futures-util = "0.3"
+notify = "7"
+percent-encoding = "2"
+brotli = "7"

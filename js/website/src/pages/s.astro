@@ -1,0 +1,12 @@
+---
+import Layout from "../layouts/Layout.astro";
+import TerminalDemo from "../components/terminal/TerminalDemo.tsx";
+---
+
+<Layout
+  title="blit &mdash; shared terminal"
+  description="Low-latency terminal streaming. Share your terminal via WebRTC."
+  bodyClass="bg-[var(--bg)] text-[var(--fg)] antialiased h-screen overflow-hidden"
+>
+  <TerminalDemo client:only="solid-js" />
+</Layout>

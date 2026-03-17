@@ -1,0 +1,82 @@
+version: "0.5"
+
+# All ports and paths are set by bin/dev via environment variables.
+# See bin/dev for the BLIT_DEV_INSTANCE mechanism that makes it easy to
+# run multiple stacks side-by-side.
+#
+#   BLIT_DEV_SOCK       blit-server Unix socket    (default: /tmp/blit-dev.sock)
+#   BLIT_DEV_UI_PORT    Vite UI dev-server port    (default: 10000)
+#   BLIT_DEV_GW_PORT    Gateway listen port        (default: 10001)
+#   BLIT_DEV_SITE_PORT  Astro website dev port     (default: 10002)
+
+processes:
+  browser-wasm:
+    command: cargo watch -w crates/browser/src -w crates/remote/src -s "./bin/build-browser"
+    availability:
+      restart: always
+    readiness_probe:
+      exec:
+        command: test -f crates/browser/pkg/blit_browser.js
+      initial_delay_seconds: 5
+      period_seconds: 2
+      failure_threshold: 300
+
+  server:
+    # blit-server depends on: blit-remote, blit-alacritty, blit-compositor
+    command: >-
+      cargo watch
+      -w crates/server/src -w crates/remote/src -w crates/alacritty-driver/src -w crates/compositor/src
+      -x "run -p blit-server --release -- --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}"
+    environment:
+      - BLIT_SURFACE_ENCODERS=h264-vaapi,h264-software
+    availability:
+      restart: always
+    readiness_probe:
+      exec:
+        command: test -S ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
+      initial_delay_seconds: 5
+      period_seconds: 2
+      failure_threshold: 300
+
+  gateway:
+    # blit-gateway depends on: blit-webserver, blit-ssh, blit-webrtc-forwarder
+    command: cargo watch -w crates/gateway/src -w crates/webserver/src -w crates/ssh/src -w crates/webrtc-forwarder/src -x "run -p blit-gateway --release"
+    environment:
+      - BLIT_ADDR=127.0.0.1:${BLIT_DEV_GW_PORT:-10001}
+      - BLIT_CORS=*
+      - BLIT_PASSPHRASE=${BLIT_PASSPHRASE:-dev}
+      - BLIT_QUIC=0
+      - BLIT_SOCK=${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
+      - BLIT_STORE_CONFIG=1
+      - BLIT_GATEWAY_WEBRTC=${BLIT_GATEWAY_WEBRTC:-0}
+    depends_on:
+      server:
+        condition: process_healthy
+    availability:
+      restart: always
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: ${BLIT_DEV_GW_PORT:-10001}
+        path: /
+      initial_delay_seconds: 5
+      period_seconds: 2
+      failure_threshold: 300
+
+  ui:
+    command: cd js && pnpm install --frozen-lockfile && cd ui && pnpm exec vite --host --port ${BLIT_DEV_UI_PORT:-10000}
+    environment:
+      - BLIT_DEV_GW_PORT=${BLIT_DEV_GW_PORT:-10001}
+    depends_on:
+      browser-wasm:
+        condition: process_healthy
+    availability:
+      restart: always
+
+  website:
+    command: cd js && pnpm install --frozen-lockfile && cd website && pnpm exec astro dev --port ${BLIT_DEV_SITE_PORT:-3267}
+    depends_on:
+      browser-wasm:
+        condition: process_healthy
+    availability:
+      restart: always
