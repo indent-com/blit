@@ -92,11 +92,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "blit-server"
+name = "blit-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "tokio",
+]
+
+[[package]]
+name = "blit-server"
+version = "0.1.0"
+dependencies = [
  "libc",
  "lz4_flex",
  "tokio",
