@@ -72,27 +72,34 @@ pub struct Terminal {
     cursor_row: u16,
     cursor_col: u16,
     mode: u16,
+    dirty: Vec<bool>,
+    all_dirty: bool,
 }
 
 #[wasm_bindgen]
 impl Terminal {
     #[wasm_bindgen(constructor)]
     pub fn new(rows: u16, cols: u16, cell_width: f64, cell_height: f64) -> Self {
+        let total = rows as usize * cols as usize;
         Terminal {
             rows,
             cols,
             cell_width,
             cell_height,
-            cells: vec![0u8; rows as usize * cols as usize * CELL_SIZE],
+            cells: vec![0u8; total * CELL_SIZE],
             cursor_row: 0,
             cursor_col: 0,
             mode: 0,
+            dirty: vec![true; total],
+            all_dirty: true,
         }
     }
 
     pub fn set_cell_size(&mut self, cell_width: f64, cell_height: f64) {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
+        self.all_dirty = true;
+        self.dirty.fill(true);
     }
 
     // mode bits: 0=cursor_vis, 1=app_cursor, 2=app_keypad, 3=bracketed_paste, 4-6=mouse_mode, 7-8=mouse_enc
@@ -138,14 +145,17 @@ impl Terminal {
 
         let new_rows = u16::from_le_bytes([payload[0], payload[1]]);
         let new_cols = u16::from_le_bytes([payload[2], payload[3]]);
-        self.cursor_row = u16::from_le_bytes([payload[4], payload[5]]);
-        self.cursor_col = u16::from_le_bytes([payload[6], payload[7]]);
-        self.mode = u16::from_le_bytes([payload[8], payload[9]]);
+        let new_cursor_row = u16::from_le_bytes([payload[4], payload[5]]);
+        let new_cursor_col = u16::from_le_bytes([payload[6], payload[7]]);
+        let new_mode = u16::from_le_bytes([payload[8], payload[9]]);
 
         if new_rows != self.rows || new_cols != self.cols {
             self.rows = new_rows;
             self.cols = new_cols;
-            self.cells = vec![0u8; new_rows as usize * new_cols as usize * CELL_SIZE];
+            let total = new_rows as usize * new_cols as usize;
+            self.cells = vec![0u8; total * CELL_SIZE];
+            self.dirty = vec![true; total];
+            self.all_dirty = true;
         }
 
         let total_cells = self.rows as usize * self.cols as usize;
@@ -165,9 +175,35 @@ impl Terminal {
                 let idx = i * CELL_SIZE;
                 self.cells[idx..idx + CELL_SIZE]
                     .copy_from_slice(&payload[cell_off..cell_off + CELL_SIZE]);
+                if !self.all_dirty {
+                    self.dirty[i] = true;
+                }
                 cell_off += CELL_SIZE;
             }
         }
+
+        // Mark cursor positions dirty when cursor moves or visibility changes
+        if !self.all_dirty {
+            let cursor_moved =
+                new_cursor_row != self.cursor_row || new_cursor_col != self.cursor_col;
+            let vis_changed = (new_mode & 1) != (self.mode & 1);
+            if cursor_moved || vis_changed {
+                let old_idx =
+                    self.cursor_row as usize * self.cols as usize + self.cursor_col as usize;
+                if old_idx < total_cells {
+                    self.dirty[old_idx] = true;
+                }
+            }
+            let new_idx =
+                new_cursor_row as usize * self.cols as usize + new_cursor_col as usize;
+            if new_idx < total_cells {
+                self.dirty[new_idx] = true;
+            }
+        }
+
+        self.cursor_row = new_cursor_row;
+        self.cursor_col = new_cursor_col;
+        self.mode = new_mode;
     }
 
     pub fn get_html(&self, start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> String {
@@ -313,44 +349,61 @@ impl Terminal {
         result
     }
 
-    pub fn render(&self, ctx: &CanvasRenderingContext2d) {
+    pub fn render(&mut self, ctx: &CanvasRenderingContext2d) {
         let cw = self.cell_width;
         let ch = self.cell_height;
+        let cursor_visible = self.mode & 1 != 0;
+        let cols = self.cols as usize;
+        let total = self.rows as usize * cols;
 
-        ctx.set_fill_style_str("#000");
-        ctx.fill_rect(0.0, 0.0, self.cols as f64 * cw, self.rows as f64 * ch);
-
-        ctx.set_font(&format!("{}px ui-monospace, monospace", ch as u32));
+        let normal_font = format!("{}px ui-monospace, monospace", ch as u32);
+        ctx.set_font(&normal_font);
         ctx.set_text_baseline("bottom");
 
-        let cursor_visible = self.mode & 1 != 0;
+        let do_all = self.all_dirty;
+        if do_all {
+            ctx.set_fill_style_str("#000");
+            ctx.fill_rect(0.0, 0.0, cols as f64 * cw, self.rows as f64 * ch);
+            self.all_dirty = false;
+        }
 
-        for row in 0..self.rows as usize {
-            for col in 0..self.cols as usize {
-                let idx = (row * self.cols as usize + col) * CELL_SIZE;
-                let cell = &self.cells[idx..idx + CELL_SIZE];
+        for i in 0..total {
+            if !do_all && !self.dirty[i] {
+                continue;
+            }
+            self.dirty[i] = false;
 
-                let f0 = cell[0];
-                let f1 = cell[1];
+            let row = i / cols;
+            let col = i % cols;
+            let idx = i * CELL_SIZE;
+            let x = col as f64 * cw;
+            let y = row as f64 * ch;
 
-                if f1 & 4 != 0 {
-                    continue; // wide continuation
+            let f0 = self.cells[idx];
+            let f1 = self.cells[idx + 1];
+
+            if f1 & 4 != 0 {
+                // wide continuation — only needs clearing in partial mode
+                if !do_all {
+                    ctx.set_fill_style_str("#000");
+                    ctx.fill_rect(x, y, cw, ch);
                 }
+                continue;
+            }
 
-                let x = col as f64 * cw;
-                let y = row as f64 * ch;
+            let fg_type = f0 & 3;
+            let bg_type = (f0 >> 2) & 3;
+            let bold = f0 & (1 << 4) != 0;
+            let dim = f0 & (1 << 5) != 0;
+            let italic = f0 & (1 << 6) != 0;
+            let underline = f0 & (1 << 7) != 0;
+            let inverse = f1 & 1 != 0;
+            let wide = f1 & 2 != 0;
+            let content_len = ((f1 >> 3) & 7) as usize;
 
-                let fg_type = f0 & 3;
-                let bg_type = (f0 >> 2) & 3;
-                let bold = f0 & (1 << 4) != 0;
-                let dim = f0 & (1 << 5) != 0;
-                let italic = f0 & (1 << 6) != 0;
-                let underline = f0 & (1 << 7) != 0;
-                let inverse = f1 & 1 != 0;
-                let wide = f1 & 2 != 0;
-                let content_len = ((f1 >> 3) & 7) as usize;
-
-                let (fg_color, bg_color) = if inverse {
+            let (fg_color, bg_color) = {
+                let cell = &self.cells[idx..idx + CELL_SIZE];
+                if inverse {
                     (
                         color_css(bg_type, cell[5], cell[6], cell[7], "#000", dim),
                         color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", false),
@@ -360,56 +413,64 @@ impl Terminal {
                         color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", dim),
                         color_css(bg_type, cell[5], cell[6], cell[7], "#000", false),
                     )
-                };
-
-                if bg_color != "#000" {
-                    ctx.set_fill_style_str(&bg_color);
-                    let w = if wide { cw * 2.0 } else { cw };
-                    ctx.fill_rect(x, y, w, ch);
                 }
+            };
 
-                if cursor_visible
-                    && self.cursor_row == row as u16
-                    && self.cursor_col == col as u16
-                {
-                    ctx.set_fill_style_str("rgba(204,204,204,0.5)");
-                    ctx.fill_rect(x, y, cw, ch);
-                }
+            let cell_w = if wide { cw * 2.0 } else { cw };
 
-                if content_len > 0 {
-                    let content =
-                        std::str::from_utf8(&cell[8..8 + content_len]).unwrap_or("");
-                    if !content.is_empty() && content != " " {
-                        let mut font_changed = false;
-                        if bold || italic {
-                            let mut font = String::new();
-                            if bold {
-                                font.push_str("bold ");
-                            }
-                            if italic {
-                                font.push_str("italic ");
-                            }
-                            font.push_str(&format!("{}px ui-monospace, monospace", ch as u32));
-                            ctx.set_font(&font);
-                            font_changed = true;
+            // In partial mode, clear the cell area first
+            if !do_all {
+                ctx.set_fill_style_str("#000");
+                ctx.fill_rect(x, y, cell_w, ch);
+            }
+
+            if bg_color != "#000" {
+                ctx.set_fill_style_str(&bg_color);
+                ctx.fill_rect(x, y, cell_w, ch);
+            }
+
+            if cursor_visible
+                && self.cursor_row == row as u16
+                && self.cursor_col == col as u16
+            {
+                ctx.set_fill_style_str("rgba(204,204,204,0.5)");
+                ctx.fill_rect(x, y, cw, ch);
+            }
+
+            if content_len > 0 {
+                let content =
+                    std::str::from_utf8(&self.cells[idx + 8..idx + 8 + content_len])
+                        .unwrap_or("");
+                if !content.is_empty() && content != " " {
+                    ctx.save();
+                    ctx.begin_path();
+                    ctx.rect(x, y, cell_w, ch);
+                    ctx.clip();
+
+                    if bold || italic {
+                        let mut font = String::new();
+                        if bold {
+                            font.push_str("bold ");
                         }
-
-                        ctx.set_fill_style_str(&fg_color);
-                        let _ = ctx.fill_text(content, x, y + ch);
-
-                        if underline {
-                            ctx.set_stroke_style_str(&fg_color);
-                            ctx.begin_path();
-                            ctx.move_to(x, y + ch - 1.0);
-                            let w = if wide { cw * 2.0 } else { cw };
-                            ctx.line_to(x + w, y + ch - 1.0);
-                            ctx.stroke();
+                        if italic {
+                            font.push_str("italic ");
                         }
-
-                        if font_changed {
-                            ctx.set_font(&format!("{}px ui-monospace, monospace", ch as u32));
-                        }
+                        font.push_str(&normal_font);
+                        ctx.set_font(&font);
                     }
+
+                    ctx.set_fill_style_str(&fg_color);
+                    let _ = ctx.fill_text(content, x, y + ch);
+
+                    if underline {
+                        ctx.set_stroke_style_str(&fg_color);
+                        ctx.begin_path();
+                        ctx.move_to(x, y + ch - 1.0);
+                        ctx.line_to(x + cell_w, y + ch - 1.0);
+                        ctx.stroke();
+                    }
+
+                    ctx.restore();
                 }
             }
         }

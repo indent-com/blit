@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>btrm</title>
+<title>blit</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: ui-monospace, monospace; }
@@ -89,11 +89,11 @@ canvas { display: block; outline: none; cursor: text; position: absolute; left: 
 </div></div>
 <script type="module">
 const _base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
-const { default: init, Terminal } = await import(_base + 'btrm_browser.js');
+const { default: init, Terminal } = await import(_base + 'blit_browser.js');
 
 const FONT = 'ui-monospace, monospace';
 const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12;
-const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03;
+const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04;
 
 const hud = document.getElementById('hud');
 const authEl = document.getElementById('auth');
@@ -108,6 +108,7 @@ const inputSink = document.getElementById('input-sink');
 
 let ws, cell, cols, rows, dpr;
 let terminals = {};
+let ptyTitles = {};
 let focusedPty = null;
 let ptyIds = [];
 let frames = 0, lastFpsTime = performance.now(), fps = 0;
@@ -152,7 +153,8 @@ function updateTabs() {
     for (const id of ptyIds) {
         const t = document.createElement('span');
         t.className = 'tab' + (id === focusedPty ? ' active' : '');
-        const label = document.createTextNode(`#${id}`);
+        const title = ptyTitles[id];
+        const label = document.createTextNode(title ? `${id}: ${title}` : `#${id}`);
         t.appendChild(label);
         const close = document.createElement('span');
         close.className = 'close';
@@ -174,6 +176,8 @@ function focusPty(id) {
     focusedPty = id;
     scrollOffset = 0;
     updateTabs();
+    const title = ptyTitles[id];
+    document.title = title ? `${title} — blit` : 'blit';
     if (ws && ws.readyState === WebSocket.OPEN) {
         const msg = new Uint8Array(3);
         msg[0] = C2S_FOCUS;
@@ -393,8 +397,13 @@ async function main() {
             t.render(offCtx);
             const cw = cell.w * dpr, ch = cell.h * dpr;
             let predLen = 0;
-            if (predicted && (t.echo() || !t.icanon())) {
+            if (predicted && t.echo()) {
                 const cr = t.cursor_row, cc = t.cursor_col;
+                // Clear the original cursor and predicted area
+                const clearLen = Math.min(predicted.length + 1, cols - cc);
+                offCtx.fillStyle = '#000';
+                offCtx.fillRect(cc * cw, cr * ch, clearLen * cw, ch);
+                // Draw predicted text at half opacity
                 offCtx.font = `${Math.round(ch)}px ${FONT}`;
                 offCtx.textBaseline = 'bottom';
                 offCtx.fillStyle = 'rgba(204,204,204,0.5)';
@@ -402,7 +411,7 @@ async function main() {
                     offCtx.fillText(predicted[i], (cc + i) * cw, cr * ch + ch);
                     predLen++;
                 }
-                // Draw predicted cursor
+                // Draw cursor after predicted text
                 if (cc + predLen < cols) {
                     offCtx.fillStyle = 'rgba(204,204,204,0.5)';
                     offCtx.fillRect((cc + predLen) * cw, cr * ch, cw, ch);
@@ -480,7 +489,7 @@ async function main() {
             sendKey(bytes);
             // Predictive input when echo is on
             const t = terminals[focusedPty];
-            if (t && (t.echo() || !t.icanon())) {
+            if (t && t.echo()) {
                 if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
                     if (!predicted) {
                         predictedFromRow = t.cursor_row;
@@ -635,9 +644,6 @@ function connect(pass) {
                     }
                 }
                 needsRender = true;
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(new Uint8Array([C2S_ACK]));
-                }
                 break;
             }
             case S2C_CREATED: {
@@ -654,6 +660,7 @@ function connect(pass) {
                 const id = data[1] | (data[2] << 8);
                 ptyIds = ptyIds.filter(x => x !== id);
                 if (terminals[id]) { terminals[id].free(); delete terminals[id]; }
+                delete ptyTitles[id];
                 if (focusedPty === id) {
                     focusedPty = ptyIds.length > 0 ? ptyIds[ptyIds.length - 1] : null;
                     if (focusedPty !== null) {
@@ -680,6 +687,17 @@ function connect(pass) {
                 for (const id of ptyIds) sendResizeForPty(id);
                 break;
             }
+            case S2C_TITLE: {
+                if (data.length < 3) break;
+                const id = data[1] | (data[2] << 8);
+                const title = new TextDecoder().decode(data.slice(3));
+                ptyTitles[id] = title;
+                updateTabs();
+                if (id === focusedPty) {
+                    document.title = title ? `${title} — blit` : 'blit';
+                }
+                break;
+            }
         }
     };
 
@@ -692,8 +710,10 @@ function connect(pass) {
             terminals[id].free();
             delete terminals[id];
         }
+        ptyTitles = {};
         ptyIds = [];
         focusedPty = null;
+        document.title = 'blit';
         predicted = '';
         predictedFromCol = 0;
         predictedFromRow = 0;
@@ -724,12 +744,17 @@ function keyToBytes(e) {
     const t = focusedPty !== null ? terminals[focusedPty] : null;
     const appCursor = t && t.app_cursor();
 
-    if (e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
-        const code = e.key.toLowerCase().charCodeAt(0);
-        if (code >= 97 && code <= 122) return new Uint8Array([code - 96]);
-        if (e.key === '[') return new Uint8Array([0x1b]);
-        if (e.key === '\\') return new Uint8Array([0x1c]);
-        if (e.key === ']') return new Uint8Array([0x1d]);
+    if (e.ctrlKey && !e.altKey && !e.metaKey) {
+        // Some platforms return the control char directly as e.key
+        const kc = e.key.charCodeAt(0);
+        if (e.key.length === 1 && kc >= 1 && kc <= 26) return new Uint8Array([kc]);
+        if (e.key.length === 1) {
+            const code = e.key.toLowerCase().charCodeAt(0);
+            if (code >= 97 && code <= 122) return new Uint8Array([code - 96]);
+            if (e.key === '[') return new Uint8Array([0x1b]);
+            if (e.key === '\\') return new Uint8Array([0x1c]);
+            if (e.key === ']') return new Uint8Array([0x1d]);
+        }
     }
 
     if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {

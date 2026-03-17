@@ -1,9 +1,9 @@
 /.direnv/
 /target/
 /result
-/web/btrm_browser_bg.wasm
-/web/btrm_browser_bg.wasm.d.ts
-/web/btrm_browser.js
-/web/btrm_browser.d.ts
+/web/blit_browser_bg.wasm
+/web/blit_browser_bg.wasm.d.ts
+/web/blit_browser.js
+/web/blit_browser.d.ts
 /web/package.json
 /web/.gitignore

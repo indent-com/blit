@@ -82,16 +82,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
-name = "block-buffer"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
-dependencies = [
- "generic-array",
-]
-
-[[package]]
-name = "btrm-browser"
+name = "blit-browser"
 version = "0.1.0"
 dependencies = [
  "js-sys",
@@ -101,7 +92,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "btrm-server"
+name = "blit-server"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -110,6 +101,15 @@ dependencies = [
  "lz4_flex",
  "tokio",
  "vt100",
+]
+
+[[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
