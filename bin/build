@@ -2,5 +2,5 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 (cd browser && wasm-pack build --target web --release --out-dir ../web)
-cargo build --release -p blit-server
-echo "built: target/release/blit-server"
+cargo build --release -p blit-server -p blit-gateway
+echo "built: target/release/blit-server target/release/blit-gateway"

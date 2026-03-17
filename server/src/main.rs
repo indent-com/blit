@@ -1,8 +1,3 @@
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{FromRequest, State, WebSocketUpgrade};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
-use futures_util::{SinkExt, StreamExt};
 use lz4_flex::compress_prepend_size;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -10,13 +5,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, RawFd>>>;
-
-const INDEX_HTML: &str = include_str!("../../web/index.html");
-const BROWSER_JS: &[u8] = include_bytes!("../../web/blit_browser.js");
-const BROWSER_WASM: &[u8] = include_bytes!("../../web/blit_browser_bg.wasm");
 
 const C2S_INPUT: u8 = 0x00;
 const C2S_RESIZE: u8 = 0x01;
@@ -35,13 +28,11 @@ const S2C_TITLE: u8 = 0x04;
 // Cell: 12 bytes
 // [0]    flags: fg_type(2) | bg_type(2) | bold(1) | dim(1) | italic(1) | underline(1)
 // [1]    flags2: inverse(1) | wide(1) | wide_cont(1) | content_len(3) | reserved(2)
-// [2..5] fg (r, g, b) — idx: r=idx
-// [5..8] bg (r, g, b) — idx: r=idx
+// [2..5] fg (r, g, b) -- idx: r=idx
+// [5..8] bg (r, g, b) -- idx: r=idx
 // [8..12] content (up to 4 bytes UTF-8)
 const CELL_SIZE: usize = 12;
 
-// ~10MB of scrollback at 80 cols ≈ 10_000_000 / (80 * 12) ≈ 10416 rows
-// Use a generous fixed row count; vt100 crate manages memory internally.
 const SCROLLBACK_ROWS: usize = 100_000;
 
 #[derive(Default)]
@@ -62,7 +53,6 @@ impl vt100::Callbacks for TitleCallbacks {
 }
 
 struct Config {
-    passphrase: String,
     shell: String,
 }
 
@@ -71,6 +61,26 @@ impl AsRawFd for OwnedFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0
     }
+}
+
+async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await.ok()?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 {
+        return Some(vec![]);
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await.ok()?;
+    Some(buf)
+}
+
+async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> bool {
+    let len = payload.len() as u32;
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(payload);
+    writer.write_all(&buf).await.is_ok()
 }
 
 fn encode_cell(screen: &vt100::Screen, row: u16, col: u16, buf: &mut [u8; CELL_SIZE]) {
@@ -165,9 +175,9 @@ struct ClientState {
     tx: mpsc::Sender<Vec<u8>>,
     focus: Option<u16>,
     size: Option<(u16, u16)>,
-    scroll_offset: usize,    // 0 = live view, >0 = scrolled back N rows
-    scroll_snap: Vec<u8>,    // prev snapshot for scrolled view (per-client)
-    last_sent_snap: Vec<u8>, // last snapshot successfully sent (for live diffs)
+    scroll_offset: usize,
+    scroll_snap: Vec<u8>,
+    last_sent_snap: Vec<u8>,
 }
 
 struct Session {
@@ -221,7 +231,6 @@ impl Session {
         }
         pty.parser.screen_mut().set_size(rows, cols);
         pty.dirty = true;
-        // Invalidate per-client snapshots so next send is a full frame
         for c in self.clients.values_mut() {
             if c.focus == Some(pty_id) {
                 c.last_sent_snap.clear();
@@ -319,7 +328,12 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, state: AppState) -> Pty
     Pty {
         master_fd: master,
         child_pid: pid,
-        parser: vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_ROWS, TitleCallbacks::default()),
+        parser: vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            SCROLLBACK_ROWS,
+            TitleCallbacks::default(),
+        ),
         dirty: true,
         reader_handle,
     }
@@ -397,7 +411,6 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
         };
 
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        let eof;
         if n > 0 {
             let data = &buf[..n as usize];
             let mut sess = state.1.lock().await;
@@ -410,17 +423,13 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
             tokio::task::yield_now().await;
             continue;
         } else if n == 0 {
-            eof = true;
+            break;
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
                 guard.clear_ready();
                 continue;
             }
-            eof = true;
-        }
-
-        if eof {
             break;
         }
     }
@@ -494,7 +503,6 @@ fn pack_mode(screen: &vt100::Screen, echo: bool, icanon: bool) -> u16 {
     m
 }
 
-/// Build a full-screen update message from the current screen snapshot.
 fn build_snapshot_msg(
     id: u16,
     snap: &[u8],
@@ -542,7 +550,6 @@ fn build_snapshot_msg(
     msg
 }
 
-/// Snapshot current pty state for diffing.
 struct PtySnapshot {
     snap: Vec<u8>,
     cursor: (u16, u16),
@@ -564,7 +571,6 @@ fn take_snapshot(pty: &Pty) -> PtySnapshot {
     }
 }
 
-/// Build scrollback-view update for a client at the given offset.
 fn build_scrollback_update(
     pty: &mut Pty,
     id: u16,
@@ -577,8 +583,7 @@ fn build_scrollback_update(
 
     let snap = snapshot_screen(screen);
     let (rows, cols) = screen.size();
-    // In scrollback view: hide cursor, strip mouse/etc
-    let mode: u16 = 0; // no cursor, no modes while scrolled
+    let mode: u16 = 0;
     let cursor = (0u16, 0u16);
 
     let msg = build_snapshot_msg(id, &snap, prev_snap, rows, cols, cursor, mode);
@@ -589,15 +594,13 @@ fn build_scrollback_update(
 
 #[tokio::main]
 async fn main() {
-    let passphrase = std::env::var("BLIT_PASS").unwrap_or_else(|_| {
-        eprintln!("BLIT_PASS environment variable required");
-        std::process::exit(1);
-    });
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let addr = std::env::var("BLIT_ADDR").unwrap_or_else(|_| "0.0.0.0:3264".into());
+    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| "/tmp/blit.sock".into());
+
+    let _ = std::fs::remove_file(&sock_path);
 
     let state: AppState = Arc::new((
-        Config { passphrase, shell },
+        Config { shell },
         Mutex::new(Session::new()),
         Arc::new(std::sync::RwLock::new(HashMap::new())),
     ));
@@ -611,19 +614,19 @@ async fn main() {
         }
     });
 
-    let app = axum::Router::new()
-        .fallback(get(root_handler))
-        .with_state(state);
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    eprintln!("listening on {sock_path}");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    eprintln!("listening on {addr}");
-    axum::serve(listener, app).await.unwrap();
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let state = state.clone();
+        tokio::spawn(handle_client(stream, state));
+    }
 }
 
 async fn tick(state: &AppState) {
     let mut sess = state.1.lock().await;
 
-    // Send title updates
     let ids: Vec<u16> = sess.ptys.keys().copied().collect();
     for &id in &ids {
         let pty = sess.ptys.get_mut(&id).unwrap();
@@ -639,7 +642,6 @@ async fn tick(state: &AppState) {
         }
     }
 
-    // Snapshot dirty PTYs
     let mut snapshots: HashMap<u16, PtySnapshot> = HashMap::new();
     for &id in &ids {
         let pty = sess.ptys.get_mut(&id).unwrap();
@@ -650,7 +652,6 @@ async fn tick(state: &AppState) {
         pty.dirty = false;
     }
 
-    // Per-client delivery
     let client_ids: Vec<u64> = sess.clients.keys().copied().collect();
     for cid in client_ids {
         let (focus, scroll_offset) = {
@@ -660,10 +661,13 @@ async fn tick(state: &AppState) {
         let Some(pid) = focus else { continue };
 
         let sent = if scroll_offset == 0 {
-            // Live view: diff from this client's last-sent snapshot
-            let Some(cur) = snapshots.get(&pid) else { continue };
+            let Some(cur) = snapshots.get(&pid) else {
+                continue;
+            };
             let prev = &sess.clients.get(&cid).unwrap().last_sent_snap;
-            let msg = build_snapshot_msg(pid, &cur.snap, prev, cur.rows, cur.cols, cur.cursor, cur.mode);
+            let msg = build_snapshot_msg(
+                pid, &cur.snap, prev, cur.rows, cur.cols, cur.cursor, cur.mode,
+            );
             let c = sess.clients.get_mut(&cid).unwrap();
             if c.tx.try_send(msg).is_ok() {
                 c.last_sent_snap = cur.snap.clone();
@@ -672,7 +676,6 @@ async fn tick(state: &AppState) {
                 false
             }
         } else {
-            // Scrollback view: per-client diff
             let prev_snap = {
                 let c = sess.clients.get(&cid).unwrap();
                 c.scroll_snap.clone()
@@ -699,67 +702,10 @@ async fn tick(state: &AppState) {
     }
 }
 
-async fn root_handler(
-    State(state): State<AppState>,
-    request: axum::extract::Request,
-) -> Response {
-    let path = request.uri().path();
-    if path.ends_with("/blit_browser.js") {
-        return (
-            [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-            BROWSER_JS,
-        )
-            .into_response();
-    }
-    if path.ends_with("/blit_browser_bg.wasm") {
-        return (
-            [(axum::http::header::CONTENT_TYPE, "application/wasm")],
-            BROWSER_WASM,
-        )
-            .into_response();
-    }
-    let is_ws = request
-        .headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-    if is_ws {
-        match WebSocketUpgrade::from_request(request, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| handle_ws(socket, state)),
-            Err(e) => e.into_response(),
-        }
-    } else {
-        Html(INDEX_HTML).into_response()
-    }
-}
-
-async fn handle_ws(mut ws: WebSocket, state: AppState) {
+async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
     let config = &state.0;
+    let (mut reader, mut writer) = stream.into_split();
 
-    let authed = loop {
-        match ws.recv().await {
-            Some(Ok(Message::Text(pass))) => {
-                if pass.trim() == config.passphrase {
-                    let _ = ws.send(Message::Text("ok".into())).await;
-                    break true;
-                } else {
-                    let _ = ws.close().await;
-                    break false;
-                }
-            }
-            Some(Ok(Message::Ping(d))) => {
-                let _ = ws.send(Message::Pong(d)).await;
-            }
-            _ => break false,
-        }
-    };
-    if !authed {
-        return;
-    }
-    eprintln!("client authenticated");
-
-    let (mut tx, mut rx) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2);
     let client_id;
 
@@ -784,20 +730,17 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         }
     }
 
+    eprintln!("client connected");
+
     let sender = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            if tx.send(Message::Binary(msg.into())).await.is_err() {
+            if !write_frame(&mut writer, &msg).await {
                 break;
             }
         }
     });
 
-    while let Some(Ok(msg)) = rx.next().await {
-        let data = match msg {
-            Message::Binary(d) => d,
-            Message::Close(_) => break,
-            _ => continue,
-        };
+    while let Some(data) = read_frame(&mut reader).await {
         if data.is_empty() {
             continue;
         }
@@ -808,7 +751,6 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
 
         if data[0] == C2S_INPUT && data.len() >= 3 {
             let pid = u16::from_le_bytes([data[1], data[2]]);
-            // Any input resets scroll to live view
             {
                 let mut sess = state.1.lock().await;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
@@ -834,19 +776,18 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         match data[0] {
             C2S_SCROLL if data.len() >= 7 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
-                let offset = u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
+                let offset =
+                    u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
                 if sess.ptys.contains_key(&pid) {
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         if c.scroll_offset != offset {
                             c.scroll_offset = offset;
                             c.scroll_snap.clear();
-                            // Transitioning back to live: clear last_sent_snap for full diff
                             if offset == 0 {
                                 c.last_sent_snap.clear();
                             }
                         }
                     }
-                    // Mark pty dirty so tick sends the scrollback view
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
                         pty.dirty = true;
                     }
@@ -890,10 +831,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
             C2S_FOCUS if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 if sess.ptys.contains_key(&pid) {
-                    let old_pid = sess
-                        .clients
-                        .get(&client_id)
-                        .and_then(|c| c.focus);
+                    let old_pid = sess.clients.get(&client_id).and_then(|c| c.focus);
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.focus = Some(pid);
                         c.scroll_offset = 0;

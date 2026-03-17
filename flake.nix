@@ -38,11 +38,19 @@
         };
       in
       {
-        packages.default = rustPlatform.buildRustPackage {
+        packages.blit-server = rustPlatform.buildRustPackage {
           pname = "blit-server";
           version = "0.1.0";
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-server" ];
+          cargoLock.lockFile = ./Cargo.lock;
+        };
+
+        packages.default = rustPlatform.buildRustPackage {
+          pname = "blit-gateway";
+          version = "0.1.0";
+          src = ./.;
+          cargoBuildFlags = [ "-p" "blit-gateway" ];
           cargoLock.lockFile = ./Cargo.lock;
           preBuild = ''
             mkdir -p web
@@ -62,7 +70,8 @@
           shellHook = ''
             echo "blit dev shell"
             echo "  build browser wasm: cd browser && wasm-pack build --target web --release --out-dir ../web"
-            echo "  run server:         BLIT_PASS=secret cargo run --release -p blit-server  # http://localhost:3264"
+            echo "  run server:         cargo run -p blit-server"
+            echo "  run gateway:        BLIT_PASS=secret cargo run -p blit-gateway  # http://localhost:3264"
           '';
         };
       }

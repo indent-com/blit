@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["server", "browser"]
+members = ["server", "gateway", "browser"]
 
 [profile.release]
 opt-level = "s"
