@@ -1,6 +1,7 @@
 use lz4_flex::compress_prepend_size;
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
@@ -595,7 +596,13 @@ fn build_scrollback_update(
 #[tokio::main]
 async fn main() {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| "/tmp/blit.sock".into());
+    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
+        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+            format!("{dir}/blit.sock")
+        } else {
+            "/tmp/blit.sock".into()
+        }
+    });
 
     let _ = std::fs::remove_file(&sock_path);
 
@@ -615,6 +622,7 @@ async fn main() {
     });
 
     let listener = UnixListener::bind(&sock_path).unwrap();
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     eprintln!("listening on {sock_path}");
 
     loop {

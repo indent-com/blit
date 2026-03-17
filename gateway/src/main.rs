@@ -44,7 +44,13 @@ async fn main() {
         eprintln!("BLIT_PASS environment variable required");
         std::process::exit(1);
     });
-    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| "/tmp/blit.sock".into());
+    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
+        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+            format!("{dir}/blit.sock")
+        } else {
+            "/tmp/blit.sock".into()
+        }
+    });
     let addr = std::env::var("BLIT_ADDR").unwrap_or_else(|_| "0.0.0.0:3264".into());
 
     let state: AppState = Arc::new(Config {
