@@ -187,12 +187,14 @@ struct ClientState {
     last_sent_mode: u16,
     /// Frames currently in flight (sent, not yet ACKed).
     unacked: u8,
+    /// Bytes currently in flight (sum of compressed frame sizes not yet ACKed).
+    unacked_bytes: u32,
     /// EWMA RTT estimate in milliseconds.
     rtt_ms: f32,
     /// Client's measured display refresh rate (fps), reported via C2S_DISPLAY_RATE.
     display_fps: f32,
-    /// Send timestamp of each in-flight frame, oldest first.
-    send_times: VecDeque<Instant>,
+    /// Send timestamp and compressed size of each in-flight frame, oldest first.
+    send_times: VecDeque<(Instant, u32)>,
     /// Diagnostics: frames sent since last log.
     frames_sent: u32,
     /// Diagnostics: ACKs received since last log.
@@ -201,9 +203,16 @@ struct ClientState {
     last_log: Instant,
 }
 
+/// Max compressed bytes to keep in flight.  This bounds latency on
+/// bandwidth-limited links: at 32 KB/s the queue drains in ≤ 500 ms;
+/// at 10 MB/s the same budget is only ~1.6 ms.  Frame count is NOT capped —
+/// small frames (few dirty cells) can fill the window freely, sustaining
+/// high fps even at high RTT without adding meaningful latency.
+const MAX_BYTES_IN_FLIGHT: u32 = 16 * 1024;
+
 /// Frames to keep in flight: exactly enough to sustain display_fps at the
-/// current RTT, plus one tick (4 ms) of slack so a single missed tick doesn't
-/// stall the pipeline.
+/// current RTT, plus one tick of slack.  The bytes cap above handles
+/// bandwidth-limited links; this handles high-RTT links.
 fn rtt_window(rtt_ms: f32, display_fps: f32) -> u8 {
     ((rtt_ms * display_fps / 1000.0).ceil() as u8 + 1).max(2)
 }
@@ -734,7 +743,8 @@ async fn tick(state: &AppState) {
     // snapshot+diff+compress work entirely rather than doing it 250×/s for nothing.
     let needful_ptys: std::collections::HashSet<u16> = sess.clients.values()
         .filter(|c| c.scroll_offset == 0)
-        .filter(|c| c.unacked < rtt_window(c.rtt_ms, c.display_fps))
+        .filter(|c| c.unacked < rtt_window(c.rtt_ms, c.display_fps)
+                 && c.unacked_bytes < MAX_BYTES_IN_FLIGHT)
         .filter_map(|c| c.focus)
         .collect();
 
@@ -754,14 +764,14 @@ async fn tick(state: &AppState) {
 
     let client_ids: Vec<u64> = sess.clients.keys().copied().collect();
     for cid in client_ids {
-        let (focus, scroll_offset, unacked, window) = {
+        let (focus, scroll_offset, unacked, unacked_bytes, window) = {
             let c = sess.clients.get(&cid).unwrap();
-            (c.focus, c.scroll_offset, c.unacked, rtt_window(c.rtt_ms, c.display_fps))
+            (c.focus, c.scroll_offset, c.unacked, c.unacked_bytes,
+             rtt_window(c.rtt_ms, c.display_fps))
         };
         let Some(pid) = focus else { continue };
 
-        // Don't get ahead of the client: keep at most window frames in flight.
-        if unacked >= window {
+        if unacked >= window || unacked_bytes >= MAX_BYTES_IN_FLIGHT {
             continue;
         }
 
@@ -780,11 +790,13 @@ async fn tick(state: &AppState) {
                 continue;
             };
             let c = sess.clients.get_mut(&cid).unwrap();
+            let frame_bytes = msg.len() as u32;
             if c.tx.try_send(msg).is_ok() {
                 c.last_sent_snap = cur.snap.clone();
                 c.last_sent_cursor = cur.cursor;
                 c.last_sent_mode = cur.mode;
-                c.send_times.push_back(Instant::now());
+                c.send_times.push_back((Instant::now(), frame_bytes));
+                c.unacked_bytes += frame_bytes;
                 c.unacked += 1;
                 c.frames_sent += 1;
                 true
@@ -801,9 +813,11 @@ async fn tick(state: &AppState) {
                     build_scrollback_update(pty, pid, scroll_offset, &prev_snap)
                 {
                     let c = sess.clients.get_mut(&cid).unwrap();
+                    let frame_bytes = msg.len() as u32;
                     if c.tx.try_send(msg).is_ok() {
                         c.scroll_snap = new_snap;
-                        c.send_times.push_back(Instant::now());
+                        c.send_times.push_back((Instant::now(), frame_bytes));
+                        c.unacked_bytes += frame_bytes;
                         c.unacked += 1;
                         true
                     } else {
@@ -847,7 +861,8 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 last_sent_cursor: (0, 0),
                 last_sent_mode: 0,
                 unacked: 0,
-                rtt_ms: 200.0,
+                unacked_bytes: 0,
+                rtt_ms: 10.0,
                 display_fps: 60.0,
                 send_times: VecDeque::new(),
                 frames_sent: 0,
@@ -890,28 +905,32 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
         if data[0] == C2S_ACK {
             let mut sess = state.1.lock().await;
             // Collect everything we need from ClientState before dropping that borrow.
-            let (focus_pid, scroll_offset, do_log, frames_sent, acks_recv, rtt_ms, unacked, display_fps) = {
+            let (focus_pid, scroll_offset, do_log, frames_sent, acks_recv, rtt_ms, unacked, unacked_bytes, display_fps) = {
                 let Some(c) = sess.clients.get_mut(&client_id) else {
                     continue;
                 };
                 c.unacked = c.unacked.saturating_sub(1);
                 c.acks_recv += 1;
-                // Only trust RTT samples when the pipeline isn't backed up.
-                // When many frames are queued, elapsed() includes queueing
-                // delay, which inflates RTT → grows window → more queueing.
-                if let Some(t) = c.send_times.pop_front() {
-                    if c.unacked <= 4 {
-                        let sample_ms = t.elapsed().as_secs_f32() * 1000.0;
+                if let Some((t, sz)) = c.send_times.pop_front() {
+                    c.unacked_bytes = c.unacked_bytes.saturating_sub(sz);
+                    // When backed up, only trust samples that would shrink RTT
+                    // (and therefore the window), not ones inflated by queueing.
+                    let sample_ms = t.elapsed().as_secs_f32() * 1000.0;
+                    if c.unacked_bytes < MAX_BYTES_IN_FLIGHT / 2 || sample_ms < c.rtt_ms {
                         c.rtt_ms = c.rtt_ms * 0.875 + sample_ms * 0.125;
                     }
                 }
                 let do_log = c.last_log.elapsed().as_secs_f32() >= 1.0;
                 let window = rtt_window(c.rtt_ms, c.display_fps);
                 let out = (
-                    if c.unacked < window { c.focus } else { None },
+                    if c.unacked < window && c.unacked_bytes < MAX_BYTES_IN_FLIGHT {
+                        c.focus
+                    } else {
+                        None
+                    },
                     c.scroll_offset,
                     do_log,
-                    c.frames_sent, c.acks_recv, c.rtt_ms, c.unacked, c.display_fps,
+                    c.frames_sent, c.acks_recv, c.rtt_ms, c.unacked, c.unacked_bytes, c.display_fps,
                 );
                 if do_log {
                     c.frames_sent = 0;
@@ -942,11 +961,13 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         };
                         if let Some(msg) = msg {
                             let c = sess.clients.get_mut(&client_id).unwrap();
+                            let frame_bytes = msg.len() as u32;
                             if c.tx.try_send(msg).is_ok() {
                                 c.last_sent_snap = snap.snap;
                                 c.last_sent_cursor = snap.cursor;
                                 c.last_sent_mode = snap.mode;
-                                c.send_times.push_back(Instant::now());
+                                c.send_times.push_back((Instant::now(), frame_bytes));
+                                c.unacked_bytes += frame_bytes;
                                 c.unacked += 1;
                                 c.frames_sent += 1;
                             } else {
@@ -968,7 +989,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
             if do_log {
                 let window = rtt_window(rtt_ms, display_fps);
                 eprintln!(
-                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms window={window} unacked={unacked} display_fps={display_fps:.0} | tick_fires={} tick_snaps={}",
+                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms window={window} unacked={unacked} unacked_bytes={unacked_bytes} display_fps={display_fps:.0} | tick_fires={} tick_snaps={}",
                     sess.tick_fires, sess.tick_snaps,
                 );
                 sess.tick_fires = 0;
