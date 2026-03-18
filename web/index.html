@@ -92,7 +92,7 @@ const _base = location.pathname.endsWith('/') ? location.pathname : location.pat
 const { default: init, Terminal } = await import(_base + 'blit_browser.js');
 
 const FONT = 'ui-monospace, monospace';
-const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12;
+const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_DISPLAY_RATE = 0x04, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12;
 const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04;
 
 const hud = document.getElementById('hud');
@@ -121,6 +121,12 @@ let scrollOffset = 0;
 // Frames queued from onmessage, to be fed+ACKed in rAF (ties server rate to display rate)
 let pendingFrames = [];
 const ACK_MSG = new Uint8Array([C2S_ACK]);
+
+// Display rate tracking: measured rAF fps, reported to server so the flow
+// control window stays sized for the actual renderer, not a hardcoded rate.
+let rafPrevTime = 0;
+let rafFpsEwma = 60;
+let lastReportedFps = 0;
 
 // Predictive input
 let predicted = '';
@@ -397,9 +403,24 @@ async function main() {
         updateHud();
     }, 1000);
 
-    function renderLoop() {
-        // Process all frames queued since last rAF, then ACK them all.
-        // This ties the server's send rate to the display refresh rate.
+    function renderLoop(now) {
+        // Measure rAF fps and report to server when it changes.
+        if (rafPrevTime > 0) {
+            const dt = now - rafPrevTime;
+            if (dt > 0 && dt < 500) {
+                rafFpsEwma = rafFpsEwma * 0.8 + (1000 / dt) * 0.2;
+                const rounded = Math.round(rafFpsEwma / 5) * 5; // quantize to nearest 5
+                if (rounded !== lastReportedFps && ws && ws.readyState === WebSocket.OPEN) {
+                    lastReportedFps = rounded;
+                    const fps = Math.max(10, Math.min(1000, rounded));
+                    ws.send(new Uint8Array([C2S_DISPLAY_RATE, fps & 0xff, (fps >> 8) & 0xff]));
+                }
+            }
+        }
+        rafPrevTime = now;
+
+        // Decode all frames queued since the last rAF in one batch.
+        // ACKs are sent immediately in onmessage so RTT = pure network latency.
         if (pendingFrames.length > 0) {
             const toProcess = pendingFrames;
             pendingFrames = [];
@@ -408,6 +429,11 @@ async function main() {
                     terminals[ptyId] = new Terminal(rows, cols, cell.w * dpr, cell.h * dpr);
                 }
                 terminals[ptyId].feed_compressed(payload);
+                // ACK after each frame is decoded: server's window now tracks
+                // frames-rendered rather than frames-received.  If rAF is slow
+                // (heavy canvas work), ACKs slow down, the server backs off, and
+                // pendingFrames stays bounded at ~window×(rAF_jitter/RTT) ≈ 1.
+                if (ws && ws.readyState === WebSocket.OPEN) ws.send(ACK_MSG);
             }
             // Update predictive echo confirmation after all frames applied
             if (predicted && focusedPty !== null && terminals[focusedPty]) {
@@ -421,42 +447,32 @@ async function main() {
                 }
             }
             needsRender = true;
-            // Send one ACK per received frame so the server's flow control stays accurate
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                for (let i = 0; i < toProcess.length; i++) {
-                    ws.send(ACK_MSG);
-                }
-            }
         }
 
         if (needsRender && focusedPty !== null && terminals[focusedPty]) {
             const t = terminals[focusedPty];
             t.render(offCtx);
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(offscreen, 0, 0);
             const cw = cell.w * dpr, ch = cell.h * dpr;
             let predLen = 0;
             if (predicted && t.echo()) {
                 const cr = t.cursor_row, cc = t.cursor_col;
-                // Clear the original cursor and predicted area
-                const clearLen = Math.min(predicted.length + 1, cols - cc);
-                offCtx.fillStyle = '#000';
-                offCtx.fillRect(cc * cw, cr * ch, clearLen * cw, ch);
-                // Draw predicted text at half opacity
-                offCtx.font = `${Math.round(ch)}px ${FONT}`;
-                offCtx.textBaseline = 'bottom';
-                offCtx.fillStyle = 'rgba(204,204,204,0.5)';
+                // Draw predicted text at half opacity on main canvas (not offscreen)
+                ctx.font = `${Math.round(ch)}px ${FONT}`;
+                ctx.textBaseline = 'bottom';
+                ctx.fillStyle = 'rgba(204,204,204,0.5)';
                 for (let i = 0; i < predicted.length && cc + i < cols; i++) {
-                    offCtx.fillText(predicted[i], (cc + i) * cw, cr * ch + ch);
+                    ctx.fillText(predicted[i], (cc + i) * cw, cr * ch + ch);
                     predLen++;
                 }
                 // Draw cursor after predicted text
                 if (cc + predLen < cols) {
-                    offCtx.fillStyle = 'rgba(204,204,204,0.5)';
-                    offCtx.fillRect((cc + predLen) * cw, cr * ch, cw, ch);
+                    ctx.fillStyle = 'rgba(204,204,204,0.5)';
+                    ctx.fillRect((cc + predLen) * cw, cr * ch, cw, ch);
                 }
             }
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(offscreen, 0, 0);
             frames++;
             needsRender = false;
         }
@@ -664,8 +680,10 @@ function connect(pass) {
             case S2C_UPDATE: {
                 if (data.length < 3) break;
                 const ptyId = data[1] | (data[2] << 8);
-                // Queue for processing in rAF so ACKs are tied to render rate
-                pendingFrames.push({ ptyId, payload: data.slice(3) });
+                pendingFrames.push({ ptyId, payload: data.subarray(3) });
+                // ACK sent in rAF after feed_compressed, not here.
+                // This ties the server's send rate to the actual render rate
+                // rather than the network receive rate, bounding display lag.
                 break;
             }
             case S2C_CREATED: {
@@ -711,7 +729,7 @@ function connect(pass) {
             case S2C_TITLE: {
                 if (data.length < 3) break;
                 const id = data[1] | (data[2] << 8);
-                const title = new TextDecoder().decode(data.slice(3));
+                const title = new TextDecoder().decode(data.subarray(3));
                 ptyTitles[id] = title;
                 updateTabs();
                 if (id === focusedPty) {

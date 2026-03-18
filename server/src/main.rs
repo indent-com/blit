@@ -16,6 +16,7 @@ const C2S_INPUT: u8 = 0x00;
 const C2S_RESIZE: u8 = 0x01;
 const C2S_SCROLL: u8 = 0x02;
 const C2S_ACK: u8 = 0x03;
+const C2S_DISPLAY_RATE: u8 = 0x04;
 const C2S_CREATE: u8 = 0x10;
 const C2S_FOCUS: u8 = 0x11;
 const C2S_CLOSE: u8 = 0x12;
@@ -170,6 +171,9 @@ struct Pty {
     parser: vt100::Parser<TitleCallbacks>,
     dirty: bool,
     reader_handle: tokio::task::JoinHandle<()>,
+    /// Cached (echo, icanon) from tcgetattr; refreshed every ~250ms.
+    lflag_cache: (bool, bool),
+    lflag_last: Instant,
 }
 
 struct ClientState {
@@ -179,10 +183,14 @@ struct ClientState {
     scroll_offset: usize,
     scroll_snap: Vec<u8>,
     last_sent_snap: Vec<u8>,
+    last_sent_cursor: (u16, u16),
+    last_sent_mode: u16,
     /// Frames currently in flight (sent, not yet ACKed).
     unacked: u8,
     /// EWMA RTT estimate in milliseconds.
     rtt_ms: f32,
+    /// Client's measured display refresh rate (fps), reported via C2S_DISPLAY_RATE.
+    display_fps: f32,
     /// Send timestamp of each in-flight frame, oldest first.
     send_times: VecDeque<Instant>,
     /// Diagnostics: frames sent since last log.
@@ -193,9 +201,11 @@ struct ClientState {
     last_log: Instant,
 }
 
-/// Frames to keep in flight: enough to sustain 250 fps at the current RTT.
-fn rtt_window(rtt_ms: f32) -> u8 {
-    ((rtt_ms * 250.0 / 1000.0).ceil() as u8).max(1)
+/// Frames to keep in flight: exactly enough to sustain display_fps at the
+/// current RTT, plus one tick (4 ms) of slack so a single missed tick doesn't
+/// stall the pipeline.
+fn rtt_window(rtt_ms: f32, display_fps: f32) -> u8 {
+    ((rtt_ms * display_fps / 1000.0).ceil() as u8 + 1).max(2)
 }
 
 struct Session {
@@ -349,6 +359,7 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, state: AppState) -> Pty
 
     let reader_handle = tokio::spawn(pty_reader(master, id, state));
 
+    let lflag_cache = pty_lflag(master);
     Pty {
         master_fd: master,
         child_pid: pid,
@@ -360,6 +371,8 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, state: AppState) -> Pty
         ),
         dirty: true,
         reader_handle,
+        lflag_cache,
+        lflag_last: Instant::now(),
     }
 }
 
@@ -427,6 +440,11 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
     };
 
     let mut buf = [0u8; 16384];
+    // Accumulate multiple reads before locking the session mutex and yielding.
+    // Without batching, high-throughput output (e.g. video) causes 16 lock/yield
+    // cycles per 250 KB frame; each yield lets the tick snapshot run (~0.5 ms),
+    // creating back-pressure that reduces the effective PTY throughput.
+    let mut batch: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     loop {
         let mut guard = match async_fd.readable().await {
@@ -434,26 +452,44 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
             Err(_) => break,
         };
 
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n > 0 {
-            let data = &buf[..n as usize];
+        // Drain all currently available data into `batch` before processing.
+        batch.clear();
+        let mut exit = false;
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                batch.extend_from_slice(&buf[..n as usize]);
+                // Cap batch size so the mutex isn't held too long in one go.
+                if batch.len() >= 64 * 1024 {
+                    break;
+                }
+            } else if n == 0 {
+                exit = true;
+                break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    break;
+                } else {
+                    exit = true;
+                    break;
+                }
+            }
+        }
+
+        if !batch.is_empty() {
             let mut sess = state.1.lock().await;
             if let Some(pty) = sess.ptys.get_mut(&pty_id) {
-                pty.parser.process(data);
+                pty.parser.process(&batch);
                 pty.dirty = true;
-                respond_to_queries(fd, data, pty.parser.screen());
+                respond_to_queries(fd, &batch, pty.parser.screen());
             }
             drop(sess);
             tokio::task::yield_now().await;
-            continue;
-        } else if n == 0 {
-            break;
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                guard.clear_ready();
-                continue;
-            }
+        }
+
+        if exit {
             break;
         }
     }
@@ -535,7 +571,9 @@ fn build_snapshot_msg(
     cols: u16,
     cursor: (u16, u16),
     mode: u16,
-) -> Vec<u8> {
+    prev_cursor: (u16, u16),
+    prev_mode: u16,
+) -> Option<Vec<u8>> {
     let total_cells = rows as usize * cols as usize;
     let bitmask_len = (total_cells + 7) / 8;
     let full = prev.len() != snap.len();
@@ -550,6 +588,11 @@ fn build_snapshot_msg(
         }
     }
 
+    // Skip sending when nothing changed (cells, cursor, and mode all identical)
+    if dirty_count == 0 && cursor == prev_cursor && mode == prev_mode {
+        return None;
+    }
+
     let payload_size = 10 + bitmask_len + dirty_count * CELL_SIZE;
     let mut payload = Vec::with_capacity(payload_size);
     payload.extend_from_slice(&rows.to_le_bytes());
@@ -559,10 +602,14 @@ fn build_snapshot_msg(
     payload.extend_from_slice(&mode.to_le_bytes());
     payload.extend_from_slice(&bitmask);
 
-    for i in 0..total_cells {
-        if bitmask[i / 8] & (1 << (i % 8)) != 0 {
-            let off = i * CELL_SIZE;
-            payload.extend_from_slice(&snap[off..off + CELL_SIZE]);
+    // Struct-of-arrays layout: all f0 bytes, then all f1 bytes, ..., then all c3 bytes.
+    // Homogeneous columns (mostly-zero color/flag arrays) compress far better than
+    // interleaved AOS because LZ4 can reference long runs of zeros in each column.
+    for byte_pos in 0..CELL_SIZE {
+        for i in 0..total_cells {
+            if bitmask[i / 8] & (1 << (i % 8)) != 0 {
+                payload.push(snap[i * CELL_SIZE + byte_pos]);
+            }
         }
     }
 
@@ -571,7 +618,7 @@ fn build_snapshot_msg(
     msg.push(S2C_UPDATE);
     msg.extend_from_slice(&id.to_le_bytes());
     msg.extend_from_slice(&compressed);
-    msg
+    Some(msg)
 }
 
 struct PtySnapshot {
@@ -582,8 +629,12 @@ struct PtySnapshot {
     cols: u16,
 }
 
-fn take_snapshot(pty: &Pty) -> PtySnapshot {
-    let (echo, icanon) = pty_lflag(pty.master_fd);
+fn take_snapshot(pty: &mut Pty) -> PtySnapshot {
+    if pty.lflag_last.elapsed() >= Duration::from_millis(250) {
+        pty.lflag_cache = pty_lflag(pty.master_fd);
+        pty.lflag_last = Instant::now();
+    }
+    let (echo, icanon) = pty.lflag_cache;
     let screen = pty.parser.screen();
     let (rows, cols) = screen.size();
     PtySnapshot {
@@ -600,7 +651,7 @@ fn build_scrollback_update(
     id: u16,
     offset: usize,
     prev_snap: &[u8],
-) -> (Vec<u8>, Vec<u8>) {
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let screen = pty.parser.screen_mut();
     let old_sb = screen.scrollback();
     screen.set_scrollback(offset);
@@ -610,10 +661,10 @@ fn build_scrollback_update(
     let mode: u16 = 0;
     let cursor = (0u16, 0u16);
 
-    let msg = build_snapshot_msg(id, &snap, prev_snap, rows, cols, cursor, mode);
+    let msg = build_snapshot_msg(id, &snap, prev_snap, rows, cols, cursor, mode, cursor, mode);
 
     screen.set_scrollback(old_sb);
-    (msg, snap)
+    msg.map(|m| (m, snap))
 }
 
 #[tokio::main]
@@ -637,7 +688,11 @@ async fn main() {
 
     let tick_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(4));
+        // 8 ms ≈ 120 Hz — matches a typical display refresh interval.
+        // The ACK handler drives steady-state delivery; the tick is a fallback
+        // for the first frame and for cases where ACK handler found no diff.
+        let mut interval = tokio::time::interval(Duration::from_millis(8));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             tick(&tick_state).await;
@@ -674,10 +729,22 @@ async fn tick(state: &AppState) {
         }
     }
 
+    // Only snapshot PTYs that have at least one client with room in their window.
+    // When all windows are full (high-throughput steady state), skip the expensive
+    // snapshot+diff+compress work entirely rather than doing it 250×/s for nothing.
+    let needful_ptys: std::collections::HashSet<u16> = sess.clients.values()
+        .filter(|c| c.scroll_offset == 0)
+        .filter(|c| c.unacked < rtt_window(c.rtt_ms, c.display_fps))
+        .filter_map(|c| c.focus)
+        .collect();
+
     let mut snapshots: HashMap<u16, PtySnapshot> = HashMap::new();
     for &id in &ids {
         let pty = sess.ptys.get_mut(&id).unwrap();
         if !pty.dirty {
+            continue;
+        }
+        if !needful_ptys.contains(&id) {
             continue;
         }
         snapshots.insert(id, take_snapshot(pty));
@@ -689,7 +756,7 @@ async fn tick(state: &AppState) {
     for cid in client_ids {
         let (focus, scroll_offset, unacked, window) = {
             let c = sess.clients.get(&cid).unwrap();
-            (c.focus, c.scroll_offset, c.unacked, rtt_window(c.rtt_ms))
+            (c.focus, c.scroll_offset, c.unacked, rtt_window(c.rtt_ms, c.display_fps))
         };
         let Some(pid) = focus else { continue };
 
@@ -702,13 +769,21 @@ async fn tick(state: &AppState) {
             let Some(cur) = snapshots.get(&pid) else {
                 continue;
             };
-            let prev = &sess.clients.get(&cid).unwrap().last_sent_snap;
-            let msg = build_snapshot_msg(
-                pid, &cur.snap, prev, cur.rows, cur.cols, cur.cursor, cur.mode,
-            );
+            let (prev_snap, prev_cursor, prev_mode) = {
+                let c = sess.clients.get(&cid).unwrap();
+                (c.last_sent_snap.clone(), c.last_sent_cursor, c.last_sent_mode)
+            };
+            let Some(msg) = build_snapshot_msg(
+                pid, &cur.snap, &prev_snap, cur.rows, cur.cols, cur.cursor, cur.mode,
+                prev_cursor, prev_mode,
+            ) else {
+                continue;
+            };
             let c = sess.clients.get_mut(&cid).unwrap();
             if c.tx.try_send(msg).is_ok() {
                 c.last_sent_snap = cur.snap.clone();
+                c.last_sent_cursor = cur.cursor;
+                c.last_sent_mode = cur.mode;
                 c.send_times.push_back(Instant::now());
                 c.unacked += 1;
                 c.frames_sent += 1;
@@ -722,16 +797,20 @@ async fn tick(state: &AppState) {
                 c.scroll_snap.clone()
             };
             if let Some(pty) = sess.ptys.get_mut(&pid) {
-                let (msg, new_snap) =
-                    build_scrollback_update(pty, pid, scroll_offset, &prev_snap);
-                let c = sess.clients.get_mut(&cid).unwrap();
-                if c.tx.try_send(msg).is_ok() {
-                    c.scroll_snap = new_snap;
-                    c.send_times.push_back(Instant::now());
-                    c.unacked += 1;
-                    true
+                if let Some((msg, new_snap)) =
+                    build_scrollback_update(pty, pid, scroll_offset, &prev_snap)
+                {
+                    let c = sess.clients.get_mut(&cid).unwrap();
+                    if c.tx.try_send(msg).is_ok() {
+                        c.scroll_snap = new_snap;
+                        c.send_times.push_back(Instant::now());
+                        c.unacked += 1;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
-                    false
+                    continue;
                 }
             } else {
                 false
@@ -749,7 +828,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
     let config = &state.0;
     let (mut reader, mut writer) = stream.into_split();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2);
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(32);
     let client_id;
 
     {
@@ -765,8 +844,11 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 scroll_offset: 0,
                 scroll_snap: Vec::new(),
                 last_sent_snap: Vec::new(),
+                last_sent_cursor: (0, 0),
+                last_sent_mode: 0,
                 unacked: 0,
                 rtt_ms: 200.0,
+                display_fps: 60.0,
                 send_times: VecDeque::new(),
                 frames_sent: 0,
                 acks_recv: 0,
@@ -807,37 +889,100 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
 
         if data[0] == C2S_ACK {
             let mut sess = state.1.lock().await;
-            if let Some(c) = sess.clients.get_mut(&client_id) {
+            // Collect everything we need from ClientState before dropping that borrow.
+            let (focus_pid, scroll_offset, do_log, frames_sent, acks_recv, rtt_ms, unacked, display_fps) = {
+                let Some(c) = sess.clients.get_mut(&client_id) else {
+                    continue;
+                };
                 c.unacked = c.unacked.saturating_sub(1);
                 c.acks_recv += 1;
-                // Sample RTT from every ACK, not just when the window drains.
+                // Only trust RTT samples when the pipeline isn't backed up.
+                // When many frames are queued, elapsed() includes queueing
+                // delay, which inflates RTT → grows window → more queueing.
                 if let Some(t) = c.send_times.pop_front() {
-                    let sample_ms = t.elapsed().as_secs_f32() * 1000.0;
-                    c.rtt_ms = c.rtt_ms * 0.875 + sample_ms * 0.125;
+                    if c.unacked <= 4 {
+                        let sample_ms = t.elapsed().as_secs_f32() * 1000.0;
+                        c.rtt_ms = c.rtt_ms * 0.875 + sample_ms * 0.125;
+                    }
                 }
-                // Periodic diagnostics
                 let do_log = c.last_log.elapsed().as_secs_f32() >= 1.0;
-                let (frames_sent, acks_recv, rtt_ms, unacked) =
-                    (c.frames_sent, c.acks_recv, c.rtt_ms, c.unacked);
+                let window = rtt_window(c.rtt_ms, c.display_fps);
+                let out = (
+                    if c.unacked < window { c.focus } else { None },
+                    c.scroll_offset,
+                    do_log,
+                    c.frames_sent, c.acks_recv, c.rtt_ms, c.unacked, c.display_fps,
+                );
                 if do_log {
                     c.frames_sent = 0;
                     c.acks_recv = 0;
                     c.last_log = Instant::now();
                 }
-                if c.unacked < rtt_window(c.rtt_ms) {
-                    if let Some(pid) = c.focus {
-                        if let Some(pty) = sess.ptys.get_mut(&pid) {
-                            pty.dirty = true;
+                out
+            };
+            // c borrow ends; now free to access sess.ptys.
+            // Send immediately instead of waiting for the next 4 ms tick — that
+            // wait would cap throughput to ~75% of the window-limited rate.
+            if let Some(pid) = focus_pid {
+                if scroll_offset == 0 {
+                    // Take a fresh snapshot, diff against what the client last saw,
+                    // and push the frame directly without going through tick().
+                    // Also clear dirty so the tick doesn't re-snapshot the same state.
+                    let snap = sess.ptys.get_mut(&pid).map(|pty| {
+                        let s = take_snapshot(pty);
+                        pty.dirty = false;
+                        s
+                    });
+                    if let Some(snap) = snap {
+                        let msg = {
+                            let c = sess.clients.get(&client_id).unwrap();
+                            build_snapshot_msg(pid, &snap.snap, &c.last_sent_snap,
+                                snap.rows, snap.cols, snap.cursor, snap.mode,
+                                c.last_sent_cursor, c.last_sent_mode)
+                        };
+                        if let Some(msg) = msg {
+                            let c = sess.clients.get_mut(&client_id).unwrap();
+                            if c.tx.try_send(msg).is_ok() {
+                                c.last_sent_snap = snap.snap;
+                                c.last_sent_cursor = snap.cursor;
+                                c.last_sent_mode = snap.mode;
+                                c.send_times.push_back(Instant::now());
+                                c.unacked += 1;
+                                c.frames_sent += 1;
+                            } else {
+                                // Channel full (sender task stalled on a slow socket).
+                                // Re-arm dirty so the tick retries on its next fire.
+                                if let Some(pty) = sess.ptys.get_mut(&pid) {
+                                    pty.dirty = true;
+                                }
+                            }
                         }
                     }
+                } else {
+                    // Scrollback path: let the tick handle it.
+                    if let Some(pty) = sess.ptys.get_mut(&pid) {
+                        pty.dirty = true;
+                    }
                 }
-                if do_log {
-                    eprintln!(
-                        "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms window={} unacked={unacked} | tick_fires={} tick_snaps={}",
-                        rtt_window(rtt_ms), sess.tick_fires, sess.tick_snaps,
-                    );
-                    sess.tick_fires = 0;
-                    sess.tick_snaps = 0;
+            }
+            if do_log {
+                let window = rtt_window(rtt_ms, display_fps);
+                eprintln!(
+                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms window={window} unacked={unacked} display_fps={display_fps:.0} | tick_fires={} tick_snaps={}",
+                    sess.tick_fires, sess.tick_snaps,
+                );
+                sess.tick_fires = 0;
+                sess.tick_snaps = 0;
+            }
+            continue;
+        }
+
+        if data[0] == C2S_DISPLAY_RATE && data.len() >= 3 {
+            let fps = u16::from_le_bytes([data[1], data[2]]) as f32;
+            if fps >= 10.0 && fps <= 1000.0 {
+                let mut sess = state.1.lock().await;
+                if let Some(c) = sess.clients.get_mut(&client_id) {
+                    c.display_fps = fps;
                 }
             }
             continue;

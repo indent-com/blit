@@ -1,7 +1,5 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
-use std::collections::HashMap;
+use web_sys::CanvasRenderingContext2d;
 
 const CELL_SIZE: usize = 12;
 
@@ -40,6 +38,68 @@ fn idx_to_rgb(idx: u8) -> (u8, u8, u8) {
     (v, v, v)
 }
 
+/// Compact color representation — avoids String allocations in the hot render path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CellColor {
+    r: u8,
+    g: u8,
+    b: u8,
+    is_default: bool,
+}
+
+impl CellColor {
+    const DEFAULT_FG: Self = Self { r: 204, g: 204, b: 204, is_default: true };
+    const DEFAULT_BG: Self = Self { r: 0,   g: 0,   b: 0,   is_default: true };
+    const DIM_FG:     Self = Self { r: 102, g: 102, b: 102, is_default: false };
+    const DIM_BG:     Self = Self { r: 0,   g: 0,   b: 0,   is_default: false };
+
+    fn resolve(color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> Self {
+        match color_type {
+            0 => {
+                if dim {
+                    if is_fg { Self::DIM_FG } else { Self::DIM_BG }
+                } else if is_fg {
+                    Self::DEFAULT_FG
+                } else {
+                    Self::DEFAULT_BG
+                }
+            }
+            1 => {
+                let (cr, cg, cb) = idx_to_rgb(r);
+                if dim {
+                    Self { r: cr / 2, g: cg / 2, b: cb / 2, is_default: false }
+                } else {
+                    Self { r: cr, g: cg, b: cb, is_default: false }
+                }
+            }
+            2 => {
+                if dim {
+                    Self { r: r / 2, g: g / 2, b: b / 2, is_default: false }
+                } else {
+                    Self { r, g, b, is_default: false }
+                }
+            }
+            _ => if is_fg { Self::DEFAULT_FG } else { Self::DEFAULT_BG },
+        }
+    }
+
+    fn to_css(&self) -> String {
+        if self.is_default {
+            if self.r == 204 { "#ccc".into() } else { "#000".into() }
+        } else {
+            format!("rgb({},{},{})", self.r, self.g, self.b)
+        }
+    }
+
+    /// Pack into u32 for fill-style change detection (no String needed).
+    fn pack(&self) -> u32 {
+        ((self.is_default as u32) << 24)
+            | ((self.r as u32) << 16)
+            | ((self.g as u32) << 8)
+            | self.b as u32
+    }
+}
+
 fn color_css(color_type: u8, r: u8, g: u8, b: u8, default: &str, dim: bool) -> String {
     let (cr, cg, cb) = match color_type {
         0 => {
@@ -64,56 +124,6 @@ fn color_css(color_type: u8, r: u8, g: u8, b: u8, default: &str, dim: bool) -> S
     }
 }
 
-fn font_str(bold: bool, italic: bool, cell_height: u32) -> String {
-    let mut f = String::new();
-    if bold {
-        f.push_str("bold ");
-    }
-    if italic {
-        f.push_str("italic ");
-    }
-    f.push_str(&format!("{cell_height}px ui-monospace, monospace"));
-    f
-}
-
-/// Pre-render a single glyph (text + optional underline) onto a transparent canvas.
-/// The canvas has size (width × height) matching the cell dimensions.
-fn create_glyph(
-    content: &str,
-    fg_color: &str,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    width: u32,
-    height: u32,
-) -> HtmlCanvasElement {
-    let window = web_sys::window().unwrap_throw();
-    let document = window.document().unwrap_throw();
-    let canvas = document
-        .create_element("canvas")
-        .unwrap_throw()
-        .unchecked_into::<HtmlCanvasElement>();
-    canvas.set_width(width);
-    canvas.set_height(height);
-    let ctx = canvas
-        .get_context("2d")
-        .unwrap_throw()
-        .unwrap_throw()
-        .unchecked_into::<CanvasRenderingContext2d>();
-    ctx.set_font(&font_str(bold, italic, height));
-    ctx.set_text_baseline("bottom");
-    ctx.set_fill_style_str(fg_color);
-    let _ = ctx.fill_text(content, 0.0, height as f64);
-    if underline {
-        ctx.set_stroke_style_str(fg_color);
-        ctx.begin_path();
-        ctx.move_to(0.0, height as f64 - 1.0);
-        ctx.line_to(width as f64, height as f64 - 1.0);
-        ctx.stroke();
-    }
-    canvas
-}
-
 #[wasm_bindgen]
 pub struct Terminal {
     rows: u16,
@@ -126,8 +136,6 @@ pub struct Terminal {
     mode: u16,
     dirty: Vec<bool>,
     all_dirty: bool,
-    /// Glyph cache: key encodes (fg_color, style_bits, content); value is a pre-rendered canvas.
-    glyph_cache: HashMap<String, HtmlCanvasElement>,
 }
 
 #[wasm_bindgen]
@@ -146,7 +154,6 @@ impl Terminal {
             mode: 0,
             dirty: vec![true; total],
             all_dirty: true,
-            glyph_cache: HashMap::new(),
         }
     }
 
@@ -155,49 +162,23 @@ impl Terminal {
         self.cell_height = cell_height;
         self.all_dirty = true;
         self.dirty.fill(true);
-        self.glyph_cache.clear();
     }
 
-    // mode bits: 0=cursor_vis, 1=app_cursor, 2=app_keypad, 3=bracketed_paste, 4-6=mouse_mode, 7-8=mouse_enc
-    pub fn mouse_mode(&self) -> u8 {
-        ((self.mode >> 4) & 7) as u8
-    }
-    pub fn mouse_encoding(&self) -> u8 {
-        ((self.mode >> 7) & 3) as u8
-    }
-    pub fn app_cursor(&self) -> bool {
-        self.mode & 2 != 0
-    }
-    pub fn bracketed_paste(&self) -> bool {
-        self.mode & 8 != 0
-    }
-    pub fn echo(&self) -> bool {
-        self.mode & (1 << 9) != 0
-    }
-    pub fn icanon(&self) -> bool {
-        self.mode & (1 << 10) != 0
-    }
-    #[wasm_bindgen(getter)]
-    pub fn cursor_row(&self) -> u16 {
-        self.cursor_row
-    }
-    #[wasm_bindgen(getter)]
-    pub fn cursor_col(&self) -> u16 {
-        self.cursor_col
-    }
+    pub fn mouse_mode(&self) -> u8 { ((self.mode >> 4) & 7) as u8 }
+    pub fn mouse_encoding(&self) -> u8 { ((self.mode >> 7) & 3) as u8 }
+    pub fn app_cursor(&self) -> bool { self.mode & 2 != 0 }
+    pub fn bracketed_paste(&self) -> bool { self.mode & 8 != 0 }
+    pub fn echo(&self) -> bool { self.mode & (1 << 9) != 0 }
+    pub fn icanon(&self) -> bool { self.mode & (1 << 10) != 0 }
+    #[wasm_bindgen(getter)] pub fn cursor_row(&self) -> u16 { self.cursor_row }
+    #[wasm_bindgen(getter)] pub fn cursor_col(&self) -> u16 { self.cursor_col }
 
-    /// Feed LZ4-compressed binary update.
-    /// Header (10): rows(2) + cols(2) + cursor(4) + mode(2)
-    /// Bitmask: ceil(rows*cols/8) bytes
-    /// Cells: popcount × 12 bytes
     pub fn feed_compressed(&mut self, data: &[u8]) {
         let payload = match lz4_flex::decompress_size_prepended(data) {
             Ok(d) => d,
             Err(_) => return,
         };
-        if payload.len() < 10 {
-            return;
-        }
+        if payload.len() < 10 { return; }
 
         let new_rows = u16::from_le_bytes([payload[0], payload[1]]);
         let new_cols = u16::from_le_bytes([payload[2], payload[3]]);
@@ -212,50 +193,44 @@ impl Terminal {
             self.cells = vec![0u8; total * CELL_SIZE];
             self.dirty = vec![true; total];
             self.all_dirty = true;
-            self.glyph_cache.clear();
         }
 
         let total_cells = self.rows as usize * self.cols as usize;
         let bitmask_len = (total_cells + 7) / 8;
-        if payload.len() < 10 + bitmask_len {
-            return;
-        }
+        if payload.len() < 10 + bitmask_len { return; }
 
         let bitmask = &payload[10..10 + bitmask_len];
-        let mut cell_off = 10 + bitmask_len;
+        let data_start = 10 + bitmask_len;
 
+        // Count dirty cells to compute SoA column offsets.
+        let dirty_count = (0..total_cells)
+            .filter(|&i| bitmask[i / 8] & (1 << (i % 8)) != 0)
+            .count();
+        if payload.len() < data_start + dirty_count * CELL_SIZE { return; }
+
+        // Decode struct-of-arrays: column `byte_pos` starts at data_start + byte_pos * dirty_count.
+        let mut dirty_idx = 0usize;
         for i in 0..total_cells {
             if bitmask[i / 8] & (1 << (i % 8)) != 0 {
-                if cell_off + CELL_SIZE > payload.len() {
-                    break;
+                let cell_idx = i * CELL_SIZE;
+                for byte_pos in 0..CELL_SIZE {
+                    self.cells[cell_idx + byte_pos] =
+                        payload[data_start + byte_pos * dirty_count + dirty_idx];
                 }
-                let idx = i * CELL_SIZE;
-                self.cells[idx..idx + CELL_SIZE]
-                    .copy_from_slice(&payload[cell_off..cell_off + CELL_SIZE]);
-                if !self.all_dirty {
-                    self.dirty[i] = true;
-                }
-                cell_off += CELL_SIZE;
+                if !self.all_dirty { self.dirty[i] = true; }
+                dirty_idx += 1;
             }
         }
 
-        // Mark cursor positions dirty when cursor moves or visibility changes
         if !self.all_dirty {
-            let cursor_moved =
-                new_cursor_row != self.cursor_row || new_cursor_col != self.cursor_col;
+            let cursor_moved = new_cursor_row != self.cursor_row || new_cursor_col != self.cursor_col;
             let vis_changed = (new_mode & 1) != (self.mode & 1);
             if cursor_moved || vis_changed {
-                let old_idx =
-                    self.cursor_row as usize * self.cols as usize + self.cursor_col as usize;
-                if old_idx < total_cells {
-                    self.dirty[old_idx] = true;
-                }
+                let old_idx = self.cursor_row as usize * self.cols as usize + self.cursor_col as usize;
+                if old_idx < total_cells { self.dirty[old_idx] = true; }
             }
-            let new_idx =
-                new_cursor_row as usize * self.cols as usize + new_cursor_col as usize;
-            if new_idx < total_cells {
-                self.dirty[new_idx] = true;
-            }
+            let new_idx = new_cursor_row as usize * self.cols as usize + new_cursor_col as usize;
+            if new_idx < total_cells { self.dirty[new_idx] = true; }
         }
 
         self.cursor_row = new_cursor_row;
@@ -269,98 +244,47 @@ impl Terminal {
         );
         for row in start_row..=end_row.min(self.rows - 1) {
             let c0 = if row == start_row { start_col } else { 0 };
-            let c1 = if row == end_row {
-                end_col
-            } else {
-                self.cols - 1
-            };
+            let c1 = if row == end_row { end_col } else { self.cols - 1 };
             let mut line = String::new();
             let mut col = c0;
             while col <= c1.min(self.cols - 1) {
                 let idx = (row as usize * self.cols as usize + col as usize) * CELL_SIZE;
                 let cell = &self.cells[idx..idx + CELL_SIZE];
-                let f0 = cell[0];
-                let f1 = cell[1];
-                if f1 & 4 != 0 {
-                    col += 1;
-                    continue;
-                }
-                let fg_type = f0 & 3;
-                let bg_type = (f0 >> 2) & 3;
-                let bold = f0 & (1 << 4) != 0;
-                let dim = f0 & (1 << 5) != 0;
-                let italic = f0 & (1 << 6) != 0;
-                let underline = f0 & (1 << 7) != 0;
+                let f0 = cell[0]; let f1 = cell[1];
+                if f1 & 4 != 0 { col += 1; continue; }
+                let fg_type = f0 & 3; let bg_type = (f0 >> 2) & 3;
+                let bold = f0 & (1 << 4) != 0; let dim = f0 & (1 << 5) != 0;
+                let italic = f0 & (1 << 6) != 0; let underline = f0 & (1 << 7) != 0;
                 let inverse = f1 & 1 != 0;
                 let content_len = ((f1 >> 3) & 7) as usize;
-
                 let (fg, bg) = if inverse {
-                    (
-                        color_css(bg_type, cell[5], cell[6], cell[7], "#000", dim),
-                        color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", false),
-                    )
+                    (color_css(bg_type, cell[5], cell[6], cell[7], "#000", dim),
+                     color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", false))
                 } else {
-                    (
-                        color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", dim),
-                        color_css(bg_type, cell[5], cell[6], cell[7], "#000", false),
-                    )
+                    (color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", dim),
+                     color_css(bg_type, cell[5], cell[6], cell[7], "#000", false))
                 };
-
                 let ch = if content_len > 0 {
-                    std::str::from_utf8(&cell[8..8 + content_len])
-                        .unwrap_or(" ")
-                        .to_string()
-                } else {
-                    " ".to_string()
-                };
-
+                    std::str::from_utf8(&cell[8..8 + content_len]).unwrap_or(" ").to_string()
+                } else { " ".to_string() };
                 let has_style = fg != "#ccc" || bg != "#000" || bold || italic || underline;
                 if has_style {
                     let mut style = String::new();
-                    if fg != "#ccc" {
-                        style.push_str("color:");
-                        style.push_str(&fg);
-                        style.push(';');
-                    }
-                    if bg != "#000" {
-                        style.push_str("background:");
-                        style.push_str(&bg);
-                        style.push(';');
-                    }
-                    if bold {
-                        style.push_str("font-weight:bold;");
-                    }
-                    if italic {
-                        style.push_str("font-style:italic;");
-                    }
-                    if underline {
-                        style.push_str("text-decoration:underline;");
-                    }
-                    line.push_str("<span style=\"");
-                    line.push_str(&style);
-                    line.push_str("\">");
-                    match ch.as_str() {
-                        "&" => line.push_str("&amp;"),
-                        "<" => line.push_str("&lt;"),
-                        ">" => line.push_str("&gt;"),
-                        _ => line.push_str(&ch),
-                    }
+                    if fg != "#ccc" { style.push_str("color:"); style.push_str(&fg); style.push(';'); }
+                    if bg != "#000" { style.push_str("background:"); style.push_str(&bg); style.push(';'); }
+                    if bold { style.push_str("font-weight:bold;"); }
+                    if italic { style.push_str("font-style:italic;"); }
+                    if underline { style.push_str("text-decoration:underline;"); }
+                    line.push_str("<span style=\""); line.push_str(&style); line.push_str("\">");
+                    match ch.as_str() { "&" => line.push_str("&amp;"), "<" => line.push_str("&lt;"), ">" => line.push_str("&gt;"), _ => line.push_str(&ch) }
                     line.push_str("</span>");
                 } else {
-                    match ch.as_str() {
-                        "&" => line.push_str("&amp;"),
-                        "<" => line.push_str("&lt;"),
-                        ">" => line.push_str("&gt;"),
-                        _ => line.push_str(&ch),
-                    }
+                    match ch.as_str() { "&" => line.push_str("&amp;"), "<" => line.push_str("&lt;"), ">" => line.push_str("&gt;"), _ => line.push_str(&ch) }
                 }
                 col += 1;
             }
-            let trimmed = line.trim_end();
-            html.push_str(trimmed);
-            if row < end_row.min(self.rows - 1) {
-                html.push('\n');
-            }
+            html.push_str(line.trim_end());
+            if row < end_row.min(self.rows - 1) { html.push('\n'); }
         }
         html.push_str("</pre>");
         html
@@ -370,26 +294,16 @@ impl Terminal {
         let mut result = String::new();
         for row in start_row..=end_row.min(self.rows - 1) {
             let c0 = if row == start_row { start_col } else { 0 };
-            let c1 = if row == end_row {
-                end_col
-            } else {
-                self.cols - 1
-            };
+            let c1 = if row == end_row { end_col } else { self.cols - 1 };
             let mut line = String::new();
             let mut col = c0;
             while col <= c1.min(self.cols - 1) {
                 let idx = (row as usize * self.cols as usize + col as usize) * CELL_SIZE;
                 let f1 = self.cells[idx + 1];
-                if f1 & 4 != 0 {
-                    // wide continuation
-                    col += 1;
-                    continue;
-                }
+                if f1 & 4 != 0 { col += 1; continue; }
                 let content_len = ((f1 >> 3) & 7) as usize;
                 if content_len > 0 {
-                    if let Ok(s) =
-                        std::str::from_utf8(&self.cells[idx + 8..idx + 8 + content_len])
-                    {
+                    if let Ok(s) = std::str::from_utf8(&self.cells[idx + 8..idx + 8 + content_len]) {
                         line.push_str(s);
                     }
                 } else {
@@ -397,11 +311,8 @@ impl Terminal {
                 }
                 col += 1;
             }
-            let trimmed = line.trim_end();
-            result.push_str(trimmed);
-            if row < end_row.min(self.rows - 1) {
-                result.push('\n');
-            }
+            result.push_str(line.trim_end());
+            if row < end_row.min(self.rows - 1) { result.push('\n'); }
         }
         result
     }
@@ -412,6 +323,7 @@ impl Terminal {
         let cursor_visible = self.mode & 1 != 0;
         let cols = self.cols as usize;
         let total = self.rows as usize * cols;
+        let normal_font = format!("{}px ui-monospace, monospace", ch as u32);
 
         let do_all = self.all_dirty;
         if do_all {
@@ -420,10 +332,17 @@ impl Terminal {
             self.all_dirty = false;
         }
 
+        // Track fill style as packed u32 to skip redundant set_fill_style_str calls.
+        // Valid only if fill_known is true; starts known-black only after do_all cleared the canvas.
+        let mut fill_known = do_all;
+        let mut fill_packed: u32 = CellColor::DEFAULT_BG.pack();
+        let mut current_font_bold = false;
+        let mut current_font_italic = false;
+        ctx.set_font(&normal_font);
+        ctx.set_text_baseline("bottom");
+
         for i in 0..total {
-            if !do_all && !self.dirty[i] {
-                continue;
-            }
+            if !do_all && !self.dirty[i] { continue; }
             self.dirty[i] = false;
 
             let row = i / cols;
@@ -436,9 +355,14 @@ impl Terminal {
             let f1 = self.cells[idx + 1];
 
             if f1 & 4 != 0 {
-                // wide continuation — only needs clearing in partial mode
+                // wide continuation
                 if !do_all {
-                    ctx.set_fill_style_str("#000");
+                    let black = CellColor::DEFAULT_BG.pack();
+                    if !fill_known || fill_packed != black {
+                        ctx.set_fill_style_str("#000");
+                        fill_packed = black;
+                        fill_known = true;
+                    }
                     ctx.fill_rect(x, y, cw, ch);
                 }
                 continue;
@@ -454,71 +378,83 @@ impl Terminal {
             let wide = f1 & 2 != 0;
             let content_len = ((f1 >> 3) & 7) as usize;
 
-            let (fg_color, bg_color) = {
-                let cell = &self.cells[idx..idx + CELL_SIZE];
-                if inverse {
-                    (
-                        color_css(bg_type, cell[5], cell[6], cell[7], "#000", dim),
-                        color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", false),
-                    )
-                } else {
-                    (
-                        color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", dim),
-                        color_css(bg_type, cell[5], cell[6], cell[7], "#000", false),
-                    )
-                }
+            let cell = &self.cells[idx..idx + CELL_SIZE];
+            let (fg, bg) = if inverse {
+                (CellColor::resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
+                 CellColor::resolve(fg_type, cell[2], cell[3], cell[4], true, false))
+            } else {
+                (CellColor::resolve(fg_type, cell[2], cell[3], cell[4], true, dim),
+                 CellColor::resolve(bg_type, cell[5], cell[6], cell[7], false, false))
             };
 
             let cell_w = if wide { cw * 2.0 } else { cw };
+            let bg_black = bg == CellColor::DEFAULT_BG || bg == CellColor::DIM_BG;
 
-            // In partial mode, clear the cell area first
+            // Clear cell in partial mode
             if !do_all {
-                ctx.set_fill_style_str("#000");
+                let black = CellColor::DEFAULT_BG.pack();
+                if !fill_known || fill_packed != black {
+                    ctx.set_fill_style_str("#000");
+                    fill_packed = black;
+                    fill_known = true;
+                }
                 ctx.fill_rect(x, y, cell_w, ch);
             }
 
-            if bg_color != "#000" {
-                ctx.set_fill_style_str(&bg_color);
+            if !bg_black {
+                let p = bg.pack();
+                if !fill_known || fill_packed != p {
+                    let css = bg.to_css();
+                    ctx.set_fill_style_str(&css);
+                    fill_packed = p;
+                    fill_known = true;
+                }
                 ctx.fill_rect(x, y, cell_w, ch);
             }
 
-            if cursor_visible
-                && self.cursor_row == row as u16
-                && self.cursor_col == col as u16
-            {
+            if cursor_visible && self.cursor_row == row as u16 && self.cursor_col == col as u16 {
                 ctx.set_fill_style_str("rgba(204,204,204,0.5)");
+                fill_known = false; // rgba — don't try to match with pack()
                 ctx.fill_rect(x, y, cw, ch);
             }
 
             if content_len > 0 {
-                // Copy content out first to release the borrow on self.cells
-                // before we mutably borrow self.glyph_cache.
-                let content = {
-                    let bytes = &self.cells[idx + 8..idx + 8 + content_len];
-                    std::str::from_utf8(bytes).unwrap_or("").to_owned()
-                };
-
+                let content = std::str::from_utf8(&self.cells[idx + 8..idx + 8 + content_len])
+                    .unwrap_or("");
                 if !content.is_empty() && content != " " {
-                    // Cache key: fg_color + NUL + style_bits + NUL + content
-                    // style_bits: bit0=bold, bit1=italic, bit2=underline, bit3=wide
-                    let style_bits = (bold as u8)
-                        | ((italic as u8) << 1)
-                        | ((underline as u8) << 2)
-                        | ((wide as u8) << 3);
-                    let mut key = fg_color.clone();
-                    key.push('\x00');
-                    key.push(style_bits as char);
-                    key.push('\x00');
-                    key.push_str(&content);
+                    // Set font and fill BEFORE save() so tracking stays valid after restore().
+                    if bold != current_font_bold || italic != current_font_italic {
+                        let f = if bold && italic { format!("bold italic {normal_font}") }
+                                else if bold      { format!("bold {normal_font}") }
+                                else if italic    { format!("italic {normal_font}") }
+                                else              { normal_font.clone() };
+                        ctx.set_font(&f);
+                        current_font_bold = bold;
+                        current_font_italic = italic;
+                    }
+                    let fg_p = fg.pack();
+                    if !fill_known || fill_packed != fg_p {
+                        ctx.set_fill_style_str(&fg.to_css());
+                        fill_packed = fg_p;
+                        fill_known = true;
+                    }
 
-                    let glyph_w = cell_w as u32;
-                    let glyph_h = ch as u32;
-                    let fg = fg_color.clone();
-
-                    let glyph = self.glyph_cache.entry(key).or_insert_with(|| {
-                        create_glyph(&content, &fg, bold, italic, underline, glyph_w, glyph_h)
-                    });
-                    let _ = ctx.draw_image_with_html_canvas_element(glyph, x, y);
+                    // Clip to cell so text doesn't bleed into neighbors.
+                    // save/restore reverts the clip; fill+font state is unchanged.
+                    ctx.save();
+                    ctx.begin_path();
+                    ctx.rect(x, y, cell_w, ch);
+                    ctx.clip();
+                    let _ = ctx.fill_text(content, x, y + ch);
+                    if underline {
+                        ctx.set_stroke_style_str(&fg.to_css());
+                        ctx.begin_path();
+                        ctx.move_to(x, y + ch - 1.0);
+                        ctx.line_to(x + cell_w, y + ch - 1.0);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+                    // Canvas fill/font state is identical to before save(); tracking is still valid.
                 }
             }
         }

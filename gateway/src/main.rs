@@ -7,6 +7,36 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+/// Wraps TcpListener to set TCP_NODELAY on every accepted connection,
+/// disabling Nagle's algorithm for low-latency frame delivery.
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+        async {
+            loop {
+                match self.0.accept().await {
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        return (stream, addr);
+                    }
+                    Err(e) => {
+                        eprintln!("accept error: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const BROWSER_JS: &[u8] = include_bytes!("../../web/blit_browser.js");
 const BROWSER_WASM: &[u8] = include_bytes!("../../web/blit_browser_bg.wasm");
@@ -62,7 +92,8 @@ async fn main() {
         .fallback(get(root_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let tcp = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = NoDelayListener(tcp);
     eprintln!("listening on {addr}");
     axum::serve(listener, app).await.unwrap();
 }
