@@ -294,8 +294,8 @@ nix run .#npm-publish -- --dry-run
 Tag and push to trigger CI:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 This builds amd64 + arm64 .deb packages, creates a GitHub release, publishes to npm, and updates the APT repository on GitHub Pages.

@@ -13,7 +13,7 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.1.2";
+        version = "0.1.3";
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" ];
@@ -22,18 +22,6 @@
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rustToolchain;
           rustc = rustToolchain;
-        };
-
-        # Static musl toolchain + platform for .deb builds
-        muslTarget = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64-unknown-linux-musl" else "x86_64-unknown-linux-musl";
-
-        rustToolchainMusl = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ muslTarget ];
-        };
-
-        rustPlatformMusl = pkgs.makeRustPlatform {
-          cargo = rustToolchainMusl;
-          rustc = rustToolchainMusl;
         };
 
         browserWasm = rustPlatform.buildRustPackage {
@@ -150,28 +138,43 @@
           doCheck = false;
         };
 
-        # Static musl builds for .deb packages
-        mkMuslBin = { pname, cargoPkg, extraArgs ? {} }: rustPlatformMusl.buildRustPackage ({
+        # Static musl builds for .deb packages (Linux only).
+        # Use pkgsStatic so the entire toolchain (C linker included) targets musl,
+        # producing fully static binaries with no Nix store references.
+        pkgsMusl = pkgs.pkgsStatic;
+
+        rustToolchainMusl = pkgsMusl.rust-bin.stable.latest.default.override {
+          targets = [
+            (if pkgs.stdenv.hostPlatform.isAarch64
+             then "aarch64-unknown-linux-musl"
+             else "x86_64-unknown-linux-musl")
+          ];
+        };
+
+        rustPlatformMusl = pkgsMusl.makeRustPlatform {
+          cargo = rustToolchainMusl;
+          rustc = rustToolchainMusl;
+        };
+
+        mkStaticBin = { pname, cargoPkg, extraArgs ? {} }: rustPlatformMusl.buildRustPackage ({
           inherit pname version;
           src = ./.;
           cargoBuildFlags = [ "-p" cargoPkg ];
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = false;
-          CARGO_BUILD_TARGET = muslTarget;
-          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
         } // extraArgs);
 
-        blit-server-static = mkMuslBin {
+        blit-server-static = mkStaticBin {
           pname = "blit-server";
           cargoPkg = "blit-server";
         };
 
-        blit-cli-static = mkMuslBin {
+        blit-cli-static = mkStaticBin {
           pname = "blit-cli";
           cargoPkg = "blit-cli";
         };
 
-        blit-gateway-static = mkMuslBin {
+        blit-gateway-static = mkStaticBin {
           pname = "blit-gateway";
           cargoPkg = "blit-gateway";
           extraArgs = {
