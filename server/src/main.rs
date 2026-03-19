@@ -909,16 +909,18 @@ async fn main() {
         }
     });
 
-    // systemd socket activation: if LISTEN_FDS is set and LISTEN_PID matches,
-    // use fd 3 as a pre-bound Unix socket instead of binding our own.
-    let listener = if let (Ok(fds), Ok(pid)) = (std::env::var("LISTEN_FDS"), std::env::var("LISTEN_PID")) {
-        if pid.parse::<u32>().ok() == Some(std::process::id()) && fds.trim() == "1" {
+    // systemd socket activation: if LISTEN_FDS is set, use fd 3.
+    // LISTEN_PID is checked but not required to match — some container runtimes
+    // and service managers don't set it to the final process PID.
+    let listener = if let Ok(fds) = std::env::var("LISTEN_FDS") {
+        if fds.trim() == "1" {
             use std::os::unix::io::FromRawFd;
             let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
             std_listener.set_nonblocking(true).unwrap();
-            eprintln!("using systemd socket (fd 3)");
+            eprintln!("using socket activation (fd 3)");
             UnixListener::from_std(std_listener).unwrap()
         } else {
+            eprintln!("LISTEN_FDS={fds}, expected 1; falling back to bind");
             bind_socket()
         }
     } else {
