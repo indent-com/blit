@@ -139,8 +139,8 @@
         };
 
         # Static musl builds for .deb packages (Linux only).
-        # pkgsStatic provides a full musl toolchain so the C linker produces
-        # truly static binaries with no Nix store references.
+        # pkgsStatic provides a full musl stdenv; using rust-bin toolchain from
+        # the overlay ensures consistency with the rest of the flake.
         rustToolchainStatic = pkgs.pkgsStatic.rust-bin.stable.latest.default;
 
         rustPlatformStatic = pkgs.pkgsStatic.makeRustPlatform {
@@ -177,6 +177,7 @@
             '';
           };
         };
+
 
         mkDeb = { pname, binName ? pname, binPkg, description }: pkgs.stdenv.mkDerivation {
           pname = "${pname}-deb";

@@ -866,13 +866,15 @@ fn build_scrollback_update(
 }
 
 fn bind_socket() -> UnixListener {
-    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
-        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            format!("{dir}/blit.sock")
-        } else {
-            "/tmp/blit.sock".into()
-        }
-    });
+    let sock_path = std::env::args().nth(1)
+        .or_else(|| std::env::var("BLIT_SOCK").ok())
+        .unwrap_or_else(|| {
+            if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+                format!("{dir}/blit.sock")
+            } else {
+                "/tmp/blit.sock".into()
+            }
+        });
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path).unwrap();
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
