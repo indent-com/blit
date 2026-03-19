@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-debs:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build debs
+        run: |
+          for pkg in blit-server-deb blit-cli-deb blit-gateway-deb; do
+            nix build .#"$pkg" --no-link --print-out-paths >> outputs.txt
+          done
+
+      - name: Collect debs
+        run: |
+          mkdir -p debs
+          for dir in $(cat outputs.txt); do
+            cp "$dir"/*.deb debs/
+          done
+          ls -lh debs/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.arch }}
+          path: debs/*.deb
+
+  npm-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build & publish npm package
+        run: |
+          out=$(nix build .#blit-npm --no-link --print-out-paths)
+          tmp=$(mktemp -d)
+          cp -a "$out"/* "$tmp"/
+          chmod -R u+w "$tmp"
+          version="${GITHUB_REF_NAME#v}"
+          cat > "$tmp/package.json" <<EOF
+          {
+            "name": "blit-wasm",
+            "version": "$version",
+            "description": "Low-latency terminal streaming — JS+WASM client",
+            "type": "module",
+            "main": "blit.js",
+            "types": "blit.d.ts",
+            "files": ["blit_bg.wasm","blit_bg.js","blit_bg.wasm.d.ts","blit.js","blit.d.ts"],
+            "keywords": ["terminal","tty","wasm","webrtc","streaming"],
+            "license": "MIT",
+            "repository": {"type":"git","url":"https://github.com/pcarrier/blit"}
+          }
+          EOF
+          sed -i 's/^          //' "$tmp/package.json"
+          npm publish "$tmp"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  release:
+    needs: [build-debs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: debs
+
+      - name: List artifacts
+        run: ls -lh debs/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: debs/*.deb
+          generate_release_notes: true
+
+  apt-repo:
+    needs: [build-debs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: debs
+
+      - name: Import GPG key
+        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Build APT repo
+        run: |
+          sudo apt-get update && sudo apt-get install -y dpkg-dev
+
+          mkdir -p repo/pool repo/dists/stable/main/binary-amd64
+          mkdir -p repo/dists/stable/main/binary-arm64
+          cp debs/*.deb repo/pool/
+          cp .github/blit.gpg repo/blit.gpg
+
+          cd repo
+          dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
+          dpkg-scanpackages --arch arm64 pool > dists/stable/main/binary-arm64/Packages
+          gzip -k dists/stable/main/binary-amd64/Packages
+          gzip -k dists/stable/main/binary-arm64/Packages
+
+          cat > dists/stable/Release <<'RELEASE'
+          Origin: blit
+          Label: blit
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          RELEASE
+          sed -i 's/^          //' dists/stable/Release
+
+          apt-ftparchive release dists/stable >> dists/stable/Release
+          gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --armor --clearsign --output dists/stable/InRelease dists/stable/Release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+      - uses: actions/deploy-pages@v4

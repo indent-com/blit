@@ -172,6 +172,8 @@ impl Terminal {
     pub fn icanon(&self) -> bool { self.mode & (1 << 10) != 0 }
     #[wasm_bindgen(getter)] pub fn cursor_row(&self) -> u16 { self.cursor_row }
     #[wasm_bindgen(getter)] pub fn cursor_col(&self) -> u16 { self.cursor_col }
+    #[wasm_bindgen(getter)] pub fn rows(&self) -> u16 { self.rows }
+    #[wasm_bindgen(getter)] pub fn cols(&self) -> u16 { self.cols }
 
     pub fn feed_compressed(&mut self, data: &[u8]) {
         let payload = match lz4_flex::decompress_size_prepended(data) {

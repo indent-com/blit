@@ -314,9 +314,12 @@ function focusPty(id) {
     }
     resizeCanvasBacking();
     if (terminals[id]) {
-        terminals[id].render(offCtx);
+        const t = terminals[id];
+        t.render(offCtx);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(offscreen, 0, 0);
+        const tw = Math.round(t.cols * cell.w * dpr);
+        const th = Math.round(t.rows * cell.h * dpr);
+        ctx.drawImage(offscreen, 0, 0, tw, th, 0, 0, tw, th);
     } else {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
@@ -547,7 +550,9 @@ async function main() {
             t.render(offCtx);
             ctx.fillStyle = '#000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(offscreen, 0, 0);
+            const tw = Math.round(t.cols * cell.w * dpr);
+            const th = Math.round(t.rows * cell.h * dpr);
+            ctx.drawImage(offscreen, 0, 0, tw, th, 0, 0, tw, th);
             const cw = cell.w * dpr, ch = cell.h * dpr;
             let predLen = 0;
             if (predicted && t.echo()) {

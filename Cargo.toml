@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["server", "gateway", "browser", "demo", "cli"]
+members = ["server", "gateway", "browser", "demo", "cli", "npm"]
 
 [profile.release]
 opt-level = "s"

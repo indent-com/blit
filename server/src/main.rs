@@ -476,7 +476,7 @@ fn nudge_delivery(state: &AppState) {
     state.3.notify_one();
 }
 
-fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, state: AppState) -> Pty {
+fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, argv: Option<&[&str]>, state: AppState) -> Pty {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     unsafe {
@@ -499,8 +499,6 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, state: AppState) -> Pty
         libc::ioctl(master, libc::TIOCSWINSZ, &ws);
     }
 
-    let shell_c = CString::new(shell).unwrap();
-    let login_flag = CString::new("-l").unwrap();
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
 
@@ -519,6 +517,24 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, state: AppState) -> Pty
         std::env::set_var("TERM", "xterm-256color");
         std::env::set_var("COLUMNS", &cols.to_string());
         std::env::set_var("LINES", &rows.to_string());
+        if let Some(args) = argv {
+            if !args.is_empty() {
+                let cargs: Vec<CString> = args.iter()
+                    .map(|s| CString::new(*s).unwrap())
+                    .collect();
+                let ptrs: Vec<*const libc::c_char> = cargs.iter()
+                    .map(|c| c.as_ptr())
+                    .chain(std::iter::once(std::ptr::null()))
+                    .collect();
+                unsafe {
+                    libc::execvp(ptrs[0], ptrs.as_ptr());
+                    libc::_exit(1);
+                }
+            }
+        }
+        // Default: login shell
+        let shell_c = CString::new(shell).unwrap();
+        let login_flag = CString::new("-l").unwrap();
         unsafe {
             let p = shell_c.as_ptr();
             let l = login_flag.as_ptr();
@@ -1262,9 +1278,16 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 } else {
                     (24, 80)
                 };
+                let argv: Option<Vec<&str>> = if data.len() > 5 {
+                    std::str::from_utf8(&data[5..]).ok().map(|s| {
+                        s.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>()
+                    }).filter(|v| !v.is_empty())
+                } else {
+                    None
+                };
                 let id = sess.next_pty_id;
                 sess.next_pty_id += 1;
-                let pty = spawn_pty(&config.shell, rows, cols, id, state.clone());
+                let pty = spawn_pty(&config.shell, rows, cols, id, argv.as_deref(), state.clone());
                 sess.ptys.insert(id, pty);
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.focus = Some(id);
