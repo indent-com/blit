@@ -32,13 +32,24 @@ jobs:
             nix build .#"$pkg" --no-link --print-out-paths >> outputs.txt
           done
 
-      - name: Collect debs
+      - name: Collect and verify debs
         run: |
-          mkdir -p debs
+          mkdir -p debs tmp
           for dir in $(cat outputs.txt); do
             cp "$dir"/*.deb debs/
           done
           ls -lh debs/
+
+          # Verify binaries are statically linked
+          for deb in debs/*.deb; do
+            dpkg-deb -x "$deb" tmp/
+          done
+          for bin in tmp/usr/bin/*; do
+            echo "=== $bin ==="
+            file "$bin"
+            file "$bin" | grep -q "statically linked" || { echo "FATAL: $bin is not static!"; exit 1; }
+          done
+          rm -rf tmp
 
       - uses: actions/upload-artifact@v4
         with:

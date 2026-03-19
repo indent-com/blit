@@ -143,7 +143,16 @@
         };
 
         # Static musl builds for .deb packages (Linux only).
-        # Rust's musl targets are statically linked by default — no pkgsStatic needed.
+        # We cross-compile to musl using CARGO_BUILD_TARGET and point the linker
+        # at musl's CC so the result is fully static (no glibc, no Nix store refs).
+        cargoLinkerEnv = let
+          targetUpper = builtins.replaceStrings ["-"] ["_"]
+            (pkgs.lib.toUpper muslTarget);
+        in {
+          "CARGO_TARGET_${targetUpper}_LINKER" = "${pkgs.pkgsMusl.stdenv.cc}/bin/cc";
+          CC = "${pkgs.pkgsMusl.stdenv.cc}/bin/cc";
+        };
+
         mkStaticBin = { pname, cargoPkg, extraArgs ? {} }: rustPlatform.buildRustPackage ({
           inherit pname version;
           src = ./.;
@@ -151,7 +160,9 @@
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = false;
           CARGO_BUILD_TARGET = muslTarget;
-        } // extraArgs);
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+          nativeBuildInputs = [ pkgs.pkgsMusl.stdenv.cc ];
+        } // cargoLinkerEnv // extraArgs);
 
         blit-server-static = mkStaticBin {
           pname = "blit-server";
