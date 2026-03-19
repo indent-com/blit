@@ -32,7 +32,7 @@ cat > "$tmp/package.json" <<'EOF'
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pcarrier/blit"
+    "url": "https://github.com/indent-com/blit"
   }
 }
 EOF

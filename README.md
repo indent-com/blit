@@ -37,19 +37,19 @@ graph LR
 
 ```bash
 # Run directly
-nix run github:pcarrier/blit          # blit-gateway (default)
-nix run github:pcarrier/blit#blit-server
-nix run github:pcarrier/blit#blit-cli
+nix run github:indent-com/blit                # blit-cli (default)
+nix run github:indent-com/blit#blit-server
+nix run github:indent-com/blit#blit-gateway
 
 # Or install
-nix profile install github:pcarrier/blit
+nix profile install github:indent-com/blit
 ```
 
 ### APT (Debian/Ubuntu)
 
 ```bash
-curl -fsSL https://pcarrier.github.io/blit/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
-echo "deb [signed-by=/usr/share/keyrings/blit.gpg] https://pcarrier.github.io/blit stable main" \
+curl -fsSL https://indent-com.github.io/blit/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
+echo "deb [signed-by=/usr/share/keyrings/blit.gpg] https://indent-com.github.io/blit stable main" \
   | sudo tee /etc/apt/sources.list.d/blit.list
 sudo apt update
 sudo apt install blit-server blit-gateway blit-cli

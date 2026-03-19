@@ -70,6 +70,7 @@
           cargoBuildFlags = [ "-p" "blit-cli" ];
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = false;
+          meta.mainProgram = "blit";
         };
 
         blit-gateway = rustPlatform.buildRustPackage {
@@ -86,7 +87,7 @@
           doCheck = false;
         };
 
-        mkDeb = { pname, binPkg, description }: pkgs.stdenv.mkDerivation {
+        mkDeb = { pname, binName ? pname, binPkg, description }: pkgs.stdenv.mkDerivation {
           pname = "${pname}-deb";
           inherit version;
           nativeBuildInputs = [ pkgs.dpkg ];
@@ -95,7 +96,7 @@
             let arch = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
             in ''
               mkdir -p pkg/DEBIAN pkg/usr/bin
-              cp ${binPkg}/bin/${pname} pkg/usr/bin/
+              cp ${binPkg}/bin/${binName} pkg/usr/bin/
               cat > pkg/DEBIAN/control <<'CTRL'
 Package: ${pname}
 Version: ${version}
@@ -112,8 +113,9 @@ CTRL
       {
         packages.blit-server = blit-server;
         packages.blit-cli = blit-cli;
+        packages.blit-gateway = blit-gateway;
         packages.blit-npm = npmPkg;
-        packages.default = blit-gateway;
+        packages.default = blit-cli;
 
         packages.blit-server-deb = mkDeb {
           pname = "blit-server";
@@ -121,7 +123,7 @@ CTRL
           description = "blit terminal streaming server";
         };
         packages.blit-cli-deb = mkDeb {
-          pname = "blit-cli";
+          pname = "blit";
           binPkg = blit-cli;
           description = "blit terminal client";
         };

@@ -74,7 +74,7 @@ jobs:
             "files": ["blit_bg.wasm","blit_bg.js","blit_bg.wasm.d.ts","blit.js","blit.d.ts"],
             "keywords": ["terminal","tty","wasm","webrtc","streaming"],
             "license": "MIT",
-            "repository": {"type":"git","url":"https://github.com/pcarrier/blit"}
+            "repository": {"type":"git","url":"https://github.com/indent-com/blit"}
           }
           EOF
           sed -i 's/^          //' "$tmp/package.json"
