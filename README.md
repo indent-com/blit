@@ -15,7 +15,7 @@ graph LR
     subgraph Clients
         G[blit-gateway<br/>HTTP + WS] -->|WebSocket| B[Browser<br/>WASM canvas]
         C[blit-cli<br/>ANSI render]
-        W[blit-wasm<br/>npm package]
+        W[blit-client<br/>npm package]
     end
 
     S <-->|Unix socket| G
@@ -29,7 +29,7 @@ graph LR
 
 **blit-cli** connects to the server from any terminal — over Unix socket (default), TCP, or SSH — and renders updates as ANSI escape sequences.
 
-**blit-wasm** (npm package) provides the terminal state machine and protocol helpers as a WASM module, for embedding in VS Code extensions or other JS/TS applications.
+**blit-client** (npm package) provides the terminal state machine and protocol helpers as a WASM module, for embedding in VS Code extensions or other JS/TS applications.
 
 ## Install
 
@@ -67,7 +67,7 @@ docker run -p 3264:3264 -e BLIT_PASS=secret blit
 ### npm (WASM library)
 
 ```bash
-npm install blit-wasm
+npm install blit-client
 ```
 
 ## Usage
@@ -149,13 +149,13 @@ Navigate to the gateway address (default `http://localhost:3264`), enter the pas
 
 Mouse selection copies as both plain text and styled HTML. Middle-click closes a tab. Scroll wheel moves through scrollback (or is forwarded to the terminal when mouse mode is active).
 
-## WASM library (blit-wasm)
+## WASM library (blit-client)
 
-The `blit-wasm` npm package provides the terminal state machine and full protocol support, with no DOM or canvas dependencies. Designed for VS Code extensions, Electron apps, or any JS/TS environment.
+The `blit-client` npm package provides the terminal state machine and full protocol support, with no DOM or canvas dependencies. Designed for VS Code extensions, Electron apps, or any JS/TS environment.
 
 ```typescript
 import { Terminal, parse_server_msg, msg_create, msg_input, msg_resize,
-         msg_ack, S2C_UPDATE, S2C_TITLE, S2C_CREATED } from 'blit-wasm';
+         msg_ack, S2C_UPDATE, S2C_TITLE, S2C_CREATED } from 'blit-client';
 
 // Create a terminal
 const term = new Terminal(24, 80);
@@ -280,18 +280,13 @@ cargo run -p blit-cli
 ```bash
 nix build .#blit-server       # Server binary
 nix build .#blit-cli           # CLI binary
-nix build .#default            # Gateway binary (includes WASM)
-nix build .#blit-npm           # WASM npm package
-nix build .#blit-server-deb    # Debian package
+nix build .#blit-gateway       # Gateway binary (includes WASM)
+nix build .#blit-client        # WASM npm package
+nix build .#blit-server-deb    # Debian package (static musl)
 nix build .#blit-cli-deb
 nix build .#blit-gateway-deb
-```
-
-### Publish npm package
-
-```bash
-bin/publish              # Build via Nix + npm publish
-bin/publish --dry-run    # Preview
+nix run .#npm-publish          # Publish blit-client to npm
+nix run .#npm-publish -- --dry-run
 ```
 
 ### Release

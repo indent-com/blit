@@ -24,6 +24,18 @@
           rustc = rustToolchain;
         };
 
+        # Static musl toolchain + platform for .deb builds
+        muslTarget = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64-unknown-linux-musl" else "x86_64-unknown-linux-musl";
+
+        rustToolchainMusl = pkgs.rust-bin.stable.latest.default.override {
+          targets = [ muslTarget ];
+        };
+
+        rustPlatformMusl = pkgs.makeRustPlatform {
+          cargo = rustToolchainMusl;
+          rustc = rustToolchainMusl;
+        };
+
         browserWasm = rustPlatform.buildRustPackage {
           pname = "blit-browser";
           inherit version;
@@ -39,8 +51,8 @@
           doCheck = false;
         };
 
-        npmPkg = rustPlatform.buildRustPackage {
-          pname = "blit-npm";
+        blit-client-bundler = rustPlatform.buildRustPackage {
+          pname = "blit-client-bundler";
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit" ];
@@ -52,6 +64,57 @@
           '';
           dontInstall = true;
           doCheck = false;
+        };
+
+        blit-client-node = rustPlatform.buildRustPackage {
+          pname = "blit-client-node";
+          inherit version;
+          src = ./.;
+          cargoBuildFlags = [ "-p" "blit" ];
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [ pkgs.wasm-pack pkgs.wasm-bindgen-cli pkgs.binaryen ];
+          buildPhase = ''
+            cd npm
+            HOME=$TMPDIR wasm-pack build --target nodejs --release --out-dir $out
+          '';
+          dontInstall = true;
+          doCheck = false;
+        };
+
+        npm-publish = pkgs.writeShellApplication {
+          name = "npm-publish";
+          runtimeInputs = [ pkgs.nodejs ];
+          text = ''
+            tmp=$(mktemp -d)
+            trap 'rm -rf "$tmp"' EXIT
+
+            # Start with the bundler build (has blit.js as ESM entry + blit_bg.js + .wasm + .d.ts)
+            cp -a ${blit-client-bundler}/* "$tmp"/
+            chmod -R u+w "$tmp"
+
+            # Add the node entry from the nodejs build
+            cp ${blit-client-node}/blit.js "$tmp/blit_node.js"
+
+            cat > "$tmp/package.json" <<'PKGJSON'
+            {
+              "name": "blit-client",
+              "version": "${version}",
+              "description": "Low-latency terminal streaming — JS+WASM client",
+              "main": "blit_node.js",
+              "module": "blit.js",
+              "types": "blit.d.ts",
+              "files": ["blit_bg.wasm","blit_bg.js","blit_bg.wasm.d.ts","blit.js","blit.d.ts","blit_node.js"],
+              "keywords": ["terminal","tty","wasm","streaming"],
+              "license": "MIT",
+              "repository": {"type":"git","url":"git+https://github.com/indent-com/blit.git"}
+            }
+            PKGJSON
+            sed -i 's/^            //' "$tmp/package.json"
+            echo "Package contents:"
+            ls -lh "$tmp"
+            echo ""
+            npm publish "$tmp" "$@"
+          '';
         };
 
         blit-server = rustPlatform.buildRustPackage {
@@ -87,6 +150,39 @@
           doCheck = false;
         };
 
+        # Static musl builds for .deb packages
+        mkMuslBin = { pname, cargoPkg, extraArgs ? {} }: rustPlatformMusl.buildRustPackage ({
+          inherit pname version;
+          src = ./.;
+          cargoBuildFlags = [ "-p" cargoPkg ];
+          cargoLock.lockFile = ./Cargo.lock;
+          doCheck = false;
+          CARGO_BUILD_TARGET = muslTarget;
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+        } // extraArgs);
+
+        blit-server-static = mkMuslBin {
+          pname = "blit-server";
+          cargoPkg = "blit-server";
+        };
+
+        blit-cli-static = mkMuslBin {
+          pname = "blit-cli";
+          cargoPkg = "blit-cli";
+        };
+
+        blit-gateway-static = mkMuslBin {
+          pname = "blit-gateway";
+          cargoPkg = "blit-gateway";
+          extraArgs = {
+            preBuild = ''
+              mkdir -p web
+              cp ${browserWasm}/blit_browser_bg.wasm web/
+              cp ${browserWasm}/blit_browser.js web/
+            '';
+          };
+        };
+
         mkDeb = { pname, binName ? pname, binPkg, description }: pkgs.stdenv.mkDerivation {
           pname = "${pname}-deb";
           inherit version;
@@ -114,22 +210,23 @@ CTRL
         packages.blit-server = blit-server;
         packages.blit-cli = blit-cli;
         packages.blit-gateway = blit-gateway;
-        packages.blit-npm = npmPkg;
+        packages.blit-client = blit-client-bundler;
+        packages.npm-publish = npm-publish;
         packages.default = blit-cli;
 
         packages.blit-server-deb = mkDeb {
           pname = "blit-server";
-          binPkg = blit-server;
+          binPkg = blit-server-static;
           description = "blit terminal streaming server";
         };
         packages.blit-cli-deb = mkDeb {
           pname = "blit";
-          binPkg = blit-cli;
+          binPkg = blit-cli-static;
           description = "blit terminal client";
         };
         packages.blit-gateway-deb = mkDeb {
           pname = "blit-gateway";
-          binPkg = blit-gateway;
+          binPkg = blit-gateway-static;
           description = "blit WebSocket gateway";
         };
 
