@@ -1,0 +1,9 @@
+[package]
+name = "blit-remote"
+version = "0.2.0"
+edition = "2021"
+description = "Remote blit protocol, frame state, and callback DOM renderer"
+
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
+unicode-width = "0.2"

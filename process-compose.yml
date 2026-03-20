@@ -1,17 +1,25 @@
 version: "0.5"
 
 processes:
+  browser-assets:
+    command: cargo watch -w browser/src -w remote/src -s "./bin/build-browser"
+    availability:
+      restart: on_failure
+      max_restarts: 0
+
   server:
-    command: cargo watch -w server/src -x "run -p blit-server"
+    command: cargo watch -w server/src -w remote/src -w wezterm-driver/src -x "run -p blit-server --release"
     availability:
       restart: on_failure
       max_restarts: 0
 
   gateway:
-    command: cargo watch -w gateway/src -x "run -p blit-gateway"
+    command: cargo watch -w gateway/src -w web -x "run -p blit-gateway --release"
     environment:
       - BLIT_PASS=${BLIT_PASS:-dev}
     depends_on:
+      browser-assets:
+        condition: process_started
       server:
         condition: process_started
     availability:

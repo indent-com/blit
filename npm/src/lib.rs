@@ -1,320 +1,361 @@
 #![allow(non_snake_case)]
 
+use blit_remote::{self as remote, parse_server_msg as parse_msg, ServerMsg as Msg, TerminalState};
+use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 
-const CELL_SIZE: usize = 12;
+#[wasm_bindgen]
+pub fn C2S_INPUT() -> u8 {
+    remote::C2S_INPUT
+}
 
-// ── Protocol constants ──────────────────────────────────────────────
-// Exposed as top-level getter functions for JS consumption.
+#[wasm_bindgen]
+pub fn C2S_RESIZE() -> u8 {
+    remote::C2S_RESIZE
+}
 
-// Client → Server
-#[wasm_bindgen] pub fn C2S_INPUT() -> u8 { 0x00 }
-#[wasm_bindgen] pub fn C2S_RESIZE() -> u8 { 0x01 }
-#[wasm_bindgen] pub fn C2S_SCROLL() -> u8 { 0x02 }
-#[wasm_bindgen] pub fn C2S_ACK() -> u8 { 0x03 }
-#[wasm_bindgen] pub fn C2S_DISPLAY_RATE() -> u8 { 0x04 }
-#[wasm_bindgen] pub fn C2S_CLIENT_METRICS() -> u8 { 0x05 }
-#[wasm_bindgen] pub fn C2S_CREATE() -> u8 { 0x10 }
-#[wasm_bindgen] pub fn C2S_FOCUS() -> u8 { 0x11 }
-#[wasm_bindgen] pub fn C2S_CLOSE() -> u8 { 0x12 }
+#[wasm_bindgen]
+pub fn C2S_SCROLL() -> u8 {
+    remote::C2S_SCROLL
+}
 
-// Server → Client
-#[wasm_bindgen] pub fn S2C_UPDATE() -> u8 { 0x00 }
-#[wasm_bindgen] pub fn S2C_CREATED() -> u8 { 0x01 }
-#[wasm_bindgen] pub fn S2C_CLOSED() -> u8 { 0x02 }
-#[wasm_bindgen] pub fn S2C_LIST() -> u8 { 0x03 }
-#[wasm_bindgen] pub fn S2C_TITLE() -> u8 { 0x04 }
+#[wasm_bindgen]
+pub fn C2S_ACK() -> u8 {
+    remote::C2S_ACK
+}
 
-// ── Protocol message builders ───────────────────────────────────────
+#[wasm_bindgen]
+pub fn C2S_DISPLAY_RATE() -> u8 {
+    remote::C2S_DISPLAY_RATE
+}
+
+#[wasm_bindgen]
+pub fn C2S_CLIENT_METRICS() -> u8 {
+    remote::C2S_CLIENT_METRICS
+}
+
+#[wasm_bindgen]
+pub fn C2S_CREATE() -> u8 {
+    remote::C2S_CREATE
+}
+
+#[wasm_bindgen]
+pub fn C2S_FOCUS() -> u8 {
+    remote::C2S_FOCUS
+}
+
+#[wasm_bindgen]
+pub fn C2S_CLOSE() -> u8 {
+    remote::C2S_CLOSE
+}
+
+#[wasm_bindgen]
+pub fn C2S_SUBSCRIBE() -> u8 {
+    remote::C2S_SUBSCRIBE
+}
+
+#[wasm_bindgen]
+pub fn C2S_UNSUBSCRIBE() -> u8 {
+    remote::C2S_UNSUBSCRIBE
+}
+
+#[wasm_bindgen]
+pub fn C2S_SEARCH() -> u8 {
+    remote::C2S_SEARCH
+}
+
+#[wasm_bindgen]
+pub fn S2C_UPDATE() -> u8 {
+    remote::S2C_UPDATE
+}
+
+#[wasm_bindgen]
+pub fn S2C_CREATED() -> u8 {
+    remote::S2C_CREATED
+}
+
+#[wasm_bindgen]
+pub fn S2C_CLOSED() -> u8 {
+    remote::S2C_CLOSED
+}
+
+#[wasm_bindgen]
+pub fn S2C_LIST() -> u8 {
+    remote::S2C_LIST
+}
+
+#[wasm_bindgen]
+pub fn S2C_TITLE() -> u8 {
+    remote::S2C_TITLE
+}
+
+#[wasm_bindgen]
+pub fn S2C_SEARCH_RESULTS() -> u8 {
+    remote::S2C_SEARCH_RESULTS
+}
 
 #[wasm_bindgen]
 pub fn msg_create(rows: u16, cols: u16) -> Vec<u8> {
-    vec![
-        0x10,
-        (rows & 0xff) as u8, (rows >> 8) as u8,
-        (cols & 0xff) as u8, (cols >> 8) as u8,
-    ]
+    remote::msg_create(rows, cols)
+}
+
+#[wasm_bindgen]
+pub fn msg_create_command(rows: u16, cols: u16, command: &str) -> Vec<u8> {
+    remote::msg_create_command(rows, cols, command)
 }
 
 #[wasm_bindgen]
 pub fn msg_input(pty_id: u16, data: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(3 + data.len());
-    msg.push(0x00);
-    msg.push((pty_id & 0xff) as u8);
-    msg.push((pty_id >> 8) as u8);
-    msg.extend_from_slice(data);
-    msg
+    remote::msg_input(pty_id, data)
 }
 
 #[wasm_bindgen]
 pub fn msg_resize(pty_id: u16, rows: u16, cols: u16) -> Vec<u8> {
-    vec![
-        0x01,
-        (pty_id & 0xff) as u8, (pty_id >> 8) as u8,
-        (rows & 0xff) as u8, (rows >> 8) as u8,
-        (cols & 0xff) as u8, (cols >> 8) as u8,
-    ]
+    remote::msg_resize(pty_id, rows, cols)
 }
 
 #[wasm_bindgen]
 pub fn msg_focus(pty_id: u16) -> Vec<u8> {
-    vec![
-        0x11,
-        (pty_id & 0xff) as u8, (pty_id >> 8) as u8,
-    ]
+    remote::msg_focus(pty_id)
 }
 
 #[wasm_bindgen]
 pub fn msg_close(pty_id: u16) -> Vec<u8> {
-    vec![
-        0x12,
-        (pty_id & 0xff) as u8, (pty_id >> 8) as u8,
-    ]
+    remote::msg_close(pty_id)
 }
 
 #[wasm_bindgen]
 pub fn msg_ack() -> Vec<u8> {
-    vec![0x03]
+    remote::msg_ack()
 }
 
 #[wasm_bindgen]
 pub fn msg_scroll(pty_id: u16, offset: u32) -> Vec<u8> {
-    vec![
-        0x02,
-        (pty_id & 0xff) as u8, (pty_id >> 8) as u8,
-        (offset & 0xff) as u8, ((offset >> 8) & 0xff) as u8,
-        ((offset >> 16) & 0xff) as u8, ((offset >> 24) & 0xff) as u8,
-    ]
+    remote::msg_scroll(pty_id, offset)
+}
+
+#[wasm_bindgen]
+pub fn msg_search(request_id: u16, query: &str) -> Vec<u8> {
+    remote::msg_search(request_id, query)
 }
 
 #[wasm_bindgen]
 pub fn msg_display_rate(fps: u16) -> Vec<u8> {
-    vec![
-        0x04,
-        (fps & 0xff) as u8, (fps >> 8) as u8,
-    ]
+    remote::msg_display_rate(fps)
 }
 
 #[wasm_bindgen]
 pub fn msg_client_metrics(backlog: u16, ack_ahead: u16, apply_ms_x10: u16) -> Vec<u8> {
-    vec![
-        0x05,
-        (backlog & 0xff) as u8, (backlog >> 8) as u8,
-        (ack_ahead & 0xff) as u8, (ack_ahead >> 8) as u8,
-        (apply_ms_x10 & 0xff) as u8, (apply_ms_x10 >> 8) as u8,
-    ]
+    remote::msg_client_metrics(backlog, ack_ahead, apply_ms_x10)
 }
 
-// ── Server message parser ───────────────────────────────────────────
+#[wasm_bindgen]
+pub fn msg_subscribe(pty_id: u16) -> Vec<u8> {
+    remote::msg_subscribe(pty_id)
+}
 
-/// Parsed server message. Check `kind()` to determine the variant,
-/// then access the relevant fields.
+#[wasm_bindgen]
+pub fn msg_unsubscribe(pty_id: u16) -> Vec<u8> {
+    remote::msg_unsubscribe(pty_id)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchResult {
+    pty_id: u16,
+    score: u32,
+    primary_source: u8,
+    matched_sources: u8,
+    scroll_offset: Option<u32>,
+    context: String,
+}
+
+impl SearchResult {
+    fn from_remote(result: remote::SearchResultEntry<'_>) -> Self {
+        Self {
+            pty_id: result.pty_id,
+            score: result.score,
+            primary_source: result.primary_source,
+            matched_sources: result.matched_sources,
+            scroll_offset: result.scroll_offset,
+            context: String::from_utf8_lossy(result.context).into_owned(),
+        }
+    }
+
+    fn to_js_value(&self) -> JsValue {
+        let obj = Object::new();
+        Reflect::set(&obj, &JsValue::from_str("ptyId"), &JsValue::from(self.pty_id)).unwrap();
+        Reflect::set(&obj, &JsValue::from_str("score"), &JsValue::from(self.score)).unwrap();
+        Reflect::set(&obj, &JsValue::from_str("primarySource"), &JsValue::from(self.primary_source)).unwrap();
+        Reflect::set(&obj, &JsValue::from_str("matchedSources"), &JsValue::from(self.matched_sources)).unwrap();
+        Reflect::set(&obj, &JsValue::from_str("scrollOffset"), &self.scroll_offset.map(JsValue::from).unwrap_or(JsValue::NULL)).unwrap();
+        Reflect::set(&obj, &JsValue::from_str("context"), &JsValue::from_str(&self.context)).unwrap();
+        obj.into()
+    }
+}
+
 #[wasm_bindgen]
 pub struct ServerMsg {
     kind: u8,
     pty_id: u16,
+    request_id: u16,
     payload: Vec<u8>,
+    pty_ids: Vec<u16>,
+    search_results: Vec<SearchResult>,
+}
+
+impl ServerMsg {
+    fn from_remote(msg: Msg<'_>) -> Self {
+        match msg {
+            Msg::Update { pty_id, payload } => Self {
+                kind: remote::S2C_UPDATE, pty_id, request_id: 0,
+                payload: payload.to_vec(), pty_ids: Vec::new(), search_results: Vec::new(),
+            },
+            Msg::Created { pty_id } => Self {
+                kind: remote::S2C_CREATED, pty_id, request_id: 0,
+                payload: Vec::new(), pty_ids: Vec::new(), search_results: Vec::new(),
+            },
+            Msg::Closed { pty_id } => Self {
+                kind: remote::S2C_CLOSED, pty_id, request_id: 0,
+                payload: Vec::new(), pty_ids: Vec::new(), search_results: Vec::new(),
+            },
+            Msg::List { pty_ids } => Self {
+                kind: remote::S2C_LIST, pty_id: 0, request_id: 0,
+                payload: Vec::new(), pty_ids, search_results: Vec::new(),
+            },
+            Msg::Title { pty_id, title } => Self {
+                kind: remote::S2C_TITLE, pty_id, request_id: 0,
+                payload: title.to_vec(), pty_ids: Vec::new(), search_results: Vec::new(),
+            },
+            Msg::SearchResults { request_id, results } => {
+                let search_results: Vec<SearchResult> =
+                    results.into_iter().map(SearchResult::from_remote).collect();
+                let pty_ids = search_results.iter().map(|r| r.pty_id).collect();
+                Self {
+                    kind: remote::S2C_SEARCH_RESULTS, pty_id: 0, request_id,
+                    payload: Vec::new(), pty_ids, search_results,
+                }
+            }
+        }
+    }
 }
 
 #[wasm_bindgen]
 impl ServerMsg {
     pub fn kind(&self) -> u8 { self.kind }
     pub fn pty_id(&self) -> u16 { self.pty_id }
-
-    /// For S2C_UPDATE: the compressed frame payload to feed to Terminal.
+    pub fn request_id(&self) -> u16 { self.request_id }
     pub fn payload(&self) -> Vec<u8> { self.payload.clone() }
+    pub fn title(&self) -> String { String::from_utf8_lossy(&self.payload).into_owned() }
+    pub fn pty_ids(&self) -> Vec<u16> { self.pty_ids.clone() }
 
-    /// For S2C_TITLE: the title string.
-    pub fn title(&self) -> String {
-        String::from_utf8_lossy(&self.payload).into_owned()
+    pub fn search_result_count(&self) -> usize { self.search_results.len() }
+
+    pub fn search_result(&self, index: usize) -> JsValue {
+        self.search_results.get(index).map(SearchResult::to_js_value).unwrap_or(JsValue::NULL)
     }
 
-    /// For S2C_LIST: array of pty IDs.
-    pub fn pty_ids(&self) -> Vec<u16> {
-        self.payload
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect()
+    pub fn search_results(&self) -> Array {
+        let results = Array::new_with_length(self.search_results.len() as u32);
+        for (i, r) in self.search_results.iter().enumerate() {
+            results.set(i as u32, r.to_js_value());
+        }
+        results
     }
 }
 
-/// Parse a binary server message. Returns None for invalid messages.
 #[wasm_bindgen]
 pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg> {
-    if data.is_empty() { return None; }
-    match data[0] {
-        0x00 => { // S2C_UPDATE
-            if data.len() < 3 { return None; }
-            let pty_id = u16::from_le_bytes([data[1], data[2]]);
-            Some(ServerMsg { kind: data[0], pty_id, payload: data[3..].to_vec() })
-        }
-        0x01 | 0x02 => { // S2C_CREATED | S2C_CLOSED
-            if data.len() < 3 { return None; }
-            let pty_id = u16::from_le_bytes([data[1], data[2]]);
-            Some(ServerMsg { kind: data[0], pty_id, payload: vec![] })
-        }
-        0x03 => { // S2C_LIST
-            if data.len() < 3 { return None; }
-            let count = u16::from_le_bytes([data[1], data[2]]) as usize;
-            let end = (3 + count * 2).min(data.len());
-            Some(ServerMsg { kind: data[0], pty_id: 0, payload: data[3..end].to_vec() })
-        }
-        0x04 => { // S2C_TITLE
-            if data.len() < 3 { return None; }
-            let pty_id = u16::from_le_bytes([data[1], data[2]]);
-            Some(ServerMsg { kind: data[0], pty_id, payload: data[3..].to_vec() })
-        }
-        _ => None,
-    }
+    Some(ServerMsg::from_remote(parse_msg(data)?))
 }
-
-// ── Terminal state machine ──────────────────────────────────────────
 
 #[wasm_bindgen]
 pub struct Terminal {
-    rows: u16,
-    cols: u16,
-    cells: Vec<u8>,
-    cursor_row: u16,
-    cursor_col: u16,
-    mode: u16,
+    inner: TerminalState,
 }
 
 #[wasm_bindgen]
 impl Terminal {
     #[wasm_bindgen(constructor)]
     pub fn new(rows: u16, cols: u16) -> Self {
-        let total = rows as usize * cols as usize;
-        Terminal {
-            rows,
-            cols,
-            cells: vec![0u8; total * CELL_SIZE],
-            cursor_row: 0,
-            cursor_col: 0,
-            mode: 0,
-        }
+        Self { inner: TerminalState::new(rows, cols) }
     }
 
-    // ── Accessors ───────────────────────────────────────────────────
+    #[wasm_bindgen(getter)]
+    pub fn rows(&self) -> u16 { self.inner.rows() }
+    #[wasm_bindgen(getter)]
+    pub fn cols(&self) -> u16 { self.inner.cols() }
+    #[wasm_bindgen(getter)]
+    pub fn cursor_row(&self) -> u16 { self.inner.cursor_row() }
+    #[wasm_bindgen(getter)]
+    pub fn cursor_col(&self) -> u16 { self.inner.cursor_col() }
 
-    #[wasm_bindgen(getter)] pub fn rows(&self) -> u16 { self.rows }
-    #[wasm_bindgen(getter)] pub fn cols(&self) -> u16 { self.cols }
-    #[wasm_bindgen(getter)] pub fn cursor_row(&self) -> u16 { self.cursor_row }
-    #[wasm_bindgen(getter)] pub fn cursor_col(&self) -> u16 { self.cursor_col }
-    pub fn cursor_visible(&self) -> bool { self.mode & 1 != 0 }
-    pub fn app_cursor(&self) -> bool { self.mode & 2 != 0 }
-    pub fn bracketed_paste(&self) -> bool { self.mode & 8 != 0 }
-    pub fn mouse_mode(&self) -> u8 { ((self.mode >> 4) & 7) as u8 }
-    pub fn mouse_encoding(&self) -> u8 { ((self.mode >> 7) & 3) as u8 }
-    pub fn echo(&self) -> bool { self.mode & (1 << 9) != 0 }
-    pub fn icanon(&self) -> bool { self.mode & (1 << 10) != 0 }
+    pub fn cursor_visible(&self) -> bool { self.inner.mode() & 1 != 0 }
+    pub fn app_cursor(&self) -> bool { self.inner.mode() & 2 != 0 }
+    pub fn bracketed_paste(&self) -> bool { self.inner.mode() & 8 != 0 }
+    pub fn mouse_mode(&self) -> u8 { ((self.inner.mode() >> 4) & 7) as u8 }
+    pub fn mouse_encoding(&self) -> u8 { ((self.inner.mode() >> 7) & 3) as u8 }
+    pub fn echo(&self) -> bool { self.inner.mode() & (1 << 9) != 0 }
+    pub fn icanon(&self) -> bool { self.inner.mode() & (1 << 10) != 0 }
+    pub fn title(&self) -> String { self.inner.title().to_owned() }
 
-    // ── Feed compressed data ────────────────────────────────────────
-
-    pub fn feed_compressed(&mut self, data: &[u8]) {
-        let payload = match lz4_flex::decompress_size_prepended(data) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        self.apply_payload(&payload);
-    }
-
-    pub fn feed_compressed_batch(&mut self, batch: &[u8]) {
-        let mut off = 0usize;
-        while off + 4 <= batch.len() {
-            let len = u32::from_le_bytes([
-                batch[off], batch[off + 1], batch[off + 2], batch[off + 3],
-            ]) as usize;
-            off += 4;
-            if off + len > batch.len() { break; }
-            if let Ok(payload) = lz4_flex::decompress_size_prepended(&batch[off..off + len]) {
-                self.apply_payload(&payload);
-            }
-            off += len;
-        }
-    }
-
-    fn apply_payload(&mut self, payload: &[u8]) {
-        if payload.len() < 10 { return; }
-
-        let new_rows = u16::from_le_bytes([payload[0], payload[1]]);
-        let new_cols = u16::from_le_bytes([payload[2], payload[3]]);
-
-        if new_rows != self.rows || new_cols != self.cols {
-            self.rows = new_rows;
-            self.cols = new_cols;
-            let total = new_rows as usize * new_cols as usize;
-            self.cells = vec![0u8; total * CELL_SIZE];
-        }
-
-        let total_cells = self.rows as usize * self.cols as usize;
-        let bitmask_len = (total_cells + 7) / 8;
-        if payload.len() < 10 + bitmask_len { return; }
-
-        let bitmask = &payload[10..10 + bitmask_len];
-        let data_start = 10 + bitmask_len;
-
-        let dirty_count = (0..total_cells)
-            .filter(|&i| bitmask[i / 8] & (1 << (i % 8)) != 0)
-            .count();
-        if payload.len() < data_start + dirty_count * CELL_SIZE { return; }
-
-        let mut dirty_idx = 0usize;
-        for i in 0..total_cells {
-            if bitmask[i / 8] & (1 << (i % 8)) != 0 {
-                let cell_idx = i * CELL_SIZE;
-                for byte_pos in 0..CELL_SIZE {
-                    self.cells[cell_idx + byte_pos] =
-                        payload[data_start + byte_pos * dirty_count + dirty_idx];
-                }
-                dirty_idx += 1;
-            }
-        }
-
-        self.cursor_row = u16::from_le_bytes([payload[4], payload[5]]);
-        self.cursor_col = u16::from_le_bytes([payload[6], payload[7]]);
-        self.mode = u16::from_le_bytes([payload[8], payload[9]]);
-    }
-
-    // ── Read terminal content ───────────────────────────────────────
+    pub fn feed_compressed(&mut self, data: &[u8]) { let _ = self.inner.feed_compressed(data); }
+    pub fn feed_compressed_batch(&mut self, batch: &[u8]) { let _ = self.inner.feed_compressed_batch(batch); }
 
     pub fn get_text(&self, start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> String {
-        let mut result = String::new();
-        for row in start_row..=end_row.min(self.rows.saturating_sub(1)) {
-            let c0 = if row == start_row { start_col } else { 0 };
-            let c1 = if row == end_row { end_col } else { self.cols - 1 };
-            let mut line = String::new();
-            let mut col = c0;
-            while col <= c1.min(self.cols - 1) {
-                let idx = (row as usize * self.cols as usize + col as usize) * CELL_SIZE;
-                let f1 = self.cells[idx + 1];
-                if f1 & 4 != 0 { col += 1; continue; }
-                let content_len = ((f1 >> 3) & 7) as usize;
-                if content_len > 0 {
-                    if let Ok(s) = std::str::from_utf8(&self.cells[idx + 8..idx + 8 + content_len]) {
-                        line.push_str(s);
-                    }
-                } else {
-                    line.push(' ');
-                }
-                col += 1;
-            }
-            result.push_str(line.trim_end());
-            if row < end_row.min(self.rows.saturating_sub(1)) { result.push('\n'); }
-        }
-        result
+        self.inner.get_text(start_row, start_col, end_row, end_col)
+    }
+    pub fn get_all_text(&self) -> String { self.inner.get_all_text() }
+    pub fn get_cell(&self, row: u16, col: u16) -> Vec<u8> { self.inner.get_cell(row, col) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_search_result(
+        bytes: &mut Vec<u8>,
+        pty_id: u16,
+        score: u32,
+        primary_source: u8,
+        matched_sources: u8,
+        scroll_offset: Option<u32>,
+        context: &str,
+    ) {
+        bytes.extend_from_slice(&pty_id.to_le_bytes());
+        bytes.extend_from_slice(&score.to_le_bytes());
+        bytes.push(primary_source);
+        bytes.push(matched_sources);
+        bytes.extend_from_slice(&scroll_offset.unwrap_or(u32::MAX).to_le_bytes());
+        bytes.extend_from_slice(&(context.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(context.as_bytes());
     }
 
-    /// Get all text content as a single string.
-    pub fn get_all_text(&self) -> String {
-        if self.rows == 0 || self.cols == 0 { return String::new(); }
-        self.get_text(0, 0, self.rows - 1, self.cols - 1)
-    }
+    #[test]
+    fn parse_server_msg_preserves_search_result_metadata() {
+        let mut data = Vec::new();
+        data.push(remote::S2C_SEARCH_RESULTS);
+        data.extend_from_slice(&17u16.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        encode_search_result(&mut data, 3, 91, 1, 0b011, Some(12), "visible");
+        encode_search_result(&mut data, 8, 44, 0, 0b001, None, "title");
 
-    /// Raw cell data for a given position. Returns 12 bytes or empty if out of bounds.
-    pub fn get_cell(&self, row: u16, col: u16) -> Vec<u8> {
-        if row >= self.rows || col >= self.cols { return vec![]; }
-        let idx = (row as usize * self.cols as usize + col as usize) * CELL_SIZE;
-        self.cells[idx..idx + CELL_SIZE].to_vec()
+        let msg = parse_server_msg(&data).unwrap();
+
+        assert_eq!(msg.kind, remote::S2C_SEARCH_RESULTS);
+        assert_eq!(msg.request_id, 17);
+        assert_eq!(msg.pty_ids, vec![3, 8]);
+        assert_eq!(
+            msg.search_results,
+            vec![
+                SearchResult {
+                    pty_id: 3, score: 91, primary_source: 1, matched_sources: 0b011,
+                    scroll_offset: Some(12), context: "visible".into(),
+                },
+                SearchResult {
+                    pty_id: 8, score: 44, primary_source: 0, matched_sources: 0b001,
+                    scroll_offset: None, context: "title".into(),
+                },
+            ]
+        );
     }
 }

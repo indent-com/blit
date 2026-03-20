@@ -4,52 +4,318 @@
 <meta charset="utf-8">
 <title>blit</title>
 <style>
+:root {
+    --terminal-font: PragmataPro, ui-monospace, monospace;
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: ui-monospace, monospace; }
-#tabs {
-    height: 28px; background: #111; border-bottom: 1px solid #333;
-    overflow-x: auto; white-space: nowrap; user-select: none;
-    line-height: 28px;
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: var(--terminal-font); }
+canvas { display: block; outline: none; }
+#workspace {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
 }
-#tabs .tab {
-    display: inline-block; padding: 0 6px 0 12px; color: #888; font: 12px/28px ui-monospace, monospace;
-    cursor: pointer; border-right: 1px solid #222; height: 28px;
+#lead-pane {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    background: #000;
 }
-#tabs .tab.active { background: #222; color: #ccc; }
-#tabs .tab:hover { background: #1a1a1a; }
-#tabs .tab .close {
-    display: inline-block; margin-left: 6px; color: #555; font-size: 14px;
-    vertical-align: middle; cursor: pointer; padding: 0 4px;
+#lead-pane canvas {
+    cursor: text;
+    position: absolute;
+    top: 0;
+    left: 0;
+    image-rendering: pixelated;
+    transform-origin: top left;
+    will-change: transform;
+    backface-visibility: hidden;
 }
-#tabs .tab .close:hover { color: #f66; }
-#tabs .newtab {
-    display: inline-block; padding: 0 10px; color: #555; cursor: pointer;
-    font: 14px/28px ui-monospace, monospace; height: 28px;
+#preview-rail {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 8;
+    background: rgba(3, 4, 6, 0.64);
+    backdrop-filter: blur(18px) saturate(1.08);
+    overflow-y: auto;
+    padding: 24px;
 }
-#tabs .newtab:hover { color: #ccc; }
-canvas { display: block; outline: none; cursor: text; position: absolute; left: 0; }
+#preview-rail.visible {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    animation: exposeOverlayIn 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+#expose-head {
+    width: min(100%, 1320px);
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+#preview-rail.visible #expose-head {
+    animation: exposeHeadIn 135ms cubic-bezier(0.2, 0.9, 0.2, 1);
+}
+#expose-toolbar {
+    display: block;
+}
+#expose-grid-shell {
+    width: min(100%, 1320px);
+    margin: 0 auto;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+}
+#expose-search {
+    width: 100%;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 14px;
+    background: rgba(18,22,28,0.72);
+    color: #eef3f8;
+    padding: 16px 18px;
+    font: 15px/1.2 var(--terminal-font);
+    outline: none;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 10px 30px rgba(0,0,0,0.14);
+}
+#expose-search::placeholder {
+    color: #6f7a86;
+}
+#expose-create {
+    flex: 0 0 auto;
+    width: 40px;
+    height: 40px;
+    margin-top: 6px;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    background: rgba(18,22,28,0.68);
+    color: #eef3f8;
+    font: 20px/1 var(--terminal-font);
+    cursor: pointer;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 10px 26px rgba(0,0,0,0.12);
+    transition: transform 90ms ease, border-color 90ms ease, background 90ms ease;
+}
+#expose-create:hover {
+    transform: translateY(-1px);
+    border-color: rgba(255,255,255,0.24);
+    background: rgba(28,34,42,0.78);
+}
+#expose-create.selected {
+    transform: translateY(-2px);
+    border-color: rgba(255,255,255,0.7);
+    box-shadow: 0 18px 48px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(255,255,255,0.18);
+    color: #fff;
+}
+#expose-create:focus-visible {
+    outline: 1px solid rgba(133, 197, 255, 0.7);
+    outline-offset: 2px;
+}
+#expose-hint {
+    color: #7c8896;
+    font: 12px/1.3 var(--terminal-font);
+    min-height: 1.3em;
+}
+#expose-grid {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    align-content: start;
+}
+#expose-grid.search-results {
+    width: min(100%, 1080px);
+    grid-template-columns: minmax(0, 1fr);
+}
+.preview-card {
+    background: linear-gradient(180deg, rgba(19,23,29,0.78), rgba(10,13,18,0.82));
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 12px;
+    color: #a1acb7;
+    cursor: pointer;
+    box-shadow: 0 14px 36px rgba(0,0,0,0.14);
+    transition: transform 100ms ease, border-color 100ms ease, box-shadow 100ms ease, color 100ms ease, background 100ms ease;
+}
+.preview-card:hover {
+    transform: translateY(-1px);
+    border-color: rgba(255,255,255,0.18);
+    color: #d9e2ea;
+    background: linear-gradient(180deg, rgba(24,29,36,0.84), rgba(12,16,22,0.88));
+}
+.preview-card.active {
+    border-color: rgba(133, 197, 255, 0.48);
+    box-shadow: inset 0 0 0 1px rgba(133, 197, 255, 0.22);
+    color: #f2f7fb;
+}
+.preview-card.selected {
+    transform: translateY(-2px);
+    border-color: rgba(255,255,255,0.7);
+    box-shadow: 0 18px 48px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(255,255,255,0.18);
+    color: #fff;
+}
+#preview-rail.visible .preview-card {
+    animation: exposeCardIn 140ms cubic-bezier(0.18, 0.88, 0.22, 1) both;
+    animation-delay: calc(var(--expose-order, 0) * 12ms);
+}
+@media (max-width: 760px) {
+    #expose-grid-shell {
+        flex-direction: column;
+        gap: 10px;
+    }
+    #expose-create {
+        margin-top: 0;
+    }
+}
+.preview-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    font: 12px/1.25 var(--terminal-font);
+    margin-bottom: 10px;
+}
+.preview-title-wrap {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1 1 auto;
+}
+.preview-meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+.preview-surface {
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 10px;
+    background: #000;
+    contain: paint;
+    border: 1px solid rgba(255,255,255,0.06);
+}
+.preview-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.preview-context {
+    display: none;
+    color: #8e9aa8;
+    font: 12px/1.4 var(--terminal-font);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.preview-role {
+    color: #728091;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 10px;
+}
+.preview-badge {
+    padding: 4px 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.03);
+    color: #90a0b2;
+    font: 10px/1 var(--terminal-font);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+.preview-badge.match {
+    color: #d9e8f8;
+    border-color: rgba(133, 197, 255, 0.28);
+    background: rgba(133, 197, 255, 0.08);
+}
+.preview-card.search-result {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+    gap: 16px;
+    align-items: start;
+}
+.preview-card.search-result .preview-head {
+    margin-bottom: 0;
+}
+.preview-card.search-result .preview-context {
+    display: block;
+}
+.preview-card.search-result .preview-surface {
+    min-height: 120px;
+}
+@media (max-width: 860px) {
+    .preview-card.search-result {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+.preview-canvas {
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    cursor: pointer;
+    transform-origin: top left;
+    will-change: transform;
+    backface-visibility: hidden;
+}
+@keyframes exposeOverlayIn {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+@keyframes exposeHeadIn {
+    from {
+        opacity: 0;
+        transform: translateY(-8px) scale(0.992);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+@keyframes exposeCardIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px) scale(0.985);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
 #input-sink {
     position: fixed; top: -9999px; left: -9999px;
     width: 1px; height: 1px; opacity: 0;
-    font: 13px ui-monospace, monospace; border: none; resize: none;
+    font: 13px var(--terminal-font); border: none; resize: none;
     white-space: pre; overflow: hidden;
 }
 #hud {
     position: fixed; top: 0; right: 0;
-    color: #444; font: 10px/1 ui-monospace, monospace;
+    color: #444; font: 10px/1 var(--terminal-font);
     padding: 2px 6px; pointer-events: none; z-index: 2;
 }
 #auth {
     position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
-    color: #ccc; font: 14px/1 ui-monospace, monospace; text-align: center;
+    color: #ccc; font: 14px/1 var(--terminal-font); text-align: center;
 }
 #auth input {
     background: #222; color: #ccc; border: 1px solid #555;
-    font: 14px/1 ui-monospace, monospace; padding: 4px 8px; margin-top: 8px; outline: none;
+    font: 14px/1 var(--terminal-font); padding: 4px 8px; margin-top: 8px; outline: none;
 }
 #status {
     position: fixed; bottom: 4px; left: 50%; transform: translateX(-50%);
-    color: #888; font: 12px/1 ui-monospace, monospace; pointer-events: none; z-index: 2;
+    color: #888; font: 12px/1 var(--terminal-font); pointer-events: none; z-index: 2;
 }
 .selection-overlay {
     position: fixed; background: rgba(100,150,255,0.3); pointer-events: none; z-index: 1;
@@ -61,7 +327,7 @@ canvas { display: block; outline: none; cursor: text; position: absolute; left: 
 #help-overlay.visible { display: flex; }
 #help-box {
     background: #1a1a1a; border: 1px solid #444; border-radius: 6px;
-    padding: 20px 28px; color: #ccc; font: 13px/2 ui-monospace, monospace;
+    padding: 20px 28px; color: #ccc; font: 13px/2 var(--terminal-font);
     max-width: 420px;
 }
 #help-box h2 { font-size: 14px; margin: 0 0 10px; color: #fff; }
@@ -75,15 +341,29 @@ canvas { display: block; outline: none; cursor: text; position: absolute; left: 
 <div id="hud"></div>
 <div id="auth">passphrase<br><input type="password" id="pass" autofocus></div>
 <div id="status"></div>
-<div id="tabs" style="display:none"></div>
-<canvas id="term" tabindex="0" style="display:none"></canvas>
-<textarea id="input-sink" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+<div id="workspace">
+<div id="lead-pane"><canvas id="term" tabindex="0"></canvas></div>
+<div id="preview-rail">
+<div id="expose-head">
+<div id="expose-toolbar">
+<input id="expose-search" type="text" placeholder="Switch PTY by title or content, or >command" autocomplete="off" spellcheck="false">
+</div>
+<div id="expose-hint"></div>
+</div>
+<div id="expose-grid-shell">
+<button id="expose-create" type="button" title="New PTY" aria-label="New PTY">+</button>
+<div id="expose-grid"></div>
+</div>
+</div>
+</div>
+<textarea id="input-sink" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" autofocus></textarea>
 <div id="help-overlay"><div id="help-box">
 <h2>Shortcuts</h2>
-<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> &mdash; New tab<br>
-<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> &mdash; Close tab<br>
-<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>{</kbd> &mdash; Previous tab<br>
-<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>}</kbd> &mdash; Next tab<br>
+<kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> &mdash; Expose / switch PTY<br>
+<kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd> &mdash; New PTY<br>
+Type <kbd>&gt;</kbd><em>command</em> in Expose and press <kbd>Enter</kbd> &mdash; New PTY running that command<br>
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> &mdash; Close PTY<br>
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> &mdash; Toggle backlog<br>
 <kbd>Shift</kbd>+<kbd>PageUp</kbd>/<kbd>PageDown</kbd> &mdash; Scroll back/forward<br>
 <kbd>Ctrl</kbd>+<kbd>?</kbd> &mdash; Toggle this help
 </div></div>
@@ -91,38 +371,621 @@ canvas { display: block; outline: none; cursor: text; position: absolute; left: 
 const _base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
 const { default: init, Terminal } = await import(_base + 'blit_browser.js');
 
-const FONT = 'ui-monospace, monospace';
-const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_DISPLAY_RATE = 0x04, C2S_CLIENT_METRICS = 0x05, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12;
-const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04;
+const DEFAULT_FONT = '"PragmataPro Liga", "PragmataPro", ui-monospace, monospace';
+const PASS_STORAGE_KEY = 'blit.passphrase';
+const FONT_STORAGE_KEY = 'blit.fontFamily';
+const USE_WEBGL_LEAD = true;
+const BG_OP_STRIDE = 4;
+const GLYPH_OP_STRIDE = 8;
+const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_DISPLAY_RATE = 0x04, C2S_CLIENT_METRICS = 0x05, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12, C2S_SUBSCRIBE = 0x13, C2S_UNSUBSCRIBE = 0x14, C2S_SEARCH = 0x15;
+const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04, S2C_SEARCH_RESULTS = 0x05;
+const SEARCH_SOURCE_TITLE = 0x00, SEARCH_SOURCE_VISIBLE = 0x01, SEARCH_SOURCE_SCROLLBACK = 0x02;
+const SEARCH_MATCH_TITLE = 1 << 0, SEARCH_MATCH_VISIBLE = 1 << 1, SEARCH_MATCH_SCROLLBACK = 1 << 2;
+const EXPOSE_CREATE_SELECTION = '__create__';
+const SEARCH_SCROLL_OFFSET_NONE = 0xffffffff;
 
 const hud = document.getElementById('hud');
 const authEl = document.getElementById('auth');
 const passInput = document.getElementById('pass');
 const statusEl = document.getElementById('status');
-const tabsEl = document.getElementById('tabs');
+const workspaceEl = document.getElementById('workspace');
+const leadPaneEl = document.getElementById('lead-pane');
+const previewRailEl = document.getElementById('preview-rail');
+const exposeGridEl = document.getElementById('expose-grid');
+const exposeSearchEl = document.getElementById('expose-search');
+const exposeCreateEl = document.getElementById('expose-create');
+const exposeHintEl = document.getElementById('expose-hint');
 const canvas = document.getElementById('term');
 const ctx = canvas.getContext('2d');
-const offscreen = document.createElement('canvas');
-const offCtx = offscreen.getContext('2d');
+const leadScratchCanvas = document.createElement('canvas');
+const leadScratchCtx = leadScratchCanvas.getContext('2d');
+const surfaceScratchCanvas = document.createElement('canvas');
+const surfaceScratchCtx = surfaceScratchCanvas.getContext('2d');
+const previewCompositeCanvas = document.createElement('canvas');
 const inputSink = document.getElementById('input-sink');
+const colorCssCache = new Map();
+const exposeSearchEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function configureCanvasContext(ctx) {
+    if (ctx) ctx.imageSmoothingEnabled = false;
+    return ctx;
+}
+
+function compileGlShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        return shader;
+    }
+    gl.deleteShader(shader);
+    return null;
+}
+
+function createGlProgram(gl, vertexSource, fragmentSource) {
+    const vertexShader = compileGlShader(gl, gl.VERTEX_SHADER, vertexSource);
+    const fragmentShader = compileGlShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+    if (!vertexShader || !fragmentShader) return null;
+    const program = gl.createProgram();
+    if (!program) return null;
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    if (gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        return program;
+    }
+    gl.deleteProgram(program);
+    return null;
+}
+
+function createLeadGlRenderer(canvasEl) {
+    const gl = canvasEl.getContext('webgl', {
+        alpha: true,
+        antialias: false,
+        depth: false,
+        stencil: false,
+        premultipliedAlpha: true,
+        // These canvases are later sampled by 2D drawImage() for lead/preview
+        // presentation, so we need a stable buffer to read from even under
+        // heavy update rates.
+        preserveDrawingBuffer: true,
+    });
+    if (!gl) {
+        return {
+            supported: false,
+            hide() {
+                canvasEl.style.display = 'none';
+            },
+            resize(width, height) {
+                if (canvasEl.width !== width) canvasEl.width = width;
+                if (canvasEl.height !== height) canvasEl.height = height;
+            },
+            render() {
+                return false;
+            },
+            renderViews() {
+                return false;
+            },
+        };
+    }
+
+    const rectProgram = createGlProgram(
+        gl,
+        `
+attribute vec2 a_pos;
+attribute vec4 a_color;
+uniform vec2 u_resolution;
+varying vec4 v_color;
+
+void main() {
+    vec2 zeroToOne = a_pos / u_resolution;
+    vec2 zeroToTwo = zeroToOne * 2.0;
+    vec2 clip = zeroToTwo - 1.0;
+    gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+    v_color = a_color;
+}
+        `,
+        `
+precision mediump float;
+varying vec4 v_color;
+
+void main() {
+    gl_FragColor = vec4(v_color.rgb * v_color.a, v_color.a);
+}
+        `,
+    );
+    const glyphProgram = createGlProgram(
+        gl,
+        `
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+attribute vec4 a_color;
+uniform vec2 u_resolution;
+varying vec2 v_uv;
+varying vec4 v_color;
+
+void main() {
+    vec2 zeroToOne = a_pos / u_resolution;
+    vec2 zeroToTwo = zeroToOne * 2.0;
+    vec2 clip = zeroToTwo - 1.0;
+    gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+    v_uv = a_uv;
+    v_color = a_color;
+}
+        `,
+        `
+precision mediump float;
+varying vec2 v_uv;
+varying vec4 v_color;
+uniform sampler2D u_texture;
+
+void main() {
+    vec4 tex = texture2D(u_texture, v_uv);
+    // White/grayscale glyphs (premultiplied: r≈g≈b≈a): tint with vertex color.
+    // Color emoji (premultiplied: channels differ): use native texture RGB.
+    float minC = min(tex.r, min(tex.g, tex.b));
+    float maxC = max(tex.r, max(tex.g, tex.b));
+    float isGray = step(maxC - minC, 0.02);
+    vec3 tinted = v_color.rgb * tex.a;
+    gl_FragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
+}
+        `,
+    );
+    if (!rectProgram || !glyphProgram) {
+        return {
+            supported: false,
+            hide() {
+                canvasEl.style.display = 'none';
+            },
+            resize(width, height) {
+                if (canvasEl.width !== width) canvasEl.width = width;
+                if (canvasEl.height !== height) canvasEl.height = height;
+            },
+            render() {
+                return false;
+            },
+            renderViews() {
+                return false;
+            },
+        };
+    }
+
+    const rectBuffer = gl.createBuffer();
+    const glyphBuffer = gl.createBuffer();
+    const atlasTexture = gl.createTexture();
+    const rectPositionLoc = gl.getAttribLocation(rectProgram, 'a_pos');
+    const rectColorLoc = gl.getAttribLocation(rectProgram, 'a_color');
+    const rectResolutionLoc = gl.getUniformLocation(rectProgram, 'u_resolution');
+    const glyphPositionLoc = gl.getAttribLocation(glyphProgram, 'a_pos');
+    const glyphUvLoc = gl.getAttribLocation(glyphProgram, 'a_uv');
+    const glyphColorLoc = gl.getAttribLocation(glyphProgram, 'a_color');
+    const glyphResolutionLoc = gl.getUniformLocation(glyphProgram, 'u_resolution');
+    const glyphTextureLoc = gl.getUniformLocation(glyphProgram, 'u_texture');
+    let uploadedAtlasVersion = -1;
+    let uploadedAtlasCanvas = null;
+
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    function hide() {
+        canvasEl.style.display = 'none';
+    }
+
+    function show() {
+        canvasEl.style.display = '';
+    }
+
+    function resize(width, height) {
+        if (canvasEl.width !== width) canvasEl.width = width;
+        if (canvasEl.height !== height) canvasEl.height = height;
+    }
+
+    function ensureAtlas(atlasCanvas, version) {
+        if (!atlasCanvas) return false;
+        if (atlasCanvas === uploadedAtlasCanvas && (version >>> 0) === (uploadedAtlasVersion >>> 0)) {
+            return true;
+        }
+        gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+        uploadedAtlasCanvas = atlasCanvas;
+        uploadedAtlasVersion = version >>> 0;
+        return true;
+    }
+
+    // Max vertices per draw call — keeps GPU buffers reasonable on all drivers.
+    const MAX_BATCH_VERTS = 65532; // divisible by 6 (triangles) and 3
+
+    function drawColoredTriangles(data) {
+        if (!data.length || !rectBuffer) return;
+        const floatsPerVert = 6;
+        const totalVerts = data.length / floatsPerVert;
+        gl.useProgram(rectProgram);
+        gl.bindBuffer(gl.ARRAY_BUFFER, rectBuffer);
+        gl.enableVertexAttribArray(rectPositionLoc);
+        gl.enableVertexAttribArray(rectColorLoc);
+        gl.uniform2f(rectResolutionLoc, canvasEl.width, canvasEl.height);
+        for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
+            const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
+            const slice = data.subarray(off * floatsPerVert, (off + count) * floatsPerVert);
+            gl.bufferData(gl.ARRAY_BUFFER, slice, gl.DYNAMIC_DRAW);
+            gl.vertexAttribPointer(rectPositionLoc, 2, gl.FLOAT, false, 24, 0);
+            gl.vertexAttribPointer(rectColorLoc, 4, gl.FLOAT, false, 24, 8);
+            gl.drawArrays(gl.TRIANGLES, 0, count);
+        }
+    }
+
+    function drawSolidRect(x1, y1, x2, y2, r, g, b, a) {
+        drawColoredTriangles(new Float32Array([
+            x1, y1, r, g, b, a,
+            x2, y1, r, g, b, a,
+            x1, y2, r, g, b, a,
+            x1, y2, r, g, b, a,
+            x2, y1, r, g, b, a,
+            x2, y2, r, g, b, a,
+        ]));
+    }
+
+    function renderRectangles(bgOps, offsetX = 0, offsetY = 0, scaleX = 1, scaleY = 1) {
+        if (!bgOps.length) return;
+        const data = new Float32Array((bgOps.length / BG_OP_STRIDE) * 36);
+        let offset = 0;
+        for (let i = 0; i < bgOps.length; i += BG_OP_STRIDE) {
+            const row = bgOps[i];
+            const col = bgOps[i + 1];
+            const colSpan = bgOps[i + 2];
+            const packed = bgOps[i + 3];
+            const x1 = offsetX + col * cell.pw * scaleX;
+            const y1 = offsetY + row * cell.ph * scaleY;
+            const x2 = x1 + colSpan * cell.pw * scaleX;
+            const y2 = y1 + cell.ph * scaleY;
+            const r = ((packed >>> 16) & 0xff) / 255;
+            const g = ((packed >>> 8) & 0xff) / 255;
+            const b = (packed & 0xff) / 255;
+            const a = 1;
+            data.set([
+                x1, y1, r, g, b, a,
+                x2, y1, r, g, b, a,
+                x1, y2, r, g, b, a,
+                x1, y2, r, g, b, a,
+                x2, y1, r, g, b, a,
+                x2, y2, r, g, b, a,
+            ], offset);
+            offset += 36;
+        }
+        drawColoredTriangles(data);
+    }
+
+    function renderCursor(cursorVisible, cursorCol, cursorRow, offsetX = 0, offsetY = 0, scaleX = 1, scaleY = 1) {
+        if (!cursorVisible) return;
+        const x1 = offsetX + cursorCol * cell.pw * scaleX;
+        const y1 = offsetY + cursorRow * cell.ph * scaleY;
+        const x2 = x1 + cell.pw * scaleX;
+        const y2 = y1 + cell.ph * scaleY;
+        drawSolidRect(x1, y1, x2, y2, 0.8, 0.8, 0.8, 0.5);
+    }
+
+    function renderGlyphs(glyphOps, atlasCanvas, atlasVersion, offsetX = 0, offsetY = 0, scaleX = 1, scaleY = 1) {
+        if (!glyphOps.length || !glyphBuffer || !ensureAtlas(atlasCanvas, atlasVersion)) return;
+        const atlasWidth = atlasCanvas.width || 1;
+        const atlasHeight = atlasCanvas.height || 1;
+        // 8 floats per vertex: x, y, u, v, r, g, b, a
+        const floatsPerVert = 8;
+        const vertsPerGlyph = 6;
+        const data = new Float32Array((glyphOps.length / GLYPH_OP_STRIDE) * vertsPerGlyph * floatsPerVert);
+        let offset = 0;
+        for (let i = 0; i < glyphOps.length; i += GLYPH_OP_STRIDE) {
+            const srcX = glyphOps[i];
+            const srcY = glyphOps[i + 1];
+            const srcW = glyphOps[i + 2];
+            const srcH = glyphOps[i + 3];
+            const row = glyphOps[i + 4];
+            const col = glyphOps[i + 5];
+            const colSpan = glyphOps[i + 6];
+            const packed = glyphOps[i + 7];
+            const dx1 = offsetX + col * cell.pw * scaleX;
+            const dy1 = offsetY + row * cell.ph * scaleY;
+            const dx2 = dx1 + colSpan * cell.pw * scaleX;
+            const dy2 = dy1 + cell.ph * scaleY;
+            const u1 = srcX / atlasWidth;
+            const v1 = srcY / atlasHeight;
+            const u2 = (srcX + srcW) / atlasWidth;
+            const v2 = (srcY + srcH) / atlasHeight;
+            const r = ((packed >>> 16) & 0xff) / 255;
+            const g = ((packed >>> 8) & 0xff) / 255;
+            const b = (packed & 0xff) / 255;
+            data.set([
+                dx1, dy1, u1, v1, r, g, b, 1,
+                dx2, dy1, u2, v1, r, g, b, 1,
+                dx1, dy2, u1, v2, r, g, b, 1,
+                dx1, dy2, u1, v2, r, g, b, 1,
+                dx2, dy1, u2, v1, r, g, b, 1,
+                dx2, dy2, u2, v2, r, g, b, 1,
+            ], offset);
+            offset += vertsPerGlyph * floatsPerVert;
+        }
+        const totalVerts = data.length / floatsPerVert;
+        const stride = floatsPerVert * 4; // 32 bytes
+        gl.useProgram(glyphProgram);
+        gl.bindBuffer(gl.ARRAY_BUFFER, glyphBuffer);
+        gl.enableVertexAttribArray(glyphPositionLoc);
+        gl.enableVertexAttribArray(glyphUvLoc);
+        gl.enableVertexAttribArray(glyphColorLoc);
+        gl.uniform2f(glyphResolutionLoc, canvasEl.width, canvasEl.height);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+        gl.uniform1i(glyphTextureLoc, 0);
+        for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
+            const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
+            const slice = data.subarray(off * floatsPerVert, (off + count) * floatsPerVert);
+            gl.bufferData(gl.ARRAY_BUFFER, slice, gl.DYNAMIC_DRAW);
+            gl.vertexAttribPointer(glyphPositionLoc, 2, gl.FLOAT, false, stride, 0);
+            gl.vertexAttribPointer(glyphUvLoc, 2, gl.FLOAT, false, stride, 8);
+            gl.vertexAttribPointer(glyphColorLoc, 4, gl.FLOAT, false, stride, 16);
+            gl.drawArrays(gl.TRIANGLES, 0, count);
+        }
+    }
+
+    function resolveViewPlacement(view) {
+        const baseWidth = Math.max(1, view.baseWidth || canvasEl.width);
+        const baseHeight = Math.max(1, view.baseHeight || canvasEl.height);
+        const targetWidth = Math.max(1, view.width || baseWidth);
+        const targetHeight = Math.max(1, view.height || baseHeight);
+        const scale = Math.min(targetWidth / baseWidth, targetHeight / baseHeight);
+        const drawWidth = Math.max(1, Math.round(baseWidth * scale));
+        const drawHeight = Math.max(1, Math.round(baseHeight * scale));
+        const offsetX = Math.round((view.x || 0) + (targetWidth - drawWidth) / 2);
+        const offsetY = Math.round((view.y || 0) + (targetHeight - drawHeight) / 2);
+        return {
+            offsetX,
+            offsetY,
+            scaleX: drawWidth / baseWidth,
+            scaleY: drawHeight / baseHeight,
+            drawWidth,
+            drawHeight,
+        };
+    }
+
+    function renderView(view, clear = true) {
+        const {
+            bgOps,
+            glyphOps,
+            atlasCanvas,
+            atlasVersion,
+            cursorVisible,
+            cursorCol,
+            cursorRow,
+        } = view;
+        const placement = resolveViewPlacement(view);
+        if (clear) {
+            drawSolidRect(
+                placement.offsetX,
+                placement.offsetY,
+                placement.offsetX + placement.drawWidth,
+                placement.offsetY + placement.drawHeight,
+                0,
+                0,
+                0,
+                1,
+            );
+        }
+        renderRectangles(bgOps, placement.offsetX, placement.offsetY, placement.scaleX, placement.scaleY);
+        renderGlyphs(glyphOps, atlasCanvas, atlasVersion, placement.offsetX, placement.offsetY, placement.scaleX, placement.scaleY);
+        renderCursor(cursorVisible, cursorCol, cursorRow, placement.offsetX, placement.offsetY, placement.scaleX, placement.scaleY);
+    }
+
+    return {
+        supported: true,
+        hide,
+        resize,
+        render(bgOps, glyphOps, atlasCanvas, atlasVersion, cursorVisible, cursorCol, cursorRow, full) {
+            show();
+            gl.viewport(0, 0, canvasEl.width, canvasEl.height);
+            renderView({
+                bgOps,
+                glyphOps,
+                atlasCanvas,
+                atlasVersion,
+                cursorVisible,
+                cursorCol,
+                cursorRow,
+                x: 0,
+                y: 0,
+                width: canvasEl.width,
+                height: canvasEl.height,
+                baseWidth: canvasEl.width,
+                baseHeight: canvasEl.height,
+            }, full);
+            gl.finish();
+            return true;
+        },
+        renderViews(views) {
+            show();
+            gl.viewport(0, 0, canvasEl.width, canvasEl.height);
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            for (const view of views) renderView(view);
+            gl.finish();
+            return true;
+        },
+    };
+}
+
+configureCanvasContext(ctx);
+configureCanvasContext(leadScratchCtx);
+configureCanvasContext(surfaceScratchCtx);
+const previewCompositeRenderer = createLeadGlRenderer(previewCompositeCanvas);
+previewCompositeRenderer.hide();
+
+function packedColorCss(packed) {
+    let css = colorCssCache.get(packed);
+    if (css) return css;
+    const isDefault = ((packed >>> 24) & 1) !== 0;
+    const r = (packed >>> 16) & 0xff;
+    const g = (packed >>> 8) & 0xff;
+    const b = packed & 0xff;
+    if (isDefault) {
+        css = r === 204 ? '#ccc' : '#000';
+    } else {
+        css = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+    }
+    colorCssCache.set(packed, css);
+    return css;
+}
+
+function applyCanvasScroll(targetCtx, sourceCanvas, scratchCanvas, scratchCtx, deltaRows, drawW, drawH) {
+    if (!deltaRows) return;
+    const dy = deltaRows * cell.ph;
+    const absY = Math.abs(dy);
+    if (!absY || absY >= drawH) return;
+    const srcY = dy > 0 ? 0 : absY;
+    const dstY = dy > 0 ? absY : 0;
+    const copyH = drawH - absY;
+    if (scratchCanvas.width !== drawW || scratchCanvas.height !== copyH) {
+        scratchCanvas.width = drawW;
+        scratchCanvas.height = copyH;
+        configureCanvasContext(scratchCtx);
+    }
+    scratchCtx.clearRect(0, 0, drawW, copyH);
+    scratchCtx.drawImage(sourceCanvas, 0, srcY, drawW, copyH, 0, 0, drawW, copyH);
+    targetCtx.drawImage(scratchCanvas, 0, 0, drawW, copyH, 0, dstY, drawW, copyH);
+}
+
+function drawOverflowText(targetCtx, terminal, { offsetX = 0, offsetY = 0, drawWidth = null, drawHeight = null } = {}) {
+    if (!targetCtx || !terminal) return;
+    const overflowCount = terminal.overflow_text_count();
+    if (overflowCount <= 0) return;
+
+    const baseWidth = Math.max(1, terminal.cols * cell.pw);
+    const baseHeight = Math.max(1, terminal.rows * cell.ph);
+    const scaledWidth = drawWidth ?? baseWidth;
+    const scaledHeight = drawHeight ?? baseHeight;
+    const scaleX = scaledWidth / baseWidth;
+    const scaleY = scaledHeight / baseHeight;
+    const cw = cell.pw * scaleX;
+    const ch = cell.ph * scaleY;
+    const textScale = 0.85;
+    const scaledTextHeight = ch * textScale;
+    const fontSize = Math.max(1, Math.round(scaledTextHeight));
+
+    targetCtx.save();
+    targetCtx.font = `${fontSize}px ${fontFamily}`;
+    targetCtx.textBaseline = 'bottom';
+    targetCtx.fillStyle = '#ccc';
+    for (let i = 0; i < overflowCount; i++) {
+        const op = terminal.overflow_text_op(i);
+        if (!op) continue;
+        const [row, col, colSpan, text] = op;
+        const x = offsetX + col * cw;
+        const y = offsetY + row * ch;
+        const w = colSpan * cw;
+        const padX = (w - w * textScale) / 2;
+        const padY = (ch - scaledTextHeight) / 2;
+        targetCtx.save();
+        targetCtx.beginPath();
+        targetCtx.rect(x, y, w, ch);
+        targetCtx.clip();
+        targetCtx.fillText(text, x + padX, y + padY + scaledTextHeight);
+        targetCtx.restore();
+    }
+    targetCtx.restore();
+}
+function readStorage(key) {
+    try {
+        return localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function writeStorage(key, value) {
+    try {
+        localStorage.setItem(key, value);
+    } catch {}
+}
+
+function removeStorage(key) {
+    try {
+        localStorage.removeItem(key);
+    } catch {}
+}
+
+function preferredFont() {
+    const queryFont = new URLSearchParams(location.search).get('font');
+    if (queryFont && queryFont.trim()) return queryFont.trim();
+    const storedFont = readStorage(FONT_STORAGE_KEY);
+    if (storedFont && storedFont.trim()) return storedFont.trim();
+    return DEFAULT_FONT;
+}
 
 let ws, cell, cols, rows, dpr;
 let terminals = {};
+let surfaceCanvases = {};
+let surfaceRenderers = {};
+let previewItems = {};
 let ptyTitles = {};
 let focusedPty = null;
 let ptyIds = [];
+let ptyLru = []; // Most-recently-focused first; used as default expose order.
+let exposeOpen = false;
+let exposeQuery = '';
+let exposeSelectedPty = null;
 let frames = 0, lastFpsTime = performance.now(), fps = 0;
 let bytesIn = 0, kbps = 0;
-let needsRender = false;
-let savedPass = null;
+let leadNeedsRender = false;
+let previewNeedsRender = false;
+let leadCanvasPrimed = false;
+let leadCanvasPty = null;
+let leadCanvasDrawWidth = 0;
+let leadCanvasDrawHeight = 0;
+let dirtyTerminals = new Set();
+let dirtyPreviewPtys = new Set();
+let previewLayoutDirty = true;
+let terminalResizeTimer = null;
+let terminalResizeVisualScheduled = false;
+let terminalResizeActive = false;
+let leadCanvasCssWidth = 0;
+let leadCanvasCssHeight = 0;
+let savedPass = readStorage(PASS_STORAGE_KEY);
 let reconnectTimer = null;
 let reconnectDelay = 500;
 let scrollOffset = 0;
-// Updates are applied on receipt so transport is not paced by rAF.
+let subscribedPtys = new Set();
+let fontFamily = preferredFont();
+let pendingFocusedCreates = 0;
+let exposeSearchRequestId = 0;
+let exposeSearchResults = null;
+let exposeSearchPending = false;
+let exposeSearchTimer = null;
+let exposeSearchInFlight = false;
+let exposeSearchSentQuery = '';
+let exposeSearchRefreshQueued = false;
+// Apply updates on a task queue so transport is not paced by rAF paint.
 const ACK_MSG = new Uint8Array([C2S_ACK]);
 let pendingApplyBatches = new Map();
-const TARGET_PLAYOUT_BACKLOG = 2;
-const MAX_ACK_AHEAD_FRAMES = 4;
+const APPLY_BATCH_FRAME_LIMIT = 4;
+const LEAD_APPLY_BATCH_LIMIT = 8;
+const APPLY_BUDGET_MS = 4;
+const TARGET_PLAYOUT_BACKLOG = 1;
+const MAX_ACK_AHEAD_FRAMES = 2;
+const METRICS_MIN_INTERVAL_MS = 50;
+const PREVIEW_RENDER_INTERVAL_MS = 1000 / 30;
+const TERMINAL_RESIZE_DEBOUNCE_MS = 50;
+const FULL_REPAINT_HOT_FRAMES = 2;
+const FULL_REPAINT_HOT_BYTES = 48 * 1024;
+const FULL_REPAINT_HOLD_MS = 120;
+const EXPOSE_SEARCH_DEBOUNCE_MS = 45;
 let ackAheadFrames = 0;
 let deferredAckFrames = 0;
 let applyMsEwma = 0;
@@ -130,6 +993,11 @@ let lastMetricsSentAt = 0;
 let lastMetricsBacklog = -1;
 let lastMetricsAckAhead = -1;
 let lastMetricsApplyMs = -1;
+let applyPumpScheduled = false;
+let lastPreviewRenderAt = 0;
+let terminalHotUntil = new Map();
+let followSyncScheduled = false;
+let previewRailUpdateScheduled = false;
 const displayFpsParam = new URLSearchParams(location.search).get('fps');
 const displayFpsTarget = (() => {
     const fps = Number(displayFpsParam);
@@ -152,6 +1020,356 @@ let selecting = false;
 let selStart = null;
 let selEnd = null;
 let selOverlays = [];
+
+function showAuth(message = '') {
+    authEl.style.display = '';
+    workspaceEl.style.display = 'none';
+    statusEl.textContent = message;
+    passInput.disabled = false;
+    passInput.value = '';
+    requestAnimationFrame(() => passInput.focus());
+}
+
+function hideAuth() {
+    authEl.style.display = 'none';
+    passInput.disabled = false;
+}
+
+function createTerminalInstance() {
+    const terminal = new Terminal(rows, cols, cell.pw, cell.ph);
+    terminal.set_font_family(fontFamily);
+    return terminal;
+}
+
+function applyFontChoice(font, { persist = true, relayout = false } = {}) {
+    const nextFont = font && font.trim() ? font.trim() : DEFAULT_FONT;
+    fontFamily = nextFont;
+    document.documentElement.style.setProperty('--terminal-font', nextFont);
+    if (persist) writeStorage(FONT_STORAGE_KEY, nextFont);
+    if (!relayout) return;
+    cell = measureCell();
+    computeSize();
+    resizeCanvasBacking();
+    for (const id of Object.keys(terminals)) {
+        const terminal = terminals[id];
+        terminal.set_font_family(fontFamily);
+        terminal.set_cell_size(cell.pw, cell.ph);
+        dirtyTerminals.add(Number(id));
+    }
+    if (focusedPty !== null && ws && ws.readyState === WebSocket.OPEN) sendResizeForPty(focusedPty);
+    requestLeadRender();
+    requestPreviewRender(null, true);
+    updateHud();
+}
+
+function requestLeadRender() {
+    leadNeedsRender = true;
+}
+
+function resetLeadCanvasState() {
+    leadCanvasPrimed = false;
+    leadCanvasPty = null;
+    leadCanvasDrawWidth = 0;
+    leadCanvasDrawHeight = 0;
+}
+
+function requestPreviewRender(ids = null, layout = false) {
+    previewNeedsRender = true;
+    previewLayoutDirty = previewLayoutDirty || layout;
+    if (ids === null) {
+        for (const id of ptyIds) dirtyPreviewPtys.add(id);
+        return;
+    }
+    for (const id of ids) dirtyPreviewPtys.add(id);
+}
+
+function schedulePreviewRailUpdate() {
+    if (previewRailUpdateScheduled) return;
+    previewRailUpdateScheduled = true;
+    requestAnimationFrame(() => {
+        previewRailUpdateScheduled = false;
+        updatePreviewRail();
+    });
+}
+
+function invalidateTerminal(ptyId) {
+    const t = terminals[ptyId];
+    if (!t) return;
+    t.set_cell_size(cell.pw, cell.ph);
+    dirtyTerminals.add(ptyId);
+    dirtyPreviewPtys.add(ptyId);
+}
+
+function invalidateAllTerminals(layout = false) {
+    for (const id of Object.keys(terminals)) invalidateTerminal(Number(id));
+    requestLeadRender();
+    requestPreviewRender(null, layout);
+}
+
+function nextExposeSearchRequestId() {
+    exposeSearchRequestId = (exposeSearchRequestId + 1) & 0xffff;
+    if (exposeSearchRequestId === 0) exposeSearchRequestId = 1;
+    return exposeSearchRequestId;
+}
+
+function resetExposeSearch() {
+    if (exposeSearchTimer !== null) {
+        clearTimeout(exposeSearchTimer);
+        exposeSearchTimer = null;
+    }
+    exposeSearchPending = false;
+    exposeSearchInFlight = false;
+    exposeSearchSentQuery = '';
+    exposeSearchRefreshQueued = false;
+    exposeSearchResults = null;
+}
+
+function sendExposeSearch(query) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        exposeSearchPending = false;
+        exposeSearchInFlight = false;
+        return;
+    }
+    const requestId = nextExposeSearchRequestId();
+    const queryBytes = exposeSearchEncoder.encode(query);
+    const msg = new Uint8Array(3 + queryBytes.length);
+    msg[0] = C2S_SEARCH;
+    msg[1] = requestId & 0xff;
+    msg[2] = (requestId >>> 8) & 0xff;
+    msg.set(queryBytes, 3);
+    exposeSearchSentQuery = query;
+    exposeSearchInFlight = true;
+    ws.send(msg);
+}
+
+function queueExposeSearch({ contentRefresh = false } = {}) {
+    if (contentRefresh && exposeSearchTimer !== null) {
+        exposeSearchRefreshQueued = true;
+        return;
+    }
+    if (exposeSearchTimer !== null) {
+        clearTimeout(exposeSearchTimer);
+        exposeSearchTimer = null;
+    }
+
+    const query = exposeQuery.trim();
+    if (!exposeOpen || !query || exposeCreateCommand()) {
+        exposeSearchPending = false;
+        exposeSearchInFlight = false;
+        exposeSearchRefreshQueued = false;
+        exposeSearchSentQuery = '';
+        exposeSearchResults = null;
+        return;
+    }
+
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        exposeSearchPending = false;
+        exposeSearchInFlight = false;
+        return;
+    }
+
+    if (contentRefresh && exposeSearchInFlight) {
+        exposeSearchRefreshQueued = true;
+        return;
+    }
+
+    if (!contentRefresh) {
+        exposeSearchRefreshQueued = false;
+    }
+    exposeSearchPending = true;
+    exposeSearchTimer = setTimeout(() => {
+        exposeSearchTimer = null;
+        if (!exposeOpen || exposeQuery.trim() !== query || exposeCreateCommand()) {
+            if (!exposeSearchInFlight) exposeSearchPending = false;
+            return;
+        }
+        sendExposeSearch(query);
+    }, EXPOSE_SEARCH_DEBOUNCE_MS);
+}
+
+function localExposeIds(query = exposeQuery) {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return [...ptyIds];
+    return ptyIds.filter((id) => {
+        const title = (ptyTitles[id] || '').toLowerCase();
+        return title.includes(normalizedQuery) || String(id).includes(normalizedQuery);
+    });
+}
+
+function lruOrder() {
+    // LRU first, then any PTYs not yet in the LRU list (newly created).
+    const seen = new Set(ptyLru);
+    return [...ptyLru.filter(id => ptyIds.includes(id)), ...ptyIds.filter(id => !seen.has(id))];
+}
+
+function filteredExposeIds() {
+    const query = exposeQuery.trim();
+    if (!query) return lruOrder();
+    if (exposeCreateCommand()) return [];
+    if (exposeSearchResults !== null) {
+        const active = new Set(ptyIds);
+        return exposeSearchResults
+            .map((result) => result.ptyId)
+            .filter((id) => active.has(id));
+    }
+    if (exposeSearchPending) {
+        return lruOrder();
+    }
+    return localExposeIds(query);
+}
+
+function sourceLabel(source) {
+    if (source === SEARCH_SOURCE_TITLE) return 'Title';
+    if (source === SEARCH_SOURCE_VISIBLE) return 'Terminal';
+    if (source === SEARCH_SOURCE_SCROLLBACK) return 'Backlog';
+    return 'Match';
+}
+
+function resultBadges(result) {
+    if (!result) return [];
+    const badges = [];
+    if (result.matchedSources & SEARCH_MATCH_TITLE) badges.push('Title');
+    if (result.matchedSources & SEARCH_MATCH_VISIBLE) badges.push('Terminal');
+    if (result.matchedSources & SEARCH_MATCH_SCROLLBACK) badges.push('Backlog');
+    return badges;
+}
+
+function exposeCreateCommand() {
+    const query = exposeQuery.trim();
+    if (!query.startsWith('>')) return null;
+    const command = query.slice(1).trim();
+    return command || null;
+}
+
+function searchResultForPty(ptyId) {
+    if (!exposeSearchResults) return null;
+    return exposeSearchResults.find((result) => result.ptyId === ptyId) || null;
+}
+
+function syncExposeSelection() {
+    const ids = filteredExposeIds();
+    if (ids.length === 0) {
+        if (exposeSelectedPty !== EXPOSE_CREATE_SELECTION) {
+            exposeSelectedPty = null;
+        }
+        return ids;
+    }
+    if (exposeSelectedPty === EXPOSE_CREATE_SELECTION) return ids;
+    if (!ids.includes(exposeSelectedPty)) {
+        exposeSelectedPty = ids.includes(focusedPty) ? focusedPty : ids[0];
+    }
+    return ids;
+}
+
+function openExpose(initialQuery = '') {
+    exposeOpen = true;
+    exposeQuery = initialQuery;
+    exposeSearchEl.value = initialQuery;
+    queueExposeSearch();
+    previewRailEl.classList.add('visible');
+    syncExposeSelection();
+    updatePreviewRail();
+    requestPreviewRender(null, true);
+    schedulePtyFollowSync();
+    requestAnimationFrame(() => exposeSearchEl.focus());
+}
+
+function closeExpose({ restoreFocus = true } = {}) {
+    exposeOpen = false;
+    exposeQuery = '';
+    exposeSelectedPty = null;
+    resetExposeSearch();
+    exposeSearchEl.value = '';
+    previewRailEl.classList.remove('visible');
+    updatePreviewRail();
+    schedulePtyFollowSync();
+    if (restoreFocus) inputSink.focus();
+}
+
+function exposeGridCols() {
+    // Match the CSS: grid-template-columns: repeat(auto-fit, minmax(280px, 1fr))
+    const grid = document.getElementById('expose-grid');
+    if (!grid) return 1;
+    const style = getComputedStyle(grid);
+    const cols = style.gridTemplateColumns.split(/\s+/).filter(s => s && s !== 'none').length;
+    return Math.max(1, cols);
+}
+
+function moveExposeSelection(direction) {
+    const ids = syncExposeSelection();
+    // The + button lives in the toolbar, not in the grid, so it's not
+    // part of directional navigation.  Only PTY cards are in the grid.
+    const targets = ids;
+    if (targets.length === 0) {
+        exposeSelectedPty = EXPOSE_CREATE_SELECTION;
+        updatePreviewRail();
+        return;
+    }
+    let current = exposeSelectedPty;
+    if (current === EXPOSE_CREATE_SELECTION || !targets.includes(current)) {
+        // Enter the grid from the toolbar.
+        current = ids.includes(focusedPty) ? focusedPty : ids[0];
+        exposeSelectedPty = current;
+        updatePreviewRail();
+        return;
+    }
+    const idx = targets.indexOf(current);
+    const gridCols = exposeGridCols();
+    let nextIdx;
+    switch (direction) {
+        case 'left':
+            nextIdx = idx > 0 ? idx - 1 : targets.length - 1;
+            break;
+        case 'right':
+            nextIdx = idx < targets.length - 1 ? idx + 1 : 0;
+            break;
+        case 'up': {
+            nextIdx = idx - gridCols;
+            if (nextIdx < 0) {
+                // Move focus up to the search/create toolbar.
+                exposeSelectedPty = EXPOSE_CREATE_SELECTION;
+                updatePreviewRail();
+                return;
+            }
+            break;
+        }
+        case 'down': {
+            nextIdx = idx + gridCols;
+            if (nextIdx >= targets.length) nextIdx = targets.length - 1;
+            break;
+        }
+        default:
+            return;
+    }
+    exposeSelectedPty = targets[nextIdx];
+    updatePreviewRail();
+}
+
+function acceptExposeSelection() {
+    const command = exposeCreateCommand();
+    if (command) {
+        closeExpose({ restoreFocus: false });
+        createFocusedPty(command);
+        return;
+    }
+    const ids = syncExposeSelection();
+    if (exposeSelectedPty === EXPOSE_CREATE_SELECTION) {
+        closeExpose({ restoreFocus: false });
+        createFocusedPty();
+        return;
+    }
+    if (ids.length === 0) return;
+    const id = ids.includes(exposeSelectedPty) ? exposeSelectedPty : ids[0];
+    const result = searchResultForPty(id);
+    closeExpose({ restoreFocus: false });
+    focusPty(id, { scrollOffsetOverride: result ? result.scrollOffset : null });
+}
+
+function previewRenderDue(now) {
+    return exposeOpen
+        && previewNeedsRender
+        && (previewLayoutDirty || now - lastPreviewRenderAt >= PREVIEW_RENDER_INTERVAL_MS);
+}
 
 function notePredictionAdvance() {
     if (predicted && focusedPty !== null && terminals[focusedPty]) {
@@ -179,13 +1397,69 @@ function pendingApplyFrameCount() {
     return total;
 }
 
+function pendingLeadApplyCount() {
+    if (focusedPty === null) return 0;
+    const queue = pendingApplyBatches.get(focusedPty);
+    return queue ? queue.length : 0;
+}
+
+function terminalUsesCookedFastPath(ptyId) {
+    const t = terminals[ptyId];
+    return !!(t && t.echo() && t.icanon());
+}
+
+function markTerminalHot(ptyId, appliedFrames, appliedBytes, queueRemaining) {
+    if (terminalUsesCookedFastPath(ptyId)) {
+        terminalHotUntil.delete(ptyId);
+        return;
+    }
+    const now = performance.now();
+    if (
+        appliedFrames >= FULL_REPAINT_HOT_FRAMES
+        || appliedBytes >= FULL_REPAINT_HOT_BYTES
+        || queueRemaining > 0
+    ) {
+        terminalHotUntil.set(ptyId, now + FULL_REPAINT_HOLD_MS);
+        return;
+    }
+    const hotUntil = terminalHotUntil.get(ptyId) || 0;
+    if (hotUntil <= now) terminalHotUntil.delete(ptyId);
+}
+
+function terminalNeedsFullRepaint(ptyId) {
+    if (terminalUsesCookedFastPath(ptyId)) return false;
+    return (terminalHotUntil.get(ptyId) || 0) > performance.now();
+}
+
+const applyPumpChannel = new MessageChannel();
+applyPumpChannel.port1.onmessage = () => {
+    applyPumpScheduled = false;
+    applyQueuedUpdates(APPLY_BUDGET_MS);
+    if (pendingApplyFrameCount() > 0 && !(leadNeedsRender && pendingLeadApplyCount() > 0)) {
+        scheduleApplyPump();
+    }
+};
+
+function scheduleApplyPump() {
+    if (applyPumpScheduled) return;
+    applyPumpScheduled = true;
+    applyPumpChannel.port2.postMessage(0);
+}
+
 function sendClientMetrics(force = false) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const now = performance.now();
-    if (!force && now - lastMetricsSentAt < 200) return;
     const backlog = Math.min(65535, pendingApplyFrameCount() + ackAheadFrames + deferredAckFrames);
     const ackAhead = Math.min(65535, ackAheadFrames);
     const applyMs = Math.min(65535, Math.round(applyMsEwma * 10));
+    const backlogChanged = lastMetricsBacklog < 0 || Math.abs(backlog - lastMetricsBacklog) >= 2;
+    const backlogPhaseChanged = lastMetricsBacklog < 0
+        || (backlog > TARGET_PLAYOUT_BACKLOG) !== (lastMetricsBacklog > TARGET_PLAYOUT_BACKLOG);
+    const applyChanged = lastMetricsApplyMs < 0 || Math.abs(applyMs - lastMetricsApplyMs) >= 5;
+    const urgent = backlogChanged || backlogPhaseChanged || ackAhead !== lastMetricsAckAhead || applyChanged;
+    if (!force && now - lastMetricsSentAt < METRICS_MIN_INTERVAL_MS && !urgent) {
+        return;
+    }
     if (!force && backlog === lastMetricsBacklog && ackAhead === lastMetricsAckAhead
         && applyMs === lastMetricsApplyMs) {
         return;
@@ -214,95 +1488,609 @@ function releaseAppliedFrames(appliedFrames) {
     }
 }
 
-function applyQueuedUpdatesForFrame() {
-    const ptyId = focusedPty !== null && pendingApplyBatches.has(focusedPty)
-        ? focusedPty
-        : pendingApplyBatches.keys().next().value;
-    if (ptyId === undefined) return 0;
-    const queue = pendingApplyBatches.get(ptyId);
-    if (!queue || queue.length === 0) return 0;
-    const applyStart = performance.now();
-    const applyCount = Math.min(
-        queue.length,
-        Math.max(1, queue.length - TARGET_PLAYOUT_BACKLOG),
-    );
-    if (!terminals[ptyId]) {
-        terminals[ptyId] = new Terminal(rows, cols, cell.w * dpr, cell.h * dpr);
+function applyQueuedUpdates(budgetMs = Infinity) {
+    const orderedIds = focusedPty !== null
+        ? [focusedPty, ...ptyIds.filter(id => id !== focusedPty)]
+        : [...pendingApplyBatches.keys()];
+    const startedAt = performance.now();
+    let totalConsumed = 0;
+    let totalRendered = 0;
+    let totalApplyMs = 0;
+    let titlesChanged = false;
+    const changedPtys = new Set();
+
+    for (const ptyId of orderedIds) {
+        if (performance.now() - startedAt >= budgetMs) break;
+        const queue = pendingApplyBatches.get(ptyId);
+        if (!queue || queue.length === 0) continue;
+        if (ptyId === focusedPty && leadNeedsRender) continue;
+        if (!terminals[ptyId]) {
+            terminals[ptyId] = createTerminalInstance();
+        }
+        const applyStart = performance.now();
+        const batchLimit = ptyId === focusedPty ? LEAD_APPLY_BATCH_LIMIT : APPLY_BATCH_FRAME_LIMIT;
+        const applyCount = Math.min(queue.length, Math.max(
+            1,
+            Math.min(batchLimit, queue.length - TARGET_PLAYOUT_BACKLOG),
+        ));
+        let appliedBytes = 0;
+        // Apply in small chunks, checking the budget between each, so we
+        // yield back to the browser event loop promptly.  This prevents
+        // long synchronous WASM calls from blocking clicks and input.
+        let applied = 0;
+        while (applied < applyCount) {
+            const chunkEnd = Math.min(applied + 4, applyCount);
+            let total = 0;
+            for (let i = applied; i < chunkEnd; i++) total += 4 + queue[i].length;
+            const batch = new Uint8Array(total);
+            let off = 0;
+            for (let i = applied; i < chunkEnd; i++) {
+                const payload = queue[i];
+                const len = payload.length;
+                batch[off] = len & 0xff;
+                batch[off + 1] = (len >> 8) & 0xff;
+                batch[off + 2] = (len >> 16) & 0xff;
+                batch[off + 3] = (len >> 24) & 0xff;
+                off += 4;
+                batch.set(payload, off);
+                off += len;
+            }
+            terminals[ptyId].feed_compressed_batch(batch);
+            appliedBytes += total;
+            applied += chunkEnd - applied;
+            if (performance.now() - startedAt >= budgetMs) break;
+        }
+        queue.splice(0, applied);
+        if (queue.length === 0) pendingApplyBatches.delete(ptyId);
+        markTerminalHot(ptyId, applied, appliedBytes, queue.length);
+        const title = terminals[ptyId].title();
+        if (title !== ptyTitles[ptyId]) {
+            ptyTitles[ptyId] = title;
+            titlesChanged = true;
+            if (ptyId === focusedPty) {
+                document.title = title ? `${title} — blit` : 'blit';
+            }
+        }
+        dirtyTerminals.add(ptyId);
+        changedPtys.add(ptyId);
+        if (ptyId === focusedPty) notePredictionAdvance();
+        totalConsumed += applied;
+        totalRendered += applied;
+        totalApplyMs += performance.now() - applyStart;
     }
-    let total = 0;
-    for (let i = 0; i < applyCount; i++) total += 4 + queue[i].length;
-    const batch = new Uint8Array(total);
-    let off = 0;
-    for (let i = 0; i < applyCount; i++) {
-        const payload = queue[i];
-        const len = payload.length;
-        batch[off] = len & 0xff;
-        batch[off + 1] = (len >> 8) & 0xff;
-        batch[off + 2] = (len >> 16) & 0xff;
-        batch[off + 3] = (len >> 24) & 0xff;
-        off += 4;
-        batch.set(payload, off);
-        off += len;
+
+    if (totalConsumed > 0) {
+        releaseAppliedFrames(totalConsumed);
     }
-    terminals[ptyId].feed_compressed_batch(batch);
-    queue.splice(0, applyCount);
-    if (queue.length === 0) pendingApplyBatches.delete(ptyId);
-    releaseAppliedFrames(applyCount);
-    const applyMs = performance.now() - applyStart;
-    applyMsEwma = applyMsEwma > 0 ? applyMsEwma * 0.8 + applyMs * 0.2 : applyMs;
-    notePredictionAdvance();
-    needsRender = true;
-    sendClientMetrics();
-    return applyCount;
+    if (totalRendered > 0) {
+        const applyMsPerFrame = totalApplyMs / totalRendered;
+        applyMsEwma = applyMsEwma > 0
+            ? applyMsEwma * 0.8 + applyMsPerFrame * 0.2
+            : applyMsPerFrame;
+        if (focusedPty !== null && changedPtys.has(focusedPty)) requestLeadRender();
+        if (changedPtys.size > 0) requestPreviewRender(changedPtys);
+        if (titlesChanged) schedulePreviewRailUpdate();
+    }
+    if (totalConsumed > 0) {
+        sendClientMetrics(pendingApplyFrameCount() > TARGET_PLAYOUT_BACKLOG);
+    }
+    return totalConsumed;
 }
 
 function measureCell() {
     const s = document.createElement('span');
-    s.style.cssText = `font: 13px ${FONT}; position: absolute; visibility: hidden; white-space: pre;`;
+    s.style.cssText = `font: 13px ${fontFamily}; position: absolute; visibility: hidden; white-space: pre;`;
     s.textContent = 'M';
     document.body.appendChild(s);
     const r = s.getBoundingClientRect();
     document.body.removeChild(s);
-    return { w: Math.ceil(r.width), h: Math.ceil(r.height) };
+    // Snap to device pixel boundaries so adjacent cells tile without
+    // subpixel gaps, then convert back to CSS pixels.
+    const d = window.devicePixelRatio || 1;
+    // Store exact integer device-pixel dimensions (pw/ph) to avoid
+    // IEEE 754 round-trip drift in w*dpr.
+    const pw = Math.round(r.width * d);
+    const ph = Math.round(r.height * d);
+    return { w: pw / d, h: ph / d, pw, ph };
 }
 
 function computeSize() {
-    const tabH = tabsEl.style.display === 'none' ? 0 : 28;
-    cols = Math.floor(window.innerWidth / cell.w);
-    rows = Math.floor((window.innerHeight - tabH) / cell.h);
+    const leadWidth = Math.max(leadPaneEl.clientWidth || window.innerWidth, cell.w);
+    cols = Math.floor(leadWidth / cell.w);
+    rows = Math.floor(window.innerHeight / cell.h);
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
 }
 
-function updateTabs() {
-    tabsEl.innerHTML = '';
-    for (const id of ptyIds) {
-        const t = document.createElement('span');
-        t.className = 'tab' + (id === focusedPty ? ' active' : '');
-        const title = ptyTitles[id];
-        const label = document.createTextNode(title ? `${id}: ${title}` : `#${id}`);
-        t.appendChild(label);
-        const close = document.createElement('span');
-        close.className = 'close';
-        close.textContent = '\u00d7';
-        close.onclick = (e) => { e.stopPropagation(); closePty(id); };
-        t.appendChild(close);
-        t.onclick = () => focusPty(id);
-        t.onauxclick = (e) => { if (e.button === 1) { e.preventDefault(); closePty(id); } };
-        tabsEl.appendChild(t);
-    }
-    const newBtn = document.createElement('span');
-    newBtn.className = 'newtab';
-    newBtn.textContent = '+';
-    newBtn.onclick = createPty;
-    tabsEl.appendChild(newBtn);
+function followPty(id) {
+    if (subscribedPtys.has(id)) return;
+    subscribedPtys.add(id);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(new Uint8Array([C2S_SUBSCRIBE, id & 0xff, (id >> 8) & 0xff]));
 }
 
-function focusPty(id) {
+function releasePtyRuntime(id) {
+    pendingApplyBatches.delete(id);
+    terminalHotUntil.delete(id);
+    dirtyTerminals.delete(id);
+    dirtyPreviewPtys.delete(id);
+    if (terminals[id]) {
+        terminals[id].free();
+        delete terminals[id];
+    }
+}
+
+function unfollowPty(id) {
+    if (!subscribedPtys.has(id)) return;
+    subscribedPtys.delete(id);
+    releasePtyRuntime(id);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(new Uint8Array([C2S_UNSUBSCRIBE, id & 0xff, (id >> 8) & 0xff]));
+    }
+}
+
+function removePreviewItem(id) {
+    const item = previewItems[id];
+    if (!item) return;
+    item.root.remove();
+    delete previewItems[id];
+}
+
+function visibleExposePtys() {
+    return exposeOpen ? filteredExposeIds() : [];
+}
+
+function desiredFollowPtys() {
+    const desired = new Set();
+    if (focusedPty !== null) desired.add(focusedPty);
+    if (exposeOpen) {
+        for (const id of visibleExposePtys()) desired.add(id);
+    }
+    return desired;
+}
+
+function syncPtyFollows() {
+    const desired = desiredFollowPtys();
+    for (const id of ptyIds) {
+        if (desired.has(id)) followPty(id);
+        else unfollowPty(id);
+    }
+}
+
+function schedulePtyFollowSync() {
+    if (followSyncScheduled) return;
+    followSyncScheduled = true;
+    requestAnimationFrame(() => {
+        followSyncScheduled = false;
+        syncPtyFollows();
+    });
+}
+
+function ensureSurface(ptyId) {
+    if (!surfaceCanvases[ptyId]) {
+        const canvas = document.createElement('canvas');
+        surfaceCanvases[ptyId] = canvas;
+        surfaceRenderers[ptyId] = createLeadGlRenderer(canvas);
+        surfaceRenderers[ptyId].hide();
+    }
+    return surfaceCanvases[ptyId];
+}
+
+function ensurePreviewItem(ptyId) {
+    if (previewItems[ptyId]) return previewItems[ptyId];
+    const root = document.createElement('div');
+    root.className = 'preview-card';
+    root.onclick = () => {
+        const result = searchResultForPty(ptyId);
+        if (exposeOpen) closeExpose({ restoreFocus: false });
+        focusPty(ptyId, { scrollOffsetOverride: result ? result.scrollOffset : null });
+    };
+    const head = document.createElement('div');
+    head.className = 'preview-head';
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'preview-title-wrap';
+    const label = document.createElement('div');
+    label.className = 'preview-label';
+    const context = document.createElement('div');
+    context.className = 'preview-context';
+    titleWrap.appendChild(label);
+    titleWrap.appendChild(context);
+    const meta = document.createElement('div');
+    meta.className = 'preview-meta';
+    const role = document.createElement('div');
+    role.className = 'preview-badge';
+    const source = document.createElement('div');
+    source.className = 'preview-badge match';
+    meta.appendChild(role);
+    meta.appendChild(source);
+    head.appendChild(titleWrap);
+    head.appendChild(meta);
+    const surface = document.createElement('div');
+    surface.className = 'preview-surface';
+    const canvas = document.createElement('canvas');
+    canvas.className = 'preview-canvas';
+    root.appendChild(head);
+    surface.appendChild(canvas);
+    root.appendChild(surface);
+    exposeGridEl.appendChild(root);
+    const item = {
+        root,
+        label,
+        context,
+        role,
+        source,
+        surface,
+        canvas,
+        ctx: configureCanvasContext(canvas.getContext('2d')),
+        committedWidthCss: 0,
+        committedHeightCss: 0,
+    };
+    previewItems[ptyId] = item;
+    dirtyPreviewPtys.add(ptyId);
+    previewLayoutDirty = true;
+    return item;
+}
+
+function updatePreviewRail() {
+    const filtered = syncExposeSelection();
+    const filteredSet = new Set(filtered);
+    const filteredOrder = new Map(filtered.map((id, idx) => [id, idx]));
+    const createCommand = exposeCreateCommand();
+    const searchActive = exposeOpen && !!exposeQuery.trim() && !createCommand;
+    const searchResultById = new Map(
+        (exposeSearchResults || []).map((result) => [result.ptyId, result])
+    );
+    const active = new Set(ptyIds);
+    for (const [id, item] of Object.entries(previewItems)) {
+        if (!active.has(Number(id))) {
+            removePreviewItem(Number(id));
+            dirtyPreviewPtys.delete(Number(id));
+        }
+    }
+    exposeGridEl.classList.toggle('search-results', searchActive);
+    for (const id of ptyIds) {
+        const item = ensurePreviewItem(id);
+        const title = ptyTitles[id];
+        const result = searchResultById.get(id) || null;
+        item.label.textContent = title ? `${id}: ${title}` : `#${id}`;
+        item.role.textContent = id === focusedPty ? 'Lead' : 'PTY';
+        item.context.textContent = searchActive && result && result.context ? result.context : '';
+        item.context.style.display = searchActive && result && result.context ? '' : 'none';
+        item.source.textContent = searchActive && result ? sourceLabel(result.primarySource) : '';
+        item.source.style.display = searchActive && result ? '' : 'none';
+        item.source.title = searchActive && result ? resultBadges(result).join(' + ') : '';
+        item.root.classList.toggle('active', id === focusedPty);
+        item.root.classList.toggle('selected', exposeOpen && id === exposeSelectedPty);
+        item.root.classList.toggle('search-result', searchActive);
+        item.root.style.display = !exposeOpen || filteredSet.has(id) ? '' : 'none';
+        const order = filteredOrder.get(id) ?? 999;
+        item.root.style.order = String(order);
+        item.root.style.setProperty('--expose-order', String(Math.min(order, 12)));
+    }
+    exposeCreateEl.classList.toggle('selected', exposeOpen && exposeSelectedPty === EXPOSE_CREATE_SELECTION);
+    if (exposeOpen) {
+        // Scroll selected card into view.
+        if (exposeSelectedPty !== null && exposeSelectedPty !== EXPOSE_CREATE_SELECTION) {
+            const item = previewItems[exposeSelectedPty];
+            if (item) item.root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+        const shortcutHint = ' • Ctrl-N new • Ctrl-W kill';
+        if (createCommand) {
+            exposeHintEl.textContent = `Enter to run "${createCommand}" in a new PTY • Esc to close`;
+        } else if (filtered.length > 0) {
+            exposeHintEl.textContent = exposeSearchPending && exposeQuery.trim() && exposeSearchResults === null
+                ? 'Searching titles, terminal, and scrollback…'
+                : `${filtered.length} match${filtered.length === 1 ? '' : 'es'} • Enter to switch${shortcutHint} • Esc to close${exposeSearchPending ? ' • Updating…' : ''}`;
+        } else {
+            exposeHintEl.textContent = exposeSearchPending && exposeQuery.trim()
+                ? 'Searching titles, terminal, and scrollback…'
+                : 'No PTYs match that search yet';
+        }
+        exposeCreateEl.title = createCommand ? `Run "${createCommand}" in a new PTY` : 'New PTY';
+        exposeCreateEl.setAttribute('aria-label', exposeCreateEl.title);
+    } else {
+        exposeHintEl.textContent = '';
+        exposeCreateEl.title = 'New PTY';
+        exposeCreateEl.setAttribute('aria-label', 'New PTY');
+    }
+    schedulePtyFollowSync();
+}
+
+function previewCanvasWidthCss(item) {
+    const measured = item.surface.clientWidth;
+    if (measured > 0) return measured;
+    const style = getComputedStyle(item.root);
+    const paddingX = parseFloat(style.paddingLeft || '0') + parseFloat(style.paddingRight || '0');
+    return Math.max(140, Math.floor(item.root.clientWidth - paddingX));
+}
+
+function previewCanvasSizeCss(ptyId, item) {
+    const surface = surfaceCanvases[ptyId];
+    const terminal = terminals[ptyId];
+    const widthCss = Math.max(140, Math.round(previewCanvasWidthCss(item)));
+    const aspect = surface
+        ? surface.height / Math.max(1, surface.width)
+        : ((terminal ? terminal.rows : rows) * cell.h) / Math.max(1, (terminal ? terminal.cols : cols) * cell.w);
+    const heightCss = Math.max(84, Math.round(widthCss * aspect));
+    return { surface, widthCss, heightCss };
+}
+
+function ensurePreviewCanvasSize(item, widthCss, heightCss) {
+    item.surface.style.height = `${heightCss}px`;
+    const pixelW = Math.max(1, Math.round(widthCss * dpr));
+    const pixelH = Math.max(1, Math.round(heightCss * dpr));
+    const resized = item.canvas.width !== pixelW || item.canvas.height !== pixelH;
+    if (resized) {
+        item.canvas.width = pixelW;
+        item.canvas.height = pixelH;
+        configureCanvasContext(item.ctx);
+    }
+    item.canvas.style.width = '100%';
+    item.canvas.style.height = '100%';
+    item.canvas.style.transform = 'translateZ(0)';
+    item.committedWidthCss = widthCss;
+    item.committedHeightCss = heightCss;
+    return { pixelW, pixelH, resized };
+}
+
+function setGpuScaledCanvas(canvasEl, baseWidthCss, baseHeightCss, targetWidthCss, targetHeightCss) {
+    const safeTargetWidth = Math.max(1, targetWidthCss);
+    const safeTargetHeight = Math.max(1, targetHeightCss);
+    const safeBaseWidth = Math.max(1, baseWidthCss || safeTargetWidth);
+    const safeBaseHeight = Math.max(1, baseHeightCss || safeTargetHeight);
+    canvasEl.style.width = `${safeBaseWidth}px`;
+    canvasEl.style.height = `${safeBaseHeight}px`;
+    canvasEl.style.transform = `translateZ(0) scale(${safeTargetWidth / safeBaseWidth}, ${safeTargetHeight / safeBaseHeight})`;
+}
+
+function scheduleResizeVisual() {
+    if (terminalResizeVisualScheduled) return;
+    terminalResizeVisualScheduled = true;
+    requestAnimationFrame(() => {
+        terminalResizeVisualScheduled = false;
+        if (!terminalResizeActive) return;
+        setGpuScaledCanvas(
+            canvas,
+            leadCanvasCssWidth,
+            leadCanvasCssHeight,
+            Math.max(1, Math.round(leadPaneEl.clientWidth)),
+            Math.max(1, Math.round(leadPaneEl.clientHeight)),
+        );
+        for (const id of ptyIds) {
+            const item = previewItems[id];
+            if (!item) continue;
+            const { widthCss, heightCss } = previewCanvasSizeCss(id, item);
+            item.surface.style.height = `${heightCss}px`;
+            setGpuScaledCanvas(
+                item.canvas,
+                item.committedWidthCss,
+                item.committedHeightCss,
+                widthCss,
+                heightCss,
+            );
+        }
+    });
+}
+
+function beginTerminalResize() {
+    terminalResizeActive = true;
+    scheduleResizeVisual();
+}
+
+function endTerminalResize() {
+    terminalResizeActive = false;
+    canvas.style.transform = 'translateZ(0)';
+    for (const item of Object.values(previewItems)) {
+        item.canvas.style.transform = 'translateZ(0)';
+    }
+}
+
+function rasterizeTerminal(ptyId) {
+    const t = terminals[ptyId];
+    if (!t) return;
+    const surface = ensureSurface(ptyId);
+    const renderer = surfaceRenderers[ptyId];
+    const sw = Math.max(1, t.cols * cell.pw);
+    const sh = Math.max(1, t.rows * cell.ph);
+    if (surface.width !== sw || surface.height !== sh) {
+        renderer.resize(sw, sh);
+    }
+    t.prepare_render_ops();
+    let full = t.last_render_full();
+    if (!full && t.last_render_scroll_rows()) {
+        // The GL surface can't pixel-shift; redo as full repaint.
+        t.prepare_full_render_ops();
+        full = true;
+    }
+    renderer.render(
+        t.background_ops(),
+        t.glyph_ops(),
+        t.glyph_atlas_canvas(),
+        t.glyph_atlas_version(),
+        t.cursor_visible(),
+        t.cursor_col,
+        t.cursor_row,
+        full,
+    );
+    dirtyTerminals.delete(ptyId);
+}
+
+function leadDamageRect(ptyId, surface, drawW, drawH) {
+    const t = terminals[ptyId];
+    if (!t) return null;
+    const rowStart = t.last_render_damage_row_start();
+    const rowEnd = t.last_render_damage_row_end();
+    const colStart = t.last_render_damage_col_start();
+    const colEnd = t.last_render_damage_col_end();
+    if (rowStart < 0 || rowEnd <= rowStart || colStart < 0 || colEnd <= colStart) {
+        return null;
+    }
+    const x = Math.max(0, colStart * cell.pw);
+    const y = Math.max(0, rowStart * cell.ph);
+    const x2 = Math.min(drawW, Math.min(surface.width, colEnd * cell.pw));
+    const y2 = Math.min(drawH, Math.min(surface.height, rowEnd * cell.ph));
+    if (x2 <= x || y2 <= y) return null;
+    return { x, y, w: x2 - x, h: y2 - y };
+}
+
+function applyLeadScroll(deltaRows, drawW, drawH) {
+    applyCanvasScroll(ctx, canvas, leadScratchCanvas, leadScratchCtx, deltaRows, drawW, drawH);
+}
+
+function renderLead() {
+    let rerasterizedLead = false;
+    if (focusedPty !== null && dirtyTerminals.has(focusedPty)) {
+        rasterizeTerminal(focusedPty);
+        rerasterizedLead = true;
+    }
+    if (focusedPty === null || !surfaceCanvases[focusedPty]) {
+        if (leadCanvasPrimed) {
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            resetLeadCanvasState();
+        }
+        return;
+    }
+    const t = terminals[focusedPty];
+    const surface = surfaceCanvases[focusedPty];
+    const drawW = Math.min(canvas.width, surface.width);
+    const drawH = Math.min(canvas.height, surface.height);
+    const fullRender = !leadCanvasPrimed
+        || leadCanvasPty !== focusedPty
+        || leadCanvasDrawWidth !== drawW
+        || leadCanvasDrawHeight !== drawH
+        || !t
+        || (rerasterizedLead && t.last_render_full());
+    if (fullRender) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(surface, 0, 0, drawW, drawH, 0, 0, drawW, drawH);
+    } else if (rerasterizedLead) {
+        const scrollRows = t.last_render_scroll_rows();
+        if (scrollRows) {
+            applyLeadScroll(scrollRows, drawW, drawH);
+        }
+        const damage = leadDamageRect(focusedPty, surface, drawW, drawH);
+        if (damage) {
+            ctx.drawImage(
+                surface,
+                damage.x, damage.y, damage.w, damage.h,
+                damage.x, damage.y, damage.w, damage.h,
+            );
+        }
+    }
+    if (rerasterizedLead && t) {
+        drawOverflowText(ctx, t, { drawWidth: drawW, drawHeight: drawH });
+    }
+    leadCanvasPrimed = true;
+    leadCanvasPty = focusedPty;
+    leadCanvasDrawWidth = drawW;
+    leadCanvasDrawHeight = drawH;
+}
+
+function renderPreviews() {
+    if (!exposeOpen) return;
+    const ids = visibleExposePtys();
+    if (previewCompositeRenderer.supported && ids.length > 0) {
+        const entries = [];
+        let compositeWidth = 1;
+        let compositeHeight = 0;
+        for (const id of ids) {
+            const item = ensurePreviewItem(id);
+            const { widthCss, heightCss } = previewCanvasSizeCss(id, item);
+            const { pixelW, pixelH } = ensurePreviewCanvasSize(item, widthCss, heightCss);
+            entries.push({ id, item, pixelW, pixelH, srcY: compositeHeight });
+            compositeWidth = Math.max(compositeWidth, pixelW);
+            compositeHeight += pixelH;
+        }
+        previewCompositeRenderer.resize(compositeWidth, Math.max(1, compositeHeight));
+        const views = [];
+        for (const entry of entries) {
+            const terminal = terminals[entry.id];
+            if (!terminal) continue;
+            terminal.prepare_full_render_ops();
+            views.push({
+                x: 0,
+                y: entry.srcY,
+                width: entry.pixelW,
+                height: entry.pixelH,
+                baseWidth: Math.max(1, terminal.cols * cell.pw),
+                baseHeight: Math.max(1, terminal.rows * cell.ph),
+                bgOps: terminal.background_ops(),
+                glyphOps: terminal.glyph_ops(),
+                atlasCanvas: terminal.glyph_atlas_canvas(),
+                atlasVersion: terminal.glyph_atlas_version(),
+                cursorVisible: terminal.cursor_visible(),
+                cursorCol: terminal.cursor_col,
+                cursorRow: terminal.cursor_row,
+            });
+        }
+        previewCompositeRenderer.renderViews(views);
+        for (const entry of entries) {
+            entry.item.ctx.fillStyle = '#000';
+            entry.item.ctx.fillRect(0, 0, entry.item.canvas.width, entry.item.canvas.height);
+            entry.item.ctx.drawImage(
+                previewCompositeCanvas,
+                0, entry.srcY, entry.pixelW, entry.pixelH,
+                0, 0, entry.item.canvas.width, entry.item.canvas.height,
+            );
+            const terminal = terminals[entry.id];
+            drawOverflowText(entry.item.ctx, terminal, {
+                drawWidth: entry.item.canvas.width,
+                drawHeight: entry.item.canvas.height,
+            });
+        }
+        dirtyPreviewPtys.clear();
+        previewLayoutDirty = false;
+        return;
+    }
+    for (const id of ids) {
+        if (dirtyTerminals.has(id)) rasterizeTerminal(id);
+        const item = ensurePreviewItem(id);
+        const { surface, widthCss, heightCss } = previewCanvasSizeCss(id, item);
+        const { resized } = ensurePreviewCanvasSize(item, widthCss, heightCss);
+        if (!previewLayoutDirty && !resized && !dirtyPreviewPtys.has(id)) continue;
+        item.ctx.fillStyle = '#000';
+        item.ctx.fillRect(0, 0, item.canvas.width, item.canvas.height);
+        if (!surface) continue;
+        const scale = item.canvas.width / Math.max(1, surface.width);
+        const drawW = item.canvas.width;
+        const drawH = Math.min(item.canvas.height, Math.round(surface.height * scale));
+        const dy = Math.floor((item.canvas.height - drawH) / 2);
+        item.ctx.drawImage(surface, 0, 0, surface.width, surface.height, 0, dy, drawW, drawH);
+        const terminal = terminals[id];
+        if (terminal) {
+            terminal.prepare_full_render_ops();
+            drawOverflowText(item.ctx, terminal, {
+                offsetY: dy,
+                drawWidth: drawW,
+                drawHeight: drawH,
+            });
+        }
+    }
+    dirtyPreviewPtys.clear();
+    previewLayoutDirty = false;
+}
+
+function touchLru(id) {
+    const idx = ptyLru.indexOf(id);
+    if (idx > 0) ptyLru.splice(idx, 1);
+    if (idx !== 0) ptyLru.unshift(id);
+}
+
+function focusPty(id, { scrollOffsetOverride = null } = {}) {
+    const previous = focusedPty;
     focusedPty = id;
-    scrollOffset = 0;
+    touchLru(id);
+    scrollOffset = Number.isFinite(scrollOffsetOverride) && scrollOffsetOverride > 0
+        ? Math.floor(scrollOffsetOverride)
+        : 0;
     predicted = '';
-    updateTabs();
+    resetLeadCanvasState();
+    if (previous !== null && previous !== id) invalidateTerminal(previous);
+    invalidateTerminal(id);
+    schedulePtyFollowSync();
+    updatePreviewRail();
     const title = ptyTitles[id];
     document.title = title ? `${title} — blit` : 'blit';
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -311,31 +2099,42 @@ function focusPty(id) {
         msg[1] = id & 0xff;
         msg[2] = (id >> 8) & 0xff;
         ws.send(msg);
+        sendResizeForPty(id);
+        if (scrollOffset > 0) {
+            sendScrollForPty(id, scrollOffset);
+        }
     }
     resizeCanvasBacking();
-    if (terminals[id]) {
-        const t = terminals[id];
-        t.render(offCtx);
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const tw = Math.round(t.cols * cell.w * dpr);
-        const th = Math.round(t.rows * cell.h * dpr);
-        ctx.drawImage(offscreen, 0, 0, tw, th, 0, 0, tw, th);
-    } else {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
+    requestLeadRender();
+    requestPreviewRender(null, true);
+    updateHud();
     inputSink.focus();
 }
 
-function createPty() {
+function createPty(command = null) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     computeSize();
-    const msg = new Uint8Array(5);
+    const commandText = typeof command === 'string' ? command.trim() : '';
+    const commandBytes = commandText ? exposeSearchEncoder.encode(commandText) : null;
+    const msg = new Uint8Array(5 + (commandBytes ? commandBytes.length : 0));
     msg[0] = C2S_CREATE;
     msg[1] = rows & 0xff;
     msg[2] = (rows >> 8) & 0xff;
     msg[3] = cols & 0xff;
     msg[4] = (cols >> 8) & 0xff;
+    if (commandBytes) msg.set(commandBytes, 5);
     ws.send(msg);
+}
+
+function createFocusedPty(command = null) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    pendingFocusedCreates += 1;
+    createPty(command);
+    return true;
+}
+
+function createPtyFromExpose() {
+    createFocusedPty(exposeCreateCommand());
 }
 
 function closePty(id) {
@@ -380,39 +2179,69 @@ function scroll(delta) {
     updateHud();
 }
 
-let resizeTimer = null;
-function sendResize() {
-    if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-        resizeTimer = null;
-        dpr = window.devicePixelRatio || 1;
-        computeSize();
-        resizeCanvasBacking();
-        for (const id of Object.keys(terminals)) {
-            terminals[id].set_cell_size(cell.w * dpr, cell.h * dpr);
-        }
-        for (const id of ptyIds) sendResizeForPty(id);
-        updateHud();
-    }, 50);
+function commitResize() {
+    if (terminalResizeTimer) {
+        clearTimeout(terminalResizeTimer);
+        terminalResizeTimer = null;
+    }
+    dpr = window.devicePixelRatio || 1;
+    cell = measureCell();
+    computeSize();
+    resizeCanvasBacking();
+    for (const id of Object.keys(terminals)) {
+        terminals[id].set_cell_size(cell.pw, cell.ph);
+        dirtyTerminals.add(Number(id));
+    }
+    if (focusedPty !== null) sendResizeForPty(focusedPty);
+    requestLeadRender();
+    requestPreviewRender(null, true);
+    schedulePtyFollowSync();
+    updateHud();
+    endTerminalResize();
+}
+
+let lastResizeCommit = 0;
+function sendResize(options = {}) {
+    const flush = options && options.flush === true;
+    beginTerminalResize();
+    if (flush) {
+        if (terminalResizeTimer) { clearTimeout(terminalResizeTimer); terminalResizeTimer = null; }
+        lastResizeCommit = performance.now();
+        commitResize();
+        return;
+    }
+    // Throttle: commit at least every TERMINAL_RESIZE_DEBOUNCE_MS during
+    // continuous resizing, instead of deferring indefinitely.
+    const elapsed = performance.now() - lastResizeCommit;
+    if (elapsed >= TERMINAL_RESIZE_DEBOUNCE_MS) {
+        if (terminalResizeTimer) { clearTimeout(terminalResizeTimer); terminalResizeTimer = null; }
+        lastResizeCommit = performance.now();
+        commitResize();
+    } else if (!terminalResizeTimer) {
+        terminalResizeTimer = setTimeout(() => {
+            terminalResizeTimer = null;
+            lastResizeCommit = performance.now();
+            commitResize();
+        }, TERMINAL_RESIZE_DEBOUNCE_MS - elapsed);
+    }
 }
 
 function resizeCanvasBacking() {
-    const tabH = tabsEl.style.display === 'none' ? 0 : 28;
-    const termW = Math.round(cols * cell.w * dpr);
-    const termH = Math.round(rows * cell.h * dpr);
-    const canvasW = Math.round(window.innerWidth * dpr);
-    const canvasH = Math.round((window.innerHeight - tabH) * dpr);
+    const cssWidth = Math.max(1, Math.round(leadPaneEl.clientWidth));
+    const cssHeight = Math.max(1, Math.round(leadPaneEl.clientHeight));
+    const canvasW = Math.max(1, Math.round(cssWidth * dpr));
+    const canvasH = Math.max(1, Math.round(cssHeight * dpr));
     if (canvas.width !== canvasW || canvas.height !== canvasH) {
         canvas.width = canvasW;
         canvas.height = canvasH;
-        canvas.style.width = window.innerWidth + 'px';
-        canvas.style.height = (window.innerHeight - tabH) + 'px';
-        canvas.style.top = tabH + 'px';
+        configureCanvasContext(ctx);
+        resetLeadCanvasState();
     }
-    if (offscreen.width !== termW || offscreen.height !== termH) {
-        offscreen.width = termW;
-        offscreen.height = termH;
-    }
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+    canvas.style.transform = 'translateZ(0)';
+    leadCanvasCssWidth = cssWidth;
+    leadCanvasCssHeight = cssHeight;
 }
 
 function updateHud() {
@@ -508,6 +2337,7 @@ function copySelection() {
 
 async function main() {
     await init();
+    applyFontChoice(fontFamily, { persist: true });
     dpr = window.devicePixelRatio || 1;
     cell = measureCell();
     computeSize();
@@ -543,22 +2373,25 @@ async function main() {
         }
         rafPrevTime = now;
 
-        applyQueuedUpdatesForFrame();
-
-        if (needsRender && focusedPty !== null && terminals[focusedPty]) {
-            const t = terminals[focusedPty];
-            t.render(offCtx);
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            const tw = Math.round(t.cols * cell.w * dpr);
-            const th = Math.round(t.rows * cell.h * dpr);
-            ctx.drawImage(offscreen, 0, 0, tw, th, 0, 0, tw, th);
-            const cw = cell.w * dpr, ch = cell.h * dpr;
+        const renderPreviewNow = previewRenderDue(now);
+        if (leadNeedsRender || renderPreviewNow) {
+            const didLeadRender = leadNeedsRender;
+            if (leadNeedsRender) {
+                renderLead();
+                leadNeedsRender = false;
+            }
+            if (renderPreviewNow) {
+                renderPreviews();
+                previewNeedsRender = false;
+                lastPreviewRenderAt = now;
+            }
+            const t = focusedPty !== null ? terminals[focusedPty] : null;
+            const cw = cell.pw, ch = cell.ph;
             let predLen = 0;
-            if (predicted && t.echo()) {
+            if (didLeadRender && predicted && t && t.echo()) {
                 const cr = t.cursor_row, cc = t.cursor_col;
                 // Draw predicted text at half opacity on main canvas (not offscreen)
-                ctx.font = `${Math.round(ch)}px ${FONT}`;
+                ctx.font = `${Math.round(ch)}px ${fontFamily}`;
                 ctx.textBaseline = 'bottom';
                 ctx.fillStyle = 'rgba(204,204,204,0.5)';
                 for (let i = 0; i < predicted.length && cc + i < cols; i++) {
@@ -572,7 +2405,9 @@ async function main() {
                 }
             }
             frames++;
-            needsRender = false;
+        }
+        if (!leadNeedsRender && pendingLeadApplyCount() > 0) {
+            scheduleApplyPump();
         }
         requestAnimationFrame(renderLoop);
     }
@@ -580,12 +2415,82 @@ async function main() {
 
     passInput.addEventListener('keydown', (e) => {
         if (e.key !== 'Enter') return;
-        savedPass = passInput.value;
-        connect(savedPass);
-        passInput.value = '';
+        const pass = passInput.value;
+        if (!pass) return;
+        passInput.disabled = true;
+        connect(pass, { source: 'prompt' });
     });
 
     window.addEventListener('resize', sendResize);
+    window.addEventListener('pointerup', () => { document.body.style.userSelect = ''; });
+    const repaintForFocusChange = () => {
+        invalidateAllTerminals(true);
+    };
+    const resyncOnVisible = () => {
+        if (!document.hidden) {
+            // Window may have been resized or moved to a different display
+            // while the tab was hidden. Remeasure everything.
+            sendResize({ flush: true });
+        }
+    };
+    window.addEventListener('focus', repaintForFocusChange);
+    window.addEventListener('blur', repaintForFocusChange);
+    document.addEventListener('visibilitychange', resyncOnVisible);
+    previewRailEl.addEventListener('click', (e) => {
+        if (e.target === previewRailEl) closeExpose();
+    });
+    exposeSearchEl.addEventListener('input', () => {
+        exposeQuery = exposeSearchEl.value;
+        queueExposeSearch();
+        updatePreviewRail();
+        requestPreviewRender(null, true);
+        schedulePtyFollowSync();
+    });
+    exposeCreateEl.addEventListener('click', () => {
+        createPtyFromExpose();
+    });
+    exposeSearchEl.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+            e.preventDefault();
+            closeExpose();
+            return;
+        }
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.key === 'Enter') {
+            e.preventDefault();
+            const command = exposeCreateCommand();
+            closeExpose({ restoreFocus: false });
+            createFocusedPty(command);
+            return;
+        }
+        if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'n') {
+            e.preventDefault();
+            closeExpose({ restoreFocus: false });
+            createFocusedPty();
+            return;
+        }
+        if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'w') {
+            e.preventDefault();
+            const ids = syncExposeSelection();
+            if (exposeSelectedPty !== null && exposeSelectedPty !== EXPOSE_CREATE_SELECTION && ids.includes(exposeSelectedPty)) {
+                closePty(exposeSelectedPty);
+            }
+            return;
+        }
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            closeExpose();
+            return;
+        }
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            acceptExposeSelection();
+            return;
+        }
+        if (e.key === 'ArrowRight') { e.preventDefault(); moveExposeSelection('right'); return; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); moveExposeSelection('left'); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); moveExposeSelection('down'); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); moveExposeSelection('up'); return; }
+    });
 
     const helpOverlay = document.getElementById('help-overlay');
     function toggleHelp() { helpOverlay.classList.toggle('visible'); }
@@ -593,6 +2498,25 @@ async function main() {
 
     // Keyboard
     inputSink.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+            e.preventDefault();
+            if (exposeOpen) closeExpose();
+            else openExpose();
+            return;
+        }
+
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.key === 'Enter') {
+            e.preventDefault();
+            if (exposeOpen) {
+                const command = exposeCreateCommand();
+                closeExpose({ restoreFocus: false });
+                createFocusedPty(command);
+            } else {
+                createFocusedPty();
+            }
+            return;
+        }
+
         // Ctrl+Shift+/ (Ctrl+?)
         if (e.ctrlKey && e.shiftKey && (e.key === '?' || e.code === 'Slash')) {
             e.preventDefault();
@@ -603,10 +2527,23 @@ async function main() {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         if (e.isComposing) return;
 
-        // Tab management
+        // PTY management
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
-            if (e.key === 'T') { e.preventDefault(); createPty(); return; }
             if (e.key === 'W') { e.preventDefault(); if (focusedPty !== null) closePty(focusedPty); return; }
+            if (e.key === 'B') {
+                e.preventDefault();
+                if (focusedPty !== null) {
+                    if (scrollOffset > 0) {
+                        scrollOffset = 0;
+                        sendScrollForPty(focusedPty, 0);
+                        updateHud();
+                        requestLeadRender();
+                    } else {
+                        scroll(rows);
+                    }
+                }
+                return;
+            }
             if ((e.key === '{' || e.code === 'BracketLeft') && ptyIds.length > 1 && focusedPty !== null) {
                 e.preventDefault();
                 focusPty(ptyIds[(ptyIds.indexOf(focusedPty) - 1 + ptyIds.length) % ptyIds.length]);
@@ -647,10 +2584,10 @@ async function main() {
                         predictedFromCol = t.cursor_col;
                     }
                     predicted += e.key;
-                    needsRender = true;
+                    requestLeadRender();
                 } else {
                     predicted = '';
-                    needsRender = true;
+                    requestLeadRender();
                 }
             } else {
                 predicted = '';
@@ -747,36 +2684,72 @@ async function main() {
     });
 
     canvas.addEventListener('click', () => inputSink.focus());
+    // Browsers may ignore programmatic focus() outside a user gesture.
+    // Catch the first keypress anywhere on the page and redirect to the sink,
+    // then re-dispatch so the keystroke isn't swallowed.
+    document.addEventListener('keydown', (e) => {
+        if (document.activeElement !== inputSink && !exposeOpen) {
+            inputSink.focus();
+            inputSink.dispatchEvent(new KeyboardEvent('keydown', e));
+        }
+    });
+
+    if (savedPass) connect(savedPass, { source: 'stored' });
+    else showAuth();
 }
 
-function connect(pass) {
+function connect(pass, { source = 'prompt' } = {}) {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     statusEl.textContent = 'connecting\u2026';
     const wsURL = (location.protocol === 'https:' ? 'wss:' : 'ws:') +
         '//' + location.host + location.pathname;
-    ws = new WebSocket(wsURL);
-    ws.binaryType = 'arraybuffer';
+    const socket = new WebSocket(wsURL);
+    if (ws && ws !== socket) {
+        try {
+            ws.onclose = null;
+            ws.close();
+        } catch {}
+    }
+    ws = socket;
+    socket.binaryType = 'arraybuffer';
+    let opened = false;
+    let authenticated = false;
+    let suppressReconnect = false;
 
-    ws.onopen = () => {
+    if (source === 'stored') hideAuth();
+
+    socket.onopen = () => {
+        if (ws !== socket) return;
+        opened = true;
         statusEl.textContent = 'authenticating\u2026';
-        ws.send(pass);
+        socket.send(pass);
     };
 
-    ws.onmessage = (e) => {
+    socket.onmessage = (e) => {
+        if (ws !== socket) return;
         if (typeof e.data === 'string') {
             if (e.data === 'ok') {
-                authEl.style.display = 'none';
-                tabsEl.style.display = '';
-                canvas.style.display = 'block';
+                authenticated = true;
+                savedPass = pass;
+                writeStorage(PASS_STORAGE_KEY, pass);
+                hideAuth();
+                workspaceEl.style.display = 'flex';
                 statusEl.textContent = '';
                 reconnectDelay = 500;
                 computeSize();
                 resizeCanvasBacking();
-                updateTabs();
+                updatePreviewRail();
                 inputSink.focus();
+            } else if (e.data.startsWith('error:')) {
+                // Server-side error after auth (e.g. transport connect failed).
+                // Show in status bar and suppress reconnect — retrying would
+                // just hit the same error (server not running, socket missing).
+                statusEl.textContent = e.data.slice(6);
+                suppressReconnect = true;
             } else {
-                statusEl.textContent = 'auth failed';
                 savedPass = null;
+                removeStorage(PASS_STORAGE_KEY);
+                showAuth('auth failed');
             }
             return;
         }
@@ -801,33 +2774,60 @@ function connect(pass) {
                 } else {
                     deferredAckFrames += 1;
                 }
-                sendClientMetrics();
+                scheduleApplyPump();
+                sendClientMetrics(deferredAckFrames > 0 || pendingApplyFrameCount() > TARGET_PLAYOUT_BACKLOG);
+                if (exposeOpen && exposeQuery.trim()) {
+                    queueExposeSearch({ contentRefresh: true });
+                }
                 break;
             }
             case S2C_CREATED: {
                 if (data.length < 3) break;
                 const id = data[1] | (data[2] << 8);
+                const focusCreated = pendingFocusedCreates > 0;
+                if (focusCreated) pendingFocusedCreates -= 1;
                 if (!ptyIds.includes(id)) ptyIds.push(id);
-                if (!terminals[id]) terminals[id] = new Terminal(rows, cols, cell.w * dpr, cell.h * dpr);
-                focusPty(id);
+                if (!terminals[id]) terminals[id] = createTerminalInstance();
+                dirtyTerminals.add(id);
+                requestPreviewRender([id], true);
+                if (focusedPty === null || focusCreated) {
+                    if (focusCreated && exposeOpen) closeExpose({ restoreFocus: false });
+                    focusPty(id);
+                }
+                else {
+                    if (exposeOpen && exposeQuery.trim()) queueExposeSearch({ contentRefresh: true });
+                    schedulePreviewRailUpdate();
+                    schedulePtyFollowSync();
+                }
                 break;
             }
             case S2C_CLOSED: {
                 if (data.length < 3) break;
                 const id = data[1] | (data[2] << 8);
                 ptyIds = ptyIds.filter(x => x !== id);
+                ptyLru = ptyLru.filter(x => x !== id);
                 if (terminals[id]) { terminals[id].free(); delete terminals[id]; }
+                subscribedPtys.delete(id);
+                pendingApplyBatches.delete(id);
+                terminalHotUntil.delete(id);
+                dirtyTerminals.delete(id);
+                dirtyPreviewPtys.delete(id);
+                delete surfaceCanvases[id];
+                delete surfaceRenderers[id];
+                removePreviewItem(id);
                 delete ptyTitles[id];
                 if (focusedPty === id) {
                     focusedPty = ptyIds.length > 0 ? ptyIds[ptyIds.length - 1] : null;
                     if (focusedPty !== null) {
                         focusPty(focusedPty);
                     } else {
+                        resetLeadCanvasState();
                         ctx.clearRect(0, 0, canvas.width, canvas.height);
                         createPty();
                     }
                 }
-                updateTabs();
+                if (exposeOpen && exposeQuery.trim()) queueExposeSearch({ contentRefresh: true });
+                schedulePreviewRailUpdate();
                 break;
             }
             case S2C_LIST: {
@@ -838,56 +2838,155 @@ function connect(pass) {
                     const off = 3 + i * 2;
                     if (off + 1 < data.length) ptyIds.push(data[off] | (data[off + 1] << 8));
                 }
-                updateTabs();
+                requestPreviewRender(ptyIds, true);
+                if (exposeOpen && exposeQuery.trim()) queueExposeSearch({ contentRefresh: true });
+                schedulePreviewRailUpdate();
                 if (ptyIds.length > 0 && focusedPty === null) focusPty(ptyIds[0]);
                 if (ptyIds.length === 0) createPty();
-                for (const id of ptyIds) sendResizeForPty(id);
+                if (focusedPty !== null) sendResizeForPty(focusedPty);
+                schedulePtyFollowSync();
                 break;
             }
             case S2C_TITLE: {
                 if (data.length < 3) break;
                 const id = data[1] | (data[2] << 8);
-                const title = new TextDecoder().decode(data.subarray(3));
+                const title = textDecoder.decode(data.subarray(3));
                 ptyTitles[id] = title;
-                updateTabs();
+                if (exposeOpen && exposeQuery.trim()) queueExposeSearch({ contentRefresh: true });
+                schedulePreviewRailUpdate();
                 if (id === focusedPty) {
                     document.title = title ? `${title} — blit` : 'blit';
+                }
+                break;
+            }
+            case S2C_SEARCH_RESULTS: {
+                if (data.length < 5 || !exposeOpen || !exposeQuery.trim()) break;
+                const requestId = data[1] | (data[2] << 8);
+                if (requestId !== exposeSearchRequestId) break;
+                exposeSearchInFlight = false;
+                exposeSearchPending = exposeSearchTimer !== null;
+                if (exposeCreateCommand()) break;
+                if (exposeQuery.trim() !== exposeSearchSentQuery) {
+                    if (exposeSearchRefreshQueued && !exposeSearchTimer) {
+                        exposeSearchRefreshQueued = false;
+                        queueExposeSearch({ contentRefresh: true });
+                    }
+                    break;
+                }
+                const count = data[3] | (data[4] << 8);
+                const results = [];
+                let off = 5;
+                for (let i = 0; i < count; i++) {
+                    if (off + 14 > data.length) break;
+                    const ptyId = data[off] | (data[off + 1] << 8);
+                    const score = (
+                        data[off + 2]
+                        | (data[off + 3] << 8)
+                        | (data[off + 4] << 16)
+                        | (data[off + 5] << 24)
+                    ) >>> 0;
+                    const primarySource = data[off + 6];
+                    const matchedSources = data[off + 7];
+                    const rawScrollOffset = (
+                        data[off + 8]
+                        | (data[off + 9] << 8)
+                        | (data[off + 10] << 16)
+                        | (data[off + 11] << 24)
+                    ) >>> 0;
+                    const contextLen = data[off + 12] | (data[off + 13] << 8);
+                    off += 14;
+                    if (off + contextLen > data.length) break;
+                    const context = textDecoder.decode(data.subarray(off, off + contextLen));
+                    off += contextLen;
+                    results.push({
+                        ptyId,
+                        score,
+                        primarySource,
+                        matchedSources,
+                        scrollOffset: rawScrollOffset === SEARCH_SCROLL_OFFSET_NONE ? null : rawScrollOffset,
+                        context,
+                    });
+                }
+                exposeSearchPending = false;
+                exposeSearchResults = results;
+                schedulePreviewRailUpdate();
+                syncPtyFollows();
+                requestPreviewRender(visibleExposePtys(), true);
+                if (exposeSearchRefreshQueued) {
+                    exposeSearchRefreshQueued = false;
+                    queueExposeSearch({ contentRefresh: true });
                 }
                 break;
             }
         }
     };
 
-    ws.onerror = () => {};
+    socket.onerror = () => {};
 
-    ws.onclose = () => {
-        statusEl.textContent = 'disconnected';
+    socket.onclose = () => {
+        if (ws !== socket) return;
+        ws = null;
+        if (!suppressReconnect) statusEl.textContent = 'disconnected';
+        if (terminalResizeTimer) {
+            clearTimeout(terminalResizeTimer);
+            terminalResizeTimer = null;
+        }
+        endTerminalResize();
         // Reset client state so reconnect starts clean
         for (const id of Object.keys(terminals)) {
             terminals[id].free();
             delete terminals[id];
         }
+        surfaceCanvases = {};
+        surfaceRenderers = {};
+        previewItems = {};
+        subscribedPtys = new Set();
+        exposeGridEl.innerHTML = '';
         ptyTitles = {};
         ptyIds = [];
         focusedPty = null;
+        exposeOpen = false;
+        exposeQuery = '';
+        exposeSelectedPty = null;
+        pendingFocusedCreates = 0;
+        resetExposeSearch();
+        exposeSearchEl.value = '';
+        previewRailEl.classList.remove('visible');
+        resetLeadCanvasState();
         document.title = 'blit';
         predicted = '';
         predictedFromCol = 0;
         predictedFromRow = 0;
         scrollOffset = 0;
-        needsRender = false;
+        leadNeedsRender = false;
+        previewNeedsRender = false;
+        lastPreviewRenderAt = 0;
+        dirtyTerminals = new Set();
+        dirtyPreviewPtys = new Set();
+        previewLayoutDirty = true;
         pendingApplyBatches = new Map();
+        terminalHotUntil = new Map();
         ackAheadFrames = 0;
         deferredAckFrames = 0;
         applyMsEwma = 0;
+        applyPumpScheduled = false;
         lastMetricsSentAt = 0;
         lastMetricsBacklog = -1;
         lastMetricsAckAhead = -1;
         lastMetricsApplyMs = -1;
-        if (savedPass) {
+        if (opened && !authenticated) {
+            savedPass = null;
+            removeStorage(PASS_STORAGE_KEY);
+            showAuth(source === 'stored' ? 'saved passphrase failed' : 'auth failed');
+            return;
+        }
+        if (!opened && source === 'prompt') {
+            passInput.disabled = false;
+        }
+        if (savedPass && !suppressReconnect) {
             reconnectTimer = setTimeout(() => {
                 statusEl.textContent = 'reconnecting\u2026';
-                connect(savedPass);
+                connect(savedPass, { source: 'stored' });
             }, reconnectDelay);
             reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
         }

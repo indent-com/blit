@@ -6,6 +6,82 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+    {
+      nixosModules.default = self.nixosModules.blit;
+      nixosModules.blit = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.blit;
+          inherit (lib) mkEnableOption mkOption types mkIf;
+        in {
+          options.services.blit = {
+            enable = mkEnableOption "blit terminal multiplexer";
+
+            package = mkOption {
+              type = types.package;
+              default = self.packages.${pkgs.system}.blit-server;
+              defaultText = "self.packages.\${system}.blit-server";
+              description = "The blit-server package to use.";
+            };
+
+            users = mkOption {
+              type = types.listOf types.str;
+              default = [];
+              example = [ "alice" "bob" ];
+              description = ''
+                Users to enable blit for. Each user gets a socket-activated
+                blit-server instance at /run/blit/<user>.sock.
+              '';
+            };
+
+            shell = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "/run/current-system/sw/bin/bash";
+              description = "Shell to spawn for new PTYs. Defaults to the user's login shell.";
+            };
+
+            scrollback = mkOption {
+              type = types.int;
+              default = 10000;
+              description = "Scrollback buffer size in rows per PTY.";
+            };
+          };
+
+          config = mkIf cfg.enable {
+            systemd.services = builtins.listToAttrs (map (user: {
+              name = "blit@${user}";
+              value = {
+                description = "blit terminal multiplexer for ${user}";
+                requires = [ "blit@${user}.socket" ];
+                serviceConfig = {
+                  Type = "simple";
+                  User = user;
+                  ExecStart = let
+                    serverBin = "${cfg.package}/bin/blit-server";
+                  in "${serverBin}";
+                  Environment = lib.optional (cfg.shell != null) "SHELL=${cfg.shell}"
+                    ++ [ "HOME=%h" "BLIT_SCROLLBACK=${toString cfg.scrollback}" ];
+                };
+              };
+            }) cfg.users);
+
+            systemd.sockets = builtins.listToAttrs (map (user: {
+              name = "blit@${user}";
+              value = {
+                description = "blit terminal multiplexer socket for ${user}";
+                wantedBy = [ "sockets.target" ];
+                socketConfig = {
+                  ListenStream = "/run/blit/${user}.sock";
+                  SocketUser = user;
+                  SocketMode = "0700";
+                  RuntimeDirectory = "blit";
+                  RuntimeDirectoryMode = "0755";
+                };
+              };
+            }) cfg.users);
+          };
+        };
+    } //
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -13,7 +89,50 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.1.5";
+        version = "0.2.0";
+
+        weztermHash = "sha256-V6WvkNZryYofarsyfcmsuvtpNJ/c3O+DmOKNvoYPbmA=";
+        finlUnicodeHash = "sha256-38S6XH4hldbkb6NP+s7lXa/NR49PI0w3KYqd+jPHND0=";
+        cargoLockConfig = {
+          lockFile = ./Cargo.lock;
+          outputHashes =
+            { "finl_unicode-1.3.0" = finlUnicodeHash; }
+            // builtins.listToAttrs (map (name: { inherit name; value = weztermHash; }) [
+              "filedescriptor-0.8.3"
+              "termwiz-0.24.0"
+              "vtparse-0.7.0"
+              "wezterm-bidi-0.2.3"
+              "wezterm-blob-leases-0.1.1"
+              "wezterm-cell-0.1.0"
+              "wezterm-char-props-0.1.3"
+              "wezterm-color-types-0.3.0"
+              "wezterm-dynamic-0.2.1"
+              "wezterm-dynamic-derive-0.1.1"
+              "wezterm-escape-parser-0.1.0"
+              "wezterm-input-types-0.1.0"
+              "wezterm-surface-0.1.0"
+              "wezterm-term-0.1.0"
+            ]);
+        };
+
+        # wezterm-term uses include_bytes!("../../../termwiz/data/wezterm") which
+        # reaches outside its crate into the wezterm monorepo.  When nix vendors
+        # crates individually, that path doesn't exist.  Place it where the
+        # include_bytes! expects it relative to the cargo vendor dir.
+        # wezterm-term's include_bytes! references a terminfo file via a
+        # relative path that escapes the crate root into the wezterm monorepo.
+        # When nix vendors the crate, that path doesn't exist.  Fix it by
+        # placing the file where the include_bytes! expects it.
+        patchWeztermTerminfo = ''
+          for d in "cargo-vendor-dir" "$NIX_BUILD_TOP/cargo-vendor-dir"; do
+            if [ -d "$d/wezterm-term-0.1.0" ]; then
+              mkdir -p "$d/termwiz/data"
+              cp ${./vendor-patches/wezterm-terminfo} "$d/termwiz/data/wezterm"
+              echo "patched wezterm-term vendor at $d"
+              break
+            fi
+          done
+        '';
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" "x86_64-unknown-linux-musl" ];
@@ -29,7 +148,7 @@
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-browser" ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
           nativeBuildInputs = [ pkgs.wasm-pack pkgs.wasm-bindgen-cli pkgs.binaryen ];
           buildPhase = ''
             cd browser
@@ -44,7 +163,7 @@
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit" ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
           nativeBuildInputs = [ pkgs.wasm-pack pkgs.wasm-bindgen-cli pkgs.binaryen ];
           buildPhase = ''
             cd npm
@@ -59,7 +178,7 @@
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit" ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
           nativeBuildInputs = [ pkgs.wasm-pack pkgs.wasm-bindgen-cli pkgs.binaryen ];
           buildPhase = ''
             cd npm
@@ -105,12 +224,45 @@
           '';
         };
 
+        react-publish = pkgs.writeShellApplication {
+          name = "react-publish";
+          runtimeInputs = [ pkgs.nodejs ];
+          text = ''
+            tmp=$(mktemp -d)
+            trap 'rm -rf "$tmp"' EXIT
+
+            # Set up blit-browser as a resolvable package for tsc
+            wasm="$tmp/blit-browser"
+            mkdir -p "$wasm"
+            cp ${browserWasm}/blit_browser.js ${browserWasm}/blit_browser.d.ts "$wasm"/
+            # Also grab the .wasm.d.ts if present
+            cp ${browserWasm}/blit_browser_bg.wasm.d.ts "$wasm"/ 2>/dev/null || true
+            echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > "$wasm/package.json"
+
+            # Copy the react package source
+            cp -a ${./react}/* "$tmp"/
+            chmod -R u+w "$tmp"
+
+            cd "$tmp"
+            # Point the devDependency at our local WASM build
+            ${pkgs.nodejs}/bin/npm pkg set "devDependencies.blit-browser=file:$wasm"
+            npm install
+            npm run build
+
+            echo "Package contents:"
+            ls -lh dist/
+            echo ""
+            npm publish "$@"
+          '';
+        };
+
         blit-server = rustPlatform.buildRustPackage {
           pname = "blit-server";
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-server" ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
+          preBuild = patchWeztermTerminfo;
           doCheck = false;
         };
 
@@ -119,7 +271,8 @@
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-cli" ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
+          preBuild = copyWebAssets;
           doCheck = false;
           meta.mainProgram = "blit";
         };
@@ -129,7 +282,7 @@
           inherit version;
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-gateway" ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
           preBuild = ''
             mkdir -p web
             cp ${browserWasm}/blit_browser_bg.wasm web/
@@ -152,7 +305,8 @@
           inherit pname version;
           src = ./.;
           cargoBuildFlags = [ "-p" cargoPkg ];
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = cargoLockConfig;
+          preBuild = patchWeztermTerminfo;
           doCheck = false;
         } // extraArgs);
 
@@ -161,9 +315,23 @@
           cargoPkg = "blit-server";
         };
 
+        copyWebAssets = ''
+          mkdir -p web/snippets
+          cp ${browserWasm}/blit_browser.js web/
+          cp ${browserWasm}/blit_browser_bg.wasm web/
+          cp ${browserWasm}/blit_browser.d.ts web/
+          cp ${browserWasm}/blit_browser_bg.wasm.d.ts web/
+          for d in ${browserWasm}/snippets/blit-browser-*/; do
+            name=$(basename "$d")
+            mkdir -p "web/snippets/$name"
+            cp "$d"/* "web/snippets/$name/"
+          done
+        '';
+
         blit-cli-static = mkStaticBin {
           pname = "blit-cli";
           cargoPkg = "blit-cli";
+          extraArgs = { preBuild = copyWebAssets; };
         };
 
         blit-gateway-static = mkStaticBin {
@@ -179,7 +347,7 @@
         };
 
 
-        mkDeb = { pname, binName ? pname, binPkg, description }: pkgs.stdenv.mkDerivation {
+        mkDeb = { pname, binName ? pname, binPkg, description, extraInstall ? "" }: pkgs.stdenv.mkDerivation {
           pname = "${pname}-deb";
           inherit version;
           nativeBuildInputs = [ pkgs.dpkg ];
@@ -189,6 +357,7 @@
             in ''
               mkdir -p pkg/DEBIAN pkg/usr/bin
               cp ${binPkg}/bin/${binName} pkg/usr/bin/
+              ${extraInstall}
               cat > pkg/DEBIAN/control <<'CTRL'
 Package: ${pname}
 Version: ${version}
@@ -208,12 +377,21 @@ CTRL
         packages.blit-gateway = blit-gateway;
         packages.blit-client = blit-client-bundler;
         packages.npm-publish = npm-publish;
+        packages.react-publish = react-publish;
         packages.default = blit-cli;
 
         packages.blit-server-deb = mkDeb {
           pname = "blit-server";
           binPkg = blit-server-static;
           description = "blit terminal streaming server";
+          extraInstall = let
+            socketUnit = ./systemd + "/blit@.socket";
+            serviceUnit = ./systemd + "/blit@.service";
+          in ''
+            mkdir -p pkg/lib/systemd/system
+            cp ${socketUnit} pkg/lib/systemd/system/blit@.socket
+            cp ${serviceUnit} pkg/lib/systemd/system/blit@.service
+          '';
         };
         packages.blit-cli-deb = mkDeb {
           pname = "blit";
@@ -239,7 +417,7 @@ CTRL
 
           shellHook = ''
             echo "blit dev shell"
-            echo "  dev:                dev  (server + gateway, auto-reload on source change)"
+            echo "  dev:                dev  (server + gateway + browser assets, auto-reload on source change)"
             echo "  build:              build"
             echo "  run server:         cargo run -p blit-server"
             echo "  run gateway:        BLIT_PASS=secret cargo run -p blit-gateway  # http://localhost:3264"

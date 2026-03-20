@@ -1,0 +1,9 @@
+[Unit]
+Description=blit terminal multiplexer for %i
+Requires=blit@%i.socket
+
+[Service]
+Type=simple
+User=%i
+ExecStart=blit-server
+Restart=no

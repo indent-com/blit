@@ -1,7 +1,8 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-const GLYPHS: &[u8] = b"@#$%&*+=<>^~!?|/\\[]{}()0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const GLYPHS: &[u8] =
+    b"@#$%&*+=<>^~!?|/\\[]{}()0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 struct Args {
     fps: u64,
@@ -116,11 +117,10 @@ impl RawMode {
                 | libc::ICRNL
                 | libc::IXON);
             raw.c_oflag &= !libc::OPOST;
-            raw.c_lflag &=
-                !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
+            raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
             raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
             raw.c_cflag |= libc::CS8;
-            raw.c_cc[libc::VMIN] = 0;  // non-blocking reads
+            raw.c_cc[libc::VMIN] = 0; // non-blocking reads
             raw.c_cc[libc::VTIME] = 0;
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
             Self { saved }
@@ -207,9 +207,7 @@ fn stamp_splash(
     }
 
     let (base_angle, spread) = match direction {
-        Some((dx, dy)) if dx.abs() + dy.abs() > 0.1 => {
-            (dy.atan2(dx) + std::f32::consts::PI, 0.9)
-        }
+        Some((dx, dy)) if dx.abs() + dy.abs() > 0.1 => (dy.atan2(dx) + std::f32::consts::PI, 0.9),
         _ => (0.0, std::f32::consts::PI),
     };
 
@@ -255,7 +253,10 @@ fn main() -> io::Result<()> {
     let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps);
 
     let mut rng = Rng::new();
-    let star_count = |c: u16, r: u16| args.stars.unwrap_or(((c as usize * r as usize) / 60).max(8));
+    let star_count = |c: u16, r: u16| {
+        args.stars
+            .unwrap_or(((c as usize * r as usize) / 60).max(8))
+    };
     let mut stars = gen_stars(&mut rng, cols, rows, star_count(cols, rows));
     let mut frame: u64 = 0;
     let start = Instant::now();
@@ -317,11 +318,22 @@ fn main() -> io::Result<()> {
             if brightness < 0.1 {
                 write!(seq_buf, "\x1b[{};{}H\x1b[0m ", star.row, star.col).unwrap();
             } else {
-                let glyph = if brightness > 0.72 { '*' } else if brightness > 0.38 { '+' } else { '.' };
+                let glyph = if brightness > 0.72 {
+                    '*'
+                } else if brightness > 0.38 {
+                    '+'
+                } else {
+                    '.'
+                };
                 let v = (40.0 + brightness * 215.0) as u8;
                 let r = (v as f32 * 0.82) as u8;
                 let g = (v as f32 * 0.88) as u8;
-                write!(seq_buf, "\x1b[{};{}H\x1b[38;2;{r};{g};{v}m{glyph}", star.row, star.col).unwrap();
+                write!(
+                    seq_buf,
+                    "\x1b[{};{}H\x1b[38;2;{r};{g};{v}m{glyph}",
+                    star.row, star.col
+                )
+                .unwrap();
             }
         }
 
@@ -331,8 +343,7 @@ fn main() -> io::Result<()> {
         let motion = drift_col.abs() + drift_row.abs();
 
         // Stamp fresh particles behind the cursor and let the terminal keep the trail.
-        let emit_count =
-            ((4.0 + work_scale * 5.0 + motion * 0.9).round() as usize).clamp(4, 14);
+        let emit_count = ((4.0 + work_scale * 5.0 + motion * 0.9).round() as usize).clamp(4, 14);
         let tail_col = mouse_col as f32 - drift_col * 0.8;
         let tail_row = mouse_row as f32 - drift_row * 0.5;
         for i in 0..emit_count {
@@ -350,8 +361,7 @@ fn main() -> io::Result<()> {
                 0.7 + motion * 0.05,
             );
         }
-        let splash_count =
-            ((motion * 1.3 + work_scale * 2.0).round() as usize).clamp(0, 8);
+        let splash_count = ((motion * 1.3 + work_scale * 2.0).round() as usize).clamp(0, 8);
         stamp_splash(
             &mut seq_buf,
             &mut rng,
@@ -368,9 +378,9 @@ fn main() -> io::Result<()> {
 
         // Clicks add a short spark pulse without replacing the cursor trail.
         for burst in &mut bursts {
-            let burst_emit =
-                (((12_i32 - burst.age as i32 * 2).max(0) as f32) * work_scale.max(0.45)).round()
-                    as usize;
+            let burst_emit = (((12_i32 - burst.age as i32 * 2).max(0) as f32)
+                * work_scale.max(0.45))
+            .round() as usize;
             let burst_emit = burst_emit.clamp(0, 12);
             stamp_splash(
                 &mut seq_buf,

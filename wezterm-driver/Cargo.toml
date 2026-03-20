@@ -1,0 +1,9 @@
+[package]
+name = "blit-wezterm"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+blit-remote = { path = "../remote" }
+wezterm-term = { git = "https://github.com/wez/wezterm", rev = "05343b387085842b434d267f91b6b0ec157e4331", package = "wezterm-term" }
+wezterm-surface = { git = "https://github.com/wez/wezterm", rev = "05343b387085842b434d267f91b6b0ec157e4331", package = "wezterm-surface" }

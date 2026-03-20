@@ -1,8 +1,10 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{FromRequest, State, WebSocketUpgrade};
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -38,8 +40,7 @@ impl axum::serve::Listener for NoDelayListener {
 }
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");
-const BROWSER_JS: &[u8] = include_bytes!("../../web/blit_browser.js");
-const BROWSER_WASM: &[u8] = include_bytes!("../../web/blit_browser_bg.wasm");
+const WEB_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../web");
 
 struct Config {
     passphrase: String,
@@ -98,24 +99,12 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn root_handler(
-    State(state): State<AppState>,
-    request: axum::extract::Request,
-) -> Response {
+async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let path = request.uri().path();
-    if path.ends_with("/blit_browser.js") {
-        return (
-            [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-            BROWSER_JS,
-        )
-            .into_response();
-    }
-    if path.ends_with("/blit_browser_bg.wasm") {
-        return (
-            [(axum::http::header::CONTENT_TYPE, "application/wasm")],
-            BROWSER_WASM,
-        )
-            .into_response();
+    if let Some(asset_path) = static_asset_path(path) {
+        if let Ok(bytes) = tokio::fs::read(&asset_path).await {
+            return ([(CONTENT_TYPE, content_type(&asset_path))], bytes).into_response();
+        }
     }
     let is_ws = request
         .headers()
@@ -130,6 +119,33 @@ async fn root_handler(
         }
     } else {
         Html(INDEX_HTML).into_response()
+    }
+}
+
+fn static_asset_path(path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let relative = Path::new(trimmed);
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(Path::new(WEB_ROOT).join(relative))
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
+        "js" => "application/javascript",
+        "wasm" => "application/wasm",
+        "d.ts" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
 
@@ -182,11 +198,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
 
     let sock_to_ws = tokio::spawn(async move {
         while let Some(data) = read_frame(&mut sock_reader).await {
-            if ws_tx
-                .send(Message::Binary(data.into()))
-                .await
-                .is_err()
-            {
+            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
                 break;
             }
         }

@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["server", "gateway", "browser", "demo", "cli", "npm"]
+members = [
+    "remote",
+    "wezterm-driver",
+    "server",
+    "gateway",
+    "browser",
+    "demo",
+    "cli",
+    "npm",
+]
 
 [profile.release]
 opt-level = "s"

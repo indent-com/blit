@@ -1,0 +1,15 @@
+[Unit]
+Description=blit terminal multiplexer
+Requires=blit.socket
+
+[Service]
+Type=simple
+ExecStart=blit-server
+# Keep running after all clients disconnect — PTYs stay alive.
+# Stop manually with: systemctl --user stop blit.service
+Restart=no
+# Socket activation passes the fd; BLIT_SOCK is not used.
+# Environment inherits from the user session (SHELL, TERM, etc).
+
+[Install]
+WantedBy=default.target
