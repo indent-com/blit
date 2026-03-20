@@ -3,12 +3,31 @@ use std::time::{Duration, Instant};
 
 const GLYPHS: &[u8] = b"@#$%&*+=<>^~!?|/\\[]{}()0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|v| v.clamp(min, max))
-        .unwrap_or(default)
+struct Args {
+    fps: u64,
+    stars: Option<usize>,
+}
+
+fn parse_args() -> Args {
+    let mut fps = 120u64;
+    let mut stars = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--fps" => {
+                if let Some(n) = it.next().and_then(|s| s.parse::<u64>().ok()) {
+                    fps = n.clamp(1, 1_000);
+                }
+            }
+            "--stars" => {
+                if let Some(n) = it.next().and_then(|s| s.parse::<usize>().ok()) {
+                    stars = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    Args { fps, stars }
 }
 
 fn get_term_size() -> (u16, u16) {
@@ -117,6 +136,24 @@ impl Drop for RawMode {
     }
 }
 
+struct Star {
+    col: u16,
+    row: u16,
+    phase: f32,
+    speed: f32,
+}
+
+fn gen_stars(rng: &mut Rng, cols: u16, rows: u16, count: usize) -> Vec<Star> {
+    (0..count)
+        .map(|_| Star {
+            col: (rng.next() % cols as u64) as u16 + 1,
+            row: (rng.next() % rows as u64) as u16 + 1,
+            phase: rng.next_f32() * std::f32::consts::TAU,
+            speed: 0.02 + rng.next_f32() * 0.06,
+        })
+        .collect()
+}
+
 /// Short-lived click pulse that emits extra particles.
 struct Burst {
     col: u16, // 1-indexed
@@ -198,6 +235,7 @@ fn stamp_splash(
 }
 
 fn main() -> io::Result<()> {
+    let args = parse_args();
     let (mut cols, mut rows) = get_term_size();
     let mut parser = vt100::Parser::new(rows, cols, 0);
     parser.process(b"\x1b[?25l"); // keep parser in sync: cursor hidden
@@ -213,13 +251,13 @@ fn main() -> io::Result<()> {
     let _raw = RawMode::enter();
     let _cleanup = Cleanup; // dropped before _raw
 
-    let target_fps = env_u64("BLIT_DEMO_FPS", 120, 1, 1_000);
+    let target_fps = args.fps;
     let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps);
-    let title_interval = Duration::from_nanos(100_000_000); //  10 Hz
 
     let mut rng = Rng::new();
+    let star_count = |c: u16, r: u16| args.stars.unwrap_or(((c as usize * r as usize) / 60).max(8));
+    let mut stars = gen_stars(&mut rng, cols, rows, star_count(cols, rows));
     let mut frame: u64 = 0;
-    let mut last_title = Instant::now();
     let start = Instant::now();
     let mut next_frame_at = start + frame_interval;
 
@@ -267,9 +305,26 @@ fn main() -> io::Result<()> {
             parser = vt100::Parser::new(rows, cols, 0);
             parser.process(b"\x1b[?25l");
             write!(out, "\x1b[2J")?;
+            stars = gen_stars(&mut rng, cols, rows, star_count(cols, rows));
         }
 
         seq_buf.clear();
+
+        // Stars (background layer) — rendered first so particles paint over them.
+        for star in &mut stars {
+            star.phase = (star.phase + star.speed) % std::f32::consts::TAU;
+            let brightness = (star.phase.sin() + 1.0) * 0.5; // [0.0, 1.0]
+            if brightness < 0.1 {
+                write!(seq_buf, "\x1b[{};{}H\x1b[0m ", star.row, star.col).unwrap();
+            } else {
+                let glyph = if brightness > 0.72 { '*' } else if brightness > 0.38 { '+' } else { '.' };
+                let v = (40.0 + brightness * 215.0) as u8;
+                let r = (v as f32 * 0.82) as u8;
+                let g = (v as f32 * 0.88) as u8;
+                write!(seq_buf, "\x1b[{};{}H\x1b[38;2;{r};{g};{v}m{glyph}", star.row, star.col).unwrap();
+            }
+        }
+
         let hue_base = (frame * 7 % 360) as u16;
         let drift_col = mouse_col as f32 - last_mouse_col as f32;
         let drift_row = mouse_row as f32 - last_mouse_row as f32;
@@ -361,19 +416,16 @@ fn main() -> io::Result<()> {
         last_mouse_col = mouse_col;
         last_mouse_row = mouse_row;
 
-        if last_title.elapsed() >= title_interval {
-            let elapsed = start.elapsed().as_secs_f64();
-            let fps = frame as f64 / elapsed.max(0.001);
-            write!(
-                out,
-                "\x1b]0;blit-demo | frame {} | {:.0} fps | load {:.0}% | particles {}\x07",
-                frame,
-                fps,
-                work_scale * 100.0,
-                emit_count,
-            )?;
-            last_title = Instant::now();
-        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let fps = frame as f64 / elapsed.max(0.001);
+        write!(
+            out,
+            "\x1b]0;blit-demo | frame {} | {:.0} fps | load {:.0}% | particles {}\x07",
+            frame,
+            fps,
+            work_scale * 100.0,
+            emit_count,
+        )?;
 
         out.flush()?;
         frame += 1;

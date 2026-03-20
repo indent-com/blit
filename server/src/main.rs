@@ -36,7 +36,7 @@ const S2C_TITLE: u8 = 0x04;
 // [8..12] content (up to 4 bytes UTF-8)
 const CELL_SIZE: usize = 12;
 
-const SCROLLBACK_ROWS: usize = 100_000;
+const SCROLLBACK_ROWS_DEFAULT: usize = 100_000;
 
 #[derive(Default)]
 struct TitleCallbacks {
@@ -57,6 +57,7 @@ impl vt100::Callbacks for TitleCallbacks {
 
 struct Config {
     shell: String,
+    scrollback: usize,
 }
 
 struct OwnedFd(RawFd);
@@ -476,7 +477,7 @@ fn nudge_delivery(state: &AppState) {
     state.3.notify_one();
 }
 
-fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, argv: Option<&[&str]>, state: AppState) -> Option<Pty> {
+fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, argv: Option<&[&str]>, scrollback: usize, state: AppState) -> Option<Pty> {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     unsafe {
@@ -564,7 +565,7 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, id: u16, argv: Option<&[&str]>, 
         parser: vt100::Parser::new_with_callbacks(
             rows,
             cols,
-            SCROLLBACK_ROWS,
+            scrollback,
             TitleCallbacks::default(),
         ),
         dirty: true,
@@ -885,8 +886,12 @@ fn bind_socket() -> UnixListener {
 #[tokio::main]
 async fn main() {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let scrollback = std::env::var("BLIT_SCROLLBACK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SCROLLBACK_ROWS_DEFAULT);
     let state: AppState = Arc::new((
-        Config { shell },
+        Config { shell, scrollback },
         Mutex::new(Session::new()),
         Arc::new(std::sync::RwLock::new(HashMap::new())),
         Arc::new(Notify::new()),
@@ -1312,7 +1317,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 };
                 let id = sess.next_pty_id;
                 sess.next_pty_id += 1;
-                if let Some(pty) = spawn_pty(&config.shell, rows, cols, id, argv.as_deref(), state.clone()) {
+                if let Some(pty) = spawn_pty(&config.shell, rows, cols, id, argv.as_deref(), config.scrollback, state.clone()) {
                     sess.ptys.insert(id, pty);
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.focus = Some(id);
