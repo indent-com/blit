@@ -368,7 +368,8 @@ Type <kbd>&gt;</kbd><em>command</em> in Expose and press <kbd>Enter</kbd> &mdash
 <kbd>Ctrl</kbd>+<kbd>?</kbd> &mdash; Toggle this help
 </div></div>
 <script type="module">
-const { default: init, Terminal } = await import('/blit_browser.js');
+const _base = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]*$/, '');
+const { default: init, Terminal } = await import(_base + 'blit_browser.js');
 
 const DEFAULT_FONT = '"PragmataPro Liga", "PragmataPro", ui-monospace, monospace';
 const PASS_STORAGE_KEY = 'blit.passphrase';

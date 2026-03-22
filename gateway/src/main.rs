@@ -123,11 +123,13 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
 }
 
 fn static_asset_path(path: &str) -> Option<PathBuf> {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
+    // Use only the last path segment — assets are flat in WEB_ROOT and
+    // the gateway may be mounted behind a reverse proxy at a sub-path.
+    let filename = path.rsplit('/').next().unwrap_or("");
+    if filename.is_empty() {
         return None;
     }
-    let relative = Path::new(trimmed);
+    let relative = Path::new(filename);
     if relative
         .components()
         .any(|component| !matches!(component, Component::Normal(_)))
@@ -226,9 +228,10 @@ mod tests {
     }
 
     #[test]
-    fn static_asset_path_nested() {
+    fn static_asset_path_nested_uses_filename_only() {
+        // Gateway may be behind a reverse proxy at a sub-path
         let result = static_asset_path("/assets/style.css").unwrap();
-        assert_eq!(result, Path::new(WEB_ROOT).join("assets/style.css"));
+        assert_eq!(result, Path::new(WEB_ROOT).join("style.css"));
     }
 
     #[test]
@@ -248,28 +251,21 @@ mod tests {
 
     #[test]
     fn static_asset_path_traversal_dotdot() {
-        assert!(static_asset_path("/../etc/passwd").is_none());
-    }
-
-    #[test]
-    fn static_asset_path_traversal_mid() {
-        assert!(static_asset_path("/assets/../../../etc/passwd").is_none());
+        // Last segment is "passwd" which is a normal filename
+        let result = static_asset_path("/../etc/passwd").unwrap();
+        assert_eq!(result, Path::new(WEB_ROOT).join("passwd"));
     }
 
     #[test]
     fn static_asset_path_double_dots_bare() {
+        // Last segment is ".." which is Component::ParentDir
         assert!(static_asset_path("/..").is_none());
     }
 
     #[test]
     fn static_asset_path_current_dir_dot() {
-        // "." is Component::CurDir, not Component::Normal
+        // Last segment is "." which is Component::CurDir
         assert!(static_asset_path("/.").is_none());
-    }
-
-    #[test]
-    fn static_asset_path_dot_in_middle() {
-        assert!(static_asset_path("/./foo").is_none());
     }
 
     #[test]
@@ -279,9 +275,16 @@ mod tests {
     }
 
     #[test]
-    fn static_asset_path_deeply_nested() {
+    fn static_asset_path_deeply_nested_uses_filename() {
         let result = static_asset_path("/a/b/c/d.wasm").unwrap();
-        assert_eq!(result, Path::new(WEB_ROOT).join("a/b/c/d.wasm"));
+        assert_eq!(result, Path::new(WEB_ROOT).join("d.wasm"));
+    }
+
+    #[test]
+    fn static_asset_path_reverse_proxy_prefix() {
+        // /vt/blit_browser.js → just "blit_browser.js"
+        let result = static_asset_path("/vt/blit_browser.js").unwrap();
+        assert_eq!(result, Path::new(WEB_ROOT).join("blit_browser.js"));
     }
 
     // --- content_type tests ---
