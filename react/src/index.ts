@@ -21,4 +21,7 @@ export type {
   BlitTerminalProps,
   BlitSession,
   ConnectionStatus,
+  TerminalPalette,
 } from './types';
+
+export { PALETTES } from './palettes';

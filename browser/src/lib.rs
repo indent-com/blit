@@ -32,7 +32,7 @@ const MODE_ECHO: u16 = 1 << 9;
 const MODE_ICANON: u16 = 1 << 10;
 const MODE_ALT_SCREEN: u16 = 1 << 11;
 
-const ANSI_COLORS: [[u8; 3]; 16] = [
+const DEFAULT_ANSI_COLORS: [[u8; 3]; 16] = [
     [0, 0, 0],
     [170, 0, 0],
     [0, 170, 0],
@@ -51,11 +51,89 @@ const ANSI_COLORS: [[u8; 3]; 16] = [
     [255, 255, 255],
 ];
 
-fn idx_to_rgb(idx: u8) -> (u8, u8, u8) {
-    if idx < 16 {
-        let c = ANSI_COLORS[idx as usize];
-        return (c[0], c[1], c[2]);
+#[derive(Clone)]
+struct Palette {
+    ansi_16: [[u8; 3]; 16],
+    default_fg: [u8; 3],
+    default_bg: [u8; 3],
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            ansi_16: DEFAULT_ANSI_COLORS,
+            default_fg: [204, 204, 204],
+            default_bg: [0, 0, 0],
+        }
     }
+}
+
+impl Palette {
+    fn idx_to_rgb(&self, idx: u8) -> (u8, u8, u8) {
+        if idx < 16 {
+            let c = self.ansi_16[idx as usize];
+            return (c[0], c[1], c[2]);
+        }
+        idx_to_rgb_high(idx)
+    }
+
+    fn resolve(&self, color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> CellColor {
+        match color_type {
+            0 => {
+                let [cr, cg, cb] = if is_fg { self.default_fg } else { self.default_bg };
+                let (r, g, b) = if dim && is_fg {
+                    ((cr as u16 * 6 / 10) as u8, (cg as u16 * 6 / 10) as u8, (cb as u16 * 6 / 10) as u8)
+                } else {
+                    (cr, cg, cb)
+                };
+                CellColor { r, g, b, is_default: true }
+            }
+            1 => {
+                let (cr, cg, cb) = self.idx_to_rgb(r);
+                let (r, g, b) = if dim { (cr / 2, cg / 2, cb / 2) } else { (cr, cg, cb) };
+                CellColor { r, g, b, is_default: false }
+            }
+            2 => {
+                let (r, g, b) = if dim { (r / 2, g / 2, b / 2) } else { (r, g, b) };
+                CellColor { r, g, b, is_default: false }
+            }
+            _ => {
+                let [cr, cg, cb] = if is_fg { self.default_fg } else { self.default_bg };
+                CellColor { r: cr, g: cg, b: cb, is_default: true }
+            }
+        }
+    }
+
+    fn default_bg_packed(&self) -> u32 {
+        let [r, g, b] = self.default_bg;
+        (1u32 << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+    }
+
+    fn color_css(&self, color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> String {
+        let (cr, cg, cb) = match color_type {
+            0 => {
+                let [dr, dg, db] = if is_fg { self.default_fg } else { self.default_bg };
+                if dim && is_fg {
+                    return format!("rgb({},{},{})",
+                        (dr as u16 * 6 / 10) as u8,
+                        (dg as u16 * 6 / 10) as u8,
+                        (db as u16 * 6 / 10) as u8);
+                }
+                return format!("#{:02x}{:02x}{:02x}", dr, dg, db);
+            }
+            1 => self.idx_to_rgb(r),
+            2 => (r, g, b),
+            _ => {
+                let [dr, dg, db] = if is_fg { self.default_fg } else { self.default_bg };
+                return format!("#{:02x}{:02x}{:02x}", dr, dg, db);
+            }
+        };
+        let (cr, cg, cb) = if dim { (cr / 2, cg / 2, cb / 2) } else { (cr, cg, cb) };
+        format!("#{:02x}{:02x}{:02x}", cr, cg, cb)
+    }
+}
+
+fn idx_to_rgb_high(idx: u8) -> (u8, u8, u8) {
     if idx < 232 {
         let i = idx - 16;
         let r = (i / 36) * 51;
@@ -77,122 +155,12 @@ struct CellColor {
 }
 
 impl CellColor {
-    const DEFAULT_FG: Self = Self {
-        r: 204,
-        g: 204,
-        b: 204,
-        is_default: true,
-    };
-    const DEFAULT_BG: Self = Self {
-        r: 0,
-        g: 0,
-        b: 0,
-        is_default: true,
-    };
-    const DIM_FG: Self = Self {
-        r: 102,
-        g: 102,
-        b: 102,
-        is_default: false,
-    };
-    const DIM_BG: Self = Self {
-        r: 0,
-        g: 0,
-        b: 0,
-        is_default: false,
-    };
-
-    fn resolve(color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> Self {
-        match color_type {
-            0 => {
-                if dim {
-                    if is_fg {
-                        Self::DIM_FG
-                    } else {
-                        Self::DIM_BG
-                    }
-                } else if is_fg {
-                    Self::DEFAULT_FG
-                } else {
-                    Self::DEFAULT_BG
-                }
-            }
-            1 => {
-                let (cr, cg, cb) = idx_to_rgb(r);
-                if dim {
-                    Self {
-                        r: cr / 2,
-                        g: cg / 2,
-                        b: cb / 2,
-                        is_default: false,
-                    }
-                } else {
-                    Self {
-                        r: cr,
-                        g: cg,
-                        b: cb,
-                        is_default: false,
-                    }
-                }
-            }
-            2 => {
-                if dim {
-                    Self {
-                        r: r / 2,
-                        g: g / 2,
-                        b: b / 2,
-                        is_default: false,
-                    }
-                } else {
-                    Self {
-                        r,
-                        g,
-                        b,
-                        is_default: false,
-                    }
-                }
-            }
-            _ => {
-                if is_fg {
-                    Self::DEFAULT_FG
-                } else {
-                    Self::DEFAULT_BG
-                }
-            }
-        }
-    }
-
     /// Pack into u32 for fill-style change detection (no String needed).
     fn pack(&self) -> u32 {
         ((self.is_default as u32) << 24)
             | ((self.r as u32) << 16)
             | ((self.g as u32) << 8)
             | self.b as u32
-    }
-
-}
-
-fn color_css(color_type: u8, r: u8, g: u8, b: u8, default: &str, dim: bool) -> String {
-    let (cr, cg, cb) = match color_type {
-        0 => {
-            return if dim {
-                if default == "#ccc" {
-                    "rgb(102,102,102)".into()
-                } else {
-                    "rgb(0,0,0)".into()
-                }
-            } else {
-                default.into()
-            };
-        }
-        1 => idx_to_rgb(r),
-        2 => (r, g, b),
-        _ => return default.into(),
-    };
-    if dim {
-        format!("rgb({},{},{})", cr / 2, cg / 2, cb / 2)
-    } else {
-        format!("rgb({cr},{cg},{cb})")
     }
 }
 
@@ -561,6 +529,7 @@ pub struct Terminal {
     cell_width: f64,
     cell_height: f64,
     font_family: String,
+    palette: Palette,
     inner: TerminalState,
     painted_cells: Vec<u8>,
     painted_rows: u16,
@@ -584,6 +553,7 @@ impl Terminal {
             cell_width,
             cell_height,
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
+            palette: Palette::default(),
             inner: TerminalState::new(rows, cols),
             painted_cells: Vec::new(),
             painted_rows: 0,
@@ -627,6 +597,19 @@ impl Terminal {
         self.font_family.clear();
         self.font_family.push_str(next);
         self.invalidate_render_cache();
+    }
+
+    pub fn set_default_colors(&mut self, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g: u8, bg_b: u8) {
+        self.palette.default_fg = [fg_r, fg_g, fg_b];
+        self.palette.default_bg = [bg_r, bg_g, bg_b];
+        self.invalidate_render_cache();
+    }
+
+    pub fn set_ansi_color(&mut self, idx: u8, r: u8, g: u8, b: u8) {
+        if idx < 16 {
+            self.palette.ansi_16[idx as usize] = [r, g, b];
+            self.invalidate_render_cache();
+        }
     }
 
     pub fn mouse_mode(&self) -> u8 {
@@ -740,8 +723,13 @@ impl Terminal {
     }
 
     pub fn get_html(&self, start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> String {
-        let mut html = String::from(
-            "<pre style=\"font-family:ui-monospace,monospace;background:#000;color:#ccc;padding:4px\">",
+        let [dfr, dfg, dfb] = self.palette.default_fg;
+        let [dbr, dbg, dbb] = self.palette.default_bg;
+        let default_fg_css = format!("#{:02x}{:02x}{:02x}", dfr, dfg, dfb);
+        let default_bg_css = format!("#{:02x}{:02x}{:02x}", dbr, dbg, dbb);
+        let mut html = format!(
+            "<pre style=\"font-family:ui-monospace,monospace;background:{};color:{};padding:4px\">",
+            default_bg_css, default_fg_css,
         );
         for row in start_row..=end_row.min(self.inner.rows().saturating_sub(1)) {
             let c0 = if row == start_row { start_col } else { 0 };
@@ -771,13 +759,13 @@ impl Terminal {
                 let content_len = ((f1 >> 3) & 7) as usize;
                 let (fg, bg) = if inverse {
                     (
-                        color_css(bg_type, cell[5], cell[6], cell[7], "#000", dim),
-                        color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", false),
+                        self.palette.color_css(bg_type, cell[5], cell[6], cell[7], false, dim),
+                        self.palette.color_css(fg_type, cell[2], cell[3], cell[4], true, false),
                     )
                 } else {
                     (
-                        color_css(fg_type, cell[2], cell[3], cell[4], "#ccc", dim),
-                        color_css(bg_type, cell[5], cell[6], cell[7], "#000", false),
+                        self.palette.color_css(fg_type, cell[2], cell[3], cell[4], true, dim),
+                        self.palette.color_css(bg_type, cell[5], cell[6], cell[7], false, false),
                     )
                 };
                 let flat = row as usize * self.inner.cols() as usize + col as usize;
@@ -793,15 +781,15 @@ impl Terminal {
                 } else {
                     " ".to_string()
                 };
-                let has_style = fg != "#ccc" || bg != "#000" || bold || italic || underline;
+                let has_style = fg != default_fg_css || bg != default_bg_css || bold || italic || underline;
                 if has_style {
                     let mut style = String::new();
-                    if fg != "#ccc" {
+                    if fg != default_fg_css {
                         style.push_str("color:");
                         style.push_str(&fg);
                         style.push(';');
                     }
-                    if bg != "#000" {
+                    if bg != default_bg_css {
                         style.push_str("background:");
                         style.push_str(&bg);
                         style.push(';');
@@ -930,7 +918,7 @@ impl Terminal {
         let cols = self.inner.cols() as usize;
         let total = rows * cols;
         let normal_font = format!("{}px {}", ch.round().max(1.0) as u32, self.font_family);
-        let black = CellColor::DEFAULT_BG.pack();
+        let black = self.palette.default_bg_packed();
 
         self.bg_ops.clear();
         self.glyph_ops.clear();
@@ -1052,13 +1040,13 @@ impl Terminal {
             let content_len = ((f1 >> 3) & 7) as usize;
             let (fg, bg) = if inverse {
                 (
-                    CellColor::resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
-                    CellColor::resolve(fg_type, cell[2], cell[3], cell[4], true, false),
+                    self.palette.resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
+                    self.palette.resolve(fg_type, cell[2], cell[3], cell[4], true, false),
                 )
             } else {
                 (
-                    CellColor::resolve(fg_type, cell[2], cell[3], cell[4], true, dim),
-                    CellColor::resolve(bg_type, cell[5], cell[6], cell[7], false, false),
+                    self.palette.resolve(fg_type, cell[2], cell[3], cell[4], true, dim),
+                    self.palette.resolve(bg_type, cell[5], cell[6], cell[7], false, false),
                 )
             };
             let cell_cols = if wide { 2 } else { 1 };
@@ -1069,7 +1057,7 @@ impl Terminal {
                 continue;
             }
 
-            let bg_black = bg == CellColor::DEFAULT_BG || bg == CellColor::DIM_BG;
+            let bg_black = bg.is_default;
             self.last_render.note_rect(row, col, 1, cell_cols);
 
             if !do_all && bg_black {

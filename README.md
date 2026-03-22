@@ -330,6 +330,7 @@ Renders a single PTY. Owns FOCUS, RESIZE, INPUT, SCROLL, mouse/keyboard encoding
 | `fontSize` | `number` | Font size in CSS pixels. Default: `13` |
 | `className` | `string` | CSS class for the container div. |
 | `style` | `CSSProperties` | Inline styles for the container div. |
+| `palette` | `TerminalPalette` | Color palette (fg, bg, 16 ANSI colors). See `PALETTES` for built-ins. |
 
 ### Imperative handle
 
@@ -344,6 +345,30 @@ termRef.current?.rows;                  // current grid dimensions
 termRef.current?.cols;
 termRef.current?.status;                // 'connecting' | 'connected' | ...
 ```
+
+### Palettes
+
+Ten built-in palettes are exported as `PALETTES`. Each has an `id`, `name`, `dark` flag, and `fg`/`bg`/`ansi` color arrays (RGB 0–255):
+
+```tsx
+import { BlitTerminal, PALETTES } from "blit-react";
+import type { TerminalPalette } from "blit-react";
+
+// Use a built-in palette
+const nord = PALETTES.find((p) => p.id === 'nord')!;
+<BlitTerminal transport={t} ptyId={id} palette={nord} />
+
+// Build your own
+const custom: TerminalPalette = {
+  id: 'my-theme', name: 'My Theme', dark: true,
+  fg: [200, 200, 200], bg: [20, 20, 20],
+  ansi: [ /* 16 × [r,g,b] entries */ ],
+};
+```
+
+Available built-in IDs: `default`, `solarized-dark`, `solarized-light`, `dracula`, `one-dark`, `nord`, `gruvbox-dark`, `gruvbox-light`, `catppuccin`, `tokyo-night`.
+
+The `dark` field is informational — use it to sync surrounding UI (e.g. set a CSS `color-scheme`). It does not affect rendering.
 
 ### Transport interface
 

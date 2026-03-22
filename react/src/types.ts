@@ -1,5 +1,19 @@
 import type React from 'react';
 
+/** A terminal color palette. */
+export interface TerminalPalette {
+  id: string;
+  name: string;
+  /** true = dark background, false = light background. */
+  dark: boolean;
+  /** Default foreground color as [r, g, b] (0–255). */
+  fg: [number, number, number];
+  /** Default background color as [r, g, b] (0–255). */
+  bg: [number, number, number];
+  /** ANSI 16-color entries, indexed 0–15. */
+  ansi: Array<[number, number, number]>;
+}
+
 /** Connection lifecycle states. */
 export type ConnectionStatus =
   | 'connecting'
@@ -48,6 +62,8 @@ export interface BlitTerminalProps {
   className?: string;
   /** Additional inline styles for the container. */
   style?: React.CSSProperties;
+  /** Color palette applied to the terminal. */
+  palette?: TerminalPalette;
 }
 
 /** Wire protocol constants: client-to-server message types. */

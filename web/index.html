@@ -6,9 +6,64 @@
 <style>
 :root {
     --terminal-font: PragmataPro, ui-monospace, monospace;
+    --term-bg: #000000;
+    --ui-overlay-bg: rgba(3,4,6,0.64);
+    --ui-card-bg-from: rgba(19,23,29,0.78);
+    --ui-card-bg-to: rgba(10,13,18,0.82);
+    --ui-card-bg-hover-from: rgba(24,29,36,0.84);
+    --ui-card-bg-hover-to: rgba(12,16,22,0.88);
+    --ui-border: rgba(255,255,255,0.08);
+    --ui-border-hover: rgba(255,255,255,0.18);
+    --ui-text: #a1acb7;
+    --ui-text-bright: #d9e2ea;
+    --ui-input-bg: rgba(18,22,28,0.72);
+    --ui-input-text: #eef3f8;
+    --ui-placeholder: #6f7a86;
+    --ui-muted: #7c8896;
+    --ui-button-bg: rgba(18,22,28,0.68);
+    --ui-hud: #444;
+    --ui-status: #888;
+    --ui-auth-text: #ccc;
+    --ui-auth-input-bg: #222;
+    --ui-auth-border: #555;
+    --ui-help-bg: #1a1a1a;
+    --ui-help-border: #444;
+    --ui-help-text: #ccc;
+    --ui-help-title: #fff;
+    --ui-kbd-bg: #333;
+    --ui-kbd-border: #555;
+    --ui-kbd-text: #eee;
+}
+html[data-theme="light"] {
+    --ui-overlay-bg: rgba(230,232,235,0.88);
+    --ui-card-bg-from: rgba(255,255,255,0.92);
+    --ui-card-bg-to: rgba(242,244,246,0.96);
+    --ui-card-bg-hover-from: rgba(255,255,255,0.98);
+    --ui-card-bg-hover-to: rgba(245,247,249,0.99);
+    --ui-border: rgba(0,0,0,0.10);
+    --ui-border-hover: rgba(0,0,0,0.22);
+    --ui-text: #4a5568;
+    --ui-text-bright: #1a202c;
+    --ui-input-bg: rgba(255,255,255,0.85);
+    --ui-input-text: #1a202c;
+    --ui-placeholder: #9ca3af;
+    --ui-muted: #718096;
+    --ui-button-bg: rgba(240,242,244,0.9);
+    --ui-hud: #888;
+    --ui-status: #555;
+    --ui-auth-text: #333;
+    --ui-auth-input-bg: #f5f5f5;
+    --ui-auth-border: #ccc;
+    --ui-help-bg: #f8f9fa;
+    --ui-help-border: #ccc;
+    --ui-help-text: #333;
+    --ui-help-title: #111;
+    --ui-kbd-bg: #e8e8e8;
+    --ui-kbd-border: #bbb;
+    --ui-kbd-text: #333;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: var(--terminal-font); }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--term-bg); font-family: var(--terminal-font); }
 canvas { display: block; outline: none; }
 #workspace {
     display: none;
@@ -40,7 +95,7 @@ canvas { display: block; outline: none; }
     position: fixed;
     inset: 0;
     z-index: 8;
-    background: rgba(3, 4, 6, 0.64);
+    background: var(--ui-overlay-bg);
     backdrop-filter: blur(18px) saturate(1.08);
     overflow-y: auto;
     padding: 24px;
@@ -73,27 +128,27 @@ canvas { display: block; outline: none; }
 }
 #expose-search {
     width: 100%;
-    border: 1px solid rgba(255,255,255,0.1);
+    border: 1px solid var(--ui-border);
     border-radius: 14px;
-    background: rgba(18,22,28,0.72);
-    color: #eef3f8;
+    background: var(--ui-input-bg);
+    color: var(--ui-input-text);
     padding: 16px 18px;
     font: 15px/1.2 var(--terminal-font);
     outline: none;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 10px 30px rgba(0,0,0,0.14);
 }
 #expose-search::placeholder {
-    color: #6f7a86;
+    color: var(--ui-placeholder);
 }
 #expose-create {
     flex: 0 0 auto;
     width: 40px;
     height: 40px;
     margin-top: 6px;
-    border: 1px solid rgba(255,255,255,0.1);
+    border: 1px solid var(--ui-border);
     border-radius: 12px;
-    background: rgba(18,22,28,0.68);
-    color: #eef3f8;
+    background: var(--ui-button-bg);
+    color: var(--ui-input-text);
     font: 20px/1 var(--terminal-font);
     cursor: pointer;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 10px 26px rgba(0,0,0,0.12);
@@ -101,21 +156,19 @@ canvas { display: block; outline: none; }
 }
 #expose-create:hover {
     transform: translateY(-1px);
-    border-color: rgba(255,255,255,0.24);
-    background: rgba(28,34,42,0.78);
+    border-color: var(--ui-border-hover);
 }
 #expose-create.selected {
     transform: translateY(-2px);
-    border-color: rgba(255,255,255,0.7);
-    box-shadow: 0 18px 48px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(255,255,255,0.18);
-    color: #fff;
+    border-color: var(--ui-border-hover);
+    box-shadow: 0 18px 48px rgba(0,0,0,0.34), inset 0 0 0 1px var(--ui-border-hover);
 }
 #expose-create:focus-visible {
     outline: 1px solid rgba(133, 197, 255, 0.7);
     outline-offset: 2px;
 }
 #expose-hint {
-    color: #7c8896;
+    color: var(--ui-muted);
     font: 12px/1.3 var(--terminal-font);
     min-height: 1.3em;
 }
@@ -132,31 +185,31 @@ canvas { display: block; outline: none; }
     grid-template-columns: minmax(0, 1fr);
 }
 .preview-card {
-    background: linear-gradient(180deg, rgba(19,23,29,0.78), rgba(10,13,18,0.82));
-    border: 1px solid rgba(255,255,255,0.08);
+    background: linear-gradient(180deg, var(--ui-card-bg-from), var(--ui-card-bg-to));
+    border: 1px solid var(--ui-border);
     border-radius: 16px;
     padding: 12px;
-    color: #a1acb7;
+    color: var(--ui-text);
     cursor: pointer;
     box-shadow: 0 14px 36px rgba(0,0,0,0.14);
     transition: transform 100ms ease, border-color 100ms ease, box-shadow 100ms ease, color 100ms ease, background 100ms ease;
 }
 .preview-card:hover {
     transform: translateY(-1px);
-    border-color: rgba(255,255,255,0.18);
-    color: #d9e2ea;
-    background: linear-gradient(180deg, rgba(24,29,36,0.84), rgba(12,16,22,0.88));
+    border-color: var(--ui-border-hover);
+    color: var(--ui-text-bright);
+    background: linear-gradient(180deg, var(--ui-card-bg-hover-from), var(--ui-card-bg-hover-to));
 }
 .preview-card.active {
     border-color: rgba(133, 197, 255, 0.48);
     box-shadow: inset 0 0 0 1px rgba(133, 197, 255, 0.22);
-    color: #f2f7fb;
+    color: var(--ui-text-bright);
 }
 .preview-card.selected {
     transform: translateY(-2px);
-    border-color: rgba(255,255,255,0.7);
-    box-shadow: 0 18px 48px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(255,255,255,0.18);
-    color: #fff;
+    border-color: var(--ui-border-hover);
+    box-shadow: 0 18px 48px rgba(0,0,0,0.34), inset 0 0 0 1px var(--ui-border-hover);
+    color: var(--ui-text-bright);
 }
 #preview-rail.visible .preview-card {
     animation: exposeCardIn 140ms cubic-bezier(0.18, 0.88, 0.22, 1) both;
@@ -209,14 +262,14 @@ canvas { display: block; outline: none; }
 }
 .preview-context {
     display: none;
-    color: #8e9aa8;
+    color: var(--ui-muted);
     font: 12px/1.4 var(--terminal-font);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 .preview-role {
-    color: #728091;
+    color: var(--ui-muted);
     text-transform: uppercase;
     letter-spacing: 0.08em;
     font-size: 10px;
@@ -302,20 +355,20 @@ canvas { display: block; outline: none; }
 }
 #hud {
     position: fixed; top: 0; right: 0;
-    color: #444; font: 10px/1 var(--terminal-font);
+    color: var(--ui-hud); font: 10px/1 var(--terminal-font);
     padding: 2px 6px; pointer-events: none; z-index: 2;
 }
 #auth {
     position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
-    color: #ccc; font: 14px/1 var(--terminal-font); text-align: center;
+    color: var(--ui-auth-text); font: 14px/1 var(--terminal-font); text-align: center;
 }
 #auth input {
-    background: #222; color: #ccc; border: 1px solid #555;
+    background: var(--ui-auth-input-bg); color: var(--ui-auth-text); border: 1px solid var(--ui-auth-border);
     font: 14px/1 var(--terminal-font); padding: 4px 8px; margin-top: 8px; outline: none;
 }
 #status {
     position: fixed; bottom: 4px; left: 50%; transform: translateX(-50%);
-    color: #888; font: 12px/1 var(--terminal-font); pointer-events: none; z-index: 2;
+    color: var(--ui-status); font: 12px/1 var(--terminal-font); pointer-events: none; z-index: 2;
 }
 .selection-overlay {
     position: fixed; background: rgba(100,150,255,0.3); pointer-events: none; z-index: 1;
@@ -326,14 +379,14 @@ canvas { display: block; outline: none; }
 }
 #help-overlay.visible { display: flex; }
 #help-box {
-    background: #1a1a1a; border: 1px solid #444; border-radius: 6px;
-    padding: 20px 28px; color: #ccc; font: 13px/2 var(--terminal-font);
-    max-width: 420px;
+    background: var(--ui-help-bg); border: 1px solid var(--ui-help-border); border-radius: 6px;
+    padding: 20px 28px; color: var(--ui-help-text); font: 13px/2 var(--terminal-font);
+    max-width: 480px;
 }
-#help-box h2 { font-size: 14px; margin: 0 0 10px; color: #fff; }
+#help-box h2 { font-size: 14px; margin: 0 0 10px; color: var(--ui-help-title); }
 #help-box kbd {
-    background: #333; border: 1px solid #555; border-radius: 3px;
-    padding: 1px 5px; font-size: 12px; color: #eee;
+    background: var(--ui-kbd-bg); border: 1px solid var(--ui-kbd-border); border-radius: 3px;
+    padding: 1px 5px; font-size: 12px; color: var(--ui-kbd-text);
 }
 </style>
 </head>
@@ -374,6 +427,40 @@ const { default: init, Terminal } = await import(_base + 'blit_browser.js');
 const DEFAULT_FONT = '"PragmataPro Liga", "PragmataPro", ui-monospace, monospace';
 const PASS_STORAGE_KEY = 'blit.passphrase';
 const FONT_STORAGE_KEY = 'blit.fontFamily';
+const PALETTE_STORAGE_KEY = 'blit.palette';
+
+const PALETTES = [
+    { id: 'default', name: 'Default', dark: true,
+      fg: [204,204,204], bg: [0,0,0],
+      ansi: [[0,0,0],[170,0,0],[0,170,0],[170,85,0],[0,0,170],[170,0,170],[0,170,170],[170,170,170],[85,85,85],[255,85,85],[85,255,85],[255,255,85],[85,85,255],[255,85,255],[85,255,255],[255,255,255]] },
+    { id: 'solarized-dark', name: 'Solarized Dark', dark: true,
+      fg: [131,148,150], bg: [0,43,54],
+      ansi: [[7,54,66],[220,50,47],[133,153,0],[181,137,0],[38,139,210],[211,54,130],[42,161,152],[238,232,213],[0,43,54],[203,75,22],[88,110,117],[101,123,131],[131,148,150],[108,113,196],[147,161,161],[253,246,227]] },
+    { id: 'solarized-light', name: 'Solarized Light', dark: false,
+      fg: [101,123,131], bg: [253,246,227],
+      ansi: [[7,54,66],[220,50,47],[133,153,0],[181,137,0],[38,139,210],[211,54,130],[42,161,152],[238,232,213],[0,43,54],[203,75,22],[88,110,117],[101,123,131],[131,148,150],[108,113,196],[147,161,161],[253,246,227]] },
+    { id: 'dracula', name: 'Dracula', dark: true,
+      fg: [248,248,242], bg: [40,42,54],
+      ansi: [[33,34,44],[255,85,85],[80,250,123],[241,250,140],[189,147,249],[255,121,198],[139,233,253],[248,248,242],[98,114,164],[255,110,110],[105,255,148],[255,255,165],[214,172,255],[255,146,223],[164,255,255],[255,255,255]] },
+    { id: 'one-dark', name: 'One Dark', dark: true,
+      fg: [171,178,191], bg: [40,44,52],
+      ansi: [[30,33,39],[224,108,117],[152,195,121],[209,154,102],[97,175,239],[198,120,221],[86,182,194],[171,178,191],[92,99,112],[224,108,117],[152,195,121],[229,192,123],[97,175,239],[198,120,221],[86,182,194],[255,255,255]] },
+    { id: 'nord', name: 'Nord', dark: true,
+      fg: [216,222,233], bg: [46,52,64],
+      ansi: [[59,66,82],[191,97,106],[163,190,140],[235,203,139],[129,161,193],[180,142,173],[136,192,208],[229,233,240],[76,86,106],[191,97,106],[163,190,140],[235,203,139],[129,161,193],[180,142,173],[143,188,187],[236,239,244]] },
+    { id: 'gruvbox-dark', name: 'Gruvbox Dark', dark: true,
+      fg: [235,219,178], bg: [40,40,40],
+      ansi: [[40,40,40],[204,36,29],[152,151,26],[215,153,33],[69,133,136],[177,98,134],[104,157,106],[168,153,132],[146,131,116],[251,73,52],[184,187,38],[250,189,47],[131,165,152],[211,134,155],[142,192,124],[235,219,178]] },
+    { id: 'gruvbox-light', name: 'Gruvbox Light', dark: false,
+      fg: [60,56,54], bg: [251,241,199],
+      ansi: [[40,40,40],[204,36,29],[152,151,26],[215,153,33],[69,133,136],[177,98,134],[104,157,106],[168,153,132],[146,131,116],[251,73,52],[184,187,38],[250,189,47],[131,165,152],[211,134,155],[142,192,124],[235,219,178]] },
+    { id: 'catppuccin', name: 'Catppuccin Mocha', dark: true,
+      fg: [205,214,244], bg: [30,30,46],
+      ansi: [[69,71,90],[243,139,168],[166,227,161],[249,226,175],[137,180,250],[245,194,231],[148,226,213],[186,194,222],[88,91,112],[243,139,168],[166,227,161],[249,226,175],[137,180,250],[245,194,231],[148,226,213],[166,173,200]] },
+    { id: 'tokyo-night', name: 'Tokyo Night', dark: true,
+      fg: [192,202,245], bg: [26,27,38],
+      ansi: [[21,22,30],[247,118,142],[158,206,106],[224,175,104],[122,162,247],[187,154,247],[125,207,255],[169,177,214],[65,72,104],[247,118,142],[158,206,106],[224,175,104],[122,162,247],[187,154,247],[125,207,255],[192,202,245]] },
+];
 const USE_WEBGL_LEAD = true;
 const BG_OP_STRIDE = 4;
 const GLYPH_OP_STRIDE = 8;
@@ -813,7 +900,7 @@ void main() {
         renderViews(views) {
             show();
             gl.viewport(0, 0, canvasEl.width, canvasEl.height);
-            gl.clearColor(0, 0, 0, 1);
+            gl.clearColor(currentPalette.bg[0]/255, currentPalette.bg[1]/255, currentPalette.bg[2]/255, 1);
             gl.clear(gl.COLOR_BUFFER_BIT);
             for (const view of views) renderView(view);
             gl.finish();
@@ -831,15 +918,10 @@ previewCompositeRenderer.hide();
 function packedColorCss(packed) {
     let css = colorCssCache.get(packed);
     if (css) return css;
-    const isDefault = ((packed >>> 24) & 1) !== 0;
     const r = (packed >>> 16) & 0xff;
     const g = (packed >>> 8) & 0xff;
     const b = packed & 0xff;
-    if (isDefault) {
-        css = r === 204 ? '#ccc' : '#000';
-    } else {
-        css = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
-    }
+    css = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
     colorCssCache.set(packed, css);
     return css;
 }
@@ -927,6 +1009,46 @@ function preferredFont() {
     const storedFont = readStorage(FONT_STORAGE_KEY);
     if (storedFont && storedFont.trim()) return storedFont.trim();
     return DEFAULT_FONT;
+}
+
+function preferredPalette() {
+    const queryId = new URLSearchParams(location.search).get('palette');
+    if (queryId) {
+        const p = PALETTES.find(p => p.id === queryId);
+        if (p) return p;
+    }
+    const storedId = readStorage(PALETTE_STORAGE_KEY);
+    if (storedId) {
+        const p = PALETTES.find(p => p.id === storedId);
+        if (p) return p;
+    }
+    return PALETTES[0];
+}
+
+function termBgCss(palette) {
+    const [r,g,b] = palette.bg;
+    return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+}
+
+let currentPalette = preferredPalette();
+let termBgColor = termBgCss(currentPalette);
+
+function applyPalette(palette, { persist = true } = {}) {
+    currentPalette = palette;
+    termBgColor = termBgCss(palette);
+    if (persist) writeStorage(PALETTE_STORAGE_KEY, palette.id);
+    document.documentElement.setAttribute('data-theme', palette.dark ? 'dark' : 'light');
+    document.documentElement.style.setProperty('--term-bg', termBgColor);
+    colorCssCache.clear();
+    for (const t of Object.values(terminals)) {
+        t.set_default_colors(...palette.fg, ...palette.bg);
+        for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...palette.ansi[i]);
+        t.invalidate_render_cache();
+    }
+    // Redraw everything
+    resetLeadCanvasState();
+    requestLeadRender();
+    requestPreviewRender(null, false);
 }
 
 let ws, cell, cols, rows, dpr;
@@ -1038,6 +1160,8 @@ function hideAuth() {
 function createTerminalInstance() {
     const terminal = new Terminal(rows, cols, cell.pw, cell.ph);
     terminal.set_font_family(fontFamily);
+    terminal.set_default_colors(...currentPalette.fg, ...currentPalette.bg);
+    for (let i = 0; i < 16; i++) terminal.set_ansi_color(i, ...currentPalette.ansi[i]);
     return terminal;
 }
 
@@ -1775,12 +1899,14 @@ function updatePreviewRail() {
             if (item) item.root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
         }
         const shortcutHint = ' • Ctrl-N new • Ctrl-W kill';
+        const selectedIdx = exposeSelectedPty !== null && exposeSelectedPty !== EXPOSE_CREATE_SELECTION
+            ? filtered.indexOf(exposeSelectedPty) : -1;
         if (createCommand) {
             exposeHintEl.textContent = `Enter to run "${createCommand}" in a new PTY • Esc to close`;
         } else if (filtered.length > 0) {
             exposeHintEl.textContent = exposeSearchPending && exposeQuery.trim() && exposeSearchResults === null
                 ? 'Searching titles, terminal, and scrollback…'
-                : `${filtered.length} match${filtered.length === 1 ? '' : 'es'} • Enter to switch${shortcutHint} • Esc to close${exposeSearchPending ? ' • Updating…' : ''}`;
+                : `${selectedIdx >= 0 ? (searchActive ? selectedIdx : selectedIdx + 1) + ' / ' : ''}${filtered.length} match${filtered.length === 1 ? '' : 'es'} • Enter to switch${shortcutHint} • Esc to close${exposeSearchPending ? ' • Updating…' : ''}`;
         } else {
             exposeHintEl.textContent = exposeSearchPending && exposeQuery.trim()
                 ? 'Searching titles, terminal, and scrollback…'
@@ -1945,7 +2071,7 @@ function renderLead() {
     }
     if (focusedPty === null || !surfaceCanvases[focusedPty]) {
         if (leadCanvasPrimed) {
-            ctx.fillStyle = '#000';
+            ctx.fillStyle = termBgColor;
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             resetLeadCanvasState();
         }
@@ -1962,7 +2088,7 @@ function renderLead() {
         || !t
         || (rerasterizedLead && t.last_render_full());
     if (fullRender) {
-        ctx.fillStyle = '#000';
+        ctx.fillStyle = termBgColor;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(surface, 0, 0, drawW, drawH, 0, 0, drawW, drawH);
     } else if (rerasterizedLead) {

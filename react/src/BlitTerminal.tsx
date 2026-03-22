@@ -7,7 +7,7 @@ import {
   useState,
 } from 'react';
 import type { Terminal } from 'blit-browser';
-import type { BlitTerminalProps, ConnectionStatus } from './types';
+import type { BlitTerminalProps, ConnectionStatus, TerminalPalette } from './types';
 import { C2S_ACK } from './types';
 import { useBlitConnection } from './hooks/useBlitConnection';
 import { measureCell, type CellMetrics } from './hooks/useBlitTerminal';
@@ -139,6 +139,7 @@ interface GlRenderer {
     cursorCol: number,
     cursorRow: number,
     cell: CellMetrics,
+    bgColor: [number, number, number],
   ): void;
   dispose(): void;
 }
@@ -407,9 +408,10 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       cursorCol: number,
       cursorRow: number,
       cell: CellMetrics,
+      bgColor: [number, number, number],
     ) {
       gl!.viewport(0, 0, canvas.width, canvas.height);
-      gl!.clearColor(0, 0, 0, 1);
+      gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
       gl!.clear(gl!.COLOR_BUFFER_BIT);
       renderRectangles(bgOps, cell);
       if (atlasCanvas) {
@@ -582,6 +584,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       fontSize = DEFAULT_FONT_SIZE,
       className,
       style,
+      palette,
     } = props;
 
     // Refs for DOM elements.
@@ -602,6 +605,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     const subscribedRef = useRef(false);
     const scrollOffsetRef = useRef(0);
     const wasmModRef = useRef<typeof import('blit-browser') | null>(null);
+    const paletteRef = useRef<TerminalPalette | undefined>(palette);
 
     // React state for things the consumer might read.
     const [wasmReady, setWasmReady] = useState(false);
@@ -714,6 +718,11 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         cell.ph,
       );
       t.set_font_family(fontFamily);
+      const pal = paletteRef.current;
+      if (pal) {
+        t.set_default_colors(...pal.fg, ...pal.bg);
+        for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...pal.ansi[i]);
+      }
       terminalRef.current = t;
       needsRenderRef.current = true;
 
@@ -724,6 +733,20 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         }
       };
     }, [wasmReady, ptyId, fontFamily]);
+
+    // -----------------------------------------------------------------------
+    // Palette changes
+    // -----------------------------------------------------------------------
+
+    useEffect(() => {
+      paletteRef.current = palette;
+      const t = terminalRef.current;
+      if (!t || !palette) return;
+      t.set_default_colors(...palette.fg, ...palette.bg);
+      for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...palette.ansi[i]);
+      t.invalidate_render_cache();
+      needsRenderRef.current = true;
+    }, [palette]);
 
     // -----------------------------------------------------------------------
     // Subscribe/unsubscribe to PTY
@@ -841,6 +864,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             t.cursor_col,
             t.cursor_row,
             cell,
+            paletteRef.current?.bg ?? [0, 0, 0],
           );
 
           // Render overflow text (emoji / wide Unicode) via 2D overlay canvas.
@@ -858,7 +882,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
                 const fSize = Math.max(1, Math.round(scaledH));
                 ctx.font = `${fSize}px ${fontFamily}`;
                 ctx.textBaseline = 'bottom';
-                ctx.fillStyle = '#ccc';
+                const [fgR, fgG, fgB] = paletteRef.current?.fg ?? [204, 204, 204];
+                ctx.fillStyle = `#${fgR.toString(16).padStart(2,'0')}${fgG.toString(16).padStart(2,'0')}${fgB.toString(16).padStart(2,'0')}`;
                 for (let i = 0; i < overflowCount; i++) {
                   const op = t.overflow_text_op(i);
                   if (!op) continue;
