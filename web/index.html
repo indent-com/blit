@@ -442,7 +442,7 @@ Type <kbd>&gt;</kbd><em>command</em> in Expose and press <kbd>Enter</kbd> &mdash
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> &mdash; Toggle backlog<br>
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>{</kbd>/<kbd>}</kbd> &mdash; Previous/next PTY<br>
 <kbd>Shift</kbd>+<kbd>PageUp</kbd>/<kbd>PageDown</kbd> &mdash; Scroll back/forward<br>
-<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> &mdash; Palette picker<br>
+<kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> &mdash; Palette picker<br>
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> &mdash; Toggle HUD (size/fps/kbps)<br>
 <kbd>Ctrl</kbd>+<kbd>?</kbd> &mdash; Toggle this help
 </div></div>
@@ -2776,13 +2776,18 @@ async function main() {
             return;
         }
 
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && (e.key === 'K' || e.code === 'KeyK')) {
+            e.preventDefault();
+            togglePaletteMenu();
+            return;
+        }
+
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         if (e.isComposing) return;
 
         // PTY management
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
             if (e.key === 'H') { e.preventDefault(); hudVisible = !hudVisible; updateHud(); return; }
-            if (e.key === 'P') { e.preventDefault(); togglePaletteMenu(); return; }
             if (e.key === 'W') { e.preventDefault(); if (focusedPty !== null) closePty(focusedPty); return; }
             if (e.key === 'B') {
                 e.preventDefault();
@@ -2942,7 +2947,9 @@ async function main() {
     // Catch the first keypress anywhere on the page and redirect to the sink,
     // then re-dispatch so the keystroke isn't swallowed.
     document.addEventListener('keydown', (e) => {
-        if (document.activeElement !== inputSink && !exposeOpen && document.activeElement !== passInput) {
+        if (document.activeElement !== inputSink && !exposeOpen
+            && document.activeElement !== passInput
+            && !paletteOverlay.classList.contains('visible')) {
             inputSink.focus();
             inputSink.dispatchEvent(new KeyboardEvent('keydown', e));
         }
