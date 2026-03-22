@@ -65,6 +65,11 @@ pub fn C2S_SEARCH() -> u8 {
 }
 
 #[wasm_bindgen]
+pub fn C2S_CREATE_AT() -> u8 {
+    remote::C2S_CREATE_AT
+}
+
+#[wasm_bindgen]
 pub fn S2C_UPDATE() -> u8 {
     remote::S2C_UPDATE
 }
@@ -112,6 +117,11 @@ pub fn msg_create_command(rows: u16, cols: u16, command: &str) -> Vec<u8> {
 #[wasm_bindgen]
 pub fn msg_create_tagged_command(rows: u16, cols: u16, tag: &str, command: &str) -> Vec<u8> {
     remote::msg_create_tagged_command(rows, cols, tag, command)
+}
+
+#[wasm_bindgen]
+pub fn msg_create_at(rows: u16, cols: u16, tag: &str, src_pty_id: u16) -> Vec<u8> {
+    remote::msg_create_at(rows, cols, tag, src_pty_id)
 }
 
 #[wasm_bindgen]
@@ -554,15 +564,15 @@ mod tests {
         assert_eq!(u16::from_le_bytes([m[1], m[2]]), 30);
         assert_eq!(u16::from_le_bytes([m[3], m[4]]), 120);
         assert_eq!(u16::from_le_bytes([m[5], m[6]]), 4); // tag_len
-        assert_eq!(&m[7..], b"test");
+        assert_eq!(&m[7..11], b"test");
+        assert_eq!(m.len(), 11);
     }
 
     #[test]
     fn msg_create_command_includes_command() {
         let m = msg_create_command(24, 80, "bash");
         assert_eq!(m[0], remote::C2S_CREATE);
-        // tag_len = 0, then command follows
-        assert_eq!(u16::from_le_bytes([m[5], m[6]]), 0);
+        assert_eq!(u16::from_le_bytes([m[5], m[6]]), 0); // tag_len = 0
         assert_eq!(&m[7..], b"bash");
     }
 
@@ -573,6 +583,18 @@ mod tests {
         assert_eq!(u16::from_le_bytes([m[5], m[6]]), 1); // tag_len = 1
         assert_eq!(m[7], b't');
         assert_eq!(&m[8..], b"cmd");
+    }
+
+    #[test]
+    fn msg_create_at_encodes_src_pty_id() {
+        let m = msg_create_at(24, 80, "shell", 42);
+        assert_eq!(m[0], remote::C2S_CREATE_AT);
+        assert_eq!(u16::from_le_bytes([m[1], m[2]]), 24);
+        assert_eq!(u16::from_le_bytes([m[3], m[4]]), 80);
+        assert_eq!(u16::from_le_bytes([m[5], m[6]]), 5); // tag_len "shell"
+        assert_eq!(&m[7..12], b"shell");
+        assert_eq!(u16::from_le_bytes([m[12], m[13]]), 42); // src_pty_id
+        assert_eq!(m.len(), 14);
     }
 
     #[test]

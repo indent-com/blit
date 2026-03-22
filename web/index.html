@@ -2,6 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
 <title>blit</title>
 <style>
 :root {
@@ -63,7 +64,7 @@ html[data-theme="light"] {
     --ui-kbd-text: #333;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { width: 100%; height: 100%; overflow: hidden; background: var(--term-bg); font-family: var(--terminal-font); }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--term-bg); font-family: var(--terminal-font); touch-action: none; overscroll-behavior: none; }
 canvas { display: block; outline: none; }
 #workspace {
     display: none;
@@ -89,6 +90,7 @@ canvas { display: block; outline: none; }
     transform-origin: top left;
     will-change: transform;
     backface-visibility: hidden;
+    touch-action: none;
 }
 #preview-rail {
     display: none;
@@ -353,6 +355,25 @@ canvas { display: block; outline: none; }
     font: 13px var(--terminal-font); border: none; resize: none;
     white-space: pre; overflow: hidden;
 }
+#touch-bar {
+    display: none; position: fixed; bottom: env(keyboard-inset-bottom, 0px);
+    left: 0; right: 0; z-index: 9;
+    background: var(--ui-help-bg); border-top: 1px solid var(--ui-border);
+    padding: 4px 2px; gap: 3px;
+    justify-content: center; flex-wrap: wrap;
+    -webkit-user-select: none; user-select: none;
+}
+@media (pointer: coarse) { #touch-bar { display: flex; } }
+#touch-bar button {
+    background: var(--ui-kbd-bg); color: var(--ui-kbd-text);
+    border: 1px solid var(--ui-kbd-border); border-radius: 4px;
+    font: 12px/1 var(--terminal-font); padding: 8px 10px;
+    flex: 1 1 0; text-align: center;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+}
+#touch-bar button.active { background: var(--ui-border-hover); }
+#touch-bar button:active { background: var(--ui-border-hover); }
 #hud {
     position: fixed; top: 0; right: 0;
     color: var(--ui-hud); font: 10px/1 var(--terminal-font);
@@ -364,7 +385,7 @@ canvas { display: block; outline: none; }
 }
 #auth input {
     background: var(--ui-auth-input-bg); color: var(--ui-auth-text); border: 1px solid var(--ui-auth-border);
-    font: 14px/1 var(--terminal-font); padding: 4px 8px; margin-top: 8px; outline: none;
+    font: 16px/1 var(--terminal-font); padding: 4px 8px; margin-top: 8px; outline: none;
 }
 #status {
     position: fixed; bottom: 4px; left: 50%; transform: translateX(-50%);
@@ -415,7 +436,7 @@ canvas { display: block; outline: none; }
 </head>
 <body>
 <div id="hud"></div>
-<div id="auth">passphrase<br><input type="password" id="pass" autofocus></div>
+<form id="auth" action="javascript:void(0)"><label for="pass">passphrase</label><br><input type="password" id="pass" autofocus></form>
 <div id="status"></div>
 <div id="workspace">
 <div id="lead-pane"><canvas id="term" tabindex="0"></canvas></div>
@@ -432,11 +453,12 @@ canvas { display: block; outline: none; }
 </div>
 </div>
 </div>
+<div id="touch-bar"></div>
 <textarea id="input-sink" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" autofocus></textarea>
 <div id="help-overlay"><div id="help-box">
 <h2>Shortcuts</h2>
 <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> &mdash; Expose / switch PTY<br>
-<kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd> &mdash; New PTY<br>
+<kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd> &mdash; New PTY in same cwd<br>
 Type <kbd>&gt;</kbd><em>command</em> in Expose and press <kbd>Enter</kbd> &mdash; New PTY running that command<br>
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> &mdash; Close PTY<br>
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> &mdash; Toggle backlog<br>
@@ -503,7 +525,7 @@ const PALETTES = [
 const USE_WEBGL_LEAD = true;
 const BG_OP_STRIDE = 4;
 const GLYPH_OP_STRIDE = 8;
-const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_DISPLAY_RATE = 0x04, C2S_CLIENT_METRICS = 0x05, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12, C2S_SUBSCRIBE = 0x13, C2S_UNSUBSCRIBE = 0x14, C2S_SEARCH = 0x15;
+const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_DISPLAY_RATE = 0x04, C2S_CLIENT_METRICS = 0x05, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12, C2S_SUBSCRIBE = 0x13, C2S_UNSUBSCRIBE = 0x14, C2S_SEARCH = 0x15, C2S_CREATE_AT = 0x16;
 const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04, S2C_SEARCH_RESULTS = 0x05;
 const SEARCH_SOURCE_TITLE = 0x00, SEARCH_SOURCE_VISIBLE = 0x01, SEARCH_SOURCE_SCROLLBACK = 0x02;
 const SEARCH_MATCH_TITLE = 1 << 0, SEARCH_MATCH_VISIBLE = 1 << 1, SEARCH_MATCH_SCROLLBACK = 1 << 2;
@@ -1115,6 +1137,13 @@ function applyPalette(palette, { persist = true } = {}) {
 }
 
 let ws, cell, cols, rows, dpr;
+let touchCtrl = false, touchAlt = false;
+function clearTouchModifiers() {
+    touchCtrl = false; touchAlt = false;
+    const cb = document.querySelector('#touch-bar .active');
+    if (cb) cb.classList.remove('active');
+    document.querySelectorAll('#touch-bar .active').forEach(b => b.classList.remove('active'));
+}
 let cursorBlinkOn = true;
 let cursorBlinkTimer = null;
 function startCursorBlink() {
@@ -2347,6 +2376,24 @@ function createFocusedPty(command = null) {
     return true;
 }
 
+function createFocusedPtyInCwd() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (focusedPty === null) return createFocusedPty();
+    computeSize();
+    const msg = new Uint8Array(9);
+    msg[0] = C2S_CREATE_AT;
+    msg[1] = rows & 0xff;
+    msg[2] = (rows >> 8) & 0xff;
+    msg[3] = cols & 0xff;
+    msg[4] = (cols >> 8) & 0xff;
+    msg[5] = 0; msg[6] = 0; // tag_len = 0
+    msg[7] = focusedPty & 0xff;
+    msg[8] = (focusedPty >> 8) & 0xff;
+    pendingFocusedCreates += 1;
+    ws.send(msg);
+    return true;
+}
+
 function createPtyFromExpose() {
     createFocusedPty(exposeCreateCommand());
 }
@@ -2629,8 +2676,7 @@ async function main() {
     }
     requestAnimationFrame(renderLoop);
 
-    passInput.addEventListener('keydown', (e) => {
-        if (e.key !== 'Enter') return;
+    authEl.addEventListener('submit', (e) => {
         e.preventDefault();
         const pass = passInput.value;
         if (!pass) return;
@@ -2780,7 +2826,7 @@ async function main() {
                 closeExpose({ restoreFocus: false });
                 createFocusedPty(command);
             } else {
-                createFocusedPty();
+                createFocusedPtyInCwd();
             }
             return;
         }
@@ -2888,7 +2934,23 @@ async function main() {
         if (e.inputType === 'deleteContentBackward' && !inputSink.value) {
             if (focusedPty !== null) sendKey(new Uint8Array([0x7f]));
         } else if (inputSink.value && focusedPty !== null) {
-            sendKey(new TextEncoder().encode(inputSink.value.replace(/\n/g, '\r')));
+            let text = inputSink.value.replace(/\n/g, '\r');
+            if (touchCtrl || touchAlt) {
+                const enc = new TextEncoder();
+                for (const ch of text) {
+                    const code = ch.toLowerCase().charCodeAt(0);
+                    if (touchCtrl && code >= 97 && code <= 122) {
+                        sendKey(new Uint8Array([code - 96]));
+                    } else if (touchAlt) {
+                        sendKey(enc.encode('\x1b' + ch));
+                    } else {
+                        sendKey(enc.encode(ch));
+                    }
+                }
+                clearTouchModifiers();
+            } else {
+                sendKey(new TextEncoder().encode(text));
+            }
         }
         inputSink.value = '';
     });
@@ -2971,6 +3033,74 @@ async function main() {
             inputSink.dispatchEvent(new KeyboardEvent('keydown', e));
         }
     });
+
+    // Touch bar for mobile — modifier keys and essentials missing from virtual keyboards
+    const touchBar = document.getElementById('touch-bar');
+    {
+        const keys = [
+            { label: 'Esc', send: '\x1b' },
+            { label: 'Tab', send: '\t' },
+            { label: 'Ctrl', toggle: 'ctrl' },
+            { label: 'Alt', toggle: 'alt' },
+            { label: '\u2190', send: 'ArrowLeft' },
+            { label: '\u2192', send: 'ArrowRight' },
+            { label: '\u2191', send: 'ArrowUp' },
+            { label: '\u2193', send: 'ArrowDown' },
+            { label: '|', send: '|' },
+            { label: '/', send: '/' },
+            { label: '-', send: '-' },
+            { label: '~', send: '~' },
+        ];
+        const arrowKeys = { ArrowLeft: 'D', ArrowRight: 'C', ArrowUp: 'A', ArrowDown: 'B' };
+        const ctrlBtn = { el: null };
+        const altBtn = { el: null };
+        for (const k of keys) {
+            const btn = document.createElement('button');
+            btn.textContent = k.label;
+            btn.setAttribute('tabindex', '-1');
+            if (k.toggle === 'ctrl') ctrlBtn.el = btn;
+            if (k.toggle === 'alt') altBtn.el = btn;
+            btn.addEventListener('pointerdown', (e) => {
+                e.preventDefault(); // don't steal focus from inputSink
+                if (k.toggle === 'ctrl') {
+                    touchCtrl = !touchCtrl;
+                    btn.classList.toggle('active', touchCtrl);
+                    return;
+                }
+                if (k.toggle === 'alt') {
+                    touchAlt = !touchAlt;
+                    btn.classList.toggle('active', touchAlt);
+                    return;
+                }
+                if (focusedPty === null) return;
+                let bytes;
+                if (arrowKeys[k.send]) {
+                    const t = terminals[focusedPty];
+                    const appCursor = t && t.app_cursor();
+                    const mod = (touchAlt ? 2 : 0) + (touchCtrl ? 4 : 0);
+                    if (mod) {
+                        bytes = new TextEncoder().encode(`\x1b[1;${mod + 1}${arrowKeys[k.send]}`);
+                    } else {
+                        const prefix = appCursor ? '\x1bO' : '\x1b[';
+                        bytes = new TextEncoder().encode(prefix + arrowKeys[k.send]);
+                    }
+                } else if (touchCtrl && k.send.length === 1) {
+                    const code = k.send.toLowerCase().charCodeAt(0);
+                    if (code >= 97 && code <= 122) bytes = new Uint8Array([code - 96]);
+                    else bytes = new TextEncoder().encode(k.send);
+                } else if (touchAlt && k.send.length === 1) {
+                    bytes = new TextEncoder().encode('\x1b' + k.send);
+                } else {
+                    bytes = new TextEncoder().encode(k.send);
+                }
+                sendKey(bytes);
+                // Clear sticky modifiers after use
+                if (touchCtrl) { touchCtrl = false; ctrlBtn.el.classList.remove('active'); }
+                if (touchAlt) { touchAlt = false; altBtn.el.classList.remove('active'); }
+            });
+            touchBar.appendChild(btn);
+        }
+    }
 
     if (savedPass) connect(savedPass, { source: 'stored' });
     else showAuth();
@@ -3302,6 +3432,14 @@ function keyToBytes(e) {
             if (e.key === '\\') return new Uint8Array([0x1c]);
             if (e.key === ']') return new Uint8Array([0x1d]);
         }
+        // Fallback: use e.code when e.key is unhelpful (e.g. macOS Ctrl+letter)
+        if (e.code && e.code.startsWith('Key')) {
+            const cc = e.code.charCodeAt(3);
+            if (cc >= 65 && cc <= 90) return new Uint8Array([cc - 64]);
+        }
+        if (e.code === 'BracketLeft') return new Uint8Array([0x1b]);
+        if (e.code === 'Backslash') return new Uint8Array([0x1c]);
+        if (e.code === 'BracketRight') return new Uint8Array([0x1d]);
     }
 
     if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {

@@ -1,7 +1,8 @@
 use blit_remote::{
     build_update_msg, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
-    C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
-    C2S_UNSUBSCRIBE, S2C_CLOSED, S2C_CREATED, S2C_LIST, S2C_SEARCH_RESULTS, S2C_TITLE,
+    C2S_CREATE_AT, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE, C2S_SCROLL, C2S_SEARCH,
+    C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, S2C_CLOSED, S2C_CREATED, S2C_LIST, S2C_SEARCH_RESULTS,
+    S2C_TITLE,
 };
 use blit_wezterm::{SearchResult as WeztermSearchResult, TerminalDriver as WeztermDriver};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -816,6 +817,12 @@ fn nudge_delivery(state: &AppState) {
     state.3.notify_one();
 }
 
+fn pty_cwd(pid: libc::pid_t) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok())
+}
+
 fn spawn_pty(
     shell: &str,
     rows: u16,
@@ -824,6 +831,7 @@ fn spawn_pty(
     tag: &str,
     command: Option<&str>,
     argv: Option<&[&str]>,
+    dir: Option<&str>,
     scrollback: usize,
     state: AppState,
 ) -> Option<Pty> {
@@ -870,6 +878,11 @@ fn spawn_pty(
             libc::dup2(slave, 2);
             if slave > 2 {
                 libc::close(slave);
+            }
+        }
+        if let Some(d) = dir {
+            if let Ok(dir_c) = CString::new(d) {
+                unsafe { libc::chdir(dir_c.as_ptr()); }
             }
         }
         std::env::set_var("TERM", "xterm-256color");
@@ -1855,6 +1868,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 }
             }
             C2S_CREATE => {
+                // Format: [opcode][rows:2][cols:2][tag_len:2][tag:N][command...]
                 let (rows, cols) = if data.len() >= 5 {
                     (
                         u16::from_le_bytes([data[1], data[2]]),
@@ -1863,19 +1877,18 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 } else {
                     (24, 80)
                 };
-                // New format: [rows:2][cols:2][tag_len:2][tag:N][command...]
-                // Old format: [rows:2][cols:2][command...]
-                let (tag, cmd_start) = if data.len() >= 7 {
-                    let tag_len = u16::from_le_bytes([data[5], data[6]]) as usize;
-                    if data.len() >= 7 + tag_len {
-                        let tag = std::str::from_utf8(&data[7..7 + tag_len]).unwrap_or_default();
-                        (tag, 7 + tag_len)
-                    } else {
-                        ("", 5)
-                    }
+                let tag_len = if data.len() >= 7 {
+                    u16::from_le_bytes([data[5], data[6]]) as usize
                 } else {
-                    ("", 5)
+                    0
                 };
+                let tag = if data.len() >= 7 + tag_len {
+                    std::str::from_utf8(&data[7..7 + tag_len]).unwrap_or_default()
+                } else {
+                    ""
+                };
+                let cmd_start = 7 + tag_len;
+                let dir: Option<String> = None;
                 let create_payload = data
                     .get(cmd_start..)
                     .and_then(|bytes| std::str::from_utf8(bytes).ok());
@@ -1902,6 +1915,64 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     tag,
                     command,
                     argv.as_deref(),
+                    dir.as_deref(),
+                    config.scrollback,
+                    state.clone(),
+                ) {
+                    let mut msg = Vec::with_capacity(3 + pty.tag.len());
+                    msg.push(S2C_CREATED);
+                    msg.extend_from_slice(&id.to_le_bytes());
+                    msg.extend_from_slice(pty.tag.as_bytes());
+                    sess.ptys.insert(id, pty);
+                    if let Some(c) = sess.clients.get_mut(&client_id) {
+                        c.lead = Some(id);
+                        subscribe_client_to(c, id);
+                        c.scroll_offset = 0;
+                        c.scroll_cache = FrameState::default();
+                        reset_inflight(c);
+                    }
+                    sess.send_to_all(&msg);
+                    need_nudge = true;
+                }
+            }
+            C2S_CREATE_AT => {
+                // Format: [opcode][rows:2][cols:2][tag_len:2][tag:N][src_pty_id:2]
+                let (rows, cols) = if data.len() >= 5 {
+                    (
+                        u16::from_le_bytes([data[1], data[2]]),
+                        u16::from_le_bytes([data[3], data[4]]),
+                    )
+                } else {
+                    (24, 80)
+                };
+                let tag_len = if data.len() >= 7 {
+                    u16::from_le_bytes([data[5], data[6]]) as usize
+                } else {
+                    0
+                };
+                let tag = if data.len() >= 7 + tag_len {
+                    std::str::from_utf8(&data[7..7 + tag_len]).unwrap_or_default()
+                } else {
+                    ""
+                };
+                let src_start = 7 + tag_len;
+                let dir = if data.len() >= src_start + 2 {
+                    let src_id = u16::from_le_bytes([data[src_start], data[src_start + 1]]);
+                    sess.ptys.get(&src_id).and_then(|p| pty_cwd(p.child_pid))
+                } else {
+                    None
+                };
+                let id = sess.next_pty_id;
+                sess.next_pty_id += 1;
+                if let Some(pty) = spawn_pty(
+                    &config.shell,
+                    rows,
+                    cols,
+                    id,
+                    tag,
+                    None,
+                    None,
+                    dir.as_deref(),
                     config.scrollback,
                     state.clone(),
                 ) {

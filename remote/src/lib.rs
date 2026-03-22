@@ -35,6 +35,7 @@ pub const C2S_CLOSE: u8 = 0x12;
 pub const C2S_SUBSCRIBE: u8 = 0x13;
 pub const C2S_UNSUBSCRIBE: u8 = 0x14;
 pub const C2S_SEARCH: u8 = 0x15;
+pub const C2S_CREATE_AT: u8 = 0x16;
 
 pub const S2C_UPDATE: u8 = 0x00;
 pub const S2C_CREATED: u8 = 0x01;
@@ -1166,6 +1167,20 @@ pub fn msg_create_tagged(rows: u16, cols: u16, tag: &str) -> Vec<u8> {
     msg
 }
 
+/// Spawn a new PTY in the same working directory as `src_pty_id`.
+pub fn msg_create_at(rows: u16, cols: u16, tag: &str, src_pty_id: u16) -> Vec<u8> {
+    let tag_bytes = tag.as_bytes();
+    let tag_len = tag_bytes.len() as u16;
+    let mut msg = Vec::with_capacity(9 + tag_bytes.len());
+    msg.push(C2S_CREATE_AT);
+    msg.extend_from_slice(&rows.to_le_bytes());
+    msg.extend_from_slice(&cols.to_le_bytes());
+    msg.extend_from_slice(&tag_len.to_le_bytes());
+    msg.extend_from_slice(tag_bytes);
+    msg.extend_from_slice(&src_pty_id.to_le_bytes());
+    msg
+}
+
 pub fn msg_create_command(rows: u16, cols: u16, command: &str) -> Vec<u8> {
     msg_create_tagged_command(rows, cols, "", command)
 }
@@ -1935,7 +1950,6 @@ mod tests {
         assert_eq!(msg[0], C2S_CREATE);
         assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 24);
         assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), 80);
-        // tag_len = 0
         assert_eq!(u16::from_le_bytes([msg[5], msg[6]]), 0);
     }
 

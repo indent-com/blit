@@ -21,16 +21,16 @@ Inside the dev shell:
 cargo run -p blit-server
 
 # Terminal 2
-BLIT_PASS=secret cargo run -p blit-gateway
-
-# Terminal 3
 cargo run -p blit-cli
 ```
 
-Then:
+`blit-cli` acts as a gateway in browser mode: it starts an HTTP/WebSocket server on a random loopback port, injects a session token into the served HTML, and opens the browser automatically. No passphrase prompt or separate `blit-gateway` process needed for local use.
 
-- Open `http://localhost:3264` in a browser and enter `secret`, or
-- Use the terminal client with `blit`.
+Use `--console` for the ANSI terminal renderer instead:
+
+```bash
+cargo run -p blit-cli -- --console
+```
 
 If you use `direnv`, `.envrc` already wires the flake and adds the local `bin/` scripts to `PATH`.
 
@@ -53,7 +53,7 @@ dev
 
 - `blit-server`: PTY host and frame producer
 - `blit-gateway`: HTTP/WebSocket gateway for browsers
-- `blit` / `blit-cli`: terminal client
+- `blit` / `blit-cli`: terminal client and embedded gateway (browser mode) or ANSI renderer (console mode)
 - `blit-demo`: local demos, including `netdash`
 
 ### Libraries
@@ -158,7 +158,7 @@ The `blit-server-deb` package ships these unit files in `/lib/systemd/system/`.
 
 ### `blit-gateway`
 
-The gateway serves the browser UI and proxies WebSocket traffic to the server's Unix socket.
+The gateway serves the browser UI and proxies WebSocket traffic to the server's Unix socket. Use it for always-on deployments where the gateway must run independently of the CLI — for example, behind a reverse proxy or as a systemd service. For local and SSH use, the `blit` CLI embeds equivalent gateway functionality and is simpler to run.
 
 ```bash
 BLIT_PASS=secret blit-gateway
@@ -173,10 +173,12 @@ BLIT_PASS=secret BLIT_ADDR=127.0.0.1:3264 blit-gateway
 
 ### `blit`
 
-The CLI connects to a blit-server and opens the browser UI. A bare hostname is treated as an SSH target.
+Without `--console`, `blit` acts as an embedded gateway: it starts an HTTP/WebSocket server on a random loopback port, injects a one-time session token into the served HTML (no passphrase prompt), and opens the browser. A bare hostname is treated as an SSH target; SSH connections are multiplexed over a single TCP connection using `-L` Unix socket forwarding (no `nc` or `socat` needed on the remote).
+
+With `--console`, it renders directly to the terminal using the ANSI renderer.
 
 ```bash
-blit                        # local server, browser UI
+blit                        # local server, browser UI (embedded gateway)
 blit myhost                 # SSH to myhost, browser UI
 blit user@host              # SSH with explicit user
 blit --console              # local server, terminal renderer
@@ -185,9 +187,7 @@ blit --socket /path.sock    # explicit Unix socket
 blit --tcp host:9000        # raw TCP
 ```
 
-By default, `blit` opens a browser tab backed by an embedded HTTP+WebSocket server on loopback. Each browser tab gets its own blit-server session. SSH connections are multiplexed over a single TCP connection using `-L` Unix socket forwarding (no `nc` or `socat` needed on the remote).
-
-Use `--console` for the ANSI terminal renderer instead of the browser.
+Each browser tab gets its own connection to the blit-server.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -205,7 +205,7 @@ Shortcuts:
 | Shortcut | Action |
 |---|---|
 | `Ctrl`/`Cmd`+`K` | Open Expose / switch PTY |
-| `Ctrl`/`Cmd`+`Shift`+`Enter` | New PTY |
+| `Ctrl`/`Cmd`+`Shift`+`Enter` | New PTY in focused PTY's cwd (falls back to shell default) |
 | `Ctrl+Shift+W` | Close focused PTY |
 | `Ctrl+Shift+B` | Toggle backlog |
 | `Ctrl+Shift+{` / `Ctrl+Shift+}` | Previous / next PTY |
@@ -267,7 +267,7 @@ Useful API surface:
 - `feed_compressed(data)` and `feed_compressed_batch(batch)`
 - `title()`, `get_text(...)`, `get_all_text()`, `get_cell(...)`
 - `cursor_visible()`, `app_cursor()`, `bracketed_paste()`, `mouse_mode()`, `mouse_encoding()`, `echo()`, `icanon()`
-- `msg_create`, `msg_input`, `msg_resize`, `msg_focus`, `msg_close`, `msg_subscribe`, `msg_unsubscribe`, `msg_ack`, `msg_scroll`, `msg_search`, `msg_display_rate`, `msg_client_metrics`
+- `msg_create`, `msg_create_at(rows, cols, tag, src_pty_id)`, `msg_input`, `msg_resize`, `msg_focus`, `msg_close`, `msg_subscribe`, `msg_unsubscribe`, `msg_ack`, `msg_scroll`, `msg_search`, `msg_display_rate`, `msg_client_metrics`
 - `parse_server_msg(...)` preserves rich search metadata via `search_result_count()`, `search_result(i)`, and `search_results()`
 
 ## React Component
@@ -368,7 +368,7 @@ const custom: TerminalPalette = {
 };
 ```
 
-Available built-in IDs: `default`, `solarized-dark`, `solarized-light`, `dracula`, `one-dark`, `nord`, `gruvbox-dark`, `gruvbox-light`, `catppuccin`, `tokyo-night`.
+Available built-in IDs: `default`, `solarized-dark`, `solarized-light`, `dracula`, `one-dark`, `nord`, `gruvbox-dark`, `gruvbox-light`, `catppuccin`, `tokyo-night`, `tomorrow`, `tomorrow-night`, `tomorrow-night-midnight`.
 
 The `dark` field is informational — use it to sync surrounding UI (e.g. set a CSS `color-scheme`). It does not affect rendering.
 
