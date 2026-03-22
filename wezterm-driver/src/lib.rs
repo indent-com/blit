@@ -1061,6 +1061,261 @@ mod tests {
         );
     }
 
+    // ── clamp_u16 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn clamp_u16_in_range() {
+        assert_eq!(clamp_u16(5, 10), 5);
+        assert_eq!(clamp_u16(0, 10), 0);
+        assert_eq!(clamp_u16(9, 10), 9);
+    }
+
+    #[test]
+    fn clamp_u16_below_zero() {
+        assert_eq!(clamp_u16(-1, 10), 0);
+        assert_eq!(clamp_u16(-100, 10), 0);
+    }
+
+    #[test]
+    fn clamp_u16_above_upper() {
+        assert_eq!(clamp_u16(10, 10), 9);
+        assert_eq!(clamp_u16(1000, 10), 9);
+    }
+
+    #[test]
+    fn clamp_u16_upper_zero() {
+        // upper=0 → saturating_sub(1) = 0, max(0) = 0
+        assert_eq!(clamp_u16(5, 0), 0);
+        assert_eq!(clamp_u16(-1, 0), 0);
+    }
+
+    // ── fnv1a_32 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn fnv1a_32_empty() {
+        // FNV-1a offset basis
+        assert_eq!(fnv1a_32(b""), 0x811c_9dc5);
+    }
+
+    #[test]
+    fn fnv1a_32_known_values() {
+        // Known FNV-1a 32-bit values for short ASCII strings
+        assert_eq!(fnv1a_32(b"a"), 0xe40c292c);
+        assert_eq!(fnv1a_32(b"foobar"), 0xbf9cf968);
+    }
+
+    #[test]
+    fn fnv1a_32_different_inputs_differ() {
+        assert_ne!(fnv1a_32(b"hello"), fnv1a_32(b"world"));
+    }
+
+    // ── score_lower_text_match ──────────────────────────────────────────
+
+    #[test]
+    fn score_lower_exact_prefix() {
+        let score = score_lower_text_match("hello world", "hello", 100, 50, 10);
+        // Should include base + prefix_bonus
+        assert!(score >= 150);
+    }
+
+    #[test]
+    fn score_lower_middle_match() {
+        let score = score_lower_text_match("say hello world", "hello", 100, 50, 10);
+        // Should match but no full prefix bonus
+        assert!(score > 0);
+        assert!(score < score_lower_text_match("hello world", "hello", 100, 50, 10));
+    }
+
+    #[test]
+    fn score_lower_no_match() {
+        assert_eq!(score_lower_text_match("hello world", "xyz", 100, 50, 10), 0);
+    }
+
+    #[test]
+    fn score_lower_multiple_matches() {
+        let single = score_lower_text_match("foo bar", "foo", 100, 50, 10);
+        let multi = score_lower_text_match("foo bar foo baz foo", "foo", 100, 50, 10);
+        assert!(multi > single);
+    }
+
+    #[test]
+    fn score_lower_boundary_bonus() {
+        // Match after a space (boundary char) gets half prefix bonus
+        let boundary = score_lower_text_match("x hello", "hello", 100, 50, 10);
+        let non_boundary = score_lower_text_match("xhello", "hello", 100, 50, 10);
+        assert!(boundary > non_boundary);
+    }
+
+    // ── is_search_boundary ──────────────────────────────────────────────
+
+    #[test]
+    fn is_search_boundary_space() {
+        assert!(is_search_boundary(b' '));
+    }
+
+    #[test]
+    fn is_search_boundary_punctuation() {
+        assert!(is_search_boundary(b'/'));
+        assert!(is_search_boundary(b'-'));
+        assert!(is_search_boundary(b'.'));
+        assert!(is_search_boundary(b':'));
+    }
+
+    #[test]
+    fn is_search_boundary_alphanumeric() {
+        assert!(!is_search_boundary(b'a'));
+        assert!(!is_search_boundary(b'Z'));
+        assert!(!is_search_boundary(b'0'));
+        assert!(!is_search_boundary(b'9'));
+    }
+
+    // ── compact_search_text ─────────────────────────────────────────────
+
+    #[test]
+    fn compact_search_text_normalizes_whitespace() {
+        assert_eq!(compact_search_text("hello   world"), "hello world");
+        assert_eq!(compact_search_text("  leading"), "leading");
+        assert_eq!(compact_search_text("trailing  "), "trailing");
+        assert_eq!(compact_search_text("  both  "), "both");
+    }
+
+    #[test]
+    fn compact_search_text_tabs_and_newlines() {
+        assert_eq!(compact_search_text("a\tb\nc"), "a b c");
+    }
+
+    #[test]
+    fn compact_search_text_empty() {
+        assert_eq!(compact_search_text(""), "");
+        assert_eq!(compact_search_text("   "), "");
+    }
+
+    #[test]
+    fn compact_search_text_no_change() {
+        assert_eq!(compact_search_text("already clean"), "already clean");
+    }
+
+    // ── search_excerpt ──────────────────────────────────────────────────
+
+    #[test]
+    fn search_excerpt_short_text() {
+        let text = "hello world";
+        let lower = "hello world";
+        let result = search_excerpt(text, lower, "hello");
+        assert!(result.contains("hello"));
+        // Short text, no ellipsis at start
+        assert!(!result.starts_with("..."));
+    }
+
+    #[test]
+    fn search_excerpt_long_text_with_ellipsis() {
+        let text = "A".repeat(100) + "needle" + &"B".repeat(100);
+        let lower = text.to_lowercase();
+        let result = search_excerpt(&text, &lower, "needle");
+        assert!(result.contains("needle"));
+        assert!(result.starts_with("..."));
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn search_excerpt_no_match_returns_compact() {
+        let text = "hello world";
+        let lower = "hello world";
+        let result = search_excerpt(text, lower, "xyz");
+        assert_eq!(result, "hello world");
+    }
+
+    // ── encode_color ────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_color_default() {
+        let mut flags = 0u8;
+        let mut dst = [0u8; 3];
+        encode_color(ColorAttribute::Default, &mut flags, &mut dst, false);
+        assert_eq!(flags, 0);
+        assert_eq!(dst, [0, 0, 0]);
+    }
+
+    #[test]
+    fn encode_color_palette_index_fg() {
+        let mut flags = 0u8;
+        let mut dst = [0u8; 3];
+        encode_color(ColorAttribute::PaletteIndex(42), &mut flags, &mut dst, false);
+        assert_eq!(flags & 0x03, 1); // 1 << 0
+        assert_eq!(dst[0], 42);
+    }
+
+    #[test]
+    fn encode_color_palette_index_bg() {
+        let mut flags = 0u8;
+        let mut dst = [0u8; 3];
+        encode_color(ColorAttribute::PaletteIndex(7), &mut flags, &mut dst, true);
+        assert_eq!(flags & 0x0c, 4); // 1 << 2
+        assert_eq!(dst[0], 7);
+    }
+
+    #[test]
+    fn encode_color_true_color_fg() {
+        let mut flags = 0u8;
+        let mut dst = [0u8; 3];
+        let color = wezterm_term::color::SrgbaTuple(0.5, 0.25, 1.0, 1.0);
+        encode_color(
+            ColorAttribute::TrueColorWithDefaultFallback(color),
+            &mut flags,
+            &mut dst,
+            false,
+        );
+        assert_eq!(flags & 0x03, 2); // 2 << 0
+        // Check that RGB bytes are populated (exact values depend on conversion)
+        assert!(dst[0] > 0 || dst[1] > 0 || dst[2] > 0);
+    }
+
+    #[test]
+    fn encode_color_true_color_bg() {
+        let mut flags = 0u8;
+        let mut dst = [0u8; 3];
+        let color = wezterm_term::color::SrgbaTuple(1.0, 0.0, 0.0, 1.0);
+        encode_color(
+            ColorAttribute::TrueColorWithDefaultFallback(color),
+            &mut flags,
+            &mut dst,
+            true,
+        );
+        assert_eq!(flags & 0x0c, 8); // 2 << 2
+        assert_eq!(dst[0], 255); // red channel
+    }
+
+    // ── encode_visible_cell (via TerminalDriver round-trip) ─────────────
+
+    #[test]
+    fn encode_visible_cell_ascii_inline() {
+        // Process a simple ASCII character and verify it encodes inline
+        let mut driver = TerminalDriver::new(2, 10, 100);
+        driver.process(b"\x1b[HA");
+        let frame = driver.snapshot(false, false);
+        let content = frame.cell_content(0, 0);
+        assert_eq!(content, "A");
+        // f1 bits 3..5 should encode length 1
+        let f1 = frame.cells()[1];
+        let content_len = (f1 >> 3) & 7;
+        assert_eq!(content_len, 1);
+    }
+
+    #[test]
+    fn encode_visible_cell_wide_char() {
+        let mut driver = TerminalDriver::new(2, 10, 100);
+        driver.process("全".as_bytes());
+        let frame = driver.snapshot(false, false);
+        let content = frame.cell_content(0, 0);
+        assert_eq!(content, "全");
+        // wide flag
+        let f1 = frame.cells()[1];
+        assert_ne!(f1 & (1 << 1), 0);
+        // continuation cell
+        let cont_f1 = frame.cells()[CELL_SIZE + 1];
+        assert_ne!(cont_f1 & (1 << 2), 0);
+    }
+
     #[test]
     fn survives_random_binary_torrent_and_recovers() {
         let mut driver = TerminalDriver::new(24, 80, 100);

@@ -555,3 +555,216 @@ impl Drop for Cleanup {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── hsv_to_rgb ──────────────────────────────────────────────────────
+
+    #[test]
+    fn hsv_pure_black() {
+        // v=0 means black regardless of h and s
+        assert_eq!(hsv_to_rgb(0, 255, 0), (0, 0, 0));
+        assert_eq!(hsv_to_rgb(180, 128, 0), (0, 0, 0));
+    }
+
+    #[test]
+    fn hsv_pure_white() {
+        // s=0, v=255 → white
+        assert_eq!(hsv_to_rgb(0, 0, 255), (255, 255, 255));
+        assert_eq!(hsv_to_rgb(123, 0, 255), (255, 255, 255));
+    }
+
+    #[test]
+    fn hsv_primary_red() {
+        assert_eq!(hsv_to_rgb(0, 255, 255), (255, 0, 0));
+    }
+
+    #[test]
+    fn hsv_primary_green() {
+        assert_eq!(hsv_to_rgb(120, 255, 255), (0, 255, 0));
+    }
+
+    #[test]
+    fn hsv_primary_blue() {
+        assert_eq!(hsv_to_rgb(240, 255, 255), (0, 0, 255));
+    }
+
+    #[test]
+    fn hsv_intermediate_yellow() {
+        // h=60, full saturation and value → yellow (255,255,0)
+        assert_eq!(hsv_to_rgb(60, 255, 255), (255, 255, 0));
+    }
+
+    #[test]
+    fn hsv_intermediate_cyan() {
+        assert_eq!(hsv_to_rgb(180, 255, 255), (0, 255, 255));
+    }
+
+    #[test]
+    fn hsv_half_value_gray() {
+        // s=0, v=128 → gray
+        let (r, g, b) = hsv_to_rgb(0, 0, 128);
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        // 128/255*255 ≈ 128
+        assert!((r as i16 - 128).abs() <= 1);
+    }
+
+    // ── Rng ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rng_new_produces_different_values() {
+        // Two Rng::new() calls should (almost certainly) differ since they
+        // seed from the system clock.
+        let a = Rng::new();
+        let b = Rng::new();
+        // The internal states could theoretically match if called in the
+        // same nanosecond, but the chance is negligible.
+        assert!(a.0 != 0 && b.0 != 0);
+    }
+
+    #[test]
+    fn rng_next_deterministic() {
+        let mut a = Rng(42);
+        let mut b = Rng(42);
+        for _ in 0..100 {
+            assert_eq!(a.next(), b.next());
+        }
+    }
+
+    #[test]
+    fn rng_next_changes_state() {
+        let mut r = Rng(42);
+        let first = r.next();
+        let second = r.next();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn rng_next_f32_in_unit_range() {
+        let mut r = Rng(12345);
+        for _ in 0..1000 {
+            let v = r.next_f32();
+            assert!(v >= 0.0 && v < 1.0, "next_f32 out of range: {}", v);
+        }
+    }
+
+    #[test]
+    fn rng_range_f32_respects_bounds() {
+        let mut r = Rng(99999);
+        for _ in 0..1000 {
+            let v = r.range_f32(3.0, 7.0);
+            assert!(v >= 3.0 && v < 7.0, "range_f32 out of [3,7): {}", v);
+        }
+    }
+
+    // ── parse_mouse_params ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_mouse_params_valid() {
+        assert_eq!(parse_mouse_params(b"0;10;20"), Some((0, 10, 20)));
+        assert_eq!(parse_mouse_params(b"32;1;1"), Some((32, 1, 1)));
+        assert_eq!(parse_mouse_params(b"0;100;200"), Some((0, 100, 200)));
+    }
+
+    #[test]
+    fn parse_mouse_params_empty() {
+        assert_eq!(parse_mouse_params(b""), None);
+    }
+
+    #[test]
+    fn parse_mouse_params_invalid() {
+        assert_eq!(parse_mouse_params(b"abc"), None);
+        assert_eq!(parse_mouse_params(b"0;10"), None); // too few parts
+        assert_eq!(parse_mouse_params(b"0;10;abc"), None);
+    }
+
+    #[test]
+    fn parse_mouse_params_partial_semicolons() {
+        assert_eq!(parse_mouse_params(b";10;20"), None); // empty first field
+        assert_eq!(parse_mouse_params(b"0;;20"), None);  // empty middle field
+    }
+
+    // ── parse_input ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_input_quit_on_q() {
+        let mut col = 40;
+        let mut row = 12;
+        let mut bursts = Vec::new();
+        assert!(parse_input(b"q", &mut col, &mut row, &mut bursts, 80, 24));
+    }
+
+    #[test]
+    fn parse_input_quit_on_ctrl_c() {
+        let mut col = 40;
+        let mut row = 12;
+        let mut bursts = Vec::new();
+        assert!(parse_input(b"\x03", &mut col, &mut row, &mut bursts, 80, 24));
+    }
+
+    #[test]
+    fn parse_input_quit_on_lone_esc() {
+        let mut col = 40;
+        let mut row = 12;
+        let mut bursts = Vec::new();
+        assert!(parse_input(b"\x1b", &mut col, &mut row, &mut bursts, 80, 24));
+    }
+
+    #[test]
+    fn parse_input_sgr_mouse_motion() {
+        let mut col = 1;
+        let mut row = 1;
+        let mut bursts = Vec::new();
+        // SGR mouse motion event: button 32 (motion flag), col=15, row=10, 'M' final
+        let input = b"\x1b[<32;15;10M";
+        let quit = parse_input(input, &mut col, &mut row, &mut bursts, 80, 24);
+        assert!(!quit);
+        assert_eq!(col, 15);
+        assert_eq!(row, 10);
+        // Motion events (btn & 0x20 != 0) should not create bursts
+        assert!(bursts.is_empty());
+    }
+
+    #[test]
+    fn parse_input_sgr_mouse_click_creates_burst() {
+        let mut col = 1;
+        let mut row = 1;
+        let mut bursts = Vec::new();
+        // SGR mouse press: button 0, col=5, row=3, 'M' final (press)
+        let input = b"\x1b[<0;5;3M";
+        let quit = parse_input(input, &mut col, &mut row, &mut bursts, 80, 24);
+        assert!(!quit);
+        assert_eq!(col, 5);
+        assert_eq!(row, 3);
+        assert_eq!(bursts.len(), 1);
+        assert_eq!(bursts[0].col, 5);
+        assert_eq!(bursts[0].row, 3);
+        assert_eq!(bursts[0].age, 0);
+    }
+
+    #[test]
+    fn parse_input_mouse_release_no_burst() {
+        let mut col = 1;
+        let mut row = 1;
+        let mut bursts = Vec::new();
+        // 'm' final byte means release
+        let input = b"\x1b[<0;5;3m";
+        let quit = parse_input(input, &mut col, &mut row, &mut bursts, 80, 24);
+        assert!(!quit);
+        assert!(bursts.is_empty());
+    }
+
+    #[test]
+    fn parse_input_clamps_mouse_to_bounds() {
+        let mut col = 1;
+        let mut row = 1;
+        let mut bursts = Vec::new();
+        let input = b"\x1b[<32;999;999M";
+        parse_input(input, &mut col, &mut row, &mut bursts, 80, 24);
+        assert_eq!(col, 80);
+        assert_eq!(row, 24);
+    }
+}

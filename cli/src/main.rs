@@ -1408,11 +1408,13 @@ async fn handle_server_msg(
         S2C_LIST if frame.len() >= 3 => {
             let count = u16::from_le_bytes([frame[1], frame[2]]) as usize;
             ptys.clear();
-            for i in 0..count {
-                let off = 3 + i * 2;
-                if off + 1 < frame.len() {
-                    ptys.push(u16::from_le_bytes([frame[off], frame[off + 1]]));
-                }
+            let mut off = 3;
+            for _ in 0..count {
+                if off + 4 > frame.len() { break; }
+                let id = u16::from_le_bytes([frame[off], frame[off + 1]]);
+                let tag_len = u16::from_le_bytes([frame[off + 2], frame[off + 3]]) as usize;
+                off += 4 + tag_len;
+                ptys.push(id);
             }
             expose.sync(ptys);
             if let Some(&id) = ptys.first() {
@@ -1622,5 +1624,395 @@ mod tests {
         // CUP for row 2, col 5 → \x1b[3;6H (1-based)
         assert!(output_contains(&out, b"\x1b[3;6H"),
             "cursor not positioned at expected row=2 col=5");
+    }
+
+    // ── make_frame ──────────────────────────────────────────────────────
+
+    #[test]
+    fn make_frame_empty_payload() {
+        let f = make_frame(&[]);
+        assert_eq!(f, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn make_frame_small_payload() {
+        let f = make_frame(&[0xAB, 0xCD]);
+        assert_eq!(f.len(), 6);
+        assert_eq!(&f[..4], &2u32.to_le_bytes());
+        assert_eq!(&f[4..], &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn make_frame_256_byte_payload() {
+        let payload = vec![0x42; 256];
+        let f = make_frame(&payload);
+        assert_eq!(f.len(), 260);
+        assert_eq!(u32::from_le_bytes([f[0], f[1], f[2], f[3]]), 256);
+        assert!(f[4..].iter().all(|&b| b == 0x42));
+    }
+
+    // ── pack_color / emit_color ─────────────────────────────────────────
+
+    #[test]
+    fn pack_color_default() {
+        let p = pack_color(0, 0, 0, 0);
+        assert_eq!(p, 0);
+    }
+
+    #[test]
+    fn pack_color_indexed() {
+        let p = pack_color(1, 42, 0, 0);
+        // color_type=1 at bits 24, r=42 at bits 16
+        assert_eq!(p, (1u64 << 24) | (42u64 << 16));
+    }
+
+    #[test]
+    fn pack_color_rgb() {
+        let p = pack_color(2, 0xFF, 0x80, 0x40);
+        assert_eq!(p, (2u64 << 24) | (0xFFu64 << 16) | (0x80u64 << 8) | 0x40u64);
+    }
+
+    #[test]
+    fn emit_color_default_fg() {
+        let packed = pack_color(0, 0, 0, 0);
+        let mut out = Vec::new();
+        emit_color(packed, true, &mut out);
+        assert_eq!(out, b"\x1b[39m");
+    }
+
+    #[test]
+    fn emit_color_default_bg() {
+        let packed = pack_color(0, 0, 0, 0);
+        let mut out = Vec::new();
+        emit_color(packed, false, &mut out);
+        assert_eq!(out, b"\x1b[49m");
+    }
+
+    #[test]
+    fn emit_color_indexed_fg() {
+        let packed = pack_color(1, 196, 0, 0);
+        let mut out = Vec::new();
+        emit_color(packed, true, &mut out);
+        // \x1b[38;5;196m
+        let expected = b"\x1b[38;5;196m";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn emit_color_indexed_bg() {
+        let packed = pack_color(1, 42, 0, 0);
+        let mut out = Vec::new();
+        emit_color(packed, false, &mut out);
+        assert_eq!(out, b"\x1b[48;5;42m");
+    }
+
+    #[test]
+    fn emit_color_rgb_fg() {
+        let packed = pack_color(2, 10, 20, 30);
+        let mut out = Vec::new();
+        emit_color(packed, true, &mut out);
+        assert_eq!(out, b"\x1b[38;2;10;20;30m");
+    }
+
+    #[test]
+    fn emit_color_rgb_bg() {
+        let packed = pack_color(2, 255, 128, 0);
+        let mut out = Vec::new();
+        emit_color(packed, false, &mut out);
+        assert_eq!(out, b"\x1b[48;2;255;128;0m");
+    }
+
+    #[test]
+    fn emit_color_unknown_type_falls_back_to_default() {
+        let packed = pack_color(3, 1, 2, 3);
+        let mut out = Vec::new();
+        emit_color(packed, true, &mut out);
+        assert_eq!(out, b"\x1b[39m");
+    }
+
+    // ── push_u16 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn push_u16_zero() {
+        let mut out = Vec::new();
+        push_u16(&mut out, 0);
+        assert_eq!(out, b"0");
+    }
+
+    #[test]
+    fn push_u16_one() {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        assert_eq!(out, b"1");
+    }
+
+    #[test]
+    fn push_u16_255() {
+        let mut out = Vec::new();
+        push_u16(&mut out, 255);
+        assert_eq!(out, b"255");
+    }
+
+    #[test]
+    fn push_u16_max() {
+        let mut out = Vec::new();
+        push_u16(&mut out, 65535);
+        assert_eq!(out, b"65535");
+    }
+
+    #[test]
+    fn push_u16_power_of_ten() {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1000);
+        assert_eq!(out, b"1000");
+    }
+
+    // ── digits ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn digits_zero() {
+        assert_eq!(digits(0), 1);
+    }
+
+    #[test]
+    fn digits_single() {
+        assert_eq!(digits(1), 1);
+        assert_eq!(digits(9), 1);
+    }
+
+    #[test]
+    fn digits_double() {
+        assert_eq!(digits(10), 2);
+        assert_eq!(digits(99), 2);
+    }
+
+    #[test]
+    fn digits_triple() {
+        assert_eq!(digits(100), 3);
+        assert_eq!(digits(999), 3);
+    }
+
+    #[test]
+    fn digits_large() {
+        assert_eq!(digits(10000), 5);
+        assert_eq!(digits(65535), 5);
+    }
+
+    // ── parse_expose_key ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_expose_key_empty() {
+        let (action, consumed) = parse_expose_key(&[]);
+        assert!(matches!(action, ExposeAction::None));
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn parse_expose_key_ctrl_k() {
+        let (action, consumed) = parse_expose_key(&[0x0B]);
+        assert!(matches!(action, ExposeAction::Close));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_bare_escape() {
+        let (action, consumed) = parse_expose_key(&[0x1B]);
+        assert!(matches!(action, ExposeAction::Close));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_arrow_up() {
+        let (action, consumed) = parse_expose_key(&[0x1B, b'[', b'A']);
+        assert!(matches!(action, ExposeAction::Up));
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn parse_expose_key_arrow_down() {
+        let (action, consumed) = parse_expose_key(&[0x1B, b'[', b'B']);
+        assert!(matches!(action, ExposeAction::Down));
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn parse_expose_key_unknown_csi() {
+        // e.g. arrow right \x1b[C — not handled, returns None
+        let (action, consumed) = parse_expose_key(&[0x1B, b'[', b'C']);
+        assert!(matches!(action, ExposeAction::None));
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn parse_expose_key_enter_cr() {
+        let (action, consumed) = parse_expose_key(&[0x0D]);
+        assert!(matches!(action, ExposeAction::Select));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_enter_lf() {
+        let (action, consumed) = parse_expose_key(&[0x0A]);
+        assert!(matches!(action, ExposeAction::Select));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_ctrl_n() {
+        let (action, consumed) = parse_expose_key(&[0x0E]);
+        assert!(matches!(action, ExposeAction::Create));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_ctrl_w() {
+        let (action, consumed) = parse_expose_key(&[0x17]);
+        assert!(matches!(action, ExposeAction::Kill));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_tab_is_none() {
+        // Tab (0x09) is not a recognized expose key
+        let (action, consumed) = parse_expose_key(&[0x09]);
+        assert!(matches!(action, ExposeAction::None));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_backspace_is_none() {
+        // Backspace (0x7F) is not a recognized expose key
+        let (action, consumed) = parse_expose_key(&[0x7F]);
+        assert!(matches!(action, ExposeAction::None));
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn parse_expose_key_plain_char_is_none() {
+        let (action, consumed) = parse_expose_key(b"a");
+        assert!(matches!(action, ExposeAction::None));
+        assert_eq!(consumed, 1);
+    }
+
+    // ── Expose struct ───────────────────────────────────────────────────
+
+    #[test]
+    fn expose_new_defaults() {
+        let e = Expose::new();
+        assert!(!e.open);
+        assert_eq!(e.selected, 0);
+        assert!(e.lru.is_empty());
+        assert!(e.titles.is_empty());
+    }
+
+    #[test]
+    fn expose_touch_adds_to_front() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        assert_eq!(e.lru, vec![2, 1]);
+    }
+
+    #[test]
+    fn expose_touch_moves_existing_to_front() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        e.touch(3);
+        e.touch(1); // move 1 to front
+        assert_eq!(e.lru, vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn expose_remove_removes_from_lru_and_titles() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        e.titles.insert(1, "hello".into());
+        e.titles.insert(2, "world".into());
+        e.remove(1);
+        assert_eq!(e.lru, vec![2]);
+        assert!(!e.titles.contains_key(&1));
+        assert!(e.titles.contains_key(&2));
+    }
+
+    #[test]
+    fn expose_remove_nonexistent_is_noop() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.remove(99);
+        assert_eq!(e.lru, vec![1]);
+    }
+
+    #[test]
+    fn expose_sync_adds_missing_and_removes_stale() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        e.touch(3);
+        // Sync with [2, 4]: removes 1 and 3, adds 4 at end
+        e.sync(&[2, 4]);
+        assert_eq!(e.lru.len(), 2);
+        assert!(e.lru.contains(&2));
+        assert!(e.lru.contains(&4));
+        assert!(!e.lru.contains(&1));
+        assert!(!e.lru.contains(&3));
+    }
+
+    #[test]
+    fn expose_sync_preserves_lru_order_for_existing() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        e.touch(3);
+        // lru is [3, 2, 1]
+        e.sync(&[1, 2, 3]);
+        // Existing items keep their LRU order: [3, 2, 1]
+        assert_eq!(e.lru, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn expose_sync_empty_clears_lru() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.sync(&[]);
+        assert!(e.lru.is_empty());
+    }
+
+    #[test]
+    fn expose_visible_ids_returns_lru() {
+        let mut e = Expose::new();
+        e.touch(5);
+        e.touch(10);
+        assert_eq!(e.visible_ids(), &[10, 5]);
+    }
+
+    #[test]
+    fn expose_clamp_selection_empty() {
+        let mut e = Expose::new();
+        e.selected = 5;
+        e.clamp_selection();
+        assert_eq!(e.selected, 0);
+    }
+
+    #[test]
+    fn expose_clamp_selection_within_bounds() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        e.touch(3);
+        e.selected = 1;
+        e.clamp_selection();
+        assert_eq!(e.selected, 1);
+    }
+
+    #[test]
+    fn expose_clamp_selection_over_bounds() {
+        let mut e = Expose::new();
+        e.touch(1);
+        e.touch(2);
+        e.selected = 10;
+        e.clamp_selection();
+        assert_eq!(e.selected, 1); // len - 1
     }
 }

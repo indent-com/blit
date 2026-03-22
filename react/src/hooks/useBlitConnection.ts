@@ -30,11 +30,16 @@ export interface ServerMessage {
   ptyIds?: number[];
 }
 
+export interface PtyListEntry {
+  ptyId: number;
+  tag: string;
+}
+
 export interface BlitConnectionCallbacks {
   onUpdate?: (ptyId: number, payload: Uint8Array) => void;
-  onCreated?: (ptyId: number) => void;
+  onCreated?: (ptyId: number, tag: string) => void;
   onClosed?: (ptyId: number) => void;
-  onList?: (ptyIds: number[]) => void;
+  onList?: (entries: PtyListEntry[]) => void;
   onTitle?: (ptyId: number, title: string) => void;
 }
 
@@ -94,7 +99,8 @@ export function useBlitConnection(
         case S2C_CREATED: {
           if (bytes.length < 3) break;
           const ptyId = bytes[1] | (bytes[2] << 8);
-          callbacksRef.current.onCreated?.(ptyId);
+          const tag = textDecoder.decode(bytes.subarray(3));
+          callbacksRef.current.onCreated?.(ptyId, tag);
           break;
         }
         case S2C_CLOSED: {
@@ -106,14 +112,18 @@ export function useBlitConnection(
         case S2C_LIST: {
           if (bytes.length < 3) break;
           const count = bytes[1] | (bytes[2] << 8);
-          const ids: number[] = [];
+          const entries: { ptyId: number; tag: string }[] = [];
+          let off = 3;
           for (let i = 0; i < count; i++) {
-            const off = 3 + i * 2;
-            if (off + 1 < bytes.length) {
-              ids.push(bytes[off] | (bytes[off + 1] << 8));
-            }
+            if (off + 4 > bytes.length) break;
+            const ptyId = bytes[off] | (bytes[off + 1] << 8);
+            const tagLen = bytes[off + 2] | (bytes[off + 3] << 8);
+            off += 4;
+            const tag = textDecoder.decode(bytes.subarray(off, off + tagLen));
+            off += tagLen;
+            entries.push({ ptyId, tag });
           }
-          callbacksRef.current.onList?.(ids);
+          callbacksRef.current.onList?.(entries);
           break;
         }
         case S2C_TITLE: {
@@ -181,18 +191,22 @@ export function useBlitConnection(
   );
 
   const sendCreate = useCallback(
-    (rows: number, cols: number, command?: string) => {
+    (rows: number, cols: number, options?: { tag?: string; command?: string }) => {
       const encoder = new TextEncoder();
-      const commandBytes = command?.trim()
-        ? encoder.encode(command.trim())
+      const tagBytes = options?.tag ? encoder.encode(options.tag) : new Uint8Array(0);
+      const commandBytes = options?.command?.trim()
+        ? encoder.encode(options.command.trim())
         : null;
-      const msg = new Uint8Array(5 + (commandBytes ? commandBytes.length : 0));
+      const msg = new Uint8Array(7 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
       msg[0] = C2S_CREATE;
       msg[1] = rows & 0xff;
       msg[2] = (rows >> 8) & 0xff;
       msg[3] = cols & 0xff;
       msg[4] = (cols >> 8) & 0xff;
-      if (commandBytes) msg.set(commandBytes, 5);
+      msg[5] = tagBytes.length & 0xff;
+      msg[6] = (tagBytes.length >> 8) & 0xff;
+      if (tagBytes.length) msg.set(tagBytes, 7);
+      if (commandBytes) msg.set(commandBytes, 7 + tagBytes.length);
       transport.send(msg);
     },
     [transport],

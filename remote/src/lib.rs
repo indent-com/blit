@@ -1011,11 +1011,17 @@ impl CallbackRenderer {
 
 pub enum ServerMsg<'a> {
     Update { pty_id: u16, payload: &'a [u8] },
-    Created { pty_id: u16 },
+    Created { pty_id: u16, tag: &'a str },
     Closed { pty_id: u16 },
-    List { pty_ids: Vec<u16> },
+    List { entries: Vec<PtyListEntry<'a>> },
     Title { pty_id: u16, title: &'a [u8] },
     SearchResults { request_id: u16, results: Vec<SearchResultEntry<'a>> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtyListEntry<'a> {
+    pub pty_id: u16,
+    pub tag: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1046,8 +1052,10 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             if data.len() < 3 {
                 return None;
             }
+            let tag = std::str::from_utf8(data.get(3..).unwrap_or_default()).unwrap_or_default();
             Some(ServerMsg::Created {
                 pty_id: u16::from_le_bytes([data[1], data[2]]),
+                tag,
             })
         }
         S2C_CLOSED => {
@@ -1063,11 +1071,19 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 return None;
             }
             let count = u16::from_le_bytes([data[1], data[2]]) as usize;
-            let mut pty_ids = Vec::with_capacity(count);
-            for chunk in data[3..].chunks_exact(2).take(count) {
-                pty_ids.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            let mut entries = Vec::with_capacity(count);
+            let mut offset = 3;
+            for _ in 0..count {
+                if offset + 4 > data.len() { break; }
+                let pty_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                let tag_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                offset += 4;
+                if offset + tag_len > data.len() { break; }
+                let tag = std::str::from_utf8(&data[offset..offset + tag_len]).unwrap_or_default();
+                offset += tag_len;
+                entries.push(PtyListEntry { pty_id, tag });
             }
-            Some(ServerMsg::List { pty_ids })
+            Some(ServerMsg::List { entries })
         }
         S2C_TITLE => {
             if data.len() < 3 {
@@ -1135,17 +1151,27 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
 }
 
 pub fn msg_create(rows: u16, cols: u16) -> Vec<u8> {
-    vec![
-        C2S_CREATE,
-        (rows & 0xff) as u8,
-        (rows >> 8) as u8,
-        (cols & 0xff) as u8,
-        (cols >> 8) as u8,
-    ]
+    msg_create_tagged(rows, cols, "")
+}
+
+pub fn msg_create_tagged(rows: u16, cols: u16, tag: &str) -> Vec<u8> {
+    let tag_bytes = tag.as_bytes();
+    let tag_len = tag_bytes.len() as u16;
+    let mut msg = Vec::with_capacity(7 + tag_bytes.len());
+    msg.push(C2S_CREATE);
+    msg.extend_from_slice(&rows.to_le_bytes());
+    msg.extend_from_slice(&cols.to_le_bytes());
+    msg.extend_from_slice(&tag_len.to_le_bytes());
+    msg.extend_from_slice(tag_bytes);
+    msg
 }
 
 pub fn msg_create_command(rows: u16, cols: u16, command: &str) -> Vec<u8> {
-    let mut msg = msg_create(rows, cols);
+    msg_create_tagged_command(rows, cols, "", command)
+}
+
+pub fn msg_create_tagged_command(rows: u16, cols: u16, tag: &str, command: &str) -> Vec<u8> {
+    let mut msg = msg_create_tagged(rows, cols, tag);
     msg.extend_from_slice(command.as_bytes());
     msg
 }
@@ -1898,5 +1924,694 @@ mod tests {
         assert_eq!(results[0].matched_sources, 0b111);
         assert_eq!(results[0].scroll_offset, Some(9));
         assert_eq!(results[0].context, b"hello");
+    }
+
+    // --- Tag tests ---
+
+    #[test]
+    fn msg_create_no_tag_has_zero_tag_len() {
+        let msg = msg_create(24, 80);
+        assert_eq!(msg.len(), 7);
+        assert_eq!(msg[0], C2S_CREATE);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 24);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), 80);
+        // tag_len = 0
+        assert_eq!(u16::from_le_bytes([msg[5], msg[6]]), 0);
+    }
+
+    #[test]
+    fn msg_create_tagged_encodes_tag() {
+        let msg = msg_create_tagged(24, 80, "my-pty");
+        assert_eq!(msg[0], C2S_CREATE);
+        let tag_len = u16::from_le_bytes([msg[5], msg[6]]) as usize;
+        assert_eq!(tag_len, 6);
+        assert_eq!(&msg[7..7 + tag_len], b"my-pty");
+        assert_eq!(msg.len(), 7 + tag_len);
+    }
+
+    #[test]
+    fn msg_create_tagged_command_encodes_both() {
+        let msg = msg_create_tagged_command(30, 120, "editor", "vim");
+        let tag_len = u16::from_le_bytes([msg[5], msg[6]]) as usize;
+        assert_eq!(tag_len, 6);
+        assert_eq!(&msg[7..13], b"editor");
+        assert_eq!(&msg[13..], b"vim");
+    }
+
+    #[test]
+    fn msg_create_command_has_empty_tag() {
+        let msg = msg_create_command(24, 80, "ls");
+        let tag_len = u16::from_le_bytes([msg[5], msg[6]]) as usize;
+        assert_eq!(tag_len, 0);
+        assert_eq!(&msg[7..], b"ls");
+    }
+
+    #[test]
+    fn msg_create_tagged_empty_tag() {
+        let msg = msg_create_tagged(24, 80, "");
+        assert_eq!(msg.len(), 7);
+        assert_eq!(u16::from_le_bytes([msg[5], msg[6]]), 0);
+    }
+
+    #[test]
+    fn msg_create_tagged_unicode_tag() {
+        let msg = msg_create_tagged(24, 80, "日本語");
+        let tag_len = u16::from_le_bytes([msg[5], msg[6]]) as usize;
+        assert_eq!(tag_len, "日本語".len());
+        assert_eq!(std::str::from_utf8(&msg[7..7 + tag_len]).unwrap(), "日本語");
+    }
+
+    #[test]
+    fn parse_created_with_tag() {
+        let mut wire = vec![S2C_CREATED, 0x05, 0x00];
+        wire.extend_from_slice(b"hello");
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::Created { pty_id, tag } => {
+                assert_eq!(pty_id, 5);
+                assert_eq!(tag, "hello");
+            }
+            _ => panic!("expected Created"),
+        }
+    }
+
+    #[test]
+    fn parse_created_without_tag() {
+        let wire = vec![S2C_CREATED, 0x03, 0x00];
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::Created { pty_id, tag } => {
+                assert_eq!(pty_id, 3);
+                assert_eq!(tag, "");
+            }
+            _ => panic!("expected Created"),
+        }
+    }
+
+    #[test]
+    fn parse_list_with_tags() {
+        // 2 entries: id=1 tag="ab", id=2 tag=""
+        let mut wire = vec![S2C_LIST, 0x02, 0x00];
+        // entry 1: id=1, tag_len=2, tag="ab"
+        wire.extend_from_slice(&1u16.to_le_bytes());
+        wire.extend_from_slice(&2u16.to_le_bytes());
+        wire.extend_from_slice(b"ab");
+        // entry 2: id=2, tag_len=0
+        wire.extend_from_slice(&2u16.to_le_bytes());
+        wire.extend_from_slice(&0u16.to_le_bytes());
+
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::List { entries } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].pty_id, 1);
+                assert_eq!(entries[0].tag, "ab");
+                assert_eq!(entries[1].pty_id, 2);
+                assert_eq!(entries[1].tag, "");
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn parse_list_empty() {
+        let wire = vec![S2C_LIST, 0x00, 0x00];
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::List { entries } => assert_eq!(entries.len(), 0),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn parse_list_truncated_gracefully() {
+        // count=2 but only 1 complete entry
+        let mut wire = vec![S2C_LIST, 0x02, 0x00];
+        wire.extend_from_slice(&1u16.to_le_bytes());
+        wire.extend_from_slice(&0u16.to_le_bytes());
+        // missing second entry
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::List { entries } => assert_eq!(entries.len(), 1),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn parse_list_with_long_tags() {
+        let long_tag = "a".repeat(300);
+        let mut wire = vec![S2C_LIST, 0x01, 0x00];
+        wire.extend_from_slice(&42u16.to_le_bytes());
+        wire.extend_from_slice(&(long_tag.len() as u16).to_le_bytes());
+        wire.extend_from_slice(long_tag.as_bytes());
+
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::List { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].pty_id, 42);
+                assert_eq!(entries[0].tag, long_tag);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn create_and_created_tag_round_trip() {
+        // Simulate: client sends create with tag, server echoes tag in created
+        let create_msg = msg_create_tagged(24, 80, "my-session");
+        let tag_len = u16::from_le_bytes([create_msg[5], create_msg[6]]) as usize;
+        let tag = std::str::from_utf8(&create_msg[7..7 + tag_len]).unwrap();
+
+        // Server builds S2C_CREATED with the tag
+        let mut created_wire = vec![S2C_CREATED, 0x07, 0x00]; // pty_id = 7
+        created_wire.extend_from_slice(tag.as_bytes());
+
+        let msg = parse_server_msg(&created_wire).unwrap();
+        match msg {
+            ServerMsg::Created { pty_id, tag: parsed_tag } => {
+                assert_eq!(pty_id, 7);
+                assert_eq!(parsed_tag, "my-session");
+            }
+            _ => panic!("expected Created"),
+        }
+    }
+
+    // --- FrameState tests ---
+
+    #[test]
+    fn frame_state_accessors() {
+        let mut f = FrameState::new(4, 10);
+        assert_eq!(f.rows(), 4);
+        assert_eq!(f.cols(), 10);
+        assert_eq!(f.cursor_row(), 0);
+        assert_eq!(f.cursor_col(), 0);
+        assert_eq!(f.mode(), 0);
+        assert_eq!(f.title(), "");
+        assert_eq!(f.cells().len(), 4 * 10 * CELL_SIZE);
+        assert_eq!(f.cells_mut().len(), 4 * 10 * CELL_SIZE);
+        assert!(f.overflow().is_empty());
+        assert!(f.overflow_mut().is_empty());
+    }
+
+    #[test]
+    fn frame_state_from_parts() {
+        let cells = vec![0u8; 2 * 4 * CELL_SIZE];
+        let f = FrameState::from_parts(2, 4, 1, 3, 0x0F, "hello", cells.clone());
+        assert_eq!(f.rows(), 2);
+        assert_eq!(f.cols(), 4);
+        assert_eq!(f.cursor_row(), 1);
+        assert_eq!(f.cursor_col(), 3);
+        assert_eq!(f.mode(), 0x0F);
+        assert_eq!(f.title(), "hello");
+        assert_eq!(f.cells(), &cells[..]);
+    }
+
+    #[test]
+    fn frame_state_from_parts_wrong_size() {
+        // cells with wrong size should be ignored (stays zeroed)
+        let cells = vec![0u8; 10]; // wrong size
+        let f = FrameState::from_parts(2, 4, 0, 0, 0, "", cells);
+        assert_eq!(f.cells().len(), 2 * 4 * CELL_SIZE);
+    }
+
+    #[test]
+    fn frame_state_resize() {
+        let mut f = FrameState::new(4, 10);
+        f.set_cursor(3, 9);
+        f.resize(2, 5);
+        assert_eq!(f.rows(), 2);
+        assert_eq!(f.cols(), 5);
+        assert_eq!(f.cursor_row(), 1); // clamped
+        assert_eq!(f.cursor_col(), 4); // clamped
+        assert_eq!(f.cells().len(), 2 * 5 * CELL_SIZE);
+    }
+
+    #[test]
+    fn frame_state_resize_noop() {
+        let mut f = FrameState::new(4, 10);
+        let ptr_before = f.cells().as_ptr();
+        f.resize(4, 10); // same size
+        let ptr_after = f.cells().as_ptr();
+        assert_eq!(ptr_before, ptr_after); // no realloc
+    }
+
+    #[test]
+    fn frame_state_set_cursor_clamps() {
+        let mut f = FrameState::new(4, 10);
+        f.set_cursor(100, 200);
+        assert_eq!(f.cursor_row(), 3);
+        assert_eq!(f.cursor_col(), 9);
+    }
+
+    #[test]
+    fn frame_state_set_title() {
+        let mut f = FrameState::new(2, 2);
+        assert!(f.set_title("new title"));
+        assert_eq!(f.title(), "new title");
+        assert!(!f.set_title("new title")); // same title returns false
+        assert!(f.set_title("other"));
+    }
+
+    #[test]
+    fn frame_state_get_text_and_write_text() {
+        let mut f = FrameState::new(2, 10);
+        f.write_text(0, 0, "Hello", CellStyle::default());
+        f.write_text(1, 0, "World", CellStyle::default());
+        let text = f.get_text(0, 0, 1, 9);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        let all = f.get_all_text();
+        assert!(all.contains("Hello"));
+    }
+
+    #[test]
+    fn frame_state_get_text_empty() {
+        let f = FrameState::new(0, 0);
+        assert_eq!(f.get_text(0, 0, 0, 0), "");
+        assert_eq!(f.get_all_text(), "");
+    }
+
+    #[test]
+    fn frame_state_get_cell() {
+        let f = FrameState::new(2, 4);
+        let cell = f.get_cell(0, 0);
+        assert_eq!(cell.len(), CELL_SIZE);
+        // Out of bounds
+        assert!(f.get_cell(100, 100).is_empty());
+    }
+
+    #[test]
+    fn frame_state_cell_content_blank() {
+        let f = FrameState::new(2, 4);
+        assert_eq!(f.cell_content(0, 0), " "); // blank cell
+        assert_eq!(f.cell_content(100, 0), ""); // out of bounds
+    }
+
+    #[test]
+    fn frame_state_cell_content_with_text() {
+        let mut f = FrameState::new(2, 10);
+        f.write_text(0, 0, "A", CellStyle::default());
+        assert_eq!(f.cell_content(0, 0), "A");
+    }
+
+    #[test]
+    fn frame_state_fill_rect() {
+        let mut f = FrameState::new(4, 10);
+        f.fill_rect(Rect::new(0, 0, 2, 5), 'X', CellStyle::default());
+        assert_eq!(f.cell_content(0, 0), "X");
+        assert_eq!(f.cell_content(1, 4), "X");
+        assert_eq!(f.cell_content(2, 0), " "); // outside rect
+    }
+
+    #[test]
+    fn frame_state_wrapped_text() {
+        let mut f = FrameState::new(4, 10);
+        let lines = f.write_wrapped_text(Rect::new(0, 0, 4, 5), "hello world", CellStyle::default());
+        assert!(lines >= 2); // "hello world" wraps at width 5
+    }
+
+    #[test]
+    fn frame_state_wrapped_text_empty_rect() {
+        let mut f = FrameState::new(4, 10);
+        assert_eq!(f.write_wrapped_text(Rect::new(0, 0, 0, 0), "hi", CellStyle::default()), 0);
+    }
+
+    #[test]
+    fn frame_state_scrolling_text() {
+        let mut f = FrameState::new(4, 10);
+        f.write_scrolling_text(
+            Rect::new(0, 0, 3, 10),
+            &["line1", "line2", "line3", "line4"],
+            0,
+            CellStyle::default(),
+        );
+        // Last 3 lines visible with offset_from_bottom=0
+        assert_eq!(f.cell_content(0, 0), "l"); // "line2"
+    }
+
+    #[test]
+    fn frame_state_scrolling_text_empty_rect() {
+        let mut f = FrameState::new(4, 10);
+        f.write_scrolling_text(Rect::new(0, 0, 0, 0), &["hi"], 0, CellStyle::default());
+        // Should not panic
+    }
+
+    #[test]
+    fn frame_state_clear() {
+        let mut f = FrameState::new(2, 4);
+        f.write_text(0, 0, "AB", CellStyle::default());
+        f.clear(CellStyle::default());
+        assert_eq!(f.cell_content(0, 0), " ");
+    }
+
+    // --- TerminalState tests ---
+
+    #[test]
+    fn terminal_state_accessors() {
+        let t = TerminalState::new(24, 80);
+        assert_eq!(t.rows(), 24);
+        assert_eq!(t.cols(), 80);
+        assert_eq!(t.cursor_row(), 0);
+        assert_eq!(t.cursor_col(), 0);
+        assert_eq!(t.mode(), 0);
+        assert_eq!(t.title(), "");
+        assert!(t.all_dirty());
+        assert_eq!(t.dirty_flags().len(), 24 * 80);
+        assert_eq!(t.cells().len(), 24 * 80 * CELL_SIZE);
+        assert_eq!(t.frame().rows(), 24);
+    }
+
+    #[test]
+    fn terminal_state_mutators() {
+        let mut t = TerminalState::new(4, 10);
+        t.frame_mut().set_title("test");
+        assert_eq!(t.title(), "test");
+        t.dirty_flags_mut()[0] = false;
+        assert!(!t.dirty_flags()[0]);
+        t.mark_all_dirty();
+        assert!(t.all_dirty());
+        t.clear_all_dirty();
+        assert!(!t.all_dirty());
+    }
+
+    #[test]
+    fn terminal_state_set_title() {
+        let mut t = TerminalState::new(4, 10);
+        assert!(t.frame_mut().set_title("hello"));
+        assert_eq!(t.title(), "hello");
+        assert!(!t.frame_mut().set_title("hello")); // same
+    }
+
+    #[test]
+    fn terminal_state_get_text() {
+        let t = TerminalState::new(2, 10);
+        let text = t.get_text(0, 0, 0, 9);
+        assert!(text.is_empty() || text.chars().all(|c| c == ' ' || c == '\n'));
+        assert!(t.get_cell(0, 0).len() == CELL_SIZE);
+        assert!(t.get_cell(100, 100).is_empty());
+    }
+
+    #[test]
+    fn terminal_state_resize() {
+        let mut t = TerminalState::new(4, 10);
+        t.frame_mut().resize(2, 5);
+        // Note: TerminalState.dirty isn't updated by frame_mut().resize()
+        // directly — that happens through feed_compressed. So just check frame.
+        assert_eq!(t.rows(), 2);
+        assert_eq!(t.cols(), 5);
+    }
+
+    #[test]
+    fn terminal_state_feed_compressed_invalid() {
+        let mut t = TerminalState::new(4, 10);
+        assert!(!t.feed_compressed(b"garbage"));
+        assert!(!t.feed_compressed(&[]));
+    }
+
+    #[test]
+    fn terminal_state_feed_compressed_batch_empty() {
+        let mut t = TerminalState::new(4, 10);
+        assert!(!t.feed_compressed_batch(&[]));
+    }
+
+    #[test]
+    fn terminal_state_feed_compressed_batch_truncated() {
+        let mut t = TerminalState::new(4, 10);
+        // Length header says 100 bytes but only 4 bytes present
+        let batch = &[100, 0, 0, 0];
+        assert!(!t.feed_compressed_batch(batch));
+    }
+
+    // --- Client message builder tests ---
+
+    #[test]
+    fn msg_input_format() {
+        let msg = msg_input(5, b"hello");
+        assert_eq!(msg[0], C2S_INPUT);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 5);
+        assert_eq!(&msg[3..], b"hello");
+    }
+
+    #[test]
+    fn msg_resize_format() {
+        let msg = msg_resize(3, 24, 80);
+        assert_eq!(msg[0], C2S_RESIZE);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 3);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), 24);
+        assert_eq!(u16::from_le_bytes([msg[5], msg[6]]), 80);
+    }
+
+    #[test]
+    fn msg_focus_format() {
+        let msg = msg_focus(7);
+        assert_eq!(msg[0], C2S_FOCUS);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 7);
+        assert_eq!(msg.len(), 3);
+    }
+
+    #[test]
+    fn msg_close_format() {
+        let msg = msg_close(9);
+        assert_eq!(msg[0], C2S_CLOSE);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 9);
+    }
+
+    #[test]
+    fn msg_subscribe_unsubscribe_format() {
+        let sub = msg_subscribe(1);
+        assert_eq!(sub[0], C2S_SUBSCRIBE);
+        assert_eq!(u16::from_le_bytes([sub[1], sub[2]]), 1);
+
+        let unsub = msg_unsubscribe(2);
+        assert_eq!(unsub[0], C2S_UNSUBSCRIBE);
+        assert_eq!(u16::from_le_bytes([unsub[1], unsub[2]]), 2);
+    }
+
+    #[test]
+    fn msg_search_format() {
+        let msg = msg_search(42, "test query");
+        assert_eq!(msg[0], C2S_SEARCH);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 42);
+        assert_eq!(&msg[3..], b"test query");
+    }
+
+    #[test]
+    fn msg_ack_format() {
+        let msg = msg_ack();
+        assert_eq!(msg, vec![C2S_ACK]);
+    }
+
+    #[test]
+    fn msg_scroll_format() {
+        let msg = msg_scroll(5, 1000);
+        assert_eq!(msg[0], C2S_SCROLL);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 5);
+        assert_eq!(u32::from_le_bytes([msg[3], msg[4], msg[5], msg[6]]), 1000);
+    }
+
+    #[test]
+    fn msg_display_rate_format() {
+        let msg = msg_display_rate(120);
+        assert_eq!(msg[0], C2S_DISPLAY_RATE);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 120);
+    }
+
+    #[test]
+    fn msg_client_metrics_format() {
+        let msg = msg_client_metrics(3, 5, 100);
+        assert_eq!(msg[0], C2S_CLIENT_METRICS);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 3);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), 5);
+        assert_eq!(u16::from_le_bytes([msg[5], msg[6]]), 100);
+    }
+
+    // --- CallbackRenderer tests ---
+
+    #[test]
+    fn callback_renderer_resize() {
+        let mut r = CallbackRenderer::new(2, 8);
+        assert_eq!(r.frame().rows(), 2);
+        r.resize(4, 16);
+        assert_eq!(r.frame().rows(), 4);
+        assert_eq!(r.frame().cols(), 16);
+    }
+
+    #[test]
+    fn callback_renderer_fill() {
+        let mut r = CallbackRenderer::new(4, 10);
+        r.render(|dom| {
+            dom.fill(Rect::new(0, 0, 2, 5), '#', CellStyle::default());
+        });
+        assert_eq!(r.frame().cell_content(0, 0), "#");
+        assert_eq!(r.frame().cell_content(1, 4), "#");
+    }
+
+    #[test]
+    fn callback_renderer_text() {
+        let mut r = CallbackRenderer::new(4, 20);
+        r.render(|dom| {
+            dom.text(0, 0, "Hello", CellStyle::default());
+        });
+        assert_eq!(r.frame().cell_content(0, 0), "H");
+        assert_eq!(r.frame().cell_content(0, 4), "o");
+    }
+
+    #[test]
+    fn callback_renderer_set_title() {
+        let mut r = CallbackRenderer::new(2, 8);
+        r.render(|dom| {
+            dom.set_title("my title");
+        });
+        assert_eq!(r.frame().title(), "my title");
+    }
+
+    #[test]
+    fn callback_renderer_set_background() {
+        let mut r = CallbackRenderer::new(2, 4);
+        let style = CellStyle {
+            bg: Color::Rgb(255, 0, 0),
+            ..CellStyle::default()
+        };
+        r.render(|dom| {
+            dom.set_background(style);
+        });
+        // Background fill should have been applied to all cells
+        assert_eq!(r.frame().cells().len(), 2 * 4 * CELL_SIZE);
+    }
+
+    #[test]
+    fn callback_renderer_scrolling_text() {
+        let mut r = CallbackRenderer::new(4, 20);
+        r.render(|dom| {
+            dom.scrolling_text(
+                Rect::new(0, 0, 3, 20),
+                ["a", "b", "c", "d", "e"].map(String::from),
+                0,
+                CellStyle::default(),
+            );
+        });
+        // Should show the last 3 lines
+        assert_eq!(r.frame().cell_content(0, 0), "c");
+    }
+
+    // --- parse_server_msg edge cases ---
+
+    #[test]
+    fn parse_empty_returns_none() {
+        assert!(parse_server_msg(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_unknown_type_returns_none() {
+        assert!(parse_server_msg(&[0xFF, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn parse_update_too_short() {
+        assert!(parse_server_msg(&[S2C_UPDATE, 0x00]).is_none());
+    }
+
+    #[test]
+    fn parse_closed() {
+        let msg = parse_server_msg(&[S2C_CLOSED, 0x05, 0x00]).unwrap();
+        match msg {
+            ServerMsg::Closed { pty_id } => assert_eq!(pty_id, 5),
+            _ => panic!("expected Closed"),
+        }
+    }
+
+    #[test]
+    fn parse_title() {
+        let mut wire = vec![S2C_TITLE, 0x01, 0x00];
+        wire.extend_from_slice(b"mytitle");
+        let msg = parse_server_msg(&wire).unwrap();
+        match msg {
+            ServerMsg::Title { pty_id, title } => {
+                assert_eq!(pty_id, 1);
+                assert_eq!(title, b"mytitle");
+            }
+            _ => panic!("expected Title"),
+        }
+    }
+
+    // --- build_update_msg round-trip ---
+
+    #[test]
+    fn build_update_msg_round_trip_with_resize() {
+        let style = CellStyle::default();
+        let mut prev = FrameState::new(2, 4);
+        prev.write_text(0, 0, "AB", style);
+
+        let mut next = FrameState::new(3, 5); // different size
+        next.write_text(0, 0, "XY", style);
+        next.set_title("resized");
+
+        let msg = build_update_msg(1, &next, &prev).unwrap();
+        assert!(!msg.is_empty());
+
+        // Apply to a terminal
+        let mut t = TerminalState::new(2, 4);
+        assert!(t.feed_compressed(&msg[3..])); // skip pty_id header
+        assert_eq!(t.rows(), 3);
+        assert_eq!(t.cols(), 5);
+        assert_eq!(t.title(), "resized");
+    }
+
+    #[test]
+    fn build_update_msg_cursor_change() {
+        let mut prev = FrameState::new(4, 10);
+        prev.set_cursor(0, 0);
+
+        let mut next = prev.clone();
+        next.set_cursor(2, 5);
+
+        let msg = build_update_msg(0, &next, &prev).unwrap();
+
+        let mut t = TerminalState::new(4, 10);
+        assert!(t.feed_compressed(&msg[3..]));
+        assert_eq!(t.cursor_row(), 2);
+        assert_eq!(t.cursor_col(), 5);
+    }
+
+    #[test]
+    fn build_update_msg_mode_change() {
+        let prev = FrameState::new(2, 4);
+        let mut next = prev.clone();
+        next.set_mode(0x0F);
+
+        let msg = build_update_msg(0, &next, &prev).unwrap();
+        let mut t = TerminalState::new(2, 4);
+        assert!(t.feed_compressed(&msg[3..]));
+        assert_eq!(t.mode(), 0x0F);
+    }
+
+    #[test]
+    fn feed_compressed_batch_multiple_frames() {
+        let style = CellStyle::default();
+        let prev = FrameState::new(2, 4);
+
+        let mut mid = prev.clone();
+        mid.write_text(0, 0, "AB", style);
+        let msg1 = build_update_msg(0, &mid, &prev).unwrap();
+
+        let mut next = mid.clone();
+        next.write_text(1, 0, "CD", style);
+        let msg2 = build_update_msg(0, &next, &mid).unwrap();
+
+        // Build batch: [len1:4][compressed1][len2:4][compressed2]
+        let payload1 = &msg1[3..];
+        let payload2 = &msg2[3..];
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&(payload1.len() as u32).to_le_bytes());
+        batch.extend_from_slice(payload1);
+        batch.extend_from_slice(&(payload2.len() as u32).to_le_bytes());
+        batch.extend_from_slice(payload2);
+
+        let mut t = TerminalState::new(2, 4);
+        assert!(t.feed_compressed_batch(&batch));
+        let text = t.get_all_text();
+        assert!(text.contains("AB"));
+        assert!(text.contains("CD"));
     }
 }

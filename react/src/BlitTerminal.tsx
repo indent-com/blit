@@ -580,10 +580,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       ptyId,
       fontFamily = DEFAULT_FONT,
       fontSize = DEFAULT_FONT_SIZE,
-      onTitleChange,
-      onPtyCreated,
-      onPtyClosed,
-      onPtyList,
       className,
       style,
     } = props;
@@ -611,7 +607,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     const [wasmReady, setWasmReady] = useState(false);
 
     // -----------------------------------------------------------------------
-    // Connection callbacks
+    // Connection callbacks — BlitTerminal only cares about UPDATE (rendering)
     // -----------------------------------------------------------------------
 
     const onUpdate = useCallback(
@@ -628,44 +624,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       [ptyId, transport],
     );
 
-    const onCreated = useCallback(
-      (createdId: number) => {
-        onPtyCreated?.(createdId);
-      },
-      [onPtyCreated],
-    );
-
-    const onClosed = useCallback(
-      (closedId: number) => {
-        onPtyClosed?.(closedId);
-      },
-      [onPtyClosed],
-    );
-
-    const onList = useCallback(
-      (ids: number[]) => {
-        onPtyList?.(ids);
-      },
-      [onPtyList],
-    );
-
-    const onTitle = useCallback(
-      (titlePtyId: number, title: string) => {
-        if (titlePtyId === ptyId) {
-          onTitleChange?.(title);
-        }
-      },
-      [ptyId, onTitleChange],
-    );
-
     const { status, sendInput, sendResize, sendSubscribe, sendUnsubscribe, sendScroll } =
-      useBlitConnection(transport, {
-        onUpdate,
-        onCreated,
-        onClosed,
-        onList,
-        onTitle,
-      });
+      useBlitConnection(transport, { onUpdate });
 
     // -----------------------------------------------------------------------
     // Imperative handle

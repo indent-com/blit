@@ -26,6 +26,14 @@ export interface BlitTransport {
   onstatuschange: ((status: ConnectionStatus) => void) | null;
 }
 
+/** A tracked PTY session. */
+export type BlitSession = {
+  ptyId: number;
+  tag: string;
+  title: string | null;
+  state: 'active' | 'closed';
+};
+
 /** Options for the BlitTerminal component. */
 export interface BlitTerminalProps {
   /** Transport instance for server communication. */
@@ -36,14 +44,6 @@ export interface BlitTerminalProps {
   fontFamily?: string;
   /** Font size in CSS pixels used for cell measurement. */
   fontSize?: number;
-  /** Called when the terminal title changes. */
-  onTitleChange?: (title: string) => void;
-  /** Called when a PTY is created by the server. */
-  onPtyCreated?: (ptyId: number) => void;
-  /** Called when a PTY is closed by the server. */
-  onPtyClosed?: (ptyId: number) => void;
-  /** Called when the PTY list is received. */
-  onPtyList?: (ptyIds: number[]) => void;
   /** Additional CSS class name for the container. */
   className?: string;
   /** Additional inline styles for the container. */

@@ -7,3 +7,5 @@
 /web/blit_browser.d.ts
 /web/package.json
 /web/.gitignore
+node_modules/
+coverage/

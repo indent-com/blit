@@ -211,3 +211,161 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
 
     eprintln!("client disconnected");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // --- static_asset_path tests ---
+
+    #[test]
+    fn static_asset_path_normal_file() {
+        let result = static_asset_path("/app.js").unwrap();
+        assert_eq!(result, Path::new(WEB_ROOT).join("app.js"));
+    }
+
+    #[test]
+    fn static_asset_path_nested() {
+        let result = static_asset_path("/assets/style.css").unwrap();
+        assert_eq!(result, Path::new(WEB_ROOT).join("assets/style.css"));
+    }
+
+    #[test]
+    fn static_asset_path_empty() {
+        assert!(static_asset_path("").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_just_slash() {
+        assert!(static_asset_path("/").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_multiple_slashes() {
+        assert!(static_asset_path("///").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_traversal_dotdot() {
+        assert!(static_asset_path("/../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_traversal_mid() {
+        assert!(static_asset_path("/assets/../../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_double_dots_bare() {
+        assert!(static_asset_path("/..").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_current_dir_dot() {
+        // "." is Component::CurDir, not Component::Normal
+        assert!(static_asset_path("/.").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_dot_in_middle() {
+        assert!(static_asset_path("/./foo").is_none());
+    }
+
+    #[test]
+    fn static_asset_path_no_leading_slash() {
+        let result = static_asset_path("app.js").unwrap();
+        assert_eq!(result, Path::new(WEB_ROOT).join("app.js"));
+    }
+
+    #[test]
+    fn static_asset_path_deeply_nested() {
+        let result = static_asset_path("/a/b/c/d.wasm").unwrap();
+        assert_eq!(result, Path::new(WEB_ROOT).join("a/b/c/d.wasm"));
+    }
+
+    // --- content_type tests ---
+
+    #[test]
+    fn content_type_js() {
+        assert_eq!(content_type(Path::new("app.js")), "application/javascript");
+    }
+
+    #[test]
+    fn content_type_wasm() {
+        assert_eq!(content_type(Path::new("mod.wasm")), "application/wasm");
+    }
+
+    #[test]
+    fn content_type_html() {
+        assert_eq!(
+            content_type(Path::new("index.html")),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn content_type_css() {
+        assert_eq!(
+            content_type(Path::new("style.css")),
+            "text/css; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn content_type_json() {
+        assert_eq!(content_type(Path::new("data.json")), "application/json");
+    }
+
+    #[test]
+    fn content_type_d_ts() {
+        // Path::extension() returns only the last extension, so "foo.d.ts"
+        // has extension "ts", which does not match the "d.ts" arm.
+        // This means .d.ts files fall through to the default.
+        assert_eq!(
+            content_type(Path::new("types.d.ts")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn content_type_svg() {
+        // svg is not explicitly handled, falls to default
+        assert_eq!(
+            content_type(Path::new("logo.svg")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn content_type_png() {
+        assert_eq!(
+            content_type(Path::new("icon.png")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn content_type_ico() {
+        assert_eq!(
+            content_type(Path::new("favicon.ico")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn content_type_unknown() {
+        assert_eq!(
+            content_type(Path::new("readme.xyz")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn content_type_no_extension() {
+        assert_eq!(
+            content_type(Path::new("Makefile")),
+            "application/octet-stream"
+        );
+    }
+}

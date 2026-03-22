@@ -1,6 +1,6 @@
 {
   "name": "blit-react",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,7 +9,10 @@
   ],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
   },
   "peerDependencies": {
     "blit-browser": ">=0.2.0",
@@ -17,12 +20,16 @@
     "react-dom": ">=18.0.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.0.0",
     "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
     "blit-browser": "file:../web",
+    "jsdom": "^25.0.0",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "vitest": "^3.0.0"
   },
   "license": "MIT"
 }

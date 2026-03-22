@@ -2110,18 +2110,22 @@ function focusPty(id, { scrollOffsetOverride = null } = {}) {
     inputSink.focus();
 }
 
-function createPty(command = null) {
+function createPty(command = null, tag = '') {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     computeSize();
+    const tagBytes = tag ? exposeSearchEncoder.encode(tag) : new Uint8Array(0);
     const commandText = typeof command === 'string' ? command.trim() : '';
     const commandBytes = commandText ? exposeSearchEncoder.encode(commandText) : null;
-    const msg = new Uint8Array(5 + (commandBytes ? commandBytes.length : 0));
+    const msg = new Uint8Array(7 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
     msg[0] = C2S_CREATE;
     msg[1] = rows & 0xff;
     msg[2] = (rows >> 8) & 0xff;
     msg[3] = cols & 0xff;
     msg[4] = (cols >> 8) & 0xff;
-    if (commandBytes) msg.set(commandBytes, 5);
+    msg[5] = tagBytes.length & 0xff;
+    msg[6] = (tagBytes.length >> 8) & 0xff;
+    if (tagBytes.length) msg.set(tagBytes, 7);
+    if (commandBytes) msg.set(commandBytes, 7 + tagBytes.length);
     ws.send(msg);
 }
 
@@ -2833,9 +2837,13 @@ function connect(pass, { source = 'prompt' } = {}) {
                 if (data.length < 3) break;
                 const count = data[1] | (data[2] << 8);
                 ptyIds = [];
+                let listOff = 3;
                 for (let i = 0; i < count; i++) {
-                    const off = 3 + i * 2;
-                    if (off + 1 < data.length) ptyIds.push(data[off] | (data[off + 1] << 8));
+                    if (listOff + 4 > data.length) break;
+                    const id = data[listOff] | (data[listOff + 1] << 8);
+                    const tagLen = data[listOff + 2] | (data[listOff + 3] << 8);
+                    listOff += 4 + tagLen;
+                    ptyIds.push(id);
                 }
                 requestPreviewRender(ptyIds, true);
                 if (exposeOpen && exposeQuery.trim()) queueExposeSearch({ contentRefresh: true });

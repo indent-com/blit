@@ -141,7 +141,7 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.2.0";
+        version = "0.2.1";
 
         weztermHash = "sha256-V6WvkNZryYofarsyfcmsuvtpNJ/c3O+DmOKNvoYPbmA=";
         finlUnicodeHash = "sha256-38S6XH4hldbkb6NP+s7lXa/NR49PI0w3KYqd+jPHND0=";
@@ -188,6 +188,7 @@
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" "x86_64-unknown-linux-musl" ];
+          extensions = [ "llvm-tools" ];
         };
 
         rustPlatform = pkgs.makeRustPlatform {
@@ -455,6 +456,18 @@ CTRL
           description = "blit WebSocket gateway";
         };
 
+        packages.tests = pkgs.writeShellApplication {
+          name = "blit-tests";
+          runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm ];
+          text = ''
+            echo "=== Rust tests ==="
+            cargo test --workspace
+            echo ""
+            echo "=== React tests ==="
+            (cd react && pnpm install --frozen-lockfile 2>/dev/null || pnpm install && pnpm vitest run)
+          '';
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = [
             rustToolchain
@@ -464,6 +477,7 @@ CTRL
             pkgs.pkgsStatic.stdenv.cc
             pkgs.process-compose
             pkgs.cargo-watch
+            pkgs.cargo-llvm-cov
           ];
 
           shellHook = ''

@@ -275,29 +275,52 @@ The `blit-react` package (`react/`) embeds a blit terminal in any React app. Net
 ### Quick start
 
 ```tsx
-import { BlitTerminal, WebSocketTransport } from "blit-react";
-import { useState, useRef } from 'react';
+import { BlitTerminal, WebSocketTransport, useBlitSessions } from "blit-react";
+import { useRef } from 'react';
 
 function App() {
   const transport = useRef(
     new WebSocketTransport('wss://myhost:3264/', 'secret'),
   ).current;
-  const [ptyId, setPtyId] = useState<number | null>(null);
+  const { sessions, createPty } = useBlitSessions(transport, {
+    autoCreateIfEmpty: true,
+  });
+  const active = sessions.find((s) => s.state === 'active');
 
   return (
     <BlitTerminal
       transport={transport}
-      ptyId={ptyId}
-      onPtyList={(ids) => setPtyId(ids[0] ?? null)}
-      onPtyCreated={(id) => setPtyId((prev) => prev ?? id)}
-      onTitleChange={(title) => (document.title = title)}
+      ptyId={active?.ptyId ?? null}
       style={{ width: '100%', height: '100vh' }}
     />
   );
 }
 ```
 
-### `<BlitTerminal>` props
+### `useBlitSessions`
+
+Manages the session lifecycle: LIST, CREATED, CLOSED, and TITLE parsing. Returns reactive state and control functions.
+
+```ts
+const { ready, sessions, status, createPty, focusPty, closePty } =
+  useBlitSessions(transport, {
+    autoCreateIfEmpty: true,          // create a PTY if the server has none
+    getInitialSize: () => ({ rows: 24, cols: 80 }),
+  });
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `ready` | `boolean` | `true` after the first LIST is received. |
+| `sessions` | `readonly BlitSession[]` | Current sessions with `ptyId`, `tag`, `title`, and `state`. |
+| `status` | `ConnectionStatus` | Transport connection status. |
+| `createPty` | `(opts?) => void` | Create a PTY. Accepts `{ rows?, cols?, command?, tag? }`. |
+| `focusPty` | `(ptyId) => void` | Focus a PTY on the server. |
+| `closePty` | `(ptyId) => void` | Close a PTY. |
+
+### `<BlitTerminal>`
+
+Renders a single PTY. Owns FOCUS, RESIZE, INPUT, SCROLL, mouse/keyboard encoding, and ACK after updates.
 
 | Prop | Type | Description |
 |---|---|---|
@@ -305,23 +328,16 @@ function App() {
 | `ptyId` | `number \| null` | PTY to display. `null` = waiting for a PTY. |
 | `fontFamily` | `string` | CSS font family. Default: `"PragmataPro, ui-monospace, monospace"` |
 | `fontSize` | `number` | Font size in CSS pixels. Default: `13` |
-| `onTitleChange` | `(title: string) => void` | Called when the focused PTY's title changes. |
-| `onPtyCreated` | `(ptyId: number) => void` | Called when a PTY is created. |
-| `onPtyClosed` | `(ptyId: number) => void` | Called when a PTY is closed. |
-| `onPtyList` | `(ptyIds: number[]) => void` | Called with the initial PTY list on connect. |
 | `className` | `string` | CSS class for the container div. |
 | `style` | `CSSProperties` | Inline styles for the container div. |
 
 ### Imperative handle
-
-Use a ref when you need direct access:
 
 ```tsx
 const termRef = useRef<BlitTerminalHandle>(null);
 
 <BlitTerminal ref={termRef} transport={transport} ptyId={ptyId} />
 
-// Later:
 termRef.current?.focus();               // focus the input sink
 termRef.current?.terminal;              // underlying WASM Terminal instance
 termRef.current?.rows;                  // current grid dimensions
@@ -331,11 +347,9 @@ termRef.current?.status;                // 'connecting' | 'connected' | ...
 
 ### Transport interface
 
-The component is transport-agnostic. Implement `BlitTransport` for any binary channel:
+Implement `BlitTransport` for any binary channel:
 
 ```ts
-type ConnectionStatus = 'connecting' | 'authenticating' | 'connected' | 'disconnected' | 'error';
-
 interface BlitTransport {
   send(data: Uint8Array): void;
   close(): void;
@@ -345,30 +359,43 @@ interface BlitTransport {
 }
 ```
 
-A `WebSocketTransport` is included for the common case:
+Two transports are included:
+
+**`WebSocketTransport`** — authenticating WebSocket with auto-reconnect:
 
 ```ts
 import { WebSocketTransport } from "blit-react";
 
-const transport = new WebSocketTransport(
-  'wss://myhost:3264/',      // WebSocket URL
-  'secret',                  // passphrase
-  {
-    reconnect: true,          // auto-reconnect (default: true)
-    reconnectDelay: 500,      // initial delay ms (default: 500)
-    maxReconnectDelay: 10000, // max delay ms (default: 10000)
-    reconnectBackoff: 1.5,    // backoff multiplier (default: 1.5)
-  },
-);
+const transport = new WebSocketTransport('wss://myhost:3264/', 'secret', {
+  reconnect: true,
+  reconnectDelay: 500,
+  maxReconnectDelay: 10000,
+  reconnectBackoff: 1.5,
+});
+```
+
+**`createWebRtcDataChannelTransport`** — WebRTC data channel with 4-byte frame envelope:
+
+```ts
+import { createWebRtcDataChannelTransport } from "blit-react";
+
+const transport = createWebRtcDataChannelTransport(peerConnection, {
+  label: 'blit',
+  displayRateFps: 120,
+  connectTimeoutMs: 10000,
+});
+
+await transport.waitForSync();
 ```
 
 ### Hooks
 
 For custom UIs that don't use the built-in `<BlitTerminal>`:
 
-- **`useBlitConnection(transport, callbacks)`** — parses server messages and returns semantic helpers: `sendInput`, `sendResize`, `sendCreate`, `sendFocus`, `sendClose`, `sendSubscribe`, `sendUnsubscribe`, `sendScroll`, `sendAck`, and `status`.
+- **`useBlitSessions(transport, options?)`** — manages session lifecycle (LIST, CREATED, CLOSED, TITLE). Returns `{ ready, sessions, status, createPty, focusPty, closePty }`.
+- **`useBlitConnection(transport, callbacks)`** — low-level server message parsing. Returns `sendInput`, `sendResize`, `sendCreate`, `sendFocus`, `sendClose`, `sendSubscribe`, `sendUnsubscribe`, `sendScroll`, `sendAck`, and `status`.
 - **`useBlitTerminal(options?)`** — manages WASM `Terminal` lifecycle and cell metrics.
-- **`measureCell(fontFamily, fontSize)`** — measures cell dimensions snapped to device pixels. Returns `{ width, height, deviceWidth, deviceHeight }`.
+- **`measureCell(fontFamily, fontSize)`** — measures cell dimensions snapped to device pixels.
 
 ## Callback Rendering
 
