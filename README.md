@@ -205,8 +205,10 @@ Shortcuts:
 | Shortcut | Action |
 |---|---|
 | `Ctrl`/`Cmd`+`K` | Open Expose / switch PTY |
+| `Ctrl`/`Cmd`+`Shift`+`Enter` | New PTY |
 | `Ctrl+Shift+W` | Close focused PTY |
 | `Ctrl+Shift+B` | Toggle backlog |
+| `Ctrl+Shift+{` / `Ctrl+Shift+}` | Previous / next PTY |
 | `Shift+PageUp` / `Shift+PageDown` | Scrollback |
 | `Ctrl+Shift+/` | Toggle help |
 
