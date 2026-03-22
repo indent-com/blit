@@ -77,7 +77,10 @@
               blit = {
                 serviceConfig = {
                   Label = "com.blit.server";
-                  ProgramArguments = [ "${cfg.package}/bin/blit-server" ];
+                  ProgramArguments = [
+                    "/bin/sh" "-lc"
+                    "exec ${cfg.package}/bin/blit-server"
+                  ];
                   EnvironmentVariables = {
                     BLIT_SOCK = cfg.socketPath;
                     BLIT_SCROLLBACK = toString cfg.scrollback;

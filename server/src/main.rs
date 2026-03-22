@@ -818,9 +818,37 @@ fn nudge_delivery(state: &AppState) {
 }
 
 fn pty_cwd(pid: libc::pid_t) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .and_then(|p| p.into_os_string().into_string().ok())
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CStr;
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                std::mem::size_of::<libc::proc_vnodepathinfo>() as i32,
+            )
+        };
+        if ret <= 0 {
+            return None;
+        }
+        let info = unsafe { &*(buf.as_ptr() as *const libc::proc_vnodepathinfo) };
+        let cstr = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) };
+        cstr.to_str().ok().map(|s| s.to_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn spawn_pty(
@@ -880,7 +908,10 @@ fn spawn_pty(
                 libc::close(slave);
             }
         }
-        if let Some(d) = dir {
+        let effective_dir = dir
+            .map(String::from)
+            .or_else(|| std::env::var("HOME").ok());
+        if let Some(d) = effective_dir {
             if let Ok(dir_c) = CString::new(d) {
                 unsafe { libc::chdir(dir_c.as_ptr()); }
             }
