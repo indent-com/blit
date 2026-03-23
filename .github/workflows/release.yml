@@ -82,44 +82,8 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  build-macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-13
-            arch: x86_64
-          - runner: macos-14
-            arch: aarch64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Build binaries
-        run: |
-          for pkg in blit-server blit-cli blit-gateway; do
-            nix build .#"$pkg" --no-link --print-out-paths >> outputs.txt
-          done
-
-      - name: Collect binaries
-        run: |
-          mkdir -p macos
-          for dir in $(cat outputs.txt); do
-            for bin in "$dir"/bin/*; do
-              name=$(basename "$bin")
-              cp "$bin" "macos/${name}-darwin-${{ matrix.arch }}"
-            done
-          done
-          ls -lh macos/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.arch }}
-          path: macos/*
-
   release:
-    needs: [build-debs, build-macos]
+    needs: [build-debs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -128,23 +92,13 @@ jobs:
           merge-multiple: true
           path: debs
 
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: macos-*
-          merge-multiple: true
-          path: macos
-
       - name: List artifacts
-        run: |
-          ls -lh debs/
-          ls -lh macos/
+        run: ls -lh debs/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            debs/*.deb
-            macos/*
+          files: debs/*.deb
           generate_release_notes: true
 
   apt-repo:
