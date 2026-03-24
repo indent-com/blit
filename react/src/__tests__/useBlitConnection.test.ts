@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
-import { useBlitConnection } from '../hooks/useBlitConnection';
-import { MockTransport } from './mock-transport';
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { renderHook, act } from "@testing-library/react";
+import { useBlitConnection } from "../hooks/useBlitConnection";
+import { MockTransport } from "./mock-transport";
 import {
   C2S_INPUT,
   C2S_RESIZE,
@@ -14,127 +14,136 @@ import {
   C2S_UNSUBSCRIBE,
   S2C_UPDATE,
   S2C_SEARCH_RESULTS,
-} from '../types';
+} from "../types";
 
-describe('useBlitConnection', () => {
+describe("useBlitConnection", () => {
   let transport: MockTransport;
 
   beforeEach(() => {
     transport = new MockTransport();
   });
 
-  it('starts with connected status', () => {
-    const { result } = renderHook(() =>
-      useBlitConnection(transport, {}),
-    );
-    expect(result.current.status).toBe('connected');
+  it("starts with connected status", () => {
+    const { result } = renderHook(() => useBlitConnection(transport, {}));
+    expect(result.current.status).toBe("connected");
   });
 
-  it('tracks status changes', () => {
-    const { result } = renderHook(() =>
-      useBlitConnection(transport, {}),
-    );
-    act(() => transport.setStatus('disconnected'));
-    expect(result.current.status).toBe('disconnected');
+  it("tracks status changes", () => {
+    const { result } = renderHook(() => useBlitConnection(transport, {}));
+    act(() => transport.setStatus("disconnected"));
+    expect(result.current.status).toBe("disconnected");
   });
 
   // --- Callback dispatching ---
 
-  it('dispatches onCreated with tag', () => {
+  it("dispatches onCreated with tag", () => {
     const onCreated = vi.fn();
     renderHook(() => useBlitConnection(transport, { onCreated }));
-    act(() => transport.pushCreated(5, 'hello'));
-    expect(onCreated).toHaveBeenCalledWith(5, 'hello');
+    act(() => transport.pushCreated(5, "hello"));
+    expect(onCreated).toHaveBeenCalledWith(5, "hello");
   });
 
-  it('dispatches onCreated with empty tag', () => {
+  it("dispatches onCreated with empty tag", () => {
     const onCreated = vi.fn();
     renderHook(() => useBlitConnection(transport, { onCreated }));
     act(() => transport.pushCreated(1));
-    expect(onCreated).toHaveBeenCalledWith(1, '');
+    expect(onCreated).toHaveBeenCalledWith(1, "");
   });
 
-  it('dispatches onClosed', () => {
+  it("dispatches onClosed", () => {
     const onClosed = vi.fn();
     renderHook(() => useBlitConnection(transport, { onClosed }));
     act(() => transport.pushClosed(3));
     expect(onClosed).toHaveBeenCalledWith(3);
   });
 
-  it('dispatches onList with tags', () => {
+  it("dispatches onList with tags", () => {
     const onList = vi.fn();
     renderHook(() => useBlitConnection(transport, { onList }));
-    act(() => transport.pushList([{ ptyId: 1, tag: 'a' }, { ptyId: 2, tag: 'b' }]));
+    act(() =>
+      transport.pushList([
+        { ptyId: 1, tag: "a" },
+        { ptyId: 2, tag: "b" },
+      ]),
+    );
     expect(onList).toHaveBeenCalledWith([
-      { ptyId: 1, tag: 'a' },
-      { ptyId: 2, tag: 'b' },
+      { ptyId: 1, tag: "a" },
+      { ptyId: 2, tag: "b" },
     ]);
   });
 
-  it('dispatches onList with empty list', () => {
+  it("dispatches onList with empty list", () => {
     const onList = vi.fn();
     renderHook(() => useBlitConnection(transport, { onList }));
     act(() => transport.pushList([]));
     expect(onList).toHaveBeenCalledWith([]);
   });
 
-  it('dispatches onTitle', () => {
+  it("dispatches onTitle", () => {
     const onTitle = vi.fn();
     renderHook(() => useBlitConnection(transport, { onTitle }));
-    act(() => transport.pushTitle(7, 'vim'));
-    expect(onTitle).toHaveBeenCalledWith(7, 'vim');
+    act(() => transport.pushTitle(7, "vim"));
+    expect(onTitle).toHaveBeenCalledWith(7, "vim");
   });
 
-  it('dispatches onUpdate', () => {
+  it("dispatches onUpdate", () => {
     const onUpdate = vi.fn();
     renderHook(() => useBlitConnection(transport, { onUpdate }));
-    const payload = new Uint8Array([S2C_UPDATE, 0x02, 0x00, 0xAA, 0xBB]);
+    const payload = new Uint8Array([S2C_UPDATE, 0x02, 0x00, 0xaa, 0xbb]);
     act(() => transport.push(payload));
     expect(onUpdate).toHaveBeenCalledWith(2, expect.any(Uint8Array));
     const p = onUpdate.mock.calls[0][1] as Uint8Array;
-    expect(p[0]).toBe(0xAA);
-    expect(p[1]).toBe(0xBB);
+    expect(p[0]).toBe(0xaa);
+    expect(p[1]).toBe(0xbb);
   });
 
-  it('dispatches onSearchResults', () => {
+  it("dispatches onSearchResults", () => {
     const onSearchResults = vi.fn();
     renderHook(() => useBlitConnection(transport, { onSearchResults }));
     const encoder = new TextEncoder();
-    const text = encoder.encode('hello');
-    const msg = new Uint8Array(3 + 8 + text.length);
+    const context = encoder.encode("hello");
+    const msg = new Uint8Array(5 + 14 + context.length);
     msg[0] = S2C_SEARCH_RESULTS;
-    msg[1] = 1; // count lo
-    msg[2] = 0; // count hi
-    msg[3] = 5; // ptyId lo
-    msg[4] = 0; // ptyId hi
-    msg[5] = 10; // line lo
-    msg[6] = 0; // line hi
-    msg[7] = 3; // col lo
-    msg[8] = 0; // col hi
-    msg[9] = text.length; // textLen lo
-    msg[10] = 0; // textLen hi
-    msg.set(text, 11);
+    msg[1] = 42; // requestId lo
+    msg[2] = 0; // requestId hi
+    msg[3] = 1; // count lo
+    msg[4] = 0; // count hi
+    msg[5] = 5; // ptyId lo
+    msg[6] = 0; // ptyId hi
+    msg[7] = 100; // score byte 0
+    msg[8] = 0; // score byte 1
+    msg[9] = 0; // score byte 2
+    msg[10] = 0; // score byte 3
+    msg[11] = 1; // primarySource (visible)
+    msg[12] = 3; // matchedSources (title + visible)
+    msg[13] = 0xff; // scrollOffset byte 0 (none)
+    msg[14] = 0xff; // scrollOffset byte 1
+    msg[15] = 0xff; // scrollOffset byte 2
+    msg[16] = 0xff; // scrollOffset byte 3
+    msg[17] = context.length; // contextLen lo
+    msg[18] = 0; // contextLen hi
+    msg.set(context, 19);
     act(() => transport.push(msg));
-    expect(onSearchResults).toHaveBeenCalledWith([
-      { ptyId: 5, line: 10, col: 3, text: 'hello' },
+    expect(onSearchResults).toHaveBeenCalledWith(42, [
+      { ptyId: 5, score: 100, primarySource: 1, matchedSources: 3, scrollOffset: null, context: "hello" },
     ]);
   });
 
-  it('dispatches onStatusChange', () => {
+  it("dispatches onStatusChange", () => {
     const onStatusChange = vi.fn();
     renderHook(() => useBlitConnection(transport, { onStatusChange }));
-    act(() => transport.setStatus('disconnected'));
-    expect(onStatusChange).toHaveBeenCalledWith('disconnected');
+    act(() => transport.setStatus("disconnected"));
+    expect(onStatusChange).toHaveBeenCalledWith("disconnected");
   });
 
-  it('ignores too-short messages', () => {
+  it("ignores too-short messages", () => {
     const onCreated = vi.fn();
     renderHook(() => useBlitConnection(transport, { onCreated }));
     act(() => transport.push(new Uint8Array([0x01, 0x05])));
     expect(onCreated).not.toHaveBeenCalled();
   });
 
-  it('ignores empty messages', () => {
+  it("ignores empty messages", () => {
     const onUpdate = vi.fn();
     renderHook(() => useBlitConnection(transport, { onUpdate }));
     act(() => transport.push(new Uint8Array([])));
@@ -143,13 +152,13 @@ describe('useBlitConnection', () => {
 
   // --- Send helpers ---
 
-  it('sendAck sends ACK', () => {
+  it("sendAck sends ACK", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendAck());
     expect(transport.sent[0]).toEqual(new Uint8Array([C2S_ACK]));
   });
 
-  it('sendInput sends INPUT with ptyId and data', () => {
+  it("sendInput sends INPUT with ptyId and data", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendInput(3, new Uint8Array([0x6c, 0x73])));
     const msg = transport.sent[0];
@@ -159,7 +168,7 @@ describe('useBlitConnection', () => {
     expect(msg[4]).toBe(0x73);
   });
 
-  it('sendResize sends RESIZE', () => {
+  it("sendResize sends RESIZE", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendResize(1, 24, 80));
     const msg = transport.sent[0];
@@ -169,7 +178,7 @@ describe('useBlitConnection', () => {
     expect(msg[5] | (msg[6] << 8)).toBe(80);
   });
 
-  it('sendScroll sends SCROLL', () => {
+  it("sendScroll sends SCROLL", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendScroll(2, 100));
     const msg = transport.sent[0];
@@ -179,20 +188,20 @@ describe('useBlitConnection', () => {
     expect(offset).toBe(100);
   });
 
-  it('sendCreate sends CREATE with tag and command', () => {
+  it("sendCreate sends CREATE with tag and command", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
-    act(() => result.current.sendCreate(24, 80, { tag: 'x', command: 'ls' }));
+    act(() => result.current.sendCreate(24, 80, { tag: "x", command: "ls" }));
     const msg = transport.sent[0];
     expect(msg[0]).toBe(C2S_CREATE);
     expect(msg[1] | (msg[2] << 8)).toBe(24);
     expect(msg[3] | (msg[4] << 8)).toBe(80);
     const tagLen = msg[5] | (msg[6] << 8);
     expect(tagLen).toBe(1);
-    expect(new TextDecoder().decode(msg.slice(7, 8))).toBe('x');
-    expect(new TextDecoder().decode(msg.slice(8))).toBe('ls');
+    expect(new TextDecoder().decode(msg.slice(7, 8))).toBe("x");
+    expect(new TextDecoder().decode(msg.slice(8))).toBe("ls");
   });
 
-  it('sendCreate sends CREATE without tag/command', () => {
+  it("sendCreate sends CREATE without tag/command", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendCreate(24, 80));
     const msg = transport.sent[0];
@@ -201,7 +210,7 @@ describe('useBlitConnection', () => {
     expect(msg.length).toBe(7);
   });
 
-  it('sendFocus sends FOCUS', () => {
+  it("sendFocus sends FOCUS", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendFocus(9));
     const msg = transport.sent[0];
@@ -209,7 +218,7 @@ describe('useBlitConnection', () => {
     expect(msg[1] | (msg[2] << 8)).toBe(9);
   });
 
-  it('sendClose sends CLOSE', () => {
+  it("sendClose sends CLOSE", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendClose(4));
     const msg = transport.sent[0];
@@ -217,7 +226,7 @@ describe('useBlitConnection', () => {
     expect(msg[1] | (msg[2] << 8)).toBe(4);
   });
 
-  it('sendSubscribe sends SUBSCRIBE', () => {
+  it("sendSubscribe sends SUBSCRIBE", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendSubscribe(6));
     const msg = transport.sent[0];
@@ -225,7 +234,7 @@ describe('useBlitConnection', () => {
     expect(msg[1] | (msg[2] << 8)).toBe(6);
   });
 
-  it('sendUnsubscribe sends UNSUBSCRIBE', () => {
+  it("sendUnsubscribe sends UNSUBSCRIBE", () => {
     const { result } = renderHook(() => useBlitConnection(transport, {}));
     act(() => result.current.sendUnsubscribe(6));
     const msg = transport.sent[0];
@@ -235,50 +244,50 @@ describe('useBlitConnection', () => {
 
   // --- Unicode tags and titles ---
 
-  it('handles unicode tag in CREATED', () => {
+  it("handles unicode tag in CREATED", () => {
     const onCreated = vi.fn();
     renderHook(() => useBlitConnection(transport, { onCreated }));
-    act(() => transport.pushCreated(1, '日本語'));
-    expect(onCreated).toHaveBeenCalledWith(1, '日本語');
+    act(() => transport.pushCreated(1, "日本語"));
+    expect(onCreated).toHaveBeenCalledWith(1, "日本語");
   });
 
-  it('handles unicode title in TITLE', () => {
+  it("handles unicode title in TITLE", () => {
     const onTitle = vi.fn();
     renderHook(() => useBlitConnection(transport, { onTitle }));
-    act(() => transport.pushTitle(1, 'émacs'));
-    expect(onTitle).toHaveBeenCalledWith(1, 'émacs');
+    act(() => transport.pushTitle(1, "émacs"));
+    expect(onTitle).toHaveBeenCalledWith(1, "émacs");
   });
 
-  it('handles LIST with unicode tags', () => {
+  it("handles LIST with unicode tags", () => {
     const onList = vi.fn();
     renderHook(() => useBlitConnection(transport, { onList }));
-    act(() => transport.pushList([{ ptyId: 1, tag: '🚀' }]));
-    expect(onList).toHaveBeenCalledWith([{ ptyId: 1, tag: '🚀' }]);
+    act(() => transport.pushList([{ ptyId: 1, tag: "🚀" }]));
+    expect(onList).toHaveBeenCalledWith([{ ptyId: 1, tag: "🚀" }]);
   });
 
   // --- Multi-consumer ---
 
-  it('two hooks on the same transport both receive messages', () => {
+  it("two hooks on the same transport both receive messages", () => {
     const onCreated1 = vi.fn();
     const onCreated2 = vi.fn();
     renderHook(() => useBlitConnection(transport, { onCreated: onCreated1 }));
     renderHook(() => useBlitConnection(transport, { onCreated: onCreated2 }));
-    act(() => transport.pushCreated(5, 'shared'));
-    expect(onCreated1).toHaveBeenCalledWith(5, 'shared');
-    expect(onCreated2).toHaveBeenCalledWith(5, 'shared');
+    act(() => transport.pushCreated(5, "shared"));
+    expect(onCreated1).toHaveBeenCalledWith(5, "shared");
+    expect(onCreated2).toHaveBeenCalledWith(5, "shared");
   });
 
-  it('two hooks on the same transport both track status', () => {
+  it("two hooks on the same transport both track status", () => {
     const { result: r1 } = renderHook(() => useBlitConnection(transport, {}));
     const { result: r2 } = renderHook(() => useBlitConnection(transport, {}));
-    expect(r1.current.status).toBe('connected');
-    expect(r2.current.status).toBe('connected');
-    act(() => transport.setStatus('disconnected'));
-    expect(r1.current.status).toBe('disconnected');
-    expect(r2.current.status).toBe('disconnected');
+    expect(r1.current.status).toBe("connected");
+    expect(r2.current.status).toBe("connected");
+    act(() => transport.setStatus("disconnected"));
+    expect(r1.current.status).toBe("disconnected");
+    expect(r2.current.status).toBe("disconnected");
   });
 
-  it('unmounting one hook does not break the other', () => {
+  it("unmounting one hook does not break the other", () => {
     const onTitle1 = vi.fn();
     const onTitle2 = vi.fn();
     const { unmount } = renderHook(() =>
@@ -286,12 +295,12 @@ describe('useBlitConnection', () => {
     );
     renderHook(() => useBlitConnection(transport, { onTitle: onTitle2 }));
 
-    act(() => transport.pushTitle(1, 'both'));
+    act(() => transport.pushTitle(1, "both"));
     expect(onTitle1).toHaveBeenCalledTimes(1);
     expect(onTitle2).toHaveBeenCalledTimes(1);
 
     unmount();
-    act(() => transport.pushTitle(1, 'solo'));
+    act(() => transport.pushTitle(1, "solo"));
     expect(onTitle1).toHaveBeenCalledTimes(1);
     expect(onTitle2).toHaveBeenCalledTimes(2);
   });

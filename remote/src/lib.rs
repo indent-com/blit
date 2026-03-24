@@ -37,6 +37,12 @@ pub const C2S_UNSUBSCRIBE: u8 = 0x14;
 pub const C2S_SEARCH: u8 = 0x15;
 pub const C2S_CREATE_AT: u8 = 0x16;
 pub const C2S_CREATE_N: u8 = 0x17;
+/// Generic create: [0x18][nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][...optional fields]
+/// Features: bit 0 = has src_pty_id (2 bytes after tag), bit 1 = has command (remaining bytes after src_pty_id if present)
+/// Server responds with S2C_CREATED_N using the same nonce.
+pub const C2S_CREATE2: u8 = 0x18;
+pub const CREATE2_HAS_SRC_PTY: u8 = 1 << 0;
+pub const CREATE2_HAS_COMMAND: u8 = 1 << 1;
 
 pub const S2C_UPDATE: u8 = 0x00;
 pub const S2C_CREATED: u8 = 0x01;
@@ -418,19 +424,12 @@ impl FrameState {
 #[derive(Clone, Debug)]
 pub struct TerminalState {
     frame: FrameState,
-    dirty: Vec<bool>,
-    all_dirty: bool,
 }
 
 impl TerminalState {
     pub fn new(rows: u16, cols: u16) -> Self {
         let frame = FrameState::new(rows, cols);
-        let total = rows as usize * cols as usize;
-        Self {
-            frame,
-            dirty: vec![true; total],
-            all_dirty: true,
-        }
+        Self { frame }
     }
 
     pub fn frame(&self) -> &FrameState {
@@ -467,28 +466,6 @@ impl TerminalState {
 
     pub fn cells(&self) -> &[u8] {
         self.frame.cells()
-    }
-
-    pub fn dirty_flags(&self) -> &[bool] {
-        &self.dirty
-    }
-
-    pub fn dirty_flags_mut(&mut self) -> &mut [bool] {
-        &mut self.dirty
-    }
-
-    pub fn all_dirty(&self) -> bool {
-        self.all_dirty
-    }
-
-    pub fn clear_all_dirty(&mut self) {
-        self.all_dirty = false;
-        self.dirty.fill(false);
-    }
-
-    pub fn mark_all_dirty(&mut self) {
-        self.all_dirty = true;
-        self.dirty.fill(true);
     }
 
     pub fn set_title(&mut self, title: &str) -> bool {
@@ -563,14 +540,10 @@ impl TerminalState {
         };
 
         let resized = new_rows != self.frame.rows || new_cols != self.frame.cols;
-        if new_rows != self.frame.rows || new_cols != self.frame.cols {
+        if resized {
             self.frame.resize(new_rows, new_cols);
-            let total = new_rows as usize * new_cols as usize;
-            self.dirty = vec![true; total];
-            self.all_dirty = true;
         }
 
-        let total_cells = self.frame.rows as usize * self.frame.cols as usize;
         let old_cursor_row = self.frame.cursor_row;
         let old_cursor_col = self.frame.cursor_col;
         let old_mode = self.frame.mode;
@@ -593,23 +566,6 @@ impl TerminalState {
 
         if strings_present {
             self.apply_overflow_strings(&payload[ops_end..]);
-        }
-
-        if !self.all_dirty {
-            let cursor_moved = new_cursor_row != old_cursor_row || new_cursor_col != old_cursor_col;
-            let vis_changed = (new_mode & 1) != (old_mode & 1);
-            if cursor_moved || vis_changed {
-                let old_idx =
-                    old_cursor_row as usize * self.frame.cols as usize + old_cursor_col as usize;
-                if old_idx < total_cells {
-                    self.dirty[old_idx] = true;
-                }
-            }
-            let new_idx =
-                new_cursor_row as usize * self.frame.cols as usize + new_cursor_col as usize;
-            if new_idx < total_cells {
-                self.dirty[new_idx] = true;
-            }
         }
 
         self.frame.cursor_row = new_cursor_row;
@@ -729,9 +685,6 @@ impl TerminalState {
             if new_content_len != CONTENT_OVERFLOW {
                 self.frame.overflow.remove(&i);
             }
-            if !self.all_dirty {
-                self.dirty[i] = true;
-            }
             dirty_idx += 1;
         }
     }
@@ -785,12 +738,10 @@ impl TerminalState {
                 .copy_from_slice(&temp[src_off..src_off + cols as usize * CELL_SIZE]);
         }
 
-        // Apply copied overflow strings.
         for (idx, s) in overflow_temp {
             self.frame.overflow.insert(idx, s);
         }
 
-        self.mark_rect_dirty(dst_row, dst_col, rows, cols);
         true
     }
 
@@ -820,11 +771,9 @@ impl TerminalState {
                 self.frame.cells[off..off + CELL_SIZE].copy_from_slice(cell);
             }
         }
-        self.mark_rect_dirty(row, col, row_end - row, col_end - col);
         true
     }
 
-    /// Parse and apply overflow string table: [u16 count] [for each: u32 cell_index, u16 len, utf8]
     fn apply_overflow_strings(&mut self, data: &[u8]) {
         if data.len() < 2 {
             return;
@@ -848,18 +797,6 @@ impl TerminalState {
         }
     }
 
-    fn mark_rect_dirty(&mut self, row: u16, col: u16, rows: u16, cols: u16) {
-        if self.all_dirty {
-            return;
-        }
-        let row_end = row.saturating_add(rows).min(self.frame.rows);
-        let col_end = col.saturating_add(cols).min(self.frame.cols);
-        for r in row..row_end {
-            let start = r as usize * self.frame.cols as usize + col as usize;
-            let end = r as usize * self.frame.cols as usize + col_end as usize;
-            self.dirty[start..end].fill(true);
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2380,8 +2317,6 @@ mod tests {
         assert_eq!(t.cursor_col(), 0);
         assert_eq!(t.mode(), 0);
         assert_eq!(t.title(), "");
-        assert!(t.all_dirty());
-        assert_eq!(t.dirty_flags().len(), 24 * 80);
         assert_eq!(t.cells().len(), 24 * 80 * CELL_SIZE);
         assert_eq!(t.frame().rows(), 24);
     }
@@ -2391,12 +2326,6 @@ mod tests {
         let mut t = TerminalState::new(4, 10);
         t.frame_mut().set_title("test");
         assert_eq!(t.title(), "test");
-        t.dirty_flags_mut()[0] = false;
-        assert!(!t.dirty_flags()[0]);
-        t.mark_all_dirty();
-        assert!(t.all_dirty());
-        t.clear_all_dirty();
-        assert!(!t.all_dirty());
     }
 
     #[test]

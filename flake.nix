@@ -479,7 +479,7 @@ PKGJSON
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-cli" ];
           cargoLock = cargoLockConfig;
-          preBuild = copyWebAssets;
+          preBuild = copyWebAppDist;
           postInstall = installManPages;
           doCheck = false;
           meta.mainProgram = "blit";
@@ -491,11 +491,7 @@ PKGJSON
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-gateway" ];
           cargoLock = cargoLockConfig;
-          preBuild = ''
-            mkdir -p web
-            cp ${browserWasm}/blit_browser_bg.wasm web/
-            cp ${browserWasm}/blit_browser.js web/
-          '';
+          preBuild = copyWebAppDist;
           postInstall = installManPages;
           doCheck = false;
         };
@@ -537,35 +533,70 @@ PKGJSON
           cargoPkg = "blit-server";
         };
 
-        copyWebAssets = ''
-          mkdir -p web/snippets
-          cp ${browserWasm}/blit_browser.js web/
-          cp ${browserWasm}/blit_browser_bg.wasm web/
-          cp ${browserWasm}/blit_browser.d.ts web/
-          cp ${browserWasm}/blit_browser_bg.wasm.d.ts web/
-          for d in ${browserWasm}/snippets/blit-browser-*/; do
-            name=$(basename "$d")
-            mkdir -p "web/snippets/$name"
-            cp "$d"/* "web/snippets/$name/"
-          done
+        reactNpmDeps = pkgs.fetchNpmDeps {
+          src = ./react;
+          hash = "sha256-fWpzPYKa7miYdta+uzq2QEIRyB8C7z8ajhS3s82VEYc=";
+        };
+
+        webAppNpmDeps = pkgs.fetchNpmDeps {
+          src = ./web-app;
+          hash = "sha256-UtiMxzhbfmQQ/e09EAcvqUJ1GRdmyodmckCYnB3jojA=";
+        };
+
+        webAppDist = pkgs.stdenv.mkDerivation {
+          pname = "blit-web-app";
+          inherit version;
+          src = ./.;
+          nativeBuildInputs = [ pkgs.nodejs ];
+          buildPhase = ''
+            export HOME=$TMPDIR
+
+            # Set up browser/pkg with WASM assets
+            mkdir -p browser/pkg/snippets
+            cp ${browserWasm}/blit_browser.js browser/pkg/
+            cp ${browserWasm}/blit_browser_bg.wasm browser/pkg/
+            cp ${browserWasm}/blit_browser.d.ts browser/pkg/
+            cp ${browserWasm}/blit_browser_bg.wasm.d.ts browser/pkg/
+            echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > browser/pkg/package.json
+            for d in ${browserWasm}/snippets/blit-browser-*/; do
+              name=$(basename "$d")
+              mkdir -p "browser/pkg/snippets/$name"
+              cp "$d"/* "browser/pkg/snippets/$name/"
+            done
+
+            # Build react package (install from prefetched cache)
+            cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
+            chmod -R u+w "$TMPDIR/react-cache"
+            (cd react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
+
+            # Build web-app (install from prefetched cache)
+            # package-lock.json is committed without file: deps; vite.config.ts aliases blit-react/blit-browser to source
+            cp -r ${webAppNpmDeps} "$TMPDIR/webapp-cache"
+            chmod -R u+w "$TMPDIR/webapp-cache"
+            (cd web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
+          '';
+          installPhase = ''
+            mkdir -p $out
+            cp web-app/dist/index.html $out/
+          '';
+          doCheck = false;
+        };
+
+        copyWebAppDist = ''
+          mkdir -p web-app/dist
+          cp ${webAppDist}/index.html web-app/dist/
         '';
 
         blit-cli-static = mkStaticBin {
           pname = "blit-cli";
           cargoPkg = "blit-cli";
-          extraArgs = { preBuild = copyWebAssets; };
+          extraArgs = { preBuild = copyWebAppDist; };
         };
 
         blit-gateway-static = mkStaticBin {
           pname = "blit-gateway";
           cargoPkg = "blit-gateway";
-          extraArgs = {
-            preBuild = ''
-              mkdir -p web
-              cp ${browserWasm}/blit_browser_bg.wasm web/
-              cp ${browserWasm}/blit_browser.js web/
-            '';
-          };
+          extraArgs = { preBuild = copyWebAppDist; };
         };
 
 
@@ -648,17 +679,17 @@ CTRL
           name = "blit-tests";
           runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm ];
           text = ''
-            echo "=== Copying WASM assets for blit-cli include_bytes! ==="
-            mkdir -p web/snippets
-            cp -n ${browserWasm}/blit_browser.js web/ 2>/dev/null || true
-            cp -n ${browserWasm}/blit_browser_bg.wasm web/ 2>/dev/null || true
-            cp -n ${browserWasm}/blit_browser.d.ts web/ 2>/dev/null || true
-            cp -n ${browserWasm}/blit_browser_bg.wasm.d.ts web/ 2>/dev/null || true
+            echo "=== Setting up web-app dist ==="
+            mkdir -p web-app/dist
+            cp ${webAppDist}/index.html web-app/dist/
 
             echo "=== Rust tests ==="
             cargo test --workspace
             echo ""
             echo "=== React tests ==="
+            mkdir -p browser/pkg
+            echo '{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}' > browser/pkg/package.json
+            touch browser/pkg/blit_browser.js
             (cd react && pnpm install --frozen-lockfile 2>/dev/null || pnpm install && pnpm vitest run)
           '';
         };

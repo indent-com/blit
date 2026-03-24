@@ -1,4 +1,4 @@
-import type React from 'react';
+import type React from "react";
 
 /** A terminal color palette. */
 export interface TerminalPalette {
@@ -16,11 +16,11 @@ export interface TerminalPalette {
 
 /** Connection lifecycle states. */
 export type ConnectionStatus =
-  | 'connecting'
-  | 'authenticating'
-  | 'connected'
-  | 'disconnected'
-  | 'error';
+  | "connecting"
+  | "authenticating"
+  | "connected"
+  | "disconnected"
+  | "error";
 
 /**
  * Transport abstraction for blit server communication.
@@ -40,11 +40,23 @@ export interface BlitTransport {
   /** Current connection status. */
   readonly status: ConnectionStatus;
   /** Register a listener for transport events. */
-  addEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
-  addEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  addEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
   /** Remove a previously registered listener. */
-  removeEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
-  removeEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  removeEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  removeEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
 }
 
 /** A tracked PTY session. */
@@ -52,7 +64,7 @@ export type BlitSession = {
   ptyId: number;
   tag: string;
   title: string | null;
-  state: 'active' | 'closed';
+  state: "active" | "closed";
 };
 
 /** Options for the BlitTerminal component. */
@@ -71,7 +83,14 @@ export interface BlitTerminalProps {
   style?: React.CSSProperties;
   /** Color palette applied to the terminal. */
   palette?: TerminalPalette;
+  /** When true, the terminal renders but never sends resize, input, or scroll commands. */
+  readOnly?: boolean;
+  /** TerminalStore for centralized terminal management. */
+  store: import("./TerminalStore").TerminalStore;
 }
+
+export const DEFAULT_FONT = "PragmataPro, ui-monospace, monospace";
+export const DEFAULT_FONT_SIZE = 13;
 
 /** Wire protocol constants: client-to-server message types. */
 export const C2S_INPUT = 0x00;
@@ -85,7 +104,12 @@ export const C2S_FOCUS = 0x11;
 export const C2S_CLOSE = 0x12;
 export const C2S_SUBSCRIBE = 0x13;
 export const C2S_UNSUBSCRIBE = 0x14;
+export const C2S_SEARCH = 0x15;
+export const C2S_CREATE_AT = 0x16;
 export const C2S_CREATE_N = 0x17;
+export const C2S_CREATE2 = 0x18;
+export const CREATE2_HAS_SRC_PTY = 1 << 0;
+export const CREATE2_HAS_COMMAND = 1 << 1;
 
 /** Wire protocol constants: server-to-client message types. */
 export const S2C_UPDATE = 0x00;

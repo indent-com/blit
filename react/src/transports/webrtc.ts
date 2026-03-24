@@ -1,5 +1,5 @@
-import type { BlitTransport, ConnectionStatus } from '../types';
-import { C2S_DISPLAY_RATE } from '../types';
+import type { BlitTransport, ConnectionStatus } from "../types";
+import { C2S_DISPLAY_RATE } from "../types";
 
 export interface WebRtcDataChannelTransportOptions {
   /** Data channel label. Default: "blit". */
@@ -14,11 +14,11 @@ export function createWebRtcDataChannelTransport(
   pc: RTCPeerConnection,
   opts?: WebRtcDataChannelTransportOptions,
 ): BlitTransport & { waitForSync(): Promise<void> } {
-  const label = opts?.label ?? 'blit';
+  const label = opts?.label ?? "blit";
   const displayRateFps = opts?.displayRateFps ?? 120;
   const connectTimeoutMs = opts?.connectTimeoutMs ?? 10000;
 
-  let _status: ConnectionStatus = 'connecting';
+  let _status: ConnectionStatus = "connecting";
   let channel: RTCDataChannel | null = null;
   let disposed = false;
   let syncResolve: (() => void) | null = null;
@@ -34,23 +34,31 @@ export function createWebRtcDataChannelTransport(
     },
 
     addEventListener(type: string, listener: (data: never) => void): void {
-      if (type === 'message') {
-        messageListeners.add(listener as unknown as (data: ArrayBuffer) => void);
-      } else if (type === 'statuschange') {
-        statusListeners.add(listener as unknown as (status: ConnectionStatus) => void);
+      if (type === "message") {
+        messageListeners.add(
+          listener as unknown as (data: ArrayBuffer) => void,
+        );
+      } else if (type === "statuschange") {
+        statusListeners.add(
+          listener as unknown as (status: ConnectionStatus) => void,
+        );
       }
     },
 
     removeEventListener(type: string, listener: (data: never) => void): void {
-      if (type === 'message') {
-        messageListeners.delete(listener as unknown as (data: ArrayBuffer) => void);
-      } else if (type === 'statuschange') {
-        statusListeners.delete(listener as unknown as (status: ConnectionStatus) => void);
+      if (type === "message") {
+        messageListeners.delete(
+          listener as unknown as (data: ArrayBuffer) => void,
+        );
+      } else if (type === "statuschange") {
+        statusListeners.delete(
+          listener as unknown as (status: ConnectionStatus) => void,
+        );
       }
     },
 
     send(data: Uint8Array) {
-      if (!channel || channel.readyState !== 'open') return;
+      if (!channel || channel.readyState !== "open") return;
       const frame = new Uint8Array(4 + data.length);
       const len = data.length;
       frame[0] = len & 0xff;
@@ -71,12 +79,12 @@ export function createWebRtcDataChannelTransport(
         }
         channel = null;
       }
-      setStatus('disconnected');
+      setStatus("disconnected");
     },
 
     waitForSync() {
-      if (_status === 'connected') return Promise.resolve();
-      if (_status === 'error' || _status === 'disconnected') {
+      if (_status === "connected") return Promise.resolve();
+      if (_status === "error" || _status === "disconnected") {
         return Promise.reject(new Error(`transport ${_status}`));
       }
       return new Promise<void>((resolve, reject) => {
@@ -90,11 +98,11 @@ export function createWebRtcDataChannelTransport(
     if (_status === s) return;
     _status = s;
     for (const l of statusListeners) l(s);
-    if (s === 'connected') {
+    if (s === "connected") {
       syncResolve?.();
       syncResolve = null;
       syncReject = null;
-    } else if (s === 'error' || s === 'disconnected') {
+    } else if (s === "error" || s === "disconnected") {
       syncReject?.(new Error(`transport ${s}`));
       syncResolve = null;
       syncReject = null;
@@ -104,18 +112,18 @@ export function createWebRtcDataChannelTransport(
   // --- Data channel setup ---
 
   channel = pc.createDataChannel(label, { ordered: true });
-  channel.binaryType = 'arraybuffer';
+  channel.binaryType = "arraybuffer";
 
   const timeout = setTimeout(() => {
-    if (_status === 'connecting') {
-      setStatus('error');
+    if (_status === "connecting") {
+      setStatus("error");
     }
   }, connectTimeoutMs);
 
   channel.onopen = () => {
     if (disposed) return;
     clearTimeout(timeout);
-    setStatus('connected');
+    setStatus("connected");
     const msg = new Uint8Array(3);
     msg[0] = C2S_DISPLAY_RATE;
     msg[1] = displayRateFps & 0xff;
@@ -147,19 +155,19 @@ export function createWebRtcDataChannelTransport(
   channel.onerror = () => {
     if (disposed) return;
     clearTimeout(timeout);
-    setStatus('error');
+    setStatus("error");
   };
 
   channel.onclose = () => {
     if (disposed) return;
     clearTimeout(timeout);
-    setStatus('disconnected');
+    setStatus("disconnected");
   };
 
-  pc.addEventListener('connectionstatechange', () => {
+  pc.addEventListener("connectionstatechange", () => {
     if (disposed) return;
-    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      setStatus('disconnected');
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      setStatus("disconnected");
     }
   });
 

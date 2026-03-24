@@ -9,35 +9,12 @@ use tokio::sync::mpsc;
 // Browser mode imports
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{FromRequest, WebSocketUpgrade};
-use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-// Embedded web assets
-const WEB_INDEX_HTML: &str = include_str!("../../web/index.html");
-const WEB_JS: &[u8] = include_bytes!("../../web/blit_browser.js");
-const WEB_WASM: &[u8] = include_bytes!("../../web/blit_browser_bg.wasm");
-const WEB_DTS: &[u8] = include_bytes!("../../web/blit_browser.d.ts");
-const WEB_WASM_DTS: &[u8] = include_bytes!("../../web/blit_browser_bg.wasm.d.ts");
-// The wasm-bindgen inline_js snippet — content is stable, hash in the path changes per build.
-// Serve for any /snippets/blit-browser-*/inline0.js request.
-const WEB_SNIPPET_INLINE0: &[u8] = br#"const glyphTextCache = new Map();
-
-export function blitFillTextCodePoint(ctx, codePoint, x, y) {
-  let text = glyphTextCache.get(codePoint);
-  if (text === undefined) {
-    text = String.fromCodePoint(codePoint);
-    glyphTextCache.set(codePoint, text);
-  }
-  ctx.fillText(text, x, y);
-}
-
-export function blitFillText(ctx, text, x, y) {
-  ctx.fillText(text, x, y);
-}
-"#;
+const WEB_INDEX_HTML: &str = include_str!("../../web-app/dist/index.html");
 
 // ── Terminal size ─────────────────────────────────────────────────────────────
 fn term_size() -> (u16, u16) {
@@ -174,14 +151,9 @@ impl Renderer {
 
         let total = screen.rows() as usize * cols as usize;
         let cols_usize = cols as usize;
-        let all_dirty = screen.all_dirty();
-        let dirty = screen.dirty_flags();
 
         let cells = screen.cells();
         for i in 0..total {
-            if !all_dirty && !dirty[i] {
-                continue;
-            }
             let off = i * CELL_SIZE;
             let cell = &cells[off..off + CELL_SIZE];
             let row = (i / cols_usize) as u16;
@@ -672,9 +644,9 @@ async fn run_browser(args: Vec<String>) {
     });
 
     let injected_html = WEB_INDEX_HTML.replacen(
-        "<script type=\"module\">",
+        "<script",
         &format!(
-            "<style>#auth{{display:none!important}}</style>\n<script>localStorage.setItem('blit.passphrase','{token}');</script>\n<script type=\"module\">"
+            "<script>localStorage.setItem('blit.passphrase','{token}');</script>\n<script"
         ),
         1,
     );
@@ -775,32 +747,11 @@ fn open_browser(url: &str) {
     eprintln!("blit: open {url} in your browser");
 }
 
-fn serve_embedded_asset(path: &str) -> Option<Response> {
-    let trimmed = path.trim_start_matches('/');
-    let (bytes, ct): (&[u8], &str) = match trimmed {
-        "blit_browser.js" => (WEB_JS, "application/javascript"),
-        "blit_browser_bg.wasm" => (WEB_WASM, "application/wasm"),
-        "blit_browser.d.ts" => (WEB_DTS, "text/plain; charset=utf-8"),
-        "blit_browser_bg.wasm.d.ts" => (WEB_WASM_DTS, "text/plain; charset=utf-8"),
-        p if p.starts_with("snippets/blit-browser-") && p.ends_with("/inline0.js") => {
-            (WEB_SNIPPET_INLINE0, "application/javascript")
-        }
-        _ => return None,
-    };
-    Some(([(CONTENT_TYPE, ct)], bytes.to_vec()).into_response())
-}
-
 async fn browser_root_handler(
     axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
     request: axum::extract::Request,
     index_html: &'static str,
 ) -> Response {
-    let path = request.uri().path().to_owned();
-
-    if let Some(resp) = serve_embedded_asset(&path) {
-        return resp;
-    }
-
     let is_ws = request
         .headers()
         .get("upgrade")
@@ -1252,11 +1203,8 @@ async fn run(transport: Transport) {
                             }
                         } else if let Some(id) = focused_pty {
                             let _ = frame_tx.send(make_frame(&msg_resize(id, r, c))).await;
-                            // Force full redraw after resize
-                            screen.mark_all_dirty();
                             out_buf.clear();
                             renderer.render(&screen, &mut out_buf);
-                            screen.clear_all_dirty();
                             if !out_buf.is_empty() {
                                 let _ = stdout.write_all(&out_buf).await;
                                 let _ = stdout.flush().await;
@@ -1423,11 +1371,8 @@ async fn close_expose(
     cols: u16,
 ) {
     expose.open = false;
-    // Force full repaint of the terminal
-    screen.mark_all_dirty();
     out_buf.clear();
     renderer.render(screen, out_buf);
-    screen.clear_all_dirty();
     if !out_buf.is_empty() {
         let _ = stdout.write_all(out_buf).await;
                     let _ = stdout.flush().await;
@@ -1487,12 +1432,9 @@ async fn handle_server_msg(
                 let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
                 let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
                 if expose.open {
-                    // Close expose and switch to new PTY
                     expose.open = false;
-                    screen.mark_all_dirty();
                     out_buf.clear();
                     renderer.render(screen, out_buf);
-                    screen.clear_all_dirty();
                     if !out_buf.is_empty() {
                         let _ = stdout.write_all(out_buf).await;
                     let _ = stdout.flush().await;
@@ -1514,10 +1456,8 @@ async fn handle_server_msg(
                 let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
                 if expose.open {
                     expose.open = false;
-                    screen.mark_all_dirty();
                     out_buf.clear();
                     renderer.render(screen, out_buf);
-                    screen.clear_all_dirty();
                     if !out_buf.is_empty() {
                         let _ = stdout.write_all(out_buf).await;
                     let _ = stdout.flush().await;
@@ -1603,14 +1543,11 @@ async fn handle_server_msg(
                 }
 
                 renderer.render(screen, out_buf);
-                screen.clear_all_dirty();
 
                 if !out_buf.is_empty() {
                     let _ = stdout.write_all(out_buf).await;
                     let _ = stdout.flush().await;
                 }
-            } else {
-                screen.clear_all_dirty();
             }
 
             let _ = frame_tx.send(make_frame(&msg_ack())).await;
@@ -1633,13 +1570,10 @@ mod tests {
         let mut renderer = Renderer::new();
         let mut screen = TerminalState::new(4, 10);
         screen.frame_mut().set_mode(1); // cursor visible
-        screen.mark_all_dirty();
 
         let mut out = Vec::new();
         renderer.render(&screen, &mut out);
 
-        // The first render enters alt screen and hides cursor, then must
-        // re-show it because the screen mode says cursor is visible.
         assert!(output_contains(&out, b"\x1b[?25h"),
             "cursor show sequence missing from first render output");
     }
@@ -1649,14 +1583,10 @@ mod tests {
         let mut renderer = Renderer::new();
         let mut screen = TerminalState::new(4, 10);
         screen.frame_mut().set_mode(1); // cursor visible
-        screen.mark_all_dirty();
 
         let mut out = Vec::new();
         renderer.render(&screen, &mut out);
-        screen.clear_all_dirty();
 
-        // Second render, same mode — should NOT emit hide.
-        screen.mark_all_dirty();
         out.clear();
         renderer.render(&screen, &mut out);
 
@@ -1669,15 +1599,11 @@ mod tests {
         let mut renderer = Renderer::new();
         let mut screen = TerminalState::new(4, 10);
         screen.frame_mut().set_mode(0); // cursor hidden
-        screen.mark_all_dirty();
 
         let mut out = Vec::new();
         renderer.render(&screen, &mut out);
-        screen.clear_all_dirty();
 
-        // Now cursor becomes visible.
         screen.frame_mut().set_mode(1);
-        screen.mark_all_dirty();
         out.clear();
         renderer.render(&screen, &mut out);
 
@@ -1691,7 +1617,6 @@ mod tests {
         let mut screen = TerminalState::new(4, 10);
         screen.frame_mut().set_mode(1);
         screen.frame_mut().set_cursor(2, 5);
-        screen.mark_all_dirty();
 
         let mut out = Vec::new();
         renderer.render(&screen, &mut out);

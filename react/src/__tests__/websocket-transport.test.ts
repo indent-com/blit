@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { WebSocketTransport } from '../transports/websocket';
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { WebSocketTransport } from "../transports/websocket";
 
 // ---------------------------------------------------------------------------
 // Mock WebSocket
@@ -14,7 +14,7 @@ class MockWebSocket {
   static instances: MockWebSocket[] = [];
 
   readonly url: string;
-  binaryType = 'blob';
+  binaryType = "blob";
   readyState: number = MockWebSocket.CONNECTING;
   sentData: (string | Uint8Array | ArrayBuffer)[] = [];
 
@@ -69,7 +69,7 @@ function latestSocket(): MockWebSocket {
 function authenticateTransport(transport: WebSocketTransport): MockWebSocket {
   const ws = latestSocket();
   ws.simulateOpen();
-  ws.simulateMessage('ok');
+  ws.simulateMessage("ok");
   return ws;
 }
 
@@ -77,11 +77,11 @@ function authenticateTransport(transport: WebSocketTransport): MockWebSocket {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('WebSocketTransport', () => {
+describe("WebSocketTransport", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     MockWebSocket.instances = [];
-    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal("WebSocket", MockWebSocket);
   });
 
   afterEach(() => {
@@ -89,57 +89,57 @@ describe('WebSocketTransport', () => {
     vi.unstubAllGlobals();
   });
 
-  it('constructor immediately connects and sets status to connecting', () => {
-    const transport = new WebSocketTransport('ws://localhost:1234', 'secret');
+  it("constructor immediately connects and sets status to connecting", () => {
+    const transport = new WebSocketTransport("ws://localhost:1234", "secret");
     expect(MockWebSocket.instances).toHaveLength(1);
-    expect(latestSocket().url).toBe('ws://localhost:1234');
-    expect(transport.status).toBe('connecting');
+    expect(latestSocket().url).toBe("ws://localhost:1234");
+    expect(transport.status).toBe("connecting");
     transport.close();
   });
 
-  it('sends passphrase on socket open and transitions to authenticating', () => {
+  it("sends passphrase on socket open and transitions to authenticating", () => {
     const statuses: string[] = [];
-    const transport = new WebSocketTransport('ws://host', 'mypass');
-    transport.addEventListener('statuschange', (s) => statuses.push(s));
+    const transport = new WebSocketTransport("ws://host", "mypass");
+    transport.addEventListener("statuschange", (s) => statuses.push(s));
 
     latestSocket().simulateOpen();
 
-    expect(transport.status).toBe('authenticating');
-    expect(latestSocket().sentData).toEqual(['mypass']);
-    expect(statuses).toContain('authenticating');
+    expect(transport.status).toBe("authenticating");
+    expect(latestSocket().sentData).toEqual(["mypass"]);
+    expect(statuses).toContain("authenticating");
     transport.close();
   });
 
-  it('transitions to connected when server responds ok', () => {
+  it("transitions to connected when server responds ok", () => {
     const statuses: string[] = [];
-    const transport = new WebSocketTransport('ws://host', 'pass');
-    transport.addEventListener('statuschange', (s) => statuses.push(s));
+    const transport = new WebSocketTransport("ws://host", "pass");
+    transport.addEventListener("statuschange", (s) => statuses.push(s));
 
     authenticateTransport(transport);
 
-    expect(transport.status).toBe('connected');
-    expect(statuses).toContain('connected');
+    expect(transport.status).toBe("connected");
+    expect(statuses).toContain("connected");
     transport.close();
   });
 
-  it('transitions to error and closes socket on non-ok auth response', () => {
+  it("transitions to error and closes socket on non-ok auth response", () => {
     const statuses: string[] = [];
-    const transport = new WebSocketTransport('ws://host', 'pass');
-    transport.addEventListener('statuschange', (s) => statuses.push(s));
+    const transport = new WebSocketTransport("ws://host", "pass");
+    transport.addEventListener("statuschange", (s) => statuses.push(s));
 
     const ws = latestSocket();
     ws.simulateOpen();
-    ws.simulateMessage('denied');
+    ws.simulateMessage("denied");
 
-    expect(statuses).toContain('error');
+    expect(statuses).toContain("error");
     expect(ws.readyState).toBe(MockWebSocket.CLOSED);
     transport.close();
   });
 
-  it('forwards binary messages to message listeners after authentication', () => {
+  it("forwards binary messages to message listeners after authentication", () => {
     const received: ArrayBuffer[] = [];
-    const transport = new WebSocketTransport('ws://host', 'pass');
-    transport.addEventListener('message', (data) => received.push(data));
+    const transport = new WebSocketTransport("ws://host", "pass");
+    transport.addEventListener("message", (data) => received.push(data));
 
     const ws = authenticateTransport(transport);
 
@@ -151,10 +151,10 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('ignores binary messages before authentication', () => {
+  it("ignores binary messages before authentication", () => {
     const received: ArrayBuffer[] = [];
-    const transport = new WebSocketTransport('ws://host', 'pass');
-    transport.addEventListener('message', (data) => received.push(data));
+    const transport = new WebSocketTransport("ws://host", "pass");
+    transport.addEventListener("message", (data) => received.push(data));
 
     const ws = latestSocket();
     ws.simulateOpen();
@@ -164,8 +164,8 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('schedules reconnect on close after successful auth', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass', {
+  it("schedules reconnect on close after successful auth", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 1000,
     });
     const ws = authenticateTransport(transport);
@@ -173,17 +173,17 @@ describe('WebSocketTransport', () => {
     const instancesBefore = MockWebSocket.instances.length;
     ws.simulateClose();
 
-    expect(transport.status).toBe('disconnected');
+    expect(transport.status).toBe("disconnected");
 
     vi.advanceTimersByTime(1000);
 
     expect(MockWebSocket.instances.length).toBe(instancesBefore + 1);
-    expect(transport.status).toBe('connecting');
+    expect(transport.status).toBe("connecting");
     transport.close();
   });
 
-  it('does not reconnect on close before auth', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass', {
+  it("does not reconnect on close before auth", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 500,
     });
     const ws = latestSocket();
@@ -192,26 +192,26 @@ describe('WebSocketTransport', () => {
     const instancesBefore = MockWebSocket.instances.length;
     ws.simulateClose();
 
-    expect(transport.status).toBe('disconnected');
+    expect(transport.status).toBe("error");
 
     vi.advanceTimersByTime(5000);
     expect(MockWebSocket.instances.length).toBe(instancesBefore);
     transport.close();
   });
 
-  it('transitions to error on socket error before auth', () => {
+  it("transitions to error on socket error before auth", () => {
     const statuses: string[] = [];
-    const transport = new WebSocketTransport('ws://host', 'pass');
-    transport.addEventListener('statuschange', (s) => statuses.push(s));
+    const transport = new WebSocketTransport("ws://host", "pass");
+    transport.addEventListener("statuschange", (s) => statuses.push(s));
 
     latestSocket().simulateError();
 
-    expect(transport.status).toBe('error');
+    expect(transport.status).toBe("error");
     transport.close();
   });
 
-  it('send() works when connected', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass');
+  it("send() works when connected", () => {
+    const transport = new WebSocketTransport("ws://host", "pass");
     const ws = authenticateTransport(transport);
 
     const data = new Uint8Array([1, 2, 3]);
@@ -222,8 +222,8 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('send() is a no-op when not connected', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass');
+  it("send() is a no-op when not connected", () => {
+    const transport = new WebSocketTransport("ws://host", "pass");
     const ws = latestSocket();
 
     transport.send(new Uint8Array([1, 2, 3]));
@@ -231,8 +231,8 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('close() disposes and prevents reconnect', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass', {
+  it("close() disposes and prevents reconnect", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 500,
     });
     authenticateTransport(transport);
@@ -243,11 +243,11 @@ describe('WebSocketTransport', () => {
     vi.advanceTimersByTime(10000);
 
     expect(MockWebSocket.instances.length).toBe(instancesBefore);
-    expect(transport.status).toBe('disconnected');
+    expect(transport.status).toBe("disconnected");
   });
 
-  it('reconnect delay increases with backoff', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass', {
+  it("reconnect delay increases with backoff", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 100,
       reconnectBackoff: 2,
       maxReconnectDelay: 10000,
@@ -264,7 +264,7 @@ describe('WebSocketTransport', () => {
 
     ws = latestSocket();
     ws.simulateOpen();
-    ws.simulateMessage('ok');
+    ws.simulateMessage("ok");
     ws.simulateClose();
 
     countBefore = MockWebSocket.instances.length;
@@ -276,8 +276,8 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('successful reconnect resets the delay', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass', {
+  it("successful reconnect resets the delay", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 100,
       reconnectBackoff: 2,
       maxReconnectDelay: 10000,
@@ -289,7 +289,7 @@ describe('WebSocketTransport', () => {
     vi.advanceTimersByTime(100);
     ws = latestSocket();
     ws.simulateOpen();
-    ws.simulateMessage('ok');
+    ws.simulateMessage("ok");
 
     ws.simulateClose();
 
@@ -300,8 +300,8 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('reconnect:false disables reconnection', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass', {
+  it("reconnect:false disables reconnection", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
       reconnect: false,
     });
     const ws = authenticateTransport(transport);
@@ -315,11 +315,11 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('removeEventListener stops delivery', () => {
-    const transport = new WebSocketTransport('ws://host', 'pass');
+  it("removeEventListener stops delivery", () => {
+    const transport = new WebSocketTransport("ws://host", "pass");
     const cb = vi.fn();
-    transport.addEventListener('message', cb);
-    transport.removeEventListener('message', cb);
+    transport.addEventListener("message", cb);
+    transport.removeEventListener("message", cb);
 
     const ws = authenticateTransport(transport);
     ws.simulateMessage(new ArrayBuffer(4));
@@ -328,12 +328,12 @@ describe('WebSocketTransport', () => {
     transport.close();
   });
 
-  it('multiple message listeners all receive data', () => {
+  it("multiple message listeners all receive data", () => {
     const cb1 = vi.fn();
     const cb2 = vi.fn();
-    const transport = new WebSocketTransport('ws://host', 'pass');
-    transport.addEventListener('message', cb1);
-    transport.addEventListener('message', cb2);
+    const transport = new WebSocketTransport("ws://host", "pass");
+    transport.addEventListener("message", cb1);
+    transport.addEventListener("message", cb2);
 
     const ws = authenticateTransport(transport);
     ws.simulateMessage(new ArrayBuffer(4));

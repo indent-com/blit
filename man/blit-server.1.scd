@@ -6,39 +6,39 @@ blit-server - terminal streaming server
 
 # SYNOPSIS
 
-*blit-server* [*--socket* _PATH_] [_PATH_]
+_blit-server_ [*--socket* _PATH_] [_PATH_]
 
 # DESCRIPTION
 
-*blit-server* multiplexes PTYs on a Unix socket. It tracks terminal state using
+_blit-server_ multiplexes PTYs on a Unix socket. It tracks terminal state using
 the wezterm parser, diffs cell grids into LZ4-compressed binary frames, and
 publishes updates to connected clients.
 
-Supports systemd socket activation via *LISTEN_FDS=1*.
+Supports systemd socket activation via _LISTEN_FDS=1_.
 
 # OPTIONS
 
-*--socket* _PATH_
-	Unix socket path. Can also be given as a positional argument.
+_--socket_ _PATH_
+Unix socket path. Can also be given as a positional argument.
 
-*--help*, *-h*
-	Print usage and exit.
+_--help_, _-h_
+Print usage and exit.
 
-*--version*, *-V*
-	Print version and exit.
+_--version_, _-V_
+Print version and exit.
 
 # ENVIRONMENT
 
-*BLIT_SOCK*
-	Unix socket path. Defaults to _$XDG_RUNTIME_DIR/blit.sock_ or
-	_/tmp/blit.sock_.
+_BLIT_SOCK_
+Unix socket path. Defaults to _$XDG_RUNTIME_DIR/blit.sock_ or
+_/tmp/blit.sock_.
 
-*SHELL*
-	Shell to spawn for new PTYs (default: _/bin/sh_).
+_SHELL_
+Shell to spawn for new PTYs (default: _/bin/sh_).
 
-*BLIT_SCROLLBACK*
-	Scrollback buffer rows per PTY (default: 10000).
+_BLIT_SCROLLBACK_
+Scrollback buffer rows per PTY (default: 10000).
 
 # SEE ALSO
 
-*blit*(1), *blit-gateway*(1)
+_blit_(1), _blit-gateway_(1)

@@ -5,23 +5,24 @@ import {
   useImperativeHandle,
   useRef,
   useState,
-} from 'react';
-import type { Terminal } from 'blit-browser';
-import type { BlitTerminalProps, ConnectionStatus, TerminalPalette } from './types';
-import { C2S_ACK } from './types';
-import { useBlitConnection } from './hooks/useBlitConnection';
-import { measureCell, type CellMetrics } from './hooks/useBlitTerminal';
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const DEFAULT_FONT = '"PragmataPro Liga", "PragmataPro", ui-monospace, monospace';
-const DEFAULT_FONT_SIZE = 13;
+} from "react";
+import type { Terminal } from "blit-browser";
+import type {
+  BlitTerminalProps,
+  ConnectionStatus,
+  TerminalPalette,
+} from "./types";
+import {
+  C2S_INPUT,
+  C2S_RESIZE,
+  C2S_SCROLL,
+  DEFAULT_FONT,
+  DEFAULT_FONT_SIZE,
+} from "./types";
+import { measureCell, type CellMetrics } from "./hooks/useBlitTerminal";
 const BG_OP_STRIDE = 4;
 const GLYPH_OP_STRIDE = 8;
 const MAX_BATCH_VERTS = 65532;
-const MAX_ACK_AHEAD = 2;
 
 // ---------------------------------------------------------------------------
 // Shader sources (ported verbatim from web/index.html)
@@ -142,19 +143,17 @@ interface GlRenderer {
     cursorBlinkOn: boolean,
     cell: CellMetrics,
     bgColor: [number, number, number],
-    full: boolean,
   ): void;
   dispose(): void;
 }
 
 function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
-  const gl = canvas.getContext('webgl', {
+  const gl = canvas.getContext("webgl", {
     alpha: true,
     antialias: false,
     depth: false,
     stencil: false,
     premultipliedAlpha: true,
-    preserveDrawingBuffer: false,
   });
 
   if (!gl) {
@@ -182,15 +181,15 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   const glyphBuffer = gl.createBuffer()!;
   const atlasTexture = gl.createTexture()!;
 
-  const rectPosLoc = gl.getAttribLocation(rectProgram, 'a_pos');
-  const rectColorLoc = gl.getAttribLocation(rectProgram, 'a_color');
-  const rectResLoc = gl.getUniformLocation(rectProgram, 'u_resolution');
+  const rectPosLoc = gl.getAttribLocation(rectProgram, "a_pos");
+  const rectColorLoc = gl.getAttribLocation(rectProgram, "a_color");
+  const rectResLoc = gl.getUniformLocation(rectProgram, "u_resolution");
 
-  const glyphPosLoc = gl.getAttribLocation(glyphProgram, 'a_pos');
-  const glyphUvLoc = gl.getAttribLocation(glyphProgram, 'a_uv');
-  const glyphColorLoc = gl.getAttribLocation(glyphProgram, 'a_color');
-  const glyphResLoc = gl.getUniformLocation(glyphProgram, 'u_resolution');
-  const glyphTexLoc = gl.getUniformLocation(glyphProgram, 'u_texture');
+  const glyphPosLoc = gl.getAttribLocation(glyphProgram, "a_pos");
+  const glyphUvLoc = gl.getAttribLocation(glyphProgram, "a_uv");
+  const glyphColorLoc = gl.getAttribLocation(glyphProgram, "a_color");
+  const glyphResLoc = gl.getUniformLocation(glyphProgram, "u_resolution");
+  const glyphTexLoc = gl.getUniformLocation(glyphProgram, "u_texture");
 
   let uploadedAtlasVersion = -1;
   let uploadedAtlasCanvas: HTMLCanvasElement | null = null;
@@ -212,7 +211,7 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   ): boolean {
     if (
       atlasCanvas === uploadedAtlasCanvas &&
-      (version >>> 0) === (uploadedAtlasVersion >>> 0)
+      version >>> 0 === uploadedAtlasVersion >>> 0
     ) {
       return true;
     }
@@ -264,20 +263,47 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   ): void {
     drawColoredTriangles(
       new Float32Array([
-        x1, y1, r, g, b, a,
-        x2, y1, r, g, b, a,
-        x1, y2, r, g, b, a,
-        x1, y2, r, g, b, a,
-        x2, y1, r, g, b, a,
-        x2, y2, r, g, b, a,
+        x1,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x1,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        x1,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y2,
+        r,
+        g,
+        b,
+        a,
       ]),
     );
   }
 
-  function renderRectangles(
-    bgOps: Uint32Array,
-    cell: CellMetrics,
-  ): void {
+  function renderRectangles(bgOps: Uint32Array, cell: CellMetrics): void {
     if (!bgOps.length) return;
     const data = new Float32Array((bgOps.length / BG_OP_STRIDE) * 36);
     let offset = 0;
@@ -295,12 +321,42 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       const b = (packed & 0xff) / 255;
       data.set(
         [
-          x1, y1, r, g, b, 1,
-          x2, y1, r, g, b, 1,
-          x1, y2, r, g, b, 1,
-          x1, y2, r, g, b, 1,
-          x2, y1, r, g, b, 1,
-          x2, y2, r, g, b, 1,
+          x1,
+          y1,
+          r,
+          g,
+          b,
+          1,
+          x2,
+          y1,
+          r,
+          g,
+          b,
+          1,
+          x1,
+          y2,
+          r,
+          g,
+          b,
+          1,
+          x1,
+          y2,
+          r,
+          g,
+          b,
+          1,
+          x2,
+          y1,
+          r,
+          g,
+          b,
+          1,
+          x2,
+          y2,
+          r,
+          g,
+          b,
+          1,
         ],
         offset,
       );
@@ -318,13 +374,26 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     cell: CellMetrics,
   ): void {
     if (!cursorVisible) return;
-    const blinks = cursorStyle === 0 || cursorStyle === 1 || cursorStyle === 3 || cursorStyle === 5;
+    const blinks =
+      cursorStyle === 0 ||
+      cursorStyle === 1 ||
+      cursorStyle === 3 ||
+      cursorStyle === 5;
     if (blinks && !cursorBlinkOn) return;
     const x1 = cursorCol * cell.pw;
     const y1 = cursorRow * cell.ph;
     if (cursorStyle === 3 || cursorStyle === 4) {
       const h = Math.max(1, Math.round(cell.ph * 0.12));
-      drawSolidRect(x1, y1 + cell.ph - h, x1 + cell.pw, y1 + cell.ph, 0.8, 0.8, 0.8, 0.8);
+      drawSolidRect(
+        x1,
+        y1 + cell.ph - h,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.8,
+        0.8,
+        0.8,
+        0.8,
+      );
     } else if (cursorStyle === 5 || cursorStyle === 6) {
       const w = Math.max(1, Math.round(cell.pw * 0.12));
       drawSolidRect(x1, y1, x1 + w, y1 + cell.ph, 0.8, 0.8, 0.8, 0.8);
@@ -370,12 +439,54 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       const b = (packed & 0xff) / 255;
       data.set(
         [
-          dx1, dy1, u1, v1, r, g, b, 1,
-          dx2, dy1, u2, v1, r, g, b, 1,
-          dx1, dy2, u1, v2, r, g, b, 1,
-          dx1, dy2, u1, v2, r, g, b, 1,
-          dx2, dy1, u2, v1, r, g, b, 1,
-          dx2, dy2, u2, v2, r, g, b, 1,
+          dx1,
+          dy1,
+          u1,
+          v1,
+          r,
+          g,
+          b,
+          1,
+          dx2,
+          dy1,
+          u2,
+          v1,
+          r,
+          g,
+          b,
+          1,
+          dx1,
+          dy2,
+          u1,
+          v2,
+          r,
+          g,
+          b,
+          1,
+          dx1,
+          dy2,
+          u1,
+          v2,
+          r,
+          g,
+          b,
+          1,
+          dx2,
+          dy1,
+          u2,
+          v1,
+          r,
+          g,
+          b,
+          1,
+          dx2,
+          dy2,
+          u2,
+          v2,
+          r,
+          g,
+          b,
+          1,
         ],
         offset,
       );
@@ -424,18 +535,22 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       cursorBlinkOn: boolean,
       cell: CellMetrics,
       bgColor: [number, number, number],
-      full: boolean,
     ) {
       gl!.viewport(0, 0, canvas.width, canvas.height);
-      if (full) {
-        gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
-        gl!.clear(gl!.COLOR_BUFFER_BIT);
-      }
+      gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
+      gl!.clear(gl!.COLOR_BUFFER_BIT);
       renderRectangles(bgOps, cell);
       if (atlasCanvas) {
         renderGlyphs(glyphOps, atlasCanvas, atlasVersion, cell);
       }
-      renderCursor(cursorVisible, cursorCol, cursorRow, cursorStyle, cursorBlinkOn, cell);
+      renderCursor(
+        cursorVisible,
+        cursorCol,
+        cursorRow,
+        cursorStyle,
+        cursorBlinkOn,
+        cell,
+      );
     },
     dispose() {
       gl!.deleteBuffer(rectBuffer);
@@ -453,41 +568,37 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
 
 const encoder = new TextEncoder();
 
-function keyToBytes(
-  e: KeyboardEvent,
-  appCursor: boolean,
-): Uint8Array | null {
+function keyToBytes(e: KeyboardEvent, appCursor: boolean): Uint8Array | null {
   if (e.ctrlKey && !e.altKey && !e.metaKey) {
     const kc = e.key.charCodeAt(0);
-    if (e.key.length === 1 && kc >= 1 && kc <= 26)
-      return new Uint8Array([kc]);
+    if (e.key.length === 1 && kc >= 1 && kc <= 26) return new Uint8Array([kc]);
     if (e.key.length === 1) {
       const code = e.key.toLowerCase().charCodeAt(0);
       if (code >= 97 && code <= 122) return new Uint8Array([code - 96]);
-      if (e.key === '[') return new Uint8Array([0x1b]);
-      if (e.key === '\\') return new Uint8Array([0x1c]);
-      if (e.key === ']') return new Uint8Array([0x1d]);
+      if (e.key === "[") return new Uint8Array([0x1b]);
+      if (e.key === "\\") return new Uint8Array([0x1c]);
+      if (e.key === "]") return new Uint8Array([0x1d]);
     }
     // Fallback: use e.code when e.key is unhelpful (e.g. macOS Ctrl+letter)
-    if (e.code && e.code.startsWith('Key')) {
+    if (e.code && e.code.startsWith("Key")) {
       const cc = e.code.charCodeAt(3);
       if (cc >= 65 && cc <= 90) return new Uint8Array([cc - 64]);
     }
-    if (e.code === 'BracketLeft') return new Uint8Array([0x1b]);
-    if (e.code === 'Backslash') return new Uint8Array([0x1c]);
-    if (e.code === 'BracketRight') return new Uint8Array([0x1d]);
+    if (e.code === "BracketLeft") return new Uint8Array([0x1b]);
+    if (e.code === "Backslash") return new Uint8Array([0x1c]);
+    if (e.code === "BracketRight") return new Uint8Array([0x1d]);
   }
 
   if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
-    if (e.key === '?') return new Uint8Array([0x7f]);
-    if (e.key === ' ' || e.key === '@') return new Uint8Array([0x00]);
+    if (e.key === "?") return new Uint8Array([0x7f]);
+    if (e.key === " " || e.key === "@") return new Uint8Array([0x00]);
   }
 
   const arrows: Record<string, string> = {
-    ArrowUp: 'A',
-    ArrowDown: 'B',
-    ArrowRight: 'C',
-    ArrowLeft: 'D',
+    ArrowUp: "A",
+    ArrowDown: "B",
+    ArrowRight: "C",
+    ArrowLeft: "D",
   };
   if (arrows[e.key]) {
     const mod =
@@ -496,7 +607,7 @@ function keyToBytes(
       (e.ctrlKey ? 4 : 0) +
       (e.metaKey ? 8 : 0);
     if (mod) return encoder.encode(`\x1b[1;${mod + 1}${arrows[e.key]}`);
-    const prefix = appCursor ? '\x1bO' : '\x1b[';
+    const prefix = appCursor ? "\x1bO" : "\x1b[";
     return encoder.encode(prefix + arrows[e.key]);
   }
 
@@ -507,31 +618,37 @@ function keyToBytes(
     (e.metaKey ? 8 : 0);
 
   const tilde: Record<string, string> = {
-    PageUp: '5',
-    PageDown: '6',
-    Delete: '3',
-    Insert: '2',
+    PageUp: "5",
+    PageDown: "6",
+    Delete: "3",
+    Insert: "2",
   };
   if (tilde[e.key]) {
     if (mod) return encoder.encode(`\x1b[${tilde[e.key]};${mod + 1}~`);
     return encoder.encode(`\x1b[${tilde[e.key]}~`);
   }
 
-  const he: Record<string, string> = { Home: 'H', End: 'F' };
+  const he: Record<string, string> = { Home: "H", End: "F" };
   if (he[e.key]) {
     if (mod) return encoder.encode(`\x1b[1;${mod + 1}${he[e.key]}`);
     return encoder.encode(`\x1b[${he[e.key]}`);
   }
 
-  const f14: Record<string, string> = { F1: 'P', F2: 'Q', F3: 'R', F4: 'S' };
+  const f14: Record<string, string> = { F1: "P", F2: "Q", F3: "R", F4: "S" };
   if (f14[e.key]) {
     if (mod) return encoder.encode(`\x1b[1;${mod + 1}${f14[e.key]}`);
     return encoder.encode(`\x1bO${f14[e.key]}`);
   }
 
   const fkeys: Record<string, string> = {
-    F5: '15', F6: '17', F7: '18', F8: '19',
-    F9: '20', F10: '21', F11: '23', F12: '24',
+    F5: "15",
+    F6: "17",
+    F7: "18",
+    F8: "19",
+    F9: "20",
+    F10: "21",
+    F11: "23",
+    F12: "24",
   };
   if (fkeys[e.key]) {
     if (mod) return encoder.encode(`\x1b[${fkeys[e.key]};${mod + 1}~`);
@@ -539,16 +656,16 @@ function keyToBytes(
   }
 
   const simple: Record<string, string> = {
-    Enter: '\r',
-    Backspace: '\x7f',
-    Tab: '\t',
-    Escape: '\x1b',
+    Enter: "\r",
+    Backspace: "\x7f",
+    Tab: "\t",
+    Escape: "\x1b",
   };
   if (simple[e.key]) return encoder.encode(simple[e.key]);
 
   if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.length === 1) {
     const code = e.key.charCodeAt(0);
-    if (code >= 0x20 && code <= 0x7e) return encoder.encode('\x1b' + e.key);
+    if (code >= 0x20 && code <= 0x7e) return encoder.encode("\x1b" + e.key);
     return encoder.encode(e.key);
   }
 
@@ -557,22 +674,6 @@ function keyToBytes(
   }
 
   return null;
-}
-
-// ---------------------------------------------------------------------------
-// WASM singleton initialisation
-// ---------------------------------------------------------------------------
-
-let wasmInitPromise: Promise<typeof import('blit-browser')> | null = null;
-
-function initWasm(): Promise<typeof import('blit-browser')> {
-  if (!wasmInitPromise) {
-    wasmInitPromise = import('blit-browser').then(async (mod) => {
-      await mod.default();
-      return mod;
-    });
-  }
-  return wasmInitPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +712,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       className,
       style,
       palette,
+      readOnly = false,
+      store,
     } = props;
 
     // Refs for DOM elements.
@@ -627,14 +730,18 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     const rowsRef = useRef(24);
     const colsRef = useRef(80);
     const needsRenderRef = useRef(false);
-    const needsFullRenderRef = useRef(true);
-    const ackAheadRef = useRef(0);
-    const subscribedRef = useRef(false);
+
     const scrollOffsetRef = useRef(0);
     const cursorBlinkOnRef = useRef(true);
-    const cursorBlinkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const wasmModRef = useRef<typeof import('blit-browser') | null>(null);
+    const cursorBlinkTimerRef = useRef<ReturnType<typeof setInterval> | null>(
+      null,
+    );
     const paletteRef = useRef<TerminalPalette | undefined>(palette);
+
+
+    const predictedRef = useRef("");
+    const predictedFromRowRef = useRef(0);
+    const predictedFromColRef = useRef(0);
 
     // React state for things the consumer might read.
     const [wasmReady, setWasmReady] = useState(false);
@@ -643,22 +750,107 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // Connection callbacks — BlitTerminal only cares about UPDATE (rendering)
     // -----------------------------------------------------------------------
 
-    const onUpdate = useCallback(
-      (updatePtyId: number, payload: Uint8Array) => {
-        if (updatePtyId !== ptyId || !terminalRef.current) return;
-        terminalRef.current.feed_compressed(payload);
-        needsRenderRef.current = true;
-        // ACK
-        if (ackAheadRef.current < MAX_ACK_AHEAD) {
-          transport.send(new Uint8Array([C2S_ACK]));
-          ackAheadRef.current += 1;
+    const [status, setStatus] = useState<ConnectionStatus>(transport.status);
+
+    const reconcilePrediction = useCallback(() => {
+      const t = terminalRef.current;
+      if (!t || !predictedRef.current) return;
+      const cr = t.cursor_row;
+      const cc = t.cursor_col;
+      if (cr !== predictedFromRowRef.current) {
+        predictedRef.current = "";
+        return;
+      }
+      const advance = cc - predictedFromColRef.current;
+      if (advance > 0 && advance <= predictedRef.current.length) {
+        predictedRef.current = predictedRef.current.slice(advance);
+        predictedFromColRef.current = cc;
+      } else if (advance < 0 || advance > predictedRef.current.length) {
+        predictedRef.current = "";
+      }
+    }, []);
+
+    useEffect(() => {
+      const syncReadOnlySize = (t: Terminal) => {
+        const tr = t.rows;
+        const tc = t.cols;
+        if (tr !== rowsRef.current || tc !== colsRef.current) {
+          rowsRef.current = tr;
+          colsRef.current = tc;
         }
+        needsRenderRef.current = true;
+      };
+      const unsub = store.addDirtyListener((dirtyPtyId: number) => {
+        if (dirtyPtyId !== ptyId) return;
+        const t = store.getTerminal(dirtyPtyId);
+        if (t && terminalRef.current !== t) {
+          terminalRef.current = t;
+          needsRenderRef.current = true;
+        }
+        if (!t) return;
+        needsRenderRef.current = true;
+        reconcilePrediction();
+        if (readOnly) syncReadOnlySize(t);
+      });
+      if (ptyId !== null) {
+        const t = store.getTerminal(ptyId);
+        if (t) {
+          terminalRef.current = t;
+          if (readOnly) syncReadOnlySize(t);
+        }
+      }
+      const onStatus = (s: ConnectionStatus) => setStatus(s);
+      transport.addEventListener("statuschange", onStatus);
+      setStatus(transport.status);
+      return () => {
+        unsub();
+        transport.removeEventListener("statuschange", onStatus);
+      };
+    }, [transport, ptyId, readOnly, store, reconcilePrediction]);
+
+    const sendInput = useCallback(
+      (id: number, data: Uint8Array) => {
+        const msg = new Uint8Array(3 + data.length);
+        msg[0] = C2S_INPUT;
+        msg[1] = id & 0xff;
+        msg[2] = (id >> 8) & 0xff;
+        msg.set(data, 3);
+        transport.send(msg);
       },
-      [ptyId, transport],
+      [transport],
     );
 
-    const { status, sendInput, sendResize, sendSubscribe, sendUnsubscribe, sendScroll } =
-      useBlitConnection(transport, { onUpdate });
+    const sendResize = useCallback(
+      (id: number, rows: number, cols: number) => {
+        const msg = new Uint8Array(7);
+        msg[0] = C2S_RESIZE;
+        msg[1] = id & 0xff;
+        msg[2] = (id >> 8) & 0xff;
+        msg[3] = rows & 0xff;
+        msg[4] = (rows >> 8) & 0xff;
+        msg[5] = cols & 0xff;
+        msg[6] = (cols >> 8) & 0xff;
+        transport.send(msg);
+      },
+      [transport],
+    );
+
+    const sendScroll = useCallback(
+      (id: number, offset: number) => {
+        const msg = new Uint8Array(7);
+        msg[0] = C2S_SCROLL;
+        msg[1] = id & 0xff;
+        msg[2] = (id >> 8) & 0xff;
+        msg[3] = offset & 0xff;
+        msg[4] = (offset >> 8) & 0xff;
+        msg[5] = (offset >> 16) & 0xff;
+        msg[6] = (offset >> 24) & 0xff;
+        transport.send(msg);
+      },
+      [transport],
+    );
+
+
 
     // -----------------------------------------------------------------------
     // Imperative handle
@@ -689,39 +881,35 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
-      let cancelled = false;
-      initWasm().then((mod) => {
-        if (cancelled) return;
-        wasmModRef.current = mod;
-        setWasmReady(true);
-      });
-      return () => {
-        cancelled = true;
-      };
-    }, []);
+      const unsub = store.onReady(() => setWasmReady(true));
+      if (store.isReady()) setWasmReady(true);
+      return unsub;
+    }, [store]);
 
     // -----------------------------------------------------------------------
     // Cell measurement (re-measure when font changes)
     // -----------------------------------------------------------------------
 
     useEffect(() => {
-      cellRef.current = measureCell(fontFamily, fontSize);
-      if (terminalRef.current) {
-        terminalRef.current.set_cell_size(
-          cellRef.current.pw,
-          cellRef.current.ph,
-        );
-        terminalRef.current.set_font_family(fontFamily);
-        needsRenderRef.current = true;
-        needsFullRenderRef.current = true;
+      const cell = measureCell(fontFamily, fontSize);
+      cellRef.current = cell;
+      if (!readOnly) {
+        const t = terminalRef.current;
+        if (t) {
+          t.set_cell_size(cell.pw, cell.ph);
+          t.set_font_family(fontFamily);
+        }
+        store.setCellSize(cell.pw, cell.ph);
       }
-    }, [fontFamily, fontSize]);
+      needsRenderRef.current = true;
+    }, [fontFamily, fontSize, store, readOnly]);
 
     // -----------------------------------------------------------------------
     // Cursor blink timer
     // -----------------------------------------------------------------------
 
     useEffect(() => {
+      if (readOnly) return;
       cursorBlinkOnRef.current = true;
       const timer = setInterval(() => {
         cursorBlinkOnRef.current = !cursorBlinkOnRef.current;
@@ -732,7 +920,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         clearInterval(timer);
         cursorBlinkTimerRef.current = null;
       };
-    }, []);
+    }, [readOnly]);
 
     // -----------------------------------------------------------------------
     // GL renderer lifecycle
@@ -754,32 +942,22 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
-      if (!wasmReady || ptyId === null) return;
-      const mod = wasmModRef.current!;
-      const cell = cellRef.current;
-
-      const t = new mod.Terminal(
-        rowsRef.current,
-        colsRef.current,
-        cell.pw,
-        cell.ph,
-      );
-      t.set_font_family(fontFamily);
-      const pal = paletteRef.current;
-      if (pal) {
-        t.set_default_colors(...pal.fg, ...pal.bg);
-        for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...pal.ansi[i]);
-      }
-      terminalRef.current = t;
-      needsRenderRef.current = true;
-
-      return () => {
-        t.free();
-        if (terminalRef.current === t) {
-          terminalRef.current = null;
+      if (ptyId !== null) {
+        const t = store.getTerminal(ptyId);
+        if (t) {
+          terminalRef.current = t;
+          if (!readOnly) {
+            const cell = cellRef.current;
+            t.set_cell_size(cell.pw, cell.ph);
+            if (typeof t.set_font_family === "function") t.set_font_family(fontFamily);
+          }
+          needsRenderRef.current = true;
+          needsRenderRef.current = true;
         }
-      };
-    }, [wasmReady, ptyId, fontFamily]);
+      } else {
+        terminalRef.current = null;
+      }
+    }, [wasmReady, ptyId, store, fontFamily, readOnly]);
 
     // -----------------------------------------------------------------------
     // Palette changes
@@ -791,35 +969,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       if (!t || !palette) return;
       t.set_default_colors(...palette.fg, ...palette.bg);
       for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...palette.ansi[i]);
-      t.invalidate_render_cache();
       needsRenderRef.current = true;
-      needsFullRenderRef.current = true;
     }, [palette]);
-
-    // -----------------------------------------------------------------------
-    // Subscribe/unsubscribe to PTY
-    // -----------------------------------------------------------------------
-
-    useEffect(() => {
-      if (ptyId === null || status !== 'connected') {
-        if (subscribedRef.current && ptyId !== null) {
-          sendUnsubscribe(ptyId);
-          subscribedRef.current = false;
-        }
-        return;
-      }
-      sendSubscribe(ptyId);
-      subscribedRef.current = true;
-      // Send initial resize.
-      sendResize(ptyId, rowsRef.current, colsRef.current);
-
-      return () => {
-        if (subscribedRef.current) {
-          sendUnsubscribe(ptyId);
-          subscribedRef.current = false;
-        }
-      };
-    }, [ptyId, status, sendSubscribe, sendUnsubscribe, sendResize]);
 
     // -----------------------------------------------------------------------
     // Resize observer
@@ -827,7 +978,19 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       const container = containerRef.current;
-      if (!container) return;
+      if (!container || readOnly) return;
+
+      let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+      let pendingRows = colsRef.current;
+      let pendingCols = rowsRef.current;
+      let lastSentPtyId: number | null = null;
+
+      const flushResize = () => {
+        resizeTimer = null;
+        if (ptyId !== null) {
+          sendResize(ptyId, pendingRows, pendingCols);
+        }
+      };
 
       const handleResize = () => {
         const cell = cellRef.current;
@@ -836,47 +999,37 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         const cols = Math.max(1, Math.floor(w / cell.w));
         const rows = Math.max(1, Math.floor(h / cell.h));
 
-        if (cols === colsRef.current && rows === rowsRef.current) return;
-
-        rowsRef.current = rows;
-        colsRef.current = cols;
-
-        // Resize GL canvas backing.
-        const pw = cols * cell.pw;
-        const ph = rows * cell.ph;
-        rendererRef.current?.resize(pw, ph);
-
-        // Resize overlay canvas.
-        const overlay = overlayCanvasRef.current;
-        if (overlay) {
-          overlay.width = pw;
-          overlay.height = ph;
-          overlay.style.width = `${cols * cell.w}px`;
-          overlay.style.height = `${rows * cell.h}px`;
+        const sizeChanged = cols !== colsRef.current || rows !== rowsRef.current;
+        if (sizeChanged) {
+          rowsRef.current = rows;
+          colsRef.current = cols;
+          needsRenderRef.current = true;
         }
 
-        // Resize GL canvas CSS size.
-        const glCanvas = glCanvasRef.current;
-        if (glCanvas) {
-          glCanvas.style.width = `${cols * cell.w}px`;
-          glCanvas.style.height = `${rows * cell.h}px`;
-        }
+        pendingRows = rows;
+        pendingCols = cols;
 
-        needsRenderRef.current = true;
-        needsFullRenderRef.current = true;
-
-        if (ptyId !== null && status === 'connected') {
+        // Send immediately on ptyId change, debounce during continuous resize
+        if (ptyId !== null && lastSentPtyId !== ptyId) {
+          lastSentPtyId = ptyId;
           sendResize(ptyId, rows, cols);
+        } else if (sizeChanged) {
+          if (resizeTimer) clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(flushResize, 100);
         }
       };
 
       const observer = new ResizeObserver(handleResize);
       observer.observe(container);
-      // Run once immediately.
+      window.addEventListener("resize", handleResize);
       handleResize();
 
-      return () => observer.disconnect();
-    }, [ptyId, status, sendResize]);
+      return () => {
+        observer.disconnect();
+        window.removeEventListener("resize", handleResize);
+        if (resizeTimer) clearTimeout(resizeTimer);
+      };
+    }, [ptyId, readOnly, sendResize]);
 
     // -----------------------------------------------------------------------
     // Render loop
@@ -888,30 +1041,52 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       const renderLoop = () => {
         if (!running) return;
 
-        if (needsRenderRef.current && terminalRef.current && rendererRef.current?.supported) {
+        if (
+          needsRenderRef.current &&
+          terminalRef.current &&
+          rendererRef.current?.supported
+        ) {
           needsRenderRef.current = false;
           const t = terminalRef.current;
           const cell = cellRef.current;
           const renderer = rendererRef.current;
 
-          t.prepare_render_ops();
-          let full = needsFullRenderRef.current || t.last_render_full();
-          if (!full && t.last_render_scroll_rows()) {
-            t.prepare_full_render_ops();
-            full = true;
+          // Always sync canvas backing to the terminal's actual grid.
+          // The terminal dimensions come from the server and may differ
+          // from colsRef/rowsRef (which reflect the container size).
+          {
+            const termCols = t.cols;
+            const termRows = t.rows;
+            const pw = termCols * cell.pw;
+            const ph = termRows * cell.ph;
+            if (!readOnly) {
+              const cssW = `${termCols * cell.w}px`;
+              const cssH = `${termRows * cell.h}px`;
+              const glCanvas = glCanvasRef.current;
+              if (glCanvas) {
+                if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
+                if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
+              }
+              const overlay = overlayCanvasRef.current;
+              if (overlay) {
+                if (overlay.style.width !== cssW) overlay.style.width = cssW;
+                if (overlay.style.height !== cssH) overlay.style.height = cssH;
+              }
+            }
+            renderer.resize(pw, ph);
+            const overlay = overlayCanvasRef.current;
+            if (!readOnly && overlay) {
+              if (overlay.width !== pw) overlay.width = pw;
+              if (overlay.height !== ph) overlay.height = ph;
+            }
           }
-          needsFullRenderRef.current = false;
 
-          const bgOps = t.background_ops();
-          const glyphOps = t.glyph_ops();
-          const atlasCanvas = t.glyph_atlas_canvas();
-          const atlasVersion = t.glyph_atlas_version();
-
+          t.prepare_render_ops();
           renderer.render(
-            bgOps,
-            glyphOps,
-            atlasCanvas,
-            atlasVersion,
+            t.background_ops(),
+            t.glyph_ops(),
+            t.glyph_atlas_canvas(),
+            t.glyph_atlas_version(),
             t.cursor_visible(),
             t.cursor_col,
             t.cursor_row,
@@ -919,15 +1094,13 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             cursorBlinkOnRef.current,
             cell,
             paletteRef.current?.bg ?? [0, 0, 0],
-            full,
           );
 
-          // Render overflow text (emoji / wide Unicode) via 2D overlay canvas.
-          // Only redraw on full renders — overflow text doesn't change on blink frames.
+          // Overflow text (emoji / wide Unicode) via 2D overlay canvas.
           const overflowCount = t.overflow_text_count();
           const overlay = overlayCanvasRef.current;
-          if (full && overlay) {
-            const ctx = overlay.getContext('2d');
+          if (overlay) {
+            const ctx = overlay.getContext("2d");
             if (ctx) {
               ctx.clearRect(0, 0, overlay.width, overlay.height);
               if (overflowCount > 0) {
@@ -937,13 +1110,20 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
                 const scaledH = ch * scale;
                 const fSize = Math.max(1, Math.round(scaledH));
                 ctx.font = `${fSize}px ${fontFamily}`;
-                ctx.textBaseline = 'bottom';
-                const [fgR, fgG, fgB] = paletteRef.current?.fg ?? [204, 204, 204];
-                ctx.fillStyle = `#${fgR.toString(16).padStart(2,'0')}${fgG.toString(16).padStart(2,'0')}${fgB.toString(16).padStart(2,'0')}`;
+                ctx.textBaseline = "bottom";
+                const [fgR, fgG, fgB] = paletteRef.current?.fg ?? [
+                  204, 204, 204,
+                ];
+                ctx.fillStyle = `#${fgR.toString(16).padStart(2, "0")}${fgG.toString(16).padStart(2, "0")}${fgB.toString(16).padStart(2, "0")}`;
                 for (let i = 0; i < overflowCount; i++) {
                   const op = t.overflow_text_op(i);
                   if (!op) continue;
-                  const [row, col, colSpan, text] = op as [number, number, number, string];
+                  const [row, col, colSpan, text] = op as [
+                    number,
+                    number,
+                    number,
+                    string,
+                  ];
                   const x = col * cw;
                   const y = row * ch;
                   const w = colSpan * cw;
@@ -960,8 +1140,28 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             }
           }
 
-          // Reset ack-ahead after rendering a frame.
-          ackAheadRef.current = 0;
+          if (!readOnly && predictedRef.current && overlay) {
+            const t2 = terminalRef.current;
+            if (t2 && t2.echo()) {
+              const ctx2 = overlay.getContext("2d");
+              if (ctx2) {
+                const cw = cell.pw;
+                const ch = cell.ph;
+                const cc = t2.cursor_col;
+                const cr = t2.cursor_row;
+                const [fR, fG, fB] = paletteRef.current?.fg ?? [204, 204, 204];
+                ctx2.fillStyle = `rgba(${fR},${fG},${fB},0.5)`;
+                const fSize = Math.max(1, Math.round(ch * 0.85));
+                ctx2.font = `${fSize}px ${fontFamily}`;
+                ctx2.textBaseline = "bottom";
+                const pred = predictedRef.current;
+                for (let i = 0; i < pred.length && cc + i < colsRef.current; i++) {
+                  ctx2.fillText(pred[i], (cc + i) * cw, cr * ch + ch);
+                }
+              }
+            }
+          }
+
         }
 
         rafRef.current = requestAnimationFrame(renderLoop);
@@ -981,73 +1181,76 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       const input = inputRef.current;
-      if (!input) return;
+      if (!input || readOnly) return;
 
       const handleKeyDown = (e: KeyboardEvent) => {
-        if (ptyId === null || status !== 'connected') return;
+        if (ptyId === null || status !== "connected") return;
         if (e.isComposing) return;
-        if (e.key === 'Dead') return;
+        if (e.key === "Dead") return;
 
         const t = terminalRef.current;
         const appCursor = t ? t.app_cursor() : false;
         const bytes = keyToBytes(e, appCursor);
         if (bytes) {
           e.preventDefault();
-          // Reset scroll to live on any real input.
           if (scrollOffsetRef.current > 0) {
             scrollOffsetRef.current = 0;
             sendScroll(ptyId, 0);
+          }
+          if (t && t.echo() && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            if (!predictedRef.current) {
+              predictedFromRowRef.current = t.cursor_row;
+              predictedFromColRef.current = t.cursor_col;
+            }
+            predictedRef.current += e.key;
+            needsRenderRef.current = true;
+          } else {
+            predictedRef.current = "";
           }
           sendInput(ptyId, bytes);
         }
       };
 
       const handleCompositionEnd = (e: CompositionEvent) => {
-        if (e.data && ptyId !== null && status === 'connected') {
+        if (e.data && ptyId !== null && status === "connected") {
           sendInput(ptyId, encoder.encode(e.data));
         }
-        input.value = '';
+        input.value = "";
       };
 
       const handleInput = (e: Event) => {
         const inputEvent = e as InputEvent;
         if (inputEvent.isComposing) {
           if (
-            inputEvent.inputType === 'deleteContentBackward' &&
+            inputEvent.inputType === "deleteContentBackward" &&
             !input.value &&
             ptyId !== null &&
-            status === 'connected'
+            status === "connected"
           ) {
             sendInput(ptyId, new Uint8Array([0x7f]));
           }
           return;
         }
-        if (
-          inputEvent.inputType === 'deleteContentBackward' &&
-          !input.value
-        ) {
-          if (ptyId !== null && status === 'connected') {
+        if (inputEvent.inputType === "deleteContentBackward" && !input.value) {
+          if (ptyId !== null && status === "connected") {
             sendInput(ptyId, new Uint8Array([0x7f]));
           }
-        } else if (input.value && ptyId !== null && status === 'connected') {
-          sendInput(
-            ptyId,
-            encoder.encode(input.value.replace(/\n/g, '\r')),
-          );
+        } else if (input.value && ptyId !== null && status === "connected") {
+          sendInput(ptyId, encoder.encode(input.value.replace(/\n/g, "\r")));
         }
-        input.value = '';
+        input.value = "";
       };
 
-      input.addEventListener('keydown', handleKeyDown);
-      input.addEventListener('compositionend', handleCompositionEnd);
-      input.addEventListener('input', handleInput);
+      input.addEventListener("keydown", handleKeyDown);
+      input.addEventListener("compositionend", handleCompositionEnd);
+      input.addEventListener("input", handleInput);
 
       return () => {
-        input.removeEventListener('keydown', handleKeyDown);
-        input.removeEventListener('compositionend', handleCompositionEnd);
-        input.removeEventListener('input', handleInput);
+        input.removeEventListener("keydown", handleKeyDown);
+        input.removeEventListener("compositionend", handleCompositionEnd);
+        input.removeEventListener("input", handleInput);
       };
-    }, [ptyId, status, sendInput, sendScroll]);
+    }, [ptyId, status, readOnly, sendInput, sendScroll]);
 
     // -----------------------------------------------------------------------
     // Mouse input
@@ -1055,7 +1258,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       const canvas = glCanvasRef.current;
-      if (!canvas) return;
+      if (!canvas || readOnly) return;
 
       function mouseToCell(e: MouseEvent): { row: number; col: number } {
         const rect = canvas!.getBoundingClientRect();
@@ -1073,25 +1276,32 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       }
 
       function sendMouseEvent(
-        type: 'down' | 'up' | 'move',
+        type: "down" | "up" | "move",
         e: MouseEvent,
         button: number,
       ): boolean {
         const t = terminalRef.current;
-        if (!t || t.mouse_mode() === 0 || ptyId === null || status !== 'connected')
+        if (
+          !t ||
+          t.mouse_mode() === 0 ||
+          ptyId === null ||
+          status !== "connected"
+        )
           return false;
 
         const pos = mouseToCell(e);
         const enc = t.mouse_encoding();
 
         if (enc === 2) {
-          const suffix = type === 'up' ? 'm' : 'M';
+          const suffix = type === "up" ? "m" : "M";
           const seq = `\x1b[<${button};${pos.col + 1};${pos.row + 1}${suffix}`;
           sendInput(ptyId, encoder.encode(seq));
         } else {
-          if (type === 'up') button = 3;
+          if (type === "up") button = 3;
           const seq = new Uint8Array([
-            0x1b, 0x5b, 0x4d,
+            0x1b,
+            0x5b,
+            0x4d,
             button + 32,
             pos.col + 33,
             pos.row + 33,
@@ -1101,28 +1311,115 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         return true;
       }
 
+      let selecting = false;
+      let selStart: { row: number; col: number } | null = null;
+      let selEnd: { row: number; col: number } | null = null;
+      const selOverlays: HTMLElement[] = [];
+
+      function clearSelection() {
+        for (const el of selOverlays) el.remove();
+        selOverlays.length = 0;
+        selStart = selEnd = null;
+      }
+
+      function drawSelection() {
+        for (const el of selOverlays) el.remove();
+        selOverlays.length = 0;
+        if (!selStart || !selEnd) return;
+        let sr = selStart.row, sc = selStart.col;
+        let er = selEnd.row, ec = selEnd.col;
+        if (sr > er || (sr === er && sc > ec)) {
+          [sr, sc, er, ec] = [er, ec, sr, sc];
+        }
+        const rect = canvas!.getBoundingClientRect();
+        const cell = cellRef.current;
+        for (let r = sr; r <= er; r++) {
+          const c0 = r === sr ? sc : 0;
+          const c1 = r === er ? ec : colsRef.current - 1;
+          const el = document.createElement("div");
+          el.style.cssText =
+            "position:fixed;background:rgba(100,150,255,0.3);pointer-events:none;z-index:1";
+          el.style.left = rect.left + c0 * cell.w + "px";
+          el.style.top = rect.top + r * cell.h + "px";
+          el.style.width = (c1 - c0 + 1) * cell.w + "px";
+          el.style.height = cell.h + "px";
+          document.body.appendChild(el);
+          selOverlays.push(el);
+        }
+      }
+
+      function copySelection() {
+        if (!selStart || !selEnd) return;
+        const t = terminalRef.current;
+        if (!t) return;
+        let sr = selStart.row, sc = selStart.col;
+        let er = selEnd.row, ec = selEnd.col;
+        if (sr > er || (sr === er && sc > ec)) {
+          [sr, sc, er, ec] = [er, ec, sr, sc];
+        }
+        const text = t.get_text(sr, sc, er, ec);
+        const html = t.get_html(sr, sc, er, ec);
+        if (text) {
+          navigator.clipboard.write([
+            new ClipboardItem({
+              "text/plain": new Blob([text], { type: "text/plain" }),
+              "text/html": new Blob([html], { type: "text/html" }),
+            }),
+          ]);
+        }
+      }
+
       const handleMouseDown = (e: MouseEvent) => {
-        if (!e.shiftKey && sendMouseEvent('down', e, e.button)) {
+        if (!e.shiftKey && sendMouseEvent("down", e, e.button)) {
           e.preventDefault();
+          return;
+        }
+        if (e.button === 0) {
+          clearSelection();
+          selecting = true;
+          selStart = mouseToCell(e);
+          selEnd = selStart;
         }
       };
 
       const handleMouseMove = (e: MouseEvent) => {
-        if (e.shiftKey) return;
-        const t = terminalRef.current;
-        if (!t) return;
-        const mode = t.mouse_mode();
-        if (mode === 3 || mode === 4) {
-          const button = e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0;
-          if (e.buttons || mode === 4) {
-            sendMouseEvent('move', e, button + 32);
+        if (!e.shiftKey) {
+          const t = terminalRef.current;
+          if (t) {
+            const mode = t.mouse_mode();
+            if (mode === 3 || mode === 4) {
+              const button =
+                e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0;
+              if (e.buttons || mode === 4) {
+                sendMouseEvent("move", e, button + 32);
+                return;
+              }
+            }
           }
+        }
+        if (selecting) {
+          selEnd = mouseToCell(e);
+          drawSelection();
         }
       };
 
       const handleMouseUp = (e: MouseEvent) => {
-        if (!e.shiftKey) {
-          sendMouseEvent('up', e, e.button);
+        if (!e.shiftKey && sendMouseEvent("up", e, e.button)) {
+          e.preventDefault();
+          return;
+        }
+        if (selecting) {
+          selecting = false;
+          selEnd = mouseToCell(e);
+          drawSelection();
+          if (
+            selStart &&
+            selEnd &&
+            (selStart.row !== selEnd.row || selStart.col !== selEnd.col)
+          ) {
+            copySelection();
+          }
+          clearSelection();
         }
         inputRef.current?.focus();
       };
@@ -1132,12 +1429,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (t && t.mouse_mode() > 0) {
           e.preventDefault();
           const button = e.deltaY < 0 ? 64 : 65;
-          sendMouseEvent('down', e, button);
-        } else if (ptyId !== null && status === 'connected') {
+          sendMouseEvent("down", e, button);
+        } else if (ptyId !== null && status === "connected") {
           e.preventDefault();
-          const lines =
-            Math.round(-e.deltaY / 20) || (e.deltaY > 0 ? -3 : 3);
-          scrollOffsetRef.current = Math.max(0, scrollOffsetRef.current + lines);
+          const lines = Math.round(-e.deltaY / 20) || (e.deltaY > 0 ? -3 : 3);
+          scrollOffsetRef.current = Math.max(
+            0,
+            scrollOffsetRef.current + lines,
+          );
           sendScroll(ptyId, scrollOffsetRef.current);
         }
       };
@@ -1151,20 +1450,20 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         inputRef.current?.focus();
       };
 
-      canvas.addEventListener('mousedown', handleMouseDown);
-      canvas.addEventListener('mousemove', handleMouseMove);
-      window.addEventListener('mouseup', handleMouseUp);
-      canvas.addEventListener('wheel', handleWheel, { passive: false });
-      canvas.addEventListener('contextmenu', handleContextMenu);
-      canvas.addEventListener('click', handleClick);
+      canvas.addEventListener("mousedown", handleMouseDown);
+      canvas.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mouseup", handleMouseUp);
+      canvas.addEventListener("wheel", handleWheel, { passive: false });
+      canvas.addEventListener("contextmenu", handleContextMenu);
+      canvas.addEventListener("click", handleClick);
 
       return () => {
-        canvas.removeEventListener('mousedown', handleMouseDown);
-        canvas.removeEventListener('mousemove', handleMouseMove);
-        window.removeEventListener('mouseup', handleMouseUp);
-        canvas.removeEventListener('wheel', handleWheel);
-        canvas.removeEventListener('contextmenu', handleContextMenu);
-        canvas.removeEventListener('click', handleClick);
+        canvas.removeEventListener("mousedown", handleMouseDown);
+        canvas.removeEventListener("mousemove", handleMouseMove);
+        window.removeEventListener("mouseup", handleMouseUp);
+        canvas.removeEventListener("wheel", handleWheel);
+        canvas.removeEventListener("contextmenu", handleContextMenu);
+        canvas.removeEventListener("click", handleClick);
       };
     }, [ptyId, status, sendInput, sendScroll]);
 
@@ -1177,55 +1476,69 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         ref={containerRef}
         className={className}
         style={{
-          position: 'relative',
-          overflow: 'hidden',
+          position: "relative",
+          overflow: "hidden",
           ...style,
         }}
       >
         <canvas
           ref={glCanvasRef}
-          style={{
-            display: 'block',
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            imageRendering: 'pixelated',
-            cursor: 'text',
-          }}
+          style={
+            readOnly
+              ? {
+                  display: "block",
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "contain",
+                  objectPosition: "top left",
+                  imageRendering: "pixelated",
+                }
+              : {
+                  display: "block",
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  cursor: "text",
+                  willChange: "transform",
+                }
+          }
         />
-        <canvas
-          ref={overlayCanvasRef}
-          style={{
-            display: 'block',
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            pointerEvents: 'none',
-            imageRendering: 'pixelated',
-          }}
-        />
-        <textarea
-          ref={inputRef}
-          aria-label="Terminal input"
-          autoCapitalize="off"
-          autoComplete="off"
-          autoCorrect="off"
-          spellCheck={false}
-          style={{
-            position: 'absolute',
-            opacity: 0,
-            width: 1,
-            height: 1,
-            top: 0,
-            left: 0,
-            padding: 0,
-            border: 'none',
-            outline: 'none',
-            resize: 'none',
-            overflow: 'hidden',
-          }}
-          tabIndex={0}
-        />
+        {!readOnly && (
+          <canvas
+            ref={overlayCanvasRef}
+            style={{
+              display: "block",
+              position: "absolute",
+              top: 0,
+              left: 0,
+              pointerEvents: "none",
+            }}
+          />
+        )}
+        {!readOnly && (
+          <textarea
+            ref={inputRef}
+            aria-label="Terminal input"
+            autoCapitalize="off"
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
+            style={{
+              position: "absolute",
+              opacity: 0,
+              width: 1,
+              height: 1,
+              top: 0,
+              left: 0,
+              padding: 0,
+              border: "none",
+              outline: "none",
+              resize: "none",
+              overflow: "hidden",
+            }}
+            tabIndex={0}
+          />
+        )}
       </div>
     );
   },
