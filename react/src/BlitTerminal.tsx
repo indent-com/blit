@@ -153,7 +153,7 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     depth: false,
     stencil: false,
     premultipliedAlpha: true,
-    preserveDrawingBuffer: false,
+    preserveDrawingBuffer: true,
   });
 
   if (!gl) {
