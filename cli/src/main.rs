@@ -85,10 +85,13 @@ impl Drop for RawMode {
 struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        // Reset attributes, show cursor, disable mouse, leave alternate screen
-        const RESET: &[u8] = b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
+        // Reset cursor shape, disable mouse, reset modes, show cursor,
+        // reset attributes, leave alternate screen, move to bottom, newline.
+        const RESET: &[u8] = b"\x1b[ q\
+                               \x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
                                \x1b[?1016l\x1b[?1006l\x1b[?1005l\
-                               \x1b[?2004l\x1b>\x1b[?1l\x1b[?25h\x1b[0m\x1b[?1049l\r\n";
+                               \x1b[?2004l\x1b>\x1b[?1l\x1b[?25h\x1b[0m\x1b[?1049l\
+                               \x1b[999;1H\r\n";
         unsafe {
             libc::write(libc::STDOUT_FILENO, RESET.as_ptr().cast(), RESET.len());
         }
@@ -210,6 +213,15 @@ impl Renderer {
             } else {
                 b"\x1b[?25l"
             });
+        }
+
+        // Cursor shape (DECSCUSR)
+        let cursor_style = (screen.mode() >> 12) & 7;
+        let prev_cursor_style = (self.prev_mode >> 12) & 7;
+        if cursor_style != prev_cursor_style {
+            out.extend_from_slice(b"\x1b[");
+            push_u16(out, cursor_style);
+            out.extend_from_slice(b" q");
         }
 
         // Place cursor
