@@ -1,4 +1,4 @@
-import type { BlitTransport, BlitTransportEventMap, ConnectionStatus } from '../types';
+import type { BlitTransport, ConnectionStatus } from '../types';
 import { C2S_DISPLAY_RATE } from '../types';
 
 export interface WebRtcDataChannelTransportOptions {
@@ -33,25 +33,19 @@ export function createWebRtcDataChannelTransport(
       return _status;
     },
 
-    addEventListener<K extends keyof BlitTransportEventMap>(
-      type: K,
-      listener: (data: BlitTransportEventMap[K]) => void,
-    ): void {
+    addEventListener(type: string, listener: (data: never) => void): void {
       if (type === 'message') {
-        messageListeners.add(listener as (data: ArrayBuffer) => void);
+        messageListeners.add(listener as unknown as (data: ArrayBuffer) => void);
       } else if (type === 'statuschange') {
-        statusListeners.add(listener as (status: ConnectionStatus) => void);
+        statusListeners.add(listener as unknown as (status: ConnectionStatus) => void);
       }
     },
 
-    removeEventListener<K extends keyof BlitTransportEventMap>(
-      type: K,
-      listener: (data: BlitTransportEventMap[K]) => void,
-    ): void {
+    removeEventListener(type: string, listener: (data: never) => void): void {
       if (type === 'message') {
-        messageListeners.delete(listener as (data: ArrayBuffer) => void);
+        messageListeners.delete(listener as unknown as (data: ArrayBuffer) => void);
       } else if (type === 'statuschange') {
-        statusListeners.delete(listener as (status: ConnectionStatus) => void);
+        statusListeners.delete(listener as unknown as (status: ConnectionStatus) => void);
       }
     },
 

@@ -1,4 +1,4 @@
-import type { BlitTransport, BlitTransportEventMap, ConnectionStatus } from '../types';
+import type { BlitTransport, ConnectionStatus } from '../types';
 
 export interface WebSocketTransportOptions {
   /** Enable automatic reconnection on disconnect. Default: true. */
@@ -62,10 +62,9 @@ export class WebSocketTransport implements BlitTransport {
     this.setStatus('disconnected');
   }
 
-  addEventListener<K extends keyof BlitTransportEventMap>(
-    type: K,
-    listener: (data: BlitTransportEventMap[K]) => void,
-  ): void {
+  addEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
+  addEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  addEventListener(type: string, listener: (...args: never[]) => void): void {
     if (type === 'message') {
       this.messageListeners.add(listener as (data: ArrayBuffer) => void);
     } else if (type === 'statuschange') {
@@ -73,10 +72,9 @@ export class WebSocketTransport implements BlitTransport {
     }
   }
 
-  removeEventListener<K extends keyof BlitTransportEventMap>(
-    type: K,
-    listener: (data: BlitTransportEventMap[K]) => void,
-  ): void {
+  removeEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
+  removeEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  removeEventListener(type: string, listener: (...args: never[]) => void): void {
     if (type === 'message') {
       this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
     } else if (type === 'statuschange') {

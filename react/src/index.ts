@@ -5,7 +5,7 @@ export { useBlitConnection } from './hooks/useBlitConnection';
 export type { BlitConnectionCallbacks, PtyListEntry, SearchResult } from './hooks/useBlitConnection';
 
 export { useBlitSessions } from './hooks/useBlitSessions';
-export type { UseBlitSessionsOptions } from './hooks/useBlitSessions';
+export type { UseBlitSessionsOptions, UseBlitSessionsReturn, UseBlitSessionsFn } from './hooks/useBlitSessions';
 
 export { useBlitTerminal, measureCell } from './hooks/useBlitTerminal';
 export type { CellMetrics, UseBlitTerminalOptions } from './hooks/useBlitTerminal';
