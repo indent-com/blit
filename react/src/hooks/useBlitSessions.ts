@@ -1,7 +1,7 @@
-import { useCallback, useRef, useSyncExternalStore } from 'react';
-import type { BlitTransport, BlitSession, ConnectionStatus } from '../types';
-import { FEATURE_CREATE_NONCE, PROTOCOL_VERSION } from '../types';
-import { useBlitConnection } from './useBlitConnection';
+import { useCallback, useRef, useSyncExternalStore } from "react";
+import type { BlitTransport, BlitSession, ConnectionStatus } from "../types";
+import { FEATURE_CREATE_NONCE, PROTOCOL_VERSION } from "../types";
+import { useBlitConnection } from "./useBlitConnection";
 
 export interface UseBlitSessionsOptions {
   /** Automatically create a PTY if the initial list is empty. Default: false. */
@@ -34,7 +34,12 @@ export interface UseBlitSessionsReturn {
   readonly sessions: readonly BlitSession[];
   readonly status: ConnectionStatus;
   readonly focusedPtyId: number | null;
-  readonly createPty: (opts?: { rows?: number; cols?: number; command?: string; tag?: string }) => Promise<number>;
+  readonly createPty: (opts?: {
+    rows?: number;
+    cols?: number;
+    command?: string;
+    tag?: string;
+  }) => Promise<number>;
   readonly focusPty: (ptyId: number) => void;
   readonly closePty: (ptyId: number) => Promise<void>;
 }
@@ -63,12 +68,14 @@ export function useBlitSessions(
   const readyListenersRef = useRef(new Set<() => void>());
   const focusedPtyIdRef = useRef<number | null>(null);
   const focusedListenersRef = useRef(new Set<() => void>());
-  const pendingCreatesRef = useRef<Map<number, (ptyId: number) => void>>(new Map());
+  const pendingCreatesRef = useRef<Map<number, (ptyId: number) => void>>(
+    new Map(),
+  );
   const nonceCounterRef = useRef(0);
   const serverFeaturesRef = useRef<number | null>(null);
   const pendingClosesRef = useRef<Map<number, Array<() => void>>>(new Map());
-  const wasConnectedRef = useRef(transport.status === 'connected');
-  const hasConnectedRef = useRef(transport.status === 'connected');
+  const wasConnectedRef = useRef(transport.status === "connected");
+  const hasConnectedRef = useRef(transport.status === "connected");
 
   const notify = useCallback(() => {
     for (const l of listenersRef.current) l();
@@ -104,7 +111,7 @@ export function useBlitSessions(
       } else {
         sessionsRef.current = [
           ...prev,
-          { ptyId, tag, title: null, state: 'active' as const, ...patch },
+          { ptyId, tag, title: null, state: "active" as const, ...patch },
         ];
       }
       notify();
@@ -116,8 +123,9 @@ export function useBlitSessions(
 
   const onCreated = useCallback(
     (ptyId: number, tag: string) => {
-      upsert(ptyId, tag, { state: 'active' });
-      const hasNonce = serverFeaturesRef.current !== null &&
+      upsert(ptyId, tag, { state: "active" });
+      const hasNonce =
+        serverFeaturesRef.current !== null &&
         (serverFeaturesRef.current & FEATURE_CREATE_NONCE) !== 0;
       if (!hasNonce && pendingCreatesRef.current.size > 0) {
         const first = pendingCreatesRef.current.entries().next().value!;
@@ -132,7 +140,7 @@ export function useBlitSessions(
 
   const onCreatedN = useCallback(
     (nonce: number, ptyId: number, tag: string) => {
-      upsert(ptyId, tag, { state: 'active' });
+      upsert(ptyId, tag, { state: "active" });
       const resolve = pendingCreatesRef.current.get(nonce);
       if (resolve) {
         pendingCreatesRef.current.delete(nonce);
@@ -150,7 +158,7 @@ export function useBlitSessions(
       const idx = prev.findIndex((s) => s.ptyId === closedId);
       if (idx >= 0) {
         const next = [...prev];
-        next[idx] = { ...next[idx], state: 'closed' };
+        next[idx] = { ...next[idx], state: "closed" };
         sessionsRef.current = next;
         notify();
         lifecycleRef.current?.onSessionClosed?.(next[idx]);
@@ -161,7 +169,9 @@ export function useBlitSessions(
         }
       }
       if (focusedPtyIdRef.current === closedId) {
-        const nextActive = sessionsRef.current.find((s) => s.state === 'active');
+        const nextActive = sessionsRef.current.find(
+          (s) => s.state === "active",
+        );
         setFocused(nextActive?.ptyId ?? null);
       }
     },
@@ -171,11 +181,15 @@ export function useBlitSessions(
   const onList = useCallback(
     (entries: { ptyId: number; tag: string }[]) => {
       const ids = new Set(entries.map((e) => e.ptyId));
-      let next = sessionsRef.current
-        .map((s) => (ids.has(s.ptyId) ? s : { ...s, state: 'closed' as const }));
+      let next = sessionsRef.current.map((s) =>
+        ids.has(s.ptyId) ? s : { ...s, state: "closed" as const },
+      );
       for (const { ptyId, tag } of entries) {
         if (!next.some((s) => s.ptyId === ptyId)) {
-          next = [...next, { ptyId, tag, title: null, state: 'active' as const }];
+          next = [
+            ...next,
+            { ptyId, tag, title: null, state: "active" as const },
+          ];
         }
       }
       sessionsRef.current = next;
@@ -186,8 +200,11 @@ export function useBlitSessions(
       }
       notify();
 
-      if (focusedPtyIdRef.current !== null && !ids.has(focusedPtyIdRef.current)) {
-        const nextActive = next.find((s) => s.state === 'active');
+      if (
+        focusedPtyIdRef.current !== null &&
+        !ids.has(focusedPtyIdRef.current)
+      ) {
+        const nextActive = next.find((s) => s.state === "active");
         setFocused(nextActive?.ptyId ?? null);
       } else if (focusedPtyIdRef.current === null && entries.length > 0) {
         setFocused(entries[0].ptyId);
@@ -201,7 +218,15 @@ export function useBlitSessions(
         });
       }
     },
-    [notify, notifyReady, setFocused, autoCreate, autoTag, autoCommand, getSize],
+    [
+      notify,
+      notifyReady,
+      setFocused,
+      autoCreate,
+      autoTag,
+      autoCommand,
+      getSize,
+    ],
   );
 
   const onTitle = useCallback(
@@ -239,33 +264,30 @@ export function useBlitSessions(
     [notify],
   );
 
-  const onStatusChange = useCallback(
-    (newStatus: ConnectionStatus) => {
-      if (newStatus === 'disconnected' || newStatus === 'error') {
-        if (wasConnectedRef.current) {
-          wasConnectedRef.current = false;
-          lifecycleRef.current?.onDisconnect?.();
-        }
-        for (const resolve of pendingCreatesRef.current.values()) {
-          resolve(-1);
-        }
-        pendingCreatesRef.current.clear();
-        for (const resolvers of pendingClosesRef.current.values()) {
-          for (const r of resolvers) r();
-        }
-        pendingClosesRef.current.clear();
-      } else if (newStatus === 'connected') {
-        if (!wasConnectedRef.current) {
-          wasConnectedRef.current = true;
-          if (hasConnectedRef.current) {
-            lifecycleRef.current?.onReconnect?.();
-          }
-          hasConnectedRef.current = true;
-        }
+  const onStatusChange = useCallback((newStatus: ConnectionStatus) => {
+    if (newStatus === "disconnected" || newStatus === "error") {
+      if (wasConnectedRef.current) {
+        wasConnectedRef.current = false;
+        lifecycleRef.current?.onDisconnect?.();
       }
-    },
-    [],
-  );
+      for (const resolve of pendingCreatesRef.current.values()) {
+        resolve(-1);
+      }
+      pendingCreatesRef.current.clear();
+      for (const resolvers of pendingClosesRef.current.values()) {
+        for (const r of resolvers) r();
+      }
+      pendingClosesRef.current.clear();
+    } else if (newStatus === "connected") {
+      if (!wasConnectedRef.current) {
+        wasConnectedRef.current = true;
+        if (hasConnectedRef.current) {
+          lifecycleRef.current?.onReconnect?.();
+        }
+        hasConnectedRef.current = true;
+      }
+    }
+  }, []);
 
   const onHello = useCallback(
     (version: number, features: number) => {
@@ -278,62 +300,73 @@ export function useBlitSessions(
     [transport],
   );
 
-  const sendCreateRef = useRef<(rows: number, cols: number, options?: { tag?: string; command?: string }) => void>(() => {});
+  const sendCreateRef = useRef<
+    (
+      rows: number,
+      cols: number,
+      options?: { tag?: string; command?: string },
+    ) => void
+  >(() => {});
 
-  const { status, sendCreate, sendCreateN, sendFocus, sendClose } = useBlitConnection(
-    transport,
-    { onCreated, onCreatedN, onClosed, onList, onTitle, onUpdate, onHello, onStatusChange },
-  );
+  const { status, sendCreate, sendCreateN, sendFocus, sendClose } =
+    useBlitConnection(transport, {
+      onCreated,
+      onCreatedN,
+      onClosed,
+      onList,
+      onTitle,
+      onUpdate,
+      onHello,
+      onStatusChange,
+    });
   sendCreateRef.current = sendCreate;
 
   // --- Public API ---
 
   const sessions = useSyncExternalStore(
-    useCallback(
-      (l: () => void) => {
-        listenersRef.current.add(l);
-        return () => listenersRef.current.delete(l);
-      },
-      [],
-    ),
+    useCallback((l: () => void) => {
+      listenersRef.current.add(l);
+      return () => listenersRef.current.delete(l);
+    }, []),
     useCallback(() => sessionsRef.current, []),
     useCallback(() => sessionsRef.current, []),
   );
 
   const ready = useSyncExternalStore(
-    useCallback(
-      (l: () => void) => {
-        readyListenersRef.current.add(l);
-        return () => readyListenersRef.current.delete(l);
-      },
-      [],
-    ),
+    useCallback((l: () => void) => {
+      readyListenersRef.current.add(l);
+      return () => readyListenersRef.current.delete(l);
+    }, []),
     useCallback(() => readyRef.current, []),
     useCallback(() => readyRef.current, []),
   );
 
   const focusedPtyId = useSyncExternalStore(
-    useCallback(
-      (l: () => void) => {
-        focusedListenersRef.current.add(l);
-        return () => focusedListenersRef.current.delete(l);
-      },
-      [],
-    ),
+    useCallback((l: () => void) => {
+      focusedListenersRef.current.add(l);
+      return () => focusedListenersRef.current.delete(l);
+    }, []),
     useCallback(() => focusedPtyIdRef.current, []),
     useCallback(() => focusedPtyIdRef.current, []),
   );
 
   const createPty = useCallback(
-    (opts?: { rows?: number; cols?: number; command?: string; tag?: string }): Promise<number> => {
+    (opts?: {
+      rows?: number;
+      cols?: number;
+      command?: string;
+      tag?: string;
+    }): Promise<number> => {
       const { rows, cols } = getSize();
       const r = opts?.rows ?? rows;
       const c = opts?.cols ?? cols;
       const createOpts = { tag: opts?.tag, command: opts?.command };
       return new Promise<number>((resolve) => {
-        const nonce = nonceCounterRef.current = (nonceCounterRef.current + 1) & 0xffff;
+        const nonce = (nonceCounterRef.current =
+          (nonceCounterRef.current + 1) & 0xffff);
         pendingCreatesRef.current.set(nonce, resolve);
-        const hasNonce = serverFeaturesRef.current !== null &&
+        const hasNonce =
+          serverFeaturesRef.current !== null &&
           (serverFeaturesRef.current & FEATURE_CREATE_NONCE) !== 0;
         if (hasNonce) {
           sendCreateN(nonce, r, c, createOpts);
@@ -368,5 +401,13 @@ export function useBlitSessions(
     [sendClose],
   );
 
-  return { ready, sessions, status, focusedPtyId, createPty, focusPty, closePty } as const;
+  return {
+    ready,
+    sessions,
+    status,
+    focusedPtyId,
+    createPty,
+    focusPty,
+    closePty,
+  } as const;
 }

@@ -1,4 +1,4 @@
-import type React from 'react';
+import type React from "react";
 
 /** A terminal color palette. */
 export interface TerminalPalette {
@@ -16,11 +16,11 @@ export interface TerminalPalette {
 
 /** Connection lifecycle states. */
 export type ConnectionStatus =
-  | 'connecting'
-  | 'authenticating'
-  | 'connected'
-  | 'disconnected'
-  | 'error';
+  | "connecting"
+  | "authenticating"
+  | "connected"
+  | "disconnected"
+  | "error";
 
 /**
  * Transport abstraction for blit server communication.
@@ -40,11 +40,23 @@ export interface BlitTransport {
   /** Current connection status. */
   readonly status: ConnectionStatus;
   /** Register a listener for transport events. */
-  addEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
-  addEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  addEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
   /** Remove a previously registered listener. */
-  removeEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
-  removeEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  removeEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  removeEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
 }
 
 /** A tracked PTY session. */
@@ -52,7 +64,7 @@ export type BlitSession = {
   ptyId: number;
   tag: string;
   title: string | null;
-  state: 'active' | 'closed';
+  state: "active" | "closed";
 };
 
 /** Options for the BlitTerminal component. */

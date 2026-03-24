@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createWebRtcDataChannelTransport } from '../transports/webrtc';
-import { C2S_DISPLAY_RATE } from '../types';
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createWebRtcDataChannelTransport } from "../transports/webrtc";
+import { C2S_DISPLAY_RATE } from "../types";
 
 // ---------------------------------------------------------------------------
 // Minimal WebRTC mocks (jsdom doesn't ship WebRTC APIs)
@@ -8,8 +8,8 @@ import { C2S_DISPLAY_RATE } from '../types';
 
 class MockRTCDataChannel {
   label: string;
-  binaryType = 'arraybuffer';
-  readyState: RTCDataChannelState = 'connecting';
+  binaryType = "arraybuffer";
+  readyState: RTCDataChannelState = "connecting";
   ordered?: boolean;
 
   onopen: ((ev: Event) => void) | null = null;
@@ -28,34 +28,37 @@ class MockRTCDataChannel {
   }
 
   close() {
-    this.readyState = 'closed';
+    this.readyState = "closed";
   }
 
   simulateOpen() {
-    this.readyState = 'open';
-    this.onopen?.(new Event('open'));
+    this.readyState = "open";
+    this.onopen?.(new Event("open"));
   }
 
   simulateMessage(data: ArrayBuffer) {
-    this.onmessage?.(new MessageEvent('message', { data }));
+    this.onmessage?.(new MessageEvent("message", { data }));
   }
 
   simulateError() {
-    this.onerror?.(new Event('error'));
+    this.onerror?.(new Event("error"));
   }
 
   simulateClose() {
-    this.readyState = 'closed';
-    this.onclose?.(new Event('close'));
+    this.readyState = "closed";
+    this.onclose?.(new Event("close"));
   }
 }
 
 class MockRTCPeerConnection {
-  connectionState: RTCPeerConnectionState = 'new';
+  connectionState: RTCPeerConnectionState = "new";
   private listeners: Record<string, ((...args: any[]) => void)[]> = {};
   lastChannel: MockRTCDataChannel | null = null;
 
-  createDataChannel(label: string, opts?: RTCDataChannelInit): MockRTCDataChannel {
+  createDataChannel(
+    label: string,
+    opts?: RTCDataChannelInit,
+  ): MockRTCDataChannel {
     const ch = new MockRTCDataChannel(label, opts);
     this.lastChannel = ch;
     return ch as any;
@@ -75,8 +78,8 @@ class MockRTCPeerConnection {
 
   simulateConnectionState(state: RTCPeerConnectionState) {
     this.connectionState = state;
-    for (const cb of this.listeners['connectionstatechange'] ?? []) {
-      cb(new Event('connectionstatechange'));
+    for (const cb of this.listeners["connectionstatechange"] ?? []) {
+      cb(new Event("connectionstatechange"));
     }
   }
 }
@@ -100,7 +103,7 @@ function frame(payload: Uint8Array): Uint8Array {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('createWebRtcDataChannelTransport', () => {
+describe("createWebRtcDataChannelTransport", () => {
   let pc: MockRTCPeerConnection;
   let channel: MockRTCDataChannel;
 
@@ -113,7 +116,9 @@ describe('createWebRtcDataChannelTransport', () => {
     vi.useRealTimers();
   });
 
-  function create(opts?: Parameters<typeof createWebRtcDataChannelTransport>[1]) {
+  function create(
+    opts?: Parameters<typeof createWebRtcDataChannelTransport>[1],
+  ) {
     const t = createWebRtcDataChannelTransport(pc as any, opts);
     channel = pc.lastChannel!;
     return t;
@@ -121,19 +126,19 @@ describe('createWebRtcDataChannelTransport', () => {
 
   it('initial status is "connecting"', () => {
     const t = create();
-    expect(t.status).toBe('connecting');
+    expect(t.status).toBe("connecting");
   });
 
   it('channel open sets status to "connected"', () => {
     const t = create();
     const statusCb = vi.fn();
-    t.addEventListener('statuschange', statusCb);
+    t.addEventListener("statuschange", statusCb);
     channel.simulateOpen();
-    expect(t.status).toBe('connected');
-    expect(statusCb).toHaveBeenCalledWith('connected');
+    expect(t.status).toBe("connected");
+    expect(statusCb).toHaveBeenCalledWith("connected");
   });
 
-  it('sends C2S_DISPLAY_RATE message on open', () => {
+  it("sends C2S_DISPLAY_RATE message on open", () => {
     create();
     channel.simulateOpen();
     expect(channel.sent.length).toBe(1);
@@ -148,7 +153,7 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(sent[6]).toBe(0);
   });
 
-  it('send() wraps data in a 4-byte length-prefixed frame', () => {
+  it("send() wraps data in a 4-byte length-prefixed frame", () => {
     const t = create();
     channel.simulateOpen();
     channel.sent = [];
@@ -166,10 +171,10 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(sent.slice(4)).toEqual(payload);
   });
 
-  it('incoming messages are deframed (4-byte envelope removed)', () => {
+  it("incoming messages are deframed (4-byte envelope removed)", () => {
     const t = create();
     const onmsg = vi.fn();
-    t.addEventListener('message', onmsg);
+    t.addEventListener("message", onmsg);
     channel.simulateOpen();
 
     const payload = new Uint8Array([1, 2, 3]);
@@ -180,10 +185,10 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(received).toEqual(payload);
   });
 
-  it('reassembles partial frames', () => {
+  it("reassembles partial frames", () => {
     const t = create();
     const onmsg = vi.fn();
-    t.addEventListener('message', onmsg);
+    t.addEventListener("message", onmsg);
     channel.simulateOpen();
 
     const payload = new Uint8Array([10, 20, 30, 40, 50]);
@@ -199,10 +204,10 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(new Uint8Array(onmsg.mock.calls[0][0])).toEqual(payload);
   });
 
-  it('handles multiple frames in one chunk', () => {
+  it("handles multiple frames in one chunk", () => {
     const t = create();
     const onmsg = vi.fn();
-    t.addEventListener('message', onmsg);
+    t.addEventListener("message", onmsg);
     channel.simulateOpen();
 
     const p1 = new Uint8Array([0xaa]);
@@ -225,54 +230,54 @@ describe('createWebRtcDataChannelTransport', () => {
     const t = create();
     channel.simulateOpen();
     t.close();
-    expect(t.status).toBe('disconnected');
+    expect(t.status).toBe("disconnected");
   });
 
   it('channel error sets status to "error"', () => {
     const t = create();
     const statusCb = vi.fn();
-    t.addEventListener('statuschange', statusCb);
+    t.addEventListener("statuschange", statusCb);
     channel.simulateError();
-    expect(t.status).toBe('error');
-    expect(statusCb).toHaveBeenCalledWith('error');
+    expect(t.status).toBe("error");
+    expect(statusCb).toHaveBeenCalledWith("error");
   });
 
   it('channel close sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
     channel.simulateClose();
-    expect(t.status).toBe('disconnected');
+    expect(t.status).toBe("disconnected");
   });
 
   it('PeerConnection state "failed" sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
-    pc.simulateConnectionState('failed');
-    expect(t.status).toBe('disconnected');
+    pc.simulateConnectionState("failed");
+    expect(t.status).toBe("disconnected");
   });
 
   it('PeerConnection state "closed" sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
-    pc.simulateConnectionState('closed');
-    expect(t.status).toBe('disconnected');
+    pc.simulateConnectionState("closed");
+    expect(t.status).toBe("disconnected");
   });
 
-  it('waitForSync() resolves on connect', async () => {
+  it("waitForSync() resolves on connect", async () => {
     const t = create();
     const p = t.waitForSync();
     channel.simulateOpen();
     await expect(p).resolves.toBeUndefined();
   });
 
-  it('waitForSync() rejects on error', async () => {
+  it("waitForSync() rejects on error", async () => {
     const t = create();
     const p = t.waitForSync();
     channel.simulateError();
-    await expect(p).rejects.toThrow('transport error');
+    await expect(p).rejects.toThrow("transport error");
   });
 
-  it('waitForSync() resolves immediately if already connected', async () => {
+  it("waitForSync() resolves immediately if already connected", async () => {
     const t = create();
     channel.simulateOpen();
     await expect(t.waitForSync()).resolves.toBeUndefined();
@@ -281,59 +286,61 @@ describe('createWebRtcDataChannelTransport', () => {
   it('connect timeout fires and sets status to "error"', () => {
     const t = create({ connectTimeoutMs: 500 });
     const statusCb = vi.fn();
-    t.addEventListener('statuschange', statusCb);
+    t.addEventListener("statuschange", statusCb);
 
     vi.advanceTimersByTime(500);
 
-    expect(t.status).toBe('error');
-    expect(statusCb).toHaveBeenCalledWith('error');
+    expect(t.status).toBe("error");
+    expect(statusCb).toHaveBeenCalledWith("error");
   });
 
-  it('disposed transport ignores further events', () => {
+  it("disposed transport ignores further events", () => {
     const t = create();
     const statusCb = vi.fn();
-    t.addEventListener('statuschange', statusCb);
+    t.addEventListener("statuschange", statusCb);
 
     t.close();
     statusCb.mockClear();
 
     channel = pc.lastChannel!;
-    channel.onopen?.(new Event('open'));
-    channel.onmessage?.(new MessageEvent('message', { data: frame(new Uint8Array([1])).buffer }));
-    channel.onerror?.(new Event('error'));
-    channel.onclose?.(new Event('close'));
+    channel.onopen?.(new Event("open"));
+    channel.onmessage?.(
+      new MessageEvent("message", { data: frame(new Uint8Array([1])).buffer }),
+    );
+    channel.onerror?.(new Event("error"));
+    channel.onclose?.(new Event("close"));
 
-    expect(t.status).toBe('disconnected');
+    expect(t.status).toBe("disconnected");
     expect(statusCb).not.toHaveBeenCalled();
   });
 
-  it('uses custom label option', () => {
-    create({ label: 'my-channel' });
-    expect(channel.label).toBe('my-channel');
+  it("uses custom label option", () => {
+    create({ label: "my-channel" });
+    expect(channel.label).toBe("my-channel");
   });
 
-  it('send() is a no-op when channel is not open', () => {
+  it("send() is a no-op when channel is not open", () => {
     const t = create();
     t.send(new Uint8Array([1, 2, 3]));
     expect(channel.sent.length).toBe(0);
   });
 
-  it('removeEventListener stops delivery', () => {
+  it("removeEventListener stops delivery", () => {
     const t = create();
     const cb = vi.fn();
-    t.addEventListener('message', cb);
-    t.removeEventListener('message', cb);
+    t.addEventListener("message", cb);
+    t.removeEventListener("message", cb);
     channel.simulateOpen();
     channel.simulateMessage(frame(new Uint8Array([1])).buffer as ArrayBuffer);
     expect(cb).not.toHaveBeenCalled();
   });
 
-  it('multiple message listeners all receive data', () => {
+  it("multiple message listeners all receive data", () => {
     const cb1 = vi.fn();
     const cb2 = vi.fn();
     const t = create();
-    t.addEventListener('message', cb1);
-    t.addEventListener('message', cb2);
+    t.addEventListener("message", cb1);
+    t.addEventListener("message", cb2);
     channel.simulateOpen();
     channel.simulateMessage(frame(new Uint8Array([1])).buffer as ArrayBuffer);
     expect(cb1).toHaveBeenCalledTimes(1);

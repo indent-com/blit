@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
-import type { BlitTransport, ConnectionStatus } from '../types';
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import type { BlitTransport, ConnectionStatus } from "../types";
 import {
   S2C_UPDATE,
   S2C_CREATED,
@@ -19,7 +19,7 @@ import {
   C2S_RESIZE,
   C2S_INPUT,
   C2S_SCROLL,
-} from '../types';
+} from "../types";
 
 const textDecoder = new TextDecoder();
 
@@ -171,8 +171,8 @@ export function useBlitConnection(
       callbacksRef.current.onStatusChange?.(newStatus);
     };
 
-    transport.addEventListener('message', onMessage);
-    transport.addEventListener('statuschange', onStatus);
+    transport.addEventListener("message", onMessage);
+    transport.addEventListener("statuschange", onStatus);
 
     if (statusRef.current !== transport.status) {
       statusRef.current = transport.status;
@@ -180,8 +180,8 @@ export function useBlitConnection(
     }
 
     return () => {
-      transport.removeEventListener('message', onMessage);
-      transport.removeEventListener('statuschange', onStatus);
+      transport.removeEventListener("message", onMessage);
+      transport.removeEventListener("statuschange", onStatus);
     };
   }, [transport]);
 
@@ -234,13 +234,21 @@ export function useBlitConnection(
   );
 
   const sendCreate = useCallback(
-    (rows: number, cols: number, options?: { tag?: string; command?: string }) => {
+    (
+      rows: number,
+      cols: number,
+      options?: { tag?: string; command?: string },
+    ) => {
       const encoder = new TextEncoder();
-      const tagBytes = options?.tag ? encoder.encode(options.tag) : new Uint8Array(0);
+      const tagBytes = options?.tag
+        ? encoder.encode(options.tag)
+        : new Uint8Array(0);
       const commandBytes = options?.command?.trim()
         ? encoder.encode(options.command.trim())
         : null;
-      const msg = new Uint8Array(7 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
+      const msg = new Uint8Array(
+        7 + tagBytes.length + (commandBytes ? commandBytes.length : 0),
+      );
       msg[0] = C2S_CREATE;
       msg[1] = rows & 0xff;
       msg[2] = (rows >> 8) & 0xff;
@@ -256,13 +264,22 @@ export function useBlitConnection(
   );
 
   const sendCreateN = useCallback(
-    (nonce: number, rows: number, cols: number, options?: { tag?: string; command?: string }) => {
+    (
+      nonce: number,
+      rows: number,
+      cols: number,
+      options?: { tag?: string; command?: string },
+    ) => {
       const encoder = new TextEncoder();
-      const tagBytes = options?.tag ? encoder.encode(options.tag) : new Uint8Array(0);
+      const tagBytes = options?.tag
+        ? encoder.encode(options.tag)
+        : new Uint8Array(0);
       const commandBytes = options?.command?.trim()
         ? encoder.encode(options.command.trim())
         : null;
-      const msg = new Uint8Array(9 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
+      const msg = new Uint8Array(
+        9 + tagBytes.length + (commandBytes ? commandBytes.length : 0),
+      );
       msg[0] = C2S_CREATE_N;
       msg[1] = nonce & 0xff;
       msg[2] = (nonce >> 8) & 0xff;
