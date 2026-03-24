@@ -1,4 +1,4 @@
-import type { BlitTransport, ConnectionStatus } from '../types';
+import type { BlitTransport, BlitTransportEventMap, ConnectionStatus } from '../types';
 import { C2S_DISPLAY_RATE } from '../types';
 
 export interface WebRtcDataChannelTransportOptions {
@@ -10,13 +10,6 @@ export interface WebRtcDataChannelTransportOptions {
   connectTimeoutMs?: number;
 }
 
-/**
- * Creates a BlitTransport backed by a WebRTC data channel.
- *
- * The transport manages the data channel lifecycle on the given
- * RTCPeerConnection and handles the 4-byte length-prefixed frame envelope
- * used by the blit protocol over non-WebSocket transports.
- */
 export function createWebRtcDataChannelTransport(
   pc: RTCPeerConnection,
   opts?: WebRtcDataChannelTransportOptions,
@@ -32,16 +25,38 @@ export function createWebRtcDataChannelTransport(
   let syncReject: ((err: Error) => void) | null = null;
   let readBuf = new Uint8Array(0);
 
+  const messageListeners = new Set<(data: ArrayBuffer) => void>();
+  const statusListeners = new Set<(status: ConnectionStatus) => void>();
+
   const transport: BlitTransport & { waitForSync(): Promise<void> } = {
     get status() {
       return _status;
     },
-    onmessage: null,
-    onstatuschange: null,
+
+    addEventListener<K extends keyof BlitTransportEventMap>(
+      type: K,
+      listener: (data: BlitTransportEventMap[K]) => void,
+    ): void {
+      if (type === 'message') {
+        messageListeners.add(listener as (data: ArrayBuffer) => void);
+      } else if (type === 'statuschange') {
+        statusListeners.add(listener as (status: ConnectionStatus) => void);
+      }
+    },
+
+    removeEventListener<K extends keyof BlitTransportEventMap>(
+      type: K,
+      listener: (data: BlitTransportEventMap[K]) => void,
+    ): void {
+      if (type === 'message') {
+        messageListeners.delete(listener as (data: ArrayBuffer) => void);
+      } else if (type === 'statuschange') {
+        statusListeners.delete(listener as (status: ConnectionStatus) => void);
+      }
+    },
 
     send(data: Uint8Array) {
       if (!channel || channel.readyState !== 'open') return;
-      // Wrap in 4-byte length-prefixed frame.
       const frame = new Uint8Array(4 + data.length);
       const len = data.length;
       frame[0] = len & 0xff;
@@ -80,7 +95,7 @@ export function createWebRtcDataChannelTransport(
   function setStatus(s: ConnectionStatus) {
     if (_status === s) return;
     _status = s;
-    transport.onstatuschange?.(s);
+    for (const l of statusListeners) l(s);
     if (s === 'connected') {
       syncResolve?.();
       syncResolve = null;
@@ -107,7 +122,6 @@ export function createWebRtcDataChannelTransport(
     if (disposed) return;
     clearTimeout(timeout);
     setStatus('connected');
-    // Advertise display rate.
     const msg = new Uint8Array(3);
     msg[0] = C2S_DISPLAY_RATE;
     msg[1] = displayRateFps & 0xff;
@@ -118,13 +132,11 @@ export function createWebRtcDataChannelTransport(
   channel.onmessage = (e: MessageEvent) => {
     if (disposed) return;
     const incoming = new Uint8Array(e.data as ArrayBuffer);
-    // Append to read buffer for frame reassembly.
     const combined = new Uint8Array(readBuf.length + incoming.length);
     combined.set(readBuf);
     combined.set(incoming, readBuf.length);
     readBuf = combined;
 
-    // Drain complete frames.
     while (readBuf.length >= 4) {
       const len =
         readBuf[0] |
@@ -134,7 +146,7 @@ export function createWebRtcDataChannelTransport(
       if (readBuf.length < 4 + len) break;
       const payload = readBuf.slice(4, 4 + len);
       readBuf = readBuf.subarray(4 + len);
-      transport.onmessage?.(payload.buffer);
+      for (const l of messageListeners) l(payload.buffer as ArrayBuffer);
     }
   };
 

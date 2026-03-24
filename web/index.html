@@ -526,7 +526,7 @@ const USE_WEBGL_LEAD = true;
 const BG_OP_STRIDE = 4;
 const GLYPH_OP_STRIDE = 8;
 const C2S_INPUT = 0x00, C2S_RESIZE = 0x01, C2S_SCROLL = 0x02, C2S_ACK = 0x03, C2S_DISPLAY_RATE = 0x04, C2S_CLIENT_METRICS = 0x05, C2S_CREATE = 0x10, C2S_FOCUS = 0x11, C2S_CLOSE = 0x12, C2S_SUBSCRIBE = 0x13, C2S_UNSUBSCRIBE = 0x14, C2S_SEARCH = 0x15, C2S_CREATE_AT = 0x16;
-const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04, S2C_SEARCH_RESULTS = 0x05;
+const S2C_UPDATE = 0x00, S2C_CREATED = 0x01, S2C_CLOSED = 0x02, S2C_LIST = 0x03, S2C_TITLE = 0x04, S2C_SEARCH_RESULTS = 0x05, S2C_CREATED_N = 0x06, S2C_HELLO = 0x07;
 const SEARCH_SOURCE_TITLE = 0x00, SEARCH_SOURCE_VISIBLE = 0x01, SEARCH_SOURCE_SCROLLBACK = 0x02;
 const SEARCH_MATCH_TITLE = 1 << 0, SEARCH_MATCH_VISIBLE = 1 << 1, SEARCH_MATCH_SCROLLBACK = 1 << 2;
 const EXPOSE_CREATE_SELECTION = '__create__';
@@ -3345,6 +3345,29 @@ function connect(pass, { source = 'prompt' } = {}) {
                     exposeSearchRefreshQueued = false;
                     queueExposeSearch({ contentRefresh: true });
                 }
+                break;
+            }
+            case S2C_CREATED_N: {
+                if (data.length < 5) break;
+                const id = data[3] | (data[4] << 8);
+                const focusCreated = pendingFocusedCreates > 0;
+                if (focusCreated) pendingFocusedCreates -= 1;
+                if (!ptyIds.includes(id)) ptyIds.push(id);
+                if (!terminals[id]) terminals[id] = createTerminalInstance();
+                dirtyTerminals.add(id);
+                requestPreviewRender([id], true);
+                if (focusedPty === null || focusCreated) {
+                    if (focusCreated && exposeOpen) closeExpose({ restoreFocus: false });
+                    focusPty(id);
+                }
+                else {
+                    if (exposeOpen && exposeQuery.trim()) queueExposeSearch({ contentRefresh: true });
+                    schedulePreviewRailUpdate();
+                    schedulePtyFollowSync();
+                }
+                break;
+            }
+            case S2C_HELLO: {
                 break;
             }
         }

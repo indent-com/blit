@@ -1,6 +1,7 @@
 use blit_remote::{
     msg_ack, msg_close, msg_create, msg_focus, msg_input, msg_resize, TerminalState,
-    C2S_DISPLAY_RATE, CELL_SIZE, S2C_CLOSED, S2C_CREATED, S2C_LIST, S2C_TITLE, S2C_UPDATE,
+    C2S_DISPLAY_RATE, CELL_SIZE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_HELLO, S2C_LIST,
+    S2C_TITLE, S2C_UPDATE,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -1487,6 +1488,33 @@ async fn handle_server_msg(
                 }
             }
         }
+
+        S2C_CREATED_N if frame.len() >= 5 => {
+            let id = u16::from_le_bytes([frame[3], frame[4]]);
+            if !ptys.contains(&id) {
+                ptys.push(id);
+            }
+            expose.sync(ptys);
+            if focused_pty.is_none() || expose.open {
+                *focused_pty = Some(id);
+                expose.touch(id);
+                let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
+                let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
+                if expose.open {
+                    expose.open = false;
+                    screen.mark_all_dirty();
+                    out_buf.clear();
+                    renderer.render(screen, out_buf);
+                    screen.clear_all_dirty();
+                    if !out_buf.is_empty() {
+                        let _ = stdout.write_all(out_buf).await;
+                    let _ = stdout.flush().await;
+                    }
+                }
+            }
+        }
+
+        S2C_HELLO => {}
 
         S2C_CLOSED if frame.len() >= 3 => {
             let id = u16::from_le_bytes([frame[1], frame[2]]);

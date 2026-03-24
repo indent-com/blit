@@ -2,10 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import { MockTransport } from './mock-transport';
 import { S2C_CREATED, S2C_CLOSED, S2C_LIST, S2C_TITLE } from '../types';
 
-/**
- * Tests the mock transport itself — ensures the wire format helpers
- * produce correct protocol bytes.
- */
 describe('MockTransport', () => {
   it('starts as connected', () => {
     const t = new MockTransport();
@@ -22,27 +18,47 @@ describe('MockTransport', () => {
   it('close sets disconnected', () => {
     const t = new MockTransport();
     const cb = vi.fn();
-    t.onstatuschange = cb;
+    t.addEventListener('statuschange', cb);
     t.close();
     expect(t.status).toBe('disconnected');
     expect(cb).toHaveBeenCalledWith('disconnected');
   });
 
-  it('push delivers to onmessage', () => {
+  it('push delivers to message listeners', () => {
     const t = new MockTransport();
     const cb = vi.fn();
-    t.onmessage = cb;
+    t.addEventListener('message', cb);
     t.push(new Uint8Array([0xAA]));
     expect(cb).toHaveBeenCalledTimes(1);
     const buf = cb.mock.calls[0][0] as ArrayBuffer;
     expect(new Uint8Array(buf)).toEqual(new Uint8Array([0xAA]));
   });
 
+  it('removeEventListener stops delivery', () => {
+    const t = new MockTransport();
+    const cb = vi.fn();
+    t.addEventListener('message', cb);
+    t.removeEventListener('message', cb);
+    t.push(new Uint8Array([0xAA]));
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('multiple listeners all receive messages', () => {
+    const t = new MockTransport();
+    const cb1 = vi.fn();
+    const cb2 = vi.fn();
+    t.addEventListener('message', cb1);
+    t.addEventListener('message', cb2);
+    t.push(new Uint8Array([0xAA]));
+    expect(cb1).toHaveBeenCalledTimes(1);
+    expect(cb2).toHaveBeenCalledTimes(1);
+  });
+
   describe('pushCreated', () => {
     it('builds correct wire format without tag', () => {
       const t = new MockTransport();
       const msgs: ArrayBuffer[] = [];
-      t.onmessage = (d) => msgs.push(d);
+      t.addEventListener('message', (d) => msgs.push(d));
       t.pushCreated(5);
       const bytes = new Uint8Array(msgs[0]);
       expect(bytes[0]).toBe(S2C_CREATED);
@@ -53,7 +69,7 @@ describe('MockTransport', () => {
     it('builds correct wire format with tag', () => {
       const t = new MockTransport();
       const msgs: ArrayBuffer[] = [];
-      t.onmessage = (d) => msgs.push(d);
+      t.addEventListener('message', (d) => msgs.push(d));
       t.pushCreated(1, 'hello');
       const bytes = new Uint8Array(msgs[0]);
       expect(bytes[0]).toBe(S2C_CREATED);
@@ -66,7 +82,7 @@ describe('MockTransport', () => {
     it('builds correct wire format', () => {
       const t = new MockTransport();
       const msgs: ArrayBuffer[] = [];
-      t.onmessage = (d) => msgs.push(d);
+      t.addEventListener('message', (d) => msgs.push(d));
       t.pushClosed(0x0102);
       const bytes = new Uint8Array(msgs[0]);
       expect(bytes[0]).toBe(S2C_CLOSED);
@@ -79,7 +95,7 @@ describe('MockTransport', () => {
     it('empty list', () => {
       const t = new MockTransport();
       const msgs: ArrayBuffer[] = [];
-      t.onmessage = (d) => msgs.push(d);
+      t.addEventListener('message', (d) => msgs.push(d));
       t.pushList([]);
       const bytes = new Uint8Array(msgs[0]);
       expect(bytes[0]).toBe(S2C_LIST);
@@ -90,20 +106,18 @@ describe('MockTransport', () => {
     it('entries with tags', () => {
       const t = new MockTransport();
       const msgs: ArrayBuffer[] = [];
-      t.onmessage = (d) => msgs.push(d);
+      t.addEventListener('message', (d) => msgs.push(d));
       t.pushList([{ ptyId: 1, tag: 'ab' }, { ptyId: 2 }]);
       const bytes = new Uint8Array(msgs[0]);
       expect(bytes[0]).toBe(S2C_LIST);
-      expect(bytes[1] | (bytes[2] << 8)).toBe(2); // count
+      expect(bytes[1] | (bytes[2] << 8)).toBe(2);
 
-      // Entry 1: pty_id=1, tag_len=2, tag="ab"
       let off = 3;
       expect(bytes[off] | (bytes[off + 1] << 8)).toBe(1);
       expect(bytes[off + 2] | (bytes[off + 3] << 8)).toBe(2);
       expect(new TextDecoder().decode(bytes.subarray(off + 4, off + 6))).toBe('ab');
       off += 6;
 
-      // Entry 2: pty_id=2, tag_len=0
       expect(bytes[off] | (bytes[off + 1] << 8)).toBe(2);
       expect(bytes[off + 2] | (bytes[off + 3] << 8)).toBe(0);
     });
@@ -113,7 +127,7 @@ describe('MockTransport', () => {
     it('builds correct wire format', () => {
       const t = new MockTransport();
       const msgs: ArrayBuffer[] = [];
-      t.onmessage = (d) => msgs.push(d);
+      t.addEventListener('message', (d) => msgs.push(d));
       t.pushTitle(7, 'vim');
       const bytes = new Uint8Array(msgs[0]);
       expect(bytes[0]).toBe(S2C_TITLE);

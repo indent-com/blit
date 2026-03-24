@@ -228,12 +228,20 @@ pub struct ServerMsg {
 impl ServerMsg {
     fn from_remote(msg: Msg<'_>) -> Self {
         match msg {
+            Msg::Hello { version, features } => Self {
+                kind: remote::S2C_HELLO, pty_id: version, request_id: 0, tag: String::new(),
+                payload: features.to_le_bytes().to_vec(), pty_ids: Vec::new(), tags: Vec::new(), search_results: Vec::new(),
+            },
             Msg::Update { pty_id, payload } => Self {
                 kind: remote::S2C_UPDATE, pty_id, request_id: 0, tag: String::new(),
                 payload: payload.to_vec(), pty_ids: Vec::new(), tags: Vec::new(), search_results: Vec::new(),
             },
             Msg::Created { pty_id, tag } => Self {
                 kind: remote::S2C_CREATED, pty_id, request_id: 0, tag: tag.to_owned(),
+                payload: Vec::new(), pty_ids: Vec::new(), tags: Vec::new(), search_results: Vec::new(),
+            },
+            Msg::CreatedN { nonce, pty_id, tag } => Self {
+                kind: remote::S2C_CREATED_N, pty_id, request_id: nonce, tag: tag.to_owned(),
                 payload: Vec::new(), pty_ids: Vec::new(), tags: Vec::new(), search_results: Vec::new(),
             },
             Msg::Closed { pty_id } => Self {

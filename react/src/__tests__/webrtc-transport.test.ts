@@ -31,8 +31,6 @@ class MockRTCDataChannel {
     this.readyState = 'closed';
   }
 
-  // --- test helpers ---
-
   simulateOpen() {
     this.readyState = 'open';
     this.onopen?.(new Event('open'));
@@ -87,7 +85,6 @@ class MockRTCPeerConnection {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Build a 4-byte little-endian length-prefixed frame around `payload`. */
 function frame(payload: Uint8Array): Uint8Array {
   const len = payload.length;
   const buf = new Uint8Array(4 + len);
@@ -122,47 +119,39 @@ describe('createWebRtcDataChannelTransport', () => {
     return t;
   }
 
-  // 1
   it('initial status is "connecting"', () => {
     const t = create();
     expect(t.status).toBe('connecting');
   });
 
-  // 2
   it('channel open sets status to "connected"', () => {
     const t = create();
     const statusCb = vi.fn();
-    t.onstatuschange = statusCb;
+    t.addEventListener('statuschange', statusCb);
     channel.simulateOpen();
     expect(t.status).toBe('connected');
     expect(statusCb).toHaveBeenCalledWith('connected');
   });
 
-  // 3
   it('sends C2S_DISPLAY_RATE message on open', () => {
     create();
     channel.simulateOpen();
-    // The transport wraps in a 4-byte frame, so the raw send is a frame around [0x04, rate_lo, rate_hi].
     expect(channel.sent.length).toBe(1);
     const sent = channel.sent[0];
-    // Frame: 4-byte LE length (3) + payload (3 bytes)
     expect(sent.length).toBe(7);
-    // Payload length = 3
     expect(sent[0]).toBe(3);
     expect(sent[1]).toBe(0);
     expect(sent[2]).toBe(0);
     expect(sent[3]).toBe(0);
-    // Payload: C2S_DISPLAY_RATE, 120 & 0xff, (120 >> 8) & 0xff
     expect(sent[4]).toBe(C2S_DISPLAY_RATE);
-    expect(sent[5]).toBe(120); // default 120 fps
+    expect(sent[5]).toBe(120);
     expect(sent[6]).toBe(0);
   });
 
-  // 4
   it('send() wraps data in a 4-byte length-prefixed frame', () => {
     const t = create();
     channel.simulateOpen();
-    channel.sent = []; // clear the display-rate message
+    channel.sent = [];
 
     const payload = new Uint8Array([0xaa, 0xbb, 0xcc]);
     t.send(payload);
@@ -170,7 +159,6 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(channel.sent.length).toBe(1);
     const sent = channel.sent[0];
     expect(sent.length).toBe(7);
-    // LE length = 3
     expect(sent[0]).toBe(3);
     expect(sent[1]).toBe(0);
     expect(sent[2]).toBe(0);
@@ -178,11 +166,10 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(sent.slice(4)).toEqual(payload);
   });
 
-  // 5
   it('incoming messages are deframed (4-byte envelope removed)', () => {
     const t = create();
     const onmsg = vi.fn();
-    t.onmessage = onmsg;
+    t.addEventListener('message', onmsg);
     channel.simulateOpen();
 
     const payload = new Uint8Array([1, 2, 3]);
@@ -193,17 +180,15 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(received).toEqual(payload);
   });
 
-  // 6
   it('reassembles partial frames', () => {
     const t = create();
     const onmsg = vi.fn();
-    t.onmessage = onmsg;
+    t.addEventListener('message', onmsg);
     channel.simulateOpen();
 
     const payload = new Uint8Array([10, 20, 30, 40, 50]);
     const full = frame(payload);
-    // Split in the middle
-    const part1 = full.slice(0, 3); // only 3 bytes (not even a full header)
+    const part1 = full.slice(0, 3);
     const part2 = full.slice(3);
 
     channel.simulateMessage(part1.buffer);
@@ -214,11 +199,10 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(new Uint8Array(onmsg.mock.calls[0][0])).toEqual(payload);
   });
 
-  // 7
   it('handles multiple frames in one chunk', () => {
     const t = create();
     const onmsg = vi.fn();
-    t.onmessage = onmsg;
+    t.addEventListener('message', onmsg);
     channel.simulateOpen();
 
     const p1 = new Uint8Array([0xaa]);
@@ -237,7 +221,6 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(new Uint8Array(onmsg.mock.calls[1][0])).toEqual(p2);
   });
 
-  // 8
   it('close() sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
@@ -245,17 +228,15 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(t.status).toBe('disconnected');
   });
 
-  // 9
   it('channel error sets status to "error"', () => {
     const t = create();
     const statusCb = vi.fn();
-    t.onstatuschange = statusCb;
+    t.addEventListener('statuschange', statusCb);
     channel.simulateError();
     expect(t.status).toBe('error');
     expect(statusCb).toHaveBeenCalledWith('error');
   });
 
-  // 10
   it('channel close sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
@@ -263,7 +244,6 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(t.status).toBe('disconnected');
   });
 
-  // 11
   it('PeerConnection state "failed" sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
@@ -271,7 +251,6 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(t.status).toBe('disconnected');
   });
 
-  // 12
   it('PeerConnection state "closed" sets status to "disconnected"', () => {
     const t = create();
     channel.simulateOpen();
@@ -279,7 +258,6 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(t.status).toBe('disconnected');
   });
 
-  // 13
   it('waitForSync() resolves on connect', async () => {
     const t = create();
     const p = t.waitForSync();
@@ -287,7 +265,6 @@ describe('createWebRtcDataChannelTransport', () => {
     await expect(p).resolves.toBeUndefined();
   });
 
-  // 14
   it('waitForSync() rejects on error', async () => {
     const t = create();
     const p = t.waitForSync();
@@ -295,18 +272,16 @@ describe('createWebRtcDataChannelTransport', () => {
     await expect(p).rejects.toThrow('transport error');
   });
 
-  // 15
   it('waitForSync() resolves immediately if already connected', async () => {
     const t = create();
     channel.simulateOpen();
     await expect(t.waitForSync()).resolves.toBeUndefined();
   });
 
-  // 16
   it('connect timeout fires and sets status to "error"', () => {
     const t = create({ connectTimeoutMs: 500 });
     const statusCb = vi.fn();
-    t.onstatuschange = statusCb;
+    t.addEventListener('statuschange', statusCb);
 
     vi.advanceTimersByTime(500);
 
@@ -314,38 +289,54 @@ describe('createWebRtcDataChannelTransport', () => {
     expect(statusCb).toHaveBeenCalledWith('error');
   });
 
-  // 17
   it('disposed transport ignores further events', () => {
     const t = create();
     const statusCb = vi.fn();
-    t.onstatuschange = statusCb;
+    t.addEventListener('statuschange', statusCb);
 
-    t.close(); // disposes
+    t.close();
     statusCb.mockClear();
 
-    // These should all be no-ops:
-    channel = pc.lastChannel!; // channel was nulled but we kept our ref
+    channel = pc.lastChannel!;
     channel.onopen?.(new Event('open'));
     channel.onmessage?.(new MessageEvent('message', { data: frame(new Uint8Array([1])).buffer }));
     channel.onerror?.(new Event('error'));
     channel.onclose?.(new Event('close'));
 
-    // Status should remain disconnected, no extra calls
     expect(t.status).toBe('disconnected');
     expect(statusCb).not.toHaveBeenCalled();
   });
 
-  // 18
   it('uses custom label option', () => {
     create({ label: 'my-channel' });
     expect(channel.label).toBe('my-channel');
   });
 
-  // 19
   it('send() is a no-op when channel is not open', () => {
     const t = create();
-    // Channel is still in 'connecting' state
     t.send(new Uint8Array([1, 2, 3]));
     expect(channel.sent.length).toBe(0);
+  });
+
+  it('removeEventListener stops delivery', () => {
+    const t = create();
+    const cb = vi.fn();
+    t.addEventListener('message', cb);
+    t.removeEventListener('message', cb);
+    channel.simulateOpen();
+    channel.simulateMessage(frame(new Uint8Array([1])).buffer as ArrayBuffer);
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('multiple message listeners all receive data', () => {
+    const cb1 = vi.fn();
+    const cb2 = vi.fn();
+    const t = create();
+    t.addEventListener('message', cb1);
+    t.addEventListener('message', cb2);
+    channel.simulateOpen();
+    channel.simulateMessage(frame(new Uint8Array([1])).buffer as ArrayBuffer);
+    expect(cb1).toHaveBeenCalledTimes(1);
+    expect(cb2).toHaveBeenCalledTimes(1);
   });
 });

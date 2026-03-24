@@ -2,7 +2,7 @@ export { BlitTerminal } from './BlitTerminal';
 export type { BlitTerminalHandle } from './BlitTerminal';
 
 export { useBlitConnection } from './hooks/useBlitConnection';
-export type { BlitConnectionCallbacks, PtyListEntry } from './hooks/useBlitConnection';
+export type { BlitConnectionCallbacks, PtyListEntry, SearchResult } from './hooks/useBlitConnection';
 
 export { useBlitSessions } from './hooks/useBlitSessions';
 export type { UseBlitSessionsOptions } from './hooks/useBlitSessions';
@@ -18,6 +18,7 @@ export type { WebRtcDataChannelTransportOptions } from './transports/webrtc';
 
 export type {
   BlitTransport,
+  BlitTransportEventMap,
   BlitTerminalProps,
   BlitSession,
   ConnectionStatus,

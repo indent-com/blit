@@ -1,8 +1,8 @@
 use blit_remote::{
-    build_update_msg, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
-    C2S_CREATE_AT, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE, C2S_SCROLL, C2S_SEARCH,
-    C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, S2C_CLOSED, S2C_CREATED, S2C_LIST, S2C_SEARCH_RESULTS,
-    S2C_TITLE,
+    build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
+    C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE, C2S_SCROLL,
+    C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED,
+    S2C_CREATED_N, S2C_LIST, S2C_SEARCH_RESULTS, S2C_TITLE,
 };
 use blit_wezterm::{SearchResult as WeztermSearchResult, TerminalDriver as WeztermDriver};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1740,6 +1740,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 goodput_window_start: Instant::now(),
             },
         );
+        if let Some(c) = sess.clients.get(&client_id) {
+            let _ = c.tx.try_send(msg_hello(1, FEATURE_CREATE_NONCE));
+        }
         let list = sess.pty_list_msg();
         if let Some(c) = sess.clients.get(&client_id) {
             let _ = c.tx.try_send(list);
@@ -2030,6 +2033,90 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         reset_inflight(c);
                     }
                     sess.send_to_all(&msg);
+                    need_nudge = true;
+                }
+            }
+            C2S_CREATE_N => {
+                // Format: [opcode][nonce:2][rows:2][cols:2][tag_len:2][tag:N][command...]
+                let nonce = if data.len() >= 3 {
+                    u16::from_le_bytes([data[1], data[2]])
+                } else {
+                    0
+                };
+                let (rows, cols) = if data.len() >= 7 {
+                    (
+                        u16::from_le_bytes([data[3], data[4]]),
+                        u16::from_le_bytes([data[5], data[6]]),
+                    )
+                } else {
+                    (24, 80)
+                };
+                let tag_len = if data.len() >= 9 {
+                    u16::from_le_bytes([data[7], data[8]]) as usize
+                } else {
+                    0
+                };
+                let tag = if data.len() >= 9 + tag_len {
+                    std::str::from_utf8(&data[9..9 + tag_len]).unwrap_or_default()
+                } else {
+                    ""
+                };
+                let cmd_start = 9 + tag_len;
+                let dir: Option<String> = None;
+                let create_payload = data
+                    .get(cmd_start..)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok());
+                let command = create_payload
+                    .filter(|payload| !payload.contains('\0'))
+                    .map(str::trim)
+                    .filter(|payload| !payload.is_empty());
+                let argv: Option<Vec<&str>> = create_payload
+                    .filter(|payload| payload.contains('\0'))
+                    .map(|payload| {
+                        payload
+                            .split('\0')
+                            .filter(|arg| !arg.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|args| !args.is_empty());
+                let id = sess.next_pty_id;
+                sess.next_pty_id += 1;
+                if let Some(pty) = spawn_pty(
+                    &config.shell,
+                    rows,
+                    cols,
+                    id,
+                    tag,
+                    command,
+                    argv.as_deref(),
+                    dir.as_deref(),
+                    config.scrollback,
+                    state.clone(),
+                ) {
+                    let tag_bytes = pty.tag.as_bytes();
+                    let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
+                    nonce_msg.push(S2C_CREATED_N);
+                    nonce_msg.extend_from_slice(&nonce.to_le_bytes());
+                    nonce_msg.extend_from_slice(&id.to_le_bytes());
+                    nonce_msg.extend_from_slice(tag_bytes);
+                    let mut broadcast_msg = Vec::with_capacity(3 + tag_bytes.len());
+                    broadcast_msg.push(S2C_CREATED);
+                    broadcast_msg.extend_from_slice(&id.to_le_bytes());
+                    broadcast_msg.extend_from_slice(tag_bytes);
+                    sess.ptys.insert(id, pty);
+                    if let Some(c) = sess.clients.get_mut(&client_id) {
+                        c.lead = Some(id);
+                        subscribe_client_to(c, id);
+                        c.scroll_offset = 0;
+                        c.scroll_cache = FrameState::default();
+                        reset_inflight(c);
+                        let _ = c.tx.try_send(nonce_msg);
+                    }
+                    for (&cid, c) in sess.clients.iter() {
+                        if cid != client_id {
+                            let _ = c.tx.try_send(broadcast_msg.clone());
+                        }
+                    }
                     need_nudge = true;
                 }
             }

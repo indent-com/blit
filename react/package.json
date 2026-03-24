@@ -1,9 +1,32 @@
 {
   "name": "blit-react",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./hooks": {
+      "types": "./dist/hooks/index.d.ts",
+      "default": "./dist/hooks/index.js"
+    },
+    "./transports": {
+      "types": "./dist/transports/index.d.ts",
+      "default": "./dist/transports/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./palettes": {
+      "types": "./dist/palettes.d.ts",
+      "default": "./dist/palettes.js"
+    }
+  },
+  "sideEffects": false,
   "files": [
     "dist"
   ],
@@ -15,7 +38,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "blit-browser": ">=0.3.0",
+    "blit-browser": ">=0.4.0",
     "react": ">=18.0.0",
     "react-dom": ">=18.0.0"
   },

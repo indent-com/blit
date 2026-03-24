@@ -3,13 +3,17 @@ import type { BlitTransport, ConnectionStatus } from '../types';
 import {
   S2C_UPDATE,
   S2C_CREATED,
+  S2C_CREATED_N,
   S2C_CLOSED,
   S2C_LIST,
   S2C_TITLE,
+  S2C_SEARCH_RESULTS,
+  S2C_HELLO,
   C2S_ACK,
   C2S_SUBSCRIBE,
   C2S_UNSUBSCRIBE,
   C2S_CREATE,
+  C2S_CREATE_N,
   C2S_CLOSE,
   C2S_FOCUS,
   C2S_RESIZE,
@@ -22,11 +26,8 @@ const textDecoder = new TextDecoder();
 export interface ServerMessage {
   type: number;
   ptyId: number;
-  /** Raw payload after the 3-byte header (only for S2C_UPDATE). */
   payload?: Uint8Array;
-  /** Decoded title string (only for S2C_TITLE). */
   title?: string;
-  /** List of PTY IDs (only for S2C_LIST). */
   ptyIds?: number[];
 }
 
@@ -35,58 +36,25 @@ export interface PtyListEntry {
   tag: string;
 }
 
+export interface SearchResult {
+  ptyId: number;
+  line: number;
+  col: number;
+  text: string;
+}
+
 export interface BlitConnectionCallbacks {
   onUpdate?: (ptyId: number, payload: Uint8Array) => void;
   onCreated?: (ptyId: number, tag: string) => void;
+  onCreatedN?: (nonce: number, ptyId: number, tag: string) => void;
   onClosed?: (ptyId: number) => void;
   onList?: (entries: PtyListEntry[]) => void;
   onTitle?: (ptyId: number, title: string) => void;
+  onSearchResults?: (results: SearchResult[]) => void;
+  onHello?: (version: number, features: number) => void;
+  onStatusChange?: (status: ConnectionStatus) => void;
 }
 
-// ---------------------------------------------------------------------------
-// Per-transport fan-out: multiple useBlitConnection hooks can share one
-// transport without clobbering each other's onmessage/onstatuschange.
-// ---------------------------------------------------------------------------
-
-type MessageHandler = (data: ArrayBuffer) => void;
-type StatusHandler = (status: ConnectionStatus) => void;
-
-interface TransportFanout {
-  messageHandlers: Set<MessageHandler>;
-  statusHandlers: Set<StatusHandler>;
-  /** The handlers we installed on the transport (so we can detect replacement). */
-  installedOnMessage: MessageHandler;
-  installedOnStatus: StatusHandler;
-}
-
-const fanouts = new WeakMap<BlitTransport, TransportFanout>();
-
-function getFanout(transport: BlitTransport): TransportFanout {
-  let f = fanouts.get(transport);
-  if (f) return f;
-
-  const messageHandlers = new Set<MessageHandler>();
-  const statusHandlers = new Set<StatusHandler>();
-
-  const installedOnMessage: MessageHandler = (data) => {
-    for (const h of messageHandlers) h(data);
-  };
-  const installedOnStatus: StatusHandler = (status) => {
-    for (const h of statusHandlers) h(status);
-  };
-
-  transport.onmessage = installedOnMessage;
-  transport.onstatuschange = installedOnStatus;
-
-  f = { messageHandlers, statusHandlers, installedOnMessage, installedOnStatus };
-  fanouts.set(transport, f);
-  return f;
-}
-
-/**
- * Hook that manages a blit transport connection, parsing server messages
- * and providing helper functions for sending client messages.
- */
 export function useBlitConnection(
   transport: BlitTransport,
   callbacks: BlitConnectionCallbacks,
@@ -94,7 +62,6 @@ export function useBlitConnection(
   const callbacksRef = useRef(callbacks);
   callbacksRef.current = callbacks;
 
-  // Status tracking via useSyncExternalStore for tear-free reads.
   const statusRef = useRef<ConnectionStatus>(transport.status);
   const listenersRef = useRef(new Set<() => void>());
 
@@ -110,8 +77,6 @@ export function useBlitConnection(
   const status = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   useEffect(() => {
-    const fanout = getFanout(transport);
-
     const onMessage = (data: ArrayBuffer) => {
       const bytes = new Uint8Array(data);
       if (bytes.length === 0) return;
@@ -130,6 +95,14 @@ export function useBlitConnection(
           const ptyId = bytes[1] | (bytes[2] << 8);
           const tag = textDecoder.decode(bytes.subarray(3));
           callbacksRef.current.onCreated?.(ptyId, tag);
+          break;
+        }
+        case S2C_CREATED_N: {
+          if (bytes.length < 5) break;
+          const nonce = bytes[1] | (bytes[2] << 8);
+          const ptyId = bytes[3] | (bytes[4] << 8);
+          const tag = textDecoder.decode(bytes.subarray(5));
+          callbacksRef.current.onCreatedN?.(nonce, ptyId, tag);
           break;
         }
         case S2C_CLOSED: {
@@ -162,26 +135,53 @@ export function useBlitConnection(
           callbacksRef.current.onTitle?.(ptyId, title);
           break;
         }
+        case S2C_SEARCH_RESULTS: {
+          if (bytes.length < 3) break;
+          const count = bytes[1] | (bytes[2] << 8);
+          const results: SearchResult[] = [];
+          let off = 3;
+          for (let i = 0; i < count; i++) {
+            if (off + 8 > bytes.length) break;
+            const ptyId = bytes[off] | (bytes[off + 1] << 8);
+            const line = bytes[off + 2] | (bytes[off + 3] << 8);
+            const col = bytes[off + 4] | (bytes[off + 5] << 8);
+            const textLen = bytes[off + 6] | (bytes[off + 7] << 8);
+            off += 8;
+            const text = textDecoder.decode(bytes.subarray(off, off + textLen));
+            off += textLen;
+            results.push({ ptyId, line, col, text });
+          }
+          callbacksRef.current.onSearchResults?.(results);
+          break;
+        }
+        case S2C_HELLO: {
+          if (bytes.length < 7) break;
+          const version = bytes[1] | (bytes[2] << 8);
+          const features =
+            bytes[3] | (bytes[4] << 8) | (bytes[5] << 16) | (bytes[6] << 24);
+          callbacksRef.current.onHello?.(version, features);
+          break;
+        }
       }
     };
 
     const onStatus = (newStatus: ConnectionStatus) => {
       statusRef.current = newStatus;
       for (const listener of listenersRef.current) listener();
+      callbacksRef.current.onStatusChange?.(newStatus);
     };
 
-    fanout.messageHandlers.add(onMessage);
-    fanout.statusHandlers.add(onStatus);
+    transport.addEventListener('message', onMessage);
+    transport.addEventListener('statuschange', onStatus);
 
-    // Sync in case status changed before we attached.
     if (statusRef.current !== transport.status) {
       statusRef.current = transport.status;
       for (const listener of listenersRef.current) listener();
     }
 
     return () => {
-      fanout.messageHandlers.delete(onMessage);
-      fanout.statusHandlers.delete(onStatus);
+      transport.removeEventListener('message', onMessage);
+      transport.removeEventListener('statuschange', onStatus);
     };
   }, [transport]);
 
@@ -255,6 +255,30 @@ export function useBlitConnection(
     [transport],
   );
 
+  const sendCreateN = useCallback(
+    (nonce: number, rows: number, cols: number, options?: { tag?: string; command?: string }) => {
+      const encoder = new TextEncoder();
+      const tagBytes = options?.tag ? encoder.encode(options.tag) : new Uint8Array(0);
+      const commandBytes = options?.command?.trim()
+        ? encoder.encode(options.command.trim())
+        : null;
+      const msg = new Uint8Array(9 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
+      msg[0] = C2S_CREATE_N;
+      msg[1] = nonce & 0xff;
+      msg[2] = (nonce >> 8) & 0xff;
+      msg[3] = rows & 0xff;
+      msg[4] = (rows >> 8) & 0xff;
+      msg[5] = cols & 0xff;
+      msg[6] = (cols >> 8) & 0xff;
+      msg[7] = tagBytes.length & 0xff;
+      msg[8] = (tagBytes.length >> 8) & 0xff;
+      if (tagBytes.length) msg.set(tagBytes, 9);
+      if (commandBytes) msg.set(commandBytes, 9 + tagBytes.length);
+      transport.send(msg);
+    },
+    [transport],
+  );
+
   const sendFocus = useCallback(
     (ptyId: number) => {
       const msg = new Uint8Array(3);
@@ -306,6 +330,7 @@ export function useBlitConnection(
     sendResize,
     sendScroll,
     sendCreate,
+    sendCreateN,
     sendFocus,
     sendClose,
     sendSubscribe,

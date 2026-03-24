@@ -27,6 +27,11 @@ export type ConnectionStatus =
  * Implementations handle the underlying protocol (WebSocket, WebTransport, etc.)
  * while consumers only deal with binary messages and status changes.
  */
+export type BlitTransportEventMap = {
+  message: ArrayBuffer;
+  statuschange: ConnectionStatus;
+};
+
 export interface BlitTransport {
   /** Send binary data to the server. */
   send(data: Uint8Array): void;
@@ -34,10 +39,16 @@ export interface BlitTransport {
   close(): void;
   /** Current connection status. */
   readonly status: ConnectionStatus;
-  /** Called when a binary message is received from the server. */
-  onmessage: ((data: ArrayBuffer) => void) | null;
-  /** Called when the connection status changes. */
-  onstatuschange: ((status: ConnectionStatus) => void) | null;
+  /** Register a listener for transport events. */
+  addEventListener<K extends keyof BlitTransportEventMap>(
+    type: K,
+    listener: (data: BlitTransportEventMap[K]) => void,
+  ): void;
+  /** Remove a previously registered listener. */
+  removeEventListener<K extends keyof BlitTransportEventMap>(
+    type: K,
+    listener: (data: BlitTransportEventMap[K]) => void,
+  ): void;
 }
 
 /** A tracked PTY session. */
@@ -78,6 +89,7 @@ export const C2S_FOCUS = 0x11;
 export const C2S_CLOSE = 0x12;
 export const C2S_SUBSCRIBE = 0x13;
 export const C2S_UNSUBSCRIBE = 0x14;
+export const C2S_CREATE_N = 0x17;
 
 /** Wire protocol constants: server-to-client message types. */
 export const S2C_UPDATE = 0x00;
@@ -86,3 +98,8 @@ export const S2C_CLOSED = 0x02;
 export const S2C_LIST = 0x03;
 export const S2C_TITLE = 0x04;
 export const S2C_SEARCH_RESULTS = 0x05;
+export const S2C_CREATED_N = 0x06;
+export const S2C_HELLO = 0x07;
+
+export const PROTOCOL_VERSION = 1;
+export const FEATURE_CREATE_NONCE = 1 << 0;

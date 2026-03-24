@@ -13,6 +13,7 @@ import {
   C2S_SUBSCRIBE,
   C2S_UNSUBSCRIBE,
   S2C_UPDATE,
+  S2C_SEARCH_RESULTS,
 } from '../types';
 
 describe('useBlitConnection', () => {
@@ -95,10 +96,40 @@ describe('useBlitConnection', () => {
     expect(p[1]).toBe(0xBB);
   });
 
+  it('dispatches onSearchResults', () => {
+    const onSearchResults = vi.fn();
+    renderHook(() => useBlitConnection(transport, { onSearchResults }));
+    const encoder = new TextEncoder();
+    const text = encoder.encode('hello');
+    const msg = new Uint8Array(3 + 8 + text.length);
+    msg[0] = S2C_SEARCH_RESULTS;
+    msg[1] = 1; // count lo
+    msg[2] = 0; // count hi
+    msg[3] = 5; // ptyId lo
+    msg[4] = 0; // ptyId hi
+    msg[5] = 10; // line lo
+    msg[6] = 0; // line hi
+    msg[7] = 3; // col lo
+    msg[8] = 0; // col hi
+    msg[9] = text.length; // textLen lo
+    msg[10] = 0; // textLen hi
+    msg.set(text, 11);
+    act(() => transport.push(msg));
+    expect(onSearchResults).toHaveBeenCalledWith([
+      { ptyId: 5, line: 10, col: 3, text: 'hello' },
+    ]);
+  });
+
+  it('dispatches onStatusChange', () => {
+    const onStatusChange = vi.fn();
+    renderHook(() => useBlitConnection(transport, { onStatusChange }));
+    act(() => transport.setStatus('disconnected'));
+    expect(onStatusChange).toHaveBeenCalledWith('disconnected');
+  });
+
   it('ignores too-short messages', () => {
     const onCreated = vi.fn();
     renderHook(() => useBlitConnection(transport, { onCreated }));
-    // S2C_CREATED with only 1 byte after type
     act(() => transport.push(new Uint8Array([0x01, 0x05])));
     expect(onCreated).not.toHaveBeenCalled();
   });
@@ -166,8 +197,8 @@ describe('useBlitConnection', () => {
     act(() => result.current.sendCreate(24, 80));
     const msg = transport.sent[0];
     expect(msg[0]).toBe(C2S_CREATE);
-    expect(msg[5] | (msg[6] << 8)).toBe(0); // tag_len = 0
-    expect(msg.length).toBe(7); // no command
+    expect(msg[5] | (msg[6] << 8)).toBe(0);
+    expect(msg.length).toBe(7);
   });
 
   it('sendFocus sends FOCUS', () => {
@@ -225,7 +256,7 @@ describe('useBlitConnection', () => {
     expect(onList).toHaveBeenCalledWith([{ ptyId: 1, tag: '🚀' }]);
   });
 
-  // --- Multi-consumer fan-out ---
+  // --- Multi-consumer ---
 
   it('two hooks on the same transport both receive messages', () => {
     const onCreated1 = vi.fn();
@@ -255,15 +286,13 @@ describe('useBlitConnection', () => {
     );
     renderHook(() => useBlitConnection(transport, { onTitle: onTitle2 }));
 
-    // Both receive
     act(() => transport.pushTitle(1, 'both'));
     expect(onTitle1).toHaveBeenCalledTimes(1);
     expect(onTitle2).toHaveBeenCalledTimes(1);
 
-    // Unmount first, second still works
     unmount();
     act(() => transport.pushTitle(1, 'solo'));
-    expect(onTitle1).toHaveBeenCalledTimes(1); // not called again
+    expect(onTitle1).toHaveBeenCalledTimes(1);
     expect(onTitle2).toHaveBeenCalledTimes(2);
   });
 });

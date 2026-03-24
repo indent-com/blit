@@ -54,7 +54,7 @@ dev
 - `blit-server`: PTY host and frame producer
 - `blit-gateway`: HTTP/WebSocket gateway for browsers
 - `blit` / `blit-cli`: terminal client and embedded gateway (browser mode) or ANSI renderer (console mode)
-- `blit-demo`: local demos, including `netdash`
+- `blit-demo`: local demos
 
 ### Libraries
 
@@ -491,33 +491,6 @@ renderer.render(|dom| {
     );
 });
 ```
-
-That callback surface is what the new `netdash` demo uses.
-
-## Demo: `netdash`
-
-`netdash` is a Linux-only TCP dashboard rendered through `blit-remote` and painted directly into your local terminal.
-
-```bash
-cargo run -p blit-demo --bin netdash -- --fps 12 --poll-ms 120
-```
-
-What it does:
-
-- reconciles Linux TCP state via `sock_diag` dumps on the configured interval
-- applies `sock_diag` destroy notifications as they arrive
-- keeps a rolling peer/connection model
-- redraws at a capped presentation rate instead of on every sample
-- supports keyboard and basic mouse interaction
-
-Controls:
-
-- `Tab` or `1/2/3`: switch panels
-- arrows or `j/k`: move selection
-- `Enter`: filter connections by the selected peer
-- `s`: cycle sort order
-- `c`: clear the current filter
-- `?`: toggle help
 
 ## Building And Packaging
 

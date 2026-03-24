@@ -34,7 +34,6 @@ describe('useBlitSessions — advanced scenarios', () => {
       transport.pushCreated(1, 'first');
       transport.pushCreated(1, 'second');
     });
-    // Should update the existing entry, not duplicate
     const matches = result.current.sessions.filter((s) => s.ptyId === 1);
     expect(matches.length).toBe(1);
     expect(matches[0].state).toBe('active');
@@ -92,7 +91,6 @@ describe('useBlitSessions — advanced scenarios', () => {
   it('LIST with same entries is idempotent', () => {
     const { result } = renderHook(() => useBlitSessions(transport));
     act(() => transport.pushList([{ ptyId: 1, tag: 'a' }, { ptyId: 2, tag: 'b' }]));
-    const first = result.current.sessions;
     act(() => transport.pushList([{ ptyId: 1, tag: 'a' }, { ptyId: 2, tag: 'b' }]));
     expect(result.current.sessions.map((s) => s.ptyId)).toEqual([1, 2]);
     expect(result.current.sessions.every((s) => s.state === 'active')).toBe(true);
@@ -105,10 +103,7 @@ describe('useBlitSessions — advanced scenarios', () => {
       transport.pushClosed(1);
     });
     expect(result.current.sessions[0].state).toBe('closed');
-    // Server reconnect sends LIST again with same pty
     act(() => transport.pushList([{ ptyId: 1 }]));
-    // The closed entry should remain closed since LIST doesn't re-activate
-    // (LIST only adds new entries and marks missing as closed)
   });
 
   it('empty LIST marks everything closed', () => {
@@ -165,12 +160,10 @@ describe('useBlitSessions — advanced scenarios', () => {
     });
     act(() => transport.setStatus('disconnected'));
     act(() => transport.setStatus('connected'));
-    // Server sends new LIST on reconnect — pty 1 gone, pty 3 new
     act(() => transport.pushList([{ ptyId: 2, tag: 'b' }, { ptyId: 3, tag: 'c' }]));
     expect(result.current.sessions.find((s) => s.ptyId === 1)?.state).toBe('closed');
     expect(result.current.sessions.find((s) => s.ptyId === 2)?.state).toBe('active');
     expect(result.current.sessions.find((s) => s.ptyId === 3)?.state).toBe('active');
-    // Title from before disconnect should be preserved for surviving pty
     expect(result.current.sessions.find((s) => s.ptyId === 1)?.title).toBe('vim');
   });
 
@@ -222,7 +215,6 @@ describe('useBlitSessions — advanced scenarios', () => {
 
   it('operations before LIST are safe', () => {
     const { result } = renderHook(() => useBlitSessions(transport));
-    // These arrive before LIST
     act(() => {
       transport.pushCreated(1, 'early');
       transport.pushTitle(1, 'title');
@@ -231,5 +223,23 @@ describe('useBlitSessions — advanced scenarios', () => {
     expect(result.current.ready).toBe(false);
     expect(result.current.sessions.length).toBe(1);
     expect(result.current.sessions[0].title).toBe('title');
+  });
+
+  // --- focusedPtyId advanced ---
+
+  it('focusedPtyId survives LIST reconciliation when pty still exists', () => {
+    const { result } = renderHook(() => useBlitSessions(transport));
+    act(() => transport.pushList([{ ptyId: 1 }, { ptyId: 2 }, { ptyId: 3 }]));
+    act(() => result.current.focusPty(2));
+    act(() => transport.pushList([{ ptyId: 2 }, { ptyId: 3 }]));
+    expect(result.current.focusedPtyId).toBe(2);
+  });
+
+  it('focusedPtyId falls back when focused pty removed from LIST', () => {
+    const { result } = renderHook(() => useBlitSessions(transport));
+    act(() => transport.pushList([{ ptyId: 1 }, { ptyId: 2 }]));
+    act(() => result.current.focusPty(1));
+    act(() => transport.pushList([{ ptyId: 2 }]));
+    expect(result.current.focusedPtyId).toBe(2);
   });
 });

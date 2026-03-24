@@ -35,6 +35,12 @@ export function measureCell(fontFamily: string, fontSize: number): CellMetrics {
 export interface UseBlitTerminalOptions {
   fontFamily?: string;
   fontSize?: number;
+  /**
+   * When provided, skips the DOM measurement probe and uses these metrics
+   * directly. Useful when the consumer already knows cell dimensions
+   * from a shared font configuration.
+   */
+  initialCellMetrics?: CellMetrics;
 }
 
 /**
@@ -45,8 +51,8 @@ export function useBlitTerminal(options?: UseBlitTerminalOptions) {
   const fontFamily = options?.fontFamily ?? DEFAULT_FONT;
   const fontSize = options?.fontSize ?? 13;
 
-  const [cell, setCell] = useState<CellMetrics>(() =>
-    measureCell(fontFamily, fontSize),
+  const [cell, setCell] = useState<CellMetrics>(
+    () => options?.initialCellMetrics ?? measureCell(fontFamily, fontSize),
   );
   const terminalRef = useRef<Terminal | null>(null);
   const [dimensions, setDimensions] = useState<{ rows: number; cols: number }>({
@@ -54,15 +60,22 @@ export function useBlitTerminal(options?: UseBlitTerminalOptions) {
     cols: 80,
   });
 
-  // Re-measure when font changes.
   useEffect(() => {
+    if (options?.initialCellMetrics) {
+      setCell(options.initialCellMetrics);
+      if (terminalRef.current) {
+        terminalRef.current.set_cell_size(options.initialCellMetrics.pw, options.initialCellMetrics.ph);
+        terminalRef.current.set_font_family(fontFamily);
+      }
+      return;
+    }
     const newCell = measureCell(fontFamily, fontSize);
     setCell(newCell);
     if (terminalRef.current) {
       terminalRef.current.set_cell_size(newCell.pw, newCell.ph);
       terminalRef.current.set_font_family(fontFamily);
     }
-  }, [fontFamily, fontSize]);
+  }, [fontFamily, fontSize, options?.initialCellMetrics]);
 
   const computeSize = useCallback(
     (containerWidth: number, containerHeight: number) => {
