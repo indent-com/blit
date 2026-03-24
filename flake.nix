@@ -540,7 +540,7 @@ PKGJSON
 
         webAppNpmDeps = pkgs.fetchNpmDeps {
           src = ./web-app;
-          hash = "sha256-LluQX9Lpmt9nlJRJRByr0HWHTa4QEoe72Wz1hAiFeeQ=";
+          hash = "sha256-UtiMxzhbfmQQ/e09EAcvqUJ1GRdmyodmckCYnB3jojA=";
         };
 
         webAppDist = pkgs.stdenv.mkDerivation {
