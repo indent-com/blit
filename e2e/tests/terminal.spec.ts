@@ -54,7 +54,7 @@ test.describe("Terminal", () => {
 
     await page.keyboard.press("Control+k");
 
-    const dialog = page.locator("dialog[open]");
+    const dialog = page.locator('div[role="dialog"]');
     await expect(dialog).toBeVisible({ timeout: 5_000 });
 
     const exposeSearch = dialog.locator('input[type="text"]');
@@ -70,7 +70,7 @@ test.describe("Terminal", () => {
     await page.waitForTimeout(500);
 
     await page.keyboard.press("Control+k");
-    const dialog = page.locator("dialog[open]");
+    const dialog = page.locator('div[role="dialog"]');
     await expect(dialog).toBeVisible({ timeout: 5_000 });
 
     const itemsBefore = await dialog.locator("ul > li").count();
@@ -96,7 +96,7 @@ test.describe("Terminal", () => {
     await page.waitForTimeout(500);
 
     await page.keyboard.press("Control+k");
-    const dialog = page.locator("dialog[open]");
+    const dialog = page.locator('div[role="dialog"]');
     await expect(dialog).toBeVisible({ timeout: 5_000 });
 
     const previewCanvas = dialog.locator("canvas").first();

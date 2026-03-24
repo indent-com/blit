@@ -533,6 +533,16 @@ PKGJSON
           cargoPkg = "blit-server";
         };
 
+        reactNpmDeps = pkgs.fetchNpmDeps {
+          src = ./react;
+          hash = "sha256-fWpzPYKa7miYdta+uzq2QEIRyB8C7z8ajhS3s82VEYc=";
+        };
+
+        webAppNpmDeps = pkgs.fetchNpmDeps {
+          src = ./web-app;
+          hash = "sha256-LluQX9Lpmt9nlJRJRByr0HWHTa4QEoe72Wz1hAiFeeQ=";
+        };
+
         webAppDist = pkgs.stdenv.mkDerivation {
           pname = "blit-web-app";
           inherit version;
@@ -554,11 +564,16 @@ PKGJSON
               cp "$d"/* "browser/pkg/snippets/$name/"
             done
 
-            # Build react package
-            (cd react && npm install && npm run build)
+            # Build react package (install from prefetched cache)
+            cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
+            chmod -R u+w "$TMPDIR/react-cache"
+            (cd react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
 
-            # Build web-app
-            (cd web-app && npm install && npx vite build)
+            # Build web-app (install from prefetched cache)
+            # package-lock.json is committed without file: deps; vite.config.ts aliases blit-react/blit-browser to source
+            cp -r ${webAppNpmDeps} "$TMPDIR/webapp-cache"
+            chmod -R u+w "$TMPDIR/webapp-cache"
+            (cd web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
           '';
           installPhase = ''
             mkdir -p $out

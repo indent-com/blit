@@ -663,7 +663,7 @@ function ExposeOverlay({
       : dark ? "rgba(255,255,255,0.15)" : "rgba(0,0,0,0.15)";
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div role="dialog" aria-label="Expose" style={styles.overlay} onClick={onClose}>
       <nav
         style={{
           ...styles.exposePanel,
