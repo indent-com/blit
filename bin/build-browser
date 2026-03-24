@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-(cd browser && wasm-pack build --target web --release --out-dir ../web)
+
+# Build WASM module
+(cd browser && wasm-pack build --target web --release --out-dir pkg)
+
+# Build React web app
+(cd web-app && npm install --prefer-offline && npm run build)

@@ -46,7 +46,7 @@
     "@testing-library/react": "^16.0.0",
     "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
-    "blit-browser": "file:../web",
+    "blit-browser": "file:../browser/pkg",
     "jsdom": "^25.0.0",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",

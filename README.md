@@ -120,11 +120,11 @@ blit-server
 blit-server --socket /tmp/blit.sock
 ```
 
-| Variable | Default | Description |
-|---|---|---|
-| `SHELL` | `/bin/sh` | Shell to spawn for new PTYs |
-| `BLIT_SOCK` | `$XDG_RUNTIME_DIR/blit.sock` or `/tmp/blit.sock` | Unix socket path (ignored under socket activation) |
-| `BLIT_SCROLLBACK` | `10000` | Scrollback rows per PTY |
+| Variable          | Default                                          | Description                                        |
+| ----------------- | ------------------------------------------------ | -------------------------------------------------- |
+| `SHELL`           | `/bin/sh`                                        | Shell to spawn for new PTYs                        |
+| `BLIT_SOCK`       | `$XDG_RUNTIME_DIR/blit.sock` or `/tmp/blit.sock` | Unix socket path (ignored under socket activation) |
+| `BLIT_SCROLLBACK` | `10000`                                          | Scrollback rows per PTY                            |
 
 #### systemd socket activation
 
@@ -207,11 +207,11 @@ BLIT_PASS=secret blit-gateway
 BLIT_PASS=secret BLIT_ADDR=127.0.0.1:3264 blit-gateway
 ```
 
-| Variable | Default | Description |
-|---|---|---|
-| `BLIT_PASS` | required | Browser passphrase |
-| `BLIT_ADDR` | `0.0.0.0:3264` | HTTP/WebSocket listen address |
-| `BLIT_SOCK` | `/run/blit/$USER.sock`, then `$XDG_RUNTIME_DIR/blit.sock`, then `/tmp/blit.sock` | Upstream server socket |
+| Variable    | Default                                                                          | Description                   |
+| ----------- | -------------------------------------------------------------------------------- | ----------------------------- |
+| `BLIT_PASS` | required                                                                         | Browser passphrase            |
+| `BLIT_ADDR` | `0.0.0.0:3264`                                                                   | HTTP/WebSocket listen address |
+| `BLIT_SOCK` | `/run/blit/$USER.sock`, then `$XDG_RUNTIME_DIR/blit.sock`, then `/tmp/blit.sock` | Upstream server socket        |
 
 ### `blit`
 
@@ -231,10 +231,10 @@ blit --tcp host:9000        # raw TCP
 
 Each browser tab gets its own connection to the blit-server.
 
-| Variable | Default | Description |
-|---|---|---|
-| `BLIT_SOCK` | `/run/blit/$USER.sock`, then `$XDG_RUNTIME_DIR/blit.sock`, then `/tmp/blit.sock` | Unix socket path |
-| `BLIT_DISPLAY_FPS` | `240` | Advertised client display rate (console mode), clamped to `10..=1000` |
+| Variable           | Default                                                                          | Description                                                           |
+| ------------------ | -------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `BLIT_SOCK`        | `/run/blit/$USER.sock`, then `$XDG_RUNTIME_DIR/blit.sock`, then `/tmp/blit.sock` | Unix socket path                                                      |
+| `BLIT_DISPLAY_FPS` | `240`                                                                            | Advertised client display rate (console mode), clamped to `10..=1000` |
 
 ### Browser UI
 
@@ -244,17 +244,17 @@ Press `Ctrl/Cmd+K` to open Expose. It shows live PTY previews, searches titles a
 
 Shortcuts:
 
-| Shortcut | Action |
-|---|---|
-| `Ctrl`/`Cmd`+`K` | Open Expose / switch PTY |
-| `Ctrl`/`Cmd`+`Shift`+`K` | Palette picker |
-| `Ctrl`/`Cmd`+`Shift`+`Enter` | New PTY in focused PTY's cwd (falls back to shell default) |
-| `Ctrl+Shift+W` | Close focused PTY |
-| `Ctrl+Shift+B` | Toggle backlog |
-| `Ctrl+Shift+H` | Toggle HUD (size/fps/kbps) |
-| `Ctrl+Shift+{` / `Ctrl+Shift+}` | Previous / next PTY |
-| `Shift+PageUp` / `Shift+PageDown` | Scrollback |
-| `Ctrl+Shift+/` | Toggle help |
+| Shortcut                          | Action                                                     |
+| --------------------------------- | ---------------------------------------------------------- |
+| `Ctrl`/`Cmd`+`K`                  | Open Expose / switch PTY                                   |
+| `Ctrl`/`Cmd`+`Shift`+`K`          | Palette picker                                             |
+| `Ctrl`/`Cmd`+`Shift`+`Enter`      | New PTY in focused PTY's cwd (falls back to shell default) |
+| `Ctrl+Shift+W`                    | Close focused PTY                                          |
+| `Ctrl+Shift+B`                    | Toggle backlog                                             |
+| `Ctrl+Shift+H`                    | Toggle HUD (size/fps/kbps)                                 |
+| `Ctrl+Shift+{` / `Ctrl+Shift+}`   | Previous / next PTY                                        |
+| `Shift+PageUp` / `Shift+PageDown` | Scrollback                                                 |
+| `Ctrl+Shift+/`                    | Toggle help                                                |
 
 Mouse behavior:
 
@@ -322,22 +322,22 @@ The `blit-react` package (`react/`) embeds a blit terminal in any React app. Net
 
 ```tsx
 import { BlitTerminal, WebSocketTransport, useBlitSessions } from "blit-react";
-import { useRef } from 'react';
+import { useRef } from "react";
 
 function App() {
   const transport = useRef(
-    new WebSocketTransport('wss://myhost:3264/', 'secret'),
+    new WebSocketTransport("wss://myhost:3264/", "secret"),
   ).current;
   const { sessions, createPty } = useBlitSessions(transport, {
     autoCreateIfEmpty: true,
   });
-  const active = sessions.find((s) => s.state === 'active');
+  const active = sessions.find((s) => s.state === "active");
 
   return (
     <BlitTerminal
       transport={transport}
       ptyId={active?.ptyId ?? null}
-      style={{ width: '100%', height: '100vh' }}
+      style={{ width: "100%", height: "100vh" }}
     />
   );
 }
@@ -350,46 +350,46 @@ Manages the session lifecycle: LIST, CREATED, CLOSED, and TITLE parsing. Returns
 ```ts
 const { ready, sessions, status, createPty, focusPty, closePty } =
   useBlitSessions(transport, {
-    autoCreateIfEmpty: true,          // create a PTY if the server has none
+    autoCreateIfEmpty: true, // create a PTY if the server has none
     getInitialSize: () => ({ rows: 24, cols: 80 }),
   });
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `ready` | `boolean` | `true` after the first LIST is received. |
-| `sessions` | `readonly BlitSession[]` | Current sessions with `ptyId`, `tag`, `title`, and `state`. |
-| `status` | `ConnectionStatus` | Transport connection status. |
-| `createPty` | `(opts?) => void` | Create a PTY. Accepts `{ rows?, cols?, command?, tag? }`. |
-| `focusPty` | `(ptyId) => void` | Focus a PTY on the server. |
-| `closePty` | `(ptyId) => void` | Close a PTY. |
+| Field       | Type                     | Description                                                 |
+| ----------- | ------------------------ | ----------------------------------------------------------- |
+| `ready`     | `boolean`                | `true` after the first LIST is received.                    |
+| `sessions`  | `readonly BlitSession[]` | Current sessions with `ptyId`, `tag`, `title`, and `state`. |
+| `status`    | `ConnectionStatus`       | Transport connection status.                                |
+| `createPty` | `(opts?) => void`        | Create a PTY. Accepts `{ rows?, cols?, command?, tag? }`.   |
+| `focusPty`  | `(ptyId) => void`        | Focus a PTY on the server.                                  |
+| `closePty`  | `(ptyId) => void`        | Close a PTY.                                                |
 
 ### `<BlitTerminal>`
 
 Renders a single PTY. Owns FOCUS, RESIZE, INPUT, SCROLL, mouse/keyboard encoding, and ACK after updates.
 
-| Prop | Type | Description |
-|---|---|---|
-| `transport` | `BlitTransport` | **Required.** Transport instance for server communication. |
-| `ptyId` | `number \| null` | PTY to display. `null` = waiting for a PTY. |
-| `fontFamily` | `string` | CSS font family. Default: `"PragmataPro, ui-monospace, monospace"` |
-| `fontSize` | `number` | Font size in CSS pixels. Default: `13` |
-| `className` | `string` | CSS class for the container div. |
-| `style` | `CSSProperties` | Inline styles for the container div. |
-| `palette` | `TerminalPalette` | Color palette (fg, bg, 16 ANSI colors). See `PALETTES` for built-ins. |
+| Prop         | Type              | Description                                                           |
+| ------------ | ----------------- | --------------------------------------------------------------------- |
+| `transport`  | `BlitTransport`   | **Required.** Transport instance for server communication.            |
+| `ptyId`      | `number \| null`  | PTY to display. `null` = waiting for a PTY.                           |
+| `fontFamily` | `string`          | CSS font family. Default: `"PragmataPro, ui-monospace, monospace"`    |
+| `fontSize`   | `number`          | Font size in CSS pixels. Default: `13`                                |
+| `className`  | `string`          | CSS class for the container div.                                      |
+| `style`      | `CSSProperties`   | Inline styles for the container div.                                  |
+| `palette`    | `TerminalPalette` | Color palette (fg, bg, 16 ANSI colors). See `PALETTES` for built-ins. |
 
 ### Imperative handle
 
 ```tsx
 const termRef = useRef<BlitTerminalHandle>(null);
 
-<BlitTerminal ref={termRef} transport={transport} ptyId={ptyId} />
+<BlitTerminal ref={termRef} transport={transport} ptyId={ptyId} />;
 
-termRef.current?.focus();               // focus the input sink
-termRef.current?.terminal;              // underlying WASM Terminal instance
-termRef.current?.rows;                  // current grid dimensions
+termRef.current?.focus(); // focus the input sink
+termRef.current?.terminal; // underlying WASM Terminal instance
+termRef.current?.rows; // current grid dimensions
 termRef.current?.cols;
-termRef.current?.status;                // 'connecting' | 'connected' | ...
+termRef.current?.status; // 'connecting' | 'connected' | ...
 ```
 
 ### Palettes
@@ -401,14 +401,19 @@ import { BlitTerminal, PALETTES } from "blit-react";
 import type { TerminalPalette } from "blit-react";
 
 // Use a built-in palette
-const nord = PALETTES.find((p) => p.id === 'nord')!;
-<BlitTerminal transport={t} ptyId={id} palette={nord} />
+const nord = PALETTES.find((p) => p.id === "nord")!;
+<BlitTerminal transport={t} ptyId={id} palette={nord} />;
 
 // Build your own
 const custom: TerminalPalette = {
-  id: 'my-theme', name: 'My Theme', dark: true,
-  fg: [200, 200, 200], bg: [20, 20, 20],
-  ansi: [ /* 16 × [r,g,b] entries */ ],
+  id: "my-theme",
+  name: "My Theme",
+  dark: true,
+  fg: [200, 200, 200],
+  bg: [20, 20, 20],
+  ansi: [
+    /* 16 × [r,g,b] entries */
+  ],
 };
 ```
 
@@ -437,7 +442,7 @@ Two transports are included:
 ```ts
 import { WebSocketTransport } from "blit-react";
 
-const transport = new WebSocketTransport('wss://myhost:3264/', 'secret', {
+const transport = new WebSocketTransport("wss://myhost:3264/", "secret", {
   reconnect: true,
   reconnectDelay: 500,
   maxReconnectDelay: 10000,
@@ -451,7 +456,7 @@ const transport = new WebSocketTransport('wss://myhost:3264/', 'secret', {
 import { createWebRtcDataChannelTransport } from "blit-react";
 
 const transport = createWebRtcDataChannelTransport(peerConnection, {
-  label: 'blit',
+  label: "blit",
   displayRateFps: 120,
   connectTimeoutMs: 10000,
 });

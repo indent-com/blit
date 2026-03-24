@@ -1,4 +1,8 @@
-import type { BlitTransport, BlitTransportEventMap, ConnectionStatus } from '../types';
+import type {
+  BlitTransport,
+  BlitTransportEventMap,
+  ConnectionStatus,
+} from "../types";
 import {
   S2C_CREATED,
   S2C_CREATED_N,
@@ -7,7 +11,7 @@ import {
   S2C_LIST,
   S2C_TITLE,
   S2C_UPDATE,
-} from '../types';
+} from "../types";
 
 export class MockTransport implements BlitTransport {
   private _status: ConnectionStatus;
@@ -15,7 +19,7 @@ export class MockTransport implements BlitTransport {
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
   sent: Uint8Array[] = [];
 
-  constructor(initialStatus: ConnectionStatus = 'connected') {
+  constructor(initialStatus: ConnectionStatus = "connected") {
     this._status = initialStatus;
   }
 
@@ -28,16 +32,16 @@ export class MockTransport implements BlitTransport {
   }
 
   close() {
-    this.setStatus('disconnected');
+    this.setStatus("disconnected");
   }
 
   addEventListener<K extends keyof BlitTransportEventMap>(
     type: K,
     listener: (data: BlitTransportEventMap[K]) => void,
   ): void {
-    if (type === 'message') {
+    if (type === "message") {
       this.messageListeners.add(listener as (data: ArrayBuffer) => void);
-    } else if (type === 'statuschange') {
+    } else if (type === "statuschange") {
       this.statusListeners.add(listener as (status: ConnectionStatus) => void);
     }
   }
@@ -46,10 +50,12 @@ export class MockTransport implements BlitTransport {
     type: K,
     listener: (data: BlitTransportEventMap[K]) => void,
   ): void {
-    if (type === 'message') {
+    if (type === "message") {
       this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
-    } else if (type === 'statuschange') {
-      this.statusListeners.delete(listener as (status: ConnectionStatus) => void);
+    } else if (type === "statuschange") {
+      this.statusListeners.delete(
+        listener as (status: ConnectionStatus) => void,
+      );
     }
   }
 
@@ -59,13 +65,16 @@ export class MockTransport implements BlitTransport {
   }
 
   push(data: Uint8Array) {
-    const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+    const buf = data.buffer.slice(
+      data.byteOffset,
+      data.byteOffset + data.byteLength,
+    ) as ArrayBuffer;
     for (const l of this.messageListeners) l(buf);
   }
 
   // --- Helpers to build wire-format server messages ---
 
-  pushCreated(ptyId: number, tag = '') {
+  pushCreated(ptyId: number, tag = "") {
     const tagBytes = new TextEncoder().encode(tag);
     const msg = new Uint8Array(3 + tagBytes.length);
     msg[0] = S2C_CREATED;
@@ -75,7 +84,7 @@ export class MockTransport implements BlitTransport {
     this.push(msg);
   }
 
-  pushCreatedN(nonce: number, ptyId: number, tag = '') {
+  pushCreatedN(nonce: number, ptyId: number, tag = "") {
     const tagBytes = new TextEncoder().encode(tag);
     const msg = new Uint8Array(5 + tagBytes.length);
     msg[0] = S2C_CREATED_N;
@@ -92,8 +101,12 @@ export class MockTransport implements BlitTransport {
   }
 
   pushList(entries: { ptyId: number; tag?: string }[]) {
-    const parts: number[] = [S2C_LIST, entries.length & 0xff, (entries.length >> 8) & 0xff];
-    for (const { ptyId, tag = '' } of entries) {
+    const parts: number[] = [
+      S2C_LIST,
+      entries.length & 0xff,
+      (entries.length >> 8) & 0xff,
+    ];
+    for (const { ptyId, tag = "" } of entries) {
       const tagBytes = new TextEncoder().encode(tag);
       parts.push(ptyId & 0xff, (ptyId >> 8) & 0xff);
       parts.push(tagBytes.length & 0xff, (tagBytes.length >> 8) & 0xff);

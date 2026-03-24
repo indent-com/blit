@@ -27,10 +27,8 @@ extern "C" {
 
 const DEFAULT_FONT_FAMILY: &str = r#"PragmataPro, ui-monospace, monospace"#;
 const BG_OP_STRIDE: usize = 4;
-const ENABLE_SCROLL_COPY: bool = true;
 const MODE_ECHO: u16 = 1 << 9;
 const MODE_ICANON: u16 = 1 << 10;
-const MODE_ALT_SCREEN: u16 = 1 << 11;
 
 const DEFAULT_ANSI_COLORS: [[u8; 3]; 16] = [
     [0, 0, 0],
@@ -102,11 +100,6 @@ impl Palette {
                 CellColor { r: cr, g: cg, b: cb, is_default: true }
             }
         }
-    }
-
-    fn default_bg_packed(&self) -> u32 {
-        let [r, g, b] = self.default_bg;
-        (1u32 << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
     }
 
     fn color_css(&self, color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> String {
@@ -471,61 +464,6 @@ impl GlyphAtlas {
     }
 }
 
-#[derive(Clone, Copy)]
-struct RenderDamage {
-    full: bool,
-    min_row: i32,
-    max_row: i32,
-    min_col: i32,
-    max_col: i32,
-    scroll_delta_rows: i32,
-}
-
-impl Default for RenderDamage {
-    fn default() -> Self {
-        Self {
-            full: false,
-            min_row: -1,
-            max_row: -1,
-            min_col: -1,
-            max_col: -1,
-            scroll_delta_rows: 0,
-        }
-    }
-}
-
-impl RenderDamage {
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn note_rect(&mut self, row: usize, col: usize, row_span: usize, col_span: usize) {
-        if self.full {
-            return;
-        }
-        let row = row as i32;
-        let col = col as i32;
-        let row_end = row + row_span as i32;
-        let col_end = col + col_span as i32;
-        if self.min_row < 0 {
-            self.min_row = row;
-            self.max_row = row_end;
-            self.min_col = col;
-            self.max_col = col_end;
-        } else {
-            self.min_row = self.min_row.min(row);
-            self.max_row = self.max_row.max(row_end);
-            self.min_col = self.min_col.min(col);
-            self.max_col = self.max_col.max(col_end);
-        }
-    }
-}
-
-struct ScrollCopy {
-    delta_rows: i32,
-    matched_rows: Vec<bool>,
-}
-
 #[wasm_bindgen]
 pub struct Terminal {
     cell_width: f64,
@@ -533,17 +471,9 @@ pub struct Terminal {
     font_family: String,
     palette: Palette,
     inner: TerminalState,
-    painted_cells: Vec<u8>,
-    painted_rows: u16,
-    painted_cols: u16,
-    painted_cursor_row: u16,
-    painted_cursor_col: u16,
     glyph_atlas: GlyphAtlas,
-    last_render: RenderDamage,
     bg_ops: Vec<u32>,
     glyph_ops: Vec<u32>,
-    /// Overflow text ops: (row, col, col_span, string) for cells whose
-    /// content exceeds 4 bytes and can't use the glyph atlas.
     overflow_text_ops: Vec<(u32, u32, u32, String)>,
 }
 
@@ -557,13 +487,7 @@ impl Terminal {
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             palette: Palette::default(),
             inner: TerminalState::new(rows, cols),
-            painted_cells: Vec::new(),
-            painted_rows: 0,
-            painted_cols: 0,
-            painted_cursor_row: 0,
-            painted_cursor_col: 0,
             glyph_atlas: GlyphAtlas::default(),
-            last_render: RenderDamage::default(),
             bg_ops: Vec::new(),
             glyph_ops: Vec::new(),
             overflow_text_ops: Vec::new(),
@@ -573,17 +497,11 @@ impl Terminal {
     pub fn set_cell_size(&mut self, cell_width: f64, cell_height: f64) {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
-        self.painted_rows = 0;
-        self.painted_cols = 0;
         self.glyph_atlas.invalidate();
-        self.inner.mark_all_dirty();
     }
 
     pub fn invalidate_render_cache(&mut self) {
-        self.painted_rows = 0;
-        self.painted_cols = 0;
         self.glyph_atlas.invalidate();
-        self.inner.mark_all_dirty();
     }
 
     pub fn set_font_family(&mut self, font_family: &str) {
@@ -598,19 +516,17 @@ impl Terminal {
         }
         self.font_family.clear();
         self.font_family.push_str(next);
-        self.invalidate_render_cache();
+        self.glyph_atlas.invalidate();
     }
 
     pub fn set_default_colors(&mut self, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g: u8, bg_b: u8) {
         self.palette.default_fg = [fg_r, fg_g, fg_b];
         self.palette.default_bg = [bg_r, bg_g, bg_b];
-        self.invalidate_render_cache();
     }
 
     pub fn set_ansi_color(&mut self, idx: u8, r: u8, g: u8, b: u8) {
         if idx < 16 {
             self.palette.ansi_16[idx as usize] = [r, g, b];
-            self.invalidate_render_cache();
         }
     }
 
@@ -659,24 +575,6 @@ impl Terminal {
     pub fn cursor_style(&self) -> u16 {
         (self.inner.mode() >> 12) & 7
     }
-    pub fn last_render_full(&self) -> bool {
-        self.last_render.full
-    }
-    pub fn last_render_scroll_rows(&self) -> i32 {
-        self.last_render.scroll_delta_rows
-    }
-    pub fn last_render_damage_row_start(&self) -> i32 {
-        self.last_render.min_row
-    }
-    pub fn last_render_damage_row_end(&self) -> i32 {
-        self.last_render.max_row
-    }
-    pub fn last_render_damage_col_start(&self) -> i32 {
-        self.last_render.min_col
-    }
-    pub fn last_render_damage_col_end(&self) -> i32 {
-        self.last_render.max_col
-    }
 
     pub fn feed_compressed(&mut self, data: &[u8]) {
         let _ = self.inner.feed_compressed(data);
@@ -687,11 +585,6 @@ impl Terminal {
     }
 
     pub fn prepare_render_ops(&mut self) {
-        self.prepare_render_ops_inner();
-    }
-
-    pub fn prepare_full_render_ops(&mut self) {
-        self.inner.mark_all_dirty();
         self.prepare_render_ops_inner();
     }
 
@@ -880,11 +773,6 @@ impl Terminal {
 }
 
 impl Terminal {
-    fn cooked_mode(&self) -> bool {
-        let mode = self.inner.mode();
-        mode & MODE_ECHO != 0 && mode & MODE_ICANON != 0 && mode & MODE_ALT_SCREEN == 0
-    }
-
     fn push_bg_op(&mut self, row: usize, col: usize, col_span: usize, packed: u32) {
         if self.bg_ops.len() >= BG_OP_STRIDE {
             let last = self.bg_ops.len() - BG_OP_STRIDE;
@@ -915,92 +803,30 @@ impl Terminal {
     }
 
     fn prepare_render_ops_inner(&mut self) {
-        self.prepare_render_ops_attempt(false, 0);
-    }
-
-    fn prepare_render_ops_attempt(&mut self, force_all: bool, _retries: u32) {
         let cw = self.cell_width;
         let ch = self.cell_height;
         let rows = self.inner.rows() as usize;
         let cols = self.inner.cols() as usize;
         let total = rows * cols;
         let normal_font = format!("{}px {}", ch.round().max(1.0) as u32, self.font_family);
-        let black = self.palette.default_bg_packed();
 
         self.bg_ops.clear();
         self.glyph_ops.clear();
         self.overflow_text_ops.clear();
-        self.last_render.reset();
 
-        let do_all = force_all
-            || self.inner.all_dirty()
-            || self.painted_rows != self.inner.rows()
-            || self.painted_cols != self.inner.cols()
-            || self.painted_cells.len() != self.inner.cells().len();
-        if do_all {
-            self.inner.clear_all_dirty();
-            self.last_render.full = true;
-        } else if ENABLE_SCROLL_COPY && self.cooked_mode() {
-            if let Some(scroll_copy) = self.detect_scroll_copy(cols, rows) {
-                self.last_render.scroll_delta_rows = scroll_copy.delta_rows;
-                for (row, matched) in scroll_copy.matched_rows.iter().enumerate() {
-                    let row_start = row * cols;
-                    if *matched {
-                        self.inner.dirty_flags_mut()[row_start..row_start + cols].fill(false);
-                    } else {
-                        self.inner.dirty_flags_mut()[row_start..row_start + cols].fill(true);
-                    }
-                }
-            }
-        }
-
-        if !do_all {
-            let old_idx =
-                self.painted_cursor_row as usize * cols + self.painted_cursor_col as usize;
-            if old_idx < total {
-                self.inner.dirty_flags_mut()[old_idx] = true;
-            }
-            let new_idx =
-                self.inner.cursor_row() as usize * cols + self.inner.cursor_col() as usize;
-            if new_idx < total {
-                self.inner.dirty_flags_mut()[new_idx] = true;
-            }
-        }
-
-        // When a continuation cell is dirty, also mark its primary wide cell
-        // dirty so the glyph is repainted across both cells.  Without this,
-        // the continuation's bg fill erases the right half of the emoji.
-        if !do_all {
-            for i in 1..total {
-                if !self.inner.dirty_flags()[i] {
-                    continue;
-                }
-                let f1 = self.inner.cells()[i * CELL_SIZE + 1];
-                if f1 & 4 != 0 {
-                    // This is a wide continuation — dirty the primary cell.
-                    self.inner.dirty_flags_mut()[i - 1] = true;
-                }
-            }
-        }
-
-        // ── Pre-scan: collect unique glyph keys and size the atlas ───────
         self.glyph_atlas.ensure_metrics(cw, ch);
         let cells = self.inner.cells();
-        let dirty = self.inner.dirty_flags();
         let mut needed_keys: HashMap<GlyphKey, ()> = HashMap::new();
         for i in 0..total {
-            if !do_all && !dirty[i] {
-                continue;
-            }
             let idx = i * CELL_SIZE;
             let f0 = cells[idx];
             let f1 = cells[idx + 1];
             if f1 & 4 != 0 {
-                continue; // wide continuation
+                continue;
             }
             let content_len = ((f1 >> 3) & 7) as usize;
             if content_len == 0 || content_len == 7 {
-                continue; // empty or overflow
+                continue;
             }
             let content_bytes = &cells[idx + 8..idx + 8 + content_len];
             if content_bytes == b" " {
@@ -1019,23 +845,20 @@ impl Terminal {
         let total_unique = self.glyph_atlas.slots.len() + needed_keys.len();
         self.glyph_atlas.ensure_capacity(total_unique);
 
-        // ── Main pass: generate bg + glyph ops ──────────────────────────
-        let mut i = 0usize;
-        while i < total {
-            if !do_all && !self.inner.dirty_flags()[i] {
-                i += 1;
-                continue;
-            }
-
+        for i in 0..total {
             let row = i / cols;
             let col = i % cols;
             let idx = i * CELL_SIZE;
-            self.inner.dirty_flags_mut()[i] = false;
 
             let mut cell = [0u8; CELL_SIZE];
             cell.copy_from_slice(&self.inner.cells()[idx..idx + CELL_SIZE]);
             let f0 = cell[0];
             let f1 = cell[1];
+
+            if f1 & 4 != 0 {
+                continue;
+            }
+
             let fg_type = f0 & 3;
             let bg_type = (f0 >> 2) & 3;
             let bold = f0 & (1 << 4) != 0;
@@ -1050,7 +873,7 @@ impl Terminal {
                     self.palette.resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
                     {
                         let mut c = self.palette.resolve(fg_type, cell[2], cell[3], cell[4], true, false);
-                        c.is_default = false; // inverted bg must always be drawn
+                        c.is_default = false;
                         c
                     },
                 )
@@ -1062,19 +885,7 @@ impl Terminal {
             };
             let cell_cols = if wide { 2 } else { 1 };
 
-            if f1 & 4 != 0 {
-                self.last_render.note_rect(row, col, 1, 1);
-                i += 1;
-                continue;
-            }
-
-            let bg_black = bg.is_default;
-            self.last_render.note_rect(row, col, 1, cell_cols);
-
-            if !do_all && bg_black {
-                self.push_bg_op(row, col, cell_cols, black);
-            }
-            if !bg_black {
+            if !bg.is_default {
                 self.push_bg_op(row, col, cell_cols, bg.pack());
             }
 
@@ -1101,97 +912,7 @@ impl Terminal {
                     }
                 }
             }
-            i += 1;
         }
-
-        self.sync_painted_frame();
-    }
-
-    fn sync_painted_frame(&mut self) {
-        self.painted_rows = self.inner.rows();
-        self.painted_cols = self.inner.cols();
-        self.painted_cursor_row = self.inner.cursor_row();
-        self.painted_cursor_col = self.inner.cursor_col();
-        self.painted_cells.clear();
-        self.painted_cells.extend_from_slice(self.inner.cells());
-    }
-
-    fn detect_scroll_copy(&self, cols: usize, rows: usize) -> Option<ScrollCopy> {
-        if rows < 3
-            || cols == 0
-            || self.painted_rows != self.inner.rows()
-            || self.painted_cols != self.inner.cols()
-            || self.painted_cells.len() != self.inner.cells().len()
-        {
-            return None;
-        }
-
-        let dirty_rows: Vec<bool> = (0..rows)
-            .map(|row| {
-                let row_start = row * cols;
-                self.inner.dirty_flags()[row_start..row_start + cols]
-                    .iter()
-                    .any(|dirty| *dirty)
-            })
-            .collect();
-        let dirty_row_count = dirty_rows.iter().filter(|dirty| **dirty).count();
-        if dirty_row_count * 2 < rows {
-            return None;
-        }
-
-        let row_bytes = cols * CELL_SIZE;
-        let current = self.inner.cells();
-        let previous = &self.painted_cells;
-        let max_delta = rows.saturating_sub(1).min(6);
-        let mut best: Option<(usize, i32, Vec<bool>)> = None;
-
-        for delta in 1..=max_delta {
-            let overlap = rows - delta;
-            if overlap < 3 {
-                continue;
-            }
-            for signed_delta in [-(delta as i32), delta as i32] {
-                let mut matched_rows = vec![false; rows];
-                let mut matched = 0usize;
-                let mut matched_dirty = 0usize;
-                for row in 0..rows {
-                    let src_row = row as i32 - signed_delta;
-                    if src_row < 0 || src_row >= rows as i32 {
-                        continue;
-                    }
-                    let cur_start = row * row_bytes;
-                    let prev_start = src_row as usize * row_bytes;
-                    if current[cur_start..cur_start + row_bytes]
-                        == previous[prev_start..prev_start + row_bytes]
-                    {
-                        matched_rows[row] = true;
-                        matched += 1;
-                        if dirty_rows[row] {
-                            matched_dirty += 1;
-                        }
-                    }
-                }
-                if matched * 5 < overlap * 4 || matched_dirty * 5 < dirty_row_count * 4 {
-                    continue;
-                }
-                let replace = match &best {
-                    None => true,
-                    Some((best_matched, best_delta, _)) => {
-                        matched > *best_matched
-                            || (matched == *best_matched
-                                && signed_delta.unsigned_abs() < best_delta.unsigned_abs())
-                    }
-                };
-                if replace {
-                    best = Some((matched, signed_delta, matched_rows));
-                }
-            }
-        }
-
-        best.map(|(_, delta_rows, matched_rows)| ScrollCopy {
-            delta_rows,
-            matched_rows,
-        })
     }
 
 }

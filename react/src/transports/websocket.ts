@@ -1,4 +1,4 @@
-import type { BlitTransport, ConnectionStatus } from '../types';
+import type { BlitTransport, ConnectionStatus } from "../types";
 
 export interface WebSocketTransportOptions {
   /** Enable automatic reconnection on disconnect. Default: true. */
@@ -13,7 +13,7 @@ export interface WebSocketTransportOptions {
 
 export class WebSocketTransport implements BlitTransport {
   private ws: WebSocket | null = null;
-  private _status: ConnectionStatus = 'disconnected';
+  private _status: ConnectionStatus = "disconnected";
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private currentDelay: number;
   private disposed = false;
@@ -27,7 +27,11 @@ export class WebSocketTransport implements BlitTransport {
   private readonly maxDelay: number;
   private readonly backoff: number;
 
-  constructor(url: string, passphrase: string, options?: WebSocketTransportOptions) {
+  constructor(
+    url: string,
+    passphrase: string,
+    options?: WebSocketTransportOptions,
+  ) {
     this.url = url;
     this.passphrase = passphrase;
     this._reconnect = options?.reconnect ?? true;
@@ -59,26 +63,43 @@ export class WebSocketTransport implements BlitTransport {
       this.ws.close();
       this.ws = null;
     }
-    this.setStatus('disconnected');
+    this.setStatus("disconnected");
   }
 
-  addEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
-  addEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
+  addEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
   addEventListener(type: string, listener: (...args: never[]) => void): void {
-    if (type === 'message') {
+    if (type === "message") {
       this.messageListeners.add(listener as (data: ArrayBuffer) => void);
-    } else if (type === 'statuschange') {
+    } else if (type === "statuschange") {
       this.statusListeners.add(listener as (status: ConnectionStatus) => void);
     }
   }
 
-  removeEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
-  removeEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
-  removeEventListener(type: string, listener: (...args: never[]) => void): void {
-    if (type === 'message') {
+  removeEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  removeEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
+  removeEventListener(
+    type: string,
+    listener: (...args: never[]) => void,
+  ): void {
+    if (type === "message") {
       this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
-    } else if (type === 'statuschange') {
-      this.statusListeners.delete(listener as (status: ConnectionStatus) => void);
+    } else if (type === "statuschange") {
+      this.statusListeners.delete(
+        listener as (status: ConnectionStatus) => void,
+      );
     }
   }
 
@@ -104,15 +125,18 @@ export class WebSocketTransport implements BlitTransport {
         this.connect();
       }
     }, this.currentDelay);
-    this.currentDelay = Math.min(this.currentDelay * this.backoff, this.maxDelay);
+    this.currentDelay = Math.min(
+      this.currentDelay * this.backoff,
+      this.maxDelay,
+    );
   }
 
   private connect(): void {
     if (this.disposed) return;
-    this.setStatus('connecting');
+    this.setStatus("connecting");
 
     const socket = new WebSocket(this.url);
-    socket.binaryType = 'arraybuffer';
+    socket.binaryType = "arraybuffer";
 
     if (this.ws && this.ws !== socket) {
       try {
@@ -128,20 +152,20 @@ export class WebSocketTransport implements BlitTransport {
 
     socket.onopen = () => {
       if (this.ws !== socket || this.disposed) return;
-      this.setStatus('authenticating');
+      this.setStatus("authenticating");
       socket.send(this.passphrase);
     };
 
     socket.onmessage = (e: MessageEvent) => {
       if (this.ws !== socket || this.disposed) return;
 
-      if (typeof e.data === 'string') {
-        if (e.data === 'ok') {
+      if (typeof e.data === "string") {
+        if (e.data === "ok") {
           authenticated = true;
           this.currentDelay = this.initialDelay;
-          this.setStatus('connected');
+          this.setStatus("connected");
         } else {
-          this.setStatus('error');
+          this.setStatus("error");
           socket.close();
         }
         return;
@@ -155,17 +179,18 @@ export class WebSocketTransport implements BlitTransport {
     socket.onerror = () => {
       if (this.ws !== socket || this.disposed) return;
       if (!authenticated) {
-        this.setStatus('error');
+        this.setStatus("error");
       }
     };
 
     socket.onclose = () => {
       if (this.ws !== socket || this.disposed) return;
       this.ws = null;
-      const wasConnected = authenticated;
-      this.setStatus('disconnected');
-      if (wasConnected) {
+      if (authenticated) {
+        this.setStatus("disconnected");
         this.scheduleReconnect();
+      } else {
+        this.setStatus("error");
       }
     };
   }

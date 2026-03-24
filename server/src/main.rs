@@ -1,8 +1,9 @@
 use blit_remote::{
     build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
-    C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE, C2S_SCROLL,
-    C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED,
-    S2C_CREATED_N, S2C_LIST, S2C_SEARCH_RESULTS, S2C_TITLE,
+    C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE,
+    C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, CREATE2_HAS_COMMAND,
+    CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_SEARCH_RESULTS, S2C_TITLE,
 };
 use blit_wezterm::{SearchResult as WeztermSearchResult, TerminalDriver as WeztermDriver};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -831,6 +832,11 @@ impl Session {
                 ws_ypixel: 0,
             };
             libc::ioctl(pty.master_fd, libc::TIOCSWINSZ, &ws);
+            let mut fg_pgid: libc::pid_t = 0;
+            libc::ioctl(pty.master_fd, libc::TIOCGPGRP, &mut fg_pgid);
+            if fg_pgid > 0 {
+                libc::kill(-fg_pgid, libc::SIGWINCH);
+            }
             libc::kill(-pty.child_pid, libc::SIGWINCH);
         }
     }
@@ -948,17 +954,17 @@ fn spawn_pty(
                 libc::close(slave);
             }
         }
-        let effective_dir = dir
-            .map(String::from)
-            .or_else(|| std::env::var("HOME").ok());
+        let effective_dir = dir.map(String::from);
         if let Some(d) = effective_dir {
             if let Ok(dir_c) = CString::new(d) {
                 unsafe { libc::chdir(dir_c.as_ptr()); }
             }
         }
         std::env::set_var("TERM", "xterm-256color");
-        std::env::set_var("COLUMNS", &cols.to_string());
-        std::env::set_var("LINES", &rows.to_string());
+        // Don't set COLUMNS/LINES — ncurses apps prioritize these over
+        // TIOCGWINSZ and won't resize properly if they're set to stale values.
+        std::env::remove_var("COLUMNS");
+        std::env::remove_var("LINES");
         if let Some(command) = command {
             let shell_c = CString::new(shell).unwrap();
             let exec_flag = CString::new("-lc").unwrap();
@@ -2174,6 +2180,73 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         reset_inflight(c);
                     }
                     sess.send_to_all(&msg);
+                    need_nudge = true;
+                }
+            }
+            C2S_CREATE2 => {
+                // Generic create: [0x18][nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][...fields]
+                if data.len() < 10 { break; }
+                let nonce = u16::from_le_bytes([data[1], data[2]]);
+                let rows = u16::from_le_bytes([data[3], data[4]]);
+                let cols = u16::from_le_bytes([data[5], data[6]]);
+                let features = data[7];
+                let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
+                let tag = if data.len() >= 10 + tag_len {
+                    std::str::from_utf8(&data[10..10 + tag_len]).unwrap_or_default()
+                } else {
+                    ""
+                };
+                let mut cursor = 10 + tag_len;
+                let dir = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
+                    let src_id = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
+                    cursor += 2;
+                    sess.ptys.get(&src_id).and_then(|p| pty_cwd(p.child_pid))
+                } else {
+                    None
+                };
+                let create_payload = if features & CREATE2_HAS_COMMAND != 0 {
+                    data.get(cursor..).and_then(|b| std::str::from_utf8(b).ok())
+                } else {
+                    None
+                };
+                let command = create_payload
+                    .filter(|p| !p.contains('\0'))
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty());
+                let argv: Option<Vec<&str>> = create_payload
+                    .filter(|p| p.contains('\0'))
+                    .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
+                    .filter(|a| !a.is_empty());
+                let id = sess.next_pty_id;
+                sess.next_pty_id += 1;
+                if let Some(pty) = spawn_pty(
+                    &config.shell, rows, cols, id, tag, command, argv.as_deref(),
+                    dir.as_deref(), config.scrollback, state.clone(),
+                ) {
+                    let tag_bytes = pty.tag.as_bytes();
+                    let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
+                    nonce_msg.push(S2C_CREATED_N);
+                    nonce_msg.extend_from_slice(&nonce.to_le_bytes());
+                    nonce_msg.extend_from_slice(&id.to_le_bytes());
+                    nonce_msg.extend_from_slice(tag_bytes);
+                    let mut broadcast_msg = Vec::with_capacity(3 + tag_bytes.len());
+                    broadcast_msg.push(S2C_CREATED);
+                    broadcast_msg.extend_from_slice(&id.to_le_bytes());
+                    broadcast_msg.extend_from_slice(tag_bytes);
+                    sess.ptys.insert(id, pty);
+                    if let Some(c) = sess.clients.get_mut(&client_id) {
+                        c.lead = Some(id);
+                        subscribe_client_to(c, id);
+                        c.scroll_offset = 0;
+                        c.scroll_cache = FrameState::default();
+                        reset_inflight(c);
+                        let _ = c.tx.try_send(nonce_msg);
+                    }
+                    for (&cid, c) in sess.clients.iter() {
+                        if cid != client_id {
+                            let _ = c.tx.try_send(broadcast_msg.clone());
+                        }
+                    }
                     need_nudge = true;
                 }
             }

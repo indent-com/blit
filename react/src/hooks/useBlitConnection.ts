@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
-import type { BlitTransport, ConnectionStatus } from '../types';
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import type { BlitTransport, ConnectionStatus } from "../types";
 import {
   S2C_UPDATE,
   S2C_CREATED,
@@ -12,14 +12,16 @@ import {
   C2S_ACK,
   C2S_SUBSCRIBE,
   C2S_UNSUBSCRIBE,
-  C2S_CREATE,
-  C2S_CREATE_N,
+  C2S_CREATE2,
+  CREATE2_HAS_SRC_PTY,
+  CREATE2_HAS_COMMAND,
   C2S_CLOSE,
   C2S_FOCUS,
   C2S_RESIZE,
   C2S_INPUT,
   C2S_SCROLL,
-} from '../types';
+  C2S_SEARCH,
+} from "../types";
 
 const textDecoder = new TextDecoder();
 
@@ -36,11 +38,20 @@ export interface PtyListEntry {
   tag: string;
 }
 
+export const SEARCH_SOURCE_TITLE = 0;
+export const SEARCH_SOURCE_VISIBLE = 1;
+export const SEARCH_SOURCE_SCROLLBACK = 2;
+export const SEARCH_MATCH_TITLE = 1 << 0;
+export const SEARCH_MATCH_VISIBLE = 1 << 1;
+export const SEARCH_MATCH_SCROLLBACK = 1 << 2;
+
 export interface SearchResult {
   ptyId: number;
-  line: number;
-  col: number;
-  text: string;
+  score: number;
+  primarySource: number;
+  matchedSources: number;
+  scrollOffset: number | null;
+  context: string;
 }
 
 export interface BlitConnectionCallbacks {
@@ -50,7 +61,7 @@ export interface BlitConnectionCallbacks {
   onClosed?: (ptyId: number) => void;
   onList?: (entries: PtyListEntry[]) => void;
   onTitle?: (ptyId: number, title: string) => void;
-  onSearchResults?: (results: SearchResult[]) => void;
+  onSearchResults?: (requestId: number, results: SearchResult[]) => void;
   onHello?: (version: number, features: number) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
 }
@@ -136,22 +147,43 @@ export function useBlitConnection(
           break;
         }
         case S2C_SEARCH_RESULTS: {
-          if (bytes.length < 3) break;
-          const count = bytes[1] | (bytes[2] << 8);
+          if (bytes.length < 5) break;
+          const requestId = bytes[1] | (bytes[2] << 8);
+          const count = bytes[3] | (bytes[4] << 8);
           const results: SearchResult[] = [];
-          let off = 3;
+          let off = 5;
           for (let i = 0; i < count; i++) {
-            if (off + 8 > bytes.length) break;
+            if (off + 14 > bytes.length) break;
             const ptyId = bytes[off] | (bytes[off + 1] << 8);
-            const line = bytes[off + 2] | (bytes[off + 3] << 8);
-            const col = bytes[off + 4] | (bytes[off + 5] << 8);
-            const textLen = bytes[off + 6] | (bytes[off + 7] << 8);
-            off += 8;
-            const text = textDecoder.decode(bytes.subarray(off, off + textLen));
-            off += textLen;
-            results.push({ ptyId, line, col, text });
+            const score =
+              bytes[off + 2] |
+              (bytes[off + 3] << 8) |
+              (bytes[off + 4] << 16) |
+              ((bytes[off + 5] << 24) >>> 0);
+            const primarySource = bytes[off + 6];
+            const matchedSources = bytes[off + 7];
+            const rawScroll =
+              (bytes[off + 8] |
+              (bytes[off + 9] << 8) |
+              (bytes[off + 10] << 16) |
+              (bytes[off + 11] << 24)) >>> 0;
+            const scrollOffset = rawScroll === 0xffffffff ? null : rawScroll;
+            const contextLen = bytes[off + 12] | (bytes[off + 13] << 8);
+            off += 14;
+            const context = textDecoder.decode(
+              bytes.subarray(off, off + contextLen),
+            );
+            off += contextLen;
+            results.push({
+              ptyId,
+              score,
+              primarySource,
+              matchedSources,
+              scrollOffset,
+              context,
+            });
           }
-          callbacksRef.current.onSearchResults?.(results);
+          callbacksRef.current.onSearchResults?.(requestId, results);
           break;
         }
         case S2C_HELLO: {
@@ -171,8 +203,8 @@ export function useBlitConnection(
       callbacksRef.current.onStatusChange?.(newStatus);
     };
 
-    transport.addEventListener('message', onMessage);
-    transport.addEventListener('statuschange', onStatus);
+    transport.addEventListener("message", onMessage);
+    transport.addEventListener("statuschange", onStatus);
 
     if (statusRef.current !== transport.status) {
       statusRef.current = transport.status;
@@ -180,8 +212,8 @@ export function useBlitConnection(
     }
 
     return () => {
-      transport.removeEventListener('message', onMessage);
-      transport.removeEventListener('statuschange', onStatus);
+      transport.removeEventListener("message", onMessage);
+      transport.removeEventListener("statuschange", onStatus);
     };
   }, [transport]);
 
@@ -233,47 +265,45 @@ export function useBlitConnection(
     [transport],
   );
 
-  const sendCreate = useCallback(
-    (rows: number, cols: number, options?: { tag?: string; command?: string }) => {
+  const sendCreate2 = useCallback(
+    (
+      nonce: number,
+      rows: number,
+      cols: number,
+      options?: { tag?: string; command?: string; srcPtyId?: number },
+    ) => {
       const encoder = new TextEncoder();
-      const tagBytes = options?.tag ? encoder.encode(options.tag) : new Uint8Array(0);
-      const commandBytes = options?.command?.trim()
-        ? encoder.encode(options.command.trim())
-        : null;
-      const msg = new Uint8Array(7 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
-      msg[0] = C2S_CREATE;
-      msg[1] = rows & 0xff;
-      msg[2] = (rows >> 8) & 0xff;
-      msg[3] = cols & 0xff;
-      msg[4] = (cols >> 8) & 0xff;
-      msg[5] = tagBytes.length & 0xff;
-      msg[6] = (tagBytes.length >> 8) & 0xff;
-      if (tagBytes.length) msg.set(tagBytes, 7);
-      if (commandBytes) msg.set(commandBytes, 7 + tagBytes.length);
-      transport.send(msg);
-    },
-    [transport],
-  );
-
-  const sendCreateN = useCallback(
-    (nonce: number, rows: number, cols: number, options?: { tag?: string; command?: string }) => {
-      const encoder = new TextEncoder();
-      const tagBytes = options?.tag ? encoder.encode(options.tag) : new Uint8Array(0);
-      const commandBytes = options?.command?.trim()
-        ? encoder.encode(options.command.trim())
-        : null;
-      const msg = new Uint8Array(9 + tagBytes.length + (commandBytes ? commandBytes.length : 0));
-      msg[0] = C2S_CREATE_N;
+      const tagBytes = options?.tag
+        ? encoder.encode(options.tag)
+        : new Uint8Array(0);
+      let features = 0;
+      const hasSrc = options?.srcPtyId != null;
+      const cmdText = options?.command?.trim() ?? "";
+      const hasCmd = cmdText.length > 0;
+      if (hasSrc) features |= CREATE2_HAS_SRC_PTY;
+      if (hasCmd) features |= CREATE2_HAS_COMMAND;
+      const cmdBytes = hasCmd ? encoder.encode(cmdText) : new Uint8Array(0);
+      const msg = new Uint8Array(
+        10 + tagBytes.length + (hasSrc ? 2 : 0) + cmdBytes.length,
+      );
+      msg[0] = C2S_CREATE2;
       msg[1] = nonce & 0xff;
       msg[2] = (nonce >> 8) & 0xff;
       msg[3] = rows & 0xff;
       msg[4] = (rows >> 8) & 0xff;
       msg[5] = cols & 0xff;
       msg[6] = (cols >> 8) & 0xff;
-      msg[7] = tagBytes.length & 0xff;
-      msg[8] = (tagBytes.length >> 8) & 0xff;
-      if (tagBytes.length) msg.set(tagBytes, 9);
-      if (commandBytes) msg.set(commandBytes, 9 + tagBytes.length);
+      msg[7] = features;
+      msg[8] = tagBytes.length & 0xff;
+      msg[9] = (tagBytes.length >> 8) & 0xff;
+      let cursor = 10;
+      if (tagBytes.length) { msg.set(tagBytes, cursor); cursor += tagBytes.length; }
+      if (hasSrc) {
+        msg[cursor] = options!.srcPtyId! & 0xff;
+        msg[cursor + 1] = (options!.srcPtyId! >> 8) & 0xff;
+        cursor += 2;
+      }
+      if (cmdBytes.length) msg.set(cmdBytes, cursor);
       transport.send(msg);
     },
     [transport],
@@ -323,17 +353,31 @@ export function useBlitConnection(
     [transport],
   );
 
+  const sendSearch = useCallback(
+    (requestId: number, query: string) => {
+      const encoder = new TextEncoder();
+      const queryBytes = encoder.encode(query);
+      const msg = new Uint8Array(3 + queryBytes.length);
+      msg[0] = C2S_SEARCH;
+      msg[1] = requestId & 0xff;
+      msg[2] = (requestId >> 8) & 0xff;
+      msg.set(queryBytes, 3);
+      transport.send(msg);
+    },
+    [transport],
+  );
+
   return {
     status,
     sendAck,
     sendInput,
     sendResize,
     sendScroll,
-    sendCreate,
-    sendCreateN,
+    sendCreate2,
     sendFocus,
     sendClose,
     sendSubscribe,
     sendUnsubscribe,
+    sendSearch,
   };
 }

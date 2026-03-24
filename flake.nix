@@ -479,7 +479,7 @@ PKGJSON
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-cli" ];
           cargoLock = cargoLockConfig;
-          preBuild = copyWebAssets;
+          preBuild = copyWebAppDist;
           postInstall = installManPages;
           doCheck = false;
           meta.mainProgram = "blit";
@@ -491,11 +491,7 @@ PKGJSON
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-gateway" ];
           cargoLock = cargoLockConfig;
-          preBuild = ''
-            mkdir -p web
-            cp ${browserWasm}/blit_browser_bg.wasm web/
-            cp ${browserWasm}/blit_browser.js web/
-          '';
+          preBuild = copyWebAppDist;
           postInstall = installManPages;
           doCheck = false;
         };
@@ -537,35 +533,55 @@ PKGJSON
           cargoPkg = "blit-server";
         };
 
-        copyWebAssets = ''
-          mkdir -p web/snippets
-          cp ${browserWasm}/blit_browser.js web/
-          cp ${browserWasm}/blit_browser_bg.wasm web/
-          cp ${browserWasm}/blit_browser.d.ts web/
-          cp ${browserWasm}/blit_browser_bg.wasm.d.ts web/
-          for d in ${browserWasm}/snippets/blit-browser-*/; do
-            name=$(basename "$d")
-            mkdir -p "web/snippets/$name"
-            cp "$d"/* "web/snippets/$name/"
-          done
+        webAppDist = pkgs.stdenv.mkDerivation {
+          pname = "blit-web-app";
+          inherit version;
+          src = ./.;
+          nativeBuildInputs = [ pkgs.nodejs ];
+          buildPhase = ''
+            export HOME=$TMPDIR
+
+            # Set up browser/pkg with WASM assets
+            mkdir -p browser/pkg/snippets
+            cp ${browserWasm}/blit_browser.js browser/pkg/
+            cp ${browserWasm}/blit_browser_bg.wasm browser/pkg/
+            cp ${browserWasm}/blit_browser.d.ts browser/pkg/
+            cp ${browserWasm}/blit_browser_bg.wasm.d.ts browser/pkg/
+            echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > browser/pkg/package.json
+            for d in ${browserWasm}/snippets/blit-browser-*/; do
+              name=$(basename "$d")
+              mkdir -p "browser/pkg/snippets/$name"
+              cp "$d"/* "browser/pkg/snippets/$name/"
+            done
+
+            # Build react package
+            (cd react && npm install && npm run build)
+
+            # Build web-app
+            (cd web-app && npm install && npx vite build)
+          '';
+          installPhase = ''
+            mkdir -p $out
+            cp web-app/dist/index.html $out/
+          '';
+          doCheck = false;
+        };
+
+        copyWebAppDist = ''
+          mkdir -p web-app/dist
+          cp ${webAppDist}/index.html web-app/dist/
         '';
 
         blit-cli-static = mkStaticBin {
           pname = "blit-cli";
           cargoPkg = "blit-cli";
-          extraArgs = { preBuild = copyWebAssets; };
+          extraArgs = { preBuild = copyWebAppDist; };
         };
 
         blit-gateway-static = mkStaticBin {
           pname = "blit-gateway";
           cargoPkg = "blit-gateway";
-          extraArgs = {
-            preBuild = ''
-              mkdir -p web
-              cp ${browserWasm}/blit_browser_bg.wasm web/
-              cp ${browserWasm}/blit_browser.js web/
-            '';
-          };
+          extraArgs = { preBuild = copyWebAppDist; };
         };
 
 
@@ -648,12 +664,9 @@ CTRL
           name = "blit-tests";
           runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm ];
           text = ''
-            echo "=== Copying WASM assets for blit-cli include_bytes! ==="
-            mkdir -p web/snippets
-            cp -n ${browserWasm}/blit_browser.js web/ 2>/dev/null || true
-            cp -n ${browserWasm}/blit_browser_bg.wasm web/ 2>/dev/null || true
-            cp -n ${browserWasm}/blit_browser.d.ts web/ 2>/dev/null || true
-            cp -n ${browserWasm}/blit_browser_bg.wasm.d.ts web/ 2>/dev/null || true
+            echo "=== Setting up web-app dist ==="
+            mkdir -p web-app/dist
+            cp ${webAppDist}/index.html web-app/dist/
 
             echo "=== Rust tests ==="
             cargo test --workspace

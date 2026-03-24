@@ -1,109 +1,120 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from "@playwright/test";
 
-/** Helper: authenticate and wait for workspace to be visible */
-async function authenticate(page: import('@playwright/test').Page) {
-  await page.goto('/');
+async function authenticate(page: import("@playwright/test").Page) {
+  await page.goto("/");
   await page.evaluate(() => localStorage.clear());
-  await page.goto('/');
-  const passInput = page.locator('#pass');
+  await page.goto("/");
+  const passInput = page.locator('input[type="password"]');
   await expect(passInput).toBeVisible();
-  await passInput.fill('test-secret');
-  await passInput.press('Enter');
-  await expect(page.locator('#workspace')).toBeVisible({ timeout: 10_000 });
+  await passInput.fill("test-secret");
+  await passInput.press("Enter");
+  await expect(page.locator("canvas").first()).toBeVisible({ timeout: 10_000 });
 }
 
-test.describe('Terminal', () => {
-  test('after auth, terminal canvas is visible with non-zero dimensions', async ({ page }) => {
+test.describe("Terminal", () => {
+  test("after auth, terminal canvas is visible with non-zero dimensions", async ({
+    page,
+  }) => {
     await authenticate(page);
 
-    const canvas = page.locator('#term');
+    const canvas = page.locator("canvas").first();
     await expect(canvas).toBeVisible({ timeout: 10_000 });
 
-    // Canvas should have non-zero dimensions (terminal is rendering)
     const box = await canvas.boundingBox();
     expect(box).not.toBeNull();
     expect(box!.width).toBeGreaterThan(0);
     expect(box!.height).toBeGreaterThan(0);
   });
 
-  test('can type in terminal and see output', async ({ page }) => {
+  test("can type in terminal and see output", async ({ page }) => {
     await authenticate(page);
 
-    // Wait for terminal to be ready
-    await page.locator('#term').waitFor({ state: 'visible', timeout: 10_000 });
-
-    // Give the terminal a moment to fully initialize
+    await page.locator("canvas").first().waitFor({ state: "visible", timeout: 10_000 });
     await page.waitForTimeout(1000);
 
-    // Focus the input sink (how the terminal receives keyboard input)
-    const inputSink = page.locator('#input-sink');
+    const inputSink = page.locator('textarea[aria-label="Terminal input"]');
     await inputSink.focus();
 
-    // Type a command
-    await page.keyboard.type('echo hello-e2e-test', { delay: 50 });
-    await page.keyboard.press('Enter');
+    await page.keyboard.type("echo hello-e2e-test", { delay: 50 });
+    await page.keyboard.press("Enter");
 
-    // Wait a bit for the command to execute and render
     await page.waitForTimeout(2000);
 
-    // We can't read canvas text directly, but we can verify the terminal
-    // is still rendering (canvas dimensions still valid) and check that
-    // the input sink is functional
-    const canvas = page.locator('#term');
+    const canvas = page.locator("canvas").first();
     const box = await canvas.boundingBox();
     expect(box).not.toBeNull();
     expect(box!.width).toBeGreaterThan(0);
     expect(box!.height).toBeGreaterThan(0);
   });
 
-  test('Expose opens on Ctrl+K and shows PTY list', async ({ page }) => {
+  test("Expose opens on Ctrl+K and shows search and PTY list", async ({ page }) => {
     await authenticate(page);
-    await page.locator('#term').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator("canvas").first().waitFor({ state: "visible", timeout: 10_000 });
     await page.waitForTimeout(500);
 
-    // Open Expose with Ctrl+K
-    await page.keyboard.press('Control+k');
+    await page.keyboard.press("Control+k");
 
-    const previewRail = page.locator('#preview-rail');
-    await expect(previewRail).toHaveClass(/visible/, { timeout: 5_000 });
+    const dialog = page.locator("dialog[open]");
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
 
-    // The expose search input should be visible
-    const exposeSearch = page.locator('#expose-search');
+    const exposeSearch = dialog.locator('input[type="text"]');
     await expect(exposeSearch).toBeVisible();
 
-    // The create button should be visible
-    const createBtn = page.locator('#expose-create');
+    const createBtn = dialog.locator("li").last();
     await expect(createBtn).toBeVisible();
   });
 
-  test('can create a new PTY from Expose', async ({ page }) => {
+  test("can create a new PTY from Expose", async ({ page }) => {
     await authenticate(page);
-    await page.locator('#term').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator("canvas").first().waitFor({ state: "visible", timeout: 10_000 });
     await page.waitForTimeout(500);
 
-    // Open Expose
-    await page.keyboard.press('Control+k');
-    const previewRail = page.locator('#preview-rail');
-    await expect(previewRail).toHaveClass(/visible/, { timeout: 5_000 });
+    await page.keyboard.press("Control+k");
+    const dialog = page.locator("dialog[open]");
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
 
-    // Count existing PTY cards
-    const cardsBefore = await page.locator('.preview-card').count();
+    const itemsBefore = await dialog.locator("ul > li").count();
 
-    // Click the "+" button to create a new PTY
-    const createBtn = page.locator('#expose-create');
+    const createBtn = dialog.locator("ul > li").last();
     await createBtn.click();
 
-    // Wait for a new card to appear
     await page.waitForTimeout(2000);
 
-    // Re-open Expose to check card count (it may have auto-closed)
-    const isVisible = await previewRail.evaluate(el => el.classList.contains('visible'));
+    const isVisible = await dialog.isVisible().catch(() => false);
     if (!isVisible) {
-      await page.keyboard.press('Control+k');
-      await expect(previewRail).toHaveClass(/visible/, { timeout: 5_000 });
+      await page.keyboard.press("Control+k");
+      await expect(dialog).toBeVisible({ timeout: 5_000 });
     }
 
-    const cardsAfter = await page.locator('.preview-card').count();
-    expect(cardsAfter).toBeGreaterThan(cardsBefore);
+    const itemsAfter = await dialog.locator("ul > li").count();
+    expect(itemsAfter).toBeGreaterThan(itemsBefore);
+  });
+
+  test("Expose preview canvases render with non-zero dimensions and switching tabs works", async ({ page }) => {
+    await authenticate(page);
+    await page.locator("canvas").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.waitForTimeout(500);
+
+    await page.keyboard.press("Control+k");
+    const dialog = page.locator("dialog[open]");
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+
+    const previewCanvas = dialog.locator("canvas").first();
+    await expect(previewCanvas).toBeVisible({ timeout: 5_000 });
+    const box = await previewCanvas.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.width).toBeGreaterThan(0);
+    expect(box!.height).toBeGreaterThan(0);
+
+    const firstItem = dialog.locator("ul > li").first();
+    await firstItem.click();
+
+    await expect(dialog).not.toBeVisible({ timeout: 5_000 });
+    const mainCanvas = page.locator("canvas").first();
+    await expect(mainCanvas).toBeVisible({ timeout: 5_000 });
+    const mainBox = await mainCanvas.boundingBox();
+    expect(mainBox).not.toBeNull();
+    expect(mainBox!.width).toBeGreaterThan(0);
+    expect(mainBox!.height).toBeGreaterThan(0);
   });
 });

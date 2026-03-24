@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Terminal } from 'blit-browser';
-
-const DEFAULT_FONT = '"PragmataPro Liga", "PragmataPro", ui-monospace, monospace';
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { Terminal } from "blit-browser";
+import { DEFAULT_FONT } from "../types";
 
 export interface CellMetrics {
   /** CSS pixel width. */
@@ -19,9 +18,9 @@ export interface CellMetrics {
  * into a hidden span, then snapping to device pixel boundaries.
  */
 export function measureCell(fontFamily: string, fontSize: number): CellMetrics {
-  const span = document.createElement('span');
+  const span = document.createElement("span");
   span.style.cssText = `font: ${fontSize}px ${fontFamily}; position: absolute; visibility: hidden; white-space: pre;`;
-  span.textContent = 'M';
+  span.textContent = "M";
   document.body.appendChild(span);
   const rect = span.getBoundingClientRect();
   document.body.removeChild(span);
@@ -64,7 +63,10 @@ export function useBlitTerminal(options?: UseBlitTerminalOptions) {
     if (options?.initialCellMetrics) {
       setCell(options.initialCellMetrics);
       if (terminalRef.current) {
-        terminalRef.current.set_cell_size(options.initialCellMetrics.pw, options.initialCellMetrics.ph);
+        terminalRef.current.set_cell_size(
+          options.initialCellMetrics.pw,
+          options.initialCellMetrics.ph,
+        );
         terminalRef.current.set_font_family(fontFamily);
       }
       return;
