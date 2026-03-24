@@ -687,6 +687,9 @@ CTRL
             cargo test --workspace
             echo ""
             echo "=== React tests ==="
+            mkdir -p browser/pkg
+            echo '{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}' > browser/pkg/package.json
+            touch browser/pkg/blit_browser.js
             (cd react && pnpm install --frozen-lockfile 2>/dev/null || pnpm install && pnpm vitest run)
           '';
         };
