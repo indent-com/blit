@@ -142,6 +142,7 @@ interface GlRenderer {
     cursorBlinkOn: boolean,
     cell: CellMetrics,
     bgColor: [number, number, number],
+    full: boolean,
   ): void;
   dispose(): void;
 }
@@ -153,7 +154,7 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     depth: false,
     stencil: false,
     premultipliedAlpha: true,
-    preserveDrawingBuffer: true,
+    preserveDrawingBuffer: false,
   });
 
   if (!gl) {
@@ -423,10 +424,13 @@ function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       cursorBlinkOn: boolean,
       cell: CellMetrics,
       bgColor: [number, number, number],
+      full: boolean,
     ) {
       gl!.viewport(0, 0, canvas.width, canvas.height);
-      gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
-      gl!.clear(gl!.COLOR_BUFFER_BIT);
+      if (full) {
+        gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
+        gl!.clear(gl!.COLOR_BUFFER_BIT);
+      }
       renderRectangles(bgOps, cell);
       if (atlasCanvas) {
         renderGlyphs(glyphOps, atlasCanvas, atlasVersion, cell);
@@ -464,6 +468,14 @@ function keyToBytes(
       if (e.key === '\\') return new Uint8Array([0x1c]);
       if (e.key === ']') return new Uint8Array([0x1d]);
     }
+    // Fallback: use e.code when e.key is unhelpful (e.g. macOS Ctrl+letter)
+    if (e.code && e.code.startsWith('Key')) {
+      const cc = e.code.charCodeAt(3);
+      if (cc >= 65 && cc <= 90) return new Uint8Array([cc - 64]);
+    }
+    if (e.code === 'BracketLeft') return new Uint8Array([0x1b]);
+    if (e.code === 'Backslash') return new Uint8Array([0x1c]);
+    if (e.code === 'BracketRight') return new Uint8Array([0x1d]);
   }
 
   if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
@@ -615,6 +627,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     const rowsRef = useRef(24);
     const colsRef = useRef(80);
     const needsRenderRef = useRef(false);
+    const needsFullRenderRef = useRef(true);
     const ackAheadRef = useRef(0);
     const subscribedRef = useRef(false);
     const scrollOffsetRef = useRef(0);
@@ -700,6 +713,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         );
         terminalRef.current.set_font_family(fontFamily);
         needsRenderRef.current = true;
+        needsFullRenderRef.current = true;
       }
     }, [fontFamily, fontSize]);
 
@@ -779,6 +793,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...palette.ansi[i]);
       t.invalidate_render_cache();
       needsRenderRef.current = true;
+      needsFullRenderRef.current = true;
     }, [palette]);
 
     // -----------------------------------------------------------------------
@@ -848,6 +863,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         }
 
         needsRenderRef.current = true;
+        needsFullRenderRef.current = true;
 
         if (ptyId !== null && status === 'connected') {
           sendResize(ptyId, rows, cols);
@@ -879,9 +895,12 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           const renderer = rendererRef.current;
 
           t.prepare_render_ops();
-          if (t.last_render_scroll_rows()) {
+          let full = needsFullRenderRef.current || t.last_render_full();
+          if (!full && t.last_render_scroll_rows()) {
             t.prepare_full_render_ops();
+            full = true;
           }
+          needsFullRenderRef.current = false;
 
           const bgOps = t.background_ops();
           const glyphOps = t.glyph_ops();
@@ -900,12 +919,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             cursorBlinkOnRef.current,
             cell,
             paletteRef.current?.bg ?? [0, 0, 0],
+            full,
           );
 
           // Render overflow text (emoji / wide Unicode) via 2D overlay canvas.
+          // Only redraw on full renders — overflow text doesn't change on blink frames.
           const overflowCount = t.overflow_text_count();
           const overlay = overlayCanvasRef.current;
-          if (overlay) {
+          if (full && overlay) {
             const ctx = overlay.getContext('2d');
             if (ctx) {
               ctx.clearRect(0, 0, overlay.width, overlay.height);
@@ -1158,7 +1179,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         style={{
           position: 'relative',
           overflow: 'hidden',
-          background: '#000',
           ...style,
         }}
       >
