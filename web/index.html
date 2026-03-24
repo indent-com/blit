@@ -352,8 +352,9 @@ canvas { display: block; outline: none; }
 #input-sink {
     position: fixed; top: -9999px; left: -9999px;
     width: 1px; height: 1px; opacity: 0;
-    font: 13px var(--terminal-font); border: none; resize: none;
-    white-space: pre; overflow: hidden;
+    font: 13px var(--terminal-font); border: none;
+    white-space: pre; overflow: hidden; outline: none;
+    -webkit-user-modify: read-write-plaintext-only;
 }
 #touch-bar {
     display: none; position: fixed; bottom: env(keyboard-inset-bottom, 0px);
@@ -454,7 +455,7 @@ canvas { display: block; outline: none; }
 </div>
 </div>
 <div id="touch-bar"></div>
-<textarea id="input-sink" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" autofocus></textarea>
+<div id="input-sink" contenteditable="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" autofocus></div>
 <div id="help-overlay"><div id="help-box">
 <h2>Shortcuts</h2>
 <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> &mdash; Expose / switch PTY<br>
@@ -551,7 +552,7 @@ const surfaceScratchCanvas = document.createElement('canvas');
 const surfaceScratchCtx = surfaceScratchCanvas.getContext('2d');
 const previewCompositeCanvas = document.createElement('canvas');
 const inputSink = document.getElementById('input-sink');
-inputSink.value = ''; // Clear any browser-restored content from prior page load
+inputSink.textContent = ''; // Clear any browser-restored content from prior page load
 const colorCssCache = new Map();
 const exposeSearchEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -2319,7 +2320,7 @@ function touchLru(id) {
 
 function focusPty(id, { scrollOffsetOverride = null } = {}) {
     const previous = focusedPty;
-    if (previous === null) inputSink.value = ''; // discard any browser-restored content
+    if (previous === null) inputSink.textContent = ''; // discard any browser-restored content
     focusedPty = id;
     touchLru(id);
     scrollOffset = Number.isFinite(scrollOffsetOverride) && scrollOffsetOverride > 0
@@ -2926,22 +2927,22 @@ async function main() {
 
     inputSink.addEventListener('compositionend', (e) => {
         if (e.data && focusedPty !== null) sendKey(new TextEncoder().encode(e.data));
-        inputSink.value = '';
+        inputSink.textContent = '';
     });
 
     inputSink.addEventListener('input', (e) => {
         if (e.isComposing) {
             // Android fires deleteContentBackward with isComposing=true during IME.
-            if (e.inputType === 'deleteContentBackward' && !inputSink.value && focusedPty !== null)
+            if (e.inputType === 'deleteContentBackward' && !inputSink.textContent && focusedPty !== null)
                 sendKey(new Uint8Array([0x7f]));
             return;
         }
         // Android Enter inserts \n into the textarea instead of firing keydown Enter.
         // Android Backspace fires deleteContentBackward with an empty textarea value.
-        if (e.inputType === 'deleteContentBackward' && !inputSink.value) {
+        if (e.inputType === 'deleteContentBackward' && !inputSink.textContent) {
             if (focusedPty !== null) sendKey(new Uint8Array([0x7f]));
-        } else if (inputSink.value && focusedPty !== null) {
-            let text = inputSink.value.replace(/\n/g, '\r');
+        } else if (inputSink.textContent && focusedPty !== null) {
+            let text = inputSink.textContent.replace(/\n/g, '\r');
             if (touchCtrl || touchAlt) {
                 const enc = new TextEncoder();
                 for (const ch of text) {
@@ -2959,7 +2960,7 @@ async function main() {
                 sendKey(new TextEncoder().encode(text));
             }
         }
-        inputSink.value = '';
+        inputSink.textContent = '';
     });
 
     // Mouse: forward to PTY if mouse mode is active, otherwise do selection

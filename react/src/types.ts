@@ -40,15 +40,11 @@ export interface BlitTransport {
   /** Current connection status. */
   readonly status: ConnectionStatus;
   /** Register a listener for transport events. */
-  addEventListener<K extends keyof BlitTransportEventMap>(
-    type: K,
-    listener: (data: BlitTransportEventMap[K]) => void,
-  ): void;
+  addEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
+  addEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
   /** Remove a previously registered listener. */
-  removeEventListener<K extends keyof BlitTransportEventMap>(
-    type: K,
-    listener: (data: BlitTransportEventMap[K]) => void,
-  ): void;
+  removeEventListener(type: 'message', listener: (data: ArrayBuffer) => void): void;
+  removeEventListener(type: 'statuschange', listener: (status: ConnectionStatus) => void): void;
 }
 
 /** A tracked PTY session. */

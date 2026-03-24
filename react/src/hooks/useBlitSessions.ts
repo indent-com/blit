@@ -29,10 +29,25 @@ export interface UseBlitSessionsOptions {
   onReconnect?: () => void;
 }
 
+export interface UseBlitSessionsReturn {
+  readonly ready: boolean;
+  readonly sessions: readonly BlitSession[];
+  readonly status: ConnectionStatus;
+  readonly focusedPtyId: number | null;
+  readonly createPty: (opts?: { rows?: number; cols?: number; command?: string; tag?: string }) => Promise<number>;
+  readonly focusPty: (ptyId: number) => void;
+  readonly closePty: (ptyId: number) => Promise<void>;
+}
+
+export type UseBlitSessionsFn = (
+  transport: BlitTransport,
+  options?: UseBlitSessionsOptions,
+) => UseBlitSessionsReturn;
+
 export function useBlitSessions(
   transport: BlitTransport,
   options?: UseBlitSessionsOptions,
-) {
+): UseBlitSessionsReturn {
   const autoCreate = options?.autoCreateIfEmpty ?? false;
   const autoTag = options?.autoCreateTag;
   const autoCommand = options?.autoCreateCommand;
