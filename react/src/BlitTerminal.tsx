@@ -327,8 +327,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       if (!container || readOnly) return;
 
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-      let pendingRows = colsRef.current;
-      let pendingCols = rowsRef.current;
+      let pendingRows = rowsRef.current;
+      let pendingCols = colsRef.current;
       let lastSentPtyId: number | null = null;
 
       const flushResize = () => {
@@ -557,7 +557,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         running = false;
         cancelAnimationFrame(rafRef.current);
       };
-    }, [fontFamily]);
+    }, [fontFamily, readOnly]);
 
     // -----------------------------------------------------------------------
     // Keyboard input

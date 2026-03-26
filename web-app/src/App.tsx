@@ -26,6 +26,7 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
         if (status === "connected") {
           writeStorage(PASS_KEY, pass);
           t.removeEventListener("statuschange", onStatus);
+          t.close();
           setTransport(new WebSocketTransport(wsUrl(), pass));
         } else if (status === "error") {
           setAuthError("Authentication failed");
