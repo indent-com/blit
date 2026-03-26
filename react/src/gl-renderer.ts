@@ -313,9 +313,10 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       const colSpan = glyphOps[i + 6];
       const packed = glyphOps[i + 7];
       const dx1 = col * cell.pw;
-      const dy1 = row * cell.ph;
+      const vertPad = srcH - cell.ph;
+      const dy1 = row * cell.ph - vertPad;
       const dx2 = dx1 + colSpan * cell.pw;
-      const dy2 = dy1 + cell.ph;
+      const dy2 = dy1 + srcH;
       const u1 = srcX / atlasWidth;
       const v1 = srcY / atlasHeight;
       const u2 = (srcX + srcW) / atlasWidth;

@@ -231,6 +231,7 @@ impl GlyphAtlas {
     const MIN_SIZE: u32 = 2048;
     const MAX_SIZE: u32 = 8192;
     const PADDING: u32 = 1;
+    const VERT_PAD: u32 = 2;
 
     fn invalidate(&mut self) {
         self.slots.clear();
@@ -410,7 +411,7 @@ impl GlyphAtlas {
         } else {
             self.cell_width.max(1)
         };
-        let render_height = self.cell_height.max(1);
+        let render_height = self.cell_height.max(1) + Self::VERT_PAD;
         let slot = self.allocate_slot(render_width, render_height)?;
         let ctx = self.ctx.as_ref()?;
         let code_point = key.code_point()?;
@@ -436,9 +437,9 @@ impl GlyphAtlas {
             let font_size = scaled_h.round().max(1.0) as u32;
             let scaled_font = format!("{}px {}", font_size, &font[font.find("px ").map(|i| i + 3).unwrap_or(0)..]);
             let pad_y = (cell_height - scaled_h) / 2.0;
-            (scaled_font, center_x, slot.src_y + pad_y + scaled_h)
+            (scaled_font, center_x, slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64)
         } else {
-            (font, center_x, slot.src_y + cell_height)
+            (font, center_x, slot.src_y + cell_height + Self::VERT_PAD as f64)
         };
         ctx.set_font(&draw_font);
         ctx.set_text_align("center");
@@ -452,8 +453,8 @@ impl GlyphAtlas {
         if key.underline {
             ctx.set_stroke_style_str("#fff");
             ctx.begin_path();
-            ctx.move_to(slot.src_x, slot.src_y + cell_height - 1.0);
-            ctx.line_to(slot.src_x + slot.width, slot.src_y + cell_height - 1.0);
+            ctx.move_to(slot.src_x, slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0);
+            ctx.line_to(slot.src_x + slot.width, slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0);
             ctx.stroke();
         }
         ctx.restore();
