@@ -314,6 +314,7 @@ impl ModeTracker {
 
 pub struct TerminalDriver {
     terminal: Terminal,
+    config: Arc<DriverConfig>,
     modes: ModeTracker,
     title: String,
     title_dirty: bool,
@@ -337,6 +338,7 @@ impl TerminalDriver {
 
         Self {
             terminal,
+            config,
             modes: ModeTracker::default(),
             title: String::new(),
             title_dirty: false,
@@ -348,9 +350,24 @@ impl TerminalDriver {
         self.modes.process(data);
         // Wezterm can panic on pathological input (e.g. divide-by-zero in the
         // image handler for random binary data).  Catch and discard.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.terminal.advance_bytes(data);
-        }));
+        }))
+        .is_err()
+        {
+            let size = self.terminal.get_size();
+            self.terminal = Terminal::new(
+                TerminalSize {
+                    rows: size.rows,
+                    cols: size.cols,
+                    ..TerminalSize::default()
+                },
+                self.config.clone(),
+                "blit-server",
+                env!("CARGO_PKG_VERSION"),
+                Box::new(io::sink()),
+            );
+        }
         self.refresh_title();
     }
 
