@@ -33,7 +33,11 @@ export function ExposeOverlay({
   onCreate: (command?: string) => void;
   searchResultsCbRef: React.RefObject<((reqId: number, results: SearchResult[]) => void) | null>;
 }) {
-  const active = sessions.sessions.filter((s) => s.state === "active");
+  // Show active first, then exited at the end
+  const visible = [
+    ...sessions.sessions.filter((s) => s.state === "active"),
+    ...sessions.sessions.filter((s) => s.state === "exited"),
+  ];
   const { palette, fontFamily: font } = useBlitContext();
   const dark = palette?.dark ?? true;
   const [query, setQuery] = useState("");
@@ -74,20 +78,22 @@ export function ExposeOverlay({
     };
   }, [searchResultsCbRef]);
 
-  const sessionsByPtyId = new Map(active.map((s) => [s.ptyId, s]));
+  const sessionsByPtyId = new Map(visible.map((s) => [s.ptyId, s]));
 
-  const items: { ptyId: number; title: string; context?: string; source?: number }[] = searching && searchResults
+  const items: { ptyId: number; title: string; exited: boolean; context?: string; source?: number }[] = searching && searchResults
     ? searchResults
         .filter((r) => sessionsByPtyId.has(r.ptyId))
         .map((r) => ({
           ptyId: r.ptyId,
           title: sessionsByPtyId.get(r.ptyId)!.title ?? `PTY ${r.ptyId}`,
+          exited: sessionsByPtyId.get(r.ptyId)!.state === "exited",
           context: r.context,
           source: r.primarySource,
         }))
-    : active.map((s) => ({
+    : visible.map((s) => ({
         ptyId: s.ptyId,
         title: s.title ?? `PTY ${s.ptyId}`,
+        exited: s.state === "exited",
       }));
 
   const itemCount = isCommand ? 1 : items.length + 1;
@@ -249,6 +255,9 @@ export function ExposeOverlay({
                           {it.source != null && (
                             <mark style={styles.badge}>{SOURCE_LABEL[it.source] ?? "Match"}</mark>
                           )}
+                          {it.exited && (
+                            <mark style={{ ...styles.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
+                          )}
                           {it.ptyId === sessions.focusedPtyId && (
                             <mark style={styles.badge}>Lead</mark>
                           )}
@@ -281,6 +290,9 @@ export function ExposeOverlay({
                     <>
                       <header style={styles.cardHeader}>
                         <span style={styles.exposeItemLabel}>{it.title}</span>
+                        {it.exited && (
+                          <mark style={{ ...styles.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
+                        )}
                         {it.ptyId === sessions.focusedPtyId && (
                           <mark style={styles.badge}>Lead</mark>
                         )}

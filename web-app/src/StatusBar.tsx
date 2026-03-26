@@ -18,7 +18,7 @@ export function StatusBar({
   onPalette: () => void;
   onFont: () => void;
 }) {
-  const active = sessions.sessions.filter((s) => s.state === "active");
+  const active = sessions.sessions.filter((s) => s.state !== "closed");
   return (
     <>
       <button onClick={onExpose} style={styles.statusBtn} title="Expose (Cmd+K)">

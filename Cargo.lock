@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "blit-browser"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "blit-remote",
  "js-sys",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "blit-cli"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "axum",
  "blit-remote",
@@ -267,20 +267,20 @@ dependencies = [
 
 [[package]]
 name = "blit-demo"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "blit-remote",
  "libc",
  "netlink-packet-core",
  "netlink-packet-sock-diag",
- "netlink-packet-utils",
+ "netlink-packet-utils 0.6.0",
  "netlink-sys",
  "vt100",
 ]
 
 [[package]]
 name = "blit-gateway"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "blit-remote"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "lz4_flex",
  "unicode-width",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "blit-server"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "blit-remote",
  "blit-wezterm",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "blit-wezterm"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "blit-remote",
  "wezterm-surface",
@@ -1304,7 +1304,7 @@ checksum = "72724faf704479d67b388da142b186f916188505e7e0b26719019c525882eda4"
 dependencies = [
  "anyhow",
  "byteorder",
- "netlink-packet-utils",
+ "netlink-packet-utils 0.5.2",
 ]
 
 [[package]]
@@ -1318,7 +1318,7 @@ dependencies = [
  "byteorder",
  "libc",
  "netlink-packet-core",
- "netlink-packet-utils",
+ "netlink-packet-utils 0.5.2",
  "smallvec",
 ]
 
@@ -1332,6 +1332,17 @@ dependencies = [
  "byteorder",
  "paste",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "netlink-packet-utils"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3176f18d11a1ae46053e59ec89d46ba318ae1343615bd3f8c908bfc84edae35c"
+dependencies = [
+ "byteorder",
+ "pastey",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

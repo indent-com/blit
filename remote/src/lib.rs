@@ -56,6 +56,9 @@ pub const S2C_TITLE: u8 = 0x04;
 pub const S2C_SEARCH_RESULTS: u8 = 0x05;
 pub const S2C_CREATED_N: u8 = 0x06;
 pub const S2C_HELLO: u8 = 0x07;
+/// The PTY's subprocess has exited but the terminal state is retained.
+/// Clients can still read/scroll the last frame. Send C2S_CLOSE to dismiss.
+pub const S2C_EXITED: u8 = 0x08;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 
@@ -1016,6 +1019,7 @@ pub enum ServerMsg<'a> {
     Created { pty_id: u16, tag: &'a str },
     CreatedN { nonce: u16, pty_id: u16, tag: &'a str },
     Closed { pty_id: u16 },
+    Exited { pty_id: u16 },
     List { entries: Vec<PtyListEntry<'a>> },
     Title { pty_id: u16, title: &'a [u8] },
     SearchResults { request_id: u16, results: Vec<SearchResultEntry<'a>> },
@@ -1083,6 +1087,14 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 return None;
             }
             Some(ServerMsg::Closed {
+                pty_id: u16::from_le_bytes([data[1], data[2]]),
+            })
+        }
+        S2C_EXITED => {
+            if data.len() < 3 {
+                return None;
+            }
+            Some(ServerMsg::Exited {
                 pty_id: u16::from_le_bytes([data[1], data[2]]),
             })
         }

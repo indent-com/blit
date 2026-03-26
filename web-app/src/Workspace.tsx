@@ -86,7 +86,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
     if (sessions.focusedPtyId !== null) desired.add(sessions.focusedPtyId);
     if (overlay === "expose") {
       for (const s of sessions.sessions) {
-        if (s.state === "active") desired.add(s.ptyId);
+        if (s.state !== "closed") desired.add(s.ptyId);
       }
     }
     store.setDesiredSubscriptions(desired);
@@ -225,7 +225,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
         const s = sessionsRef.current;
         if (!s) return;
         const ids = s.sessions
-          .filter((x) => x.state === "active")
+          .filter((x) => x.state !== "closed")
           .map((x) => x.ptyId);
         if (ids.length < 2 || s.focusedPtyId == null) return;
         const idx = ids.indexOf(s.focusedPtyId);

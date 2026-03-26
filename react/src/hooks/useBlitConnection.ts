@@ -9,6 +9,7 @@ import {
   S2C_TITLE,
   S2C_SEARCH_RESULTS,
   S2C_HELLO,
+  S2C_EXITED,
 } from "../types";
 import {
   buildAckMessage,
@@ -59,6 +60,7 @@ export interface BlitConnectionCallbacks {
   onCreated?: (ptyId: number, tag: string) => void;
   onCreatedN?: (nonce: number, ptyId: number, tag: string) => void;
   onClosed?: (ptyId: number) => void;
+  onExited?: (ptyId: number) => void;
   onList?: (entries: PtyListEntry[]) => void;
   onTitle?: (ptyId: number, title: string) => void;
   onSearchResults?: (requestId: number, results: SearchResult[]) => void;
@@ -120,6 +122,12 @@ export function useBlitConnection(
           if (bytes.length < 3) break;
           const ptyId = bytes[1] | (bytes[2] << 8);
           callbacksRef.current.onClosed?.(ptyId);
+          break;
+        }
+        case S2C_EXITED: {
+          if (bytes.length < 3) break;
+          const ptyId = bytes[1] | (bytes[2] << 8);
+          callbacksRef.current.onExited?.(ptyId);
           break;
         }
         case S2C_LIST: {

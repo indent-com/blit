@@ -1,6 +1,6 @@
 [package]
 name = "blit-demo"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -11,5 +11,5 @@ vt100 = "0.16"
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core = "0.7.0"
 netlink-packet-sock-diag = { version = "0.4.2", features = ["rich_nlas"] }
-netlink-packet-utils = "0.5.2"
+netlink-packet-utils = "0.6.0"
 netlink-sys = "0.8.8"

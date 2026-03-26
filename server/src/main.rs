@@ -2,8 +2,8 @@ use blit_remote::{
     build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
     C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE,
     C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, CREATE2_HAS_COMMAND,
-    CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
-    S2C_SEARCH_RESULTS, S2C_TITLE,
+    CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_EXITED,
+    S2C_LIST, S2C_SEARCH_RESULTS, S2C_TITLE,
 };
 use blit_wezterm::{SearchResult as WeztermSearchResult, TerminalDriver as WeztermDriver};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -169,6 +169,8 @@ struct Pty {
     last_title_send: Instant,
     /// Title changed but not yet sent (debounced).
     title_pending: bool,
+    /// The subprocess has exited but the terminal state is retained for reading.
+    exited: bool,
 }
 
 struct ClientState {
@@ -1027,6 +1029,7 @@ fn spawn_pty(
         lflag_last: Instant::now(),
         last_title_send: Instant::now(),
         title_pending: false,
+        exited: false,
     })
 }
 
@@ -1168,17 +1171,21 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
 }
 
 async fn cleanup_pty(pty_id: u16, state: &AppState) {
+    // Remove the fd so no more writes go to the closed master.
     state.2.write().unwrap().remove(&pty_id);
     let mut sess = state.1.lock().await;
-    if let Some(pty) = sess.ptys.remove(&pty_id) {
+    if let Some(pty) = sess.ptys.get_mut(&pty_id) {
+        if pty.exited {
+            return;
+        }
+        pty.exited = true;
         unsafe {
             libc::kill(pty.child_pid, libc::SIGHUP);
             libc::close(pty.master_fd);
         }
-        for client in sess.clients.values_mut() {
-            unsubscribe_client_from(client, pty_id);
-        }
-        let mut msg = vec![S2C_CLOSED];
+        pty.dirty = true;
+        // Broadcast S2C_EXITED — PTY stays in the list, clients can still read it.
+        let mut msg = vec![S2C_EXITED];
         msg.extend_from_slice(&pty_id.to_le_bytes());
         sess.send_to_all(&msg);
     }
@@ -1762,6 +1769,11 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     msg.extend_from_slice(title_bytes);
                     let _ = c.tx.try_send(msg);
                 }
+                if pty.exited {
+                    let mut msg = vec![S2C_EXITED];
+                    msg.extend_from_slice(&id.to_le_bytes());
+                    let _ = c.tx.try_send(msg);
+                }
             }
         }
     }
@@ -1967,7 +1979,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.size = Some((rows, cols));
                 }
-                if sess.ptys.contains_key(&pid) {
+                if sess.ptys.get(&pid).is_some_and(|p| !p.exited) {
                     if let Some((r, c)) = sess.min_size_for_pty(pid) {
                         sess.resize_pty(pid, r, c);
                         need_nudge = true;
@@ -2313,11 +2325,13 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
             C2S_CLOSE if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 if let Some(pty) = sess.ptys.remove(&pid) {
-                    state.2.write().unwrap().remove(&pid);
-                    pty.reader_handle.abort();
-                    unsafe {
-                        libc::kill(pty.child_pid, libc::SIGHUP);
-                        libc::close(pty.master_fd);
+                    if !pty.exited {
+                        state.2.write().unwrap().remove(&pid);
+                        pty.reader_handle.abort();
+                        unsafe {
+                            libc::kill(pty.child_pid, libc::SIGHUP);
+                            libc::close(pty.master_fd);
+                        }
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);

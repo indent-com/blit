@@ -22,7 +22,9 @@ export interface UseBlitSessionsOptions {
   getTerminal?: (ptyId: number) => { title(): string } | null;
   /** Called when a new session appears (server-initiated or from createPty). */
   onSessionCreated?: (session: BlitSession) => void;
-  /** Called when a session is closed (server-initiated or from closePty). */
+  /** Called when a session's subprocess exits but terminal state is retained. */
+  onSessionExited?: (session: BlitSession) => void;
+  /** Called when a session is closed (dismissed via closePty). */
   onSessionClosed?: (session: BlitSession) => void;
   /** Called when the transport disconnects. */
   onDisconnect?: () => void;
@@ -174,6 +176,21 @@ export function useBlitSessions(
     [upsert, setFocused],
   );
 
+  const onExited = useCallback(
+    (exitedId: number) => {
+      const prev = sessionsRef.current;
+      const idx = prev.findIndex((s) => s.ptyId === exitedId);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], state: "exited" };
+        sessionsRef.current = next;
+        notify();
+        lifecycleRef.current?.onSessionExited?.(next[idx]);
+      }
+    },
+    [notify],
+  );
+
   const onClosed = useCallback(
     (closedId: number) => {
       const prev = sessionsRef.current;
@@ -192,7 +209,7 @@ export function useBlitSessions(
       }
       if (focusedPtyIdRef.current === closedId) {
         const nextActive = sessionsRef.current.find(
-          (s) => s.state === "active",
+          (s) => s.state === "active" || s.state === "exited",
         );
         setFocused(nextActive?.ptyId ?? null);
       }
@@ -226,10 +243,12 @@ export function useBlitSessions(
         focusedPtyIdRef.current !== null &&
         !ids.has(focusedPtyIdRef.current)
       ) {
-        const nextActive = next.find((s) => s.state === "active");
-        if (nextActive) {
-          setFocused(nextActive.ptyId);
-          sendFocusRef.current(nextActive.ptyId);
+        const nextAlive = next.find(
+          (s) => s.state === "active" || s.state === "exited",
+        );
+        if (nextAlive) {
+          setFocused(nextAlive.ptyId);
+          sendFocusRef.current(nextAlive.ptyId);
         } else {
           setFocused(null);
         }
@@ -352,6 +371,7 @@ export function useBlitSessions(
       onCreated,
       onCreatedN,
       onClosed,
+      onExited,
       onList,
       onTitle,
       onUpdate,
