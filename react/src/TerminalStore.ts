@@ -69,12 +69,16 @@ export class TerminalStore {
     transport.addEventListener("statuschange", this.onStatus);
 
     const resolved = wasm instanceof Promise ? wasm : Promise.resolve(wasm);
-    resolved.then((mod) => {
-      if (this.disposed) return;
-      this.mod = mod;
-      this.ready = true;
-      for (const l of this.readyListeners) l();
-    });
+    resolved
+      .then((mod) => {
+        if (this.disposed) return;
+        this.mod = mod;
+        this.ready = true;
+        for (const l of this.readyListeners) l();
+      })
+      .catch((err) => {
+        console.error("blit: failed to load WASM module:", err);
+      });
   }
 
   get transport(): BlitTransport {

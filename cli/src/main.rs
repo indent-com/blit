@@ -36,16 +36,18 @@ struct RawMode {
 }
 
 impl RawMode {
-    fn enter() -> Self {
+    fn enter() -> Option<Self> {
         unsafe {
             let mut saved: libc::termios = std::mem::zeroed();
-            libc::tcgetattr(libc::STDIN_FILENO, &mut saved);
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut saved) != 0 {
+                return None;
+            }
             let mut raw = saved;
             libc::cfmakeraw(&mut raw);
             raw.c_cc[libc::VMIN] = 1;
             raw.c_cc[libc::VTIME] = 0;
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
-            Self { saved }
+            Some(Self { saved })
         }
     }
 }
@@ -76,6 +78,8 @@ impl Drop for Cleanup {
 }
 
 // ── Framing ───────────────────────────────────────────────────────────────────
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut hdr = [0u8; 4];
     r.read_exact(&mut hdr).await.ok()?;
@@ -83,12 +87,16 @@ async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     if len == 0 {
         return Some(vec![]);
     }
+    if len > MAX_FRAME_SIZE {
+        return None;
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await.ok()?;
     Some(buf)
 }
 
 fn make_frame(payload: &[u8]) -> Vec<u8> {
+    debug_assert!(payload.len() <= u32::MAX as usize);
     let mut v = Vec::with_capacity(4 + payload.len());
     v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     v.extend_from_slice(payload);
@@ -494,7 +502,9 @@ impl Transport {
             Transport::Ssh(mut child) => {
                 let stdout = child.stdout.take().expect("ssh stdout");
                 let stdin = child.stdin.take().expect("ssh stdin");
-                std::mem::forget(child);
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
                 (Box::new(stdout), Box::new(stdin))
             }
         }
@@ -676,14 +686,21 @@ async fn run_browser(args: Vec<String>) {
         connector,
     });
 
+    fn js_escape(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('<', "\\x3c")
+            .replace('>', "\\x3e")
+    }
     let host_injection = match &remote_host {
-        Some(h) => format!("localStorage.setItem('blit.host','{h}');"),
+        Some(h) => format!("localStorage.setItem('blit.host','{}');", js_escape(h)),
         None => String::new(),
     };
     let injected_html = WEB_INDEX_HTML.replacen(
         "<script",
         &format!(
-            "<script>localStorage.setItem('blit.passphrase','{token}');{host_injection}</script>\n<script"
+            "<script>localStorage.setItem('blit.passphrase','{}');{host_injection}</script>\n<script",
+            js_escape(&token)
         ),
         1,
     );
@@ -703,12 +720,10 @@ async fn run_browser(args: Vec<String>) {
 
     open_browser(&url);
 
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        std::process::exit(0);
-    });
-
-    axum::serve(listener, app).await.unwrap();
+    tokio::select! {
+        r = axum::serve(listener, app) => { if let Err(e) = r { eprintln!("blit: serve error: {e}"); } }
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 async fn setup_ssh_forward(ssh_args: &[String]) -> BrowserConnector {
@@ -849,7 +864,7 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     // Transport → WS
-    let transport_to_ws = tokio::spawn(async move {
+    let mut transport_to_ws = tokio::spawn(async move {
         let mut frames = 0u64;
         while let Some(data) = read_frame(&mut transport_reader).await {
             frames += 1;
@@ -868,7 +883,7 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     });
 
     // WS → Transport
-    let ws_to_transport = tokio::spawn(async move {
+    let mut ws_to_transport = tokio::spawn(async move {
         while let Some(msg_result) = ws_rx.next().await {
             match msg_result {
                 Ok(Message::Binary(d)) => {
@@ -889,9 +904,11 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     });
 
     tokio::select! {
-        _ = transport_to_ws => {}
-        _ = ws_to_transport => {}
+        _ = &mut transport_to_ws => {}
+        _ = &mut ws_to_transport => {}
     }
+    transport_to_ws.abort();
+    ws_to_transport.abort();
 
     eprintln!("blit: browser client disconnected");
 }
@@ -1073,7 +1090,11 @@ impl Expose {
                     out.extend_from_slice(b": ");
                     let max_title = (cols as usize).saturating_sub(12);
                     let display = if title.len() > max_title {
-                        &title[..max_title]
+                        let mut end = max_title;
+                        while end > 0 && !title.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        &title[..end]
                     } else {
                         title.as_str()
                     };

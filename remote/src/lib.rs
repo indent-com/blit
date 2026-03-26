@@ -121,8 +121,13 @@ pub struct FrameState {
     line_flags: Vec<u8>,
 }
 
+const MAX_FRAME_ROWS: u16 = 500;
+const MAX_FRAME_COLS: u16 = 500;
+
 impl FrameState {
     pub fn new(rows: u16, cols: u16) -> Self {
+        let rows = rows.min(MAX_FRAME_ROWS);
+        let cols = cols.min(MAX_FRAME_COLS);
         let total = rows as usize * cols as usize;
         Self {
             rows,
@@ -244,6 +249,8 @@ impl FrameState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.min(MAX_FRAME_ROWS);
+        let cols = cols.min(MAX_FRAME_COLS);
         if rows == self.rows && cols == self.cols {
             return;
         }
@@ -308,7 +315,7 @@ impl FrameState {
             }
             let width = self.set_cell(row, cur_col, ch, style);
             if width == 0 {
-                break;
+                continue;
             }
             cur_col = cur_col.saturating_add(width);
         }
@@ -412,8 +419,11 @@ impl FrameState {
         if row >= self.rows || col >= self.cols {
             return 0;
         }
-        let width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1) as u16;
-        let width = if width > 1 && col + 1 < self.cols {
+        let raw_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if raw_width == 0 {
+            return 0;
+        }
+        let width = if raw_width > 1 && col + 1 < self.cols {
             2
         } else {
             1
@@ -627,8 +637,8 @@ impl TerminalState {
             false
         };
 
-        self.frame.cursor_row = new_cursor_row;
-        self.frame.cursor_col = new_cursor_col;
+        self.frame.cursor_row = new_cursor_row.min(self.frame.rows.saturating_sub(1));
+        self.frame.cursor_col = new_cursor_col.min(self.frame.cols.saturating_sub(1));
         self.frame.mode = new_mode;
         resized
             || title_changed
@@ -798,6 +808,12 @@ impl TerminalState {
                 .copy_from_slice(&temp[src_off..src_off + cols as usize * CELL_SIZE]);
         }
 
+        for r in 0..rows as usize {
+            for c in 0..cols as usize {
+                let dst_flat = (dst_row as usize + r) * frame_cols + dst_col as usize + c;
+                self.frame.overflow.remove(&dst_flat);
+            }
+        }
         for (idx, s) in overflow_temp {
             self.frame.overflow.insert(idx, s);
         }
@@ -1196,40 +1212,40 @@ pub fn msg_create(rows: u16, cols: u16) -> Vec<u8> {
 
 pub fn msg_create_tagged(rows: u16, cols: u16, tag: &str) -> Vec<u8> {
     let tag_bytes = tag.as_bytes();
-    let tag_len = tag_bytes.len() as u16;
-    let mut msg = Vec::with_capacity(7 + tag_bytes.len());
+    let tag_len = tag_bytes.len().min(u16::MAX as usize);
+    let mut msg = Vec::with_capacity(7 + tag_len);
     msg.push(C2S_CREATE);
     msg.extend_from_slice(&rows.to_le_bytes());
     msg.extend_from_slice(&cols.to_le_bytes());
-    msg.extend_from_slice(&tag_len.to_le_bytes());
-    msg.extend_from_slice(tag_bytes);
+    msg.extend_from_slice(&(tag_len as u16).to_le_bytes());
+    msg.extend_from_slice(&tag_bytes[..tag_len]);
     msg
 }
 
 /// Spawn a new PTY in the same working directory as `src_pty_id`.
 pub fn msg_create_at(rows: u16, cols: u16, tag: &str, src_pty_id: u16) -> Vec<u8> {
     let tag_bytes = tag.as_bytes();
-    let tag_len = tag_bytes.len() as u16;
-    let mut msg = Vec::with_capacity(9 + tag_bytes.len());
+    let tag_len = tag_bytes.len().min(u16::MAX as usize);
+    let mut msg = Vec::with_capacity(9 + tag_len);
     msg.push(C2S_CREATE_AT);
     msg.extend_from_slice(&rows.to_le_bytes());
     msg.extend_from_slice(&cols.to_le_bytes());
-    msg.extend_from_slice(&tag_len.to_le_bytes());
-    msg.extend_from_slice(tag_bytes);
+    msg.extend_from_slice(&(tag_len as u16).to_le_bytes());
+    msg.extend_from_slice(&tag_bytes[..tag_len]);
     msg.extend_from_slice(&src_pty_id.to_le_bytes());
     msg
 }
 
 pub fn msg_create_n(nonce: u16, rows: u16, cols: u16, tag: &str) -> Vec<u8> {
     let tag_bytes = tag.as_bytes();
-    let tag_len = tag_bytes.len() as u16;
-    let mut msg = Vec::with_capacity(9 + tag_bytes.len());
+    let tag_len = tag_bytes.len().min(u16::MAX as usize);
+    let mut msg = Vec::with_capacity(9 + tag_len);
     msg.push(C2S_CREATE_N);
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.extend_from_slice(&rows.to_le_bytes());
     msg.extend_from_slice(&cols.to_le_bytes());
-    msg.extend_from_slice(&tag_len.to_le_bytes());
-    msg.extend_from_slice(tag_bytes);
+    msg.extend_from_slice(&(tag_len as u16).to_le_bytes());
+    msg.extend_from_slice(&tag_bytes[..tag_len]);
     msg
 }
 
@@ -1643,13 +1659,16 @@ fn append_full_width_fill_ops(
             end += 1;
         }
 
+        if *op_count >= u16::MAX {
+            break;
+        }
         out.push(OP_FILL_RECT);
         out.extend_from_slice(&(row as u16).to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&((end - row) as u16).to_le_bytes());
         out.extend_from_slice(&current.cols.to_le_bytes());
         out.extend_from_slice(&cell);
-        *op_count += 1;
+        *op_count = op_count.saturating_add(1);
 
         for r in row..end {
             let row_off = basis.cell_offset(r as u16, 0);

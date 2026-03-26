@@ -24,6 +24,7 @@ export function createWebRtcDataChannelTransport(
   let syncResolve: (() => void) | null = null;
   let syncReject: ((err: Error) => void) | null = null;
   let readBuf = new Uint8Array(0);
+  let connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
   const messageListeners = new Set<(data: ArrayBuffer) => void>();
   const statusListeners = new Set<(status: ConnectionStatus) => void>();
@@ -71,6 +72,7 @@ export function createWebRtcDataChannelTransport(
 
     close() {
       disposed = true;
+      if (connectTimeout !== null) clearTimeout(connectTimeout);
       if (channel) {
         try {
           channel.close();
@@ -79,6 +81,7 @@ export function createWebRtcDataChannelTransport(
         }
         channel = null;
       }
+      pc.removeEventListener("connectionstatechange", onConnectionStateChange);
       setStatus("disconnected");
     },
 
@@ -114,7 +117,7 @@ export function createWebRtcDataChannelTransport(
   channel = pc.createDataChannel(label, { ordered: true });
   channel.binaryType = "arraybuffer";
 
-  const timeout = setTimeout(() => {
+  connectTimeout = setTimeout(() => {
     if (_status === "connecting") {
       setStatus("error");
     }
@@ -122,7 +125,7 @@ export function createWebRtcDataChannelTransport(
 
   channel.onopen = () => {
     if (disposed) return;
-    clearTimeout(timeout);
+    if (connectTimeout !== null) clearTimeout(connectTimeout);
     setStatus("connected");
     const msg = new Uint8Array(3);
     msg[0] = C2S_DISPLAY_RATE;
@@ -147,29 +150,30 @@ export function createWebRtcDataChannelTransport(
         (readBuf[3] << 24);
       if (readBuf.length < 4 + len) break;
       const payload = readBuf.slice(4, 4 + len);
-      readBuf = readBuf.subarray(4 + len);
+      readBuf = readBuf.slice(4 + len);
       for (const l of messageListeners) l(payload.buffer as ArrayBuffer);
     }
   };
 
   channel.onerror = () => {
     if (disposed) return;
-    clearTimeout(timeout);
+    if (connectTimeout !== null) clearTimeout(connectTimeout);
     setStatus("error");
   };
 
   channel.onclose = () => {
     if (disposed) return;
-    clearTimeout(timeout);
+    if (connectTimeout !== null) clearTimeout(connectTimeout);
     setStatus("disconnected");
   };
 
-  pc.addEventListener("connectionstatechange", () => {
+  function onConnectionStateChange() {
     if (disposed) return;
     if (pc.connectionState === "failed" || pc.connectionState === "closed") {
       setStatus("disconnected");
     }
-  });
+  }
+  pc.addEventListener("connectionstatechange", onConnectionStateChange);
 
   return transport;
 }

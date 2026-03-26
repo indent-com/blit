@@ -259,8 +259,10 @@ export function useBlitSessions(
 
       if (autoCreate && entries.length === 0) {
         const { rows, cols } = getSize();
-        const nonce = (nonceCounterRef.current =
-          (nonceCounterRef.current + 1) & 0xffff);
+        let nonce: number;
+        do {
+          nonce = (nonceCounterRef.current = (nonceCounterRef.current + 1) & 0xffff);
+        } while (pendingCreatesRef.current.has(nonce));
         sendCreate2Ref.current(nonce, rows, cols, {
           tag: autoTag,
           command: autoCommand,
@@ -423,8 +425,10 @@ export function useBlitSessions(
       const r = opts?.rows ?? rows;
       const c = opts?.cols ?? cols;
       return new Promise<number>((resolve) => {
-        const nonce = (nonceCounterRef.current =
-          (nonceCounterRef.current + 1) & 0xffff);
+        let nonce: number;
+        do {
+          nonce = (nonceCounterRef.current = (nonceCounterRef.current + 1) & 0xffff);
+        } while (pendingCreatesRef.current.has(nonce));
         pendingCreatesRef.current.set(nonce, resolve);
         sendCreate2(nonce, r, c, {
           tag: opts?.tag,

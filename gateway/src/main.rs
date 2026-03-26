@@ -46,6 +46,8 @@ struct Config {
 
 type AppState = Arc<Config>;
 
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.ok()?;
@@ -53,12 +55,18 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     if len == 0 {
         return Some(vec![]);
     }
+    if len > MAX_FRAME_SIZE {
+        return None;
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await.ok()?;
     Some(buf)
 }
 
 async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> bool {
+    if payload.len() > u32::MAX as usize {
+        return false;
+    }
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_le_bytes());
@@ -103,10 +111,16 @@ async fn main() {
 
     let app = build_app(state);
 
-    let tcp = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let tcp = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
+        eprintln!("blit-gateway: cannot bind to {addr}: {e}");
+        std::process::exit(1);
+    });
     let listener = NoDelayListener(tcp);
     eprintln!("listening on {addr}");
-    axum::serve(listener, app).await.unwrap();
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("blit-gateway: serve error: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn build_app(state: AppState) -> axum::Router {
@@ -132,11 +146,22 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
     }
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
 async fn handle_ws(mut ws: WebSocket, state: AppState) {
     let authed = loop {
         match ws.recv().await {
             Some(Ok(Message::Text(pass))) => {
-                if pass.trim() == state.passphrase {
+                if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
                     let _ = ws.send(Message::Text("ok".into())).await;
                     break true;
                 } else {
@@ -165,7 +190,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
     let (mut sock_reader, mut sock_writer) = stream.into_split();
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    let ws_to_sock = tokio::spawn(async move {
+    let mut ws_to_sock = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
                 Message::Binary(d) => {
@@ -179,7 +204,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         }
     });
 
-    let sock_to_ws = tokio::spawn(async move {
+    let mut sock_to_ws = tokio::spawn(async move {
         while let Some(data) = read_frame(&mut sock_reader).await {
             if ws_tx.send(Message::Binary(data.into())).await.is_err() {
                 break;
@@ -188,9 +213,11 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
     });
 
     tokio::select! {
-        _ = ws_to_sock => {}
-        _ = sock_to_ws => {}
+        _ = &mut ws_to_sock => {}
+        _ = &mut sock_to_ws => {}
     }
+    ws_to_sock.abort();
+    sock_to_ws.abort();
 
     eprintln!("client disconnected");
 }
