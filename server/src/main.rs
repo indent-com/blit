@@ -129,6 +129,8 @@ const SNAPSHOT_MAX_DEFER: Duration = Duration::from_millis(1);
 /// acts as a safety valve if the application crashes mid-frame.
 const SNAPSHOT_SYNC_DEFER: Duration = Duration::from_millis(50);
 
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.ok()?;
@@ -136,12 +138,18 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     if len == 0 {
         return Some(vec![]);
     }
+    if len > MAX_FRAME_SIZE {
+        return None;
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await.ok()?;
     Some(buf)
 }
 
 async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> bool {
+    if payload.len() > u32::MAX as usize {
+        return false;
+    }
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_le_bytes());
@@ -783,6 +791,26 @@ impl Session {
         }
     }
 
+    fn allocate_pty_id(&mut self) -> Option<u16> {
+        let start = self.next_pty_id;
+        loop {
+            let id = self.next_pty_id;
+            self.next_pty_id = self.next_pty_id.wrapping_add(1);
+            if id == 0 {
+                if self.next_pty_id == start {
+                    return None;
+                }
+                continue;
+            }
+            if !self.ptys.contains_key(&id) {
+                return Some(id);
+            }
+            if self.next_pty_id == start {
+                return None;
+            }
+        }
+    }
+
     fn send_to_all(&self, msg: &[u8]) {
         for c in self.clients.values() {
             let _ = c.tx.try_send(msg.to_vec());
@@ -1285,7 +1313,7 @@ fn try_send_update(
     if client.tx.try_send(msg).is_ok() {
         client.last_sent.insert(pid, current.clone());
         record_send(client, bytes, now, paced);
-        client.frames_sent += 1;
+        client.frames_sent = client.frames_sent.wrapping_add(1);
         SendOutcome::Sent
     } else {
         // Outbox full — the sender can't keep up.  Advance last_sent to
@@ -2031,8 +2059,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                             .collect::<Vec<_>>()
                     })
                     .filter(|args| !args.is_empty());
-                let id = sess.next_pty_id;
-                sess.next_pty_id += 1;
+                let Some(id) = sess.allocate_pty_id() else { continue; };
                 if let Some(pty) = spawn_pty(
                     &config.shell,
                     rows,
@@ -2104,8 +2131,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                             .collect::<Vec<_>>()
                     })
                     .filter(|args| !args.is_empty());
-                let id = sess.next_pty_id;
-                sess.next_pty_id += 1;
+                let Some(id) = sess.allocate_pty_id() else { continue; };
                 if let Some(pty) = spawn_pty(
                     &config.shell,
                     rows,
@@ -2172,8 +2198,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 } else {
                     None
                 };
-                let id = sess.next_pty_id;
-                sess.next_pty_id += 1;
+                let Some(id) = sess.allocate_pty_id() else { continue; };
                 if let Some(pty) = spawn_pty(
                     &config.shell,
                     rows,
@@ -2204,7 +2229,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
             }
             C2S_CREATE2 => {
                 // Generic create: [0x18][nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][...fields]
-                if data.len() < 10 { break; }
+                if data.len() < 10 { continue; }
                 let nonce = u16::from_le_bytes([data[1], data[2]]);
                 let rows = u16::from_le_bytes([data[3], data[4]]);
                 let cols = u16::from_le_bytes([data[5], data[6]]);
@@ -2236,8 +2261,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     .filter(|p| p.contains('\0'))
                     .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
                     .filter(|a| !a.is_empty());
-                let id = sess.next_pty_id;
-                sess.next_pty_id += 1;
+                let Some(id) = sess.allocate_pty_id() else { continue; };
                 if let Some(pty) = spawn_pty(
                     &config.shell, rows, cols, id, tag, command, argv.as_deref(),
                     dir.as_deref(), config.scrollback, state.clone(),
