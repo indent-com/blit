@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "blit-browser"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blit-remote",
  "js-sys",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "blit-cli"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "axum",
  "blit-remote",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "blit-demo"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blit-remote",
  "libc",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "blit-gateway"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "axum",
  "futures-util",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "blit-remote"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "lz4_flex",
  "unicode-width",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "blit-server"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blit-remote",
  "blit-wezterm",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "blit-wezterm"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blit-remote",
  "wezterm-surface",

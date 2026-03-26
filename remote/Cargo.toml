@@ -1,6 +1,6 @@
 [package]
 name = "blit-remote"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "Remote blit protocol, frame state, and callback DOM renderer"
 

@@ -132,6 +132,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       }
     }, []);
 
+    const applyPaletteToTerminal = useCallback((t: Terminal | null) => {
+      const nextPalette = paletteRef.current;
+      if (!t || !nextPalette) return;
+      t.set_default_colors(...nextPalette.fg, ...nextPalette.bg);
+      for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...nextPalette.ansi[i]);
+      needsRenderRef.current = true;
+    }, []);
+
     useEffect(() => {
       const syncReadOnlySize = (t: Terminal) => {
         const tr = t.rows;
@@ -148,7 +156,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (!t) return;
         if (terminalRef.current !== t) {
           terminalRef.current = t;
-          needsRenderRef.current = true;
+          applyPaletteToTerminal(t);
         }
         needsRenderRef.current = true;
         reconcilePrediction();
@@ -158,6 +166,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         const t = store.getTerminal(ptyId);
         if (t) {
           terminalRef.current = t;
+          applyPaletteToTerminal(t);
           if (readOnly) syncReadOnlySize(t);
         }
       }
@@ -168,7 +177,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         unsub();
         transport.removeEventListener("statuschange", onStatus);
       };
-    }, [transport, ptyId, readOnly, store, reconcilePrediction]);
+    }, [transport, ptyId, readOnly, store, reconcilePrediction, applyPaletteToTerminal]);
 
     const sendInput = useCallback(
       (id: number, data: Uint8Array) => {
@@ -288,6 +297,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         const t = store.getTerminal(ptyId);
         if (t) {
           terminalRef.current = t;
+          applyPaletteToTerminal(t);
           if (!readOnly) {
             const cell = cellRef.current;
             t.set_cell_size(cell.pw, cell.ph);
@@ -303,7 +313,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         needsRenderRef.current = false;
         if (ptyId !== null) store.release(ptyId);
       };
-    }, [wasmReady, ptyId, store, fontFamily, readOnly]);
+    }, [wasmReady, ptyId, store, fontFamily, readOnly, applyPaletteToTerminal]);
 
     // -----------------------------------------------------------------------
     // Palette changes
@@ -311,12 +321,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       paletteRef.current = palette;
-      const t = terminalRef.current;
-      if (!t || !palette) return;
-      t.set_default_colors(...palette.fg, ...palette.bg);
-      for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...palette.ansi[i]);
-      needsRenderRef.current = true;
-    }, [palette]);
+      applyPaletteToTerminal(terminalRef.current);
+    }, [palette, applyPaletteToTerminal]);
 
     // -----------------------------------------------------------------------
     // Resize observer
