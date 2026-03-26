@@ -381,7 +381,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         window.removeEventListener("resize", handleResize);
         if (resizeTimer) clearTimeout(resizeTimer);
       };
-    }, [ptyId, readOnly, sendResize]);
+    }, [ptyId, readOnly, sendResize, fontFamily, fontSize]);
 
     // -----------------------------------------------------------------------
     // Render loop
@@ -563,7 +563,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         running = false;
         cancelAnimationFrame(rafRef.current);
       };
-    }, [fontFamily, readOnly]);
+    }, [fontFamily, fontSize, readOnly]);
 
     // -----------------------------------------------------------------------
     // Keyboard input

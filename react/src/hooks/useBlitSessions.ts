@@ -5,6 +5,8 @@ import { useBlitConnection, type SearchResult } from "./useBlitConnection";
 import { useBlitContext } from "../BlitContext";
 
 export interface UseBlitSessionsOptions {
+  /** Pre-seed the focused PTY ID (e.g. from a URL hash). If the PTY exists in the first LIST, it will be focused instead of the default first entry. */
+  initialPtyId?: number | null;
   /** Automatically create a PTY if the initial list is empty. Default: false. */
   autoCreateIfEmpty?: boolean;
   /** Tag to assign to auto-created PTYs (requires autoCreateIfEmpty). */
@@ -81,7 +83,7 @@ export function useBlitSessions(
   const listenersRef = useRef(new Set<() => void>());
   const readyRef = useRef(false);
   const readyListenersRef = useRef(new Set<() => void>());
-  const focusedPtyIdRef = useRef<number | null>(null);
+  const focusedPtyIdRef = useRef<number | null>(options?.initialPtyId ?? null);
   const focusedListenersRef = useRef(new Set<() => void>());
   const pendingCreatesRef = useRef<Map<number, (ptyId: number) => void>>(
     new Map(),

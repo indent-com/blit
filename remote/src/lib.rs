@@ -1367,11 +1367,16 @@ pub fn build_update_msg(
     let mut ops = Vec::new();
     let mut op_count = 0u16;
 
+    // Scroll-aware ops apply when content is "cooked" (shell output) or when
+    // either frame has mode 0 (scrollback frames use mode=0, and their content
+    // is always static text that benefits from COPY_RECT).
+    let scroll_eligible = (mode_is_cooked(current.mode) && mode_is_cooked(previous.mode))
+        || current.mode == 0
+        || previous.mode == 0;
     if ENABLE_SCROLL_OPS
         && same_size
         && previous.cells != current.cells
-        && mode_is_cooked(current.mode)
-        && mode_is_cooked(previous.mode)
+        && scroll_eligible
     {
         if let Some(delta_rows) = detect_vertical_scroll(current, previous) {
             let mut basis = previous.clone();
@@ -1948,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_scroll_heavy_update_falls_back_to_patch_op() {
+    fn mode_zero_scroll_uses_copy_rect() {
         let style = CellStyle::default();
         let mut prev = FrameState::new(5, 6);
         prev.write_text(0, 0, "one", style);
@@ -1970,7 +1975,18 @@ mod tests {
         let decoded = decompress_size_prepended(payload).unwrap();
         let op_count = u16::from_le_bytes([decoded[12], decoded[13]]);
         assert!(op_count >= 1);
-        assert_eq!(decoded[14], OP_PATCH_CELLS);
+        // mode=0 frames (scrollback) now use COPY_RECT for efficient scrolling
+        assert_eq!(decoded[14], OP_COPY_RECT);
+
+        // Verify round-trip correctness
+        let baseline = build_update_msg(9, &prev, &FrameState::new(5, 6)).unwrap();
+        let mut state = TerminalState::new(5, 6);
+        let ServerMsg::Update { payload: bp, .. } = parse_server_msg(&baseline).unwrap() else {
+            panic!("expected update");
+        };
+        state.feed_compressed(bp);
+        state.feed_compressed(payload);
+        assert_eq!(state.frame().cells(), next.cells());
     }
 
     #[test]

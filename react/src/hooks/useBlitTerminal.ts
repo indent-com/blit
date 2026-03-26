@@ -14,15 +14,18 @@ export interface CellMetrics {
  * into a hidden span, then snapping to device pixel boundaries.
  */
 export function measureCell(fontFamily: string, fontSize: number): CellMetrics {
-  const span = document.createElement("span");
-  span.style.cssText = `font: ${fontSize}px ${fontFamily}; position: absolute; visibility: hidden; white-space: pre;`;
-  span.textContent = "M";
-  document.body.appendChild(span);
-  const rect = span.getBoundingClientRect();
-  document.body.removeChild(span);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d")!;
+  ctx.font = `${fontSize}px ${fontFamily}`;
+  const metrics = ctx.measureText("M");
+  const w = metrics.width;
+  // Use font metrics for accurate height: ascent + descent gives the full
+  // glyph extent. This matches how real terminals compute cell height from
+  // the font's ascender/descender values.
+  const h = metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent;
 
   const dpr = window.devicePixelRatio || 1;
-  const pw = Math.round(rect.width * dpr);
-  const ph = Math.round(rect.height * dpr);
+  const pw = Math.round(w * dpr);
+  const ph = Math.round(h * dpr);
   return { w: pw / dpr, h: ph / dpr, pw, ph };
 }
