@@ -1,8 +1,7 @@
 import type { CellMetrics } from "./hooks/useBlitTerminal";
 
-const BG_OP_STRIDE = 4;
-const GLYPH_OP_STRIDE = 8;
 const MAX_BATCH_VERTS = 65532;
+const GLYPH_FLOATS_PER_VERT = 8;
 
 const RECT_VS = `
 attribute vec2 a_pos;
@@ -98,11 +97,13 @@ function createProgram(
 
 export interface GlRenderer {
   supported: boolean;
+  maxDimension: number;
   resize(width: number, height: number): void;
   render(
-    bgOps: Uint32Array,
-    glyphOps: Uint32Array,
+    bgVerts: Float32Array,
+    glyphVerts: Float32Array,
     atlasCanvas: HTMLCanvasElement | undefined,
+    atlasVersion: number,
     cursorVisible: boolean,
     cursorCol: number,
     cursorRow: number,
@@ -126,6 +127,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   if (!gl) {
     return {
       supported: false,
+      maxDimension: 0,
       resize() {},
       render() {},
       dispose() {},
@@ -138,6 +140,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   if (!rectProgram || !glyphProgram) {
     return {
       supported: false,
+      maxDimension: 0,
       resize() {},
       render() {},
       dispose() {},
@@ -179,7 +182,11 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  function uploadAtlas(atlasCanvas: HTMLCanvasElement): void {
+  let lastAtlasVersion = -1;
+
+  function uploadAtlas(atlasCanvas: HTMLCanvasElement, version: number): void {
+    if (version === lastAtlasVersion) return;
+    lastAtlasVersion = version;
     gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
     gl!.texImage2D(
       gl!.TEXTURE_2D,
@@ -235,37 +242,6 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     );
   }
 
-  function renderRectangles(bgOps: Uint32Array, cell: CellMetrics): void {
-    if (!bgOps.length) return;
-    const data = new Float32Array((bgOps.length / BG_OP_STRIDE) * 36);
-    let offset = 0;
-    for (let i = 0; i < bgOps.length; i += BG_OP_STRIDE) {
-      const row = bgOps[i];
-      const col = bgOps[i + 1];
-      const colSpan = bgOps[i + 2];
-      const packed = bgOps[i + 3];
-      const x1 = col * cell.pw;
-      const y1 = row * cell.ph;
-      const x2 = x1 + colSpan * cell.pw;
-      const y2 = y1 + cell.ph;
-      const r = ((packed >>> 16) & 0xff) / 255;
-      const g = ((packed >>> 8) & 0xff) / 255;
-      const b = (packed & 0xff) / 255;
-      data.set(
-        [
-          x1, y1, r, g, b, 1,
-          x2, y1, r, g, b, 1,
-          x1, y2, r, g, b, 1,
-          x1, y2, r, g, b, 1,
-          x2, y1, r, g, b, 1,
-          x2, y2, r, g, b, 1,
-        ],
-        offset,
-      );
-      offset += 36;
-    }
-    drawColoredTriangles(data);
-  }
 
   function renderCursor(
     cursorVisible: boolean,
@@ -298,57 +274,15 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     }
   }
 
-  function renderGlyphs(
-    glyphOps: Uint32Array,
+  function uploadAndDrawGlyphs(
+    data: Float32Array,
     atlasCanvas: HTMLCanvasElement,
-    cell: CellMetrics,
+    atlasVersion: number,
   ): void {
-    if (!glyphOps.length || !atlasCanvas) return;
-    uploadAtlas(atlasCanvas);
-    const atlasWidth = atlasCanvas.width || 1;
-    const atlasHeight = atlasCanvas.height || 1;
-    const floatsPerVert = 8;
-    const vertsPerGlyph = 6;
-    const data = new Float32Array(
-      (glyphOps.length / GLYPH_OP_STRIDE) * vertsPerGlyph * floatsPerVert,
-    );
-    let offset = 0;
-    for (let i = 0; i < glyphOps.length; i += GLYPH_OP_STRIDE) {
-      const srcX = glyphOps[i];
-      const srcY = glyphOps[i + 1];
-      const srcW = glyphOps[i + 2];
-      const srcH = glyphOps[i + 3];
-      const row = glyphOps[i + 4];
-      const col = glyphOps[i + 5];
-      const colSpan = glyphOps[i + 6];
-      const packed = glyphOps[i + 7];
-      const dx1 = col * cell.pw;
-      const vertPad = srcH - cell.ph;
-      const dy1 = row * cell.ph - vertPad;
-      const dx2 = dx1 + colSpan * cell.pw;
-      const dy2 = dy1 + srcH;
-      const u1 = srcX / atlasWidth;
-      const v1 = srcY / atlasHeight;
-      const u2 = (srcX + srcW) / atlasWidth;
-      const v2 = (srcY + srcH) / atlasHeight;
-      const r = ((packed >>> 16) & 0xff) / 255;
-      const g = ((packed >>> 8) & 0xff) / 255;
-      const b = (packed & 0xff) / 255;
-      data.set(
-        [
-          dx1, dy1, u1, v1, r, g, b, 1,
-          dx2, dy1, u2, v1, r, g, b, 1,
-          dx1, dy2, u1, v2, r, g, b, 1,
-          dx1, dy2, u1, v2, r, g, b, 1,
-          dx2, dy1, u2, v1, r, g, b, 1,
-          dx2, dy2, u2, v2, r, g, b, 1,
-        ],
-        offset,
-      );
-      offset += vertsPerGlyph * floatsPerVert;
-    }
-    const totalVerts = data.length / floatsPerVert;
-    const stride = floatsPerVert * 4;
+    if (!data.length || !atlasCanvas) return;
+    uploadAtlas(atlasCanvas, atlasVersion);
+    const totalVerts = data.length / GLYPH_FLOATS_PER_VERT;
+    const stride = GLYPH_FLOATS_PER_VERT * 4;
     gl!.useProgram(glyphProgram);
     gl!.bindBuffer(gl!.ARRAY_BUFFER, glyphBuffer);
     gl!.enableVertexAttribArray(glyphPosLoc);
@@ -360,10 +294,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     gl!.uniform1i(glyphTexLoc, 0);
     for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
       const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
-      const slice = data.subarray(
-        off * floatsPerVert,
-        (off + count) * floatsPerVert,
-      );
+      const slice = data.subarray(off * GLYPH_FLOATS_PER_VERT, (off + count) * GLYPH_FLOATS_PER_VERT);
       gl!.bufferData(gl!.ARRAY_BUFFER, slice, gl!.DYNAMIC_DRAW);
       gl!.vertexAttribPointer(glyphPosLoc, 2, gl!.FLOAT, false, stride, 0);
       gl!.vertexAttribPointer(glyphUvLoc, 2, gl!.FLOAT, false, stride, 8);
@@ -374,6 +305,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
 
   return {
     supported: true,
+    maxDimension: maxDim,
     resize(width: number, height: number) {
       const w = Math.min(width, maxDim);
       const h = Math.min(height, maxDim);
@@ -381,9 +313,10 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       if (canvas.height !== h) canvas.height = h;
     },
     render(
-      bgOps: Uint32Array,
-      glyphOps: Uint32Array,
+      bgVerts: Float32Array,
+      glyphVerts: Float32Array,
       atlasCanvas: HTMLCanvasElement | undefined,
+      atlasVersion: number,
       cursorVisible: boolean,
       cursorCol: number,
       cursorRow: number,
@@ -396,9 +329,9 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       gl!.viewport(0, 0, canvas.width, canvas.height);
       gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
       gl!.clear(gl!.COLOR_BUFFER_BIT);
-      renderRectangles(bgOps, cell);
+      drawColoredTriangles(bgVerts);
       if (atlasCanvas) {
-        renderGlyphs(glyphOps, atlasCanvas, cell);
+        uploadAndDrawGlyphs(glyphVerts, atlasCanvas, atlasVersion);
       }
       renderCursor(
         cursorVisible,

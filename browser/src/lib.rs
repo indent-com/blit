@@ -1,8 +1,14 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use blit_remote::{TerminalState, CELL_SIZE};
 use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
+
+/// Expose WASM linear memory for zero-copy typed array views.
+#[wasm_bindgen]
+pub fn wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
 
 #[wasm_bindgen(inline_js = r#"
 const glyphTextCache = new Map();
@@ -217,7 +223,7 @@ struct GlyphSlot {
 struct GlyphAtlas {
     canvas: Option<HtmlCanvasElement>,
     ctx: Option<CanvasRenderingContext2d>,
-    slots: HashMap<GlyphKey, GlyphSlot>,
+    slots: FxHashMap<GlyphKey, GlyphSlot>,
     version: u32,
     next_x: u32,
     next_y: u32,
@@ -225,6 +231,8 @@ struct GlyphAtlas {
     cell_width: u32,
     cell_height: u32,
     wide_cell_width: u32,
+    /// Cached canvas size — avoids DOM property access per glyph.
+    cached_size: u32,
 }
 
 impl GlyphAtlas {
@@ -243,23 +251,21 @@ impl GlyphAtlas {
         self.cell_height = 0;
         self.wide_cell_width = 0;
         if let Some(ctx) = &self.ctx {
-            if let Some(c) = &self.canvas {
-                ctx.clear_rect(0.0, 0.0, c.width() as f64, c.height() as f64);
+            if self.cached_size > 0 {
+                ctx.clear_rect(0.0, 0.0, self.cached_size as f64, self.cached_size as f64);
             }
             ctx.set_text_baseline("bottom");
         }
     }
 
     fn atlas_size(&self) -> u32 {
-        self.canvas.as_ref().map(|c| c.width()).unwrap_or(Self::MIN_SIZE)
+        if self.cached_size > 0 { self.cached_size } else { Self::MIN_SIZE }
     }
 
     fn ensure_canvas_sized(&mut self, size: u32) -> bool {
         let size = size.clamp(Self::MIN_SIZE, Self::MAX_SIZE);
-        if let Some(canvas) = &self.canvas {
-            if canvas.width() == size && canvas.height() == size && self.ctx.is_some() {
-                return true;
-            }
+        if self.cached_size == size && self.canvas.is_some() && self.ctx.is_some() {
+            return true;
         }
         let Some(window) = web_sys::window() else {
             return false;
@@ -296,6 +302,7 @@ impl GlyphAtlas {
         };
         self.canvas = Some(canvas);
         self.ctx = Some(ctx);
+        self.cached_size = size;
         // Resize clears the canvas, so all cached slots are invalid.
         self.slots.clear();
         self.version = self.version.wrapping_add(1);
@@ -474,8 +481,11 @@ pub struct Terminal {
     inner: TerminalState,
     glyph_atlas: GlyphAtlas,
     bg_ops: Vec<u32>,
-    glyph_ops: Vec<u32>,
     overflow_text_ops: Vec<(u32, u32, u32, String)>,
+    /// Ready-to-upload background vertex data (6 verts × 6 floats per rect).
+    bg_verts: Vec<f32>,
+    /// Ready-to-upload glyph vertex data (6 verts × 8 floats per glyph).
+    glyph_verts: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -490,7 +500,8 @@ impl Terminal {
             inner: TerminalState::new(rows, cols),
             glyph_atlas: GlyphAtlas::default(),
             bg_ops: Vec::new(),
-            glyph_ops: Vec::new(),
+            bg_verts: Vec::new(),
+            glyph_verts: Vec::new(),
             overflow_text_ops: Vec::new(),
         }
     }
@@ -589,12 +600,24 @@ impl Terminal {
         self.prepare_render_ops_inner();
     }
 
-    pub fn background_ops(&self) -> Vec<u32> {
-        self.bg_ops.clone()
+    /// Pointer to ready-to-upload background vertex data (f32).
+    pub fn bg_verts_ptr(&self) -> *const f32 {
+        self.bg_verts.as_ptr()
     }
 
-    pub fn glyph_ops(&self) -> Vec<u32> {
-        self.glyph_ops.clone()
+    /// Length of background vertex data (in f32 elements).
+    pub fn bg_verts_len(&self) -> usize {
+        self.bg_verts.len()
+    }
+
+    /// Pointer to ready-to-upload glyph vertex data (f32).
+    pub fn glyph_verts_ptr(&self) -> *const f32 {
+        self.glyph_verts.as_ptr()
+    }
+
+    /// Length of glyph vertex data (in f32 elements).
+    pub fn glyph_verts_len(&self) -> usize {
+        self.glyph_verts.len()
     }
 
     pub fn overflow_text_count(&self) -> usize {
@@ -795,16 +818,26 @@ impl Terminal {
             .extend_from_slice(&[row as u32, col as u32, col_span as u32, packed]);
     }
 
-    fn push_glyph_op(&mut self, slot: GlyphSlot, row: usize, col: usize, col_span: usize, fg_packed: u32) {
-        self.glyph_ops.extend_from_slice(&[
-            slot.src_x as u32,
-            slot.src_y as u32,
-            slot.width as u32,
-            slot.height as u32,
-            row as u32,
-            col as u32,
-            col_span as u32,
-            fg_packed,
+    fn push_glyph_vert(&mut self, slot: GlyphSlot, row: usize, col: usize, col_span: usize, fg_packed: u32) {
+        let pw = self.cell_width as f32;
+        let ph = self.cell_height as f32;
+        let aw = self.glyph_atlas.atlas_size().max(1) as f32;
+        let sx = slot.src_x as f32;
+        let sy = slot.src_y as f32;
+        let sw = slot.width as f32;
+        let sh = slot.height as f32;
+        let dx1 = col as f32 * pw;
+        let dy1 = row as f32 * ph - (sh - ph);
+        let dx2 = dx1 + col_span as f32 * pw;
+        let dy2 = dy1 + sh;
+        let u1 = sx / aw; let v1 = sy / aw;
+        let u2 = (sx + sw) / aw; let v2 = (sy + sh) / aw;
+        let r = ((fg_packed >> 16) & 0xff) as f32 / 255.0;
+        let g = ((fg_packed >> 8) & 0xff) as f32 / 255.0;
+        let b = (fg_packed & 0xff) as f32 / 255.0;
+        self.glyph_verts.extend_from_slice(&[
+            dx1,dy1,u1,v1,r,g,b,1.0, dx2,dy1,u2,v1,r,g,b,1.0, dx1,dy2,u1,v2,r,g,b,1.0,
+            dx1,dy2,u1,v2,r,g,b,1.0, dx2,dy1,u2,v1,r,g,b,1.0, dx2,dy2,u2,v2,r,g,b,1.0,
         ]);
     }
 
@@ -817,45 +850,16 @@ impl Terminal {
         let normal_font = format!("{}px {}", ch.round().max(1.0) as u32, self.font_family);
 
         self.bg_ops.clear();
-        self.glyph_ops.clear();
+        self.glyph_verts.clear();
         self.overflow_text_ops.clear();
 
         self.glyph_atlas.ensure_metrics(cw, ch);
-        let cells = self.inner.cells();
-        let mut needed_keys: HashMap<GlyphKey, ()> = HashMap::new();
-        for i in 0..total {
-            let idx = i * CELL_SIZE;
-            let f0 = cells[idx];
-            let f1 = cells[idx + 1];
-            if f1 & 4 != 0 {
-                continue;
-            }
-            let content_len = ((f1 >> 3) & 7) as usize;
-            if content_len == 0 || content_len == 7 {
-                continue;
-            }
-            let content_bytes = &cells[idx + 8..idx + 8 + content_len];
-            if content_bytes == b" " {
-                continue;
-            }
-            let bold = f0 & (1 << 4) != 0;
-            let italic = f0 & (1 << 6) != 0;
-            let underline = f0 & (1 << 7) != 0;
-            let wide = f1 & 2 != 0;
-            if let Some(key) = GlyphKey::new(content_bytes, bold, italic, underline, wide) {
-                if !self.glyph_atlas.slots.contains_key(&key) {
-                    needed_keys.insert(key, ());
-                }
-            }
-        }
-        let total_unique = self.glyph_atlas.slots.len() + needed_keys.len();
-        self.glyph_atlas.ensure_capacity(total_unique);
+        // Pre-grow atlas based on previous capacity — avoids mid-frame
+        // invalidation for steady-state rendering (same glyph set).
+        self.glyph_atlas.ensure_capacity(self.glyph_atlas.slots.len());
 
         for i in 0..total {
-            let row = i / cols;
-            let col = i % cols;
             let idx = i * CELL_SIZE;
-
             let mut cell = [0u8; CELL_SIZE];
             cell.copy_from_slice(&self.inner.cells()[idx..idx + CELL_SIZE]);
             let f0 = cell[0];
@@ -874,6 +878,9 @@ impl Terminal {
             let inverse = f1 & 1 != 0;
             let wide = f1 & 2 != 0;
             let content_len = ((f1 >> 3) & 7) as usize;
+            let row = i / cols;
+            let col = i % cols;
+
             let (fg, bg) = if inverse {
                 (
                     self.palette.resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
@@ -913,12 +920,40 @@ impl Terminal {
                         if let Some(slot) =
                             self.glyph_atlas.ensure_glyph(key, &normal_font, cw, ch)
                         {
-                            self.push_glyph_op(slot, row, col, cell_cols, fg.pack());
+                            self.push_glyph_vert(slot, row, col, cell_cols, fg.pack());
                         }
                     }
                 }
             }
         }
+
+        // Build ready-to-upload background vertex buffer from coalesced ops.
+        self.build_bg_verts();
     }
+
+    fn build_bg_verts(&mut self) {
+        let pw = self.cell_width as f32;
+        let ph = self.cell_height as f32;
+        self.bg_verts.clear();
+        self.bg_verts.reserve(self.bg_ops.len() / BG_OP_STRIDE * 36);
+        let ops = &self.bg_ops;
+        let mut i = 0;
+        while i < ops.len() {
+            let x1 = ops[i + 1] as f32 * pw;
+            let y1 = ops[i] as f32 * ph;
+            let x2 = x1 + ops[i + 2] as f32 * pw;
+            let y2 = y1 + ph;
+            let packed = ops[i + 3];
+            let r = ((packed >> 16) & 0xff) as f32 / 255.0;
+            let g = ((packed >> 8) & 0xff) as f32 / 255.0;
+            let b = (packed & 0xff) as f32 / 255.0;
+            self.bg_verts.extend_from_slice(&[
+                x1,y1,r,g,b,1.0, x2,y1,r,g,b,1.0, x1,y2,r,g,b,1.0,
+                x1,y2,r,g,b,1.0, x2,y1,r,g,b,1.0, x2,y2,r,g,b,1.0,
+            ]);
+            i += BG_OP_STRIDE;
+        }
+    }
+
 
 }

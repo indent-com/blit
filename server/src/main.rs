@@ -133,13 +133,10 @@ const PTY_READ_DRAIN_MAX_BYTES: usize = 256 * 1024;
 const PREVIEW_FPS_CAP: f32 = 30.0;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const LOCAL_FAST_PATH_MIN_WINDOW_FRAMES: usize = 8;
-/// After the reader processes a batch, wait this long before snapshotting
-/// in case the program is mid-frame (e.g. mpv between write() calls where
-/// the kernel buffer is momentarily empty).
-const SNAPSHOT_WRITE_DEBOUNCE: Duration = Duration::from_micros(500);
-/// Maximum time to defer a snapshot after the PTY first becomes dirty.
-/// Caps the debounce for continuous output (e.g. base64 /dev/random).
-const SNAPSHOT_MAX_DEFER: Duration = Duration::from_millis(1);
+/// Maximum time to defer a snapshot when the kernel PTY buffer has
+/// unread data.  Prevents starvation under continuous output (e.g.
+/// cat /dev/random) where the buffer never empties.
+const SNAPSHOT_PENDING_CAP: Duration = Duration::from_millis(1);
 /// Maximum time to defer a snapshot while the application holds an open
 /// synchronized-output bracket (?2026h without a matching ?2026l).  Large
 /// enough to cover a single video frame at 24fps (~41ms) with headroom;
@@ -181,10 +178,8 @@ struct Pty {
     /// Client-chosen tag set at creation time.
     tag: String,
     dirty: bool,
-    /// When the PTY first became dirty (for capping the defer).
+    /// When the PTY first became dirty (for capping synchronized output defer).
     dirty_since: Option<Instant>,
-    /// When the reader last processed data (for write debounce).
-    last_write: Instant,
     draining: bool,
     reader_handle: tokio::task::JoinHandle<()>,
     /// Cached (echo, icanon) from tcgetattr; refreshed every ~250ms.
@@ -1067,7 +1062,6 @@ fn spawn_pty(
         tag: tag.to_owned(),
         dirty: true,
         dirty_since: Some(Instant::now()),
-        last_write: Instant::now(),
         draining: false,
         reader_handle,
         lflag_cache,
@@ -1165,7 +1159,6 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
                         pty.dirty_since = Some(now);
                     }
                     pty.dirty = true;
-                    pty.last_write = now;
                     respond_to_queries(fd, chunk, pty.driver.size(), pty.driver.cursor_position());
                 }
                 drop(sess);
@@ -1551,34 +1544,27 @@ async fn tick(state: &AppState) -> TickOutcome {
         if !pty.dirty || pty.draining || !needful_ptys.contains(&id) {
             continue;
         }
-        // Don't snapshot while the kernel PTY buffer has unread data — the
-        // reader hasn't processed it yet, so the terminal is stale.  Also
-        // debounce: if the reader just processed data, the program may be
-        // between write() calls with the kernel buffer momentarily empty.
-        // Both checks are capped by SNAPSHOT_MAX_DEFER for continuous output.
-        let capped = pty.dirty_since
-            .map(|since| since + SNAPSHOT_MAX_DEFER <= now)
-            .unwrap_or(false);
-        if !capped {
-            let recent = pty.last_write + SNAPSHOT_WRITE_DEBOUNCE > now;
-            if recent || pty_has_pending_data(pty.master_fd) {
-                let retry = pty.last_write + SNAPSHOT_WRITE_DEBOUNCE;
-                next_deadline = Some(match next_deadline {
-                    Some(existing) => existing.min(retry),
-                    None => retry,
-                });
-                continue;
-            }
-        }
-        // Respect synchronized output (DEC ?2026): the application has
-        // opened a frame boundary and not yet closed it.  Defer until
-        // ?2026l arrives or SNAPSHOT_SYNC_DEFER elapses (safety valve for
-        // a crashed/buggy application that never sends the closing marker).
+        // Respect synchronized output (DEC ?2026) first: the application
+        // has opened a frame boundary and not yet closed it.  This takes
+        // priority over pending-data checks since the app is explicitly
+        // telling us the screen is incomplete.
         if pty.driver.synced_output() {
             let sync_capped = pty.dirty_since
                 .map(|since| since + SNAPSHOT_SYNC_DEFER <= now)
                 .unwrap_or(false);
             if !sync_capped {
+                continue;
+            }
+        }
+        // Don't snapshot while the kernel PTY buffer has unread data —
+        // the reader hasn't processed it yet, so the terminal is stale.
+        // Cap the defer so continuous output (cat /dev/random) still gets
+        // periodic snapshots.
+        if !pty.exited && pty_has_pending_data(pty.master_fd) {
+            let capped = pty.dirty_since
+                .map(|since| since + SNAPSHOT_PENDING_CAP <= now)
+                .unwrap_or(false);
+            if !capped {
                 continue;
             }
         }

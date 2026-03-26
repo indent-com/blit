@@ -67,6 +67,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       style,
       palette = ctx.palette,
       readOnly = false,
+      onRender,
     } = props;
 
     // Refs for DOM elements.
@@ -78,11 +79,12 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // Refs for mutable state that must not trigger re-renders.
     const terminalRef = useRef<Terminal | null>(null);
     const rendererRef = useRef<GlRenderer | null>(null);
-    const rafRef = useRef<number>(0);
     const cellRef = useRef<CellMetrics>(measureCell(fontFamily, fontSize));
     const rowsRef = useRef(24);
     const colsRef = useRef(80);
-    const needsRenderRef = useRef(false);
+    const contentDirtyRef = useRef(true);
+    const rafRef = useRef(0);
+    const renderScheduledRef = useRef(false);
 
     const scrollOffsetRef = useRef(0);
     const cursorBlinkOnRef = useRef(true);
@@ -94,6 +96,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     const selStartRef = useRef<{ row: number; col: number } | null>(null);
     const selEndRef = useRef<{ row: number; col: number } | null>(null);
+    const selectingRef = useRef(false);
     const hoveredUrlRef = useRef<{
       row: number;
       startCol: number;
@@ -107,6 +110,17 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     // React state for things the consumer might read.
     const [wasmReady, setWasmReady] = useState(false);
+
+    // Demand-driven rendering — only rAF when something changed.
+    const doRenderRef = useRef(() => {});
+    const scheduleRender = useCallback(() => {
+      if (renderScheduledRef.current) return;
+      renderScheduledRef.current = true;
+      rafRef.current = requestAnimationFrame(() => {
+        renderScheduledRef.current = false;
+        doRenderRef.current();
+      });
+    }, []);
 
     // -----------------------------------------------------------------------
     // Connection callbacks — BlitTerminal only cares about UPDATE (rendering)
@@ -137,7 +151,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       if (!t || !nextPalette) return;
       t.set_default_colors(...nextPalette.fg, ...nextPalette.bg);
       for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...nextPalette.ansi[i]);
-      needsRenderRef.current = true;
+      contentDirtyRef.current = true;
+      scheduleRender();
     }, []);
 
     useEffect(() => {
@@ -148,7 +163,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           rowsRef.current = tr;
           colsRef.current = tc;
         }
-        needsRenderRef.current = true;
+        scheduleRender();
       };
       const unsub = store.addDirtyListener((dirtyPtyId: number) => {
         if (dirtyPtyId !== ptyId) return;
@@ -158,7 +173,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           terminalRef.current = t;
           applyPaletteToTerminal(t);
         }
-        needsRenderRef.current = true;
+        contentDirtyRef.current = true;
+        scheduleRender();
         reconcilePrediction();
         if (readOnly) syncReadOnlySize(t);
       });
@@ -237,8 +253,18 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     }, [store]);
 
     // -----------------------------------------------------------------------
-    // Cell measurement (re-measure when font changes)
+    // Cell measurement (re-measure when font or DPR changes)
     // -----------------------------------------------------------------------
+
+    const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1);
+
+    useEffect(() => {
+      if (typeof window.matchMedia !== "function") return;
+      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      const onChange = () => setDpr(window.devicePixelRatio || 1);
+      mq.addEventListener("change", onChange);
+      return () => mq.removeEventListener("change", onChange);
+    }, [dpr]);
 
     useEffect(() => {
       const cell = measureCell(fontFamily, fontSize);
@@ -251,8 +277,9 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         }
         store.setCellSize(cell.pw, cell.ph);
       }
-      needsRenderRef.current = true;
-    }, [fontFamily, fontSize, store, readOnly]);
+      contentDirtyRef.current = true;
+      scheduleRender();
+    }, [fontFamily, fontSize, dpr, store, readOnly]);
 
     // -----------------------------------------------------------------------
     // Cursor blink timer
@@ -263,14 +290,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       cursorBlinkOnRef.current = true;
       const timer = setInterval(() => {
         cursorBlinkOnRef.current = !cursorBlinkOnRef.current;
-        needsRenderRef.current = true;
+        scheduleRender();
       }, 530);
       cursorBlinkTimerRef.current = timer;
       return () => {
         clearInterval(timer);
         cursorBlinkTimerRef.current = null;
       };
-    }, [readOnly]);
+    }, [readOnly, scheduleRender]);
 
     // -----------------------------------------------------------------------
     // GL renderer lifecycle
@@ -303,14 +330,13 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             t.set_cell_size(cell.pw, cell.ph);
             t.set_font_family(fontFamily);
           }
-          needsRenderRef.current = true;
+          scheduleRender();
         }
       } else {
         terminalRef.current = null;
       }
       return () => {
         terminalRef.current = null;
-        needsRenderRef.current = false;
         if (ptyId !== null) store.release(ptyId);
       };
     }, [wasmReady, ptyId, store, fontFamily, readOnly, applyPaletteToTerminal]);
@@ -355,7 +381,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (sizeChanged) {
           rowsRef.current = rows;
           colsRef.current = cols;
-          needsRenderRef.current = true;
+          contentDirtyRef.current = true;
+          scheduleRender();
         }
 
         pendingRows = rows;
@@ -381,24 +408,17 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         window.removeEventListener("resize", handleResize);
         if (resizeTimer) clearTimeout(resizeTimer);
       };
-    }, [ptyId, readOnly, sendResize, fontFamily, fontSize]);
+    }, [ptyId, readOnly, sendResize, fontFamily, fontSize, dpr]);
 
     // -----------------------------------------------------------------------
-    // Render loop
+    // Render (demand-driven — only rAF when something changed)
     // -----------------------------------------------------------------------
 
     useEffect(() => {
-      let running = true;
+      doRenderRef.current = () => {
+        if (!terminalRef.current || !rendererRef.current?.supported) return;
 
-      const renderLoop = () => {
-        if (!running) return;
-
-        if (
-          needsRenderRef.current &&
-          terminalRef.current &&
-          rendererRef.current?.supported
-        ) {
-          needsRenderRef.current = false;
+        {
           const t = terminalRef.current;
           // Guard against freed WASM objects (PTY closed or switched)
           const cell = cellRef.current;
@@ -434,11 +454,19 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             }
           }
 
-          t.prepare_render_ops();
+          if (contentDirtyRef.current) {
+            contentDirtyRef.current = false;
+            t.prepare_render_ops();
+          }
+
+          const mem = store.wasmMemory()!;
+          const bgVerts = new Float32Array(mem.buffer, t.bg_verts_ptr(), t.bg_verts_len());
+          const glyphVerts = new Float32Array(mem.buffer, t.glyph_verts_ptr(), t.glyph_verts_len());
           renderer.render(
-            t.background_ops(),
-            t.glyph_ops(),
+            bgVerts,
+            glyphVerts,
             t.glyph_atlas_canvas(),
+            t.glyph_atlas_version(),
             t.cursor_visible(),
             t.cursor_col,
             t.cursor_row,
@@ -552,18 +580,19 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             }
           }
 
+          onRender?.();
         }
-
-        rafRef.current = requestAnimationFrame(renderLoop);
       };
 
-      rafRef.current = requestAnimationFrame(renderLoop);
+      // Initial render.
+      scheduleRender();
 
       return () => {
-        running = false;
+        doRenderRef.current = () => {};
         cancelAnimationFrame(rafRef.current);
+        renderScheduledRef.current = false;
       };
-    }, [fontFamily, fontSize, readOnly]);
+    }, [fontFamily, fontSize, dpr, readOnly, scheduleRender, store]);
 
     // -----------------------------------------------------------------------
     // Keyboard input
@@ -593,7 +622,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
               predictedFromColRef.current = t.cursor_col;
             }
             predictedRef.current += e.key;
-            needsRenderRef.current = true;
+            scheduleRender();
           } else {
             predictedRef.current = "";
           }
@@ -710,11 +739,11 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
       function clearSelection() {
         selStartRef.current = selEndRef.current = null;
-        needsRenderRef.current = true;
+        scheduleRender();
       }
 
       function drawSelection() {
-        needsRenderRef.current = true;
+        scheduleRender();
       }
 
       function getRowText(row: number): string {
@@ -738,13 +767,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       }
 
       function isWrapped(row: number): boolean {
-        const t = terminalRef.current as Record<string, unknown> | null;
-        if (t && typeof t.is_wrapped === "function") {
-          return !!(t.is_wrapped as (row: number) => boolean)(row);
-        }
-        // Fallback for older WASM builds without is_wrapped
-        const text = getRowText(row);
-        return text.length >= colsRef.current;
+        const t = terminalRef.current;
+        return t ? t.is_wrapped(row) : false;
       }
 
       function logicalLineRange(row: number): { startRow: number; endRow: number } {
@@ -806,6 +830,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (e.button === 0) {
           clearSelection();
           selecting = true;
+          selectingRef.current = true;
+          if (ptyId !== null) store.freeze(ptyId);
           const cell = mouseToCell(e);
           const detail = Math.min(e.detail, 3) as 1 | 2 | 3;
           selGranularity = detail;
@@ -871,6 +897,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         }
         if (selecting) {
           selecting = false;
+          selectingRef.current = false;
           if (selGranularity === 1) {
             selEndRef.current = mouseToCell(e);
           }
@@ -883,6 +910,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             copySelection();
           }
           clearSelection();
+          if (ptyId !== null) store.thaw(ptyId);
         }
         if (canvas.contains(e.target as Node)) {
           inputRef.current?.focus();
@@ -951,7 +979,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (selecting) {
           if (hoveredUrlRef.current) {
             hoveredUrlRef.current = null;
-            needsRenderRef.current = true;
+            scheduleRender();
             canvas.style.cursor = "text";
             lastHoverUrl = null;
           }
@@ -966,7 +994,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           hoveredUrlRef.current = hit
             ? { row: cell.row, startCol: hit.startCol, endCol: hit.endCol, url: hit.url }
             : null;
-          needsRenderRef.current = true;
+          scheduleRender();
         }
       };
 

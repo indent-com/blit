@@ -87,6 +87,8 @@ export interface BlitTerminalProps {
   readOnly?: boolean;
   /** TerminalStore for centralized terminal management. Falls back to BlitProvider context if omitted. */
   store?: import("./TerminalStore").TerminalStore;
+  /** Called after each render frame (for metrics). */
+  onRender?: () => void;
 }
 
 export const DEFAULT_FONT = "PragmataPro, ui-monospace, monospace";

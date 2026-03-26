@@ -7,6 +7,7 @@ export function StatusBar({
   sessions,
   metrics,
   palette,
+  termSize,
   onExpose,
   onPalette,
   onFont,
@@ -14,6 +15,7 @@ export function StatusBar({
   sessions: UseBlitSessionsReturn;
   metrics: Metrics;
   palette: TerminalPalette;
+  termSize: string | null;
   onExpose: () => void;
   onPalette: () => void;
   onFont: () => void;
@@ -38,6 +40,7 @@ export function StatusBar({
         )}
       </span>
       <span style={styles.statusMetrics}>
+        {termSize && <>{termSize} &middot; </>}
         {formatBw(metrics.bw)} &middot; {metrics.ups} UPS &middot; {metrics.fps} FPS
       </span>
       <button onClick={onPalette} style={styles.statusBtn} title="Palette (Cmd+Shift+P)">

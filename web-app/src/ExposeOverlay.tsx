@@ -101,7 +101,7 @@ export function ExposeOverlay({
         exited: s.state === "exited",
       }));
 
-  const itemCount = isCommand ? 1 : items.length + 1;
+  const itemCount = isCommand ? 0 : items.length + 1;
   // Default to the most recent PTY that isn't the currently focused one,
   // so Cmd+K Enter switches back — like Alt-Tab.
   const defaultIdx = items.findIndex((it) => it.ptyId !== sessions.focusedPtyId);
@@ -216,26 +216,28 @@ export function ExposeOverlay({
               color: "inherit",
             }}
           />
+          {isCommand && (
+            <button
+              style={{
+                ...styles.exposeCloseBtn,
+                opacity: 1,
+                backgroundColor: "#58f",
+                color: "#fff",
+                padding: "4px 10px",
+                borderRadius: 4,
+                fontSize: 13,
+              }}
+              onClick={() => onCreate(commandText || undefined)}
+            >
+              Run
+            </button>
+          )}
           <button style={styles.exposeCloseBtn} onClick={onClose}>
             Esc
           </button>
         </header>
+        {!isCommand && (
         <ul ref={listRef} style={searching ? styles.exposeSearchResults : styles.exposeCards}>
-          {isCommand ? (
-            <li
-              style={{
-                ...styles.exposeItem,
-                borderColor: itemBorder(true),
-                backgroundColor: itemBg(true),
-              }}
-              onClick={() => onCreate(commandText || undefined)}
-            >
-              <span style={styles.exposeItemLabel}>
-                Run: <strong>{commandText || "(shell)"}</strong>
-              </span>
-            </li>
-          ) : (
-            <>
               {items.map((it, i) => (
                 <li
                   key={it.ptyId}
@@ -345,9 +347,8 @@ export function ExposeOverlay({
               >
                 <span style={{ fontSize: searching ? 16 : 32, opacity: 0.5 }}>+</span>
               </li>
-            </>
-          )}
         </ul>
+        )}
       </nav>
     </div>
   );

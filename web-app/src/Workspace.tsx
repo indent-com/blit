@@ -71,7 +71,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
     onSessionClosed: (session) => store.freeTerminal(session.ptyId),
   });
   sessionsRef.current = sessions;
-  const metrics = useMetrics(transport);
+  const { countFrame, ...metrics } = useMetrics(transport);
 
   const dark = palette.dark;
 
@@ -273,6 +273,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
           ...styles.workspace,
           backgroundColor: bg,
           color: dark ? "#e0e0e0" : "#333",
+          fontFamily: font,
         }}
       >
         <section style={styles.termContainer}>
@@ -280,6 +281,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
             <BlitTerminal
               ref={termCallbackRef}
               ptyId={sessions.focusedPtyId}
+              onRender={countFrame}
               style={{ width: "100%", height: "100%" }}
             />
           )}
@@ -328,6 +330,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
             sessions={sessions}
             metrics={metrics}
             palette={palette}
+            termSize={termRef.current ? `${termRef.current.cols}x${termRef.current.rows}` : null}
             onExpose={() => toggleOverlay("expose")}
             onPalette={() => toggleOverlay("palette")}
             onFont={() => toggleOverlay("font")}

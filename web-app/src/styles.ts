@@ -48,9 +48,9 @@ export const styles: Record<string, React.CSSProperties> = {
     color: "inherit",
     cursor: "pointer",
     fontSize: 12,
+    fontFamily: "inherit",
     opacity: 0.7,
     padding: "2px 6px",
-
   },
   statusTitle: {
     flex: 1,
@@ -122,6 +122,7 @@ export const styles: Record<string, React.CSSProperties> = {
     border: "none",
     color: "inherit",
     cursor: "pointer",
+    fontFamily: "inherit",
     opacity: 0.5,
     fontSize: 12,
   },
@@ -224,7 +225,7 @@ export const styles: Record<string, React.CSSProperties> = {
     gap: 10,
     padding: "6px 8px",
     border: "none",
-
+    fontFamily: "inherit",
     cursor: "pointer",
     width: "100%",
     color: "inherit",

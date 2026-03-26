@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { BlitTransport } from "blit-react";
 
 export interface Metrics {
@@ -9,15 +9,26 @@ export interface Metrics {
 
 const INTERVAL = 1000;
 const C2S_DISPLAY_RATE = 0x04;
-const INITIAL_TARGET_FPS = 120;
 
-export function useMetrics(transport: BlitTransport): Metrics {
+export function useMetrics(transport: BlitTransport): Metrics & { countFrame: () => void } {
   const [metrics, setMetrics] = useState<Metrics>({ bw: 0, fps: 0, ups: 0 });
   const bytesRef = useRef(0);
   const framesRef = useRef(0);
   const updatesRef = useRef(0);
 
+  const countFrame = useCallback(() => {
+    framesRef.current++;
+  }, []);
+
   useEffect(() => {
+    function sendDisplayRate(fps: number) {
+      const msg = new Uint8Array(3);
+      msg[0] = C2S_DISPLAY_RATE;
+      msg[1] = fps & 0xff;
+      msg[2] = (fps >> 8) & 0xff;
+      transport.send(msg);
+    }
+
     const onMessage = (data: ArrayBuffer) => {
       bytesRef.current += data.byteLength;
       const view = new Uint8Array(data);
@@ -27,49 +38,39 @@ export function useMetrics(transport: BlitTransport): Metrics {
     };
     transport.addEventListener("message", onMessage);
 
+    // Continuously probe the display's refresh rate capability and
+    // report it to the server for pacing.
     let rafId = 0;
-    let prevTime = 0;
-    let fpsEwma = INITIAL_TARGET_FPS;
+    let prevRafTime = 0;
+    let fpsEwma = 120;
     let lastReported = 0;
 
-    function sendDisplayRate(fps: number) {
-      const msg = new Uint8Array(3);
-      msg[0] = C2S_DISPLAY_RATE;
-      msg[1] = fps & 0xff;
-      msg[2] = (fps >> 8) & 0xff;
-      transport.send(msg);
-    }
-
-    const onStatus = (status: string) => {
-      if (status === "connected") {
-        const fps = lastReported || INITIAL_TARGET_FPS;
-        sendDisplayRate(fps);
-        lastReported = fps;
-      }
-    };
-    transport.addEventListener("statuschange", onStatus);
-    if (transport.status === "connected") {
-      sendDisplayRate(INITIAL_TARGET_FPS);
-      lastReported = INITIAL_TARGET_FPS;
-    }
-
-    const countFrame = (now: number) => {
-      framesRef.current++;
-      if (prevTime > 0) {
-        const dt = now - prevTime;
+    const probeDisplayRate = (now: number) => {
+      if (prevRafTime > 0) {
+        const dt = now - prevRafTime;
         if (dt > 0 && dt < 500) {
           fpsEwma = fpsEwma * 0.8 + (1000 / dt) * 0.2;
-          const advertised = Math.max(10, Math.round(fpsEwma / 5) * 5);
+          const advertised = Math.round(fpsEwma);
           if (advertised !== lastReported && transport.status === "connected") {
             sendDisplayRate(advertised);
             lastReported = advertised;
           }
         }
       }
-      prevTime = now;
-      rafId = requestAnimationFrame(countFrame);
+      prevRafTime = now;
+      rafId = requestAnimationFrame(probeDisplayRate);
     };
-    rafId = requestAnimationFrame(countFrame);
+
+    const onStatus = (status: string) => {
+      if (status === "connected") {
+        const fps = lastReported || Math.round(fpsEwma);
+        sendDisplayRate(fps);
+        lastReported = fps;
+      }
+    };
+    transport.addEventListener("statuschange", onStatus);
+
+    rafId = requestAnimationFrame(probeDisplayRate);
 
     const timer = setInterval(() => {
       setMetrics({
@@ -90,7 +91,7 @@ export function useMetrics(transport: BlitTransport): Metrics {
     };
   }, [transport]);
 
-  return metrics;
+  return { ...metrics, countFrame };
 }
 
 export function formatBw(bytes: number): string {

@@ -31,6 +31,8 @@ export class TerminalStore {
   private onStatus: (status: string) => void;
   private ready = false;
   private readyListeners = new Set<() => void>();
+  private frozenPtys = new Set<number>();
+  private frozenBuffers = new Map<number, Uint8Array[]>();
 
   constructor(transport: BlitTransport, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
     this._transport = transport;
@@ -39,12 +41,23 @@ export class TerminalStore {
       const bytes = new Uint8Array(data);
       if (bytes.length < 3 || bytes[0] !== S2C_UPDATE) return;
       const ptyId = bytes[1] | (bytes[2] << 8);
+      // ACK every frame immediately — don't gate on rendering.
+      this._transport.send(buildAckMessage());
+      // Buffer frames for frozen PTYs (e.g. during selection).
+      if (this.frozenPtys.has(ptyId)) {
+        let buf = this.frozenBuffers.get(ptyId);
+        if (!buf) {
+          buf = [];
+          this.frozenBuffers.set(ptyId, buf);
+        }
+        buf.push(new Uint8Array(bytes.subarray(3)));
+        return;
+      }
       let t = this.terminals.get(ptyId);
       if (!t) {
         if (!this.mod) return;
         t = this.createTerminal();
         this.terminals.set(ptyId, t);
-        // Free the stale terminal now that the fresh one is ready.
         const stale = this.staleTerminals.get(ptyId);
         if (stale) {
           this.staleTerminals.delete(ptyId);
@@ -52,8 +65,6 @@ export class TerminalStore {
         }
       }
       t.feed_compressed(bytes.subarray(3));
-      // ACK every frame immediately — don't gate on rendering.
-      this._transport.send(buildAckMessage());
       for (const l of this.dirtyListeners) l(ptyId);
     };
 
@@ -87,6 +98,20 @@ export class TerminalStore {
 
   isReady(): boolean {
     return this.ready;
+  }
+
+  private _wasmMem: WebAssembly.Memory | null = null;
+
+  /** Get the WASM linear memory for zero-copy typed array views. */
+  wasmMemory(): WebAssembly.Memory | null {
+    if (this._wasmMem) return this._wasmMem;
+    if (!this.mod) return null;
+    const m = this.mod as Record<string, unknown>;
+    if (typeof m.wasm_memory === "function") {
+      this._wasmMem = (m.wasm_memory as () => WebAssembly.Memory)();
+      return this._wasmMem;
+    }
+    return null;
   }
 
   onReady(listener: () => void): () => void {
@@ -138,6 +163,33 @@ export class TerminalStore {
 
   getCellSize(): { pw: number; ph: number } {
     return { pw: this.cellPw, ph: this.cellPh };
+  }
+
+  /** Freeze a PTY: buffer incoming frames instead of applying them. */
+  freeze(ptyId: number): void {
+    this.frozenPtys.add(ptyId);
+  }
+
+  /** Thaw a PTY: apply all buffered frames and resume normal updates. */
+  thaw(ptyId: number): void {
+    this.frozenPtys.delete(ptyId);
+    const buf = this.frozenBuffers.get(ptyId);
+    if (buf && buf.length > 0) {
+      this.frozenBuffers.delete(ptyId);
+      let t = this.terminals.get(ptyId);
+      if (!t && this.mod) {
+        t = this.createTerminal();
+        this.terminals.set(ptyId, t);
+      }
+      if (t) {
+        for (const frame of buf) {
+          t.feed_compressed(frame);
+        }
+        for (const l of this.dirtyListeners) l(ptyId);
+      }
+    } else {
+      this.frozenBuffers.delete(ptyId);
+    }
   }
 
   setDesiredSubscriptions(ptyIds: Set<number>): void {
