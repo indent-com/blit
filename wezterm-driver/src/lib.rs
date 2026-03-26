@@ -330,7 +330,7 @@ impl TerminalDriver {
                 cols: cols as usize,
                 ..TerminalSize::default()
             },
-            config,
+            config.clone(),
             "blit-server",
             env!("CARGO_PKG_VERSION"),
             Box::new(io::sink()),
