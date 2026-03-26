@@ -18,18 +18,24 @@ export function StatusBar({
   onPalette: () => void;
   onFont: () => void;
 }) {
-  const active = sessions.sessions.filter((s) => s.state !== "closed");
+  const visible = sessions.sessions.filter((s) => s.state !== "closed");
+  const exited = visible.filter((s) => s.state === "exited").length;
+  const focused = sessions.sessions.find((s) => s.ptyId === sessions.focusedPtyId);
   return (
     <>
       <button onClick={onExpose} style={styles.statusBtn} title="Expose (Cmd+K)">
-        {active.length} PTY{active.length !== 1 ? "s" : ""}
+        {visible.length} PTY{visible.length !== 1 ? "s" : ""}
+        {exited > 0 && <span style={{ opacity: 0.5 }}> ({exited} exited)</span>}
       </button>
       <span style={styles.statusTitle}>
-        {sessions.focusedPtyId != null &&
-          (sessions.sessions.find(
-            (s) => s.ptyId === sessions.focusedPtyId,
-          )?.title ??
-            `PTY ${sessions.focusedPtyId}`)}
+        {focused && (
+          <>
+            {focused.title ?? `PTY ${focused.ptyId}`}
+            {focused.state === "exited" && (
+              <span style={{ color: "#a44", marginLeft: 6, fontSize: 11 }}>[exited]</span>
+            )}
+          </>
+        )}
       </span>
       <span style={styles.statusMetrics}>
         {formatBw(metrics.bw)} &middot; {metrics.ups} UPS &middot; {metrics.fps} FPS
