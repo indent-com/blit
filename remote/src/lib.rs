@@ -33,6 +33,11 @@ pub const C2S_SCROLL: u8 = 0x02;
 pub const C2S_ACK: u8 = 0x03;
 pub const C2S_DISPLAY_RATE: u8 = 0x04;
 pub const C2S_CLIENT_METRICS: u8 = 0x05;
+/// Mouse event: [0x06][pty_id:2][type:1][button:1][col:2][row:2]
+/// type: 0=down, 1=up, 2=move
+/// button: 0=left, 1=mid, 2=right, 3=release, 64=wheel_up, 65=wheel_down
+/// The server generates the correct escape sequence based on mouse_mode and mouse_encoding.
+pub const C2S_MOUSE: u8 = 0x06;
 pub const C2S_CREATE: u8 = 0x10;
 pub const C2S_FOCUS: u8 = 0x11;
 pub const C2S_CLOSE: u8 = 0x12;
@@ -62,17 +67,12 @@ pub const S2C_EXITED: u8 = 0x08;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
+    #[default]
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,8 +119,9 @@ pub struct FrameState {
     overflow: BTreeMap<usize, String>,
     /// Per-row flags. `ROW_FLAG_WRAPPED` means the row continues on the next.
     line_flags: Vec<u8>,
+    /// Total scrollback lines available for this PTY.
+    scrollback_lines: u32,
 }
-
 
 impl FrameState {
     pub fn new(rows: u16, cols: u16) -> Self {
@@ -135,6 +136,7 @@ impl FrameState {
             title: String::new(),
             overflow: BTreeMap::new(),
             line_flags: vec![0; rows as usize],
+            scrollback_lines: 0,
         }
     }
 
@@ -204,6 +206,14 @@ impl FrameState {
 
     pub fn line_flags_mut(&mut self) -> &mut Vec<u8> {
         &mut self.line_flags
+    }
+
+    pub fn scrollback_lines(&self) -> u32 {
+        self.scrollback_lines
+    }
+
+    pub fn set_scrollback_lines(&mut self, lines: u32) {
+        self.scrollback_lines = lines;
     }
 
     pub fn is_wrapped(&self, row: u16) -> bool {
@@ -612,7 +622,7 @@ impl TerminalState {
             after_strings += ops_end;
         }
 
-        let line_flags_changed = if line_flags_present {
+        let (line_flags_changed, after_line_flags) = if line_flags_present {
             let lf_start = after_strings;
             let lf_end = lf_start + new_rows as usize;
             if payload.len() >= lf_end {
@@ -620,16 +630,23 @@ impl TerminalState {
                 let changed = self.frame.line_flags != new_flags;
                 self.frame.line_flags.clear();
                 self.frame.line_flags.extend_from_slice(new_flags);
-                changed
+                (changed, lf_end)
             } else {
-                false
+                (false, after_strings)
             }
-        } else if resized {
-            // On resize without line_flags, reset to all-unwrapped.
-            false
         } else {
-            false
+            (false, after_strings)
         };
+
+        // Trailing scrollback count (backward-compatible extension).
+        if payload.len() >= after_line_flags + 4 {
+            self.frame.scrollback_lines = u32::from_le_bytes([
+                payload[after_line_flags],
+                payload[after_line_flags + 1],
+                payload[after_line_flags + 2],
+                payload[after_line_flags + 3],
+            ]);
+        }
 
         self.frame.cursor_row = new_cursor_row.min(self.frame.rows.saturating_sub(1));
         self.frame.cursor_col = new_cursor_col.min(self.frame.cols.saturating_sub(1));
@@ -829,7 +846,9 @@ impl TerminalState {
         let frame_cols = self.frame.cols as usize;
         for r in row..row_end {
             for c in col..col_end {
-                self.frame.overflow.remove(&(r as usize * frame_cols + c as usize));
+                self.frame
+                    .overflow
+                    .remove(&(r as usize * frame_cols + c as usize));
             }
         }
         if row >= row_end || col >= col_end {
@@ -854,7 +873,9 @@ impl TerminalState {
             if off + 6 > data.len() {
                 break;
             }
-            let cell_idx = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+            let cell_idx =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                    as usize;
             let len = u16::from_le_bytes([data[off + 4], data[off + 5]]) as usize;
             off += 6;
             if off + len > data.len() {
@@ -867,7 +888,6 @@ impl TerminalState {
         }
         off
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -1024,15 +1044,40 @@ impl CallbackRenderer {
 }
 
 pub enum ServerMsg<'a> {
-    Hello { version: u16, features: u32 },
-    Update { pty_id: u16, payload: &'a [u8] },
-    Created { pty_id: u16, tag: &'a str },
-    CreatedN { nonce: u16, pty_id: u16, tag: &'a str },
-    Closed { pty_id: u16 },
-    Exited { pty_id: u16 },
-    List { entries: Vec<PtyListEntry<'a>> },
-    Title { pty_id: u16, title: &'a [u8] },
-    SearchResults { request_id: u16, results: Vec<SearchResultEntry<'a>> },
+    Hello {
+        version: u16,
+        features: u32,
+    },
+    Update {
+        pty_id: u16,
+        payload: &'a [u8],
+    },
+    Created {
+        pty_id: u16,
+        tag: &'a str,
+    },
+    CreatedN {
+        nonce: u16,
+        pty_id: u16,
+        tag: &'a str,
+    },
+    Closed {
+        pty_id: u16,
+    },
+    Exited {
+        pty_id: u16,
+    },
+    List {
+        entries: Vec<PtyListEntry<'a>>,
+    },
+    Title {
+        pty_id: u16,
+        title: &'a [u8],
+    },
+    SearchResults {
+        request_id: u16,
+        results: Vec<SearchResultEntry<'a>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1116,11 +1161,15 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             let mut entries = Vec::with_capacity(count);
             let mut offset = 3;
             for _ in 0..count {
-                if offset + 4 > data.len() { break; }
+                if offset + 4 > data.len() {
+                    break;
+                }
                 let pty_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
                 let tag_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
                 offset += 4;
-                if offset + tag_len > data.len() { break; }
+                if offset + tag_len > data.len() {
+                    break;
+                }
                 let tag = std::str::from_utf8(&data[offset..offset + tag_len]).unwrap_or_default();
                 offset += tag_len;
                 entries.push(PtyListEntry { pty_id, tag });
@@ -1367,11 +1416,7 @@ pub fn build_update_msg(
     let scroll_eligible = (mode_is_cooked(current.mode) && mode_is_cooked(previous.mode))
         || current.mode == 0
         || previous.mode == 0;
-    if ENABLE_SCROLL_OPS
-        && same_size
-        && previous.cells != current.cells
-        && scroll_eligible
-    {
+    if ENABLE_SCROLL_OPS && same_size && previous.cells != current.cells && scroll_eligible {
         if let Some(delta_rows) = detect_vertical_scroll(current, previous) {
             let mut basis = previous.clone();
             encode_copy_rect_op(&mut ops, current, delta_rows);
@@ -1420,8 +1465,8 @@ pub fn build_update_msg(
         Vec::new()
     };
 
-    let line_flags_changed = current.line_flags != previous.line_flags
-        || current.rows != previous.rows;
+    let line_flags_changed =
+        current.line_flags != previous.line_flags || current.rows != previous.rows;
     let has_line_flags = line_flags_changed && !current.line_flags.iter().all(|&f| f == 0);
 
     let title_bytes = if title_changed {
@@ -1432,15 +1477,29 @@ pub fn build_update_msg(
     let title_len = title_bytes.len().min(TITLE_LEN_MASK as usize);
     let title_field = OPS_PRESENT
         | if has_overflow { STRINGS_PRESENT } else { 0 }
-        | if has_line_flags { LINE_FLAGS_PRESENT } else { 0 }
+        | if has_line_flags {
+            LINE_FLAGS_PRESENT
+        } else {
+            0
+        }
         | if title_changed {
             TITLE_PRESENT | title_len as u16
         } else {
             0
         };
 
-    let mut payload =
-        Vec::with_capacity(12 + title_len + 2 + ops.len() + overflow_section.len() + if has_line_flags { current.rows as usize } else { 0 });
+    let mut payload = Vec::with_capacity(
+        12 + title_len
+            + 2
+            + ops.len()
+            + overflow_section.len()
+            + if has_line_flags {
+                current.rows as usize
+            } else {
+                0
+            }
+            + 4,
+    );
     payload.extend_from_slice(&current.rows.to_le_bytes());
     payload.extend_from_slice(&current.cols.to_le_bytes());
     payload.extend_from_slice(&current.cursor_row.to_le_bytes());
@@ -1456,6 +1515,8 @@ pub fn build_update_msg(
     if has_line_flags {
         payload.extend_from_slice(&current.line_flags);
     }
+    // Trailing scrollback count — old clients ignore extra bytes.
+    payload.extend_from_slice(&current.scrollback_lines.to_le_bytes());
 
     let compressed = compress_prepend_size(&payload);
     let mut msg = Vec::with_capacity(3 + compressed.len());
@@ -1562,7 +1623,7 @@ fn detect_vertical_scroll(current: &FrameState, previous: &FrameState) -> Option
 fn encode_copy_rect_op(out: &mut Vec<u8>, current: &FrameState, delta_rows: i16) {
     let rows = current.rows;
     let cols = current.cols;
-    let delta = delta_rows.unsigned_abs() as u16;
+    let delta = delta_rows.unsigned_abs();
     let (src_row, dst_row, copy_rows) = if delta_rows > 0 {
         (0, delta, rows.saturating_sub(delta))
     } else {
@@ -1578,7 +1639,7 @@ fn encode_copy_rect_op(out: &mut Vec<u8>, current: &FrameState, delta_rows: i16)
 }
 
 fn apply_vertical_scroll_copy(frame: &mut FrameState, delta_rows: i16) {
-    let delta = delta_rows.unsigned_abs() as u16;
+    let delta = delta_rows.unsigned_abs();
     if delta == 0 || delta >= frame.rows {
         return;
     }
@@ -1658,7 +1719,7 @@ fn append_full_width_fill_ops(
             end += 1;
         }
 
-        if *op_count >= u16::MAX {
+        if *op_count == u16::MAX {
             break;
         }
         out.push(OP_FILL_RECT);
@@ -2023,7 +2084,11 @@ mod tests {
         ]
         .concat();
 
-        let ServerMsg::SearchResults { request_id, results } = parse_server_msg(&msg).unwrap() else {
+        let ServerMsg::SearchResults {
+            request_id,
+            results,
+        } = parse_server_msg(&msg).unwrap()
+        else {
             panic!("expected search results");
         };
         assert_eq!(request_id, 7);
@@ -2237,7 +2302,10 @@ mod tests {
 
         let msg = parse_server_msg(&created_wire).unwrap();
         match msg {
-            ServerMsg::Created { pty_id, tag: parsed_tag } => {
+            ServerMsg::Created {
+                pty_id,
+                tag: parsed_tag,
+            } => {
                 assert_eq!(pty_id, 7);
                 assert_eq!(parsed_tag, "my-session");
             }
@@ -2375,14 +2443,18 @@ mod tests {
     #[test]
     fn frame_state_wrapped_text() {
         let mut f = FrameState::new(4, 10);
-        let lines = f.write_wrapped_text(Rect::new(0, 0, 4, 5), "hello world", CellStyle::default());
+        let lines =
+            f.write_wrapped_text(Rect::new(0, 0, 4, 5), "hello world", CellStyle::default());
         assert!(lines >= 2); // "hello world" wraps at width 5
     }
 
     #[test]
     fn frame_state_wrapped_text_empty_rect() {
         let mut f = FrameState::new(4, 10);
-        assert_eq!(f.write_wrapped_text(Rect::new(0, 0, 0, 0), "hi", CellStyle::default()), 0);
+        assert_eq!(
+            f.write_wrapped_text(Rect::new(0, 0, 0, 0), "hi", CellStyle::default()),
+            0
+        );
     }
 
     #[test]

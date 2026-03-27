@@ -37,17 +37,28 @@ const DEFAULT_FONT_FAMILY: &str = r#"ui-monospace, monospace"#;
 /// or non-generic names work correctly in canvas `ctx.font` assignments.
 fn css_quote_font_family(family: &str) -> String {
     const GENERIC: &[&str] = &[
-        "serif", "sans-serif", "monospace", "cursive", "fantasy",
-        "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded",
-        "math", "emoji", "fangsong",
+        "serif",
+        "sans-serif",
+        "monospace",
+        "cursive",
+        "fantasy",
+        "system-ui",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+        "math",
+        "emoji",
+        "fangsong",
     ];
     family
         .split(',')
         .map(|f| {
             let f = f.trim();
-            if GENERIC.iter().any(|g| g.eq_ignore_ascii_case(f)) {
-                f.to_owned()
-            } else if f.starts_with('"') || f.starts_with('\'') {
+            if GENERIC.iter().any(|g| g.eq_ignore_ascii_case(f))
+                || f.starts_with('"')
+                || f.starts_with('\'')
+            {
                 f.to_owned()
             } else {
                 format!("'{f}'")
@@ -108,26 +119,66 @@ impl Palette {
     fn resolve(&self, color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> CellColor {
         match color_type {
             0 => {
-                let [cr, cg, cb] = if is_fg { self.default_fg } else { self.default_bg };
+                let [cr, cg, cb] = if is_fg {
+                    self.default_fg
+                } else {
+                    self.default_bg
+                };
                 let (r, g, b) = if dim && is_fg {
-                    ((cr as u16 * 6 / 10) as u8, (cg as u16 * 6 / 10) as u8, (cb as u16 * 6 / 10) as u8)
+                    (
+                        (cr as u16 * 6 / 10) as u8,
+                        (cg as u16 * 6 / 10) as u8,
+                        (cb as u16 * 6 / 10) as u8,
+                    )
                 } else {
                     (cr, cg, cb)
                 };
-                CellColor { r, g, b, is_default: true }
+                CellColor {
+                    r,
+                    g,
+                    b,
+                    is_default: true,
+                }
             }
             1 => {
                 let (cr, cg, cb) = self.idx_to_rgb(r);
-                let (r, g, b) = if dim { (cr / 2, cg / 2, cb / 2) } else { (cr, cg, cb) };
-                CellColor { r, g, b, is_default: false }
+                let (r, g, b) = if dim {
+                    (cr / 2, cg / 2, cb / 2)
+                } else {
+                    (cr, cg, cb)
+                };
+                CellColor {
+                    r,
+                    g,
+                    b,
+                    is_default: false,
+                }
             }
             2 => {
-                let (r, g, b) = if dim { (r / 2, g / 2, b / 2) } else { (r, g, b) };
-                CellColor { r, g, b, is_default: false }
+                let (r, g, b) = if dim {
+                    (r / 2, g / 2, b / 2)
+                } else {
+                    (r, g, b)
+                };
+                CellColor {
+                    r,
+                    g,
+                    b,
+                    is_default: false,
+                }
             }
             _ => {
-                let [cr, cg, cb] = if is_fg { self.default_fg } else { self.default_bg };
-                CellColor { r: cr, g: cg, b: cb, is_default: true }
+                let [cr, cg, cb] = if is_fg {
+                    self.default_fg
+                } else {
+                    self.default_bg
+                };
+                CellColor {
+                    r: cr,
+                    g: cg,
+                    b: cb,
+                    is_default: true,
+                }
             }
         }
     }
@@ -135,23 +186,37 @@ impl Palette {
     fn color_css(&self, color_type: u8, r: u8, g: u8, b: u8, is_fg: bool, dim: bool) -> String {
         let (cr, cg, cb) = match color_type {
             0 => {
-                let [dr, dg, db] = if is_fg { self.default_fg } else { self.default_bg };
+                let [dr, dg, db] = if is_fg {
+                    self.default_fg
+                } else {
+                    self.default_bg
+                };
                 if dim && is_fg {
-                    return format!("rgb({},{},{})",
+                    return format!(
+                        "rgb({},{},{})",
                         (dr as u16 * 6 / 10) as u8,
                         (dg as u16 * 6 / 10) as u8,
-                        (db as u16 * 6 / 10) as u8);
+                        (db as u16 * 6 / 10) as u8
+                    );
                 }
                 return format!("#{:02x}{:02x}{:02x}", dr, dg, db);
             }
             1 => self.idx_to_rgb(r),
             2 => (r, g, b),
             _ => {
-                let [dr, dg, db] = if is_fg { self.default_fg } else { self.default_bg };
+                let [dr, dg, db] = if is_fg {
+                    self.default_fg
+                } else {
+                    self.default_bg
+                };
                 return format!("#{:02x}{:02x}{:02x}", dr, dg, db);
             }
         };
-        let (cr, cg, cb) = if dim { (cr / 2, cg / 2, cb / 2) } else { (cr, cg, cb) };
+        let (cr, cg, cb) = if dim {
+            (cr / 2, cg / 2, cb / 2)
+        } else {
+            (cr, cg, cb)
+        };
         format!("#{:02x}{:02x}{:02x}", cr, cg, cb)
     }
 }
@@ -198,13 +263,7 @@ struct GlyphKey {
 }
 
 impl GlyphKey {
-    fn new(
-        bytes: &[u8],
-        bold: bool,
-        italic: bool,
-        underline: bool,
-        wide: bool,
-    ) -> Option<Self> {
+    fn new(bytes: &[u8], bold: bool, italic: bool, underline: bool, wide: bool) -> Option<Self> {
         if bytes.is_empty() || bytes.len() > 4 {
             return None;
         }
@@ -283,7 +342,11 @@ impl GlyphAtlas {
     }
 
     fn atlas_size(&self) -> u32 {
-        if self.cached_size > 0 { self.cached_size } else { Self::MIN_SIZE }
+        if self.cached_size > 0 {
+            self.cached_size
+        } else {
+            Self::MIN_SIZE
+        }
     }
 
     fn ensure_canvas_sized(&mut self, size: u32) -> bool {
@@ -371,7 +434,7 @@ impl GlyphAtlas {
         if cols == 0 {
             return Self::MAX_SIZE;
         }
-        let rows_needed = (count + cols - 1) / cols;
+        let rows_needed = count.div_ceil(cols);
         let height_needed = rows_needed * ch;
         let mut size = Self::MIN_SIZE;
         while (size as usize) < height_needed && size < Self::MAX_SIZE {
@@ -389,10 +452,8 @@ impl GlyphAtlas {
     /// invalidates all cached slots.
     fn ensure_capacity(&mut self, needed_glyphs: usize) -> bool {
         let required = self.size_for_glyphs(needed_glyphs);
-        if required > self.atlas_size() {
-            if !self.ensure_canvas_sized(required) {
-                return false;
-            }
+        if required > self.atlas_size() && !self.ensure_canvas_sized(required) {
+            return false;
         }
         true
     }
@@ -465,11 +526,23 @@ impl GlyphAtlas {
             let scale = 0.85;
             let scaled_h = cell_height * scale;
             let font_size = scaled_h.round().max(1.0) as u32;
-            let scaled_font = format!("{}px {}", font_size, &font[font.find("px ").map(|i| i + 3).unwrap_or(0)..]);
+            let scaled_font = format!(
+                "{}px {}",
+                font_size,
+                &font[font.find("px ").map(|i| i + 3).unwrap_or(0)..]
+            );
             let pad_y = (cell_height - scaled_h) / 2.0;
-            (scaled_font, slot.src_x, slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64)
+            (
+                scaled_font,
+                slot.src_x,
+                slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64,
+            )
         } else {
-            (font, slot.src_x, slot.src_y + cell_height + Self::VERT_PAD as f64)
+            (
+                font,
+                slot.src_x,
+                slot.src_y + cell_height + Self::VERT_PAD as f64,
+            )
         };
         ctx.set_font(&draw_font);
         // Render in white — the GL shader tints per-vertex.
@@ -482,8 +555,14 @@ impl GlyphAtlas {
         if key.underline {
             ctx.set_stroke_style_str("#fff");
             ctx.begin_path();
-            ctx.move_to(slot.src_x, slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0);
-            ctx.line_to(slot.src_x + slot.width, slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0);
+            ctx.move_to(
+                slot.src_x,
+                slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
+            );
+            ctx.line_to(
+                slot.src_x + slot.width,
+                slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
+            );
             ctx.stroke();
         }
         ctx.restore();
@@ -552,7 +631,15 @@ impl Terminal {
         self.glyph_atlas.invalidate();
     }
 
-    pub fn set_default_colors(&mut self, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g: u8, bg_b: u8) {
+    pub fn set_default_colors(
+        &mut self,
+        fg_r: u8,
+        fg_g: u8,
+        fg_b: u8,
+        bg_r: u8,
+        bg_g: u8,
+        bg_b: u8,
+    ) {
         self.palette.default_fg = [fg_r, fg_g, fg_b];
         self.palette.default_bg = [bg_r, bg_g, bg_b];
     }
@@ -599,6 +686,9 @@ impl Terminal {
     #[wasm_bindgen(getter)]
     pub fn cols(&self) -> u16 {
         self.inner.cols()
+    }
+    pub fn scrollback_lines(&self) -> u32 {
+        self.inner.frame().scrollback_lines()
     }
     pub fn cursor_visible(&self) -> bool {
         self.inner.mode() & 1 != 0
@@ -704,18 +794,25 @@ impl Terminal {
                 let content_len = ((f1 >> 3) & 7) as usize;
                 let (fg, bg) = if inverse {
                     (
-                        self.palette.color_css(bg_type, cell[5], cell[6], cell[7], false, dim),
-                        self.palette.color_css(fg_type, cell[2], cell[3], cell[4], true, false),
+                        self.palette
+                            .color_css(bg_type, cell[5], cell[6], cell[7], false, dim),
+                        self.palette
+                            .color_css(fg_type, cell[2], cell[3], cell[4], true, false),
                     )
                 } else {
                     (
-                        self.palette.color_css(fg_type, cell[2], cell[3], cell[4], true, dim),
-                        self.palette.color_css(bg_type, cell[5], cell[6], cell[7], false, false),
+                        self.palette
+                            .color_css(fg_type, cell[2], cell[3], cell[4], true, dim),
+                        self.palette
+                            .color_css(bg_type, cell[5], cell[6], cell[7], false, false),
                     )
                 };
                 let flat = row as usize * self.inner.cols() as usize + col as usize;
                 let ch = if content_len == 7 {
-                    self.inner.frame().overflow().get(&flat)
+                    self.inner
+                        .frame()
+                        .overflow()
+                        .get(&flat)
                         .map(|s| s.as_str())
                         .unwrap_or(" ")
                         .to_string()
@@ -726,7 +823,8 @@ impl Terminal {
                 } else {
                     " ".to_string()
                 };
-                let has_style = fg != default_fg_css || bg != default_bg_css || bold || italic || underline;
+                let has_style =
+                    fg != default_fg_css || bg != default_bg_css || bold || italic || underline;
                 if has_style {
                     let mut style = String::new();
                     if fg != default_fg_css {
@@ -819,7 +917,6 @@ impl Terminal {
         }
         result
     }
-
 }
 
 impl Terminal {
@@ -839,7 +936,14 @@ impl Terminal {
             .extend_from_slice(&[row as u32, col as u32, col_span as u32, packed]);
     }
 
-    fn push_glyph_vert(&mut self, slot: GlyphSlot, row: usize, col: usize, col_span: usize, fg_packed: u32) {
+    fn push_glyph_vert(
+        &mut self,
+        slot: GlyphSlot,
+        row: usize,
+        col: usize,
+        col_span: usize,
+        fg_packed: u32,
+    ) {
         let pw = self.cell_width as f32;
         let ph = self.cell_height as f32;
         let aw = self.glyph_atlas.atlas_size().max(1) as f32;
@@ -851,14 +955,17 @@ impl Terminal {
         let dy1 = row as f32 * ph - (sh - ph);
         let dx2 = dx1 + col_span as f32 * pw;
         let dy2 = dy1 + sh;
-        let u1 = sx / aw; let v1 = sy / aw;
-        let u2 = (sx + sw) / aw; let v2 = (sy + sh) / aw;
+        let u1 = sx / aw;
+        let v1 = sy / aw;
+        let u2 = (sx + sw) / aw;
+        let v2 = (sy + sh) / aw;
         let r = ((fg_packed >> 16) & 0xff) as f32 / 255.0;
         let g = ((fg_packed >> 8) & 0xff) as f32 / 255.0;
         let b = (fg_packed & 0xff) as f32 / 255.0;
         self.glyph_verts.extend_from_slice(&[
-            dx1,dy1,u1,v1,r,g,b,1.0, dx2,dy1,u2,v1,r,g,b,1.0, dx1,dy2,u1,v2,r,g,b,1.0,
-            dx1,dy2,u1,v2,r,g,b,1.0, dx2,dy1,u2,v1,r,g,b,1.0, dx2,dy2,u2,v2,r,g,b,1.0,
+            dx1, dy1, u1, v1, r, g, b, 1.0, dx2, dy1, u2, v1, r, g, b, 1.0, dx1, dy2, u1, v2, r, g,
+            b, 1.0, dx1, dy2, u1, v2, r, g, b, 1.0, dx2, dy1, u2, v1, r, g, b, 1.0, dx2, dy2, u2,
+            v2, r, g, b, 1.0,
         ]);
     }
 
@@ -868,7 +975,11 @@ impl Terminal {
         let rows = self.inner.rows() as usize;
         let cols = self.inner.cols() as usize;
         let total = rows * cols;
-        let normal_font = format!("{}px {}", ch.round().max(1.0) as u32, css_quote_font_family(&self.font_family));
+        let normal_font = format!(
+            "{}px {}",
+            ch.round().max(1.0) as u32,
+            css_quote_font_family(&self.font_family)
+        );
 
         self.bg_ops.clear();
         self.glyph_verts.clear();
@@ -877,7 +988,8 @@ impl Terminal {
         self.glyph_atlas.ensure_metrics(cw, ch);
         // Pre-grow atlas based on previous capacity — avoids mid-frame
         // invalidation for steady-state rendering (same glyph set).
-        self.glyph_atlas.ensure_capacity(self.glyph_atlas.slots.len());
+        self.glyph_atlas
+            .ensure_capacity(self.glyph_atlas.slots.len());
 
         for i in 0..total {
             let idx = i * CELL_SIZE;
@@ -904,17 +1016,22 @@ impl Terminal {
 
             let (fg, bg) = if inverse {
                 (
-                    self.palette.resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
+                    self.palette
+                        .resolve(bg_type, cell[5], cell[6], cell[7], false, dim),
                     {
-                        let mut c = self.palette.resolve(fg_type, cell[2], cell[3], cell[4], true, false);
+                        let mut c = self
+                            .palette
+                            .resolve(fg_type, cell[2], cell[3], cell[4], true, false);
                         c.is_default = false;
                         c
                     },
                 )
             } else {
                 (
-                    self.palette.resolve(fg_type, cell[2], cell[3], cell[4], true, dim),
-                    self.palette.resolve(bg_type, cell[5], cell[6], cell[7], false, false),
+                    self.palette
+                        .resolve(fg_type, cell[2], cell[3], cell[4], true, dim),
+                    self.palette
+                        .resolve(bg_type, cell[5], cell[6], cell[7], false, false),
                 )
             };
             let cell_cols = if wide { 2 } else { 1 };
@@ -935,11 +1052,8 @@ impl Terminal {
             } else if content_len > 0 {
                 let content_bytes = &cell[8..8 + content_len];
                 if content_bytes != b" " {
-                    if let Some(key) =
-                        GlyphKey::new(content_bytes, bold, italic, underline, wide)
-                    {
-                        if let Some(slot) =
-                            self.glyph_atlas.ensure_glyph(key, &normal_font, cw, ch)
+                    if let Some(key) = GlyphKey::new(content_bytes, bold, italic, underline, wide) {
+                        if let Some(slot) = self.glyph_atlas.ensure_glyph(key, &normal_font, cw, ch)
                         {
                             self.push_glyph_vert(slot, row, col, cell_cols, fg.pack());
                         }
@@ -969,12 +1083,10 @@ impl Terminal {
             let g = ((packed >> 8) & 0xff) as f32 / 255.0;
             let b = (packed & 0xff) as f32 / 255.0;
             self.bg_verts.extend_from_slice(&[
-                x1,y1,r,g,b,1.0, x2,y1,r,g,b,1.0, x1,y2,r,g,b,1.0,
-                x1,y2,r,g,b,1.0, x2,y1,r,g,b,1.0, x2,y2,r,g,b,1.0,
+                x1, y1, r, g, b, 1.0, x2, y1, r, g, b, 1.0, x1, y2, r, g, b, 1.0, x1, y2, r, g, b,
+                1.0, x2, y1, r, g, b, 1.0, x2, y2, r, g, b, 1.0,
             ]);
             i += BG_OP_STRIDE;
         }
     }
-
-
 }

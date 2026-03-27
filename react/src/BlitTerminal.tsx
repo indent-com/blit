@@ -17,6 +17,10 @@ import {
   buildInputMessage,
   buildResizeMessage,
   buildScrollMessage,
+  buildMouseMessage,
+  MOUSE_DOWN,
+  MOUSE_UP,
+  MOUSE_MOVE,
 } from "./protocol";
 import {
   measureCell,
@@ -72,6 +76,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       palette = ctx.palette,
       readOnly = false,
       onRender,
+      scrollbarColor = "rgba(255,255,255,0.3)",
+      scrollbarWidth = 4,
     } = props;
 
     // Refs for DOM elements.
@@ -87,11 +93,15 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     const rowsRef = useRef(24);
     const colsRef = useRef(80);
     const contentDirtyRef = useRef(true);
+    /** Track WASM buffer identity to detect heap growth that invalidates vertex pointers. */
+    const lastWasmBufferRef = useRef<ArrayBuffer | null>(null);
     const [cellVersion, setCellVersion] = useState(0);
     const rafRef = useRef(0);
     const renderScheduledRef = useRef(false);
 
     const scrollOffsetRef = useRef(0);
+    const scrollFadeRef = useRef(0);
+    const scrollFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const cursorBlinkOnRef = useRef(true);
     const cursorBlinkTimerRef = useRef<ReturnType<typeof setInterval> | null>(
       null,
@@ -277,33 +287,38 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     }, [dpr]);
 
     useEffect(() => {
-      const apply = () => {
+      const apply = (forceInvalidate = false) => {
         const cell = measureCell(fontFamily, fontSize);
         const changed =
           cell.pw !== cellRef.current.pw || cell.ph !== cellRef.current.ph;
+        const shouldInvalidate = forceInvalidate || changed;
         cellRef.current = cell;
         if (!readOnly) {
           const t = terminalRef.current;
           if (t) {
             t.set_cell_size(cell.pw, cell.ph);
             t.set_font_family(fontFamily);
-            if (changed) t.invalidate_render_cache();
+            if (shouldInvalidate) t.invalidate_render_cache();
           }
           store.setCellSize(cell.pw, cell.ph);
         }
-        if (changed) {
+        if (shouldInvalidate) {
           contentDirtyRef.current = true;
           scheduleRender();
+        }
+        if (changed) {
           setCellVersion((v) => v + 1);
         }
       };
       // Always apply on effect run (font/size/dpr changed).
       contentDirtyRef.current = true;
-      apply();
+      apply(true);
       scheduleRender();
-      // Re-measure when fonts finish loading — only re-renders if metrics change.
-      document.fonts?.addEventListener("loadingdone", apply);
-      return () => document.fonts?.removeEventListener("loadingdone", apply);
+      // Re-measure when fonts finish loading. Even if metrics stay the same,
+      // the glyph atlas may need a rebuild because the actual raster changed.
+      const onFontsLoaded = () => apply(true);
+      document.fonts?.addEventListener("loadingdone", onFontsLoaded);
+      return () => document.fonts?.removeEventListener("loadingdone", onFontsLoaded);
     }, [fontFamily, fontSize, dpr, store, readOnly, scheduleRender]);
 
     // -----------------------------------------------------------------------
@@ -349,6 +364,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             t.set_cell_size(cell.pw, cell.ph);
             t.set_font_family(fontFamily);
           }
+          contentDirtyRef.current = true;
           scheduleRender();
         }
       } else {
@@ -414,11 +430,12 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       doRenderRef.current = () => {
-        if (!terminalRef.current || !rendererRef.current?.supported) return;
+        const t0 = performance.now();
+        if (!rendererRef.current?.supported) return;
+        if (!terminalRef.current) return;
 
         {
           const t = terminalRef.current;
-          // Guard against freed WASM objects (PTY closed or switched)
           const cell = cellRef.current;
           const renderer = rendererRef.current;
 
@@ -437,12 +454,18 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             }
           }
 
+          const mem = store.wasmMemory()!;
+          // Detect WASM heap growth: if the underlying ArrayBuffer changed,
+          // vertex pointers from the previous prepare_render_ops are invalid.
+          if (mem.buffer !== lastWasmBufferRef.current) {
+            lastWasmBufferRef.current = mem.buffer;
+            contentDirtyRef.current = true;
+          }
+
           if (contentDirtyRef.current) {
             contentDirtyRef.current = false;
             t.prepare_render_ops();
           }
-
-          const mem = store.wasmMemory()!;
           const bgVerts = new Float32Array(
             mem.buffer,
             t.bg_verts_ptr(),
@@ -586,13 +609,35 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
                   }
                 }
               }
+
+              // Scrollbar indicator
+              if (scrollFadeRef.current > 0 && scrollOffsetRef.current > 0) {
+                const t2 = terminalRef.current;
+                if (t2) {
+                  const totalLines = t2.scrollback_lines() + rowsRef.current;
+                  const viewportRows = rowsRef.current;
+                  if (totalLines > viewportRows) {
+                    const ch = cell.ph;
+                    const canvasH = viewportRows * ch;
+                    const barW = scrollbarWidth;
+                    const barH = Math.max(barW, (viewportRows / totalLines) * canvasH);
+                    const scrollFraction = scrollOffsetRef.current / (totalLines - viewportRows);
+                    const barY = (1 - scrollFraction) * (canvasH - barH);
+                    const barX = colsRef.current * cell.pw - barW - 2;
+                    ctx.fillStyle = scrollbarColor;
+                    ctx.beginPath();
+                    ctx.roundRect(barX, barY, barW, barH, barW / 2);
+                    ctx.fill();
+                  }
+                }
+              }
             }
           }
 
           if (!readOnly) {
             store.noteFrameRendered();
           }
-          onRender?.();
+          onRender?.(performance.now() - t0);
         }
       };
 
@@ -712,39 +757,23 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         };
       }
 
+      /** Send a structured mouse event to the server (C2S_MOUSE).
+       *  The server generates the correct escape sequence based on
+       *  the terminal's current mouse mode, encoding, and cooked-mode state. */
       function sendMouseEvent(
         type: "down" | "up" | "move",
         e: MouseEvent,
         button: number,
       ): boolean {
+        if (ptyId === null || status !== "connected") return false;
+        // Quick client-side check to avoid unnecessary messages.
+        // The server does the authoritative check.
         const t = terminalRef.current;
-        if (
-          !t ||
-          t.mouse_mode() === 0 ||
-          ptyId === null ||
-          status !== "connected"
-        )
-          return false;
+        if (t && t.mouse_mode() === 0) return false;
 
         const pos = mouseToCell(e);
-        const enc = t.mouse_encoding();
-
-        if (enc === 2) {
-          const suffix = type === "up" ? "m" : "M";
-          const seq = `\x1b[<${button};${pos.col + 1};${pos.row + 1}${suffix}`;
-          sendInput(ptyId, encoder.encode(seq));
-        } else {
-          if (type === "up") button = 3;
-          const seq = new Uint8Array([
-            0x1b,
-            0x5b,
-            0x4d,
-            button + 32,
-            pos.col + 33,
-            pos.row + 33,
-          ]);
-          sendInput(ptyId, seq);
-        }
+        const typeCode = type === "down" ? MOUSE_DOWN : type === "up" ? MOUSE_UP : MOUSE_MOVE;
+        transport.send(buildMouseMessage(ptyId, typeCode, button, pos.col, pos.row));
         return true;
       }
 
@@ -849,6 +878,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       }
 
       let mouseDownButton = -1;
+      let lastMouseCell = { row: -1, col: -1 };
       const handleMouseDown = (e: MouseEvent) => {
         if (!e.shiftKey && sendMouseEvent("down", e, e.button)) {
           mouseDownButton = e.button;
@@ -859,7 +889,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           clearSelection();
           selecting = true;
           selectingRef.current = true;
-          if (ptyId !== null) store.freeze(ptyId);
+          // Don't freeze yet — freeze on first drag movement so clicks
+          // don't pause video players (mpv -vo tct, etc.)
           const cell = mouseToCell(e);
           const detail = Math.min(e.detail, 3) as 1 | 2 | 3;
           selGranularity = detail;
@@ -888,15 +919,17 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           const t = terminalRef.current;
           if (t) {
             const mode = t.mouse_mode();
-            if (mode === 3 || mode === 4) {
+            if (mode >= 3) {
+              // Only report when the cell coordinate changes (like real terminals).
+              const cell = mouseToCell(e);
+              if (cell.row === lastMouseCell.row && cell.col === lastMouseCell.col) return;
+              lastMouseCell = cell;
               if (e.buttons) {
-                // Button held during motion: report which button.
                 const button =
                   e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0;
                 sendMouseEvent("move", e, button + 32);
                 return;
               } else if (mode === 4) {
-                // Any-event tracking: motion with no button = code 35.
                 sendMouseEvent("move", e, 35);
                 return;
               }
@@ -904,6 +937,9 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           }
         }
         if (selecting) {
+          // Freeze on first drag so selection text is stable, but not
+          // on mousedown alone (which would pause video players).
+          if (ptyId !== null && !store.isFrozen(ptyId)) store.freeze(ptyId);
           const cell = mouseToCell(e);
           if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
             // Extend selection by word/line granularity from the anchor
@@ -929,18 +965,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
       const handleMouseUp = (e: MouseEvent) => {
         if (mouseDownButton >= 0) {
-          // Always send the release — bypass mouse_mode() check since the
-          // mode might have changed between mousedown and mouseup.
-          if (ptyId !== null && status === "connected") {
-            const t = terminalRef.current;
-            const pos = mouseToCell(e);
-            const enc = t ? t.mouse_encoding() : 0;
-            if (enc === 2) {
-              sendInput(ptyId, encoder.encode(`\x1b[<${mouseDownButton};${pos.col + 1};${pos.row + 1}m`));
-            } else {
-              sendInput(ptyId, new Uint8Array([0x1b, 0x5b, 0x4d, 3 + 32, pos.col + 33, pos.row + 33]));
-            }
-          }
+          sendMouseEvent("up", e, mouseDownButton);
           mouseDownButton = -1;
           return;
         }
@@ -981,6 +1006,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             scrollOffsetRef.current + lines,
           );
           sendScroll(ptyId, scrollOffsetRef.current);
+          // Show scrollbar, fade after 1s of inactivity
+          scrollFadeRef.current = 1;
+          if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
+          scrollFadeTimerRef.current = setTimeout(() => {
+            scrollFadeRef.current = 0;
+            scheduleRender();
+          }, 1000);
+          scheduleRender();
         }
       };
 
@@ -1056,13 +1089,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       // Send a synthetic mouseup when the window loses focus, so apps
       // like zellij/tmux don't get stuck in a "button held" state.
       const handleBlur = () => {
-        if (mouseDownButton >= 0 && ptyId !== null && status === "connected") {
-          const t = terminalRef.current;
-          const enc = t ? t.mouse_encoding() : 0;
-          if (enc === 2) {
-            sendInput(ptyId, encoder.encode(`\x1b[<${mouseDownButton};1;1m`));
-          } else {
-            sendInput(ptyId, new Uint8Array([0x1b, 0x5b, 0x4d, 3 + 32, 33, 33]));
+        if (mouseDownButton >= 0) {
+          // Synthetic release at (0,0) — server handles encoding + mode check
+          if (ptyId !== null && status === "connected") {
+            transport.send(buildMouseMessage(ptyId, MOUSE_UP, mouseDownButton, 0, 0));
           }
           mouseDownButton = -1;
         }
@@ -1092,6 +1122,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         canvas.removeEventListener("wheel", handleWheel);
         canvas.removeEventListener("contextmenu", handleContextMenu);
         canvas.removeEventListener("click", handleClick);
+        if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
       };
     }, [ptyId, status, sendInput, sendScroll]);
 

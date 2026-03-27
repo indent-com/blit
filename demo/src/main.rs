@@ -161,6 +161,7 @@ struct Burst {
     age: u8,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stamp_particle(
     seq_buf: &mut Vec<u8>,
     rng: &mut Rng,
@@ -189,6 +190,7 @@ fn stamp_particle(
     .unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stamp_splash(
     seq_buf: &mut Vec<u8>,
     rng: &mut Rng,
@@ -284,17 +286,17 @@ fn main() -> io::Result<()> {
                 stdin_buf.len(),
             )
         };
-        if n > 0 {
-            if parse_input(
+        if n > 0
+            && parse_input(
                 &stdin_buf[..n as usize],
                 &mut mouse_col,
                 &mut mouse_row,
                 &mut bursts,
                 cols,
                 rows,
-            ) {
-                break; // quit
-            }
+            )
+        {
+            break; // quit
         }
 
         let prev = parser.screen().clone();
@@ -647,7 +649,7 @@ mod tests {
         let mut r = Rng(12345);
         for _ in 0..1000 {
             let v = r.next_f32();
-            assert!(v >= 0.0 && v < 1.0, "next_f32 out of range: {}", v);
+            assert!((0.0..1.0).contains(&v), "next_f32 out of range: {}", v);
         }
     }
 
@@ -656,7 +658,7 @@ mod tests {
         let mut r = Rng(99999);
         for _ in 0..1000 {
             let v = r.range_f32(3.0, 7.0);
-            assert!(v >= 3.0 && v < 7.0, "range_f32 out of [3,7): {}", v);
+            assert!((3.0..7.0).contains(&v), "range_f32 out of [3,7): {}", v);
         }
     }
 
@@ -684,7 +686,7 @@ mod tests {
     #[test]
     fn parse_mouse_params_partial_semicolons() {
         assert_eq!(parse_mouse_params(b";10;20"), None); // empty first field
-        assert_eq!(parse_mouse_params(b"0;;20"), None);  // empty middle field
+        assert_eq!(parse_mouse_params(b"0;;20"), None); // empty middle field
     }
 
     // ── parse_input ─────────────────────────────────────────────────────
@@ -702,7 +704,14 @@ mod tests {
         let mut col = 40;
         let mut row = 12;
         let mut bursts = Vec::new();
-        assert!(parse_input(b"\x03", &mut col, &mut row, &mut bursts, 80, 24));
+        assert!(parse_input(
+            b"\x03",
+            &mut col,
+            &mut row,
+            &mut bursts,
+            80,
+            24
+        ));
     }
 
     #[test]
@@ -710,7 +719,14 @@ mod tests {
         let mut col = 40;
         let mut row = 12;
         let mut bursts = Vec::new();
-        assert!(parse_input(b"\x1b", &mut col, &mut row, &mut bursts, 80, 24));
+        assert!(parse_input(
+            b"\x1b",
+            &mut col,
+            &mut row,
+            &mut bursts,
+            80,
+            24
+        ));
     }
 
     #[test]

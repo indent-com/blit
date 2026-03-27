@@ -1,0 +1,9 @@
+[package]
+name = "blit-webserver"
+version = "0.8.0"
+edition = "2021"
+
+[dependencies]
+blit-fonts = { path = "../fonts" }
+axum = "0.8"
+percent-encoding = "2"

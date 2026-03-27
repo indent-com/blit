@@ -52,7 +52,7 @@ dev
 ### Binaries
 
 - `blit-server`: PTY host and frame producer
-- `blit-gateway`: HTTP/WebSocket gateway for browsers
+- `blit-gateway`: HTTP/WebSocket/WebTransport gateway for browsers
 - `blit` / `blit-cli`: terminal client and embedded gateway (browser mode) or ANSI renderer (console mode)
 - `blit-demo`: local demos
 
@@ -97,7 +97,7 @@ graph LR
 
 **Server side.** `blit-server` owns PTYs and terminal state. When a PTY produces output, the wezterm parser (`blit-wezterm`) interprets escape sequences and updates an in-memory cell grid. The server then diffs this grid against what each client last received, producing a compact binary frame: 12-byte cells (style flags, fg/bg color, up to 4 bytes of UTF-8 content), LZ4-compressed, with per-client delta tracking. Only changed cells are sent.
 
-**Transport.** The server exposes a Unix socket. `blit-gateway` bridges that socket to HTTP/WebSocket for browser clients, handling authentication and serving the static web assets. The `blit` CLI can either connect directly to the socket (local) or tunnel it over SSH (`-L` forwarding) and spin up an embedded gateway on a random loopback port. Clients and server exchange a binary protocol of tagged messages (`C2S_INPUT`, `C2S_RESIZE`, `S2C_UPDATE`, etc.) — no JSON, no text framing.
+**Transport.** The server exposes a Unix socket. `blit-gateway` bridges that socket to browsers over WebSocket (TCP) and WebTransport (QUIC/HTTP3), handling authentication and serving the static web assets. WebTransport is preferred when available — it eliminates head-of-line blocking across multiplexed PTYs, enables 0-RTT reconnection, and survives IP address changes (WiFi↔cellular). The browser falls back to WebSocket automatically when WebTransport is unavailable or QUIC is blocked. The `blit` CLI can either connect directly to the socket (local) or tunnel it over SSH (`-L` forwarding) and spin up an embedded gateway on a random loopback port. Clients and server exchange a binary protocol of tagged messages (`C2S_INPUT`, `C2S_RESIZE`, `S2C_UPDATE`, etc.) — no JSON, no text framing.
 
 **Client side.** The browser receives compressed frame diffs over WebSocket and feeds them to a WASM terminal state machine (`blit-browser`). Rendering is WebGL: glyphs are rasterized into a texture atlas at the device-pixel cell size, then drawn as textured quads. Background colors and cursor are separate draw calls. The 2D canvas composites the WebGL surface with overflow text (emoji, wide Unicode) and predicted input. The React component (`blit-react`) wraps the same WASM module with transport injection, so you can swap WebSocket for WebRTC or anything else.
 
@@ -202,18 +202,21 @@ This creates launchd user agents for `blit-server` (with `KeepAlive`) and each g
 
 ### `blit-gateway`
 
-The gateway serves the browser UI and proxies WebSocket traffic to the server's Unix socket. Use it for always-on deployments where the gateway must run independently of the CLI — for example, behind a reverse proxy or as a systemd service. For local and SSH use, the `blit` CLI embeds equivalent gateway functionality and is simpler to run.
+The gateway serves the browser UI and proxies WebSocket traffic to the server's Unix socket. Set `BLIT_QUIC=1` to also listen for WebTransport (QUIC/HTTP3) connections on the same address (UDP). WebTransport requires TLS — supply `BLIT_TLS_CERT` and `BLIT_TLS_KEY` for production certs, or let the gateway auto-generate a self-signed cert whose SHA-256 hash is injected into the served HTML for `serverCertificateHashes`. Use the gateway for always-on deployments where it must run independently of the CLI — for example, behind a reverse proxy or as a systemd service. For local and SSH use, the `blit` CLI embeds equivalent gateway functionality and is simpler to run.
 
 ```bash
 BLIT_PASS=secret blit-gateway
 BLIT_PASS=secret BLIT_ADDR=127.0.0.1:3264 blit-gateway
 ```
 
-| Variable    | Default                                                                          | Description                   |
-| ----------- | -------------------------------------------------------------------------------- | ----------------------------- |
-| `BLIT_PASS` | required                                                                         | Browser passphrase            |
-| `BLIT_ADDR` | `0.0.0.0:3264`                                                                   | HTTP/WebSocket listen address |
-| `BLIT_SOCK` | `/run/blit/$USER.sock`, then `$XDG_RUNTIME_DIR/blit.sock`, then `/tmp/blit.sock` | Upstream server socket        |
+| Variable        | Default                                                                          | Description                                         |
+| --------------- | -------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `BLIT_PASS`     | required                                                                         | Browser passphrase                                  |
+| `BLIT_ADDR`     | `0.0.0.0:3264`                                                                   | HTTP/WebSocket listen address                       |
+| `BLIT_SOCK`     | `/run/blit/$USER.sock`, then `$XDG_RUNTIME_DIR/blit.sock`, then `/tmp/blit.sock` | Upstream server socket                              |
+| `BLIT_QUIC`     | unset                                                                            | Set to `1` to enable WebTransport (QUIC/HTTP3)      |
+| `BLIT_TLS_CERT` | auto-generated self-signed                                                       | PEM certificate file for WebTransport TLS           |
+| `BLIT_TLS_KEY`  | auto-generated self-signed                                                       | PEM private key file for WebTransport TLS           |
 
 ### `blit`
 
@@ -418,7 +421,7 @@ interface BlitTransport {
 }
 ```
 
-Two transports are included:
+Three transports are included:
 
 **`WebSocketTransport`** — authenticating WebSocket with auto-reconnect:
 
@@ -430,6 +433,17 @@ const transport = new WebSocketTransport("wss://myhost:3264/", "secret", {
   reconnectDelay: 500,
   maxReconnectDelay: 10000,
   reconnectBackoff: 1.5,
+});
+```
+
+**`WebTransportTransport`** — WebTransport (QUIC/HTTP3) with length-prefixed framing and auto-reconnect:
+
+```ts
+import { WebTransportTransport } from "blit-react";
+
+const transport = new WebTransportTransport("https://myhost:3264/", "secret", {
+  serverCertificateHash: "abcd1234...", // required for self-signed certs
+  reconnect: true,
 });
 ```
 

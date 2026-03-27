@@ -2,13 +2,14 @@
 resolver = "2"
 members = [
     "remote",
-    "wezterm-driver",
+    "alacritty-driver",
     "server",
     "gateway",
     "browser",
     "demo",
     "cli",
     "fonts",
+    "webserver",
 ]
 
 [profile.release]

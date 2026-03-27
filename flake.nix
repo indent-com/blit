@@ -65,6 +65,21 @@
                     example = [ "/Library/Fonts" "~/Library/Fonts" ];
                     description = "Extra font directories to search.";
                   };
+                  quic = mkOption {
+                    type = types.bool;
+                    default = false;
+                    description = "Enable WebTransport (QUIC/HTTP3) alongside WebSocket.";
+                  };
+                  tlsCert = mkOption {
+                    type = types.nullOr types.path;
+                    default = null;
+                    description = "PEM certificate file for WebTransport TLS. Auto-generated if null.";
+                  };
+                  tlsKey = mkOption {
+                    type = types.nullOr types.path;
+                    default = null;
+                    description = "PEM private key file for WebTransport TLS. Auto-generated if null.";
+                  };
                   package = mkOption {
                     type = types.package;
                     default = self.packages.${pkgs.system}.blit-gateway;
@@ -113,6 +128,12 @@
                     BLIT_ADDR = "${gw.addr}:${toString gw.port}";
                   } // lib.optionalAttrs (gw.fontDirs != []) {
                     BLIT_FONT_DIRS = lib.concatStringsSep ":" gw.fontDirs;
+                  } // lib.optionalAttrs gw.quic {
+                    BLIT_QUIC = "1";
+                  } // lib.optionalAttrs (gw.tlsCert != null) {
+                    BLIT_TLS_CERT = gw.tlsCert;
+                  } // lib.optionalAttrs (gw.tlsKey != null) {
+                    BLIT_TLS_KEY = gw.tlsKey;
                   };
                   RunAtLoad = true;
                   KeepAlive = true;
@@ -190,6 +211,21 @@
                     example = [ "/usr/share/fonts" "/home/alice/.local/share/fonts" ];
                     description = "Extra font directories to search.";
                   };
+                  quic = mkOption {
+                    type = types.bool;
+                    default = false;
+                    description = "Enable WebTransport (QUIC/HTTP3) alongside WebSocket.";
+                  };
+                  tlsCert = mkOption {
+                    type = types.nullOr types.path;
+                    default = null;
+                    description = "PEM certificate file for WebTransport TLS. Auto-generated if null.";
+                  };
+                  tlsKey = mkOption {
+                    type = types.nullOr types.path;
+                    default = null;
+                    description = "PEM private key file for WebTransport TLS. Auto-generated if null.";
+                  };
                   package = mkOption {
                     type = types.package;
                     default = self.packages.${pkgs.system}.blit-gateway;
@@ -235,7 +271,10 @@
                   Environment = [
                     "BLIT_SOCK=/run/blit/${gw.user}.sock"
                     "BLIT_ADDR=${gw.addr}:${toString gw.port}"
-                  ] ++ lib.optional (gw.fontDirs != []) "BLIT_FONT_DIRS=${lib.concatStringsSep ":" gw.fontDirs}";
+                  ] ++ lib.optional (gw.fontDirs != []) "BLIT_FONT_DIRS=${lib.concatStringsSep ":" gw.fontDirs}"
+                    ++ lib.optional gw.quic "BLIT_QUIC=1"
+                    ++ lib.optional (gw.tlsCert != null) "BLIT_TLS_CERT=${gw.tlsCert}"
+                    ++ lib.optional (gw.tlsKey != null) "BLIT_TLS_KEY=${gw.tlsKey}";
                   EnvironmentFile = gw.passFile;
                   AmbientCapabilities = lib.mkIf (gw.port < 1024) [ "CAP_NET_BIND_SERVICE" ];
                 };
@@ -266,54 +305,15 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.7.3";
+        version = "0.8.0";
 
-        weztermHash = "sha256-V6WvkNZryYofarsyfcmsuvtpNJ/c3O+DmOKNvoYPbmA=";
-        finlUnicodeHash = "sha256-38S6XH4hldbkb6NP+s7lXa/NR49PI0w3KYqd+jPHND0=";
         cargoLockConfig = {
           lockFile = ./Cargo.lock;
-          outputHashes =
-            { "finl_unicode-1.3.0" = finlUnicodeHash; }
-            // builtins.listToAttrs (map (name: { inherit name; value = weztermHash; }) [
-              "filedescriptor-0.8.3"
-              "termwiz-0.24.0"
-              "vtparse-0.7.0"
-              "wezterm-bidi-0.2.3"
-              "wezterm-blob-leases-0.1.1"
-              "wezterm-cell-0.1.0"
-              "wezterm-char-props-0.1.3"
-              "wezterm-color-types-0.3.0"
-              "wezterm-dynamic-0.2.1"
-              "wezterm-dynamic-derive-0.1.1"
-              "wezterm-escape-parser-0.1.0"
-              "wezterm-input-types-0.1.0"
-              "wezterm-surface-0.1.0"
-              "wezterm-term-0.1.0"
-            ]);
         };
-
-        # wezterm-term uses include_bytes!("../../../termwiz/data/wezterm") which
-        # reaches outside its crate into the wezterm monorepo.  When nix vendors
-        # crates individually, that path doesn't exist.  Place it where the
-        # include_bytes! expects it relative to the cargo vendor dir.
-        # wezterm-term's include_bytes! references a terminfo file via a
-        # relative path that escapes the crate root into the wezterm monorepo.
-        # When nix vendors the crate, that path doesn't exist.  Fix it by
-        # placing the file where the include_bytes! expects it.
-        patchWeztermTerminfo = ''
-          for d in "cargo-vendor-dir" "$NIX_BUILD_TOP/cargo-vendor-dir"; do
-            if [ -d "$d/wezterm-term-0.1.0" ]; then
-              mkdir -p "$d/termwiz/data"
-              cp ${./vendor-patches/wezterm-terminfo} "$d/termwiz/data/wezterm"
-              echo "patched wezterm-term vendor at $d"
-              break
-            fi
-          done
-        '';
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" "x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl" ];
-          extensions = [ "llvm-tools" ];
+          extensions = [ "clippy" "llvm-tools" ];
         };
 
         rustPlatform = pkgs.makeRustPlatform {
@@ -419,7 +419,6 @@ PKGJSON
           src = ./.;
           cargoBuildFlags = [ "-p" "blit-server" ];
           cargoLock = cargoLockConfig;
-          preBuild = patchWeztermTerminfo;
           postInstall = installManPages;
           doCheck = false;
         };
@@ -467,7 +466,6 @@ PKGJSON
           src = ./.;
           cargoBuildFlags = [ "-p" cargoPkg ];
           cargoLock = cargoLockConfig;
-          preBuild = patchWeztermTerminfo;
           doCheck = false;
           # pkgsStatic's CC wrapper setup hook sets NIX_CFLAGS_LINK=" -static",
           # which causes the glibc CC to link build scripts with -static.
@@ -486,7 +484,7 @@ PKGJSON
 
         reactNpmDeps = pkgs.fetchNpmDeps {
           src = ./react;
-          hash = "sha256-jVyvXSLzuV8Hl4gFdCgj5q5A2Aq91V0Nq7SIMRXBWM8=";
+          hash = "sha256-cEIvdIZU/DwpzKndNtjmVSdtTZJTbiK256m5TrM0UWs=";
         };
 
         webAppNpmDeps = pkgs.fetchNpmDeps {
@@ -624,6 +622,19 @@ CTRL
           description = "blit WebSocket gateway";
         };
 
+        packages.lint = pkgs.writeShellApplication {
+          name = "blit-lint";
+          runtimeInputs = [ rustToolchain ];
+          text = ''
+            echo "=== Setting up web-app dist ==="
+            mkdir -p web-app/dist
+            cp ${webAppDist}/index.html web-app/dist/
+
+            echo "=== Clippy ==="
+            cargo clippy --workspace -- -D warnings
+          '';
+        };
+
         packages.tests = pkgs.writeShellApplication {
           name = "blit-tests";
           runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm ];
@@ -646,6 +657,7 @@ CTRL
         devShells.default = pkgs.mkShell {
           buildInputs = [
             rustToolchain
+            pkgs.curl
             pkgs.binaryen
             pkgs.cargo-flamegraph
             pkgs.cargo-llvm-cov

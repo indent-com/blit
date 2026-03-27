@@ -39,36 +39,57 @@ pub struct FontVariant {
 
 /// Read font family and subfamily from a TTF/OTF/TTC file's `name` table.
 fn read_font_info(data: &[u8]) -> Option<FontInfo> {
-    if data.len() < 12 { return None; }
+    if data.len() < 12 {
+        return None;
+    }
 
     let offset = if &data[0..4] == b"ttcf" {
-        if data.len() < 16 { return None; }
+        if data.len() < 16 {
+            return None;
+        }
         u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize
     } else {
         0
     };
 
-    if offset + 12 > data.len() { return None; }
+    if offset + 12 > data.len() {
+        return None;
+    }
     let num_tables = u16::from_be_bytes([data[offset + 4], data[offset + 5]]) as usize;
-    if offset + 12 + num_tables * 16 > data.len() { return None; }
+    if offset + 12 + num_tables * 16 > data.len() {
+        return None;
+    }
 
     let mut name_offset = 0usize;
     let mut name_length = 0usize;
     for i in 0..num_tables {
         let rec = offset + 12 + i * 16;
         if &data[rec..rec + 4] == b"name" {
-            name_offset = u32::from_be_bytes([data[rec + 8], data[rec + 9], data[rec + 10], data[rec + 11]]) as usize;
-            name_length = u32::from_be_bytes([data[rec + 12], data[rec + 13], data[rec + 14], data[rec + 15]]) as usize;
+            name_offset =
+                u32::from_be_bytes([data[rec + 8], data[rec + 9], data[rec + 10], data[rec + 11]])
+                    as usize;
+            name_length = u32::from_be_bytes([
+                data[rec + 12],
+                data[rec + 13],
+                data[rec + 14],
+                data[rec + 15],
+            ]) as usize;
             break;
         }
     }
-    if name_offset == 0 || name_offset + name_length > data.len() { return None; }
+    if name_offset == 0 || name_offset + name_length > data.len() {
+        return None;
+    }
 
     let tbl = &data[name_offset..];
-    if tbl.len() < 6 { return None; }
+    if tbl.len() < 6 {
+        return None;
+    }
     let count = u16::from_be_bytes([tbl[2], tbl[3]]) as usize;
     let string_offset = u16::from_be_bytes([tbl[4], tbl[5]]) as usize;
-    if tbl.len() < 6 + count * 12 { return None; }
+    if tbl.len() < 6 + count * 12 {
+        return None;
+    }
 
     // Collect candidates for name IDs 1 (family), 2 (subfamily), 16 (typo family), 17 (typo subfamily).
     // Prefer platform 3 (Windows UTF-16) over 1 (Mac).
@@ -87,19 +108,32 @@ fn read_font_info(data: &[u8]) -> Option<FontInfo> {
 
         let is_family = name_id == 1 || name_id == 16;
         let is_subfamily = name_id == 2 || name_id == 17;
-        if !is_family && !is_subfamily { continue; }
+        if !is_family && !is_subfamily {
+            continue;
+        }
 
-        let plat_bonus: u8 = if platform == 3 { 2 } else if platform == 1 { 1 } else { 0 };
-        if plat_bonus == 0 { continue; }
+        let plat_bonus: u8 = if platform == 3 {
+            2
+        } else if platform == 1 {
+            1
+        } else {
+            0
+        };
+        if plat_bonus == 0 {
+            continue;
+        }
         let typo_bonus: u8 = if name_id >= 16 { 4 } else { 0 };
         let priority = plat_bonus + typo_bonus;
 
         let start = string_offset + str_off;
-        if start + length > tbl.len() { continue; }
+        if start + length > tbl.len() {
+            continue;
+        }
         let raw = &tbl[start..start + length];
 
         let decoded = if platform == 3 {
-            let chars: Vec<u16> = raw.chunks_exact(2)
+            let chars: Vec<u16> = raw
+                .chunks_exact(2)
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             String::from_utf16_lossy(&chars)
@@ -107,7 +141,9 @@ fn read_font_info(data: &[u8]) -> Option<FontInfo> {
             String::from_utf8_lossy(raw).into_owned()
         };
         let decoded = decoded.trim().to_owned();
-        if decoded.is_empty() { continue; }
+        if decoded.is_empty() {
+            continue;
+        }
 
         if is_family && priority > family_pri {
             family = Some(decoded);
@@ -138,7 +174,9 @@ fn subfamily_to_weight_style(subfamily: &str) -> (&'static str, &'static str) {
 
 pub fn find_font_files(family: &str) -> Vec<FontVariant> {
     if let Some(results) = find_via_fc_match(family) {
-        if !results.is_empty() { return results; }
+        if !results.is_empty() {
+            return results;
+        }
     }
     let dirs = font_dirs();
     let family_lower = family.to_lowercase();
@@ -155,19 +193,27 @@ fn find_via_fc_match(family: &str) -> Option<Vec<FontVariant>> {
         .args(["--format", "%{file}\n%{style}\n", "-a", family])
         .output()
         .ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = text.lines().collect();
     let mut results = Vec::new();
     let mut seen = BTreeSet::new();
     for pair in lines.chunks(2) {
-        if pair.len() < 2 { break; }
+        if pair.len() < 2 {
+            break;
+        }
         let path = pair[0].trim();
         let style_str = pair[1].trim();
-        if path.is_empty() || !seen.insert(path.to_owned()) { continue; }
+        if path.is_empty() || !seen.insert(path.to_owned()) {
+            continue;
+        }
         if let Ok(data) = std::fs::read(path) {
             if let Some(info) = read_font_info(&data) {
-                if !info.family.eq_ignore_ascii_case(family) { continue; }
+                if !info.family.eq_ignore_ascii_case(family) {
+                    continue;
+                }
                 let (weight, style) = subfamily_to_weight_style(style_str);
                 results.push(FontVariant {
                     path: path.to_owned(),
@@ -177,7 +223,11 @@ fn find_via_fc_match(family: &str) -> Option<Vec<FontVariant>> {
             }
         }
     }
-    if results.is_empty() { None } else { Some(results) }
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
 }
 
 fn find_in_dir_recursive(
@@ -186,15 +236,24 @@ fn find_in_dir_recursive(
     family_nospace: &str,
     results: &mut Vec<FontVariant>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            find_in_dir_recursive(&path.to_string_lossy(), family_lower, family_nospace, results);
+            find_in_dir_recursive(
+                &path.to_string_lossy(),
+                family_lower,
+                family_nospace,
+                results,
+            );
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext, "ttf" | "otf" | "woff" | "woff2" | "ttc") { continue; }
+        if !matches!(ext, "ttf" | "otf" | "woff" | "woff2" | "ttc") {
+            continue;
+        }
 
         if let Ok(data) = std::fs::read(&path) {
             if let Some(info) = read_font_info(&data) {
@@ -225,7 +284,9 @@ fn list_via_fc_list() -> Option<Vec<String>> {
         .args(["--format", "%{family}\n"])
         .output()
         .ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut families = BTreeSet::new();
     for line in text.lines() {
@@ -236,7 +297,9 @@ fn list_via_fc_list() -> Option<Vec<String>> {
             }
         }
     }
-    if families.is_empty() { return None; }
+    if families.is_empty() {
+        return None;
+    }
     Some(families.into_iter().collect())
 }
 
@@ -250,7 +313,9 @@ fn list_via_name_tables() -> Vec<String> {
 }
 
 fn scan_dir_recursive(dir: &str, families: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -258,7 +323,9 @@ fn scan_dir_recursive(dir: &str, families: &mut BTreeSet<String>) {
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext, "ttf" | "otf" | "woff" | "woff2" | "ttc") { continue; }
+        if !matches!(ext, "ttf" | "otf" | "woff" | "woff2" | "ttc") {
+            continue;
+        }
         if let Ok(data) = std::fs::read(&path) {
             if let Some(info) = read_font_info(&data) {
                 families.insert(info.family);
@@ -269,7 +336,7 @@ fn scan_dir_recursive(dir: &str, families: &mut BTreeSet<String>) {
 
 pub fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -277,15 +344,25 @@ pub fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(CHARS[(n >> 18 & 63) as usize] as char);
         out.push(CHARS[(n >> 12 & 63) as usize] as char);
-        if chunk.len() > 1 { out.push(CHARS[(n >> 6 & 63) as usize] as char); } else { out.push('='); }
-        if chunk.len() > 2 { out.push(CHARS[(n & 63) as usize] as char); } else { out.push('='); }
+        if chunk.len() > 1 {
+            out.push(CHARS[(n >> 6 & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
     }
     out
 }
 
 pub fn font_face_css(family: &str) -> Option<String> {
     let files = find_font_files_with_data(family);
-    if files.is_empty() { return None; }
+    if files.is_empty() {
+        return None;
+    }
     let mut css = String::new();
     for (variant, data) in &files {
         let ext = variant.path.rsplit('.').next().unwrap_or("ttf");
@@ -301,17 +378,24 @@ pub fn font_face_css(family: &str) -> Option<String> {
             family, variant.weight, variant.style, mime, b64,
         ));
     }
-    if css.is_empty() { None } else { Some(css) }
+    if css.is_empty() {
+        None
+    } else {
+        Some(css)
+    }
 }
 
 /// Like `find_font_files` but returns the file data alongside each variant,
 /// avoiding a second read in `font_face_css`.
 fn find_font_files_with_data(family: &str) -> Vec<(FontVariant, Vec<u8>)> {
     let variants = find_font_files(family);
-    variants.into_iter().filter_map(|v| {
-        let data = std::fs::read(&v.path).ok()?;
-        Some((v, data))
-    }).collect()
+    variants
+        .into_iter()
+        .filter_map(|v| {
+            let data = std::fs::read(&v.path).ok()?;
+            Some((v, data))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -334,6 +418,9 @@ mod tests {
         assert_eq!(subfamily_to_weight_style("Bold"), ("bold", "normal"));
         assert_eq!(subfamily_to_weight_style("Italic"), ("normal", "italic"));
         assert_eq!(subfamily_to_weight_style("Bold Italic"), ("bold", "italic"));
-        assert_eq!(subfamily_to_weight_style("Bold Oblique"), ("bold", "italic"));
+        assert_eq!(
+            subfamily_to_weight_style("Bold Oblique"),
+            ("bold", "italic")
+        );
     }
 }

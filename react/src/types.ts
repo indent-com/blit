@@ -87,8 +87,12 @@ export interface BlitTerminalProps {
   readOnly?: boolean;
   /** TerminalStore for centralized terminal management. Falls back to BlitProvider context if omitted. */
   store?: import("./TerminalStore").TerminalStore;
-  /** Called after each render frame (for metrics). */
-  onRender?: () => void;
+  /** Called after each render frame. Receives the render duration in ms. */
+  onRender?: (renderMs: number) => void;
+  /** Scrollbar indicator color (CSS color string). Default: "rgba(255,255,255,0.3)" */
+  scrollbarColor?: string;
+  /** Scrollbar indicator width in pixels. Default: 4 */
+  scrollbarWidth?: number;
 }
 
 export const DEFAULT_FONT = "ui-monospace, monospace";
@@ -101,6 +105,7 @@ export const C2S_SCROLL = 0x02;
 export const C2S_ACK = 0x03;
 export const C2S_DISPLAY_RATE = 0x04;
 export const C2S_CLIENT_METRICS = 0x05;
+export const C2S_MOUSE = 0x06;
 export const C2S_CREATE = 0x10;
 export const C2S_FOCUS = 0x11;
 export const C2S_CLOSE = 0x12;

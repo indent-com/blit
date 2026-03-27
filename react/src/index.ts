@@ -29,6 +29,9 @@ export type { CellMetrics } from "./hooks/useBlitTerminal";
 export { WebSocketTransport } from "./transports/websocket";
 export type { WebSocketTransportOptions } from "./transports/websocket";
 
+export { WebTransportTransport } from "./transports/webtransport";
+export type { WebTransportTransportOptions } from "./transports/webtransport";
+
 export { createWebRtcDataChannelTransport } from "./transports/webrtc";
 export type { WebRtcDataChannelTransportOptions } from "./transports/webrtc";
 
@@ -64,6 +67,8 @@ export {
   buildUnsubscribeMessage,
   buildSearchMessage,
   buildCreate2Message,
+  buildDisplayRateMessage,
+  buildClientMetricsMessage,
 } from "./protocol";
 
 export { createGlRenderer } from "./gl-renderer";

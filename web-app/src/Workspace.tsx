@@ -8,12 +8,12 @@ import {
   BlitTerminal,
   BlitProvider,
   useBlitSessions,
-  WebSocketTransport,
   TerminalStore,
   DEFAULT_FONT,
   CSS_GENERIC,
 } from "blit-react";
 import type {
+  BlitTransport,
   BlitTerminalHandle,
   BlitWasmModule,
   TerminalPalette,
@@ -22,21 +22,25 @@ import type {
 } from "blit-react";
 import { useMetrics } from "./useMetrics";
 import { PALETTE_KEY, FONT_KEY, FONT_SIZE_KEY, writeStorage, preferredPalette, preferredFont, preferredFontSize, blitHost, basePath } from "./storage";
-import { themeFor, layout, ui } from "./theme";
+import { themeFor, layout } from "./theme";
 import { StatusBar } from "./StatusBar";
 import { ExposeOverlay } from "./ExposeOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
 import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
+import { DisconnectedOverlay } from "./DisconnectedOverlay";
 
 export type Overlay = "expose" | "palette" | "font" | "help" | null;
 
-export function Workspace({ transport, wasm, onAuthError }: { transport: WebSocketTransport; wasm: BlitWasmModule; onAuthError: () => void }) {
+export function Workspace({ transport, wasm, onAuthError }: { transport: BlitTransport; wasm: BlitWasmModule; onAuthError: () => void }) {
   const [palette, setPalette] = useState<TerminalPalette>(preferredPalette);
   const [font, setFont] = useState(preferredFont);
   const [fontSize, setFontSize] = useState(preferredFontSize);
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [serverFonts, setServerFonts] = useState<string[]>([]);
+  const [offlineVisible, setOfflineVisible] = useState(
+    transport.status === "disconnected" || transport.status === "error",
+  );
 
   // Always append fallback so the terminal is usable while custom fonts load.
   const fontWithFallback = font === DEFAULT_FONT ? font : `${font}, ${DEFAULT_FONT}`;
@@ -80,10 +84,11 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
     onSessionClosed: (session) => store.freeTerminal(session.ptyId),
   });
   sessionsRef.current = sessions;
-  const { countFrame, ...metrics } = useMetrics(transport);
+  const { countFrame, timelineRef, netRef, ...metrics } = useMetrics(transport);
 
   const dark = palette.dark;
   const theme = themeFor(dark);
+  const statusBarRaised = overlay !== null || offlineVisible;
 
   useEffect(() => {
     store.setPalette(palette);
@@ -149,6 +154,19 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
     transport.addEventListener("statuschange", onStatus);
     return () => transport.removeEventListener("statuschange", onStatus);
   }, [transport, onAuthError]);
+
+  useEffect(() => {
+    const syncOffline = (status: string) => {
+      if (status === "connected") {
+        setOfflineVisible(false);
+      } else if (status === "disconnected" || status === "error") {
+        setOfflineVisible(true);
+      }
+    };
+    syncOffline(transport.status);
+    transport.addEventListener("statuschange", syncOffline);
+    return () => transport.removeEventListener("statuschange", syncOffline);
+  }, [transport]);
 
   const termCallbackRef = useCallback((handle: BlitTerminalHandle | null) => {
     (termRef as React.MutableRefObject<BlitTerminalHandle | null>).current = handle;
@@ -314,9 +332,6 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
               style={{ width: "100%", height: "100%" }}
             />
           )}
-          {(sessions.status === "disconnected" || sessions.status === "error") && (
-            <output style={ui.disconnected}>Disconnected</output>
-          )}
         </section>
         {overlay === "expose" && (
           <ExposeOverlay
@@ -351,10 +366,15 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
         {overlay === "help" && (
           <HelpOverlay onClose={closeOverlay} dark={dark} />
         )}
+        {offlineVisible && <DisconnectedOverlay dark={dark} />}
         <footer
           style={{
             ...layout.statusBar,
+            backgroundColor: theme.bg,
             borderTopColor: theme.subtleBorder,
+            position: statusBarRaised ? "relative" : undefined,
+            zIndex: statusBarRaised ? 121 : undefined,
+            pointerEvents: statusBarRaised ? "none" : undefined,
           }}
         >
           <StatusBar
@@ -362,6 +382,9 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
             metrics={metrics}
             palette={palette}
             termSize={termRef.current ? `${termRef.current.cols}x${termRef.current.rows}` : null}
+            store={store}
+            timelineRef={timelineRef}
+            netRef={netRef}
             onExpose={() => toggleOverlay("expose")}
             onPalette={() => toggleOverlay("palette")}
             onFont={() => toggleOverlay("font")}

@@ -4,6 +4,7 @@ import type { BlitTransport, TerminalPalette } from "./types";
 import {
   buildAckMessage,
   buildClientMetricsMessage,
+  buildDisplayRateMessage,
   buildSubscribeMessage,
   buildUnsubscribeMessage,
 } from "./protocol";
@@ -37,10 +38,17 @@ export class TerminalStore {
   private frozenBuffers = new Map<number, Uint8Array[]>();
   private sharedRenderer: GlRenderer | null = null;
   private sharedCanvas: HTMLCanvasElement | null = null;
+  private displayFps = 0;
+  private rafHandle = 0;
+  private rafPrev = 0;
+  private rafSamples: number[] = [];
   private pendingAppliedFrames = 0;
   private ackAheadFrames = 0;
   private applyMsX10 = 0;
   private metricsFlushQueued = false;
+  private metricsHeartbeat: ReturnType<typeof setInterval> | null = null;
+  /** Queued compressed payloads per PTY, drained in the rAF callback. */
+  private pendingFrames = new Map<number, Uint8Array[]>();
 
   constructor(transport: BlitTransport, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
     this._transport = transport;
@@ -83,14 +91,17 @@ export class TerminalStore {
         this.resetClientMetrics();
         this.flushClientMetrics();
         this.resync();
+        this.startMetricsHeartbeat();
       } else if (status === "disconnected" || status === "error") {
         this.subscribed.clear();
         this.resetClientMetrics();
+        this.stopMetricsHeartbeat();
       }
     };
 
     transport.addEventListener("message", this.onMessage);
     transport.addEventListener("statuschange", this.onStatus);
+    this.startRafProbe();
 
     const resolved = wasm instanceof Promise ? wasm : Promise.resolve(wasm);
     resolved
@@ -134,6 +145,22 @@ export class TerminalStore {
       queueMicrotask(flush);
     } else {
       void Promise.resolve().then(flush);
+    }
+  }
+
+  private startMetricsHeartbeat(): void {
+    this.stopMetricsHeartbeat();
+    // Send metrics every 250ms so the server always has fresh backlog info,
+    // even when no renders are happening (which would otherwise cause a
+    // deadlock: server stops sending because backlog is high, client never
+    // renders because no new frames arrive, backlog never clears).
+    this.metricsHeartbeat = setInterval(() => this.flushClientMetrics(), 250);
+  }
+
+  private stopMetricsHeartbeat(): void {
+    if (this.metricsHeartbeat !== null) {
+      clearInterval(this.metricsHeartbeat);
+      this.metricsHeartbeat = null;
     }
   }
 
@@ -224,12 +251,65 @@ export class TerminalStore {
     return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
   }
 
+  /**
+   * Drain queued compressed frames for a PTY into the WASM terminal.
+   * Called at the start of the rAF callback so decode + render happen
+   * in one JS turn, avoiding budget fragmentation.
+   * Returns true if any frames were applied.
+   */
+  drainPending(ptyId: number): boolean {
+    const q = this.pendingFrames.get(ptyId);
+    if (!q || q.length === 0) return false;
+    const t = this.terminals.get(ptyId);
+    if (!t) { q.length = 0; return false; }
+    const applyStart = this.nowMs();
+    for (const payload of q) {
+      t.feed_compressed(payload);
+    }
+    q.length = 0;
+    this.noteAppliedFrame(this.nowMs() - applyStart);
+    return true;
+  }
+
   /** Mark the latest applied terminal state as painted to the screen. */
   noteFrameRendered(): void {
     if (this.pendingAppliedFrames === 0 && this.ackAheadFrames === 0) return;
     this.pendingAppliedFrames = 0;
     this.ackAheadFrames = 0;
     this.queueClientMetricsFlush();
+  }
+
+  getDebugStats(leadPtyId?: number | null): {
+    displayFps: number;
+    pendingApplied: number;
+    ackAhead: number;
+    applyMs: number;
+    mouseMode: number;
+    mouseEncoding: number;
+    terminals: number;
+    staleTerminals: number;
+    subscribed: number;
+    frozenPtys: number;
+    pendingFrameQueues: number;
+    totalPendingFrames: number;
+  } {
+    let totalPending = 0;
+    for (const q of this.pendingFrames.values()) totalPending += q.length;
+    const lead = leadPtyId != null ? this.terminals.get(leadPtyId) : null;
+    return {
+      displayFps: this.displayFps,
+      pendingApplied: this.pendingAppliedFrames,
+      ackAhead: this.ackAheadFrames,
+      applyMs: this.applyMsX10 / 10,
+      mouseMode: lead ? lead.mouse_mode() : 0,
+      mouseEncoding: lead ? lead.mouse_encoding() : 0,
+      terminals: this.terminals.size,
+      staleTerminals: this.staleTerminals.size,
+      subscribed: this.subscribed.size,
+      frozenPtys: this.frozenPtys.size,
+      pendingFrameQueues: this.pendingFrames.size,
+      totalPendingFrames: totalPending,
+    };
   }
 
   invalidateAtlas(): void {
@@ -258,6 +338,10 @@ export class TerminalStore {
   /** Freeze a PTY: buffer incoming frames instead of applying them. */
   freeze(ptyId: number): void {
     this.frozenPtys.add(ptyId);
+  }
+
+  isFrozen(ptyId: number): boolean {
+    return this.frozenPtys.has(ptyId);
   }
 
   /** Thaw a PTY: apply all buffered frames and resume normal updates. */
@@ -313,6 +397,7 @@ export class TerminalStore {
   }
 
   private doFree(ptyId: number): void {
+    this.pendingFrames.delete(ptyId);
     const t = this.terminals.get(ptyId);
     if (t) {
       t.free();
@@ -352,13 +437,55 @@ export class TerminalStore {
     }
   }
 
+  private sendDisplayFps(): void {
+    if (this.displayFps > 0 && this._transport.status === "connected") {
+      this._transport.send(buildDisplayRateMessage(this.displayFps));
+    }
+  }
+
+  private startRafProbe(): void {
+    if (this.rafHandle || typeof requestAnimationFrame === "undefined") return;
+    const measure = (ts: number) => {
+      if (this.disposed) return;
+      if (this.rafPrev > 0) {
+        const dt = ts - this.rafPrev;
+        if (dt > 0) {
+          this.rafSamples.push(dt);
+          if (this.rafSamples.length >= 20) {
+            this.rafSamples.sort((a, b) => a - b);
+            const median = this.rafSamples[this.rafSamples.length >> 1];
+            const fps = Math.round(1_000 / median);
+            this.rafSamples = [];
+            if (fps > 0 && fps !== this.displayFps) {
+              this.displayFps = fps;
+              this.sendDisplayFps();
+            }
+          }
+        }
+      }
+      this.rafPrev = ts;
+      this.rafHandle = requestAnimationFrame(measure);
+    };
+    this.rafHandle = requestAnimationFrame(measure);
+  }
+
+  private stopRafProbe(): void {
+    if (this.rafHandle) {
+      cancelAnimationFrame(this.rafHandle);
+      this.rafHandle = 0;
+    }
+  }
+
   private resync(): void {
+    this.sendDisplayFps();
     this.subscribed.clear();
     this.syncSubscriptions();
   }
 
   dispose(): void {
     this.disposed = true;
+    this.stopRafProbe();
+    this.stopMetricsHeartbeat();
     this._transport.removeEventListener("message", this.onMessage);
     this._transport.removeEventListener("statuschange", this.onStatus);
     for (const t of this.terminals.values()) t.free();

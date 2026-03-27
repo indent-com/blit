@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 // Browser mode imports
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{FromRequest, WebSocketUpgrade};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -226,7 +226,13 @@ impl Renderer {
         out.extend_from_slice(b"\x1b[?2026l");
     }
 
-    fn emit_cell(&mut self, cell: &[u8], cell_index: usize, frame: &blit_remote::FrameState, out: &mut Vec<u8>) {
+    fn emit_cell(
+        &mut self,
+        cell: &[u8],
+        cell_index: usize,
+        frame: &blit_remote::FrameState,
+        out: &mut Vec<u8>,
+    ) {
         let f0 = cell[0];
         let f1 = cell[1];
 
@@ -520,7 +526,10 @@ async fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("blit {} — terminal streaming client", env!("CARGO_PKG_VERSION"));
+        println!(
+            "blit {} — terminal streaming client",
+            env!("CARGO_PKG_VERSION")
+        );
         println!();
         println!("USAGE: blit [OPTIONS] [HOST]");
         println!();
@@ -535,8 +544,11 @@ async fn main() {
     }
     let console_mode = args.iter().any(|a| a == "--console");
     if console_mode {
-        let filtered_args: Vec<String> =
-            args.iter().filter(|a| a.as_str() != "--console").cloned().collect();
+        let filtered_args: Vec<String> = args
+            .iter()
+            .filter(|a| a.as_str() != "--console")
+            .cloned()
+            .collect();
         let transport = match connect(&filtered_args).await {
             Ok(t) => t,
             Err(e) => {
@@ -546,8 +558,11 @@ async fn main() {
         };
         run(transport).await;
     } else {
-        let filtered_args: Vec<String> =
-            args.iter().filter(|a| a.as_str() != "--browser").cloned().collect();
+        let filtered_args: Vec<String> = args
+            .iter()
+            .filter(|a| a.as_str() != "--browser")
+            .cloned()
+            .collect();
         run_browser(filtered_args).await;
     }
 }
@@ -599,7 +614,9 @@ async fn run_browser(args: Vec<String>) {
     let token: String = {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        (0..32).map(|_| rng.sample(rand::distributions::Alphanumeric) as char).collect()
+        (0..32)
+            .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+            .collect()
     };
 
     // Extract --port before connector parsing.
@@ -608,7 +625,10 @@ async fn run_browser(args: Vec<String>) {
         let mut filtered = Vec::new();
         let mut skip_next = false;
         for (i, arg) in args.iter().enumerate() {
-            if skip_next { skip_next = false; continue; }
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
             if arg == "--port" {
                 if let Some(p) = args.get(i + 1) {
                     bind_port = p.parse().unwrap_or_else(|_| {
@@ -705,17 +725,21 @@ async fn run_browser(args: Vec<String>) {
         1,
     );
     let injected_html: &'static str = Box::leak(injected_html.into_boxed_str());
+    let html_etag: &'static str =
+        Box::leak(blit_webserver::html_etag(injected_html).into_boxed_str());
 
     let app = axum::Router::new()
-        .route("/fonts", get(fonts_list_handler))
-        .route("/font/{name}", get(font_handler))
-        .fallback(get(move |state, request| browser_root_handler(state, request, injected_html)))
+        .fallback(get(move |state, request| {
+            browser_root_handler(state, request, injected_html, html_etag)
+        }))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{bind_port}")).await.unwrap_or_else(|e| {
-        eprintln!("blit: cannot bind to port {bind_port}: {e}");
-        std::process::exit(1);
-    });
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{bind_port}"))
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("blit: cannot bind to port {bind_port}: {e}");
+            std::process::exit(1);
+        });
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     eprintln!("blit: serving browser UI at {url}");
@@ -738,9 +762,12 @@ async fn setup_ssh_forward(ssh_args: &[String]) -> BrowserConnector {
     // SSH -L doesn't expand shell variables, so we need the absolute path.
     let resolve = tokio::process::Command::new("ssh")
         .arg("-T")
-        .arg("-o").arg("ControlMaster=auto")
-        .arg("-o").arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
-        .arg("-o").arg("ControlPersist=300")
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
+        .arg("-o")
+        .arg("ControlPersist=300")
         .args(ssh_args)
         .arg("--")
         .arg(r#"sh -c 'echo "${BLIT_SOCK:-/run/blit/$(id -un).sock}"'"#)
@@ -753,7 +780,10 @@ async fn setup_ssh_forward(ssh_args: &[String]) -> BrowserConnector {
 
     if !resolve.status.success() {
         let stderr = String::from_utf8_lossy(&resolve.stderr);
-        eprintln!("blit: ssh failed to resolve remote socket path: {}", stderr.trim());
+        eprintln!(
+            "blit: ssh failed to resolve remote socket path: {}",
+            stderr.trim()
+        );
         std::process::exit(1);
     }
 
@@ -773,12 +803,18 @@ async fn setup_ssh_forward(ssh_args: &[String]) -> BrowserConnector {
     let child = tokio::process::Command::new("ssh")
         .arg("-N") // no remote command — just forward
         .arg("-T")
-        .arg("-o").arg("ControlMaster=auto")
-        .arg("-o").arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
-        .arg("-o").arg("ControlPersist=300")
-        .arg("-o").arg("ExitOnForwardFailure=yes")
-        .arg("-o").arg("StreamLocalBindUnlink=yes")
-        .arg("-L").arg(format!("{local_sock}:{remote_sock}"))
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
+        .arg("-o")
+        .arg("ControlPersist=300")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-L")
+        .arg(format!("{local_sock}:{remote_sock}"))
         .args(ssh_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -808,7 +844,12 @@ async fn browser_root_handler(
     axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
     request: axum::extract::Request,
     index_html: &'static str,
+    etag: &'static str,
 ) -> Response {
+    if let Some(resp) = blit_webserver::try_font_route(request.uri().path()) {
+        return resp;
+    }
+
     let is_ws = request
         .headers()
         .get("upgrade")
@@ -822,7 +863,11 @@ async fn browser_root_handler(
             Err(e) => e.into_response(),
         }
     } else {
-        Html(index_html).into_response()
+        let inm = request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .map(|v| v.as_bytes());
+        blit_webserver::html_response(index_html, etag, inm)
     }
 }
 
@@ -950,9 +995,12 @@ async fn connect(args: &[String]) -> Result<Transport, String> {
         let bridge = r#"sh -c 'S="${BLIT_SOCK:-/run/blit/$(id -un).sock}"; exec nc -U "$S" 2>/dev/null || socat - "UNIX-CONNECT:$S"'"#;
         let child = tokio::process::Command::new("ssh")
             .arg("-T") // no PTY — raw byte tunnel
-            .arg("-o").arg("ControlMaster=auto")
-            .arg("-o").arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
-            .arg("-o").arg("ControlPersist=300")
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
+            .arg("-o")
+            .arg("ControlPersist=300")
             .args(ssh_args)
             .arg("--")
             .arg(bridge)
@@ -1080,7 +1128,11 @@ impl Expose {
             }
 
             // Indicator
-            out.extend_from_slice(if is_focused { b"  \xe2\x96\xb6 " } else { b"    " });
+            out.extend_from_slice(if is_focused {
+                b"  \xe2\x96\xb6 "
+            } else {
+                b"    "
+            });
 
             // PTY id
             out.extend_from_slice(b"#");
@@ -1106,7 +1158,8 @@ impl Expose {
 
             // Pad to full width for inverse highlight
             if is_selected {
-                let written = 4 + 1 + digits(id) + self.titles.get(&id).map(|t| t.len() + 2).unwrap_or(0);
+                let written =
+                    4 + 1 + digits(id) + self.titles.get(&id).map(|t| t.len() + 2).unwrap_or(0);
                 let pad = (cols as usize).saturating_sub(written);
                 for _ in 0..pad {
                     out.push(b' ');
@@ -1118,9 +1171,14 @@ impl Expose {
 }
 
 fn digits(mut n: u16) -> usize {
-    if n == 0 { return 1; }
+    if n == 0 {
+        return 1;
+    }
     let mut d = 0;
-    while n > 0 { d += 1; n /= 10; }
+    while n > 0 {
+        d += 1;
+        n /= 10;
+    }
     d
 }
 
@@ -1142,18 +1200,16 @@ fn parse_expose_key(buf: &[u8]) -> (ExposeAction, usize) {
         return (ExposeAction::None, 0);
     }
     match buf[0] {
-        0x0B => (ExposeAction::Close, 1),             // Ctrl-K
+        0x0B => (ExposeAction::Close, 1),                   // Ctrl-K
         0x1B if buf.len() == 1 => (ExposeAction::Close, 1), // bare Escape
-        0x1B if buf.len() >= 3 && buf[1] == b'[' => {
-            match buf[2] {
-                b'A' => (ExposeAction::Up, 3),
-                b'B' => (ExposeAction::Down, 3),
-                _ => (ExposeAction::None, 3),
-            }
-        }
-        0x0D | 0x0A => (ExposeAction::Select, 1),     // Enter
-        0x0E => (ExposeAction::Create, 1),             // Ctrl-N
-        0x17 => (ExposeAction::Kill, 1),               // Ctrl-W
+        0x1B if buf.len() >= 3 && buf[1] == b'[' => match buf[2] {
+            b'A' => (ExposeAction::Up, 3),
+            b'B' => (ExposeAction::Down, 3),
+            _ => (ExposeAction::None, 3),
+        },
+        0x0D | 0x0A => (ExposeAction::Select, 1), // Enter
+        0x0E => (ExposeAction::Create, 1),        // Ctrl-N
+        0x17 => (ExposeAction::Kill, 1),          // Ctrl-W
         b'q' | b'Q' => (ExposeAction::Quit, 1),
         _ => (ExposeAction::None, 1),
     }
@@ -1282,6 +1338,7 @@ async fn run(transport: Transport) {
 }
 
 /// Returns true if the CLI should quit.
+#[allow(clippy::too_many_arguments)]
 async fn handle_stdin(
     data: &[u8],
     expose: &mut Expose,
@@ -1302,7 +1359,9 @@ async fn handle_stdin(
             // Send bytes before Ctrl-K to the PTY
             if pos > 0 {
                 if let Some(id) = *focused_pty {
-                    let _ = frame_tx.send(make_frame(&msg_input(id, &data[..pos]))).await;
+                    let _ = frame_tx
+                        .send(make_frame(&msg_input(id, &data[..pos])))
+                        .await;
                 }
             }
             // Open expose
@@ -1316,13 +1375,24 @@ async fn handle_stdin(
             out_buf.extend_from_slice(b"\x1b[?25l"); // hide cursor
             expose.render(rows, cols, *focused_pty, out_buf);
             let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
+            let _ = stdout.flush().await;
             // Process remaining bytes after Ctrl-K as expose input
-            if pos + 1 < data.len() {
-                if handle_expose_input(
-                    &data[pos + 1..], expose, focused_pty, renderer, screen,
-                    out_buf, frame_tx, stdout, rows, cols,
-                ).await { return true; }
+            if pos + 1 < data.len()
+                && handle_expose_input(
+                    &data[pos + 1..],
+                    expose,
+                    focused_pty,
+                    renderer,
+                    screen,
+                    out_buf,
+                    frame_tx,
+                    stdout,
+                    rows,
+                    cols,
+                )
+                .await
+            {
+                return true;
             }
             return false;
         }
@@ -1332,14 +1402,27 @@ async fn handle_stdin(
         }
     } else {
         if handle_expose_input(
-            data, expose, focused_pty, renderer, screen,
-            out_buf, frame_tx, stdout, rows, cols,
-        ).await { return true; }
+            data,
+            expose,
+            focused_pty,
+            renderer,
+            screen,
+            out_buf,
+            frame_tx,
+            stdout,
+            rows,
+            cols,
+        )
+        .await
+        {
+            return true;
+        }
     }
     false
 }
 
 /// Returns true if the CLI should quit.
+#[allow(clippy::too_many_arguments)]
 async fn handle_expose_input(
     data: &[u8],
     expose: &mut Expose,
@@ -1355,17 +1438,32 @@ async fn handle_expose_input(
     let mut off = 0;
     while off < data.len() {
         let (action, consumed) = parse_expose_key(&data[off..]);
-        if consumed == 0 { break; }
+        if consumed == 0 {
+            break;
+        }
         off += consumed;
 
         match action {
             ExposeAction::None => {}
             ExposeAction::Close => {
-                close_expose(expose, focused_pty, renderer, screen, out_buf, frame_tx, stdout, rows, cols).await;
+                close_expose(
+                    expose,
+                    focused_pty,
+                    renderer,
+                    screen,
+                    out_buf,
+                    frame_tx,
+                    stdout,
+                    rows,
+                    cols,
+                )
+                .await;
                 // Remaining bytes after close go to PTY
                 if off < data.len() {
                     if let Some(id) = *focused_pty {
-                        let _ = frame_tx.send(make_frame(&msg_input(id, &data[off..]))).await;
+                        let _ = frame_tx
+                            .send(make_frame(&msg_input(id, &data[off..])))
+                            .await;
                     }
                 }
                 return false;
@@ -1389,7 +1487,18 @@ async fn handle_expose_input(
                     let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
                     let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
                 }
-                close_expose(expose, focused_pty, renderer, screen, out_buf, frame_tx, stdout, rows, cols).await;
+                close_expose(
+                    expose,
+                    focused_pty,
+                    renderer,
+                    screen,
+                    out_buf,
+                    frame_tx,
+                    stdout,
+                    rows,
+                    cols,
+                )
+                .await;
                 return false;
             }
             ExposeAction::Create => {
@@ -1399,9 +1508,7 @@ async fn handle_expose_input(
             ExposeAction::Kill => {
                 let ids = expose.visible_ids().to_vec();
                 if let Some(&id) = ids.get(expose.selected) {
-                    let _ = frame_tx
-                        .send(make_frame(&msg_close(id)))
-                        .await;
+                    let _ = frame_tx.send(make_frame(&msg_close(id))).await;
                 }
             }
             ExposeAction::Quit => {
@@ -1416,12 +1523,13 @@ async fn handle_expose_input(
         expose.render(rows, cols, *focused_pty, out_buf);
         if !out_buf.is_empty() {
             let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
+            let _ = stdout.flush().await;
         }
     }
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn close_expose(
     expose: &mut Expose,
     focused_pty: &mut Option<u16>,
@@ -1438,7 +1546,7 @@ async fn close_expose(
     renderer.render(screen, out_buf);
     if !out_buf.is_empty() {
         let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
+        let _ = stdout.flush().await;
     }
     // Re-send resize in case the terminal size changed while expose was open
     if let Some(id) = *focused_pty {
@@ -1446,6 +1554,7 @@ async fn close_expose(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_msg(
     frame: &[u8],
     screen: &mut TerminalState,
@@ -1466,7 +1575,9 @@ async fn handle_server_msg(
             ptys.clear();
             let mut off = 3;
             for _ in 0..count {
-                if off + 4 > frame.len() { break; }
+                if off + 4 > frame.len() {
+                    break;
+                }
                 let id = u16::from_le_bytes([frame[off], frame[off + 1]]);
                 let tag_len = u16::from_le_bytes([frame[off + 2], frame[off + 3]]) as usize;
                 off += 4 + tag_len;
@@ -1500,7 +1611,7 @@ async fn handle_server_msg(
                     renderer.render(screen, out_buf);
                     if !out_buf.is_empty() {
                         let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
+                        let _ = stdout.flush().await;
                     }
                 }
             }
@@ -1523,7 +1634,7 @@ async fn handle_server_msg(
                     renderer.render(screen, out_buf);
                     if !out_buf.is_empty() {
                         let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
+                        let _ = stdout.flush().await;
                     }
                 }
             }
@@ -1546,7 +1657,11 @@ async fn handle_server_msg(
                 }
             }
             if *focused_pty == Some(id) {
-                *focused_pty = expose.lru.first().copied().or_else(|| ptys.first().copied());
+                *focused_pty = expose
+                    .lru
+                    .first()
+                    .copied()
+                    .or_else(|| ptys.first().copied());
                 if let Some(new_id) = *focused_pty {
                     let _ = frame_tx.send(make_frame(&msg_focus(new_id))).await;
                     let _ = frame_tx
@@ -1565,7 +1680,7 @@ async fn handle_server_msg(
                     expose.render(rows, cols, *focused_pty, &mut *out_buf);
                     if !out_buf.is_empty() {
                         let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
+                        let _ = stdout.flush().await;
                     }
                 }
             }
@@ -1620,35 +1735,6 @@ async fn handle_server_msg(
     }
 }
 
-async fn fonts_list_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let families = blit_fonts::list_font_families();
-    let json = format!("[{}]", families.iter().map(|f| format!("\"{}\"", f.replace('"', "\\\""))).collect::<Vec<_>>().join(","));
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        json,
-    ).into_response()
-}
-
-async fn font_handler(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    match blit_fonts::font_face_css(&name) {
-        Some(css) => (
-            [
-                (axum::http::header::CONTENT_TYPE, "text/css"),
-                (axum::http::header::CACHE_CONTROL, "public, max-age=86400, immutable"),
-            ],
-            css,
-        ).into_response(),
-        None => (axum::http::StatusCode::NOT_FOUND, "font not found").into_response(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1666,8 +1752,10 @@ mod tests {
         let mut out = Vec::new();
         renderer.render(&screen, &mut out);
 
-        assert!(output_contains(&out, b"\x1b[?25h"),
-            "cursor show sequence missing from first render output");
+        assert!(
+            output_contains(&out, b"\x1b[?25h"),
+            "cursor show sequence missing from first render output"
+        );
     }
 
     #[test]
@@ -1682,8 +1770,10 @@ mod tests {
         out.clear();
         renderer.render(&screen, &mut out);
 
-        assert!(!output_contains(&out, b"\x1b[?25l"),
-            "cursor hide emitted when cursor should stay visible");
+        assert!(
+            !output_contains(&out, b"\x1b[?25l"),
+            "cursor hide emitted when cursor should stay visible"
+        );
     }
 
     #[test]
@@ -1699,8 +1789,10 @@ mod tests {
         out.clear();
         renderer.render(&screen, &mut out);
 
-        assert!(output_contains(&out, b"\x1b[?25h"),
-            "cursor show missing after mode change");
+        assert!(
+            output_contains(&out, b"\x1b[?25h"),
+            "cursor show missing after mode change"
+        );
     }
 
     #[test]
@@ -1714,8 +1806,10 @@ mod tests {
         renderer.render(&screen, &mut out);
 
         // CUP for row 2, col 5 → \x1b[3;6H (1-based)
-        assert!(output_contains(&out, b"\x1b[3;6H"),
-            "cursor not positioned at expected row=2 col=5");
+        assert!(
+            output_contains(&out, b"\x1b[3;6H"),
+            "cursor not positioned at expected row=2 col=5"
+        );
     }
 
     // ── make_frame ──────────────────────────────────────────────────────

@@ -1,0 +1,300 @@
+import type { BlitTransport, ConnectionStatus } from "../types";
+
+export interface WebTransportTransportOptions {
+  /** Enable automatic reconnection on disconnect. Default: true. */
+  reconnect?: boolean;
+  /** Initial reconnect delay in ms. Default: 500. */
+  reconnectDelay?: number;
+  /** Maximum reconnect delay in ms. Default: 10000. */
+  maxReconnectDelay?: number;
+  /** Backoff multiplier for reconnect delay. Default: 1.5. */
+  reconnectBackoff?: number;
+  /**
+   * SHA-256 hash of the server's TLS certificate (hex string).
+   * Required for self-signed certs (e.g. auto-generated gateway certs).
+   */
+  serverCertificateHash?: string;
+}
+
+/**
+ * BlitTransport implementation over WebTransport (QUIC/HTTP3).
+ *
+ * The protocol is length-prefixed binary frames on a single bidirectional
+ * QUIC stream, with a 2-byte-length + passphrase auth handshake.
+ */
+export class WebTransportTransport implements BlitTransport {
+  private wt: WebTransport | null = null;
+  private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private _status: ConnectionStatus = "disconnected";
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentDelay: number;
+  private disposed = false;
+  private messageListeners = new Set<(data: ArrayBuffer) => void>();
+  private statusListeners = new Set<(status: ConnectionStatus) => void>();
+
+  private readonly url: string;
+  private readonly passphrase: string;
+  private readonly _reconnect: boolean;
+  private readonly initialDelay: number;
+  private readonly maxDelay: number;
+  private readonly backoff: number;
+  private readonly certHash?: Uint8Array;
+
+  constructor(
+    url: string,
+    passphrase: string,
+    options?: WebTransportTransportOptions,
+  ) {
+    this.url = url;
+    this.passphrase = passphrase;
+    this._reconnect = options?.reconnect ?? true;
+    this.initialDelay = options?.reconnectDelay ?? 500;
+    this.maxDelay = options?.maxReconnectDelay ?? 10000;
+    this.backoff = options?.reconnectBackoff ?? 1.5;
+    this.currentDelay = this.initialDelay;
+    if (options?.serverCertificateHash) {
+      this.certHash = hexToBytes(options.serverCertificateHash);
+    }
+    this.connect();
+  }
+
+  get status(): ConnectionStatus {
+    return this._status;
+  }
+
+  send(data: Uint8Array): void {
+    if (!this.writer) return;
+    // Length-prefixed: 4-byte LE length + payload
+    const frame = new Uint8Array(4 + data.length);
+    frame[0] = data.length & 0xff;
+    frame[1] = (data.length >> 8) & 0xff;
+    frame[2] = (data.length >> 16) & 0xff;
+    frame[3] = (data.length >> 24) & 0xff;
+    frame.set(data, 4);
+    this.writer.write(frame).catch(() => {});
+  }
+
+  close(): void {
+    this.disposed = true;
+    this.clearReconnectTimer();
+    this.cleanup();
+    this.setStatus("disconnected");
+  }
+
+  addEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
+  addEventListener(type: string, listener: (...args: never[]) => void): void {
+    if (type === "message") {
+      this.messageListeners.add(listener as (data: ArrayBuffer) => void);
+    } else if (type === "statuschange") {
+      this.statusListeners.add(listener as (status: ConnectionStatus) => void);
+    }
+  }
+
+  removeEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  removeEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
+  removeEventListener(
+    type: string,
+    listener: (...args: never[]) => void,
+  ): void {
+    if (type === "message") {
+      this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
+    } else if (type === "statuschange") {
+      this.statusListeners.delete(
+        listener as (status: ConnectionStatus) => void,
+      );
+    }
+  }
+
+  private setStatus(status: ConnectionStatus): void {
+    if (this._status === status) return;
+    this._status = status;
+    for (const l of this.statusListeners) l(status);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disposed || !this._reconnect) return;
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.disposed) this.connect();
+    }, this.currentDelay);
+    this.currentDelay = Math.min(
+      this.currentDelay * this.backoff,
+      this.maxDelay,
+    );
+  }
+
+  private cleanup(): void {
+    this.writer = null;
+    if (this.wt) {
+      try {
+        this.wt.close();
+      } catch {}
+      this.wt = null;
+    }
+  }
+
+  private async connect(): Promise<void> {
+    if (this.disposed) return;
+    this.setStatus("connecting");
+
+    try {
+      const opts: WebTransportOptions = {};
+      if (this.certHash) {
+        opts.serverCertificateHashes = [
+          { algorithm: "sha-256", value: this.certHash.buffer as ArrayBuffer },
+        ];
+      }
+
+      const wt = new WebTransport(this.url, opts);
+      this.wt = wt;
+      await wt.ready;
+
+      if (this.disposed || this.wt !== wt) {
+        wt.close();
+        return;
+      }
+
+      // Open a bidirectional stream for the blit protocol
+      const stream = await wt.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+
+      // --- Auth: send 2-byte LE length + passphrase ---
+      this.setStatus("authenticating");
+      const passBytes = new TextEncoder().encode(this.passphrase);
+      const authMsg = new Uint8Array(2 + passBytes.length);
+      authMsg[0] = passBytes.length & 0xff;
+      authMsg[1] = (passBytes.length >> 8) & 0xff;
+      authMsg.set(passBytes, 2);
+      await writer.write(authMsg);
+
+      // Read 1-byte auth response: 1 = ok, 0 = rejected
+      const authResp = await readExact(reader, 1);
+      if (!authResp || authResp[0] !== 1) {
+        this.setStatus("error");
+        wt.close();
+        return;
+      }
+
+      if (this.disposed || this.wt !== wt) {
+        wt.close();
+        return;
+      }
+
+      this.writer = writer;
+      this.currentDelay = this.initialDelay;
+      this.setStatus("connected");
+
+      // Read loop: length-prefixed frames
+      this.readLoop(reader, wt);
+
+      // Handle connection close
+      wt.closed
+        .then(() => {
+          if (this.wt !== wt || this.disposed) return;
+          this.cleanup();
+          this.setStatus("disconnected");
+          this.scheduleReconnect();
+        })
+        .catch(() => {
+          if (this.wt !== wt || this.disposed) return;
+          this.cleanup();
+          this.setStatus("disconnected");
+          this.scheduleReconnect();
+        });
+    } catch {
+      if (this.disposed) return;
+      this.cleanup();
+      this.setStatus("error");
+      this.scheduleReconnect();
+    }
+  }
+
+  private async readLoop(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    wt: WebTransport,
+  ): Promise<void> {
+    let buffer = new Uint8Array(0);
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done || this.disposed || this.wt !== wt) break;
+        if (!value || value.length === 0) continue;
+
+        // Append to buffer
+        const newBuf = new Uint8Array(buffer.length + value.length);
+        newBuf.set(buffer);
+        newBuf.set(value, buffer.length);
+        buffer = newBuf;
+
+        // Extract complete frames
+        while (buffer.length >= 4) {
+          const len =
+            buffer[0] |
+            (buffer[1] << 8) |
+            (buffer[2] << 16) |
+            (buffer[3] << 24);
+          if (len < 0 || len > 16 * 1024 * 1024) {
+            // Invalid frame — close
+            wt.close();
+            return;
+          }
+          if (buffer.length < 4 + len) break;
+          const payload = buffer.slice(4, 4 + len);
+          buffer = buffer.subarray(4 + len);
+          for (const l of this.messageListeners) l(payload.buffer);
+        }
+      }
+    } catch {
+      // Stream closed or error
+    }
+  }
+}
+
+/** Read exactly `n` bytes from a ReadableStreamDefaultReader. */
+async function readExact(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  n: number,
+): Promise<Uint8Array | null> {
+  const buf = new Uint8Array(n);
+  let offset = 0;
+  while (offset < n) {
+    const { value, done } = await reader.read();
+    if (done || !value) return null;
+    const take = Math.min(value.length, n - offset);
+    buf.set(value.subarray(0, take), offset);
+    offset += take;
+  }
+  return buf;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.replace(/[^0-9a-fA-F]/g, "");
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}

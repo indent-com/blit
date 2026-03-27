@@ -36,6 +36,15 @@ export function wsUrl(): string {
   return proto + "//" + location.host + location.pathname;
 }
 
+export function wtUrl(): string {
+  return "https://" + location.host + location.pathname;
+}
+
+/** SHA-256 cert hash injected by the gateway for self-signed certs. */
+export function wtCertHash(): string | undefined {
+  return (window as Record<string, unknown>).__blitCertHash as string | undefined;
+}
+
 export function preferredPalette(): TerminalPalette {
   const q = new URLSearchParams(location.search).get("palette");
   if (q) {

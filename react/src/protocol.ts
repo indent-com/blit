@@ -1,7 +1,9 @@
 import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
+  C2S_DISPLAY_RATE,
   C2S_INPUT,
+  C2S_MOUSE,
   C2S_RESIZE,
   C2S_SCROLL,
   C2S_FOCUS,
@@ -33,6 +35,14 @@ export function buildClientMetricsMessage(
   msg[4] = (ackAheadFrames >> 8) & 0xff;
   msg[5] = applyMsX10 & 0xff;
   msg[6] = (applyMsX10 >> 8) & 0xff;
+  return msg;
+}
+
+export function buildDisplayRateMessage(fps: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_DISPLAY_RATE;
+  msg[1] = fps & 0xff;
+  msg[2] = (fps >> 8) & 0xff;
   return msg;
 }
 
@@ -164,5 +174,30 @@ export function buildCreate2Message(
     cursor += 2;
   }
   if (cmdBytes.length) msg.set(cmdBytes, cursor);
+  return msg;
+}
+
+/** Mouse event types for C2S_MOUSE. */
+export const MOUSE_DOWN = 0;
+export const MOUSE_UP = 1;
+export const MOUSE_MOVE = 2;
+
+export function buildMouseMessage(
+  ptyId: number,
+  type: number,
+  button: number,
+  col: number,
+  row: number,
+): Uint8Array {
+  const msg = new Uint8Array(9);
+  msg[0] = C2S_MOUSE;
+  msg[1] = ptyId & 0xff;
+  msg[2] = (ptyId >> 8) & 0xff;
+  msg[3] = type;
+  msg[4] = button;
+  msg[5] = col & 0xff;
+  msg[6] = (col >> 8) & 0xff;
+  msg[7] = row & 0xff;
+  msg[8] = (row >> 8) & 0xff;
   return msg;
 }

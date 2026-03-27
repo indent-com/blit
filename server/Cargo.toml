@@ -1,10 +1,11 @@
 [package]
 name = "blit-server"
-version = "0.7.3"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
 blit-remote = { path = "../remote" }
-blit-wezterm = { path = "../wezterm-driver" }
+blit-alacritty = { path = "../alacritty-driver" }
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
+memchr = "2"

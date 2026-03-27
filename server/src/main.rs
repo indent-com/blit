@@ -1,11 +1,11 @@
+use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
 use blit_remote::{
     build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
-    C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_RESIZE,
-    C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, CREATE2_HAS_COMMAND,
+    C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_MOUSE,
+    C2S_RESIZE, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, CREATE2_HAS_COMMAND,
     CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_EXITED,
     S2C_LIST, S2C_SEARCH_RESULTS, S2C_TITLE,
 };
-use blit_wezterm::{SearchResult as WeztermSearchResult, TerminalDriver as WeztermDriver};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
@@ -62,6 +62,16 @@ trait PtyDriver: Send {
     fn synced_output(&self) -> bool;
     fn snapshot(&mut self, echo: bool, icanon: bool) -> FrameState;
     fn scrollback_frame(&mut self, offset: usize) -> FrameState;
+    fn reset_modes(&mut self);
+    fn mouse_event(
+        &self,
+        type_: u8,
+        button: u8,
+        col: u16,
+        row: u16,
+        echo: bool,
+        icanon: bool,
+    ) -> Option<Vec<u8>>;
 }
 
 struct PtySearchResult {
@@ -72,25 +82,25 @@ struct PtySearchResult {
     scroll_offset: Option<usize>,
 }
 
-impl PtyDriver for WeztermDriver {
+impl PtyDriver for AlacrittyDriver {
     fn size(&self) -> (u16, u16) {
-        WeztermDriver::size(self)
+        AlacrittyDriver::size(self)
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        WeztermDriver::resize(self, rows, cols);
+        AlacrittyDriver::resize(self, rows, cols);
     }
 
     fn process(&mut self, data: &[u8]) {
-        WeztermDriver::process(self, data);
+        AlacrittyDriver::process(self, data);
     }
 
     fn title(&self) -> &str {
-        WeztermDriver::title(self)
+        AlacrittyDriver::title(self)
     }
 
     fn search_result(&self, query: &str) -> Option<PtySearchResult> {
-        WeztermDriver::search_result(self, query).map(|result: WeztermSearchResult| {
+        AlacrittyDriver::search_result(self, query).map(|result: AlacrittySearchResult| {
             PtySearchResult {
                 score: result.score,
                 primary_source: result.primary_source as u8,
@@ -102,47 +112,52 @@ impl PtyDriver for WeztermDriver {
     }
 
     fn take_title_dirty(&mut self) -> bool {
-        WeztermDriver::take_title_dirty(self)
+        AlacrittyDriver::take_title_dirty(self)
     }
 
     fn cursor_position(&self) -> (u16, u16) {
-        WeztermDriver::cursor_position(self)
+        AlacrittyDriver::cursor_position(self)
     }
 
     fn synced_output(&self) -> bool {
-        WeztermDriver::synced_output(self)
+        AlacrittyDriver::synced_output(self)
     }
 
     fn snapshot(&mut self, echo: bool, icanon: bool) -> FrameState {
-        WeztermDriver::snapshot(self, echo, icanon)
+        AlacrittyDriver::snapshot(self, echo, icanon)
     }
 
     fn scrollback_frame(&mut self, offset: usize) -> FrameState {
-        WeztermDriver::scrollback_frame(self, offset)
+        AlacrittyDriver::scrollback_frame(self, offset)
+    }
+
+    fn reset_modes(&mut self) {
+        AlacrittyDriver::reset_modes(self);
+    }
+
+    fn mouse_event(
+        &self,
+        type_: u8,
+        button: u8,
+        col: u16,
+        row: u16,
+        echo: bool,
+        icanon: bool,
+    ) -> Option<Vec<u8>> {
+        AlacrittyDriver::mouse_event(self, type_, button, col, row, echo, icanon)
     }
 }
 
-// At 240 fps over a 1 second RTT path we need roughly 240 frames in flight, plus
-// jitter slack, before the first ACK comes back. Keep the async outbox large
-// enough that the writer task and kernel socket buffers can absorb that window.
-//
 // Keep small to limit bufferbloat on slow connections.  The soft queue limit
 // (OUTBOX_SOFT_QUEUE_LIMIT_FRAMES) prevents the tick from queuing more than
 // ~2 frames, so this just needs to be bigger than that with some headroom.
 const OUTBOX_CAPACITY: usize = 8;
 const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 2;
 const PTY_READ_DRAIN_MAX_BYTES: usize = 256 * 1024;
-const PREVIEW_FPS_CAP: f32 = 30.0;
 const PREVIEW_FRAME_RESERVE: usize = 1;
-/// Maximum time to defer a snapshot when the kernel PTY buffer has
-/// unread data.  Prevents starvation under continuous output (e.g.
-/// cat /dev/random) where the buffer never empties.
-const SNAPSHOT_PENDING_CAP: Duration = Duration::from_millis(1);
-/// Maximum time to defer a snapshot while the application holds an open
-/// synchronized-output bracket (?2026h without a matching ?2026l).  Large
-/// enough to cover a single video frame at 24fps (~41ms) with headroom;
-/// acts as a safety valve if the application crashes mid-frame.
-const SNAPSHOT_SYNC_DEFER: Duration = Duration::from_millis(50);
+const READY_FRAME_QUEUE_CAP: usize = 4;
+const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -179,8 +194,9 @@ struct Pty {
     /// Client-chosen tag set at creation time.
     tag: String,
     dirty: bool,
-    /// When the PTY first became dirty (for capping synchronized output defer).
-    dirty_since: Option<Instant>,
+    pending_input: Vec<u8>,
+    ready_frames: VecDeque<FrameState>,
+    sync_scan_tail: Vec<u8>,
     draining: bool,
     reader_handle: tokio::task::JoinHandle<()>,
     /// Cached (echo, icanon) from tcgetattr; refreshed every ~250ms.
@@ -192,6 +208,16 @@ struct Pty {
     title_pending: bool,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
+}
+
+impl Pty {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
 }
 
 struct ClientState {
@@ -241,6 +267,7 @@ struct ClientState {
     browser_backlog_frames: u16,
     browser_ack_ahead_frames: u16,
     browser_apply_ms: f32,
+    last_metrics_update: Instant,
     last_log: Instant,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
@@ -320,10 +347,14 @@ fn target_queue_ms(client: &ClientState) -> f32 {
     base_queue_ms(client) + client.probe_frames.max(0.0) * frame_ms * probe_scale
 }
 
-fn bandwidth_floor_bps(client: &ClientState) -> f32 {
-    let browser_ready = client.browser_ack_ahead_frames <= 1
+fn browser_ready(client: &ClientState) -> bool {
+    client.browser_ack_ahead_frames <= 1
         && client.browser_apply_ms <= 1.0
-        && !outbox_backpressured(client);
+        && !outbox_backpressured(client)
+}
+
+fn bandwidth_floor_bps(client: &ClientState) -> f32 {
+    let browser_ready = browser_ready(client);
     let backlog_scale = match client.browser_backlog_frames {
         0..=2 => 0.9,
         3..=8 => 0.8,
@@ -335,24 +366,22 @@ fn bandwidth_floor_bps(client: &ClientState) -> f32 {
         .min(client.goodput_bps * if browser_ready { 0.75 } else { 0.9 });
     let goodput_floor = (client.goodput_bps - penalty)
         .max(client.goodput_bps * if browser_ready { 0.35 } else { 0.2 });
-    let delivery_floor = client.delivery_bps * 0.5;
+    // On a browser-ready path, the per-frame delivery estimate is already
+    // end-to-end and reacts much faster than ACK-window goodput. Halving it
+    // leaves large-frame local links chronically underpaced.
+    let delivery_floor = client.delivery_bps * if browser_ready { 1.0 } else { 0.5 };
     let recent_sample_floor = if browser_ready && client.last_goodput_sample_bps > 0.0 {
         client.last_goodput_sample_bps * backlog_scale
     } else {
         0.0
     };
-    goodput_floor
-        .max(recent_sample_floor)
-        .max(delivery_floor)
-        .max(16_384.0)
+    goodput_floor.max(recent_sample_floor).max(delivery_floor)
 }
 
 fn pacing_fps(client: &ClientState) -> f32 {
     let frame_bytes = client.avg_paced_frame_bytes.max(256.0);
     let sustainable = bandwidth_floor_bps(client) / frame_bytes;
-    sustainable
-        .min(browser_pacing_fps(client))
-        .clamp(1.0, client.display_fps.max(1.0))
+    sustainable.min(browser_pacing_fps(client))
 }
 
 fn throughput_limited(client: &ClientState) -> bool {
@@ -361,19 +390,16 @@ fn throughput_limited(client: &ClientState) -> bool {
     // The old check (pacing_fps < cadence * 0.9) only saw lead bandwidth,
     // which is often tiny, so previews could starve the lead undetected.
     let lead_bps = client.avg_paced_frame_bytes.max(256.0) * browser_pacing_fps(client);
-    let preview_bps = client.avg_preview_frame_bytes.max(256.0)
-        * client.display_fps.min(PREVIEW_FPS_CAP).max(1.0);
+    let preview_bps = client.avg_preview_frame_bytes.max(256.0) * client.display_fps.max(1.0);
     (lead_bps + preview_bps) > floor * 0.9
 }
 
 fn browser_pacing_fps(client: &ClientState) -> f32 {
     let mut fps = client.display_fps.max(1.0);
 
-    if client.browser_apply_ms > 0.0 {
-        let apply_bound = 1_000.0 / (client.browser_apply_ms * 1.5).max(1.0);
-        fps = fps.min(apply_bound);
-    }
-
+    // Backlog and ack-ahead are direct signals from the browser about
+    // whether it's keeping up.  No predictive apply-time bound — it
+    // consistently underestimates capacity and causes 30fps death spirals.
     let backlog = client.browser_backlog_frames as f32;
     if backlog > 4.0 {
         fps = fps.min(fps * (4.0 / backlog));
@@ -392,9 +418,9 @@ fn browser_backlog_blocked(client: &ClientState) -> bool {
 
 fn byte_budget_for(client: &ClientState, budget_ms: f32) -> usize {
     let budget_bps = if throughput_limited(client) {
-        bandwidth_floor_bps(client).max(32_768.0)
+        bandwidth_floor_bps(client)
     } else {
-        client.goodput_bps.max(32_768.0)
+        client.goodput_bps.max(bandwidth_floor_bps(client))
     };
     let bytes = budget_bps * budget_ms.max(1.0) / 1_000.0;
     bytes.ceil().max(client.avg_frame_bytes.max(256.0)) as usize
@@ -424,7 +450,7 @@ fn send_interval(client: &ClientState) -> Duration {
 }
 
 fn preview_fps(client: &ClientState) -> f32 {
-    let mut fps = client.display_fps.min(PREVIEW_FPS_CAP).max(1.0);
+    let mut fps = client.display_fps.max(1.0);
     if client.lead.is_some() {
         // Always budget preview bandwidth: available minus lead's share.
         // Without this, large preview frames (e.g. 12 KB) at 30 fps consume
@@ -451,6 +477,87 @@ fn advance_deadline(deadline: &mut Instant, now: Instant, interval: Duration) {
     };
 }
 
+fn should_snapshot_pty(dirty: bool, needful: bool, synced_output: bool) -> bool {
+    dirty && needful && !synced_output
+}
+
+fn should_break_pty_drain(drained_bytes: usize, synced_output_open: bool) -> bool {
+    drained_bytes >= PTY_READ_DRAIN_MAX_BYTES && !synced_output_open
+}
+
+fn enqueue_ready_frame(queue: &mut VecDeque<FrameState>, frame: FrameState) -> bool {
+    if queue.len() >= READY_FRAME_QUEUE_CAP {
+        return false;
+    }
+    queue.push_back(frame);
+    true
+}
+
+fn pty_has_visual_update(pty: &Pty) -> bool {
+    pty.dirty || !pty.ready_frames.is_empty()
+}
+
+/// Find the first `\x1b[?2026l` in `bytes`, handling sequences that span
+/// the `prefix`/`bytes` boundary. Uses SIMD-accelerated memchr for the
+/// initial ESC scan.
+fn find_sync_output_end(prefix: &[u8], bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let needle = SYNC_OUTPUT_END;
+    let nlen = needle.len();
+
+    // Check for a match straddling the prefix/bytes boundary.
+    if !prefix.is_empty() {
+        let tail = if prefix.len() >= nlen - 1 {
+            &prefix[prefix.len() - (nlen - 1)..]
+        } else {
+            prefix
+        };
+        let combined_len = tail.len() + bytes.len().min(nlen);
+        if combined_len >= nlen {
+            // Small stack buffer to check the boundary region.
+            let mut buf = [0u8; 32]; // SYNC_OUTPUT_END is 8 bytes, so 32 is plenty
+            let blen = combined_len.min(buf.len());
+            let tlen = tail.len().min(blen);
+            buf[..tlen].copy_from_slice(&tail[..tlen]);
+            let rest = (blen - tlen).min(bytes.len());
+            buf[tlen..tlen + rest].copy_from_slice(&bytes[..rest]);
+            for i in 0..=(blen.saturating_sub(nlen)) {
+                if &buf[i..i + nlen] == needle {
+                    let end_in_bytes = (i + nlen).saturating_sub(tail.len());
+                    if end_in_bytes > 0 && end_in_bytes <= bytes.len() {
+                        return Some(end_in_bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    // SIMD-scan for ESC (0x1b) then verify the full sequence.
+    let mut offset = 0;
+    while let Some(pos) = memchr::memchr(0x1b, &bytes[offset..]) {
+        let abs = offset + pos;
+        if abs + nlen <= bytes.len() && &bytes[abs..abs + nlen] == needle {
+            return Some(abs + nlen);
+        }
+        offset = abs + 1;
+    }
+    None
+}
+
+fn update_sync_scan_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    tail.extend_from_slice(bytes);
+    let keep = SYNC_OUTPUT_END.len().saturating_sub(1);
+    if tail.len() > keep {
+        let drop = tail.len() - keep;
+        tail.drain(..drop);
+    }
+}
+
 fn preview_deadline(client: &ClientState, pid: u16, now: Instant) -> Instant {
     client
         .preview_next_send_at
@@ -466,7 +573,11 @@ fn client_has_due_preview(sess: &Session, client: &ClientState, now: Instant) ->
     client.subscriptions.iter().copied().any(|pid| {
         Some(pid) != client.lead
             && preview_deadline(client, pid, now) <= now
-            && sess.ptys.get(&pid).map(|pty| pty.dirty).unwrap_or(false)
+            && sess
+                .ptys
+                .get(&pid)
+                .map(pty_has_visual_update)
+                .unwrap_or(false)
     })
 }
 
@@ -605,8 +716,13 @@ fn record_ack(client: &mut ClientState) {
                 if client.goodput_window_bytes >= min_reliable {
                     client.goodput_jitter_bps =
                         ewma_with_direction(client.goodput_jitter_bps, jitter_sample, 0.5, 0.125);
+                    let jitter_decay = if browser_ready(client) && sample_ms < path_rtt * 3.0 {
+                        0.90
+                    } else {
+                        0.98
+                    };
                     client.max_goodput_jitter_bps =
-                        (client.max_goodput_jitter_bps * 0.98).max(jitter_sample);
+                        (client.max_goodput_jitter_bps * jitter_decay).max(jitter_sample);
                     // Cap jitter at 45% of goodput so jitter_ratio can never
                     // exceed 0.45 from measurement noise alone.  Real congestion
                     // will still drive goodput_bps down and widen the window.
@@ -664,9 +780,15 @@ fn record_ack(client: &mut ClientState) {
             && jitter_ratio < 0.25
         {
             client.probe_frames = (client.probe_frames + 1.0).min(max_probe_frames);
+        } else if !likely_window_limited
+            && browser_ready(client)
+            && queue_delay_ms <= frame_ms * 2.0
+            && jitter_ratio < 0.25
+        {
+            client.probe_frames = (client.probe_frames + 0.25).min(max_probe_frames * 0.5);
         } else if queue_delay_ms > frame_ms * high_delay_frames || jitter_ratio > 0.5 {
-            client.probe_frames *= 0.25;
-        } else {
+            client.probe_frames = (client.probe_frames * 0.5).max(1.0);
+        } else if queue_delay_ms > frame_ms * 2.0 || !browser_ready(client) {
             client.probe_frames = (client.probe_frames - 0.5).max(0.0);
         }
     } else {
@@ -808,8 +930,9 @@ impl Session {
         if cur_rows == rows && cur_cols == cols {
             return;
         }
+        pty.ready_frames.clear();
         pty.driver.resize(rows, cols);
-        pty.dirty = true;
+        pty.mark_dirty();
         for c in self.clients.values_mut() {
             if c.subscriptions.contains(&pty_id) {
                 c.last_sent.remove(&pty_id);
@@ -893,6 +1016,7 @@ fn pty_cwd(pid: libc::pid_t) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_pty(
     shell: &str,
     rows: u16,
@@ -1015,10 +1139,12 @@ fn spawn_pty(
     Some(Pty {
         master_fd: master,
         child_pid: pid,
-        driver: Box::new(WeztermDriver::new(rows, cols, scrollback)),
+        driver: Box::new(AlacrittyDriver::new(rows, cols, scrollback)),
         tag: tag.to_owned(),
         dirty: true,
-        dirty_since: Some(Instant::now()),
+        pending_input: Vec::new(),
+        ready_frames: VecDeque::new(),
+        sync_scan_tail: Vec::new(),
         draining: false,
         reader_handle,
         lflag_cache,
@@ -1088,17 +1214,29 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
         }
     };
 
-    let mut buf = [0u8; 16384];
+    let mut buf = vec![0u8; 256 * 1024];
 
     loop {
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(_) => break,
+        let has_pending_input = {
+            let sess = state.1.lock().await;
+            sess.ptys
+                .get(&pty_id)
+                .map(|pty| !pty.pending_input.is_empty())
+                .unwrap_or(false)
+        };
+        let mut guard = if has_pending_input {
+            None
+        } else {
+            Some(match async_fd.readable().await {
+                Ok(g) => g,
+                Err(_) => break,
+            })
         };
 
         let mut exit = false;
         let mut drained_any = false;
         let mut drained_bytes = 0usize;
+        let mut blocked_on_ready_frames = false;
         {
             let mut sess = state.1.lock().await;
             if let Some(pty) = sess.ptys.get_mut(&pty_id) {
@@ -1106,37 +1244,97 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
             }
         }
         loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                let chunk = &buf[..n as usize];
+            let (queue_full, pending_chunk, sync_scan_tail) = {
+                let mut sess = state.1.lock().await;
+                sess.ptys
+                    .get_mut(&pty_id)
+                    .map(|pty| {
+                        if pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP {
+                            return (true, None, pty.sync_scan_tail.clone());
+                        }
+                        let pending = if pty.pending_input.is_empty() {
+                            None
+                        } else {
+                            Some(std::mem::take(&mut pty.pending_input))
+                        };
+                        (false, pending, pty.sync_scan_tail.clone())
+                    })
+                    .unwrap_or((false, None, Vec::new()))
+            };
+            if queue_full {
+                blocked_on_ready_frames = true;
+                break;
+            }
+
+            let chunk_storage: Vec<u8>;
+            let chunk = if let Some(pending) = pending_chunk {
+                chunk_storage = pending;
+                chunk_storage.as_slice()
+            } else {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    &buf[..n as usize]
+                } else if n == 0 {
+                    exit = true;
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        if let Some(guard) = guard.as_mut() {
+                            guard.clear_ready();
+                        }
+                        break;
+                    } else {
+                        exit = true;
+                        break;
+                    }
+                }
+            };
+
+            let sync_boundary = find_sync_output_end(&sync_scan_tail, chunk);
+            let process_len = sync_boundary.unwrap_or(chunk.len());
+            let to_process = &chunk[..process_len];
+            let remainder = &chunk[process_len..];
+
+            if !to_process.is_empty() {
+                let mut synced_output_open = false;
+                let mut ready_frames_len = 0usize;
                 let mut sess = state.1.lock().await;
                 if let Some(pty) = sess.ptys.get_mut(&pty_id) {
-                    pty.driver.process(chunk);
-                    let now = Instant::now();
-                    if !pty.dirty {
-                        pty.dirty_since = Some(now);
+                    pty.driver.process(to_process);
+                    pty.mark_dirty();
+                    synced_output_open = pty.driver.synced_output();
+                    update_sync_scan_tail(&mut pty.sync_scan_tail, to_process);
+                    if !remainder.is_empty() {
+                        pty.pending_input.extend_from_slice(remainder);
                     }
-                    pty.dirty = true;
-                    respond_to_queries(fd, chunk, pty.driver.size(), pty.driver.cursor_position());
+                    if sync_boundary.is_some() && !synced_output_open {
+                        let frame = take_snapshot(pty);
+                        if enqueue_ready_frame(&mut pty.ready_frames, frame) {
+                            pty.clear_dirty();
+                            ready_frames_len = pty.ready_frames.len();
+                        } else {
+                            blocked_on_ready_frames = true;
+                        }
+                    }
+                    respond_to_queries(
+                        fd,
+                        to_process,
+                        pty.driver.size(),
+                        pty.driver.cursor_position(),
+                    );
                 }
                 drop(sess);
                 drained_any = true;
-                drained_bytes = drained_bytes.saturating_add(chunk.len());
-                if drained_bytes >= PTY_READ_DRAIN_MAX_BYTES {
+                drained_bytes = drained_bytes.saturating_add(to_process.len());
+                if blocked_on_ready_frames || ready_frames_len >= READY_FRAME_QUEUE_CAP {
                     break;
                 }
-                tokio::task::yield_now().await;
-            } else if n == 0 {
-                exit = true;
-                break;
-            } else {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    guard.clear_ready();
+                if should_break_pty_drain(drained_bytes, synced_output_open) {
                     break;
-                } else {
-                    exit = true;
-                    break;
+                }
+                if !synced_output_open {
+                    tokio::task::yield_now().await;
                 }
             }
         }
@@ -1153,6 +1351,9 @@ async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
             // after this drain. Yield here so delivery can snapshot the
             // just-finished drain boundary before we mark the PTY draining again.
             tokio::task::yield_now().await;
+        } else if blocked_on_ready_frames {
+            nudge_delivery(&state);
+            tokio::time::sleep(SNAPSHOT_RETRY_INTERVAL).await;
         }
 
         if exit {
@@ -1173,28 +1374,20 @@ async fn cleanup_pty(pty_id: u16, state: &AppState) {
             return;
         }
         pty.exited = true;
+        // Reset mouse mode etc. so the client stops sending mouse events
+        // to the now-dead shell (e.g. mpv exits without disabling ?1003).
+        pty.driver.reset_modes();
         unsafe {
             libc::kill(pty.child_pid, libc::SIGHUP);
             libc::close(pty.master_fd);
             libc::waitpid(pty.child_pid, std::ptr::null_mut(), libc::WNOHANG);
         }
-        pty.dirty = true;
+        pty.mark_dirty();
         // Broadcast S2C_EXITED — PTY stays in the list, clients can still read it.
         let mut msg = vec![S2C_EXITED];
         msg.extend_from_slice(&pty_id.to_le_bytes());
         sess.send_to_all(&msg);
     }
-}
-
-/// Check if the kernel PTY buffer has data waiting to be read.
-fn pty_has_pending_data(fd: libc::c_int) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-    ret > 0 && pfd.revents & libc::POLLIN != 0
 }
 
 fn pty_lflag(fd: libc::c_int) -> (bool, bool) {
@@ -1268,17 +1461,17 @@ enum SendOutcome {
 fn try_send_update(
     client: &mut ClientState,
     pid: u16,
-    current: &FrameState,
+    current: FrameState,
+    msg: Option<Vec<u8>>,
     now: Instant,
     paced: bool,
 ) -> SendOutcome {
-    let previous = client.last_sent.get(&pid).cloned().unwrap_or_default();
-    let Some(msg) = build_update_msg(pid, current, &previous) else {
+    let Some(msg) = msg else {
         return SendOutcome::NoChange;
     };
     let bytes = msg.len();
     if client.tx.try_send(msg).is_ok() {
-        client.last_sent.insert(pid, current.clone());
+        client.last_sent.insert(pid, current);
         record_send(client, bytes, now, paced);
         client.frames_sent = client.frames_sent.wrapping_add(1);
         SendOutcome::Sent
@@ -1288,7 +1481,7 @@ fn try_send_update(
         // now), effectively dropping this intermediate state.  Without
         // this, backpressure causes the tick to re-dirty the PTY, building
         // ever-larger diffs that make the backlog worse.
-        client.last_sent.insert(pid, current.clone());
+        client.last_sent.insert(pid, current);
         SendOutcome::Backpressured
     }
 }
@@ -1361,9 +1554,9 @@ fn parse_config() -> Config {
 }
 
 fn bind_socket(sock_path: &str) -> UnixListener {
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path).unwrap();
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = std::fs::remove_file(sock_path);
+    let listener = UnixListener::bind(sock_path).unwrap();
+    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     eprintln!("listening on {sock_path}");
     listener
 }
@@ -1457,7 +1650,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     for &id in &ids {
         let pty = sess.ptys.get_mut(&id).unwrap();
         if pty.driver.take_title_dirty() {
-            pty.dirty = true;
+            pty.mark_dirty();
             pty.title_pending = true;
         }
         if pty.title_pending && now.duration_since(pty.last_title_send) >= title_interval {
@@ -1497,38 +1690,26 @@ async fn tick(state: &AppState) -> TickOutcome {
     let mut snapshots: HashMap<u16, FrameState> = HashMap::new();
     for &id in &ids {
         let pty = sess.ptys.get_mut(&id).unwrap();
-        if !pty.dirty || pty.draining || !needful_ptys.contains(&id) {
+        if needful_ptys.contains(&id) {
+            if let Some(frame) = pty.ready_frames.pop_front() {
+                snapshots.insert(id, frame);
+                sess.tick_snaps += 1;
+                did_work = true;
+                continue;
+            }
+        }
+        if !should_snapshot_pty(
+            pty.dirty,
+            needful_ptys.contains(&id),
+            pty.driver.synced_output(),
+        ) {
             continue;
         }
-        // Respect synchronized output (DEC ?2026) first: the application
-        // has opened a frame boundary and not yet closed it.  This takes
-        // priority over pending-data checks since the app is explicitly
-        // telling us the screen is incomplete.
-        if pty.driver.synced_output() {
-            let sync_capped = pty
-                .dirty_since
-                .map(|since| since + SNAPSHOT_SYNC_DEFER <= now)
-                .unwrap_or(false);
-            if !sync_capped {
-                continue;
-            }
-        }
-        // Don't snapshot while the kernel PTY buffer has unread data —
-        // the reader hasn't processed it yet, so the terminal is stale.
-        // Cap the defer so continuous output (cat /dev/random) still gets
-        // periodic snapshots.
-        if !pty.exited && pty_has_pending_data(pty.master_fd) {
-            let capped = pty
-                .dirty_since
-                .map(|since| since + SNAPSHOT_PENDING_CAP <= now)
-                .unwrap_or(false);
-            if !capped {
-                continue;
-            }
-        }
+        // Applications that care about complete-frame boundaries should
+        // use DEC synchronized output (?2026). Outside that bracket we
+        // snapshot immediately instead of heuristically coalescing reads.
         snapshots.insert(id, take_snapshot(pty));
-        pty.dirty = false;
-        pty.dirty_since = None;
+        pty.clear_dirty();
         sess.tick_snaps += 1;
         did_work = true;
     }
@@ -1543,6 +1724,12 @@ async fn tick(state: &AppState) -> TickOutcome {
         if let Some(c) = sess.clients.get_mut(&cid) {
             if c.inflight_bytes == 0 && c.min_rtt_ms > 0.0 && c.rtt_ms > c.min_rtt_ms {
                 c.rtt_ms = (c.rtt_ms * 0.99 + c.min_rtt_ms * 0.01).max(c.min_rtt_ms);
+            }
+            // Decay stale browser metrics so a missed/delayed metrics update
+            // can't permanently block the delivery loop.
+            if c.last_metrics_update.elapsed() > Duration::from_secs(1) {
+                c.browser_backlog_frames = 0;
+                c.browser_ack_ahead_frames = 0;
             }
         }
         let (
@@ -1602,7 +1789,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         SendOutcome::Sent => did_work = true,
                         SendOutcome::Backpressured => {
                             if let Some(pty) = sess.ptys.get_mut(&pid) {
-                                pty.dirty = true;
+                                pty.mark_dirty();
                             }
                         }
                         SendOutcome::NoChange => {}
@@ -1614,20 +1801,41 @@ async fn tick(state: &AppState) -> TickOutcome {
                     });
                 }
             } else if can_send_lead {
-                if let Some(cur) = snapshots.get(&pid) {
-                    let c = sess.clients.get_mut(&cid).unwrap();
-                    match try_send_update(c, pid, cur, now, true) {
+                if let Some(cur) = snapshots.get(&pid).cloned() {
+                    let previous = sess
+                        .clients
+                        .get(&cid)
+                        .and_then(|c| c.last_sent.get(&pid).cloned())
+                        .unwrap_or_default();
+                    drop(sess);
+                    let msg = build_update_msg(pid, &cur, &previous);
+                    sess = state.1.lock().await;
+                    let Some(c) = sess.clients.get_mut(&cid) else {
+                        continue;
+                    };
+                    match try_send_update(c, pid, cur, msg, now, true) {
                         SendOutcome::Sent => did_work = true,
                         SendOutcome::Backpressured => {
                             if let Some(pty) = sess.ptys.get_mut(&pid) {
-                                pty.dirty = true;
+                                pty.mark_dirty();
                             }
                         }
                         SendOutcome::NoChange => {}
                     }
+                } else {
+                    let has_pending = sess
+                        .ptys
+                        .get(&pid)
+                        .map(pty_has_visual_update)
+                        .unwrap_or(false);
+                    let _ = has_pending;
                 }
             } else {
-                let has_pending = sess.ptys.get(&pid).map(|pty| pty.dirty).unwrap_or(false);
+                let has_pending = sess
+                    .ptys
+                    .get(&pid)
+                    .map(pty_has_visual_update)
+                    .unwrap_or(false);
                 if has_pending && lead_has_window {
                     next_deadline = Some(match next_deadline {
                         Some(existing) => existing.min(lead_deadline),
@@ -1659,7 +1867,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                 break;
             }
             if !preview_can_send {
-                let has_pending = sess.ptys.get(&pid).map(|pty| pty.dirty).unwrap_or(false);
+                let has_pending = sess
+                    .ptys
+                    .get(&pid)
+                    .map(pty_has_visual_update)
+                    .unwrap_or(false);
                 // Only set a deadline when the reason is *timing* (deadline
                 // in the future), not capacity (preview window closed).
                 // A past deadline here spins the delivery loop because
@@ -1673,17 +1885,34 @@ async fn tick(state: &AppState) -> TickOutcome {
                 continue;
             }
             let Some(cur) = snapshots.get(&pid) else {
+                let has_pending = sess
+                    .ptys
+                    .get(&pid)
+                    .map(pty_has_visual_update)
+                    .unwrap_or(false);
+                let _ = has_pending;
                 continue;
             };
-            let c = sess.clients.get_mut(&cid).unwrap();
-            match try_send_update(c, pid, cur, now, false) {
+            let cur = cur.clone();
+            let previous = sess
+                .clients
+                .get(&cid)
+                .and_then(|c| c.last_sent.get(&pid).cloned())
+                .unwrap_or_default();
+            drop(sess);
+            let msg = build_update_msg(pid, &cur, &previous);
+            sess = state.1.lock().await;
+            let Some(c) = sess.clients.get_mut(&cid) else {
+                break;
+            };
+            match try_send_update(c, pid, cur, msg, now, false) {
                 SendOutcome::Sent => {
                     record_preview_send(c, pid, now);
                     did_work = true;
                 }
                 SendOutcome::Backpressured => {
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
-                        pty.dirty = true;
+                        pty.mark_dirty();
                     }
                     break;
                 }
@@ -1752,6 +1981,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 browser_backlog_frames: 0,
                 browser_ack_ahead_frames: 0,
                 browser_apply_ms: 0.0,
+                last_metrics_update: Instant::now(),
                 last_log: Instant::now(),
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
@@ -1883,7 +2113,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
 
         if data[0] == C2S_DISPLAY_RATE && data.len() >= 3 {
             let fps = u16::from_le_bytes([data[1], data[2]]) as f32;
-            if fps >= 10.0 && fps <= 1000.0 {
+            if fps > 0.0 {
                 let mut sess = state.1.lock().await;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.display_fps = fps;
@@ -1902,6 +2132,31 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 c.browser_backlog_frames = backlog_frames;
                 c.browser_ack_ahead_frames = ack_ahead_frames;
                 c.browser_apply_ms = apply_ms;
+                c.last_metrics_update = Instant::now();
+            }
+            nudge_delivery(&state);
+            continue;
+        }
+
+        // Server-side mouse: client sends structured mouse data, server generates
+        // the correct escape sequence using the terminal's current mouse mode/encoding.
+        if data[0] == C2S_MOUSE && data.len() >= 9 {
+            let pid = u16::from_le_bytes([data[1], data[2]]);
+            let type_ = data[3];
+            let button = data[4];
+            let col = u16::from_le_bytes([data[5], data[6]]);
+            let row = u16::from_le_bytes([data[7], data[8]]);
+            let sess = state.1.lock().await;
+            if let Some(pty) = sess.ptys.get(&pid) {
+                let (echo, icanon) = pty.lflag_cache;
+                if let Some(seq) = pty
+                    .driver
+                    .mouse_event(type_, button, col, row, echo, icanon)
+                {
+                    if let Some(&fd) = state.2.read().unwrap().get(&pid) {
+                        pty_write_all(fd, &seq);
+                    }
+                }
             }
             continue;
         }
@@ -1914,7 +2169,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     if update_client_scroll_state(c, pid, 0) {
                         if let Some(pty) = sess.ptys.get_mut(&pid) {
-                            pty.dirty = true;
+                            pty.mark_dirty();
                             need_nudge = true;
                         }
                     }
@@ -1978,7 +2233,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         update_client_scroll_state(c, pid, offset);
                     }
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
-                        pty.dirty = true;
+                        pty.mark_dirty();
                         need_nudge = true;
                     }
                 }
@@ -2303,7 +2558,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         }
                     }
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
-                        pty.dirty = true;
+                        pty.mark_dirty();
                         need_nudge = true;
                     }
                     if let Some((r, c)) = sess.min_size_for_pty(pid) {
@@ -2326,7 +2581,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         subscribe_client_to(c, pid);
                     }
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
-                        pty.dirty = true;
+                        pty.mark_dirty();
                     }
                     need_nudge = true;
                 }
@@ -2430,6 +2685,7 @@ mod tests {
             browser_backlog_frames: 0,
             browser_ack_ahead_frames: 0,
             browser_apply_ms: 0.0,
+            last_metrics_update: Instant::now(),
             last_log: Instant::now(),
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
@@ -2594,13 +2850,79 @@ mod tests {
         assert!(deadline >= now);
     }
 
+    #[test]
+    fn should_snapshot_pty_requires_dirty_and_needful() {
+        assert!(should_snapshot_pty(true, true, false));
+        assert!(!should_snapshot_pty(false, true, false));
+        assert!(!should_snapshot_pty(true, false, false));
+    }
+
+    #[test]
+    fn should_snapshot_pty_defers_synced_output() {
+        assert!(!should_snapshot_pty(true, true, true));
+        assert!(should_snapshot_pty(true, true, false));
+    }
+
+    #[test]
+    fn should_break_pty_drain_at_cap_when_not_synced() {
+        assert!(should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES, false));
+        assert!(should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES + 1, false));
+    }
+
+    #[test]
+    fn should_not_break_pty_drain_mid_synced_frame() {
+        assert!(!should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES, true));
+        assert!(!should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES * 8, true));
+    }
+
+    #[test]
+    fn enqueue_ready_frame_refuses_new_frames_when_capped() {
+        let mut queue = VecDeque::new();
+        for cols in 1..=(READY_FRAME_QUEUE_CAP as u16) {
+            assert!(enqueue_ready_frame(&mut queue, FrameState::new(1, cols)));
+        }
+        assert!(!enqueue_ready_frame(
+            &mut queue,
+            FrameState::new(1, READY_FRAME_QUEUE_CAP as u16 + 1),
+        ));
+        assert_eq!(queue.len(), READY_FRAME_QUEUE_CAP);
+        assert_eq!(queue.front().map(FrameState::cols), Some(1));
+        assert_eq!(
+            queue.back().map(FrameState::cols),
+            Some(READY_FRAME_QUEUE_CAP as u16),
+        );
+    }
+
+    #[test]
+    fn find_sync_output_end_returns_end_of_first_close_sequence() {
+        let bytes = b"abc\x1b[?2026lrest\x1b[?2026l";
+        assert_eq!(find_sync_output_end(&[], bytes), Some(11));
+    }
+
+    #[test]
+    fn find_sync_output_end_returns_none_without_close_sequence() {
+        assert_eq!(find_sync_output_end(&[], b"\x1b[?2026hpartial"), None);
+    }
+
+    #[test]
+    fn find_sync_output_end_detects_boundary_split_across_reads() {
+        assert_eq!(find_sync_output_end(b"abc\x1b[?20", b"26lrest"), Some(3));
+    }
+
+    #[test]
+    fn update_sync_scan_tail_keeps_recent_suffix_only() {
+        let mut tail = Vec::new();
+        update_sync_scan_tail(&mut tail, b"123456789");
+        assert_eq!(tail, b"3456789");
+    }
+
     // ── window_saturated ──
 
     #[test]
     fn window_saturated_at_90_percent_frames() {
         let client = test_client();
         let target = target_frame_window(&client);
-        let frames_90 = (target * 9 + 9) / 10; // ceil(target * 0.9)
+        let frames_90 = (target * 9).div_ceil(10); // ceil(target * 0.9)
         assert!(window_saturated(&client, frames_90, 0));
     }
 
@@ -2614,7 +2936,7 @@ mod tests {
     fn window_saturated_at_90_percent_bytes() {
         let client = test_client();
         let target_bytes = target_byte_window(&client);
-        let bytes_90 = (target_bytes * 9 + 9) / 10;
+        let bytes_90 = (target_bytes * 9).div_ceil(10);
         assert!(window_saturated(&client, 0, bytes_90));
     }
 
@@ -2712,7 +3034,7 @@ mod tests {
         let mut client = test_client();
         client.goodput_bps = 0.0;
         client.delivery_bps = 0.0;
-        assert!(bandwidth_floor_bps(&client) >= 16_384.0);
+        assert_eq!(bandwidth_floor_bps(&client), 0.0);
     }
 
     #[test]
@@ -2721,21 +3043,41 @@ mod tests {
         client.goodput_bps = 1_000_000.0;
         client.delivery_bps = 1_000_000.0;
         let floor = bandwidth_floor_bps(&client);
-        assert!(floor > 16_384.0);
+        assert!(floor > 0.0);
+    }
+
+    #[test]
+    fn browser_ready_delivery_floor_can_drive_large_frames_to_display_fps() {
+        let mut client = test_client();
+        client.display_fps = 60.0;
+        client.browser_backlog_frames = 0;
+        client.browser_ack_ahead_frames = 0;
+        client.browser_apply_ms = 0.2;
+        client.goodput_bps = 3_000_000.0;
+        client.delivery_bps = 9_500_000.0;
+        client.last_goodput_sample_bps = 3_000_000.0;
+        client.avg_paced_frame_bytes = 150_000.0;
+        client.avg_preview_frame_bytes = 1_024.0;
+        client.avg_frame_bytes = 150_000.0;
+
+        assert!(
+            (pacing_fps(&client) - client.display_fps).abs() < 0.01,
+            "browser-ready delivery floor should let large frames reach display_fps on a fast path",
+        );
     }
 
     // ── pacing_fps ──
 
     #[test]
-    fn pacing_fps_at_least_one() {
-        let client = test_client();
-        assert!(pacing_fps(&client) >= 1.0);
-    }
-
-    #[test]
-    fn pacing_fps_at_most_display_fps() {
-        let client = test_client();
-        assert!(pacing_fps(&client) <= client.display_fps);
+    fn pacing_fps_zero_when_no_bandwidth() {
+        let mut client = test_client();
+        client.goodput_bps = 0.0;
+        client.delivery_bps = 0.0;
+        client.last_goodput_sample_bps = 0.0;
+        assert!(
+            pacing_fps(&client) == 0.0,
+            "pacing_fps should be 0 with zero bandwidth"
+        );
     }
 
     #[test]
@@ -2795,16 +3137,6 @@ mod tests {
         client.browser_ack_ahead_frames = 10;
         let ahead = browser_pacing_fps(&client);
         assert!(ahead < normal, "high ack_ahead should reduce pacing fps");
-    }
-
-    #[test]
-    fn browser_pacing_fps_reduced_by_slow_apply() {
-        let mut client = test_client();
-        client.display_fps = 60.0;
-        let normal = browser_pacing_fps(&client);
-        client.browser_apply_ms = 100.0;
-        let slow = browser_pacing_fps(&client);
-        assert!(slow < normal, "slow apply time should reduce pacing fps");
     }
 
     // ── browser_backlog_blocked ──
@@ -2868,11 +3200,7 @@ mod tests {
         let client = test_client();
         let interval = send_interval(&client);
         let expected = Duration::from_secs_f64(1.0 / browser_pacing_fps(&client) as f64);
-        let diff = if interval > expected {
-            interval - expected
-        } else {
-            expected - interval
-        };
+        let diff = interval.abs_diff(expected);
         assert!(diff < Duration::from_micros(10));
     }
 
@@ -2882,13 +3210,6 @@ mod tests {
     fn preview_fps_at_least_one() {
         let client = test_client();
         assert!(preview_fps(&client) >= 1.0);
-    }
-
-    #[test]
-    fn preview_fps_capped() {
-        let mut client = test_client();
-        client.display_fps = 240.0;
-        assert!(preview_fps(&client) <= PREVIEW_FPS_CAP + 0.01);
     }
 
     // ── window_open ──
@@ -3578,6 +3899,95 @@ mod tests {
         assert!(
             !lead_window_open(&client, true),
             "preview reservation should apply uniformly for lead clients"
+        );
+    }
+
+    // ── property: blip recovery on healthy paths ──
+
+    #[test]
+    fn probe_recovers_on_healthy_path_after_blip() {
+        let mut client = browser_ready_high_bandwidth_client();
+        client.probe_frames = 8.0;
+
+        // Blip: 3 ACKs with inflated RTT crush probes.
+        sim_acks(&mut client, 3, 30_000, 200.0);
+        let post_blip = client.probe_frames;
+        assert!(
+            post_blip < 4.0,
+            "probe_frames {post_blip:.1} should have dropped after blip"
+        );
+
+        // Reset browser metrics to healthy (browser cleared backlog).
+        client.browser_backlog_frames = 0;
+        client.browser_ack_ahead_frames = 0;
+        client.browser_apply_ms = 0.3;
+
+        // Recovery: 20 healthy ACKs at low RTT on an underfilled path.
+        sim_acks(&mut client, 20, 30_000, 1.0);
+
+        assert!(
+            client.probe_frames > post_blip,
+            "probe_frames {:.1} should have recovered from {post_blip:.1} after healthy ACKs",
+            client.probe_frames,
+        );
+    }
+
+    #[test]
+    fn jitter_decays_fast_on_browser_ready_path() {
+        let mut client = browser_ready_high_bandwidth_client();
+
+        // Inject elevated jitter (simulating post-blip state).
+        client.max_goodput_jitter_bps = client.goodput_bps * 0.4;
+        client.goodput_jitter_bps = client.goodput_bps * 0.3;
+        let initial_jitter = client.max_goodput_jitter_bps;
+
+        // 10 healthy ACKs on a browser-ready path.
+        sim_acks(&mut client, 10, 30_000, 1.0);
+
+        assert!(
+            client.max_goodput_jitter_bps < initial_jitter * 0.5,
+            "max_goodput_jitter_bps {:.0} should have decayed below {:.0} \
+             (50% of initial {initial_jitter:.0}) after 10 healthy ACKs on a ready path",
+            client.max_goodput_jitter_bps,
+            initial_jitter * 0.5,
+        );
+    }
+
+    #[test]
+    fn byte_budget_uses_floor_when_goodput_depressed() {
+        let mut client = browser_ready_high_bandwidth_client();
+        client.goodput_bps = 100_000.0;
+
+        let budget = byte_budget_for(&client, 100.0);
+        let floor_budget = (bandwidth_floor_bps(&client) * 100.0 / 1_000.0).ceil() as usize;
+
+        assert!(
+            budget >= floor_budget,
+            "byte_budget {budget} should be at least bandwidth_floor-based {floor_budget} \
+             when goodput_bps is depressed but delivery_bps is high"
+        );
+    }
+
+    #[test]
+    fn probe_floor_maintained_under_congestion_signal() {
+        let mut client = test_client();
+        client.display_fps = 120.0;
+        client.rtt_ms = 40.0;
+        client.min_rtt_ms = 40.0;
+        client.goodput_bps = 5_000_000.0;
+        client.delivery_bps = 5_000_000.0;
+        client.last_goodput_sample_bps = 5_000_000.0;
+        client.avg_paced_frame_bytes = 10_000.0;
+        client.avg_preview_frame_bytes = 1_024.0;
+        client.probe_frames = 10.0;
+
+        // Many ACKs with high RTT: probes should not drop below the floor.
+        sim_acks(&mut client, 20, 10_000, 600.0);
+
+        assert!(
+            client.probe_frames >= 1.0,
+            "probe_frames {:.1} should not drop below the floor of 1.0",
+            client.probe_frames,
         );
     }
 }

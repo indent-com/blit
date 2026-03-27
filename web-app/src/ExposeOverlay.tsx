@@ -12,7 +12,8 @@ import {
   SEARCH_SOURCE_SCROLLBACK,
 } from "blit-react";
 import type { UseBlitSessionsReturn, SearchResult } from "blit-react";
-import { themeFor, layout, ui } from "./theme";
+import { overlayChromeStyles, themeFor, ui } from "./theme";
+import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 
 const SOURCE_LABEL: Record<number, string> = {
   [SEARCH_SOURCE_TITLE]: "Title",
@@ -46,6 +47,7 @@ export function ExposeOverlay({
   const { palette, fontFamily: font } = useBlitContext();
   const dark = palette?.dark ?? true;
   const theme = themeFor(dark);
+  const chrome = overlayChromeStyles(theme, dark);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
@@ -189,19 +191,15 @@ export function ExposeOverlay({
     selected ? theme.accent : theme.border;
 
   return (
-    <div role="dialog" aria-label="Expose" style={layout.overlay} onClick={onClose}>
-      <nav
+    <OverlayBackdrop dark={dark} label="Expose" onClose={onClose}>
+      <OverlayPanel
+        dark={dark}
         style={{
-          width: "90%",
+          width: "min(90vw, 900px)",
           maxWidth: 900,
-          maxHeight: "80vh",
-          padding: 16,
-          overflow: "auto",
           backgroundColor: theme.panelBg,
-          color: theme.fg,
           fontFamily: font,
         }}
-        onClick={(e) => e.stopPropagation()}
       >
         <header style={{
           display: "flex",
@@ -241,15 +239,7 @@ export function ExposeOverlay({
               Run
             </button>
           )}
-          <button style={{
-            background: "none",
-            border: "none",
-            color: "inherit",
-            cursor: "pointer",
-            fontFamily: "inherit",
-            opacity: 0.5,
-            fontSize: 12,
-          }} onClick={onClose}>
+          <button style={chrome.closeButton} onClick={onClose}>
             Esc
           </button>
         </header>
@@ -436,7 +426,7 @@ export function ExposeOverlay({
               </li>
         </ul>
         )}
-      </nav>
-    </div>
+      </OverlayPanel>
+    </OverlayBackdrop>
   );
 }

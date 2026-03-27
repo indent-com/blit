@@ -5,7 +5,8 @@ import {
   useCallback,
 } from "react";
 import { DEFAULT_FONT } from "blit-react";
-import { themeFor, layout, ui } from "./theme";
+import { themeFor, ui } from "./theme";
+import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 export function FontOverlay({
   currentFamily,
@@ -94,20 +95,16 @@ export function FontOverlay({
     : query || currentFamily;
 
   return (
-    <div style={layout.overlay} onClick={dismiss}>
-      <section
+    <OverlayBackdrop dark={dark} label="Font" onClose={dismiss}>
+      <OverlayPanel
+        dark={dark}
         style={{
-          ...layout.panel,
           minWidth: 320,
-          backgroundColor: theme.solidPanelBg,
-          color: theme.fg,
-          maxHeight: "80vh",
           display: "flex",
           flexDirection: "column",
         }}
-        onClick={(e) => e.stopPropagation()}
       >
-        <h2 style={{ fontWeight: 600, marginBottom: 12, fontSize: 16, flexShrink: 0 }}>Font</h2>
+        <OverlayHeader dark={dark} title="Font" onClose={dismiss} />
         <form onSubmit={(e) => {
           e.preventDefault();
           const family = selectedIdx >= 0 && selectedIdx < filtered.length
@@ -190,7 +187,7 @@ export function FontOverlay({
           flexShrink: 0,
         }}>Apply</button>
         </form>
-      </section>
-    </div>
+      </OverlayPanel>
+    </OverlayBackdrop>
   );
 }

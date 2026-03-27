@@ -1,4 +1,5 @@
-import { themeFor, layout, ui } from "./theme";
+import { ui } from "./theme";
+import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 export function HelpOverlay({
   onClose,
@@ -7,7 +8,6 @@ export function HelpOverlay({
   onClose: () => void;
   dark: boolean;
 }) {
-  const theme = themeFor(dark);
   const mod_ = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
   const shortcuts = [
     [`${mod_}+K`, "Expose (switch PTYs)"],
@@ -20,23 +20,13 @@ export function HelpOverlay({
     ["Ctrl+?", "Help"],
   ];
   return (
-    <div
-      open
-      style={layout.overlay}
-      onClick={onClose}
-    >
-      <article
-        style={{
-          ...layout.panel,
-          minWidth: 300,
-          backgroundColor: theme.solidPanelBg,
-          color: theme.fg,
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 style={{ fontWeight: 600, marginBottom: 12, fontSize: 16 }}>
-          Keyboard shortcuts
-        </h2>
+    <OverlayBackdrop dark={dark} label="Help" onClose={onClose}>
+      <OverlayPanel dark={dark} style={{ minWidth: 300 }}>
+        <OverlayHeader
+          dark={dark}
+          title="Keyboard shortcuts"
+          onClose={onClose}
+        />
         <table style={{ borderSpacing: "12px 6px" }}>
           <tbody>
             {shortcuts.map(([key, desc]) => (
@@ -49,7 +39,7 @@ export function HelpOverlay({
             ))}
           </tbody>
         </table>
-      </article>
-    </div>
+      </OverlayPanel>
+    </OverlayBackdrop>
   );
 }

@@ -1,97 +1,100 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BlitTransport } from "blit-react";
 
+export interface RenderSample {
+  t: number;   // timestamp (ms, relative to page load)
+  ms: number;  // render duration
+}
+
+export interface NetSample {
+  t: number;   // timestamp (ms, relative to page load)
+  bytes: number; // message size
+  dir: "rx" | "tx"; // direction
+}
+
 export interface Metrics {
   bw: number;
   fps: number;
   ups: number;
+  renderMs: number;
+  maxRenderMs: number;
 }
 
 const INTERVAL = 1000;
-const C2S_DISPLAY_RATE = 0x04;
 
-export function useMetrics(transport: BlitTransport): Metrics & { countFrame: () => void } {
-  const [metrics, setMetrics] = useState<Metrics>({ bw: 0, fps: 0, ups: 0 });
+export function useMetrics(transport: BlitTransport): Metrics & {
+  countFrame: (renderMs?: number) => void;
+  timelineRef: React.RefObject<RenderSample[]>;
+  netRef: React.RefObject<NetSample[]>;
+} {
+  const [metrics, setMetrics] = useState<Metrics>({ bw: 0, fps: 0, ups: 0, renderMs: 0, maxRenderMs: 0 });
   const bytesRef = useRef(0);
   const framesRef = useRef(0);
   const updatesRef = useRef(0);
+  const renderMsSumRef = useRef(0);
+  const renderMsMaxRef = useRef(0);
+  const timelineRef = useRef<RenderSample[]>([]);
+  const netRef = useRef<NetSample[]>([]);
+  const TIMELINE_MAX = 500;
+  const NET_MAX = 2000;
 
-  const countFrame = useCallback(() => {
+  const countFrame = useCallback((renderMs?: number) => {
     framesRef.current++;
+    if (renderMs != null) {
+      renderMsSumRef.current += renderMs;
+      renderMsMaxRef.current = Math.max(renderMsMaxRef.current, renderMs);
+      const tl = timelineRef.current;
+      tl.push({ t: performance.now(), ms: renderMs });
+      if (tl.length > TIMELINE_MAX) tl.splice(0, tl.length - TIMELINE_MAX);
+    }
   }, []);
 
   useEffect(() => {
-    function sendDisplayRate(fps: number) {
-      const msg = new Uint8Array(3);
-      msg[0] = C2S_DISPLAY_RATE;
-      msg[1] = fps & 0xff;
-      msg[2] = (fps >> 8) & 0xff;
-      transport.send(msg);
-    }
-
     const onMessage = (data: ArrayBuffer) => {
       bytesRef.current += data.byteLength;
       const view = new Uint8Array(data);
       if (view[0] === 0x00) {
         updatesRef.current++;
       }
+      const nl = netRef.current;
+      nl.push({ t: performance.now(), bytes: data.byteLength, dir: "rx" });
+      if (nl.length > NET_MAX) nl.splice(0, nl.length - NET_MAX);
     };
     transport.addEventListener("message", onMessage);
 
-    // Continuously probe the display's refresh rate capability and
-    // report it to the server for pacing.
-    let rafId = 0;
-    let prevRafTime = 0;
-    let fpsEwma = 120;
-    let lastReported = 0;
-
-    const probeDisplayRate = (now: number) => {
-      if (prevRafTime > 0) {
-        const dt = now - prevRafTime;
-        if (dt > 0 && dt < 500) {
-          fpsEwma = fpsEwma * 0.8 + (1000 / dt) * 0.2;
-          const advertised = Math.round(fpsEwma);
-          if (advertised !== lastReported && transport.status === "connected") {
-            sendDisplayRate(advertised);
-            lastReported = advertised;
-          }
-        }
-      }
-      prevRafTime = now;
-      rafId = requestAnimationFrame(probeDisplayRate);
+    // Intercept send to record tx events
+    const origSend = transport.send.bind(transport);
+    transport.send = (data: Uint8Array) => {
+      const nl = netRef.current;
+      nl.push({ t: performance.now(), bytes: data.byteLength, dir: "tx" });
+      if (nl.length > NET_MAX) nl.splice(0, nl.length - NET_MAX);
+      origSend(data);
     };
-
-    const onStatus = (status: string) => {
-      if (status === "connected") {
-        const fps = lastReported || Math.round(fpsEwma);
-        sendDisplayRate(fps);
-        lastReported = fps;
-      }
-    };
-    transport.addEventListener("statuschange", onStatus);
-
-    rafId = requestAnimationFrame(probeDisplayRate);
 
     const timer = setInterval(() => {
+      const frames = framesRef.current;
       setMetrics({
         bw: bytesRef.current,
-        fps: framesRef.current,
+        fps: frames,
         ups: updatesRef.current,
+        renderMs: frames > 0 ? renderMsSumRef.current / frames : 0,
+        maxRenderMs: renderMsMaxRef.current,
       });
       bytesRef.current = 0;
       framesRef.current = 0;
       updatesRef.current = 0;
+      renderMsSumRef.current = 0;
+      renderMsMaxRef.current = 0;
     }, INTERVAL);
 
     return () => {
       transport.removeEventListener("message", onMessage);
-      transport.removeEventListener("statuschange", onStatus);
-      cancelAnimationFrame(rafId);
+      transport.send = origSend;
       clearInterval(timer);
     };
   }, [transport]);
 
-  return { ...metrics, countFrame };
+  return { ...metrics, countFrame, timelineRef, netRef };
 }
 
 export function formatBw(bytes: number): string {

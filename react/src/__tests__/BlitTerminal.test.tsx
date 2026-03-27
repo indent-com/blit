@@ -28,6 +28,9 @@ type FakeTerminal = {
   cols: number;
   set_default_colors: ReturnType<typeof vi.fn>;
   set_ansi_color: ReturnType<typeof vi.fn>;
+  set_cell_size: ReturnType<typeof vi.fn>;
+  set_font_family: ReturnType<typeof vi.fn>;
+  invalidate_render_cache: ReturnType<typeof vi.fn>;
 };
 
 class MockStore {
@@ -69,13 +72,50 @@ class MockStore {
 }
 
 describe("BlitTerminal", () => {
+  let originalFonts: PropertyDescriptor | undefined;
+
   beforeEach(() => {
     vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
     vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+    const listeners = new Map<string, Set<EventListener>>();
+    originalFonts = Object.getOwnPropertyDescriptor(document, "fonts");
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        addEventListener: vi.fn((type: string, listener: EventListener) => {
+          let set = listeners.get(type);
+          if (!set) {
+            set = new Set();
+            listeners.set(type, set);
+          }
+          set.add(listener);
+        }),
+        removeEventListener: vi.fn((type: string, listener: EventListener) => {
+          listeners.get(type)?.delete(listener);
+        }),
+        dispatch(type: string) {
+          for (const listener of listeners.get(type) ?? []) {
+            listener(new Event(type));
+          }
+        },
+      },
+    });
   });
 
   afterEach(() => {
     cleanup();
+    if (originalFonts) {
+      Object.defineProperty(document, "fonts", originalFonts);
+    } else {
+      delete (document as Document & { fonts?: unknown }).fonts;
+    }
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -110,6 +150,9 @@ describe("BlitTerminal", () => {
       cols: 80,
       set_default_colors: vi.fn(),
       set_ansi_color: vi.fn(),
+      set_cell_size: vi.fn(),
+      set_font_family: vi.fn(),
+      invalidate_render_cache: vi.fn(),
     };
 
     expect(terminal.set_default_colors).not.toHaveBeenCalled();
@@ -133,5 +176,43 @@ describe("BlitTerminal", () => {
         ...palette.ansi[i],
       );
     }
+  });
+
+  it("invalidates the glyph cache when fonts finish loading even if metrics stay the same", () => {
+    const transport = new MockTransport();
+    const store = new MockStore();
+    const terminal: FakeTerminal = {
+      rows: 24,
+      cols: 80,
+      set_default_colors: vi.fn(),
+      set_ansi_color: vi.fn(),
+      set_cell_size: vi.fn(),
+      set_font_family: vi.fn(),
+      invalidate_render_cache: vi.fn(),
+    };
+    store.terminal = terminal;
+
+    render(
+      <BlitTerminal
+        ptyId={7}
+        fontFamily="Test Mono"
+        fontSize={14}
+        store={store as unknown as TerminalStore}
+        transport={transport}
+      />,
+    );
+
+    terminal.invalidate_render_cache.mockClear();
+
+    act(() => {
+      (
+        document.fonts as unknown as {
+          dispatch: (type: string) => void;
+        }
+      ).dispatch("loadingdone");
+    });
+
+    expect(terminal.invalidate_render_cache).toHaveBeenCalledTimes(1);
+    expect(terminal.set_font_family).toHaveBeenCalledWith("Test Mono");
   });
 });

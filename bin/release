@@ -41,6 +41,26 @@ ensure_clean_tree() {
     fi
 }
 
+# Discover workspace member Cargo.toml paths from the root Cargo.toml.
+find_cargo_manifests() {
+    perl -ne '
+        if (/^\s*"([^"]+)"/) {
+            my $dir = $1;
+            print "$dir/Cargo.toml\n" if -f "$dir/Cargo.toml";
+        }
+    ' Cargo.toml
+}
+
+# Discover workspace crate names from Cargo.lock.
+find_workspace_crates() {
+    local current_version="$1"
+    perl -0777 -ne '
+        while (/\[\[package\]\]\nname = "([^"]+)"\nversion = "\Q'"$current_version"'\E"/g) {
+            print "$1\n";
+        }
+    ' Cargo.lock
+}
+
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     usage
     exit 0
@@ -72,27 +92,11 @@ if git rev-parse -q --verify "refs/tags/v$target_version" >/dev/null 2>&1; then
     die "tag v$target_version already exists"
 fi
 
-cargo_manifests=(
-    remote/Cargo.toml
-    gateway/Cargo.toml
-    fonts/Cargo.toml
-    cli/Cargo.toml
-    browser/Cargo.toml
-    wezterm-driver/Cargo.toml
-    server/Cargo.toml
-    demo/Cargo.toml
-)
+mapfile -t cargo_manifests < <(find_cargo_manifests)
+[[ ${#cargo_manifests[@]} -gt 0 ]] || die "no workspace members found"
 
-workspace_crates=(
-    blit-browser
-    blit-cli
-    blit-demo
-    blit-fonts
-    blit-gateway
-    blit-remote
-    blit-server
-    blit-wezterm
-)
+mapfile -t workspace_crates < <(find_workspace_crates "$current_version")
+[[ ${#workspace_crates[@]} -gt 0 ]] || die "no workspace crates found in Cargo.lock at version $current_version"
 
 for file in "${cargo_manifests[@]}"; do
     [[ "$(read_toml_version "$file")" == "$current_version" ]] \
@@ -118,11 +122,11 @@ if (lock.version !== expected) {
   process.exit(1);
 }
 if (lock.packages?.[""]?.version !== expected) {
-  console.error(`release: expected react/package-lock.json packages[\"\"] to be at version ${expected}`);
+  console.error(`release: expected react/package-lock.json packages[""] to be at version ${expected}`);
   process.exit(1);
 }
 if (lock.packages?.["../browser/pkg"]?.version !== expected) {
-  console.error(`release: expected react/package-lock.json packages[\"../browser/pkg\"] to be at version ${expected}`);
+  console.error(`release: expected react/package-lock.json packages["../browser/pkg"] to be at version ${expected}`);
   process.exit(1);
 }
 NODE
@@ -208,19 +212,11 @@ done
 
 cargo test -p blit-server -- --nocapture
 
-git add \
-    Cargo.lock \
-    browser/Cargo.toml \
-    cli/Cargo.toml \
-    demo/Cargo.toml \
-    flake.nix \
-    fonts/Cargo.toml \
-    gateway/Cargo.toml \
-    react/package-lock.json \
-    react/package.json \
-    remote/Cargo.toml \
-    server/Cargo.toml \
-    wezterm-driver/Cargo.toml
+# Stage all changed versioned files
+git add Cargo.lock flake.nix react/package.json react/package-lock.json
+for file in "${cargo_manifests[@]}"; do
+    git add "$file"
+done
 
 git commit -m "release $target_version"
 

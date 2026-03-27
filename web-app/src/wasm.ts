@@ -5,7 +5,7 @@ let initPromise: Promise<typeof import("blit-browser")> | null = null;
 export function initWasm(): Promise<typeof import("blit-browser")> {
   if (!initPromise) {
     initPromise = import("blit-browser").then(async (mod) => {
-      await mod.default(wasmBuffer);
+      await mod.default({ module_or_path: wasmBuffer });
       return mod;
     });
   }

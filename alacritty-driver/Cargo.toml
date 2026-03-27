@@ -1,0 +1,9 @@
+[package]
+name = "blit-alacritty"
+version = "0.8.0"
+edition = "2021"
+
+[dependencies]
+blit-remote = { path = "../remote" }
+alacritty_terminal = "0.25"
+regex = "1"

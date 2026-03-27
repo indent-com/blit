@@ -1,13 +1,20 @@
 [package]
 name = "blit-gateway"
-version = "0.7.3"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
-blit-fonts = { path = "../fonts" }
+blit-webserver = { path = "../webserver" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
+web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+ring = "0.17"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+time = "0.3"
 
 [dev-dependencies]
 http-body-util = "0.1"

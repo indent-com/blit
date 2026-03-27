@@ -2,32 +2,85 @@ import {
   useState,
   useCallback,
   useRef,
+  useEffect,
 } from "react";
-import { WebSocketTransport } from "blit-react";
+import {
+  WebSocketTransport,
+  WebTransportTransport,
+} from "blit-react";
+import type { BlitTransport } from "blit-react";
 import type { BlitWasmModule } from "blit-react";
-import { PASS_KEY, readStorage, writeStorage, wsUrl } from "./storage";
+import {
+  PASS_KEY,
+  readStorage,
+  writeStorage,
+  wsUrl,
+  wtUrl,
+  wtCertHash,
+} from "./storage";
 import { themeFor } from "./theme";
 import { Workspace } from "./Workspace";
 
+function createBestTransport(
+  pass: string,
+  onFallbackToWebSocket: () => void,
+): BlitTransport {
+  const certHash = wtCertHash();
+  const canTryWebTransport = typeof WebTransport !== "undefined";
+  if (!canTryWebTransport || !certHash) {
+    return new WebSocketTransport(wsUrl(), pass);
+  }
+  const wt = new WebTransportTransport(wtUrl(), pass, {
+    serverCertificateHash: certHash,
+  });
+  let connectedOnce = false;
+  const onStatus = (status: string) => {
+    if (status === "connected") {
+      connectedOnce = true;
+      wt.removeEventListener("statuschange", onStatus);
+      return;
+    }
+    if (!connectedOnce && (status === "error" || status === "disconnected")) {
+      wt.removeEventListener("statuschange", onStatus);
+      wt.close();
+      onFallbackToWebSocket();
+    }
+  };
+  wt.addEventListener("statuschange", onStatus);
+  return wt;
+}
+
 export function App({ wasm }: { wasm: BlitWasmModule }) {
   const savedPass = readStorage(PASS_KEY);
-  const [transport, setTransport] = useState<WebSocketTransport | null>(() =>
-    savedPass ? new WebSocketTransport(wsUrl(), savedPass) : null,
-  );
+  const [transport, setTransport] = useState<BlitTransport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const passRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!savedPass || transport) return;
+    setTransport(
+      createBestTransport(savedPass, () =>
+        setTransport(new WebSocketTransport(wsUrl(), savedPass)),
+      ),
+    );
+  }, [savedPass, transport]);
 
   const connect = useCallback(
     (pass: string) => {
       setAuthError(null);
       transport?.close();
+      // Auth check uses plain WebSocket (no QUIC dependency)
       const t = new WebSocketTransport(wsUrl(), pass, { reconnect: false });
       const onStatus = (status: string) => {
         if (status === "connected") {
           writeStorage(PASS_KEY, pass);
           t.removeEventListener("statuschange", onStatus);
           t.close();
-          setTransport(new WebSocketTransport(wsUrl(), pass));
+          setTransport(
+            createBestTransport(pass, () =>
+              setTransport(new WebSocketTransport(wsUrl(), pass)),
+            ),
+          );
         } else if (status === "error") {
           setAuthError("Authentication failed");
           t.close();
