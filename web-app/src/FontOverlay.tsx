@@ -5,7 +5,7 @@ import {
   useCallback,
 } from "react";
 import { DEFAULT_FONT } from "blit-react";
-import { styles } from "./styles";
+import { themeFor, layout, ui } from "./theme";
 
 export function FontOverlay({
   currentFamily,
@@ -24,6 +24,7 @@ export function FontOverlay({
   onClose: () => void;
   dark: boolean;
 }) {
+  const theme = themeFor(dark);
   const [query, setQuery] = useState("");
   const [size, setSize] = useState(currentSize);
   const [selectedIdx, setSelectedIdx] = useState(-1);
@@ -61,14 +62,6 @@ export function FontOverlay({
         e.preventDefault();
         setSelectedIdx((i) => Math.max(i - 1, -1));
         break;
-      case "Enter":
-        e.preventDefault();
-        if (selectedIdx >= 0 && selectedIdx < filtered.length) {
-          onSelect(filtered[selectedIdx], size);
-        } else if (query.trim()) {
-          onSelect(query.trim(), size);
-        }
-        break;
       case "Escape":
         e.preventDefault();
         dismiss();
@@ -91,8 +84,8 @@ export function FontOverlay({
   }, [query]);
 
   const inputStyle = {
-    ...styles.exposeSearch,
-    backgroundColor: dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.05)",
+    ...ui.input,
+    backgroundColor: theme.inputBg,
     color: "inherit",
   };
 
@@ -101,20 +94,27 @@ export function FontOverlay({
     : query || currentFamily;
 
   return (
-    <div style={styles.overlay} onClick={dismiss}>
+    <div style={layout.overlay} onClick={dismiss}>
       <section
         style={{
-          ...styles.helpBox,
-          backgroundColor: dark ? "#1e1e1e" : "#f5f5f5",
-          color: dark ? "#e0e0e0" : "#333",
+          ...layout.panel,
+          minWidth: 320,
+          backgroundColor: theme.solidPanelBg,
+          color: theme.fg,
           maxHeight: "80vh",
           display: "flex",
           flexDirection: "column",
-          minWidth: 320,
         }}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 style={{ fontWeight: 600, marginBottom: 12, fontSize: 16, flexShrink: 0 }}>Font</h2>
+        <form onSubmit={(e) => {
+          e.preventDefault();
+          const family = selectedIdx >= 0 && selectedIdx < filtered.length
+            ? filtered[selectedIdx]
+            : query.trim() || currentFamily;
+          onSelect(family, size);
+        }} style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0 }}>
         <input
           ref={inputRef}
           type="text"
@@ -122,7 +122,7 @@ export function FontOverlay({
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Search fonts or type a name"
-          style={{ ...inputStyle, marginBottom: 8 }}
+          style={inputStyle}
         />
         {filtered.length > 0 && (
           <ul
@@ -134,7 +134,6 @@ export function FontOverlay({
               flex: 1,
               minHeight: 0,
               maxHeight: 200,
-              marginBottom: 8,
             }}
           >
             {filtered.map((f, i) => (
@@ -145,7 +144,7 @@ export function FontOverlay({
                   cursor: "pointer",
                   borderRadius: 3,
                   backgroundColor: i === selectedIdx
-                    ? dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)"
+                    ? theme.selectedBg
                     : "transparent",
                   listStyle: "none",
                   fontSize: 13,
@@ -180,9 +179,17 @@ export function FontOverlay({
             style={{ ...inputStyle, width: 52, flex: "none", textAlign: "center" }}
           />
         </div>
-        <span style={{ fontSize: size, fontFamily: previewFamily || DEFAULT_FONT, flexShrink: 0, marginTop: 8 }}>
+        <span style={{ fontSize: size, fontFamily: previewFamily || DEFAULT_FONT, flexShrink: 0 }}>
           The quick brown fox
         </span>
+        <button type="submit" style={{
+          ...ui.btn,
+          alignSelf: "flex-end",
+          padding: "4px 12px",
+          border: "1px solid rgba(128,128,128,0.3)",
+          flexShrink: 0,
+        }}>Apply</button>
+        </form>
       </section>
     </div>
   );

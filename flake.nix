@@ -79,7 +79,7 @@
                   Label = "com.blit.server";
                   ProgramArguments = [
                     "/bin/sh" "-lc"
-                    "exec ${cfg.package}/bin/blit-server"
+                    ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; exec ${cfg.package}/bin/blit-server''
                   ];
                   EnvironmentVariables = {
                     BLIT_SOCK = cfg.socketPath;
@@ -250,7 +250,7 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.7.0";
+        version = "0.7.1";
 
         weztermHash = "sha256-V6WvkNZryYofarsyfcmsuvtpNJ/c3O+DmOKNvoYPbmA=";
         finlUnicodeHash = "sha256-38S6XH4hldbkb6NP+s7lXa/NR49PI0w3KYqd+jPHND0=";
@@ -645,6 +645,9 @@ CTRL
           ];
 
           shellHook = ''
+            if [ -z "''${LANG-}" ]; then
+              export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"
+            fi
             echo "blit dev shell"
             echo "  dev:                dev  (server + gateway + browser assets, auto-reload on source change)"
             echo "  build:              build"

@@ -6,7 +6,7 @@ import {
 import { WebSocketTransport } from "blit-react";
 import type { BlitWasmModule } from "blit-react";
 import { PASS_KEY, readStorage, writeStorage, wsUrl } from "./storage";
-import { styles } from "./styles";
+import { themeFor } from "./theme";
 import { Workspace } from "./Workspace";
 
 export function App({ wasm }: { wasm: BlitWasmModule }) {
@@ -66,13 +66,21 @@ function AuthScreen({
   onSubmit: (pass: string) => void;
 }) {
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const theme = themeFor(dark);
   return (
     <main style={{
-      ...styles.authContainer,
-      backgroundColor: dark ? "#1a1a1a" : "#f5f5f5",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      height: "100%",
+      backgroundColor: theme.bg,
     }}>
       <form
-        style={styles.authForm}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+        }}
         onSubmit={(e) => {
           e.preventDefault();
           const v = passRef.current?.value;
@@ -85,12 +93,17 @@ function AuthScreen({
           placeholder="passphrase"
           autoFocus
           style={{
-            ...styles.authInput,
-            backgroundColor: dark ? "#2a2a2a" : "#fff",
-            color: dark ? "#eee" : "#333",
+            padding: "8px 12px",
+            fontSize: 16,
+            border: "1px solid #444",
+            outline: "none",
+            width: 260,
+            fontFamily: "inherit",
+            backgroundColor: theme.solidInputBg,
+            color: theme.fg,
           }}
         />
-        {error && <output style={styles.authError}>{error}</output>}
+        {error && <output style={{ color: theme.errorText, fontSize: 13 }}>{error}</output>}
       </form>
     </main>
   );

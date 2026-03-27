@@ -12,7 +12,7 @@ import {
   SEARCH_SOURCE_SCROLLBACK,
 } from "blit-react";
 import type { UseBlitSessionsReturn, SearchResult } from "blit-react";
-import { styles } from "./styles";
+import { themeFor, layout, ui } from "./theme";
 
 const SOURCE_LABEL: Record<number, string> = {
   [SEARCH_SOURCE_TITLE]: "Title",
@@ -45,6 +45,7 @@ export function ExposeOverlay({
   });
   const { palette, fontFamily: font } = useBlitContext();
   const dark = palette?.dark ?? true;
+  const theme = themeFor(dark);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
@@ -183,26 +184,31 @@ export function ExposeOverlay({
   }, [selectedIdx]);
 
   const itemBg = (selected: boolean) =>
-    selected
-      ? dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.04)"
-      : "transparent";
+    selected ? theme.hoverBg : "transparent";
   const itemBorder = (selected: boolean) =>
-    selected
-      ? "#58f"
-      : dark ? "rgba(255,255,255,0.15)" : "rgba(0,0,0,0.15)";
+    selected ? theme.accent : theme.border;
 
   return (
-    <div role="dialog" aria-label="Expose" style={styles.overlay} onClick={onClose}>
+    <div role="dialog" aria-label="Expose" style={layout.overlay} onClick={onClose}>
       <nav
         style={{
-          ...styles.exposePanel,
-          backgroundColor: dark ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.9)",
-          color: dark ? "#e0e0e0" : "#333",
+          width: "90%",
+          maxWidth: 900,
+          maxHeight: "80vh",
+          padding: 16,
+          overflow: "auto",
+          backgroundColor: theme.panelBg,
+          color: theme.fg,
           fontFamily: font,
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <header style={styles.exposeHeader}>
+        <header style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 12,
+        }}>
           <input
             ref={searchRef}
             type="text"
@@ -211,17 +217,20 @@ export function ExposeOverlay({
             onKeyDown={handleKeyDown}
             placeholder="Search terminals, or >command"
             style={{
-              ...styles.exposeSearch,
-              backgroundColor: dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.05)",
+              ...ui.input,
+              backgroundColor: theme.inputBg,
               color: "inherit",
             }}
           />
           {isCommand && (
             <button
               style={{
-                ...styles.exposeCloseBtn,
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                fontFamily: "inherit",
                 opacity: 1,
-                backgroundColor: "#58f",
+                backgroundColor: theme.accent,
                 color: "#fff",
                 padding: "4px 10px",
                 borderRadius: 4,
@@ -232,21 +241,51 @@ export function ExposeOverlay({
               Run
             </button>
           )}
-          <button style={styles.exposeCloseBtn} onClick={onClose}>
+          <button style={{
+            background: "none",
+            border: "none",
+            color: "inherit",
+            cursor: "pointer",
+            fontFamily: "inherit",
+            opacity: 0.5,
+            fontSize: 12,
+          }} onClick={onClose}>
             Esc
           </button>
         </header>
         {!isCommand && (
-        <ul ref={listRef} style={searching ? styles.exposeSearchResults : styles.exposeCards}>
+        <ul ref={listRef} style={searching ? {
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 1fr)",
+          gap: 8,
+          listStyle: "none",
+          padding: 0,
+          margin: 0,
+        } : {
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+          gap: 12,
+          listStyle: "none",
+          padding: 0,
+          margin: 0,
+        }}>
               {items.map((it, i) => (
                 <li
                   key={it.ptyId}
                   style={searching ? {
-                    ...styles.exposeItem,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "8px 12px",
+                    border: "1px solid",
+                    cursor: "pointer",
+                    listStyle: "none",
                     borderColor: itemBorder(i === selectedIdx),
                     backgroundColor: itemBg(i === selectedIdx),
                   } : {
-                    ...styles.card,
+                    border: "2px solid",
+                    overflow: "hidden",
+                    cursor: "pointer",
                     borderColor: itemBorder(i === selectedIdx),
                     backgroundColor: itemBg(i === selectedIdx),
                   }}
@@ -264,15 +303,21 @@ export function ExposeOverlay({
                       </figure>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={styles.exposeItemLabel}>{it.title}</span>
+                          <span style={{
+                            flex: 1,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap" as const,
+                            fontSize: 13,
+                          }}>{it.title}</span>
                           {it.source != null && (
-                            <mark style={styles.badge}>{SOURCE_LABEL[it.source] ?? "Match"}</mark>
+                            <mark style={ui.badge}>{SOURCE_LABEL[it.source] ?? "Match"}</mark>
                           )}
                           {it.exited && (
-                            <mark style={{ ...styles.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
+                            <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
                           )}
                           {it.ptyId === sessions.focusedPtyId && (
-                            <mark style={styles.badge}>Lead</mark>
+                            <mark style={ui.badge}>Lead</mark>
                           )}
                         </div>
                         {it.context && (
@@ -289,7 +334,16 @@ export function ExposeOverlay({
                         )}
                       </div>
                       <button
-                        style={styles.exposeCloseItemBtn}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "inherit",
+                          cursor: "pointer",
+                          opacity: 0.4,
+                          fontSize: 14,
+                          padding: "0 4px",
+                          fontFamily: "inherit",
+                        }}
                         title="Close (Ctrl+W)"
                         onClick={(e) => {
                           e.stopPropagation();
@@ -301,16 +355,38 @@ export function ExposeOverlay({
                     </>
                   ) : (
                     <>
-                      <header style={styles.cardHeader}>
-                        <span style={styles.exposeItemLabel}>{it.title}</span>
+                      <header style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "6px 10px",
+                        fontSize: 12,
+                        opacity: 0.8,
+                      }}>
+                        <span style={{
+                          flex: 1,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap" as const,
+                          fontSize: 13,
+                        }}>{it.title}</span>
                         {it.exited && (
-                          <mark style={{ ...styles.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
+                          <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
                         )}
                         {it.ptyId === sessions.focusedPtyId && (
-                          <mark style={styles.badge}>Lead</mark>
+                          <mark style={ui.badge}>Lead</mark>
                         )}
                         <button
-                          style={styles.exposeCloseItemBtn}
+                          style={{
+                            background: "none",
+                            border: "none",
+                            color: "inherit",
+                            cursor: "pointer",
+                            opacity: 0.4,
+                            fontSize: 14,
+                            padding: "0 4px",
+                            fontFamily: "inherit",
+                          }}
                           title="Close (Ctrl+W)"
                           onClick={(e) => {
                             e.stopPropagation();
@@ -320,7 +396,7 @@ export function ExposeOverlay({
                           x
                         </button>
                       </header>
-                      <figure style={styles.cardPreview}>
+                      <figure style={{ margin: 0, overflow: "hidden" }}>
                         <BlitTerminal
                           ptyId={it.ptyId}
                           readOnly
@@ -333,12 +409,23 @@ export function ExposeOverlay({
               ))}
               <li
                 style={searching ? {
-                  ...styles.exposeItem,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 12px",
+                  border: "1px solid",
+                  cursor: "pointer",
+                  listStyle: "none",
                   borderColor: itemBorder(selectedIdx === items.length),
                   backgroundColor: itemBg(selectedIdx === items.length),
                 } : {
-                  ...styles.card,
-                  ...styles.cardCreate,
+                  border: "2px solid",
+                  overflow: "hidden",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  minHeight: 120,
                   borderColor: itemBorder(selectedIdx === items.length),
                   backgroundColor: itemBg(selectedIdx === items.length),
                 }}

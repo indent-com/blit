@@ -22,7 +22,7 @@ import type {
 } from "blit-react";
 import { useMetrics } from "./useMetrics";
 import { PALETTE_KEY, FONT_KEY, FONT_SIZE_KEY, writeStorage, preferredPalette, preferredFont, preferredFontSize, blitHost } from "./storage";
-import { styles } from "./styles";
+import { themeFor, layout, ui } from "./theme";
 import { StatusBar } from "./StatusBar";
 import { ExposeOverlay } from "./ExposeOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
@@ -83,6 +83,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
   const { countFrame, ...metrics } = useMetrics(transport);
 
   const dark = palette.dark;
+  const theme = themeFor(dark);
 
   useEffect(() => {
     store.setPalette(palette);
@@ -260,6 +261,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
         return;
       }
       if (mod && e.shiftKey && e.key === "W") {
+        if (overlayRef.current) return; // let the overlay handle it
         e.preventDefault();
         const s = sessionsRef.current;
         if (s && s.focusedPtyId != null) s.closePty(s.focusedPtyId);
@@ -297,13 +299,13 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
     <BlitProvider transport={transport} store={store} palette={palette} fontFamily={fontWithFallback} fontSize={fontSize}>
       <main
         style={{
-          ...styles.workspace,
+          ...layout.workspace,
           backgroundColor: bg,
-          color: dark ? "#e0e0e0" : "#333",
+          color: theme.fg,
           fontFamily: fontWithFallback,
         }}
       >
-        <section style={styles.termContainer}>
+        <section style={layout.termContainer}>
           {sessions.focusedPtyId != null && (
             <BlitTerminal
               ref={termCallbackRef}
@@ -313,7 +315,7 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
             />
           )}
           {(sessions.status === "disconnected" || sessions.status === "error") && (
-            <output style={styles.disconnected}>Disconnected</output>
+            <output style={ui.disconnected}>Disconnected</output>
           )}
         </section>
         {overlay === "expose" && (
@@ -351,8 +353,8 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: WebSock
         )}
         <footer
           style={{
-            ...styles.statusBar,
-            borderTopColor: dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)",
+            ...layout.statusBar,
+            borderTopColor: theme.subtleBorder,
           }}
         >
           <StatusBar

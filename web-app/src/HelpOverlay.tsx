@@ -1,4 +1,4 @@
-import { styles } from "./styles";
+import { themeFor, layout, ui } from "./theme";
 
 export function HelpOverlay({
   onClose,
@@ -7,6 +7,7 @@ export function HelpOverlay({
   onClose: () => void;
   dark: boolean;
 }) {
+  const theme = themeFor(dark);
   const mod_ = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
   const shortcuts = [
     [`${mod_}+K`, "Expose (switch PTYs)"],
@@ -21,14 +22,15 @@ export function HelpOverlay({
   return (
     <div
       open
-      style={styles.overlay}
+      style={layout.overlay}
       onClick={onClose}
     >
       <article
         style={{
-          ...styles.helpBox,
-          backgroundColor: dark ? "#1e1e1e" : "#f5f5f5",
-          color: dark ? "#e0e0e0" : "#333",
+          ...layout.panel,
+          minWidth: 300,
+          backgroundColor: theme.solidPanelBg,
+          color: theme.fg,
         }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -40,7 +42,7 @@ export function HelpOverlay({
             {shortcuts.map(([key, desc]) => (
               <tr key={key}>
                 <td>
-                  <kbd style={styles.kbd}>{key}</kbd>
+                  <kbd style={ui.kbd}>{key}</kbd>
                 </td>
                 <td style={{ fontSize: 13 }}>{desc}</td>
               </tr>

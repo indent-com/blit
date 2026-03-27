@@ -461,19 +461,26 @@ impl GlyphAtlas {
             render_width as f64 + (Self::PADDING * 2) as f64,
             render_height as f64 + (Self::PADDING * 2) as f64,
         );
+        // Box drawing (U+2500–U+257F) and block elements (U+2580–U+259F)
+        // must fill the full cell so adjacent cells connect seamlessly.
+        let is_box_drawing = (0x2500..=0x259F).contains(&code_point);
+
         let center_x = slot.src_x + render_width as f64 / 2.0;
-        let (draw_font, draw_x, draw_y) = if key.wide {
+        let (draw_font, draw_x, draw_y, align) = if key.wide {
             let scale = 0.85;
             let scaled_h = cell_height * scale;
             let font_size = scaled_h.round().max(1.0) as u32;
             let scaled_font = format!("{}px {}", font_size, &font[font.find("px ").map(|i| i + 3).unwrap_or(0)..]);
             let pad_y = (cell_height - scaled_h) / 2.0;
-            (scaled_font, center_x, slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64)
+            (scaled_font, center_x, slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64, "center")
+        } else if is_box_drawing {
+            // Left-align at exact cell boundary, full cell height
+            (font, slot.src_x, slot.src_y + cell_height + Self::VERT_PAD as f64, "left")
         } else {
-            (font, center_x, slot.src_y + cell_height + Self::VERT_PAD as f64)
+            (font, center_x, slot.src_y + cell_height + Self::VERT_PAD as f64, "center")
         };
         ctx.set_font(&draw_font);
-        ctx.set_text_align("center");
+        ctx.set_text_align(align);
         // Render in white — the GL shader tints per-vertex.
         ctx.set_fill_style_str("#fff");
         ctx.save();

@@ -6,6 +6,7 @@ import {
   buildSubscribeMessage,
   buildUnsubscribeMessage,
 } from "./protocol";
+import { createGlRenderer, type GlRenderer } from "./gl-renderer";
 
 export type BlitWasmModule = typeof import("blit-browser");
 
@@ -33,6 +34,8 @@ export class TerminalStore {
   private readyListeners = new Set<() => void>();
   private frozenPtys = new Set<number>();
   private frozenBuffers = new Map<number, Uint8Array[]>();
+  private sharedRenderer: GlRenderer | null = null;
+  private sharedCanvas: HTMLCanvasElement | null = null;
 
   constructor(transport: BlitTransport, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
     this._transport = transport;
@@ -146,6 +149,19 @@ export class TerminalStore {
     for (const t of this.terminals.values()) {
       t.set_font_family(fontFamily);
     }
+  }
+
+  /** Get a shared GL renderer for readOnly (preview) terminals. */
+  getSharedRenderer(): { renderer: GlRenderer; canvas: HTMLCanvasElement } | null {
+    if (this.sharedRenderer?.supported) {
+      return { renderer: this.sharedRenderer, canvas: this.sharedCanvas! };
+    }
+    if (!this.sharedCanvas) {
+      this.sharedCanvas = document.createElement("canvas");
+    }
+    this.sharedRenderer = createGlRenderer(this.sharedCanvas);
+    if (!this.sharedRenderer.supported) return null;
+    return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
   }
 
   invalidateAtlas(): void {
@@ -284,5 +300,8 @@ export class TerminalStore {
     this.subscribed.clear();
     this.dirtyListeners.clear();
     this.readyListeners.clear();
+    this.sharedRenderer?.dispose();
+    this.sharedRenderer = null;
+    this.sharedCanvas = null;
   }
 }

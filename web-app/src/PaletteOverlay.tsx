@@ -6,7 +6,7 @@ import {
 } from "react";
 import { PALETTES } from "blit-react";
 import type { TerminalPalette } from "blit-react";
-import { styles } from "./styles";
+import { themeFor, layout, ui } from "./theme";
 
 export function PaletteOverlay({
   current,
@@ -21,6 +21,7 @@ export function PaletteOverlay({
   onClose: () => void;
   dark: boolean;
 }) {
+  const theme = themeFor(dark);
   const originalRef = useRef(current);
   const initialIdx = PALETTES.findIndex((p) => p.id === current.id);
   const [selectedIdx, setSelectedIdx] = useState(initialIdx >= 0 ? initialIdx : 0);
@@ -72,7 +73,7 @@ export function PaletteOverlay({
   return (
     <div
       open
-      style={styles.overlay}
+      style={layout.overlay}
       onClick={dismiss}
     >
       <menu
@@ -80,9 +81,11 @@ export function PaletteOverlay({
         tabIndex={0}
         onKeyDown={handleKeyDown}
         style={{
-          ...styles.paletteBox,
-          backgroundColor: dark ? "#1e1e1e" : "#f5f5f5",
-          color: dark ? "#e0e0e0" : "#333",
+          ...layout.panel,
+          minWidth: 280,
+          listStyle: "none",
+          backgroundColor: theme.solidPanelBg,
+          color: theme.fg,
           outline: "none",
         }}
         onClick={(e) => e.stopPropagation()}
@@ -94,26 +97,33 @@ export function PaletteOverlay({
               onClick={() => onSelect(p)}
               onMouseEnter={() => preview(i)}
               style={{
-                ...styles.paletteItem,
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "6px 8px",
+                border: "none",
+                fontFamily: "inherit",
+                cursor: "pointer",
+                width: "100%",
+                color: "inherit",
+                textAlign: "left" as const,
                 backgroundColor:
                   i === selectedIdx
-                    ? dark
-                      ? "rgba(255,255,255,0.1)"
-                      : "rgba(0,0,0,0.08)"
+                    ? theme.selectedBg
                     : "transparent",
               }}
             >
-              <span style={styles.paletteSwatches}>
+              <span style={{ display: "flex", gap: 2 }}>
                 <span
                   style={{
-                    ...styles.swatch,
+                    ...ui.swatch,
                     backgroundColor: `rgb(${p.bg[0]},${p.bg[1]},${p.bg[2]})`,
                     border: "1px solid rgba(128,128,128,0.3)",
                   }}
                 />
                 <span
                   style={{
-                    ...styles.swatch,
+                    ...ui.swatch,
                     backgroundColor: `rgb(${p.fg[0]},${p.fg[1]},${p.fg[2]})`,
                   }}
                 />
@@ -121,7 +131,7 @@ export function PaletteOverlay({
                   <span
                     key={j}
                     style={{
-                      ...styles.swatch,
+                      ...ui.swatch,
                       backgroundColor: `rgb(${c[0]},${c[1]},${c[2]})`,
                     }}
                   />

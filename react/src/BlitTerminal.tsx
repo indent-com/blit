@@ -18,9 +18,13 @@ import {
   buildResizeMessage,
   buildScrollMessage,
 } from "./protocol";
-import { measureCell, type CellMetrics } from "./hooks/useBlitTerminal";
+import {
+  measureCell,
+  cssFontFamily,
+  type CellMetrics,
+} from "./hooks/useBlitTerminal";
 import { useBlitContext } from "./BlitContext";
-import { createGlRenderer, type GlRenderer } from "./gl-renderer";
+import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, encoder } from "./keyboard";
 
 // ---------------------------------------------------------------------------
@@ -73,16 +77,17 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // Refs for DOM elements.
     const containerRef = useRef<HTMLDivElement>(null);
     const glCanvasRef = useRef<HTMLCanvasElement>(null);
-    const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
 
     // Refs for mutable state that must not trigger re-renders.
     const terminalRef = useRef<Terminal | null>(null);
     const rendererRef = useRef<GlRenderer | null>(null);
+    const displayCtxRef = useRef<CanvasRenderingContext2D | null>(null);
     const cellRef = useRef<CellMetrics>(measureCell(fontFamily, fontSize));
     const rowsRef = useRef(24);
     const colsRef = useRef(80);
     const contentDirtyRef = useRef(true);
+    const [cellVersion, setCellVersion] = useState(0);
     const rafRef = useRef(0);
     const renderScheduledRef = useRef(false);
 
@@ -92,7 +97,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       null,
     );
     const paletteRef = useRef<TerminalPalette | undefined>(palette);
-
 
     const selStartRef = useRef<{ row: number; col: number } | null>(null);
     const selEndRef = useRef<{ row: number; col: number } | null>(null);
@@ -111,7 +115,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // React state for things the consumer might read.
     const [wasmReady, setWasmReady] = useState(false);
 
-    // Demand-driven rendering — only rAF when something changed.
     const doRenderRef = useRef(() => {});
     const scheduleRender = useCallback(() => {
       if (renderScheduledRef.current) return;
@@ -193,7 +196,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         unsub();
         transport.removeEventListener("statuschange", onStatus);
       };
-    }, [transport, ptyId, readOnly, store, reconcilePrediction, applyPaletteToTerminal]);
+    }, [
+      transport,
+      ptyId,
+      readOnly,
+      store,
+      reconcilePrediction,
+      applyPaletteToTerminal,
+    ]);
 
     const sendInput = useCallback(
       (id: number, data: Uint8Array) => {
@@ -215,8 +225,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       },
       [transport],
     );
-
-
 
     // -----------------------------------------------------------------------
     // Imperative handle
@@ -260,7 +268,9 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       if (typeof window.matchMedia !== "function") return;
-      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      const mq = window.matchMedia(
+        `(resolution: ${window.devicePixelRatio}dppx)`,
+      );
       const onChange = () => setDpr(window.devicePixelRatio || 1);
       mq.addEventListener("change", onChange);
       return () => mq.removeEventListener("change", onChange);
@@ -269,23 +279,31 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     useEffect(() => {
       const apply = () => {
         const cell = measureCell(fontFamily, fontSize);
+        const changed =
+          cell.pw !== cellRef.current.pw || cell.ph !== cellRef.current.ph;
         cellRef.current = cell;
         if (!readOnly) {
           const t = terminalRef.current;
           if (t) {
             t.set_cell_size(cell.pw, cell.ph);
             t.set_font_family(fontFamily);
-            t.invalidate_render_cache();
+            if (changed) t.invalidate_render_cache();
           }
           store.setCellSize(cell.pw, cell.ph);
         }
-        contentDirtyRef.current = true;
-        scheduleRender();
+        if (changed) {
+          contentDirtyRef.current = true;
+          scheduleRender();
+          setCellVersion((v) => v + 1);
+        }
       };
+      // Always apply on effect run (font/size/dpr changed).
+      contentDirtyRef.current = true;
       apply();
-      // Re-measure when fonts finish loading (e.g. server-provided @font-face).
-      document.fonts.addEventListener("loadingdone", apply);
-      return () => document.fonts.removeEventListener("loadingdone", apply);
+      scheduleRender();
+      // Re-measure when fonts finish loading — only re-renders if metrics change.
+      document.fonts?.addEventListener("loadingdone", apply);
+      return () => document.fonts?.removeEventListener("loadingdone", apply);
     }, [fontFamily, fontSize, dpr, store, readOnly, scheduleRender]);
 
     // -----------------------------------------------------------------------
@@ -311,15 +329,9 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
-      const canvas = glCanvasRef.current;
-      if (!canvas) return;
-      const renderer = createGlRenderer(canvas);
-      rendererRef.current = renderer;
-      return () => {
-        renderer.dispose();
-        rendererRef.current = null;
-      };
-    }, []);
+      const shared = store.getSharedRenderer();
+      if (shared) rendererRef.current = shared.renderer;
+    }, [store]);
 
     // -----------------------------------------------------------------------
     // Terminal instance lifecycle
@@ -365,18 +377,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       const container = containerRef.current;
       if (!container || readOnly) return;
 
-      let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-      let pendingRows = rowsRef.current;
-      let pendingCols = colsRef.current;
-      let lastSentPtyId: number | null = null;
-
-      const flushResize = () => {
-        resizeTimer = null;
-        if (ptyId !== null) {
-          sendResize(ptyId, pendingRows, pendingCols);
-        }
-      };
-
       const handleResize = () => {
         const cell = cellRef.current;
         const w = container.clientWidth;
@@ -384,24 +384,16 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         const cols = Math.max(1, Math.floor(w / cell.w));
         const rows = Math.max(1, Math.floor(h / cell.h));
 
-        const sizeChanged = cols !== colsRef.current || rows !== rowsRef.current;
+        const sizeChanged =
+          cols !== colsRef.current || rows !== rowsRef.current;
         if (sizeChanged) {
           rowsRef.current = rows;
           colsRef.current = cols;
           contentDirtyRef.current = true;
           scheduleRender();
-        }
-
-        pendingRows = rows;
-        pendingCols = cols;
-
-        // Send immediately on ptyId change, debounce during continuous resize
-        if (ptyId !== null && lastSentPtyId !== ptyId) {
-          lastSentPtyId = ptyId;
-          sendResize(ptyId, rows, cols);
-        } else if (sizeChanged) {
-          if (resizeTimer) clearTimeout(resizeTimer);
-          resizeTimer = setTimeout(flushResize, 100);
+          if (ptyId !== null) {
+            sendResize(ptyId, rows, cols);
+          }
         }
       };
 
@@ -413,9 +405,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       return () => {
         observer.disconnect();
         window.removeEventListener("resize", handleResize);
-        if (resizeTimer) clearTimeout(resizeTimer);
       };
-    }, [ptyId, readOnly, sendResize, fontFamily, fontSize, dpr]);
+    }, [ptyId, readOnly, sendResize, fontFamily, fontSize, dpr, cellVersion]);
 
     // -----------------------------------------------------------------------
     // Render (demand-driven — only rAF when something changed)
@@ -431,33 +422,18 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           const cell = cellRef.current;
           const renderer = rendererRef.current;
 
-          // Always sync canvas backing to the terminal's actual grid.
-          // The terminal dimensions come from the server and may differ
-          // from colsRef/rowsRef (which reflect the container size).
-          {
-            const termCols = t.cols;
-            const termRows = t.rows;
-            const pw = termCols * cell.pw;
-            const ph = termRows * cell.ph;
-            if (!readOnly) {
-              const cssW = `${termCols * cell.w}px`;
-              const cssH = `${termRows * cell.h}px`;
-              const glCanvas = glCanvasRef.current;
-              if (glCanvas) {
-                if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
-                if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
-              }
-              const overlay = overlayCanvasRef.current;
-              if (overlay) {
-                if (overlay.style.width !== cssW) overlay.style.width = cssW;
-                if (overlay.style.height !== cssH) overlay.style.height = cssH;
-              }
-            }
-            renderer.resize(pw, ph);
-            const overlay = overlayCanvasRef.current;
-            if (!readOnly && overlay) {
-              if (overlay.width !== pw) overlay.width = pw;
-              if (overlay.height !== ph) overlay.height = ph;
+          const termCols = t.cols;
+          const termRows = t.rows;
+          const pw = termCols * cell.pw;
+          const ph = termRows * cell.ph;
+
+          if (!readOnly) {
+            const cssW = `${termCols * cell.w}px`;
+            const cssH = `${termRows * cell.h}px`;
+            const glCanvas = glCanvasRef.current;
+            if (glCanvas) {
+              if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
+              if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
             }
           }
 
@@ -467,8 +443,17 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           }
 
           const mem = store.wasmMemory()!;
-          const bgVerts = new Float32Array(mem.buffer, t.bg_verts_ptr(), t.bg_verts_len());
-          const glyphVerts = new Float32Array(mem.buffer, t.glyph_verts_ptr(), t.glyph_verts_len());
+          const bgVerts = new Float32Array(
+            mem.buffer,
+            t.bg_verts_ptr(),
+            t.bg_verts_len(),
+          );
+          const glyphVerts = new Float32Array(
+            mem.buffer,
+            t.glyph_verts_ptr(),
+            t.glyph_verts_len(),
+          );
+          renderer.resize(pw, ph);
           renderer.render(
             bgVerts,
             glyphVerts,
@@ -483,20 +468,31 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             paletteRef.current?.bg ?? [0, 0, 0],
           );
 
-          // Overflow text (emoji / wide Unicode) via 2D overlay canvas.
-          const overflowCount = t.overflow_text_count();
-          const overlay = overlayCanvasRef.current;
-          if (overlay) {
-            const ctx = overlay.getContext("2d");
+          // Copy GL to display canvas, then draw overlay content on top.
+          const shared = store.getSharedRenderer();
+          const displayCanvas = glCanvasRef.current;
+          if (shared && displayCanvas) {
+            if (displayCanvas.width !== pw) {
+              displayCanvas.width = pw;
+              displayCtxRef.current = null;
+            }
+            if (displayCanvas.height !== ph) {
+              displayCanvas.height = ph;
+              displayCtxRef.current = null;
+            }
+            const ctx = (displayCtxRef.current ??=
+              displayCanvas.getContext("2d"));
             if (ctx) {
-              ctx.clearRect(0, 0, overlay.width, overlay.height);
+              ctx.drawImage(shared.canvas, 0, 0);
 
               // Selection highlight
               const ss = selStartRef.current;
               const se = selEndRef.current;
               if (ss && se) {
-                let sr = ss.row, sc = ss.col;
-                let er = se.row, ec = se.col;
+                let sr = ss.row,
+                  sc = ss.col;
+                let er = se.row,
+                  ec = se.col;
                 if (sr > er || (sr === er && sc > ec)) {
                   [sr, sc, er, ec] = [er, ec, sr, sc];
                 }
@@ -516,25 +512,27 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
               // URL hover underline
               const hurl = hoveredUrlRef.current;
               if (hurl) {
-                const [fgR, fgG, fgB] = paletteRef.current?.fg ?? [204, 204, 204];
+                const [fgR, fgG, fgB] = paletteRef.current?.fg ?? [
+                  204, 204, 204,
+                ];
                 ctx.strokeStyle = `rgba(${fgR},${fgG},${fgB},0.6)`;
                 ctx.lineWidth = Math.max(1, Math.round(cell.ph * 0.06));
                 const y = hurl.row * cell.ph + cell.ph - ctx.lineWidth;
-                const x1 = hurl.startCol * cell.pw;
-                const x2 = (hurl.endCol + 1) * cell.pw;
                 ctx.beginPath();
-                ctx.moveTo(x1, y);
-                ctx.lineTo(x2, y);
+                ctx.moveTo(hurl.startCol * cell.pw, y);
+                ctx.lineTo((hurl.endCol + 1) * cell.pw, y);
                 ctx.stroke();
               }
 
+              // Overflow text (emoji / wide Unicode)
+              const overflowCount = t.overflow_text_count();
               if (overflowCount > 0) {
                 const cw = cell.pw;
                 const ch = cell.ph;
                 const scale = 0.85;
                 const scaledH = ch * scale;
                 const fSize = Math.max(1, Math.round(scaledH));
-                ctx.font = `${fSize}px ${fontFamily}`;
+                ctx.font = `${fSize}px ${cssFontFamily(fontFamily)}`;
                 ctx.textBaseline = "bottom";
                 const [fgR, fgG, fgB] = paletteRef.current?.fg ?? [
                   204, 204, 204,
@@ -562,26 +560,30 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
                   ctx.restore();
                 }
               }
-            }
-          }
 
-          if (!readOnly && predictedRef.current && overlay) {
-            const t2 = terminalRef.current;
-            if (t2 && t2.echo()) {
-              const ctx2 = overlay.getContext("2d");
-              if (ctx2) {
-                const cw = cell.pw;
-                const ch = cell.ph;
-                const cc = t2.cursor_col;
-                const cr = t2.cursor_row;
-                const [fR, fG, fB] = paletteRef.current?.fg ?? [204, 204, 204];
-                ctx2.fillStyle = `rgba(${fR},${fG},${fB},0.5)`;
-                const fSize = Math.max(1, Math.round(ch * 0.85));
-                ctx2.font = `${fSize}px ${fontFamily}`;
-                ctx2.textBaseline = "bottom";
-                const pred = predictedRef.current;
-                for (let i = 0; i < pred.length && cc + i < colsRef.current; i++) {
-                  ctx2.fillText(pred[i], (cc + i) * cw, cr * ch + ch);
+              // Predicted echo
+              if (!readOnly && predictedRef.current) {
+                const t2 = terminalRef.current;
+                if (t2 && t2.echo()) {
+                  const cw = cell.pw;
+                  const ch = cell.ph;
+                  const [fR, fG, fB] = paletteRef.current?.fg ?? [
+                    204, 204, 204,
+                  ];
+                  ctx.fillStyle = `rgba(${fR},${fG},${fB},0.5)`;
+                  const fSize = Math.max(1, Math.round(ch * 0.85));
+                  ctx.font = `${fSize}px ${cssFontFamily(fontFamily)}`;
+                  ctx.textBaseline = "bottom";
+                  const pred = predictedRef.current;
+                  const cc = t2.cursor_col;
+                  const cr = t2.cursor_row;
+                  for (
+                    let i = 0;
+                    i < pred.length && cc + i < colsRef.current;
+                    i++
+                  ) {
+                    ctx.fillText(pred[i], (cc + i) * cw, cr * ch + ch);
+                  }
                 }
               }
             }
@@ -595,7 +597,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       scheduleRender();
 
       return () => {
-        doRenderRef.current = () => {};
         cancelAnimationFrame(rafRef.current);
         renderScheduledRef.current = false;
       };
@@ -623,7 +624,14 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             scrollOffsetRef.current = 0;
             sendScroll(ptyId, 0);
           }
-          if (t && t.echo() && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          if (
+            t &&
+            t.echo() &&
+            e.key.length === 1 &&
+            !e.ctrlKey &&
+            !e.metaKey &&
+            !e.altKey
+          ) {
             if (!predictedRef.current) {
               predictedFromRowRef.current = t.cursor_row;
               predictedFromColRef.current = t.cursor_col;
@@ -761,7 +769,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
       const WORD_CHARS = /[A-Za-z0-9_\-./~:@]/;
 
-      function wordBoundsAt(row: number, col: number): { start: number; end: number } {
+      function wordBoundsAt(
+        row: number,
+        col: number,
+      ): { start: number; end: number } {
         const text = getRowText(row);
         if (col >= text.length || !WORD_CHARS.test(text[col])) {
           return { start: col, end: col };
@@ -778,7 +789,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         return t ? t.is_wrapped(row) : false;
       }
 
-      function logicalLineRange(row: number): { startRow: number; endRow: number } {
+      function logicalLineRange(row: number): {
+        startRow: number;
+        endRow: number;
+      } {
         const maxRow = rowsRef.current - 1;
         let startRow = row;
         while (startRow > 0 && isWrapped(startRow - 1)) startRow--;
@@ -812,8 +826,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (!selStartRef.current || !selEndRef.current) return;
         const t = terminalRef.current;
         if (!t) return;
-        let sr = selStartRef.current.row, sc = selStartRef.current.col;
-        let er = selEndRef.current.row, ec = selEndRef.current.col;
+        let sr = selStartRef.current.row,
+          sc = selStartRef.current.col;
+        let er = selEndRef.current.row,
+          ec = selEndRef.current.col;
         if (sr > er || (sr === er && sc > ec)) {
           [sr, sc, er, ec] = [er, ec, sr, sc];
         }
@@ -829,8 +845,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         }
       }
 
+      let mouseDownButton = -1;
       const handleMouseDown = (e: MouseEvent) => {
         if (!e.shiftKey && sendMouseEvent("down", e, e.button)) {
+          mouseDownButton = e.button;
           e.preventDefault();
           return;
         }
@@ -860,15 +878,23 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       };
 
       const handleMouseMove = (e: MouseEvent) => {
-        if (!e.shiftKey) {
+        // Only forward mouse events when a button is held (drag in progress)
+        // or the cursor is actually over the terminal canvas.
+        const overCanvas = mouseDownButton >= 0 || canvas.contains(e.target as Node);
+        if (!e.shiftKey && overCanvas) {
           const t = terminalRef.current;
           if (t) {
             const mode = t.mouse_mode();
             if (mode === 3 || mode === 4) {
-              const button =
-                e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0;
-              if (e.buttons || mode === 4) {
+              if (e.buttons) {
+                // Button held during motion: report which button.
+                const button =
+                  e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0;
                 sendMouseEvent("move", e, button + 32);
+                return;
+              } else if (mode === 4) {
+                // Any-event tracking: motion with no button = code 35.
+                sendMouseEvent("move", e, 35);
                 return;
               }
             }
@@ -882,7 +908,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             // Compare drag position vs anchor to determine direction
             const dragBefore =
               dragStart.row < selAnchorStart.row ||
-              (dragStart.row === selAnchorStart.row && dragStart.col < selAnchorStart.col);
+              (dragStart.row === selAnchorStart.row &&
+                dragStart.col < selAnchorStart.col);
             if (dragBefore) {
               selStartRef.current = dragStart;
               selEndRef.current = selAnchorEnd;
@@ -898,8 +925,20 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       };
 
       const handleMouseUp = (e: MouseEvent) => {
-        if (!e.shiftKey && sendMouseEvent("up", e, e.button)) {
-          e.preventDefault();
+        if (mouseDownButton >= 0) {
+          // Always send the release — bypass mouse_mode() check since the
+          // mode might have changed between mousedown and mouseup.
+          if (ptyId !== null && status === "connected") {
+            const t = terminalRef.current;
+            const pos = mouseToCell(e);
+            const enc = t ? t.mouse_encoding() : 0;
+            if (enc === 2) {
+              sendInput(ptyId, encoder.encode(`\x1b[<${mouseDownButton};${pos.col + 1};${pos.row + 1}m`));
+            } else {
+              sendInput(ptyId, new Uint8Array([0x1b, 0x5b, 0x4d, 3 + 32, pos.col + 33, pos.row + 33]));
+            }
+          }
+          mouseDownButton = -1;
           return;
         }
         if (selecting) {
@@ -912,7 +951,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           if (
             selStartRef.current &&
             selEndRef.current &&
-            (selStartRef.current.row !== selEndRef.current.row || selStartRef.current.col !== selEndRef.current.col)
+            (selStartRef.current.row !== selEndRef.current.row ||
+              selStartRef.current.col !== selEndRef.current.col)
           ) {
             copySelection();
           }
@@ -999,25 +1039,53 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           lastHoverUrl = url;
           canvas.style.cursor = hit ? "pointer" : "text";
           hoveredUrlRef.current = hit
-            ? { row: cell.row, startCol: hit.startCol, endCol: hit.endCol, url: hit.url }
+            ? {
+                row: cell.row,
+                startCol: hit.startCol,
+                endCol: hit.endCol,
+                url: hit.url,
+              }
             : null;
           scheduleRender();
         }
       };
 
+      // Send a synthetic mouseup when the window loses focus, so apps
+      // like zellij/tmux don't get stuck in a "button held" state.
+      const handleBlur = () => {
+        if (mouseDownButton >= 0 && ptyId !== null && status === "connected") {
+          const t = terminalRef.current;
+          const enc = t ? t.mouse_encoding() : 0;
+          if (enc === 2) {
+            sendInput(ptyId, encoder.encode(`\x1b[<${mouseDownButton};1;1m`));
+          } else {
+            sendInput(ptyId, new Uint8Array([0x1b, 0x5b, 0x4d, 3 + 32, 33, 33]));
+          }
+          mouseDownButton = -1;
+        }
+        if (selecting) {
+          selecting = false;
+          selectingRef.current = false;
+          clearSelection();
+          if (ptyId !== null) store.thaw(ptyId);
+        }
+      };
+
       canvas.addEventListener("mousedown", handleMouseDown);
-      canvas.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mousemove", handleMouseMove);
       canvas.addEventListener("mousemove", handleHoverMove);
       window.addEventListener("mouseup", handleMouseUp);
+      window.addEventListener("blur", handleBlur);
       canvas.addEventListener("wheel", handleWheel, { passive: false });
       canvas.addEventListener("contextmenu", handleContextMenu);
       canvas.addEventListener("click", handleClick);
 
       return () => {
         canvas.removeEventListener("mousedown", handleMouseDown);
-        canvas.removeEventListener("mousemove", handleMouseMove);
+        window.removeEventListener("mousemove", handleMouseMove);
         canvas.removeEventListener("mousemove", handleHoverMove);
         window.removeEventListener("mouseup", handleMouseUp);
+        window.removeEventListener("blur", handleBlur);
         canvas.removeEventListener("wheel", handleWheel);
         canvas.removeEventListener("contextmenu", handleContextMenu);
         canvas.removeEventListener("click", handleClick);
@@ -1048,7 +1116,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
                   height: "100%",
                   objectFit: "contain",
                   objectPosition: "top left",
-                  imageRendering: "pixelated",
                 }
               : {
                   display: "block",
@@ -1060,18 +1127,6 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
                 }
           }
         />
-        {!readOnly && (
-          <canvas
-            ref={overlayCanvasRef}
-            style={{
-              display: "block",
-              position: "absolute",
-              top: 0,
-              left: 0,
-              pointerEvents: "none",
-            }}
-          />
-        )}
         {!readOnly && (
           <textarea
             ref={inputRef}

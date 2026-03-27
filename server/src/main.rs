@@ -1074,7 +1074,8 @@ fn spawn_pty(
 }
 
 fn respond_to_queries(fd: libc::c_int, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
-    const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c";
+    // VT420 with features matching xterm-256color capabilities.
+    const DA1_RESPONSE: &[u8] = b"\x1b[?64;1;2;6;9;15;18;21;22c";
 
     let mut i = 0;
     while i < data.len() {
