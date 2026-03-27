@@ -61,6 +61,10 @@ class MockStore {
 
   release(): void {}
 
+  getSharedRenderer() {
+    return null;
+  }
+
   setCellSize(): void {}
 }
 

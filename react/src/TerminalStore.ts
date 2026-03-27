@@ -3,6 +3,7 @@ import { S2C_UPDATE, DEFAULT_FONT } from "./types";
 import type { BlitTransport, TerminalPalette } from "./types";
 import {
   buildAckMessage,
+  buildClientMetricsMessage,
   buildSubscribeMessage,
   buildUnsubscribeMessage,
 } from "./protocol";
@@ -36,6 +37,10 @@ export class TerminalStore {
   private frozenBuffers = new Map<number, Uint8Array[]>();
   private sharedRenderer: GlRenderer | null = null;
   private sharedCanvas: HTMLCanvasElement | null = null;
+  private pendingAppliedFrames = 0;
+  private ackAheadFrames = 0;
+  private applyMsX10 = 0;
+  private metricsFlushQueued = false;
 
   constructor(transport: BlitTransport, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
     this._transport = transport;
@@ -56,6 +61,7 @@ export class TerminalStore {
         buf.push(new Uint8Array(bytes.subarray(3)));
         return;
       }
+      const applyStart = this.nowMs();
       let t = this.terminals.get(ptyId);
       if (!t) {
         if (!this.mod) return;
@@ -68,14 +74,18 @@ export class TerminalStore {
         }
       }
       t.feed_compressed(bytes.subarray(3));
+      this.noteAppliedFrame(this.nowMs() - applyStart);
       for (const l of this.dirtyListeners) l(ptyId);
     };
 
     this.onStatus = (status: string) => {
       if (status === "connected") {
+        this.resetClientMetrics();
+        this.flushClientMetrics();
         this.resync();
       } else if (status === "disconnected" || status === "error") {
         this.subscribed.clear();
+        this.resetClientMetrics();
       }
     };
 
@@ -97,6 +107,56 @@ export class TerminalStore {
 
   get transport(): BlitTransport {
     return this._transport;
+  }
+
+  private nowMs(): number {
+    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  private resetClientMetrics(): void {
+    this.pendingAppliedFrames = 0;
+    this.ackAheadFrames = 0;
+    this.applyMsX10 = 0;
+    this.metricsFlushQueued = false;
+  }
+
+  private queueClientMetricsFlush(): void {
+    if (this.metricsFlushQueued) return;
+    this.metricsFlushQueued = true;
+    const flush = () => {
+      this.metricsFlushQueued = false;
+      this.flushClientMetrics();
+    };
+    if (typeof queueMicrotask === "function") {
+      queueMicrotask(flush);
+    } else {
+      void Promise.resolve().then(flush);
+    }
+  }
+
+  private flushClientMetrics(): void {
+    if (this.disposed || this._transport.status !== "connected") return;
+    this._transport.send(
+      buildClientMetricsMessage(
+        Math.min(this.pendingAppliedFrames, 0xffff),
+        Math.min(this.ackAheadFrames, 0xffff),
+        Math.min(this.applyMsX10, 0xffff),
+      ),
+    );
+  }
+
+  private noteAppliedFrame(applyMs: number): void {
+    this.pendingAppliedFrames = Math.min(this.pendingAppliedFrames + 1, 0xffff);
+    this.ackAheadFrames = Math.min(this.ackAheadFrames + 1, 0xffff);
+    const sampleX10 = Math.min(Math.round(applyMs * 10), 0xffff);
+    this.applyMsX10 =
+      this.applyMsX10 > 0
+        ? Math.round(this.applyMsX10 * 0.8 + sampleX10 * 0.2)
+        : sampleX10;
+    this.queueClientMetricsFlush();
   }
 
   isReady(): boolean {
@@ -162,6 +222,14 @@ export class TerminalStore {
     this.sharedRenderer = createGlRenderer(this.sharedCanvas);
     if (!this.sharedRenderer.supported) return null;
     return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
+  }
+
+  /** Mark the latest applied terminal state as painted to the screen. */
+  noteFrameRendered(): void {
+    if (this.pendingAppliedFrames === 0 && this.ackAheadFrames === 0) return;
+    this.pendingAppliedFrames = 0;
+    this.ackAheadFrames = 0;
+    this.queueClientMetricsFlush();
   }
 
   invalidateAtlas(): void {

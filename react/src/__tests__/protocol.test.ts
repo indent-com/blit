@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildAckMessage,
+  buildClientMetricsMessage,
   buildInputMessage,
   buildResizeMessage,
   buildScrollMessage,
@@ -13,6 +14,7 @@ import {
 } from "../protocol";
 import {
   C2S_ACK,
+  C2S_CLIENT_METRICS,
   C2S_INPUT,
   C2S_RESIZE,
   C2S_SCROLL,
@@ -32,6 +34,14 @@ describe("protocol message builders", () => {
   it("buildAckMessage", () => {
     const msg = buildAckMessage();
     expect(msg).toEqual(new Uint8Array([C2S_ACK]));
+  });
+
+  it("buildClientMetricsMessage", () => {
+    const msg = buildClientMetricsMessage(3, 5, 27);
+    expect(msg[0]).toBe(C2S_CLIENT_METRICS);
+    expect(msg[1] | (msg[2] << 8)).toBe(3);
+    expect(msg[3] | (msg[4] << 8)).toBe(5);
+    expect(msg[5] | (msg[6] << 8)).toBe(27);
   });
 
   it("buildInputMessage", () => {

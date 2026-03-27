@@ -1,5 +1,6 @@
 import {
   C2S_ACK,
+  C2S_CLIENT_METRICS,
   C2S_INPUT,
   C2S_RESIZE,
   C2S_SCROLL,
@@ -17,6 +18,22 @@ const textEncoder = new TextEncoder();
 
 export function buildAckMessage(): Uint8Array {
   return new Uint8Array([C2S_ACK]);
+}
+
+export function buildClientMetricsMessage(
+  backlogFrames: number,
+  ackAheadFrames: number,
+  applyMsX10: number,
+): Uint8Array {
+  const msg = new Uint8Array(7);
+  msg[0] = C2S_CLIENT_METRICS;
+  msg[1] = backlogFrames & 0xff;
+  msg[2] = (backlogFrames >> 8) & 0xff;
+  msg[3] = ackAheadFrames & 0xff;
+  msg[4] = (ackAheadFrames >> 8) & 0xff;
+  msg[5] = applyMsX10 & 0xff;
+  msg[6] = (applyMsX10 >> 8) & 0xff;
+  return msg;
 }
 
 export function buildInputMessage(

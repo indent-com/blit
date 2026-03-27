@@ -589,6 +589,9 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             }
           }
 
+          if (!readOnly) {
+            store.noteFrameRendered();
+          }
           onRender?.();
         }
       };
