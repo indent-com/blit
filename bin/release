@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/release <version>
+
+Bumps the repo release version, prints the changes since the latest v* tag,
+runs the server verification suite, and commits the result as:
+
+  release <version>
+EOF
+}
+
+die() {
+    echo "release: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+read_toml_version() {
+    perl -ne 'if (/^version = "([^"]+)"/) { print "$1\n"; exit 0 }' "$1"
+}
+
+read_flake_version() {
+    perl -ne 'if (/^\s*version = "([^"]+)";$/) { print "$1\n"; exit 0 }' "$1"
+}
+
+ensure_clean_tree() {
+    local status
+    status="$(git status --porcelain)"
+    if [[ -n "$status" ]]; then
+        printf '%s\n' "$status" >&2
+        die "working tree must be clean"
+    fi
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+target_version="$1"
+[[ "$target_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "version must look like 0.8.0"
+
+require_cmd git
+require_cmd perl
+require_cmd node
+require_cmd cargo
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "must be run inside the git repository"
+ensure_clean_tree
+
+current_version="$(read_toml_version remote/Cargo.toml)"
+[[ -n "$current_version" ]] || die "could not read current version from remote/Cargo.toml"
+[[ "$target_version" != "$current_version" ]] || die "version is already $target_version"
+
+if git rev-parse -q --verify "refs/tags/v$target_version" >/dev/null 2>&1; then
+    die "tag v$target_version already exists"
+fi
+
+cargo_manifests=(
+    remote/Cargo.toml
+    gateway/Cargo.toml
+    fonts/Cargo.toml
+    cli/Cargo.toml
+    browser/Cargo.toml
+    wezterm-driver/Cargo.toml
+    server/Cargo.toml
+    demo/Cargo.toml
+)
+
+workspace_crates=(
+    blit-browser
+    blit-cli
+    blit-demo
+    blit-fonts
+    blit-gateway
+    blit-remote
+    blit-server
+    blit-wezterm
+)
+
+for file in "${cargo_manifests[@]}"; do
+    [[ "$(read_toml_version "$file")" == "$current_version" ]] \
+        || die "expected $file to be at version $current_version"
+done
+
+[[ "$(read_flake_version flake.nix)" == "$current_version" ]] \
+    || die "expected flake.nix to be at version $current_version"
+
+node - "$current_version" <<'NODE'
+const fs = require("fs");
+const expected = process.argv[2];
+
+const pkg = JSON.parse(fs.readFileSync("react/package.json", "utf8"));
+if (pkg.version !== expected) {
+  console.error(`release: expected react/package.json to be at version ${expected}`);
+  process.exit(1);
+}
+
+const lock = JSON.parse(fs.readFileSync("react/package-lock.json", "utf8"));
+if (lock.version !== expected) {
+  console.error(`release: expected react/package-lock.json to be at version ${expected}`);
+  process.exit(1);
+}
+if (lock.packages?.[""]?.version !== expected) {
+  console.error(`release: expected react/package-lock.json packages[\"\"] to be at version ${expected}`);
+  process.exit(1);
+}
+if (lock.packages?.["../browser/pkg"]?.version !== expected) {
+  console.error(`release: expected react/package-lock.json packages[\"../browser/pkg\"] to be at version ${expected}`);
+  process.exit(1);
+}
+NODE
+
+previous_tag="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+if [[ -n "$previous_tag" ]]; then
+    echo "Changes since $previous_tag:"
+    git log --oneline "$previous_tag"..HEAD
+    echo
+else
+    echo "No previous v* tag found."
+    echo
+fi
+
+for file in "${cargo_manifests[@]}"; do
+    FROM="$current_version" TO="$target_version" \
+        perl -0pi -e 's/^version = "\Q$ENV{FROM}\E"$/version = "$ENV{TO}"/m' "$file"
+done
+
+FROM="$current_version" TO="$target_version" \
+    perl -0pi -e 's/version = "\Q$ENV{FROM}\E";/version = "$ENV{TO}";/' flake.nix
+
+node - "$target_version" <<'NODE'
+const fs = require("fs");
+const version = process.argv[2];
+
+const pkgPath = "react/package.json";
+const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+pkg.version = version;
+fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+
+const lockPath = "react/package-lock.json";
+const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+lock.version = version;
+lock.packages = lock.packages || {};
+lock.packages[""] = lock.packages[""] || {};
+lock.packages[""].version = version;
+if (lock.packages["../browser/pkg"]) {
+  lock.packages["../browser/pkg"].version = version;
+}
+fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+NODE
+
+for crate in "${workspace_crates[@]}"; do
+    CRATE="$crate" FROM="$current_version" TO="$target_version" \
+        perl -0pi -e 's/(name = "\Q$ENV{CRATE}\E"\nversion = ")\Q$ENV{FROM}\E(")/$1$ENV{TO}$2/g' Cargo.lock
+done
+
+for file in "${cargo_manifests[@]}"; do
+    [[ "$(read_toml_version "$file")" == "$target_version" ]] \
+        || die "failed to update $file to version $target_version"
+done
+
+[[ "$(read_flake_version flake.nix)" == "$target_version" ]] \
+    || die "failed to update flake.nix to version $target_version"
+
+node - "$target_version" <<'NODE'
+const fs = require("fs");
+const expected = process.argv[2];
+
+const pkg = JSON.parse(fs.readFileSync("react/package.json", "utf8"));
+if (pkg.version !== expected) {
+  console.error(`release: failed to update react/package.json to version ${expected}`);
+  process.exit(1);
+}
+
+const lock = JSON.parse(fs.readFileSync("react/package-lock.json", "utf8"));
+if (lock.version !== expected || lock.packages?.[""]?.version !== expected) {
+  console.error(`release: failed to update react/package-lock.json to version ${expected}`);
+  process.exit(1);
+}
+if (lock.packages?.["../browser/pkg"] && lock.packages["../browser/pkg"].version !== expected) {
+  console.error(`release: failed to update react/package-lock.json browser pkg entry to version ${expected}`);
+  process.exit(1);
+}
+NODE
+
+for crate in "${workspace_crates[@]}"; do
+    CRATE="$crate" EXPECTED="$target_version" \
+        perl -0ne 'exit(!/name = "\Q$ENV{CRATE}\E"\nversion = "\Q$ENV{EXPECTED}\E"/)' Cargo.lock \
+        || die "failed to update Cargo.lock entry for $crate to version $target_version"
+done
+
+cargo test -p blit-server -- --nocapture
+
+git add \
+    Cargo.lock \
+    browser/Cargo.toml \
+    cli/Cargo.toml \
+    demo/Cargo.toml \
+    flake.nix \
+    fonts/Cargo.toml \
+    gateway/Cargo.toml \
+    react/package-lock.json \
+    react/package.json \
+    remote/Cargo.toml \
+    server/Cargo.toml \
+    wezterm-driver/Cargo.toml
+
+git commit -m "release $target_version"
+
+echo
+echo "Created release commit:"
+git log -1 --oneline --decorate
