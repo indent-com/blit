@@ -1,8 +1,9 @@
+use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
 
-/// Serve the font family list as JSON.
-pub fn fonts_list_response() -> Response {
-    let families = blit_fonts::list_font_families();
+/// Serve the monospace font family list as JSON.
+pub fn fonts_list_response(cors_origin: Option<&str>) -> Response {
+    let families = blit_fonts::list_monospace_font_families();
     let json = format!(
         "[{}]",
         families
@@ -11,31 +12,42 @@ pub fn fonts_list_response() -> Response {
             .collect::<Vec<_>>()
             .join(",")
     );
-    (
+    let mut resp = (
         [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         json,
     )
-        .into_response()
+        .into_response();
+    add_cors(&mut resp, cors_origin);
+    resp
 }
 
 /// Serve a font's @font-face CSS by family name, or 404.
-pub fn font_response(name: &str) -> Response {
+pub fn font_response(name: &str, cors_origin: Option<&str>) -> Response {
     match blit_fonts::font_face_css(name) {
-        Some(css) => (
-            [
-                (axum::http::header::CONTENT_TYPE, "text/css"),
-                (
-                    axum::http::header::CACHE_CONTROL,
-                    "public, max-age=86400, immutable",
-                ),
-            ],
-            css,
-        )
-            .into_response(),
+        Some(css) => {
+            let mut resp = (
+                [
+                    (header::CONTENT_TYPE, "text/css"),
+                    (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
+                ],
+                css,
+            )
+                .into_response();
+            add_cors(&mut resp, cors_origin);
+            resp
+        }
         None => (axum::http::StatusCode::NOT_FOUND, "font not found").into_response(),
+    }
+}
+
+fn add_cors(resp: &mut Response, origin: Option<&str>) {
+    if let Some(origin) = origin {
+        if let Ok(val) = origin.parse() {
+            resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, val);
+        }
     }
 }
 
@@ -57,14 +69,14 @@ pub fn html_response(html: &'static str, etag: &str, if_none_match: Option<&[u8]
 /// Try to match a font route from a raw request path (any prefix).
 /// Handles `/fonts`, `/vt/fonts`, `/font/Name`, `/vt/font/Name%20With%20Spaces`.
 /// Returns `Some(response)` if the path matched a font route, `None` otherwise.
-pub fn try_font_route(path: &str) -> Option<Response> {
+pub fn try_font_route(path: &str, cors_origin: Option<&str>) -> Option<Response> {
     if path == "/fonts" || path.ends_with("/fonts") {
-        return Some(fonts_list_response());
+        return Some(fonts_list_response(cors_origin));
     }
     if let Some(raw) = path.rsplit_once("/font/").map(|(_, n)| n) {
         if !raw.contains('/') && !raw.is_empty() {
             let name = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
-            return Some(font_response(&name));
+            return Some(font_response(&name, cors_origin));
         }
     }
     None

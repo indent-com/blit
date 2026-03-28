@@ -6,33 +6,36 @@ import { resolve, join } from "node:path";
 
 const wasmPath = resolve(__dirname, "../browser/pkg/blit_browser_bg.wasm");
 const snippetsDir = resolve(__dirname, "../browser/pkg/snippets");
+const isDev = process.env.NODE_ENV !== "production" && !process.argv.includes("build");
 
 export default defineConfig({
   plugins: [
     react(),
-    viteSingleFile(),
+    // Only inline everything into a single HTML file for production builds.
+    !isDev && viteSingleFile(),
     {
       name: "inline-wasm",
       resolveId(id) {
         if (id === "virtual:blit-wasm") return "\0virtual:blit-wasm";
       },
       load(id) {
-        if (id === "\0virtual:blit-wasm") {
-          const wasm = readFileSync(wasmPath);
-          const b64 = wasm.toString("base64");
-          return `
+        if (id !== "\0virtual:blit-wasm") return;
+        if (isDev) {
+          // In dev, use a URL import so Vite serves the file directly.
+          return `export default "/@fs${wasmPath}";`;
+        }
+        const wasm = readFileSync(wasmPath);
+        const b64 = wasm.toString("base64");
+        return `
 const b64 = ${JSON.stringify(b64)};
 const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 export default bin.buffer;
 `;
-        }
       },
     },
     {
       name: "resolve-blit-snippets",
       resolveId(id, importer) {
-        // wasm-pack puts inline JS in ./snippets/blit-browser-<hash>/inline0.js
-        // The hash changes every build, so resolve to whatever dir exists.
         const match = id.match(/\.\/snippets\/blit-browser-[^/]+\/(.*)/);
         if (match && importer && existsSync(snippetsDir)) {
           const file = match[1];
@@ -43,11 +46,18 @@ export default bin.buffer;
         }
       },
     },
-  ],
+  ].filter(Boolean),
   resolve: {
     alias: {
       "blit-react": resolve(__dirname, "../react/src"),
       "blit-browser": resolve(__dirname, "../browser/pkg/blit_browser.js"),
+    },
+  },
+  server: {
+    port: 3265,
+    fs: {
+      // Allow serving the WASM file from outside the web-app directory.
+      allow: [resolve(__dirname, "..")],
     },
   },
   build: {

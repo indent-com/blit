@@ -27,6 +27,8 @@ export class MockTransport implements BlitTransport {
     return this._status;
   }
 
+  connect() {}
+
   send(data: Uint8Array) {
     this.sent.push(new Uint8Array(data));
   }

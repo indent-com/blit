@@ -7,33 +7,25 @@ processes:
       restart: always
     readiness_probe:
       exec:
-        command: test -f web-app/dist/index.html
+        command: test -f browser/pkg/blit_browser.js
       initial_delay_seconds: 5
       period_seconds: 2
       failure_threshold: 300
 
-  web-app:
-    command: cargo watch -w web-app/src -w web-app/index.html -w react/src -s "(cd web-app && npm run build)"
-    depends_on:
-      browser-wasm:
-        condition: process_healthy
-    availability:
-      restart: always
-
   server:
-    command: cargo build -p blit-server --release && ./target/release/blit-server --socket /tmp/blit-dev.sock
+    command: cargo watch -w server/src -w remote/src -w alacritty-driver/src -x "run -p blit-server --release -- --socket /tmp/blit-dev.sock"
     availability:
       restart: always
 
   gateway:
-    command: cargo watch -w gateway/src -w webserver/src -w web-app/dist/index.html -x "run -p blit-gateway --release"
+    command: cargo watch -w gateway/src -w webserver/src -x "run -p blit-gateway --release"
     environment:
       - BLIT_PASS=${BLIT_PASS:-dev}
       - BLIT_SOCK=/tmp/blit-dev.sock
+      - BLIT_ADDR=127.0.0.1:3266
+      - BLIT_CORS=*
       - BLIT_QUIC=1
     depends_on:
-      browser-wasm:
-        condition: process_healthy
       server:
         condition: process_started
     availability:
@@ -41,8 +33,20 @@ processes:
     readiness_probe:
       http_get:
         host: 127.0.0.1
-        port: 3264
+        port: 3266
         path: /
       initial_delay_seconds: 5
       period_seconds: 2
       failure_threshold: 300
+
+  web-app:
+    command: cd web-app && npx vite --host
+    environment:
+      - VITE_BLIT_GATEWAY=localhost:3266
+    depends_on:
+      browser-wasm:
+        condition: process_healthy
+      gateway:
+        condition: process_healthy
+    availability:
+      restart: always

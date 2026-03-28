@@ -1,4 +1,5 @@
 import type React from "react";
+import type { TerminalPalette } from "blit-react";
 
 export interface Theme {
   bg: string;
@@ -16,6 +17,7 @@ export interface Theme {
   error: string;
   errorText: string;
   success: string;
+  warning: string;
 }
 
 export const darkTheme: Theme = {
@@ -34,6 +36,7 @@ export const darkTheme: Theme = {
   error: "#a44",
   errorText: "#f55",
   success: "#4a4",
+  warning: "#da3",
 };
 
 export const lightTheme: Theme = {
@@ -52,11 +55,72 @@ export const lightTheme: Theme = {
   error: "#a44",
   errorText: "#f55",
   success: "#4a4",
+  warning: "#da3",
 };
 
-export function themeFor(dark: boolean): Theme {
-  return dark ? darkTheme : lightTheme;
+function rgb([r, g, b]: [number, number, number]): string {
+  return `rgb(${r}, ${g}, ${b})`;
 }
+
+function rgba([r, g, b]: [number, number, number], alpha: number): string {
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function mix(
+  from: [number, number, number],
+  to: [number, number, number],
+  amount: number,
+): [number, number, number] {
+  return [
+    Math.round(from[0] + (to[0] - from[0]) * amount),
+    Math.round(from[1] + (to[1] - from[1]) * amount),
+    Math.round(from[2] + (to[2] - from[2]) * amount),
+  ];
+}
+
+function themeFromPalette(palette: TerminalPalette): Theme {
+  const panelSurface = mix(palette.bg, palette.fg, palette.dark ? 0.08 : 0.04);
+  const inputSurface = mix(palette.bg, palette.fg, palette.dark ? 0.14 : 0.08);
+  const accent = palette.ansi[12] ?? palette.ansi[4] ?? palette.fg;
+  const error = palette.ansi[1] ?? palette.fg;
+  const errorText = palette.ansi[9] ?? error;
+  const success = palette.ansi[2] ?? palette.fg;
+  const warning = palette.ansi[3] ?? palette.fg;
+
+  return {
+    bg: rgb(palette.bg),
+    fg: rgb(palette.fg),
+    dimFg: rgba(palette.fg, palette.dark ? 0.62 : 0.68),
+    panelBg: rgba(palette.bg, palette.dark ? 0.88 : 0.94),
+    solidPanelBg: rgb(panelSurface),
+    inputBg: rgba(palette.fg, palette.dark ? 0.1 : 0.06),
+    solidInputBg: rgb(inputSurface),
+    border: rgba(palette.fg, 0.18),
+    subtleBorder: rgba(palette.fg, palette.dark ? 0.12 : 0.1),
+    hoverBg: rgba(palette.fg, palette.dark ? 0.06 : 0.05),
+    selectedBg: rgba(palette.fg, palette.dark ? 0.11 : 0.09),
+    accent: rgb(accent),
+    error: rgb(error),
+    errorText: rgb(errorText),
+    success: rgb(success),
+    warning: rgb(warning),
+  };
+}
+
+export function themeFor(source: boolean | TerminalPalette): Theme {
+  if (typeof source === "boolean") {
+    return source ? darkTheme : lightTheme;
+  }
+  return themeFromPalette(source);
+}
+
+/** Centralized z-index scale (increments of 10 for easy insertion). */
+export const z = {
+  exitedBanner: 10,
+  overlay: 20,
+  disconnected: 30,
+  debugPanel: 40,
+} as const;
 
 // Layout styles that don't depend on the theme.
 export const layout: Record<string, React.CSSProperties> = {
@@ -69,7 +133,7 @@ export const layout: Record<string, React.CSSProperties> = {
     backgroundColor: "rgba(0,0,0,0.5)",
     backdropFilter: "blur(4px)",
     WebkitBackdropFilter: "blur(4px)",
-    zIndex: 100,
+    zIndex: z.overlay,
     width: "100%",
     height: "100%",
     maxWidth: "100%",
@@ -129,7 +193,6 @@ export const ui: Record<string, React.CSSProperties> = {
   badge: {
     fontSize: 10,
     padding: "1px 6px",
-    borderRadius: 9999,
     backgroundColor: "rgba(88,136,255,0.25)",
     color: "inherit",
     flexShrink: 0,
@@ -227,10 +290,8 @@ export function overlayChromeStyles(
     },
     actionButton: {
       appearance: "none",
-      border: `1px solid ${dark ? "rgba(255,255,255,0.14)" : "rgba(48,22,14,0.16)"}`,
-      backgroundColor: dark
-        ? "rgba(255,255,255,0.05)"
-        : "rgba(255,255,255,0.6)",
+      border: `1px solid ${theme.subtleBorder}`,
+      backgroundColor: theme.inputBg,
       color: theme.fg,
       padding: "10px 14px",
       fontSize: 12,
@@ -257,26 +318,26 @@ export function disconnectedStyles(
     ...chrome,
     card: {
       ...chrome.panel,
-      width: "min(240px, calc(100vw - 32px))",
+      width: "min(24em, calc(100vw - 2em))",
       maxWidth: "100%",
       background: dark ? theme.solidPanelBg : theme.panelBg,
       padding: 0,
     },
     content: {
       display: "grid",
-      gap: 14,
+      gap: "0.75em",
       justifyItems: "center",
-      padding: "18px 18px 16px",
+      padding: "1.2em 1.4em 1em",
     },
     title: {
       margin: 0,
-      fontSize: 18,
+      fontSize: "1.2em",
       lineHeight: 1.2,
       fontWeight: 600,
     },
     reloadButton: {
       ...chrome.actionButton,
-      padding: "8px 12px",
+      padding: "0.5em 0.75em",
     },
   };
 }

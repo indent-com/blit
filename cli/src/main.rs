@@ -846,7 +846,7 @@ async fn browser_root_handler(
     index_html: &'static str,
     etag: &'static str,
 ) -> Response {
-    if let Some(resp) = blit_webserver::try_font_route(request.uri().path()) {
+    if let Some(resp) = blit_webserver::try_font_route(request.uri().path(), None) {
         return resp;
     }
 

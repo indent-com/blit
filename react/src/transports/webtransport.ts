@@ -27,6 +27,7 @@ export class WebTransportTransport implements BlitTransport {
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private _status: ConnectionStatus = "disconnected";
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectPromise: Promise<void> | null = null;
   private currentDelay: number;
   private disposed = false;
   private messageListeners = new Set<(data: ArrayBuffer) => void>();
@@ -153,8 +154,29 @@ export class WebTransportTransport implements BlitTransport {
     }
   }
 
-  async connect(): Promise<void> {
+  connect(): void {
+    if (this.connectPromise) return;
+    const connectPromise = this.connectInternal().finally(() => {
+      if (this.connectPromise === connectPromise) {
+        this.connectPromise = null;
+      }
+    });
+    this.connectPromise = connectPromise;
+  }
+
+  private async connectInternal(): Promise<void> {
     if (this.disposed) return;
+    if (this.reconnectTimer !== null) {
+      this.clearReconnectTimer();
+      this.currentDelay = this.initialDelay;
+    }
+    if (
+      this._status === "connecting" ||
+      this._status === "authenticating" ||
+      this._status === "connected"
+    ) {
+      return;
+    }
     this.setStatus("connecting");
 
     try {
@@ -166,6 +188,7 @@ export class WebTransportTransport implements BlitTransport {
       }
 
       const wt = new WebTransport(this.url, opts);
+      let authRejected = false;
       this.wt = wt;
       await wt.ready;
 
@@ -189,8 +212,9 @@ export class WebTransportTransport implements BlitTransport {
       await writer.write(authMsg);
 
       // Read 1-byte auth response: 1 = ok, 0 = rejected
-      const authResp = await readExact(reader, 1);
+      const { data: authResp, remainder } = await readExactBuffered(reader, 1);
       if (!authResp || authResp[0] !== 1) {
+        authRejected = true;
         this.setStatus("error");
         wt.close();
         return;
@@ -206,21 +230,25 @@ export class WebTransportTransport implements BlitTransport {
       this.setStatus("connected");
 
       // Read loop: length-prefixed frames
-      this.readLoop(reader, wt);
+      void this.readLoop(reader, wt, new Uint8Array(remainder));
 
       // Handle connection close
       wt.closed
         .then(() => {
           if (this.wt !== wt || this.disposed) return;
           this.cleanup();
-          this.setStatus("disconnected");
-          this.scheduleReconnect();
+          this.setStatus(authRejected ? "error" : "disconnected");
+          if (!authRejected) {
+            this.scheduleReconnect();
+          }
         })
         .catch(() => {
           if (this.wt !== wt || this.disposed) return;
           this.cleanup();
-          this.setStatus("disconnected");
-          this.scheduleReconnect();
+          this.setStatus(authRejected ? "error" : "disconnected");
+          if (!authRejected) {
+            this.scheduleReconnect();
+          }
         });
     } catch {
       if (this.disposed) return;
@@ -233,22 +261,12 @@ export class WebTransportTransport implements BlitTransport {
   private async readLoop(
     reader: ReadableStreamDefaultReader<Uint8Array>,
     wt: WebTransport,
+    initialBuffer = new Uint8Array(0),
   ): Promise<void> {
-    let buffer = new Uint8Array(0);
+    let buffer = initialBuffer;
 
     try {
       while (true) {
-        const { value, done } = await reader.read();
-        if (done || this.disposed || this.wt !== wt) break;
-        if (!value || value.length === 0) continue;
-
-        // Append to buffer
-        const newBuf = new Uint8Array(buffer.length + value.length);
-        newBuf.set(buffer);
-        newBuf.set(value, buffer.length);
-        buffer = newBuf;
-
-        // Extract complete frames
         while (buffer.length >= 4) {
           const len =
             buffer[0] |
@@ -265,6 +283,16 @@ export class WebTransportTransport implements BlitTransport {
           buffer = buffer.subarray(4 + len);
           for (const l of this.messageListeners) l(payload.buffer);
         }
+
+        const { value, done } = await reader.read();
+        if (done || this.disposed || this.wt !== wt) break;
+        if (!value || value.length === 0) continue;
+
+        // Append to buffer
+        const newBuf = new Uint8Array(buffer.length + value.length);
+        newBuf.set(buffer);
+        newBuf.set(value, buffer.length);
+        buffer = newBuf;
       }
     } catch {
       // Stream closed or error
@@ -273,20 +301,28 @@ export class WebTransportTransport implements BlitTransport {
 }
 
 /** Read exactly `n` bytes from a ReadableStreamDefaultReader. */
-async function readExact(
+async function readExactBuffered(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   n: number,
-): Promise<Uint8Array | null> {
+  initialBuffer = new Uint8Array(0),
+): Promise<{ data: Uint8Array | null; remainder: Uint8Array }> {
   const buf = new Uint8Array(n);
   let offset = 0;
+  let buffer = initialBuffer;
   while (offset < n) {
-    const { value, done } = await reader.read();
-    if (done || !value) return null;
-    const take = Math.min(value.length, n - offset);
-    buf.set(value.subarray(0, take), offset);
+    if (buffer.length === 0) {
+      const { value, done } = await reader.read();
+      if (done || !value) {
+        return { data: null, remainder: new Uint8Array(0) };
+      }
+      buffer = new Uint8Array(value);
+    }
+    const take = Math.min(buffer.length, n - offset);
+    buf.set(buffer.subarray(0, take), offset);
     offset += take;
+    buffer = buffer.subarray(take);
   }
-  return buf;
+  return { data: buf, remainder: buffer };
 }
 
 function hexToBytes(hex: string): Uint8Array {

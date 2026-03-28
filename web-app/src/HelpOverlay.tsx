@@ -1,4 +1,5 @@
-import { ui } from "./theme";
+import type { TerminalPalette } from "blit-react";
+import { themeFor, ui } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 type Shortcut = [string, string];
@@ -6,11 +7,12 @@ type Section = { title: string; items: Shortcut[] };
 
 export function HelpOverlay({
   onClose,
-  dark,
+  palette,
 }: {
   onClose: () => void;
-  dark: boolean;
+  palette: TerminalPalette;
 }) {
+  const theme = themeFor(palette);
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
   const sections: Section[] = [
     {
@@ -66,24 +68,39 @@ export function HelpOverlay({
   const right = sections.slice(half);
 
   return (
-    <OverlayBackdrop dark={dark} label="Help" onClose={onClose}>
-      <OverlayPanel dark={dark} style={{ minWidth: 520, maxWidth: 680 }}>
-        <OverlayHeader dark={dark} title="Keyboard & mouse shortcuts" onClose={onClose} />
+    <OverlayBackdrop palette={palette} label="Help" onClose={onClose}>
+      <OverlayPanel palette={palette} style={{ minWidth: 520, maxWidth: 680 }}>
+        <OverlayHeader palette={palette} title="Keyboard & mouse shortcuts" onClose={onClose} />
         <div style={{ display: "flex", gap: 24, padding: "4px 0" }}>
-          <Column sections={left} />
-          <Column sections={right} />
+          <Column sections={left} theme={theme} />
+          <Column sections={right} theme={theme} />
         </div>
       </OverlayPanel>
     </OverlayBackdrop>
   );
 }
 
-function Column({ sections }: { sections: Section[] }) {
+function Column({
+  sections,
+  theme,
+}: {
+  sections: Section[];
+  theme: ReturnType<typeof themeFor>;
+}) {
   return (
     <div style={{ flex: 1, minWidth: 0 }}>
       {sections.map((s) => (
         <div key={s.title} style={{ marginBottom: 12 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, opacity: 0.5, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 600,
+              color: theme.dimFg,
+              marginBottom: 4,
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+            }}
+          >
             {s.title}
           </div>
           <table style={{ borderSpacing: "8px 3px", marginLeft: -8 }}>
@@ -93,7 +110,7 @@ function Column({ sections }: { sections: Section[] }) {
                   <td style={{ whiteSpace: "nowrap" }}>
                     <kbd style={ui.kbd}>{key}</kbd>
                   </td>
-                  <td style={{ fontSize: 12, opacity: 0.8 }}>{desc}</td>
+                  <td style={{ fontSize: 12, color: theme.dimFg }}>{desc}</td>
                 </tr>
               ))}
             </tbody>

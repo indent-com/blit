@@ -6,23 +6,37 @@ import {
 } from "react";
 import {
   BlitTerminal,
-  BlitProvider,
+  BlitWorkspaceProvider,
+  createBlitWorkspace,
+  useBlitConnection,
+  useBlitFocusedSession,
   useBlitSessions,
-  TerminalStore,
+  useBlitWorkspace,
+  useBlitWorkspaceState,
   DEFAULT_FONT,
   CSS_GENERIC,
 } from "blit-react";
 import type {
   BlitTransport,
   BlitTerminalHandle,
+  BlitSession,
   BlitWasmModule,
+  SessionId,
   TerminalPalette,
-  UseBlitSessionsReturn,
-  SearchResult,
 } from "blit-react";
 import { useMetrics } from "./useMetrics";
-import { PALETTE_KEY, FONT_KEY, FONT_SIZE_KEY, writeStorage, preferredPalette, preferredFont, preferredFontSize, blitHost, basePath } from "./storage";
-import { themeFor, layout } from "./theme";
+import {
+  PALETTE_KEY,
+  FONT_KEY,
+  FONT_SIZE_KEY,
+  writeStorage,
+  preferredPalette,
+  preferredFont,
+  preferredFontSize,
+  blitHost,
+  basePath,
+} from "./storage";
+import { themeFor, layout, ui, z } from "./theme";
 import { StatusBar } from "./StatusBar";
 import { ExposeOverlay } from "./ExposeOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
@@ -32,155 +46,270 @@ import { DisconnectedOverlay } from "./DisconnectedOverlay";
 
 export type Overlay = "expose" | "palette" | "font" | "help" | null;
 
-export function Workspace({ transport, wasm, onAuthError }: { transport: BlitTransport; wasm: BlitWasmModule; onAuthError: () => void }) {
+const PRIMARY_CONNECTION_ID = "default";
+
+function splitFontFamilies(value: string): string[] {
+  return value
+    .split(",")
+    .map((family) => family.trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+}
+
+function fontStyleId(family: string): string {
+  return `blit-font-${family.replace(/\s+/g, "-").toLowerCase()}`;
+}
+
+export function Workspace({
+  transport,
+  wasm,
+  onAuthError,
+}: {
+  transport: BlitTransport;
+  wasm: BlitWasmModule;
+  onAuthError: () => void;
+}) {
+  const workspaceRef = useRef<ReturnType<typeof createBlitWorkspace> | null>(null);
+  if (!workspaceRef.current) {
+    workspaceRef.current = createBlitWorkspace({ wasm });
+  }
+  const workspace = workspaceRef.current;
+
+  useEffect(() => {
+    workspace.addConnection({
+      id: PRIMARY_CONNECTION_ID,
+      transport,
+    });
+    return () => {
+      workspace.removeConnection(PRIMARY_CONNECTION_ID);
+    };
+  }, [workspace, transport]);
+
+  useEffect(() => {
+    return () => {
+      workspace.dispose();
+    };
+  }, [workspace]);
+
+  return (
+    <BlitWorkspaceProvider workspace={workspace}>
+      <WorkspaceScreen
+        transport={transport}
+        primaryConnectionId={PRIMARY_CONNECTION_ID}
+        onAuthError={onAuthError}
+      />
+    </BlitWorkspaceProvider>
+  );
+}
+
+function WorkspaceScreen({
+  transport,
+  primaryConnectionId,
+  onAuthError,
+}: {
+  transport: BlitTransport;
+  primaryConnectionId: string;
+  onAuthError: () => void;
+}) {
+  const workspace = useBlitWorkspace();
+  const workspaceState = useBlitWorkspaceState();
+  const sessions = useBlitSessions();
+  const focusedSession = useBlitFocusedSession();
+  const connection = useBlitConnection(primaryConnectionId);
+
   const [palette, setPalette] = useState<TerminalPalette>(preferredPalette);
   const [font, setFont] = useState(preferredFont);
+  const [resolvedFont, setResolvedFont] = useState(preferredFont);
   const [fontSize, setFontSize] = useState(preferredFontSize);
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [debugPanel, setDebugPanel] = useState(false);
-  const toggleDebug = useCallback(() => setDebugPanel((d) => !d), []);
   const [serverFonts, setServerFonts] = useState<string[]>([]);
-  const [offlineVisible, setOfflineVisible] = useState(
-    transport.status === "disconnected" || transport.status === "error",
-  );
+  const [offlineVisible, setOfflineVisible] = useState(false);
+  const [fontLoading, setFontLoading] = useState(false);
+  const toggleDebug = useCallback(() => setDebugPanel((value) => !value), []);
+  const fontRequestVersionRef = useRef(0);
+  const paletteOverlayOriginRef = useRef<TerminalPalette | null>(null);
+  const fontOverlayOriginRef = useRef<{ family: string; size: number } | null>(null);
 
-  // Always append fallback so the terminal is usable while custom fonts load.
-  const fontWithFallback = font === DEFAULT_FONT ? font : `${font}, ${DEFAULT_FONT}`;
+  const resolvedFontWithFallback =
+    resolvedFont === DEFAULT_FONT ? resolvedFont : `${resolvedFont}, ${DEFAULT_FONT}`;
 
   useEffect(() => {
-    fetch(`${basePath}fonts`).then((r) => r.ok ? r.json() : []).then(setServerFonts).catch(() => {});
+    fetch(`${basePath}fonts`)
+      .then((response) => (response.ok ? response.json() : []))
+      .then(setServerFonts)
+      .catch(() => {});
   }, []);
-  const termRef = useRef<BlitTerminalHandle>(null);
+
+  const termRef = useRef<BlitTerminalHandle | null>(null);
   const overlayRef = useRef<Overlay>(null);
   overlayRef.current = overlay;
-  const sessionsRef = useRef<UseBlitSessionsReturn | null>(null);
-  const searchResultsCbRef = useRef<((reqId: number, results: SearchResult[]) => void) | null>(null);
 
-  const storeRef = useRef<{ transport: BlitTransport; store: TerminalStore } | null>(null);
-  if (!storeRef.current || storeRef.current.transport !== transport) {
-    storeRef.current?.store.dispose();
-    storeRef.current = { transport, store: new TerminalStore(transport, wasm) };
-  }
-  const store = storeRef.current.store;
+  const stateRef = useRef<{
+    focusedSessionId: SessionId | null;
+    sessions: readonly BlitSession[];
+    supportsRestart: boolean;
+  }>({
+    focusedSessionId: null,
+    sessions: [],
+    supportsRestart: false,
+  });
+  stateRef.current = {
+    focusedSessionId: workspaceState.focusedSessionId,
+    sessions,
+    supportsRestart: connection?.supportsRestart ?? false,
+  };
 
-  const onSearchResults = useCallback(
-    (reqId: number, results: SearchResult[]) => {
-      searchResultsCbRef.current?.(reqId, results);
-    },
-    [],
-  );
+  const { countFrame, timelineRef, netRef, ...metrics } = useMetrics(transport);
+  const dark = palette.dark;
+  const theme = themeFor(palette);
 
-  const initialPtyIdRef = useRef(() => {
+  const initialHashPtyIdRef = useRef<number | null>((() => {
     const hash = location.hash.substring(1);
     const id = parseInt(hash, 10);
-    return id >= 0 ? id : null;
-  });
-  const sessions = useBlitSessions(transport, {
-    initialPtyId: initialPtyIdRef.current(),
-    autoCreateIfEmpty: true,
-    getInitialSize: () => ({
-      rows: termRef.current?.rows ?? 24,
-      cols: termRef.current?.cols ?? 80,
-    }),
-    getTerminal: (ptyId) => store.getTerminal(ptyId),
-    onSearchResults,
-    onSessionClosed: (session) => store.freeTerminal(session.ptyId),
-  });
-  sessionsRef.current = sessions;
-  const { countFrame, timelineRef, netRef, ...metrics } = useMetrics(transport);
-
-  const dark = palette.dark;
-  const theme = themeFor(dark);
-  const statusBarRaised = overlay !== null || offlineVisible;
+    return Number.isFinite(id) && id >= 0 ? id : null;
+  })());
+  const initialHashAppliedRef = useRef(false);
 
   useEffect(() => {
-    store.setPalette(palette);
-  }, [store, palette]);
-
-  const [fontLoading, setFontLoading] = useState(false);
-  useEffect(() => {
-    store.setFontFamily(fontWithFallback);
-    // Try to load custom fonts from the server's system fonts.
-    const families = font.split(",").map((f) => f.trim().replace(/^['"]|['"]$/g, ""));
-    let pending = 0;
-    for (const f of families) {
-      if (!f || CSS_GENERIC.has(f.toLowerCase())) continue;
-      const id = `blit-font-${f.replace(/\s+/g, "-").toLowerCase()}`;
-      if (document.getElementById(id)) continue;
-      pending++;
-      setFontLoading(true);
-      fetch(`${basePath}font/${encodeURIComponent(f)}`).then((res) => {
-        if (!res.ok) return;
-        return res.text().then(async (css) => {
-          if (document.getElementById(id)) return;
-          const style = document.createElement("style");
-          style.id = id;
-          style.textContent = css;
-          document.head.appendChild(style);
-          await document.fonts.ready;
-        });
-      }).catch(() => {}).finally(() => {
-        pending--;
-        if (pending <= 0) setFontLoading(false);
-      });
+    if (initialHashAppliedRef.current) return;
+    if (!connection?.ready) return;
+    const initialPtyId = initialHashPtyIdRef.current;
+    if (initialPtyId == null) {
+      initialHashAppliedRef.current = true;
+      return;
     }
-    if (pending === 0) setFontLoading(false);
-  }, [store, font]);
-
-  // LRU order: most recently focused PTY first.
-  const lruRef = useRef<number[]>([]);
-
-  // Sync focused PTY to URL hash and LRU.
-  useEffect(() => {
-    store.setLead(sessions.focusedPtyId);
-    if (sessions.focusedPtyId !== null) {
-      const lru = lruRef.current.filter((id) => id !== sessions.focusedPtyId);
-      lru.unshift(sessions.focusedPtyId);
-      lruRef.current = lru;
-      history.replaceState(null, "", `#${sessions.focusedPtyId}`);
+    const match = sessions.find(
+      (session) =>
+        session.connectionId === primaryConnectionId &&
+        session.ptyId === initialPtyId &&
+        session.state !== "closed",
+    );
+    if (match) {
+      workspace.focusSession(match.id);
     }
-  }, [store, sessions.focusedPtyId]);
+    initialHashAppliedRef.current = true;
+  }, [connection?.ready, primaryConnectionId, sessions, workspace]);
 
   useEffect(() => {
-    const desired = new Set<number>();
-    if (sessions.focusedPtyId !== null) desired.add(sessions.focusedPtyId);
+    const requestedFont = font.trim() || DEFAULT_FONT;
+    const families = splitFontFamilies(requestedFont).filter(
+      (family) => !CSS_GENERIC.has(family.toLowerCase()),
+    );
+    const requestVersion = ++fontRequestVersionRef.current;
+    let cancelled = false;
+
+    if (families.length === 0) {
+      setResolvedFont(requestedFont);
+      setFontLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setFontLoading(true);
+
+    const loadRequestedFont = async () => {
+      for (const family of families) {
+        if (cancelled || requestVersion !== fontRequestVersionRef.current) return;
+
+        const loadSpec = `16px "${family}"`;
+        if (document.fonts?.check?.(loadSpec)) continue;
+
+        const id = fontStyleId(family);
+        if (!document.getElementById(id)) {
+          try {
+            const response = await fetch(`${basePath}font/${encodeURIComponent(family)}`);
+            if (response.ok) {
+              const css = await response.text();
+              if (cancelled || requestVersion !== fontRequestVersionRef.current) return;
+              if (!document.getElementById(id)) {
+                const style = document.createElement("style");
+                style.id = id;
+                style.textContent = css;
+                document.head.appendChild(style);
+              }
+            }
+          } catch {}
+        }
+
+        try {
+          if (typeof document.fonts?.load === "function") {
+            await document.fonts.load(loadSpec, "BESbswy");
+          } else if (document.fonts?.ready) {
+            await document.fonts.ready;
+          }
+        } catch {}
+      }
+
+      if (cancelled || requestVersion !== fontRequestVersionRef.current) return;
+      setResolvedFont(requestedFont);
+      setFontLoading(false);
+    };
+
+    void loadRequestedFont();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [font]);
+
+  const lruRef = useRef<SessionId[]>([]);
+
+  useEffect(() => {
+    if (!workspaceState.focusedSessionId) return;
+    const lru = lruRef.current.filter((id) => id !== workspaceState.focusedSessionId);
+    lru.unshift(workspaceState.focusedSessionId);
+    lruRef.current = lru;
+    const focused = sessions.find((session) => session.id === workspaceState.focusedSessionId);
+    if (focused) {
+      history.replaceState(null, "", `#${focused.ptyId}`);
+    }
+  }, [sessions, workspaceState.focusedSessionId]);
+
+  useEffect(() => {
+    const desired = new Set<SessionId>();
+    if (workspaceState.focusedSessionId) {
+      desired.add(workspaceState.focusedSessionId);
+    }
     if (overlay === "expose") {
-      for (const s of sessions.sessions) {
-        if (s.state !== "closed") desired.add(s.ptyId);
+      for (const session of sessions) {
+        if (session.state !== "closed") desired.add(session.id);
       }
     }
-    store.setDesiredSubscriptions(desired);
-  }, [store, sessions.focusedPtyId, sessions.sessions, overlay]);
+    workspace.setVisibleSessions(desired);
+  }, [overlay, sessions, workspace, workspaceState.focusedSessionId]);
+
+  const hasConnectedRef = useRef(connection?.status === "connected");
+  useEffect(() => {
+    const status = connection?.status;
+    if (!status) return;
+    if (status === "connected") {
+      hasConnectedRef.current = true;
+    } else if (connection?.error === "auth") {
+      onAuthError();
+    }
+  }, [connection?.status, connection?.error, onAuthError]);
 
   useEffect(() => {
-    return () => store.dispose();
-  }, [store]);
+    const status = connection?.status;
+    if (!status) return;
 
-  useEffect(() => {
-    let wasConnected = false;
-    const onStatus = (status: string) => {
-      if (status === "connected") wasConnected = true;
-      if (status === "error" && !wasConnected) onAuthError();
-    };
-    transport.addEventListener("statuschange", onStatus);
-    return () => transport.removeEventListener("statuschange", onStatus);
-  }, [transport, onAuthError]);
+    if (status === "connected") {
+      setOfflineVisible(false);
+      return;
+    }
 
-  useEffect(() => {
-    const syncOffline = (status: string) => {
-      if (status === "connected") {
-        setOfflineVisible(false);
-      } else if (status === "disconnected" || status === "error") {
-        setOfflineVisible(true);
-      }
-    };
-    syncOffline(transport.status);
-    transport.addEventListener("statuschange", syncOffline);
-    return () => transport.removeEventListener("statuschange", syncOffline);
-  }, [transport]);
+    if (
+      hasConnectedRef.current ||
+      (connection?.retryCount ?? 0) > 0 ||
+      (connection?.error != null && connection.error !== "auth")
+    ) {
+      setOfflineVisible(true);
+    }
+  }, [connection?.status, connection?.retryCount, connection?.error]);
 
   const termCallbackRef = useCallback((handle: BlitTerminalHandle | null) => {
-    (termRef as React.MutableRefObject<BlitTerminalHandle | null>).current = handle;
+    termRef.current = handle;
     if (handle && !overlayRef.current) {
       handle.focus();
     }
@@ -198,67 +327,125 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: BlitTra
   }, []);
 
   useEffect(() => {
-    const focused = sessions.sessions.find(
-      (s) => s.ptyId === sessions.focusedPtyId,
-    );
     const host = blitHost();
     const parts: string[] = [];
-    if (focused?.title) parts.push(focused.title);
+    if (focusedSession?.title) parts.push(focusedSession.title);
     if (host && host !== "localhost" && host !== "127.0.0.1") parts.push(host);
     parts.push("blit");
     document.title = parts.join(" — ");
-  }, [sessions.focusedPtyId, sessions.sessions]);
+  }, [focusedSession?.title]);
 
   const focusTerminal = useCallback(() => {
     setTimeout(() => termRef.current?.focus(), 0);
   }, []);
 
   const closeOverlay = useCallback(() => {
+    paletteOverlayOriginRef.current = null;
+    fontOverlayOriginRef.current = null;
     setOverlay(null);
     focusTerminal();
   }, [focusTerminal]);
 
-  const toggleOverlay = useCallback((target: Overlay) => {
-    setOverlay((cur) => {
-      if (cur === target) {
-        focusTerminal();
-        return null;
+  const restoreOverlayPreview = useCallback((target: Overlay) => {
+    if (target === "palette") {
+      const original = paletteOverlayOriginRef.current;
+      if (original) {
+        setPalette(original);
       }
-      return target;
-    });
-  }, [focusTerminal]);
+      paletteOverlayOriginRef.current = null;
+      return;
+    }
 
-  const changePalette = useCallback((p: TerminalPalette) => {
-    setPalette(p);
-    writeStorage(PALETTE_KEY, p.id);
+    if (target === "font") {
+      const original = fontOverlayOriginRef.current;
+      if (original) {
+        setFont(original.family);
+        setFontSize(original.size);
+      }
+      fontOverlayOriginRef.current = null;
+    }
+  }, []);
+
+  const cancelOverlay = useCallback(() => {
+    restoreOverlayPreview(overlayRef.current);
+    closeOverlay();
+  }, [closeOverlay, restoreOverlayPreview]);
+
+  const toggleOverlay = useCallback((target: Overlay) => {
+    const current = overlayRef.current;
+    if (current === target) {
+      cancelOverlay();
+      return;
+    }
+
+    restoreOverlayPreview(current);
+
+    if (target === "palette") {
+      paletteOverlayOriginRef.current = palette;
+    } else if (target === "font") {
+      fontOverlayOriginRef.current = {
+        family: font,
+        size: fontSize,
+      };
+    }
+
+    setOverlay(target);
+  }, [cancelOverlay, font, fontSize, palette, restoreOverlayPreview]);
+
+  const changePalette = useCallback((nextPalette: TerminalPalette) => {
+    setPalette(nextPalette);
+    paletteOverlayOriginRef.current = null;
+    writeStorage(PALETTE_KEY, nextPalette.id);
     closeOverlay();
   }, [closeOverlay]);
 
-  const changeFont = useCallback((f: string, size: number) => {
-    const value = f.trim() || DEFAULT_FONT;
+  const changeFont = useCallback((family: string, size: number) => {
+    const value = family.trim() || DEFAULT_FONT;
     setFont(value);
     setFontSize(size);
+    fontOverlayOriginRef.current = null;
     writeStorage(FONT_KEY, value);
     writeStorage(FONT_SIZE_KEY, String(size));
     closeOverlay();
   }, [closeOverlay]);
 
-  const switchPty = useCallback(
-    (ptyId: number) => {
-      sessions.focusPty(ptyId);
-      closeOverlay();
-    },
-    [sessions, closeOverlay],
-  );
+  const switchSession = useCallback((sessionId: SessionId) => {
+    workspace.focusSession(sessionId);
+    closeOverlay();
+  }, [closeOverlay, workspace]);
 
   const createAndFocus = useCallback(async (command?: string) => {
-    const id = await sessions.createPty({
-      ...(command ? { command } : {}),
-      ...(!command && sessions.focusedPtyId != null ? { srcPtyId: sessions.focusedPtyId } : {}),
-    });
-    sessions.focusPty(id);
-    closeOverlay();
-  }, [sessions, closeOverlay]);
+    try {
+      const session = await workspace.createSession({
+        connectionId: primaryConnectionId,
+        rows: termRef.current?.rows ?? 24,
+        cols: termRef.current?.cols ?? 80,
+        ...(command ? { command } : {}),
+        ...(!command && workspaceState.focusedSessionId
+          ? { cwdFromSessionId: workspaceState.focusedSessionId }
+          : {}),
+      });
+      workspace.focusSession(session.id);
+      closeOverlay();
+    } catch (error) {
+      if (connection?.status !== "disconnected" && connection?.status !== "error") {
+        console.error("blit: failed to create PTY", error);
+      }
+    }
+  }, [closeOverlay, connection?.status, primaryConnectionId, workspace, workspaceState.focusedSessionId]);
+
+  const handleRestartOrClose = useCallback(() => {
+    if (!focusedSession) {
+      void createAndFocus();
+      return;
+    }
+    if (focusedSession.state !== "exited") return;
+    if (connection?.supportsRestart) {
+      workspace.restartSession(focusedSession.id);
+    } else {
+      void workspace.closeSession(focusedSession.id);
+    }
+  }, [connection?.supportsRestart, createAndFocus, focusedSession, workspace]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -291,125 +478,268 @@ export function Workspace({ transport, wasm, onAuthError }: { transport: BlitTra
       }
       if (mod && e.shiftKey && e.key === "Enter") {
         e.preventDefault();
-        createAndFocus();
+        void createAndFocus();
         return;
       }
+      if (e.key === "Enter" && !mod && !e.shiftKey && !overlayRef.current) {
+        const current = stateRef.current;
+        const focused = current.focusedSessionId
+          ? current.sessions.find((session) => session.id === current.focusedSessionId)
+          : null;
+        if ((focused && focused.state === "exited") || current.focusedSessionId == null) {
+          e.preventDefault();
+          handleRestartOrClose();
+          return;
+        }
+      }
       if (mod && e.shiftKey && e.key === "W") {
-        if (overlayRef.current) return; // let the overlay handle it
+        if (overlayRef.current) return;
         e.preventDefault();
-        const s = sessionsRef.current;
-        if (s && s.focusedPtyId != null) s.closePty(s.focusedPtyId);
+        if (stateRef.current.focusedSessionId) {
+          void workspace.closeSession(stateRef.current.focusedSessionId);
+        }
         return;
       }
       if (mod && e.shiftKey && (e.key === "{" || e.key === "}")) {
         e.preventDefault();
-        const s = sessionsRef.current;
-        if (!s) return;
-        const ids = s.sessions
-          .filter((x) => x.state !== "closed")
-          .map((x) => x.ptyId);
-        if (ids.length < 2 || s.focusedPtyId == null) return;
-        const idx = ids.indexOf(s.focusedPtyId);
-        const next =
+        const visible = stateRef.current.sessions
+          .filter((session) => session.state !== "closed")
+          .map((session) => session.id);
+        const currentId = stateRef.current.focusedSessionId;
+        if (visible.length < 2 || !currentId) return;
+        const index = visible.indexOf(currentId);
+        const nextId =
           e.key === "}"
-            ? ids[(idx + 1) % ids.length]
-            : ids[(idx - 1 + ids.length) % ids.length];
-        s.focusPty(next);
+            ? visible[(index + 1) % visible.length]
+            : visible[(index - 1 + visible.length) % visible.length];
+        workspace.focusSession(nextId);
         return;
       }
-      if (e.key === "Escape" && overlayRef.current) {
-        e.preventDefault();
-        closeOverlay();
-        return;
+      if (e.key === "Escape") {
+        if (overlayRef.current) {
+          e.preventDefault();
+          cancelOverlay();
+          return;
+        }
+        if (focusedSession?.state === "exited") {
+          e.preventDefault();
+          void workspace.closeSession(focusedSession.id);
+        }
       }
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [toggleOverlay, closeOverlay, createAndFocus]);
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [cancelOverlay, createAndFocus, focusedSession, handleRestartOrClose, toggleDebug, toggleOverlay, workspace]);
 
-  const bg = `rgb(${palette.bg[0]},${palette.bg[1]},${palette.bg[2]})`;
+  const debugStats = workspace.getConnectionDebugStats(
+    primaryConnectionId,
+    workspaceState.focusedSessionId,
+  );
 
   return (
-    <BlitProvider transport={transport} store={store} palette={palette} fontFamily={fontWithFallback} fontSize={fontSize}>
+    <BlitWorkspaceProvider
+      workspace={workspace}
+      palette={palette}
+      fontFamily={resolvedFontWithFallback}
+      fontSize={fontSize}
+    >
       <main
         style={{
           ...layout.workspace,
-          backgroundColor: bg,
+          backgroundColor: theme.bg,
           color: theme.fg,
-          fontFamily: fontWithFallback,
+          fontFamily: resolvedFontWithFallback,
         }}
       >
-        <section style={layout.termContainer}>
-          {sessions.focusedPtyId != null && (
+      <section style={layout.termContainer}>
+        {workspaceState.focusedSessionId != null ? (
+          <>
             <BlitTerminal
               ref={termCallbackRef}
-              ptyId={sessions.focusedPtyId}
+              sessionId={workspaceState.focusedSessionId}
               onRender={countFrame}
               style={{ width: "100%", height: "100%" }}
+              fontFamily={resolvedFontWithFallback}
+              fontSize={fontSize}
+              palette={palette}
             />
-          )}
-        </section>
-        {overlay === "expose" && (
-          <ExposeOverlay
-            sessions={sessions}
-            lru={lruRef.current}
-            onSelect={switchPty}
-            onClose={closeOverlay}
-            onCreate={createAndFocus}
-            searchResultsCbRef={searchResultsCbRef}
-          />
-        )}
-        {overlay === "palette" && (
-          <PaletteOverlay
-            current={palette}
-            onSelect={changePalette}
-            onPreview={setPalette}
-            onClose={closeOverlay}
-            dark={dark}
-          />
-        )}
-        {overlay === "font" && (
-          <FontOverlay
-            currentFamily={font}
-            currentSize={fontSize}
-            serverFonts={serverFonts}
-            onSelect={changeFont}
-            onPreview={(f, s) => { setFont(f); setFontSize(s); }}
-            onClose={closeOverlay}
-            dark={dark}
-          />
-        )}
-        {overlay === "help" && (
-          <HelpOverlay onClose={closeOverlay} dark={dark} />
-        )}
-        {offlineVisible && <DisconnectedOverlay dark={dark} />}
-        <footer
-          style={{
-            ...layout.statusBar,
-            backgroundColor: theme.bg,
-            borderTopColor: theme.subtleBorder,
-            position: statusBarRaised ? "relative" : undefined,
-            zIndex: statusBarRaised ? 121 : undefined,
-            pointerEvents: statusBarRaised ? "none" : undefined,
-          }}
-        >
-          <StatusBar
-            sessions={sessions}
-            metrics={metrics}
-            palette={palette}
-            termSize={termRef.current ? `${termRef.current.cols}x${termRef.current.rows}` : null}
-            fontLoading={fontLoading}
-            debug={debugPanel}
-            toggleDebug={toggleDebug}
-            store={store}
-            timelineRef={timelineRef}
-            netRef={netRef}
+            {focusedSession?.state === "exited" && (
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: 32,
+                  left: "50%",
+                  transform: "translateX(-50%)",
+                  backgroundColor: theme.solidPanelBg,
+                  border: `1px solid ${theme.border}`,
+                  padding: "6px 14px",
+                  fontSize: 12,
+                  zIndex: z.exitedBanner,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
+                  Exited
+                </mark>
+                {connection?.supportsRestart ? (
+                  <button onClick={() => handleRestartOrClose()} style={{ ...ui.btn, fontSize: 12 }}>
+                    Restart <kbd style={ui.kbd}>Enter</kbd>
+                  </button>
+                ) : null}
+                <button
+                  onClick={() => void workspace.closeSession(focusedSession.id)}
+                  style={{ ...ui.btn, fontSize: 12, opacity: 0.5 }}
+                >
+                  Close <kbd style={ui.kbd}>Esc</kbd>
+                </button>
+              </div>
+            )}
+          </>
+        ) : (
+          <EmptyState
+            theme={theme}
+            mod={/Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl"}
+            onCreate={() => void createAndFocus()}
             onExpose={() => toggleOverlay("expose")}
-            onPalette={() => toggleOverlay("palette")}
-            onFont={() => toggleOverlay("font")}
+            onHelp={() => toggleOverlay("help")}
           />
-        </footer>
+        )}
+      </section>
+      {overlay === "expose" && (
+        <ExposeOverlay
+          sessions={sessions}
+          focusedSessionId={workspaceState.focusedSessionId}
+          lru={lruRef.current}
+          palette={palette}
+          onSelect={switchSession}
+          onClose={closeOverlay}
+          onCreate={createAndFocus}
+        />
+      )}
+      {overlay === "palette" && (
+        <PaletteOverlay
+          current={palette}
+          onSelect={changePalette}
+          onPreview={setPalette}
+          onClose={closeOverlay}
+        />
+      )}
+      {overlay === "font" && (
+        <FontOverlay
+          currentFamily={font}
+          currentSize={fontSize}
+          serverFonts={serverFonts}
+          palette={palette}
+          onSelect={changeFont}
+          onPreview={(family, size) => {
+            setFont(family);
+            setFontSize(size);
+          }}
+          onClose={closeOverlay}
+        />
+      )}
+      {overlay === "help" && <HelpOverlay onClose={closeOverlay} palette={palette} />}
+      {offlineVisible && (
+        <DisconnectedOverlay
+          palette={palette}
+          status={connection?.status ?? "disconnected"}
+          retryCount={connection?.retryCount ?? 0}
+          error={connection?.error ?? null}
+          onReconnect={() => workspace.reconnectConnection(primaryConnectionId)}
+        />
+      )}
+      <footer
+        style={{
+          ...layout.statusBar,
+          backgroundColor: theme.bg,
+          borderTopColor: theme.subtleBorder,
+        }}
+      >
+        <StatusBar
+          sessions={sessions}
+          focusedSession={focusedSession}
+          status={connection?.status ?? "disconnected"}
+          metrics={metrics}
+          palette={palette}
+          termSize={termRef.current ? `${termRef.current.cols}x${termRef.current.rows}` : null}
+          fontLoading={fontLoading}
+          debug={debugPanel}
+          toggleDebug={toggleDebug}
+          debugStats={debugStats}
+          timelineRef={timelineRef}
+          netRef={netRef}
+          onExpose={() => toggleOverlay("expose")}
+          onPalette={() => toggleOverlay("palette")}
+          onFont={() => toggleOverlay("font")}
+        />
+      </footer>
       </main>
-    </BlitProvider>
+    </BlitWorkspaceProvider>
+  );
+}
+
+function EmptyState({
+  theme,
+  mod,
+  onCreate,
+  onExpose,
+  onHelp,
+}: {
+  theme: ReturnType<typeof themeFor>;
+  mod: string;
+  onCreate: () => void;
+  onExpose: () => void;
+  onHelp: () => void;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "100%",
+        gap: 12,
+        opacity: 0.6,
+      }}
+    >
+      <div style={{ fontSize: 14 }}>No terminal open</div>
+      <div
+        style={{
+          fontSize: 12,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <button onClick={onCreate} style={{ ...ui.btn, fontSize: 12 }}>
+          New terminal <kbd style={ui.kbd}>Enter</kbd>{" "}
+          <kbd style={ui.kbd}>{mod}+Shift+Enter</kbd>
+        </button>
+        <button onClick={onExpose} style={{ ...ui.btn, fontSize: 12 }}>
+          Expose <kbd style={ui.kbd}>{mod}+K</kbd>
+        </button>
+        <button onClick={onHelp} style={{ ...ui.btn, fontSize: 12 }}>
+          Help <kbd style={ui.kbd}>Ctrl+?</kbd>
+        </button>
+      </div>
+      <button
+        onClick={onCreate}
+        style={{
+          marginTop: 8,
+          padding: "6px 16px",
+          fontSize: 13,
+          backgroundColor: theme.accent,
+          color: "#fff",
+          border: "none",
+          cursor: "pointer",
+        }}
+      >
+        New terminal
+      </button>
+    </div>
   );
 }

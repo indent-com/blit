@@ -19,6 +19,10 @@ export class WebSocketTransport implements BlitTransport {
   private disposed = false;
   private messageListeners = new Set<(data: ArrayBuffer) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
+  /** True when the gateway explicitly rejected the passphrase. */
+  authRejected = false;
+  /** Last error message from the gateway, if any. */
+  lastError: string | null = null;
 
   private readonly url: string;
   private readonly passphrase: string;
@@ -132,6 +136,12 @@ export class WebSocketTransport implements BlitTransport {
 
   connect(): void {
     if (this.disposed) return;
+    // Cancel any pending auto-reconnect; manual connect takes priority.
+    if (this.reconnectTimer !== null) {
+      this.clearReconnectTimer();
+      this.currentDelay = this.initialDelay;
+    }
+    if (this._status === "connecting" || this._status === "authenticating" || this._status === "connected") return;
     this.setStatus("connecting");
 
     const socket = new WebSocket(this.url);
@@ -161,9 +171,19 @@ export class WebSocketTransport implements BlitTransport {
       if (typeof e.data === "string") {
         if (e.data === "ok") {
           authenticated = true;
+          this.authRejected = false;
+          this.lastError = null;
           this.currentDelay = this.initialDelay;
           this.setStatus("connected");
+        } else if (e.data === "auth") {
+          this.authRejected = true;
+          this.lastError = "Authentication failed";
+          this.setStatus("error");
+          socket.close();
         } else {
+          // Gateway sent an error (e.g. "error:cannot connect to blit-server")
+          this.authRejected = false;
+          this.lastError = e.data.startsWith("error:") ? e.data.slice(6) : e.data;
           this.setStatus("error");
           socket.close();
         }
@@ -187,9 +207,12 @@ export class WebSocketTransport implements BlitTransport {
       this.ws = null;
       if (authenticated) {
         this.setStatus("disconnected");
-        this.scheduleReconnect();
       } else {
-        this.setStatus("error");
+        this.setStatus(this.authRejected ? "error" : "disconnected");
+      }
+      // Always retry unless auth was explicitly rejected or reconnect is off.
+      if (!this.authRejected) {
+        this.scheduleReconnect();
       }
     };
   }

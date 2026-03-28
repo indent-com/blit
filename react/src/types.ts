@@ -22,6 +22,9 @@ export type ConnectionStatus =
   | "disconnected"
   | "error";
 
+export type ConnectionId = string;
+export type SessionId = string;
+
 /**
  * Transport abstraction for blit server communication.
  * Implementations handle the underlying protocol (WebSocket, WebTransport, etc.)
@@ -33,7 +36,7 @@ export type BlitTransportEventMap = {
 };
 
 export interface BlitTransport {
-  /** Start connecting. Call after registering listeners. */
+  /** Start connecting. Safe to call repeatedly. Call after registering listeners. */
   connect(): void;
   /** Send binary data to the server. */
   send(data: Uint8Array): void;
@@ -61,20 +64,50 @@ export interface BlitTransport {
   ): void;
 }
 
-/** A tracked PTY session. */
+/** A tracked terminal session. */
 export type BlitSession = {
+  id: SessionId;
+  connectionId: ConnectionId;
   ptyId: number;
   tag: string;
   title: string | null;
-  state: "active" | "exited" | "closed";
+  state: "creating" | "active" | "exited" | "closed";
 };
+
+export interface BlitConnectionSnapshot {
+  id: ConnectionId;
+  status: ConnectionStatus;
+  ready: boolean;
+  supportsRestart: boolean;
+  retryCount: number;
+  /** Non-null when the last connection attempt failed with an explicit error message. */
+  error: string | null;
+  sessions: readonly BlitSession[];
+  focusedSessionId: SessionId | null;
+}
+
+export interface BlitWorkspaceSnapshot {
+  connections: readonly BlitConnectionSnapshot[];
+  sessions: readonly BlitSession[];
+  focusedSessionId: SessionId | null;
+  ready: boolean;
+}
+
+export interface BlitSearchResult {
+  sessionId: SessionId;
+  connectionId: ConnectionId;
+  ptyId: number;
+  score: number;
+  primarySource: number;
+  matchedSources: number;
+  scrollOffset: number | null;
+  context: string;
+}
 
 /** Options for the BlitTerminal component. */
 export interface BlitTerminalProps {
-  /** Transport instance for server communication. Falls back to store.transport if omitted. */
-  transport?: BlitTransport;
-  /** PTY ID to display. If null, the component waits for a PTY to be created. */
-  ptyId: number | null;
+  /** Session ID to display. If null, the component renders an empty surface. */
+  sessionId: SessionId | null;
   /** CSS font family for the terminal. */
   fontFamily?: string;
   /** Font size in CSS pixels used for cell measurement. */
@@ -87,8 +120,6 @@ export interface BlitTerminalProps {
   palette?: TerminalPalette;
   /** When true, the terminal renders but never sends resize, input, or scroll commands. */
   readOnly?: boolean;
-  /** TerminalStore for centralized terminal management. Falls back to BlitProvider context if omitted. */
-  store?: import("./TerminalStore").TerminalStore;
   /** Called after each render frame. Receives the render duration in ms. */
   onRender?: (renderMs: number) => void;
   /** Scrollbar indicator color (CSS color string). Default: "rgba(255,255,255,0.3)" */
@@ -108,6 +139,7 @@ export const C2S_ACK = 0x03;
 export const C2S_DISPLAY_RATE = 0x04;
 export const C2S_CLIENT_METRICS = 0x05;
 export const C2S_MOUSE = 0x06;
+export const C2S_RESTART = 0x07;
 export const C2S_CREATE = 0x10;
 export const C2S_FOCUS = 0x11;
 export const C2S_CLOSE = 0x12;
@@ -133,3 +165,4 @@ export const S2C_EXITED = 0x08;
 
 export const PROTOCOL_VERSION = 1;
 export const FEATURE_CREATE_NONCE = 1 << 0;
+export const FEATURE_RESTART = 1 << 1;

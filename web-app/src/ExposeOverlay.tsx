@@ -3,15 +3,22 @@ import {
   useCallback,
   useEffect,
   useRef,
+  type KeyboardEvent,
 } from "react";
 import {
   BlitTerminal,
-  useBlitContext,
   SEARCH_SOURCE_TITLE,
   SEARCH_SOURCE_VISIBLE,
   SEARCH_SOURCE_SCROLLBACK,
+  useBlitContext,
+  useBlitWorkspace,
 } from "blit-react";
-import type { UseBlitSessionsReturn, SearchResult } from "blit-react";
+import type {
+  BlitSearchResult,
+  BlitSession,
+  SessionId,
+  TerminalPalette,
+} from "blit-react";
 import { overlayChromeStyles, themeFor, ui } from "./theme";
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 
@@ -23,92 +30,108 @@ const SOURCE_LABEL: Record<number, string> = {
 
 export function ExposeOverlay({
   sessions,
+  focusedSessionId,
   lru,
+  palette,
   onSelect,
   onClose,
   onCreate,
-  searchResultsCbRef,
 }: {
-  sessions: UseBlitSessionsReturn;
-  lru: number[];
-  onSelect: (id: number) => void;
+  sessions: readonly BlitSession[];
+  focusedSessionId: SessionId | null;
+  lru: SessionId[];
+  palette: TerminalPalette;
+  onSelect: (sessionId: SessionId) => void;
   onClose: () => void;
   onCreate: (command?: string) => void;
-  searchResultsCbRef: React.RefObject<((reqId: number, results: SearchResult[]) => void) | null>;
 }) {
-  // Sort by LRU: most recently focused first, then any not in LRU.
-  const notClosed = sessions.sessions.filter((s) => s.state !== "closed");
-  const lruIndex = new Map(lru.map((id, i) => [id, i]));
-  const visible = [...notClosed].sort((a, b) => {
-    const ai = lruIndex.get(a.ptyId) ?? Infinity;
-    const bi = lruIndex.get(b.ptyId) ?? Infinity;
-    return ai - bi;
+  const workspace = useBlitWorkspace();
+  const notClosed = sessions.filter((session) => session.state !== "closed");
+  const lruIndex = new Map(lru.map((id, index) => [id, index]));
+  const visible = [...notClosed].sort((left, right) => {
+    const leftIndex = lruIndex.get(left.id) ?? Infinity;
+    const rightIndex = lruIndex.get(right.id) ?? Infinity;
+    return leftIndex - rightIndex;
   });
-  const { palette, fontFamily: font } = useBlitContext();
-  const dark = palette?.dark ?? true;
-  const theme = themeFor(dark);
+
+  const { fontFamily: font } = useBlitContext();
+  const dark = palette.dark;
+  const theme = themeFor(palette);
   const chrome = overlayChromeStyles(theme, dark);
   const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<BlitSearchResult[] | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
-  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
   const requestIdRef = useRef(0);
 
   const isCommand = query.startsWith(">");
   const commandText = isCommand ? query.slice(1).trim() : "";
   const searching = !isCommand && query.length > 0;
+  const showConnectionBadge = new Set(notClosed.map((session) => session.connectionId)).size > 1;
 
   useEffect(() => {
     if (!searching) {
       setSearchResults(null);
       return;
     }
-    const id = (requestIdRef.current = (requestIdRef.current + 1) & 0xffff);
-    sessions.sendSearch(id, query);
-  }, [query, searching, sessions]);
 
-  const onSearchResultsRef = useRef<((reqId: number, results: SearchResult[]) => void) | null>(null);
-  onSearchResultsRef.current = (reqId: number, results: SearchResult[]) => {
-    if (reqId === requestIdRef.current) {
-      setSearchResults(results);
-    }
-  };
+    let cancelled = false;
+    const requestId = ++requestIdRef.current;
+    workspace.search(query).then((results) => {
+      if (!cancelled && requestId === requestIdRef.current) {
+        setSearchResults(results);
+      }
+    }).catch(() => {
+      if (!cancelled && requestId === requestIdRef.current) {
+        setSearchResults([]);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [query, searching, workspace]);
 
   useEffect(() => {
-    const handler = (reqId: number, results: SearchResult[]) => {
-      onSearchResultsRef.current?.(reqId, results);
-    };
-    (searchResultsCbRef as React.MutableRefObject<typeof handler | null>).current = handler;
-    return () => {
-      if (searchResultsCbRef.current === handler) {
-        (searchResultsCbRef as React.MutableRefObject<typeof handler | null>).current = null;
-      }
-    };
-  }, [searchResultsCbRef]);
+    searchRef.current?.focus();
+  }, []);
 
-  const sessionsByPtyId = new Map(visible.map((s) => [s.ptyId, s]));
-
-  const items: { ptyId: number; title: string; exited: boolean; context?: string; source?: number }[] = searching && searchResults
+  const sessionsById = new Map(visible.map((session) => [session.id, session]));
+  const items: Array<{
+    sessionId: SessionId;
+    ptyId: number;
+    connectionId: string;
+    title: string;
+    exited: boolean;
+    context?: string;
+    source?: number;
+  }> = searching && searchResults
     ? searchResults
-        .filter((r) => sessionsByPtyId.has(r.ptyId))
-        .map((r) => ({
-          ptyId: r.ptyId,
-          title: sessionsByPtyId.get(r.ptyId)!.title ?? `PTY ${r.ptyId}`,
-          exited: sessionsByPtyId.get(r.ptyId)!.state === "exited",
-          context: r.context,
-          source: r.primarySource,
-        }))
-    : visible.map((s) => ({
-        ptyId: s.ptyId,
-        title: s.title ?? `PTY ${s.ptyId}`,
-        exited: s.state === "exited",
+        .filter((result) => sessionsById.has(result.sessionId))
+        .map((result) => {
+          const session = sessionsById.get(result.sessionId)!;
+          return {
+            sessionId: result.sessionId,
+            ptyId: result.ptyId,
+            connectionId: result.connectionId,
+            title: session.title ?? session.tag ?? `PTY ${result.ptyId}`,
+            exited: session.state === "exited",
+            context: result.context,
+            source: result.primarySource,
+          };
+        })
+    : visible.map((session) => ({
+        sessionId: session.id,
+        ptyId: session.ptyId,
+        connectionId: session.connectionId,
+        title: session.title ?? session.tag ?? `PTY ${session.ptyId}`,
+        exited: session.state === "exited",
       }));
 
   const itemCount = isCommand ? 0 : items.length + 1;
-  // Default to the most recent PTY that isn't the currently focused one,
-  // so Cmd+K Enter switches back — like Alt-Tab.
-  const defaultIdx = items.findIndex((it) => it.ptyId !== sessions.focusedPtyId);
-  const [selectedIdx, setSelectedIdx] = useState(defaultIdx >= 0 ? defaultIdx : 0);
+  const altIdx = items.findIndex((item) => item.sessionId !== focusedSessionId);
+  const defaultIdx = altIdx >= 0 ? altIdx : items.length;
+  const [selectedIdx, setSelectedIdx] = useState(defaultIdx);
   const prevQueryRef = useRef(query);
 
   useEffect(() => {
@@ -118,71 +141,65 @@ export function ExposeOverlay({
     }
   }, [query]);
 
-  useEffect(() => {
-    searchRef.current?.focus();
-  }, []);
-
   const gridColsRef = useRef(1);
-
   useEffect(() => {
-    const ul = listRef.current;
-    if (!ul) return;
-    const style = getComputedStyle(ul);
+    const list = listRef.current;
+    if (!list) return;
+    const style = getComputedStyle(list);
     const cols = style.gridTemplateColumns
       .split(/\s+/)
-      .filter((s) => s && s !== "none").length;
+      .filter((value) => value && value !== "none").length;
     gridColsRef.current = Math.max(1, cols);
   });
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: KeyboardEvent) => {
       const gridCols = gridColsRef.current;
       switch (e.key) {
         case "ArrowRight":
           e.preventDefault();
-          setSelectedIdx((i) => (i + 1) % itemCount);
+          setSelectedIdx((index) => (index + 1) % itemCount);
           break;
         case "ArrowLeft":
           e.preventDefault();
-          setSelectedIdx((i) => (i - 1 + itemCount) % itemCount);
+          setSelectedIdx((index) => (index - 1 + itemCount) % itemCount);
           break;
         case "ArrowDown":
           e.preventDefault();
-          setSelectedIdx((i) => Math.min(i + gridCols, itemCount - 1));
+          setSelectedIdx((index) => Math.min(index + gridCols, itemCount - 1));
           break;
         case "ArrowUp":
           e.preventDefault();
-          setSelectedIdx((i) => Math.max(i - gridCols, 0));
+          setSelectedIdx((index) => Math.max(index - gridCols, 0));
           break;
-        case "Enter": {
+        case "Enter":
           e.preventDefault();
           if (isCommand) {
             onCreate(commandText || undefined);
           } else if (selectedIdx < items.length) {
-            onSelect(items[selectedIdx].ptyId);
+            onSelect(items[selectedIdx].sessionId);
           } else {
             onCreate();
           }
           break;
-        }
         case "w":
         case "W":
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
             if (!isCommand && selectedIdx < items.length) {
-              sessions.closePty(items[selectedIdx].ptyId);
-              setSelectedIdx((i) => Math.min(i, Math.max(0, items.length - 2)));
+              void workspace.closeSession(items[selectedIdx].sessionId);
+              setSelectedIdx((index) => Math.min(index, Math.max(0, items.length - 2)));
             }
           }
           break;
       }
     },
-    [selectedIdx, items, itemCount, isCommand, commandText, onSelect, onCreate, sessions],
+    [commandText, isCommand, itemCount, items, onCreate, onSelect, selectedIdx, workspace],
   );
 
   useEffect(() => {
-    const el = listRef.current?.children[selectedIdx] as HTMLElement | undefined;
-    el?.scrollIntoView({ block: "nearest" });
+    const element = listRef.current?.children[selectedIdx] as HTMLElement | undefined;
+    element?.scrollIntoView({ block: "nearest" });
   }, [selectedIdx]);
 
   const itemBg = (selected: boolean) =>
@@ -191,9 +208,9 @@ export function ExposeOverlay({
     selected ? theme.accent : theme.border;
 
   return (
-    <OverlayBackdrop dark={dark} label="Expose" onClose={onClose}>
+    <OverlayBackdrop palette={palette} label="Expose" onClose={onClose}>
       <OverlayPanel
-        dark={dark}
+        palette={palette}
         style={{
           width: "min(90vw, 900px)",
           maxWidth: 900,
@@ -201,12 +218,14 @@ export function ExposeOverlay({
           fontFamily: font,
         }}
       >
-        <header style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 12,
-        }}>
+        <header
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: 12,
+          }}
+        >
           <input
             ref={searchRef}
             type="text"
@@ -231,7 +250,6 @@ export function ExposeOverlay({
                 backgroundColor: theme.accent,
                 color: "#fff",
                 padding: "4px 10px",
-                borderRadius: 4,
                 fontSize: 13,
               }}
               onClick={() => onCreate(commandText || undefined)}
@@ -244,85 +262,158 @@ export function ExposeOverlay({
           </button>
         </header>
         {!isCommand && (
-        <ul ref={listRef} style={searching ? {
-          display: "grid",
-          gridTemplateColumns: "minmax(0, 1fr)",
-          gap: 8,
-          listStyle: "none",
-          padding: 0,
-          margin: 0,
-        } : {
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
-          gap: 12,
-          listStyle: "none",
-          padding: 0,
-          margin: 0,
-        }}>
-              {items.map((it, i) => (
-                <li
-                  key={it.ptyId}
-                  style={searching ? {
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    padding: "8px 12px",
-                    border: "1px solid",
-                    cursor: "pointer",
-                    listStyle: "none",
-                    borderColor: itemBorder(i === selectedIdx),
-                    backgroundColor: itemBg(i === selectedIdx),
-                  } : {
-                    border: "2px solid",
-                    overflow: "hidden",
-                    cursor: "pointer",
-                    borderColor: itemBorder(i === selectedIdx),
-                    backgroundColor: itemBg(i === selectedIdx),
-                  }}
-                  onClick={() => onSelect(it.ptyId)}
-                  onMouseEnter={() => setSelectedIdx(i)}
-                >
-                  {searching ? (
-                    <>
-                      <figure style={{ margin: 0, width: 120, height: 68, flexShrink: 0, overflow: "hidden" }}>
-                        <BlitTerminal
-                          ptyId={it.ptyId}
-                          readOnly
-                          style={{ width: "100%", height: "100%", pointerEvents: "none" }}
-                        />
-                      </figure>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{
+          <ul
+            ref={listRef}
+            style={searching
+              ? {
+                  display: "grid",
+                  gridTemplateColumns: "minmax(0, 1fr)",
+                  gap: 8,
+                  listStyle: "none",
+                  padding: 0,
+                  margin: 0,
+                }
+              : {
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+                  gap: 12,
+                  listStyle: "none",
+                  padding: 0,
+                  margin: 0,
+                }}
+          >
+            {items.map((item, index) => (
+              <li
+                key={item.sessionId}
+                style={searching
+                  ? {
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "8px 12px",
+                      border: "1px solid",
+                      cursor: "pointer",
+                      listStyle: "none",
+                      borderColor: itemBorder(index === selectedIdx),
+                      backgroundColor: itemBg(index === selectedIdx),
+                    }
+                  : {
+                      border: "2px solid",
+                      overflow: "hidden",
+                      cursor: "pointer",
+                      borderColor: itemBorder(index === selectedIdx),
+                      backgroundColor: itemBg(index === selectedIdx),
+                    }}
+                onClick={() => onSelect(item.sessionId)}
+                onMouseEnter={() => setSelectedIdx(index)}
+              >
+                {searching ? (
+                  <>
+                    <figure style={{ margin: 0, width: 120, height: 68, flexShrink: 0, overflow: "hidden" }}>
+                      <BlitTerminal
+                        sessionId={item.sessionId}
+                        readOnly
+                        style={{ width: "100%", height: "100%", pointerEvents: "none" }}
+                      />
+                    </figure>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span
+                          style={{
                             flex: 1,
                             overflow: "hidden",
                             textOverflow: "ellipsis",
-                            whiteSpace: "nowrap" as const,
+                            whiteSpace: "nowrap",
                             fontSize: 13,
-                          }}>{it.title}</span>
-                          {it.source != null && (
-                            <mark style={ui.badge}>{SOURCE_LABEL[it.source] ?? "Match"}</mark>
-                          )}
-                          {it.exited && (
-                            <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
-                          )}
-                          {it.ptyId === sessions.focusedPtyId && (
-                            <mark style={ui.badge}>Lead</mark>
-                          )}
-                        </div>
-                        {it.context && (
-                          <div style={{
+                          }}
+                        >
+                          {item.title}
+                        </span>
+                        {showConnectionBadge && (
+                          <mark style={ui.badge}>{item.connectionId}</mark>
+                        )}
+                        {item.source != null && (
+                          <mark style={ui.badge}>{SOURCE_LABEL[item.source] ?? "Match"}</mark>
+                        )}
+                        {item.exited && (
+                          <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
+                            Exited
+                          </mark>
+                        )}
+                        {item.sessionId === focusedSessionId && (
+                          <mark style={ui.badge}>Lead</mark>
+                        )}
+                      </div>
+                      {item.context && (
+                        <div
+                          style={{
                             fontSize: 11,
                             opacity: 0.6,
                             marginTop: 2,
                             overflow: "hidden",
                             textOverflow: "ellipsis",
-                            whiteSpace: "nowrap" as const,
-                          }}>
-                            {it.context}
-                          </div>
-                        )}
-                      </div>
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {item.context}
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      style={{
+                        background: "none",
+                        border: "none",
+                        color: "inherit",
+                        cursor: "pointer",
+                        opacity: 0.4,
+                        fontSize: 14,
+                        padding: "0 4px",
+                        fontFamily: "inherit",
+                      }}
+                      title="Close (Ctrl+W)"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void workspace.closeSession(item.sessionId);
+                      }}
+                    >
+                      x
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <header
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "6px 10px",
+                        fontSize: 12,
+                        opacity: 0.8,
+                        gap: 6,
+                      }}
+                    >
+                      <span
+                        style={{
+                          flex: 1,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          fontSize: 13,
+                        }}
+                      >
+                        {item.title}
+                      </span>
+                      {showConnectionBadge && (
+                        <mark style={ui.badge}>{item.connectionId}</mark>
+                      )}
+                      {item.exited && (
+                        <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
+                          Exited
+                        </mark>
+                      )}
+                      {item.sessionId === focusedSessionId && (
+                        <mark style={ui.badge}>Lead</mark>
+                      )}
                       <button
                         style={{
                           background: "none",
@@ -337,94 +428,53 @@ export function ExposeOverlay({
                         title="Close (Ctrl+W)"
                         onClick={(e) => {
                           e.stopPropagation();
-                          sessions.closePty(it.ptyId);
+                          void workspace.closeSession(item.sessionId);
                         }}
                       >
                         x
                       </button>
-                    </>
-                  ) : (
-                    <>
-                      <header style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        padding: "6px 10px",
-                        fontSize: 12,
-                        opacity: 0.8,
-                      }}>
-                        <span style={{
-                          flex: 1,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap" as const,
-                          fontSize: 13,
-                        }}>{it.title}</span>
-                        {it.exited && (
-                          <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>Exited</mark>
-                        )}
-                        {it.ptyId === sessions.focusedPtyId && (
-                          <mark style={ui.badge}>Lead</mark>
-                        )}
-                        <button
-                          style={{
-                            background: "none",
-                            border: "none",
-                            color: "inherit",
-                            cursor: "pointer",
-                            opacity: 0.4,
-                            fontSize: 14,
-                            padding: "0 4px",
-                            fontFamily: "inherit",
-                          }}
-                          title="Close (Ctrl+W)"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            sessions.closePty(it.ptyId);
-                          }}
-                        >
-                          x
-                        </button>
-                      </header>
-                      <figure style={{ margin: 0, overflow: "hidden" }}>
-                        <BlitTerminal
-                          ptyId={it.ptyId}
-                          readOnly
-                          style={{ width: "100%", height: "100%", pointerEvents: "none" }}
-                        />
-                      </figure>
-                    </>
-                  )}
-                </li>
-              ))}
-              <li
-                style={searching ? {
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "8px 12px",
-                  border: "1px solid",
-                  cursor: "pointer",
-                  listStyle: "none",
-                  borderColor: itemBorder(selectedIdx === items.length),
-                  backgroundColor: itemBg(selectedIdx === items.length),
-                } : {
-                  border: "2px solid",
-                  overflow: "hidden",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  minHeight: 120,
-                  borderColor: itemBorder(selectedIdx === items.length),
-                  backgroundColor: itemBg(selectedIdx === items.length),
-                }}
-                onClick={() => onCreate()}
-                onMouseEnter={() => setSelectedIdx(items.length)}
-              >
-                <span style={{ fontSize: searching ? 16 : 32, opacity: 0.5 }}>+</span>
+                    </header>
+                    <figure style={{ margin: 0, overflow: "hidden" }}>
+                      <BlitTerminal
+                        sessionId={item.sessionId}
+                        readOnly
+                        style={{ width: "100%", height: "100%", pointerEvents: "none" }}
+                      />
+                    </figure>
+                  </>
+                )}
               </li>
-        </ul>
+            ))}
+            <li
+              style={searching
+                ? {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "8px 12px",
+                    border: "1px solid",
+                    cursor: "pointer",
+                    listStyle: "none",
+                    borderColor: itemBorder(selectedIdx === items.length),
+                    backgroundColor: itemBg(selectedIdx === items.length),
+                  }
+                : {
+                    border: "2px solid",
+                    overflow: "hidden",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    minHeight: 120,
+                    borderColor: itemBorder(selectedIdx === items.length),
+                    backgroundColor: itemBg(selectedIdx === items.length),
+                  }}
+              onClick={() => onCreate()}
+              onMouseEnter={() => setSelectedIdx(items.length)}
+            >
+              <span style={{ fontSize: searching ? 16 : 32, opacity: 0.5 }}>+</span>
+            </li>
+          </ul>
         )}
       </OverlayPanel>
     </OverlayBackdrop>

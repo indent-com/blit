@@ -4,24 +4,26 @@ import {
   type HTMLAttributes,
   type ReactNode,
 } from "react";
+import type { TerminalPalette } from "blit-react";
 import { layout, overlayChromeStyles, themeFor } from "./theme";
 
 export function OverlayBackdrop({
-  dark,
+  palette,
   label,
   onClose,
   dismissOnBackdrop = true,
   children,
   style,
 }: {
-  dark: boolean;
+  palette: TerminalPalette;
   label: string;
   onClose?: () => void;
   dismissOnBackdrop?: boolean;
   children: ReactNode;
   style?: CSSProperties;
 }) {
-  const styles = overlayChromeStyles(themeFor(dark), dark);
+  const dark = palette.dark;
+  const styles = overlayChromeStyles(themeFor(palette), dark);
 
   return (
     <div
@@ -40,11 +42,15 @@ export function OverlayBackdrop({
   );
 }
 
-export const OverlayPanel = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement> & {
-  dark: boolean;
-}>(
-  function OverlayPanel({ dark, style, onClick, ...props }, ref) {
-    const styles = overlayChromeStyles(themeFor(dark), dark);
+export const OverlayPanel = forwardRef<
+  HTMLDivElement,
+  HTMLAttributes<HTMLDivElement> & {
+    palette: TerminalPalette;
+  }
+>(
+  function OverlayPanel({ palette, style, onClick, ...props }, ref) {
+    const dark = palette.dark;
+    const styles = overlayChromeStyles(themeFor(palette), dark);
 
     return (
       <div
@@ -65,21 +71,22 @@ export const OverlayPanel = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
 );
 
 export function OverlayHeader({
-  dark,
+  palette,
   title,
   subtitle,
   actions,
   onClose,
   closeLabel = "Esc",
 }: {
-  dark: boolean;
+  palette: TerminalPalette;
   title: ReactNode;
   subtitle?: ReactNode;
   actions?: ReactNode;
   onClose?: () => void;
   closeLabel?: string;
 }) {
-  const styles = overlayChromeStyles(themeFor(dark), dark);
+  const dark = palette.dark;
+  const styles = overlayChromeStyles(themeFor(palette), dark);
 
   return (
     <header style={styles.header}>

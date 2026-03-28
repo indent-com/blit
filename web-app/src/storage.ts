@@ -28,21 +28,26 @@ export function writeStorage(key: string, value: string) {
   } catch {}
 }
 
-/** Base path for API requests, derived from the page URL. Handles reverse proxy prefixes like /vt/. */
-export const basePath = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
+/** Gateway host — in dev mode, Vite injects VITE_BLIT_GATEWAY to point to the gateway port. */
+const gatewayHost = import.meta.env.VITE_BLIT_GATEWAY ?? location.host;
+
+/** Base path for API requests. In dev mode, points to the gateway; in production, relative to the page. */
+export const basePath = gatewayHost !== location.host
+  ? `//${gatewayHost}/`
+  : (location.pathname.endsWith("/") ? location.pathname : location.pathname + "/");
 
 export function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return proto + "//" + location.host + location.pathname;
+  return proto + "//" + gatewayHost + location.pathname;
 }
 
 export function wtUrl(): string {
-  return "https://" + location.host + location.pathname;
+  return "https://" + gatewayHost + location.pathname;
 }
 
 /** SHA-256 cert hash injected by the gateway for self-signed certs. */
 export function wtCertHash(): string | undefined {
-  return (window as Record<string, unknown>).__blitCertHash as string | undefined;
+  return (window as unknown as { __blitCertHash?: string }).__blitCertHash;
 }
 
 export function preferredPalette(): TerminalPalette {

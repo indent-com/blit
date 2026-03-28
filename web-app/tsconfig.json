@@ -4,13 +4,19 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
+    "types": ["vite/client"],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "blit-react": ["../react/src/index.ts"],
+      "blit-browser": ["../browser/pkg/blit_browser.d.ts"]
+    }
   },
   "include": ["src"]
 }

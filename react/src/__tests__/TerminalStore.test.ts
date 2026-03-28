@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { BlitWasmModule } from "../TerminalStore";
-import { TerminalStore } from "../TerminalStore";
+import { TerminalStore, type TerminalStoreDelegate } from "../TerminalStore";
 import { MockTransport } from "./mock-transport";
 import { C2S_ACK, C2S_CLIENT_METRICS } from "../types";
 
@@ -13,6 +13,7 @@ class FakeTerminal {
   ) {}
 
   set_font_family(_fontFamily: string): void {}
+  set_font_size(_fontSize: number): void {}
   set_default_colors(
     _fgR: number,
     _fgG: number,
@@ -33,13 +34,18 @@ const wasm = {
 describe("TerminalStore client metrics", () => {
   it("reports applied-frame backlog and clears it after render", async () => {
     const transport = new MockTransport();
-    const store = new TerminalStore(transport, wasm);
-    await Promise.resolve();
+    const delegate: TerminalStoreDelegate = {
+      send: (data) => transport.send(data),
+      getStatus: () => transport.status,
+    };
+    const store = new TerminalStore(delegate, wasm);
 
-    transport.pushUpdate(7, new Uint8Array([1, 2, 3]));
-    await Promise.resolve();
+    // Simulate connected status
+    store.handleStatusChange("connected");
+    transport.sent = [];
 
-    expect(transport.sent[0]).toEqual(new Uint8Array([C2S_ACK]));
+    store.handleUpdate(7, new Uint8Array([1, 2, 3]));
+    await Promise.resolve();
 
     const appliedMetrics = transport.sent.find(
       (msg) => msg[0] === C2S_CLIENT_METRICS,
@@ -55,11 +61,18 @@ describe("TerminalStore client metrics", () => {
     store.noteFrameRendered();
     await Promise.resolve();
 
-    const clearedMetrics = transport.sent[transport.sent.length - 1];
-    expect(clearedMetrics[0]).toBe(C2S_CLIENT_METRICS);
+    const acksAfterRender = transport.sent.filter(
+      (msg) => msg[0] === C2S_ACK,
+    );
+    expect(acksAfterRender.length).toBeGreaterThan(0);
+
+    const clearedMetrics = transport.sent
+      .filter((msg) => msg[0] === C2S_CLIENT_METRICS)
+      .pop()!;
+    expect(clearedMetrics).toBeTruthy();
     expect((clearedMetrics[1] | (clearedMetrics[2] << 8)) >>> 0).toBe(0);
     expect((clearedMetrics[3] | (clearedMetrics[4] << 8)) >>> 0).toBe(0);
 
-    store.dispose();
+    store.destroy();
   });
 });

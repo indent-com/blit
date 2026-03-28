@@ -45,6 +45,8 @@ static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag
 struct Config {
     passphrase: String,
     sock_path: String,
+    /// CORS origin for font routes. None = no CORS, Some("*") = allow all.
+    cors_origin: Option<String>,
     /// Live cert hash for WebTransport. Updated on cert rotation.
     wt_cert_hash: std::sync::RwLock<Option<String>>,
 }
@@ -93,6 +95,7 @@ async fn main() {
             println!("  BLIT_ADDR       Listen address (default: 0.0.0.0:3264)");
             println!("  BLIT_SOCK       Upstream server socket");
             println!("  BLIT_FONT_DIRS  Colon-separated extra font directories");
+            println!("  BLIT_CORS       CORS origin for font routes (* or specific origin)");
             println!("  BLIT_QUIC       Set to 1 to enable WebTransport (QUIC/HTTP3)");
             println!("  BLIT_TLS_CERT   PEM certificate file (for WebTransport)");
             println!("  BLIT_TLS_KEY    PEM private key file (for WebTransport)");
@@ -120,9 +123,12 @@ async fn main() {
         .map(|v| v == "1")
         .unwrap_or(false);
 
+    let cors_origin = std::env::var("BLIT_CORS").ok();
+
     let state: AppState = Arc::new(Config {
         passphrase,
         sock_path,
+        cors_origin,
         wt_cert_hash: std::sync::RwLock::new(None),
     });
 
@@ -170,7 +176,7 @@ fn build_app(state: AppState) -> axum::Router {
 async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let path = request.uri().path();
 
-    if let Some(resp) = blit_webserver::try_font_route(path) {
+    if let Some(resp) = blit_webserver::try_font_route(path, state.cors_origin.as_deref()) {
         return resp;
     }
 
@@ -230,9 +236,9 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         match ws.recv().await {
             Some(Ok(Message::Text(pass))) => {
                 if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
-                    let _ = ws.send(Message::Text("ok".into())).await;
                     break true;
                 } else {
+                    let _ = ws.send(Message::Text("auth".into())).await;
                     let _ = ws.close().await;
                     break false;
                 }
@@ -252,9 +258,12 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot connect to blit-server: {e}");
+            let _ = ws.send(Message::Text(format!("error:{e}").into())).await;
+            let _ = ws.close().await;
             return;
         }
     };
+    let _ = ws.send(Message::Text("ok".into())).await;
     let (mut sock_reader, mut sock_writer) = stream.into_split();
     let (mut ws_tx, mut ws_rx) = ws.split();
 
@@ -584,6 +593,7 @@ mod tests {
         let state: AppState = Arc::new(Config {
             passphrase: "test".into(),
             sock_path: "/nonexistent.sock".into(),
+            cors_origin: None,
             wt_cert_hash: std::sync::RwLock::new(None),
         });
         build_app(state)

@@ -9,15 +9,11 @@ import {
 import type { Terminal } from "blit-browser";
 import type {
   BlitTerminalProps,
-  ConnectionStatus,
   TerminalPalette,
 } from "./types";
+import type { ConnectionStatus } from "./types";
 import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
 import {
-  buildInputMessage,
-  buildResizeMessage,
-  buildScrollMessage,
-  buildMouseMessage,
   MOUSE_DOWN,
   MOUSE_UP,
   MOUSE_MOVE,
@@ -27,7 +23,9 @@ import {
   cssFontFamily,
   type CellMetrics,
 } from "./hooks/useBlitTerminal";
-import { useBlitContext } from "./BlitContext";
+import { useBlitContext, useRequiredBlitWorkspace } from "./BlitContext";
+import { useBlitConnection } from "./hooks/useBlitConnection";
+import { useBlitSession } from "./hooks/useBlitSession";
 import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, encoder } from "./keyboard";
 
@@ -60,15 +58,15 @@ export interface BlitTerminalHandle {
 export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
   function BlitTerminal(props, ref) {
     const ctx = useBlitContext();
-    const store = props.store ?? ctx.store;
-    if (!store) {
-      throw new Error(
-        "BlitTerminal requires a store prop or a BlitProvider ancestor",
-      );
+    const workspace = useRequiredBlitWorkspace();
+    const session = useBlitSession(props.sessionId);
+    const connection = useBlitConnection(session?.connectionId);
+    const store = session ? workspace.getConnection(session.connectionId)?.getStore() ?? null : null;
+    if (props.sessionId !== null && (!session || !connection || !store)) {
+      throw new Error(`Unknown blit session ${props.sessionId}`);
     }
-    const transport = props.transport ?? ctx.transport ?? store.transport;
     const {
-      ptyId,
+      sessionId,
       fontFamily = ctx.fontFamily ?? DEFAULT_FONT,
       fontSize = ctx.fontSize ?? DEFAULT_FONT_SIZE,
       className,
@@ -79,6 +77,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       scrollbarColor = "rgba(255,255,255,0.3)",
       scrollbarWidth = 4,
     } = props;
+    const ptyId = session?.ptyId ?? null;
 
     // Refs for DOM elements.
     const containerRef = useRef<HTMLDivElement>(null);
@@ -146,7 +145,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // Connection callbacks — BlitTerminal only cares about UPDATE (rendering)
     // -----------------------------------------------------------------------
 
-    const [status, setStatus] = useState<ConnectionStatus>(transport.status);
+    const status: ConnectionStatus = connection?.status ?? "disconnected";
 
     const reconcilePrediction = useCallback(() => {
       const t = terminalRef.current;
@@ -176,6 +175,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     }, []);
 
     useEffect(() => {
+      if (!store) return;
       const syncReadOnlySize = (t: Terminal) => {
         const tr = t.rows;
         const tc = t.cols;
@@ -198,49 +198,48 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         reconcilePrediction();
         if (readOnly) syncReadOnlySize(t);
       });
+      // Check for a terminal that was created between render and this effect.
       if (ptyId !== null) {
         const t = store.getTerminal(ptyId);
         if (t) {
-          terminalRef.current = t;
-          applyPaletteToTerminal(t);
+          if (terminalRef.current !== t) {
+            terminalRef.current = t;
+            applyPaletteToTerminal(t);
+          }
+          contentDirtyRef.current = true;
+          scheduleRender();
           if (readOnly) syncReadOnlySize(t);
         }
       }
-      const onStatus = (s: ConnectionStatus) => setStatus(s);
-      transport.addEventListener("statuschange", onStatus);
-      setStatus(transport.status);
       return () => {
         unsub();
-        transport.removeEventListener("statuschange", onStatus);
       };
     }, [
-      transport,
       ptyId,
       readOnly,
       store,
       reconcilePrediction,
       applyPaletteToTerminal,
     ]);
-
     const sendInput = useCallback(
-      (id: number, data: Uint8Array) => {
-        transport.send(buildInputMessage(id, data));
+      (id: string, data: Uint8Array) => {
+        workspace.sendInput(id, data);
       },
-      [transport],
+      [workspace],
     );
 
     const sendResize = useCallback(
-      (id: number, rows: number, cols: number) => {
-        transport.send(buildResizeMessage(id, rows, cols));
+      (id: string, rows: number, cols: number) => {
+        workspace.resizeSession(id, rows, cols);
       },
-      [transport],
+      [workspace],
     );
 
     const sendScroll = useCallback(
-      (id: number, offset: number) => {
-        transport.send(buildScrollMessage(id, offset));
+      (id: string, offset: number) => {
+        workspace.scrollSession(id, offset);
       },
-      [transport],
+      [workspace],
     );
 
     // -----------------------------------------------------------------------
@@ -272,6 +271,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
+      if (!store) {
+        setWasmReady(false);
+        return;
+      }
       const unsub = store.onReady(() => setWasmReady(true));
       if (store.isReady()) setWasmReady(true);
       return unsub;
@@ -294,6 +297,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     }, [dpr]);
 
     useEffect(() => {
+      if (!store) return;
+      const rasterFontSize = fontSize * dpr;
       const apply = (forceInvalidate = false) => {
         const cell = measureCell(fontFamily, fontSize);
         const changed =
@@ -305,8 +310,11 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           if (t) {
             t.set_cell_size(cell.pw, cell.ph);
             t.set_font_family(fontFamily);
+            t.set_font_size(rasterFontSize);
             if (shouldInvalidate) t.invalidate_render_cache();
           }
+          store.setFontFamily(fontFamily);
+          store.setFontSize(rasterFontSize);
           store.setCellSize(cell.pw, cell.ph);
         }
         if (shouldInvalidate) {
@@ -351,6 +359,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
+      if (!store) return;
       const shared = store.getSharedRenderer();
       if (shared) rendererRef.current = shared.renderer;
     }, [store]);
@@ -360,6 +369,10 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
+      if (!store) {
+        terminalRef.current = null;
+        return;
+      }
       if (ptyId !== null) {
         store.retain(ptyId);
         const t = store.getTerminal(ptyId);
@@ -370,6 +383,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             const cell = cellRef.current;
             t.set_cell_size(cell.pw, cell.ph);
             t.set_font_family(fontFamily);
+            t.set_font_size(fontSize * dpr);
           }
           contentDirtyRef.current = true;
           scheduleRender();
@@ -381,7 +395,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         terminalRef.current = null;
         if (ptyId !== null) store.release(ptyId);
       };
-    }, [wasmReady, ptyId, store, fontFamily, readOnly, applyPaletteToTerminal]);
+    }, [wasmReady, ptyId, store, fontFamily, fontSize, readOnly, applyPaletteToTerminal]);
 
     // -----------------------------------------------------------------------
     // Palette changes
@@ -414,8 +428,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           colsRef.current = cols;
           contentDirtyRef.current = true;
           scheduleRender();
-          if (ptyId !== null) {
-            sendResize(ptyId, rows, cols);
+          if (sessionId !== null) {
+            sendResize(sessionId, rows, cols);
           }
         }
       };
@@ -436,10 +450,21 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // -----------------------------------------------------------------------
 
     useEffect(() => {
+      if (!store) return;
       doRenderRef.current = () => {
         const t0 = performance.now();
-        if (!rendererRef.current?.supported) return;
-        if (!terminalRef.current) return;
+        if (!rendererRef.current?.supported) {
+          const shared = store.getSharedRenderer();
+          if (shared) rendererRef.current = shared.renderer;
+          if (!rendererRef.current?.supported) {
+            if (!readOnly) store.noteFrameRendered();
+            return;
+          }
+        }
+        if (!terminalRef.current) {
+          if (!readOnly) store.noteFrameRendered();
+          return;
+        }
 
         {
           const t = terminalRef.current;
@@ -673,7 +698,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       if (!input || readOnly) return;
 
       const handleKeyDown = (e: KeyboardEvent) => {
-        if (ptyId === null || status !== "connected") return;
+        if (e.defaultPrevented) return;
+        if (sessionId === null || status !== "connected") return;
         if (e.isComposing) return;
         if (e.key === "Dead") return;
 
@@ -685,7 +711,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             e.preventDefault();
             const delta = e.key === "PageUp" ? rowsRef.current : -rowsRef.current;
             scrollOffsetRef.current = Math.max(0, Math.min(maxScroll, scrollOffsetRef.current + delta));
-            sendScroll(ptyId, scrollOffsetRef.current);
+            sendScroll(sessionId, scrollOffsetRef.current);
             scrollFadeRef.current = 1;
             if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
             scrollFadeTimerRef.current = setTimeout(() => { scrollFadeRef.current = 0; scheduleRender(); }, 1000);
@@ -700,7 +726,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           if (maxScroll > 0 || scrollOffsetRef.current > 0) {
             e.preventDefault();
             scrollOffsetRef.current = e.key === "Home" ? maxScroll : 0;
-            sendScroll(ptyId, scrollOffsetRef.current);
+            sendScroll(sessionId, scrollOffsetRef.current);
             scrollFadeRef.current = 1;
             if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
             scrollFadeTimerRef.current = setTimeout(() => { scrollFadeRef.current = 0; scheduleRender(); }, 1000);
@@ -716,7 +742,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           e.preventDefault();
           if (scrollOffsetRef.current > 0) {
             scrollOffsetRef.current = 0;
-            sendScroll(ptyId, 0);
+            sendScroll(sessionId, 0);
           }
           if (
             t &&
@@ -735,13 +761,13 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           } else {
             predictedRef.current = "";
           }
-          sendInput(ptyId, bytes);
+          sendInput(sessionId, bytes);
         }
       };
 
       const handleCompositionEnd = (e: CompositionEvent) => {
-        if (e.data && ptyId !== null && status === "connected") {
-          sendInput(ptyId, encoder.encode(e.data));
+        if (e.data && sessionId !== null && status === "connected") {
+          sendInput(sessionId, encoder.encode(e.data));
         }
         input.value = "";
       };
@@ -752,19 +778,19 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           if (
             inputEvent.inputType === "deleteContentBackward" &&
             !input.value &&
-            ptyId !== null &&
+            sessionId !== null &&
             status === "connected"
           ) {
-            sendInput(ptyId, new Uint8Array([0x7f]));
+            sendInput(sessionId, new Uint8Array([0x7f]));
           }
           return;
         }
         if (inputEvent.inputType === "deleteContentBackward" && !input.value) {
-          if (ptyId !== null && status === "connected") {
-            sendInput(ptyId, new Uint8Array([0x7f]));
+          if (sessionId !== null && status === "connected") {
+            sendInput(sessionId, new Uint8Array([0x7f]));
           }
-        } else if (input.value && ptyId !== null && status === "connected") {
-          sendInput(ptyId, encoder.encode(input.value.replace(/\n/g, "\r")));
+        } else if (input.value && sessionId !== null && status === "connected") {
+          sendInput(sessionId, encoder.encode(input.value.replace(/\n/g, "\r")));
         }
         input.value = "";
       };
@@ -778,7 +804,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         input.removeEventListener("compositionend", handleCompositionEnd);
         input.removeEventListener("input", handleInput);
       };
-    }, [ptyId, status, readOnly, sendInput, sendScroll]);
+    }, [sessionId, status, readOnly, sendInput, sendScroll]);
 
     // -----------------------------------------------------------------------
     // Mouse input
@@ -786,7 +812,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
     useEffect(() => {
       const canvas = glCanvasRef.current;
-      if (!canvas || readOnly) return;
+      if (!canvas || readOnly || !store) return;
 
       function mouseToCell(e: MouseEvent): { row: number; col: number } {
         const rect = canvas!.getBoundingClientRect();
@@ -819,12 +845,12 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
       function scrollToCanvasY(y: number) {
         const geo = scrollbarGeoRef.current;
-        if (!geo || ptyId === null || status !== "connected") return;
+        if (!geo || sessionId === null || status !== "connected") return;
         const fraction = 1 - y / (geo.canvasH - geo.barH);
         const maxScroll = geo.totalLines - geo.viewportRows;
         const offset = Math.round(Math.max(0, Math.min(maxScroll, fraction * maxScroll)));
         scrollOffsetRef.current = offset;
-        sendScroll(ptyId, offset);
+        sendScroll(sessionId, offset);
         scrollFadeRef.current = 1;
         scheduleRender();
       }
@@ -837,7 +863,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         e: MouseEvent,
         button: number,
       ): boolean {
-        if (ptyId === null || status !== "connected") return false;
+        if (sessionId === null || status !== "connected") return false;
         // Quick client-side check to avoid unnecessary messages.
         // The server does the authoritative check.
         const t = terminalRef.current;
@@ -845,7 +871,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
 
         const pos = mouseToCell(e);
         const typeCode = type === "down" ? MOUSE_DOWN : type === "up" ? MOUSE_UP : MOUSE_MOVE;
-        transport.send(buildMouseMessage(ptyId, typeCode, button, pos.col, pos.row));
+        workspace.sendMouse(sessionId, typeCode, button, pos.col, pos.row);
         return true;
       }
 
@@ -1099,7 +1125,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           e.preventDefault();
           const button = e.deltaY < 0 ? 64 : 65;
           sendMouseEvent("down", e, button);
-        } else if (ptyId !== null && status === "connected") {
+        } else if (sessionId !== null && status === "connected") {
           const t2 = terminalRef.current;
           const maxScroll = t2 ? t2.scrollback_lines() : 0;
           if (maxScroll === 0 && scrollOffsetRef.current === 0) return; // nothing to scroll
@@ -1111,7 +1137,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             0,
             Math.min(maxScroll, scrollOffsetRef.current + lines),
           );
-          sendScroll(ptyId, scrollOffsetRef.current);
+          sendScroll(sessionId, scrollOffsetRef.current);
           if (scrollOffsetRef.current > 0) {
             scrollFadeRef.current = 1;
             if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
@@ -1208,8 +1234,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       const handleBlur = () => {
         if (mouseDownButton >= 0) {
           // Synthetic release at (0,0) — server handles encoding + mode check
-          if (ptyId !== null && status === "connected") {
-            transport.send(buildMouseMessage(ptyId, MOUSE_UP, mouseDownButton, 0, 0));
+          if (sessionId !== null && status === "connected") {
+            workspace.sendMouse(sessionId, MOUSE_UP, mouseDownButton, 0, 0);
           }
           mouseDownButton = -1;
         }
@@ -1241,7 +1267,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         canvas.removeEventListener("click", handleClick);
         if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
       };
-    }, [ptyId, status, sendInput, sendScroll]);
+    }, [ptyId, sessionId, status, sendScroll, store, workspace, readOnly]);
 
     // -----------------------------------------------------------------------
     // Render

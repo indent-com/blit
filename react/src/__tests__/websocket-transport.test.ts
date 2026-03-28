@@ -89,8 +89,10 @@ describe("WebSocketTransport", () => {
     vi.unstubAllGlobals();
   });
 
-  it("constructor immediately connects and sets status to connecting", () => {
+  it("starts as disconnected and connects on connect()", () => {
     const transport = new WebSocketTransport("ws://localhost:1234", "secret");
+    expect(transport.status).toBe("disconnected");
+    transport.connect();
     expect(MockWebSocket.instances).toHaveLength(1);
     expect(latestSocket().url).toBe("ws://localhost:1234");
     expect(transport.status).toBe("connecting");
@@ -102,6 +104,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "mypass");
     transport.addEventListener("statuschange", (s) => statuses.push(s));
 
+    transport.connect();
     latestSocket().simulateOpen();
 
     expect(transport.status).toBe("authenticating");
@@ -115,6 +118,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass");
     transport.addEventListener("statuschange", (s) => statuses.push(s));
 
+    transport.connect();
     authenticateTransport(transport);
 
     expect(transport.status).toBe("connected");
@@ -122,17 +126,39 @@ describe("WebSocketTransport", () => {
     transport.close();
   });
 
-  it("transitions to error and closes socket on non-ok auth response", () => {
+  it("transitions to error on auth rejection", () => {
     const statuses: string[] = [];
     const transport = new WebSocketTransport("ws://host", "pass");
     transport.addEventListener("statuschange", (s) => statuses.push(s));
 
+    transport.connect();
     const ws = latestSocket();
     ws.simulateOpen();
-    ws.simulateMessage("denied");
+    ws.simulateMessage("auth");
 
     expect(statuses).toContain("error");
+    expect(transport.authRejected).toBe(true);
+    expect(transport.lastError).toBe("Authentication failed");
     expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+    transport.close();
+  });
+
+  it("transitions to error on server error and retries", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
+      reconnectDelay: 500,
+    });
+    transport.connect();
+    const ws = latestSocket();
+    ws.simulateOpen();
+    ws.simulateMessage("error:cannot connect to blit-server");
+
+    expect(transport.authRejected).toBe(false);
+    expect(transport.lastError).toBe("cannot connect to blit-server");
+
+    // Server errors trigger reconnect (unlike auth rejection)
+    const instancesBefore = MockWebSocket.instances.length;
+    vi.advanceTimersByTime(500);
+    expect(MockWebSocket.instances.length).toBe(instancesBefore + 1);
     transport.close();
   });
 
@@ -141,6 +167,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass");
     transport.addEventListener("message", (data) => received.push(data));
 
+    transport.connect();
     const ws = authenticateTransport(transport);
 
     const buf = new ArrayBuffer(4);
@@ -156,6 +183,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass");
     transport.addEventListener("message", (data) => received.push(data));
 
+    transport.connect();
     const ws = latestSocket();
     ws.simulateOpen();
     ws.simulateMessage(new ArrayBuffer(4));
@@ -168,6 +196,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 1000,
     });
+    transport.connect();
     const ws = authenticateTransport(transport);
 
     const instancesBefore = MockWebSocket.instances.length;
@@ -182,20 +211,22 @@ describe("WebSocketTransport", () => {
     transport.close();
   });
 
-  it("does not reconnect on close before auth", () => {
+  it("reconnects on close before auth (not rejected)", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 500,
     });
+    transport.connect();
     const ws = latestSocket();
     ws.simulateOpen();
 
     const instancesBefore = MockWebSocket.instances.length;
     ws.simulateClose();
 
-    expect(transport.status).toBe("error");
+    // Close before auth response is treated as transient — reconnects
+    expect(transport.status).toBe("disconnected");
 
-    vi.advanceTimersByTime(5000);
-    expect(MockWebSocket.instances.length).toBe(instancesBefore);
+    vi.advanceTimersByTime(500);
+    expect(MockWebSocket.instances.length).toBe(instancesBefore + 1);
     transport.close();
   });
 
@@ -204,6 +235,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass");
     transport.addEventListener("statuschange", (s) => statuses.push(s));
 
+    transport.connect();
     latestSocket().simulateError();
 
     expect(transport.status).toBe("error");
@@ -212,6 +244,7 @@ describe("WebSocketTransport", () => {
 
   it("send() works when connected", () => {
     const transport = new WebSocketTransport("ws://host", "pass");
+    transport.connect();
     const ws = authenticateTransport(transport);
 
     const data = new Uint8Array([1, 2, 3]);
@@ -224,6 +257,7 @@ describe("WebSocketTransport", () => {
 
   it("send() is a no-op when not connected", () => {
     const transport = new WebSocketTransport("ws://host", "pass");
+    transport.connect();
     const ws = latestSocket();
 
     transport.send(new Uint8Array([1, 2, 3]));
@@ -235,6 +269,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 500,
     });
+    transport.connect();
     authenticateTransport(transport);
 
     transport.close();
@@ -253,6 +288,7 @@ describe("WebSocketTransport", () => {
       maxReconnectDelay: 10000,
     });
 
+    transport.connect();
     let ws = authenticateTransport(transport);
     ws.simulateClose();
 
@@ -283,6 +319,7 @@ describe("WebSocketTransport", () => {
       maxReconnectDelay: 10000,
     });
 
+    transport.connect();
     let ws = authenticateTransport(transport);
     ws.simulateClose();
 
@@ -304,6 +341,7 @@ describe("WebSocketTransport", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnect: false,
     });
+    transport.connect();
     const ws = authenticateTransport(transport);
 
     const countBefore = MockWebSocket.instances.length;
@@ -321,6 +359,7 @@ describe("WebSocketTransport", () => {
     transport.addEventListener("message", cb);
     transport.removeEventListener("message", cb);
 
+    transport.connect();
     const ws = authenticateTransport(transport);
     ws.simulateMessage(new ArrayBuffer(4));
 
@@ -335,6 +374,7 @@ describe("WebSocketTransport", () => {
     transport.addEventListener("message", cb1);
     transport.addEventListener("message", cb2);
 
+    transport.connect();
     const ws = authenticateTransport(transport);
     ws.simulateMessage(new ArrayBuffer(4));
 

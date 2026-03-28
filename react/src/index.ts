@@ -1,27 +1,22 @@
 export { BlitTerminal } from "./BlitTerminal";
 export type { BlitTerminalHandle } from "./BlitTerminal";
 
-export { useBlitConnection } from "./hooks/useBlitConnection";
+export { createBlitWorkspace, BlitWorkspace } from "./BlitWorkspace";
 export type {
-  BlitConnectionCallbacks,
-  PtyListEntry,
-  SearchResult,
-} from "./hooks/useBlitConnection";
+  AddBlitConnectionOptions,
+  CreateBlitWorkspaceOptions,
+  CreateWorkspaceSessionOptions,
+} from "./BlitWorkspace";
 export {
   SEARCH_SOURCE_TITLE,
   SEARCH_SOURCE_VISIBLE,
   SEARCH_SOURCE_SCROLLBACK,
-  SEARCH_MATCH_TITLE,
-  SEARCH_MATCH_VISIBLE,
-  SEARCH_MATCH_SCROLLBACK,
-} from "./hooks/useBlitConnection";
+} from "./BlitConnection";
 
+export { useBlitConnection } from "./hooks/useBlitConnection";
 export { useBlitSessions } from "./hooks/useBlitSessions";
-export type {
-  UseBlitSessionsOptions,
-  UseBlitSessionsReturn,
-  UseBlitSessionsFn,
-} from "./hooks/useBlitSessions";
+export { useBlitWorkspace, useBlitWorkspaceState } from "./hooks/useBlitWorkspace";
+export { useBlitFocusedSession } from "./hooks/useBlitSession";
 
 export { measureCell, CSS_GENERIC } from "./hooks/useBlitTerminal";
 export type { CellMetrics } from "./hooks/useBlitTerminal";
@@ -40,38 +35,23 @@ export {
   DEFAULT_FONT_SIZE,
 } from "./types";
 export type {
+  BlitConnectionSnapshot,
+  BlitSearchResult,
+  BlitWorkspaceSnapshot,
   BlitTransport,
-  BlitTransportEventMap,
-  BlitTerminalProps,
   BlitSession,
+  ConnectionId,
   ConnectionStatus,
+  SessionId,
   TerminalPalette,
 } from "./types";
 
 export { PALETTES } from "./palettes";
 
-export { TerminalStore } from "./TerminalStore";
-export type { BlitWasmModule, TerminalDirtyListener } from "./TerminalStore";
-
-export { BlitProvider, useBlitContext } from "./BlitContext";
-export type { BlitContextValue, BlitProviderProps } from "./BlitContext";
+export type { BlitWasmModule } from "./TerminalStore";
 
 export {
-  buildAckMessage,
-  buildInputMessage,
-  buildResizeMessage,
-  buildScrollMessage,
-  buildFocusMessage,
-  buildCloseMessage,
-  buildSubscribeMessage,
-  buildUnsubscribeMessage,
-  buildSearchMessage,
-  buildCreate2Message,
-  buildDisplayRateMessage,
-  buildClientMetricsMessage,
-} from "./protocol";
-
-export { createGlRenderer } from "./gl-renderer";
-export type { GlRenderer } from "./gl-renderer";
-
-export { keyToBytes } from "./keyboard";
+  BlitWorkspaceProvider,
+  useBlitContext,
+} from "./BlitContext";
+export type { BlitContextValue, BlitProviderProps } from "./BlitContext";

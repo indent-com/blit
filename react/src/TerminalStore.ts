@@ -1,6 +1,6 @@
 import type { Terminal } from "blit-browser";
-import { S2C_UPDATE, DEFAULT_FONT } from "./types";
-import type { BlitTransport, TerminalPalette } from "./types";
+import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
+import type { ConnectionStatus, TerminalPalette } from "./types";
 import {
   buildAckMessage,
   buildClientMetricsMessage,
@@ -14,6 +14,11 @@ export type BlitWasmModule = typeof import("blit-browser");
 
 export type TerminalDirtyListener = (ptyId: number) => void;
 
+export interface TerminalStoreDelegate {
+  send(data: Uint8Array): void;
+  getStatus(): ConnectionStatus;
+}
+
 export class TerminalStore {
   private mod: BlitWasmModule | null = null;
   private terminals = new Map<number, Terminal>();
@@ -22,16 +27,15 @@ export class TerminalStore {
   private pendingFree = new Set<number>();
   private subscribed = new Set<number>();
   private desired = new Set<number>();
-  private _transport: BlitTransport;
+  private readonly delegate: TerminalStoreDelegate;
   private dirtyListeners = new Set<TerminalDirtyListener>();
   private leadPtyId: number | null = null;
   private fontFamily = DEFAULT_FONT;
+  private fontSize = DEFAULT_FONT_SIZE;
   private cellPw = 1;
   private cellPh = 1;
   private palette: TerminalPalette | null = null;
   private disposed = false;
-  private onMessage: (data: ArrayBuffer) => void;
-  private onStatus: (status: string) => void;
   private ready = false;
   private readyListeners = new Set<() => void>();
   private frozenPtys = new Set<number>();
@@ -47,65 +51,16 @@ export class TerminalStore {
   private applyMsX10 = 0;
   private metricsFlushQueued = false;
   private metricsHeartbeat: ReturnType<typeof setInterval> | null = null;
+  private pendingAcks = 0;
   /** Queued compressed payloads per PTY, drained in the rAF callback. */
   private pendingFrames = new Map<number, Uint8Array[]>();
 
-  constructor(transport: BlitTransport, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
-    this._transport = transport;
-
-    this.onMessage = (data: ArrayBuffer) => {
-      const bytes = new Uint8Array(data);
-      if (bytes.length < 3 || bytes[0] !== S2C_UPDATE) return;
-      const ptyId = bytes[1] | (bytes[2] << 8);
-      // ACK every frame immediately — don't gate on rendering.
-      this._transport.send(buildAckMessage());
-      // Buffer frames for frozen PTYs (e.g. during selection).
-      if (this.frozenPtys.has(ptyId)) {
-        let buf = this.frozenBuffers.get(ptyId);
-        if (!buf) {
-          buf = [];
-          this.frozenBuffers.set(ptyId, buf);
-        }
-        buf.push(new Uint8Array(bytes.subarray(3)));
-        return;
-      }
-      const applyStart = this.nowMs();
-      let t = this.terminals.get(ptyId);
-      if (!t) {
-        if (!this.mod) return;
-        t = this.createTerminal();
-        this.terminals.set(ptyId, t);
-        const stale = this.staleTerminals.get(ptyId);
-        if (stale) {
-          this.staleTerminals.delete(ptyId);
-          stale.free();
-        }
-      }
-      t.feed_compressed(bytes.subarray(3));
-      this.noteAppliedFrame(this.nowMs() - applyStart);
-      for (const l of this.dirtyListeners) l(ptyId);
-    };
-
-    this.onStatus = (status: string) => {
-      if (status === "connected") {
-        this.resetClientMetrics();
-        this.flushClientMetrics();
-        this.resync();
-        this.startMetricsHeartbeat();
-      } else if (status === "disconnected" || status === "error") {
-        this.subscribed.clear();
-        this.resetClientMetrics();
-        this.stopMetricsHeartbeat();
-      }
-    };
-
-    transport.addEventListener("message", this.onMessage);
-    transport.addEventListener("statuschange", this.onStatus);
+  constructor(delegate: TerminalStoreDelegate, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
+    this.delegate = delegate;
     this.startRafProbe();
 
-    const resolved = wasm instanceof Promise ? wasm : Promise.resolve(wasm);
-    resolved
-      .then((mod) => {
+    if (wasm instanceof Promise) {
+      wasm.then((mod) => {
         if (this.disposed) return;
         this.mod = mod;
         this.ready = true;
@@ -114,10 +69,10 @@ export class TerminalStore {
       .catch((err) => {
         console.error("blit: failed to load WASM module:", err);
       });
-  }
-
-  get transport(): BlitTransport {
-    return this._transport;
+    } else {
+      this.mod = wasm;
+      this.ready = true;
+    }
   }
 
   private nowMs(): number {
@@ -165,8 +120,8 @@ export class TerminalStore {
   }
 
   private flushClientMetrics(): void {
-    if (this.disposed || this._transport.status !== "connected") return;
-    this._transport.send(
+    if (this.disposed || this.delegate.getStatus() !== "connected") return;
+    this.delegate.send(
       buildClientMetricsMessage(
         Math.min(this.pendingAppliedFrames, 0xffff),
         Math.min(this.ackAheadFrames, 0xffff),
@@ -216,11 +171,56 @@ export class TerminalStore {
   private createTerminal(): Terminal {
     const t = new this.mod!.Terminal(24, 80, this.cellPw, this.cellPh);
     if (typeof t.set_font_family === "function") t.set_font_family(this.fontFamily);
+    if (typeof t.set_font_size === "function") t.set_font_size(this.fontSize);
     if (this.palette) {
       t.set_default_colors(...this.palette.fg, ...this.palette.bg);
       for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...this.palette.ansi[i]);
     }
     return t;
+  }
+
+  handleUpdate(ptyId: number, payload: Uint8Array): void {
+    this.pendingAcks++;
+    // Buffer frames for frozen PTYs (e.g. during selection).
+    if (this.frozenPtys.has(ptyId)) {
+      let buf = this.frozenBuffers.get(ptyId);
+      if (!buf) {
+        buf = [];
+        this.frozenBuffers.set(ptyId, buf);
+      }
+      buf.push(new Uint8Array(payload));
+      return;
+    }
+
+    const applyStart = this.nowMs();
+    let terminal = this.terminals.get(ptyId);
+    if (!terminal) {
+      if (!this.mod) return;
+      terminal = this.createTerminal();
+      this.terminals.set(ptyId, terminal);
+      const stale = this.staleTerminals.get(ptyId);
+      if (stale) {
+        this.staleTerminals.delete(ptyId);
+        stale.free();
+      }
+    }
+    terminal.feed_compressed(payload);
+    this.noteAppliedFrame(this.nowMs() - applyStart);
+    for (const listener of this.dirtyListeners) listener(ptyId);
+  }
+
+  handleStatusChange(status: ConnectionStatus): void {
+    if (status === "connected") {
+      this.resetClientMetrics();
+      this.flushClientMetrics();
+      this.resync();
+      this.startMetricsHeartbeat();
+    } else if (status === "disconnected" || status === "error") {
+      this.subscribed.clear();
+      this.resetClientMetrics();
+      this.pendingAcks = 0;
+      this.stopMetricsHeartbeat();
+    }
   }
 
   getTerminal(ptyId: number): Terminal | null {
@@ -235,6 +235,13 @@ export class TerminalStore {
     this.fontFamily = fontFamily;
     for (const t of this.terminals.values()) {
       t.set_font_family(fontFamily);
+    }
+  }
+
+  setFontSize(fontSize: number): void {
+    this.fontSize = fontSize;
+    for (const t of this.terminals.values()) {
+      t.set_font_size(fontSize);
     }
   }
 
@@ -273,7 +280,13 @@ export class TerminalStore {
 
   /** Mark the latest applied terminal state as painted to the screen. */
   noteFrameRendered(): void {
-    if (this.pendingAppliedFrames === 0 && this.ackAheadFrames === 0) return;
+    // Send ACKs now that the frames have been rendered — not before.
+    // This keeps ACKs in sync with actual rendering, so the server's
+    // RTT measurement reflects render time and backlog stays accurate.
+    while (this.pendingAcks > 0 && this.delegate.getStatus() === "connected") {
+      this.pendingAcks--;
+      this.delegate.send(buildAckMessage());
+    }
     this.pendingAppliedFrames = 0;
     this.ackAheadFrames = 0;
     this.queueClientMetricsFlush();
@@ -412,7 +425,7 @@ export class TerminalStore {
   }
 
   private syncSubscriptions(): void {
-    if (this._transport.status !== "connected") return;
+    if (this.delegate.getStatus() !== "connected") return;
     for (const id of this.desired) {
       if (!this.subscribed.has(id)) {
         this.subscribed.add(id);
@@ -424,13 +437,13 @@ export class TerminalStore {
           this.terminals.delete(id);
           this.staleTerminals.set(id, old);
         }
-        this._transport.send(buildSubscribeMessage(id));
+        this.delegate.send(buildSubscribeMessage(id));
       }
     }
     for (const id of this.subscribed) {
       if (!this.desired.has(id)) {
         this.subscribed.delete(id);
-        this._transport.send(buildUnsubscribeMessage(id));
+        this.delegate.send(buildUnsubscribeMessage(id));
         // Don't free the terminal — BlitTerminal may still hold a ref.
         // It will be freed on PTY close or store dispose.
       }
@@ -438,8 +451,8 @@ export class TerminalStore {
   }
 
   private sendDisplayFps(): void {
-    if (this.displayFps > 0 && this._transport.status === "connected") {
-      this._transport.send(buildDisplayRateMessage(this.displayFps));
+    if (this.displayFps > 0 && this.delegate.getStatus() === "connected") {
+      this.delegate.send(buildDisplayRateMessage(this.displayFps));
     }
   }
 
@@ -482,12 +495,11 @@ export class TerminalStore {
     this.syncSubscriptions();
   }
 
-  dispose(): void {
+  /** Permanently destroy the store — free all WASM terminals and GL resources. */
+  destroy(): void {
     this.disposed = true;
     this.stopRafProbe();
     this.stopMetricsHeartbeat();
-    this._transport.removeEventListener("message", this.onMessage);
-    this._transport.removeEventListener("statuschange", this.onStatus);
     for (const t of this.terminals.values()) t.free();
     this.terminals.clear();
     for (const t of this.staleTerminals.values()) t.free();

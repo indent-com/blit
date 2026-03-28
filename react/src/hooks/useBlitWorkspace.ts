@@ -1,13 +1,16 @@
 import { useSyncExternalStore } from "react";
-import type { BlitSession } from "../types";
+import type { BlitWorkspaceSnapshot } from "../types";
 import { useRequiredBlitWorkspace } from "../BlitContext";
 
-export function useBlitSessions(): readonly BlitSession[] {
+export function useBlitWorkspace() {
+  return useRequiredBlitWorkspace();
+}
+
+export function useBlitWorkspaceState(): BlitWorkspaceSnapshot {
   const workspace = useRequiredBlitWorkspace();
-  const snapshot = useSyncExternalStore(
+  return useSyncExternalStore(
     workspace.subscribe,
     workspace.getSnapshot,
     workspace.getSnapshot,
   );
-  return snapshot.sessions;
 }

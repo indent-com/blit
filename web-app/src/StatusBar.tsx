@@ -1,69 +1,95 @@
-import { useState, useCallback, useRef, useEffect, type RefObject } from "react";
-import type { UseBlitSessionsReturn, TerminalPalette, TerminalStore } from "blit-react";
+import { useRef, useEffect, type RefObject } from "react";
+import type {
+  BlitSession,
+  ConnectionStatus,
+  TerminalPalette,
+} from "blit-react";
 import { formatBw } from "./useMetrics";
 import type { Metrics, RenderSample, NetSample } from "./useMetrics";
+import { themeFor, ui, z } from "./theme";
 
 type TimelineRef = RefObject<RenderSample[]>;
 type NetRef = RefObject<NetSample[]>;
-import { themeFor, ui } from "./theme";
+type DebugStats = {
+  displayFps: number;
+  pendingApplied: number;
+  ackAhead: number;
+  applyMs: number;
+  mouseMode: number;
+  mouseEncoding: number;
+  terminals: number;
+  staleTerminals: number;
+  subscribed: number;
+  frozenPtys: number;
+  pendingFrameQueues: number;
+  totalPendingFrames: number;
+} | null;
+
+function rgba([r, g, b]: [number, number, number], alpha: number): string {
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
 
 export function StatusBar({
   sessions,
+  focusedSession,
+  status,
   metrics,
   palette,
   termSize,
   fontLoading,
   debug,
   toggleDebug,
-  store,
+  debugStats,
   timelineRef,
   netRef,
   onExpose,
   onPalette,
   onFont,
 }: {
-  sessions: UseBlitSessionsReturn;
+  sessions: readonly BlitSession[];
+  focusedSession: BlitSession | null;
+  status: ConnectionStatus;
   metrics: Metrics;
   palette: TerminalPalette;
   termSize: string | null;
   fontLoading: boolean;
   debug: boolean;
   toggleDebug: () => void;
-  store: TerminalStore;
+  debugStats: DebugStats;
   timelineRef: TimelineRef;
   netRef: NetRef;
   onExpose: () => void;
   onPalette: () => void;
   onFont: () => void;
 }) {
-  const theme = themeFor(palette.dark);
-  const visible = sessions.sessions.filter((s) => s.state !== "closed");
-  const exited = visible.filter((s) => s.state === "exited").length;
-  const focused = sessions.sessions.find((s) => s.ptyId === sessions.focusedPtyId);
+  const theme = themeFor(palette);
+  const visible = sessions.filter((session) => session.state !== "closed");
+  const exited = visible.filter((session) => session.state === "exited").length;
+
   return (
     <>
       <button onClick={onExpose} style={ui.btn} title="Expose (Cmd+K)">
         {visible.length} PTY{visible.length !== 1 ? "s" : ""}
         {exited > 0 && <span style={{ opacity: 0.5 }}> ({exited} exited)</span>}
       </button>
-      <span style={{
-        flex: 1,
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-        opacity: 0.7,
-      }}>
-        {focused && (
+      <span
+        style={{
+          flex: 1,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          opacity: 0.7,
+        }}
+      >
+        {focusedSession && (
           <>
-            {focused.title ?? `PTY ${focused.ptyId}`}
-            {focused.state === "exited" && (
-              <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)", marginLeft: 6 }}>Exited</mark>
-            )}
+            {focusedSession.title ?? focusedSession.tag ?? `PTY ${focusedSession.ptyId}`}
           </>
         )}
       </span>
       <span style={{ fontSize: 11, opacity: 0.5, flexShrink: 0, whiteSpace: "nowrap" }}>
-        {termSize ? `${termSize}@` : ""}{metrics.fps}/{metrics.ups}
+        {termSize ? `${termSize}@` : ""}
+        {metrics.fps}/{metrics.ups}
       </span>
       <button onClick={toggleDebug} style={{ ...ui.btn, opacity: debug ? 1 : 0.3 }} title="Debug stats">
         &#x1F41B;
@@ -76,60 +102,103 @@ export function StatusBar({
       </button>
       <span
         role="status"
-        aria-label={sessions.status}
+        aria-label={status}
+        title={status}
         style={{
           width: 6,
           height: 6,
           borderRadius: "50%",
           flexShrink: 0,
-          backgroundColor: sessions.status === "connected" ? theme.success : theme.error,
+          backgroundColor:
+            status === "connected"
+              ? theme.success
+              : status === "connecting" || status === "authenticating"
+                ? theme.warning
+                : theme.error,
         }}
       />
-      {debug && <DebugPanel metrics={metrics} store={store} dark={palette.dark} timelineRef={timelineRef} netRef={netRef} focusedPtyId={sessions.focusedPtyId} />}
+      {debug && (
+        <DebugPanel
+          metrics={metrics}
+          debugStats={debugStats}
+          palette={palette}
+          timelineRef={timelineRef}
+          netRef={netRef}
+        />
+      )}
     </>
   );
 }
 
-function DebugPanel({ metrics, store, dark, timelineRef, netRef, focusedPtyId }: { metrics: Metrics; store: TerminalStore; dark: boolean; timelineRef: TimelineRef; netRef: NetRef; focusedPtyId: number | null }) {
-  const s = store.getDebugStats(focusedPtyId);
-  const theme = themeFor(dark);
+function DebugPanel({
+  metrics,
+  debugStats,
+  palette,
+  timelineRef,
+  netRef,
+}: {
+  metrics: Metrics;
+  debugStats: DebugStats;
+  palette: TerminalPalette;
+  timelineRef: TimelineRef;
+  netRef: NetRef;
+}) {
+  const stats = debugStats ?? {
+    displayFps: 0,
+    pendingApplied: 0,
+    ackAhead: 0,
+    applyMs: 0,
+    mouseMode: 0,
+    mouseEncoding: 0,
+    terminals: 0,
+    staleTerminals: 0,
+    subscribed: 0,
+    frozenPtys: 0,
+    pendingFrameQueues: 0,
+    totalPendingFrames: 0,
+  };
+  const theme = themeFor(palette);
+  const dark = palette.dark;
+
   return (
-    <div style={{
-      position: "fixed",
-      top: 0,
-      right: 0,
-      backgroundColor: dark ? "rgba(20,20,20,0.7)" : "rgba(245,245,245,0.7)",
-      backdropFilter: "blur(6px)",
-      WebkitBackdropFilter: "blur(6px)",
-      color: theme.fg,
-      borderLeft: `1px solid ${dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)"}`,
-      borderBottom: `1px solid ${dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)"}`,
-      padding: "6px 10px",
-      fontSize: 11,
-      fontFamily: "ui-monospace, monospace",
-      lineHeight: 1.6,
-      zIndex: 200,
-      whiteSpace: "pre",
-      pointerEvents: "none",
-      minWidth: 260,
-    }}>
+    <div
+      style={{
+        position: "fixed",
+        top: 0,
+        right: 0,
+        backgroundColor: rgba(palette.bg, dark ? 0.78 : 0.84),
+        backdropFilter: "blur(6px)",
+        WebkitBackdropFilter: "blur(6px)",
+        color: theme.fg,
+        borderLeft: `1px solid ${theme.subtleBorder}`,
+        borderBottom: `1px solid ${theme.subtleBorder}`,
+        padding: "6px 10px",
+        fontSize: 11,
+        fontFamily: "ui-monospace, monospace",
+        lineHeight: 1.6,
+        zIndex: z.debugPanel,
+        whiteSpace: "pre",
+        pointerEvents: "none",
+        minWidth: 260,
+      }}
+    >
       <Row label="FPS / UPS" value={`${metrics.fps} / ${metrics.ups}`} />
       <Row label="Bandwidth" value={formatBw(metrics.bw)} />
       <Row label="Render" value={`${metrics.renderMs.toFixed(1)} ms avg, ${metrics.maxRenderMs.toFixed(1)} ms max`} />
-      <Row label="Display Hz" value={s.displayFps} />
-      <Row label="Backlog" value={s.pendingApplied} />
-      <Row label="Ack ahead" value={s.ackAhead} />
-      <Row label="Apply" value={`${s.applyMs.toFixed(1)} ms`} />
-      <Row label="Mouse" value={`mode=${s.mouseMode} enc=${s.mouseEncoding}`} />
-      <Row label="Queued" value={`${s.totalPendingFrames} frames in ${s.pendingFrameQueues} queues`} />
-      <Row label="Terminals" value={`${s.terminals} live, ${s.staleTerminals} stale, ${s.frozenPtys} frozen`} />
-      <div style={{ borderTop: `1px solid ${dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)"}`, marginTop: 4, paddingTop: 2 }}>
+      <Row label="Display Hz" value={stats.displayFps} />
+      <Row label="Backlog" value={stats.pendingApplied} />
+      <Row label="Ack ahead" value={stats.ackAhead} />
+      <Row label="Apply" value={`${stats.applyMs.toFixed(1)} ms`} />
+      <Row label="Mouse" value={`mode=${stats.mouseMode} enc=${stats.mouseEncoding}`} />
+      <Row label="Queued" value={`${stats.totalPendingFrames} frames in ${stats.pendingFrameQueues} queues`} />
+      <Row label="Terminals" value={`${stats.terminals} live, ${stats.staleTerminals} stale, ${stats.frozenPtys} frozen`} />
+      <div style={{ borderTop: `1px solid ${theme.subtleBorder}`, marginTop: 4, paddingTop: 2 }}>
         <span style={{ opacity: 0.6, fontSize: 10 }}>Render</span>
-        <RenderTimeline timelineRef={timelineRef} dark={dark} displayFps={s.displayFps} />
+        <RenderTimeline timelineRef={timelineRef} palette={palette} displayFps={stats.displayFps} />
       </div>
-      <div style={{ borderTop: `1px solid ${dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)"}`, marginTop: 4, paddingTop: 2 }}>
+      <div style={{ borderTop: `1px solid ${theme.subtleBorder}`, marginTop: 4, paddingTop: 2 }}>
         <span style={{ opacity: 0.6, fontSize: 10 }}>Network</span>
-        <NetTimeline netRef={netRef} dark={dark} />
+        <NetTimeline netRef={netRef} palette={palette} />
       </div>
     </div>
   );
@@ -144,12 +213,24 @@ function Row({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function RenderTimeline({ timelineRef, dark, displayFps }: { timelineRef: TimelineRef; dark: boolean; displayFps: number }) {
+function RenderTimeline({
+  timelineRef,
+  palette,
+  displayFps,
+}: {
+  timelineRef: TimelineRef;
+  palette: TerminalPalette;
+  displayFps: number;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
   const W = 300;
   const H = 80;
   const dpr = typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1;
+  const fg = palette.fg;
+  const success = palette.ansi[2] ?? palette.fg;
+  const warning = palette.ansi[3] ?? palette.fg;
+  const error = palette.ansi[1] ?? palette.fg;
 
   useEffect(() => {
     const draw = () => {
@@ -170,8 +251,7 @@ function RenderTimeline({ timelineRef, dark, displayFps }: { timelineRef: Timeli
       const maxMs = 20;
       const budgetMs = displayFps > 0 ? 1000 / displayFps : 16.67;
 
-      // Budget line
-      ctx.strokeStyle = dark ? "rgba(255,80,80,0.4)" : "rgba(200,0,0,0.3)";
+      ctx.strokeStyle = rgba(error, 0.45);
       ctx.lineWidth = dpr;
       const budgetY = (1 - budgetMs / maxMs) * H * dpr;
       ctx.beginPath();
@@ -179,23 +259,21 @@ function RenderTimeline({ timelineRef, dark, displayFps }: { timelineRef: Timeli
       ctx.lineTo(W * dpr, budgetY);
       ctx.stroke();
 
-      // Render bars
-      for (const s of samples) {
-        const age = now - s.t;
+      for (const sample of samples) {
+        const age = now - sample.t;
         if (age > windowMs || age < 0) continue;
         const x = ((windowMs - age) / windowMs) * W * dpr;
-        const barH = Math.min(s.ms / maxMs, 1) * H * dpr;
+        const barH = Math.min(sample.ms / maxMs, 1) * H * dpr;
         const y = H * dpr - barH;
 
-        if (s.ms < budgetMs) ctx.fillStyle = dark ? "rgba(80,200,120,0.8)" : "rgba(40,160,80,0.8)";
-        else if (s.ms < budgetMs * 2) ctx.fillStyle = dark ? "rgba(255,200,60,0.8)" : "rgba(200,160,0,0.8)";
-        else ctx.fillStyle = dark ? "rgba(255,80,80,0.8)" : "rgba(200,40,40,0.8)";
+        if (sample.ms < budgetMs) ctx.fillStyle = rgba(success, 0.82);
+        else if (sample.ms < budgetMs * 2) ctx.fillStyle = rgba(warning, 0.82);
+        else ctx.fillStyle = rgba(error, 0.82);
 
         ctx.fillRect(x, y, Math.max(1, dpr), barH);
       }
 
-      // Labels
-      ctx.fillStyle = dark ? "rgba(255,255,255,0.4)" : "rgba(0,0,0,0.4)";
+      ctx.fillStyle = rgba(fg, 0.45);
       ctx.font = `${9 * dpr}px ui-monospace, monospace`;
       ctx.textBaseline = "top";
       ctx.fillText(`${maxMs}ms`, 2 * dpr, 2 * dpr);
@@ -209,7 +287,7 @@ function RenderTimeline({ timelineRef, dark, displayFps }: { timelineRef: Timeli
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [timelineRef, dark, dpr, displayFps]);
+  }, [displayFps, dpr, error, fg, success, timelineRef, warning]);
 
   return (
     <canvas
@@ -221,12 +299,21 @@ function RenderTimeline({ timelineRef, dark, displayFps }: { timelineRef: Timeli
   );
 }
 
-function NetTimeline({ netRef, dark }: { netRef: NetRef; dark: boolean }) {
+function NetTimeline({
+  netRef,
+  palette,
+}: {
+  netRef: NetRef;
+  palette: TerminalPalette;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
   const W = 300;
   const H = 50;
   const dpr = typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1;
+  const fg = palette.fg;
+  const rx = palette.ansi[12] ?? palette.ansi[6] ?? palette.fg;
+  const tx = palette.ansi[11] ?? palette.ansi[3] ?? palette.fg;
 
   useEffect(() => {
     const draw = () => {
@@ -244,59 +331,45 @@ function NetTimeline({ netRef, dark }: { netRef: NetRef; dark: boolean }) {
 
       const now = performance.now();
       const windowMs = 2000;
-      // Auto-scale: find max bytes in the window
       let maxBytes = 256;
-      for (const s of samples) {
-        if (now - s.t <= windowMs) maxBytes = Math.max(maxBytes, s.bytes);
+      for (const sample of samples) {
+        if (now - sample.t <= windowMs) maxBytes = Math.max(maxBytes, sample.bytes);
       }
 
       const midY = (H * dpr) / 2;
 
-      // Center line
-      ctx.strokeStyle = dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)";
+      ctx.strokeStyle = rgba(fg, 0.12);
       ctx.lineWidth = dpr;
       ctx.beginPath();
       ctx.moveTo(0, midY);
       ctx.lineTo(W * dpr, midY);
       ctx.stroke();
 
-      // Draw events: rx above center, tx below
-      for (const s of samples) {
-        const age = now - s.t;
+      for (const sample of samples) {
+        const age = now - sample.t;
         if (age > windowMs || age < 0) continue;
         const x = ((windowMs - age) / windowMs) * W * dpr;
-        const barH = Math.max(1, (s.bytes / maxBytes) * midY * 0.9);
-
-        if (s.dir === "rx") {
-          ctx.fillStyle = dark ? "rgba(100,180,255,0.7)" : "rgba(40,100,200,0.7)";
-          ctx.fillRect(x, midY - barH, Math.max(1, dpr), barH);
-        } else {
-          ctx.fillStyle = dark ? "rgba(255,160,80,0.7)" : "rgba(200,100,20,0.7)";
-          ctx.fillRect(x, midY, Math.max(1, dpr), barH);
-        }
+        const barH = Math.min(sample.bytes / maxBytes, 1) * (H * dpr * 0.45);
+        const y = sample.dir === "rx" ? midY - barH : midY;
+        ctx.fillStyle = sample.dir === "rx"
+          ? rgba(rx, 0.82)
+          : rgba(tx, 0.82);
+        ctx.fillRect(x, y, Math.max(1, dpr), barH);
       }
 
-      // Labels
-      ctx.fillStyle = dark ? "rgba(255,255,255,0.4)" : "rgba(0,0,0,0.4)";
+      ctx.fillStyle = rgba(fg, 0.45);
       ctx.font = `${9 * dpr}px ui-monospace, monospace`;
       ctx.textBaseline = "top";
-      ctx.fillStyle = dark ? "rgba(100,180,255,0.5)" : "rgba(40,100,200,0.5)";
-      ctx.fillText("rx", 2 * dpr, 2 * dpr);
+      ctx.fillText(formatBw(maxBytes).replace("/s", ""), 2 * dpr, 2 * dpr);
       ctx.textBaseline = "bottom";
-      ctx.fillStyle = dark ? "rgba(255,160,80,0.5)" : "rgba(200,100,20,0.5)";
+      ctx.fillText("rx", 2 * dpr, midY - 2 * dpr);
       ctx.fillText("tx", 2 * dpr, H * dpr - 2 * dpr);
-      // Max scale
-      ctx.textBaseline = "top";
-      ctx.textAlign = "right";
-      ctx.fillStyle = dark ? "rgba(255,255,255,0.3)" : "rgba(0,0,0,0.3)";
-      ctx.fillText(formatBw(maxBytes), (W - 2) * dpr, 2 * dpr);
-      ctx.textAlign = "left";
 
       rafRef.current = requestAnimationFrame(draw);
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [netRef, dark, dpr]);
+  }, [dpr, fg, netRef, rx, tx]);
 
   return (
     <canvas

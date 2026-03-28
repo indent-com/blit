@@ -28,6 +28,7 @@ pub fn font_dirs() -> Vec<String> {
 pub struct FontInfo {
     pub family: String,
     pub subfamily: String,
+    pub is_monospace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,21 +38,22 @@ pub struct FontVariant {
     pub style: String,
 }
 
-/// Read font family and subfamily from a TTF/OTF/TTC file's `name` table.
-fn read_font_info(data: &[u8]) -> Option<FontInfo> {
+fn sfnt_offset(data: &[u8]) -> Option<usize> {
     if data.len() < 12 {
         return None;
     }
-
-    let offset = if &data[0..4] == b"ttcf" {
+    if &data[0..4] == b"ttcf" {
         if data.len() < 16 {
             return None;
         }
-        u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize
+        Some(u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize)
     } else {
-        0
-    };
+        Some(0)
+    }
+}
 
+fn table_slice<'a>(data: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+    let offset = sfnt_offset(data)?;
     if offset + 12 > data.len() {
         return None;
     }
@@ -59,29 +61,81 @@ fn read_font_info(data: &[u8]) -> Option<FontInfo> {
     if offset + 12 + num_tables * 16 > data.len() {
         return None;
     }
-
-    let mut name_offset = 0usize;
-    let mut name_length = 0usize;
     for i in 0..num_tables {
         let rec = offset + 12 + i * 16;
-        if &data[rec..rec + 4] == b"name" {
-            name_offset =
-                u32::from_be_bytes([data[rec + 8], data[rec + 9], data[rec + 10], data[rec + 11]])
-                    as usize;
-            name_length = u32::from_be_bytes([
+        if &data[rec..rec + 4] == tag {
+            let table_offset = u32::from_be_bytes([
+                data[rec + 8],
+                data[rec + 9],
+                data[rec + 10],
+                data[rec + 11],
+            ]) as usize;
+            let table_length = u32::from_be_bytes([
                 data[rec + 12],
                 data[rec + 13],
                 data[rec + 14],
                 data[rec + 15],
             ]) as usize;
-            break;
+            let table_end = table_offset.checked_add(table_length)?;
+            if table_end > data.len() {
+                return None;
+            }
+            return Some(&data[table_offset..table_end]);
         }
     }
-    if name_offset == 0 || name_offset + name_length > data.len() {
-        return None;
+    None
+}
+
+fn read_is_monospace(data: &[u8]) -> bool {
+    if let Some(post) = table_slice(data, b"post") {
+        if post.len() >= 16 {
+            let is_fixed_pitch = u32::from_be_bytes([post[12], post[13], post[14], post[15]]);
+            if is_fixed_pitch != 0 {
+                return true;
+            }
+        }
     }
 
-    let tbl = &data[name_offset..];
+    let Some(hhea) = table_slice(data, b"hhea") else {
+        return false;
+    };
+    let Some(hmtx) = table_slice(data, b"hmtx") else {
+        return false;
+    };
+    if hhea.len() < 36 {
+        return false;
+    }
+    let num_long_metrics = u16::from_be_bytes([hhea[34], hhea[35]]) as usize;
+    if num_long_metrics == 0 {
+        return false;
+    }
+    let Some(metrics_len) = num_long_metrics.checked_mul(4) else {
+        return false;
+    };
+    if hmtx.len() < metrics_len {
+        return false;
+    }
+
+    let mut reference_width: Option<u16> = None;
+    for i in 0..num_long_metrics {
+        let idx = i * 4;
+        let advance = u16::from_be_bytes([hmtx[idx], hmtx[idx + 1]]);
+        if advance == 0 {
+            continue;
+        }
+        match reference_width {
+            Some(width) if width != advance => return false,
+            Some(_) => {}
+            None => reference_width = Some(advance),
+        }
+    }
+
+    reference_width.is_some()
+}
+
+/// Read font family and subfamily from a TTF/OTF/TTC file's `name` table.
+fn read_font_info(data: &[u8]) -> Option<FontInfo> {
+    let tbl = table_slice(data, b"name")?;
     if tbl.len() < 6 {
         return None;
     }
@@ -157,6 +211,7 @@ fn read_font_info(data: &[u8]) -> Option<FontInfo> {
     Some(FontInfo {
         family: family?,
         subfamily: subfamily.unwrap_or_else(|| "Regular".to_owned()),
+        is_monospace: read_is_monospace(data),
     })
 }
 
@@ -279,6 +334,13 @@ pub fn list_font_families() -> Vec<String> {
     list_via_name_tables()
 }
 
+pub fn list_monospace_font_families() -> Vec<String> {
+    if let Some(families) = list_monospace_via_fc_list() {
+        return families;
+    }
+    list_monospace_via_name_tables()
+}
+
 fn list_via_fc_list() -> Option<Vec<String>> {
     let output = std::process::Command::new("fc-list")
         .args(["--format", "%{family}\n"])
@@ -312,6 +374,56 @@ fn list_via_name_tables() -> Vec<String> {
     families.into_iter().collect()
 }
 
+fn list_monospace_via_fc_list() -> Option<Vec<String>> {
+    let output = std::process::Command::new("fc-list")
+        .args(["--format", "%{file}\t%{family}\n"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut families = BTreeSet::new();
+    let mut seen_paths = BTreeSet::new();
+    for line in text.lines() {
+        let Some((path, names)) = line.split_once('\t') else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || !seen_paths.insert(path.to_owned()) {
+            continue;
+        }
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        let Some(info) = read_font_info(&data) else {
+            continue;
+        };
+        if !info.is_monospace {
+            continue;
+        }
+        for name in names.split(',') {
+            let name = name.trim();
+            if !name.is_empty() {
+                families.insert(name.to_owned());
+            }
+        }
+    }
+    if families.is_empty() {
+        return None;
+    }
+    Some(families.into_iter().collect())
+}
+
+fn list_monospace_via_name_tables() -> Vec<String> {
+    let dirs = font_dirs();
+    let mut families = BTreeSet::new();
+    for dir in &dirs {
+        scan_monospace_dir_recursive(dir, &mut families);
+    }
+    families.into_iter().collect()
+}
+
 fn scan_dir_recursive(dir: &str, families: &mut BTreeSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -329,6 +441,30 @@ fn scan_dir_recursive(dir: &str, families: &mut BTreeSet<String>) {
         if let Ok(data) = std::fs::read(&path) {
             if let Some(info) = read_font_info(&data) {
                 families.insert(info.family);
+            }
+        }
+    }
+}
+
+fn scan_monospace_dir_recursive(dir: &str, families: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_monospace_dir_recursive(&path.to_string_lossy(), families);
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "ttf" | "otf" | "woff" | "woff2" | "ttc") {
+            continue;
+        }
+        if let Ok(data) = std::fs::read(&path) {
+            if let Some(info) = read_font_info(&data) {
+                if info.is_monospace {
+                    families.insert(info.family);
+                }
             }
         }
     }
@@ -402,6 +538,25 @@ fn find_font_files_with_data(family: &str) -> Vec<(FontVariant, Vec<u8>)> {
 mod tests {
     use super::*;
 
+    fn build_test_font(tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let header_len = 12 + tables.len() * 16;
+        let mut data = vec![0u8; header_len];
+        data[0..4].copy_from_slice(&[0, 1, 0, 0]);
+        data[4..6].copy_from_slice(&(tables.len() as u16).to_be_bytes());
+
+        let mut offset = header_len;
+        for (i, (tag, table)) in tables.iter().enumerate() {
+            let rec = 12 + i * 16;
+            data[rec..rec + 4].copy_from_slice(*tag);
+            data[rec + 8..rec + 12].copy_from_slice(&(offset as u32).to_be_bytes());
+            data[rec + 12..rec + 16].copy_from_slice(&(table.len() as u32).to_be_bytes());
+            data.extend_from_slice(table);
+            offset += table.len();
+        }
+
+        data
+    }
+
     #[test]
     fn parse_font_info_from_system_fonts() {
         let families = list_font_families();
@@ -422,5 +577,39 @@ mod tests {
             subfamily_to_weight_style("Bold Oblique"),
             ("bold", "italic")
         );
+    }
+
+    #[test]
+    fn detects_monospace_from_post_table() {
+        let mut post = vec![0u8; 32];
+        post[12..16].copy_from_slice(&1u32.to_be_bytes());
+        let font = build_test_font(&[(b"post", post)]);
+        assert!(read_is_monospace(&font));
+    }
+
+    #[test]
+    fn detects_monospace_from_uniform_hmtx_widths() {
+        let mut hhea = vec![0u8; 36];
+        hhea[34..36].copy_from_slice(&2u16.to_be_bytes());
+
+        let mut hmtx = vec![0u8; 8];
+        hmtx[0..2].copy_from_slice(&600u16.to_be_bytes());
+        hmtx[4..6].copy_from_slice(&600u16.to_be_bytes());
+
+        let font = build_test_font(&[(b"hhea", hhea), (b"hmtx", hmtx)]);
+        assert!(read_is_monospace(&font));
+    }
+
+    #[test]
+    fn rejects_variable_width_fonts() {
+        let mut hhea = vec![0u8; 36];
+        hhea[34..36].copy_from_slice(&2u16.to_be_bytes());
+
+        let mut hmtx = vec![0u8; 8];
+        hmtx[0..2].copy_from_slice(&500u16.to_be_bytes());
+        hmtx[4..6].copy_from_slice(&700u16.to_be_bytes());
+
+        let font = build_test_font(&[(b"hhea", hhea), (b"hmtx", hmtx)]);
+        assert!(!read_is_monospace(&font));
     }
 }

@@ -38,6 +38,9 @@ pub const C2S_CLIENT_METRICS: u8 = 0x05;
 /// button: 0=left, 1=mid, 2=right, 3=release, 64=wheel_up, 65=wheel_down
 /// The server generates the correct escape sequence based on mouse_mode and mouse_encoding.
 pub const C2S_MOUSE: u8 = 0x06;
+/// Restart an exited PTY: [0x07][pty_id:2]
+/// Server spawns a new shell in the same PTY slot, preserving the pty_id.
+pub const C2S_RESTART: u8 = 0x07;
 pub const C2S_CREATE: u8 = 0x10;
 pub const C2S_FOCUS: u8 = 0x11;
 pub const C2S_CLOSE: u8 = 0x12;
@@ -66,6 +69,7 @@ pub const S2C_HELLO: u8 = 0x07;
 pub const S2C_EXITED: u8 = 0x08;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
+pub const FEATURE_RESTART: u32 = 1 << 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {

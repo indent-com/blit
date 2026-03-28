@@ -305,7 +305,7 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.8.1";
+        version = "0.9.0";
 
         cargoLockConfig = {
           lockFile = ./Cargo.lock;
@@ -648,8 +648,12 @@ CTRL
             echo ""
             echo "=== React tests ==="
             mkdir -p browser/pkg
-            echo '{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}' > browser/pkg/package.json
-            touch browser/pkg/blit_browser.js
+            if [ ! -f browser/pkg/package.json ]; then
+              echo '{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}' > browser/pkg/package.json
+            fi
+            if [ ! -f browser/pkg/blit_browser.js ]; then
+              touch browser/pkg/blit_browser.js
+            fi
             (cd react && pnpm install --frozen-lockfile 2>/dev/null || pnpm install && pnpm vitest run)
           '';
         };

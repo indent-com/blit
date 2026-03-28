@@ -2,8 +2,9 @@ use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as Al
 use blit_remote::{
     build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
     C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_MOUSE,
-    C2S_RESIZE, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE, CREATE2_HAS_COMMAND,
-    CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_EXITED,
+    C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE,
+    CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, FEATURE_RESTART, S2C_CLOSED,
+    S2C_CREATED, S2C_CREATED_N, S2C_EXITED,
     S2C_LIST, S2C_SEARCH_RESULTS, S2C_TITLE,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -208,6 +209,8 @@ struct Pty {
     title_pending: bool,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
+    /// Command used to create this PTY (None = default shell).
+    command: Option<String>,
 }
 
 impl Pty {
@@ -843,7 +846,6 @@ fn update_client_scroll_state(client: &mut ClientState, pty_id: u16, next_offset
 
 struct Session {
     ptys: HashMap<u16, Pty>,
-    next_pty_id: u16,
     next_client_id: u64,
     /// Diagnostics: how many times tick() was called this second.
     tick_fires: u32,
@@ -870,7 +872,6 @@ impl Session {
     fn new() -> Self {
         Self {
             ptys: HashMap::new(),
-            next_pty_id: 1,
             next_client_id: 1,
             clients: HashMap::new(),
             tick_fires: 0,
@@ -879,23 +880,7 @@ impl Session {
     }
 
     fn allocate_pty_id(&mut self) -> Option<u16> {
-        let start = self.next_pty_id;
-        loop {
-            let id = self.next_pty_id;
-            self.next_pty_id = self.next_pty_id.wrapping_add(1);
-            if id == 0 {
-                if self.next_pty_id == start {
-                    return None;
-                }
-                continue;
-            }
-            if !self.ptys.contains_key(&id) {
-                return Some(id);
-            }
-            if self.next_pty_id == start {
-                return None;
-            }
-        }
+        (1..=u16::MAX).find(|id| !self.ptys.contains_key(id))
     }
 
     fn send_to_all(&self, msg: &[u8]) {
@@ -942,20 +927,22 @@ impl Session {
                 reset_inflight(c);
             }
         }
-        unsafe {
-            let ws = libc::winsize {
-                ws_row: rows,
-                ws_col: cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            libc::ioctl(pty.master_fd, libc::TIOCSWINSZ, &ws);
-            let mut fg_pgid: libc::pid_t = 0;
-            libc::ioctl(pty.master_fd, libc::TIOCGPGRP, &mut fg_pgid);
-            if fg_pgid > 0 {
-                libc::kill(-fg_pgid, libc::SIGWINCH);
+        if !pty.exited {
+            unsafe {
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                libc::ioctl(pty.master_fd, libc::TIOCSWINSZ, &ws);
+                let mut fg_pgid: libc::pid_t = 0;
+                libc::ioctl(pty.master_fd, libc::TIOCGPGRP, &mut fg_pgid);
+                if fg_pgid > 0 {
+                    libc::kill(-fg_pgid, libc::SIGWINCH);
+                }
+                libc::kill(-pty.child_pid, libc::SIGWINCH);
             }
-            libc::kill(-pty.child_pid, libc::SIGWINCH);
         }
     }
 
@@ -1131,11 +1118,16 @@ fn spawn_pty(
         libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
+    unsafe {
+        libc::close(slave);
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
     state.2.write().unwrap().insert(id, master);
-
-    let reader_handle = tokio::spawn(pty_reader(master, id, state));
-
+    let reader_handle = tokio::spawn(pty_reader(master, id, state.clone()));
     let lflag_cache = pty_lflag(master);
+
     Some(Pty {
         master_fd: master,
         child_pid: pid,
@@ -1152,7 +1144,81 @@ fn spawn_pty(
         last_title_send: Instant::now(),
         title_pending: false,
         exited: false,
+        command: command.map(|s| s.to_owned()),
     })
+}
+
+/// Spawn a new child process on a fresh PTY pair.
+/// Returns (master_fd, child_pid, reader_handle) for swapping into an existing Pty.
+fn respawn_child(
+    shell: &str,
+    rows: u16,
+    cols: u16,
+    pty_id: u16,
+    command: Option<&str>,
+    state: AppState,
+) -> Option<(libc::c_int, libc::pid_t, tokio::task::JoinHandle<()>)> {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    unsafe {
+        if libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0 {
+            return None;
+        }
+        let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        libc::ioctl(master, libc::TIOCSWINSZ, &ws);
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(master); libc::close(slave); }
+        return None;
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(master);
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+            libc::dup2(slave, 0);
+            libc::dup2(slave, 1);
+            libc::dup2(slave, 2);
+            if slave > 2 { libc::close(slave); }
+        }
+        std::env::set_var("TERM", "xterm-256color");
+        std::env::set_var("COLORTERM", "truecolor");
+        std::env::remove_var("COLUMNS");
+        std::env::remove_var("LINES");
+        if let Some(cmd) = command {
+            let shell_c = CString::new(shell).unwrap();
+            let flag = CString::new("-lc").unwrap();
+            let cmd_c = CString::new(cmd).unwrap();
+            unsafe {
+                libc::execvp(shell_c.as_ptr(), [shell_c.as_ptr(), flag.as_ptr(), cmd_c.as_ptr(), std::ptr::null()].as_ptr());
+                libc::_exit(1);
+            }
+        }
+        let shell_c = CString::new(shell).unwrap();
+        let login = CString::new("-l").unwrap();
+        unsafe {
+            libc::execvp(shell_c.as_ptr(), [shell_c.as_ptr(), login.as_ptr(), std::ptr::null()].as_ptr());
+            libc::_exit(1);
+        }
+    }
+
+    unsafe {
+        libc::close(slave);
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    state.2.write().unwrap().insert(pty_id, master);
+    let reader_handle = tokio::spawn(pty_reader(master, pty_id, state));
+    Some((master, pid, reader_handle))
 }
 
 fn respond_to_queries(fd: libc::c_int, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
@@ -1555,8 +1621,13 @@ fn parse_config() -> Config {
 
 fn bind_socket(sock_path: &str) -> UnixListener {
     let _ = std::fs::remove_file(sock_path);
-    let listener = UnixListener::bind(sock_path).unwrap();
-    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(sock_path).unwrap_or_else(|e| {
+        eprintln!("blit-server: cannot bind to {sock_path}: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("blit-server: warning: cannot set socket permissions: {e}");
+    }
     eprintln!("listening on {sock_path}");
     listener
 }
@@ -1648,7 +1719,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     let title_interval = Duration::from_secs_f64(1.0 / max_fps as f64);
     let ids: Vec<u16> = sess.ptys.keys().copied().collect();
     for &id in &ids {
-        let pty = sess.ptys.get_mut(&id).unwrap();
+        let Some(pty) = sess.ptys.get_mut(&id) else { continue };
         if pty.driver.take_title_dirty() {
             pty.mark_dirty();
             pty.title_pending = true;
@@ -1689,7 +1760,7 @@ async fn tick(state: &AppState) -> TickOutcome {
 
     let mut snapshots: HashMap<u16, FrameState> = HashMap::new();
     for &id in &ids {
-        let pty = sess.ptys.get_mut(&id).unwrap();
+        let Some(pty) = sess.ptys.get_mut(&id) else { continue };
         if needful_ptys.contains(&id) {
             if let Some(frame) = pty.ready_frames.pop_front() {
                 snapshots.insert(id, frame);
@@ -1741,7 +1812,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             any_send_window,
             lead_deadline,
         ) = {
-            let c = sess.clients.get(&cid).unwrap();
+            let Some(c) = sess.clients.get(&cid) else { continue };
             let reserve_preview_slot = client_has_due_preview(&sess, c, now);
             (
                 c.lead,
@@ -1762,14 +1833,14 @@ async fn tick(state: &AppState) -> TickOutcome {
             if scroll_offset > 0 {
                 if can_send_lead {
                     let prev_frame = {
-                        let c = sess.clients.get(&cid).unwrap();
+                        let Some(c) = sess.clients.get(&cid) else { continue };
                         c.scroll_cache.clone()
                     };
                     let outcome = if let Some(pty) = sess.ptys.get_mut(&pid) {
                         if let Some((msg, new_frame)) =
                             build_scrollback_update(pty, pid, scroll_offset, &prev_frame)
                         {
-                            let c = sess.clients.get_mut(&cid).unwrap();
+                            let Some(c) = sess.clients.get_mut(&cid) else { break };
                             let bytes = msg.len();
                             if c.tx.try_send(msg).is_ok() {
                                 c.scroll_cache = new_frame;
@@ -1988,7 +2059,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
             },
         );
         if let Some(c) = sess.clients.get(&client_id) {
-            let _ = c.tx.try_send(msg_hello(1, FEATURE_CREATE_NONCE));
+            let _ = c.tx.try_send(msg_hello(1, FEATURE_CREATE_NONCE | FEATURE_RESTART));
         }
         let mut initial_msgs = Vec::new();
         initial_msgs.push(sess.pty_list_msg());
@@ -2245,11 +2316,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.size = Some((rows, cols));
                 }
-                if sess.ptys.get(&pid).is_some_and(|p| !p.exited) {
-                    if let Some((r, c)) = sess.min_size_for_pty(pid) {
-                        sess.resize_pty(pid, r, c);
-                        need_nudge = true;
-                    }
+                if let Some((r, c)) = sess.min_size_for_pty(pid) {
+                    sess.resize_pty(pid, r, c);
+                    need_nudge = true;
                 }
             }
             C2S_CREATE => {
@@ -2544,12 +2613,6 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
             }
             C2S_FOCUS if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
-                // Always re-send the PTY list on focus — the client may have
-                // missed the initial S2C_LIST if the transport connected before
-                // the message listener was registered.
-                if let Some(c) = sess.clients.get(&client_id) {
-                    let _ = c.tx.try_send(sess.pty_list_msg());
-                }
                 if sess.ptys.contains_key(&pid) {
                     let old_pid = sess.clients.get(&client_id).and_then(|c| c.lead);
                     if let Some(c) = sess.clients.get_mut(&client_id) {
@@ -2605,6 +2668,39 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                             sess.resize_pty(pid, r, c);
                             need_nudge = true;
                         }
+                    }
+                }
+            }
+            C2S_RESTART if data.len() >= 3 => {
+                let pid = u16::from_le_bytes([data[1], data[2]]);
+                let restart_info = sess.ptys.get(&pid)
+                    .filter(|p| p.exited)
+                    .map(|p| (p.driver.size(), p.command.clone(), p.tag.clone()));
+                if let Some(((rows, cols), command, tag)) = restart_info {
+                    if let Some((master, child, reader)) = respawn_child(
+                        &state.0.shell, rows, cols, pid, command.as_deref(), state.clone(),
+                    ) {
+                        let Some(pty) = sess.ptys.get_mut(&pid) else { break };
+                        pty.master_fd = master;
+                        pty.child_pid = child;
+                        pty.reader_handle = reader;
+                        pty.exited = false;
+                        pty.lflag_cache = pty_lflag(master);
+                        pty.lflag_last = Instant::now();
+                        pty.mark_dirty();
+                        if let Some(c) = sess.clients.get_mut(&client_id) {
+                            c.lead = Some(pid);
+                            subscribe_client_to(c, pid);
+                            c.scroll_offset = 0;
+                            c.scroll_cache = FrameState::default();
+                            reset_inflight(c);
+                        }
+                        let mut msg = Vec::with_capacity(3 + tag.len());
+                        msg.push(S2C_CREATED);
+                        msg.extend_from_slice(&pid.to_le_bytes());
+                        msg.extend_from_slice(tag.as_bytes());
+                        sess.send_to_all(&msg);
+                        need_nudge = true;
                     }
                 }
             }

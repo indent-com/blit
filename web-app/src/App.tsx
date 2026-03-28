@@ -43,16 +43,11 @@ function createBestTransport(
     if (!connectedOnce && (status === "error" || status === "disconnected")) {
       wt.removeEventListener("statuschange", onStatus);
       wt.close();
+      console.warn("WebTransport failed (cert may have changed), falling back to WebSocket");
       onFallbackToWebSocket();
     }
   };
   wt.addEventListener("statuschange", onStatus);
-  // Don't connect yet — useBlitConnection will call connect() after
-  // registering the message listener. But WT needs to connect for the
-  // fallback status listener to fire. We connect the WT transport here;
-  // if it succeeds, useBlitConnection will be a no-op reconnect.
-  // If it fails, the fallback creates a WS transport that useBlitConnection connects.
-  wt.connect();
   return wt;
 }
 
@@ -86,7 +81,7 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
             createBestTransport(pass, () => {
               const ws = new WebSocketTransport(wsUrl(), pass);
               setTransport(ws);
-              // connect() will be called by useBlitConnection
+              // connect() will be called when the workspace attaches the connection
             }),
           );
         } else if (status === "error") {
@@ -125,7 +120,7 @@ function AuthScreen({
   onSubmit,
 }: {
   error: string | null;
-  passRef: React.RefObject<HTMLInputElement | null>;
+  passRef: React.RefObject<HTMLInputElement>;
   onSubmit: (pass: string) => void;
 }) {
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;

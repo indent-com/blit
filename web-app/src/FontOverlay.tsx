@@ -4,7 +4,7 @@ import {
   useRef,
   useCallback,
 } from "react";
-import { DEFAULT_FONT } from "blit-react";
+import { DEFAULT_FONT, type TerminalPalette } from "blit-react";
 import { themeFor, ui } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
@@ -12,26 +12,31 @@ export function FontOverlay({
   currentFamily,
   currentSize,
   serverFonts,
+  palette,
   onSelect,
   onPreview,
   onClose,
-  dark,
 }: {
   currentFamily: string;
   currentSize: number;
   serverFonts: string[];
+  palette: TerminalPalette;
   onSelect: (font: string, size: number) => void;
   onPreview: (font: string, size: number) => void;
   onClose: () => void;
-  dark: boolean;
 }) {
-  const theme = themeFor(dark);
-  const [query, setQuery] = useState("");
-  const [size, setSize] = useState(currentSize);
-  const [selectedIdx, setSelectedIdx] = useState(-1);
+  const theme = themeFor(palette);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const originalRef = useRef({ family: currentFamily, size: currentSize });
+  const initialFamily = originalRef.current.family.trim();
+  const initialFamilyLower = initialFamily.toLowerCase();
+  const initialIdx = serverFonts.findIndex(
+    (font) => font.toLowerCase() === initialFamilyLower,
+  );
+  const [query, setQuery] = useState(initialFamily);
+  const [size, setSize] = useState(currentSize);
+  const [selectedIdx, setSelectedIdx] = useState(initialIdx);
 
   const dismiss = useCallback(() => {
     onPreview(originalRef.current.family, originalRef.current.size);
@@ -40,12 +45,16 @@ export function FontOverlay({
 
   useEffect(() => {
     inputRef.current?.focus();
+    inputRef.current?.select();
   }, []);
 
-  const lowerQuery = query.toLowerCase();
-  const filtered = lowerQuery
-    ? serverFonts.filter((f) => f.toLowerCase().includes(lowerQuery))
-    : serverFonts;
+  const trimmedQuery = query.trim();
+  const showAllFonts =
+    trimmedQuery.length === 0 || trimmedQuery.toLowerCase() === initialFamilyLower;
+  const lowerQuery = trimmedQuery.toLowerCase();
+  const filtered = showAllFonts
+    ? serverFonts
+    : serverFonts.filter((f) => f.toLowerCase().includes(lowerQuery));
 
   // Preview the selected font in the terminal
   const previewFont = useCallback((family: string) => {
@@ -81,8 +90,12 @@ export function FontOverlay({
 
   // Reset selection when query changes
   useEffect(() => {
-    setSelectedIdx(-1);
-  }, [query]);
+    if (showAllFonts) {
+      setSelectedIdx(initialIdx);
+    } else {
+      setSelectedIdx(-1);
+    }
+  }, [initialIdx, showAllFonts]);
 
   const inputStyle = {
     ...ui.input,
@@ -92,24 +105,24 @@ export function FontOverlay({
 
   const previewFamily = selectedIdx >= 0 && selectedIdx < filtered.length
     ? filtered[selectedIdx]
-    : query || currentFamily;
+    : trimmedQuery || originalRef.current.family;
 
   return (
-    <OverlayBackdrop dark={dark} label="Font" onClose={dismiss}>
+    <OverlayBackdrop palette={palette} label="Font" onClose={dismiss}>
       <OverlayPanel
-        dark={dark}
+        palette={palette}
         style={{
           minWidth: 320,
           display: "flex",
           flexDirection: "column",
         }}
       >
-        <OverlayHeader dark={dark} title="Font" onClose={dismiss} />
+        <OverlayHeader palette={palette} title="Font" onClose={dismiss} />
         <form onSubmit={(e) => {
           e.preventDefault();
           const family = selectedIdx >= 0 && selectedIdx < filtered.length
             ? filtered[selectedIdx]
-            : query.trim() || currentFamily;
+            : trimmedQuery || originalRef.current.family;
           onSelect(family, size);
         }} style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0 }}>
         <input
@@ -119,6 +132,10 @@ export function FontOverlay({
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Search fonts or type a name"
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
           style={inputStyle}
         />
         {filtered.length > 0 && (
@@ -139,7 +156,6 @@ export function FontOverlay({
                 style={{
                   padding: "4px 8px",
                   cursor: "pointer",
-                  borderRadius: 3,
                   backgroundColor: i === selectedIdx
                     ? theme.selectedBg
                     : "transparent",
@@ -183,7 +199,8 @@ export function FontOverlay({
           ...ui.btn,
           alignSelf: "flex-end",
           padding: "4px 12px",
-          border: "1px solid rgba(128,128,128,0.3)",
+          border: `1px solid ${theme.subtleBorder}`,
+          backgroundColor: theme.inputBg,
           flexShrink: 0,
         }}>Apply</button>
         </form>

@@ -175,6 +175,7 @@ describe("createWebRtcDataChannelTransport", () => {
     const t = create();
     const onmsg = vi.fn();
     t.addEventListener("message", onmsg);
+    t.connect();
     channel.simulateOpen();
 
     const payload = new Uint8Array([1, 2, 3]);
@@ -189,6 +190,7 @@ describe("createWebRtcDataChannelTransport", () => {
     const t = create();
     const onmsg = vi.fn();
     t.addEventListener("message", onmsg);
+    t.connect();
     channel.simulateOpen();
 
     const payload = new Uint8Array([10, 20, 30, 40, 50]);
@@ -208,6 +210,7 @@ describe("createWebRtcDataChannelTransport", () => {
     const t = create();
     const onmsg = vi.fn();
     t.addEventListener("message", onmsg);
+    t.connect();
     channel.simulateOpen();
 
     const p1 = new Uint8Array([0xaa]);
@@ -341,6 +344,7 @@ describe("createWebRtcDataChannelTransport", () => {
     const t = create();
     t.addEventListener("message", cb1);
     t.addEventListener("message", cb2);
+    t.connect();
     channel.simulateOpen();
     channel.simulateMessage(frame(new Uint8Array([1])).buffer as ArrayBuffer);
     expect(cb1).toHaveBeenCalledTimes(1);

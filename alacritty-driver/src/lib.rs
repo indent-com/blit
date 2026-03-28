@@ -1050,6 +1050,7 @@ mod integration_tests {
         // Scrollback frame at offset 0 should match viewport
         let scroll0 = driver.scrollback_frame(0);
         // Not necessarily identical to snapshot (cursor/mode differ) but cells should match
+        assert_eq!(snap.cells(), scroll0.cells(), "offset 0 scrollback should match viewport cells");
     }
 
     #[test]

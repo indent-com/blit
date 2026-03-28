@@ -1,10 +1,9 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react";
-import type { BlitTransport, TerminalPalette } from "./types";
-import type { TerminalStore } from "./TerminalStore";
+import type { TerminalPalette } from "./types";
+import type { BlitWorkspace } from "./BlitWorkspace";
 
 export interface BlitContextValue {
-  transport?: BlitTransport;
-  store?: TerminalStore;
+  workspace?: BlitWorkspace;
   palette?: TerminalPalette;
   fontFamily?: string;
   fontSize?: number;
@@ -20,17 +19,26 @@ export interface BlitProviderProps extends BlitContextValue {
   children: ReactNode;
 }
 
-export function BlitProvider({
+export function BlitWorkspaceProvider({
   children,
-  transport,
-  store,
+  workspace,
   palette,
   fontFamily,
   fontSize,
 }: BlitProviderProps) {
   const value = useMemo(
-    () => ({ transport, store, palette, fontFamily, fontSize }),
-    [transport, store, palette, fontFamily, fontSize],
+    () => ({ workspace, palette, fontFamily, fontSize }),
+    [workspace, palette, fontFamily, fontSize],
   );
   return <BlitContext.Provider value={value}>{children}</BlitContext.Provider>;
+}
+
+export function useRequiredBlitWorkspace(): BlitWorkspace {
+  const workspace = useBlitContext().workspace;
+  if (!workspace) {
+    throw new Error(
+      "Blit components require a BlitWorkspaceProvider ancestor",
+    );
+  }
+  return workspace;
 }

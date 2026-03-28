@@ -4,6 +4,7 @@ import {
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_MOUSE,
+  C2S_RESTART,
   C2S_RESIZE,
   C2S_SCROLL,
   C2S_FOCUS,
@@ -199,5 +200,13 @@ export function buildMouseMessage(
   msg[6] = (col >> 8) & 0xff;
   msg[7] = row & 0xff;
   msg[8] = (row >> 8) & 0xff;
+  return msg;
+}
+
+export function buildRestartMessage(ptyId: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_RESTART;
+  msg[1] = ptyId & 0xff;
+  msg[2] = (ptyId >> 8) & 0xff;
   return msg;
 }

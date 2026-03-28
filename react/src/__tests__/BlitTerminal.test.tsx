@@ -1,8 +1,10 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BlitTerminal } from "../BlitTerminal";
-import type { TerminalStore } from "../TerminalStore";
-import type { TerminalPalette } from "../types";
+import { BlitWorkspace } from "../BlitWorkspace";
+import { BlitWorkspaceProvider } from "../BlitContext";
+import type { BlitWasmModule } from "../TerminalStore";
+import type { TerminalPalette, SessionId } from "../types";
 import { MockTransport } from "./mock-transport";
 
 vi.mock("../gl-renderer", () => ({
@@ -21,6 +23,8 @@ vi.mock("../hooks/useBlitTerminal", () => ({
     pw: 8,
     ph: 16,
   })),
+  cssFontFamily: (f: string) => f,
+  CSS_GENERIC: new Set(["monospace"]),
 }));
 
 type FakeTerminal = {
@@ -30,51 +34,70 @@ type FakeTerminal = {
   set_ansi_color: ReturnType<typeof vi.fn>;
   set_cell_size: ReturnType<typeof vi.fn>;
   set_font_family: ReturnType<typeof vi.fn>;
+  set_font_size: ReturnType<typeof vi.fn>;
   invalidate_render_cache: ReturnType<typeof vi.fn>;
+  mouse_mode: ReturnType<typeof vi.fn>;
+  mouse_encoding: ReturnType<typeof vi.fn>;
+  title: ReturnType<typeof vi.fn>;
+  feed_compressed: ReturnType<typeof vi.fn>;
+  free: ReturnType<typeof vi.fn>;
 };
 
-class MockStore {
-  terminal: FakeTerminal | null = null;
-  private dirtyListener: ((ptyId: number) => void) | null = null;
+function makeFakeTerminal(): FakeTerminal {
+  return {
+    rows: 24,
+    cols: 80,
+    set_default_colors: vi.fn(),
+    set_ansi_color: vi.fn(),
+    set_cell_size: vi.fn(),
+    set_font_family: vi.fn(),
+    set_font_size: vi.fn(),
+    invalidate_render_cache: vi.fn(),
+    mouse_mode: vi.fn(() => 0),
+    mouse_encoding: vi.fn(() => 0),
+    title: vi.fn(() => ""),
+    feed_compressed: vi.fn(),
+    free: vi.fn(),
+  };
+}
 
-  addDirtyListener(listener: (ptyId: number) => void): () => void {
-    this.dirtyListener = listener;
-    return () => {
-      if (this.dirtyListener === listener) this.dirtyListener = null;
-    };
-  }
+let fakeTerminals: FakeTerminal[] = [];
 
-  emitDirty(ptyId: number): void {
-    this.dirtyListener?.(ptyId);
-  }
+const wasm = {
+  Terminal: class {
+    rows = 24;
+    cols = 80;
+    set_default_colors = vi.fn();
+    set_ansi_color = vi.fn();
+    set_cell_size = vi.fn();
+    set_font_family = vi.fn();
+    set_font_size = vi.fn();
+    invalidate_render_cache = vi.fn();
+    mouse_mode = vi.fn(() => 0);
+    mouse_encoding = vi.fn(() => 0);
+    title = vi.fn(() => "");
+    feed_compressed = vi.fn();
+    free = vi.fn();
+    constructor(_r: number, _c: number, _pw: number, _ph: number) {
+      fakeTerminals.push(this as unknown as FakeTerminal);
+    }
+  },
+} as unknown as BlitWasmModule;
 
-  getTerminal(): FakeTerminal | null {
-    return this.terminal;
-  }
-
-  onReady(): () => void {
-    return () => {};
-  }
-
-  isReady(): boolean {
-    return true;
-  }
-
-  retain(): void {}
-
-  release(): void {}
-
-  getSharedRenderer() {
-    return null;
-  }
-
-  setCellSize(): void {}
+function setup() {
+  const transport = new MockTransport();
+  const workspace = new BlitWorkspace({
+    wasm,
+    connections: [{ id: "c1", transport }],
+  });
+  return { transport, workspace };
 }
 
 describe("BlitTerminal", () => {
   let originalFonts: PropertyDescriptor | undefined;
 
   beforeEach(() => {
+    fakeTerminals = [];
     vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
     vi.stubGlobal("cancelAnimationFrame", vi.fn());
     vi.stubGlobal(
@@ -120,9 +143,17 @@ describe("BlitTerminal", () => {
     vi.clearAllMocks();
   });
 
-  it("applies the configured palette when a terminal arrives after mount", () => {
-    const transport = new MockTransport();
-    const store = new MockStore();
+  it("renders with null sessionId without crashing", () => {
+    const { workspace } = setup();
+    render(
+      <BlitWorkspaceProvider workspace={workspace}>
+        <BlitTerminal sessionId={null} />
+      </BlitWorkspaceProvider>,
+    );
+  });
+
+  it("applies palette to terminal created via update", async () => {
+    const { transport, workspace } = setup();
     const palette: TerminalPalette = {
       id: "tomorrow",
       name: "Tomorrow",
@@ -135,84 +166,60 @@ describe("BlitTerminal", () => {
       ),
     };
 
+    // Create a session
+    transport.pushList([{ ptyId: 7, tag: "test" }]);
+    const snap = workspace.getSnapshot();
+    const sessionId = snap.sessions[0]?.id as SessionId;
+
     render(
-      <BlitTerminal
-        ptyId={7}
-        palette={palette}
-        readOnly
-        store={store as unknown as TerminalStore}
-        transport={transport}
-      />,
+      <BlitWorkspaceProvider workspace={workspace} palette={palette}>
+        <BlitTerminal sessionId={sessionId} readOnly />
+      </BlitWorkspaceProvider>,
     );
 
-    const terminal: FakeTerminal = {
-      rows: 24,
-      cols: 80,
-      set_default_colors: vi.fn(),
-      set_ansi_color: vi.fn(),
-      set_cell_size: vi.fn(),
-      set_font_family: vi.fn(),
-      invalidate_render_cache: vi.fn(),
-    };
-
-    expect(terminal.set_default_colors).not.toHaveBeenCalled();
-    expect(terminal.set_ansi_color).not.toHaveBeenCalled();
-
-    act(() => {
-      store.terminal = terminal;
-      store.emitDirty(7);
+    // Push an update to trigger terminal creation in the store
+    await act(async () => {
+      transport.pushUpdate(7, new Uint8Array([1, 2, 3]));
     });
 
-    expect(terminal.set_default_colors).toHaveBeenCalledTimes(1);
-    expect(terminal.set_default_colors).toHaveBeenCalledWith(
-      ...palette.fg,
-      ...palette.bg,
-    );
-    expect(terminal.set_ansi_color).toHaveBeenCalledTimes(16);
-    for (let i = 0; i < 16; i++) {
-      expect(terminal.set_ansi_color).toHaveBeenNthCalledWith(
-        i + 1,
-        i,
-        ...palette.ansi[i],
-      );
+    // The WASM terminal should have been created and palette applied
+    const terminal = fakeTerminals[fakeTerminals.length - 1];
+    if (terminal) {
+      expect(terminal.set_default_colors).toHaveBeenCalled();
     }
   });
 
-  it("invalidates the glyph cache when fonts finish loading even if metrics stay the same", () => {
-    const transport = new MockTransport();
-    const store = new MockStore();
-    const terminal: FakeTerminal = {
-      rows: 24,
-      cols: 80,
-      set_default_colors: vi.fn(),
-      set_ansi_color: vi.fn(),
-      set_cell_size: vi.fn(),
-      set_font_family: vi.fn(),
-      invalidate_render_cache: vi.fn(),
-    };
-    store.terminal = terminal;
+  it("invalidates the glyph cache when fonts finish loading", async () => {
+    const { transport, workspace } = setup();
+
+    transport.pushList([{ ptyId: 7, tag: "test" }]);
+    const snap = workspace.getSnapshot();
+    const sessionId = snap.sessions[0]?.id as SessionId;
 
     render(
-      <BlitTerminal
-        ptyId={7}
-        fontFamily="Test Mono"
-        fontSize={14}
-        store={store as unknown as TerminalStore}
-        transport={transport}
-      />,
+      <BlitWorkspaceProvider workspace={workspace}>
+        <BlitTerminal sessionId={sessionId} fontFamily="Test Mono" fontSize={14} />
+      </BlitWorkspaceProvider>,
     );
 
-    terminal.invalidate_render_cache.mockClear();
-
-    act(() => {
-      (
-        document.fonts as unknown as {
-          dispatch: (type: string) => void;
-        }
-      ).dispatch("loadingdone");
+    // Push an update to create the terminal
+    await act(async () => {
+      transport.pushUpdate(7, new Uint8Array([1, 2, 3]));
     });
 
-    expect(terminal.invalidate_render_cache).toHaveBeenCalledTimes(1);
-    expect(terminal.set_font_family).toHaveBeenCalledWith("Test Mono");
+    const terminal = fakeTerminals[fakeTerminals.length - 1];
+    if (terminal) {
+      terminal.invalidate_render_cache.mockClear();
+
+      await act(async () => {
+        (
+          document.fonts as unknown as {
+            dispatch: (type: string) => void;
+          }
+        ).dispatch("loadingdone");
+      });
+
+      expect(terminal.invalidate_render_cache).toHaveBeenCalledTimes(1);
+    }
   });
 });

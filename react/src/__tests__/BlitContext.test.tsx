@@ -1,13 +1,13 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { BlitProvider, useBlitContext } from "../BlitContext";
+import { BlitWorkspaceProvider, useBlitContext } from "../BlitContext";
 import type { BlitContextValue } from "../BlitContext";
-import { MockTransport } from "./mock-transport";
+import type { BlitWorkspace } from "../BlitWorkspace";
 
 function wrapper(value: BlitContextValue) {
   return function Wrapper({ children }: { children: ReactNode }) {
-    return <BlitProvider {...value}>{children}</BlitProvider>;
+    return <BlitWorkspaceProvider {...value}>{children}</BlitWorkspaceProvider>;
   };
 }
 
@@ -17,12 +17,12 @@ describe("BlitContext", () => {
     expect(result.current).toEqual({});
   });
 
-  it("provides transport", () => {
-    const transport = new MockTransport();
+  it("provides workspace", () => {
+    const workspace = {} as BlitWorkspace;
     const { result } = renderHook(() => useBlitContext(), {
-      wrapper: wrapper({ transport }),
+      wrapper: wrapper({ workspace }),
     });
-    expect(result.current.transport).toBe(transport);
+    expect(result.current.workspace).toBe(workspace);
   });
 
   it("provides palette", () => {
@@ -32,7 +32,10 @@ describe("BlitContext", () => {
       dark: true,
       fg: [255, 255, 255] as [number, number, number],
       bg: [0, 0, 0] as [number, number, number],
-      ansi: Array.from({ length: 16 }, () => [0, 0, 0] as [number, number, number]),
+      ansi: Array.from(
+        { length: 16 },
+        () => [0, 0, 0] as [number, number, number],
+      ),
     };
     const { result } = renderHook(() => useBlitContext(), {
       wrapper: wrapper({ palette }),
@@ -52,8 +55,7 @@ describe("BlitContext", () => {
     const { result } = renderHook(() => useBlitContext(), {
       wrapper: wrapper({}),
     });
-    expect(result.current.transport).toBeUndefined();
-    expect(result.current.store).toBeUndefined();
+    expect(result.current.workspace).toBeUndefined();
     expect(result.current.palette).toBeUndefined();
     expect(result.current.fontFamily).toBeUndefined();
     expect(result.current.fontSize).toBeUndefined();

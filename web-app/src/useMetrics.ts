@@ -62,15 +62,6 @@ export function useMetrics(transport: BlitTransport): Metrics & {
     };
     transport.addEventListener("message", onMessage);
 
-    // Intercept send to record tx events
-    const origSend = transport.send.bind(transport);
-    transport.send = (data: Uint8Array) => {
-      const nl = netRef.current;
-      nl.push({ t: performance.now(), bytes: data.byteLength, dir: "tx" });
-      if (nl.length > NET_MAX) nl.splice(0, nl.length - NET_MAX);
-      origSend(data);
-    };
-
     const timer = setInterval(() => {
       const frames = framesRef.current;
       setMetrics({
@@ -89,7 +80,6 @@ export function useMetrics(transport: BlitTransport): Metrics & {
 
     return () => {
       transport.removeEventListener("message", onMessage);
-      transport.send = origSend;
       clearInterval(timer);
     };
   }, [transport]);

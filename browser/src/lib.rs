@@ -576,6 +576,7 @@ impl GlyphAtlas {
 pub struct Terminal {
     cell_width: f64,
     cell_height: f64,
+    font_size: f64,
     font_family: String,
     palette: Palette,
     inner: TerminalState,
@@ -595,6 +596,7 @@ impl Terminal {
         Terminal {
             cell_width,
             cell_height,
+            font_size: cell_height,
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             palette: Palette::default(),
             inner: TerminalState::new(rows, cols),
@@ -609,6 +611,15 @@ impl Terminal {
     pub fn set_cell_size(&mut self, cell_width: f64, cell_height: f64) {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
+        self.glyph_atlas.invalidate();
+    }
+
+    pub fn set_font_size(&mut self, font_size: f64) {
+        let next = font_size.max(1.0);
+        if (self.font_size - next).abs() < f64::EPSILON {
+            return;
+        }
+        self.font_size = next;
         self.glyph_atlas.invalidate();
     }
 
@@ -977,7 +988,7 @@ impl Terminal {
         let total = rows * cols;
         let normal_font = format!(
             "{}px {}",
-            ch.round().max(1.0) as u32,
+            self.font_size.round().max(1.0) as u32,
             css_quote_font_family(&self.font_family)
         );
 
