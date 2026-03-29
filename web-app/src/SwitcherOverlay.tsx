@@ -752,6 +752,7 @@ export function SwitcherOverlay({
               maxHeight: "60vh",
               overflow: "auto",
               display: "grid",
+              alignContent: "start",
               gap: scale.tightGap,
               paddingRight: 2,
             }}

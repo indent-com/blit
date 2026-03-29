@@ -258,9 +258,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot connect to blit-server: {e}");
-            let _ = ws
-                .send(Message::Text(format!("error:{e}").into()))
-                .await;
+            let _ = ws.send(Message::Text(format!("error:{e}").into())).await;
             let _ = ws.close().await;
             return;
         }

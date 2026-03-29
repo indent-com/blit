@@ -163,20 +163,18 @@ describe("BlitConnection", () => {
 
   // --- Focus ---
 
-  it("auto-selects first entry from LIST", () => {
+  it("focusedSessionId is null for empty LIST", () => {
+    transport.pushList([]);
+    expect(conn.getSnapshot().focusedSessionId).toBeNull();
+  });
+
+  it("focusedSessionId is null for non-empty LIST", () => {
     transport.pushList([
       { ptyId: 5, tag: "a" },
       { ptyId: 6, tag: "b" },
     ]);
     const snap = conn.getSnapshot();
-    expect(snap.focusedSessionId).not.toBeNull();
-    const focused = snap.sessions.find((s) => s.id === snap.focusedSessionId);
-    expect(focused?.tag).toBe("a");
-  });
-
-  it("focusedSessionId is null for empty LIST", () => {
-    transport.pushList([]);
-    expect(conn.getSnapshot().focusedSessionId).toBeNull();
+    expect(snap.focusedSessionId).toBeNull();
   });
 
   it("focusedSessionId moves to next active on CLOSED", () => {
