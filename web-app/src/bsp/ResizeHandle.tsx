@@ -14,10 +14,9 @@ export function ResizeHandle({
   const startRef = useRef(0);
   const containerRef = useRef(0);
 
-  const handlePointerDown = useCallback(
-    (e: React.PointerEvent) => {
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
       e.preventDefault();
-      (e.target as HTMLElement).setPointerCapture(e.pointerId);
       setActive(true);
 
       const isHoriz = direction === "horizontal";
@@ -32,7 +31,7 @@ export function ResizeHandle({
       startRef.current = start;
       containerRef.current = containerSize;
 
-      const onMove = (me: PointerEvent) => {
+      const onMove = (me: MouseEvent) => {
         const current = isHoriz ? me.clientX : me.clientY;
         const delta = current - startRef.current;
         startRef.current = current;
@@ -41,12 +40,12 @@ export function ResizeHandle({
 
       const onUp = () => {
         setActive(false);
-        document.removeEventListener("pointermove", onMove);
-        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
       };
 
-      document.addEventListener("pointermove", onMove);
-      document.addEventListener("pointerup", onUp);
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
     },
     [direction, onDrag],
   );
@@ -60,9 +59,9 @@ export function ResizeHandle({
 
   return (
     <div
-      onPointerDown={handlePointerDown}
-      onPointerEnter={() => setHover(true)}
-      onPointerLeave={() => setHover(false)}
+      onMouseDown={handleMouseDown}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         flexShrink: 0,
         width: isHoriz ? HANDLE_SIZE : "100%",
@@ -70,7 +69,6 @@ export function ResizeHandle({
         cursor: isHoriz ? "col-resize" : "row-resize",
         background: bg,
         transition: "background 0.1s",
-        touchAction: "none",
       }}
     />
   );
