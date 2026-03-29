@@ -1,6 +1,6 @@
 [package]
 name = "blit-cli"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 
 [[bin]]
@@ -14,4 +14,4 @@ tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
-rand = "0.8"
+rand = "0.10"

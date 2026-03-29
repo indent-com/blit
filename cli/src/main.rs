@@ -612,10 +612,11 @@ struct BrowserState {
 
 async fn run_browser(args: Vec<String>) {
     let token: String = {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        (0..32)
-            .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+        use rand::RngExt as _;
+        rand::rng()
+            .sample_iter(rand::distr::Alphanumeric)
+            .take(32)
+            .map(|b| b as char)
             .collect()
     };
 

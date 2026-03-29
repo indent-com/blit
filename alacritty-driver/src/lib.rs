@@ -220,7 +220,6 @@ impl ModeTracker {
             _ => return,
         };
         if set {
-            self.mouse_encoding = 0;
             self.mouse_mode = mode;
         } else if self.mouse_mode == mode {
             self.mouse_mode = 0;
@@ -1019,6 +1018,12 @@ mod tests {
         // Disable mouse
         driver.process(b"\x1b[?1003l");
         assert_eq!(driver.modes.mouse_mode, 0);
+
+        // Setting a new mouse mode must not reset encoding
+        driver.process(b"\x1b[?1006h");
+        assert_eq!(driver.modes.mouse_encoding, 2);
+        driver.process(b"\x1b[?1000h");
+        assert_eq!(driver.modes.mouse_encoding, 2);
     }
 
     #[test]

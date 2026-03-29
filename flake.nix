@@ -305,7 +305,7 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        version = "0.9.0";
+        version = "0.9.1";
 
         cargoLockConfig = {
           lockFile = ./Cargo.lock;
@@ -484,7 +484,7 @@ PKGJSON
 
         reactNpmDeps = pkgs.fetchNpmDeps {
           src = ./react;
-          hash = "sha256-QU4WGyuRC37bBUZERD3HICXmF3m+JxPc4HcLv1vG5U4=";
+          hash = "sha256-jOFgJfesxvN+f9xTYmtS0u+CnwUxgTOOyn9T6VYJi2k=";
         };
 
         webAppNpmDeps = pkgs.fetchNpmDeps {
@@ -685,6 +685,7 @@ CTRL
             pkgs.bun
             pkgs.cargo-flamegraph
             pkgs.cargo-llvm-cov
+            pkgs.cargo-edit
             pkgs.cargo-watch
             pkgs.curl
             pkgs.nodejs

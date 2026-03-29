@@ -1,6 +1,6 @@
 [package]
 name = "blit-gateway"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 
 [dependencies]
@@ -10,7 +10,7 @@ axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rcgen = "0.13"
+rcgen = "0.14"
 ring = "0.17"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
