@@ -23,12 +23,13 @@ export function LayoutPreview({
   /** Opacity for the highlighted leaf (defaults to 1). */
   highlightOpacity?: number;
 }) {
-  const rects: Array<{ x: number; y: number; w: number; h: number }> = [];
+  const rects: Array<{ x: number; y: number; w: number; h: number; leafIndex: number }> = [];
+  let leafCounter = 0;
   const gap = 1;
 
   function layout(n: BSPNode, x: number, y: number, w: number, h: number) {
     if (n.type === "leaf") {
-      rects.push({ x, y, w, h });
+      rects.push({ x, y, w, h, leafIndex: leafCounter++ });
       return;
     }
 
@@ -37,7 +38,7 @@ export function LayoutPreview({
       const tabH = Math.max(2, Math.round(h * 0.1));
       const tabW = Math.max(2, Math.round((w - gap * (n.children.length - 1)) / n.children.length));
       for (let i = 0; i < n.children.length; i++) {
-        rects.push({ x: x + i * (tabW + gap), y, w: tabW, h: tabH });
+        rects.push({ x: x + i * (tabW + gap), y, w: tabW, h: tabH, leafIndex: -1 });
       }
       if (n.children.length > 0) {
         layout(n.children[0].node, x, y + tabH + gap, w, h - tabH - gap);
@@ -79,7 +80,7 @@ export function LayoutPreview({
           width={Math.max(0, r.w)}
           height={Math.max(0, r.h)}
           fill={color}
-          opacity={i === highlightIndex ? (highlightOpacity ?? 1) : opacity}
+          opacity={r.leafIndex >= 0 && r.leafIndex === highlightIndex ? (highlightOpacity ?? 1) : opacity}
           rx={1}
         />
       ))}

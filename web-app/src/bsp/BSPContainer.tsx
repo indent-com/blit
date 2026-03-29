@@ -341,6 +341,11 @@ function BSPPane({
   visible: boolean;
   path?: number[];
 }) {
+  const nodeRef = useRef(node);
+  nodeRef.current = node;
+  const onResizeRef = useRef(onResize);
+  onResizeRef.current = onResize;
+
   if (node.type === "leaf") {
     const paneId = path.length > 0 ? path.join(".") : "0";
     return (
@@ -360,11 +365,6 @@ function BSPPane({
       />
     );
   }
-
-  const nodeRef = useRef(node);
-  nodeRef.current = node;
-  const onResizeRef = useRef(onResize);
-  onResizeRef.current = onResize;
 
   const paneProps = (child: BSPChild, index: number) => ({
     node: child.node,
