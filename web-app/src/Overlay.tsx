@@ -5,7 +5,7 @@ import {
   type ReactNode,
 } from "react";
 import type { TerminalPalette } from "blit-react";
-import { layout, overlayChromeStyles, themeFor } from "./theme";
+import { layout, overlayChromeStyles, themeFor, uiScale } from "./theme";
 
 export function OverlayBackdrop({
   palette,
@@ -46,11 +46,13 @@ export const OverlayPanel = forwardRef<
   HTMLDivElement,
   HTMLAttributes<HTMLDivElement> & {
     palette: TerminalPalette;
+    fontSize?: number;
   }
 >(
-  function OverlayPanel({ palette, style, onClick, ...props }, ref) {
+  function OverlayPanel({ palette, style, onClick, fontSize, ...props }, ref) {
     const dark = palette.dark;
-    const styles = overlayChromeStyles(themeFor(palette), dark);
+    const scale = uiScale(fontSize ?? 13);
+    const styles = overlayChromeStyles(themeFor(palette), dark, scale);
 
     return (
       <div
@@ -59,6 +61,7 @@ export const OverlayPanel = forwardRef<
         style={{
           ...layout.panel,
           ...styles.panel,
+          fontSize: scale.md,
           ...style,
         }}
         onClick={(e) => {
@@ -77,6 +80,7 @@ export function OverlayHeader({
   actions,
   onClose,
   closeLabel = "Esc",
+  fontSize,
 }: {
   palette: TerminalPalette;
   title: ReactNode;
@@ -84,9 +88,11 @@ export function OverlayHeader({
   actions?: ReactNode;
   onClose?: () => void;
   closeLabel?: string;
+  fontSize?: number;
 }) {
   const dark = palette.dark;
-  const styles = overlayChromeStyles(themeFor(palette), dark);
+  const scale = uiScale(fontSize ?? 13);
+  const styles = overlayChromeStyles(themeFor(palette), dark, scale);
 
   return (
     <header style={styles.header}>

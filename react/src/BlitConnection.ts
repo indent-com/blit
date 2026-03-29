@@ -6,6 +6,7 @@ import type {
   ConnectionId,
   ConnectionStatus,
   SessionId,
+  TerminalPalette,
 } from "./types";
 import {
   FEATURE_CREATE_NONCE,
@@ -118,6 +119,8 @@ export class BlitConnection {
 
   private snapshot: BlitConnectionSnapshot;
   private sessions: InternalSession[] = [];
+  private _publicSessions: BlitSession[] = [];
+  private _publicSessionsDirty = false;
 
   constructor({
     id,
@@ -168,6 +171,18 @@ export class BlitConnection {
       this.listeners.delete(listener);
     };
   };
+
+  private get publicSessions(): BlitSession[] {
+    if (this._publicSessionsDirty) {
+      this._publicSessions = this.sessions.map(toPublicSession);
+      this._publicSessionsDirty = false;
+    }
+    return this._publicSessions;
+  }
+
+  private invalidatePublicSessions(): void {
+    this._publicSessionsDirty = true;
+  }
 
   getSnapshot = (): BlitConnectionSnapshot => this.snapshot;
 
@@ -407,76 +422,62 @@ export class BlitConnection {
     });
   }
 
+  private ptyId(sessionId: SessionId): number | undefined {
+    return this.sessionsById.get(sessionId)?.ptyId;
+  }
+
   getTerminal(sessionId: SessionId) {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    return ptyId != null ? this.store.getTerminal(ptyId) : null;
+    const id = this.ptyId(sessionId);
+    return id != null ? this.store.getTerminal(id) : null;
   }
 
   retain(sessionId: SessionId): void {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    if (ptyId != null) this.store.retain(ptyId);
+    const id = this.ptyId(sessionId);
+    if (id != null) this.store.retain(id);
   }
 
   release(sessionId: SessionId): void {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    if (ptyId != null) this.store.release(ptyId);
+    const id = this.ptyId(sessionId);
+    if (id != null) this.store.release(id);
   }
 
   freeze(sessionId: SessionId): void {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    if (ptyId != null) this.store.freeze(ptyId);
+    const id = this.ptyId(sessionId);
+    if (id != null) this.store.freeze(id);
   }
 
   thaw(sessionId: SessionId): void {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    if (ptyId != null) this.store.thaw(ptyId);
+    const id = this.ptyId(sessionId);
+    if (id != null) this.store.thaw(id);
   }
 
   isFrozen(sessionId: SessionId): boolean {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    return ptyId != null && this.store.isFrozen(ptyId);
+    const id = this.ptyId(sessionId);
+    return id != null && this.store.isFrozen(id);
   }
 
   addDirtyListener(sessionId: SessionId, listener: () => void): () => void {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    if (ptyId == null) return () => {};
-    return this.store.addDirtyListener((dirtyPtyId) => {
-      if (dirtyPtyId === ptyId) listener();
+    const id = this.ptyId(sessionId);
+    if (id == null) return () => {};
+    return this.store.addDirtyListener((dirtyId) => {
+      if (dirtyId === id) listener();
     });
   }
 
-  getSharedRenderer() {
-    return this.store.getSharedRenderer();
-  }
-
-  setCellSize(pw: number, ph: number): void {
-    this.store.setCellSize(pw, ph);
-  }
-
-  getCellSize() {
-    return this.store.getCellSize();
-  }
-
-  wasmMemory() {
-    return this.store.wasmMemory();
-  }
-
   drainPending(sessionId: SessionId): boolean {
-    const ptyId = this.sessionsById.get(sessionId)?.ptyId;
-    return ptyId != null ? this.store.drainPending(ptyId) : false;
+    const id = this.ptyId(sessionId);
+    return id != null ? this.store.drainPending(id) : false;
   }
 
-  noteFrameRendered(): void {
-    this.store.noteFrameRendered();
-  }
-
-  invalidateAtlas(): void {
-    this.store.invalidateAtlas();
-  }
-
-  getStore(): TerminalStore {
-    return this.store;
-  }
+  getSharedRenderer() { return this.store.getSharedRenderer(); }
+  setCellSize(pw: number, ph: number): void { this.store.setCellSize(pw, ph); }
+  getCellSize() { return this.store.getCellSize(); }
+  wasmMemory() { return this.store.wasmMemory(); }
+  noteFrameRendered(): void { this.store.noteFrameRendered(); }
+  invalidateAtlas(): void { this.store.invalidateAtlas(); }
+  setFontFamily(f: string): void { this.store.setFontFamily(f); }
+  setFontSize(s: number): void { this.store.setFontSize(s); }
+  setPalette(p: TerminalPalette): void { this.store.setPalette(p); }
 
   isReady(): boolean {
     return this.store.isReady();
@@ -516,7 +517,7 @@ export class BlitConnection {
           this.pendingCreates.delete(firstNonce);
           pending.resolve(toPublicSession(session));
         }
-        this.ensureFocusedSession(session.id);
+
         return;
       }
       case S2C_CREATED_N: {
@@ -530,7 +531,7 @@ export class BlitConnection {
           this.pendingCreates.delete(nonce);
           pending.resolve(toPublicSession(session));
         }
-        this.ensureFocusedSession(session.id);
+
         return;
       }
       case S2C_CLOSED: {
@@ -682,7 +683,7 @@ export class BlitConnection {
       this.snapshot.focusedSessionId &&
       this.sessionsById.get(this.snapshot.focusedSessionId)?.state !== "closed"
         ? this.snapshot.focusedSessionId
-        : this.firstLiveSessionId();
+        : null;
 
     this.snapshot = {
       ...this.snapshot,
@@ -786,9 +787,10 @@ export class BlitConnection {
     this.currentSessionIdByPtyId.set(ptyId, session.id);
     this.sessionsById.set(session.id, session);
     this.sessions = [...this.sessions, session];
+    this.invalidatePublicSessions();
     this.snapshot = {
       ...this.snapshot,
-      sessions: this.sessions.map(toPublicSession),
+      sessions: this.publicSessions,
     };
     this.emit();
     return session;
@@ -803,14 +805,20 @@ export class BlitConnection {
       throw connectionError(`Unknown session ${sessionId}`);
     }
 
+    // Skip no-op updates.
+    if (Object.keys(patch).every((k) => (current as Record<string, unknown>)[k] === (patch as Record<string, unknown>)[k])) {
+      return current;
+    }
+
     const next: InternalSession = { ...current, ...patch };
     this.sessionsById.set(sessionId, next);
     this.sessions = this.sessions.map((session) =>
       session.id === sessionId ? next : session,
     );
+    this.invalidatePublicSessions();
     this.snapshot = {
       ...this.snapshot,
-      sessions: this.sessions.map(toPublicSession),
+      sessions: this.publicSessions,
     };
     this.emit();
     return next;
@@ -825,6 +833,7 @@ export class BlitConnection {
       state: "closed",
     };
     this.sessionsById.set(sessionId, next);
+    this.invalidatePublicSessions();
     this.sessions = this.sessions.map((entry) =>
       entry.id === sessionId ? next : entry,
     );
@@ -841,7 +850,7 @@ export class BlitConnection {
 
     this.snapshot = {
       ...this.snapshot,
-      sessions: this.sessions.map(toPublicSession),
+      sessions: this.publicSessions,
       focusedSessionId: nextFocus ?? null,
     };
     this.store.setLead(nextFocus ? this.sessionsById.get(nextFocus)?.ptyId ?? null : null);
@@ -863,10 +872,6 @@ export class BlitConnection {
     }
   }
 
-  private ensureFocusedSession(sessionId: SessionId): void {
-    if (this.snapshot.focusedSessionId) return;
-    this.focusSession(sessionId);
-  }
 
   private firstLiveSessionId(): SessionId | null {
     const session = this.sessions.find((entry) => entry.state !== "closed");

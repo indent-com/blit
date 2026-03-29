@@ -1,5 +1,10 @@
 import type React from "react";
-import type { TerminalPalette } from "blit-react";
+import type { BlitSession, TerminalPalette } from "blit-react";
+
+export function sessionName(s: BlitSession): string {
+  if (s.title && s.tag && s.title !== s.tag) return `${s.tag}: ${s.title}`;
+  return s.title ?? s.tag ?? "Terminal";
+}
 
 export interface Theme {
   bg: string;
@@ -18,6 +23,42 @@ export interface Theme {
   errorText: string;
   success: string;
   warning: string;
+}
+
+export interface UIScale {
+  xs: number;
+  sm: number;
+  md: number;
+  lg: number;
+  xl: number;
+  tightGap: number;
+  gap: number;
+  panelPadding: number;
+  controlY: number;
+  controlX: number;
+  icon: number;
+}
+
+export function uiScale(baseFontSize: number): UIScale {
+  const base = Math.max(10, Math.round(baseFontSize || 13));
+  const max = Math.round(base * 1.25);
+  const scaled = (multiplier: number, floor: number) => (
+    Math.max(floor, Math.min(max, Math.round(base * multiplier)))
+  );
+
+  return {
+    xs: scaled(0.78, 9),
+    sm: scaled(0.88, 10),
+    md: scaled(1, base),
+    lg: scaled(1.08, base),
+    xl: scaled(1.18, base),
+    tightGap: Math.max(4, Math.round(base * 0.3)),
+    gap: Math.max(6, Math.round(base * 0.45)),
+    panelPadding: Math.max(8, Math.round(base * 0.6)),
+    controlY: Math.max(3, Math.round(base * 0.32)),
+    controlX: Math.max(6, Math.round(base * 0.55)),
+    icon: Math.max(44, Math.round(base * 3.7)),
+  };
 }
 
 export const darkTheme: Theme = {
@@ -229,10 +270,11 @@ export interface OverlayChromeStyles {
 export function overlayChromeStyles(
   theme: Theme,
   dark: boolean,
+  scale: UIScale = uiScale(13),
 ): OverlayChromeStyles {
   return {
     overlay: {
-      padding: 16,
+      padding: Math.max(12, scale.panelPadding * 2),
     },
     panel: {
       backgroundColor: theme.solidPanelBg,
@@ -247,46 +289,47 @@ export function overlayChromeStyles(
       display: "flex",
       justifyContent: "space-between",
       alignItems: "flex-start",
-      gap: 12,
+      gap: scale.gap,
       flexWrap: "wrap",
-      marginBottom: 12,
+      marginBottom: scale.gap * 2,
     },
     headerCopy: {
       display: "grid",
-      gap: 4,
+      gap: scale.tightGap,
       minWidth: 0,
     },
     title: {
       margin: 0,
-      fontSize: 16,
+      fontSize: scale.xl,
       lineHeight: 1.2,
       fontWeight: 600,
     },
     subtitle: {
       margin: 0,
-      fontSize: 12,
+      fontSize: scale.sm,
       lineHeight: 1.4,
       color: theme.dimFg,
     },
     headerActions: {
       display: "flex",
       alignItems: "center",
-      gap: 8,
+      gap: scale.tightGap + 2,
       marginLeft: "auto",
     },
     closeButton: {
       ...ui.btn,
       opacity: 0.6,
-      padding: "4px 8px",
+      padding: `${scale.controlY}px ${scale.controlX}px`,
       border: `1px solid ${theme.subtleBorder}`,
       backgroundColor: theme.inputBg,
+      fontSize: scale.sm,
       whiteSpace: "nowrap",
     },
     footer: {
       display: "flex",
       justifyContent: "space-between",
       alignItems: "center",
-      gap: 14,
+      gap: scale.gap,
       flexWrap: "wrap",
     },
     actionButton: {
@@ -294,8 +337,8 @@ export function overlayChromeStyles(
       border: `1px solid ${theme.subtleBorder}`,
       backgroundColor: theme.inputBg,
       color: theme.fg,
-      padding: "10px 14px",
-      fontSize: 12,
+      padding: `${scale.controlY + 2}px ${scale.controlX + 2}px`,
+      fontSize: scale.sm,
       fontFamily: "inherit",
       cursor: "pointer",
     },
@@ -312,8 +355,9 @@ export interface DisconnectedStyles extends OverlayChromeStyles {
 export function disconnectedStyles(
   theme: Theme,
   dark: boolean,
+  scale: UIScale = uiScale(13),
 ): DisconnectedStyles {
-  const chrome = overlayChromeStyles(theme, dark);
+  const chrome = overlayChromeStyles(theme, dark, scale);
 
   return {
     ...chrome,

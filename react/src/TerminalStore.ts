@@ -233,16 +233,10 @@ export class TerminalStore {
 
   setFontFamily(fontFamily: string): void {
     this.fontFamily = fontFamily;
-    for (const t of this.terminals.values()) {
-      t.set_font_family(fontFamily);
-    }
   }
 
   setFontSize(fontSize: number): void {
     this.fontSize = fontSize;
-    for (const t of this.terminals.values()) {
-      t.set_font_size(fontSize);
-    }
   }
 
   /** Get a shared GL renderer for readOnly (preview) terminals. */

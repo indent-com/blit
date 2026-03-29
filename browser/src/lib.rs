@@ -587,6 +587,9 @@ pub struct Terminal {
     bg_verts: Vec<f32>,
     /// Ready-to-upload glyph vertex data (6 verts × 8 floats per glyph).
     glyph_verts: Vec<f32>,
+    /// Pixel offsets added to all vertex coordinates (for centering content).
+    render_x_offset: f32,
+    render_y_offset: f32,
 }
 
 #[wasm_bindgen]
@@ -605,6 +608,8 @@ impl Terminal {
             bg_verts: Vec::new(),
             glyph_verts: Vec::new(),
             overflow_text_ops: Vec::new(),
+            render_x_offset: 0.0,
+            render_y_offset: 0.0,
         }
     }
 
@@ -612,6 +617,11 @@ impl Terminal {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
         self.glyph_atlas.invalidate();
+    }
+
+    pub fn set_render_offset(&mut self, x: f64, y: f64) {
+        self.render_x_offset = x as f32;
+        self.render_y_offset = y as f32;
     }
 
     pub fn set_font_size(&mut self, font_size: f64) {
@@ -962,8 +972,10 @@ impl Terminal {
         let sy = slot.src_y as f32;
         let sw = slot.width as f32;
         let sh = slot.height as f32;
-        let dx1 = col as f32 * pw;
-        let dy1 = row as f32 * ph - (sh - ph);
+        let xo = self.render_x_offset;
+        let yo = self.render_y_offset;
+        let dx1 = col as f32 * pw + xo;
+        let dy1 = row as f32 * ph - (sh - ph) + yo;
         let dx2 = dx1 + col_span as f32 * pw;
         let dy2 = dy1 + sh;
         let u1 = sx / aw;
@@ -1080,13 +1092,15 @@ impl Terminal {
     fn build_bg_verts(&mut self) {
         let pw = self.cell_width as f32;
         let ph = self.cell_height as f32;
+        let xo = self.render_x_offset;
+        let yo = self.render_y_offset;
         self.bg_verts.clear();
         self.bg_verts.reserve(self.bg_ops.len() / BG_OP_STRIDE * 36);
         let ops = &self.bg_ops;
         let mut i = 0;
         while i < ops.len() {
-            let x1 = ops[i + 1] as f32 * pw;
-            let y1 = ops[i] as f32 * ph;
+            let x1 = ops[i + 1] as f32 * pw + xo;
+            let y1 = ops[i] as f32 * ph + yo;
             let x2 = x1 + ops[i + 2] as f32 * pw;
             let y2 = y1 + ph;
             let packed = ops[i + 3];

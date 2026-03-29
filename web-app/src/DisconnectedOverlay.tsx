@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import type { ConnectionStatus, TerminalPalette } from "blit-react";
-import { disconnectedStyles, themeFor, z } from "./theme";
+import { disconnectedStyles, themeFor, uiScale, z } from "./theme";
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 
 interface LogEntry {
@@ -59,12 +59,14 @@ function describeStatusTransition(
 
 export function DisconnectedOverlay({
   palette,
+  fontSize,
   status,
   retryCount,
   error,
   onReconnect,
 }: {
   palette: TerminalPalette;
+  fontSize: number;
   status: ConnectionStatus;
   retryCount: number;
   error: string | null;
@@ -72,7 +74,8 @@ export function DisconnectedOverlay({
 }) {
   const dark = palette.dark;
   const theme = themeFor(palette);
-  const styles = disconnectedStyles(theme, dark);
+  const scale = uiScale(fontSize);
+  const styles = disconnectedStyles(theme, dark, scale);
   const [log, setLog] = useState<LogEntry[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
   const previousStatusRef = useRef<ConnectionStatus | null>(null);
@@ -124,7 +127,7 @@ export function DisconnectedOverlay({
       dismissOnBackdrop={false}
       style={{ zIndex: z.disconnected }}
     >
-      <OverlayPanel palette={palette} style={styles.card}>
+      <OverlayPanel palette={palette} fontSize={fontSize} style={styles.card}>
         <div style={styles.content}>
           <h2 style={styles.title}>{statusText}</h2>
           <div

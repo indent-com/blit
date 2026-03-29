@@ -35,13 +35,16 @@ import {
   blitHost,
   basePath,
 } from "./storage";
-import { themeFor, layout, ui, z } from "./theme";
+import { themeFor, layout, ui, uiScale, z } from "./theme";
 import { StatusBar } from "./StatusBar";
-import { ExposeOverlay } from "./ExposeOverlay";
+import { SwitcherOverlay } from "./SwitcherOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
 import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { DisconnectedOverlay } from "./DisconnectedOverlay";
+import { BSPContainer } from "./bsp/BSPContainer";
+import type { BSPAssignments, BSPLayout } from "./bsp/layout";
+import { loadActiveLayout, saveActiveLayout, saveToHistory, loadRecentLayouts, PRESETS } from "./bsp/layout";
 
 export type Overlay = "expose" | "palette" | "font" | "help" | null;
 
@@ -130,6 +133,11 @@ function WorkspaceScreen({
   const [serverFonts, setServerFonts] = useState<string[]>([]);
   const [offlineVisible, setOfflineVisible] = useState(false);
   const [fontLoading, setFontLoading] = useState(false);
+  const [activeLayout, setActiveLayout] = useState<BSPLayout | null>(loadActiveLayout);
+  const activeLayoutRef = useRef(activeLayout);
+  activeLayoutRef.current = activeLayout;
+  const [layoutAssignments, setLayoutAssignments] = useState<BSPAssignments | null>(null);
+  const [pendingPaneTargetId, setPendingPaneTargetId] = useState<string | null>(null);
   const toggleDebug = useCallback(() => setDebugPanel((value) => !value), []);
   const fontRequestVersionRef = useRef(0);
   const paletteOverlayOriginRef = useRef<TerminalPalette | null>(null);
@@ -247,6 +255,13 @@ function WorkspaceScreen({
   }, [workspaceState.focusedSessionId]);
 
   useEffect(() => {
+    if (activeLayout) return;
+    setLayoutAssignments(null);
+    setPendingPaneTargetId(null);
+  }, [activeLayout]);
+
+  useEffect(() => {
+    if (activeLayout && overlay !== "expose") return;
     const desired = new Set<SessionId>();
     if (workspaceState.focusedSessionId) {
       desired.add(workspaceState.focusedSessionId);
@@ -257,7 +272,7 @@ function WorkspaceScreen({
       }
     }
     workspace.setVisibleSessions(desired);
-  }, [overlay, sessions, workspace, workspaceState.focusedSessionId]);
+  }, [activeLayout, overlay, sessions, workspace, workspaceState.focusedSessionId]);
 
   const hasConnectedRef = useRef(connection?.status === "connected");
   useEffect(() => {
@@ -414,6 +429,18 @@ function WorkspaceScreen({
     }
   }, [closeOverlay, connection?.status, primaryConnectionId, workspace, workspaceState.focusedSessionId]);
 
+  const selectPane = useCallback((paneId: string, sessionId: SessionId | null, command?: string) => {
+    if (sessionId && !command) {
+      workspace.focusSession(sessionId);
+      closeOverlay();
+      return;
+    }
+
+    setPendingPaneTargetId(paneId);
+    closeOverlay();
+    void createAndFocus(command);
+  }, [closeOverlay, createAndFocus, workspace]);
+
   const handleRestartOrClose = useCallback(() => {
     if (!focusedSession) {
       void createAndFocus();
@@ -461,7 +488,7 @@ function WorkspaceScreen({
         void createAndFocus();
         return;
       }
-      if (e.key === "Enter" && !mod && !e.shiftKey && !overlayRef.current) {
+      if (e.key === "Enter" && !mod && !e.shiftKey && !overlayRef.current && !activeLayoutRef.current) {
         const current = stateRef.current;
         const focused = current.focusedSessionId
           ? current.sessions.find((session) => session.id === current.focusedSessionId)
@@ -515,6 +542,7 @@ function WorkspaceScreen({
     primaryConnectionId,
     workspaceState.focusedSessionId,
   );
+  const chromeScale = uiScale(fontSize);
 
   return (
     <BlitWorkspaceProvider
@@ -532,7 +560,43 @@ function WorkspaceScreen({
         }}
       >
       <section style={layout.termContainer}>
-        {workspaceState.focusedSessionId != null ? (
+        {activeLayout ? (
+          <BSPContainer
+            layout={activeLayout}
+            onLayoutChange={setActiveLayout}
+            connectionId={primaryConnectionId}
+            palette={palette}
+            fontFamily={resolvedFontWithFallback}
+            fontSize={fontSize}
+            focusedSessionId={workspaceState.focusedSessionId}
+            lruSessionIds={lruRef.current}
+            manageVisibility={overlay !== "expose"}
+            preferredEmptyPaneId={pendingPaneTargetId}
+            onAssignmentsChange={setLayoutAssignments}
+            onPreferredEmptyPaneResolved={() => setPendingPaneTargetId(null)}
+            onFocusSession={(id) => workspace.focusSession(id)}
+            onCreateInPane={async (paneId, command) => {
+              setPendingPaneTargetId(paneId);
+              try {
+                await workspace.createSession({
+                  connectionId: primaryConnectionId,
+                  rows: termRef.current?.rows ?? 24,
+                  cols: termRef.current?.cols ?? 80,
+                  ...(command ? { command } : {}),
+                  ...(!command && workspaceState.focusedSessionId
+                    ? { cwdFromSessionId: workspaceState.focusedSessionId }
+                    : {}),
+                });
+                // Don't call focusSession here — BSPContainer will push focus
+                // up once reconciliation assigns the session to the pane.
+              } catch (error) {
+                if (connection?.status !== "disconnected" && connection?.status !== "error") {
+                  console.error("blit: failed to create PTY", error);
+                }
+              }
+            }}
+          />
+        ) : workspaceState.focusedSessionId != null ? (
           <>
             <BlitTerminal
               ref={termCallbackRef}
@@ -582,26 +646,47 @@ function WorkspaceScreen({
             theme={theme}
             mod={/Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl"}
             onCreate={() => void createAndFocus()}
-            onExpose={() => toggleOverlay("expose")}
+            onSwitcher={() => toggleOverlay("expose")}
             onHelp={() => toggleOverlay("help")}
           />
         )}
       </section>
       {overlay === "expose" && (
-        <ExposeOverlay
+        <SwitcherOverlay
           sessions={sessions}
           focusedSessionId={workspaceState.focusedSessionId}
           lru={lruRef.current}
           palette={palette}
           fontFamily={resolvedFontWithFallback}
+          fontSize={fontSize}
           onSelect={switchSession}
           onClose={closeOverlay}
           onCreate={createAndFocus}
+          activeLayout={activeLayout}
+          layoutAssignments={layoutAssignments}
+          onSelectPane={selectPane}
+          onApplyLayout={(l) => {
+            setPendingPaneTargetId(null);
+            setActiveLayout(l);
+            saveActiveLayout(l);
+            saveToHistory(l);
+            closeOverlay();
+          }}
+          onClearLayout={() => {
+            setPendingPaneTargetId(null);
+            setLayoutAssignments(null);
+            setActiveLayout(null);
+            saveActiveLayout(null);
+            closeOverlay();
+          }}
+          recentLayouts={loadRecentLayouts()}
+          presetLayouts={PRESETS}
         />
       )}
       {overlay === "palette" && (
         <PaletteOverlay
           current={palette}
+          fontSize={fontSize}
           onSelect={changePalette}
           onPreview={setPalette}
           onClose={closeOverlay}
@@ -613,6 +698,7 @@ function WorkspaceScreen({
           currentSize={fontSize}
           serverFonts={serverFonts}
           palette={palette}
+          fontSize={fontSize}
           onSelect={changeFont}
           onPreview={(family, size) => {
             setFont(family);
@@ -621,10 +707,11 @@ function WorkspaceScreen({
           onClose={closeOverlay}
         />
       )}
-      {overlay === "help" && <HelpOverlay onClose={closeOverlay} palette={palette} />}
+      {overlay === "help" && <HelpOverlay onClose={closeOverlay} palette={palette} fontSize={fontSize} />}
       {offlineVisible && (
         <DisconnectedOverlay
           palette={palette}
+          fontSize={fontSize}
           status={connection?.status ?? "disconnected"}
           retryCount={connection?.retryCount ?? 0}
           error={connection?.error ?? null}
@@ -636,6 +723,9 @@ function WorkspaceScreen({
           ...layout.statusBar,
           backgroundColor: theme.bg,
           borderTopColor: theme.subtleBorder,
+          height: Math.max(28, chromeScale.md + chromeScale.panelPadding + 8),
+          fontSize: chromeScale.sm,
+          gap: chromeScale.tightGap + 2,
         }}
       >
         <StatusBar
@@ -644,6 +734,7 @@ function WorkspaceScreen({
           status={connection?.status ?? "disconnected"}
           metrics={metrics}
           palette={palette}
+          fontSize={fontSize}
           termSize={termRef.current ? `${termRef.current.cols}x${termRef.current.rows}` : null}
           fontLoading={fontLoading}
           debug={debugPanel}
@@ -651,7 +742,7 @@ function WorkspaceScreen({
           debugStats={debugStats}
           timelineRef={timelineRef}
           netRef={netRef}
-          onExpose={() => toggleOverlay("expose")}
+          onSwitcher={() => toggleOverlay("expose")}
           onPalette={() => toggleOverlay("palette")}
           onFont={() => toggleOverlay("font")}
         />
@@ -665,13 +756,13 @@ function EmptyState({
   theme,
   mod,
   onCreate,
-  onExpose,
+  onSwitcher,
   onHelp,
 }: {
   theme: ReturnType<typeof themeFor>;
   mod: string;
   onCreate: () => void;
-  onExpose: () => void;
+  onSwitcher: () => void;
   onHelp: () => void;
 }) {
   return (
@@ -700,8 +791,8 @@ function EmptyState({
           New terminal <kbd style={ui.kbd}>Enter</kbd>{" "}
           <kbd style={ui.kbd}>{mod}+Shift+Enter</kbd>
         </button>
-        <button onClick={onExpose} style={{ ...ui.btn, fontSize: 12 }}>
-          Expose <kbd style={ui.kbd}>{mod}+K</kbd>
+        <button onClick={onSwitcher} style={{ ...ui.btn, fontSize: 12 }}>
+          Switcher <kbd style={ui.kbd}>{mod}+K</kbd>
         </button>
         <button onClick={onHelp} style={{ ...ui.btn, fontSize: 12 }}>
           Help <kbd style={ui.kbd}>Ctrl+?</kbd>

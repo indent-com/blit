@@ -6,23 +6,26 @@ import {
 } from "react";
 import { PALETTES } from "blit-react";
 import type { TerminalPalette } from "blit-react";
-import { themeFor, ui } from "./theme";
+import { themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 type PaletteTone = "dark" | "light";
 
 export function PaletteOverlay({
   current,
+  fontSize,
   onSelect,
   onPreview,
   onClose,
 }: {
   current: TerminalPalette;
+  fontSize: number;
   onSelect: (p: TerminalPalette) => void;
   onPreview: (p: TerminalPalette) => void;
   onClose: () => void;
 }) {
   const theme = themeFor(current);
+  const scale = uiScale(fontSize);
   const originalRef = useRef(current);
   const [tone, setTone] = useState<PaletteTone>(
     originalRef.current.dark ? "dark" : "light",
@@ -123,17 +126,18 @@ export function PaletteOverlay({
     ...ui.input,
     backgroundColor: theme.inputBg,
     color: "inherit",
+    fontSize: scale.md,
   };
 
   return (
     <OverlayBackdrop palette={current} label="Palette" onClose={dismiss}>
-      <OverlayPanel palette={current} style={{ minWidth: 280 }}>
-        <OverlayHeader palette={current} title="Palette" onClose={dismiss} />
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <OverlayPanel palette={current} fontSize={fontSize} style={{ minWidth: 280 }}>
+        <OverlayHeader palette={current} fontSize={fontSize} title="Palette" onClose={dismiss} />
+        <div style={{ display: "flex", flexDirection: "column", gap: scale.gap }}>
           <div
             role="tablist"
             aria-label="Theme tone"
-            style={{ display: "flex", gap: 6 }}
+            style={{ display: "flex", gap: scale.tightGap + 2 }}
           >
             {([
               { id: "dark", label: "Dark" },
@@ -153,10 +157,11 @@ export function PaletteOverlay({
                   }}
                   style={{
                     ...ui.btn,
-                    padding: "4px 10px",
+                    padding: `${scale.controlY}px ${scale.controlX + 2}px`,
                     border: `1px solid ${active ? theme.border : "transparent"}`,
                     backgroundColor: active ? theme.selectedBg : "transparent",
                     opacity: active ? 1 : 0.7,
+                    fontSize: scale.sm,
                   }}
                 >
                   {option.label}
@@ -168,13 +173,13 @@ export function PaletteOverlay({
             style={{
               display: "flex",
               alignItems: "center",
-              gap: 6,
-              fontSize: 11,
+              gap: scale.tightGap + 2,
+              fontSize: scale.sm,
               opacity: 0.65,
             }}
           >
             <span>Press</span>
-            <kbd style={ui.kbd}>Tab</kbd>
+            <kbd style={{ ...ui.kbd, fontSize: scale.sm }}>{"Tab"}</kbd>
             <span>to switch between dark and light</span>
           </div>
           <input
@@ -209,8 +214,8 @@ export function PaletteOverlay({
                   style={{
                     display: "flex",
                     alignItems: "center",
-                    gap: 10,
-                    padding: "6px 8px",
+                    gap: scale.gap + 2,
+                    padding: `${scale.controlY + 2}px ${scale.controlX}px`,
                     border: "none",
                     fontFamily: "inherit",
                     cursor: "pointer",
@@ -221,6 +226,7 @@ export function PaletteOverlay({
                       i === selectedIdx
                         ? theme.selectedBg
                         : "transparent",
+                    fontSize: scale.md,
                   }}
                 >
                   <span style={{ display: "flex", gap: 2 }}>
@@ -247,7 +253,7 @@ export function PaletteOverlay({
                       />
                     ))}
                   </span>
-                  <span style={{ fontSize: 13 }}>{p.name}</span>
+                  <span style={{ fontSize: scale.md }}>{p.name}</span>
                 </button>
               </li>
             ))}

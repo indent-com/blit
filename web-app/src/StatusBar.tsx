@@ -6,7 +6,7 @@ import type {
 } from "blit-react";
 import { formatBw } from "./useMetrics";
 import type { Metrics, RenderSample, NetSample } from "./useMetrics";
-import { themeFor, ui, z } from "./theme";
+import { sessionName, themeFor, ui, uiScale, z } from "./theme";
 
 type TimelineRef = RefObject<RenderSample[]>;
 type NetRef = RefObject<NetSample[]>;
@@ -35,6 +35,7 @@ export function StatusBar({
   status,
   metrics,
   palette,
+  fontSize,
   termSize,
   fontLoading,
   debug,
@@ -42,7 +43,7 @@ export function StatusBar({
   debugStats,
   timelineRef,
   netRef,
-  onExpose,
+  onSwitcher,
   onPalette,
   onFont,
 }: {
@@ -51,6 +52,7 @@ export function StatusBar({
   status: ConnectionStatus;
   metrics: Metrics;
   palette: TerminalPalette;
+  fontSize: number;
   termSize: string | null;
   fontLoading: boolean;
   debug: boolean;
@@ -58,18 +60,20 @@ export function StatusBar({
   debugStats: DebugStats;
   timelineRef: TimelineRef;
   netRef: NetRef;
-  onExpose: () => void;
+  onSwitcher: () => void;
   onPalette: () => void;
   onFont: () => void;
 }) {
   const theme = themeFor(palette);
+  const scale = uiScale(fontSize);
   const visible = sessions.filter((session) => session.state !== "closed");
   const exited = visible.filter((session) => session.state === "exited").length;
+  const buttonStyle = { ...ui.btn, fontSize: scale.sm };
 
   return (
     <>
-      <button onClick={onExpose} style={ui.btn} title="Expose (Cmd+K)">
-        {visible.length} PTY{visible.length !== 1 ? "s" : ""}
+      <button onClick={onSwitcher} style={buttonStyle} title="Workspace switcher (Cmd+K)">
+        {visible.length} terminal{visible.length !== 1 ? "s" : ""}
         {exited > 0 && <span style={{ opacity: 0.5 }}> ({exited} exited)</span>}
       </button>
       <span
@@ -83,22 +87,22 @@ export function StatusBar({
       >
         {focusedSession && (
           <>
-            {focusedSession.title ?? focusedSession.tag ?? "Terminal"}
+            {sessionName(focusedSession)}
           </>
         )}
       </span>
-      <span style={{ fontSize: 11, opacity: 0.5, flexShrink: 0, whiteSpace: "nowrap" }}>
+      <span style={{ fontSize: scale.xs, opacity: 0.5, flexShrink: 0, whiteSpace: "nowrap" }}>
         {termSize ? `${termSize}@` : ""}
         {metrics.fps}/{metrics.ups}
       </span>
-      <button onClick={toggleDebug} style={{ ...ui.btn, opacity: debug ? 1 : 0.3 }} title="Debug stats">
+      <button onClick={toggleDebug} style={{ ...buttonStyle, opacity: debug ? 1 : 0.3 }} title="Debug stats">
         &#x1F41B;
       </button>
-      <button onClick={onPalette} style={ui.btn} title={`Palette: ${palette.name} (Cmd+Shift+P)`}>
+      <button onClick={onPalette} style={buttonStyle} title={`Palette: ${palette.name} (Cmd+Shift+P)`}>
         {palette.dark ? "\u25D1" : "\u25D0"}
       </button>
-      <button onClick={onFont} style={ui.btn} title="Font (Cmd+Shift+F)">
-        {fontLoading ? <span style={{ opacity: 0.5, fontSize: 10 }}>Loading font…</span> : "Aa"}
+      <button onClick={onFont} style={buttonStyle} title="Font (Cmd+Shift+F)">
+        {fontLoading ? <span style={{ opacity: 0.5, fontSize: scale.xs }}>Loading font…</span> : "Aa"}
       </button>
       <span
         role="status"
@@ -122,6 +126,7 @@ export function StatusBar({
           metrics={metrics}
           debugStats={debugStats}
           palette={palette}
+          fontSize={fontSize}
           timelineRef={timelineRef}
           netRef={netRef}
         />
@@ -134,12 +139,14 @@ function DebugPanel({
   metrics,
   debugStats,
   palette,
+  fontSize,
   timelineRef,
   netRef,
 }: {
   metrics: Metrics;
   debugStats: DebugStats;
   palette: TerminalPalette;
+  fontSize: number;
   timelineRef: TimelineRef;
   netRef: NetRef;
 }) {
@@ -159,6 +166,7 @@ function DebugPanel({
   };
   const theme = themeFor(palette);
   const dark = palette.dark;
+  const scale = uiScale(fontSize);
 
   return (
     <div
@@ -173,7 +181,7 @@ function DebugPanel({
         borderLeft: `1px solid ${theme.subtleBorder}`,
         borderBottom: `1px solid ${theme.subtleBorder}`,
         padding: "6px 10px",
-        fontSize: 11,
+        fontSize: scale.sm,
         fontFamily: "ui-monospace, monospace",
         lineHeight: 1.6,
         zIndex: z.debugPanel,
@@ -193,12 +201,12 @@ function DebugPanel({
       <Row label="Queued" value={`${stats.totalPendingFrames} frames in ${stats.pendingFrameQueues} queues`} />
       <Row label="Terminals" value={`${stats.terminals} live, ${stats.staleTerminals} stale, ${stats.frozenPtys} frozen`} />
       <div style={{ borderTop: `1px solid ${theme.subtleBorder}`, marginTop: 4, paddingTop: 2 }}>
-        <span style={{ opacity: 0.6, fontSize: 10 }}>Render</span>
-        <RenderTimeline timelineRef={timelineRef} palette={palette} displayFps={stats.displayFps} />
+        <span style={{ opacity: 0.6, fontSize: scale.xs }}>Render</span>
+        <RenderTimeline timelineRef={timelineRef} palette={palette} displayFps={stats.displayFps} fontSize={scale.xs} />
       </div>
       <div style={{ borderTop: `1px solid ${theme.subtleBorder}`, marginTop: 4, paddingTop: 2 }}>
-        <span style={{ opacity: 0.6, fontSize: 10 }}>Network</span>
-        <NetTimeline netRef={netRef} palette={palette} />
+        <span style={{ opacity: 0.6, fontSize: scale.xs }}>Network</span>
+        <NetTimeline netRef={netRef} palette={palette} fontSize={scale.xs} />
       </div>
     </div>
   );
@@ -217,10 +225,12 @@ function RenderTimeline({
   timelineRef,
   palette,
   displayFps,
+  fontSize,
 }: {
   timelineRef: TimelineRef;
   palette: TerminalPalette;
   displayFps: number;
+  fontSize: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
@@ -274,7 +284,7 @@ function RenderTimeline({
       }
 
       ctx.fillStyle = rgba(fg, 0.45);
-      ctx.font = `${9 * dpr}px ui-monospace, monospace`;
+      ctx.font = `${fontSize * dpr}px ui-monospace, monospace`;
       ctx.textBaseline = "top";
       ctx.fillText(`${maxMs}ms`, 2 * dpr, 2 * dpr);
       ctx.textAlign = "right";
@@ -287,7 +297,7 @@ function RenderTimeline({
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [displayFps, dpr, error, fg, success, timelineRef, warning]);
+  }, [displayFps, dpr, error, fg, fontSize, success, timelineRef, warning]);
 
   return (
     <canvas
@@ -302,9 +312,11 @@ function RenderTimeline({
 function NetTimeline({
   netRef,
   palette,
+  fontSize,
 }: {
   netRef: NetRef;
   palette: TerminalPalette;
+  fontSize: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
@@ -358,7 +370,7 @@ function NetTimeline({
       }
 
       ctx.fillStyle = rgba(fg, 0.45);
-      ctx.font = `${9 * dpr}px ui-monospace, monospace`;
+      ctx.font = `${fontSize * dpr}px ui-monospace, monospace`;
       ctx.textBaseline = "top";
       ctx.fillText(formatBw(maxBytes).replace("/s", ""), 2 * dpr, 2 * dpr);
       ctx.textBaseline = "bottom";
@@ -369,7 +381,7 @@ function NetTimeline({
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [dpr, fg, netRef, rx, tx]);
+  }, [dpr, fg, fontSize, netRef, rx, tx]);
 
   return (
     <canvas

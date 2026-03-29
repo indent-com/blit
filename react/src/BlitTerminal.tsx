@@ -73,6 +73,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
       style,
       palette = ctx.palette,
       readOnly = false,
+      showCursor = true,
       onRender,
       scrollbarColor = "rgba(255,255,255,0.3)",
       scrollbarWidth = 4,
@@ -91,6 +92,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     const rowsRef = useRef(24);
     const colsRef = useRef(80);
     const contentDirtyRef = useRef(true);
+    const lastOffsetRef = useRef(0);
     /** Track WASM buffer identity to detect heap growth that invalidates vertex pointers. */
     const lastWasmBufferRef = useRef<ArrayBuffer | null>(null);
     const [cellVersion, setCellVersion] = useState(0);
@@ -311,8 +313,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             t.set_font_size(rasterFontSize);
             if (shouldInvalidate) t.invalidate_render_cache();
           }
-          blitConn.getStore().setFontFamily(fontFamily);
-          blitConn.getStore().setFontSize(rasterFontSize);
+          blitConn.setFontFamily(fontFamily);
+          blitConn.setFontSize(rasterFontSize);
           blitConn.setCellSize(cell.pw, cell.ph);
         }
         if (shouldInvalidate) {
@@ -504,6 +506,19 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             contentDirtyRef.current = true;
           }
 
+          {
+            const gridH = t.rows * cell.ph;
+            const gridW = t.cols * cell.pw;
+            const xOff = Math.max(0, Math.floor((pw - gridW) / 2));
+            const yOff = Math.max(0, Math.floor((ph - gridH) / 2));
+            const combined = xOff * 65536 + yOff;
+            if (combined !== lastOffsetRef.current) {
+              lastOffsetRef.current = combined;
+              t.set_render_offset(xOff, yOff);
+              contentDirtyRef.current = true;
+            }
+          }
+
           if (contentDirtyRef.current) {
             contentDirtyRef.current = false;
             t.prepare_render_ops();
@@ -524,7 +539,7 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
             glyphVerts,
             t.glyph_atlas_canvas(),
             t.glyph_atlas_version(),
-            t.cursor_visible(),
+            showCursor && t.cursor_visible(),
             t.cursor_col,
             t.cursor_row,
             t.cursor_style(),

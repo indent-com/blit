@@ -182,10 +182,12 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
+  let lastAtlasCanvas: HTMLCanvasElement | null = null;
   let lastAtlasVersion = -1;
 
   function uploadAtlas(atlasCanvas: HTMLCanvasElement, version: number): void {
-    if (version === lastAtlasVersion) return;
+    if (atlasCanvas === lastAtlasCanvas && version === lastAtlasVersion) return;
+    lastAtlasCanvas = atlasCanvas;
     lastAtlasVersion = version;
     gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
     gl!.texImage2D(
@@ -309,8 +311,8 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     resize(width: number, height: number) {
       const w = Math.min(width, maxDim);
       const h = Math.min(height, maxDim);
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
+      if (w > canvas.width) canvas.width = w;
+      if (h > canvas.height) canvas.height = h;
     },
     render(
       bgVerts: Float32Array,

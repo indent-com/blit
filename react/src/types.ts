@@ -118,6 +118,8 @@ export interface BlitTerminalProps {
   palette?: TerminalPalette;
   /** When true, the terminal renders but never sends resize, input, or scroll commands. */
   readOnly?: boolean;
+  /** When false, the cursor is hidden. Default: true. */
+  showCursor?: boolean;
   /** Called after each render frame. Receives the render duration in ms. */
   onRender?: (renderMs: number) => void;
   /** Scrollbar indicator color (CSS color string). Default: "rgba(255,255,255,0.3)" */

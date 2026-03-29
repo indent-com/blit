@@ -4,8 +4,8 @@ import {
   useRef,
   useCallback,
 } from "react";
-import { DEFAULT_FONT, type TerminalPalette } from "blit-react";
-import { themeFor, ui } from "./theme";
+import type { TerminalPalette } from "blit-react";
+import { themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 export function FontOverlay({
@@ -13,6 +13,7 @@ export function FontOverlay({
   currentSize,
   serverFonts,
   palette,
+  fontSize,
   onSelect,
   onPreview,
   onClose,
@@ -21,11 +22,13 @@ export function FontOverlay({
   currentSize: number;
   serverFonts: string[];
   palette: TerminalPalette;
+  fontSize: number;
   onSelect: (font: string, size: number) => void;
   onPreview: (font: string, size: number) => void;
   onClose: () => void;
 }) {
   const theme = themeFor(palette);
+  const scale = uiScale(fontSize);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const originalRef = useRef({ family: currentFamily, size: currentSize });
@@ -101,30 +104,28 @@ export function FontOverlay({
     ...ui.input,
     backgroundColor: theme.inputBg,
     color: "inherit",
+    fontSize: scale.md,
   };
-
-  const previewFamily = selectedIdx >= 0 && selectedIdx < filtered.length
-    ? filtered[selectedIdx]
-    : trimmedQuery || originalRef.current.family;
 
   return (
     <OverlayBackdrop palette={palette} label="Font" onClose={dismiss}>
       <OverlayPanel
         palette={palette}
+        fontSize={fontSize}
         style={{
           minWidth: 320,
           display: "flex",
           flexDirection: "column",
         }}
       >
-        <OverlayHeader palette={palette} title="Font" onClose={dismiss} />
+        <OverlayHeader palette={palette} fontSize={fontSize} title="Font" onClose={dismiss} />
         <form onSubmit={(e) => {
           e.preventDefault();
           const family = selectedIdx >= 0 && selectedIdx < filtered.length
             ? filtered[selectedIdx]
             : trimmedQuery || originalRef.current.family;
           onSelect(family, size);
-        }} style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0 }}>
+        }} style={{ display: "flex", flexDirection: "column", gap: scale.gap, flex: 1, minHeight: 0 }}>
         <input
           ref={inputRef}
           type="text"
@@ -154,13 +155,13 @@ export function FontOverlay({
               <li
                 key={f}
                 style={{
-                  padding: "4px 8px",
+                  padding: `${scale.controlY}px ${scale.controlX}px`,
                   cursor: "pointer",
                   backgroundColor: i === selectedIdx
                     ? theme.selectedBg
                     : "transparent",
                   listStyle: "none",
-                  fontSize: 13,
+                  fontSize: scale.md,
                 }}
                 onClick={() => onSelect(f, size)}
                 onMouseEnter={() => { setSelectedIdx(i); previewFont(f); }}
@@ -170,8 +171,8 @@ export function FontOverlay({
             ))}
           </ul>
         )}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-          <label style={{ fontSize: 13, opacity: 0.7, flexShrink: 0 }}>Size</label>
+        <div style={{ display: "flex", alignItems: "center", gap: scale.gap, flexShrink: 0 }}>
+          <label style={{ fontSize: scale.md, opacity: 0.7, flexShrink: 0 }}>Size</label>
           <input
             type="range"
             min={8}
@@ -195,9 +196,10 @@ export function FontOverlay({
         <button type="submit" style={{
           ...ui.btn,
           alignSelf: "flex-end",
-          padding: "4px 12px",
+          padding: `${scale.controlY}px ${scale.controlX + 4}px`,
           border: `1px solid ${theme.subtleBorder}`,
           backgroundColor: theme.inputBg,
+          fontSize: scale.sm,
           flexShrink: 0,
         }}>Apply</button>
         </form>
