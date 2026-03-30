@@ -46,7 +46,7 @@ _BLIT_FONT_DIRS_
 	Colon-separated list of extra directories to scan for fonts.
 
 _BLIT_CORS_
-	CORS origin for font routes. Set to _*_ or a specific origin.
+	CORS origin for font routes. Set to "\*" or a specific origin.
 
 _BLIT_QUIC_
 	Set to _1_ to enable WebTransport (QUIC/HTTP3).
