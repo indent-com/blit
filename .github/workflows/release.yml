@@ -56,8 +56,47 @@ jobs:
           name: debs-${{ matrix.arch }}
           path: debs/*.deb
 
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-latest
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build binaries
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p stage
+          for pkg in blit-server blit-cli blit-gateway; do
+            out=$(nix build .#"$pkg" --no-link --print-out-paths)
+            cp "$out"/bin/* stage/
+          done
+          ls -lh stage/
+
+      - name: Package tarballs
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for bin in stage/*; do
+            name=$(basename "$bin")
+            tar -czf "dist/${name}_${version}_darwin_${{ matrix.arch }}.tar.gz" -C stage "$name"
+          done
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.tar.gz
+
   release:
-    needs: [build-debs]
+    needs: [build-debs, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -66,13 +105,23 @@ jobs:
           merge-multiple: true
           path: debs
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: macos
+
       - name: List artifacts
-        run: ls -lh debs/
+        run: |
+          ls -lh debs/
+          ls -lh macos/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: debs/*.deb
+          files: |
+            debs/*.deb
+            macos/*.tar.gz
           generate_release_notes: true
 
   apt-repo:
