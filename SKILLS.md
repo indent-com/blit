@@ -28,7 +28,21 @@ blit resize 3 40 120                      # resize the terminal
 blit close 3                              # destroy the session
 ```
 
-Transport options (`--socket PATH`, `--tcp HOST:PORT`, `--ssh HOST`) are global and go before the subcommand.
+## Transport options
+
+By default, `blit` connects to the local daemon via its default Unix socket. Use these global flags (before the subcommand) to connect elsewhere:
+
+| Flag | Description |
+| --- | --- |
+| `-s`, `--socket <SOCKET>` | Connect to a specific Unix socket |
+| `--tcp <TCP>` | Connect via raw TCP (`HOST:PORT`) |
+| `--ssh <SSH>` | Connect via SSH to a remote host |
+
+```bash
+blit --socket /tmp/blit.sock list
+blit --tcp 192.168.1.10:7890 show 1
+blit --ssh dev-server start bash
+```
 
 ## Output conventions
 
