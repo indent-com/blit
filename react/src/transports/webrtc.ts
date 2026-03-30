@@ -83,6 +83,7 @@ export function createWebRtcDataChannelTransport(
     connectTimeout = setTimeout(() => {
       connectTimeout = null;
       if (_status === "connecting") {
+        transport.lastError = "connect timeout";
         setStatus("error");
         scheduleReconnect();
       }
@@ -92,6 +93,7 @@ export function createWebRtcDataChannelTransport(
       if (disposed || channel !== ch) return;
       clearConnectTimeout();
       currentDelay = initialDelay;
+      transport.lastError = null;
       setStatus("connected");
       const msg = new Uint8Array(3);
       msg[0] = C2S_DISPLAY_RATE;
@@ -124,6 +126,7 @@ export function createWebRtcDataChannelTransport(
     ch.onerror = () => {
       if (disposed || channel !== ch) return;
       clearConnectTimeout();
+      transport.lastError = "Data channel error";
       setStatus("error");
       scheduleReconnect();
     };

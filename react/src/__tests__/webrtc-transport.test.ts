@@ -242,6 +242,7 @@ describe("createWebRtcDataChannelTransport", () => {
     t.addEventListener("statuschange", statusCb);
     channel.simulateError();
     expect(t.status).toBe("error");
+    expect(t.lastError).toBe("Data channel error");
     expect(statusCb).toHaveBeenCalledWith("error");
   });
 
@@ -294,6 +295,7 @@ describe("createWebRtcDataChannelTransport", () => {
     vi.advanceTimersByTime(500);
 
     expect(t.status).toBe("error");
+    expect(t.lastError).toBe("connect timeout");
     expect(statusCb).toHaveBeenCalledWith("error");
   });
 
