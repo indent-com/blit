@@ -26,6 +26,7 @@ struct Config {
     shell: String,
     scrollback: usize,
     socket_path: String,
+    fd_channel: Option<RawFd>,
 }
 
 fn pty_write_all(fd: libc::c_int, mut data: &[u8]) {
@@ -1606,7 +1607,14 @@ fn default_socket_path() -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: blit-server [--socket PATH] [PATH]"
+    "usage: blit-server [--socket PATH] [--fd-channel FD] [PATH]"
+}
+
+fn parse_fd_value(s: &str, label: &str) -> RawFd {
+    s.parse::<RawFd>().unwrap_or_else(|_| {
+        eprintln!("invalid fd number for {label}: {s}");
+        std::process::exit(2);
+    })
 }
 
 fn parse_config() -> Config {
@@ -1616,12 +1624,16 @@ fn parse_config() -> Config {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(SCROLLBACK_ROWS_DEFAULT);
     let mut socket_path = std::env::var("BLIT_SOCK").ok();
+    let mut fd_channel: Option<RawFd> = std::env::var("BLIT_FD_CHANNEL")
+        .ok()
+        .map(|s| parse_fd_value(&s, "BLIT_FD_CHANNEL"));
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             println!("{}", usage());
             println!("  --socket PATH            Unix socket path (or set BLIT_SOCK)");
+            println!("  --fd-channel FD          Accept clients via fd-passing on FD (or set BLIT_FD_CHANNEL)");
             println!("  --version, -V            Print version");
             std::process::exit(0);
         }
@@ -1644,6 +1656,21 @@ fn parse_config() -> Config {
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--fd-channel=") {
+            fd_channel = Some(parse_fd_value(value, "--fd-channel"));
+            continue;
+        }
+
+        if arg == "--fd-channel" {
+            let value = args.next().unwrap_or_else(|| {
+                eprintln!("missing value for --fd-channel");
+                eprintln!("{}", usage());
+                std::process::exit(2);
+            });
+            fd_channel = Some(parse_fd_value(&value, "--fd-channel"));
+            continue;
+        }
+
         if arg.starts_with('-') {
             eprintln!("unrecognized argument: {arg}");
             eprintln!("{}", usage());
@@ -1661,6 +1688,51 @@ fn parse_config() -> Config {
         shell,
         scrollback,
         socket_path: socket_path.unwrap_or_else(default_socket_path),
+        fd_channel,
+    }
+}
+
+enum RecvFdResult {
+    Fd(RawFd),
+    WouldBlock,
+    Closed,
+}
+
+fn recv_fd(channel: RawFd) -> RecvFdResult {
+    unsafe {
+        let mut buf = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let cmsg_space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_space as _;
+        let n = libc::recvmsg(channel, &mut msg, libc::MSG_DONTWAIT);
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return RecvFdResult::WouldBlock;
+            }
+            return RecvFdResult::Closed;
+        }
+        if n == 0 {
+            return RecvFdResult::Closed;
+        }
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return RecvFdResult::Closed;
+        }
+        if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+            let fd_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
+            RecvFdResult::Fd(std::ptr::read_unaligned(fd_ptr))
+        } else {
+            RecvFdResult::Closed
+        }
     }
 }
 
@@ -1716,6 +1788,41 @@ async fn main() {
             unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
         }
     });
+
+    if let Some(channel_fd) = state.0.fd_channel {
+        use std::os::unix::io::FromRawFd;
+        eprintln!("accepting clients via fd-channel (fd {channel_fd})");
+        let channel = unsafe { std::os::unix::net::UnixStream::from_raw_fd(channel_fd) };
+        let async_channel = AsyncFd::new(channel).unwrap();
+        loop {
+            let mut guard = match async_channel.readable().await {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("fd-channel error: {e}");
+                    break;
+                }
+            };
+            match recv_fd(channel_fd) {
+                RecvFdResult::Fd(client_fd) => {
+                    let std_stream =
+                        unsafe { std::os::unix::net::UnixStream::from_raw_fd(client_fd) };
+                    std_stream.set_nonblocking(true).unwrap();
+                    let stream = tokio::net::UnixStream::from_std(std_stream).unwrap();
+                    let state = state.clone();
+                    tokio::spawn(handle_client(stream, state));
+                    guard.retain_ready();
+                }
+                RecvFdResult::WouldBlock => {
+                    guard.clear_ready();
+                }
+                RecvFdResult::Closed => {
+                    break;
+                }
+            }
+        }
+        eprintln!("fd-channel closed, shutting down");
+        return;
+    }
 
     // systemd socket activation: if LISTEN_FDS is set, use fd 3.
     // LISTEN_PID is checked but not required to match — some container runtimes
