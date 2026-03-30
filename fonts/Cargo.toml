@@ -3,5 +3,8 @@ name = "blit-fonts"
 version = "0.11.2"
 edition = "2021"
 description = "Font discovery and serving for blit"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]

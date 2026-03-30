@@ -2,14 +2,18 @@
 name = "blit-cli"
 version = "0.11.2"
 edition = "2021"
+description = "blit terminal client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "blit"
 path = "src/main.rs"
 
 [dependencies]
-blit-remote = { path = "../remote" }
-blit-webserver = { path = "../webserver" }
+blit-remote = { workspace = true }
+blit-webserver = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 axum = { version = "0.8", features = ["ws"] }

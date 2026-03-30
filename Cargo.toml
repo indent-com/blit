@@ -12,6 +12,17 @@ members = [
     "webserver",
 ]
 
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/indent-com/blit"
+homepage = "https://blit.sh"
+
+[workspace.dependencies]
+blit-remote = { version = "0.11.2", path = "remote" }
+blit-alacritty = { version = "0.11.2", path = "alacritty-driver" }
+blit-fonts = { version = "0.11.2", path = "fonts" }
+blit-webserver = { version = "0.11.2", path = "webserver" }
+
 [profile.release]
 opt-level = "s"
 lto = true

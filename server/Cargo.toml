@@ -2,10 +2,14 @@
 name = "blit-server"
 version = "0.11.2"
 edition = "2021"
+description = "blit terminal multiplexer server"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-blit-remote = { path = "../remote" }
-blit-alacritty = { path = "../alacritty-driver" }
+blit-remote = { workspace = true }
+blit-alacritty = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 memchr = "2"

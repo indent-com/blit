@@ -26,6 +26,24 @@
       "default": "./dist/palettes.js"
     }
   },
+  "description": "Low-latency terminal streaming — React components and hooks",
+  "homepage": "https://blit.sh",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/indent-com/blit.git",
+    "directory": "react"
+  },
+  "bugs": {
+    "url": "https://github.com/indent-com/blit/issues"
+  },
+  "keywords": [
+    "terminal",
+    "tty",
+    "react",
+    "streaming",
+    "webgl"
+  ],
   "sideEffects": false,
   "files": [
     "dist"

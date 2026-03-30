@@ -9,7 +9,7 @@ async function authenticate(page: import("@playwright/test").Page) {
   await passInput.fill("test-secret");
   await passInput.press("Enter");
   await expect(
-    page.getByText("No terminal open").or(page.locator("canvas").first()),
+    page.getByRole("button", { name: "New terminal" }).first().or(page.locator("canvas").first()),
   ).toBeVisible({ timeout: 10_000 });
   const canvas = page.locator("canvas").first();
   if (!(await canvas.isVisible().catch(() => false))) {

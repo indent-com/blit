@@ -2,6 +2,7 @@
 name = "blit-demo"
 version = "0.11.2"
 edition = "2024"
+publish = false
 
 [dependencies]
 blit-remote = { path = "../remote" }

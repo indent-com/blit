@@ -79,6 +79,36 @@ jobs:
             tarballs/*.tar.gz
           generate_release_notes: true
 
+  publish-crates:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/publish-crates
+
+  publish-npm:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/publish-npm-packages --provenance --access public
+
+  update-homebrew:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew tap
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: indent-com/homebrew-tap
+          event-type: update
+          client-payload: '{"version": "${{ github.ref_name }}"}'
+
   apt-repo:
     needs: [build-debs]
     runs-on: ubuntu-latest

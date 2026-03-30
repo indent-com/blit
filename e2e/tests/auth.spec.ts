@@ -42,7 +42,7 @@ test.describe("Auth flow", () => {
     await passInput.press("Enter");
 
     await expect(passInput).toBeHidden({ timeout: 10_000 });
-    const newTerminal = page.getByText("No terminal open");
+    const newTerminal = page.getByRole("button", { name: "New terminal" }).first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
@@ -54,7 +54,7 @@ test.describe("Auth flow", () => {
     await passInput.fill("test-secret");
     await passInput.press("Enter");
 
-    const newTerminal = page.getByText("No terminal open");
+    const newTerminal = page.getByRole("button", { name: "New terminal" }).first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
     await page.reload();
@@ -81,7 +81,7 @@ test.describe("Auth flow", () => {
 
     await passInput.press("Enter");
     await expect(passInput).toBeHidden({ timeout: 10_000 });
-    const newTerminal = page.getByText("No terminal open");
+    const newTerminal = page.getByRole("button", { name: "New terminal" }).first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 });

@@ -2,16 +2,16 @@
 import { $ } from "bun";
 
 const root = (await $`git rev-parse --show-toplevel`.text()).trim();
-const flake = `${root}/flake.nix`;
-let text = await Bun.file(flake).text();
+const packages = `${root}/nix/packages.nix`;
+let text = await Bun.file(packages).text();
 
 for (const dir of ["react", "web-app"]) {
   const hash = (await $`prefetch-npm-deps ${root}/${dir}/package-lock.json`.quiet()).text().trim();
   console.log(`${dir}: ${hash}`);
   text = text.replace(
-    new RegExp(`(src = \\./${dir};\\s*\\n\\s*hash = ")sha256-[A-Za-z0-9+/]+=*`),
+    new RegExp(`(src = \\.\\./${dir};\\s*\\n\\s*hash = ")sha256-[A-Za-z0-9+/]+=*`),
     `$1${hash}`,
   );
 }
 
-await Bun.write(flake, text);
+await Bun.write(packages, text);
