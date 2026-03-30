@@ -14,7 +14,7 @@ For a deep dive into how all the pieces connect — wire protocol, frame encodin
 
 **`blit-browser`** is the WASM terminal runtime. It receives compressed frame diffs and produces WebGL vertex data for rendering.
 
-**`blit-react`** is the React embedding library. It manages workspaces, connections, sessions, transports, and rendering. This is the primary integration point for applications.
+**`blit-react`** is the React embedding library. It manages workspaces, connections, sessions, transports, and rendering. This is the primary integration point for applications. See [EMBEDDING.md](EMBEDDING.md).
 
 ## Browser access
 
@@ -46,118 +46,6 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | Transport | WebSocket, WebTransport, Unix socket | WebSocket | WebSocket | TCP | UDP | WebSocket |
 | Embeddable | React library | No | No | No | No | Yes (xterm.js) |
 
-## Embedding with `blit-react`
-
-`blit-react` is workspace-first. A `BlitWorkspace` owns connections, each connection owns sessions, and each `BlitTerminal` renders a session by ID.
-
-```tsx
-import {
-  BlitTerminal,
-  BlitWorkspace,
-  BlitWorkspaceProvider,
-  WebSocketTransport,
-  useBlitFocusedSession,
-  useBlitSessions,
-  useBlitWorkspace,
-} from "blit-react";
-import { useEffect, useMemo } from "react";
-
-function EmbeddedBlit({ wasm, passphrase }: { wasm: any; passphrase: string }) {
-  const transport = useMemo(
-    () => new WebSocketTransport("wss://example.com/blit", passphrase),
-    [passphrase],
-  );
-
-  const workspace = useMemo(
-    () =>
-      new BlitWorkspace({
-        wasm,
-        connections: [{ id: "default", transport }],
-      }),
-    [transport, wasm],
-  );
-
-  useEffect(() => () => workspace.dispose(), [workspace]);
-
-  return (
-    <BlitWorkspaceProvider workspace={workspace}>
-      <TerminalScreen />
-    </BlitWorkspaceProvider>
-  );
-}
-
-function TerminalScreen() {
-  const workspace = useBlitWorkspace();
-  const sessions = useBlitSessions();
-  const focusedSession = useBlitFocusedSession();
-
-  useEffect(() => {
-    if (sessions.length > 0) return;
-    void workspace.createSession({
-      connectionId: "default",
-      rows: 24,
-      cols: 80,
-    });
-  }, [sessions.length, workspace]);
-
-  return (
-    <BlitTerminal
-      sessionId={focusedSession?.id ?? null}
-      style={{ width: "100%", height: "100vh" }}
-    />
-  );
-}
-```
-
-### React API
-
-| API | Purpose |
-| --- | --- |
-| `new BlitWorkspace({ wasm, connections })` | Create a workspace with one or more transports |
-| `BlitWorkspaceProvider` | Put the workspace, palette, and font settings in context |
-| `useBlitWorkspace()` | Get the imperative workspace object |
-| `useBlitWorkspaceState()` | Read the full reactive workspace snapshot |
-| `useBlitConnection(connectionId?)` | Read one connection snapshot |
-| `useBlitSessions()` | Read all sessions |
-| `useBlitFocusedSession()` | Read the currently focused session |
-| `BlitTerminal` | Render one session by `sessionId` |
-
-### Workspace operations
-
-- `createSession({ connectionId, rows, cols, tag?, command?, cwdFromSessionId? })`
-- `closeSession(sessionId)`
-- `restartSession(sessionId)`
-- `focusSession(sessionId | null)`
-- `search(query, { connectionId? })`
-- `setVisibleSessions(sessionIds)`
-- `addConnection(...)` / `removeConnection(connectionId)` / `reconnectConnection(connectionId)`
-
-### Transports
-
-```ts
-// WebSocket
-new WebSocketTransport(url, passphrase, { reconnect, reconnectDelay, maxReconnectDelay, reconnectBackoff })
-
-// WebTransport (QUIC/HTTP3)
-new WebTransportTransport(url, passphrase, { reconnect, serverCertificateHash })
-
-// WebRTC data channel
-createWebRtcDataChannelTransport(peerConnection, { label, displayRateFps, connectTimeoutMs })
-```
-
-Or implement your own:
-
-```ts
-interface BlitTransport {
-  connect(): void;
-  send(data: Uint8Array): void;
-  close(): void;
-  readonly status: ConnectionStatus;
-  addEventListener(type: "message" | "statuschange", listener: Function): void;
-  removeEventListener(type: "message" | "statuschange", listener: Function): void;
-}
-```
-
 ## What lives in this repo
 
 | Directory | Package | Role |
@@ -182,11 +70,28 @@ interface BlitTransport {
 brew install indent-com/tap/blit indent-com/tap/blit-gateway indent-com/tap/blit-server
 ```
 
+### Debian / Ubuntu (APT)
+
+```bash
+curl -fsSL https://repo.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
+echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://repo.blit.sh/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/blit.list
+sudo apt update
+sudo apt install blit blit-server blit-gateway
+```
+
 ### From source
 
 ```bash
 nix develop        # or use direnv — .envrc is included
 cargo build --release -p blit-cli -p blit-server -p blit-gateway
+```
+
+Individual Nix packages:
+
+```bash
+nix build .#blit-server      # or blit-cli, blit-gateway
+nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
 ```
 
 ## Quick start
@@ -243,7 +148,7 @@ dev
 
 For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and either opens the browser with an embedded local gateway or renders directly in the current terminal with `--console`.
 
-#### Agent subcommands
+## Agent subcommands
 
 The CLI includes non-interactive subcommands designed for programmatic / LLM agent use. All subcommands accept `--socket PATH`, `--tcp HOST:PORT`, or `--ssh HOST` to select the transport.
 
@@ -270,25 +175,34 @@ blit --ssh myhost show 1
 
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
-## Deployment
+## Running services
 
-### Debian / Ubuntu (APT)
+Nix users: jump to [nix-darwin](#nix-darwin) or [NixOS](#nixos).
+
+### macOS (Homebrew)
 
 ```bash
-curl -fsSL https://repo.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
-echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://repo.blit.sh/ stable main" \
-  | sudo tee /etc/apt/sources.list.d/blit.list
-sudo apt update
-sudo apt install blit blit-server blit-gateway
+brew services start blit-server
+brew services start blit-gateway
 ```
 
-### systemd
+Configuration lives in env files under `$(brew --prefix)/etc/blit/`. These start empty (the binaries have sensible defaults) and are preserved across upgrades. Add any environment variable from the tables above to override defaults:
+
+```bash
+echo 'export BLIT_PASS="secret"' >> $(brew --prefix)/etc/blit/blit-gateway.env
+echo 'export BLIT_SCROLLBACK="50000"' >> $(brew --prefix)/etc/blit/blit-server.env
+brew services restart blit-gateway blit-server
+```
+
+### Debian / Ubuntu (APT)
 
 The `blit-server` .deb ships the unit files, so after installing via APT:
 
 ```bash
 sudo systemctl enable --now blit@alice.socket
 ```
+
+### Manual (systemd)
 
 On non-Debian systems, copy the units from the repo:
 
@@ -298,7 +212,25 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now blit@alice.socket
 ```
 
-### macOS (nix-darwin)
+## Building and testing
+
+Every `nix run` target has a corresponding script in `bin/` so you don't need to remember the nix invocation:
+
+```bash
+./bin/tests                  # Rust + React unit tests
+./bin/lint                   # Clippy
+./bin/e2e                    # Playwright e2e tests
+./bin/build-debs             # .deb packages -> dist/debs/
+./bin/build-tarballs         # static tarballs -> dist/tarballs/
+./bin/browser-publish        # npm publish blit-browser
+./bin/react-publish          # npm publish blit-react
+```
+
+`build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
+The version and platform are derived from `flake.nix` and the build host.
+Linkage is verified at `nix build` time — Linux binaries must be statically linked and macOS binaries must not reference nix-store dylibs.
+
+## nix-darwin
 
 ```nix
 { inputs, ... }: {
@@ -314,25 +246,7 @@ sudo systemctl enable --now blit@alice.socket
 }
 ```
 
-### macOS (Homebrew)
-
-```bash
-brew install indent-com/tap/blit-server
-brew install indent-com/tap/blit-gateway
-brew services start blit-server
-brew services start blit-gateway
-```
-
-Configuration lives in env files under `$(brew --prefix)/etc/blit/`. These start empty (the binaries have sensible defaults) and are preserved across upgrades. Add any environment variable from the tables above to override defaults:
-
-```bash
-# e.g. configure the gateway passphrase and scrollback
-echo 'export BLIT_PASS="secret"' >> $(brew --prefix)/etc/blit/blit-gateway.env
-echo 'export BLIT_SCROLLBACK="50000"' >> $(brew --prefix)/etc/blit/blit-server.env
-brew services restart blit-gateway blit-server
-```
-
-### NixOS
+## NixOS
 
 ```nix
 { inputs, ... }: {
@@ -348,28 +262,4 @@ brew services restart blit-gateway blit-server
     };
   };
 }
-```
-## Building and testing
-
-Every `nix run` target has a corresponding script in `bin/` so you don't need to remember the nix invocation:
-
-```bash
-./bin/tests                  # Rust + React unit tests
-./bin/lint                   # Clippy
-./bin/e2e                    # Playwright e2e tests
-./bin/build-debs             # .deb packages → dist/debs/
-./bin/build-tarballs         # static tarballs → dist/tarballs/
-./bin/browser-publish        # npm publish blit-browser
-./bin/react-publish          # npm publish blit-react
-```
-
-`build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
-The version and platform are derived from `flake.nix` and the build host.
-Linkage is verified at `nix build` time — Linux binaries must be statically linked and macOS binaries must not reference nix-store dylibs.
-
-Individual packages can also be built directly:
-
-```bash
-nix build .#blit-server      # or blit-cli, blit-gateway
-nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
 ```
