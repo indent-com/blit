@@ -55,16 +55,21 @@ export function enumeratePanes(
 }
 
 export function assignSessionsToPanes(
-  paneIds: readonly string[],
+  panes: readonly BSPPane[],
   orderedSessionIds: readonly SessionId[],
 ): BSPAssignments {
   const assignments: Record<string, SessionId | null> = {};
-  for (let index = 0; index < paneIds.length; index += 1) {
-    assignments[paneIds[index]] = orderedSessionIds[index] ?? null;
+  let sessionIdx = 0;
+  for (const pane of panes) {
+    if (pane.leaf.command) {
+      assignments[pane.id] = null;
+    } else {
+      assignments[pane.id] = orderedSessionIds[sessionIdx++] ?? null;
+    }
   }
   return {
     assignments,
-    overflowSessionIds: orderedSessionIds.slice(paneIds.length),
+    overflowSessionIds: orderedSessionIds.slice(sessionIdx),
   };
 }
 
@@ -101,17 +106,18 @@ export function buildCandidateOrder({
 }
 
 export function reconcileAssignments({
-  paneIds,
+  panes,
   previous,
   liveSessionIds,
   preferredPaneId,
 }: {
-  paneIds: readonly string[];
+  panes: readonly BSPPane[];
   previous: BSPAssignments;
   liveSessionIds: readonly SessionId[];
   preferredPaneId?: string | null;
 }): BSPAssignments {
   const live = new Set(liveSessionIds);
+  const paneIds = panes.map((p) => p.id);
   const assignments: Record<string, SessionId | null> = {};
   const assigned = new Set<SessionId>();
   const overflowSessionIds = previous.overflowSessionIds.filter((sessionId) => live.has(sessionId));
@@ -127,27 +133,25 @@ export function reconcileAssignments({
     assigned.add(sessionId);
   }
 
-  const empties = paneIds.filter((paneId) => assignments[paneId] == null);
-  if (preferredPaneId) {
-    const preferredIndex = empties.indexOf(preferredPaneId);
-    if (preferredIndex > 0) {
-      const [preferred] = empties.splice(preferredIndex, 1);
-      empties.unshift(preferred);
-    } else if (preferredIndex === -1 && assignments[preferredPaneId] != null) {
-      const evicted = assignments[preferredPaneId]!;
+  if (preferredPaneId && paneIds.includes(preferredPaneId)) {
+    const current = assignments[preferredPaneId];
+    if (current) {
+      assigned.delete(current);
+      overflowSessionIds.push(current);
       assignments[preferredPaneId] = null;
-      overflowSessionIds.push(evicted);
-      empties.unshift(preferredPaneId);
+    }
+    for (const sessionId of liveSessionIds) {
+      if (!assigned.has(sessionId)) {
+        assignments[preferredPaneId] = sessionId;
+        assigned.add(sessionId);
+        break;
+      }
     }
   }
+
   for (const sessionId of liveSessionIds) {
     if (assigned.has(sessionId)) continue;
-    const paneId = empties.shift();
-    if (paneId) {
-      assignments[paneId] = sessionId;
-    } else {
-      overflowSessionIds.push(sessionId);
-    }
+    overflowSessionIds.push(sessionId);
     assigned.add(sessionId);
   }
 

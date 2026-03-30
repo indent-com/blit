@@ -1,4 +1,4 @@
-import type { BSPNode } from "./dsl";
+import { leafCount, type BSPNode } from "./dsl";
 
 /**
  * Tiny visual preview of a BSP layout as nested rectangles.
@@ -27,12 +27,6 @@ export function LayoutPreview({
   let leafCounter = 0;
   const gap = 1;
 
-  // Count leaves in a subtree without emitting rects.
-  function countLeaves(n: BSPNode): number {
-    if (n.type === "leaf") return 1;
-    return n.children.reduce((sum, c) => sum + countLeaves(c.node), 0);
-  }
-
   function layout(n: BSPNode, x: number, y: number, w: number, h: number) {
     if (n.type === "leaf") {
       rects.push({ x, y, w, h, leafIndex: leafCounter++ });
@@ -48,7 +42,7 @@ export function LayoutPreview({
       if (highlightIndex != null) {
         let leafStart = leafCounter;
         for (let i = 0; i < n.children.length; i++) {
-          const count = countLeaves(n.children[i].node);
+          const count = leafCount(n.children[i].node);
           if (highlightIndex >= leafStart && highlightIndex < leafStart + count) {
             activeChild = i;
             break;
@@ -57,16 +51,11 @@ export function LayoutPreview({
         }
       }
 
-      // Emit tab indicator rects — use the first leaf index of each child
-      // so the active tab's indicator highlights.
-      let tabLeafStart = leafCounter;
       for (let i = 0; i < n.children.length; i++) {
-        const count = countLeaves(n.children[i].node);
         rects.push({
           x: x + i * (tabW + gap), y, w: tabW, h: tabH,
-          leafIndex: i === activeChild ? tabLeafStart : -1,
+          leafIndex: i === activeChild ? (highlightIndex ?? -1) : -1,
         });
-        tabLeafStart += count;
       }
 
       // Skip leaf counters for inactive children, layout only the active one.
@@ -74,7 +63,7 @@ export function LayoutPreview({
         if (i === activeChild) {
           layout(n.children[i].node, x, y + tabH + gap, w, h - tabH - gap);
         } else {
-          leafCounter += countLeaves(n.children[i].node);
+          leafCounter += leafCount(n.children[i].node);
         }
       }
       return;

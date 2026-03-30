@@ -118,7 +118,6 @@ export function BSPContainer({
   const panes = useMemo(() => enumeratePanes(root), [root]);
   const paneIds = useMemo(() => panes.map((pane) => pane.id), [panes]);
   const [layoutState, setLayoutState] = useState<BSPAssignments>(() => {
-    // Try to restore assignments from URL hash.
     const hashAssignments = loadAssignmentsFromHash();
     if (hashAssignments) {
       const assignments: Record<string, SessionId | null> = {};
@@ -134,7 +133,7 @@ export function BSPContainer({
       focusedSessionId,
       lruSessionIds,
     });
-    return assignSessionsToPanes(paneIds, orderedSessionIds);
+    return assignSessionsToPanes(panes, orderedSessionIds);
   });
 
   const lastDslRef = useRef(layout.dsl);
@@ -147,9 +146,9 @@ export function BSPContainer({
   useEffect(() => {
     if (layout === lastLayoutRef.current) return;
 
-    const currentPaneIds = enumeratePanes(rootRef.current).map((pane) => pane.id);
-    const currentAssignedInPaneOrder = currentPaneIds
-      .map((paneId) => layoutStateRef.current.assignments[paneId])
+    const currentPanes = enumeratePanes(rootRef.current);
+    const currentAssignedInPaneOrder = currentPanes
+      .map((pane) => layoutStateRef.current.assignments[pane.id])
       .filter((sessionId): sessionId is SessionId => sessionId != null);
     const orderedSessionIds = buildCandidateOrder({
       liveSessionIds,
@@ -159,25 +158,25 @@ export function BSPContainer({
       lruSessionIds,
     });
     const nextRoot = layout.root;
-    const nextPaneIds = enumeratePanes(nextRoot).map((pane) => pane.id);
+    const nextPanes = enumeratePanes(nextRoot);
 
     lastLayoutRef.current = layout;
     lastDslRef.current = layout.dsl;
     setRoot(nextRoot);
-    setLayoutState(assignSessionsToPanes(nextPaneIds, orderedSessionIds));
+    setLayoutState(assignSessionsToPanes(nextPanes, orderedSessionIds));
   }, [focusedSessionId, layout, liveSessionIds, lruSessionIds]);
 
   useEffect(() => {
     setLayoutState((previous) => {
       const next = reconcileAssignments({
-        paneIds,
+        panes,
         previous,
         liveSessionIds,
         preferredPaneId: preferredEmptyPaneId,
       });
       return sameAssignments(previous, next) ? previous : next;
     });
-  }, [liveSessionIds, paneIds, preferredEmptyPaneId]);
+  }, [liveSessionIds, panes, preferredEmptyPaneId]);
 
   const assignedInPaneOrder = useMemo(
     () => paneIds
@@ -506,7 +505,7 @@ function BSPPane({
           })}
         </div>
         <div style={{ flex: 1, overflow: "hidden", position: "relative", minHeight: 0 }}>
-          <BSPPane {...paneProps(node.children[activeTab], activeTab)} />
+          <BSPPane key={activeTab} {...paneProps(node.children[activeTab], activeTab)} />
         </div>
       </div>
     );
@@ -575,6 +574,14 @@ function LeafPane({
   const session = sessions.find((item) => item.id === sessionId) ?? null;
   const connection = useBlitConnection(connectionId);
   const termRef = useRef<BlitTerminalHandle>(null);
+  const autoCreatedRef = useRef(false);
+
+  useEffect(() => {
+    if (sessionId || !leaf.command || autoCreatedRef.current) return;
+    if (connection?.status !== "connected") return;
+    autoCreatedRef.current = true;
+    onCreateInPane?.(paneId, leaf.command);
+  }, [sessionId, leaf.command, connection?.status, onCreateInPane, paneId]);
 
   useEffect(() => {
     if (isFocused && termRef.current) termRef.current.focus();
