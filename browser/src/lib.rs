@@ -464,7 +464,7 @@ impl GlyphAtlas {
             if let Some(ctx) = &self.ctx {
                 ctx.set_font(font);
                 let overhang = blitMeasureMaxOverhang(ctx, cell_width);
-                self.horiz_pad = (overhang.ceil() as u32).max(Self::MIN_HORIZ_PAD);
+                self.horiz_pad = (overhang as u32).max(Self::MIN_HORIZ_PAD);
             }
         }
         true
