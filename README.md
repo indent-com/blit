@@ -148,7 +148,6 @@ If building from source, substitute `cargo run -p blit-server`, `cargo run -p bl
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BLIT_SOCK` | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path |
-| `BLIT_DISPLAY_FPS` | `240` | Display refresh rate (10–1000) sent to the server |
 
 For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and opens the browser with an embedded local gateway.
 
