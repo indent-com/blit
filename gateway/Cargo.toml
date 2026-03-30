@@ -1,6 +1,6 @@
 [package]
 name = "blit-gateway"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 description = "blit WebSocket/WebTransport gateway"
 license.workspace = true

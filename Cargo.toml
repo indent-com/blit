@@ -18,10 +18,10 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.12.1", path = "remote" }
-blit-alacritty = { version = "0.12.1", path = "alacritty-driver" }
-blit-fonts = { version = "0.12.1", path = "fonts" }
-blit-webserver = { version = "0.12.1", path = "webserver" }
+blit-remote = { version = "0.12.2", path = "remote" }
+blit-alacritty = { version = "0.12.2", path = "alacritty-driver" }
+blit-fonts = { version = "0.12.2", path = "fonts" }
+blit-webserver = { version = "0.12.2", path = "webserver" }
 
 [profile.release]
 opt-level = "s"
