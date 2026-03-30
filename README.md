@@ -55,7 +55,6 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | Agent / CLI subcommands | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Reconnect on disconnect | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
 | SSH tunneling built-in | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
-| Self-hostable | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Adjacent tools
 
