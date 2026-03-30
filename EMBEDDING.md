@@ -183,47 +183,75 @@ client_ours.sendall(struct.pack("<I", len(create_msg)) + create_msg)
 
 ### Bun
 
-Bun does not expose `sendmsg`/`SCM_RIGHTS` directly, but it can spawn `blit-server` with inherited fds and then connect to it by creating a Unix socketpair via a small native helper or by using the standard socket path fallback. The simplest approach uses Bun's built-in Unix socket support alongside fd-channel:
+Bun doesn't expose `sendmsg`/`SCM_RIGHTS` in its standard library, but `bun:ffi` can call libc directly. The example below creates a socketpair, spawns `blit-server` with one end as the fd-channel, and uses `sendmsg()` via FFI to pass client fds.
 
 ```ts
 import { spawn } from "bun";
+import { dlopen, FFIType, ptr, CString } from "bun:ffi";
 
-// Bun can't create socketpairs with SCM_RIGHTS directly, so use a helper.
-// blit-fdpass is a tiny C/Rust utility that bridges: it holds the channel
-// fd and accepts local Unix connections, forwarding each as an SCM_RIGHTS
-// send. Alternatively, use node:child_process with a native addon.
-
-// Simpler approach: use blit-server's socket mode and connect directly.
-// fd-channel is most useful from languages with native sendmsg support.
-
-// If you have a native SCM_RIGHTS helper (e.g., via bun:ffi or a C addon):
-const SOCK_PATH = "/tmp/blit-embedded.sock";
-
-const server = spawn(["blit-server", "--socket", SOCK_PATH], {
-  env: { ...process.env, SHELL: "/bin/bash" },
+const libc = dlopen("libc.so.6", {
+  socketpair: { args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+  sendmsg:    { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i64 },
+  close:      { args: [FFIType.i32], returns: FFIType.i32 },
 });
 
-// Wait for socket to appear, then connect
-await Bun.sleep(100);
+const AF_UNIX = 1, SOCK_STREAM = 1;
+const SOL_SOCKET = 1, SCM_RIGHTS = 1;
 
-const client = await Bun.connect({
-  unix: SOCK_PATH,
-  socket: {
-    data(socket, data) {
-      const view = new DataView(data.buffer);
-      // First message: S2C_HELLO (opcode 0x07)
-      // Parse 4-byte LE length prefix, then payload
-    },
-    open(socket) {
-      // Send C2S_CREATE: opcode 0x10, rows=24, cols=80, tag_len=0
-      const msg = new Uint8Array([0x10, 24, 0, 80, 0, 0, 0]);
-      const frame = new Uint8Array(4 + msg.length);
-      new DataView(frame.buffer).setUint32(0, msg.length, true);
-      frame.set(msg, 4);
-      socket.write(frame);
-    },
-  },
+function socketpair(): [number, number] {
+  const fds = new Int32Array(2);
+  if (libc.symbols.socketpair(AF_UNIX, SOCK_STREAM, 0, ptr(fds)) < 0)
+    throw new Error("socketpair failed");
+  return [fds[0], fds[1]];
+}
+
+function sendFd(channel: number, clientFd: number) {
+  // Build a msghdr with one iov byte and one SCM_RIGHTS cmsg carrying clientFd.
+  // struct iovec { void *iov_base; size_t iov_len; }
+  const iovBuf = new Uint8Array(1);
+  const iov = new BigUint64Array(2);
+  iov[0] = BigInt(Bun.ptr(iovBuf));  // iov_base
+  iov[1] = 1n;                        // iov_len
+
+  // cmsg: { cmsg_len, cmsg_level, cmsg_type, data }
+  const CMSG_SPACE = 20; // CMSG_SPACE(sizeof(int)) on x86_64
+  const cmsg = new ArrayBuffer(CMSG_SPACE);
+  const cmsgView = new DataView(cmsg);
+  cmsgView.setUint32(0, 16, true);       // cmsg_len = CMSG_LEN(4)
+  cmsgView.setUint32(4, SOL_SOCKET, true);
+  cmsgView.setUint32(8, SCM_RIGHTS, true);
+  cmsgView.setInt32(12, clientFd, true);  // the fd payload
+
+  // struct msghdr (x86_64): name(8) namelen(4) pad(4) iov(8) iovlen(8) control(8) controllen(8) flags(4)
+  const msghdr = new ArrayBuffer(56);
+  const msg = new DataView(msghdr);
+  msg.setBigUint64(16, BigInt(Bun.ptr(new Uint8Array(iov.buffer))), true); // msg_iov
+  msg.setBigUint64(24, 1n, true);                                          // msg_iovlen
+  msg.setBigUint64(32, BigInt(Bun.ptr(new Uint8Array(cmsg))), true);       // msg_control
+  msg.setBigUint64(40, BigInt(CMSG_SPACE), true);                          // msg_controllen
+
+  if (libc.symbols.sendmsg(channel, ptr(new Uint8Array(msghdr)), 0) < 0)
+    throw new Error("sendmsg failed");
+}
+
+// Create the fd-channel pair
+const [channelTheirs, channelOurs] = socketpair();
+
+// Spawn blit-server with the channel fd
+const server = spawn(["blit-server"], {
+  env: { ...process.env, BLIT_FD_CHANNEL: String(channelTheirs) },
+  stdio: ["inherit", "inherit", "inherit"],
+  ipc: undefined,
 });
+libc.symbols.close(channelTheirs);
+
+// Create a client pair and send one end to the server
+const [clientOurs, clientTheirs] = socketpair();
+sendFd(channelOurs, clientTheirs);
+libc.symbols.close(clientTheirs);
+
+// clientOurs is now a live blit connection -- wrap it with Bun.connect
+// and use 4-byte LE length-prefixed framing to exchange messages.
 ```
 
-For Bun, fd-channel is usable if you bridge through `bun:ffi` to call `sendmsg()` with `SCM_RIGHTS`, or use a native addon. In most cases, connecting directly to the Unix socket is simpler -- fd-channel is primarily valuable when the embedding process needs to mediate every connection (auth gating, connection pooling, sandboxing).
+The struct layouts above assume x86_64 Linux. If you don't need per-connection mediation (auth gating, connection pooling, sandboxing), connecting directly to `blit-server`'s Unix socket via `Bun.connect({ unix: ... })` is simpler.
