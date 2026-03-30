@@ -476,6 +476,16 @@ PKGJSON
           # The musl target is still fully static: pkgsStatic's cargo setup
           # hook writes -Ctarget-feature=+crt-static into .cargo/config.toml.
           postUnpack = "export NIX_CFLAGS_LINK=''";
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+          # pkgsStatic on Darwin links against nix-store libiconv; rewrite to
+          # the system copy so the binary works outside of nix.
+          postFixup = ''
+            for bin in $out/bin/*; do
+              for lib in $(otool -L "$bin" | awk '/\/nix\/store\/.*libiconv/{print $1}'); do
+                install_name_tool -change "$lib" /usr/lib/libiconv.2.dylib "$bin"
+              done
+            done
+          '';
         } // extraArgs);
 
         blit-server-static = mkStaticBin {
