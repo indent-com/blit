@@ -42,7 +42,7 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | Multiple PTYs | ✅ First-class | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual |
 | Browser access | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | Protocol | Binary frame diffs | Raw byte stream | Raw byte stream | SSH + prediction | UDP + SSP | Raw byte stream |
-| Delta updates | ✅ Only changed cells sent | ❌ | ❌ | ❌ | ✅ Predictive | ❌ |
+| Delta updates | ✅ Only changed cells sent | ❌ | ❌ | ❌ | ✅ State diffs | ❌ |
 | LZ4 compression | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Copy-rect scrolling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Per-client backpressure | ✅ Render-metric pacing | ❌ | ❌ | ⚠️ SSH flow control | ❌ | ❌ |
