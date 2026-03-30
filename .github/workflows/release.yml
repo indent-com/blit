@@ -79,7 +79,6 @@ jobs:
             tarballs/*.tar.gz
           generate_release_notes: true
 
-<<<<<<< Updated upstream
   publish-crates:
     needs: [release]
     runs-on: ubuntu-latest
@@ -96,8 +95,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Configure npm for provenance publishing
+        run: |
+          echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" > ~/.npmrc
+          echo "registry=https://registry.npmjs.org/" >> ~/.npmrc
       - run: ./bin/publish-npm-packages --provenance --access public
-=======
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Update Homebrew tap
         uses: peter-evans/repository-dispatch@v3
         with:
@@ -105,7 +109,6 @@ jobs:
           repository: indent-com/homebrew-tap
           event-type: update
           client-payload: '{"version": "${{ github.ref_name }}"}'
->>>>>>> Stashed changes
 
   apt-repo:
     needs: [build-debs]
