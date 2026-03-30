@@ -44,6 +44,19 @@ export function blitFillTextStretched(ctx, codePoint, x, y, targetWidth) {
 export function blitFillText(ctx, text, x, y) {
   ctx.fillText(text, x, y);
 }
+
+const PROBE_CHARS = [0x4D, 0x6D, 0x57, 0x77, 0x40, 0x25, 0x23, 0x47, 0x4F, 0x51];
+
+export function blitMeasureMaxOverhang(ctx, cellWidth) {
+  let maxOverhang = 0;
+  for (const cp of PROBE_CHARS) {
+    const m = ctx.measureText(String.fromCodePoint(cp));
+    const ink = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
+    const overhang = ink - cellWidth;
+    if (overhang > maxOverhang) maxOverhang = overhang;
+  }
+  return Math.ceil(maxOverhang / 2);
+}
 "#)]
 extern "C" {
     fn blitFillTextCodePoint(ctx: &CanvasRenderingContext2d, code_point: u32, x: f64, y: f64);
@@ -55,6 +68,7 @@ extern "C" {
         target_width: f64,
     );
     fn blitFillText(ctx: &CanvasRenderingContext2d, text: &str, x: f64, y: f64);
+    fn blitMeasureMaxOverhang(ctx: &CanvasRenderingContext2d, cell_width: f64) -> f64;
 }
 
 const DEFAULT_FONT_FAMILY: &str = r#"ui-monospace, monospace"#;
@@ -340,6 +354,7 @@ struct GlyphAtlas {
     cell_width: u32,
     cell_height: u32,
     wide_cell_width: u32,
+    horiz_pad: u32,
     /// Cached canvas size — avoids DOM property access per glyph.
     cached_size: u32,
 }
@@ -349,7 +364,7 @@ impl GlyphAtlas {
     const MAX_SIZE: u32 = 8192;
     const PADDING: u32 = 1;
     const VERT_PAD: u32 = 2;
-    const HORIZ_PAD: u32 = 2;
+    const MIN_HORIZ_PAD: u32 = 2;
 
     fn invalidate(&mut self) {
         self.slots.clear();
@@ -360,6 +375,7 @@ impl GlyphAtlas {
         self.cell_width = 0;
         self.cell_height = 0;
         self.wide_cell_width = 0;
+        self.horiz_pad = Self::MIN_HORIZ_PAD;
         if let Some(ctx) = &self.ctx {
             if self.cached_size > 0 {
                 ctx.clear_rect(0.0, 0.0, self.cached_size as f64, self.cached_size as f64);
@@ -430,7 +446,7 @@ impl GlyphAtlas {
         self.ensure_canvas_sized(self.atlas_size())
     }
 
-    fn ensure_metrics(&mut self, cell_width: f64, cell_height: f64) -> bool {
+    fn ensure_metrics(&mut self, cell_width: f64, cell_height: f64, font: &str) -> bool {
         if !self.ensure_canvas() {
             return false;
         }
@@ -445,6 +461,11 @@ impl GlyphAtlas {
             self.cell_width = width;
             self.cell_height = height;
             self.wide_cell_width = wide_width;
+            if let Some(ctx) = &self.ctx {
+                ctx.set_font(font);
+                let overhang = blitMeasureMaxOverhang(ctx, cell_width);
+                self.horiz_pad = (overhang as u32).max(Self::MIN_HORIZ_PAD);
+            }
         }
         true
     }
@@ -455,7 +476,7 @@ impl GlyphAtlas {
         if count == 0 {
             return Self::MIN_SIZE;
         }
-        let cw = (self.cell_width.max(1) + Self::HORIZ_PAD * 2 + Self::PADDING * 3) as usize;
+        let cw = (self.cell_width.max(1) + self.horiz_pad * 2 + Self::PADDING * 3) as usize;
         let ch = (self.cell_height.max(1) + Self::PADDING * 3) as usize;
         let cols = (Self::MAX_SIZE as usize) / cw;
         if cols == 0 {
@@ -520,15 +541,15 @@ impl GlyphAtlas {
         cell_width: f64,
         cell_height: f64,
     ) -> Option<GlyphSlot> {
-        self.ensure_metrics(cell_width, cell_height);
+        self.ensure_metrics(cell_width, cell_height, normal_font);
         if let Some(slot) = self.slots.get(&key) {
             return Some(*slot);
         }
 
         let render_width = if key.wide {
-            self.wide_cell_width.max(1) + Self::HORIZ_PAD * 2
+            self.wide_cell_width.max(1) + self.horiz_pad * 2
         } else {
-            self.cell_width.max(1) + Self::HORIZ_PAD * 2
+            self.cell_width.max(1) + self.horiz_pad * 2
         };
         let render_height = self.cell_height.max(1) + Self::VERT_PAD;
         let slot = self.allocate_slot(render_width, render_height)?;
@@ -561,13 +582,13 @@ impl GlyphAtlas {
             let pad_y = (cell_height - scaled_h) / 2.0;
             (
                 scaled_font,
-                slot.src_x + Self::HORIZ_PAD as f64,
+                slot.src_x + self.horiz_pad as f64,
                 slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64,
             )
         } else {
             (
                 font,
-                slot.src_x + Self::HORIZ_PAD as f64,
+                slot.src_x + self.horiz_pad as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64,
             )
         };
@@ -586,11 +607,11 @@ impl GlyphAtlas {
             ctx.set_stroke_style_str("#fff");
             ctx.begin_path();
             ctx.move_to(
-                slot.src_x + Self::HORIZ_PAD as f64,
+                slot.src_x + self.horiz_pad as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
             );
             ctx.line_to(
-                slot.src_x + slot.width - Self::HORIZ_PAD as f64,
+                slot.src_x + slot.width - self.horiz_pad as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
             );
             ctx.stroke();
@@ -1039,7 +1060,7 @@ impl Terminal {
         self.glyph_verts.clear();
         self.overflow_text_ops.clear();
 
-        self.glyph_atlas.ensure_metrics(cw, ch);
+        self.glyph_atlas.ensure_metrics(cw, ch, &normal_font);
         // Pre-grow atlas based on previous capacity — avoids mid-frame
         // invalidation for steady-state rendering (same glyph set).
         self.glyph_atlas
