@@ -57,27 +57,26 @@ jobs:
           path: debs/*.deb
 
   build-macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-13
-            arch: x86_64
-          - runner: macos-latest
-            arch: aarch64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build binaries
+      - name: Build and verify binaries
         run: |
           mkdir -p stage
-          for pkg in blit-server blit-cli blit-gateway; do
+          for pkg in blit-server-static blit-cli-static blit-gateway-static; do
             out=$(nix build .#"$pkg" --no-link --print-out-paths)
             cp "$out"/bin/* stage/
           done
           ls -lh stage/
+
+          for bin in stage/*; do
+            echo "=== $bin ==="
+            otool -L "$bin"
+            otool -L "$bin" | grep -v '^\S' | grep -v '/usr/lib/' && { echo "FATAL: $bin links to non-system dylibs!"; exit 1; } || true
+          done
 
       - name: Package tarballs
         run: |
@@ -85,13 +84,13 @@ jobs:
           mkdir -p dist
           for bin in stage/*; do
             name=$(basename "$bin")
-            tar -czf "dist/${name}_${version}_darwin_${{ matrix.arch }}.tar.gz" -C stage "$name"
+            tar -czf "dist/${name}_${version}_darwin_aarch64.tar.gz" -C stage "$name"
           done
           ls -lh dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
+          name: macos-aarch64
           path: dist/*.tar.gz
 
   release:

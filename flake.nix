@@ -467,6 +467,7 @@ PKGJSON
           cargoBuildFlags = [ "-p" cargoPkg ];
           cargoLock = cargoLockConfig;
           doCheck = false;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # pkgsStatic's CC wrapper setup hook sets NIX_CFLAGS_LINK=" -static",
           # which causes the glibc CC to link build scripts with -static.
           # Statically-linked glibc binaries SIGSEGV (NSS/TLS resolver init).
@@ -598,6 +599,10 @@ CTRL
         packages.browser-publish = browser-publish;
         packages.react-publish = react-publish;
         packages.default = blit-cli;
+
+        packages.blit-server-static = blit-server-static;
+        packages.blit-cli-static = blit-cli-static;
+        packages.blit-gateway-static = blit-gateway-static;
 
         packages.blit-server-deb = mkDeb {
           pname = "blit-server";
