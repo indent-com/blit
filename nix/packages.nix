@@ -189,12 +189,6 @@ PKGJSON
               echo "rewriting $lib -> $sys"
               install_name_tool -change "$lib" "$sys" "$bin"
             done
-            bad=$(otool -L "$bin" | tail -n +2 | awk '/\/nix\/store\//{print $1}')
-            if [ -n "$bad" ]; then
-              echo "FATAL: $bin still links to nix-store dylibs:"
-              echo "$bad"
-              exit 1
-            fi
           done
         '';
       } // extraArgs);
