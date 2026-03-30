@@ -28,6 +28,10 @@ read_toml_version() {
     perl -ne 'if (/^version = "([^"]+)"/) { print "$1\n"; exit 0 }' "$1"
 }
 
+read_toml_name() {
+    perl -ne 'if (/^name = "([^"]+)"/) { print "$1\n"; exit 0 }' "$1"
+}
+
 read_flake_version() {
     perl -ne 'if (/^\s*version = "([^"]+)";$/) { print "$1\n"; exit 0 }' "$1"
 }
@@ -51,14 +55,11 @@ find_cargo_manifests() {
     ' Cargo.toml
 }
 
-# Discover workspace crate names from Cargo.lock.
+# Discover workspace crate names from member Cargo.toml files.
 find_workspace_crates() {
-    local current_version="$1"
-    perl -0777 -ne '
-        while (/\[\[package\]\]\nname = "([^"]+)"\nversion = "\Q'"$current_version"'\E"/g) {
-            print "$1\n";
-        }
-    ' Cargo.lock
+    for manifest in $(find_cargo_manifests); do
+        read_toml_name "$manifest"
+    done
 }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
@@ -95,16 +96,16 @@ fi
 mapfile -t cargo_manifests < <(find_cargo_manifests)
 [[ ${#cargo_manifests[@]} -gt 0 ]] || die "no workspace members found"
 
-mapfile -t workspace_crates < <(find_workspace_crates "$current_version")
-[[ ${#workspace_crates[@]} -gt 0 ]] || die "no workspace crates found in Cargo.lock at version $current_version"
+mapfile -t workspace_crates < <(find_workspace_crates)
+[[ ${#workspace_crates[@]} -gt 0 ]] || die "no workspace crates found"
 
 for file in "${cargo_manifests[@]}"; do
     [[ "$(read_toml_version "$file")" == "$current_version" ]] \
         || die "expected $file to be at version $current_version"
 done
 
-[[ "$(read_flake_version flake.nix)" == "$current_version" ]] \
-    || die "expected flake.nix to be at version $current_version"
+[[ "$(read_flake_version nix/packages.nix)" == "$current_version" ]] \
+    || die "expected nix/packages.nix to be at version $current_version"
 
 node - "$current_version" <<'NODE'
 const fs = require("fs");
@@ -147,7 +148,7 @@ for file in "${cargo_manifests[@]}"; do
 done
 
 FROM="$current_version" TO="$target_version" \
-    perl -0pi -e 's/version = "\Q$ENV{FROM}\E";/version = "$ENV{TO}";/' flake.nix
+    perl -0pi -e 's/version = "\Q$ENV{FROM}\E";/version = "$ENV{TO}";/' nix/packages.nix
 
 node - "$target_version" <<'NODE'
 const fs = require("fs");
@@ -180,8 +181,8 @@ for file in "${cargo_manifests[@]}"; do
         || die "failed to update $file to version $target_version"
 done
 
-[[ "$(read_flake_version flake.nix)" == "$target_version" ]] \
-    || die "failed to update flake.nix to version $target_version"
+[[ "$(read_flake_version nix/packages.nix)" == "$target_version" ]] \
+    || die "failed to update nix/packages.nix to version $target_version"
 
 node - "$target_version" <<'NODE'
 const fs = require("fs");
@@ -212,8 +213,11 @@ done
 
 cargo test -p blit-server -- --nocapture
 
+# Update npm dependency hashes in nix/packages.nix
+"$script_dir/hashes"
+
 # Stage all changed versioned files
-git add Cargo.lock flake.nix react/package.json react/package-lock.json
+git add Cargo.lock nix/packages.nix react/package.json react/package-lock.json
 for file in "${cargo_manifests[@]}"; do
     git add "$file"
 done
