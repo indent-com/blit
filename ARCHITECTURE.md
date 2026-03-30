@@ -32,7 +32,7 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-webserver` | `webserver/` | lib | Shared axum HTTP helpers for serving assets and fonts |
 | `blit-demo` | `demo/` | bin | Demo programs: `chaos`, `emojiblast`, `netdash` |
 
-Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees.
+Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `src/bin/`).
 
 ### Dependency graph
 
@@ -89,6 +89,8 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 | `0x13` | `SUBSCRIBE` | `[pty_id:2]` |
 | `0x14` | `UNSUBSCRIBE` | `[pty_id:2]` |
 | `0x15` | `SEARCH` | `[request_id:2][query:N]` |
+| `0x16` | `CREATE_AT` | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]` |
+| `0x17` | `CREATE_N` | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]` |
 | `0x18` | `CREATE2` | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
 
 `CREATE2` extends `CREATE` with a nonce for response correlation and optional fields gated by feature bits (`HAS_SRC_PTY`, `HAS_COMMAND`).
@@ -173,9 +175,8 @@ The protocol is defined purely in terms of byte streams. Any transport that can 
 `blit-server` binds a `UnixListener`. Socket path resolution:
 
 1. `$BLIT_SOCK` environment variable
-2. `/run/blit/<user>.sock` (system-wide, via systemd per-user units)
-3. `$XDG_RUNTIME_DIR/blit.sock`
-4. `/tmp/blit.sock`
+2. `$XDG_RUNTIME_DIR/blit.sock`
+3. `/tmp/blit.sock`
 
 Clients (gateway, CLI) connect to this socket and exchange length-prefixed binary frames. This is the only server-side transport; all other transports ultimately proxy to it.
 
@@ -204,7 +205,7 @@ The gateway opens a new Unix socket connection to `blit-server` for each authent
 
 Enabled with `BLIT_QUIC=1`. The gateway listens for QUIC connections on the same port as HTTP. A single bidirectional QUIC stream carries the session, using the same 4-byte length-prefixed framing as Unix sockets. Auth is a 2-byte-LE-length passphrase followed by a 1-byte response.
 
-Self-signed certificates are auto-generated and rotated every 13 days. The certificate hash is served at `/cert-hash` so the browser can pin it via `serverCertificateHash` in the `WebTransport` constructor.
+Self-signed certificates are auto-generated and rotated every 13 days. The certificate's SHA-256 hash is injected into the served HTML page as `window.__blitCertHash`, allowing the browser to pin it via `serverCertificateHashes` in the `WebTransport` constructor.
 
 ### WebRTC DataChannel
 
