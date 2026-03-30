@@ -199,7 +199,7 @@ blit --console user@myhost
 dev
 ```
 
-## Configuration
+## Configuration (demo binaries)
 
 ### `blit-server`
 
