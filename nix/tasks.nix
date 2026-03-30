@@ -242,11 +242,16 @@ in {
 
   tests = pkgs.writeShellApplication {
     name = "blit-tests";
-    runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm ];
+    runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc ];
     text = ''
       echo "=== Setting up web-app dist ==="
       mkdir -p web-app/dist
       cp ${webAppDist}/index.html web-app/dist/
+
+      echo "=== Manpage build ==="
+      for f in man/*.scd; do
+        scdoc < "$f" > /dev/null
+      done
 
       echo "=== Rust tests ==="
       cargo test --workspace
