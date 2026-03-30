@@ -211,19 +211,19 @@ For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and 
 The CLI includes non-interactive subcommands designed for programmatic / LLM agent use. All subcommands accept `--socket PATH`, `--tcp HOST:PORT`, or `--ssh HOST` to select the transport.
 
 ```bash
-blit list                          # List all PTYs (TSV: ID, TAG, TITLE, STATUS)
-blit start htop                    # Start a PTY running htop, print its ID
-blit start -t build make -j8      # Start with a tag
-blit start --rows 40 --cols 120 bash  # Start with a custom size
-blit show 3                        # Dump current visible terminal text
-blit show 3 --ansi                 # Include ANSI color/style codes
-blit history 3                     # Dump all scrollback + viewport
-blit history 3 --from-start 0 --limit 50  # First 50 lines
-blit history 3 --from-end 0 --limit 50    # Last 50 lines
+blit list                                      # List all PTYs (TSV: ID, TAG, TITLE, STATUS)
+blit start htop                                # Start a PTY running htop, print its ID
+blit start -t build make -j8                   # Start with a tag
+blit start --rows 40 --cols 120 bash           # Start with a custom size
+blit show 3                                    # Dump current visible terminal text
+blit show 3 --ansi                             # Include ANSI color/style codes
+blit history 3                                 # Dump all scrollback + viewport
+blit history 3 --from-start 0 --limit 50       # First 50 lines
+blit history 3 --from-end 0 --limit 50         # Last 50 lines
 blit history 3 --from-end 0 --limit 50 --ansi  # Last 50 with ANSI styling
-blit send 3 "q"                    # Send keystrokes (supports \n, \t, \x1b escapes)
-blit resize 3 40 120               # Resize a PTY to 40 rows x 120 cols
-blit close 3                       # Close and remove a PTY
+blit send 3 "q"                                # Send keystrokes (supports \n, \t, \x1b escapes)
+blit resize 3 40 120                           # Resize a PTY to 40 rows x 120 cols
+blit close 3                                   # Close and remove a PTY
 
 # Against a remote host
 blit --ssh myhost list
