@@ -170,7 +170,8 @@ async fn main() {
                     rows,
                     cols,
                 } => {
-                    agent::cmd_history(transport, id, from_start, from_end, limit, ansi, rows, cols)
+                    let size = agent::capture_size(rows, cols);
+                    agent::cmd_history(transport, id, from_start, from_end, limit, ansi, size)
                         .await
                 }
                 Command::Send { id, text } => {
