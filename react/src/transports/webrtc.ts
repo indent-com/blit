@@ -1,13 +1,11 @@
-import type { BlitTransport, ConnectionStatus } from "../types";
+import type { BlitTransport, BlitTransportOptions, ConnectionStatus } from "../types";
 import { C2S_DISPLAY_RATE } from "../types";
 
-export interface WebRtcDataChannelTransportOptions {
+export interface WebRtcDataChannelTransportOptions extends BlitTransportOptions {
   /** Data channel label. Default: "blit". */
   label?: string;
   /** Display rate to advertise to the server. Default: 120. */
   displayRateFps?: number;
-  /** Timeout in ms to wait for the data channel to open. Default: 10000. */
-  connectTimeoutMs?: number;
 }
 
 export function createWebRtcDataChannelTransport(
@@ -17,14 +15,21 @@ export function createWebRtcDataChannelTransport(
   const label = opts?.label ?? "blit";
   const displayRateFps = opts?.displayRateFps ?? 120;
   const connectTimeoutMs = opts?.connectTimeoutMs ?? 10000;
+  const shouldReconnect = opts?.reconnect ?? true;
+  const initialDelay = opts?.reconnectDelay ?? 500;
+  const maxDelay = opts?.maxReconnectDelay ?? 10000;
+  const backoff = opts?.reconnectBackoff ?? 1.5;
 
   let _status: ConnectionStatus = "connecting";
+  let _lastError: string | null = null;
   let channel: RTCDataChannel | null = null;
   let disposed = false;
   let syncResolve: (() => void) | null = null;
   let syncReject: ((err: Error) => void) | null = null;
   let readBuf = new Uint8Array(0);
   let connectTimeout: ReturnType<typeof setTimeout> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let currentDelay = initialDelay;
   let started = false;
   let earlyMessages: ArrayBuffer[] = [];
 
@@ -39,6 +44,108 @@ export function createWebRtcDataChannelTransport(
     }
   }
 
+  function clearConnectTimeout() {
+    if (connectTimeout !== null) {
+      clearTimeout(connectTimeout);
+      connectTimeout = null;
+    }
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function isPeerConnectionAlive(): boolean {
+    const s = pc.connectionState;
+    return s !== "failed" && s !== "closed";
+  }
+
+  function scheduleReconnect() {
+    if (disposed || !shouldReconnect || !isPeerConnectionAlive()) return;
+    clearReconnectTimer();
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!disposed && isPeerConnectionAlive()) {
+        openChannel();
+      }
+    }, currentDelay);
+    currentDelay = Math.min(currentDelay * backoff, maxDelay);
+  }
+
+  function wireChannel(ch: RTCDataChannel) {
+    channel = ch;
+    channel.binaryType = "arraybuffer";
+    readBuf = new Uint8Array(0);
+
+    clearConnectTimeout();
+    connectTimeout = setTimeout(() => {
+      connectTimeout = null;
+      if (_status === "connecting") {
+        _lastError = "connect timeout";
+        setStatus("error");
+        scheduleReconnect();
+      }
+    }, connectTimeoutMs);
+
+    ch.onopen = () => {
+      if (disposed || channel !== ch) return;
+      clearConnectTimeout();
+      currentDelay = initialDelay;
+      _lastError = null;
+      setStatus("connected");
+      const msg = new Uint8Array(3);
+      msg[0] = C2S_DISPLAY_RATE;
+      msg[1] = displayRateFps & 0xff;
+      msg[2] = (displayRateFps >> 8) & 0xff;
+      transport.send(msg);
+    };
+
+    ch.onmessage = (e: MessageEvent) => {
+      if (disposed || channel !== ch) return;
+      const incoming = new Uint8Array(e.data as ArrayBuffer);
+      const combined = new Uint8Array(readBuf.length + incoming.length);
+      combined.set(readBuf);
+      combined.set(incoming, readBuf.length);
+      readBuf = combined;
+
+      while (readBuf.length >= 4) {
+        const len =
+          readBuf[0] |
+          (readBuf[1] << 8) |
+          (readBuf[2] << 16) |
+          (readBuf[3] << 24);
+        if (readBuf.length < 4 + len) break;
+        const payload = readBuf.slice(4, 4 + len);
+        readBuf = readBuf.slice(4 + len);
+        dispatch(payload.buffer as ArrayBuffer);
+      }
+    };
+
+    ch.onerror = () => {
+      if (disposed || channel !== ch) return;
+      clearConnectTimeout();
+      _lastError = "Data channel error";
+      setStatus("error");
+      scheduleReconnect();
+    };
+
+    ch.onclose = () => {
+      if (disposed || channel !== ch) return;
+      clearConnectTimeout();
+      setStatus("disconnected");
+      scheduleReconnect();
+    };
+  }
+
+  function openChannel() {
+    if (disposed) return;
+    setStatus("connecting");
+    wireChannel(pc.createDataChannel(label, { ordered: true }));
+  }
+
   const transport: BlitTransport & { waitForSync(): Promise<void> } = {
     connect() {
       if (started) return;
@@ -51,6 +158,13 @@ export function createWebRtcDataChannelTransport(
 
     get status() {
       return _status;
+    },
+
+    get authRejected() {
+      return false;
+    },
+    get lastError() {
+      return _lastError;
     },
 
     addEventListener(type: string, listener: (data: never) => void): void {
@@ -91,7 +205,8 @@ export function createWebRtcDataChannelTransport(
 
     close() {
       disposed = true;
-      if (connectTimeout !== null) clearTimeout(connectTimeout);
+      clearConnectTimeout();
+      clearReconnectTimer();
       if (channel) {
         try {
           channel.close();
@@ -131,68 +246,16 @@ export function createWebRtcDataChannelTransport(
     }
   }
 
-  // --- Data channel setup ---
-
-  channel = pc.createDataChannel(label, { ordered: true });
-  channel.binaryType = "arraybuffer";
-
-  connectTimeout = setTimeout(() => {
-    if (_status === "connecting") {
-      setStatus("error");
-    }
-  }, connectTimeoutMs);
-
-  channel.onopen = () => {
-    if (disposed) return;
-    if (connectTimeout !== null) clearTimeout(connectTimeout);
-    setStatus("connected");
-    const msg = new Uint8Array(3);
-    msg[0] = C2S_DISPLAY_RATE;
-    msg[1] = displayRateFps & 0xff;
-    msg[2] = (displayRateFps >> 8) & 0xff;
-    transport.send(msg);
-  };
-
-  channel.onmessage = (e: MessageEvent) => {
-    if (disposed) return;
-    const incoming = new Uint8Array(e.data as ArrayBuffer);
-    const combined = new Uint8Array(readBuf.length + incoming.length);
-    combined.set(readBuf);
-    combined.set(incoming, readBuf.length);
-    readBuf = combined;
-
-    while (readBuf.length >= 4) {
-      const len =
-        readBuf[0] |
-        (readBuf[1] << 8) |
-        (readBuf[2] << 16) |
-        (readBuf[3] << 24);
-      if (readBuf.length < 4 + len) break;
-      const payload = readBuf.slice(4, 4 + len);
-      readBuf = readBuf.slice(4 + len);
-      dispatch(payload.buffer as ArrayBuffer);
-    }
-  };
-
-  channel.onerror = () => {
-    if (disposed) return;
-    if (connectTimeout !== null) clearTimeout(connectTimeout);
-    setStatus("error");
-  };
-
-  channel.onclose = () => {
-    if (disposed) return;
-    if (connectTimeout !== null) clearTimeout(connectTimeout);
-    setStatus("disconnected");
-  };
-
   function onConnectionStateChange() {
     if (disposed) return;
     if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      clearReconnectTimer();
       setStatus("disconnected");
     }
   }
   pc.addEventListener("connectionstatechange", onConnectionStateChange);
+
+  wireChannel(pc.createDataChannel(label, { ordered: true }));
 
   return transport;
 }

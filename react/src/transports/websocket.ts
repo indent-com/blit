@@ -1,20 +1,12 @@
-import type { BlitTransport, ConnectionStatus } from "../types";
+import type { BlitTransport, BlitTransportOptions, ConnectionStatus } from "../types";
 
-export interface WebSocketTransportOptions {
-  /** Enable automatic reconnection on disconnect. Default: true. */
-  reconnect?: boolean;
-  /** Initial reconnect delay in ms. Default: 500. */
-  reconnectDelay?: number;
-  /** Maximum reconnect delay in ms. Default: 10000. */
-  maxReconnectDelay?: number;
-  /** Backoff multiplier for reconnect delay. Default: 1.5. */
-  reconnectBackoff?: number;
-}
+export type WebSocketTransportOptions = BlitTransportOptions;
 
 export class WebSocketTransport implements BlitTransport {
   private ws: WebSocket | null = null;
   private _status: ConnectionStatus = "disconnected";
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private currentDelay: number;
   private disposed = false;
   private messageListeners = new Set<(data: ArrayBuffer) => void>();
@@ -30,6 +22,7 @@ export class WebSocketTransport implements BlitTransport {
   private readonly initialDelay: number;
   private readonly maxDelay: number;
   private readonly backoff: number;
+  private readonly connectTimeoutMs: number | null;
 
   constructor(
     url: string,
@@ -42,6 +35,7 @@ export class WebSocketTransport implements BlitTransport {
     this.initialDelay = options?.reconnectDelay ?? 500;
     this.maxDelay = options?.maxReconnectDelay ?? 10000;
     this.backoff = options?.reconnectBackoff ?? 1.5;
+    this.connectTimeoutMs = options?.connectTimeoutMs ?? null;
     this.currentDelay = this.initialDelay;
   }
 
@@ -55,9 +49,17 @@ export class WebSocketTransport implements BlitTransport {
     }
   }
 
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
   close(): void {
     this.disposed = true;
     this.clearReconnectTimer();
+    this.clearConnectTimer();
     if (this.ws) {
       this.ws.onclose = null;
       this.ws.onerror = null;
@@ -157,6 +159,22 @@ export class WebSocketTransport implements BlitTransport {
     }
     this.ws = socket;
 
+    this.clearConnectTimer();
+    if (this.connectTimeoutMs !== null) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.ws !== socket || this.disposed) return;
+        if (this._status === "connecting" || this._status === "authenticating") {
+          this.ws = null;
+          this.lastError = "connect timeout";
+          this.setStatus("error");
+          socket.onclose = null;
+          socket.close();
+          this.scheduleReconnect();
+        }
+      }, this.connectTimeoutMs);
+    }
+
     let authenticated = false;
 
     socket.onopen = () => {
@@ -171,6 +189,7 @@ export class WebSocketTransport implements BlitTransport {
       if (typeof e.data === "string") {
         if (e.data === "ok") {
           authenticated = true;
+          this.clearConnectTimer();
           this.authRejected = false;
           this.lastError = null;
           this.currentDelay = this.initialDelay;
@@ -204,6 +223,7 @@ export class WebSocketTransport implements BlitTransport {
 
     socket.onclose = () => {
       if (this.ws !== socket || this.disposed) return;
+      this.clearConnectTimer();
       this.ws = null;
       if (authenticated) {
         this.setStatus("disconnected");

@@ -111,4 +111,64 @@ describe("WebTransportTransport", () => {
 
     expect(messages).toEqual([payload]);
   });
+
+  it("sets authRejected and lastError on auth failure", async () => {
+    MockWebTransport.queueConnection(new Uint8Array([0]));
+    const transport = new WebTransportTransport("https://example.test", "wrong");
+    const statuses: string[] = [];
+    transport.addEventListener("statuschange", (s) => statuses.push(s));
+
+    transport.connect();
+    await flushPromises();
+
+    expect(transport.authRejected).toBe(true);
+    expect(transport.lastError).toBe("Authentication failed");
+    expect(statuses).toContain("error");
+  });
+
+  it("clears authRejected and lastError on successful auth", async () => {
+    MockWebTransport.queueConnection(new Uint8Array([1]));
+    const transport = new WebTransportTransport("https://example.test", "secret");
+
+    transport.connect();
+    await flushPromises();
+
+    expect(transport.authRejected).toBe(false);
+    expect(transport.lastError).toBeNull();
+    expect(transport.status).toBe("connected");
+  });
+
+  it("uses configurable connectTimeoutMs", async () => {
+    vi.useFakeTimers();
+    const neverReady = new Promise<void>(() => {});
+    vi.stubGlobal("WebTransport", class {
+      static instances: any[] = [];
+      ready = neverReady;
+      closed = new Promise<void>(() => {});
+      close() {}
+      async createBidirectionalStream() {
+        return {
+          readable: { getReader: () => new MockReader([]) },
+          writable: { getWriter: () => new MockWriter() },
+        } as unknown as WebTransportBidirectionalStream;
+      }
+    });
+
+    const transport = new WebTransportTransport("https://example.test", "secret", {
+      connectTimeoutMs: 3000,
+      reconnect: false,
+    });
+
+    transport.connect();
+    await flushPromises();
+    expect(transport.status).toBe("connecting");
+
+    vi.advanceTimersByTime(3000);
+    await flushPromises();
+
+    expect(transport.status).toBe("error");
+    expect(transport.lastError).toBe("connect timeout");
+    transport.close();
+    vi.useRealTimers();
+  });
 });

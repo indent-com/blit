@@ -1,14 +1,6 @@
-import type { BlitTransport, ConnectionStatus } from "../types";
+import type { BlitTransport, BlitTransportOptions, ConnectionStatus } from "../types";
 
-export interface WebTransportTransportOptions {
-  /** Enable automatic reconnection on disconnect. Default: true. */
-  reconnect?: boolean;
-  /** Initial reconnect delay in ms. Default: 500. */
-  reconnectDelay?: number;
-  /** Maximum reconnect delay in ms. Default: 10000. */
-  maxReconnectDelay?: number;
-  /** Backoff multiplier for reconnect delay. Default: 1.5. */
-  reconnectBackoff?: number;
+export interface WebTransportTransportOptions extends BlitTransportOptions {
   /**
    * SHA-256 hash of the server's TLS certificate (hex string).
    * Required for self-signed certs (e.g. auto-generated gateway certs).
@@ -32,6 +24,10 @@ export class WebTransportTransport implements BlitTransport {
   private disposed = false;
   private messageListeners = new Set<(data: ArrayBuffer) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
+  /** True when the server explicitly rejected the passphrase. */
+  authRejected = false;
+  /** Last error message, if any. */
+  lastError: string | null = null;
 
   private readonly url: string;
   private readonly passphrase: string;
@@ -39,6 +35,7 @@ export class WebTransportTransport implements BlitTransport {
   private readonly initialDelay: number;
   private readonly maxDelay: number;
   private readonly backoff: number;
+  private readonly connectTimeoutMs: number;
   private readonly certHash?: Uint8Array;
 
   constructor(
@@ -52,6 +49,7 @@ export class WebTransportTransport implements BlitTransport {
     this.initialDelay = options?.reconnectDelay ?? 500;
     this.maxDelay = options?.maxReconnectDelay ?? 10000;
     this.backoff = options?.reconnectBackoff ?? 1.5;
+    this.connectTimeoutMs = options?.connectTimeoutMs ?? 10_000;
     this.currentDelay = this.initialDelay;
     if (options?.serverCertificateHash) {
       this.certHash = hexToBytes(options.serverCertificateHash);
@@ -188,11 +186,10 @@ export class WebTransportTransport implements BlitTransport {
       }
 
       const wt = new WebTransport(this.url, opts);
-      let authRejected = false;
       this.wt = wt;
       await Promise.race([
         wt.ready,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("connect timeout")), 10_000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("connect timeout")), this.connectTimeoutMs)),
       ]);
 
       if (this.disposed || this.wt !== wt) {
@@ -217,7 +214,8 @@ export class WebTransportTransport implements BlitTransport {
       // Read 1-byte auth response: 1 = ok, 0 = rejected
       const { data: authResp, remainder } = await readExactBuffered(reader, 1);
       if (!authResp || authResp[0] !== 1) {
-        authRejected = true;
+        this.authRejected = true;
+        this.lastError = "Authentication failed";
         this.setStatus("error");
         wt.close();
         return;
@@ -229,6 +227,8 @@ export class WebTransportTransport implements BlitTransport {
       }
 
       this.writer = writer;
+      this.authRejected = false;
+      this.lastError = null;
       this.currentDelay = this.initialDelay;
       this.setStatus("connected");
 
@@ -240,22 +240,23 @@ export class WebTransportTransport implements BlitTransport {
         .then(() => {
           if (this.wt !== wt || this.disposed) return;
           this.cleanup();
-          this.setStatus(authRejected ? "error" : "disconnected");
-          if (!authRejected) {
+          this.setStatus(this.authRejected ? "error" : "disconnected");
+          if (!this.authRejected) {
             this.scheduleReconnect();
           }
         })
         .catch(() => {
           if (this.wt !== wt || this.disposed) return;
           this.cleanup();
-          this.setStatus(authRejected ? "error" : "disconnected");
-          if (!authRejected) {
+          this.setStatus(this.authRejected ? "error" : "disconnected");
+          if (!this.authRejected) {
             this.scheduleReconnect();
           }
         });
-    } catch {
+    } catch (err) {
       if (this.disposed) return;
       this.cleanup();
+      this.lastError = err instanceof Error ? err.message : "Connection failed";
       this.setStatus("error");
       this.scheduleReconnect();
     }

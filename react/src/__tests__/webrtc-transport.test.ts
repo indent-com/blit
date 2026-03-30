@@ -242,6 +242,7 @@ describe("createWebRtcDataChannelTransport", () => {
     t.addEventListener("statuschange", statusCb);
     channel.simulateError();
     expect(t.status).toBe("error");
+    expect(t.lastError).toBe("Data channel error");
     expect(statusCb).toHaveBeenCalledWith("error");
   });
 
@@ -294,6 +295,7 @@ describe("createWebRtcDataChannelTransport", () => {
     vi.advanceTimersByTime(500);
 
     expect(t.status).toBe("error");
+    expect(t.lastError).toBe("connect timeout");
     expect(statusCb).toHaveBeenCalledWith("error");
   });
 
@@ -349,5 +351,92 @@ describe("createWebRtcDataChannelTransport", () => {
     channel.simulateMessage(frame(new Uint8Array([1])).buffer as ArrayBuffer);
     expect(cb1).toHaveBeenCalledTimes(1);
     expect(cb2).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconnects automatically after channel close", () => {
+    const t = create({ reconnect: true, reconnectDelay: 200 });
+    channel.simulateOpen();
+    expect(t.status).toBe("connected");
+
+    const channelsBefore = pc.lastChannel;
+    channel.simulateClose();
+    expect(t.status).toBe("disconnected");
+
+    vi.advanceTimersByTime(200);
+    expect(pc.lastChannel).not.toBe(channelsBefore);
+    expect(t.status).toBe("connecting");
+  });
+
+  it("reconnects with exponential backoff", () => {
+    const t = create({ reconnect: true, reconnectDelay: 100, reconnectBackoff: 2, maxReconnectDelay: 1000 });
+    channel.simulateOpen();
+
+    channel.simulateClose();
+    vi.advanceTimersByTime(100);
+    const ch2 = pc.lastChannel!;
+    expect(t.status).toBe("connecting");
+
+    ch2.simulateError();
+    vi.advanceTimersByTime(100);
+    expect(t.status).toBe("error");
+    vi.advanceTimersByTime(100);
+    expect(pc.lastChannel).not.toBe(ch2);
+  });
+
+  it("does not reconnect after close()", () => {
+    const t = create({ reconnect: true, reconnectDelay: 100 });
+    channel.simulateOpen();
+
+    t.close();
+    const channelsAfterClose = pc.lastChannel;
+    vi.advanceTimersByTime(500);
+    expect(pc.lastChannel).toBe(channelsAfterClose);
+  });
+
+  it("does not reconnect when reconnect is disabled", () => {
+    const t = create({ reconnect: false });
+    channel.simulateOpen();
+
+    const channelBefore = pc.lastChannel;
+    channel.simulateClose();
+    vi.advanceTimersByTime(10000);
+    expect(pc.lastChannel).toBe(channelBefore);
+    t.close();
+  });
+
+  it("does not reconnect when peer connection is failed", () => {
+    const t = create({ reconnect: true, reconnectDelay: 100 });
+    channel.simulateOpen();
+
+    pc.simulateConnectionState("failed");
+    const channelAfter = pc.lastChannel;
+    vi.advanceTimersByTime(500);
+    expect(pc.lastChannel).toBe(channelAfter);
+    t.close();
+  });
+
+  it("reconnect resets delay on successful open", () => {
+    const t = create({ reconnect: true, reconnectDelay: 100, reconnectBackoff: 2 });
+    channel.simulateOpen();
+
+    channel.simulateClose();
+    vi.advanceTimersByTime(100);
+    const ch2 = pc.lastChannel!;
+    ch2.readyState = "open";
+    ch2.onopen?.(new Event("open"));
+    expect(t.status).toBe("connected");
+
+    ch2.onclose?.(new Event("close"));
+    vi.advanceTimersByTime(100);
+    expect(pc.lastChannel).not.toBe(ch2);
+  });
+
+  it("reconnect after connect timeout error", () => {
+    const t = create({ reconnect: true, reconnectDelay: 100, connectTimeoutMs: 500 });
+    vi.advanceTimersByTime(500);
+    expect(t.status).toBe("error");
+
+    vi.advanceTimersByTime(100);
+    expect(t.status).toBe("connecting");
   });
 });

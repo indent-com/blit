@@ -37,6 +37,7 @@ export type {
   BlitSearchResult,
   BlitWorkspaceSnapshot,
   BlitTransport,
+  BlitTransportOptions,
   BlitSession,
   ConnectionId,
   ConnectionStatus,

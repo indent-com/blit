@@ -86,15 +86,25 @@ function TerminalScreen() {
 
 ## Transports
 
+All transports share a common set of options (`BlitTransportOptions`):
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `reconnect` | `true` | Auto-reconnect on disconnect |
+| `reconnectDelay` | `500` | Initial reconnect delay (ms) |
+| `maxReconnectDelay` | `10000` | Maximum reconnect delay (ms) |
+| `reconnectBackoff` | `1.5` | Backoff multiplier |
+| `connectTimeoutMs` | none (WS) / `10000` (WT, WebRTC) | Connection timeout (ms) |
+
 ```ts
 // WebSocket
-new WebSocketTransport(url, passphrase, { reconnect, reconnectDelay, maxReconnectDelay, reconnectBackoff })
+new WebSocketTransport(url, passphrase, { reconnect, reconnectDelay, connectTimeoutMs, ... })
 
 // WebTransport (QUIC/HTTP3)
-new WebTransportTransport(url, passphrase, { reconnect, serverCertificateHash })
+new WebTransportTransport(url, passphrase, { serverCertificateHash, ... })
 
 // WebRTC data channel
-createWebRtcDataChannelTransport(peerConnection, { label, displayRateFps, connectTimeoutMs })
+createWebRtcDataChannelTransport(peerConnection, { label, displayRateFps, ... })
 ```
 
 Or implement your own:
@@ -105,6 +115,8 @@ interface BlitTransport {
   send(data: Uint8Array): void;
   close(): void;
   readonly status: ConnectionStatus;
+  readonly authRejected: boolean;
+  readonly lastError: string | null;
   addEventListener(type: "message" | "statuschange", listener: Function): void;
   removeEventListener(type: "message" | "statuschange", listener: Function): void;
 }
