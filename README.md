@@ -2,7 +2,7 @@
 
 blit is a terminal streaming stack. Most browser terminals stream raw PTY bytes over a WebSocket and let the client parse them. blit flips that: the server parses everything, diffs it, and sends only what changed — LZ4-compressed, per-client paced, and rendered with WebGL on the other end.
 
-The core libraries — `blit-server`, `blit-remote`, `blit-browser`, and `blit-react` — are the product. The CLI, gateway, and web app are a demo of what you can build with them.
+The core libraries — `blit-server`, `blit-remote`, `blit-browser`, and `blit-react` — handle the heavy lifting. The CLI, gateway, and web app are ready-to-use tools built on top of them.
 
 For a deep dive into how all the pieces connect — wire protocol, frame encoding, transport internals, the rendering pipeline — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -16,14 +16,14 @@ For a deep dive into how all the pieces connect — wire protocol, frame encodin
 
 **`blit-react`** is the React embedding library. It manages workspaces, connections, sessions, transports, and rendering. This is the primary integration point for applications.
 
-## The demo
+## Browser access
 
 Browser access to `blit-server` goes through either of two paths — pick one, not both:
 
 - **`blit-gateway`**: a standalone WebSocket/WebTransport proxy, deployed alongside the server for persistent browser access. Handles passphrase auth, serves the web app, optionally enables QUIC.
 - **`blit` (the CLI)**: connects to a local or remote `blit-server` (over SSH if needed), embeds a temporary gateway, and opens the browser — no separate gateway deployment required. Also has a `--console` mode that renders directly in the terminal.
 
-**`web-app/`** is the browser UI served by either path. It demonstrates multi-session management, BSP layouts, search, font/palette selection, and reconnection handling. It is a reference implementation, not a product surface.
+**`web-app/`** is the browser UI served by either path. It provides multi-session management, BSP layouts, search, font/palette selection, and reconnection handling.
 
 ## What makes it tick
 
@@ -169,29 +169,42 @@ interface BlitTransport {
 | `react/` | `blit-react` | Workspace-based React client library |
 | `fonts/` | | Font discovery and metadata |
 | `webserver/` | | Shared HTTP helpers for serving assets and fonts |
-| `gateway/` | `blit-gateway` | Demo: WebSocket/WebTransport proxy |
-| `cli/` | `blit` | Demo: browser/console client |
-| `web-app/` | | Demo: browser UI |
-| `demo/` | | Demo programs and test content |
+| `gateway/` | `blit-gateway` | WebSocket/WebTransport proxy |
+| `cli/` | `blit` | Browser/console client |
+| `web-app/` | | Browser UI |
+| `demo/` | | Sample programs and test content |
+
+## Install
+
+### macOS (Homebrew)
+
+```bash
+brew install indent-com/tap/blit indent-com/tap/blit-gateway indent-com/tap/blit-server
+```
+
+### From source
+
+```bash
+nix develop        # or use direnv — .envrc is included
+cargo build --release -p blit-cli -p blit-server -p blit-gateway
+```
 
 ## Quick start
 
 ```bash
-nix develop        # or use direnv — .envrc is included
-
-# Demo: browser
+# Browser
 cargo run -p blit-server &
 cargo run -p blit-cli
 
-# Demo: console
+# Console
 cargo run -p blit-cli -- --console
 
-# Demo: standalone gateway
+# Standalone gateway
 BLIT_PASS=secret cargo run -p blit-gateway &
 cargo run -p blit-server
 # open http://localhost:3264
 
-# Demo: remote host
+# Remote host
 blit --ssh myhost
 blit --console --ssh user@myhost
 
@@ -199,7 +212,7 @@ blit --console --ssh user@myhost
 dev
 ```
 
-## Configuration (demo binaries)
+## Configuration
 
 ### `blit-server`
 
@@ -257,7 +270,7 @@ blit --ssh myhost show 1
 
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
-## Deployment (demo binaries)
+## Deployment
 
 ### Debian / Ubuntu (APT)
 
