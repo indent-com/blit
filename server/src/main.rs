@@ -24,6 +24,7 @@ const SCROLLBACK_ROWS_DEFAULT: usize = 10_000;
 
 struct Config {
     shell: String,
+    shell_flags: String,
     scrollback: usize,
     socket_path: String,
     fd_channel: Option<RawFd>,
@@ -1098,9 +1099,15 @@ fn spawn_pty(
         // TIOCGWINSZ and won't resize properly if they're set to stale values.
         std::env::remove_var("COLUMNS");
         std::env::remove_var("LINES");
+        for (key, _) in std::env::vars() {
+            if key.starts_with("BLIT_") {
+                std::env::remove_var(&key);
+            }
+        }
+        let shell_flags = &state.0.shell_flags;
         if let Some(command) = command {
             let shell_c = CString::new(shell).unwrap();
-            let exec_flag = CString::new("-lc").unwrap();
+            let exec_flag = CString::new(format!("-{}c", shell_flags)).unwrap();
             let command_c = CString::new(command).unwrap();
             unsafe {
                 let p = shell_c.as_ptr();
@@ -1124,9 +1131,8 @@ fn spawn_pty(
                 }
             }
         }
-        // Default: login shell
         let shell_c = CString::new(shell).unwrap();
-        let login_flag = CString::new("-l").unwrap();
+        let login_flag = CString::new(format!("-{}", shell_flags)).unwrap();
         unsafe {
             let p = shell_c.as_ptr();
             let l = login_flag.as_ptr();
@@ -1227,9 +1233,15 @@ fn respawn_child(
         std::env::set_var("COLORTERM", "truecolor");
         std::env::remove_var("COLUMNS");
         std::env::remove_var("LINES");
+        for (key, _) in std::env::vars() {
+            if key.starts_with("BLIT_") {
+                std::env::remove_var(&key);
+            }
+        }
+        let shell_flags = &state.0.shell_flags;
         if let Some(cmd) = command {
             let shell_c = CString::new(shell).unwrap();
-            let flag = CString::new("-lc").unwrap();
+            let flag = CString::new(format!("-{}c", shell_flags)).unwrap();
             let cmd_c = CString::new(cmd).unwrap();
             unsafe {
                 libc::execvp(
@@ -1246,7 +1258,7 @@ fn respawn_child(
             }
         }
         let shell_c = CString::new(shell).unwrap();
-        let login = CString::new("-l").unwrap();
+        let login = CString::new(format!("-{}", shell_flags)).unwrap();
         unsafe {
             libc::execvp(
                 shell_c.as_ptr(),
@@ -1607,7 +1619,7 @@ fn default_socket_path() -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: blit-server [--socket PATH] [--fd-channel FD] [PATH]"
+    "usage: blit-server [--socket PATH] [--fd-channel FD] [--shell-flags FLAGS] [PATH]"
 }
 
 fn parse_fd_value(s: &str, label: &str) -> RawFd {
@@ -1619,6 +1631,7 @@ fn parse_fd_value(s: &str, label: &str) -> RawFd {
 
 fn parse_config() -> Config {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut shell_flags = std::env::var("BLIT_SHELL_FLAGS").unwrap_or_else(|_| "li".into());
     let scrollback = std::env::var("BLIT_SCROLLBACK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1634,6 +1647,7 @@ fn parse_config() -> Config {
             println!("{}", usage());
             println!("  --socket PATH            Unix socket path (or set BLIT_SOCK)");
             println!("  --fd-channel FD          Accept clients via fd-passing on FD (or set BLIT_FD_CHANNEL)");
+            println!("  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)");
             println!("  --version, -V            Print version");
             std::process::exit(0);
         }
@@ -1671,6 +1685,20 @@ fn parse_config() -> Config {
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--shell-flags=") {
+            shell_flags = value.to_owned();
+            continue;
+        }
+
+        if arg == "--shell-flags" {
+            shell_flags = args.next().unwrap_or_else(|| {
+                eprintln!("missing value for --shell-flags");
+                eprintln!("{}", usage());
+                std::process::exit(2);
+            });
+            continue;
+        }
+
         if arg.starts_with('-') {
             eprintln!("unrecognized argument: {arg}");
             eprintln!("{}", usage());
@@ -1686,6 +1714,7 @@ fn parse_config() -> Config {
 
     Config {
         shell,
+        shell_flags,
         scrollback,
         socket_path: socket_path.unwrap_or_else(default_socket_path),
         fd_channel,
