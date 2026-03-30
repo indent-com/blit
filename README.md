@@ -1,10 +1,14 @@
 # blit
 
-blit is a terminal streaming stack. The core libraries — `blit-server`, `blit-remote`, `blit-browser`, and `blit-react` — are the product. The CLI, gateway, and web app are a demo of what you can build with them.
+blit is a terminal streaming stack. Most browser terminals stream raw PTY bytes over a WebSocket and let the client parse them. blit flips that: the server parses everything, diffs it, and sends only what changed — LZ4-compressed, per-client paced, and rendered with WebGL on the other end.
 
-## The stack
+The core libraries — `blit-server`, `blit-remote`, `blit-browser`, and `blit-react` — are the product. The CLI, gateway, and web app are a demo of what you can build with them.
 
-**`blit-server`** hosts PTYs and produces per-client frame diffs over a Unix socket. It tracks the full parsed terminal state for every PTY, compares against what each client has seen, and sends only the delta, LZ4-compressed. It paces output per client based on render metrics the client reports back.
+For a deep dive into how all the pieces connect — wire protocol, frame encoding, transport internals, the rendering pipeline — see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## The stack at a glance
+
+**`blit-server`** hosts PTYs and produces per-client frame diffs over a Unix socket. It tracks the full parsed terminal state for every PTY, compares against what each client has seen, and sends only the delta. It paces output per client based on render metrics the client reports back.
 
 **`blit-remote`** is the shared wire protocol: binary message builders, frame containers, state primitives.
 
@@ -14,23 +18,21 @@ blit is a terminal streaming stack. The core libraries — `blit-server`, `blit-
 
 ## The demo
 
-Browser access to `blit-server` goes through either of two paths — you pick one, not both:
+Browser access to `blit-server` goes through either of two paths — pick one, not both:
 
 - **`blit-gateway`**: a standalone WebSocket/WebTransport proxy, deployed alongside the server for persistent browser access. Handles passphrase auth, serves the web app, optionally enables QUIC.
 - **`blit` (the CLI)**: connects to a local or remote `blit-server` (over SSH if needed), embeds a temporary gateway, and opens the browser — no separate gateway deployment required. Also has a `--console` mode that renders directly in the terminal.
 
 **`web-app/`** is the browser UI served by either path. It demonstrates multi-session management, BSP layouts, search, font/palette selection, and reconnection handling. It is a reference implementation, not a product surface.
 
-## Why blit
-
-Most browser terminals stream raw PTY bytes over a WebSocket and let the client parse them. blit does not.
+## What makes it tick
 
 - The server maintains parsed terminal state and sends binary frame diffs, not byte streams.
-- Updates are LZ4-compressed. Scrolling is encoded as copy-rect operations.
-- The client reports display rate, frame apply time, and backlog depth. The server paces each client independently.
+- Updates are LZ4-compressed. Scrolling is encoded as copy-rect operations — no resending the whole screen.
+- The client reports display rate, frame apply time, and backlog depth. The server paces each client independently, so a phone on 3G doesn't stall a workstation on localhost.
 - Keystrokes go straight to the PTY. Latency is bounded by link RTT and nothing else.
 - The ACK protocol measures true round-trip time per client. Frames are pipelined to the bandwidth-delay product.
-- The focused session gets full frame rate. Background sessions update at a lower rate.
+- The focused session gets full frame rate. Background sessions update at a lower rate so they don't hog bandwidth for terminals you're not looking at.
 
 ## How it compares
 
@@ -156,60 +158,6 @@ interface BlitTransport {
 }
 ```
 
-## Architecture
-
-```mermaid
-graph LR
-    subgraph Core Libraries
-        R["blit-remote<br/>protocol + frames + state"]
-        A["blit-alacritty<br/>terminal parser + search"]
-        B["blit-browser<br/>WASM terminal runtime"]
-        RE["blit-react<br/>workspace client + UI bindings"]
-    end
-
-    subgraph Demo Runtime
-        S["blit-server"]
-        G["blit-gateway"]
-        C["blit CLI"]
-        W["Browser UI"]
-    end
-
-    A --> S
-    R --> A
-    R --> C
-    R --> B
-    B --> RE
-    RE --> W
-    S <-->|Unix socket| G
-    S <-->|Unix socket / forwarded socket / TCP| C
-    G <-->|WebSocket / WebTransport| W
-```
-
-`blit-server` is the stateful part. It owns PTYs, scrollback, titles, focus, and per-client frame pacing. `blit-gateway` is the browser-facing part: it serves the web app, authenticates clients, and forwards binary messages. The split means PTYs survive gateway restarts, the gateway can sit behind a reverse proxy, and the CLI can embed a temporary gateway only when it needs one.
-
-### How a frame moves through the system
-
-1. A PTY writes bytes.
-2. `blit-server` feeds them into `blit-alacritty`, which tracks screen state, title changes, cursor position, modes, and scrollback.
-3. The server compares the new frame against what a given client has already seen.
-4. `blit-remote` encodes only the delta and attaches protocol metadata.
-5. The gateway ships the message over WebSocket or WebTransport.
-6. The browser or embedded client applies the update to a terminal state machine and renders it with WebGL/WASM.
-
-### Performance
-
-The goal is simple: as low latency as the link allows, refreshed as fast as the client can render.
-
-The server maintains the full parsed terminal state for every PTY and tracks what each client has already seen. Updates are binary diffs: only the cells that changed since that client's last acknowledged frame are sent, LZ4-compressed. When terminal output scrolls, the server encodes it as a copy-rect operation rather than resending the entire visible area.
-
-The client reports back how fast it can actually render: display refresh rate, frame apply time, and current backlog depth. The server uses these metrics to pace output per client, so a slow client on a mobile connection doesn't cause a fast client on localhost to stall, and neither client receives frames faster than it can paint them.
-
-Keystrokes take the shortest possible path. There is no frame queue between the user and the PTY: input goes straight to the server and into the PTY's stdin. The next frame diff reflects the result. On a local Unix socket this round-trip is under a millisecond. Over a network, it is bounded by the link RTT and nothing else.
-
-The ACK protocol gives the server a continuous measurement of each client's true round-trip time and rendering capacity. Frames are pipelined up to the measured bandwidth-delay product, so the link is always fully utilized without building up unbounded queues.
-
-The focused session gets full frame rate. Background sessions (visible as previews in the session switcher) are updated at a lower rate to avoid wasting bandwidth on terminals the user is not interacting with.
-
 ## What lives in this repo
 
 | Directory | Package | Role |
@@ -251,21 +199,7 @@ blit --console user@myhost
 dev
 ```
 
-## Lower-level crates
-
-### `blit-remote`
-
-The shared protocol and frame/state crate: wire-format message builders and parsers, frame containers, callback rendering primitives, search result constants and protocol flags.
-
-### `blit-alacritty`
-
-Terminal parsing backend. Wraps `alacritty_terminal` and adds snapshot generation, scrollback frames, title tracking, mode tracking, and search with visible and scrollback context.
-
-### `blit-browser`
-
-WASM runtime that applies compressed frame diffs and produces WebGL vertex data for rendering. Supports render offsets for content centering in previews.
-
-## Demo binary reference
+## Configuration
 
 ### `blit-server`
 
