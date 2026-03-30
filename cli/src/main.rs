@@ -69,6 +69,14 @@ enum Command {
         /// Include ANSI color/style escape sequences in output
         #[arg(long)]
         ansi: bool,
+
+        /// Resize to this many rows before capturing
+        #[arg(long)]
+        rows: Option<u16>,
+
+        /// Resize to this many columns before capturing
+        #[arg(long)]
+        cols: Option<u16>,
     },
 
     /// Print scrollback + viewport text.
@@ -94,6 +102,14 @@ enum Command {
         /// Include ANSI color/style escape sequences in output
         #[arg(long)]
         ansi: bool,
+
+        /// Resize to this many rows before capturing
+        #[arg(long)]
+        rows: Option<u16>,
+
+        /// Resize to this many columns before capturing
+        #[arg(long)]
+        cols: Option<u16>,
     },
 
     /// Send input to a session.
@@ -114,18 +130,6 @@ enum Command {
     Close {
         /// Session ID
         id: u16,
-    },
-
-    /// Resize a session
-    Resize {
-        /// Session ID
-        id: u16,
-
-        /// Terminal rows
-        rows: u16,
-
-        /// Terminal columns
-        cols: u16,
     },
 }
 
@@ -151,14 +155,24 @@ async fn main() {
                     rows,
                     cols,
                 } => agent::cmd_start(transport, tag, command, rows, cols).await,
-                Command::Show { id, ansi } => agent::cmd_show(transport, id, ansi).await,
+                Command::Show {
+                    id,
+                    ansi,
+                    rows,
+                    cols,
+                } => agent::cmd_show(transport, id, ansi, rows, cols).await,
                 Command::History {
                     id,
                     from_start,
                     from_end,
                     limit,
                     ansi,
-                } => agent::cmd_history(transport, id, from_start, from_end, limit, ansi).await,
+                    rows,
+                    cols,
+                } => {
+                    agent::cmd_history(transport, id, from_start, from_end, limit, ansi, rows, cols)
+                        .await
+                }
                 Command::Send { id, text } => {
                     let text = if text == "-" {
                         use std::io::Read;
@@ -171,9 +185,6 @@ async fn main() {
                     agent::cmd_send(transport, id, text).await
                 }
                 Command::Close { id } => agent::cmd_close(transport, id).await,
-                Command::Resize { id, rows, cols } => {
-                    agent::cmd_resize(transport, id, rows, cols).await
-                }
             };
             if let Err(e) = result {
                 eprintln!("blit: {e}");

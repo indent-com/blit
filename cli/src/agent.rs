@@ -155,11 +155,23 @@ pub async fn cmd_start(
     }
 }
 
-pub async fn cmd_show(transport: Transport, id: u16, ansi: bool) -> Result<(), String> {
+pub async fn cmd_show(
+    transport: Transport,
+    id: u16,
+    ansi: bool,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<(), String> {
     let mut conn = AgentConn::connect(transport).await?;
 
     if !conn.has_pty(id) {
         return Err(format!("pty {id} not found"));
+    }
+
+    if rows.is_some() || cols.is_some() {
+        let r = rows.unwrap_or(24);
+        let c = cols.unwrap_or(80);
+        conn.send(&msg_resize(id, r, c)).await?;
     }
 
     conn.send(&msg_subscribe(id)).await?;
@@ -195,11 +207,19 @@ pub async fn cmd_history(
     from_end: Option<u32>,
     limit: Option<u32>,
     ansi: bool,
+    rows: Option<u16>,
+    cols: Option<u16>,
 ) -> Result<(), String> {
     let mut conn = AgentConn::connect(transport).await?;
 
     if !conn.has_pty(id) {
         return Err(format!("pty {id} not found"));
+    }
+
+    if rows.is_some() || cols.is_some() {
+        let r = rows.unwrap_or(24);
+        let c = cols.unwrap_or(80);
+        conn.send(&msg_resize(id, r, c)).await?;
     }
 
     let mut flags: u8 = 0;
@@ -266,16 +286,6 @@ pub async fn cmd_close(transport: Transport, id: u16) -> Result<(), String> {
             }
         }
     }
-}
-
-pub async fn cmd_resize(transport: Transport, id: u16, rows: u16, cols: u16) -> Result<(), String> {
-    let mut conn = AgentConn::connect(transport).await?;
-
-    if !conn.has_pty(id) {
-        return Err(format!("pty {id} not found"));
-    }
-
-    conn.send(&msg_resize(id, rows, cols)).await
 }
 
 pub fn parse_escapes(s: &str) -> Vec<u8> {
