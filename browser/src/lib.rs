@@ -13,13 +13,32 @@ pub fn wasm_memory() -> JsValue {
 #[wasm_bindgen(inline_js = r#"
 const glyphTextCache = new Map();
 
-export function blitFillTextCodePoint(ctx, codePoint, x, y) {
+function codePointText(codePoint) {
   let text = glyphTextCache.get(codePoint);
   if (text === undefined) {
     text = String.fromCodePoint(codePoint);
     glyphTextCache.set(codePoint, text);
   }
-  ctx.fillText(text, x, y);
+  return text;
+}
+
+export function blitFillTextCodePoint(ctx, codePoint, x, y) {
+  ctx.fillText(codePointText(codePoint), x, y);
+}
+
+export function blitFillTextStretched(ctx, codePoint, x, y, targetWidth) {
+  const text = codePointText(codePoint);
+  const measured = ctx.measureText(text).width;
+  if (measured > 0 && Math.abs(measured - targetWidth) > 0.001) {
+    ctx.save();
+    ctx.translate(x, 0);
+    ctx.scale(targetWidth / measured, 1);
+    ctx.translate(-x, 0);
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  } else {
+    ctx.fillText(text, x, y);
+  }
 }
 
 export function blitFillText(ctx, text, x, y) {
@@ -28,6 +47,13 @@ export function blitFillText(ctx, text, x, y) {
 "#)]
 extern "C" {
     fn blitFillTextCodePoint(ctx: &CanvasRenderingContext2d, code_point: u32, x: f64, y: f64);
+    fn blitFillTextStretched(
+        ctx: &CanvasRenderingContext2d,
+        code_point: u32,
+        x: f64,
+        y: f64,
+        target_width: f64,
+    );
     fn blitFillText(ctx: &CanvasRenderingContext2d, text: &str, x: f64, y: f64);
 }
 
@@ -545,13 +571,16 @@ impl GlyphAtlas {
             )
         };
         ctx.set_font(&draw_font);
-        // Render in white — the GL shader tints per-vertex.
         ctx.set_fill_style_str("#fff");
         ctx.save();
         ctx.begin_path();
         ctx.rect(slot.src_x, slot.src_y, slot.width, slot.height);
         ctx.clip();
-        blitFillTextCodePoint(ctx, code_point, draw_x, draw_y);
+        if (0x2500..=0x259F).contains(&code_point) {
+            blitFillTextStretched(ctx, code_point, draw_x, draw_y, cell_width);
+        } else {
+            blitFillTextCodePoint(ctx, code_point, draw_x, draw_y);
+        }
         if key.underline {
             ctx.set_stroke_style_str("#fff");
             ctx.begin_path();
