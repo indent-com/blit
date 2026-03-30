@@ -687,6 +687,7 @@ function EmptyPane({
 
   return (
     <div
+      onClick={() => inputRef.current?.focus()}
       style={{
         width: "100%",
         height: "100%",
