@@ -58,8 +58,11 @@ void main() {
     float minC = min(tex.r, min(tex.g, tex.b));
     float maxC = max(tex.r, max(tex.g, tex.b));
     float isGray = step(maxC - minC, 0.02);
-    vec3 tinted = v_color.rgb * tex.a;
-    fragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
+    float lum = dot(v_color.rgb, vec3(0.299, 0.587, 0.114));
+    float gamma = mix(0.75, 1.0, lum);
+    float adj_a = pow(tex.a, gamma);
+    vec3 tinted = v_color.rgb * adj_a;
+    fragColor = vec4(mix(tex.rgb, tinted, isGray), mix(tex.a, adj_a, isGray));
 }
 `;
 
