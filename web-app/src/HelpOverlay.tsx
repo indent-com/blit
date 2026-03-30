@@ -1,6 +1,7 @@
 import type { TerminalPalette } from "blit-react";
 import { themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
+import { t } from "./i18n";
 
 type Shortcut = [string, string];
 type Section = { title: string; items: Shortcut[] };
@@ -19,44 +20,44 @@ export function HelpOverlay({
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
   const left: Section[] = [
     {
-      title: "Keyboard",
+      title: t("help.keyboard"),
       items: [
-        [`${mod}+K`, "Menu"],
-        [`${mod}+Shift+Enter`, "New terminal"],
-        [`${mod}+Shift+W`, "Close terminal"],
-        [`${mod}+Shift+{ / }`, "Prev / Next terminal"],
-        ["Ctrl+[ / ]", "Prev / Next pane"],
-        ["Ctrl+Shift+`", "Debug panel"],
-        ["Ctrl+?", "This help"],
-        ["Escape", "Close overlay"],
+        [`${mod}+K`, t("help.menu")],
+        [`${mod}+Shift+Enter`, t("help.newTerminal")],
+        [`${mod}+Shift+W`, t("help.closeTerminal")],
+        [`${mod}+Shift+{ / }`, t("help.prevNextTerminal")],
+        ["Ctrl+[ / ]", t("help.prevNextPane")],
+        ["Ctrl+Shift+`", t("help.debugPanel")],
+        ["Ctrl+?", t("help.thisHelp")],
+        ["Escape", t("help.closeOverlay")],
       ],
     },
   ];
   const right: Section[] = [
     {
-      title: "Scrollback",
+      title: t("help.scrollback"),
       items: [
-        ["Shift+Wheel", "Scroll (even in mouse mode)"],
-        ["Ctrl+PageUp / PageDown", "Page up / down"],
-        ["Ctrl+Home / End", "Top / bottom"],
-        ["Any key", "Exit scrollback"],
+        ["Shift+Wheel", t("help.scroll")],
+        ["Ctrl+PageUp / PageDown", t("help.pageUpDown")],
+        ["Ctrl+Home / End", t("help.topBottom")],
+        ["Any key", t("help.exitScrollback")],
       ],
     },
     {
-      title: "Mouse",
+      title: t("help.mouse"),
       items: [
-        ["Click + drag", "Select text"],
-        ["Double / Triple-click", "Select word / line"],
-        ["Alt+Click", "Open URL"],
-        ["Scrollbar", "Drag or click to scroll"],
+        ["Click + drag", t("help.selectText")],
+        ["Double / Triple-click", t("help.selectWordLine")],
+        ["Alt+Click", t("help.openUrl")],
+        ["Scrollbar", t("help.dragScroll")],
       ],
     },
   ];
 
   return (
-    <OverlayBackdrop palette={palette} label="Help" onClose={onClose}>
+    <OverlayBackdrop palette={palette} label={t("help.label")} onClose={onClose}>
       <OverlayPanel palette={palette} fontSize={fontSize}>
-        <OverlayHeader palette={palette} fontSize={fontSize} title="Keyboard & mouse shortcuts" onClose={onClose} />
+        <OverlayHeader palette={palette} fontSize={fontSize} title={t("help.title")} onClose={onClose} />
         <div style={{ display: "flex", gap: scale.gap * 3, padding: `${scale.tightGap}px 0` }}>
           <Column sections={left} theme={theme} scale={scale} />
           <Column sections={right} theme={theme} scale={scale} />

@@ -7,6 +7,7 @@ import type {
 import { formatBw } from "./useMetrics";
 import type { Metrics, RenderSample, NetSample } from "./useMetrics";
 import { sessionName, themeFor, ui, uiScale, z } from "./theme";
+import { t, tp } from "./i18n";
 
 type TimelineRef = RefObject<RenderSample[]>;
 type NetRef = RefObject<NetSample[]>;
@@ -72,9 +73,9 @@ export function StatusBar({
 
   return (
     <>
-      <button onClick={onSwitcher} style={buttonStyle} title="Menu (Cmd+K)">
-        {visible.length} terminal{visible.length !== 1 ? "s" : ""}
-        {exited > 0 && <span style={{ opacity: 0.5 }}> ({exited} exited)</span>}
+      <button onClick={onSwitcher} style={buttonStyle} title={t("statusbar.menuTitle")}>
+        {visible.length === 1 ? tp("statusbar.terminalOne", { count: 1 }) : tp("statusbar.terminalMany", { count: visible.length })}
+        {exited > 0 && <span style={{ opacity: 0.5 }}> {tp("statusbar.exited", { count: exited })}</span>}
       </button>
       <span
         style={{
@@ -95,14 +96,14 @@ export function StatusBar({
         {termSize ? `${termSize}@` : ""}
         {metrics.fps}/{metrics.ups}
       </span>
-      <button onClick={toggleDebug} style={{ ...buttonStyle, opacity: debug ? 1 : 0.3 }} title="Debug stats">
+      <button onClick={toggleDebug} style={{ ...buttonStyle, opacity: debug ? 1 : 0.3 }} title={t("statusbar.debugStats")}>
         &#x1F41B;
       </button>
-      <button onClick={onPalette} style={buttonStyle} title={`Palette: ${palette.name} (Cmd+Shift+P)`}>
+      <button onClick={onPalette} style={buttonStyle} title={tp("statusbar.paletteTitle", { name: palette.name })}>
         {palette.dark ? "\u25D1" : "\u25D0"}
       </button>
-      <button onClick={onFont} style={buttonStyle} title="Font (Cmd+Shift+F)">
-        {fontLoading ? <span style={{ opacity: 0.5, fontSize: scale.xs }}>Loading font…</span> : "Aa"}
+      <button onClick={onFont} style={buttonStyle} title={t("statusbar.fontTitle")}>
+        {fontLoading ? <span style={{ opacity: 0.5, fontSize: scale.xs }}>{t("statusbar.loadingFont")}</span> : "Aa"}
       </button>
       <span
         role="status"

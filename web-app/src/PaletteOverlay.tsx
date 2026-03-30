@@ -8,6 +8,7 @@ import { PALETTES } from "blit-react";
 import type { TerminalPalette } from "blit-react";
 import { themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
+import { t, tp } from "./i18n";
 
 type PaletteTone = "dark" | "light";
 
@@ -130,19 +131,19 @@ export function PaletteOverlay({
   };
 
   return (
-    <OverlayBackdrop palette={current} label="Palette" onClose={dismiss}>
+    <OverlayBackdrop palette={current} label={t("palette.label")} onClose={dismiss}>
       <OverlayPanel palette={current} fontSize={fontSize}>
-        <OverlayHeader palette={current} fontSize={fontSize} title="Palette" onClose={dismiss} />
+        <OverlayHeader palette={current} fontSize={fontSize} title={t("palette.title")} onClose={dismiss} />
         <div style={{ display: "flex", flexDirection: "column", gap: scale.gap }}>
           <div
             role="tablist"
-            aria-label="Theme tone"
+            aria-label={t("palette.toneLabel")}
             style={{ display: "flex", gap: scale.tightGap + 2 }}
           >
             {([
-              { id: "dark", label: "Dark" },
-              { id: "light", label: "Light" },
-            ] as const).map((option) => {
+              { id: "dark" as const, label: t("palette.dark") },
+              { id: "light" as const, label: t("palette.light") },
+            ]).map((option) => {
               const active = tone === option.id;
               return (
                 <button
@@ -178,9 +179,9 @@ export function PaletteOverlay({
               opacity: 0.65,
             }}
           >
-            <span>Press</span>
+            <span>{t("palette.tabHintPress")}</span>
             <kbd style={{ ...ui.kbd, fontSize: scale.sm }}>{"Tab"}</kbd>
-            <span>to switch between dark and light</span>
+            <span>{t("palette.tabHintSuffix")}</span>
           </div>
           <input
             ref={inputRef}
@@ -188,7 +189,7 @@ export function PaletteOverlay({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={`Search ${tone} themes`}
+            placeholder={tp("palette.searchPlaceholder", { tone: t(`palette.${tone}`) })}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"

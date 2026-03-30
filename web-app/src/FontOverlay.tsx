@@ -7,6 +7,7 @@ import {
 import type { TerminalPalette } from "blit-react";
 import { themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
+import { t } from "./i18n";
 
 export function FontOverlay({
   currentFamily,
@@ -108,7 +109,7 @@ export function FontOverlay({
   };
 
   return (
-    <OverlayBackdrop palette={palette} label="Font" onClose={dismiss}>
+    <OverlayBackdrop palette={palette} label={t("font.label")} onClose={dismiss}>
       <OverlayPanel
         palette={palette}
         fontSize={fontSize}
@@ -117,7 +118,7 @@ export function FontOverlay({
           flexDirection: "column",
         }}
       >
-        <OverlayHeader palette={palette} fontSize={fontSize} title="Font" onClose={dismiss} />
+        <OverlayHeader palette={palette} fontSize={fontSize} title={t("font.title")} onClose={dismiss} />
         <form onSubmit={(e) => {
           e.preventDefault();
           const family = selectedIdx >= 0 && selectedIdx < filtered.length
@@ -131,7 +132,7 @@ export function FontOverlay({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Search fonts or type a name"
+          placeholder={t("font.placeholder")}
           autoComplete="off"
           autoCorrect="off"
           autoCapitalize="off"
@@ -171,7 +172,7 @@ export function FontOverlay({
           </ul>
         )}
         <div style={{ display: "flex", alignItems: "center", gap: scale.gap, flexShrink: 0 }}>
-          <label style={{ fontSize: scale.md, opacity: 0.7, flexShrink: 0 }}>Size</label>
+          <label style={{ fontSize: scale.md, opacity: 0.7, flexShrink: 0 }}>{t("font.sizeLabel")}</label>
           <input
             type="range"
             min={8}
@@ -200,7 +201,7 @@ export function FontOverlay({
           backgroundColor: theme.inputBg,
           fontSize: scale.sm,
           flexShrink: 0,
-        }}>Apply</button>
+        }}>{t("font.apply")}</button>
         </form>
       </OverlayPanel>
     </OverlayBackdrop>

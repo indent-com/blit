@@ -19,6 +19,7 @@ import {
   wtCertHash,
 } from "./storage";
 import { themeFor } from "./theme";
+import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
 
 function createTransport(pass: string): BlitTransport {
@@ -54,7 +55,7 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
           writeStorage(PASS_KEY, pass);
           t.removeEventListener("statuschange", onStatus);
         } else if (status === "error") {
-          setAuthError("Authentication failed");
+          setAuthError(i18n("auth.failed"));
           t.close();
           t.removeEventListener("statuschange", onStatus);
         }
@@ -79,7 +80,7 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
     transport.close();
     writeStorage(PASS_KEY, "");
     setTransport(null);
-    setAuthError("Authentication failed");
+    setAuthError(i18n("auth.failed"));
   }} />;
 }
 
@@ -117,7 +118,7 @@ function AuthScreen({
         <input
           ref={passRef}
           type="password"
-          placeholder="passphrase"
+          placeholder={i18n("auth.placeholder")}
           autoFocus
           style={{
             padding: "0.5em 0.75em",

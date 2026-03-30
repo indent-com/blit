@@ -31,6 +31,7 @@ import {
 import { ResizeHandle } from "./ResizeHandle";
 import type { Theme } from "../theme";
 import { themeFor, ui, uiScale } from "../theme";
+import { t, tp } from "../i18n";
 
 function resolveLeafFontSize(leaf: BSPLeaf, baseFontSize: number): number {
   const raw = leaf.fontSize;
@@ -464,7 +465,7 @@ function BSPPane({
     const tabLabel = (child: BSPChild, index: number): string => {
       if (child.label) return child.label;
       if (child.node.type === "leaf" && child.node.tag) return child.node.tag;
-      return `Tab ${index + 1}`;
+      return tp("bsp.tab", { index: index + 1 });
     };
 
     return (
@@ -628,21 +629,21 @@ function LeafPane({
               }}
             >
               <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
-                Exited
+                {t("bsp.exited")}
               </mark>
               {connection?.supportsRestart && (
                 <button
                   onClick={() => workspace.restartSession(sessionId)}
                   style={{ ...ui.btn, fontSize: scale.sm }}
                 >
-                  Restart <kbd style={ui.kbd}>Enter</kbd>
+                  {t("bsp.restart")} <kbd style={ui.kbd}>Enter</kbd>
                 </button>
               )}
               <button
                 onClick={() => void workspace.closeSession(sessionId)}
                 style={{ ...ui.btn, fontSize: scale.sm, opacity: 0.5 }}
               >
-                Close <kbd style={ui.kbd}>Esc</kbd>
+                {t("bsp.close")} <kbd style={ui.kbd}>Esc</kbd>
               </button>
             </div>
           )}
@@ -717,7 +718,7 @@ function EmptyPane({
           gap: scale.gap,
         }}
       >
-        <mark style={ui.badge}>Empty</mark>
+        <mark style={ui.badge}>{t("bsp.empty")}</mark>
         <input
           ref={inputRef}
           type="text"
@@ -729,7 +730,7 @@ function EmptyPane({
               onCreateInPane?.(paneId, cmd.trim() || undefined);
             }
           }}
-          placeholder="Command (empty for shell)"
+          placeholder={t("bsp.commandPlaceholder")}
           style={{
             ...ui.input,
             flex: "none",

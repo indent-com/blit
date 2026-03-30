@@ -6,6 +6,7 @@ import {
 } from "react";
 import type { TerminalPalette } from "blit-react";
 import { layout, overlayChromeStyles, themeFor, uiScale } from "./theme";
+import { t } from "./i18n";
 
 export function OverlayBackdrop({
   palette,
@@ -79,7 +80,7 @@ export function OverlayHeader({
   subtitle,
   actions,
   onClose,
-  closeLabel = "Esc",
+  closeLabel = t("overlay.close"),
   fontSize,
 }: {
   palette: TerminalPalette;

@@ -37,6 +37,7 @@ import {
 } from "./storage";
 import type { UIScale } from "./theme";
 import { themeFor, layout, ui, uiScale, z } from "./theme";
+import { t } from "./i18n";
 import { StatusBar } from "./StatusBar";
 import { SwitcherOverlay } from "./SwitcherOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
@@ -657,18 +658,18 @@ function WorkspaceScreen({
                 }}
               >
                 <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
-                  Exited
+                  {t("workspace.exited")}
                 </mark>
                 {connection?.supportsRestart ? (
                   <button onClick={() => handleRestartOrClose()} style={{ ...ui.btn, fontSize: chromeScale.md }}>
-                    Restart <kbd style={ui.kbd}>Enter</kbd>
+                    {t("workspace.restart")} <kbd style={ui.kbd}>Enter</kbd>
                   </button>
                 ) : null}
                 <button
                   onClick={() => void workspace.closeSession(focusedSession.id)}
                   style={{ ...ui.btn, fontSize: chromeScale.md, opacity: 0.5 }}
                 >
-                  Close <kbd style={ui.kbd}>Esc</kbd>
+                  {t("workspace.close")} <kbd style={ui.kbd}>Esc</kbd>
                 </button>
               </div>
             )}
@@ -820,7 +821,7 @@ function EmptyState({
         opacity: 0.6,
       }}
     >
-      <div style={{ fontSize: scale.lg }}>Welcome</div>
+      <div style={{ fontSize: scale.lg }}>{t("workspace.welcome")}</div>
       <div
         style={{
           fontSize: scale.sm,
@@ -831,14 +832,14 @@ function EmptyState({
         }}
       >
         <button onClick={onCreate} style={{ ...ui.btn, fontSize: scale.md }}>
-          New terminal <kbd style={ui.kbd}>Enter</kbd>{" "}
+          {t("workspace.newTerminal")} <kbd style={ui.kbd}>Enter</kbd>{" "}
           <kbd style={ui.kbd}>{mod}+Shift+Enter</kbd>
         </button>
         <button onClick={onSwitcher} style={{ ...ui.btn, fontSize: scale.md }}>
-          Menu <kbd style={ui.kbd}>{mod}+K</kbd>
+          {t("workspace.menu")} <kbd style={ui.kbd}>{mod}+K</kbd>
         </button>
         <button onClick={onHelp} style={{ ...ui.btn, fontSize: scale.md }}>
-          Help <kbd style={ui.kbd}>Ctrl+?</kbd>
+          {t("workspace.help")} <kbd style={ui.kbd}>Ctrl+?</kbd>
         </button>
       </div>
       <button
@@ -853,7 +854,7 @@ function EmptyState({
           cursor: "pointer",
         }}
       >
-        New terminal
+        {t("workspace.newTerminal")}
       </button>
     </div>
   );

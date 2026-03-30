@@ -29,11 +29,12 @@ import {
   type BSPLayout,
 } from "./bsp/layout";
 import { leafCount } from "./bsp/dsl";
+import { t, tp } from "./i18n";
 
 const SOURCE_LABEL: Record<number, string> = {
-  [SEARCH_SOURCE_TITLE]: "Title",
-  [SEARCH_SOURCE_VISIBLE]: "Terminal",
-  [SEARCH_SOURCE_SCROLLBACK]: "Backlog",
+  [SEARCH_SOURCE_TITLE]: t("switcher.sourceTitle"),
+  [SEARCH_SOURCE_VISIBLE]: t("switcher.sourceTerminal"),
+  [SEARCH_SOURCE_SCROLLBACK]: t("switcher.sourceBacklog"),
 };
 
 type LayoutItem = {
@@ -353,8 +354,8 @@ export function SwitcherOverlay({
         const paneName = label || `Pane ${index + 1}`;
         const assignedName = session ? sessionName(session) : null;
         const subtitle = session
-          ? `Shows ${assignedName}`
-          : `Empty \u2014 Tab+>cmd or Enter for shell`;
+          ? tp("switcher.showsPane", { name: assignedName ?? "" })
+          : t("switcher.emptyPane");
         return {
           type: "pane" as const,
           key: `pane:${pane.id}`,
@@ -382,7 +383,7 @@ export function SwitcherOverlay({
         type: "session",
         key: `session:${session.id}`,
         title: sessionName(session),
-        subtitle: session.state === "exited" ? "Exited terminal" : "Open terminal",
+        subtitle: session.state === "exited" ? t("switcher.exitedTerminal") : t("switcher.openTerminal"),
         sessionId: session.id,
         exited: session.state === "exited",
         focused: session.id === focusedSessionId,
@@ -403,7 +404,7 @@ export function SwitcherOverlay({
           type: "session",
           key: `session:${session.id}`,
           title: sessionName(session),
-          subtitle: session.state === "exited" ? "Exited terminal" : "Open terminal",
+          subtitle: session.state === "exited" ? t("switcher.exitedTerminal") : t("switcher.openTerminal"),
           sessionId: session.id,
           exited: session.state === "exited",
           focused: session.id === focusedSessionId,
@@ -419,7 +420,7 @@ export function SwitcherOverlay({
         type: "session",
         key: `session:${session.id}`,
         title: sessionName(session),
-        subtitle: session.state === "exited" ? "Exited terminal" : "Open terminal",
+        subtitle: session.state === "exited" ? t("switcher.exitedTerminal") : t("switcher.openTerminal"),
         sessionId: session.id,
         exited: session.state === "exited",
         context: result.context,
@@ -434,14 +435,14 @@ export function SwitcherOverlay({
   const sections = useMemo<SwitcherSection[]>(() => {
     if (isCommand) {
       return [{
-        title: "Action",
+        title: t("switcher.sectionAction"),
         items: [{
           type: "action",
           key: "action:new-terminal",
-          title: commandText ? `Run "${commandText}"` : "New terminal",
+          title: commandText ? tp("switcher.runCommand", { command: commandText }) : t("switcher.newTerminal"),
           subtitle: commandText
-            ? "Create a new terminal running this command"
-            : "Create a new terminal in the current working directory",
+            ? t("switcher.createRunning")
+            : t("switcher.createInCwd"),
           action: "new-terminal",
         }],
       }];
@@ -453,7 +454,7 @@ export function SwitcherOverlay({
     const customLayouts = layoutChoices.custom.map<LayoutItem>((layout) => ({
       type: "layout",
       key: `layout:custom:${layout.dsl}`,
-      title: "Use typed layout",
+      title: t("switcher.useTypedLayout"),
       subtitle: layout.dsl,
       layout,
     }));
@@ -472,42 +473,42 @@ export function SwitcherOverlay({
       layout,
     }));
     if (!layoutMode && paneMatches.length > 0) {
-      next.push({ title: "Panes", items: paneMatches });
+      next.push({ title: t("switcher.sectionPanes"), items: paneMatches });
     }
     if (!layoutMode && sessionMatches.length > 0) {
-      next.push({ title: "Terminals", items: sessionMatches });
+      next.push({ title: t("switcher.sectionTerminals"), items: sessionMatches });
     }
 
     if (customLayouts.length > 0) {
-      next.push({ title: "Typed Layout", items: customLayouts });
+      next.push({ title: t("switcher.sectionTypedLayout"), items: customLayouts });
     }
     if ((searching || layoutMode) && recent.length > 0) {
-      next.push({ title: "Recent Layouts", items: recent });
+      next.push({ title: t("switcher.sectionRecentLayouts"), items: recent });
     }
     if ((searching || layoutMode) && presets.length > 0) {
-      next.push({ title: "Layouts", items: presets });
+      next.push({ title: t("switcher.sectionLayouts"), items: presets });
     }
 
     const actions: ActionItem[] = [{
       type: "action",
       key: "action:new-terminal",
-      title: "New terminal",
-      subtitle: "Create a new terminal in the current working directory",
+      title: t("switcher.newTerminal"),
+      subtitle: t("switcher.createInCwd"),
       action: "new-terminal",
     }];
     actions.push({
       type: "action",
       key: "action:change-layout",
-      title: "Layout",
-      subtitle: activeLayout ? activeLayout.dsl : "Choose or type a layout",
+      title: t("switcher.layout"),
+      subtitle: activeLayout ? activeLayout.dsl : t("switcher.chooseLayout"),
       action: "change-layout",
     });
     if (activeLayout && onClearLayout) {
       actions.push({
         type: "action",
         key: "action:clear-layout",
-        title: "Exit layout",
-        subtitle: "Return to a single focused terminal view",
+        title: t("switcher.exitLayout"),
+        subtitle: t("switcher.exitLayoutDesc"),
         action: "clear-layout",
       });
     }
@@ -515,8 +516,8 @@ export function SwitcherOverlay({
       actions.push({
         type: "action",
         key: "action:change-palette",
-        title: "Palette",
-        subtitle: "Switch color scheme",
+        title: t("switcher.palette"),
+        subtitle: t("switcher.switchColorScheme"),
         action: "change-palette",
       });
     }
@@ -524,21 +525,21 @@ export function SwitcherOverlay({
       actions.push({
         type: "action",
         key: "action:change-font",
-        title: "Font",
-        subtitle: "Switch terminal font and size",
+        title: t("switcher.font"),
+        subtitle: t("switcher.switchFont"),
         action: "change-font",
       });
     }
     actions.push({
       type: "action",
       key: "action:clear-local-storage",
-      title: "Clear local storage",
-      subtitle: "Reset all saved settings and reload",
+      title: t("switcher.clearLocalStorage"),
+      subtitle: t("switcher.clearLocalStorageDesc"),
       action: "clear-local-storage",
     });
     if (!layoutMode && (!searching || actions.some((action) => action.title.toLowerCase().includes(searchPart.toLowerCase())))) {
       next.push({
-        title: "Actions",
+        title: t("switcher.sectionActions"),
         items: searching
           ? actions.filter((action) => action.title.toLowerCase().includes(searchPart.toLowerCase()))
           : actions,
@@ -792,7 +793,7 @@ export function SwitcherOverlay({
   return (
     <OverlayBackdrop
       palette={palette}
-      label="Menu"
+      label={t("switcher.label")}
       onClose={onClose}
       style={{
         background: dark ? "rgba(0,0,0,0.66)" : "rgba(240,240,240,0.7)",
@@ -828,7 +829,7 @@ export function SwitcherOverlay({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Search or type >command"
+            placeholder={t("switcher.placeholder")}
             style={{
               ...ui.input,
               flex: 1,
@@ -857,7 +858,7 @@ export function SwitcherOverlay({
               }}
               title={activeLayout.dsl}
             >
-              {activeLayout.name === activeLayout.dsl ? `${leafCount(activeLayout.root)} panes` : activeLayout.name}
+              {activeLayout.name === activeLayout.dsl ? tp("switcher.paneCount", { count: leafCount(activeLayout.root) }) : activeLayout.name}
             </span>
           )}
           <button
@@ -870,7 +871,7 @@ export function SwitcherOverlay({
             }}
             onClick={onClose}
           >
-            Esc
+            {t("overlay.close")}
           </button>
         </div>
 
@@ -980,18 +981,18 @@ export function SwitcherOverlay({
                               {item.title}
                             </span>
                             {item.type === "session" && item.focused && (
-                              <mark style={ui.badge}>Focused</mark>
+                              <mark style={ui.badge}>{t("switcher.badgeFocused")}</mark>
                             )}
                             {item.type === "pane" && item.empty && (
-                              <mark style={ui.badge}>Empty</mark>
+                              <mark style={ui.badge}>{t("switcher.badgeEmpty")}</mark>
                             )}
                             {item.type === "session" && item.exited && (
                               <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
-                                Exited
+                                {t("switcher.badgeExited")}
                               </mark>
                             )}
                             {item.type === "layout" && activeLayout?.dsl === item.layout.dsl && (
-                              <mark style={ui.badge}>Current</mark>
+                              <mark style={ui.badge}>{t("switcher.badgeCurrent")}</mark>
                             )}
                           </div>
                           <div
@@ -1005,7 +1006,7 @@ export function SwitcherOverlay({
                           >
                             {item.subtitle}
                             {item.type === "session" && item.source != null && (
-                              <> · {SOURCE_LABEL[item.source] ?? "Match"}</>
+                              <> · {SOURCE_LABEL[item.source] ?? t("switcher.sourceMatch")}</>
                             )}
                           </div>
                           {item.type === "session" && item.context && (
@@ -1026,7 +1027,7 @@ export function SwitcherOverlay({
                         {item.type === "session" && (
                           <button
                             type="button"
-                            title="Close"
+                            title={t("switcher.close")}
                             onClick={(event) => {
                               event.stopPropagation();
                               void workspace.closeSession(item.sessionId);
@@ -1068,9 +1069,9 @@ export function SwitcherOverlay({
                   padding: scale.panelPadding,
                 }}
               >
-                <div style={{ fontSize: fsXl, color: theme.fg }}>No matches</div>
+                <div style={{ fontSize: fsXl, color: theme.fg }}>{t("switcher.noMatches")}</div>
                 <div style={{ fontSize: fsSm, maxWidth: sidebarWidth }}>
-                  Try a broader search, browse the default layouts, or type <code>{">command"}</code> to open a terminal.
+                  {t("switcher.noMatchesHint")}
                 </div>
               </div>
             )}
@@ -1110,7 +1111,7 @@ export function SwitcherOverlay({
                         color: theme.dimFg,
                       }}
                     >
-                      Layout
+                      {t("switcher.previewLayout")}
                     </div>
                     <div style={{ fontSize: fsLg, fontWeight: 600 }}>{selectedItem.title}</div>
                     <div style={{ fontSize: fsSm, color: theme.dimFg, lineHeight: 1.4 }}>{selectedItem.layout.dsl}</div>
@@ -1134,17 +1135,17 @@ export function SwitcherOverlay({
                     />
                   </div>
                   <div style={{ display: "flex", gap: scale.tightGap, flexWrap: "wrap" }}>
-                    <mark style={ui.badge}>{leafCount(selectedItem.layout.root)} panes</mark>
-                    {activeLayout?.dsl === selectedItem.layout.dsl && <mark style={ui.badge}>Current layout</mark>}
-                    {layoutChoices.recent.some((layout) => layout.dsl === selectedItem.layout.dsl) && <mark style={ui.badge}>Recent</mark>}
-                    {layoutChoices.presets.some((layout) => layout.dsl === selectedItem.layout.dsl) && <mark style={ui.badge}>Default</mark>}
+                    <mark style={ui.badge}>{tp("switcher.paneCount", { count: leafCount(selectedItem.layout.root) })}</mark>
+                    {activeLayout?.dsl === selectedItem.layout.dsl && <mark style={ui.badge}>{t("switcher.badgeCurrentLayout")}</mark>}
+                    {layoutChoices.recent.some((layout) => layout.dsl === selectedItem.layout.dsl) && <mark style={ui.badge}>{t("switcher.badgeRecent")}</mark>}
+                    {layoutChoices.presets.some((layout) => layout.dsl === selectedItem.layout.dsl) && <mark style={ui.badge}>{t("switcher.badgeDefault")}</mark>}
                   </div>
                   <button
                     type="button"
                     onClick={() => activateItem(selectedItem)}
                     style={ctaStyle}
                   >
-                    Apply Layout
+                    {t("switcher.applyLayout")}
                   </button>
                 </>
               ) : selectedItem.type === "pane" ? (
@@ -1158,14 +1159,14 @@ export function SwitcherOverlay({
                         color: theme.dimFg,
                       }}
                     >
-                      Pane
+                      {t("switcher.previewPane")}
                     </div>
                     <div style={{ fontSize: fsLg, fontWeight: 600 }}>{selectedItem.title}</div>
                     <div style={{ fontSize: fsSm, color: theme.dimFg }}>
                       {inlineCmd
-                        ? `Run "${inlineCmd}" in ${selectedItem.title}`
+                        ? tp("switcher.runInPane", { command: inlineCmd, pane: selectedItem.title })
                         : selectedItem.empty
-                          ? `${selectedItem.title} is empty \u2014 Tab+>cmd or Enter for shell`
+                          ? tp("switcher.paneEmpty", { pane: selectedItem.title })
                           : selectedItem.subtitle}
                     </div>
                   </div>
@@ -1197,7 +1198,7 @@ export function SwitcherOverlay({
                     onClick={() => activateItem(selectedItem)}
                     style={ctaStyle}
                   >
-                    {inlineCmd ? `Run "${inlineCmd}"` : "Select Pane"}
+                    {inlineCmd ? tp("switcher.runInlineCmd", { command: inlineCmd }) : t("switcher.selectPane")}
                   </button>
                 </>
               ) : selectedItem.type === "session" ? (
@@ -1211,13 +1212,13 @@ export function SwitcherOverlay({
                         color: theme.dimFg,
                       }}
                     >
-                      Terminal
+                      {t("switcher.previewTerminal")}
                     </div>
                     <div style={{ fontSize: fsLg, fontWeight: 600 }}>{selectedItem.title}</div>
                     <div style={{ fontSize: fsSm, color: theme.dimFg, lineHeight: 1.4 }}>
                       {selectedItem.subtitle}
                       {selectedItem.source != null && (
-                        <> · {SOURCE_LABEL[selectedItem.source] ?? "Match"}</>
+                        <> · {SOURCE_LABEL[selectedItem.source] ?? t("switcher.sourceMatch")}</>
                       )}
                     </div>
                   </div>
@@ -1235,7 +1236,7 @@ export function SwitcherOverlay({
                     onClick={() => activateItem(selectedItem)}
                     style={ctaStyle}
                   >
-                    Focus Terminal
+                    {t("switcher.focusTerminal")}
                   </button>
                 </>
               ) : null
@@ -1252,7 +1253,7 @@ export function SwitcherOverlay({
                   padding: scale.panelPadding,
                 }}
               >
-                Select a layout, pane, terminal, or action.
+                {t("switcher.selectHint")}
               </div>
             )}
       </div>}

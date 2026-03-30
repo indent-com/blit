@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import type { ConnectionStatus, TerminalPalette } from "blit-react";
 import { disconnectedStyles, themeFor, uiScale, z } from "./theme";
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
+import { t, tp } from "./i18n";
 
 interface LogEntry {
   time: string;
@@ -18,7 +19,7 @@ function formatTimestamp(): string {
 }
 
 function formatRetryLabel(retryCount: number): string {
-  return retryCount === 1 ? "1 retry" : `${retryCount} retries`;
+  return retryCount === 1 ? t("disconnected.retryOne") : tp("disconnected.retryMany", { count: retryCount });
 }
 
 function describeStatusTransition(
@@ -29,31 +30,31 @@ function describeStatusTransition(
   switch (status) {
     case "connecting":
       return retryCount > 0
-        ? `Retry ${retryCount} started`
-        : "Connecting to the server";
+        ? tp("disconnected.retryStarted", { count: retryCount })
+        : t("disconnected.connectingToServer");
     case "authenticating":
       return retryCount > 0
-        ? `Authenticating retry ${retryCount}`
-        : "Authenticating with the server";
+        ? tp("disconnected.retryAuth", { count: retryCount })
+        : t("disconnected.authenticatingWithServer");
     case "connected":
       return retryCount > 0
-        ? `Connection restored after ${formatRetryLabel(retryCount)}`
-        : "Connection restored";
+        ? tp("disconnected.connectionRestoredAfter", { retries: formatRetryLabel(retryCount) })
+        : t("disconnected.connectionRestored");
     case "error":
       if (previousStatus === "authenticating") {
         return retryCount > 0
-          ? `Retry ${retryCount} authentication failed`
-          : "Authentication failed";
+          ? tp("disconnected.retryAuthFailed", { count: retryCount })
+          : t("disconnected.authFailed");
       }
       return retryCount > 0
-        ? `Retry ${retryCount} failed`
-        : "Connection failed";
+        ? tp("disconnected.retryFailed", { count: retryCount })
+        : t("disconnected.connectionFailed");
     case "disconnected":
       return previousStatus === "connected"
-        ? "Connection lost"
+        ? t("disconnected.connectionLost")
         : retryCount > 0
-          ? `Retry ${retryCount} disconnected`
-          : "Disconnected from the server";
+          ? tp("disconnected.retryDisconnected", { count: retryCount })
+          : t("disconnected.disconnectedFromServer");
   }
 }
 
@@ -101,12 +102,12 @@ export function DisconnectedOverlay({
 
   const statusText =
     status === "connecting"
-      ? "Connecting…"
+      ? t("status.connecting")
       : status === "authenticating"
-        ? "Authenticating…"
+        ? t("status.authenticating")
         : status === "error"
-          ? (error ?? "Connection failed")
-          : "Disconnected";
+          ? (error ?? t("status.connectionFailed"))
+          : t("status.disconnected");
 
   const handleReconnect = () => {
     setLog((prev) => [
@@ -114,7 +115,7 @@ export function DisconnectedOverlay({
       {
         time: formatTimestamp(),
         status,
-        message: "Manual reconnect requested",
+        message: t("disconnected.manualReconnect"),
       },
     ]);
     onReconnect();
@@ -123,7 +124,7 @@ export function DisconnectedOverlay({
   return (
     <OverlayBackdrop
       palette={palette}
-      label="Offline"
+      label={t("disconnected.label")}
       dismissOnBackdrop={false}
       style={{ zIndex: z.disconnected }}
     >
@@ -146,7 +147,7 @@ export function DisconnectedOverlay({
               }}
             >
               <div style={{ fontSize: "0.72em", opacity: 0.68, marginBottom: 4 }}>
-                Status
+                {t("disconnected.statusLabel")}
               </div>
               <div style={{ fontSize: "0.95em", fontWeight: 600 }}>{statusText}</div>
             </div>
@@ -158,7 +159,7 @@ export function DisconnectedOverlay({
               }}
             >
               <div style={{ fontSize: "0.72em", opacity: 0.68, marginBottom: 4 }}>
-                Retries
+                {t("disconnected.retriesLabel")}
               </div>
               <div style={{ fontSize: "0.95em", fontWeight: 600 }}>{retryCount}</div>
             </div>
@@ -171,7 +172,7 @@ export function DisconnectedOverlay({
                 gap: 6,
               }}
             >
-              <div style={{ fontSize: "0.72em", opacity: 0.68 }}>Activity</div>
+              <div style={{ fontSize: "0.72em", opacity: 0.68 }}>{t("disconnected.activityLabel")}</div>
               <div
                 ref={logRef}
                 style={{
@@ -205,14 +206,14 @@ export function DisconnectedOverlay({
               style={styles.reloadButton}
               disabled={status === "connecting" || status === "authenticating"}
             >
-              Reconnect now
+              {t("disconnected.reconnectNow")}
             </button>
             <button
               type="button"
               onClick={() => window.location.reload()}
               style={{ ...styles.reloadButton, opacity: 0.5 }}
             >
-              Reload page
+              {t("disconnected.reloadPage")}
             </button>
           </div>
         </div>
