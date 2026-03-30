@@ -557,11 +557,11 @@ impl GlyphAtlas {
             ctx.set_stroke_style_str("#fff");
             ctx.begin_path();
             ctx.move_to(
-                slot.src_x,
+                slot.src_x + Self::HORIZ_PAD as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
             );
             ctx.line_to(
-                slot.src_x + slot.width,
+                slot.src_x + slot.width - Self::HORIZ_PAD as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
             );
             ctx.stroke();
