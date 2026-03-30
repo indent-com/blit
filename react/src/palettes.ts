@@ -605,75 +605,125 @@ export const PALETTES: TerminalPalette[] = [
     id: "tomorrow",
     name: "Tomorrow",
     dark: false,
-    fg: [77, 77, 76],
-    bg: [255, 255, 255],
+    fg: [0x4d, 0x4d, 0x4c],
+    bg: [0xff, 0xff, 0xff],
     ansi: [
-      [0, 0, 0],
-      [200, 40, 41],
-      [113, 140, 0],
-      [234, 183, 0],
-      [66, 113, 174],
-      [137, 89, 168],
-      [62, 153, 159],
-      [255, 255, 255],
-      [142, 144, 140],
-      [200, 40, 41],
-      [113, 140, 0],
-      [234, 183, 0],
-      [66, 113, 174],
-      [137, 89, 168],
-      [62, 153, 159],
-      [255, 255, 255],
+      [0x00, 0x00, 0x00], // 0  black
+      [0xc8, 0x28, 0x29], // 1  red
+      [0x71, 0x8c, 0x00], // 2  green
+      [0xf5, 0x87, 0x1f], // 3  orange
+      [0x42, 0x71, 0xae], // 4  blue
+      [0x89, 0x59, 0xa8], // 5  purple
+      [0x3e, 0x99, 0x9f], // 6  aqua
+      [0xd6, 0xd6, 0xd6], // 7  selection
+      [0x66, 0x66, 0x66], // 8  bright black
+      [0xff, 0x33, 0x34], // 9  bright red
+      [0x9e, 0xc4, 0x00], // 10 bright green
+      [0xea, 0xb7, 0x00], // 11 yellow
+      [0x42, 0x71, 0xae], // 12 bright blue
+      [0xb7, 0x77, 0xe0], // 13 bright purple
+      [0x54, 0xce, 0xd6], // 14 bright aqua
+      [0xef, 0xef, 0xef], // 15 current line
     ],
   },
   {
     id: "tomorrow-night",
     name: "Tomorrow Night",
     dark: true,
-    fg: [197, 200, 198],
-    bg: [29, 31, 33],
+    fg: [0xc5, 0xc8, 0xc6],
+    bg: [0x1d, 0x1f, 0x21],
     ansi: [
-      [29, 31, 33],
-      [204, 102, 102],
-      [181, 189, 104],
-      [240, 198, 116],
-      [129, 162, 190],
-      [178, 148, 187],
-      [138, 190, 183],
-      [197, 200, 198],
-      [150, 152, 150],
-      [204, 102, 102],
-      [181, 189, 104],
-      [240, 198, 116],
-      [129, 162, 190],
-      [178, 148, 187],
-      [138, 190, 183],
-      [255, 255, 255],
+      [0x00, 0x00, 0x00], // 0  black
+      [0xcc, 0x66, 0x66], // 1  red
+      [0xb5, 0xbd, 0x68], // 2  green
+      [0xde, 0x93, 0x5f], // 3  orange
+      [0x81, 0xa2, 0xbe], // 4  blue
+      [0xb2, 0x94, 0xbb], // 5  purple
+      [0x8a, 0xbe, 0xb7], // 6  aqua
+      [0x37, 0x3b, 0x41], // 7  selection
+      [0x66, 0x66, 0x66], // 8  bright black
+      [0xff, 0x33, 0x34], // 9  bright red
+      [0x9e, 0xc4, 0x00], // 10 bright green
+      [0xf0, 0xc6, 0x74], // 11 yellow
+      [0x81, 0xa2, 0xbe], // 12 bright blue
+      [0xb7, 0x77, 0xe0], // 13 bright purple
+      [0x54, 0xce, 0xd6], // 14 bright aqua
+      [0x28, 0x2a, 0x2e], // 15 current line
     ],
   },
   {
-    id: "tomorrow-night-midnight",
-    name: "Tomorrow Night Midnight",
+    id: "tomorrow-night-blue",
+    name: "Tomorrow Night Blue",
     dark: true,
-    fg: [197, 200, 198],
-    bg: [0, 0, 0],
+    fg: [0xff, 0xff, 0xff],
+    bg: [0x00, 0x24, 0x51],
     ansi: [
-      [0, 0, 0],
-      [204, 102, 102],
-      [153, 204, 153],
-      [255, 204, 102],
-      [102, 153, 204],
-      [204, 153, 204],
-      [102, 204, 204],
-      [204, 204, 204],
-      [153, 153, 153],
-      [242, 119, 122],
-      [153, 204, 153],
-      [255, 204, 102],
-      [102, 153, 204],
-      [204, 153, 204],
-      [102, 204, 204],
-      [255, 255, 255],
+      [0x00, 0x00, 0x00], // 0  black
+      [0xff, 0x9d, 0xa4], // 1  red
+      [0xd1, 0xf1, 0xa9], // 2  green
+      [0xff, 0xc5, 0x8f], // 3  orange
+      [0xbb, 0xda, 0xff], // 4  blue
+      [0xeb, 0xbb, 0xff], // 5  purple
+      [0x99, 0xff, 0xff], // 6  aqua
+      [0x00, 0x3f, 0x8e], // 7  selection
+      [0x66, 0x66, 0x66], // 8  bright black
+      [0xff, 0x33, 0x34], // 9  bright red
+      [0x9e, 0xc4, 0x00], // 10 bright green
+      [0xff, 0xee, 0xad], // 11 yellow
+      [0xbb, 0xda, 0xff], // 12 bright blue
+      [0xb7, 0x77, 0xe0], // 13 bright purple
+      [0x54, 0xce, 0xd6], // 14 bright aqua
+      [0x00, 0x34, 0x6e], // 15 current line
+    ],
+  },
+  {
+    id: "tomorrow-night-bright",
+    name: "Tomorrow Night Bright",
+    dark: true,
+    fg: [0xea, 0xea, 0xea],
+    bg: [0x00, 0x00, 0x00],
+    ansi: [
+      [0x00, 0x00, 0x00], // 0  black
+      [0xd5, 0x4e, 0x53], // 1  red
+      [0xb9, 0xca, 0x4a], // 2  green
+      [0xe7, 0x8c, 0x45], // 3  orange
+      [0x7a, 0xa6, 0xda], // 4  blue
+      [0xc3, 0x97, 0xd8], // 5  purple
+      [0x70, 0xc0, 0xb1], // 6  aqua
+      [0x42, 0x42, 0x42], // 7  selection
+      [0x66, 0x66, 0x66], // 8  bright black
+      [0xff, 0x33, 0x34], // 9  bright red
+      [0x9e, 0xc4, 0x00], // 10 bright green
+      [0xe7, 0xc5, 0x47], // 11 yellow
+      [0x7a, 0xa6, 0xda], // 12 bright blue
+      [0xb7, 0x77, 0xe0], // 13 bright purple
+      [0x54, 0xce, 0xd6], // 14 bright aqua
+      [0x2a, 0x2a, 0x2a], // 15 current line
+    ],
+  },
+  {
+    id: "tomorrow-night-eighties",
+    name: "Tomorrow Night Eighties",
+    dark: true,
+    fg: [0xcc, 0xcc, 0xcc],
+    bg: [0x2d, 0x2d, 0x2d],
+    ansi: [
+      [0x00, 0x00, 0x00], // 0  black
+      [0xf2, 0x77, 0x7a], // 1  red
+      [0x99, 0xcc, 0x99], // 2  green
+      [0xf9, 0x91, 0x57], // 3  orange
+      [0x66, 0x99, 0xcc], // 4  blue
+      [0xcc, 0x99, 0xcc], // 5  purple
+      [0x66, 0xcc, 0xcc], // 6  aqua
+      [0x51, 0x51, 0x51], // 7  selection
+      [0x66, 0x66, 0x66], // 8  bright black
+      [0xff, 0x33, 0x34], // 9  bright red
+      [0x9e, 0xc4, 0x00], // 10 bright green
+      [0xff, 0xcc, 0x66], // 11 yellow
+      [0x66, 0x99, 0xcc], // 12 bright blue
+      [0xb7, 0x77, 0xe0], // 13 bright purple
+      [0x54, 0xce, 0xd6], // 14 bright aqua
+      [0x39, 0x39, 0x39], // 15 current line
     ],
   },
   {
