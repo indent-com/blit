@@ -21,7 +21,7 @@ For a deep dive into how all the pieces connect — wire protocol, frame encodin
 Browser access to `blit-server` goes through either of two paths — pick one, not both:
 
 - **`blit-gateway`**: a standalone WebSocket/WebTransport proxy, deployed alongside the server for persistent browser access. Handles passphrase auth, serves the web app, optionally enables QUIC.
-- **`blit` (the CLI)**: connects to a local or remote `blit-server` (over SSH if needed), embeds a temporary gateway, and opens the browser — no separate gateway deployment required. Also has a `--console` mode that renders directly in the terminal.
+- **`blit` (the CLI)**: connects to a local or remote `blit-server` (over SSH if needed), embeds a temporary gateway, and opens the browser — no separate gateway deployment required.
 
 **`web-app/`** is the browser UI served by either path. It provides multi-session management, BSP layouts, search, font/palette selection, and reconnection handling.
 
@@ -58,11 +58,13 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | `fonts/` | | Font discovery and metadata |
 | `webserver/` | | Shared HTTP helpers for serving assets and fonts |
 | `gateway/` | `blit-gateway` | WebSocket/WebTransport proxy |
-| `cli/` | `blit` | Browser/console client |
+| `cli/` | `blit` | Browser client |
 | `web-app/` | | Browser UI |
 | `demo/` | | Sample programs and test content |
 
 ## Install
+
+Nix users: jump to [nix-darwin](#nix-darwin) or [NixOS](#nixos).
 
 ### macOS (Homebrew)
 
@@ -96,26 +98,28 @@ nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
 
 ## Quick start
 
+Start the server, then open a browser session:
+
 ```bash
-# Browser
-cargo run -p blit-server &
-cargo run -p blit-cli
-
-# Console
-cargo run -p blit-cli -- --console
-
-# Standalone gateway
-BLIT_PASS=secret cargo run -p blit-gateway &
-cargo run -p blit-server
-# open http://localhost:3264
-
-# Remote host
-blit --ssh myhost
-blit --console --ssh user@myhost
-
-# Auto-reload development loop
-dev
+blit-server &
+blit
 ```
+
+`blit` launches an embedded gateway and opens your browser. To access a remote host over SSH:
+
+```bash
+blit --ssh myhost
+```
+
+To run the gateway separately (e.g. for persistent browser access):
+
+```bash
+BLIT_PASS=secret blit-gateway &
+blit-server
+# open http://localhost:3264
+```
+
+If building from source, substitute `cargo run -p blit-server`, `cargo run -p blit-cli`, etc. For the dev environment with hot-reloading, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Configuration
 
@@ -144,9 +148,7 @@ dev
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BLIT_SOCK` | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path |
-| `BLIT_DISPLAY_FPS` | `240` | Advertised display rate in console mode |
-
-For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and either opens the browser with an embedded local gateway or renders directly in the current terminal with `--console`.
+For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and opens the browser with an embedded local gateway.
 
 ## Agent subcommands
 
@@ -176,8 +178,6 @@ blit --ssh myhost show 1
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
 ## Running services
-
-Nix users: jump to [nix-darwin](#nix-darwin) or [NixOS](#nixos).
 
 ### macOS (Homebrew)
 
