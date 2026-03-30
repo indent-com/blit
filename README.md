@@ -38,13 +38,33 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 
 | | blit | ttyd | gotty | Eternal Terminal | Mosh | xterm.js + node-pty |
 | --- | --- | --- | --- | --- | --- | --- |
-| Architecture | Separate PTY host + gateway | Single binary | Single binary | Client + daemon | Client + server | Library (BYO server) |
-| Multiple PTYs | Yes, first-class | One per instance | One per instance | One per connection | One per connection | Manual |
-| Protocol | Binary frame diffs | Terminal byte stream | Terminal byte stream | SSH + prediction | UDP + SSP | Terminal byte stream |
-| Backpressure | Per-client pacing from render metrics | None | None | SSH flow control | None | None |
-| Server-side search | Titles + visible + scrollback | No | No | No | No | No |
-| Transport | WebSocket, WebTransport, Unix socket | WebSocket | WebSocket | TCP | UDP | WebSocket |
-| Embeddable | React library | No | No | No | No | Yes (xterm.js) |
+| Architecture | PTY host + gateway | Single binary | Single binary | Client + daemon | Client + server | Library (BYO server) |
+| Multiple PTYs | ✅ First-class | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual |
+| Browser access | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| Protocol | Binary frame diffs | Raw byte stream | Raw byte stream | SSH + prediction | UDP + SSP | Raw byte stream |
+| Delta updates | ✅ Only changed cells sent | ❌ | ❌ | ❌ | ✅ State diffs | ❌ |
+| LZ4 compression | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Copy-rect scrolling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Per-client backpressure | ✅ Render-metric pacing | ❌ | ❌ | ⚠️ SSH flow control | ❌ | ❌ |
+| Background session throttling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Server-side search | ✅ Titles + visible + scrollback | ❌ | ❌ | ❌ | ❌ | ❌ |
+| WebGL rendering | ✅ | ❌ | ❌ | ❌ | ❌ | ⚠️ Addon |
+| Transport | WS, WebTransport, Unix | WebSocket | WebSocket | TCP | UDP | WebSocket |
+| WebTransport / QUIC | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Embeddable (React) | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Agent / CLI subcommands | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Reconnect on disconnect | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
+| SSH tunneling built-in | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
+
+### Adjacent tools
+
+**tmux** is the classic terminal multiplexer — windows, panes, session detach/reattach, all over a Unix socket. It's purely terminal-native: no browser access, no wire protocol beyond its own client-server IPC. blit handles the browser streaming side, so the two are complementary — you can run tmux inside a blit PTY.
+
+**Zellij** is a terminal multiplexer (like tmux) — it manages panes, tabs, and layouts inside your existing terminal. It has a WASM plugin system, built-in search, multiplayer session sharing, and a beta web client. Where blit is a streaming stack that sends rendered frames to a browser, Zellij is a local-first workspace that happens to have a web escape hatch.
+
+**sshx** is a collaborative terminal sharing tool. You run a single command and get a shareable URL with an infinite canvas of terminals, live cursors, and end-to-end encryption (Argon2 + AES). It uses a managed cloud mesh for routing, so there's no self-hosting. The focus is real-time pair programming, not persistent server access.
+
+**tmate** is a tmux fork that gives you instant terminal sharing via a hosted relay. You get an SSH URL and a read-only web URL out of the box. It's the fastest path to "let someone else see my terminal" but doesn't do browser-native rendering, backpressure, or multi-session management.
 
 ## What lives in this repo
 
@@ -121,6 +141,41 @@ blit-server
 
 If building from source, substitute `cargo run -p blit-server`, `cargo run -p blit-cli`, etc. For the dev environment with hot-reloading, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Running services
+
+### macOS (Homebrew)
+
+```bash
+brew services start blit-server
+brew services start blit-gateway
+```
+
+Configuration lives in env files under `$(brew --prefix)/etc/blit/`. These start empty (the binaries have sensible defaults) and are preserved across upgrades. Add any environment variable from the tables above to override defaults:
+
+```bash
+echo 'export BLIT_PASS="secret"' >> $(brew --prefix)/etc/blit/blit-gateway.env
+echo 'export BLIT_SCROLLBACK="50000"' >> $(brew --prefix)/etc/blit/blit-server.env
+brew services restart blit-gateway blit-server
+```
+
+### Debian / Ubuntu (systemd)
+
+The `blit-server` .deb ships the unit files, so after installing via APT:
+
+```bash
+sudo systemctl enable --now blit@alice.socket
+```
+
+### Manual (systemd)
+
+On non-Debian systems, copy the units from the repo:
+
+```bash
+sudo cp systemd/blit@.socket systemd/blit@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now blit@alice.socket
+```
+
 ## Configuration
 
 ### `blit-server`
@@ -176,41 +231,6 @@ blit --ssh myhost show 1
 ```
 
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
-
-## Running services
-
-### macOS (Homebrew)
-
-```bash
-brew services start blit-server
-brew services start blit-gateway
-```
-
-Configuration lives in env files under `$(brew --prefix)/etc/blit/`. These start empty (the binaries have sensible defaults) and are preserved across upgrades. Add any environment variable from the tables above to override defaults:
-
-```bash
-echo 'export BLIT_PASS="secret"' >> $(brew --prefix)/etc/blit/blit-gateway.env
-echo 'export BLIT_SCROLLBACK="50000"' >> $(brew --prefix)/etc/blit/blit-server.env
-brew services restart blit-gateway blit-server
-```
-
-### Debian / Ubuntu (systemd)
-
-The `blit-server` .deb ships the unit files, so after installing via APT:
-
-```bash
-sudo systemctl enable --now blit@alice.socket
-```
-
-### Manual (systemd)
-
-On non-Debian systems, copy the units from the repo:
-
-```bash
-sudo cp systemd/blit@.socket systemd/blit@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now blit@alice.socket
-```
 
 ## Contributing
 
