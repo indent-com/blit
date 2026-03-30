@@ -740,7 +740,11 @@ export function SwitcherOverlay({
       location.reload();
       return;
     }
-    onCreate(commandText || undefined);
+    if (focusedPaneId && onSelectPane) {
+      onSelectPane(focusedPaneId, null, commandText || undefined);
+    } else {
+      onCreate(commandText || undefined);
+    }
   }, [activeLayout, commandText, focusedPaneId, onApplyLayout, onChangeFont, onChangePalette, onClearLayout, onCreate, onMoveToPane, onSelect, onSelectPane, presetLayouts, query, recentLayouts, setQuery]);
 
   const handleKeyDown = useCallback((event: KeyboardEvent<HTMLInputElement>) => {

@@ -133,6 +133,11 @@ export function reconcileAssignments({
     if (preferredIndex > 0) {
       const [preferred] = empties.splice(preferredIndex, 1);
       empties.unshift(preferred);
+    } else if (preferredIndex === -1 && assignments[preferredPaneId] != null) {
+      const evicted = assignments[preferredPaneId]!;
+      assignments[preferredPaneId] = null;
+      overflowSessionIds.push(evicted);
+      empties.unshift(preferredPaneId);
     }
   }
   for (const sessionId of liveSessionIds) {
