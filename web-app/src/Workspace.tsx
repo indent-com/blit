@@ -330,20 +330,18 @@ function WorkspaceScreen({
     document.title = parts.join(" — ");
   }, [focusedSession?.title]);
 
-  const [focusTrigger, setFocusTrigger] = useState(0);
-  const focusTerminal = useCallback(() => {
-    setTimeout(() => {
-      termRef.current?.focus();
-      setFocusTrigger((n) => n + 1);
-    }, 0);
-  }, []);
+  const previousFocusRef = useRef<Element | null>(null);
 
   const closeOverlay = useCallback(() => {
     paletteOverlayOriginRef.current = null;
     fontOverlayOriginRef.current = null;
     setOverlay(null);
-    focusTerminal();
-  }, [focusTerminal]);
+    const el = previousFocusRef.current;
+    previousFocusRef.current = null;
+    if (el instanceof HTMLElement) {
+      setTimeout(() => el.focus(), 0);
+    }
+  }, []);
 
   const restoreOverlayPreview = useCallback((target: Overlay) => {
     if (target === "palette") {
@@ -378,6 +376,10 @@ function WorkspaceScreen({
     }
 
     restoreOverlayPreview(current);
+
+    if (!current) {
+      previousFocusRef.current = document.activeElement;
+    }
 
     if (target === "palette") {
       paletteOverlayOriginRef.current = palette;
@@ -617,7 +619,6 @@ function WorkspaceScreen({
             focusedSessionId={workspaceState.focusedSessionId}
             lruSessionIds={lruRef.current}
             manageVisibility={overlay !== "expose"}
-            focusTrigger={focusTrigger}
             preferredEmptyPaneId={pendingPaneTargetId}
             onAssignmentsChange={setLayoutAssignments}
             onPreferredEmptyPaneResolved={() => setPendingPaneTargetId(null)}
