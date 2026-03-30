@@ -6,14 +6,13 @@ This document describes the internals of blit: how the pieces connect, how data 
 
 blit is a terminal streaming stack. The server parses PTY output into structured terminal state, computes per-client binary diffs, and ships only the delta. The browser applies those diffs in WASM and renders with WebGL. Keystrokes travel the reverse path with no queuing.
 
-```
-                      Unix socket
-  PTY <---> blit-server <---------> blit-gateway <--WS/WebTransport--> browser
-                |                                                        |
-                |  Unix socket / TCP / SSH                               |
-                +--------------------> blit-cli (--console)              |
-                                         |                              |
-                                         +--- embeds temp gateway ------+
+```mermaid
+graph LR
+    PTY <-->|stdin/stdout| S[blit-server]
+    S <-->|Unix socket| G[blit-gateway]
+    G <-->|WebSocket / WebTransport| B[browser]
+    S <-->|Unix socket / TCP / SSH| C[blit-cli]
+    C -->|embeds temp gateway| B
 ```
 
 The server is the stateful half. It owns PTYs, scrollback, parsed terminal state, and per-client frame pacing. The gateway is stateless: it authenticates browser clients and proxies binary messages. This split means PTYs survive gateway restarts, the gateway can sit behind a reverse proxy, and the CLI can embed a temporary gateway when it needs browser access without a persistent deployment.
@@ -37,19 +36,20 @@ Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module tree
 
 ### Dependency graph
 
-```
-blit-remote
-  |
-  +---> blit-alacritty ---> blit-server
-  |
-  +---> blit-browser   ---> blit-react ---> web-app
-  |
-  +---> blit-cli
-  |
-  +---> blit-demo
+```mermaid
+graph TD
+    remote[blit-remote] --> alacritty[blit-alacritty]
+    remote --> browser[blit-browser]
+    remote --> cli[blit-cli]
+    remote --> demo[blit-demo]
 
-blit-fonts ---> blit-webserver ---> blit-gateway
-                               ---> blit-cli
+    alacritty --> server[blit-server]
+    browser --> react[blit-react]
+    react --> webapp[web-app]
+
+    fonts[blit-fonts] --> webserver[blit-webserver]
+    webserver --> gateway[blit-gateway]
+    webserver --> cli
 ```
 
 ## Wire protocol
@@ -335,15 +335,26 @@ Mouse events are sent as `C2S_MOUSE` messages. The server generates the correct 
 
 ## How a frame moves through the system
 
-1. A PTY writes bytes.
-2. `blit-server` reads them from the master fd and feeds them into `blit-alacritty`, which wraps `alacritty_terminal`. The terminal parser updates screen state, cursor position, title, modes, and scrollback.
-3. The server's tick loop checks each PTY for dirty state. For each client subscribed to a dirty PTY, it compares the new frame against that client's last-acknowledged frame.
-4. `blit-remote::build_update_msg` encodes only the delta as copy-rect, fill-rect, and patch-cells operations, then LZ4-compresses the result.
-5. The compressed frame is queued in the client's outbox, respecting the congestion window.
-6. The gateway (or embedded CLI gateway) proxies the binary message over WebSocket or WebTransport.
-7. The browser's transport delivers the `ArrayBuffer` to `blit-browser` WASM, which decompresses and applies the diff to its `TerminalState`.
-8. On the next `requestAnimationFrame`, the WASM module builds vertex buffers and the WebGL renderer paints the frame.
-9. The browser sends `C2S_ACK` back, closing the feedback loop for RTT measurement and window advancement.
+```mermaid
+sequenceDiagram
+    participant PTY
+    participant Server as blit-server
+    participant Gateway as blit-gateway
+    participant WASM as blit-browser (WASM)
+    participant GL as WebGL renderer
+
+    PTY->>Server: raw bytes
+    Server->>Server: feed into alacritty_terminal (parse VT state)
+    Server->>Server: diff new frame vs client's last-acked frame
+    Server->>Server: encode delta (copy-rect / fill-rect / patch-cells) + LZ4
+    Server->>Gateway: compressed frame (Unix socket)
+    Gateway->>WASM: compressed frame (WebSocket / WebTransport)
+    WASM->>WASM: decompress + apply diff to TerminalState
+    WASM->>GL: vertex buffers (zero-copy WASM memory)
+    GL->>GL: draw bg rects + glyph quads + cursor
+    WASM-->>Gateway: C2S_ACK
+    Gateway-->>Server: C2S_ACK (retires in-flight frame, updates RTT)
+```
 
 ## Terminal emulation
 
