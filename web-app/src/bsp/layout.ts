@@ -16,7 +16,6 @@ export interface BSPPane {
 
 export interface BSPAssignments {
   assignments: Record<string, SessionId | null>;
-  overflowSessionIds: SessionId[];
 }
 
 // ---------------------------------------------------------------------------
@@ -46,12 +45,16 @@ export function enumeratePanes(
   path: readonly number[] = [],
 ): BSPPane[] {
   if (node.type === "leaf") {
-    return [{
-      id: path.length > 0 ? path.join(".") : "0",
-      leaf: node,
-    }];
+    return [
+      {
+        id: path.length > 0 ? path.join(".") : "0",
+        leaf: node,
+      },
+    ];
   }
-  return node.children.flatMap((child, index) => enumeratePanes(child.node, [...path, index]));
+  return node.children.flatMap((child, index) =>
+    enumeratePanes(child.node, [...path, index]),
+  );
 }
 
 export function assignSessionsToPanes(
@@ -67,23 +70,18 @@ export function assignSessionsToPanes(
       assignments[pane.id] = orderedSessionIds[sessionIdx++] ?? null;
     }
   }
-  return {
-    assignments,
-    overflowSessionIds: orderedSessionIds.slice(sessionIdx),
-  };
+  return { assignments };
 }
 
 export function buildCandidateOrder({
   liveSessionIds,
   focusedSessionId,
   currentAssignedInPaneOrder = [],
-  overflowSessionIds = [],
   lruSessionIds = [],
 }: {
   liveSessionIds: readonly SessionId[];
   focusedSessionId: SessionId | null;
   currentAssignedInPaneOrder?: readonly SessionId[];
-  overflowSessionIds?: readonly SessionId[];
   lruSessionIds?: readonly SessionId[];
 }): SessionId[] {
   const live = new Set(liveSessionIds);
@@ -98,67 +96,43 @@ export function buildCandidateOrder({
 
   push(focusedSessionId);
   currentAssignedInPaneOrder.forEach(push);
-  overflowSessionIds.forEach(push);
   lruSessionIds.forEach(push);
   liveSessionIds.forEach(push);
 
   return ordered;
 }
 
+/**
+ * Keep existing assignments, clearing only sessions the server confirms are
+ * gone (known to the server but no longer live).  Sessions the server hasn't
+ * mentioned yet are preserved — they may still be loading on reload.
+ */
 export function reconcileAssignments({
   panes,
   previous,
   liveSessionIds,
-  preferredPaneId,
+  knownSessionIds,
 }: {
   panes: readonly BSPPane[];
   previous: BSPAssignments;
   liveSessionIds: readonly SessionId[];
-  preferredPaneId?: string | null;
+  /** All session IDs the server has told us about (any state). */
+  knownSessionIds: readonly SessionId[];
 }): BSPAssignments {
   const live = new Set(liveSessionIds);
-  const paneIds = panes.map((p) => p.id);
+  const known = new Set(knownSessionIds);
   const assignments: Record<string, SessionId | null> = {};
-  const assigned = new Set<SessionId>();
-  const overflowSessionIds = previous.overflowSessionIds.filter((sessionId) => live.has(sessionId));
 
-  for (const paneId of paneIds) {
-    const sessionId = previous.assignments[paneId];
-    const next = sessionId && live.has(sessionId) ? sessionId : null;
-    assignments[paneId] = next;
-    if (next) assigned.add(next);
+  for (const pane of panes) {
+    const sessionId = previous.assignments[pane.id];
+    // Live → keep.  Not yet known to server → keep (still loading).
+    // Known but not live → dead, clear.
+    const keep =
+      sessionId != null && (live.has(sessionId) || !known.has(sessionId));
+    assignments[pane.id] = keep ? sessionId : null;
   }
 
-  for (const sessionId of overflowSessionIds) {
-    assigned.add(sessionId);
-  }
-
-  if (preferredPaneId && paneIds.includes(preferredPaneId)) {
-    const current = assignments[preferredPaneId];
-    if (current) {
-      assigned.delete(current);
-      overflowSessionIds.push(current);
-      assignments[preferredPaneId] = null;
-    }
-    for (const sessionId of liveSessionIds) {
-      if (!assigned.has(sessionId)) {
-        assignments[preferredPaneId] = sessionId;
-        assigned.add(sessionId);
-        break;
-      }
-    }
-  }
-
-  for (const sessionId of liveSessionIds) {
-    if (assigned.has(sessionId)) continue;
-    overflowSessionIds.push(sessionId);
-    assigned.add(sessionId);
-  }
-
-  return {
-    assignments,
-    overflowSessionIds,
-  };
+  return { assignments };
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +145,8 @@ export function adjustWeights(
   indexB: number,
   fraction: number, // how much of the total to transfer from B to A (can be negative)
 ): BSPSplit {
-  const totalWeight = split.children[indexA].weight + split.children[indexB].weight;
+  const totalWeight =
+    split.children[indexA].weight + split.children[indexB].weight;
   const delta = fraction * totalWeight;
   const minWeight = 0.1;
 
@@ -201,7 +176,10 @@ function parseHash(): Record<string, string> {
   const result: Record<string, string> = {};
   for (const part of hash.split("&")) {
     const eq = part.indexOf("=");
-    if (eq > 0) result[part.slice(0, eq)] = part.slice(eq + 1);
+    if (eq > 0)
+      result[decodeURIComponent(part.slice(0, eq))] = decodeURIComponent(
+        part.slice(eq + 1),
+      );
   }
   return result;
 }
@@ -254,7 +232,10 @@ export function loadAssignmentsFromHash(): Record<string, string> | null {
 
 export function saveActiveLayout(layout: BSPLayout | null): void {
   if (layout) {
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ name: layout.name, dsl: layout.dsl }));
+    localStorage.setItem(
+      LAYOUT_KEY,
+      JSON.stringify({ name: layout.name, dsl: layout.dsl }),
+    );
   } else {
     localStorage.removeItem(LAYOUT_KEY);
   }
@@ -270,9 +251,8 @@ export function loadRecentLayouts(): BSPLayout[] {
     if (!raw) return [];
     const stored: StoredRecentLayout[] = JSON.parse(raw);
     return stored.flatMap((entry) => {
-      const record = typeof entry === "string"
-        ? { name: entry, dsl: entry }
-        : entry;
+      const record =
+        typeof entry === "string" ? { name: entry, dsl: entry } : entry;
       try {
         const { root, weight } = parseDSL(record.dsl);
         return [{ name: record.name, dsl: record.dsl, root, weight }];
@@ -286,9 +266,10 @@ export function loadRecentLayouts(): BSPLayout[] {
 }
 
 function pushRecentLayout(layout: BSPLayout | string): void {
-  const record = typeof layout === "string"
-    ? { name: layout, dsl: layout }
-    : { name: layout.name, dsl: layout.dsl };
+  const record =
+    typeof layout === "string"
+      ? { name: layout, dsl: layout }
+      : { name: layout.name, dsl: layout.dsl };
   try {
     const raw = localStorage.getItem(LAYOUT_HISTORY_KEY);
     const existing: StoredRecentLayout[] = raw ? JSON.parse(raw) : [];

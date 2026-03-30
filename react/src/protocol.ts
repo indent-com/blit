@@ -55,10 +55,7 @@ export function buildDisplayRateMessage(fps: number): Uint8Array {
   return msg;
 }
 
-export function buildInputMessage(
-  ptyId: number,
-  data: Uint8Array,
-): Uint8Array {
+export function buildInputMessage(ptyId: number, data: Uint8Array): Uint8Array {
   const msg = new Uint8Array(3 + data.length);
   msg[0] = C2S_INPUT;
   msg[1] = ptyId & 0xff;
@@ -75,7 +72,9 @@ export function buildResizeMessage(
   return buildResizeBatchMessage([{ ptyId, rows, cols }]);
 }
 
-export function buildResizeBatchMessage(entries: ReadonlyArray<ResizeEntry>): Uint8Array {
+export function buildResizeBatchMessage(
+  entries: ReadonlyArray<ResizeEntry>,
+): Uint8Array {
   const msg = new Uint8Array(1 + entries.length * 6);
   msg[0] = C2S_RESIZE;
   let offset = 1;
@@ -97,7 +96,9 @@ export function buildClearResizeMessage(ptyId: number): Uint8Array {
   ]);
 }
 
-export function buildClearResizeBatchMessage(ptyIds: ReadonlyArray<number>): Uint8Array {
+export function buildClearResizeBatchMessage(
+  ptyIds: ReadonlyArray<number>,
+): Uint8Array {
   return buildResizeBatchMessage(
     ptyIds.map((ptyId) => ({
       ptyId,
@@ -107,10 +108,7 @@ export function buildClearResizeBatchMessage(ptyIds: ReadonlyArray<number>): Uin
   );
 }
 
-export function buildScrollMessage(
-  ptyId: number,
-  offset: number,
-): Uint8Array {
+export function buildScrollMessage(ptyId: number, offset: number): Uint8Array {
   const msg = new Uint8Array(7);
   msg[0] = C2S_SCROLL;
   msg[1] = ptyId & 0xff;

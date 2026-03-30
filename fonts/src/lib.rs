@@ -130,6 +130,39 @@ fn read_is_monospace(data: &[u8]) -> bool {
     reference_width.is_some()
 }
 
+/// Read the monospace advance width as a fraction of the em square.
+/// Returns `advance_width / units_per_em` for the first non-zero advance in hmtx,
+/// matching how native terminals (Ghostty, kitty) compute cell width.
+fn read_advance_ratio(data: &[u8]) -> Option<f64> {
+    let head = table_slice(data, b"head")?;
+    if head.len() < 20 {
+        return None;
+    }
+    let units_per_em = u16::from_be_bytes([head[18], head[19]]) as f64;
+    if units_per_em == 0.0 {
+        return None;
+    }
+
+    let hhea = table_slice(data, b"hhea")?;
+    let hmtx = table_slice(data, b"hmtx")?;
+    if hhea.len() < 36 {
+        return None;
+    }
+    let num_long_metrics = u16::from_be_bytes([hhea[34], hhea[35]]) as usize;
+    if num_long_metrics == 0 || hmtx.len() < num_long_metrics * 4 {
+        return None;
+    }
+
+    for i in 0..num_long_metrics {
+        let idx = i * 4;
+        let advance = u16::from_be_bytes([hmtx[idx], hmtx[idx + 1]]);
+        if advance > 0 {
+            return Some(advance as f64 / units_per_em);
+        }
+    }
+    None
+}
+
 /// Read font family and subfamily from a TTF/OTF/TTC file's `name` table.
 fn read_font_info(data: &[u8]) -> Option<FontInfo> {
     let tbl = table_slice(data, b"name")?;
@@ -509,6 +542,27 @@ pub fn font_face_css(family: &str) -> Option<String> {
     } else {
         Some(css)
     }
+}
+
+/// Return the advance-width / units-per-em ratio for a font family's regular variant.
+/// This is how native terminals compute cell width: `ratio * font_size_px`.
+pub fn font_advance_ratio(family: &str) -> Option<f64> {
+    let files = find_font_files_with_data(family);
+    // Prefer the "normal" weight regular variant
+    for (variant, data) in &files {
+        if variant.style == "normal" && (variant.weight == "400" || variant.weight == "normal") {
+            if let Some(ratio) = read_advance_ratio(data) {
+                return Some(ratio);
+            }
+        }
+    }
+    // Fall back to any variant
+    for (_variant, data) in &files {
+        if let Some(ratio) = read_advance_ratio(data) {
+            return Some(ratio);
+        }
+    }
+    None
 }
 
 /// Like `find_font_files` but returns the file data alongside each variant,

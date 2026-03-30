@@ -19,18 +19,18 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 
 ## Crate map
 
-| Crate | Directory | Kind | Purpose |
-| --- | --- | --- | --- |
-| `blit-remote` | `remote/` | lib | Wire protocol: message builders/parsers, frame containers, state primitives, LZ4 compression |
-| `blit-alacritty` | `alacritty-driver/` | lib | Terminal parsing backend wrapping `alacritty_terminal`; snapshot generation, scrollback, title/mode tracking, search |
-| `blit-browser` | `browser/` | cdylib (WASM) | Applies compressed frame diffs, produces WebGL vertex data, manages glyph atlas |
-| `blit-react` | `react/` | npm | Workspace-based React client library: connections, sessions, transports, rendering |
-| `blit-server` | `server/` | bin | PTY host and frame scheduler. Listens on Unix socket. |
-| `blit-gateway` | `gateway/` | bin | WebSocket/WebTransport proxy with passphrase auth |
-| `blit` (CLI) | `cli/` | bin | Browser/console client, agent subcommands, SSH tunneling, embedded gateway |
-| `blit-fonts` | `fonts/` | lib | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing) |
-| `blit-webserver` | `webserver/` | lib | Shared axum HTTP helpers for serving assets and fonts |
-| `blit-demo` | `demo/` | bin | Demo programs: `chaos`, `emojiblast`, `netdash` |
+| Crate            | Directory           | Kind          | Purpose                                                                                                              |
+| ---------------- | ------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `blit-remote`    | `remote/`           | lib           | Wire protocol: message builders/parsers, frame containers, state primitives, LZ4 compression                         |
+| `blit-alacritty` | `alacritty-driver/` | lib           | Terminal parsing backend wrapping `alacritty_terminal`; snapshot generation, scrollback, title/mode tracking, search |
+| `blit-browser`   | `browser/`          | cdylib (WASM) | Applies compressed frame diffs, produces WebGL vertex data, manages glyph atlas                                      |
+| `blit-react`     | `react/`            | npm           | Workspace-based React client library: connections, sessions, transports, rendering                                   |
+| `blit-server`    | `server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
+| `blit-gateway`   | `gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
+| `blit` (CLI)     | `cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway                                           |
+| `blit-fonts`     | `fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
+| `blit-webserver` | `webserver/`        | lib           | Shared axum HTTP helpers for serving assets and fonts                                                                |
+| `blit-demo`      | `demo/`             | bin           | Demo programs: `chaos`, `emojiblast`, `netdash`                                                                      |
 
 Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `src/bin/`; `blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`).
 
@@ -73,26 +73,26 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 
 **Client-to-server (C2S):**
 
-| Opcode | Name | Layout |
-| --- | --- | --- |
-| `0x00` | `INPUT` | `[pty_id:2][data:N]` |
-| `0x01` | `RESIZE` | `[pty_id:2][rows:2][cols:2]...` (batch, repeating) |
-| `0x02` | `SCROLL` | `[pty_id:2][offset:4]` |
-| `0x03` | `ACK` | (empty) |
-| `0x04` | `DISPLAY_RATE` | `[fps:2]` |
-| `0x05` | `CLIENT_METRICS` | `[backlog:2][ack_ahead:2][apply_ms_x10:2]` |
-| `0x06` | `MOUSE` | `[pty_id:2][type:1][button:1][col:2][row:2]` |
-| `0x07` | `RESTART` | `[pty_id:2]` |
-| `0x10` | `CREATE` | `[rows:2][cols:2][tag_len:2][tag:N]` |
-| `0x11` | `FOCUS` | `[pty_id:2]` |
-| `0x12` | `CLOSE` | `[pty_id:2]` |
-| `0x13` | `SUBSCRIBE` | `[pty_id:2]` |
-| `0x14` | `UNSUBSCRIBE` | `[pty_id:2]` |
-| `0x15` | `SEARCH` | `[request_id:2][query:N]` |
-| `0x16` | `CREATE_AT` | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]` |
-| `0x17` | `CREATE_N` | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]` |
-| `0x18` | `CREATE2` | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
-| `0x19` | `READ` | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]` |
+| Opcode | Name             | Layout                                                              |
+| ------ | ---------------- | ------------------------------------------------------------------- |
+| `0x00` | `INPUT`          | `[pty_id:2][data:N]`                                                |
+| `0x01` | `RESIZE`         | `[pty_id:2][rows:2][cols:2]...` (batch, repeating)                  |
+| `0x02` | `SCROLL`         | `[pty_id:2][offset:4]`                                              |
+| `0x03` | `ACK`            | (empty)                                                             |
+| `0x04` | `DISPLAY_RATE`   | `[fps:2]`                                                           |
+| `0x05` | `CLIENT_METRICS` | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                          |
+| `0x06` | `MOUSE`          | `[pty_id:2][type:1][button:1][col:2][row:2]`                        |
+| `0x07` | `RESTART`        | `[pty_id:2]`                                                        |
+| `0x10` | `CREATE`         | `[rows:2][cols:2][tag_len:2][tag:N]`                                |
+| `0x11` | `FOCUS`          | `[pty_id:2]`                                                        |
+| `0x12` | `CLOSE`          | `[pty_id:2]`                                                        |
+| `0x13` | `SUBSCRIBE`      | `[pty_id:2]`                                                        |
+| `0x14` | `UNSUBSCRIBE`    | `[pty_id:2]`                                                        |
+| `0x15` | `SEARCH`         | `[request_id:2][query:N]`                                           |
+| `0x16` | `CREATE_AT`      | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                  |
+| `0x17` | `CREATE_N`       | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                       |
+| `0x18` | `CREATE2`        | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
+| `0x19` | `READ`           | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                   |
 
 `CREATE2` extends `CREATE` with a nonce for response correlation and optional fields gated by feature bits (`HAS_SRC_PTY`, `HAS_COMMAND`).
 
@@ -100,48 +100,49 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 
 **Server-to-client (S2C):**
 
-| Opcode | Name | Layout |
-| --- | --- | --- |
-| `0x00` | `UPDATE` | `[pty_id:2][lz4-compressed-frame]` |
-| `0x01` | `CREATED` | `[pty_id:2][tag:N]` |
-| `0x02` | `CLOSED` | `[pty_id:2]` |
-| `0x03` | `LIST` | `[count:2][entries...]` |
-| `0x04` | `TITLE` | `[pty_id:2][title:N]` |
-| `0x05` | `SEARCH_RESULTS` | `[request_id:2][results...]` |
-| `0x06` | `CREATED_N` | `[nonce:2][pty_id:2][tag:N]` |
-| `0x07` | `HELLO` | `[version:2][features:4]` |
-| `0x08` | `EXITED` | `[pty_id:2][exit_status:4]` |
-| `0x09` | `READY` | (empty) |
-| `0x0A` | `TEXT` | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]` |
+| Opcode | Name             | Layout                                                 |
+| ------ | ---------------- | ------------------------------------------------------ |
+| `0x00` | `UPDATE`         | `[pty_id:2][lz4-compressed-frame]`                     |
+| `0x01` | `CREATED`        | `[pty_id:2][tag:N]`                                    |
+| `0x02` | `CLOSED`         | `[pty_id:2]`                                           |
+| `0x03` | `LIST`           | `[count:2][entries...]`                                |
+| `0x04` | `TITLE`          | `[pty_id:2][title:N]`                                  |
+| `0x05` | `SEARCH_RESULTS` | `[request_id:2][results...]`                           |
+| `0x06` | `CREATED_N`      | `[nonce:2][pty_id:2][tag:N]`                           |
+| `0x07` | `HELLO`          | `[version:2][features:4]`                              |
+| `0x08` | `EXITED`         | `[pty_id:2][exit_status:4]`                            |
+| `0x09` | `READY`          | (empty)                                                |
+| `0x0A` | `TEXT`           | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]` |
 
 ### Feature negotiation
 
 On connect, the server sends `S2C_HELLO` with a protocol version and a 4-byte feature bitmask. Current features:
 
-| Bit | Name | Meaning |
-| --- | --- | --- |
-| 0 | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
-| 1 | `RESTART` | Server supports `C2S_RESTART` to respawn exited PTYs |
-| 2 | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE` |
+| Bit | Name           | Meaning                                                        |
+| --- | -------------- | -------------------------------------------------------------- |
+| 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
+| 1   | `RESTART`      | Server supports `C2S_RESTART` to respawn exited PTYs           |
+| 2   | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE` |
 
 ### Frame update encoding
 
 The `S2C_UPDATE` payload (after the opcode and pty_id) is LZ4-compressed (`lz4_flex::compress_prepend_size`). Decompressed, it contains:
 
 **Header (12 bytes):**
+
 ```
 [rows:2][cols:2][cursor_row:2][cursor_col:2][mode:2][title_field:2]
 ```
 
 The `title_field` packs flags into the upper bits and a title length into the lower 12 bits:
 
-| Bit | Flag |
-| --- | --- |
-| 15 | `TITLE_PRESENT` |
-| 14 | `OPS_PRESENT` |
-| 13 | `STRINGS_PRESENT` |
-| 12 | `LINE_FLAGS_PRESENT` |
-| 0-11 | Title UTF-8 length |
+| Bit  | Flag                 |
+| ---- | -------------------- |
+| 15   | `TITLE_PRESENT`      |
+| 14   | `OPS_PRESENT`        |
+| 13   | `STRINGS_PRESENT`    |
+| 12   | `LINE_FLAGS_PRESENT` |
+| 0-11 | Title UTF-8 length   |
 
 **Cell data** follows the header. Cells are encoded as differential operations:
 
@@ -241,8 +242,14 @@ interface BlitTransport {
   send(data: Uint8Array): void;
   close(): void;
   readonly status: ConnectionStatus;
-  addEventListener(type: "message", listener: (data: ArrayBuffer) => void): void;
-  addEventListener(type: "statuschange", listener: (status: ConnectionStatus) => void): void;
+  addEventListener(
+    type: "message",
+    listener: (data: ArrayBuffer) => void,
+  ): void;
+  addEventListener(
+    type: "statuschange",
+    listener: (status: ConnectionStatus) => void,
+  ): void;
   removeEventListener(type: string, listener: Function): void;
 }
 ```
@@ -253,12 +260,12 @@ Any implementation of this interface can be passed to `BlitWorkspace` as a conne
 
 `blit-server` is a single async Rust binary (tokio runtime) that manages PTYs and clients. It has no CLI subcommands and no RPC API beyond the binary protocol described above. Configuration is entirely via environment variables:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SHELL` | `/bin/sh` | Shell to spawn for new PTYs |
-| `BLIT_SOCK` | `$TMPDIR/blit.sock` or `$XDG_RUNTIME_DIR/blit.sock` | Unix socket path |
-| `BLIT_SCROLLBACK` | `10000` | Scrollback rows per PTY |
-| `BLIT_FD_CHANNEL` | unset | fd-channel file descriptor |
+| Variable          | Default                                             | Purpose                     |
+| ----------------- | --------------------------------------------------- | --------------------------- |
+| `SHELL`           | `/bin/sh`                                           | Shell to spawn for new PTYs |
+| `BLIT_SOCK`       | `$TMPDIR/blit.sock` or `$XDG_RUNTIME_DIR/blit.sock` | Unix socket path            |
+| `BLIT_SCROLLBACK` | `10000`                                             | Scrollback rows per PTY     |
+| `BLIT_FD_CHANNEL` | unset                                               | fd-channel file descriptor  |
 
 ### How clients control the server
 

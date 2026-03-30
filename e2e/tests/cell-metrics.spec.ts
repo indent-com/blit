@@ -31,12 +31,18 @@ for (const dpr of DPRS) {
           descent: m.fontBoundingBoxDescent,
           dpr,
           // What the canvas backing store would be at 4K
-          canvasW_4k: Math.round(w * dpr) * Math.floor(3840 * dpr / Math.max(1, Math.round(w * dpr))),
-          canvasH_4k: Math.round(h * dpr) * Math.floor(2160 * dpr / Math.max(1, Math.round(h * dpr))),
+          canvasW_4k:
+            Math.round(w * dpr) *
+            Math.floor((3840 * dpr) / Math.max(1, Math.round(w * dpr))),
+          canvasH_4k:
+            Math.round(h * dpr) *
+            Math.floor((2160 * dpr) / Math.max(1, Math.round(h * dpr))),
         };
       }, fs);
 
-      console.log(`${fs}px @${dpr}x: css=${info.cssW.toFixed(1)}x${info.cssH.toFixed(1)} dev=${info.pw}x${info.ph} ascent=${info.ascent} descent=${info.descent} 4K_canvas=${info.canvasW_4k}x${info.canvasH_4k}`);
+      console.log(
+        `${fs}px @${dpr}x: css=${info.cssW.toFixed(1)}x${info.cssH.toFixed(1)} dev=${info.pw}x${info.ph} ascent=${info.ascent} descent=${info.descent} 4K_canvas=${info.canvasW_4k}x${info.canvasH_4k}`,
+      );
       expect(info.ph).toBeGreaterThan(0);
       expect(info.pw).toBeGreaterThan(0);
 

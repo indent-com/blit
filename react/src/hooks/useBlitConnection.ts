@@ -13,7 +13,11 @@ export function useBlitConnection(
   );
 
   if (connectionId) {
-    return snapshot.connections.find((connection) => connection.id === connectionId) ?? null;
+    return (
+      snapshot.connections.find(
+        (connection) => connection.id === connectionId,
+      ) ?? null
+    );
   }
 
   if (snapshot.connections.length === 1) {
@@ -21,9 +25,15 @@ export function useBlitConnection(
   }
 
   if (snapshot.focusedSessionId) {
-    const focused = snapshot.sessions.find((session) => session.id === snapshot.focusedSessionId);
+    const focused = snapshot.sessions.find(
+      (session) => session.id === snapshot.focusedSessionId,
+    );
     if (focused) {
-      return snapshot.connections.find((connection) => connection.id === focused.connectionId) ?? null;
+      return (
+        snapshot.connections.find(
+          (connection) => connection.id === focused.connectionId,
+        ) ?? null
+      );
     }
   }
 

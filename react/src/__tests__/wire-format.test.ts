@@ -52,9 +52,7 @@ describe("wire format parsing", () => {
     it("parses pty_id and creates terminal", () => {
       transport.pushCreated(0x0103, "test");
       const sessionId = conn.getSnapshot().sessions[0].id;
-      transport.push(
-        new Uint8Array([S2C_UPDATE, 0x03, 0x01, 0xde, 0xad]),
-      );
+      transport.push(new Uint8Array([S2C_UPDATE, 0x03, 0x01, 0xde, 0xad]));
       expect(conn.getTerminal(sessionId)).not.toBeNull();
     });
 
@@ -75,9 +73,7 @@ describe("wire format parsing", () => {
   describe("S2C_CREATED", () => {
     it("parses pty_id and tag", () => {
       // pty_id=0x00FF, tag="hi"
-      transport.push(
-        new Uint8Array([S2C_CREATED, 0xff, 0x00, 0x68, 0x69]),
-      );
+      transport.push(new Uint8Array([S2C_CREATED, 0xff, 0x00, 0x68, 0x69]));
       const s = conn.getSnapshot().sessions;
       expect(s[0].tag).toBe("hi");
     });
@@ -89,9 +85,7 @@ describe("wire format parsing", () => {
 
     it("handles multi-byte UTF-8 tag", () => {
       // "é" is 0xC3 0xA9 in UTF-8
-      transport.push(
-        new Uint8Array([S2C_CREATED, 0x01, 0x00, 0xc3, 0xa9]),
-      );
+      transport.push(new Uint8Array([S2C_CREATED, 0x01, 0x00, 0xc3, 0xa9]));
       expect(conn.getSnapshot().sessions[0].tag).toBe("é");
     });
   });
@@ -118,9 +112,18 @@ describe("wire format parsing", () => {
       transport.push(
         new Uint8Array([
           S2C_LIST,
-          0x02, 0x00,
-          0x01, 0x00, 0x02, 0x00, 0x61, 0x62,
-          0x02, 0x00, 0x00, 0x00,
+          0x02,
+          0x00,
+          0x01,
+          0x00,
+          0x02,
+          0x00,
+          0x61,
+          0x62,
+          0x02,
+          0x00,
+          0x00,
+          0x00,
         ]),
       );
       const s = conn.getSnapshot().sessions;
@@ -140,8 +143,12 @@ describe("wire format parsing", () => {
       transport.push(
         new Uint8Array([
           S2C_LIST,
-          0x02, 0x00,
-          0x01, 0x00, 0x00, 0x00,
+          0x02,
+          0x00,
+          0x01,
+          0x00,
+          0x00,
+          0x00,
           // second entry missing
         ]),
       );

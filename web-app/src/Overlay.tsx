@@ -49,30 +49,28 @@ export const OverlayPanel = forwardRef<
     palette: TerminalPalette;
     fontSize?: number;
   }
->(
-  function OverlayPanel({ palette, style, onClick, fontSize, ...props }, ref) {
-    const dark = palette.dark;
-    const scale = uiScale(fontSize ?? 13);
-    const styles = overlayChromeStyles(themeFor(palette), dark, scale);
+>(function OverlayPanel({ palette, style, onClick, fontSize, ...props }, ref) {
+  const dark = palette.dark;
+  const scale = uiScale(fontSize ?? 13);
+  const styles = overlayChromeStyles(themeFor(palette), dark, scale);
 
-    return (
-      <div
-        {...props}
-        ref={ref}
-        style={{
-          ...layout.panel,
-          ...styles.panel,
-          fontSize: scale.md,
-          ...style,
-        }}
-        onClick={(e) => {
-          e.stopPropagation();
-          onClick?.(e);
-        }}
-      />
-    );
-  },
-);
+  return (
+    <div
+      {...props}
+      ref={ref}
+      style={{
+        ...layout.panel,
+        ...styles.panel,
+        fontSize: scale.md,
+        ...style,
+      }}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick?.(e);
+      }}
+    />
+  );
+});
 
 export function OverlayHeader({
   palette,

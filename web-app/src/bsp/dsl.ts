@@ -88,7 +88,8 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
     skipWhitespace();
     const start = pos;
     while (pos < trimmed.length && /[0-9.]/.test(trimmed[pos])) pos++;
-    if (pos === start) throw new DSLParseError(`Expected number at position ${pos}`, pos);
+    if (pos === start)
+      throw new DSLParseError(`Expected number at position ${pos}`, pos);
     const n = Number(trimmed.slice(start, pos));
     if (!Number.isFinite(n) || n <= 0) {
       throw new DSLParseError(`Invalid number at position ${start}`, start);
@@ -112,13 +113,15 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
         }
         pos++;
       }
-      if (pos >= trimmed.length) throw new DSLParseError(`Unterminated string at position ${pos}`, pos);
+      if (pos >= trimmed.length)
+        throw new DSLParseError(`Unterminated string at position ${pos}`, pos);
       pos++; // skip closing quote
       return value;
     }
     const start = pos;
     while (pos < trimmed.length && !SPECIAL_CHARS.test(trimmed[pos])) pos++;
-    if (pos === start) throw new DSLParseError(`Expected identifier at position ${pos}`, pos);
+    if (pos === start)
+      throw new DSLParseError(`Expected identifier at position ${pos}`, pos);
     return trimmed.slice(start, pos);
   }
 
@@ -131,7 +134,10 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
       if (unit === "px" || unit === "pt" || unit === "%") {
         return `${n}${unit}`;
       }
-      throw new DSLParseError(`Unknown font size unit '${unit}' at position ${unitStart}`, unitStart);
+      throw new DSLParseError(
+        `Unknown font size unit '${unit}' at position ${unitStart}`,
+        unitStart,
+      );
     }
     return n;
   }
@@ -153,7 +159,12 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
     } else if (/[a-zA-Z_]/.test(peek())) {
       const candidate = parseIdentifier();
       skipWhitespace();
-      if (peek() === ":" && candidate !== "line" && candidate !== "col" && candidate !== "tabs") {
+      if (
+        peek() === ":" &&
+        candidate !== "line" &&
+        candidate !== "col" &&
+        candidate !== "tabs"
+      ) {
         pos++;
         label = candidate;
       } else {
@@ -174,7 +185,10 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
       pos++;
       const command = parseIdentifier();
       if (node.type !== "leaf") {
-        throw new DSLParseError(`command can only be applied to leaf nodes at position ${pos}`, pos);
+        throw new DSLParseError(
+          `command can only be applied to leaf nodes at position ${pos}`,
+          pos,
+        );
       }
       node.command = command;
     }
@@ -184,7 +198,10 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
       pos++;
       const fontSize = parseFontSize();
       if (node.type !== "leaf") {
-        throw new DSLParseError(`fontSize can only be applied to leaf nodes at position ${pos}`, pos);
+        throw new DSLParseError(
+          `fontSize can only be applied to leaf nodes at position ${pos}`,
+          pos,
+        );
       }
       node.fontSize = fontSize;
     }
@@ -197,8 +214,12 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
     const start = pos;
     const id = parseIdentifier();
 
-    if ((id === "line" || id === "col" || id === "tabs") && (skipWhitespace(), peek() === "(")) {
-      const direction = id === "line" ? "horizontal" : id === "col" ? "vertical" : "tabs";
+    if (
+      (id === "line" || id === "col" || id === "tabs") &&
+      (skipWhitespace(), peek() === "(")
+    ) {
+      const direction =
+        id === "line" ? "horizontal" : id === "col" ? "vertical" : "tabs";
       expect("(");
       const children: BSPChild[] = [parseEntry()];
 
@@ -212,7 +233,10 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
       expect(")");
 
       if (children.length < 2) {
-        throw new DSLParseError(`Split needs at least 2 children at position ${start}`, start);
+        throw new DSLParseError(
+          `Split needs at least 2 children at position ${start}`,
+          start,
+        );
       }
 
       return { type: "split", direction, children };
@@ -225,7 +249,10 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
 
   skipWhitespace();
   if (pos < trimmed.length) {
-    throw new DSLParseError(`Unexpected '${trimmed[pos]}' at position ${pos}`, pos);
+    throw new DSLParseError(
+      `Unexpected '${trimmed[pos]}' at position ${pos}`,
+      pos,
+    );
   }
 
   return { root: entry.node, weight: entry.weight };
@@ -246,7 +273,12 @@ function serializeNode(node: BSPNode, weight: number, label?: string): string {
   if (node.type === "leaf") {
     s = quoteIfNeeded(node.tag);
   } else {
-    const keyword = node.direction === "horizontal" ? "line" : node.direction === "vertical" ? "col" : "tabs";
+    const keyword =
+      node.direction === "horizontal"
+        ? "line"
+        : node.direction === "vertical"
+          ? "col"
+          : "tabs";
     const inner = node.children
       .map((c) => serializeNode(c.node, c.weight, c.label))
       .join(", ");

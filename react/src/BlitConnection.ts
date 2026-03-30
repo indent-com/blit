@@ -87,7 +87,11 @@ function connectionError(message: string): Error {
 }
 
 function isLiveSession(session: InternalSession): boolean {
-  return session.state === "creating" || session.state === "active" || session.state === "exited";
+  return (
+    session.state === "creating" ||
+    session.state === "active" ||
+    session.state === "exited"
+  );
 }
 
 function toPublicSession(s: InternalSession): BlitSession {
@@ -114,7 +118,10 @@ export class BlitConnection {
   private features = 0;
   private disposed = false;
   /** Per-session, per-view size registry for computing minimum resize. */
-  private viewSizes = new Map<SessionId, Map<string, { rows: number; cols: number }>>();
+  private viewSizes = new Map<
+    SessionId,
+    Map<string, { rows: number; cols: number }>
+  >();
   private viewIdCounter = 0;
   private hasConnected = false;
   private retryCount = 0;
@@ -231,7 +238,9 @@ export class BlitConnection {
     return s ? toPublicSession(s) : null;
   }
 
-  getDebugStats(sessionId: SessionId | null): ReturnType<TerminalStore["getDebugStats"]> {
+  getDebugStats(
+    sessionId: SessionId | null,
+  ): ReturnType<TerminalStore["getDebugStats"]> {
     const session = sessionId ? this.sessionsById.get(sessionId) : null;
     return this.store.getDebugStats(session?.ptyId ?? null);
   }
@@ -246,7 +255,7 @@ export class BlitConnection {
     return new Promise<BlitSession>((resolve, reject) => {
       let nonce = 0;
       do {
-        nonce = (this.nonceCounter = (this.nonceCounter + 1) & 0xffff);
+        nonce = this.nonceCounter = (this.nonceCounter + 1) & 0xffff;
       } while (this.pendingCreates.has(nonce));
 
       let srcPtyId: number | undefined;
@@ -284,7 +293,11 @@ export class BlitConnection {
 
   restartSession(sessionId: SessionId): void {
     const session = this.sessionsById.get(sessionId);
-    if (!session || session.state === "closed" || this.transport.status !== "connected") {
+    if (
+      !session ||
+      session.state === "closed" ||
+      this.transport.status !== "connected"
+    ) {
       return;
     }
     this.transport.send(buildRestartMessage(session.ptyId));
@@ -321,7 +334,11 @@ export class BlitConnection {
 
   sendInput(sessionId: SessionId, data: Uint8Array): void {
     const session = this.sessionsById.get(sessionId);
-    if (!session || !isLiveSession(session) || this.transport.status !== "connected") {
+    if (
+      !session ||
+      !isLiveSession(session) ||
+      this.transport.status !== "connected"
+    ) {
       return;
     }
     this.transport.send(buildInputMessage(session.ptyId, data));
@@ -381,13 +398,19 @@ export class BlitConnection {
       return;
     }
     for (const entry of resolved) {
-      this.transport.send(buildResizeMessage(entry.ptyId, entry.rows, entry.cols));
+      this.transport.send(
+        buildResizeMessage(entry.ptyId, entry.rows, entry.cols),
+      );
     }
   }
 
   scrollSession(sessionId: SessionId, offset: number): void {
     const session = this.sessionsById.get(sessionId);
-    if (!session || !isLiveSession(session) || this.transport.status !== "connected") {
+    if (
+      !session ||
+      !isLiveSession(session) ||
+      this.transport.status !== "connected"
+    ) {
       return;
     }
     this.transport.send(buildScrollMessage(session.ptyId, offset));
@@ -401,10 +424,16 @@ export class BlitConnection {
     row: number,
   ): void {
     const session = this.sessionsById.get(sessionId);
-    if (!session || !isLiveSession(session) || this.transport.status !== "connected") {
+    if (
+      !session ||
+      !isLiveSession(session) ||
+      this.transport.status !== "connected"
+    ) {
       return;
     }
-    this.transport.send(buildMouseMessage(session.ptyId, type, button, col, row));
+    this.transport.send(
+      buildMouseMessage(session.ptyId, type, button, col, row),
+    );
   }
 
   async search(query: string): Promise<BlitSearchResult[]> {
@@ -417,7 +446,7 @@ export class BlitConnection {
     return new Promise<BlitSearchResult[]>((resolve, reject) => {
       let requestId = 0;
       do {
-        requestId = (this.searchCounter = (this.searchCounter + 1) & 0xffff);
+        requestId = this.searchCounter = (this.searchCounter + 1) & 0xffff;
       } while (this.pendingSearches.has(requestId));
 
       this.pendingSearches.set(requestId, { resolve, reject });
@@ -440,7 +469,12 @@ export class BlitConnection {
   }
 
   /** Register/update a view's size for a session. Sends the minimum to the server. */
-  setViewSize(sessionId: SessionId, viewId: string, rows: number, cols: number): void {
+  setViewSize(
+    sessionId: SessionId,
+    viewId: string,
+    rows: number,
+    cols: number,
+  ): void {
     let views = this.viewSizes.get(sessionId);
     if (!views) {
       views = new Map();
@@ -528,15 +562,33 @@ export class BlitConnection {
     return id != null ? this.store.drainPending(id) : false;
   }
 
-  getSharedRenderer() { return this.store.getSharedRenderer(); }
-  setCellSize(pw: number, ph: number): void { this.store.setCellSize(pw, ph); }
-  getCellSize() { return this.store.getCellSize(); }
-  wasmMemory() { return this.store.wasmMemory(); }
-  noteFrameRendered(): void { this.store.noteFrameRendered(); }
-  invalidateAtlas(): void { this.store.invalidateAtlas(); }
-  setFontFamily(f: string): void { this.store.setFontFamily(f); }
-  setFontSize(s: number): void { this.store.setFontSize(s); }
-  setPalette(p: TerminalPalette): void { this.store.setPalette(p); }
+  getSharedRenderer() {
+    return this.store.getSharedRenderer();
+  }
+  setCellSize(pw: number, ph: number): void {
+    this.store.setCellSize(pw, ph);
+  }
+  getCellSize() {
+    return this.store.getCellSize();
+  }
+  wasmMemory() {
+    return this.store.wasmMemory();
+  }
+  noteFrameRendered(): void {
+    this.store.noteFrameRendered();
+  }
+  invalidateAtlas(): void {
+    this.store.invalidateAtlas();
+  }
+  setFontFamily(f: string): void {
+    this.store.setFontFamily(f);
+  }
+  setFontSize(s: number): void {
+    this.store.setFontSize(s);
+  }
+  setPalette(p: TerminalPalette): void {
+    this.store.setPalette(p);
+  }
 
   isReady(): boolean {
     return this.store.isReady();
@@ -568,11 +620,12 @@ export class BlitConnection {
         const ptyId = bytes[1] | (bytes[2] << 8);
         const tag = textDecoder.decode(bytes.subarray(3));
         const session = this.upsertLiveSession(ptyId, tag, "active");
-        if ((this.features & FEATURE_CREATE_NONCE) === 0 && this.pendingCreates.size > 0) {
-          const [firstNonce, pending] = this.pendingCreates.entries().next().value as [
-            number,
-            PendingCreate,
-          ];
+        if (
+          (this.features & FEATURE_CREATE_NONCE) === 0 &&
+          this.pendingCreates.size > 0
+        ) {
+          const [firstNonce, pending] = this.pendingCreates.entries().next()
+            .value as [number, PendingCreate];
           this.pendingCreates.delete(firstNonce);
           pending.resolve(toPublicSession(session));
         }
@@ -658,8 +711,7 @@ export class BlitConnection {
       status === "error" && this.transport.lastError
         ? this.transport.lastError
         : null;
-    const authRejected =
-      status === "error" && this.transport.authRejected;
+    const authRejected = status === "error" && this.transport.authRejected;
 
     if (status === "connected") {
       this.hasConnected = true;
@@ -667,7 +719,8 @@ export class BlitConnection {
       this.lastError = null;
     } else if (
       (status === "error" || status === "disconnected") &&
-      (this.snapshot.status === "connecting" || this.snapshot.status === "authenticating")
+      (this.snapshot.status === "connecting" ||
+        this.snapshot.status === "authenticating")
     ) {
       this.retryCount++;
     }
@@ -723,7 +776,7 @@ export class BlitConnection {
     for (const entry of entries) {
       const existingSessionId = this.currentSessionIdByPtyId.get(entry.ptyId);
       const existingSession = existingSessionId
-        ? this.sessionsById.get(existingSessionId) ?? null
+        ? (this.sessionsById.get(existingSessionId) ?? null)
         : null;
       if (!existingSession || existingSession.state === "closed") {
         this.upsertLiveSession(entry.ptyId, entry.tag, "active");
@@ -747,7 +800,9 @@ export class BlitConnection {
       ready: true,
       focusedSessionId: nextFocus,
     };
-    this.store.setLead(nextFocus ? this.sessionsById.get(nextFocus)?.ptyId ?? null : null);
+    this.store.setLead(
+      nextFocus ? (this.sessionsById.get(nextFocus)?.ptyId ?? null) : null,
+    );
     this.emit();
 
     if (nextFocus && nextFocus !== previousFocus) {
@@ -781,11 +836,14 @@ export class BlitConnection {
         (bytes[offset + 8] |
           (bytes[offset + 9] << 8) |
           (bytes[offset + 10] << 16) |
-          (bytes[offset + 11] << 24)) >>> 0;
+          (bytes[offset + 11] << 24)) >>>
+        0;
       const scrollOffset = rawScroll === 0xffffffff ? null : rawScroll;
       const contextLen = bytes[offset + 12] | (bytes[offset + 13] << 8);
       offset += 14;
-      const context = textDecoder.decode(bytes.subarray(offset, offset + contextLen));
+      const context = textDecoder.decode(
+        bytes.subarray(offset, offset + contextLen),
+      );
       offset += contextLen;
 
       const sessionId = this.currentSessionIdByPtyId.get(ptyId);
@@ -828,7 +886,9 @@ export class BlitConnection {
     state: BlitSession["state"],
   ): InternalSession {
     const currentId = this.currentSessionIdByPtyId.get(ptyId);
-    const current = currentId ? this.sessionsById.get(currentId) ?? null : null;
+    const current = currentId
+      ? (this.sessionsById.get(currentId) ?? null)
+      : null;
     if (current && current.state !== "closed") {
       return this.updateSession(current.id, { tag, state });
     }
@@ -863,7 +923,13 @@ export class BlitConnection {
     }
 
     // Skip no-op updates.
-    if (Object.keys(patch).every((k) => (current as Record<string, unknown>)[k] === (patch as Record<string, unknown>)[k])) {
+    if (
+      Object.keys(patch).every(
+        (k) =>
+          (current as Record<string, unknown>)[k] ===
+          (patch as Record<string, unknown>)[k],
+      )
+    ) {
       return current;
     }
 
@@ -900,17 +966,18 @@ export class BlitConnection {
     this.store.freeTerminal(session.ptyId);
 
     const focusedWasClosed = this.snapshot.focusedSessionId === sessionId;
-    const nextFocus =
-      focusedWasClosed
-        ? this.firstLiveSessionId()
-        : this.snapshot.focusedSessionId;
+    const nextFocus = focusedWasClosed
+      ? this.firstLiveSessionId()
+      : this.snapshot.focusedSessionId;
 
     this.snapshot = {
       ...this.snapshot,
       sessions: this.publicSessions,
       focusedSessionId: nextFocus ?? null,
     };
-    this.store.setLead(nextFocus ? this.sessionsById.get(nextFocus)?.ptyId ?? null : null);
+    this.store.setLead(
+      nextFocus ? (this.sessionsById.get(nextFocus)?.ptyId ?? null) : null,
+    );
 
     const resolvers = this.pendingCloses.get(sessionId);
     if (resolvers) {
@@ -919,7 +986,11 @@ export class BlitConnection {
     }
 
     if (emit) {
-      if (focusedWasClosed && nextFocus && this.transport.status === "connected") {
+      if (
+        focusedWasClosed &&
+        nextFocus &&
+        this.transport.status === "connected"
+      ) {
         const nextSession = this.sessionsById.get(nextFocus);
         if (nextSession) {
           this.transport.send(buildFocusMessage(nextSession.ptyId));
@@ -928,7 +999,6 @@ export class BlitConnection {
       this.emit();
     }
   }
-
 
   private firstLiveSessionId(): SessionId | null {
     const session = this.sessions.find((entry) => entry.state !== "closed");

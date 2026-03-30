@@ -368,7 +368,12 @@ describe("createWebRtcDataChannelTransport", () => {
   });
 
   it("reconnects with exponential backoff", () => {
-    const t = create({ reconnect: true, reconnectDelay: 100, reconnectBackoff: 2, maxReconnectDelay: 1000 });
+    const t = create({
+      reconnect: true,
+      reconnectDelay: 100,
+      reconnectBackoff: 2,
+      maxReconnectDelay: 1000,
+    });
     channel.simulateOpen();
 
     channel.simulateClose();
@@ -416,7 +421,11 @@ describe("createWebRtcDataChannelTransport", () => {
   });
 
   it("reconnect resets delay on successful open", () => {
-    const t = create({ reconnect: true, reconnectDelay: 100, reconnectBackoff: 2 });
+    const t = create({
+      reconnect: true,
+      reconnectDelay: 100,
+      reconnectBackoff: 2,
+    });
     channel.simulateOpen();
 
     channel.simulateClose();
@@ -432,7 +441,11 @@ describe("createWebRtcDataChannelTransport", () => {
   });
 
   it("reconnect after connect timeout error", () => {
-    const t = create({ reconnect: true, reconnectDelay: 100, connectTimeoutMs: 500 });
+    const t = create({
+      reconnect: true,
+      reconnectDelay: 100,
+      connectTimeoutMs: 500,
+    });
     vi.advanceTimersByTime(500);
     expect(t.status).toBe("error");
 

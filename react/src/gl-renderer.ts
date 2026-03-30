@@ -58,14 +58,10 @@ void main() {
     float minC = min(tex.r, min(tex.g, tex.b));
     float maxC = max(tex.r, max(tex.g, tex.b));
     float isGray = step(maxC - minC, 0.02);
-    float lum = dot(v_color.rgb, vec3(0.299, 0.587, 0.114));
-    float gamma = mix(0.75, 1.0, lum);
-    float adj_a = pow(tex.a, gamma);
-    vec3 tinted = v_color.rgb * adj_a;
-    fragColor = vec4(mix(tex.rgb, tinted, isGray), mix(tex.a, adj_a, isGray));
+    vec3 tinted = v_color.rgb * tex.a;
+    fragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
 }
 `;
-
 
 function compileShader(
   gl: WebGL2RenderingContext,
@@ -162,7 +158,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   const glyphResLoc = gl.getUniformLocation(glyphProgram, "u_resolution");
   const glyphTexLoc = gl.getUniformLocation(glyphProgram, "u_texture");
 
-  const maxDim = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number || 4096;
+  const maxDim = (gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number) || 4096;
 
   canvas.addEventListener("webglcontextlost", (e) => {
     e.preventDefault();
@@ -178,8 +174,8 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
   gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
@@ -235,16 +231,45 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   ): void {
     drawColoredTriangles(
       new Float32Array([
-        x1, y1, r, g, b, a,
-        x2, y1, r, g, b, a,
-        x1, y2, r, g, b, a,
-        x1, y2, r, g, b, a,
-        x2, y1, r, g, b, a,
-        x2, y2, r, g, b, a,
+        x1,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x1,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        x1,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y2,
+        r,
+        g,
+        b,
+        a,
       ]),
     );
   }
-
 
   function renderCursor(
     cursorVisible: boolean,
@@ -263,9 +288,27 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       // Unfocused: non-blinking outline.
       const t = Math.max(1, Math.round(cell.pw * 0.08));
       drawSolidRect(x1, y1, x1 + cell.pw, y1 + t, 0.6, 0.6, 0.6, 0.6);
-      drawSolidRect(x1, y1 + cell.ph - t, x1 + cell.pw, y1 + cell.ph, 0.6, 0.6, 0.6, 0.6);
+      drawSolidRect(
+        x1,
+        y1 + cell.ph - t,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+      );
       drawSolidRect(x1, y1, x1 + t, y1 + cell.ph, 0.6, 0.6, 0.6, 0.6);
-      drawSolidRect(x1 + cell.pw - t, y1, x1 + cell.pw, y1 + cell.ph, 0.6, 0.6, 0.6, 0.6);
+      drawSolidRect(
+        x1 + cell.pw - t,
+        y1,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+      );
       return;
     }
 
@@ -278,8 +321,14 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     if (cursorStyle === 3 || cursorStyle === 4) {
       const h = Math.max(1, Math.round(cell.ph * 0.12));
       drawSolidRect(
-        x1, y1 + cell.ph - h, x1 + cell.pw, y1 + cell.ph,
-        0.8, 0.8, 0.8, 0.8,
+        x1,
+        y1 + cell.ph - h,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.8,
+        0.8,
+        0.8,
+        0.8,
       );
     } else if (cursorStyle === 5 || cursorStyle === 6) {
       const w = Math.max(1, Math.round(cell.pw * 0.12));
@@ -309,7 +358,10 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     gl!.uniform1i(glyphTexLoc, 0);
     for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
       const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
-      const slice = data.subarray(off * GLYPH_FLOATS_PER_VERT, (off + count) * GLYPH_FLOATS_PER_VERT);
+      const slice = data.subarray(
+        off * GLYPH_FLOATS_PER_VERT,
+        (off + count) * GLYPH_FLOATS_PER_VERT,
+      );
       gl!.bufferData(gl!.ARRAY_BUFFER, slice, gl!.DYNAMIC_DRAW);
       gl!.vertexAttribPointer(glyphPosLoc, 2, gl!.FLOAT, false, stride, 0);
       gl!.vertexAttribPointer(glyphUvLoc, 2, gl!.FLOAT, false, stride, 8);

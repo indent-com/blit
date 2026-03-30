@@ -108,8 +108,7 @@ describe("protocol message builders", () => {
     const msg = buildScrollMessage(2, 100);
     expect(msg[0]).toBe(C2S_SCROLL);
     expect(msg[1] | (msg[2] << 8)).toBe(2);
-    const offset =
-      msg[3] | (msg[4] << 8) | (msg[5] << 16) | (msg[6] << 24);
+    const offset = msg[3] | (msg[4] << 8) | (msg[5] << 16) | (msg[6] << 24);
     expect(offset).toBe(100);
     expect(msg.length).toBe(7);
   });

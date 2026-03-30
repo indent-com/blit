@@ -1,4 +1,8 @@
-import type { BlitTransport, BlitTransportOptions, ConnectionStatus } from "../types";
+import type {
+  BlitTransport,
+  BlitTransportOptions,
+  ConnectionStatus,
+} from "../types";
 
 export type WebSocketTransportOptions = BlitTransportOptions;
 
@@ -143,7 +147,12 @@ export class WebSocketTransport implements BlitTransport {
       this.clearReconnectTimer();
       this.currentDelay = this.initialDelay;
     }
-    if (this._status === "connecting" || this._status === "authenticating" || this._status === "connected") return;
+    if (
+      this._status === "connecting" ||
+      this._status === "authenticating" ||
+      this._status === "connected"
+    )
+      return;
     this.setStatus("connecting");
 
     const socket = new WebSocket(this.url);
@@ -164,7 +173,10 @@ export class WebSocketTransport implements BlitTransport {
       this.connectTimer = setTimeout(() => {
         this.connectTimer = null;
         if (this.ws !== socket || this.disposed) return;
-        if (this._status === "connecting" || this._status === "authenticating") {
+        if (
+          this._status === "connecting" ||
+          this._status === "authenticating"
+        ) {
           this.ws = null;
           this.lastError = "connect timeout";
           this.setStatus("error");
@@ -202,7 +214,9 @@ export class WebSocketTransport implements BlitTransport {
         } else {
           // Gateway sent an error (e.g. "error:cannot connect to blit-server")
           this.authRejected = false;
-          this.lastError = e.data.startsWith("error:") ? e.data.slice(6) : e.data;
+          this.lastError = e.data.startsWith("error:")
+            ? e.data.slice(6)
+            : e.data;
           this.setStatus("error");
           socket.close();
         }

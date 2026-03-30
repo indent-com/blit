@@ -20,7 +20,14 @@ import type {
   TerminalPalette,
 } from "blit-react";
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
-import { overlayChromeStyles, sessionName, sidebarWidth, themeFor, ui, uiScale } from "./theme";
+import {
+  overlayChromeStyles,
+  sessionName,
+  sidebarWidth,
+  themeFor,
+  ui,
+  uiScale,
+} from "./theme";
 import { LayoutPreview } from "./bsp/LayoutPreview";
 import {
   enumeratePanes,
@@ -62,7 +69,13 @@ type ActionItem = {
   key: string;
   title: string;
   subtitle: string;
-  action: "new-terminal" | "clear-layout" | "clear-local-storage" | "change-font" | "change-palette" | "change-layout";
+  action:
+    | "new-terminal"
+    | "clear-layout"
+    | "clear-local-storage"
+    | "change-font"
+    | "change-palette"
+    | "change-layout";
 };
 
 type PaneItem = {
@@ -107,7 +120,13 @@ function PaneGlyph({
   dimFg: string;
 }) {
   return (
-    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      width="24"
+      height="24"
+      fill="none"
+      aria-hidden="true"
+    >
       <rect x="4.5" y="4.5" width="15" height="15" stroke={dimFg} />
       <path d="M4.5 10.5h15" stroke={dimFg} />
       <path d="M10.5 4.5v15" stroke={dimFg} />
@@ -135,7 +154,13 @@ function ActionGlyph({
   switch (action) {
     case "new-terminal":
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
           <rect x="3.5" y="5.5" width="17" height="13" stroke={dimFg} />
           <path d="M7 10l2.5 2L7 14" stroke={fg} />
           <path d="M11.5 14h3.5" stroke={fg} />
@@ -146,7 +171,13 @@ function ActionGlyph({
     case "change-layout":
       // Grid/layout icon
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
           <rect x="4.5" y="4.5" width="15" height="15" stroke={dimFg} />
           <path d="M11 4.5v15" stroke={dimFg} />
           <path d="M4.5 12h15" stroke={dimFg} />
@@ -155,7 +186,13 @@ function ActionGlyph({
     case "clear-layout":
       // X in a box
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
           <rect x="4.5" y="4.5" width="15" height="15" stroke={dimFg} />
           <path d="M9 9l6 6M15 9l-6 6" stroke={fg} />
         </svg>
@@ -163,7 +200,13 @@ function ActionGlyph({
     case "change-palette":
       // Half circle (dark/light)
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
           <circle cx="12" cy="12" r="7.5" stroke={dimFg} />
           <path d="M12 4.5A7.5 7.5 0 0 1 12 19.5z" fill={fg} opacity="0.6" />
         </svg>
@@ -171,15 +214,44 @@ function ActionGlyph({
     case "change-font":
       // Aa text icon
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
-          <text x="4" y="18" fontSize="14" fontWeight="bold" fill={fg} fontFamily="sans-serif">A</text>
-          <text x="14" y="18" fontSize="10" fill={dimFg} fontFamily="sans-serif">a</text>
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
+          <text
+            x="4"
+            y="18"
+            fontSize="14"
+            fontWeight="bold"
+            fill={fg}
+            fontFamily="sans-serif"
+          >
+            A
+          </text>
+          <text
+            x="14"
+            y="18"
+            fontSize="10"
+            fill={dimFg}
+            fontFamily="sans-serif"
+          >
+            a
+          </text>
         </svg>
       );
     case "clear-local-storage":
       // Trash icon
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
           <path d="M7 7h10l-1 12H8L7 7z" stroke={dimFg} />
           <path d="M5 7h14" stroke={fg} />
           <path d="M10 5h4" stroke={fg} />
@@ -187,7 +259,13 @@ function ActionGlyph({
       );
     default:
       return (
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" aria-hidden="true">
+        <svg
+          viewBox="0 0 24 24"
+          width="24"
+          height="24"
+          fill="none"
+          aria-hidden="true"
+        >
           <circle cx="12" cy="12" r="3" fill={fg} opacity="0.5" />
         </svg>
       );
@@ -229,7 +307,11 @@ export function SwitcherOverlay({
   layoutAssignments?: BSPAssignments | null;
   onApplyLayout?: (layout: BSPLayout) => void;
   onClearLayout?: () => void;
-  onSelectPane?: (paneId: string, sessionId: SessionId | null, command?: string) => void;
+  onSelectPane?: (
+    paneId: string,
+    sessionId: SessionId | null,
+    command?: string,
+  ) => void;
   /** When set, selecting a session moves it to the focused pane instead of just focusing. */
   focusedPaneId?: string | null;
   onMoveToPane?: (sessionId: SessionId, targetPaneId: string) => void;
@@ -248,9 +330,8 @@ export function SwitcherOverlay({
     [lru],
   );
   const visibleSessions = useMemo(() => {
-    const isNamed = (session: BlitSession) => (
-      session.tag.length > 0 && !/^[0-9a-f-]{8,}$/.test(session.tag)
-    );
+    const isNamed = (session: BlitSession) =>
+      session.tag.length > 0 && !/^[0-9a-f-]{8,}$/.test(session.tag);
     return [...notClosed].sort((left, right) => {
       const leftNamed = isNamed(left) ? 0 : 1;
       const rightNamed = isNamed(right) ? 0 : 1;
@@ -266,7 +347,9 @@ export function SwitcherOverlay({
   const scale = uiScale(fontSize ?? 13);
   const chrome = overlayChromeStyles(theme, dark, scale);
   const [query, setQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<BlitSearchResult[] | null>(null);
+  const [searchResults, setSearchResults] = useState<BlitSearchResult[] | null>(
+    null,
+  );
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [layoutMode, setLayoutMode] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -274,8 +357,14 @@ export function SwitcherOverlay({
 
   const isCommand = query.startsWith(">");
   const commandText = isCommand ? query.slice(1).trim() : "";
-  const inlineCmd = !isCommand && query.includes(">") ? query.slice(query.indexOf(">") + 1).trim() : "";
-  const searchPart = !isCommand && query.includes(">") ? query.slice(0, query.indexOf(">")).trim() : query.trim();
+  const inlineCmd =
+    !isCommand && query.includes(">")
+      ? query.slice(query.indexOf(">") + 1).trim()
+      : "";
+  const searchPart =
+    !isCommand && query.includes(">")
+      ? query.slice(0, query.indexOf(">")).trim()
+      : query.trim();
   const searching = !isCommand && searchPart.length > 0;
 
   useEffect(() => {
@@ -285,11 +374,14 @@ export function SwitcherOverlay({
     }
 
     let cancelled = false;
-    workspace.search(searchPart).then((results) => {
-      if (!cancelled) setSearchResults(results);
-    }).catch(() => {
-      if (!cancelled) setSearchResults([]);
-    });
+    workspace
+      .search(searchPart)
+      .then((results) => {
+        if (!cancelled) setSearchResults(results);
+      })
+      .catch(() => {
+        if (!cancelled) setSearchResults([]);
+      });
 
     return () => {
       cancelled = true;
@@ -308,18 +400,19 @@ export function SwitcherOverlay({
   const layoutChoices = useMemo(() => {
     const recent = recentLayouts ?? [];
     const presets = presetLayouts ?? [];
-    const custom = searching && isCustomLayoutQuery(searchPart)
-      ? (() => {
-          try {
-            const { name, dsl } = parseLayoutQuery(searchPart);
-            const layout = layoutFromDSL(dsl);
-            if (name) layout.name = name;
-            return [layout];
-          } catch {
-            return [];
-          }
-        })()
-      : [];
+    const custom =
+      searching && isCustomLayoutQuery(searchPart)
+        ? (() => {
+            try {
+              const { name, dsl } = parseLayoutQuery(searchPart);
+              const layout = layoutFromDSL(dsl);
+              if (name) layout.name = name;
+              return [layout];
+            } catch {
+              return [];
+            }
+          })()
+        : [];
 
     if (!searching) {
       return {
@@ -330,10 +423,12 @@ export function SwitcherOverlay({
     }
 
     const needle = searchPart.toLowerCase();
-    const matches = (layouts: BSPLayout[]) => layouts.filter((layout) => (
-      layout.name.toLowerCase().includes(needle) ||
-      layout.dsl.toLowerCase().includes(needle)
-    ));
+    const matches = (layouts: BSPLayout[]) =>
+      layouts.filter(
+        (layout) =>
+          layout.name.toLowerCase().includes(needle) ||
+          layout.dsl.toLowerCase().includes(needle),
+      );
 
     return {
       recent: matches(recent),
@@ -349,7 +444,9 @@ export function SwitcherOverlay({
     return enumeratePanes(activeLayout.root)
       .map((pane, index) => {
         const sessionId = layoutAssignments?.assignments[pane.id] ?? null;
-        const session = sessionId ? sessionsById.get(sessionId) ?? null : null;
+        const session = sessionId
+          ? (sessionsById.get(sessionId) ?? null)
+          : null;
         const label = pane.leaf.tag || null;
         const paneName = label || `Pane ${index + 1}`;
         const assignedName = session ? sessionName(session) : null;
@@ -370,12 +467,17 @@ export function SwitcherOverlay({
       })
       .filter((pane) => {
         if (!searching) return true;
-        return [
-          pane.title,
-          pane.label ?? "",
-        ].some((value) => value.toLowerCase().includes(needle));
+        return [pane.title, pane.label ?? ""].some((value) =>
+          value.toLowerCase().includes(needle),
+        );
       });
-  }, [activeLayout, layoutAssignments?.assignments, query, searching, sessionsById]);
+  }, [
+    activeLayout,
+    layoutAssignments?.assignments,
+    query,
+    searching,
+    sessionsById,
+  ]);
 
   const sessionMatches = useMemo(() => {
     if (!searching) {
@@ -383,7 +485,10 @@ export function SwitcherOverlay({
         type: "session",
         key: `session:${session.id}`,
         title: sessionName(session),
-        subtitle: session.state === "exited" ? t("switcher.exitedTerminal") : t("switcher.openTerminal"),
+        subtitle:
+          session.state === "exited"
+            ? t("switcher.exitedTerminal")
+            : t("switcher.openTerminal"),
         sessionId: session.id,
         exited: session.state === "exited",
         focused: session.id === focusedSessionId,
@@ -404,7 +509,10 @@ export function SwitcherOverlay({
           type: "session",
           key: `session:${session.id}`,
           title: sessionName(session),
-          subtitle: session.state === "exited" ? t("switcher.exitedTerminal") : t("switcher.openTerminal"),
+          subtitle:
+            session.state === "exited"
+              ? t("switcher.exitedTerminal")
+              : t("switcher.openTerminal"),
           sessionId: session.id,
           exited: session.state === "exited",
           focused: session.id === focusedSessionId,
@@ -413,14 +521,18 @@ export function SwitcherOverlay({
     }
 
     for (const result of searchResults ?? []) {
-      if (!sessionsById.has(result.sessionId) || seen.has(result.sessionId)) continue;
+      if (!sessionsById.has(result.sessionId) || seen.has(result.sessionId))
+        continue;
       const session = sessionsById.get(result.sessionId)!;
       seen.add(result.sessionId);
       matches.push({
         type: "session",
         key: `session:${session.id}`,
         title: sessionName(session),
-        subtitle: session.state === "exited" ? t("switcher.exitedTerminal") : t("switcher.openTerminal"),
+        subtitle:
+          session.state === "exited"
+            ? t("switcher.exitedTerminal")
+            : t("switcher.openTerminal"),
         sessionId: session.id,
         exited: session.state === "exited",
         context: result.context,
@@ -430,22 +542,35 @@ export function SwitcherOverlay({
     }
 
     return matches;
-  }, [focusedSessionId, query, searchResults, searching, sessionsById, visibleSessions]);
+  }, [
+    focusedSessionId,
+    query,
+    searchResults,
+    searching,
+    sessionsById,
+    visibleSessions,
+  ]);
 
   const sections = useMemo<SwitcherSection[]>(() => {
     if (isCommand) {
-      return [{
-        title: t("switcher.sectionAction"),
-        items: [{
-          type: "action",
-          key: "action:new-terminal",
-          title: commandText ? tp("switcher.runCommand", { command: commandText }) : t("switcher.newTerminal"),
-          subtitle: commandText
-            ? t("switcher.createRunning")
-            : t("switcher.createInCwd"),
-          action: "new-terminal",
-        }],
-      }];
+      return [
+        {
+          title: t("switcher.sectionAction"),
+          items: [
+            {
+              type: "action",
+              key: "action:new-terminal",
+              title: commandText
+                ? tp("switcher.runCommand", { command: commandText })
+                : t("switcher.newTerminal"),
+              subtitle: commandText
+                ? t("switcher.createRunning")
+                : t("switcher.createInCwd"),
+              action: "new-terminal",
+            },
+          ],
+        },
+      ];
     }
 
     const next: SwitcherSection[] = [];
@@ -476,11 +601,17 @@ export function SwitcherOverlay({
       next.push({ title: t("switcher.sectionPanes"), items: paneMatches });
     }
     if (!layoutMode && sessionMatches.length > 0) {
-      next.push({ title: t("switcher.sectionTerminals"), items: sessionMatches });
+      next.push({
+        title: t("switcher.sectionTerminals"),
+        items: sessionMatches,
+      });
     }
 
     if (customLayouts.length > 0) {
-      next.push({ title: t("switcher.sectionTypedLayout"), items: customLayouts });
+      next.push({
+        title: t("switcher.sectionTypedLayout"),
+        items: customLayouts,
+      });
     }
     if ((searching || layoutMode) && recent.length > 0) {
       next.push({ title: t("switcher.sectionRecentLayouts"), items: recent });
@@ -489,13 +620,15 @@ export function SwitcherOverlay({
       next.push({ title: t("switcher.sectionLayouts"), items: presets });
     }
 
-    const actions: ActionItem[] = [{
-      type: "action",
-      key: "action:new-terminal",
-      title: t("switcher.newTerminal"),
-      subtitle: t("switcher.createInCwd"),
-      action: "new-terminal",
-    }];
+    const actions: ActionItem[] = [
+      {
+        type: "action",
+        key: "action:new-terminal",
+        title: t("switcher.newTerminal"),
+        subtitle: t("switcher.createInCwd"),
+        action: "new-terminal",
+      },
+    ];
     if (onChangePalette) {
       actions.push({
         type: "action",
@@ -537,11 +670,19 @@ export function SwitcherOverlay({
       subtitle: t("switcher.clearLocalStorageDesc"),
       action: "clear-local-storage",
     });
-    if (!layoutMode && (!searching || actions.some((action) => action.title.toLowerCase().includes(searchPart.toLowerCase())))) {
+    if (
+      !layoutMode &&
+      (!searching ||
+        actions.some((action) =>
+          action.title.toLowerCase().includes(searchPart.toLowerCase()),
+        ))
+    ) {
       next.push({
         title: t("switcher.sectionActions"),
         items: searching
-          ? actions.filter((action) => action.title.toLowerCase().includes(searchPart.toLowerCase()))
+          ? actions.filter((action) =>
+              action.title.toLowerCase().includes(searchPart.toLowerCase()),
+            )
           : actions,
       });
     }
@@ -593,12 +734,15 @@ export function SwitcherOverlay({
       const previewH = previewRef.current?.offsetHeight ?? 0;
       const itemCenter = itemRect.top + itemRect.height / 2 - wrapperRect.top;
       const unclamped = itemCenter - previewH / 2;
-      setPreviewTop(Math.max(0, Math.min(unclamped, wrapperRect.height - previewH)));
+      setPreviewTop(
+        Math.max(0, Math.min(unclamped, wrapperRect.height - previewH)),
+      );
     });
   }, [selectedIdx]);
 
   const selectedItem = flatItems[selectedIdx] ?? null;
-  const showPreview = !isCommand && selectedItem != null && selectedItem.type !== "action";
+  const showPreview =
+    !isCommand && selectedItem != null && selectedItem.type !== "action";
   const uiFont = fontFamily ?? "inherit";
   const compact = 0.75;
   const fsXs = Math.round(scale.xs * compact);
@@ -682,113 +826,142 @@ export function SwitcherOverlay({
     </div>
   );
 
-  const activateItem = useCallback((item: SwitcherItem | null) => {
-    if (!item) return;
-    if (item.type === "layout") {
-      const layoutStr = item.layout.name !== item.layout.dsl
-        ? `${item.layout.name}:${item.layout.dsl}`
-        : item.layout.dsl;
-      if (query.trim() === layoutStr) {
-        // Second Enter — apply.
-        onApplyLayout?.(item.layout);
-      } else {
-        // First Enter — fill input for editing.
-        setQuery(layoutStr);
+  const activateItem = useCallback(
+    (item: SwitcherItem | null) => {
+      if (!item) return;
+      if (item.type === "layout") {
+        const layoutStr =
+          item.layout.name !== item.layout.dsl
+            ? `${item.layout.name}:${item.layout.dsl}`
+            : item.layout.dsl;
+        if (query.trim() === layoutStr) {
+          // Second Enter — apply.
+          onApplyLayout?.(item.layout);
+        } else {
+          // First Enter — fill input for editing.
+          setQuery(layoutStr);
+          searchRef.current?.focus();
+          searchRef.current?.select();
+        }
+        return;
+      }
+      if (item.type === "pane") {
+        const cmdMatch = query.match(/>(.*)/);
+        const paneCommand = cmdMatch?.[1]?.trim() || undefined;
+        onSelectPane?.(item.paneId, item.sessionId, paneCommand);
+        return;
+      }
+      if (item.type === "session") {
+        if (focusedPaneId && onMoveToPane) {
+          onMoveToPane(item.sessionId, focusedPaneId);
+        } else {
+          onSelect(item.sessionId);
+        }
+        return;
+      }
+      if (item.action === "change-layout") {
+        setLayoutMode(true);
+        if (activeLayout) {
+          setQuery(
+            activeLayout.name !== activeLayout.dsl
+              ? `${activeLayout.name}:${activeLayout.dsl}`
+              : activeLayout.dsl,
+          );
+        } else {
+          setQuery("");
+        }
         searchRef.current?.focus();
         searchRef.current?.select();
+        return;
       }
-      return;
-    }
-    if (item.type === "pane") {
-      const cmdMatch = query.match(/>(.*)/);
-      const paneCommand = cmdMatch?.[1]?.trim() || undefined;
-      onSelectPane?.(item.paneId, item.sessionId, paneCommand);
-      return;
-    }
-    if (item.type === "session") {
-      if (focusedPaneId && onMoveToPane) {
-        onMoveToPane(item.sessionId, focusedPaneId);
+      if (item.action === "clear-layout") {
+        onClearLayout?.();
+        return;
+      }
+      if (item.action === "change-font") {
+        onChangeFont?.();
+        return;
+      }
+      if (item.action === "change-palette") {
+        onChangePalette?.();
+        return;
+      }
+      if (item.action === "clear-local-storage") {
+        localStorage.clear();
+        location.reload();
+        return;
+      }
+      if (focusedPaneId && onSelectPane) {
+        onSelectPane(focusedPaneId, null, commandText || undefined);
       } else {
-        onSelect(item.sessionId);
+        onCreate(commandText || undefined);
       }
-      return;
-    }
-    if (item.action === "change-layout") {
-      setLayoutMode(true);
-      if (activeLayout) {
-        setQuery(activeLayout.name !== activeLayout.dsl ? `${activeLayout.name}:${activeLayout.dsl}` : activeLayout.dsl);
-      } else {
-        setQuery("");
-      }
-      searchRef.current?.focus();
-      searchRef.current?.select();
-      return;
-    }
-    if (item.action === "clear-layout") {
-      onClearLayout?.();
-      return;
-    }
-    if (item.action === "change-font") {
-      onChangeFont?.();
-      return;
-    }
-    if (item.action === "change-palette") {
-      onChangePalette?.();
-      return;
-    }
-    if (item.action === "clear-local-storage") {
-      localStorage.clear();
-      location.reload();
-      return;
-    }
-    if (focusedPaneId && onSelectPane) {
-      onSelectPane(focusedPaneId, null, commandText || undefined);
-    } else {
-      onCreate(commandText || undefined);
-    }
-  }, [activeLayout, commandText, focusedPaneId, onApplyLayout, onChangeFont, onChangePalette, onClearLayout, onCreate, onMoveToPane, onSelect, onSelectPane, presetLayouts, query, recentLayouts, setQuery]);
+    },
+    [
+      activeLayout,
+      commandText,
+      focusedPaneId,
+      onApplyLayout,
+      onChangeFont,
+      onChangePalette,
+      onClearLayout,
+      onCreate,
+      onMoveToPane,
+      onSelect,
+      onSelectPane,
+      presetLayouts,
+      query,
+      recentLayouts,
+      setQuery,
+    ],
+  );
 
-  const handleKeyDown = useCallback((event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (flatItems.length > 0) {
-        setSelectedIdx((index) => (index + 1) % flatItems.length);
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLInputElement>) => {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        if (flatItems.length > 0) {
+          setSelectedIdx((index) => (index + 1) % flatItems.length);
+        }
+        return;
       }
-      return;
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (flatItems.length > 0) {
-        setSelectedIdx((index) => (index - 1 + flatItems.length) % flatItems.length);
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        if (flatItems.length > 0) {
+          setSelectedIdx(
+            (index) => (index - 1 + flatItems.length) % flatItems.length,
+          );
+        }
+        return;
       }
-      return;
-    }
-    if (event.key === "Escape" && layoutMode) {
-      event.preventDefault();
-      event.stopPropagation();
-      setLayoutMode(false);
-      setQuery("");
-      return;
-    }
-    if (event.key === "Enter") {
-      event.preventDefault();
-      activateItem(selectedItem);
-      return;
-    }
-    if (event.key === "Tab" && selectedItem) {
-      event.preventDefault();
-      setQuery(selectedItem.title + ">");
-      return;
-    }
-    if (
-      (event.key === "w" || event.key === "W") &&
-      (event.ctrlKey || event.metaKey) &&
-      selectedItem?.type === "session"
-    ) {
-      event.preventDefault();
-      void workspace.closeSession(selectedItem.sessionId);
-    }
-  }, [activateItem, flatItems.length, selectedItem, workspace]);
+      if (event.key === "Escape" && layoutMode) {
+        event.preventDefault();
+        event.stopPropagation();
+        setLayoutMode(false);
+        setQuery("");
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        activateItem(selectedItem);
+        return;
+      }
+      if (event.key === "Tab" && selectedItem) {
+        event.preventDefault();
+        setQuery(selectedItem.title + ">");
+        return;
+      }
+      if (
+        (event.key === "w" || event.key === "W") &&
+        (event.ctrlKey || event.metaKey) &&
+        selectedItem?.type === "session"
+      ) {
+        event.preventDefault();
+        void workspace.closeSession(selectedItem.sessionId);
+      }
+    },
+    [activateItem, flatItems.length, selectedItem, workspace],
+  );
 
   return (
     <OverlayBackdrop
@@ -799,217 +972,228 @@ export function SwitcherOverlay({
         background: dark ? "rgba(0,0,0,0.66)" : "rgba(240,240,240,0.7)",
       }}
     >
-      <div ref={wrapperRef} style={{ position: "relative", marginRight: sidebarWidth }}>
-      <OverlayPanel
-        palette={palette}
-        fontSize={fontSize}
-        style={{
-          backgroundColor: theme.solidPanelBg,
-          fontFamily: uiFont,
-          borderRadius: 0,
-          border: `1px solid ${theme.subtleBorder}`,
-          boxShadow: dark
-            ? "0 18px 60px rgba(0,0,0,0.45)"
-            : "0 18px 60px rgba(0,0,0,0.12)",
-          padding: scale.tightGap,
-          overflow: "hidden",
-        }}
+      <div
+        ref={wrapperRef}
+        style={{ position: "relative", marginRight: sidebarWidth }}
       >
-        <div
+        <OverlayPanel
+          palette={palette}
+          fontSize={fontSize}
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: scale.tightGap,
-            marginBottom: scale.tightGap,
-          }}
-        >
-          <input
-            ref={searchRef}
-            type="text"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={t("switcher.placeholder")}
-            style={{
-              ...ui.input,
-              flex: 1,
-              minWidth: 0,
-              padding: `${scale.controlY + 3}px ${scale.controlX + 1}px`,
-              fontSize: fsMd,
-              borderRadius: 0,
-              border: `1px solid ${theme.subtleBorder}`,
-              backgroundColor: railBg,
-              color: theme.fg,
-              boxShadow: "none",
-            }}
-          />
-          {activeLayout && (
-            <span
-              style={{
-                padding: `${scale.controlY}px ${scale.controlX}px`,
-                border: `1px solid ${theme.subtleBorder}`,
-                backgroundColor: railBg,
-                fontSize: fsSm,
-                color: theme.dimFg,
-                whiteSpace: "nowrap",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                maxWidth: "8em",
-              }}
-              title={activeLayout.dsl}
-            >
-              {activeLayout.name === activeLayout.dsl ? tp("switcher.paneCount", { count: leafCount(activeLayout.root) }) : activeLayout.name}
-            </span>
-          )}
-          <button
-            style={{
-              ...chrome.closeButton,
-              borderRadius: 0,
-              padding: `${scale.controlY}px ${scale.controlX}px`,
-              backgroundColor: railBg,
-              fontSize: fsSm,
-            }}
-            onClick={onClose}
-          >
-            {t("overlay.close")}
-          </button>
-        </div>
-
-        <div
-          style={{
-            display: "grid",
-            gap: scale.tightGap,
+            backgroundColor: theme.solidPanelBg,
+            fontFamily: uiFont,
+            borderRadius: 0,
+            border: `1px solid ${theme.subtleBorder}`,
+            boxShadow: dark
+              ? "0 18px 60px rgba(0,0,0,0.45)"
+              : "0 18px 60px rgba(0,0,0,0.12)",
+            padding: scale.tightGap,
+            overflow: "hidden",
           }}
         >
           <div
             style={{
-              minWidth: 0,
-              maxHeight: "80vh",
-              overflow: "auto",
-              display: "grid",
-              alignContent: "start",
+              display: "flex",
+              alignItems: "center",
               gap: scale.tightGap,
-              paddingRight: 2,
+              marginBottom: scale.tightGap,
             }}
           >
-            {sections.map((section) => (
-              <section
-                key={section.title}
+            <input
+              ref={searchRef}
+              type="text"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={t("switcher.placeholder")}
+              style={{
+                ...ui.input,
+                flex: 1,
+                minWidth: 0,
+                padding: `${scale.controlY + 3}px ${scale.controlX + 1}px`,
+                fontSize: fsMd,
+                borderRadius: 0,
+                border: `1px solid ${theme.subtleBorder}`,
+                backgroundColor: railBg,
+                color: theme.fg,
+                boxShadow: "none",
+              }}
+            />
+            {activeLayout && (
+              <span
                 style={{
-                  display: "grid",
-                  gap: scale.tightGap,
+                  padding: `${scale.controlY}px ${scale.controlX}px`,
+                  border: `1px solid ${theme.subtleBorder}`,
+                  backgroundColor: railBg,
+                  fontSize: fsSm,
+                  color: theme.dimFg,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  maxWidth: "8em",
                 }}
+                title={activeLayout.dsl}
               >
-                <div
+                {activeLayout.name === activeLayout.dsl
+                  ? tp("switcher.paneCount", {
+                      count: leafCount(activeLayout.root),
+                    })
+                  : activeLayout.name}
+              </span>
+            )}
+            <button
+              style={{
+                ...chrome.closeButton,
+                borderRadius: 0,
+                padding: `${scale.controlY}px ${scale.controlX}px`,
+                backgroundColor: railBg,
+                fontSize: fsSm,
+              }}
+              onClick={onClose}
+            >
+              {t("overlay.close")}
+            </button>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gap: scale.tightGap,
+            }}
+          >
+            <div
+              style={{
+                minWidth: 0,
+                maxHeight: "80vh",
+                overflow: "auto",
+                display: "grid",
+                alignContent: "start",
+                gap: scale.tightGap,
+                paddingRight: 2,
+              }}
+            >
+              {sections.map((section) => (
+                <section
+                  key={section.title}
                   style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: scale.gap,
+                    display: "grid",
+                    gap: scale.tightGap,
                   }}
                 >
                   <div
                     style={{
-                      fontSize: fsSm,
-                      fontWeight: 700,
-                      color: theme.dimFg,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.08em",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: scale.gap,
                     }}
                   >
-                    {section.title}
+                    <div
+                      style={{
+                        fontSize: fsSm,
+                        fontWeight: 700,
+                        color: theme.dimFg,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.08em",
+                      }}
+                    >
+                      {section.title}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: fsSm,
+                        color: theme.dimFg,
+                      }}
+                    >
+                      {section.items.length}
+                    </div>
                   </div>
-                  <div
-                    style={{
-                      fontSize: fsSm,
-                      color: theme.dimFg,
-                    }}
-                  >
-                    {section.items.length}
-                  </div>
-                </div>
-                <div style={{ display: "grid", gap: scale.tightGap }}>
-                  {section.items.map((item) => {
-                    const index = flatItems.findIndex((candidate) => itemKey(candidate) === itemKey(item));
-                    const selected = index === selectedIdx;
-                    return (
-                      <div
-                        key={item.key}
-                        ref={(element) => {
-                          itemRefs.current[index] = element;
-                        }}
-                        onClick={() => activateItem(item)}
-                        onMouseEnter={() => setSelectedIdx(index)}
-                        style={{
-                          display: "flex",
-                          alignItems: "stretch",
-                          gap: scale.tightGap,
-                          padding: scale.tightGap,
-                          borderRadius: 0,
-                          border: `1px solid ${selected ? theme.accent : theme.subtleBorder}`,
-                          backgroundColor: selected ? theme.selectedBg : cardBg,
-                          color: "inherit",
-                          textAlign: "left",
-                          cursor: "pointer",
-                          fontFamily: "inherit",
-                          boxShadow: "none",
-                          transform: "none",
-                          transition: "border-color 120ms ease, background-color 120ms ease",
-                        }}
-                      >
-                        {renderItemSquare(item, selected)}
+                  <div style={{ display: "grid", gap: scale.tightGap }}>
+                    {section.items.map((item) => {
+                      const index = flatItems.findIndex(
+                        (candidate) => itemKey(candidate) === itemKey(item),
+                      );
+                      const selected = index === selectedIdx;
+                      return (
+                        <div
+                          key={item.key}
+                          ref={(element) => {
+                            itemRefs.current[index] = element;
+                          }}
+                          onClick={() => activateItem(item)}
+                          onMouseEnter={() => setSelectedIdx(index)}
+                          style={{
+                            display: "flex",
+                            alignItems: "stretch",
+                            gap: scale.tightGap,
+                            padding: scale.tightGap,
+                            borderRadius: 0,
+                            border: `1px solid ${selected ? theme.accent : theme.subtleBorder}`,
+                            backgroundColor: selected
+                              ? theme.selectedBg
+                              : cardBg,
+                            color: "inherit",
+                            textAlign: "left",
+                            cursor: "pointer",
+                            fontFamily: "inherit",
+                            boxShadow: "none",
+                            transform: "none",
+                            transition:
+                              "border-color 120ms ease, background-color 120ms ease",
+                          }}
+                        >
+                          {renderItemSquare(item, selected)}
 
-                        <div style={{ minWidth: 0, flex: 1, display: "grid" }}>
                           <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: scale.tightGap,
-                              minWidth: 0,
-                              flexWrap: "wrap",
-                            }}
+                            style={{ minWidth: 0, flex: 1, display: "grid" }}
                           >
-                            <span
+                            <div
                               style={{
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                                fontSize: fsMd,
-                                fontWeight: 600,
+                                display: "flex",
+                                alignItems: "center",
+                                gap: scale.tightGap,
+                                minWidth: 0,
+                                flexWrap: "wrap",
                               }}
                             >
-                              {item.title}
-                            </span>
-                            {item.type === "session" && item.focused && (
-                              <mark style={ui.badge}>{t("switcher.badgeFocused")}</mark>
-                            )}
-                            {item.type === "pane" && item.empty && (
-                              <mark style={ui.badge}>{t("switcher.badgeEmpty")}</mark>
-                            )}
-                            {item.type === "session" && item.exited && (
-                              <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
-                                {t("switcher.badgeExited")}
-                              </mark>
-                            )}
-                            {item.type === "layout" && activeLayout?.dsl === item.layout.dsl && (
-                              <mark style={ui.badge}>{t("switcher.badgeCurrent")}</mark>
-                            )}
-                          </div>
-                          <div
-                            style={{
-                              fontSize: fsSm,
-                              color: theme.dimFg,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {item.subtitle}
-                            {item.type === "session" && item.source != null && (
-                              <> · {SOURCE_LABEL[item.source] ?? t("switcher.sourceMatch")}</>
-                            )}
-                          </div>
-                          {item.type === "session" && item.context && (
+                              <span
+                                style={{
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                  fontSize: fsMd,
+                                  fontWeight: 600,
+                                }}
+                              >
+                                {item.title}
+                              </span>
+                              {item.type === "session" && item.focused && (
+                                <mark style={ui.badge}>
+                                  {t("switcher.badgeFocused")}
+                                </mark>
+                              )}
+                              {item.type === "pane" && item.empty && (
+                                <mark style={ui.badge}>
+                                  {t("switcher.badgeEmpty")}
+                                </mark>
+                              )}
+                              {item.type === "session" && item.exited && (
+                                <mark
+                                  style={{
+                                    ...ui.badge,
+                                    backgroundColor: "rgba(255,100,100,0.3)",
+                                  }}
+                                >
+                                  {t("switcher.badgeExited")}
+                                </mark>
+                              )}
+                              {item.type === "layout" &&
+                                activeLayout?.dsl === item.layout.dsl && (
+                                  <mark style={ui.badge}>
+                                    {t("switcher.badgeCurrent")}
+                                  </mark>
+                                )}
+                            </div>
                             <div
                               style={{
                                 fontSize: fsSm,
@@ -1019,83 +1203,106 @@ export function SwitcherOverlay({
                                 whiteSpace: "nowrap",
                               }}
                             >
-                              {item.context}
+                              {item.subtitle}
+                              {item.type === "session" &&
+                                item.source != null && (
+                                  <>
+                                    {" "}
+                                    ·{" "}
+                                    {SOURCE_LABEL[item.source] ??
+                                      t("switcher.sourceMatch")}
+                                  </>
+                                )}
                             </div>
+                            {item.type === "session" && item.context && (
+                              <div
+                                style={{
+                                  fontSize: fsSm,
+                                  color: theme.dimFg,
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {item.context}
+                              </div>
+                            )}
+                          </div>
+
+                          {item.type === "session" && (
+                            <button
+                              type="button"
+                              title={t("switcher.close")}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void workspace.closeSession(item.sessionId);
+                              }}
+                              style={{
+                                background: railBg,
+                                border: `1px solid ${theme.subtleBorder}`,
+                                color: "inherit",
+                                cursor: "pointer",
+                                opacity: 0.75,
+                                fontSize: fsSm,
+                                padding: "1px 5px",
+                                fontFamily: "inherit",
+                                alignSelf: "center",
+                                borderRadius: 0,
+                              }}
+                            >
+                              x
+                            </button>
                           )}
                         </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
 
-                        {item.type === "session" && (
-                          <button
-                            type="button"
-                            title={t("switcher.close")}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void workspace.closeSession(item.sessionId);
-                            }}
-                            style={{
-                              background: railBg,
-                              border: `1px solid ${theme.subtleBorder}`,
-                              color: "inherit",
-                              cursor: "pointer",
-                              opacity: 0.75,
-                              fontSize: fsSm,
-                              padding: "1px 5px",
-                              fontFamily: "inherit",
-                              alignSelf: "center",
-                              borderRadius: 0,
-                            }}
-                          >
-                            x
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
+              {sections.length === 0 && (
+                <div
+                  style={{
+                    display: "grid",
+                    gap: scale.tightGap,
+                    placeItems: "center",
+                    borderRadius: 0,
+                    border: `1px dashed ${theme.subtleBorder}`,
+                    backgroundColor: railBg,
+                    textAlign: "center",
+                    color: theme.dimFg,
+                    padding: scale.panelPadding,
+                  }}
+                >
+                  <div style={{ fontSize: fsXl, color: theme.fg }}>
+                    {t("switcher.noMatches")}
+                  </div>
+                  <div style={{ fontSize: fsSm, maxWidth: sidebarWidth }}>
+                    {t("switcher.noMatchesHint")}
+                  </div>
                 </div>
-              </section>
-            ))}
-
-            {sections.length === 0 && (
-              <div
-                style={{
-                  display: "grid",
-                  gap: scale.tightGap,
-                  placeItems: "center",
-                  borderRadius: 0,
-                  border: `1px dashed ${theme.subtleBorder}`,
-                  backgroundColor: railBg,
-                  textAlign: "center",
-                  color: theme.dimFg,
-                  padding: scale.panelPadding,
-                }}
-              >
-                <div style={{ fontSize: fsXl, color: theme.fg }}>{t("switcher.noMatches")}</div>
-                <div style={{ fontSize: fsSm, maxWidth: sidebarWidth }}>
-                  {t("switcher.noMatchesHint")}
-                </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
-
-        </div>
-      </OverlayPanel>
-      {showPreview && selectedItem && <div
-        ref={previewRef}
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          position: "absolute",
-          left: "100%",
-          top: previewTop,
-          width: sidebarWidth,
-          maxHeight: "20em",
-          backgroundColor: theme.solidPanelBg,
-          border: `1px solid ${theme.subtleBorder}`,
-          borderLeft: "none",
-          padding: scale.tightGap,
-          display: "flex",
-          flexDirection: "column" as const,
-          gap: scale.tightGap,
-          borderRadius: 0,
+        </OverlayPanel>
+        {showPreview && selectedItem && (
+          <div
+            ref={previewRef}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "absolute",
+              left: "100%",
+              top: previewTop,
+              width: sidebarWidth,
+              maxHeight: "20em",
+              backgroundColor: theme.solidPanelBg,
+              border: `1px solid ${theme.subtleBorder}`,
+              borderLeft: "none",
+              padding: scale.tightGap,
+              display: "flex",
+              flexDirection: "column" as const,
+              gap: scale.tightGap,
+              borderRadius: 0,
               overflow: "hidden",
             }}
           >
@@ -1113,8 +1320,18 @@ export function SwitcherOverlay({
                     >
                       {t("switcher.previewLayout")}
                     </div>
-                    <div style={{ fontSize: fsLg, fontWeight: 600 }}>{selectedItem.title}</div>
-                    <div style={{ fontSize: fsSm, color: theme.dimFg, lineHeight: 1.4 }}>{selectedItem.layout.dsl}</div>
+                    <div style={{ fontSize: fsLg, fontWeight: 600 }}>
+                      {selectedItem.title}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: fsSm,
+                        color: theme.dimFg,
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      {selectedItem.layout.dsl}
+                    </div>
                   </div>
                   <div
                     style={{
@@ -1134,11 +1351,33 @@ export function SwitcherOverlay({
                       opacity={0.68}
                     />
                   </div>
-                  <div style={{ display: "flex", gap: scale.tightGap, flexWrap: "wrap" }}>
-                    <mark style={ui.badge}>{tp("switcher.paneCount", { count: leafCount(selectedItem.layout.root) })}</mark>
-                    {activeLayout?.dsl === selectedItem.layout.dsl && <mark style={ui.badge}>{t("switcher.badgeCurrentLayout")}</mark>}
-                    {layoutChoices.recent.some((layout) => layout.dsl === selectedItem.layout.dsl) && <mark style={ui.badge}>{t("switcher.badgeRecent")}</mark>}
-                    {layoutChoices.presets.some((layout) => layout.dsl === selectedItem.layout.dsl) && <mark style={ui.badge}>{t("switcher.badgeDefault")}</mark>}
+                  <div
+                    style={{
+                      display: "flex",
+                      gap: scale.tightGap,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <mark style={ui.badge}>
+                      {tp("switcher.paneCount", {
+                        count: leafCount(selectedItem.layout.root),
+                      })}
+                    </mark>
+                    {activeLayout?.dsl === selectedItem.layout.dsl && (
+                      <mark style={ui.badge}>
+                        {t("switcher.badgeCurrentLayout")}
+                      </mark>
+                    )}
+                    {layoutChoices.recent.some(
+                      (layout) => layout.dsl === selectedItem.layout.dsl,
+                    ) && (
+                      <mark style={ui.badge}>{t("switcher.badgeRecent")}</mark>
+                    )}
+                    {layoutChoices.presets.some(
+                      (layout) => layout.dsl === selectedItem.layout.dsl,
+                    ) && (
+                      <mark style={ui.badge}>{t("switcher.badgeDefault")}</mark>
+                    )}
                   </div>
                   <button
                     type="button"
@@ -1161,12 +1400,19 @@ export function SwitcherOverlay({
                     >
                       {t("switcher.previewPane")}
                     </div>
-                    <div style={{ fontSize: fsLg, fontWeight: 600 }}>{selectedItem.title}</div>
+                    <div style={{ fontSize: fsLg, fontWeight: 600 }}>
+                      {selectedItem.title}
+                    </div>
                     <div style={{ fontSize: fsSm, color: theme.dimFg }}>
                       {inlineCmd
-                        ? tp("switcher.runInPane", { command: inlineCmd, pane: selectedItem.title })
+                        ? tp("switcher.runInPane", {
+                            command: inlineCmd,
+                            pane: selectedItem.title,
+                          })
                         : selectedItem.empty
-                          ? tp("switcher.paneEmpty", { pane: selectedItem.title })
+                          ? tp("switcher.paneEmpty", {
+                              pane: selectedItem.title,
+                            })
                           : selectedItem.subtitle}
                     </div>
                   </div>
@@ -1198,7 +1444,9 @@ export function SwitcherOverlay({
                     onClick={() => activateItem(selectedItem)}
                     style={ctaStyle}
                   >
-                    {inlineCmd ? tp("switcher.runInlineCmd", { command: inlineCmd }) : t("switcher.selectPane")}
+                    {inlineCmd
+                      ? tp("switcher.runInlineCmd", { command: inlineCmd })
+                      : t("switcher.selectPane")}
                   </button>
                 </>
               ) : selectedItem.type === "session" ? (
@@ -1214,11 +1462,24 @@ export function SwitcherOverlay({
                     >
                       {t("switcher.previewTerminal")}
                     </div>
-                    <div style={{ fontSize: fsLg, fontWeight: 600 }}>{selectedItem.title}</div>
-                    <div style={{ fontSize: fsSm, color: theme.dimFg, lineHeight: 1.4 }}>
+                    <div style={{ fontSize: fsLg, fontWeight: 600 }}>
+                      {selectedItem.title}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: fsSm,
+                        color: theme.dimFg,
+                        lineHeight: 1.4,
+                      }}
+                    >
                       {selectedItem.subtitle}
                       {selectedItem.source != null && (
-                        <> · {SOURCE_LABEL[selectedItem.source] ?? t("switcher.sourceMatch")}</>
+                        <>
+                          {" "}
+                          ·{" "}
+                          {SOURCE_LABEL[selectedItem.source] ??
+                            t("switcher.sourceMatch")}
+                        </>
                       )}
                     </div>
                   </div>
@@ -1226,10 +1487,18 @@ export function SwitcherOverlay({
                     sessionId={selectedItem.sessionId}
                     readOnly
                     showCursor={false}
-                    style={{ width: "100%", flex: 1, minHeight: 0, pointerEvents: "none", alignSelf: "center" }}
+                    style={{
+                      width: "100%",
+                      flex: 1,
+                      minHeight: 0,
+                      pointerEvents: "none",
+                      alignSelf: "center",
+                    }}
                   />
                   {selectedItem.context && (
-                    <div style={{ fontSize: fsSm, color: theme.dimFg }}>{selectedItem.context}</div>
+                    <div style={{ fontSize: fsSm, color: theme.dimFg }}>
+                      {selectedItem.context}
+                    </div>
                   )}
                   <button
                     type="button"
@@ -1256,7 +1525,8 @@ export function SwitcherOverlay({
                 {t("switcher.selectHint")}
               </div>
             )}
-      </div>}
+          </div>
+        )}
       </div>
     </OverlayBackdrop>
   );

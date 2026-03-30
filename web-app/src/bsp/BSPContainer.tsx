@@ -40,9 +40,9 @@ function resolveLeafFontSize(leaf: BSPLeaf, baseFontSize: number): number {
   if (typeof raw === "number") {
     resolved = raw;
   } else if (raw.endsWith("%")) {
-    resolved = Math.round(baseFontSize * parseFloat(raw) / 100);
+    resolved = Math.round((baseFontSize * parseFloat(raw)) / 100);
   } else if (raw.endsWith("pt")) {
-    resolved = Math.round(parseFloat(raw) * 4 / 3);
+    resolved = Math.round((parseFloat(raw) * 4) / 3);
   } else if (raw.endsWith("px")) {
     resolved = parseFloat(raw);
   } else {
@@ -58,8 +58,7 @@ function sameAssignments(left: BSPAssignments, right: BSPAssignments): boolean {
   for (const key of leftKeys) {
     if (left.assignments[key] !== right.assignments[key]) return false;
   }
-  if (left.overflowSessionIds.length !== right.overflowSessionIds.length) return false;
-  return left.overflowSessionIds.every((sessionId, index) => sessionId === right.overflowSessionIds[index]);
+  return true;
 }
 
 export function BSPContainer({
@@ -88,6 +87,7 @@ export function BSPContainer({
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+
   focusedSessionId: SessionId | null;
   lruSessionIds: readonly SessionId[];
   manageVisibility?: boolean;
@@ -99,15 +99,21 @@ export function BSPContainer({
   /** Called with control functions so the parent can direct pane focus/assignments. */
   onFocusBySession?: (fn: (sessionId: SessionId) => void) => void;
   onFocusPane?: (fn: (paneId: string) => void) => void;
-  onMoveSessionToPane?: (fn: (sessionId: SessionId, targetPaneId: string) => void) => void;
+  onMoveSessionToPane?: (
+    fn: (sessionId: SessionId, targetPaneId: string) => void,
+  ) => void;
   onFocusedPaneChange?: (paneId: string | null) => void;
 }) {
   const workspace = useBlitWorkspace();
+  const connection = useBlitConnection(connectionId);
+  const connected = connection?.status === "connected";
   const sessions = useBlitSessions();
   const liveSessions = useMemo(
-    () => sessions.filter(
-      (session) => session.connectionId === connectionId && session.state !== "closed",
-    ),
+    () =>
+      sessions.filter(
+        (session) =>
+          session.connectionId === connectionId && session.state !== "closed",
+      ),
     [connectionId, sessions],
   );
   const liveSessionIds = useMemo(
@@ -125,9 +131,7 @@ export function BSPContainer({
       for (const paneId of paneIds) {
         assignments[paneId] = (hashAssignments[paneId] as SessionId) ?? null;
       }
-      const assigned = new Set(Object.values(assignments).filter(Boolean));
-      const overflowSessionIds = liveSessionIds.filter((id) => !assigned.has(id));
-      return { assignments, overflowSessionIds };
+      return { assignments };
     }
     const orderedSessionIds = buildCandidateOrder({
       liveSessionIds,
@@ -155,7 +159,6 @@ export function BSPContainer({
       liveSessionIds,
       focusedSessionId,
       currentAssignedInPaneOrder,
-      overflowSessionIds: layoutStateRef.current.overflowSessionIds,
       lruSessionIds,
     });
     const nextRoot = layout.root;
@@ -167,22 +170,51 @@ export function BSPContainer({
     setLayoutState(assignSessionsToPanes(nextPanes, orderedSessionIds));
   }, [focusedSessionId, layout, liveSessionIds, lruSessionIds]);
 
+  const knownSessionIds = useMemo(
+    () =>
+      sessions.filter((s) => s.connectionId === connectionId).map((s) => s.id),
+    [connectionId, sessions],
+  );
+
   useEffect(() => {
+    if (!connected) return;
     setLayoutState((previous) => {
       const next = reconcileAssignments({
         panes,
         previous,
         liveSessionIds,
-        preferredPaneId: preferredEmptyPaneId,
+        knownSessionIds,
       });
       return sameAssignments(previous, next) ? previous : next;
     });
-  }, [liveSessionIds, panes, preferredEmptyPaneId]);
+  }, [connected, liveSessionIds, knownSessionIds, panes]);
+
+  // When a new session is created targeting a specific pane, assign the first
+  // unassigned live session there once it appears.
+  useEffect(() => {
+    if (!preferredEmptyPaneId || !paneIds.includes(preferredEmptyPaneId))
+      return;
+    setLayoutState((previous) => {
+      if (previous.assignments[preferredEmptyPaneId] != null) return previous;
+      const assigned = new Set(
+        Object.values(previous.assignments).filter(Boolean),
+      );
+      const unassigned = liveSessionIds.find((id) => !assigned.has(id));
+      if (!unassigned) return previous;
+      return {
+        assignments: {
+          ...previous.assignments,
+          [preferredEmptyPaneId]: unassigned,
+        },
+      };
+    });
+  }, [preferredEmptyPaneId, liveSessionIds, paneIds]);
 
   const assignedInPaneOrder = useMemo(
-    () => paneIds
-      .map((paneId) => layoutState.assignments[paneId])
-      .filter((sessionId): sessionId is SessionId => sessionId != null),
+    () =>
+      paneIds
+        .map((paneId) => layoutState.assignments[paneId])
+        .filter((sessionId): sessionId is SessionId => sessionId != null),
     [layoutState.assignments, paneIds],
   );
 
@@ -191,11 +223,17 @@ export function BSPContainer({
     const fromHash = loadFocusedPaneFromHash();
     if (fromHash && paneIds.includes(fromHash)) return fromHash;
     if (!focusedSessionId) return paneIds[0] ?? null;
-    return paneIds.find((id) => layoutState.assignments[id] === focusedSessionId) ?? paneIds[0] ?? null;
+    return (
+      paneIds.find((id) => layoutState.assignments[id] === focusedSessionId) ??
+      paneIds[0] ??
+      null
+    );
   });
 
   // Derive the focused session from the focused pane.
-  const focusedPaneSessionId = focusedPaneId ? (layoutState.assignments[focusedPaneId] ?? null) : null;
+  const focusedPaneSessionId = focusedPaneId
+    ? (layoutState.assignments[focusedPaneId] ?? null)
+    : null;
 
   // Keep focusedPaneId valid when panes change.
   if (focusedPaneId != null && !paneIds.includes(focusedPaneId)) {
@@ -210,29 +248,36 @@ export function BSPContainer({
   }, [focusedPaneSessionId, focusedSessionId, onFocusSession]);
 
   // Allow Workspace to focus a specific session's pane (e.g. from menu).
-  const focusBySession = useCallback((sessionId: SessionId) => {
-    const paneId = paneIds.find((id) => layoutState.assignments[id] === sessionId);
-    if (paneId) setFocusedPaneId(paneId);
-  }, [layoutState.assignments, paneIds]);
+  const focusBySession = useCallback(
+    (sessionId: SessionId) => {
+      const paneId = paneIds.find(
+        (id) => layoutState.assignments[id] === sessionId,
+      );
+      if (paneId) setFocusedPaneId(paneId);
+    },
+    [layoutState.assignments, paneIds],
+  );
 
   useEffect(() => {
     onFocusBySession?.(focusBySession);
   }, [focusBySession, onFocusBySession]);
 
-
-  const moveSessionToPane = useCallback((sessionId: SessionId, targetPaneId: string) => {
-    setLayoutState((prev) => {
-      if (prev.assignments[targetPaneId] === sessionId) return prev;
-      return {
-        ...prev,
-        assignments: {
-          ...prev.assignments,
-          [targetPaneId]: sessionId,
-        },
-      };
-    });
-    setFocusedPaneId(targetPaneId);
-  }, []);
+  const moveSessionToPane = useCallback(
+    (sessionId: SessionId, targetPaneId: string) => {
+      setLayoutState((prev) => {
+        if (prev.assignments[targetPaneId] === sessionId) return prev;
+        return {
+          ...prev,
+          assignments: {
+            ...prev.assignments,
+            [targetPaneId]: sessionId,
+          },
+        };
+      });
+      setFocusedPaneId(targetPaneId);
+    },
+    [],
+  );
 
   useEffect(() => {
     onMoveSessionToPane?.(moveSessionToPane);
@@ -277,7 +322,7 @@ export function BSPContainer({
   useEffect(() => {
     if (!manageVisibility) return;
     workspace.setVisibleSessions(assignedInPaneOrder);
-  }, [assignedInPaneOrder, manageVisibility, workspace]);
+  }, [assignedInPaneOrder, knownSessionIds, manageVisibility, workspace]);
 
   useEffect(() => {
     if (!preferredEmptyPaneId || !onPreferredEmptyPaneResolved) return;
@@ -390,10 +435,16 @@ function BSPPane({
   focusedPaneId: string | null;
   onFocusPane: (paneId: string) => void;
   onCreateInPane?: (paneId: string, command?: string) => void;
-  onResize: (split: BSPSplit, indexA: number, indexB: number, fraction: number) => void;
+  onResize: (
+    split: BSPSplit,
+    indexA: number,
+    indexB: number,
+    fraction: number,
+  ) => void;
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+
   visible: boolean;
   tabMemory: React.RefObject<Record<string, number>>;
   path?: number[];
@@ -451,7 +502,10 @@ function BSPPane({
     let activeTab = -1;
     for (let i = 0; i < node.children.length; i++) {
       const childPrefix = [...path, i].join(".");
-      if (focusedPrefix === childPrefix || focusedPrefix.startsWith(childPrefix + ".")) {
+      if (
+        focusedPrefix === childPrefix ||
+        focusedPrefix.startsWith(childPrefix + ".")
+      ) {
         activeTab = i;
         break;
       }
@@ -459,7 +513,10 @@ function BSPPane({
     if (activeTab >= 0) {
       tabMemory.current![tabKey] = activeTab;
     } else {
-      activeTab = Math.min(tabMemory.current![tabKey] ?? 0, node.children.length - 1);
+      activeTab = Math.min(
+        tabMemory.current![tabKey] ?? 0,
+        node.children.length - 1,
+      );
     }
 
     const tabLabel = (child: BSPChild, index: number): string => {
@@ -469,7 +526,14 @@ function BSPPane({
     };
 
     return (
-      <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%" }}>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          width: "100%",
+          height: "100%",
+        }}
+      >
         <div
           style={{
             display: "flex",
@@ -497,7 +561,10 @@ function BSPPane({
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap" as const,
                   opacity: index === activeTab ? 1 : 0.5,
-                  borderBottom: index === activeTab ? `1px solid ${theme.accent}` : "1px solid transparent",
+                  borderBottom:
+                    index === activeTab
+                      ? `1px solid ${theme.accent}`
+                      : "1px solid transparent",
                 }}
               >
                 {tabLabel(child, index)}
@@ -505,8 +572,18 @@ function BSPPane({
             );
           })}
         </div>
-        <div style={{ flex: 1, overflow: "hidden", position: "relative", minHeight: 0 }}>
-          <BSPPane key={activeTab} {...paneProps(node.children[activeTab], activeTab)} />
+        <div
+          style={{
+            flex: 1,
+            overflow: "hidden",
+            position: "relative",
+            minHeight: 0,
+          }}
+        >
+          <BSPPane
+            key={activeTab}
+            {...paneProps(node.children[activeTab], activeTab)}
+          />
         </div>
       </div>
     );
@@ -515,13 +592,22 @@ function BSPPane({
   const flexDirection = node.direction === "horizontal" ? "row" : "column";
 
   return (
-    <div style={{ display: "flex", flexDirection, width: "100%", height: "100%" }}>
+    <div
+      style={{ display: "flex", flexDirection, width: "100%", height: "100%" }}
+    >
       {node.children.map((child, index) => (
         <Fragment key={index}>
           {index > 0 && (
             <ResizeHandle
               direction={node.direction as "horizontal" | "vertical"}
-              onDrag={(fraction) => onResizeRef.current(nodeRef.current as BSPSplit, index - 1, index, fraction)}
+              onDrag={(fraction) =>
+                onResizeRef.current(
+                  nodeRef.current as BSPSplit,
+                  index - 1,
+                  index,
+                  fraction,
+                )
+              }
             />
           )}
           <div
@@ -566,6 +652,7 @@ function LeafPane({
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+
   visible: boolean;
 }) {
   const theme = themeFor(palette);
@@ -595,7 +682,9 @@ function LeafPane({
         height: "100%",
         position: "relative",
         border: multiPane
-          ? isFocused ? `1px solid ${theme.accent}` : `1px solid transparent`
+          ? isFocused
+            ? `1px solid ${theme.accent}`
+            : `1px solid transparent`
           : "none",
       }}
       onPointerDownCapture={onFocusPane}
@@ -628,7 +717,12 @@ function LeafPane({
                 gap: scale.gap,
               }}
             >
-              <mark style={{ ...ui.badge, backgroundColor: "rgba(255,100,100,0.3)" }}>
+              <mark
+                style={{
+                  ...ui.badge,
+                  backgroundColor: "rgba(255,100,100,0.3)",
+                }}
+              >
                 {t("bsp.exited")}
               </mark>
               {connection?.supportsRestart && (
@@ -659,11 +753,13 @@ function LeafPane({
           onCreateInPane={onCreateInPane}
         />
       ) : (
-        <div style={{
-          width: "100%",
-          height: "100%",
-          backgroundColor: `rgb(${palette.bg[0]},${palette.bg[1]},${palette.bg[2]})`,
-        }} />
+        <div
+          style={{
+            width: "100%",
+            height: "100%",
+            backgroundColor: `rgb(${palette.bg[0]},${palette.bg[1]},${palette.bg[2]})`,
+          }}
+        />
       )}
     </div>
   );

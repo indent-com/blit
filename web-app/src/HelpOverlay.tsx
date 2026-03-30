@@ -55,10 +55,25 @@ export function HelpOverlay({
   ];
 
   return (
-    <OverlayBackdrop palette={palette} label={t("help.label")} onClose={onClose}>
+    <OverlayBackdrop
+      palette={palette}
+      label={t("help.label")}
+      onClose={onClose}
+    >
       <OverlayPanel palette={palette} fontSize={fontSize}>
-        <OverlayHeader palette={palette} fontSize={fontSize} title={t("help.title")} onClose={onClose} />
-        <div style={{ display: "flex", gap: scale.gap * 3, padding: `${scale.tightGap}px 0` }}>
+        <OverlayHeader
+          palette={palette}
+          fontSize={fontSize}
+          title={t("help.title")}
+          onClose={onClose}
+        />
+        <div
+          style={{
+            display: "flex",
+            gap: scale.gap * 3,
+            padding: `${scale.tightGap}px 0`,
+          }}
+        >
           <Column sections={left} theme={theme} scale={scale} />
           <Column sections={right} theme={theme} scale={scale} />
         </div>
@@ -92,14 +107,21 @@ function Column({
           >
             {s.title}
           </div>
-          <table style={{ borderSpacing: `${scale.controlX}px ${scale.controlY}px`, marginLeft: -scale.controlX }}>
+          <table
+            style={{
+              borderSpacing: `${scale.controlX}px ${scale.controlY}px`,
+              marginLeft: -scale.controlX,
+            }}
+          >
             <tbody>
               {s.items.map(([key, desc]) => (
                 <tr key={key}>
                   <td style={{ whiteSpace: "nowrap" }}>
                     <kbd style={{ ...ui.kbd, fontSize: scale.sm }}>{key}</kbd>
                   </td>
-                  <td style={{ fontSize: scale.md, color: theme.dimFg }}>{desc}</td>
+                  <td style={{ fontSize: scale.md, color: theme.dimFg }}>
+                    {desc}
+                  </td>
                 </tr>
               ))}
             </tbody>

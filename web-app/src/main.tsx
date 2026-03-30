@@ -3,7 +3,5 @@ import { initWasm } from "./wasm";
 import { App } from "./App";
 
 initWasm().then((wasm) => {
-  createRoot(document.getElementById("root")!).render(
-    <App wasm={wasm} />,
-  );
+  createRoot(document.getElementById("root")!).render(<App wasm={wasm} />);
 });

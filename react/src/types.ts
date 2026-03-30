@@ -143,6 +143,8 @@ export interface BlitTerminalProps {
   scrollbarColor?: string;
   /** Scrollbar indicator width in pixels. Default: 4 */
   scrollbarWidth?: number;
+  /** Font advance-width / units-per-em ratio from font tables for native-accurate cell width. */
+  advanceRatio?: number;
 }
 
 export const DEFAULT_FONT = "ui-monospace, monospace";

@@ -2,12 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { BlitTransport } from "blit-react";
 
 export interface RenderSample {
-  t: number;   // timestamp (ms, relative to page load)
-  ms: number;  // render duration
+  t: number; // timestamp (ms, relative to page load)
+  ms: number; // render duration
 }
 
 export interface NetSample {
-  t: number;   // timestamp (ms, relative to page load)
+  t: number; // timestamp (ms, relative to page load)
   bytes: number; // message size
   dir: "rx" | "tx"; // direction
 }
@@ -27,7 +27,13 @@ export function useMetrics(transport: BlitTransport): Metrics & {
   timelineRef: React.RefObject<RenderSample[]>;
   netRef: React.RefObject<NetSample[]>;
 } {
-  const [metrics, setMetrics] = useState<Metrics>({ bw: 0, fps: 0, ups: 0, renderMs: 0, maxRenderMs: 0 });
+  const [metrics, setMetrics] = useState<Metrics>({
+    bw: 0,
+    fps: 0,
+    ups: 0,
+    renderMs: 0,
+    maxRenderMs: 0,
+  });
   const bytesRef = useRef(0);
   const framesRef = useRef(0);
   const updatesRef = useRef(0);

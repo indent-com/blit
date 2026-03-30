@@ -1,1 +1,5 @@
-{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}
+{
+  "name": "blit-browser",
+  "version": "0.0.0",
+  "main": "blit_browser.js"
+}

@@ -1,9 +1,4 @@
-import {
-  useState,
-  useCallback,
-  useEffect,
-  useRef,
-} from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { PALETTES } from "blit-react";
 import type { TerminalPalette } from "blit-react";
 import { themeFor, ui, uiScale } from "./theme";
@@ -54,24 +49,30 @@ export function PaletteOverlay({
   const lowerQuery = trimmedQuery.toLowerCase();
   const filtered = showAllPalettes
     ? tonePalettes
-    : tonePalettes.filter((palette) =>
-        palette.name.toLowerCase().includes(lowerQuery) ||
-        palette.id.toLowerCase().includes(lowerQuery),
+    : tonePalettes.filter(
+        (palette) =>
+          palette.name.toLowerCase().includes(lowerQuery) ||
+          palette.id.toLowerCase().includes(lowerQuery),
       );
 
-  const preview = useCallback((idx: number) => {
-    const palette = filtered[idx];
-    if (!palette) return;
-    setSelectedIdx(idx);
-    onPreview(palette);
-  }, [filtered, onPreview]);
+  const preview = useCallback(
+    (idx: number) => {
+      const palette = filtered[idx];
+      if (!palette) return;
+      setSelectedIdx(idx);
+      onPreview(palette);
+    },
+    [filtered, onPreview],
+  );
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
   useEffect(() => {
-    const el = listRef.current?.children[selectedIdx] as HTMLElement | undefined;
+    const el = listRef.current?.children[selectedIdx] as
+      | HTMLElement
+      | undefined;
     el?.scrollIntoView({ block: "nearest" });
   }, [selectedIdx, filtered]);
 
@@ -131,19 +132,30 @@ export function PaletteOverlay({
   };
 
   return (
-    <OverlayBackdrop palette={current} label={t("palette.label")} onClose={dismiss}>
+    <OverlayBackdrop
+      palette={current}
+      label={t("palette.label")}
+      onClose={dismiss}
+    >
       <OverlayPanel palette={current} fontSize={fontSize}>
-        <OverlayHeader palette={current} fontSize={fontSize} title={t("palette.title")} onClose={dismiss} />
-        <div style={{ display: "flex", flexDirection: "column", gap: scale.gap }}>
+        <OverlayHeader
+          palette={current}
+          fontSize={fontSize}
+          title={t("palette.title")}
+          onClose={dismiss}
+        />
+        <div
+          style={{ display: "flex", flexDirection: "column", gap: scale.gap }}
+        >
           <div
             role="tablist"
             aria-label={t("palette.toneLabel")}
             style={{ display: "flex", gap: scale.tightGap + 2 }}
           >
-            {([
+            {[
               { id: "dark" as const, label: t("palette.dark") },
               { id: "light" as const, label: t("palette.light") },
-            ]).map((option) => {
+            ].map((option) => {
               const active = tone === option.id;
               return (
                 <button
@@ -189,7 +201,9 @@ export function PaletteOverlay({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={tp("palette.searchPlaceholder", { tone: t(`palette.${tone}`) })}
+            placeholder={tp("palette.searchPlaceholder", {
+              tone: t(`palette.${tone}`),
+            })}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
@@ -224,9 +238,7 @@ export function PaletteOverlay({
                     color: "inherit",
                     textAlign: "left" as const,
                     backgroundColor:
-                      i === selectedIdx
-                        ? theme.selectedBg
-                        : "transparent",
+                      i === selectedIdx ? theme.selectedBg : "transparent",
                     fontSize: scale.md,
                   }}
                 >

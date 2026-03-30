@@ -6,7 +6,8 @@ import { resolve, join } from "node:path";
 
 const wasmPath = resolve(__dirname, "../browser/pkg/blit_browser_bg.wasm");
 const snippetsDir = resolve(__dirname, "../browser/pkg/snippets");
-const isDev = process.env.NODE_ENV !== "production" && !process.argv.includes("build");
+const isDev =
+  process.env.NODE_ENV !== "production" && !process.argv.includes("build");
 
 export default defineConfig({
   plugins: [

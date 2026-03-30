@@ -42,9 +42,8 @@ export interface UIScale {
 export function uiScale(baseFontSize: number): UIScale {
   const base = Math.max(10, Math.round(baseFontSize || 13));
   const max = Math.round(base * 1.25);
-  const scaled = (multiplier: number, floor: number) => (
-    Math.max(floor, Math.min(max, Math.round(base * multiplier)))
-  );
+  const scaled = (multiplier: number, floor: number) =>
+    Math.max(floor, Math.min(max, Math.round(base * multiplier)));
 
   return {
     xs: scaled(0.78, 9),

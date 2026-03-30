@@ -16,7 +16,10 @@ export {
 
 export { useBlitConnection } from "./hooks/useBlitConnection";
 export { useBlitSessions } from "./hooks/useBlitSessions";
-export { useBlitWorkspace, useBlitWorkspaceState } from "./hooks/useBlitWorkspace";
+export {
+  useBlitWorkspace,
+  useBlitWorkspaceState,
+} from "./hooks/useBlitWorkspace";
 export { useBlitFocusedSession } from "./hooks/useBlitSession";
 
 export { WebSocketTransport } from "./transports/websocket";
@@ -28,10 +31,7 @@ export type { WebTransportTransportOptions } from "./transports/webtransport";
 export { createWebRtcDataChannelTransport } from "./transports/webrtc";
 export type { WebRtcDataChannelTransportOptions } from "./transports/webrtc";
 
-export {
-  DEFAULT_FONT,
-  DEFAULT_FONT_SIZE,
-} from "./types";
+export { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
 export type {
   BlitConnectionSnapshot,
   BlitSearchResult,

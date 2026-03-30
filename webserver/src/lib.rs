@@ -43,6 +43,26 @@ pub fn font_response(name: &str, cors_origin: Option<&str>) -> Response {
     }
 }
 
+/// Serve font metrics (advance ratio) as JSON.
+pub fn font_metrics_response(name: &str, cors_origin: Option<&str>) -> Response {
+    match blit_fonts::font_advance_ratio(name) {
+        Some(ratio) => {
+            let json = format!("{{\"advanceRatio\":{}}}", ratio);
+            let mut resp = (
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
+                ],
+                json,
+            )
+                .into_response();
+            add_cors(&mut resp, cors_origin);
+            resp
+        }
+        None => (axum::http::StatusCode::NOT_FOUND, "font not found").into_response(),
+    }
+}
+
 fn add_cors(resp: &mut Response, origin: Option<&str>) {
     if let Some(origin) = origin {
         if let Ok(val) = origin.parse() {
@@ -73,6 +93,12 @@ pub fn html_response(html: &'static str, etag: &str, if_none_match: Option<&[u8]
 pub fn try_font_route(path: &str, cors_origin: Option<&str>) -> Option<Response> {
     if path == "/fonts" || path.ends_with("/fonts") {
         return Some(fonts_list_response(cors_origin));
+    }
+    if let Some(raw) = path.rsplit_once("/font-metrics/").map(|(_, n)| n) {
+        if !raw.contains('/') && !raw.is_empty() {
+            let name = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+            return Some(font_metrics_response(&name, cors_origin));
+        }
     }
     if let Some(raw) = path.rsplit_once("/font/").map(|(_, n)| n) {
         if !raw.contains('/') && !raw.is_empty() {

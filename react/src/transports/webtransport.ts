@@ -1,4 +1,8 @@
-import type { BlitTransport, BlitTransportOptions, ConnectionStatus } from "../types";
+import type {
+  BlitTransport,
+  BlitTransportOptions,
+  ConnectionStatus,
+} from "../types";
 
 export interface WebTransportTransportOptions extends BlitTransportOptions {
   /**
@@ -189,7 +193,12 @@ export class WebTransportTransport implements BlitTransport {
       this.wt = wt;
       await Promise.race([
         wt.ready,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("connect timeout")), this.connectTimeoutMs)),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("connect timeout")),
+            this.connectTimeoutMs,
+          ),
+        ),
       ]);
 
       if (this.disposed || this.wt !== wt) {

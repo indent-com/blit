@@ -1,7 +1,4 @@
-import {
-  PALETTES,
-  DEFAULT_FONT,
-} from "blit-react";
+import { PALETTES, DEFAULT_FONT } from "blit-react";
 import type { TerminalPalette } from "blit-react";
 
 export const PASS_KEY = "blit.passphrase";
@@ -9,6 +6,7 @@ export const HOST_KEY = "blit.host";
 export const PALETTE_KEY = "blit.palette";
 export const FONT_KEY = "blit.fontFamily";
 export const FONT_SIZE_KEY = "blit.fontSize";
+export const FONT_SMOOTHING_KEY = "blit.fontSmoothing";
 
 /** Remote hostname: injected by CLI, or falls back to location.hostname for gateway. */
 export function blitHost(): string {
@@ -32,9 +30,12 @@ export function writeStorage(key: string, value: string) {
 const gatewayHost = import.meta.env.VITE_BLIT_GATEWAY ?? location.host;
 
 /** Base path for API requests. In dev mode, points to the gateway; in production, relative to the page. */
-export const basePath = gatewayHost !== location.host
-  ? `//${gatewayHost}/`
-  : (location.pathname.endsWith("/") ? location.pathname : location.pathname + "/");
+export const basePath =
+  gatewayHost !== location.host
+    ? `//${gatewayHost}/`
+    : location.pathname.endsWith("/")
+      ? location.pathname
+      : location.pathname + "/";
 
 export function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";

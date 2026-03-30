@@ -31,7 +31,9 @@ export class TerminalStore {
   private dirtyListeners = new Set<TerminalDirtyListener>();
   private leadPtyId: number | null = null;
   private fontFamily = DEFAULT_FONT;
-  private fontSize = DEFAULT_FONT_SIZE * (typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1);
+  private fontSize =
+    DEFAULT_FONT_SIZE *
+    (typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1);
   private cellPw = 1;
   private cellPh = 1;
   private palette: TerminalPalette | null = null;
@@ -57,20 +59,24 @@ export class TerminalStore {
   /** Queued compressed payloads per PTY, drained in the rAF callback. */
   private pendingFrames = new Map<number, Uint8Array[]>();
 
-  constructor(delegate: TerminalStoreDelegate, wasm: BlitWasmModule | Promise<BlitWasmModule>) {
+  constructor(
+    delegate: TerminalStoreDelegate,
+    wasm: BlitWasmModule | Promise<BlitWasmModule>,
+  ) {
     this.delegate = delegate;
     this.startRafProbe();
 
     if (wasm instanceof Promise) {
-      wasm.then((mod) => {
-        if (this.disposed) return;
-        this.mod = mod;
-        this.ready = true;
-        for (const l of this.readyListeners) l();
-      })
-      .catch((err) => {
-        console.error("blit: failed to load WASM module:", err);
-      });
+      wasm
+        .then((mod) => {
+          if (this.disposed) return;
+          this.mod = mod;
+          this.ready = true;
+          for (const l of this.readyListeners) l();
+        })
+        .catch((err) => {
+          console.error("blit: failed to load WASM module:", err);
+        });
     } else {
       this.mod = wasm;
       this.ready = true;
@@ -78,7 +84,10 @@ export class TerminalStore {
   }
 
   private nowMs(): number {
-    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    if (
+      typeof performance !== "undefined" &&
+      typeof performance.now === "function"
+    ) {
       return performance.now();
     }
     return Date.now();
@@ -172,7 +181,8 @@ export class TerminalStore {
 
   private createTerminal(): Terminal {
     const t = new this.mod!.Terminal(24, 80, this.cellPw, this.cellPh);
-    if (typeof t.set_font_family === "function") t.set_font_family(this.fontFamily);
+    if (typeof t.set_font_family === "function")
+      t.set_font_family(this.fontFamily);
     if (typeof t.set_font_size === "function") t.set_font_size(this.fontSize);
     if (this.palette) {
       t.set_default_colors(...this.palette.fg, ...this.palette.bg);
@@ -242,7 +252,10 @@ export class TerminalStore {
   }
 
   /** Get a shared GL renderer for readOnly (preview) terminals. */
-  getSharedRenderer(): { renderer: GlRenderer; canvas: HTMLCanvasElement } | null {
+  getSharedRenderer(): {
+    renderer: GlRenderer;
+    canvas: HTMLCanvasElement;
+  } | null {
     if (this.sharedRenderer?.supported) {
       return { renderer: this.sharedRenderer, canvas: this.sharedCanvas! };
     }
@@ -264,7 +277,10 @@ export class TerminalStore {
     const q = this.pendingFrames.get(ptyId);
     if (!q || q.length === 0) return false;
     const t = this.terminals.get(ptyId);
-    if (!t) { q.length = 0; return false; }
+    if (!t) {
+      q.length = 0;
+      return false;
+    }
     const applyStart = this.nowMs();
     for (const payload of q) {
       t.feed_compressed(payload);

@@ -36,11 +36,15 @@ describe("keyToBytes", () => {
 
   describe("simple keys", () => {
     it("Enter sends CR", () => {
-      expect(Array.from(keyToBytes(makeEvent("Enter"), false)!)).toEqual([0x0d]);
+      expect(Array.from(keyToBytes(makeEvent("Enter"), false)!)).toEqual([
+        0x0d,
+      ]);
     });
 
     it("Backspace sends DEL", () => {
-      expect(Array.from(keyToBytes(makeEvent("Backspace"), false)!)).toEqual([0x7f]);
+      expect(Array.from(keyToBytes(makeEvent("Backspace"), false)!)).toEqual([
+        0x7f,
+      ]);
     });
 
     it("Tab sends HT", () => {
@@ -48,7 +52,9 @@ describe("keyToBytes", () => {
     });
 
     it("Escape sends ESC", () => {
-      expect(Array.from(keyToBytes(makeEvent("Escape"), false)!)).toEqual([0x1b]);
+      expect(Array.from(keyToBytes(makeEvent("Escape"), false)!)).toEqual([
+        0x1b,
+      ]);
     });
   });
 
@@ -173,9 +179,7 @@ describe("keyToBytes", () => {
     });
 
     it("returns null for meta+key", () => {
-      expect(
-        keyToBytes(makeEvent("c", { metaKey: true }), false),
-      ).toBeNull();
+      expect(keyToBytes(makeEvent("c", { metaKey: true }), false)).toBeNull();
     });
   });
 });

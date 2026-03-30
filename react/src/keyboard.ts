@@ -10,8 +10,7 @@ export function keyToBytes(
 ): Uint8Array | null {
   if (e.ctrlKey && !e.altKey && !e.metaKey) {
     const kc = e.key.charCodeAt(0);
-    if (e.key.length === 1 && kc >= 1 && kc <= 26)
-      return new Uint8Array([kc]);
+    if (e.key.length === 1 && kc >= 1 && kc <= 26) return new Uint8Array([kc]);
     if (e.key.length === 1) {
       const code = e.key.toLowerCase().charCodeAt(0);
       if (code >= 97 && code <= 122) return new Uint8Array([code - 96]);

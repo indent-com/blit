@@ -1,13 +1,5 @@
-import {
-  useState,
-  useCallback,
-  useRef,
-  useEffect,
-} from "react";
-import {
-  WebSocketTransport,
-  WebTransportTransport,
-} from "blit-react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { WebSocketTransport, WebTransportTransport } from "blit-react";
 import type { BlitTransport } from "blit-react";
 import type { BlitWasmModule } from "blit-react";
 import {
@@ -40,9 +32,7 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
 
   useEffect(() => {
     if (!savedPass || transport) return;
-    setTransport(
-      createTransport(savedPass),
-    );
+    setTransport(createTransport(savedPass));
   }, [savedPass, transport]);
 
   const connect = useCallback(
@@ -76,12 +66,18 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
     );
   }
 
-  return <Workspace transport={transport} wasm={wasm} onAuthError={() => {
-    transport.close();
-    writeStorage(PASS_KEY, "");
-    setTransport(null);
-    setAuthError(i18n("auth.failed"));
-  }} />;
+  return (
+    <Workspace
+      transport={transport}
+      wasm={wasm}
+      onAuthError={() => {
+        transport.close();
+        writeStorage(PASS_KEY, "");
+        setTransport(null);
+        setAuthError(i18n("auth.failed"));
+      }}
+    />
+  );
 }
 
 function AuthScreen({
@@ -96,13 +92,15 @@ function AuthScreen({
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   const theme = themeFor(dark);
   return (
-    <main style={{
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      height: "100%",
-      backgroundColor: theme.bg,
-    }}>
+    <main
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "100%",
+        backgroundColor: theme.bg,
+      }}
+    >
       <form
         style={{
           display: "flex",
@@ -131,7 +129,11 @@ function AuthScreen({
             color: theme.fg,
           }}
         />
-        {error && <output style={{ color: theme.errorText, fontSize: "0.85em" }}>{error}</output>}
+        {error && (
+          <output style={{ color: theme.errorText, fontSize: "0.85em" }}>
+            {error}
+          </output>
+        )}
       </form>
     </main>
   );

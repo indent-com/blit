@@ -14,9 +14,19 @@ export interface CellMetrics {
  * into a hidden span, then snapping to device pixel boundaries.
  */
 export const CSS_GENERIC = new Set([
-  "serif", "sans-serif", "monospace", "cursive", "fantasy",
-  "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded",
-  "math", "emoji", "fangsong",
+  "serif",
+  "sans-serif",
+  "monospace",
+  "cursive",
+  "fantasy",
+  "system-ui",
+  "ui-serif",
+  "ui-sans-serif",
+  "ui-monospace",
+  "ui-rounded",
+  "math",
+  "emoji",
+  "fangsong",
 ]);
 
 /** Quote font families for CSS font shorthand (canvas ctx.font). */
@@ -32,16 +42,27 @@ export function cssFontFamily(family: string): string {
     .join(", ");
 }
 
-export function measureCell(fontFamily: string, fontSize: number, dpr?: number): CellMetrics {
+export function measureCell(
+  fontFamily: string,
+  fontSize: number,
+  dpr?: number,
+  advanceRatio?: number,
+): CellMetrics {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d")!;
   ctx.font = `${fontSize}px ${cssFontFamily(fontFamily)}`;
-  const metrics = ctx.measureText("M");
-  const w = metrics.width;
-  // Use font metrics for accurate height: ascent + descent gives the full
-  // glyph extent. This matches how real terminals compute cell height from
-  // the font's ascender/descender values.
-  const h = metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent;
+
+  let w: number;
+  if (advanceRatio != null) {
+    // Use the font table's advance width, matching how native terminals compute cell width.
+    w = advanceRatio * fontSize;
+  } else {
+    const sample = "MMMMMMMMMM";
+    const metrics = ctx.measureText(sample);
+    w = metrics.width / sample.length;
+  }
+  const hMetrics = ctx.measureText("M");
+  const h = hMetrics.fontBoundingBoxAscent + hMetrics.fontBoundingBoxDescent;
 
   const d = dpr ?? (window.devicePixelRatio || 1);
   const pw = Math.round(w * d);

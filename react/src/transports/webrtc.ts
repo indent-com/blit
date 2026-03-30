@@ -1,4 +1,8 @@
-import type { BlitTransport, BlitTransportOptions, ConnectionStatus } from "../types";
+import type {
+  BlitTransport,
+  BlitTransportOptions,
+  ConnectionStatus,
+} from "../types";
 import { C2S_DISPLAY_RATE } from "../types";
 
 export interface WebRtcDataChannelTransportOptions extends BlitTransportOptions {

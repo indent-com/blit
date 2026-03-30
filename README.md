@@ -36,25 +36,25 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 
 ## How it compares
 
-| | blit | ttyd | gotty | Eternal Terminal | Mosh | xterm.js + node-pty |
-| --- | --- | --- | --- | --- | --- | --- |
-| Architecture | PTY host + gateway | Single binary | Single binary | Client + daemon | Client + server | Library (BYO server) |
-| Multiple PTYs | ✅ First-class | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual |
-| Browser access | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Protocol | Binary frame diffs | Raw byte stream | Raw byte stream | SSH + prediction | UDP + SSP | Raw byte stream |
-| Delta updates | ✅ Only changed cells sent | ❌ | ❌ | ❌ | ✅ State diffs | ❌ |
-| LZ4 compression | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Copy-rect scrolling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Per-client backpressure | ✅ Render-metric pacing | ❌ | ❌ | ⚠️ SSH flow control | ❌ | ❌ |
-| Background session throttling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Server-side search | ✅ Titles + visible + scrollback | ❌ | ❌ | ❌ | ❌ | ❌ |
-| WebGL rendering | ✅ | ❌ | ❌ | ❌ | ❌ | ⚠️ Addon |
-| Transport | WS, WebTransport, Unix | WebSocket | WebSocket | TCP | UDP | WebSocket |
-| WebTransport / QUIC | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Embeddable (React) | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Agent / CLI subcommands | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Reconnect on disconnect | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
-| SSH tunneling built-in | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
+|                               | blit                             | ttyd                | gotty               | Eternal Terminal      | Mosh                  | xterm.js + node-pty  |
+| ----------------------------- | -------------------------------- | ------------------- | ------------------- | --------------------- | --------------------- | -------------------- |
+| Architecture                  | PTY host + gateway               | Single binary       | Single binary       | Client + daemon       | Client + server       | Library (BYO server) |
+| Multiple PTYs                 | ✅ First-class                   | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual            |
+| Browser access                | ✅                               | ✅                  | ✅                  | ❌                    | ❌                    | ✅                   |
+| Protocol                      | Binary frame diffs               | Raw byte stream     | Raw byte stream     | SSH + prediction      | UDP + SSP             | Raw byte stream      |
+| Delta updates                 | ✅ Only changed cells sent       | ❌                  | ❌                  | ❌                    | ✅ State diffs        | ❌                   |
+| LZ4 compression               | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Copy-rect scrolling           | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Per-client backpressure       | ✅ Render-metric pacing          | ❌                  | ❌                  | ⚠️ SSH flow control   | ❌                    | ❌                   |
+| Background session throttling | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Server-side search            | ✅ Titles + visible + scrollback | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| WebGL rendering               | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ⚠️ Addon             |
+| Transport                     | WS, WebTransport, Unix           | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
+| WebTransport / QUIC           | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Embeddable (React)            | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
+| Agent / CLI subcommands       | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Reconnect on disconnect       | ✅                               | ✅                  | ❌                  | ✅                    | ✅                    | ❌                   |
+| SSH tunneling built-in        | ✅                               | ❌                  | ❌                  | ✅                    | ✅                    | ❌                   |
 
 ### Adjacent tools
 
@@ -68,19 +68,19 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 
 ## What lives in this repo
 
-| Directory | Package | Role |
-| --- | --- | --- |
-| `server/` | `blit-server` | PTY host and frame scheduler |
-| `remote/` | `blit-remote` | Wire protocol and frame/state primitives |
-| `browser/` | `blit-browser` | WASM terminal runtime |
-| `alacritty-driver/` | `blit-alacritty` | Terminal parsing backed by `alacritty_terminal` |
-| `react/` | `blit-react` | Workspace-based React client library |
-| `fonts/` | | Font discovery and metadata |
-| `webserver/` | | Shared HTTP helpers for serving assets and fonts |
-| `gateway/` | `blit-gateway` | WebSocket/WebTransport proxy |
-| `cli/` | `blit` | Browser client |
-| `web-app/` | | Browser UI |
-| `demo/` | | Sample programs and test content |
+| Directory           | Package          | Role                                             |
+| ------------------- | ---------------- | ------------------------------------------------ |
+| `server/`           | `blit-server`    | PTY host and frame scheduler                     |
+| `remote/`           | `blit-remote`    | Wire protocol and frame/state primitives         |
+| `browser/`          | `blit-browser`   | WASM terminal runtime                            |
+| `alacritty-driver/` | `blit-alacritty` | Terminal parsing backed by `alacritty_terminal`  |
+| `react/`            | `blit-react`     | Workspace-based React client library             |
+| `fonts/`            |                  | Font discovery and metadata                      |
+| `webserver/`        |                  | Shared HTTP helpers for serving assets and fonts |
+| `gateway/`          | `blit-gateway`   | WebSocket/WebTransport proxy                     |
+| `cli/`              | `blit`           | Browser client                                   |
+| `web-app/`          |                  | Browser UI                                       |
+| `demo/`             |                  | Sample programs and test content                 |
 
 ## Install
 
@@ -180,28 +180,28 @@ sudo systemctl enable --now blit@alice.socket
 
 ### `blit-server`
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SHELL` | `/bin/sh` | Shell to spawn for new PTYs |
-| `BLIT_SOCK` | `$TMPDIR/blit.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit-$USER.sock` | Unix socket path |
-| `BLIT_SCROLLBACK` | `10000` | Scrollback rows per PTY |
+| Variable          | Default                                                                      | Purpose                     |
+| ----------------- | ---------------------------------------------------------------------------- | --------------------------- |
+| `SHELL`           | `/bin/sh`                                                                    | Shell to spawn for new PTYs |
+| `BLIT_SOCK`       | `$TMPDIR/blit.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit-$USER.sock` | Unix socket path            |
+| `BLIT_SCROLLBACK` | `10000`                                                                      | Scrollback rows per PTY     |
 
 ### `blit-gateway`
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `BLIT_PASS` | required | Browser passphrase |
-| `BLIT_ADDR` | `0.0.0.0:3264` | HTTP/WebSocket listen address |
-| `BLIT_SOCK` | `$TMPDIR/blit.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit-$USER.sock` | Upstream server socket |
-| `BLIT_CORS` | unset | CORS origin for font routes |
-| `BLIT_QUIC` | unset | Set to `1` to enable WebTransport |
-| `BLIT_TLS_CERT` | auto-generated | TLS cert for WebTransport |
-| `BLIT_TLS_KEY` | auto-generated | TLS key for WebTransport |
+| Variable        | Default                                                                      | Purpose                           |
+| --------------- | ---------------------------------------------------------------------------- | --------------------------------- |
+| `BLIT_PASS`     | required                                                                     | Browser passphrase                |
+| `BLIT_ADDR`     | `0.0.0.0:3264`                                                               | HTTP/WebSocket listen address     |
+| `BLIT_SOCK`     | `$TMPDIR/blit.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit-$USER.sock` | Upstream server socket            |
+| `BLIT_CORS`     | unset                                                                        | CORS origin for font routes       |
+| `BLIT_QUIC`     | unset                                                                        | Set to `1` to enable WebTransport |
+| `BLIT_TLS_CERT` | auto-generated                                                               | TLS cert for WebTransport         |
+| `BLIT_TLS_KEY`  | auto-generated                                                               | TLS key for WebTransport          |
 
 ### `blit` (CLI)
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
+| Variable    | Default                                                                                                                | Purpose          |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------- |
 | `BLIT_SOCK` | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path |
 
 For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and opens the browser with an embedded local gateway.

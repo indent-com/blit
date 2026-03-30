@@ -67,16 +67,16 @@ function TerminalScreen() {
 
 ### React API
 
-| API | Purpose |
-| --- | --- |
-| `new BlitWorkspace({ wasm, connections })` | Create a workspace with one or more transports |
-| `BlitWorkspaceProvider` | Put the workspace, palette, and font settings in context |
-| `useBlitWorkspace()` | Get the imperative workspace object |
-| `useBlitWorkspaceState()` | Read the full reactive workspace snapshot |
-| `useBlitConnection(connectionId?)` | Read one connection snapshot |
-| `useBlitSessions()` | Read all sessions |
-| `useBlitFocusedSession()` | Read the currently focused session |
-| `BlitTerminal` | Render one session by `sessionId` |
+| API                                        | Purpose                                                  |
+| ------------------------------------------ | -------------------------------------------------------- |
+| `new BlitWorkspace({ wasm, connections })` | Create a workspace with one or more transports           |
+| `BlitWorkspaceProvider`                    | Put the workspace, palette, and font settings in context |
+| `useBlitWorkspace()`                       | Get the imperative workspace object                      |
+| `useBlitWorkspaceState()`                  | Read the full reactive workspace snapshot                |
+| `useBlitConnection(connectionId?)`         | Read one connection snapshot                             |
+| `useBlitSessions()`                        | Read all sessions                                        |
+| `useBlitFocusedSession()`                  | Read the currently focused session                       |
+| `BlitTerminal`                             | Render one session by `sessionId`                        |
 
 ### Workspace operations
 
@@ -92,13 +92,13 @@ function TerminalScreen() {
 
 All transports share a common set of options (`BlitTransportOptions`):
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `reconnect` | `true` | Auto-reconnect on disconnect |
-| `reconnectDelay` | `500` | Initial reconnect delay (ms) |
-| `maxReconnectDelay` | `10000` | Maximum reconnect delay (ms) |
-| `reconnectBackoff` | `1.5` | Backoff multiplier |
-| `connectTimeoutMs` | none (WS) / `10000` (WT, WebRTC) | Connection timeout (ms) |
+| Option              | Default                          | Description                  |
+| ------------------- | -------------------------------- | ---------------------------- |
+| `reconnect`         | `true`                           | Auto-reconnect on disconnect |
+| `reconnectDelay`    | `500`                            | Initial reconnect delay (ms) |
+| `maxReconnectDelay` | `10000`                          | Maximum reconnect delay (ms) |
+| `reconnectBackoff`  | `1.5`                            | Backoff multiplier           |
+| `connectTimeoutMs`  | none (WS) / `10000` (WT, WebRTC) | Connection timeout (ms)      |
 
 ```ts
 // WebSocket
@@ -122,7 +122,10 @@ interface BlitTransport {
   readonly authRejected: boolean;
   readonly lastError: string | null;
   addEventListener(type: "message" | "statuschange", listener: Function): void;
-  removeEventListener(type: "message" | "statuschange", listener: Function): void;
+  removeEventListener(
+    type: "message" | "statuschange",
+    listener: Function,
+  ): void;
 }
 ```
 

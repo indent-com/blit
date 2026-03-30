@@ -73,9 +73,20 @@ export function StatusBar({
 
   return (
     <>
-      <button onClick={onSwitcher} style={buttonStyle} title={t("statusbar.menuTitle")}>
-        {visible.length === 1 ? tp("statusbar.terminalOne", { count: 1 }) : tp("statusbar.terminalMany", { count: visible.length })}
-        {exited > 0 && <span style={{ opacity: 0.5 }}> {tp("statusbar.exited", { count: exited })}</span>}
+      <button
+        onClick={onSwitcher}
+        style={buttonStyle}
+        title={t("statusbar.menuTitle")}
+      >
+        {visible.length === 1
+          ? tp("statusbar.terminalOne", { count: 1 })
+          : tp("statusbar.terminalMany", { count: visible.length })}
+        {exited > 0 && (
+          <span style={{ opacity: 0.5 }}>
+            {" "}
+            {tp("statusbar.exited", { count: exited })}
+          </span>
+        )}
       </button>
       <span
         style={{
@@ -86,24 +97,45 @@ export function StatusBar({
           opacity: 0.7,
         }}
       >
-        {focusedSession && (
-          <>
-            {sessionName(focusedSession)}
-          </>
-        )}
+        {focusedSession && <>{sessionName(focusedSession)}</>}
       </span>
-      <span style={{ fontSize: scale.xs, opacity: 0.5, flexShrink: 0, whiteSpace: "nowrap" }}>
+      <span
+        style={{
+          fontSize: scale.xs,
+          opacity: 0.5,
+          flexShrink: 0,
+          whiteSpace: "nowrap",
+        }}
+      >
         {termSize ? `${termSize}@` : ""}
         {metrics.fps}/{metrics.ups}
       </span>
-      <button onClick={toggleDebug} style={{ ...buttonStyle, opacity: debug ? 1 : 0.3 }} title={t("statusbar.debugStats")}>
+      <button
+        onClick={toggleDebug}
+        style={{ ...buttonStyle, opacity: debug ? 1 : 0.3 }}
+        title={t("statusbar.debugStats")}
+      >
         &#x1F41B;
       </button>
-      <button onClick={onPalette} style={buttonStyle} title={tp("statusbar.paletteTitle", { name: palette.name })}>
+      <button
+        onClick={onPalette}
+        style={buttonStyle}
+        title={tp("statusbar.paletteTitle", { name: palette.name })}
+      >
         {palette.dark ? "\u25D1" : "\u25D0"}
       </button>
-      <button onClick={onFont} style={buttonStyle} title={t("statusbar.fontTitle")}>
-        {fontLoading ? <span style={{ opacity: 0.5, fontSize: scale.xs }}>{t("statusbar.loadingFont")}</span> : "Aa"}
+      <button
+        onClick={onFont}
+        style={buttonStyle}
+        title={t("statusbar.fontTitle")}
+      >
+        {fontLoading ? (
+          <span style={{ opacity: 0.5, fontSize: scale.xs }}>
+            {t("statusbar.loadingFont")}
+          </span>
+        ) : (
+          "Aa"
+        )}
       </button>
       <span
         role="status"
@@ -192,19 +224,48 @@ function DebugPanel({
     >
       <Row label="FPS / UPS" value={`${metrics.fps} / ${metrics.ups}`} />
       <Row label="Bandwidth" value={formatBw(metrics.bw)} />
-      <Row label="Render" value={`${metrics.renderMs.toFixed(1)} ms avg, ${metrics.maxRenderMs.toFixed(1)} ms max`} />
+      <Row
+        label="Render"
+        value={`${metrics.renderMs.toFixed(1)} ms avg, ${metrics.maxRenderMs.toFixed(1)} ms max`}
+      />
       <Row label="Display Hz" value={stats.displayFps} />
       <Row label="Backlog" value={stats.pendingApplied} />
       <Row label="Ack ahead" value={stats.ackAhead} />
       <Row label="Apply" value={`${stats.applyMs.toFixed(1)} ms`} />
-      <Row label="Mouse" value={`mode=${stats.mouseMode} enc=${stats.mouseEncoding}`} />
-      <Row label="Queued" value={`${stats.totalPendingFrames} frames in ${stats.pendingFrameQueues} queues`} />
-      <Row label="Terminals" value={`${stats.terminals} live, ${stats.staleTerminals} stale, ${stats.frozenPtys} frozen`} />
-      <div style={{ borderTop: `1px solid ${theme.subtleBorder}`, marginTop: 4, paddingTop: 2 }}>
+      <Row
+        label="Mouse"
+        value={`mode=${stats.mouseMode} enc=${stats.mouseEncoding}`}
+      />
+      <Row
+        label="Queued"
+        value={`${stats.totalPendingFrames} frames in ${stats.pendingFrameQueues} queues`}
+      />
+      <Row
+        label="Terminals"
+        value={`${stats.terminals} live, ${stats.staleTerminals} stale, ${stats.frozenPtys} frozen`}
+      />
+      <div
+        style={{
+          borderTop: `1px solid ${theme.subtleBorder}`,
+          marginTop: 4,
+          paddingTop: 2,
+        }}
+      >
         <span style={{ opacity: 0.6, fontSize: scale.xs }}>Render</span>
-        <RenderTimeline timelineRef={timelineRef} palette={palette} displayFps={stats.displayFps} fontSize={scale.xs} />
+        <RenderTimeline
+          timelineRef={timelineRef}
+          palette={palette}
+          displayFps={stats.displayFps}
+          fontSize={scale.xs}
+        />
       </div>
-      <div style={{ borderTop: `1px solid ${theme.subtleBorder}`, marginTop: 4, paddingTop: 2 }}>
+      <div
+        style={{
+          borderTop: `1px solid ${theme.subtleBorder}`,
+          marginTop: 4,
+          paddingTop: 2,
+        }}
+      >
         <span style={{ opacity: 0.6, fontSize: scale.xs }}>Network</span>
         <NetTimeline netRef={netRef} palette={palette} fontSize={scale.xs} />
       </div>
@@ -214,7 +275,9 @@ function DebugPanel({
 
 function Row({ label, value }: { label: string; value: string | number }) {
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", gap: "1em" }}>
+    <div
+      style={{ display: "flex", justifyContent: "space-between", gap: "1em" }}
+    >
       <span style={{ opacity: 0.6 }}>{label}</span>
       <span>{value}</span>
     </div>
@@ -288,7 +351,11 @@ function RenderTimeline({
       ctx.textBaseline = "top";
       ctx.fillText(`${maxMs}ms`, 2 * dpr, 2 * dpr);
       ctx.textAlign = "right";
-      ctx.fillText(`budget ${budgetMs.toFixed(1)}ms`, (W - 2) * dpr, budgetY - 10 * dpr);
+      ctx.fillText(
+        `budget ${budgetMs.toFixed(1)}ms`,
+        (W - 2) * dpr,
+        budgetY - 10 * dpr,
+      );
       ctx.textAlign = "left";
       ctx.textBaseline = "bottom";
       ctx.fillText("0ms", 2 * dpr, H * dpr - 2 * dpr);
@@ -345,7 +412,8 @@ function NetTimeline({
       const windowMs = 2000;
       let maxBytes = 256;
       for (const sample of samples) {
-        if (now - sample.t <= windowMs) maxBytes = Math.max(maxBytes, sample.bytes);
+        if (now - sample.t <= windowMs)
+          maxBytes = Math.max(maxBytes, sample.bytes);
       }
 
       const midY = (H * dpr) / 2;
@@ -363,9 +431,7 @@ function NetTimeline({
         const x = ((windowMs - age) / windowMs) * W * dpr;
         const barH = Math.min(sample.bytes / maxBytes, 1) * (H * dpr * 0.45);
         const y = sample.dir === "rx" ? midY - barH : midY;
-        ctx.fillStyle = sample.dir === "rx"
-          ? rgba(rx, 0.82)
-          : rgba(tx, 0.82);
+        ctx.fillStyle = sample.dir === "rx" ? rgba(rx, 0.82) : rgba(tx, 0.82);
         ctx.fillRect(x, y, Math.max(1, dpr), barH);
       }
 

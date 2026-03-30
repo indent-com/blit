@@ -9,7 +9,10 @@ async function authenticate(page: import("@playwright/test").Page) {
   await passInput.fill("test-secret");
   await passInput.press("Enter");
   await expect(
-    page.getByRole("button", { name: "New terminal" }).first().or(page.locator("canvas").first()),
+    page
+      .getByRole("button", { name: "New terminal" })
+      .first()
+      .or(page.locator("canvas").first()),
   ).toBeVisible({ timeout: 10_000 });
   const canvas = page.locator("canvas").first();
   if (!(await canvas.isVisible().catch(() => false))) {
@@ -61,11 +64,27 @@ for (const vp of VIEWPORTS) {
         cellW: m.width,
         cellH: m.fontBoundingBoxAscent + m.fontBoundingBoxDescent,
         dpr: window.devicePixelRatio,
-        totalCells: c ? Math.floor(c.width / Math.max(1, Math.round(m.width * window.devicePixelRatio)))
-          * Math.floor(c.height / Math.max(1, Math.round((m.fontBoundingBoxAscent + m.fontBoundingBoxDescent) * window.devicePixelRatio))) : 0,
+        totalCells: c
+          ? Math.floor(
+              c.width /
+                Math.max(1, Math.round(m.width * window.devicePixelRatio)),
+            ) *
+            Math.floor(
+              c.height /
+                Math.max(
+                  1,
+                  Math.round(
+                    (m.fontBoundingBoxAscent + m.fontBoundingBoxDescent) *
+                      window.devicePixelRatio,
+                  ),
+                ),
+            )
+          : 0,
       };
     }, vp.fontSize);
-    console.log(`${vp.name}: canvas=${info.canvasW}x${info.canvasH} cell=${info.cellW}x${info.cellH} cells=${info.totalCells}`);
+    console.log(
+      `${vp.name}: canvas=${info.canvasW}x${info.canvasH} cell=${info.cellW}x${info.cellH} cells=${info.totalCells}`,
+    );
 
     // Check any canvas has non-blank pixels (rendering is working).
     // The display canvas (2D) is reliable; the GL canvas may be cleared

@@ -23,7 +23,13 @@ export function LayoutPreview({
   /** Opacity for the highlighted leaf (defaults to 1). */
   highlightOpacity?: number;
 }) {
-  const rects: Array<{ x: number; y: number; w: number; h: number; leafIndex: number }> = [];
+  const rects: Array<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    leafIndex: number;
+  }> = [];
   let leafCounter = 0;
   const gap = 1;
 
@@ -35,7 +41,10 @@ export function LayoutPreview({
 
     if (n.direction === "tabs") {
       const tabH = Math.max(2, Math.round(h * 0.1));
-      const tabW = Math.max(2, Math.round((w - gap * (n.children.length - 1)) / n.children.length));
+      const tabW = Math.max(
+        2,
+        Math.round((w - gap * (n.children.length - 1)) / n.children.length),
+      );
 
       // Figure out which tab child contains the highlighted leaf.
       let activeChild = 0;
@@ -43,7 +52,10 @@ export function LayoutPreview({
         let leafStart = leafCounter;
         for (let i = 0; i < n.children.length; i++) {
           const count = leafCount(n.children[i].node);
-          if (highlightIndex >= leafStart && highlightIndex < leafStart + count) {
+          if (
+            highlightIndex >= leafStart &&
+            highlightIndex < leafStart + count
+          ) {
             activeChild = i;
             break;
           }
@@ -53,7 +65,10 @@ export function LayoutPreview({
 
       for (let i = 0; i < n.children.length; i++) {
         rects.push({
-          x: x + i * (tabW + gap), y, w: tabW, h: tabH,
+          x: x + i * (tabW + gap),
+          y,
+          w: tabW,
+          h: tabH,
           leafIndex: i === activeChild ? (highlightIndex ?? -1) : -1,
         });
       }
@@ -78,9 +93,10 @@ export function LayoutPreview({
     for (let i = 0; i < n.children.length; i++) {
       const child = n.children[i];
       const size = Math.round((child.weight / totalWeight) * available);
-      const actualSize = i === n.children.length - 1
-        ? available - offset // last child gets remainder to avoid rounding gaps
-        : size;
+      const actualSize =
+        i === n.children.length - 1
+          ? available - offset // last child gets remainder to avoid rounding gaps
+          : size;
 
       if (isHoriz) {
         layout(child.node, x + offset, y, actualSize, h);
@@ -103,7 +119,11 @@ export function LayoutPreview({
           width={Math.max(0, r.w)}
           height={Math.max(0, r.h)}
           fill={color}
-          opacity={r.leafIndex >= 0 && r.leafIndex === highlightIndex ? (highlightOpacity ?? 1) : opacity}
+          opacity={
+            r.leafIndex >= 0 && r.leafIndex === highlightIndex
+              ? (highlightOpacity ?? 1)
+              : opacity
+          }
           rx={1}
         />
       ))}

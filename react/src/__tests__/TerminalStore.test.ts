@@ -5,12 +5,7 @@ import { MockTransport } from "./mock-transport";
 import { C2S_ACK, C2S_CLIENT_METRICS } from "../types";
 
 class FakeTerminal {
-  constructor(
-    _rows: number,
-    _cols: number,
-    _cellPw: number,
-    _cellPh: number,
-  ) {}
+  constructor(_rows: number, _cols: number, _cellPw: number, _cellPh: number) {}
 
   set_font_family(_fontFamily: string): void {}
   set_font_size(_fontSize: number): void {}
@@ -51,19 +46,13 @@ describe("TerminalStore client metrics", () => {
       (msg) => msg[0] === C2S_CLIENT_METRICS,
     );
     expect(appliedMetrics).toBeTruthy();
-    expect(
-      (appliedMetrics![1] | (appliedMetrics![2] << 8)) >>> 0,
-    ).toBe(1);
-    expect(
-      (appliedMetrics![3] | (appliedMetrics![4] << 8)) >>> 0,
-    ).toBe(1);
+    expect((appliedMetrics![1] | (appliedMetrics![2] << 8)) >>> 0).toBe(1);
+    expect((appliedMetrics![3] | (appliedMetrics![4] << 8)) >>> 0).toBe(1);
 
     store.noteFrameRendered();
     await Promise.resolve();
 
-    const acksAfterRender = transport.sent.filter(
-      (msg) => msg[0] === C2S_ACK,
-    );
+    const acksAfterRender = transport.sent.filter((msg) => msg[0] === C2S_ACK);
     expect(acksAfterRender.length).toBeGreaterThan(0);
 
     const clearedMetrics = transport.sent

@@ -7,6 +7,7 @@ export interface BlitContextValue {
   palette?: TerminalPalette;
   fontFamily?: string;
   fontSize?: number;
+  advanceRatio?: number;
 }
 
 const BlitContext = createContext<BlitContextValue>({});
@@ -25,10 +26,11 @@ export function BlitWorkspaceProvider({
   palette,
   fontFamily,
   fontSize,
+  advanceRatio,
 }: BlitProviderProps) {
   const value = useMemo(
-    () => ({ workspace, palette, fontFamily, fontSize }),
-    [workspace, palette, fontFamily, fontSize],
+    () => ({ workspace, palette, fontFamily, fontSize, advanceRatio }),
+    [workspace, palette, fontFamily, fontSize, advanceRatio],
   );
   return <BlitContext.Provider value={value}>{children}</BlitContext.Provider>;
 }
@@ -36,9 +38,7 @@ export function BlitWorkspaceProvider({
 export function useRequiredBlitWorkspace(): BlitWorkspace {
   const workspace = useBlitContext().workspace;
   if (!workspace) {
-    throw new Error(
-      "Blit components require a BlitWorkspaceProvider ancestor",
-    );
+    throw new Error("Blit components require a BlitWorkspaceProvider ancestor");
   }
   return workspace;
 }

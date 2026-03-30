@@ -65,49 +65,50 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt and `clippy -D 
 
 `./bin/dev` starts the full stack with hot-reloading via `process-compose`:
 
-| Process | What it does | Port / socket |
-| --- | --- | --- |
-| `browser-wasm` | Watches `browser/src` + `remote/src`, rebuilds WASM | n/a |
-| `server` | `cargo watch` running `blit-server --release` | `/tmp/blit-dev.sock` |
-| `gateway` | `cargo watch` running `blit-gateway --release` (pass=`dev`) | `127.0.0.1:3266` |
-| `web-app` | Vite dev server for `web-app/` | printed by Vite |
+| Process        | What it does                                                | Port / socket        |
+| -------------- | ----------------------------------------------------------- | -------------------- |
+| `browser-wasm` | Watches `browser/src` + `remote/src`, rebuilds WASM         | n/a                  |
+| `server`       | `cargo watch` running `blit-server --release`               | `/tmp/blit-dev.sock` |
+| `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`) | `127.0.0.1:3266`     |
+| `web-app`      | Vite dev server for `web-app/`                              | printed by Vite      |
 
 ## Project structure
 
 Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cli` which is split into four and `blit-demo` which has extra binaries in `src/bin/`. There are no multi-level module trees.
 
-| File | Lines | Role |
-| --- | --- | --- |
-| `server/src/main.rs` | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control |
-| `remote/src/lib.rs` | ~3000 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
-| `cli/src/interactive.rs` | ~1650 | Console TUI and browser mode |
-| `browser/src/lib.rs` | ~1100 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas |
-| `alacritty-driver/src/lib.rs` | ~1100 | Terminal parsing wrapper around `alacritty_terminal` |
-| `cli/src/agent.rs` | ~870 | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close` |
-| `demo/src/main.rs` | ~780 | Demo programs |
-| `gateway/src/main.rs` | ~700 | WebSocket/WebTransport proxy |
-| `fonts/src/lib.rs` | ~600 | Font discovery and TTF/OTF parsing |
-| `cli/src/main.rs` | ~185 | Clap structs and dispatch |
-| `cli/src/transport.rs` | ~130 | Transport abstraction (Unix/TCP/SSH) |
-| `webserver/src/lib.rs` | ~90 | Shared axum HTTP helpers |
+| File                          | Lines | Role                                                                                                             |
+| ----------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------- |
+| `server/src/main.rs`          | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control                                     |
+| `remote/src/lib.rs`           | ~3000 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
+| `cli/src/interactive.rs`      | ~1650 | Console TUI and browser mode                                                                                     |
+| `browser/src/lib.rs`          | ~1100 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
+| `alacritty-driver/src/lib.rs` | ~1100 | Terminal parsing wrapper around `alacritty_terminal`                                                             |
+| `cli/src/agent.rs`            | ~870  | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
+| `demo/src/main.rs`            | ~780  | Demo programs                                                                                                    |
+| `gateway/src/main.rs`         | ~700  | WebSocket/WebTransport proxy                                                                                     |
+| `fonts/src/lib.rs`            | ~600  | Font discovery and TTF/OTF parsing                                                                               |
+| `cli/src/main.rs`             | ~185  | Clap structs and dispatch                                                                                        |
+| `cli/src/transport.rs`        | ~130  | Transport abstraction (Unix/TCP/SSH)                                                                             |
+| `webserver/src/lib.rs`        | ~90   | Shared axum HTTP helpers                                                                                         |
 
 ### Non-Rust code
 
-| Directory | What |
-| --- | --- |
-| `react/` | `blit-react` npm package — React library with hooks, transports, WebGL renderer. Tests in `react/src/__tests__/`. |
-| `web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar |
-| `e2e/` | Playwright tests against the full stack (6 spec files) |
-| `nix/` | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules |
-| `systemd/` | Socket-activated unit files (user-level and system-level templates) |
-| `man/` | scdoc man pages for `blit`, `blit-server`, `blit-gateway` |
-| `bin/` | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator |
+| Directory  | What                                                                                                               |
+| ---------- | ------------------------------------------------------------------------------------------------------------------ |
+| `react/`   | `blit-react` npm package — React library with hooks, transports, WebGL renderer. Tests in `react/src/__tests__/`.  |
+| `web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                               |
+| `e2e/`     | Playwright tests against the full stack (6 spec files)                                                             |
+| `nix/`     | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules |
+| `systemd/` | Socket-activated unit files (user-level and system-level templates)                                                |
+| `man/`     | scdoc man pages for `blit`, `blit-server`, `blit-gateway`                                                          |
+| `bin/`     | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                             |
 
 ## Code conventions
 
 **Single-file crates.** Don't introduce `mod` trees. If a crate grows, add a second file at the same level (like `cli/src/agent.rs`) and `mod` it from the root.
 
 **Wire protocol changes** touch multiple layers. A new message type requires:
+
 1. Constants and `ServerMsg`/parse case in `remote/src/lib.rs`
 2. A `msg_*()` builder function in `remote/src/lib.rs`
 3. Server handler in `server/src/main.rs`

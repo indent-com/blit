@@ -9,11 +9,16 @@ async function authenticate(page: import("@playwright/test").Page) {
   await passInput.fill("test-secret");
   await passInput.press("Enter");
   await expect(
-    page.getByRole("button", { name: "New terminal" }).first().or(page.locator("canvas").first()),
+    page
+      .getByRole("button", { name: "New terminal" })
+      .first()
+      .or(page.locator("canvas").first()),
   ).toBeVisible({ timeout: 10_000 });
 }
 
-async function authenticateAndCreateTerminal(page: import("@playwright/test").Page) {
+async function authenticateAndCreateTerminal(
+  page: import("@playwright/test").Page,
+) {
   await authenticate(page);
   const canvas = page.locator("canvas").first();
   if (!(await canvas.isVisible().catch(() => false))) {
@@ -23,12 +28,13 @@ async function authenticateAndCreateTerminal(page: import("@playwright/test").Pa
 }
 
 test.describe("Terminal", () => {
-  test("after auth, workspace is ready", async ({
-    page,
-  }) => {
+  test("after auth, workspace is ready", async ({ page }) => {
     await authenticate(page);
     await expect(
-      page.getByRole("button", { name: "New terminal" }).first().or(page.locator("canvas").first()),
+      page
+        .getByRole("button", { name: "New terminal" })
+        .first()
+        .or(page.locator("canvas").first()),
     ).toBeVisible();
   });
 
@@ -66,7 +72,9 @@ test.describe("Terminal", () => {
     expect(box!.height).toBeGreaterThan(0);
   });
 
-  test("Switcher opens on Ctrl+K and shows search and items", async ({ page }) => {
+  test("Switcher opens on Ctrl+K and shows search and items", async ({
+    page,
+  }) => {
     await authenticateAndCreateTerminal(page);
     await page.waitForTimeout(500);
 
@@ -100,7 +108,9 @@ test.describe("Terminal", () => {
     expect(canvasAfter).toBeGreaterThanOrEqual(canvasBefore);
   });
 
-  test("Switcher preview canvases render with non-zero dimensions", async ({ page }) => {
+  test("Switcher preview canvases render with non-zero dimensions", async ({
+    page,
+  }) => {
     await authenticateAndCreateTerminal(page);
     await page.waitForTimeout(500);
 

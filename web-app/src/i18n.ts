@@ -68,9 +68,10 @@ const en: Messages = {
   "switcher.sectionLayouts": "Layouts",
   "switcher.sectionActions": "Actions",
   "switcher.newTerminal": "New terminal",
-  "switcher.runCommand": "Run \"{command}\"",
+  "switcher.runCommand": 'Run "{command}"',
   "switcher.createRunning": "Create a new terminal running this command",
-  "switcher.createInCwd": "Create a new terminal in the current working directory",
+  "switcher.createInCwd":
+    "Create a new terminal in the current working directory",
   "switcher.useTypedLayout": "Use typed layout",
   "switcher.exitedTerminal": "Exited terminal",
   "switcher.openTerminal": "Open terminal",
@@ -94,19 +95,20 @@ const en: Messages = {
   "switcher.badgeRecent": "Recent",
   "switcher.badgeDefault": "Default",
   "switcher.noMatches": "No matches",
-  "switcher.noMatchesHint": "Try a broader search, browse the default layouts, or type >command to open a terminal.",
+  "switcher.noMatchesHint":
+    "Try a broader search, browse the default layouts, or type >command to open a terminal.",
   "switcher.previewLayout": "Layout",
   "switcher.previewPane": "Pane",
   "switcher.previewTerminal": "Terminal",
   "switcher.applyLayout": "Apply Layout",
   "switcher.selectPane": "Select Pane",
   "switcher.focusTerminal": "Focus Terminal",
-  "switcher.runInPane": "Run \"{command}\" in {pane}",
+  "switcher.runInPane": 'Run "{command}" in {pane}',
   "switcher.paneEmpty": "{pane} is empty — Tab+>cmd or Enter for shell",
   "switcher.selectHint": "Select a layout, pane, terminal, or action.",
   "switcher.paneCount": "{count} panes",
   "switcher.close": "Close",
-  "switcher.runInlineCmd": "Run \"{command}\"",
+  "switcher.runInlineCmd": 'Run "{command}"',
 
   "statusbar.menuTitle": "Menu",
   "statusbar.terminalOne": "{count} terminal",
@@ -219,9 +221,10 @@ const es: Messages = {
   "switcher.sectionLayouts": "Diseños",
   "switcher.sectionActions": "Acciones",
   "switcher.newTerminal": "Nueva terminal",
-  "switcher.runCommand": "Ejecutar \"{command}\"",
+  "switcher.runCommand": 'Ejecutar "{command}"',
   "switcher.createRunning": "Crear una terminal ejecutando este comando",
-  "switcher.createInCwd": "Crear una terminal en el directorio de trabajo actual",
+  "switcher.createInCwd":
+    "Crear una terminal en el directorio de trabajo actual",
   "switcher.useTypedLayout": "Usar diseño escrito",
   "switcher.exitedTerminal": "Terminal finalizada",
   "switcher.openTerminal": "Terminal abierta",
@@ -245,19 +248,20 @@ const es: Messages = {
   "switcher.badgeRecent": "Reciente",
   "switcher.badgeDefault": "Predeterminado",
   "switcher.noMatches": "Sin resultados",
-  "switcher.noMatchesHint": "Intente una búsqueda más amplia, explore los diseños predeterminados o escriba >comando para abrir una terminal.",
+  "switcher.noMatchesHint":
+    "Intente una búsqueda más amplia, explore los diseños predeterminados o escriba >comando para abrir una terminal.",
   "switcher.previewLayout": "Diseño",
   "switcher.previewPane": "Panel",
   "switcher.previewTerminal": "Terminal",
   "switcher.applyLayout": "Aplicar diseño",
   "switcher.selectPane": "Seleccionar panel",
   "switcher.focusTerminal": "Enfocar terminal",
-  "switcher.runInPane": "Ejecutar \"{command}\" en {pane}",
+  "switcher.runInPane": 'Ejecutar "{command}" en {pane}',
   "switcher.paneEmpty": "{pane} está vacío — Tab+>cmd o Enter para shell",
   "switcher.selectHint": "Seleccione un diseño, panel, terminal o acción.",
   "switcher.paneCount": "{count} paneles",
   "switcher.close": "Cerrar",
-  "switcher.runInlineCmd": "Ejecutar \"{command}\"",
+  "switcher.runInlineCmd": 'Ejecutar "{command}"',
 
   "statusbar.menuTitle": "Menú",
   "statusbar.terminalOne": "{count} terminal",
@@ -322,7 +326,8 @@ const fr: Messages = {
   "disconnected.disconnectedFromServer": "Déconnecté du serveur",
   "disconnected.retryStarted": "Tentative {count} lancée",
   "disconnected.retryAuth": "Authentification de la tentative {count}",
-  "disconnected.retryAuthFailed": "Échec de l’authentification de la tentative {count}",
+  "disconnected.retryAuthFailed":
+    "Échec de l’authentification de la tentative {count}",
   "disconnected.retryFailed": "Échec de la tentative {count}",
   "disconnected.retryDisconnected": "Tentative {count} déconnectée",
   "disconnected.manualReconnect": "Reconnexion manuelle demandée",
@@ -372,7 +377,8 @@ const fr: Messages = {
   "switcher.newTerminal": "Nouveau terminal",
   "switcher.runCommand": "Exécuter « {command} »",
   "switcher.createRunning": "Créer un terminal exécutant cette commande",
-  "switcher.createInCwd": "Créer un terminal dans le répertoire de travail actuel",
+  "switcher.createInCwd":
+    "Créer un terminal dans le répertoire de travail actuel",
   "switcher.useTypedLayout": "Utiliser la disposition saisie",
   "switcher.exitedTerminal": "Terminal terminé",
   "switcher.openTerminal": "Terminal ouvert",
@@ -396,7 +402,8 @@ const fr: Messages = {
   "switcher.badgeRecent": "Récent",
   "switcher.badgeDefault": "Par défaut",
   "switcher.noMatches": "Aucun résultat",
-  "switcher.noMatchesHint": "Essayez une recherche plus large, parcourez les dispositions par défaut ou tapez >commande pour ouvrir un terminal.",
+  "switcher.noMatchesHint":
+    "Essayez une recherche plus large, parcourez les dispositions par défaut ou tapez >commande pour ouvrir un terminal.",
   "switcher.previewLayout": "Disposition",
   "switcher.previewPane": "Panneau",
   "switcher.previewTerminal": "Terminal",
@@ -405,7 +412,8 @@ const fr: Messages = {
   "switcher.focusTerminal": "Activer le terminal",
   "switcher.runInPane": "Exécuter « {command} » dans {pane}",
   "switcher.paneEmpty": "{pane} est vide — Tab+>cmd ou Entrée pour le shell",
-  "switcher.selectHint": "Sélectionnez une disposition, un panneau, un terminal ou une action.",
+  "switcher.selectHint":
+    "Sélectionnez une disposition, un panneau, un terminal ou une action.",
   "switcher.paneCount": "{count} panneaux",
   "switcher.close": "Fermer",
   "switcher.runInlineCmd": "Exécuter « {command} »",
@@ -466,14 +474,16 @@ const de: Messages = {
   "disconnected.connectingToServer": "Verbindung zum Server wird hergestellt",
   "disconnected.authenticatingWithServer": "Authentifizierung beim Server",
   "disconnected.connectionRestored": "Verbindung wiederhergestellt",
-  "disconnected.connectionRestoredAfter": "Verbindung wiederhergestellt nach {retries}",
+  "disconnected.connectionRestoredAfter":
+    "Verbindung wiederhergestellt nach {retries}",
   "disconnected.authFailed": "Authentifizierung fehlgeschlagen",
   "disconnected.connectionFailed": "Verbindung fehlgeschlagen",
   "disconnected.connectionLost": "Verbindung verloren",
   "disconnected.disconnectedFromServer": "Vom Server getrennt",
   "disconnected.retryStarted": "Versuch {count} gestartet",
   "disconnected.retryAuth": "Authentifizierung bei Versuch {count}",
-  "disconnected.retryAuthFailed": "Authentifizierung bei Versuch {count} fehlgeschlagen",
+  "disconnected.retryAuthFailed":
+    "Authentifizierung bei Versuch {count} fehlgeschlagen",
   "disconnected.retryFailed": "Versuch {count} fehlgeschlagen",
   "disconnected.retryDisconnected": "Versuch {count} getrennt",
   "disconnected.manualReconnect": "Manuelle Wiederverbindung angefordert",
@@ -523,7 +533,8 @@ const de: Messages = {
   "switcher.newTerminal": "Neues Terminal",
   "switcher.runCommand": "„{command}“ ausführen",
   "switcher.createRunning": "Neues Terminal mit diesem Befehl erstellen",
-  "switcher.createInCwd": "Neues Terminal im aktuellen Arbeitsverzeichnis erstellen",
+  "switcher.createInCwd":
+    "Neues Terminal im aktuellen Arbeitsverzeichnis erstellen",
   "switcher.useTypedLayout": "Eingegebenes Layout verwenden",
   "switcher.exitedTerminal": "Beendetes Terminal",
   "switcher.openTerminal": "Offenes Terminal",
@@ -538,7 +549,8 @@ const de: Messages = {
   "switcher.font": "Schrift",
   "switcher.switchFont": "Schrift und Größe des Terminals ändern",
   "switcher.clearLocalStorage": "Lokalen Speicher löschen",
-  "switcher.clearLocalStorageDesc": "Alle Einstellungen zurücksetzen und neu laden",
+  "switcher.clearLocalStorageDesc":
+    "Alle Einstellungen zurücksetzen und neu laden",
   "switcher.badgeFocused": "Fokussiert",
   "switcher.badgeEmpty": "Leer",
   "switcher.badgeExited": "Beendet",
@@ -547,7 +559,8 @@ const de: Messages = {
   "switcher.badgeRecent": "Kürzlich",
   "switcher.badgeDefault": "Standard",
   "switcher.noMatches": "Keine Treffer",
-  "switcher.noMatchesHint": "Versuchen Sie eine breitere Suche, sehen Sie sich die Standard-Layouts an oder geben Sie >Befehl ein, um ein Terminal zu öffnen.",
+  "switcher.noMatchesHint":
+    "Versuchen Sie eine breitere Suche, sehen Sie sich die Standard-Layouts an oder geben Sie >Befehl ein, um ein Terminal zu öffnen.",
   "switcher.previewLayout": "Layout",
   "switcher.previewPane": "Bereich",
   "switcher.previewTerminal": "Terminal",
@@ -556,7 +569,8 @@ const de: Messages = {
   "switcher.focusTerminal": "Terminal fokussieren",
   "switcher.runInPane": "„{command}“ in {pane} ausführen",
   "switcher.paneEmpty": "{pane} ist leer — Tab+>Befehl oder Enter für Shell",
-  "switcher.selectHint": "Wählen Sie ein Layout, einen Bereich, ein Terminal oder eine Aktion.",
+  "switcher.selectHint":
+    "Wählen Sie ein Layout, einen Bereich, ein Terminal oder eine Aktion.",
   "switcher.paneCount": "{count} Bereiche",
   "switcher.close": "Schließen",
   "switcher.runInlineCmd": "„{command}“ ausführen",
@@ -698,7 +712,8 @@ const ja: Messages = {
   "switcher.badgeRecent": "最近",
   "switcher.badgeDefault": "デフォルト",
   "switcher.noMatches": "一致なし",
-  "switcher.noMatchesHint": "より広い検索を試すか、デフォルトのレイアウトを閲覧するか、>コマンド でターミナルを開いてください。",
+  "switcher.noMatchesHint":
+    "より広い検索を試すか、デフォルトのレイアウトを閲覧するか、>コマンド でターミナルを開いてください。",
   "switcher.previewLayout": "レイアウト",
   "switcher.previewPane": "ペイン",
   "switcher.previewTerminal": "ターミナル",
@@ -707,7 +722,8 @@ const ja: Messages = {
   "switcher.focusTerminal": "ターミナルをフォーカス",
   "switcher.runInPane": "{pane} で「{command}」を実行",
   "switcher.paneEmpty": "{pane} は空です — Tab+>コマンド または Enter でシェル",
-  "switcher.selectHint": "レイアウト、ペイン、ターミナル、またはアクションを選択してください。",
+  "switcher.selectHint":
+    "レイアウト、ペイン、ターミナル、またはアクションを選択してください。",
   "switcher.paneCount": "{count} ペイン",
   "switcher.close": "閉じる",
   "switcher.runInlineCmd": "「{command}」を実行",
@@ -849,7 +865,8 @@ const zh: Messages = {
   "switcher.badgeRecent": "最近",
   "switcher.badgeDefault": "默认",
   "switcher.noMatches": "无匹配结果",
-  "switcher.noMatchesHint": "尝试更广泛的搜索，浏览默认布局，或输入 >命令 打开终端。",
+  "switcher.noMatchesHint":
+    "尝试更广泛的搜索，浏览默认布局，或输入 >命令 打开终端。",
   "switcher.previewLayout": "布局",
   "switcher.previewPane": "窗格",
   "switcher.previewTerminal": "终端",
@@ -909,7 +926,10 @@ const zh: Messages = {
 const locales: Record<string, Messages> = { en, es, fr, de, ja, zh };
 
 function detectLocale(): string {
-  const lang = (typeof navigator !== "undefined" ? navigator.language : "en")?.split("-")[0] ?? "en";
+  const lang =
+    (typeof navigator !== "undefined" ? navigator.language : "en")?.split(
+      "-",
+    )[0] ?? "en";
   return lang in locales ? lang : "en";
 }
 
@@ -919,7 +939,10 @@ export function t(key: string): string {
   return messages[key] ?? en[key] ?? key;
 }
 
-export function tp(key: string, params: Record<string, string | number>): string {
+export function tp(
+  key: string,
+  params: Record<string, string | number>,
+): string {
   let msg = t(key);
   for (const [k, v] of Object.entries(params)) {
     msg = msg.split(`{${k}}`).join(String(v));

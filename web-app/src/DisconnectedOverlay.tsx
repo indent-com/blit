@@ -19,7 +19,9 @@ function formatTimestamp(): string {
 }
 
 function formatRetryLabel(retryCount: number): string {
-  return retryCount === 1 ? t("disconnected.retryOne") : tp("disconnected.retryMany", { count: retryCount });
+  return retryCount === 1
+    ? t("disconnected.retryOne")
+    : tp("disconnected.retryMany", { count: retryCount });
 }
 
 function describeStatusTransition(
@@ -38,7 +40,9 @@ function describeStatusTransition(
         : t("disconnected.authenticatingWithServer");
     case "connected":
       return retryCount > 0
-        ? tp("disconnected.connectionRestoredAfter", { retries: formatRetryLabel(retryCount) })
+        ? tp("disconnected.connectionRestoredAfter", {
+            retries: formatRetryLabel(retryCount),
+          })
         : t("disconnected.connectionRestored");
     case "error":
       if (previousStatus === "authenticating") {
@@ -146,10 +150,14 @@ export function DisconnectedOverlay({
                 background: theme.inputBg,
               }}
             >
-              <div style={{ fontSize: "0.72em", opacity: 0.68, marginBottom: 4 }}>
+              <div
+                style={{ fontSize: "0.72em", opacity: 0.68, marginBottom: 4 }}
+              >
                 {t("disconnected.statusLabel")}
               </div>
-              <div style={{ fontSize: "0.95em", fontWeight: 600 }}>{statusText}</div>
+              <div style={{ fontSize: "0.95em", fontWeight: 600 }}>
+                {statusText}
+              </div>
             </div>
             <div
               style={{
@@ -158,10 +166,14 @@ export function DisconnectedOverlay({
                 background: theme.inputBg,
               }}
             >
-              <div style={{ fontSize: "0.72em", opacity: 0.68, marginBottom: 4 }}>
+              <div
+                style={{ fontSize: "0.72em", opacity: 0.68, marginBottom: 4 }}
+              >
                 {t("disconnected.retriesLabel")}
               </div>
-              <div style={{ fontSize: "0.95em", fontWeight: 600 }}>{retryCount}</div>
+              <div style={{ fontSize: "0.95em", fontWeight: 600 }}>
+                {retryCount}
+              </div>
             </div>
           </div>
           {log.length > 0 ? (
@@ -172,7 +184,9 @@ export function DisconnectedOverlay({
                 gap: 6,
               }}
             >
-              <div style={{ fontSize: "0.72em", opacity: 0.68 }}>{t("disconnected.activityLabel")}</div>
+              <div style={{ fontSize: "0.72em", opacity: 0.68 }}>
+                {t("disconnected.activityLabel")}
+              </div>
               <div
                 ref={logRef}
                 style={{
@@ -190,7 +204,11 @@ export function DisconnectedOverlay({
                 {log.map((entry, index) => (
                   <div
                     key={`${entry.time}-${index}`}
-                    style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "0.8em" }}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "auto 1fr",
+                      gap: "0.8em",
+                    }}
                   >
                     <span style={{ opacity: 0.56 }}>{entry.time}</span>
                     <span>{entry.message}</span>

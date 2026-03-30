@@ -33,11 +33,11 @@ blit close 3                              # destroy the session
 
 By default, `blit` connects to the local daemon via its default Unix socket. Use these global flags (before the subcommand) to connect elsewhere:
 
-| Flag | Description |
-| --- | --- |
+| Flag                      | Description                       |
+| ------------------------- | --------------------------------- |
 | `-s`, `--socket <SOCKET>` | Connect to a specific Unix socket |
-| `--tcp <TCP>` | Connect via raw TCP (`HOST:PORT`) |
-| `--ssh <SSH>` | Connect via SSH to a remote host |
+| `--tcp <TCP>`             | Connect via raw TCP (`HOST:PORT`) |
+| `--ssh <SSH>`             | Connect via SSH to a remote host  |
 
 ```bash
 blit --socket /tmp/blit.sock list
@@ -72,15 +72,15 @@ The `sleep` is necessary because `send` returns immediately after delivering key
 
 `send` supports C-style escapes: `\n` (newline/enter), `\r` (carriage return), `\t` (tab), `\\` (literal backslash), `\0` (NUL), `\xHH` (hex byte).
 
-| Action | Input |
-| --- | --- |
-| Press Enter | `\n` |
-| Press Ctrl+C | `\x03` |
-| Press Ctrl+D (EOF) | `\x04` |
-| Press Ctrl+Z (suspend) | `\x1a` |
-| Press Escape | `\x1b` |
-| Arrow keys | `\x1b[A` (up), `\x1b[B` (down), `\x1b[C` (right), `\x1b[D` (left) |
-| Quit vim | `\x1b:q!\n` |
+| Action                 | Input                                                             |
+| ---------------------- | ----------------------------------------------------------------- |
+| Press Enter            | `\n`                                                              |
+| Press Ctrl+C           | `\x03`                                                            |
+| Press Ctrl+D (EOF)     | `\x04`                                                            |
+| Press Ctrl+Z (suspend) | `\x1a`                                                            |
+| Press Escape           | `\x1b`                                                            |
+| Arrow keys             | `\x1b[A` (up), `\x1b[B` (down), `\x1b[C` (right), `\x1b[D` (left) |
+| Quit vim               | `\x1b:q!\n`                                                       |
 
 For multi-byte payloads or binary data, pipe through stdin:
 

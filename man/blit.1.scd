@@ -35,29 +35,29 @@ In browser mode, each tab gets its own connection to the server.
 # OPTIONS
 
 _--console_
-	Render directly to the terminal using the ANSI renderer instead of
-	opening a browser.
+Render directly to the terminal using the ANSI renderer instead of
+opening a browser.
 
 _--port_ _PORT_
-	Bind the embedded browser gateway to a specific port instead of
-	choosing one at random.
+Bind the embedded browser gateway to a specific port instead of
+choosing one at random.
 
 _--socket_ _PATH_, _-s_ _PATH_
-	Connect to a specific Unix socket.
+Connect to a specific Unix socket.
 
 _--tcp_ _HOST:PORT_
-	Connect via raw TCP.
+Connect via raw TCP.
 
 _--ssh_ _HOST_
-	Connect to a remote _blit-server_ over SSH. The remote socket path is
-	resolved using the same cascade as _BLIT_SOCK_ (see below), evaluated on
-	the remote host as the SSH user.
+Connect to a remote _blit-server_ over SSH. The remote socket path is
+resolved using the same cascade as _BLIT_SOCK_ (see below), evaluated on
+the remote host as the SSH user.
 
 _--help_, _-h_
-	Print usage and exit.
+Print usage and exit.
 
 _--version_, _-V_
-	Print version and exit.
+Print version and exit.
 
 # SUBCOMMANDS
 
@@ -67,44 +67,44 @@ on failure. The connection options (_--socket_, _--tcp_, _--ssh_) are accepted
 by all subcommands.
 
 _list_
-	List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,
-	STATUS.
+List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,
+STATUS.
 
 _start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] _COMMAND..._
-	Start a new PTY running _COMMAND_ and print its session ID. The default
-	size is 24 rows by 80 columns.
+Start a new PTY running _COMMAND_ and print its session ID. The default
+size is 24 rows by 80 columns.
 
 _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
-	Dump the current visible terminal text for session _ID_. With _--ansi_,
-	include ANSI color and style escape sequences. _--rows_ and _--cols_
-	resize the terminal before capturing; defaults are 24 rows and 80
-	columns when either flag is given.
+Dump the current visible terminal text for session _ID_. With _--ansi_,
+include ANSI color and style escape sequences. _--rows_ and _--cols_
+resize the terminal before capturing; defaults are 24 rows and 80
+columns when either flag is given.
 
 _history_ [_--ansi_] [_--from-start_ _N_ | _--from-end_ _N_] [_--limit_ _N_] [_--rows_ _N_] [_--cols_ _N_] _ID_
-	Dump scrollback and viewport for session _ID_. _--from-start_ _N_ begins
-	_N_ lines from the top (oldest = 0). _--from-end_ _N_ begins _N_ lines
-	from the bottom (newest = 0). _--limit_ caps the number of lines
-	returned. With _--ansi_, include ANSI escape sequences. _--rows_ and
-	_--cols_ resize the terminal before reading; defaults are 24 rows and 80
-	columns when either flag is given.
+Dump scrollback and viewport for session _ID_. _--from-start_ _N_ begins
+_N_ lines from the top (oldest = 0). _--from-end_ _N_ begins _N_ lines
+from the bottom (newest = 0). _--limit_ caps the number of lines
+returned. With _--ansi_, include ANSI escape sequences. _--rows_ and
+_--cols_ resize the terminal before reading; defaults are 24 rows and 80
+columns when either flag is given.
 
 _send_ _ID_ _TEXT_
-	Send keystrokes to session _ID_. _TEXT_ supports C-style escapes
-	(_\\n_, _\\t_, _\\x1b_). Use _-_ to read from stdin.
+Send keystrokes to session _ID_. _TEXT_ supports C-style escapes
+(_\\n_, _\\t_, _\\x1b_). Use _-_ to read from stdin.
 
 _close_ _ID_
-	Close and remove session _ID_.
+Close and remove session _ID_.
 
 # ENVIRONMENT
 
 _BLIT_SOCK_
-	Unix socket path. Defaults to _$TMPDIR/blit.sock_, then
-	_/tmp/blit-$USER.sock_, then _/run/blit/$USER.sock_, then
-	_$XDG_RUNTIME_DIR/blit.sock_, then _/tmp/blit.sock_.
+Unix socket path. Defaults to _$TMPDIR/blit.sock_, then
+_/tmp/blit-$USER.sock_, then _/run/blit/$USER.sock_, then
+_$XDG_RUNTIME_DIR/blit.sock_, then _/tmp/blit.sock_.
 
 _BLIT_DISPLAY_FPS_
-	Advertised client display rate in console mode (default: 240, clamped
-	10–1000).
+Advertised client display rate in console mode (default: 240, clamped
+10–1000).
 
 # SEE ALSO
 

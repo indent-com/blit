@@ -23,7 +23,9 @@ test.describe("Auth flow", () => {
     await passInput.press("Enter");
 
     const error = page.locator("output");
-    await expect(error).toContainText("Authentication failed", { timeout: 10_000 });
+    await expect(error).toContainText("Authentication failed", {
+      timeout: 10_000,
+    });
 
     await expect(passInput).toBeVisible();
     await expect(passInput).not.toBeDisabled();
@@ -42,7 +44,9 @@ test.describe("Auth flow", () => {
     await passInput.press("Enter");
 
     await expect(passInput).toBeHidden({ timeout: 10_000 });
-    const newTerminal = page.getByRole("button", { name: "New terminal" }).first();
+    const newTerminal = page
+      .getByRole("button", { name: "New terminal" })
+      .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
@@ -54,7 +58,9 @@ test.describe("Auth flow", () => {
     await passInput.fill("test-secret");
     await passInput.press("Enter");
 
-    const newTerminal = page.getByRole("button", { name: "New terminal" }).first();
+    const newTerminal = page
+      .getByRole("button", { name: "New terminal" })
+      .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
     await page.reload();
@@ -81,7 +87,9 @@ test.describe("Auth flow", () => {
 
     await passInput.press("Enter");
     await expect(passInput).toBeHidden({ timeout: 10_000 });
-    const newTerminal = page.getByRole("button", { name: "New terminal" }).first();
+    const newTerminal = page
+      .getByRole("button", { name: "New terminal" })
+      .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 });

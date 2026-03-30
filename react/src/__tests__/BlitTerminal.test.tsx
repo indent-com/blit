@@ -98,7 +98,10 @@ describe("BlitTerminal", () => {
 
   beforeEach(() => {
     fakeTerminals = [];
-    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
     vi.stubGlobal("cancelAnimationFrame", vi.fn());
     vi.stubGlobal(
       "ResizeObserver",
@@ -198,7 +201,11 @@ describe("BlitTerminal", () => {
 
     render(
       <BlitWorkspaceProvider workspace={workspace}>
-        <BlitTerminal sessionId={sessionId} fontFamily="Test Mono" fontSize={14} />
+        <BlitTerminal
+          sessionId={sessionId}
+          fontFamily="Test Mono"
+          fontSize={14}
+        />
       </BlitWorkspaceProvider>,
     );
 

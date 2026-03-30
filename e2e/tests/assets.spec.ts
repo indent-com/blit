@@ -16,7 +16,11 @@ test.describe("Asset serving", () => {
   });
 
   test("any path returns single-file HTML app", async ({ request }) => {
-    for (const path of ["/blit_browser.js", "/vt/blit_browser.js", "/vt/blit_browser_bg.wasm"]) {
+    for (const path of [
+      "/blit_browser.js",
+      "/vt/blit_browser.js",
+      "/vt/blit_browser_bg.wasm",
+    ]) {
       const resp = await request.get(path);
       expect(resp.status()).toBe(200);
       const ct = resp.headers()["content-type"] ?? "";

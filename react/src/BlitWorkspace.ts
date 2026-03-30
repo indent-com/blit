@@ -1,4 +1,7 @@
-import { BlitConnection, type CreateBlitConnectionOptions } from "./BlitConnection";
+import {
+  BlitConnection,
+  type CreateBlitConnectionOptions,
+} from "./BlitConnection";
 import type {
   BlitConnectionSnapshot,
   BlitSearchResult,
@@ -9,8 +12,10 @@ import type {
 } from "./types";
 import type { BlitWasmModule } from "./TerminalStore";
 
-export interface AddBlitConnectionOptions
-  extends Omit<CreateBlitConnectionOptions, "wasm"> {
+export interface AddBlitConnectionOptions extends Omit<
+  CreateBlitConnectionOptions,
+  "wasm"
+> {
   wasm?: BlitWasmModule | Promise<BlitWasmModule>;
 }
 
@@ -108,15 +113,25 @@ export class BlitWorkspace {
     return this.connections.get(connectionId) ?? null;
   }
 
-  getConnectionSnapshot(connectionId: ConnectionId): BlitConnectionSnapshot | null {
-    return this.snapshot.connections.find((connection) => connection.id === connectionId) ?? null;
+  getConnectionSnapshot(
+    connectionId: ConnectionId,
+  ): BlitConnectionSnapshot | null {
+    return (
+      this.snapshot.connections.find(
+        (connection) => connection.id === connectionId,
+      ) ?? null
+    );
   }
 
   getSession(sessionId: SessionId): BlitSession | null {
-    return this.snapshot.sessions.find((session) => session.id === sessionId) ?? null;
+    return (
+      this.snapshot.sessions.find((session) => session.id === sessionId) ?? null
+    );
   }
 
-  async createSession(options: CreateWorkspaceSessionOptions): Promise<BlitSession> {
+  async createSession(
+    options: CreateWorkspaceSessionOptions,
+  ): Promise<BlitSession> {
     const connection = this.requireConnection(options.connectionId);
     if (options.cwdFromSessionId) {
       const sourceSession = this.requireSession(options.cwdFromSessionId);
@@ -206,7 +221,10 @@ export class BlitWorkspace {
   }
 
   resizeSessions(entries: Iterable<ResizeWorkspaceSessionOptions>): void {
-    const entriesByConnection = new Map<ConnectionId, ResizeWorkspaceSessionOptions[]>();
+    const entriesByConnection = new Map<
+      ConnectionId,
+      ResizeWorkspaceSessionOptions[]
+    >();
     for (const entry of entries) {
       const session = this.getSession(entry.sessionId);
       if (!session) continue;
@@ -225,7 +243,10 @@ export class BlitWorkspace {
   scrollSession(sessionId: SessionId, offset: number): void {
     const session = this.getSession(sessionId);
     if (!session) return;
-    this.requireConnection(session.connectionId).scrollSession(sessionId, offset);
+    this.requireConnection(session.connectionId).scrollSession(
+      sessionId,
+      offset,
+    );
   }
 
   sendMouse(
@@ -266,9 +287,7 @@ export class BlitWorkspace {
         }
       }),
     );
-    return results
-      .flat()
-      .sort((left, right) => right.score - left.score);
+    return results.flat().sort((left, right) => right.score - left.score);
   }
 
   setVisibleSessions(sessionIds: Iterable<SessionId>): void {
@@ -286,7 +305,9 @@ export class BlitWorkspace {
     }
 
     for (const [connectionId, connection] of this.connections) {
-      connection.setVisibleSessionIds(desiredByConnection.get(connectionId) ?? []);
+      connection.setVisibleSessionIds(
+        desiredByConnection.get(connectionId) ?? [],
+      );
     }
   }
 
@@ -306,12 +327,17 @@ export class BlitWorkspace {
       connection.getSnapshot(),
     );
     const sessions = connections.flatMap((connection) => connection.sessions);
-    const focusedSessionId = this.resolveFocusedSessionId(connections, sessions);
+    const focusedSessionId = this.resolveFocusedSessionId(
+      connections,
+      sessions,
+    );
     this.snapshot = {
       connections,
       sessions,
       focusedSessionId,
-      ready: connections.length > 0 && connections.every((connection) => connection.ready),
+      ready:
+        connections.length > 0 &&
+        connections.every((connection) => connection.ready),
     };
     this.emit();
   }
@@ -321,7 +347,9 @@ export class BlitWorkspace {
     sessions: readonly BlitSession[],
   ): SessionId | null {
     if (this.snapshot.focusedSessionId) {
-      const focused = sessions.find((session) => session.id === this.snapshot.focusedSessionId);
+      const focused = sessions.find(
+        (session) => session.id === this.snapshot.focusedSessionId,
+      );
       if (focused && focused.state !== "closed") {
         return focused.id;
       }
@@ -329,7 +357,9 @@ export class BlitWorkspace {
 
     for (const connection of connections) {
       if (!connection.focusedSessionId) continue;
-      const focused = sessions.find((session) => session.id === connection.focusedSessionId);
+      const focused = sessions.find(
+        (session) => session.id === connection.focusedSessionId,
+      );
       if (focused && focused.state !== "closed") {
         return focused.id;
       }

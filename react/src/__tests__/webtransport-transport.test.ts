@@ -83,7 +83,10 @@ describe("WebTransportTransport", () => {
 
   it("connect() is idempotent while a connection attempt is in flight", async () => {
     MockWebTransport.queueConnection(new Uint8Array([1]));
-    const transport = new WebTransportTransport("https://example.test", "secret");
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "secret",
+    );
 
     transport.connect();
     transport.connect();
@@ -100,7 +103,10 @@ describe("WebTransportTransport", () => {
     firstChunk.set(frame(payload), 1);
     MockWebTransport.queueConnection(firstChunk);
 
-    const transport = new WebTransportTransport("https://example.test", "secret");
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "secret",
+    );
     const messages: Uint8Array[] = [];
     transport.addEventListener("message", (data) => {
       messages.push(new Uint8Array(data));
@@ -114,7 +120,10 @@ describe("WebTransportTransport", () => {
 
   it("sets authRejected and lastError on auth failure", async () => {
     MockWebTransport.queueConnection(new Uint8Array([0]));
-    const transport = new WebTransportTransport("https://example.test", "wrong");
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "wrong",
+    );
     const statuses: string[] = [];
     transport.addEventListener("statuschange", (s) => statuses.push(s));
 
@@ -128,7 +137,10 @@ describe("WebTransportTransport", () => {
 
   it("clears authRejected and lastError on successful auth", async () => {
     MockWebTransport.queueConnection(new Uint8Array([1]));
-    const transport = new WebTransportTransport("https://example.test", "secret");
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "secret",
+    );
 
     transport.connect();
     await flushPromises();
@@ -141,23 +153,30 @@ describe("WebTransportTransport", () => {
   it("uses configurable connectTimeoutMs", async () => {
     vi.useFakeTimers();
     const neverReady = new Promise<void>(() => {});
-    vi.stubGlobal("WebTransport", class {
-      static instances: any[] = [];
-      ready = neverReady;
-      closed = new Promise<void>(() => {});
-      close() {}
-      async createBidirectionalStream() {
-        return {
-          readable: { getReader: () => new MockReader([]) },
-          writable: { getWriter: () => new MockWriter() },
-        } as unknown as WebTransportBidirectionalStream;
-      }
-    });
+    vi.stubGlobal(
+      "WebTransport",
+      class {
+        static instances: any[] = [];
+        ready = neverReady;
+        closed = new Promise<void>(() => {});
+        close() {}
+        async createBidirectionalStream() {
+          return {
+            readable: { getReader: () => new MockReader([]) },
+            writable: { getWriter: () => new MockWriter() },
+          } as unknown as WebTransportBidirectionalStream;
+        }
+      },
+    );
 
-    const transport = new WebTransportTransport("https://example.test", "secret", {
-      connectTimeoutMs: 3000,
-      reconnect: false,
-    });
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "secret",
+      {
+        connectTimeoutMs: 3000,
+        reconnect: false,
+      },
+    );
 
     transport.connect();
     await flushPromises();
