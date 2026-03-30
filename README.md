@@ -39,12 +39,20 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | | blit | ttyd | gotty | Eternal Terminal | Mosh | xterm.js + node-pty |
 | --- | --- | --- | --- | --- | --- | --- |
 | Architecture | Separate PTY host + gateway | Single binary | Single binary | Client + daemon | Client + server | Library (BYO server) |
+| Language | Rust + TypeScript | C | Go | C++ | C++ | TypeScript |
 | Multiple PTYs | Yes, first-class | One per instance | One per instance | One per connection | One per connection | Manual |
 | Protocol | Binary frame diffs | Terminal byte stream | Terminal byte stream | SSH + prediction | UDP + SSP | Terminal byte stream |
-| Backpressure | Per-client pacing from render metrics | None | None | SSH flow control | None | None |
-| Server-side search | Titles + visible + scrollback | No | No | No | No | No |
 | Transport | WebSocket, WebTransport, Unix socket | WebSocket | WebSocket | TCP | UDP | WebSocket |
+| Rendering | WebGL | WebGL (xterm.js) | hterm / xterm.js | Native terminal | Native terminal | Canvas / WebGL (xterm.js) |
+| Backpressure | Per-client pacing from render metrics | None | None | SSH flow control | None | None |
+| Reconnection | Automatic | No | Configurable | Automatic | Automatic | Manual |
+| Roaming (IP change) | Yes (WebSocket reconnect) | No | No | Yes | Yes | No |
+| Scrollback | Server-side, searchable | Client-side (xterm.js) | No | Native terminal | No | Client-side (xterm.js) |
+| Search | Titles + visible + scrollback | Client-side (xterm.js) | No | No | No | Client-side (xterm.js addon) |
+| Auth | Passphrase | Basic / header proxy | Basic / TLS client certs | SSH | SSH | BYO |
+| Resize | Server-tracked per client | Yes | Yes | Yes | Yes | Yes |
 | Embeddable | React library | No | No | No | No | Yes (xterm.js) |
+| License | MIT | MIT | MIT | Apache-2.0 | GPL-3.0 | MIT |
 
 ## What lives in this repo
 
