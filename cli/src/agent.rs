@@ -104,6 +104,13 @@ impl AgentConn {
     fn has_pty(&self, id: u16) -> bool {
         self.ptys.iter().any(|p| p.id == id)
     }
+
+    async fn maybe_resize(&mut self, id: u16, size: Option<(u16, u16)>) -> Result<(), String> {
+        if let Some((rows, cols)) = size {
+            self.send(&msg_resize(id, rows, cols)).await?;
+        }
+        Ok(())
+    }
 }
 
 pub async fn cmd_list(transport: Transport) -> Result<(), String> {
@@ -155,12 +162,28 @@ pub async fn cmd_start(
     }
 }
 
-pub async fn cmd_show(transport: Transport, id: u16, ansi: bool) -> Result<(), String> {
+pub fn capture_size(rows: Option<u16>, cols: Option<u16>) -> Option<(u16, u16)> {
+    if rows.is_some() || cols.is_some() {
+        Some((rows.unwrap_or(24), cols.unwrap_or(80)))
+    } else {
+        None
+    }
+}
+
+pub async fn cmd_show(
+    transport: Transport,
+    id: u16,
+    ansi: bool,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<(), String> {
     let mut conn = AgentConn::connect(transport).await?;
 
     if !conn.has_pty(id) {
         return Err(format!("pty {id} not found"));
     }
+
+    conn.maybe_resize(id, capture_size(rows, cols)).await?;
 
     conn.send(&msg_subscribe(id)).await?;
 
@@ -195,12 +218,15 @@ pub async fn cmd_history(
     from_end: Option<u32>,
     limit: Option<u32>,
     ansi: bool,
+    size: Option<(u16, u16)>,
 ) -> Result<(), String> {
     let mut conn = AgentConn::connect(transport).await?;
 
     if !conn.has_pty(id) {
         return Err(format!("pty {id} not found"));
     }
+
+    conn.maybe_resize(id, size).await?;
 
     let mut flags: u8 = 0;
     if ansi {
@@ -266,16 +292,6 @@ pub async fn cmd_close(transport: Transport, id: u16) -> Result<(), String> {
             }
         }
     }
-}
-
-pub async fn cmd_resize(transport: Transport, id: u16, rows: u16, cols: u16) -> Result<(), String> {
-    let mut conn = AgentConn::connect(transport).await?;
-
-    if !conn.has_pty(id) {
-        return Err(format!("pty {id} not found"));
-    }
-
-    conn.send(&msg_resize(id, rows, cols)).await
 }
 
 pub fn parse_escapes(s: &str) -> Vec<u8> {
@@ -726,7 +742,7 @@ mod tests {
         });
 
         let transport = Transport::Unix(client);
-        let result = cmd_show(transport, 99, false).await;
+        let result = cmd_show(transport, 99, false, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
 

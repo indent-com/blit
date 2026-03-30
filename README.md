@@ -222,7 +222,8 @@ blit history 3 --from-start 0 --limit 50       # First 50 lines
 blit history 3 --from-end 0 --limit 50         # Last 50 lines
 blit history 3 --from-end 0 --limit 50 --ansi  # Last 50 with ANSI styling
 blit send 3 "q"                                # Send keystrokes (supports \n, \t, \x1b escapes)
-blit resize 3 40 120                           # Resize a PTY to 40 rows x 120 cols
+blit show 3 --rows 40 --cols 120               # Resize before capturing viewport
+blit history 3 --cols 200                      # Resize before reading scrollback
 blit close 3                                   # Close and remove a PTY
 
 # Against a remote host
