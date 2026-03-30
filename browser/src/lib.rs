@@ -323,6 +323,7 @@ impl GlyphAtlas {
     const MAX_SIZE: u32 = 8192;
     const PADDING: u32 = 1;
     const VERT_PAD: u32 = 2;
+    const HORIZ_PAD: u32 = 2;
 
     fn invalidate(&mut self) {
         self.slots.clear();
@@ -428,7 +429,7 @@ impl GlyphAtlas {
         if count == 0 {
             return Self::MIN_SIZE;
         }
-        let cw = (self.cell_width.max(1) + Self::PADDING * 3) as usize;
+        let cw = (self.cell_width.max(1) + Self::HORIZ_PAD * 2 + Self::PADDING * 3) as usize;
         let ch = (self.cell_height.max(1) + Self::PADDING * 3) as usize;
         let cols = (Self::MAX_SIZE as usize) / cw;
         if cols == 0 {
@@ -499,9 +500,9 @@ impl GlyphAtlas {
         }
 
         let render_width = if key.wide {
-            self.wide_cell_width.max(1)
+            self.wide_cell_width.max(1) + Self::HORIZ_PAD * 2
         } else {
-            self.cell_width.max(1)
+            self.cell_width.max(1) + Self::HORIZ_PAD * 2
         };
         let render_height = self.cell_height.max(1) + Self::VERT_PAD;
         let slot = self.allocate_slot(render_width, render_height)?;
@@ -534,13 +535,13 @@ impl GlyphAtlas {
             let pad_y = (cell_height - scaled_h) / 2.0;
             (
                 scaled_font,
-                slot.src_x,
+                slot.src_x + Self::HORIZ_PAD as f64,
                 slot.src_y + pad_y + scaled_h + Self::VERT_PAD as f64,
             )
         } else {
             (
                 font,
-                slot.src_x,
+                slot.src_x + Self::HORIZ_PAD as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64,
             )
         };
@@ -556,11 +557,11 @@ impl GlyphAtlas {
             ctx.set_stroke_style_str("#fff");
             ctx.begin_path();
             ctx.move_to(
-                slot.src_x,
+                slot.src_x + Self::HORIZ_PAD as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
             );
             ctx.line_to(
-                slot.src_x + slot.width,
+                slot.src_x + slot.width - Self::HORIZ_PAD as f64,
                 slot.src_y + cell_height + Self::VERT_PAD as f64 - 1.0,
             );
             ctx.stroke();
@@ -974,9 +975,10 @@ impl Terminal {
         let sh = slot.height as f32;
         let xo = self.render_x_offset;
         let yo = self.render_y_offset;
-        let dx1 = col as f32 * pw + xo;
+        let extra_w = sw - col_span as f32 * pw;
+        let dx1 = col as f32 * pw - extra_w * 0.5 + xo;
         let dy1 = row as f32 * ph - (sh - ph) + yo;
-        let dx2 = dx1 + col_span as f32 * pw;
+        let dx2 = dx1 + sw;
         let dy2 = dy1 + sh;
         let u1 = sx / aw;
         let v1 = sy / aw;
