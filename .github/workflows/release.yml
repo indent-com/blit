@@ -16,131 +16,42 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: amd64
-            system: x86_64-linux
           - runner: ubuntu-24.04-arm
             arch: arm64
-            system: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Build debs
-        run: |
-          for pkg in blit-server-deb blit-cli-deb blit-gateway-deb; do
-            nix build .#"$pkg" --no-link --print-out-paths >> outputs.txt
-          done
-
-      - name: Collect and verify debs
-        run: |
-          mkdir -p debs tmp
-          for dir in $(cat outputs.txt); do
-            cp "$dir"/*.deb debs/
-          done
-          ls -lh debs/
-
-          # Verify binaries are statically linked
-          for deb in debs/*.deb; do
-            dpkg-deb -x "$deb" tmp/
-          done
-          for bin in tmp/usr/bin/*; do
-            echo "=== $bin ==="
-            file "$bin"
-            file "$bin" | grep -qE "static(ally|-pie) linked" || { echo "FATAL: $bin is not static!"; exit 1; }
-          done
-          rm -rf tmp
-
+      - run: ./bin/build-debs debs
       - uses: actions/upload-artifact@v4
         with:
           name: debs-${{ matrix.arch }}
           path: debs/*.deb
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Build and verify binaries
-        run: |
-          mkdir -p stage
-          for pkg in blit-server-static blit-cli-static blit-gateway-static; do
-            out=$(nix build .#"$pkg" --no-link --print-out-paths)
-            cp "$out"/bin/* stage/
-          done
-          ls -lh stage/
-
-          for bin in stage/*; do
-            echo "=== $bin ==="
-            otool -L "$bin"
-            otool -L "$bin" | grep -v '^\S' | grep -v '/usr/lib/' | grep -v '/System/Library/' && { echo "FATAL: $bin links to non-system dylibs!"; exit 1; } || true
-          done
-
-      - name: Package tarballs
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          for bin in stage/*; do
-            name=$(basename "$bin")
-            tar -czf "dist/${name}_${version}_darwin_aarch64.tar.gz" -C stage "$name"
-          done
-          ls -lh dist/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-aarch64
-          path: dist/*.tar.gz
-
-  build-linux:
+  build-tarballs:
     strategy:
       matrix:
         include:
           - runner: ubuntu-latest
-            arch: x86_64
-            system: x86_64-linux
+            label: linux-x86_64
           - runner: ubuntu-24.04-arm
-            arch: aarch64
-            system: aarch64-linux
+            label: linux-aarch64
+          - runner: macos-latest
+            label: macos-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Build and verify binaries
-        run: |
-          mkdir -p stage
-          for pkg in blit-server-static blit-cli-static blit-gateway-static; do
-            out=$(nix build .#"$pkg" --no-link --print-out-paths)
-            cp "$out"/bin/* stage/
-          done
-          ls -lh stage/
-
-          for bin in stage/*; do
-            echo "=== $bin ==="
-            file "$bin"
-            file "$bin" | grep -qE "static(ally|-pie) linked" || { echo "FATAL: $bin is not static!"; exit 1; }
-          done
-
-      - name: Package tarballs
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          for bin in stage/*; do
-            name=$(basename "$bin")
-            tar -czf "dist/${name}_${version}_linux_${{ matrix.arch }}.tar.gz" -C stage "$name"
-          done
-          ls -lh dist/
-
+      - run: ./bin/build-tarballs dist
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.arch }}
+          name: tarballs-${{ matrix.label }}
           path: dist/*.tar.gz
 
   release:
-    needs: [build-debs, build-macos, build-linux]
+    needs: [build-debs, build-tarballs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -151,29 +62,21 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: macos-*
+          pattern: tarballs-*
           merge-multiple: true
-          path: macos
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: linux-*
-          merge-multiple: true
-          path: linux
+          path: tarballs
 
       - name: List artifacts
         run: |
           ls -lh debs/
-          ls -lh macos/
-          ls -lh linux/
+          ls -lh tarballs/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             debs/*.deb
-            macos/*.tar.gz
-            linux/*.tar.gz
+            tarballs/*.tar.gz
           generate_release_notes: true
 
   apt-repo:

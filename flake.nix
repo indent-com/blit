@@ -476,6 +476,15 @@ PKGJSON
           # The musl target is still fully static: pkgsStatic's cargo setup
           # hook writes -Ctarget-feature=+crt-static into .cargo/config.toml.
           postUnpack = "export NIX_CFLAGS_LINK=''";
+          postFixup = ''
+            for bin in $out/bin/*; do
+              if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
+                echo "FATAL: $bin is not statically linked:"
+                file "$bin"
+                exit 1
+              fi
+            done
+          '';
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
           # pkgsStatic on Darwin links against nix-store libiconv; rewrite to
           # the system copy so the binary works outside of nix.
@@ -607,6 +616,28 @@ CTRL
             '';
           installPhase = "true";
         };
+        blit-server-deb = mkDeb {
+          pname = "blit-server";
+          binPkg = blit-server-static;
+          description = "blit terminal streaming server";
+          extraInstall = let
+            systemdDir = ./systemd;
+          in ''
+            mkdir -p pkg/lib/systemd/system
+            cp "${systemdDir}/blit@.socket" "pkg/lib/systemd/system/blit@.socket"
+            cp "${systemdDir}/blit@.service" "pkg/lib/systemd/system/blit@.service"
+          '';
+        };
+        blit-cli-deb = mkDeb {
+          pname = "blit";
+          binPkg = blit-cli-static;
+          description = "blit terminal client";
+        };
+        blit-gateway-deb = mkDeb {
+          pname = "blit-gateway";
+          binPkg = blit-gateway-static;
+          description = "blit WebSocket gateway";
+        };
       in
       {
         packages.blit-server = blit-server;
@@ -620,27 +651,40 @@ CTRL
         packages.blit-cli-static = blit-cli-static;
         packages.blit-gateway-static = blit-gateway-static;
 
-        packages.blit-server-deb = mkDeb {
-          pname = "blit-server";
-          binPkg = blit-server-static;
-          description = "blit terminal streaming server";
-          extraInstall = let
-            systemdDir = ./systemd;
-          in ''
-            mkdir -p pkg/lib/systemd/system
-            cp "${systemdDir}/blit@.socket" "pkg/lib/systemd/system/blit@.socket"
-            cp "${systemdDir}/blit@.service" "pkg/lib/systemd/system/blit@.service"
+        packages.blit-server-deb = blit-server-deb;
+        packages.blit-cli-deb = blit-cli-deb;
+        packages.blit-gateway-deb = blit-gateway-deb;
+
+        packages.build-debs = pkgs.writeShellApplication {
+          name = "blit-build-debs";
+          text = ''
+            outdir="''${1:-dist/debs}"
+            mkdir -p "$outdir"
+            for pkg in ${blit-server-deb} ${blit-cli-deb} ${blit-gateway-deb}; do
+              cp "$pkg"/*.deb "$outdir"/
+            done
+            echo ""
+            ls -lh "$outdir"
           '';
         };
-        packages.blit-cli-deb = mkDeb {
-          pname = "blit";
-          binPkg = blit-cli-static;
-          description = "blit terminal client";
-        };
-        packages.blit-gateway-deb = mkDeb {
-          pname = "blit-gateway";
-          binPkg = blit-gateway-static;
-          description = "blit WebSocket gateway";
+
+        packages.build-tarballs = pkgs.writeShellApplication {
+          name = "blit-build-tarballs";
+          text = let
+            os = if pkgs.stdenv.isDarwin then "darwin" else "linux";
+            arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
+          in ''
+            outdir="''${1:-dist/tarballs}"
+            mkdir -p "$outdir"
+            for pkg in ${blit-server-static} ${blit-cli-static} ${blit-gateway-static}; do
+              for bin in "$pkg"/bin/*; do
+                name=$(basename "$bin")
+                tar -czf "$outdir/''${name}_${version}_${os}_${arch}.tar.gz" -C "$pkg/bin" "$name"
+              done
+            done
+            echo ""
+            ls -lh "$outdir"
+          '';
         };
 
         packages.e2e = pkgs.writeShellApplication {

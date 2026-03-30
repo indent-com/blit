@@ -276,18 +276,25 @@ sudo systemctl enable --now blit@alice.socket
 
 ## Building and testing
 
+Every `nix run` target has a corresponding script in `bin/` so you don't need to remember the nix invocation:
+
 ```bash
-nix run .#tests             # Rust + React unit tests
-nix run .#lint              # Clippy
-nix run .#e2e               # Playwright e2e tests
+./bin/tests                  # Rust + React unit tests
+./bin/lint                   # Clippy
+./bin/e2e                    # Playwright e2e tests
+./bin/build-debs             # .deb packages → dist/debs/
+./bin/build-tarballs         # static tarballs → dist/tarballs/
+./bin/browser-publish        # npm publish blit-browser
+./bin/react-publish          # npm publish blit-react
+```
 
-nix build .#blit-server     # Individual packages
-nix build .#blit-cli
-nix build .#blit-gateway
-nix build .#blit-server-deb # Debian packages
-nix build .#blit-cli-deb
-nix build .#blit-gateway-deb
+`build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
+The version and platform are derived from `flake.nix` and the build host.
+Linkage is verified at `nix build` time — Linux binaries must be statically linked and macOS binaries must not reference nix-store dylibs.
 
-nix run .#browser-publish   # npm: blit-browser
-nix run .#react-publish     # npm: blit-react
+Individual packages can also be built directly:
+
+```bash
+nix build .#blit-server      # or blit-cli, blit-gateway
+nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
 ```
