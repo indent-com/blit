@@ -462,8 +462,8 @@ function BSPPane({
       activeTab = Math.min(tabMemory.current![tabKey] ?? 0, node.children.length - 1);
     }
 
-    // Derive tab label from child: use leaf tag, or "Tab N".
     const tabLabel = (child: BSPChild, index: number): string => {
+      if (child.label) return child.label;
       if (child.node.type === "leaf" && child.node.tag) return child.node.tag;
       return `Tab ${index + 1}`;
     };

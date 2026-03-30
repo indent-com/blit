@@ -6,7 +6,8 @@
  *   node    = split | leaf
  *   split   = ("line" | "col" | "tabs") "(" entries ")"
  *   entries = entry ("," entry)*
- *   entry   = node [weight] ["@" fontSize]
+ *   entry   = [label ":"] node [weight] ["@" fontSize]
+ *   label   = identifier | quoted-string
  *   leaf    = identifier | quoted-string
  *   weight  = number
  *   fontSize = number ["px" | "pt" | "%"]
@@ -17,6 +18,7 @@
  *   line(chat 2, col(shell, tail, htop))
  *   line(editor 3 @14, col(shell @11, logs))
  *   tabs(shell, htop, logs)
+ *   tabs("Editor": col(a, b), "Terminal": col(c, d))
  *   line(editor 2, tabs(shell, logs))
  */
 
@@ -31,6 +33,7 @@ export interface BSPSplit {
 export interface BSPChild {
   node: BSPNode;
   weight: number;
+  label?: string;
 }
 
 export interface BSPLeaf {
@@ -108,7 +111,7 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
       return value;
     }
     const start = pos;
-    while (pos < trimmed.length && !/[\s(),@'"\\]/.test(trimmed[pos])) pos++;
+    while (pos < trimmed.length && !/[\s(),@'"\\:]/.test(trimmed[pos])) pos++;
     if (pos === start) throw new DSLParseError(`Expected identifier at position ${pos}`, pos);
     return trimmed.slice(start, pos);
   }
@@ -127,26 +130,48 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
     return n;
   }
 
-  function parseEntry(): { node: BSPNode; weight: number; fontSize?: number | string } {
+  function parseEntry(): { node: BSPNode; weight: number; fontSize?: number | string; label?: string } {
+    let label: string | undefined;
+
+    skipWhitespace();
+    const savedPos = pos;
+    if (peek() === '"' || peek() === "'") {
+      const candidate = parseIdentifier();
+      skipWhitespace();
+      if (peek() === ":") {
+        pos++;
+        label = candidate;
+      } else {
+        pos = savedPos;
+      }
+    } else if (/[a-zA-Z_]/.test(peek())) {
+      const candidate = parseIdentifier();
+      skipWhitespace();
+      if (peek() === ":" && candidate !== "line" && candidate !== "col" && candidate !== "tabs") {
+        pos++;
+        label = candidate;
+      } else {
+        pos = savedPos;
+      }
+    }
+
     const node = parseNode();
     skipWhitespace();
 
     let weight = 1;
     let fontSize: number | string | undefined;
 
-    // Parse optional weight (number not preceded by @)
     if (pos < trimmed.length && /[0-9]/.test(peek())) {
       weight = parseNumber();
     }
 
-    // Parse optional @fontSize
     skipWhitespace();
     if (peek() === "@") {
       pos++;
       fontSize = parseFontSize();
     }
 
-    return { node, weight, fontSize };
+    return { node, weight, fontSize, label };
   }
 
   function parseNode(): BSPNode {
@@ -167,7 +192,7 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
         }
         firstEntry.node.fontSize = firstEntry.fontSize;
       }
-      children.push({ node: firstEntry.node, weight: firstEntry.weight });
+      children.push({ node: firstEntry.node, weight: firstEntry.weight, ...(firstEntry.label != null && { label: firstEntry.label }) });
 
       skipWhitespace();
       while (peek() === ",") {
@@ -179,7 +204,7 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
           }
           entry.node.fontSize = entry.fontSize;
         }
-        children.push({ node: entry.node, weight: entry.weight });
+        children.push({ node: entry.node, weight: entry.weight, ...(entry.label != null && { label: entry.label }) });
         skipWhitespace();
       }
 
@@ -213,21 +238,25 @@ export function parseDSL(input: string): { root: BSPNode; weight: number } {
 // Serializer
 // ---------------------------------------------------------------------------
 
-function serializeNode(node: BSPNode, weight: number, fontSize?: number | string): string {
+function serializeNode(node: BSPNode, weight: number, fontSize?: number | string, label?: string): string {
   let s: string;
   if (node.type === "leaf") {
-    s = node.tag.length > 0 && !/[\s(),@'"\\]/.test(node.tag) ? node.tag : `"${node.tag.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    s = node.tag.length > 0 && !/[\s(),@'"\\:]/.test(node.tag) ? node.tag : `"${node.tag.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 
     fontSize = fontSize ?? node.fontSize;
   } else {
     const keyword = node.direction === "horizontal" ? "line" : node.direction === "vertical" ? "col" : "tabs";
     const inner = node.children
-      .map((c) => serializeNode(c.node, c.weight))
+      .map((c) => serializeNode(c.node, c.weight, undefined, c.label))
       .join(", ");
     s = `${keyword}(${inner})`;
   }
   if (weight !== 1) s += ` ${weight}`;
   if (fontSize != null) s += ` @${fontSize}`;
+  if (label != null) {
+    const safeLabel = label.length > 0 && !/[\s(),@'"\\:]/.test(label) ? label : `"${label.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    s = `${safeLabel}: ${s}`;
+  }
   return s;
 }
 
