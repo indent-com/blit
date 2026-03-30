@@ -289,13 +289,16 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
     // Cell measurement (re-measure when font or DPR changes)
     // -----------------------------------------------------------------------
 
+    // Chrome and Firefox update devicePixelRatio on zoom; Safari doesn't.
+    // Detect zoom via outerWidth/innerWidth on Safari only — on other browsers
+    // outerWidth includes browser chrome, making the ratio unreliable.
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
     function effectiveDpr(): number {
       const base = window.devicePixelRatio || 1;
-      // Safari doesn't change devicePixelRatio on Cmd+/- zoom.
-      // Detect zoom via outerWidth/innerWidth.
-      if (window.outerWidth && window.innerWidth) {
+      if (isSafari && window.outerWidth && window.innerWidth) {
         const zoom = window.outerWidth / window.innerWidth;
-        if (zoom > 0.25 && zoom < 8) return base * zoom;
+        if (zoom > 0.25 && zoom < 8) return Math.round(base * zoom * 100) / 100;
       }
       return base;
     }
