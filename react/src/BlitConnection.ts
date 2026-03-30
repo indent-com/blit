@@ -654,14 +654,12 @@ export class BlitConnection {
   private handleStatusChange = (status: ConnectionStatus): void => {
     this.store.handleStatusChange(status);
 
-    // Read transport-level error info if available.
-    const transportAny = this.transport as unknown as Record<string, unknown>;
     const lastError =
-      status === "error" && typeof transportAny.lastError === "string"
-        ? transportAny.lastError
+      status === "error" && this.transport.lastError
+        ? this.transport.lastError
         : null;
     const authRejected =
-      status === "error" && transportAny.authRejected === true;
+      status === "error" && this.transport.authRejected;
 
     if (status === "connected") {
       this.hasConnected = true;

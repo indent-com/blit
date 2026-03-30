@@ -382,4 +382,55 @@ describe("WebSocketTransport", () => {
     expect(cb2).toHaveBeenCalledTimes(1);
     transport.close();
   });
+
+  it("connect timeout fires when auth does not complete in time", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
+      connectTimeoutMs: 2000,
+    });
+    const statuses: string[] = [];
+    transport.addEventListener("statuschange", (s) => statuses.push(s));
+
+    transport.connect();
+    const ws = latestSocket();
+    ws.simulateOpen();
+    expect(transport.status).toBe("authenticating");
+
+    vi.advanceTimersByTime(2000);
+    expect(transport.status).toBe("error");
+    expect(transport.lastError).toBe("connect timeout");
+    expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+    transport.close();
+  });
+
+  it("connect timeout is cleared on successful auth", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
+      connectTimeoutMs: 2000,
+    });
+
+    transport.connect();
+    const ws = latestSocket();
+    ws.simulateOpen();
+    ws.simulateMessage("ok");
+    expect(transport.status).toBe("connected");
+
+    vi.advanceTimersByTime(5000);
+    expect(transport.status).toBe("connected");
+    transport.close();
+  });
+
+  it("connect timeout triggers reconnect when enabled", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
+      connectTimeoutMs: 1000,
+      reconnect: true,
+    });
+
+    transport.connect();
+    vi.advanceTimersByTime(1000);
+    expect(transport.status).toBe("error");
+
+    const instancesBefore = MockWebSocket.instances.length;
+    vi.advanceTimersByTime(500);
+    expect(MockWebSocket.instances.length).toBeGreaterThan(instancesBefore);
+    transport.close();
+  });
 });

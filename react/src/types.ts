@@ -35,6 +35,19 @@ export type BlitTransportEventMap = {
   statuschange: ConnectionStatus;
 };
 
+export interface BlitTransportOptions {
+  /** Enable automatic reconnection on disconnect. Default: true. */
+  reconnect?: boolean;
+  /** Initial reconnect delay in ms. Default: 500. */
+  reconnectDelay?: number;
+  /** Maximum reconnect delay in ms. Default: 10000. */
+  maxReconnectDelay?: number;
+  /** Backoff multiplier for reconnect delay. Default: 1.5. */
+  reconnectBackoff?: number;
+  /** Timeout in ms to wait for the connection to be established. Default: none for WebSocket, 10000 for others. */
+  connectTimeoutMs?: number;
+}
+
 export interface BlitTransport {
   /** Start connecting. Safe to call repeatedly. Call after registering listeners. */
   connect(): void;
@@ -44,6 +57,10 @@ export interface BlitTransport {
   close(): void;
   /** Current connection status. */
   readonly status: ConnectionStatus;
+  /** True when the server explicitly rejected authentication. */
+  readonly authRejected: boolean;
+  /** Last error message, if any. Cleared on successful connection. */
+  readonly lastError: string | null;
   /** Register a listener for transport events. */
   addEventListener(
     type: "message",

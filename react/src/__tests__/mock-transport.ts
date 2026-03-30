@@ -18,6 +18,8 @@ export class MockTransport implements BlitTransport {
   private messageListeners = new Set<(data: ArrayBuffer) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
   sent: Uint8Array[] = [];
+  authRejected = false;
+  lastError: string | null = null;
 
   constructor(initialStatus: ConnectionStatus = "connected") {
     this._status = initialStatus;
