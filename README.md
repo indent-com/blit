@@ -38,13 +38,22 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 
 | | blit | ttyd | gotty | Eternal Terminal | Mosh | xterm.js + node-pty |
 | --- | --- | --- | --- | --- | --- | --- |
-| Architecture | Separate PTY host + gateway | Single binary | Single binary | Client + daemon | Client + server | Library (BYO server) |
-| Multiple PTYs | Yes, first-class | One per instance | One per instance | One per connection | One per connection | Manual |
-| Protocol | Binary frame diffs | Terminal byte stream | Terminal byte stream | SSH + prediction | UDP + SSP | Terminal byte stream |
-| Backpressure | Per-client pacing from render metrics | None | None | SSH flow control | None | None |
-| Server-side search | Titles + visible + scrollback | No | No | No | No | No |
-| Transport | WebSocket, WebTransport, Unix socket | WebSocket | WebSocket | TCP | UDP | WebSocket |
-| Embeddable | React library | No | No | No | No | Yes (xterm.js) |
+| Architecture | PTY host + gateway | Single binary | Single binary | Client + daemon | Client + server | Library (BYO server) |
+| Multiple PTYs | ✅ First-class | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual |
+| Protocol | Binary frame diffs | Raw byte stream | Raw byte stream | SSH + prediction | UDP + SSP | Raw byte stream |
+| Delta updates | ✅ Only changed cells sent | ❌ | ❌ | ❌ | ✅ Predictive | ❌ |
+| LZ4 compression | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Copy-rect scrolling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Per-client backpressure | ✅ Render-metric pacing | ❌ | ❌ | ⚠️ SSH flow control | ❌ | ❌ |
+| Background session throttling | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Server-side search | ✅ Titles + visible + scrollback | ❌ | ❌ | ❌ | ❌ | ❌ |
+| WebGL rendering | ✅ | ❌ | ❌ | ❌ | ❌ | ⚠️ Addon |
+| Transport | WS, WebTransport, Unix | WebSocket | WebSocket | TCP | UDP | WebSocket |
+| WebTransport / QUIC | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Embeddable (React) | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Agent / CLI subcommands | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Reconnect on disconnect | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
+| SSH tunneling built-in | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
 
 ## What lives in this repo
 
