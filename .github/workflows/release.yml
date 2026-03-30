@@ -72,7 +72,6 @@ jobs:
 
       - name: Build binaries
         run: |
-          version="${GITHUB_REF_NAME#v}"
           mkdir -p stage
           for pkg in blit-server blit-cli blit-gateway; do
             out=$(nix build .#"$pkg" --no-link --print-out-paths)
