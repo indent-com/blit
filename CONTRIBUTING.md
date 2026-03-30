@@ -37,6 +37,28 @@ E2E (Playwright, requires built binaries):
 
 CI runs all three: `./bin/lint`, `./bin/tests`, `./bin/e2e`. These delegate to `nix run .#lint`, etc.
 
+## Packaging
+
+Every `nix run` target has a corresponding script in `bin/`:
+
+```bash
+./bin/build-debs             # .deb packages -> dist/debs/
+./bin/build-tarballs         # static tarballs -> dist/tarballs/
+./bin/browser-publish        # npm publish blit-browser
+./bin/react-publish          # npm publish blit-react
+```
+
+`build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
+The version and platform are derived from `flake.nix` and the build host.
+Linkage is verified at `nix build` time — Linux binaries must be statically linked and macOS binaries must not reference nix-store dylibs.
+
+Individual packages can also be built directly:
+
+```bash
+nix build .#blit-server      # or blit-cli, blit-gateway
+nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
+```
+
 There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt and `clippy -D warnings` are the only style enforcement.
 
 ## Dev environment
