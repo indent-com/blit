@@ -330,8 +330,12 @@ function WorkspaceScreen({
     document.title = parts.join(" — ");
   }, [focusedSession?.title]);
 
+  const [focusTrigger, setFocusTrigger] = useState(0);
   const focusTerminal = useCallback(() => {
-    setTimeout(() => termRef.current?.focus(), 0);
+    setTimeout(() => {
+      termRef.current?.focus();
+      setFocusTrigger((n) => n + 1);
+    }, 0);
   }, []);
 
   const closeOverlay = useCallback(() => {
@@ -436,21 +440,34 @@ function WorkspaceScreen({
 
   const focusPaneRef = useRef<((paneId: string) => void) | null>(null);
 
-  const selectPane = useCallback((paneId: string, sessionId: SessionId | null, command?: string) => {
-    if (command) {
-      setPendingPaneTargetId(paneId);
-      closeOverlay();
-      void createAndFocus(command);
-      return;
+  const createInPane = useCallback(async (paneId: string, command?: string) => {
+    setPendingPaneTargetId(paneId);
+    try {
+      await workspace.createSession({
+        connectionId: primaryConnectionId,
+        rows: termRef.current?.rows ?? 24,
+        cols: termRef.current?.cols ?? 80,
+        ...(command ? { command } : {}),
+        ...(!command && workspaceState.focusedSessionId
+          ? { cwdFromSessionId: workspaceState.focusedSessionId }
+          : {}),
+      });
+    } catch (error) {
+      if (connection?.status !== "disconnected" && connection?.status !== "error") {
+        console.error("blit: failed to create PTY", error);
+      }
     }
-    if (sessionId) {
+  }, [connection?.status, primaryConnectionId, workspace, workspaceState.focusedSessionId]);
+
+  const selectPane = useCallback((paneId: string, sessionId: SessionId | null, command?: string) => {
+    if (sessionId && !command) {
       workspace.focusSession(sessionId);
       focusBySessionRef.current?.(sessionId);
     } else {
-      focusPaneRef.current?.(paneId);
+      void createInPane(paneId, command);
     }
     closeOverlay();
-  }, [closeOverlay, createAndFocus, workspace]);
+  }, [closeOverlay, createInPane, workspace]);
 
   const handleRestartOrClose = useCallback(() => {
     if (!focusedSession) {
@@ -600,6 +617,7 @@ function WorkspaceScreen({
             focusedSessionId={workspaceState.focusedSessionId}
             lruSessionIds={lruRef.current}
             manageVisibility={overlay !== "expose"}
+            focusTrigger={focusTrigger}
             preferredEmptyPaneId={pendingPaneTargetId}
             onAssignmentsChange={setLayoutAssignments}
             onPreferredEmptyPaneResolved={() => setPendingPaneTargetId(null)}
@@ -608,26 +626,7 @@ function WorkspaceScreen({
             onFocusPane={(fn) => { focusPaneRef.current = fn; }}
             onMoveSessionToPane={(fn) => { moveSessionToPaneRef.current = fn; }}
             onFocusedPaneChange={setBspFocusedPaneId}
-            onCreateInPane={async (paneId, command) => {
-              setPendingPaneTargetId(paneId);
-              try {
-                await workspace.createSession({
-                  connectionId: primaryConnectionId,
-                  rows: termRef.current?.rows ?? 24,
-                  cols: termRef.current?.cols ?? 80,
-                  ...(command ? { command } : {}),
-                  ...(!command && workspaceState.focusedSessionId
-                    ? { cwdFromSessionId: workspaceState.focusedSessionId }
-                    : {}),
-                });
-                // Don't call focusSession here — BSPContainer will push focus
-                // up once reconciliation assigns the session to the pane.
-              } catch (error) {
-                if (connection?.status !== "disconnected" && connection?.status !== "error") {
-                  console.error("blit: failed to create PTY", error);
-                }
-              }
-            }}
+            onCreateInPane={createInPane}
           />
         ) : workspaceState.focusedSessionId != null ? (
           <>

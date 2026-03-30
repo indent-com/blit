@@ -72,6 +72,7 @@ export function BSPContainer({
   focusedSessionId,
   lruSessionIds,
   manageVisibility = true,
+  focusTrigger = 0,
   preferredEmptyPaneId = null,
   onAssignmentsChange,
   onPreferredEmptyPaneResolved,
@@ -91,6 +92,7 @@ export function BSPContainer({
   focusedSessionId: SessionId | null;
   lruSessionIds: readonly SessionId[];
   manageVisibility?: boolean;
+  focusTrigger?: number;
   preferredEmptyPaneId?: string | null;
   onAssignmentsChange?: (assignments: BSPAssignments) => void;
   onPreferredEmptyPaneResolved?: () => void;
@@ -361,6 +363,7 @@ export function BSPContainer({
         fontFamily={fontFamily}
         fontSize={fontSize}
         visible={manageVisibility}
+        focusTrigger={focusTrigger}
         tabMemory={tabMemory}
       />
     </div>
@@ -380,6 +383,7 @@ function BSPPane({
   fontFamily,
   fontSize,
   visible,
+  focusTrigger,
   tabMemory,
   path = [],
 }: {
@@ -395,6 +399,7 @@ function BSPPane({
   fontFamily: string;
   fontSize: number;
   visible: boolean;
+  focusTrigger: number;
   tabMemory: React.RefObject<Record<string, number>>;
   path?: number[];
 }) {
@@ -419,6 +424,7 @@ function BSPPane({
         fontFamily={fontFamily}
         fontSize={fontSize}
         visible={visible}
+        focusTrigger={focusTrigger}
       />
     );
   }
@@ -436,6 +442,7 @@ function BSPPane({
     fontFamily,
     fontSize,
     visible,
+    focusTrigger,
     tabMemory,
     path: [...path, index],
   });
@@ -554,6 +561,7 @@ function LeafPane({
   fontFamily,
   fontSize,
   visible,
+  focusTrigger,
 }: {
   paneId: string;
   leaf: BSPLeaf;
@@ -567,6 +575,7 @@ function LeafPane({
   fontFamily: string;
   fontSize: number;
   visible: boolean;
+  focusTrigger: number;
 }) {
   const theme = themeFor(palette);
   const scale = uiScale(fontSize);
@@ -586,7 +595,7 @@ function LeafPane({
 
   useEffect(() => {
     if (isFocused && termRef.current) termRef.current.focus();
-  }, [isFocused, sessionId, visible]);
+  }, [isFocused, sessionId, visible, focusTrigger]);
 
   return (
     <div
