@@ -12,6 +12,11 @@ members = [
     "webserver",
 ]
 
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/indent-com/blit"
+homepage = "https://blit.sh"
+
 [profile.release]
 opt-level = "s"
 lto = true

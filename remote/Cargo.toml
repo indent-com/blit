@@ -3,6 +3,9 @@ name = "blit-remote"
 version = "0.11.2"
 edition = "2021"
 description = "Remote blit protocol, frame state, and callback DOM renderer"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 lz4_flex = { version = "0.13", default-features = false, features = ["safe-encode", "safe-decode"] }

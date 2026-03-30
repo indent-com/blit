@@ -2,6 +2,10 @@
 name = "blit-server"
 version = "0.11.2"
 edition = "2021"
+description = "blit terminal multiplexer server"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 blit-remote = { path = "../remote" }

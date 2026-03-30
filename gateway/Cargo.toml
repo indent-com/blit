@@ -2,6 +2,10 @@
 name = "blit-gateway"
 version = "0.11.2"
 edition = "2021"
+description = "blit WebSocket/WebTransport gateway"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 blit-webserver = { path = "../webserver" }

@@ -2,6 +2,10 @@
 name = "blit-webserver"
 version = "0.11.2"
 edition = "2021"
+description = "Embedded web server for blit"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 blit-fonts = { path = "../fonts" }

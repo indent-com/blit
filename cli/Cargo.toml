@@ -2,6 +2,10 @@
 name = "blit-cli"
 version = "0.11.2"
 edition = "2021"
+description = "blit terminal client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "blit"
