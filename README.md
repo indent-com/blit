@@ -192,8 +192,8 @@ cargo run -p blit-server
 # open http://localhost:3264
 
 # Demo: remote host
-blit myhost
-blit --console user@myhost
+blit --ssh myhost
+blit --console --ssh user@myhost
 
 # Auto-reload development loop
 dev
@@ -228,7 +228,34 @@ dev
 | `BLIT_SOCK` | `$XDG_RUNTIME_DIR/blit.sock` or `/tmp/blit.sock` | Unix socket path |
 | `BLIT_DISPLAY_FPS` | `240` | Advertised display rate in console mode |
 
-For SSH targets, `blit` forwards the remote Unix socket over SSH and either opens the browser with an embedded local gateway or renders directly in the current terminal with `--console`.
+For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and either opens the browser with an embedded local gateway or renders directly in the current terminal with `--console`.
+
+#### Agent subcommands
+
+The CLI includes non-interactive subcommands designed for programmatic / LLM agent use. All subcommands accept `--socket PATH`, `--tcp HOST:PORT`, or `--ssh HOST` to select the transport.
+
+```bash
+blit list                          # List all PTYs (TSV: ID, TAG, TITLE, STATUS)
+blit start htop                    # Start a PTY running htop, print its ID
+blit start -t build make -j8      # Start with a tag
+blit start --rows 40 --cols 120 bash  # Start with a custom size
+blit show 3                        # Dump current visible terminal text
+blit show 3 --ansi                 # Include ANSI color/style codes
+blit history 3                     # Dump all scrollback + viewport
+blit history 3 --from-start 0 --limit 50  # First 50 lines
+blit history 3 --from-end 0 --limit 50    # Last 50 lines
+blit history 3 --from-end 0 --limit 50 --ansi  # Last 50 with ANSI styling
+blit send 3 "q"                    # Send keystrokes (supports \n, \t, \x1b escapes)
+blit resize 3 40 120               # Resize a PTY to 40 rows x 120 cols
+blit close 3                       # Close and remove a PTY
+
+# Against a remote host
+blit --ssh myhost list
+blit --ssh myhost start htop
+blit --ssh myhost show 1
+```
+
+Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
 ## Deployment (demo binaries)
 

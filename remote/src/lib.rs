@@ -59,6 +59,14 @@ pub const C2S_CREATE_N: u8 = 0x17;
 pub const C2S_CREATE2: u8 = 0x18;
 pub const CREATE2_HAS_SRC_PTY: u8 = 1 << 0;
 pub const CREATE2_HAS_COMMAND: u8 = 1 << 1;
+/// Read text from a PTY's scrollback + viewport: [0x19][nonce:2][pty_id:2][offset:4][limit:4][flags:1]
+/// offset: number of lines to skip from the top (oldest = 0), or from the end if READ_TAIL is set
+/// limit: max lines to return (0 = all)
+/// flags: bit 0 = include ANSI styling, bit 1 = offset counts from the end
+/// Server responds with S2C_TEXT using the same nonce.
+pub const C2S_READ: u8 = 0x19;
+pub const READ_ANSI: u8 = 1 << 0;
+pub const READ_TAIL: u8 = 1 << 1;
 
 pub const S2C_UPDATE: u8 = 0x00;
 pub const S2C_CREATED: u8 = 0x01;
@@ -70,7 +78,20 @@ pub const S2C_CREATED_N: u8 = 0x06;
 pub const S2C_HELLO: u8 = 0x07;
 /// The PTY's subprocess has exited but the terminal state is retained.
 /// Clients can still read/scroll the last frame. Send C2S_CLOSE to dismiss.
+/// Wire: [0x08][pty_id:2][exit_status:4]
+/// exit_status: WEXITSTATUS if normal exit, negative signal number if signalled,
+///              EXIT_STATUS_UNKNOWN if not yet collected.
 pub const S2C_EXITED: u8 = 0x08;
+pub const EXIT_STATUS_UNKNOWN: i32 = i32::MIN;
+/// Sent after the initial burst (HELLO, LIST, TITLE*, EXITED*) is complete.
+/// Clients can use this to know when the initial state has been fully transmitted.
+pub const S2C_READY: u8 = 0x09;
+/// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
+/// nonce: echoed from C2S_READ request
+/// total_lines: total available lines (scrollback + viewport rows)
+/// offset: the offset that was requested
+/// text: UTF-8 text, lines separated by \n
+pub const S2C_TEXT: u8 = 0x0A;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;
@@ -416,6 +437,75 @@ impl FrameState {
         self.get_text(0, 0, self.rows - 1, self.cols - 1)
     }
 
+    fn cell_style(&self, row: u16, col: u16) -> CellStyle {
+        if row >= self.rows || col >= self.cols {
+            return CellStyle::default();
+        }
+        let idx = self.cell_offset(row, col);
+        let f0 = self.cells[idx];
+        let f1 = self.cells[idx + 1];
+        let fg_type = f0 & 3;
+        let bg_type = (f0 >> 2) & 3;
+        let fg = match fg_type {
+            1 => Color::Indexed(self.cells[idx + 2]),
+            2 => Color::Rgb(
+                self.cells[idx + 2],
+                self.cells[idx + 3],
+                self.cells[idx + 4],
+            ),
+            _ => Color::Default,
+        };
+        let bg = match bg_type {
+            1 => Color::Indexed(self.cells[idx + 5]),
+            2 => Color::Rgb(
+                self.cells[idx + 5],
+                self.cells[idx + 6],
+                self.cells[idx + 7],
+            ),
+            _ => Color::Default,
+        };
+        CellStyle {
+            fg,
+            bg,
+            bold: (f0 >> 4) & 1 != 0,
+            dim: (f0 >> 5) & 1 != 0,
+            italic: (f0 >> 6) & 1 != 0,
+            underline: (f0 >> 7) & 1 != 0,
+            inverse: f1 & 1 != 0,
+        }
+    }
+
+    pub fn get_ansi_text(&self) -> String {
+        if self.rows == 0 || self.cols == 0 {
+            return String::new();
+        }
+        let mut result = String::new();
+        let mut cur_style = CellStyle::default();
+        for row in 0..self.rows {
+            let mut line = String::new();
+            let mut col = 0u16;
+            while col < self.cols {
+                let style = self.cell_style(row, col);
+                if style != cur_style {
+                    push_sgr(&mut line, &style);
+                    cur_style = style;
+                }
+                line.push_str(self.cell_content(row, col));
+                col += 1;
+            }
+            let trimmed = line.trim_end();
+            result.push_str(trimmed);
+            if cur_style != CellStyle::default() {
+                result.push_str("\x1b[0m");
+                cur_style = CellStyle::default();
+            }
+            if row < self.rows - 1 {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
     pub fn get_cell(&self, row: u16, col: u16) -> Vec<u8> {
         if row >= self.rows || col >= self.cols {
             return Vec::new();
@@ -538,6 +628,10 @@ impl TerminalState {
 
     pub fn get_all_text(&self) -> String {
         self.frame.get_all_text()
+    }
+
+    pub fn get_ansi_text(&self) -> String {
+        self.frame.get_ansi_text()
     }
 
     pub fn get_cell(&self, row: u16, col: u16) -> Vec<u8> {
@@ -1075,6 +1169,7 @@ pub enum ServerMsg<'a> {
     },
     Exited {
         pty_id: u16,
+        exit_status: i32,
     },
     List {
         entries: Vec<PtyListEntry<'a>>,
@@ -1086,6 +1181,14 @@ pub enum ServerMsg<'a> {
     SearchResults {
         request_id: u16,
         results: Vec<SearchResultEntry<'a>>,
+    },
+    Ready,
+    Text {
+        nonce: u16,
+        pty_id: u16,
+        total_lines: u32,
+        offset: u32,
+        text: &'a str,
     },
 }
 
@@ -1155,11 +1258,12 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             })
         }
         S2C_EXITED => {
-            if data.len() < 3 {
+            if data.len() < 7 {
                 return None;
             }
             Some(ServerMsg::Exited {
                 pty_id: u16::from_le_bytes([data[1], data[2]]),
+                exit_status: i32::from_le_bytes([data[3], data[4], data[5], data[6]]),
             })
         }
         S2C_LIST => {
@@ -1244,6 +1348,24 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             Some(ServerMsg::SearchResults {
                 request_id,
                 results,
+            })
+        }
+        S2C_READY => Some(ServerMsg::Ready),
+        S2C_TEXT => {
+            if data.len() < 13 {
+                return None;
+            }
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let pty_id = u16::from_le_bytes([data[3], data[4]]);
+            let total_lines = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+            let offset = u32::from_le_bytes([data[9], data[10], data[11], data[12]]);
+            let text = std::str::from_utf8(data.get(13..).unwrap_or_default()).unwrap_or_default();
+            Some(ServerMsg::Text {
+                nonce,
+                pty_id,
+                total_lines,
+                offset,
+                text,
             })
         }
         _ => None,
@@ -1408,6 +1530,64 @@ pub fn msg_client_metrics(backlog: u16, ack_ahead: u16, apply_ms_x10: u16) -> Ve
     msg.extend_from_slice(&ack_ahead.to_le_bytes());
     msg.extend_from_slice(&apply_ms_x10.to_le_bytes());
     msg
+}
+
+pub fn msg_read(nonce: u16, pty_id: u16, offset: u32, limit: u32, flags: u8) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(14);
+    msg.push(C2S_READ);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&offset.to_le_bytes());
+    msg.extend_from_slice(&limit.to_le_bytes());
+    msg.push(flags);
+    msg
+}
+
+pub fn msg_exited(pty_id: u16, exit_status: i32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(7);
+    msg.push(S2C_EXITED);
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&exit_status.to_le_bytes());
+    msg
+}
+
+fn push_sgr(out: &mut String, style: &CellStyle) {
+    use std::fmt::Write;
+    out.push_str("\x1b[0");
+    if style.bold {
+        out.push_str(";1");
+    }
+    if style.dim {
+        out.push_str(";2");
+    }
+    if style.italic {
+        out.push_str(";3");
+    }
+    if style.underline {
+        out.push_str(";4");
+    }
+    if style.inverse {
+        out.push_str(";7");
+    }
+    match style.fg {
+        Color::Indexed(n) => {
+            let _ = write!(out, ";38;5;{n}");
+        }
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, ";38;2;{r};{g};{b}");
+        }
+        Color::Default => {}
+    }
+    match style.bg {
+        Color::Indexed(n) => {
+            let _ = write!(out, ";48;5;{n}");
+        }
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, ";48;2;{r};{g};{b}");
+        }
+        Color::Default => {}
+    }
+    out.push('m');
 }
 
 const MODE_ALT_SCREEN: u16 = 1 << 11;

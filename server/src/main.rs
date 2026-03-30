@@ -2,10 +2,10 @@ use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as Al
 use blit_remote::{
     build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
     C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_MOUSE,
-    C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE,
+    C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_UNSUBSCRIBE,
     CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
-    FEATURE_RESTART, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_EXITED, S2C_LIST,
-    S2C_SEARCH_RESULTS, S2C_TITLE,
+    FEATURE_RESTART, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_READY, S2C_SEARCH_RESULTS, S2C_TEXT, S2C_TITLE,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
@@ -211,6 +211,9 @@ struct Pty {
     title_pending: bool,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
+    /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
+    /// EXIT_STATUS_UNKNOWN if not yet collected.
+    exit_status: i32,
     /// Command used to create this PTY (None = default shell).
     command: Option<String>,
 }
@@ -1112,7 +1115,8 @@ fn spawn_pty(
                 "-c".to_owned()
             } else {
                 format!("-{}c", shell_flags)
-            }).unwrap();
+            })
+            .unwrap();
             unsafe {
                 let p = shell_c.as_ptr();
                 let f = flag.as_ptr();
@@ -1182,6 +1186,7 @@ fn spawn_pty(
         last_title_send: Instant::now(),
         title_pending: false,
         exited: false,
+        exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
     })
 }
@@ -1254,7 +1259,8 @@ fn respawn_child(
                 "-c".to_owned()
             } else {
                 format!("-{}c", shell_flags)
-            }).unwrap();
+            })
+            .unwrap();
             let cmd_c = CString::new(cmd).unwrap();
             unsafe {
                 libc::execvp(
@@ -1521,12 +1527,17 @@ async fn cleanup_pty(pty_id: u16, state: &AppState) {
         unsafe {
             libc::kill(pty.child_pid, libc::SIGHUP);
             libc::close(pty.master_fd);
-            libc::waitpid(pty.child_pid, std::ptr::null_mut(), libc::WNOHANG);
+            let mut wstatus: libc::c_int = 0;
+            if libc::waitpid(pty.child_pid, &mut wstatus, libc::WNOHANG) > 0 {
+                if libc::WIFEXITED(wstatus) {
+                    pty.exit_status = libc::WEXITSTATUS(wstatus);
+                } else if libc::WIFSIGNALED(wstatus) {
+                    pty.exit_status = -(libc::WTERMSIG(wstatus) as i32);
+                }
+            }
         }
         pty.mark_dirty();
-        // Broadcast S2C_EXITED — PTY stays in the list, clients can still read it.
-        let mut msg = vec![S2C_EXITED];
-        msg.extend_from_slice(&pty_id.to_le_bytes());
+        let msg = blit_remote::msg_exited(pty_id, pty.exit_status);
         sess.send_to_all(&msg);
     }
 }
@@ -1664,7 +1675,9 @@ fn parse_config() -> Config {
             println!("{}", usage());
             println!("  --socket PATH            Unix socket path (or set BLIT_SOCK)");
             println!("  --fd-channel FD          Accept clients via fd-passing on FD (or set BLIT_FD_CHANNEL)");
-            println!("  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)");
+            println!(
+                "  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)"
+            );
             println!("  --version, -V            Print version");
             std::process::exit(0);
         }
@@ -2289,11 +2302,10 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 initial_msgs.push(msg);
             }
             if pty.exited {
-                let mut msg = vec![S2C_EXITED];
-                msg.extend_from_slice(&id.to_le_bytes());
-                initial_msgs.push(msg);
+                initial_msgs.push(blit_remote::msg_exited(id, pty.exit_status));
             }
         }
+        initial_msgs.push(vec![S2C_READY]);
         let tx = sess.clients.get(&client_id).map(|c| c.tx.clone());
         drop(sess);
         if let Some(tx) = tx {
@@ -2919,6 +2931,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         pty.child_pid = child;
                         pty.reader_handle = reader;
                         pty.exited = false;
+                        pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
                         pty.lflag_cache = pty_lflag(master);
                         pty.lflag_last = Instant::now();
                         pty.mark_dirty();
@@ -2935,6 +2948,86 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         msg.extend_from_slice(tag.as_bytes());
                         sess.send_to_all(&msg);
                         need_nudge = true;
+                    }
+                }
+            }
+            C2S_READ if data.len() >= 13 => {
+                let nonce = u16::from_le_bytes([data[1], data[2]]);
+                let pid = u16::from_le_bytes([data[3], data[4]]);
+                let req_offset = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+                let req_limit =
+                    u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
+                let flags = data.get(13).copied().unwrap_or(0);
+                let ansi = flags & READ_ANSI != 0;
+                let tail = flags & READ_TAIL != 0;
+
+                if let Some(pty) = sess.ptys.get_mut(&pid) {
+                    let (rows, _cols) = pty.driver.size();
+                    let viewport = take_snapshot(pty);
+                    let scrollback_lines = viewport.scrollback_lines() as usize;
+                    let total_lines = scrollback_lines + rows as usize;
+
+                    let extract = |f: &FrameState| -> String {
+                        if ansi {
+                            f.get_ansi_text()
+                        } else {
+                            f.get_all_text()
+                        }
+                    };
+
+                    let mut all_lines: Vec<String> = Vec::new();
+
+                    let mut scroll_offset = scrollback_lines;
+                    while scroll_offset > 0 {
+                        let frame = pty.driver.scrollback_frame(scroll_offset);
+                        let page = extract(&frame);
+                        let page_lines: Vec<&str> = page.lines().collect();
+                        let take = if scroll_offset < rows as usize {
+                            scroll_offset.min(page_lines.len())
+                        } else {
+                            page_lines.len()
+                        };
+                        for line in &page_lines[..take] {
+                            all_lines.push(line.to_string());
+                        }
+                        if scroll_offset <= rows as usize {
+                            break;
+                        }
+                        scroll_offset = scroll_offset.saturating_sub(rows as usize);
+                    }
+
+                    for line in extract(&viewport).lines() {
+                        all_lines.push(line.to_string());
+                    }
+
+                    let (start, end) = if tail {
+                        let end = all_lines.len().saturating_sub(req_offset);
+                        let start = if req_limit == 0 {
+                            0
+                        } else {
+                            end.saturating_sub(req_limit)
+                        };
+                        (start, end)
+                    } else {
+                        let start = req_offset.min(all_lines.len());
+                        let end = if req_limit == 0 {
+                            all_lines.len()
+                        } else {
+                            (start + req_limit).min(all_lines.len())
+                        };
+                        (start, end)
+                    };
+                    let text = all_lines[start..end].join("\n");
+
+                    let mut msg = Vec::with_capacity(13 + text.len());
+                    msg.push(S2C_TEXT);
+                    msg.extend_from_slice(&nonce.to_le_bytes());
+                    msg.extend_from_slice(&pid.to_le_bytes());
+                    msg.extend_from_slice(&(total_lines as u32).to_le_bytes());
+                    msg.extend_from_slice(&(start as u32).to_le_bytes());
+                    msg.extend_from_slice(text.as_bytes());
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = client.tx.try_send(msg);
                     }
                 }
             }

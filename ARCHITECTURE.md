@@ -27,12 +27,12 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-react` | `react/` | npm | Workspace-based React client library: connections, sessions, transports, rendering |
 | `blit-server` | `server/` | bin | PTY host and frame scheduler. Listens on Unix socket. |
 | `blit-gateway` | `gateway/` | bin | WebSocket/WebTransport proxy with passphrase auth |
-| `blit` (CLI) | `cli/` | bin | Browser/console client, SSH tunneling, embedded gateway |
+| `blit` (CLI) | `cli/` | bin | Browser/console client, agent subcommands, SSH tunneling, embedded gateway |
 | `blit-fonts` | `fonts/` | lib | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing) |
 | `blit-webserver` | `webserver/` | lib | Shared axum HTTP helpers for serving assets and fonts |
 | `blit-demo` | `demo/` | bin | Demo programs: `chaos`, `emojiblast`, `netdash` |
 
-Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `src/bin/`).
+Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `src/bin/`; `blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`).
 
 ### Dependency graph
 
@@ -61,7 +61,7 @@ All messages use a custom binary format defined in `blit-remote`. There is no pr
 Every non-WebSocket transport wraps messages in a **4-byte little-endian length prefix** followed by the payload. WebSocket provides its own framing, so the length prefix is omitted there. This framing is identical across all components:
 
 - Server: `read_frame` / `write_frame` in `server/src/main.rs`
-- CLI: `cli/src/main.rs`
+- CLI: `cli/src/transport.rs`
 - Gateway: `gateway/src/main.rs`
 - Browser WebTransport/WebRTC: `react/src/transports/`
 
@@ -92,8 +92,11 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 | `0x16` | `CREATE_AT` | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]` |
 | `0x17` | `CREATE_N` | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]` |
 | `0x18` | `CREATE2` | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
+| `0x19` | `READ` | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]` |
 
 `CREATE2` extends `CREATE` with a nonce for response correlation and optional fields gated by feature bits (`HAS_SRC_PTY`, `HAS_COMMAND`).
+
+`READ` requests text from a PTY's scrollback + viewport. `offset` is the number of lines to skip (from the top by default, or from the end when `READ_TAIL` is set). `limit` is the max lines to return (0 = all). `flags`: bit 0 (`READ_ANSI`) includes ANSI color/style escape sequences in the response; bit 1 (`READ_TAIL`) counts `offset` from the end instead of the start. The server responds with `S2C_TEXT` echoing the same nonce.
 
 **Server-to-client (S2C):**
 
@@ -107,7 +110,9 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 | `0x05` | `SEARCH_RESULTS` | `[request_id:2][results...]` |
 | `0x06` | `CREATED_N` | `[nonce:2][pty_id:2][tag:N]` |
 | `0x07` | `HELLO` | `[version:2][features:4]` |
-| `0x08` | `EXITED` | `[pty_id:2]` |
+| `0x08` | `EXITED` | `[pty_id:2][exit_status:4]` |
+| `0x09` | `READY` | (empty) |
+| `0x0A` | `TEXT` | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]` |
 
 ### Feature negotiation
 
@@ -220,7 +225,11 @@ The React library includes a `WebRtcDataChannelTransport`. An ordered DataChanne
 
 ### Transport abstraction
 
-On the Rust side, `blit-cli` defines a `Transport` enum over `UnixStream`, `TcpStream`, and SSH `Child` process. All variants are split into `Box<dyn AsyncRead> + Box<dyn AsyncWrite>` via a `split()` method -- the rest of the client is transport-agnostic.
+On the Rust side, `blit-cli` defines a `Transport` enum (in `cli/src/transport.rs`) over `UnixStream`, `TcpStream`, and SSH `Child` process. All variants are split into `Box<dyn AsyncRead> + Box<dyn AsyncWrite>` via a `split()` method -- the rest of the client is transport-agnostic.
+
+### Agent subcommands
+
+`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `resize`) in `cli/src/agent.rs` for programmatic control of PTYs. These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. All subcommands accept the same transport options (`--socket`, `--tcp`, `--ssh`) as the interactive modes.
 
 On the TypeScript side, the `BlitTransport` interface abstracts over WebSocket, WebTransport, and WebRTC:
 
@@ -251,7 +260,7 @@ Any implementation of this interface can be passed to `BlitWorkspace` as a conne
 
 ### How clients control the server
 
-All server control happens through the binary protocol. There is no separate control channel or admin API. When a client connects, it receives `S2C_HELLO` (version + features) and `S2C_LIST` (existing PTYs). From there, the client sends protocol messages to create, close, focus, subscribe, resize, search, and restart PTYs.
+All server control happens through the binary protocol. There is no separate control channel or admin API. When a client connects, it receives an initial burst: `S2C_HELLO` (version + features), `S2C_LIST` (existing PTYs), per-PTY `S2C_TITLE` and `S2C_EXITED` messages, and finally `S2C_READY` to signal the initial state is complete. From there, the client sends protocol messages to create, close, focus, subscribe, resize, search, read, and restart PTYs.
 
 The server mediates multi-client state:
 
@@ -263,7 +272,7 @@ The server mediates multi-client state:
 
 PTYs are created via `C2S_CREATE` or `C2S_CREATE2`. The server forks, sets up a PTY pair via `openpty`, execs the shell (or a custom command), and registers the master fd for async I/O. PTY output is fed through `alacritty_terminal` for VT parsing.
 
-When a PTY's subprocess exits, the server sends `S2C_EXITED` but retains the terminal state. Clients can still scroll and read. `C2S_RESTART` respawns the shell in the same slot. `C2S_CLOSE` dismisses the PTY entirely.
+When a PTY's subprocess exits, the server captures the exit status from `waitpid()` and sends `S2C_EXITED` with the exit code. The `exit_status` field is `WEXITSTATUS` for normal exits (0, 1, ...), a negative signal number for signal deaths (-9 for SIGKILL, -15 for SIGTERM), or `EXIT_STATUS_UNKNOWN` (`i32::MIN`) when the status couldn't be collected. The terminal state is retained — clients can still scroll and read. `C2S_RESTART` respawns the shell in the same slot. `C2S_CLOSE` dismisses the PTY entirely.
 
 ## Per-client frame pacing
 
