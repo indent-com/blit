@@ -1718,6 +1718,9 @@ fn recv_fd(channel: RawFd) -> RecvFdResult {
             if err.kind() == std::io::ErrorKind::WouldBlock {
                 return RecvFdResult::WouldBlock;
             }
+            if err.raw_os_error() == Some(libc::EINTR) {
+                return RecvFdResult::WouldBlock;
+            }
             return RecvFdResult::Closed;
         }
         if n == 0 {
@@ -1793,6 +1796,7 @@ async fn main() {
         use std::os::unix::io::FromRawFd;
         eprintln!("accepting clients via fd-channel (fd {channel_fd})");
         let channel = unsafe { std::os::unix::net::UnixStream::from_raw_fd(channel_fd) };
+        channel.set_nonblocking(true).unwrap();
         let async_channel = AsyncFd::new(channel).unwrap();
         loop {
             let mut guard = match async_channel.readable().await {
