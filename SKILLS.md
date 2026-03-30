@@ -24,7 +24,8 @@ blit history 3                            # full scrollback + viewport
 blit history 3 --from-end 0 --limit 50    # last 50 lines
 blit history 3 --from-start 0 --limit 50  # first 50 lines
 blit send 3 "ls -la\n"                    # type a command (note the \n)
-blit resize 3 40 120                      # resize the terminal
+blit show 3 --rows 40 --cols 120          # resize before capturing viewport
+blit history 3 --cols 200                 # resize before reading scrollback
 blit close 3                              # destroy the session
 ```
 
@@ -50,7 +51,7 @@ blit --ssh dev-server start bash
   - STATUS column: `running`, `exited(N)` (normal exit with code N), `signal(N)` (killed by signal N), or `exited` (exit status unknown).
 - `start` prints a single integer (the new session ID) to stdout.
 - `show` and `history` print terminal text to stdout, one line per terminal row. Trailing whitespace per row is trimmed.
-- `send`, `close`, and `resize` produce no stdout on success.
+- `send` and `close` produce no stdout on success.
 - All errors go to stderr. Exit code is non-zero on failure.
 
 ## Running commands
@@ -109,7 +110,7 @@ By default, `show` and `history` return plain text with colors stripped. Pass `-
 
 ## Guidelines
 
-- Use `--cols 200` or wider when starting sessions. Narrow terminals cause line wrapping that makes output harder to parse. The default is 80 columns.
+- Use `--cols 200` or wider when starting sessions (or pass `--cols` to `show`/`history` to resize before capturing). Narrow terminals cause line wrapping that makes output harder to parse. The default is 80 columns.
 - Tag sessions with `-t` so you can identify them in `list` output without tracking IDs.
 - Prefer `history --from-end 0 --limit N` over `show` when you need recent output that may have scrolled off-screen.
 - `show` is a snapshot of exactly what a human would see in the terminal right now (the viewport). `history` includes scrollback. If a command produced more output than fits on screen, `show` only has the tail.

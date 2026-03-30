@@ -83,7 +83,7 @@ Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cl
 | `cli/src/interactive.rs` | ~1650 | Console TUI and browser mode |
 | `browser/src/lib.rs` | ~1100 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas |
 | `alacritty-driver/src/lib.rs` | ~1100 | Terminal parsing wrapper around `alacritty_terminal` |
-| `cli/src/agent.rs` | ~870 | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `resize` |
+| `cli/src/agent.rs` | ~870 | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close` |
 | `demo/src/main.rs` | ~780 | Demo programs |
 | `gateway/src/main.rs` | ~700 | WebSocket/WebTransport proxy |
 | `fonts/src/lib.rs` | ~600 | Font discovery and TTF/OTF parsing |
