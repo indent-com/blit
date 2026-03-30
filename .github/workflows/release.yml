@@ -102,6 +102,11 @@ jobs:
       - run: ./bin/publish-npm-packages --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  update-homebrew:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
       - name: Update Homebrew tap
         uses: peter-evans/repository-dispatch@v3
         with:
