@@ -67,6 +67,16 @@ Pick one, not both:
 - **`blit-gateway`**: standalone proxy for persistent browser access. Handles passphrase auth, serves the web app, optionally enables QUIC.
 - **`blit` (CLI)**: connects to the server, embeds a temporary gateway, opens the browser.
 
+With the gateway:
+
+```bash
+BLIT_PASS=secret blit-gateway &
+blit-server
+# open http://localhost:3264
+```
+
+If building from source, substitute `cargo run -p blit-server`, `cargo run -p blit-cli`, etc. For the dev environment with hot-reloading, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Running services
 
 ### macOS (Homebrew)
@@ -97,16 +107,6 @@ sudo cp systemd/blit@.socket systemd/blit@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now blit@alice.socket
 ```
-
-## Gateway (persistent browser access)
-
-```bash
-BLIT_PASS=secret blit-gateway &
-blit-server
-# open http://localhost:3264
-```
-
-If building from source, substitute `cargo run -p blit-server`, `cargo run -p blit-cli`, etc. For the dev environment with hot-reloading, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Configuration
 
