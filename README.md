@@ -147,6 +147,7 @@ blit list                                      # List all PTYs (TSV: ID, TAG, TI
 blit start htop                                # Start a PTY running htop, print its ID
 blit start -t build make -j8                   # Start with a tag
 blit start --rows 40 --cols 120 bash           # Start with a custom size
+blit start --wait --timeout 60 make -j8        # Start and block until exit
 blit show 3                                    # Dump current visible terminal text
 blit show 3 --ansi                             # Include ANSI color/style codes
 blit history 3                                 # Dump all scrollback + viewport
@@ -156,6 +157,9 @@ blit history 3 --from-end 0 --limit 50 --ansi  # Last 50 with ANSI styling
 blit send 3 "q"                                # Send keystrokes (supports \n, \t, \x1b escapes)
 blit show 3 --rows 40 --cols 120               # Resize before capturing viewport
 blit history 3 --cols 200                      # Resize before reading scrollback
+blit wait 3 --timeout 30                       # Block until session exits
+blit wait 3 --timeout 60 --pattern 'DONE'      # Block until output matches regex
+blit restart 3                                 # Restart an exited session
 blit close 3                                   # Close and remove a PTY
 
 # Against a remote host
