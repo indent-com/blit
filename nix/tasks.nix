@@ -240,6 +240,63 @@ in {
     '';
   };
 
+  deploy-blit-cloud = pkgs.writeShellApplication {
+    name = "deploy-blit-cloud";
+    runtimeInputs = [ pkgs.flyctl pkgs.git ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      flyctl deploy "$root/js/blit-cloud" "$@"
+    '';
+  };
+
+  setup-blit-cloud = pkgs.writeShellApplication {
+    name = "setup-blit-cloud";
+    runtimeInputs = [ pkgs.flyctl pkgs.git ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      APP="blit-cloud"
+      ORG="''${FLY_ORG:-personal}"
+
+      echo "=== Creating Fly app: $APP ==="
+      flyctl apps create "$APP" --machines --org "$ORG" 2>/dev/null || echo "App $APP already exists, continuing..."
+
+      if ! flyctl secrets list -a "$APP" 2>/dev/null | grep -q REDIS_URL; then
+        if [ -z "''${REDIS_URL:-}" ]; then
+          echo ""
+          echo "ERROR: REDIS_URL is required. Provision Redis and pass the URL:"
+          echo ""
+          echo "  flyctl redis create --org $ORG"
+          echo "  REDIS_URL=redis://... $0"
+          exit 1
+        fi
+        echo ""
+        echo "=== Setting REDIS_URL ==="
+        flyctl secrets set REDIS_URL="$REDIS_URL" -a "$APP" --stage
+      else
+        echo ""
+        echo "REDIS_URL already set, skipping."
+      fi
+
+      if [ -n "''${CF_TURN_TOKEN_ID:-}" ] && [ -n "''${CF_TURN_API_TOKEN:-}" ]; then
+        echo ""
+        echo "=== Setting Cloudflare TURN credentials ==="
+        flyctl secrets set CF_TURN_TOKEN_ID="$CF_TURN_TOKEN_ID" CF_TURN_API_TOKEN="$CF_TURN_API_TOKEN" -a "$APP" --stage
+      fi
+
+      echo ""
+      echo "=== Deploying ==="
+      flyctl deploy "$root/js/blit-cloud" "$@"
+
+      echo ""
+      echo "=== Done ==="
+      echo "App URL: https://$APP.fly.dev"
+      echo ""
+      echo "To enable CD from GitHub Actions, add a deploy token:"
+      echo "  flyctl tokens create deploy -a $APP"
+      echo "  gh secret set FLY_API_TOKEN --repo <owner>/<repo>"
+    '';
+  };
+
   tests = pkgs.writeShellApplication {
     name = "blit-tests";
     runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun ];

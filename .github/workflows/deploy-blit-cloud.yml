@@ -1,0 +1,17 @@
+name: Deploy blit-cloud
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "js/blit-cloud/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix run .#deploy-blit-cloud
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
