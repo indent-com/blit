@@ -51,7 +51,7 @@ jobs:
           path: dist/*.tar.gz
 
   release:
-    needs: [build-debs, build-tarballs]
+    needs: [build-debs, build-tarballs, build-wheels]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -66,10 +66,17 @@ jobs:
           merge-multiple: true
           path: tarballs
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: wheels
+
       - name: List artifacts
         run: |
           ls -lh debs/
           ls -lh tarballs/
+          ls -lh wheels/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -77,6 +84,7 @@ jobs:
           files: |
             debs/*.deb
             tarballs/*.tar.gz
+            wheels/*.whl
           generate_release_notes: true
 
   build-wheels:
@@ -84,9 +92,9 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - runner: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
@@ -96,7 +104,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-          manylinux: "2_17"
+          manylinux: "off"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.target }}

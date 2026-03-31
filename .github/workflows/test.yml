@@ -56,6 +56,23 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/build-debs
 
+  build-wheels:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: "off"
+
   build-tarballs:
     strategy:
       matrix:
