@@ -15,18 +15,88 @@ Drive terminal sessions programmatically through stateless CLI subcommands. Each
 
 ```bash
 blit list                                 # TSV: ID  TAG  TITLE  STATUS
-blit start bash                           # prints the new session ID to stdout
-blit start -t build make -j8              # tag it for later reference
-blit start --rows 40 --cols 120 bash      # control terminal dimensions
+blit start --cols 200 bash                # prints the new session ID to stdout
+blit start -t build --cols 200 make -j8   # tag it for later reference
+blit start --rows 40 --cols 200 bash      # control terminal dimensions
 blit show 3                               # current viewport text (plain)
 blit show 3 --ansi                        # current viewport with ANSI colors
 blit history 3                            # full scrollback + viewport
 blit history 3 --from-end 0 --limit 50    # last 50 lines
 blit history 3 --from-start 0 --limit 50  # first 50 lines
 blit send 3 "ls -la\n"                    # type a command (note the \n)
-blit show 3 --rows 40 --cols 120          # resize before capturing viewport
+blit show 3 --rows 40 --cols 200          # resize before capturing viewport
 blit history 3 --cols 200                 # resize before reading scrollback
 blit close 3                              # destroy the session
+```
+
+**Always start sessions with `--cols 200`** (or wider). The default is 80 columns, which causes line wrapping that makes output difficult to parse. Pass `--cols` to `show`/`history` to resize an existing session before reading.
+
+## `show` vs `history`
+
+These are the two ways to read terminal output. Getting this distinction right is critical.
+
+| | `show` | `history` |
+|---|---|---|
+| **What it returns** | Current viewport — exactly what a human would see on screen right now | Full scrollback buffer + viewport |
+| **When to use** | Quick glance at current state (e.g. is the prompt back?) | Reading command output that may have scrolled off-screen |
+| **Gotcha** | If a command produced more output than fits on screen, earlier output is lost | Returns everything, which can be very large for long-running commands |
+
+**Rule of thumb:** Use `history --from-end 0 --limit N` when you need recent output. Use `show` when you only care about what's visible right now (e.g. checking for a prompt).
+
+## Running commands and waiting for output
+
+`blit start` creates a PTY but does not run the command interactively. To execute a shell command and read its output:
+
+```bash
+ID=$(blit start --cols 200 bash)
+blit send "$ID" "ls -la\n"
+sleep 0.5                    # wait for output
+blit history "$ID" --from-end 0 --limit 20
+blit close "$ID"
+```
+
+The `sleep` is necessary because `send` returns immediately after delivering keystrokes to the PTY. There is no built-in "wait for output to settle" mechanism.
+
+### Detecting when a command has finished
+
+The STATUS column in `blit list` only reflects the session's overall exit status (shown after the shell itself exits), not whether an individual command within the session has completed. To detect command completion, poll the output for a shell prompt:
+
+```bash
+# Poll until shell prompt appears (up to 10 seconds)
+for i in $(seq 1 50); do
+  blit history "$ID" --from-end 0 --limit 3 | grep -q '\$ $' && break
+  sleep 0.2
+done
+```
+
+For commands with known end markers, match on those instead:
+
+```bash
+# Wait for a build to finish (look for "BUILD SUCCESS" or "BUILD FAILURE")
+for i in $(seq 1 150); do
+  OUTPUT=$(blit history "$ID" --from-end 0 --limit 5)
+  echo "$OUTPUT" | grep -qE 'BUILD (SUCCESS|FAILURE)' && break
+  sleep 0.2
+done
+```
+
+**Do not assume a command has finished after `send`.** Always poll with `show` or `history` to confirm.
+
+## Session lifecycle
+
+Sessions persist as long as the blit daemon is running. They are **not** cleaned up automatically.
+
+- A session stays alive until you `close` it or the process inside it exits.
+- If the process exits on its own, the session remains in the `list` output with an `exited(N)` status. It still consumes resources until explicitly closed.
+- Sessions do **not** persist across daemon restarts.
+- **Clean up after yourself.** Always `close` sessions when you are done. Leaked sessions accumulate and waste resources.
+
+```bash
+# Clean up a specific session
+blit close "$ID"
+
+# Check for leaked sessions
+blit list
 ```
 
 ## Transport options
@@ -53,20 +123,6 @@ blit --ssh dev-server start bash
 - `show` and `history` print terminal text to stdout, one line per terminal row. Trailing whitespace per row is trimmed.
 - `send` and `close` produce no stdout on success.
 - All errors go to stderr. Exit code is non-zero on failure.
-
-## Running commands
-
-`blit start` creates a PTY but does not run the command interactively. To execute a shell command and read its output:
-
-```bash
-ID=$(blit start bash)
-blit send "$ID" "ls -la\n"
-sleep 0.5                    # wait for output
-blit show "$ID"              # or: blit history "$ID" --from-end 0 --limit 20
-blit close "$ID"
-```
-
-The `sleep` is necessary because `send` returns immediately after delivering keystrokes to the PTY. There is no built-in "wait for output to settle" mechanism, so poll with `show` or `history` until the output stabilizes or a known prompt appears.
 
 ## Escape sequences
 
@@ -110,10 +166,6 @@ By default, `show` and `history` return plain text with colors stripped. Pass `-
 
 ## Guidelines
 
-- Use `--cols 200` or wider when starting sessions (or pass `--cols` to `show`/`history` to resize before capturing). Narrow terminals cause line wrapping that makes output harder to parse. The default is 80 columns.
 - Tag sessions with `-t` so you can identify them in `list` output without tracking IDs.
-- Prefer `history --from-end 0 --limit N` over `show` when you need recent output that may have scrolled off-screen.
-- `show` is a snapshot of exactly what a human would see in the terminal right now (the viewport). `history` includes scrollback. If a command produced more output than fits on screen, `show` only has the tail.
 - Check exit status in `list`. The STATUS column shows `exited(0)` for success, `exited(1)` for failure, `signal(9)` for SIGKILL, etc.
 - Do not try to parse `show` or `history` output as structured data. It is terminal text with possible line wrapping and cursor artifacts.
-- Do not assume a command has finished after `send`. Always poll with `show` or `history` to confirm.
