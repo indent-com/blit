@@ -114,7 +114,7 @@
 
       webAppNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/web-app;
-        hash = "sha256-LluQX9Lpmt9nlJRJRByr0HWHTa4QEoe72Wz1hAiFeeQ=";
+        hash = "sha256-Qr0IqyQyBT6oj0MgMVNab9nCIeBBsU+26nAVYVGi8iA=";
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {

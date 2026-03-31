@@ -53,6 +53,7 @@ export default bin.buffer;
       "blit-react": resolve(__dirname, "../react/src"),
       "blit-browser": resolve(__dirname, "../../crates/browser/pkg/blit_browser.js"),
     },
+    dedupe: ["react", "react-dom"],
   },
   server: {
     port: 3265,
