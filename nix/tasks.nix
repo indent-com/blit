@@ -240,21 +240,21 @@ in {
     '';
   };
 
-  deploy-blitz-signaling = pkgs.writeShellApplication {
-    name = "deploy-blitz-signaling";
+  deploy-blit-cloud = pkgs.writeShellApplication {
+    name = "deploy-blit-cloud";
     runtimeInputs = [ pkgs.flyctl pkgs.git ];
     text = ''
       root=$(git rev-parse --show-toplevel)
-      flyctl deploy "$root/ts/blitz-signaling" "$@"
+      flyctl deploy "$root/js/blit-cloud" "$@"
     '';
   };
 
-  setup-blitz-signaling = pkgs.writeShellApplication {
-    name = "setup-blitz-signaling";
+  setup-blit-cloud = pkgs.writeShellApplication {
+    name = "setup-blit-cloud";
     runtimeInputs = [ pkgs.flyctl pkgs.git ];
     text = ''
       root=$(git rev-parse --show-toplevel)
-      APP="blitz-signaling"
+      APP="blit-cloud"
       ORG="''${FLY_ORG:-personal}"
 
       echo "=== Creating Fly app: $APP ==="
@@ -285,7 +285,7 @@ in {
 
       echo ""
       echo "=== Deploying ==="
-      flyctl deploy "$root/ts/blitz-signaling" "$@"
+      flyctl deploy "$root/js/blit-cloud" "$@"
 
       echo ""
       echo "=== Done ==="

@@ -1,4 +1,4 @@
-app = "blitz-signaling"
+app = "blit-cloud"
 primary_region = "iad"
 
 [build]

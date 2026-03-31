@@ -1,4 +1,4 @@
-# blitz-signaling
+# blit-cloud
 
 WebRTC signaling relay for blit terminal sharing. Routes WebRTC signaling
 messages (offers, answers, ICE candidates) between peers over WebSocket.
@@ -18,7 +18,7 @@ run the setup script:
 flyctl redis create
 
 # Deploy (REDIS_URL is required on first run)
-REDIS_URL=redis://... ./bin/setup-blitz-signaling
+REDIS_URL=redis://... ./bin/setup-blit-cloud
 ```
 
 The script is idempotent — re-running it skips secrets that are already set
@@ -32,12 +32,11 @@ Optional env vars for setup:
 | `CF_TURN_TOKEN_ID`  | Cloudflare TURN key ID                   |
 | `CF_TURN_API_TOKEN` | Cloudflare TURN API token                |
 | `FLY_ORG`           | Fly.io org (default: `personal`)         |
-| `FLY_REGION`        | Primary region (default: `iad`)          |
 
 To enable continuous deployment from GitHub Actions:
 
 ```bash
-flyctl tokens create deploy -a blitz-signaling
+flyctl tokens create deploy -a blit-cloud
 gh secret set FLY_API_TOKEN --repo <owner>/<repo>
 ```
 
@@ -45,7 +44,7 @@ gh secret set FLY_API_TOKEN --repo <owner>/<repo>
 
 ```bash
 docker run -d -p 6379:6379 redis:7
-cd ts/blitz-signaling
+cd js/blit-cloud
 bun install
 bun run dev
 ```

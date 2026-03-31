@@ -1,5 +1,5 @@
 {
-  "name": "blitz-signaling",
+  "name": "blit-cloud",
   "version": "0.1.0",
   "description": "WebRTC signaling relay for blit terminal sharing",
   "license": "MIT",
