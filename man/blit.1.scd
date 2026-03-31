@@ -10,7 +10,7 @@ _blit_ [OPTIONS] [HOST]
 
 _blit_ [OPTIONS] _list_
 
-_blit_ [OPTIONS] _start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
+_blit_ [OPTIONS] _start_ [_--wait_] [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
 
 _blit_ [OPTIONS] _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 
@@ -72,10 +72,12 @@ _list_
 List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,
 STATUS.
 
-_start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
+_start_ [_--wait_] [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
 Start a new PTY and print its session ID. If _COMMAND_ is omitted, the
 user's default shell is started. The default size is 24 rows by 80
-columns.
+columns. With _--wait_ (or _-w_), block until the command exits and
+propagate its exit code. Normal exits use the process exit code directly;
+signal deaths exit with 128 + signal number.
 
 _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 Dump the current visible terminal text for session _ID_. With _--ansi_,

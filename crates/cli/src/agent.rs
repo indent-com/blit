@@ -136,7 +136,8 @@ pub async fn cmd_start(
     command: Vec<String>,
     rows: u16,
     cols: u16,
-) -> Result<(), String> {
+    wait: bool,
+) -> Result<Option<i32>, String> {
     let mut conn = AgentConn::connect(transport).await?;
 
     let nonce: u16 = 1;
@@ -145,18 +146,50 @@ pub async fn cmd_start(
     let msg = msg_create_n_command(nonce, rows, cols, tag_str, &cmd_str);
     conn.send(&msg).await?;
 
+    let mut created_pty: Option<u16> = None;
+
     loop {
-        let data = conn.recv().await?;
+        let data = if wait && created_pty.is_some() {
+            read_frame(&mut conn.reader)
+                .await
+                .ok_or_else(|| "server closed connection".to_string())?
+        } else {
+            conn.recv().await?
+        };
         if data.is_empty() {
             continue;
         }
-        if let Some(ServerMsg::CreatedN {
-            nonce: n, pty_id, ..
-        }) = parse_server_msg(&data)
-        {
-            if n == nonce {
-                println!("{pty_id}");
-                return Ok(());
+        match data[0] {
+            S2C_EXITED => {
+                if let Some(ServerMsg::Exited {
+                    pty_id,
+                    exit_status,
+                }) = parse_server_msg(&data)
+                {
+                    if created_pty == Some(pty_id) {
+                        if exit_status == blit_remote::EXIT_STATUS_UNKNOWN {
+                            return Ok(Some(1));
+                        } else if exit_status < 0 {
+                            return Ok(Some(128 + (-exit_status)));
+                        } else {
+                            return Ok(Some(exit_status));
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(ServerMsg::CreatedN {
+                    nonce: n, pty_id, ..
+                }) = parse_server_msg(&data)
+                {
+                    if n == nonce {
+                        println!("{pty_id}");
+                        if !wait {
+                            return Ok(None);
+                        }
+                        created_pty = Some(pty_id);
+                    }
+                }
             }
         }
     }
@@ -540,6 +573,14 @@ mod tests {
             write_frame(&mut self.writer, &msg).await;
         }
 
+        async fn send_exited(&mut self, pty_id: u16, exit_status: i32) {
+            write_frame(
+                &mut self.writer,
+                &blit_remote::msg_exited(pty_id, exit_status),
+            )
+            .await;
+        }
+
         async fn send_closed(&mut self, pty_id: u16) {
             let mut msg = vec![S2C_CLOSED];
             msg.extend_from_slice(&pty_id.to_le_bytes());
@@ -707,6 +748,97 @@ mod tests {
                 }
             }
         }
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_wait() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst().await;
+
+            let data = mock.recv().await.unwrap();
+            assert_eq!(data[0], blit_remote::C2S_CREATE_N);
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+
+            mock.send_created_n(nonce, 5, "").await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            mock.send_exited(5, 42).await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_start(
+            transport,
+            None,
+            vec!["echo".into(), "hello".into()],
+            24,
+            80,
+            true,
+        )
+        .await;
+        assert_eq!(result.unwrap(), Some(42));
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_wait_signal() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst().await;
+
+            let data = mock.recv().await.unwrap();
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+
+            mock.send_created_n(nonce, 3, "").await;
+            mock.send_exited(3, -9).await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_start(
+            transport,
+            None,
+            vec!["sleep".into(), "999".into()],
+            24,
+            80,
+            true,
+        )
+        .await;
+        assert_eq!(result.unwrap(), Some(128 + 9));
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_no_wait() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst().await;
+
+            let data = mock.recv().await.unwrap();
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+
+            mock.send_created_n(nonce, 5, "").await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_start(
+            transport,
+            None,
+            vec!["echo".into(), "hello".into()],
+            24,
+            80,
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap(), None);
 
         mock.await.unwrap();
     }

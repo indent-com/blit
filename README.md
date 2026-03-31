@@ -147,6 +147,7 @@ blit list                                      # List all PTYs (TSV: ID, TAG, TI
 blit start htop                                # Start a PTY running htop, print its ID
 blit start -t build make -j8                   # Start with a tag
 blit start --rows 40 --cols 120 bash           # Start with a custom size
+blit start --wait make test                    # Start and block until the command exits
 blit show 3                                    # Dump current visible terminal text
 blit show 3 --ansi                             # Include ANSI color/style codes
 blit history 3                                 # Dump all scrollback + viewport

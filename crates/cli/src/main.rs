@@ -58,6 +58,10 @@ enum Command {
         /// Terminal columns
         #[arg(long, default_value = "80")]
         cols: u16,
+
+        /// Wait for the command to exit and use its exit code
+        #[arg(long, short = 'w')]
+        wait: bool,
     },
 
     /// Print the current visible text of a session
@@ -159,7 +163,14 @@ async fn main() {
                     tag,
                     rows,
                     cols,
-                } => agent::cmd_start(transport, tag, command, rows, cols).await,
+                    wait,
+                } => {
+                    match agent::cmd_start(transport, tag, command, rows, cols, wait).await {
+                        Ok(Some(code)) => std::process::exit(code),
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                }
                 Command::Show {
                     id,
                     ansi,
