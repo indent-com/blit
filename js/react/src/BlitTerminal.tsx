@@ -1,11 +1,11 @@
 import {
-  forwardRef,
   useCallback,
   useEffect,
   useImperativeHandle,
   useRef,
   useState,
 } from "react";
+import type { Ref } from "react";
 import type { Terminal } from "blit-browser";
 import type { BlitTerminalProps, TerminalPalette } from "./types";
 import type { ConnectionStatus } from "./types";
@@ -48,8 +48,10 @@ export interface BlitTerminalHandle {
  * It handles WASM initialisation, server message processing, GL rendering,
  * keyboard/mouse input, and dynamic resizing through a ResizeObserver.
  */
-export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
-  function BlitTerminal(props, ref) {
+export function BlitTerminal({
+  ref,
+  ...props
+}: BlitTerminalProps & { ref?: Ref<BlitTerminalHandle> }) {
     const ctx = useBlitContext();
     const workspace = useRequiredBlitWorkspace();
     const session = useBlitSession(props.sessionId);
@@ -1497,5 +1499,4 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         )}
       </div>
     );
-  },
-);
+}
