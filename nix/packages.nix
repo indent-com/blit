@@ -107,6 +107,44 @@
         cargoPkg = "blit-server";
       };
 
+      mkWheel = { binPkg, binName, pname, summary }:
+        let
+          platformTag =
+            if pkgs.stdenv.isDarwin then
+              (if pkgs.stdenv.hostPlatform.isAarch64 then "macosx_11_0_arm64" else "macosx_10_12_x86_64")
+            else
+              (if pkgs.stdenv.hostPlatform.isAarch64 then "musllinux_1_2_aarch64" else "musllinux_1_2_x86_64");
+          tag = "py3-none-${platformTag}";
+          whlFilename = "${pname}-${version}-${tag}.whl";
+        in pkgs.stdenv.mkDerivation {
+          pname = "${pname}-wheel";
+          inherit version;
+          nativeBuildInputs = [ pkgs.python3 ];
+          dontUnpack = true;
+          buildPhase = ''
+            mkdir -p $out
+            python3 ${../scripts/mkwheel.py} \
+              --name "${pname}" \
+              --version "${version}" \
+              --binary "${binPkg}/bin/${binName}" \
+              --bin-name "${binName}" \
+              --tag "${tag}" \
+              --summary "${summary}" \
+              --license "MIT" \
+              --homepage "https://blit.sh" \
+              --repository "https://github.com/indent-com/blit" \
+              --output "$out/${whlFilename}"
+          '';
+          installPhase = "true";
+        };
+
+      blit-server-wheel = mkWheel {
+        binPkg = blit-server-static;
+        binName = "blit-server";
+        pname = "blit_server";
+        summary = "blit terminal multiplexer server";
+      };
+
       reactNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/react;
         hash = "sha256-GXc6L3oJHPNDaR6lSvIUO+9UjjGEPcaMoz7rDSoH9Dw=";
@@ -185,6 +223,7 @@
       tasks = import ./tasks.nix {
         inherit pkgs version browserWasm blit-server blit-gateway
                 blit-server-static blit-cli-static blit-gateway-static
+                blit-server-wheel
                 manPages webAppDist rustToolchain;
       };
     in
@@ -192,6 +231,7 @@
       packages = {
         inherit blit-server blit-cli blit-gateway;
         inherit blit-server-static blit-cli-static blit-gateway-static;
+        inherit blit-server-wheel;
         default = blit-cli;
       } // tasks;
 

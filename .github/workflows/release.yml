@@ -92,23 +92,21 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            label: linux-x86_64
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+            label: linux-aarch64
           - runner: macos-latest
-            target: aarch64-apple-darwin
+            label: macos-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist
-          manylinux: "off"
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/build-wheels wheels
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.target }}
-          path: dist/*.whl
+          name: wheels-${{ matrix.label }}
+          path: wheels/*.whl
 
   publish-pypi:
     needs: [build-wheels, release]

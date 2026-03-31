@@ -1,5 +1,6 @@
 { pkgs, version, browserWasm, blit-server, blit-gateway
 , blit-server-static, blit-cli-static, blit-gateway-static
+, blit-server-wheel
 , manPages, webAppDist, rustToolchain
 }:
 let
@@ -202,6 +203,17 @@ in {
           tar -czf "$outdir/''${name}_${version}_${os}_${arch}.tar.gz" -C "$pkg/bin" "$name"
         done
       done
+      echo ""
+      ls -lh "$outdir"
+    '';
+  };
+
+  build-wheels = pkgs.writeShellApplication {
+    name = "blit-build-wheels";
+    text = ''
+      outdir="''${1:-dist/wheels}"
+      mkdir -p "$outdir"
+      cp ${blit-server-wheel}/*.whl "$outdir"/
       echo ""
       ls -lh "$outdir"
     '';
