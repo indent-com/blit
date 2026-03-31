@@ -6,10 +6,10 @@ const packages = `${root}/nix/packages.nix`;
 let text = await Bun.file(packages).text();
 
 for (const dir of ["react", "web-app"]) {
-  const hash = (await $`prefetch-npm-deps ${root}/libs/${dir}/package-lock.json`.quiet()).text().trim();
+  const hash = (await $`prefetch-npm-deps ${root}/js/${dir}/package-lock.json`.quiet()).text().trim();
   console.log(`${dir}: ${hash}`);
   text = text.replace(
-    new RegExp(`(src = \\.\\./libs/${dir};\\s*\\n\\s*hash = ")sha256-[A-Za-z0-9+/]+=*`),
+    new RegExp(`(src = \\.\\./js/${dir};\\s*\\n\\s*hash = ")sha256-[A-Za-z0-9+/]+=*`),
     `$1${hash}`,
   );
 }

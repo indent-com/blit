@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::transport::{self, make_frame, read_frame, Transport};
 
-const WEB_INDEX_HTML: &str = include_str!("../../../libs/web-app/dist/index.html");
+const WEB_INDEX_HTML: &str = include_str!("../../../js/web-app/dist/index.html");
 
 fn term_size() -> (u16, u16) {
     unsafe {

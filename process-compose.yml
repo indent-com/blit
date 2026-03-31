@@ -40,7 +40,7 @@ processes:
       failure_threshold: 300
 
   web-app:
-    command: cd libs/web-app && npx vite --host
+    command: cd js/web-app && npx vite --host
     environment:
       - VITE_BLIT_GATEWAY=localhost:3266
     depends_on:

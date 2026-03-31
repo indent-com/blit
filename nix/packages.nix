@@ -108,12 +108,12 @@
       };
 
       reactNpmDeps = pkgs.fetchNpmDeps {
-        src = ../libs/react;
+        src = ../js/react;
         hash = "sha256-aMWhMNeY9NUyTxhPbooD4ygcoNLzLU1LZXmxttB7XwY=";
       };
 
       webAppNpmDeps = pkgs.fetchNpmDeps {
-        src = ../libs/web-app;
+        src = ../js/web-app;
         hash = "sha256-LluQX9Lpmt9nlJRJRByr0HWHTa4QEoe72Wz1hAiFeeQ=";
       };
 
@@ -139,22 +139,22 @@
 
           cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
           chmod -R u+w "$TMPDIR/react-cache"
-          (cd libs/react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
+          (cd js/react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
 
           cp -r ${webAppNpmDeps} "$TMPDIR/webapp-cache"
           chmod -R u+w "$TMPDIR/webapp-cache"
-          (cd libs/web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
+          (cd js/web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
         '';
         installPhase = ''
           mkdir -p $out
-          cp libs/web-app/dist/index.html $out/
+          cp js/web-app/dist/index.html $out/
         '';
         doCheck = false;
       };
 
       copyWebAppDist = ''
-        mkdir -p libs/web-app/dist
-        cp ${webAppDist}/index.html libs/web-app/dist/
+        mkdir -p js/web-app/dist
+        cp ${webAppDist}/index.html js/web-app/dist/
       '';
 
       blit-cli-static = mkStaticBin {

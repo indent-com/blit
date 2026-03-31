@@ -57,7 +57,7 @@ PKGJSON
       cp ${browserWasm}/blit_browser_bg.wasm.d.ts "$wasm"/ 2>/dev/null || true
       echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > "$wasm/package.json"
 
-      cp -a ${../libs/react}/* "$tmp"/
+      cp -a ${../js/react}/* "$tmp"/
       chmod -R u+w "$tmp"
 
       cd "$tmp"
@@ -232,8 +232,8 @@ in {
     runtimeInputs = [ rustToolchain ];
     text = ''
       echo "=== Setting up web-app dist ==="
-      mkdir -p libs/web-app/dist
-      cp ${webAppDist}/index.html libs/web-app/dist/
+      mkdir -p js/web-app/dist
+      cp ${webAppDist}/index.html js/web-app/dist/
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
@@ -245,8 +245,8 @@ in {
     runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun ];
     text = ''
       echo "=== Setting up web-app dist ==="
-      mkdir -p libs/web-app/dist
-      cp ${webAppDist}/index.html libs/web-app/dist/
+      mkdir -p js/web-app/dist
+      cp ${webAppDist}/index.html js/web-app/dist/
 
       echo "=== Manpage build ==="
       for f in man/*.scd; do
@@ -264,7 +264,7 @@ in {
       if [ ! -f crates/browser/pkg/blit_browser.js ]; then
         touch crates/browser/pkg/blit_browser.js
       fi
-      (cd libs/react && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
+      (cd js/react && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
 
       export BLIT_SERVER="${blit-server}/bin/blit-server"
       echo ""

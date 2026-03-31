@@ -23,7 +23,7 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 - **`blit-gateway`**: a standalone WebSocket/WebTransport proxy, deployed alongside the server for persistent browser access. Handles passphrase auth, serves the web app, optionally enables QUIC.
 - **`blit` (the CLI)**: connects to a local or remote `blit-server` (over SSH if needed), embeds a temporary gateway, and opens the browser — no separate gateway deployment required.
 
-**`libs/web-app/`** is the browser UI served by either path. It provides multi-session management, BSP layouts, search, font/palette selection, and reconnection handling.
+**`js/web-app/`** is the browser UI served by either path. It provides multi-session management, BSP layouts, search, font/palette selection, and reconnection handling.
 
 ## What makes it tick
 
@@ -74,12 +74,12 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | `crates/remote/`           | `blit-remote`    | Wire protocol and frame/state primitives         |
 | `crates/browser/`          | `blit-browser`   | WASM terminal runtime                            |
 | `crates/alacritty-driver/` | `blit-alacritty` | Terminal parsing backed by `alacritty_terminal`  |
-| `libs/react/`              | `blit-react`     | Workspace-based React client library             |
+| `js/react/`              | `blit-react`     | Workspace-based React client library             |
 | `crates/fonts/`            |                  | Font discovery and metadata                      |
 | `crates/webserver/`        |                  | Shared HTTP helpers for serving assets and fonts |
 | `crates/gateway/`          | `blit-gateway`   | WebSocket/WebTransport proxy                     |
 | `crates/cli/`              | `blit`           | Browser client                                   |
-| `libs/web-app/`            |                  | Browser UI                                       |
+| `js/web-app/`            |                  | Browser UI                                       |
 | `crates/demo/`             |                  | Sample programs and test content                 |
 
 ## Install

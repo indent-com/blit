@@ -118,23 +118,23 @@ node - "$current_version" <<'NODE'
 const fs = require("fs");
 const expected = process.argv[2];
 
-const pkg = JSON.parse(fs.readFileSync("libs/react/package.json", "utf8"));
+const pkg = JSON.parse(fs.readFileSync("js/react/package.json", "utf8"));
 if (pkg.version !== expected) {
-  console.error(`release: expected libs/react/package.json to be at version ${expected}`);
+  console.error(`release: expected js/react/package.json to be at version ${expected}`);
   process.exit(1);
 }
 
-const lock = JSON.parse(fs.readFileSync("libs/react/package-lock.json", "utf8"));
+const lock = JSON.parse(fs.readFileSync("js/react/package-lock.json", "utf8"));
 if (lock.version !== expected) {
-  console.error(`release: expected libs/react/package-lock.json to be at version ${expected}`);
+  console.error(`release: expected js/react/package-lock.json to be at version ${expected}`);
   process.exit(1);
 }
 if (lock.packages?.[""]?.version !== expected) {
-  console.error(`release: expected libs/react/package-lock.json packages[""] to be at version ${expected}`);
+  console.error(`release: expected js/react/package-lock.json packages[""] to be at version ${expected}`);
   process.exit(1);
 }
 if (lock.packages?.["../../crates/browser/pkg"]?.version !== expected) {
-  console.error(`release: expected libs/react/package-lock.json packages["../../crates/browser/pkg"] to be at version ${expected}`);
+  console.error(`release: expected js/react/package-lock.json packages["../../crates/browser/pkg"] to be at version ${expected}`);
   process.exit(1);
 }
 NODE
@@ -165,12 +165,12 @@ node - "$target_version" <<'NODE'
 const fs = require("fs");
 const version = process.argv[2];
 
-const pkgPath = "libs/react/package.json";
+const pkgPath = "js/react/package.json";
 const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
 pkg.version = version;
 fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
 
-const lockPath = "libs/react/package-lock.json";
+const lockPath = "js/react/package-lock.json";
 const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
 lock.version = version;
 lock.packages = lock.packages || {};
@@ -206,19 +206,19 @@ node - "$target_version" <<'NODE'
 const fs = require("fs");
 const expected = process.argv[2];
 
-const pkg = JSON.parse(fs.readFileSync("libs/react/package.json", "utf8"));
+const pkg = JSON.parse(fs.readFileSync("js/react/package.json", "utf8"));
 if (pkg.version !== expected) {
-  console.error(`release: failed to update libs/react/package.json to version ${expected}`);
+  console.error(`release: failed to update js/react/package.json to version ${expected}`);
   process.exit(1);
 }
 
-const lock = JSON.parse(fs.readFileSync("libs/react/package-lock.json", "utf8"));
+const lock = JSON.parse(fs.readFileSync("js/react/package-lock.json", "utf8"));
 if (lock.version !== expected || lock.packages?.[""]?.version !== expected) {
-  console.error(`release: failed to update libs/react/package-lock.json to version ${expected}`);
+  console.error(`release: failed to update js/react/package-lock.json to version ${expected}`);
   process.exit(1);
 }
 if (lock.packages?.["../../crates/browser/pkg"] && lock.packages["../../crates/browser/pkg"].version !== expected) {
-  console.error(`release: failed to update libs/react/package-lock.json browser pkg entry to version ${expected}`);
+  console.error(`release: failed to update js/react/package-lock.json browser pkg entry to version ${expected}`);
   process.exit(1);
 }
 NODE
@@ -236,7 +236,7 @@ cargo test -p blit-server -- --nocapture
 git add nix/packages.nix
 
 # Stage all changed versioned files
-git add Cargo.toml Cargo.lock nix/common.nix libs/react/package.json libs/react/package-lock.json
+git add Cargo.toml Cargo.lock nix/common.nix js/react/package.json js/react/package-lock.json
 for file in "${cargo_manifests[@]}"; do
     git add "$file"
 done

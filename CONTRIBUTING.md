@@ -26,7 +26,7 @@ Run `cargo fmt` to auto-fix formatting before committing.
 TypeScript (React library):
 
 ```bash
-cd libs/react && pnpm install && pnpm vitest run
+cd js/react && pnpm install && pnpm vitest run
 ```
 
 E2E (Playwright, requires built binaries):
@@ -70,7 +70,7 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt and `clippy -D 
 | `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM | n/a                  |
 | `server`       | `cargo watch` running `blit-server --release`               | `/tmp/blit-dev.sock` |
 | `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`) | `127.0.0.1:3266`     |
-| `web-app`      | Vite dev server for `libs/web-app/`                         | printed by Vite      |
+| `web-app`      | Vite dev server for `js/web-app/`                         | printed by Vite      |
 
 ## Project structure
 
@@ -95,8 +95,8 @@ Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cl
 
 | Directory  | What                                                                                                               |
 | ---------- | ------------------------------------------------------------------------------------------------------------------ |
-| `libs/react/`   | `blit-react` npm package — React library with hooks, transports, WebGL renderer. Tests in `libs/react/src/__tests__/`.  |
-| `libs/web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                               |
+| `js/react/`   | `blit-react` npm package — React library with hooks, transports, WebGL renderer. Tests in `js/react/src/__tests__/`.  |
+| `js/web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                               |
 | `e2e/`     | Playwright tests against the full stack (6 spec files)                                                             |
 | `nix/`     | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules |
 | `systemd/` | Socket-activated unit files (user-level and system-level templates)                                                |

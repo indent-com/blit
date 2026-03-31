@@ -38,7 +38,7 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
-const INDEX_HTML: &str = include_str!("../../../libs/web-app/dist/index.html");
+const INDEX_HTML: &str = include_str!("../../../js/web-app/dist/index.html");
 
 static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML));
 

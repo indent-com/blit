@@ -6,4 +6,4 @@ cd "$(dirname "$0")/.."
 (cd crates/browser && wasm-pack build --target web --release --out-dir pkg)
 
 # Build React web app
-(cd libs/web-app && npm install --prefer-offline && npm run build)
+(cd js/web-app && npm install --prefer-offline && npm run build)
