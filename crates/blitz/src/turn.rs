@@ -15,6 +15,8 @@ const ALLOCATE_RESPONSE: u16 = 0x0103;
 const ALLOCATE_ERROR: u16 = 0x0113;
 const CREATE_PERM_REQUEST: u16 = 0x0008;
 const CREATE_PERM_RESPONSE: u16 = 0x0108;
+const REFRESH_REQUEST: u16 = 0x0004;
+const REFRESH_RESPONSE: u16 = 0x0104;
 const SEND_INDICATION: u16 = 0x0016;
 const DATA_INDICATION: u16 = 0x0017;
 
@@ -26,8 +28,12 @@ const ATTR_DATA: u16 = 0x0013;
 const ATTR_REALM: u16 = 0x0014;
 const ATTR_NONCE: u16 = 0x0015;
 const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
+const ATTR_LIFETIME: u16 = 0x000D;
 const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4 * 60);
+const PERMISSION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4 * 60);
 
 fn txn_id() -> [u8; 12] {
     let u = uuid::Uuid::new_v4();
@@ -369,6 +375,36 @@ async fn udp_create_permission(
     Err("CreatePermission failed".into())
 }
 
+async fn udp_refresh(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    nonce: &[u8],
+    realm: &str,
+    key: &[u8],
+    username: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut w = StunWriter::new(REFRESH_REQUEST);
+    let tid = w.tid();
+    w.attr(ATTR_LIFETIME, &600u32.to_be_bytes());
+    w.attr(ATTR_USERNAME, username.as_bytes());
+    w.attr(ATTR_REALM, realm.as_bytes());
+    w.attr(ATTR_NONCE, nonce);
+    socket.send_to(&w.build_with_integrity(key), server).await?;
+
+    let mut buf = [0u8; 512];
+    let (n, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        socket.recv_from(&mut buf),
+    )
+    .await??;
+    if let Some((mtype, rtid, _)) = parse_stun(&buf[..n]) {
+        if rtid == tid && mtype == REFRESH_RESPONSE {
+            return Ok(());
+        }
+    }
+    Err("TURN refresh failed".into())
+}
+
 async fn udp_relay_task(
     socket: UdpSocket,
     server: SocketAddr,
@@ -382,6 +418,10 @@ async fn udp_relay_task(
 ) {
     let mut buf = vec![0u8; 65535];
     let mut permitted = std::collections::HashSet::new();
+    let mut refresh_timer = tokio::time::interval(REFRESH_INTERVAL);
+    refresh_timer.tick().await;
+    let mut perm_timer = tokio::time::interval(PERMISSION_LIFETIME);
+    perm_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -412,6 +452,15 @@ async fn udp_relay_task(
                         }
                     }
                 }
+            }
+            _ = refresh_timer.tick() => {
+                if let Err(e) = udp_refresh(&socket, server, &nonce, &realm, &key, &username).await {
+                    eprintln!("TURN refresh failed: {e}");
+                    break;
+                }
+            }
+            _ = perm_timer.tick() => {
+                permitted.clear();
             }
         }
     }
@@ -577,6 +626,34 @@ async fn tcp_create_permission(
     Err("CreatePermission failed".into())
 }
 
+async fn tcp_refresh(
+    stream: &mut TcpStream,
+    nonce: &[u8],
+    realm: &str,
+    key: &[u8],
+    username: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut w = StunWriter::new(REFRESH_REQUEST);
+    let tid = w.tid();
+    w.attr(ATTR_LIFETIME, &600u32.to_be_bytes());
+    w.attr(ATTR_USERNAME, username.as_bytes());
+    w.attr(ATTR_REALM, realm.as_bytes());
+    w.attr(ATTR_NONCE, nonce);
+    stream.write_all(&w.build_with_integrity(key)).await?;
+
+    let msg = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stream.read_stun_message(),
+    )
+    .await??;
+    if let Some((mtype, rtid, _)) = parse_stun(&msg) {
+        if rtid == tid && mtype == REFRESH_RESPONSE {
+            return Ok(());
+        }
+    }
+    Err("TURN refresh failed".into())
+}
+
 async fn tcp_relay_task(
     mut stream: TcpStream,
     _relay_addr: SocketAddr,
@@ -588,6 +665,10 @@ async fn tcp_relay_task(
     recv_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
 ) {
     let mut permitted = std::collections::HashSet::new();
+    let mut refresh_timer = tokio::time::interval(REFRESH_INTERVAL);
+    refresh_timer.tick().await;
+    let mut perm_timer = tokio::time::interval(PERMISSION_LIFETIME);
+    perm_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -621,6 +702,15 @@ async fn tcp_relay_task(
                     }
                     Err(_) => break,
                 }
+            }
+            _ = refresh_timer.tick() => {
+                if let Err(e) = tcp_refresh(&mut stream, &nonce, &realm, &key, &username).await {
+                    eprintln!("TURN refresh failed: {e}");
+                    break;
+                }
+            }
+            _ = perm_timer.tick() => {
+                permitted.clear();
             }
         }
     }
