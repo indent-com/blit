@@ -41,7 +41,7 @@ function getOrCreateChannel(channelId: string): Channel {
 }
 
 function redisKey(prefix: string, ...parts: string[]): string {
-  return `rendezvous:${prefix}:${parts.join(":")}`;
+  return `blitz:${prefix}:${parts.join(":")}`;
 }
 
 function channelPresenceTopic(channelId: string): string {
@@ -108,8 +108,8 @@ subRedis.on("message", (topic: string, message: string) => {
   try {
     const envelope = JSON.parse(message);
 
-    if (topic.startsWith("rendezvous:presence:")) {
-      const channelId = topic.slice("rendezvous:presence:".length);
+    if (topic.startsWith("blitz:presence:")) {
+      const channelId = topic.slice("blitz:presence:".length);
       broadcastToLocalPeers(channelId, envelope.sessionId, message);
       return;
     }
@@ -325,4 +325,4 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-Bun.write(Bun.stdout, `Rendezvous service listening on port ${PORT}\n`);
+Bun.write(Bun.stdout, `Blitz service listening on port ${PORT}\n`);

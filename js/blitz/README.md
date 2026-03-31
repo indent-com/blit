@@ -1,4 +1,4 @@
-# blit-rendezvous
+# blitz
 
 WebRTC signaling relay for blit terminal sharing. Routes WebRTC signaling
 messages (offers, answers, ICE candidates) between peers over WebSocket.
@@ -37,7 +37,7 @@ Peers receive `peer_left` when the other side disconnects.
 docker run -d -p 6379:6379 redis:7
 
 # Start the service
-cd js/rendezvous
+cd js/blitz
 bun install
 bun run dev
 ```
@@ -57,9 +57,9 @@ to point at a Redis instance.
 The Dockerfile builds a minimal image suitable for any container platform:
 
 ```bash
-cd js/rendezvous
-docker build -t blit-rendezvous .
-docker run -p 8000:8000 -e REDIS_URL=redis://your-redis:6379 blit-rendezvous
+cd js/blitz
+docker build -t blitz .
+docker run -p 8000:8000 -e REDIS_URL=redis://your-redis:6379 blitz
 ```
 
 ### Fly.io (easiest)
@@ -68,13 +68,13 @@ docker run -p 8000:8000 -e REDIS_URL=redis://your-redis:6379 blit-rendezvous
 Redis via Upstash:
 
 ```bash
-cd js/rendezvous
+cd js/blitz
 
 # Launch the app (creates fly.toml automatically)
 fly launch --no-deploy
 
 # Provision Redis
-fly redis create --name blit-rendezvous-redis
+fly redis create --name blitz-redis
 
 # Set the connection string (printed by the previous command)
 fly secrets set REDIS_URL=redis://...
