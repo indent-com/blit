@@ -1,6 +1,6 @@
 [package]
 name = "blit-cli"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 description = "blit terminal client"
 license.workspace = true
