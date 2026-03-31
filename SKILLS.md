@@ -19,6 +19,7 @@ blit start --cols 200                     # start default shell, print session I
 blit start --cols 200 htop                # start a specific command
 blit start -t build --cols 200 make -j8   # tag it for later reference
 blit start --rows 40 --cols 200 htop      # control terminal dimensions
+blit start --cols 200 --wait --timeout 60 make -j8  # start and block until exit
 blit show 3                               # current viewport text (plain)
 blit show 3 --ansi                        # current viewport with ANSI colors
 blit history 3                            # full scrollback + viewport
@@ -56,14 +57,21 @@ ID=$(blit start --cols 200 ls -la)     # run a command
 ID=$(blit start --cols 200)            # start a shell
 ```
 
-The command runs asynchronously — `start` returns as soon as the PTY is created, not when the command finishes. Use `blit wait` to block until the command completes.
+The command runs asynchronously — `start` returns as soon as the PTY is created, not when the command finishes. Use `--wait --timeout N` on `start` or `blit wait` separately to block until completion.
 
 ### Waiting for completion
 
-`blit wait` blocks until a session exits or a pattern matches in its output. The `--timeout` flag is required.
+For one-shot commands, the simplest approach is `start --wait --timeout N`:
 
 ```bash
-# Wait for a one-shot command to finish
+# Start and block until the command finishes
+blit start --cols 200 --wait --timeout 120 make -j8
+```
+
+For more control, use `blit wait` separately. It blocks until a session exits or a pattern matches in its output. The `--timeout` flag is required.
+
+```bash
+# Start, then wait separately (useful when you need the session ID)
 ID=$(blit start --cols 200 make -j8)
 blit wait "$ID" --timeout 120
 blit history "$ID" --from-end 0 --limit 50
@@ -77,7 +85,7 @@ blit send "$ID" "npm install\n"
 blit wait "$ID" --timeout 60 --pattern '\$ $'
 ```
 
-Exit codes: `blit wait` exits with the PTY's exit code on normal exit, 124 on timeout, and prints the exit status to stdout (e.g. `exited(0)`, `signal(9)`). With `--pattern`, it prints the matching line instead and exits 0.
+Exit codes: `blit wait` (and `start --wait`) exits with the PTY's exit code on normal exit, 124 on timeout, and prints the exit status to stdout (e.g. `exited(0)`, `signal(9)`). With `--pattern`, it prints the matching line instead and exits 0.
 
 **Do not assume a command has finished after `start` or `send`.** Always use `wait` to confirm.
 

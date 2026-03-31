@@ -144,7 +144,7 @@ pub async fn cmd_start(
     command: Vec<String>,
     rows: u16,
     cols: u16,
-) -> Result<(), String> {
+) -> Result<u16, String> {
     let mut conn = AgentConn::connect(transport).await?;
 
     let nonce: u16 = 1;
@@ -164,7 +164,7 @@ pub async fn cmd_start(
         {
             if n == nonce {
                 println!("{pty_id}");
-                return Ok(());
+                return Ok(pty_id);
             }
         }
     }

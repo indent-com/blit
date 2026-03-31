@@ -58,6 +58,14 @@ enum Command {
         /// Terminal columns
         #[arg(long, default_value = "80")]
         cols: u16,
+
+        /// Block until the process exits (requires --timeout)
+        #[arg(long, requires = "timeout")]
+        wait: bool,
+
+        /// Maximum seconds to wait (only with --wait)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Print the current visible text of a session
@@ -177,7 +185,37 @@ async fn main() {
                     tag,
                     rows,
                     cols,
-                } => agent::cmd_start(transport, tag, command, rows, cols).await,
+                    wait,
+                    timeout,
+                } => {
+                    let start_result =
+                        agent::cmd_start(transport, tag, command, rows, cols).await;
+                    if wait {
+                        let pty_id = match start_result {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        let transport2 =
+                            match transport::connect(&conn.socket, &conn.tcp, &conn.ssh).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    eprintln!("blit: {e}");
+                                    std::process::exit(1);
+                                }
+                            };
+                        match agent::cmd_wait(transport2, pty_id, timeout.unwrap(), None).await {
+                            Ok(code) => std::process::exit(code),
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    start_result.map(|_| ())
+                }
                 Command::Show {
                     id,
                     ansi,
