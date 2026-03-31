@@ -9,6 +9,12 @@ const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN;
 const MESSAGE_TEMPLATE =
   process.env.MESSAGE_TEMPLATE ||
   "Welcome to blitz! Terminals are now available at https://blitz.sh/#{secret}";
+const INSTALL_SCRIPT =
+  process.env.INSTALL_SCRIPT ||
+  `#!/bin/sh
+set -eu
+echo "work in progress"
+`;
 const ICE_TTL = 86400;
 const SESSION_TTL = 600;
 const MAX_PAYLOAD_BYTES = 65536;
@@ -206,6 +212,25 @@ const server = Bun.serve<ClientData>({
           "Access-Control-Allow-Methods": "GET, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type",
         },
+      });
+    }
+
+    if (url.pathname === "/") {
+      const ua = (req.headers.get("user-agent") || "").toLowerCase();
+      if (ua.startsWith("curl/") || ua.startsWith("wget/") || ua.startsWith("httpie/")) {
+        return new Response(INSTALL_SCRIPT, {
+          headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+      return new Response("https://blit.sh", {
+        status: 302,
+        headers: { ...cors, Location: "https://blit.sh" },
+      });
+    }
+
+    if (url.pathname === "/install.sh") {
+      return new Response(INSTALL_SCRIPT, {
+        headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
       });
     }
 
