@@ -166,6 +166,8 @@ blit --ssh myhost show 1
 
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
+If you're building an AI agent that drives terminals, [SKILLS.md](SKILLS.md) is a ready-made skill definition — drop it into your agent's tool list and it can create, control, and read blit sessions out of the box.
+
 ## What lives in this repo
 
 | Directory                  | Package          | Role                                             |
