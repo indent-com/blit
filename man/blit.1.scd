@@ -24,6 +24,10 @@ _blit_ [OPTIONS] _wait_ _--timeout_ _N_ [_--pattern_ _REGEX_] _ID_
 
 _blit_ [OPTIONS] _close_ _ID_
 
+_blit_ [OPTIONS] _server_ [_--shell-flags_ _FLAGS_] [_--scrollback_ _N_] [_--fd-channel_ _FD_]
+
+_blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--signal-url_ _URL_] [_--url_ _TEMPLATE_] [_--quiet_]
+
 # DESCRIPTION
 
 _blit_ connects to a _blit-server_(1) instance and provides a terminal
@@ -115,6 +119,18 @@ cleared — old output persists. Fails if the session is still running.
 _close_ _ID_
 Close and remove session _ID_.
 
+_server_ [_--shell-flags_ _FLAGS_] [_--scrollback_ _N_] [_--fd-channel_ _FD_]
+Run the blit terminal multiplexer server in-process. The server listens
+on the Unix socket specified by _--socket_ (or the default path). This is
+equivalent to running _blit-server_(1) as a standalone binary.
+
+_share_ [_--passphrase_ _PASSPHRASE_] [_--signal-url_ _URL_] [_--url_ _TEMPLATE_] [_--quiet_]
+Share a terminal session via WebRTC. If no server is running at the
+default socket path, one is started automatically in-process. A sharing
+URL is printed to stdout. The passphrase can also be set via the
+_BLITZ_PASSPHRASE_ environment variable. If omitted, a random passphrase
+is generated.
+
 # ENVIRONMENT
 
 _BLIT_SOCK_
@@ -122,10 +138,13 @@ Unix socket path. Defaults to _$TMPDIR/blit.sock_, then
 _/tmp/blit-$USER.sock_, then _/run/blit/$USER.sock_, then
 _$XDG_RUNTIME_DIR/blit.sock_, then _/tmp/blit.sock_.
 
+_BLITZ_PASSPHRASE_
+Passphrase for _share_. Overridden by _--passphrase_.
+
 _BLIT_DISPLAY_FPS_
 Advertised client display rate in console mode (default: 240, clamped
 10–1000).
 
 # SEE ALSO
 
-_blit-server_(1), _blit-gateway_(1)
+_blit-server_(1), _blit-gateway_(1), _blit-webrtc-forwarder_(1)

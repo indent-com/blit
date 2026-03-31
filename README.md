@@ -7,6 +7,12 @@ blit-server &
 blit                # opens browser
 ```
 
+Or share a terminal over WebRTC:
+
+```bash
+blit share           # prints a URL anyone can open
+```
+
 Or over SSH:
 
 ```bash
@@ -34,7 +40,7 @@ sudo apt install blit blit-server blit-gateway
 ### Nix
 
 ```bash
-nix build .#blit-server      # or blit-cli, blit-gateway
+nix build .#blit-server      # or blit-cli, blit-gateway, blit-webrtc-forwarder
 ```
 
 Or jump to [nix-darwin](#nix-darwin) / [NixOS](#nixos) for service configuration.
@@ -43,7 +49,7 @@ Or jump to [nix-darwin](#nix-darwin) / [NixOS](#nixos) for service configuration
 
 ```bash
 nix develop        # or use direnv — .envrc is included
-cargo build --release -p blit-cli -p blit-server -p blit-gateway
+cargo build --release -p blit-cli -p blit-server -p blit-gateway -p blit-webrtc-forwarder
 ```
 
 ## How it works
@@ -52,7 +58,9 @@ cargo build --release -p blit-cli -p blit-server -p blit-gateway
 
 **`blit-gateway`** is a stateless WebSocket/WebTransport proxy that authenticates browser clients and forwards traffic to the server over a Unix socket. PTYs survive gateway restarts.
 
-**`blit` (CLI)** connects to a local or remote server (over SSH if needed), embeds a temporary gateway, and opens the browser. No separate deployment required.
+**`blit` (CLI)** connects to a local or remote server (over SSH if needed), embeds a temporary gateway, and opens the browser. Also includes `blit server` (run a server in-process) and `blit share` (share a terminal via WebRTC). No separate deployment required.
+
+**`blit-webrtc-forwarder`** bridges a blit-server session to browsers over WebRTC. Handles signaling, STUN/TURN NAT traversal, and peer-to-peer data channels. Used internally by `blit share`, or run standalone for custom deployments.
 
 **`blit-react`** is the React embedding library — the primary integration point for applications. See [EMBEDDING.md](EMBEDDING.md).
 
@@ -162,6 +170,10 @@ blit wait 3 --timeout 60 --pattern 'DONE'      # Block until output matches rege
 blit restart 3                                 # Restart an exited session
 blit close 3                                   # Close and remove a PTY
 
+blit server                                    # Run blit-server in-process
+blit share                                     # Share via WebRTC (auto-starts server)
+blit share --passphrase mysecret               # Share with a specific passphrase
+
 # Against a remote host
 blit --ssh myhost list
 blit --ssh myhost start htop
@@ -181,7 +193,8 @@ If you're building an AI agent that drives terminals, [SKILLS.md](SKILLS.md) is 
 | `crates/browser/`          | `blit-browser`   | WASM terminal runtime                            |
 | `crates/alacritty-driver/` | `blit-alacritty` | Terminal parsing backed by `alacritty_terminal`  |
 | `crates/gateway/`          | `blit-gateway`   | WebSocket/WebTransport proxy                     |
-| `crates/cli/`              | `blit`           | Browser client, agent subcommands, SSH tunnels   |
+| `crates/webrtc-forwarder/` | `blit-webrtc-forwarder` | WebRTC bridge for NAT traversal (STUN/TURN) |
+| `crates/cli/`              | `blit`           | Browser client, agent subcommands, SSH tunnels, `server`/`share` |
 | `crates/fonts/`            | `blit-fonts`     | Font discovery and metadata                      |
 | `crates/webserver/`        | `blit-webserver` | Shared HTTP helpers for serving assets and fonts |
 | `crates/demo/`             | `blit-demo`      | Sample programs and test content                 |
@@ -203,7 +216,7 @@ If you're building an AI agent that drives terminals, [SKILLS.md](SKILLS.md) is 
 | Background session throttling | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | Server-side search            | ✅ Titles + visible + scrollback | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | WebGL rendering               | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ⚠️ Addon             |
-| Transport                     | WS, WebTransport, Unix           | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
+| Transport                     | WS, WebTransport, WebRTC, Unix   | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
 | WebTransport / QUIC           | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | Embeddable (React)            | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
 | Agent / CLI subcommands       | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |

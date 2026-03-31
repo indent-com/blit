@@ -32,6 +32,9 @@ blit wait 3 --timeout 30                  # block until session exits
 blit wait 3 --timeout 60 --pattern 'BUILD (SUCCESS|FAILURE)'  # wait for output pattern
 blit restart 3                            # restart an exited session
 blit close 3                              # destroy the session
+blit server                               # run blit-server in-process
+blit share                                # share terminal via WebRTC (auto-starts server)
+blit share --passphrase mysecret          # share with a specific passphrase
 ```
 
 **Always start sessions with `--cols 200`** (or wider). The default is 80 columns, which causes line wrapping that makes output difficult to parse. Pass `--cols` to `show`/`history` to resize an existing session before reading.
