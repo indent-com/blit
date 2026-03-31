@@ -255,7 +255,6 @@ in {
     text = ''
       root=$(git rev-parse --show-toplevel)
       APP="blitz-signaling"
-      REGION="''${FLY_REGION:-iad}"
       ORG="''${FLY_ORG:-personal}"
 
       echo "=== Creating Fly app: $APP ==="
