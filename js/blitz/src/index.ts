@@ -15,9 +15,16 @@ const DEFAULT_ICE_SERVERS = [
   { urls: "stun:stun1.l.google.com:19302" },
 ];
 
+let cachedIce: { data: unknown; expiresAt: number } | null = null;
+const ICE_CACHE_TTL = ICE_TTL / 2;
+
 async function getIceServers() {
   if (!CF_TURN_TOKEN_ID || !CF_TURN_API_TOKEN) {
     return { iceServers: DEFAULT_ICE_SERVERS };
+  }
+
+  if (cachedIce && Date.now() < cachedIce.expiresAt) {
+    return cachedIce.data;
   }
 
   const res = await fetch(
@@ -36,7 +43,9 @@ async function getIceServers() {
     throw new Error(`Cloudflare TURN API returned ${res.status}`);
   }
 
-  return await res.json();
+  const data = await res.json();
+  cachedIce = { data, expiresAt: Date.now() + ICE_CACHE_TTL * 1000 };
+  return data;
 }
 
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
