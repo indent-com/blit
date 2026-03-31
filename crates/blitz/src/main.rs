@@ -6,7 +6,6 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 const DEFAULT_SIGNAL_URL: &str = "wss://cloud.blit.sh";
@@ -47,6 +46,11 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+struct PeerState {
+    handle: tokio::task::JoinHandle<()>,
+    signal_tx: mpsc::UnboundedSender<serde_json::Value>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -72,54 +76,66 @@ async fn main() {
         println!("{url}");
     }
 
-    let (sig_tx, mut sig_rx) = mpsc::unbounded_channel::<signaling::Event>();
+    let (sig_event_tx, mut sig_event_rx) = mpsc::unbounded_channel::<signaling::Event>();
+    let (sig_send_tx, sig_send_rx) = mpsc::unbounded_channel::<String>();
     let signal_url = format!(
         "{}/channel/{}/producer",
         cli.signal_url.trim_end_matches('/'),
         public_key_hex,
     );
 
-    tokio::spawn(signaling::connect(signal_url, signing_key.clone(), sig_tx));
+    tokio::spawn(signaling::connect(
+        signal_url,
+        signing_key.clone(),
+        sig_event_tx,
+        sig_send_rx,
+    ));
 
-    let peers: Arc<tokio::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let mut peers: HashMap<String, PeerState> = HashMap::new();
 
-    while let Some(event) = sig_rx.recv().await {
+    while let Some(event) = sig_event_rx.recv().await {
         match event {
             signaling::Event::Registered { session_id } => {
                 eprintln!("registered with signaling server (session {session_id})");
+                for (id, state) in peers.drain() {
+                    eprintln!("aborting stale peer task: {id}");
+                    state.handle.abort();
+                }
             }
-            signaling::Event::PeerJoined { session_id, .. } => {
+            signaling::Event::PeerJoined { session_id } => {
                 eprintln!("consumer joined: {session_id}");
+                let (peer_sig_tx, peer_sig_rx) = mpsc::unbounded_channel();
                 let peer_id = session_id.clone();
                 let sock = sock_path.clone();
-                let signing_key = signing_key.clone();
-                let signal_url_base = cli.signal_url.clone();
-                let pubkey = public_key_hex.clone();
+                let out_tx = sig_send_tx.clone();
+                let key = signing_key.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        peer::handle_peer(peer_id.clone(), sock, signing_key, signal_url_base, pubkey).await
+                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key).await
                     {
                         eprintln!("peer {peer_id} error: {e}");
                     }
                 });
-                peers.lock().await.insert(session_id, handle);
+                peers.insert(
+                    session_id,
+                    PeerState {
+                        handle,
+                        signal_tx: peer_sig_tx,
+                    },
+                );
             }
-            signaling::Event::PeerLeft { session_id, .. } => {
+            signaling::Event::PeerLeft { session_id } => {
                 eprintln!("consumer left: {session_id}");
-                if let Some(handle) = peers.lock().await.remove(&session_id) {
-                    handle.abort();
+                if let Some(state) = peers.remove(&session_id) {
+                    state.handle.abort();
                 }
             }
-            signaling::Event::Signal {
-                from,
-                data,
-            } => {
-                eprintln!("received signal from {from}");
-                // Signal data is handled within the peer task via its own signaling connection.
-                // For the initial implementation, the main signaling connection forwards
-                // offer/answer/candidate messages to the appropriate peer.
-                let _ = (from, data);
+            signaling::Event::Signal { from, data } => {
+                if let Some(state) = peers.get(&from) {
+                    let _ = state.signal_tx.send(data);
+                } else {
+                    eprintln!("signal from unknown peer {from}, ignoring");
+                }
             }
             signaling::Event::Error { message } => {
                 eprintln!("signaling error: {message}");

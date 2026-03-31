@@ -8,57 +8,33 @@ use str0m::net::Receive;
 use str0m::{Candidate, Event, Input, Output, Rtc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 pub async fn handle_peer(
     peer_session_id: String,
     sock_path: String,
+    mut signal_rx: mpsc::UnboundedReceiver<serde_json::Value>,
+    signal_tx: mpsc::UnboundedSender<String>,
     signing_key: SigningKey,
-    signal_url_base: String,
-    public_key_hex: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let signal_url = format!(
-        "{}/channel/{}/producer",
-        signal_url_base.trim_end_matches('/'),
-        public_key_hex,
-    );
-
-    let (ws, _) = tokio_tungstenite::connect_async(&signal_url).await?;
-    let (mut ws_write, mut ws_read) = futures_util::StreamExt::split(ws);
-
-    let _reg: serde_json::Value = loop {
-        use futures_util::StreamExt;
-        if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = ws_read.next().await
-        {
-            let msg: serde_json::Value = serde_json::from_str(&text)?;
-            if msg.get("type").and_then(|t| t.as_str()) == Some("registered") {
-                break msg;
-            }
-        }
-    };
-
     let udp = UdpSocket::bind("0.0.0.0:0")?;
     udp.set_nonblocking(true)?;
     let local_addr = udp.local_addr()?;
 
     let mut rtc = Rtc::new(Instant::now());
-
     rtc.add_local_candidate(Candidate::host(local_addr, "udp").expect("valid candidate"));
 
     let offer: SdpOffer = loop {
-        use futures_util::StreamExt;
-        if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = ws_read.next().await
-        {
-            let msg: serde_json::Value = serde_json::from_str(&text)?;
-            if msg.get("type").and_then(|t| t.as_str()) == Some("signal") {
-                if let Some(data) = msg.get("data") {
-                    if let Some(sdp) = data.get("sdp") {
-                        let offer: SdpOffer = serde_json::from_value(sdp.clone())?;
-                        break offer;
-                    }
+        match signal_rx.recv().await {
+            Some(data) => {
+                if let Some(sdp) = data.get("sdp") {
+                    let offer: SdpOffer = serde_json::from_value(sdp.clone())?;
+                    break offer;
                 }
             }
+            None => return Ok(()),
         }
     };
 
@@ -66,17 +42,13 @@ pub async fn handle_peer(
     let answer_json = serde_json::to_value(&answer)?;
     let signal_data = serde_json::json!({ "sdp": answer_json });
     let msg = signaling::build_signed_message(&signing_key, &peer_session_id, &signal_data);
-    use futures_util::SinkExt;
-    ws_write
-        .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
-        .await?;
+    signal_tx.send(msg).map_err(|e| format!("send failed: {e}"))?;
 
     let tokio_udp = tokio::net::UdpSocket::from_std(udp)?;
 
     let mut blit_conn: Option<UnixStream> = None;
     let mut blit_channel: Option<ChannelId> = None;
-    let mut buf = vec![0u8; 2000];
-    let mut sock_read_buf = vec![0u8; 4 + MAX_FRAME_SIZE];
+    let mut buf = vec![0u8; 65535];
 
     loop {
         let timeout = loop {
@@ -111,9 +83,15 @@ pub async fn handle_peer(
                                     }
                                     let payload = &data[4..4 + len];
                                     let frame_len = (payload.len() as u32).to_le_bytes();
-                                    let _ = conn.write_all(&frame_len).await;
+                                    if conn.write_all(&frame_len).await.is_err() {
+                                        eprintln!("blit-server socket write failed");
+                                        return Ok(());
+                                    }
                                     if !payload.is_empty() {
-                                        let _ = conn.write_all(payload).await;
+                                        if conn.write_all(payload).await.is_err() {
+                                            eprintln!("blit-server socket write failed");
+                                            return Ok(());
+                                        }
                                     }
                                 }
                             }
@@ -170,17 +148,15 @@ pub async fn handle_peer(
                 match result {
                     Ok(len) if len <= MAX_FRAME_SIZE => {
                         if let Some(conn) = &mut blit_conn {
-                            let payload_buf = &mut sock_read_buf[4..4 + len];
+                            let mut payload = vec![0u8; len];
                             if len > 0 {
-                                conn.read_exact(payload_buf).await?;
+                                conn.read_exact(&mut payload).await?;
                             }
                             if let Some(cid) = blit_channel {
                                 let frame_len = (len as u32).to_le_bytes();
                                 let mut frame = Vec::with_capacity(4 + len);
                                 frame.extend_from_slice(&frame_len);
-                                if len > 0 {
-                                    frame.extend_from_slice(&sock_read_buf[4..4 + len]);
-                                }
+                                frame.extend_from_slice(&payload);
                                 if let Some(mut ch) = rtc.channel(cid) {
                                     let _ = ch.write(true, &frame);
                                 }
@@ -193,21 +169,16 @@ pub async fn handle_peer(
                     }
                 }
             }
-            msg = async {
-                use futures_util::StreamExt;
-                ws_read.next().await
-            } => {
-                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = msg {
-                    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                    if parsed.get("type").and_then(|t| t.as_str()) == Some("signal") {
-                        if let Some(data) = parsed.get("data") {
-                            if let Some(candidate) = data.get("candidate") {
-                                if let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
-                                    let _ = rtc.add_remote_candidate(c);
-                                }
+            sig = signal_rx.recv() => {
+                match sig {
+                    Some(data) => {
+                        if let Some(candidate) = data.get("candidate") {
+                            if let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
+                                let _ = rtc.add_remote_candidate(c);
                             }
                         }
                     }
+                    None => return Ok(()),
                 }
             }
         }

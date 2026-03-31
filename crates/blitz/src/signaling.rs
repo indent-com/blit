@@ -1,6 +1,6 @@
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -11,11 +11,9 @@ pub enum Event {
         session_id: String,
     },
     PeerJoined {
-        role: String,
         session_id: String,
     },
     PeerLeft {
-        role: String,
         session_id: String,
     },
     Signal {
@@ -31,9 +29,6 @@ pub enum Event {
 struct ServerMessage {
     #[serde(rename = "type")]
     msg_type: String,
-    #[serde(rename = "channelId")]
-    channel_id: Option<String>,
-    role: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
     from: Option<String>,
@@ -65,9 +60,14 @@ pub fn build_signed_message(key: &SigningKey, target: &str, data: &serde_json::V
     .unwrap()
 }
 
-pub async fn connect(url: String, key: SigningKey, tx: mpsc::UnboundedSender<Event>) {
+pub async fn connect(
+    url: String,
+    key: SigningKey,
+    event_tx: mpsc::UnboundedSender<Event>,
+    mut outgoing_rx: mpsc::UnboundedReceiver<String>,
+) {
     loop {
-        match try_connect(&url, &key, &tx).await {
+        match try_connect(&url, &key, &event_tx, &mut outgoing_rx).await {
             Ok(()) => {
                 eprintln!("signaling connection closed, reconnecting...");
             }
@@ -83,48 +83,63 @@ async fn try_connect(
     url: &str,
     _key: &SigningKey,
     tx: &mpsc::UnboundedSender<Event>,
+    outgoing_rx: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
-    let (_write, mut read) = ws.split();
+    let (mut write, mut read) = ws.split();
 
-    while let Some(msg) = read.next().await {
-        let msg = msg?;
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            _ => continue,
-        };
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                };
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
 
-        let parsed: ServerMessage = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+                let parsed: ServerMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
 
-        let event = match parsed.msg_type.as_str() {
-            "registered" => Event::Registered {
-                session_id: parsed.session_id.unwrap_or_default(),
-            },
-            "peer_joined" => Event::PeerJoined {
-                role: parsed.role.unwrap_or_default(),
-                session_id: parsed.session_id.unwrap_or_default(),
-            },
-            "peer_left" => Event::PeerLeft {
-                role: parsed.role.unwrap_or_default(),
-                session_id: parsed.session_id.unwrap_or_default(),
-            },
-            "signal" => Event::Signal {
-                from: parsed.from.unwrap_or_default(),
-                data: parsed.data.unwrap_or(serde_json::Value::Null),
-            },
-            "error" => Event::Error {
-                message: parsed.message.unwrap_or_default(),
-            },
-            _ => continue,
-        };
+                let event = match parsed.msg_type.as_str() {
+                    "registered" => Event::Registered {
+                        session_id: parsed.session_id.unwrap_or_default(),
+                    },
+                    "peer_joined" => Event::PeerJoined {
+                        session_id: parsed.session_id.unwrap_or_default(),
+                    },
+                    "peer_left" => Event::PeerLeft {
+                        session_id: parsed.session_id.unwrap_or_default(),
+                    },
+                    "signal" => Event::Signal {
+                        from: parsed.from.unwrap_or_default(),
+                        data: parsed.data.unwrap_or(serde_json::Value::Null),
+                    },
+                    "error" => Event::Error {
+                        message: parsed.message.unwrap_or_default(),
+                    },
+                    _ => continue,
+                };
 
-        if tx.send(event).is_err() {
-            break;
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+            msg = outgoing_rx.recv() => {
+                match msg {
+                    Some(text) => {
+                        write.send(Message::Text(text.into())).await?;
+                    }
+                    None => break,
+                }
+            }
         }
     }
 

@@ -1,10 +1,18 @@
+use sha2::{Digest, Sha256};
+
 pub async fn start_embedded(passphrase: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(passphrase.as_bytes());
+    hasher.update(b"socket-path");
+    let hash: [u8; 32] = hasher.finalize().into();
+    let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
+
     let sock_path = format!(
         "{}/blitz-{}.sock",
         std::env::var("TMPDIR")
             .or_else(|_| std::env::var("XDG_RUNTIME_DIR"))
             .unwrap_or_else(|_| "/tmp".into()),
-        &passphrase[..8.min(passphrase.len())],
+        suffix,
     );
 
     let config = blit_server::Config {
@@ -20,7 +28,12 @@ pub async fn start_embedded(passphrase: &str) -> String {
         blit_server::run(config).await;
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for _ in 0..50 {
+        if std::path::Path::new(&sock_path).exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     let cleanup_path = sock_path.clone();
     tokio::spawn(async move {
