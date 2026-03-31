@@ -8,7 +8,7 @@ const CF_TURN_TOKEN_ID = process.env.CF_TURN_TOKEN_ID;
 const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN;
 const MESSAGE_TEMPLATE =
   process.env.MESSAGE_TEMPLATE ||
-  "Welcome to blitz! Terminals are now available at https://blitz.sh/#{secret}";
+  "Welcome to blit! Terminals are now available at https://blit.sh/#{secret}";
 const INSTALL_SCRIPT =
   process.env.INSTALL_SCRIPT ||
   `#!/bin/sh
@@ -91,7 +91,7 @@ function getOrCreateChannel(channelId: string): Channel {
 }
 
 function redisKey(prefix: string, ...parts: string[]): string {
-  return `blitz:${prefix}:${parts.join(":")}`;
+  return `blit:${prefix}:${parts.join(":")}`;
 }
 
 function channelPresenceTopic(channelId: string): string {
@@ -158,8 +158,8 @@ subRedis.on("message", (topic: string, message: string) => {
   try {
     const envelope = JSON.parse(message);
 
-    if (topic.startsWith("blitz:presence:")) {
-      const channelId = topic.slice("blitz:presence:".length);
+    if (topic.startsWith("blit:presence:")) {
+      const channelId = topic.slice("blit:presence:".length);
       broadcastToLocalPeers(channelId, envelope.sessionId, message);
       return;
     }
@@ -406,4 +406,4 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-Bun.write(Bun.stdout, `Blitz signaling service listening on port ${PORT}\n`);
+Bun.write(Bun.stdout, `blit-cloud listening on port ${PORT}\n`);

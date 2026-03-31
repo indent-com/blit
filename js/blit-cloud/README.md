@@ -52,7 +52,7 @@ bun run dev
 ## Protocol
 
 ```
-wss://cloud.blitz.sh/channel/<64-char-hex-pubkey>/<producer|consumer>
+wss://cloud.blit.sh/channel/<64-char-hex-pubkey>/<producer|consumer>
 ```
 
 On connect, the server assigns a session ID and sends presence notifications:
@@ -104,7 +104,7 @@ By default it returns Google's public STUN servers. If `CF_TURN_TOKEN_ID` and
 terminal session is shared:
 
 ```jsonc
-{"template": "Welcome to blitz! Terminals are now available at https://blitz.sh/#{secret}"}
+{"template": "Welcome to blit! Terminals are now available at https://blit.sh/#{secret}"}
 ```
 
 The `{secret}` placeholder is intended to be replaced client-side with the
