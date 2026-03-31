@@ -215,20 +215,7 @@ const server = Bun.serve<ClientData>({
       });
     }
 
-    if (url.pathname === "/") {
-      const ua = (req.headers.get("user-agent") || "").toLowerCase();
-      if (ua.startsWith("curl/") || ua.startsWith("wget/") || ua.startsWith("httpie/")) {
-        return new Response(INSTALL_SCRIPT, {
-          headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
-        });
-      }
-      return new Response("https://blit.sh", {
-        status: 302,
-        headers: { ...cors, Location: "https://blit.sh" },
-      });
-    }
-
-    if (url.pathname === "/install.sh") {
+    if (url.pathname === "/" || url.pathname === "/install.sh") {
       return new Response(INSTALL_SCRIPT, {
         headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
       });
