@@ -15,9 +15,10 @@ Drive terminal sessions programmatically through stateless CLI subcommands. Each
 
 ```bash
 blit list                                 # TSV: ID  TAG  TITLE  STATUS
-blit start --cols 200 bash                # prints the new session ID to stdout
+blit start --cols 200                     # start default shell, print session ID
+blit start --cols 200 htop                # start a specific command
 blit start -t build --cols 200 make -j8   # tag it for later reference
-blit start --rows 40 --cols 200 bash      # control terminal dimensions
+blit start --rows 40 --cols 200 htop      # control terminal dimensions
 blit show 3                               # current viewport text (plain)
 blit show 3 --ansi                        # current viewport with ANSI colors
 blit history 3                            # full scrollback + viewport
@@ -26,6 +27,7 @@ blit history 3 --from-start 0 --limit 50  # first 50 lines
 blit send 3 "ls -la\n"                    # type a command (note the \n)
 blit show 3 --rows 40 --cols 200          # resize before capturing viewport
 blit history 3 --cols 200                 # resize before reading scrollback
+blit restart 3                            # restart an exited session
 blit close 3                              # destroy the session
 ```
 
@@ -45,10 +47,10 @@ These are the two ways to read terminal output. Getting this distinction right i
 
 ## Running commands and waiting for output
 
-`blit start` creates a PTY but does not run the command interactively. To execute a shell command and read its output:
+`blit start` creates a PTY and prints its session ID. Without a command argument, it starts the user's default shell. To execute a shell command and read its output:
 
 ```bash
-ID=$(blit start --cols 200 bash)
+ID=$(blit start --cols 200)
 blit send "$ID" "ls -la\n"
 sleep 0.5                    # wait for output
 blit history "$ID" --from-end 0 --limit 20
@@ -88,10 +90,14 @@ Sessions persist as long as the blit daemon is running. They are **not** cleaned
 
 - A session stays alive until you `close` it or the process inside it exits.
 - If the process exits on its own, the session remains in the `list` output with an `exited(N)` status. It still consumes resources until explicitly closed.
+- Use `blit restart ID` to re-run an exited session with its original command, size, and tag. Fails if the session is still running.
 - Sessions do **not** persist across daemon restarts.
 - **Clean up after yourself.** Always `close` sessions when you are done. Leaked sessions accumulate and waste resources.
 
 ```bash
+# Restart a failed build
+blit restart "$ID"
+
 # Clean up a specific session
 blit close "$ID"
 
@@ -121,7 +127,7 @@ blit --ssh dev-server start bash
   - STATUS column: `running`, `exited(N)` (normal exit with code N), `signal(N)` (killed by signal N), or `exited` (exit status unknown).
 - `start` prints a single integer (the new session ID) to stdout.
 - `show` and `history` print terminal text to stdout, one line per terminal row. Trailing whitespace per row is trimmed.
-- `send` and `close` produce no stdout on success.
+- `send`, `restart`, and `close` produce no stdout on success.
 - All errors go to stderr. Exit code is non-zero on failure.
 
 ## Escape sequences

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use blit_remote::{
-    msg_ack, msg_close, msg_create_n_command, msg_input, msg_read, msg_resize, msg_subscribe,
-    parse_server_msg, ServerMsg, TerminalState, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_READY,
-    S2C_TEXT, S2C_TITLE, S2C_UPDATE,
+    msg_ack, msg_close, msg_create_n_command, msg_input, msg_read, msg_resize, msg_restart,
+    msg_subscribe, parse_server_msg, ServerMsg, TerminalState, S2C_EXITED, S2C_HELLO, S2C_LIST,
+    S2C_READY, S2C_TEXT, S2C_TITLE, S2C_UPDATE,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -287,6 +287,32 @@ pub async fn cmd_close(transport: Transport, id: u16) -> Result<(), String> {
             continue;
         }
         if let Some(ServerMsg::Closed { pty_id }) = parse_server_msg(&data) {
+            if pty_id == id {
+                return Ok(());
+            }
+        }
+    }
+}
+
+pub async fn cmd_restart(transport: Transport, id: u16) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+
+    if !conn.has_pty(id) {
+        return Err(format!("pty {id} not found"));
+    }
+
+    if !conn.exited.contains_key(&id) {
+        return Err(format!("pty {id} is still running"));
+    }
+
+    conn.send(&msg_restart(id)).await?;
+
+    loop {
+        let data = conn.recv().await?;
+        if data.is_empty() {
+            continue;
+        }
+        if let Some(ServerMsg::Created { pty_id, .. }) = parse_server_msg(&data) {
             if pty_id == id {
                 return Ok(());
             }

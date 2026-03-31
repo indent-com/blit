@@ -10,13 +10,15 @@ _blit_ [OPTIONS] [HOST]
 
 _blit_ [OPTIONS] _list_
 
-_blit_ [OPTIONS] _start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] _COMMAND..._
+_blit_ [OPTIONS] _start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
 
 _blit_ [OPTIONS] _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 
 _blit_ [OPTIONS] _history_ [_--ansi_] [_--from-start_ _N_ | _--from-end_ _N_] [_--limit_ _N_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 
 _blit_ [OPTIONS] _send_ _ID_ _TEXT_
+
+_blit_ [OPTIONS] _restart_ _ID_
 
 _blit_ [OPTIONS] _close_ _ID_
 
@@ -70,9 +72,10 @@ _list_
 List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,
 STATUS.
 
-_start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] _COMMAND..._
-Start a new PTY running _COMMAND_ and print its session ID. The default
-size is 24 rows by 80 columns.
+_start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
+Start a new PTY and print its session ID. If _COMMAND_ is omitted, the
+user's default shell is started. The default size is 24 rows by 80
+columns.
 
 _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 Dump the current visible terminal text for session _ID_. With _--ansi_,
@@ -91,6 +94,10 @@ columns when either flag is given.
 _send_ _ID_ _TEXT_
 Send keystrokes to session _ID_. _TEXT_ supports C-style escapes
 (_\\n_, _\\t_, _\\x1b_). Use _-_ to read from stdin.
+
+_restart_ _ID_
+Restart an exited session. The original command, terminal size, and tag
+are preserved. Fails if the session is still running.
 
 _close_ _ID_
 Close and remove session _ID_.

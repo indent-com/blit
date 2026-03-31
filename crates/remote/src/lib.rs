@@ -1481,6 +1481,13 @@ pub fn msg_close(pty_id: u16) -> Vec<u8> {
     msg
 }
 
+pub fn msg_restart(pty_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_RESTART);
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg
+}
+
 pub fn msg_subscribe(pty_id: u16) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3);
     msg.push(C2S_SUBSCRIBE);

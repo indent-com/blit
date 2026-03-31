@@ -44,8 +44,7 @@ enum Command {
 
     /// Start a new terminal session and print its ID
     Start {
-        /// Command to run
-        #[arg(required = true)]
+        /// Command to run (defaults to $SHELL or /bin/sh)
         command: Vec<String>,
 
         /// Session tag / label
@@ -126,6 +125,12 @@ enum Command {
         text: String,
     },
 
+    /// Restart an exited session (re-runs the original command)
+    Restart {
+        /// Session ID
+        id: u16,
+    },
+
     /// Close a session
     Close {
         /// Session ID
@@ -185,6 +190,7 @@ async fn main() {
                     };
                     agent::cmd_send(transport, id, text).await
                 }
+                Command::Restart { id } => agent::cmd_restart(transport, id).await,
                 Command::Close { id } => agent::cmd_close(transport, id).await,
             };
             if let Err(e) = result {
