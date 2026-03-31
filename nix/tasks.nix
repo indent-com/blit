@@ -264,7 +264,7 @@ in {
       if ! flyctl secrets list -a "$APP" 2>/dev/null | grep -q REDIS_URL; then
         echo ""
         echo "=== Provisioning Upstash Redis ==="
-        output=$(flyctl redis create --name "$APP-redis" --region "$REGION" --no-replicas --org "$ORG" --enable-eviction --plan free 2>&1) || {
+        output=$(yes n | flyctl redis create --name "$APP-redis" --region "$REGION" --no-replicas --org "$ORG" --enable-eviction 2>&1) || {
           echo "$output"
           echo ""
           echo "ERROR: Redis provisioning failed. Set REDIS_URL manually and re-run:"
