@@ -74,12 +74,12 @@ Browser access to `blit-server` goes through either of two paths — pick one, n
 | `crates/remote/`           | `blit-remote`    | Wire protocol and frame/state primitives         |
 | `crates/browser/`          | `blit-browser`   | WASM terminal runtime                            |
 | `crates/alacritty-driver/` | `blit-alacritty` | Terminal parsing backed by `alacritty_terminal`  |
-| `js/react/`              | `blit-react`     | Workspace-based React client library             |
+| `js/react/`                | `blit-react`     | Workspace-based React client library             |
 | `crates/fonts/`            |                  | Font discovery and metadata                      |
 | `crates/webserver/`        |                  | Shared HTTP helpers for serving assets and fonts |
 | `crates/gateway/`          | `blit-gateway`   | WebSocket/WebTransport proxy                     |
 | `crates/cli/`              | `blit`           | Browser client                                   |
-| `js/web-app/`            |                  | Browser UI                                       |
+| `js/web-app/`              |                  | Browser UI                                       |
 | `crates/demo/`             |                  | Sample programs and test content                 |
 
 ## Install
