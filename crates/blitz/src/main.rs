@@ -1,6 +1,8 @@
+mod ice;
 mod peer;
 mod server;
 mod signaling;
+mod turn;
 
 use clap::Parser;
 use ed25519_dalek::SigningKey;
@@ -79,6 +81,17 @@ async fn main() {
         println!("{url}");
     }
 
+    let ice_config = match ice::fetch_ice_config(&cli.signal_url).await {
+        Ok(cfg) => {
+            eprintln!("fetched ICE config ({} servers)", cfg.ice_servers.len());
+            Some(cfg)
+        }
+        Err(e) => {
+            eprintln!("failed to fetch ICE config: {e}");
+            None
+        }
+    };
+
     let (sig_event_tx, mut sig_event_rx) = mpsc::unbounded_channel::<signaling::Event>();
     let (sig_send_tx, sig_send_rx) = mpsc::unbounded_channel::<String>();
     let signal_url = format!(
@@ -130,9 +143,10 @@ async fn main() {
                 let out_tx = sig_send_tx.clone();
                 let key = signing_key.clone();
                 let est = established.clone();
+                let ice = ice_config.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key, est).await
+                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key, est, ice).await
                     {
                         eprintln!("peer {peer_id} error: {e}");
                     }

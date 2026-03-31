@@ -1,4 +1,6 @@
+use crate::ice::{self, IceConfig, Transport};
 use crate::signaling;
+use crate::turn::{self, TurnRelay};
 use ed25519_dalek::SigningKey;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,13 +23,60 @@ pub async fn handle_peer(
     signal_tx: mpsc::UnboundedSender<String>,
     signing_key: SigningKey,
     established: Arc<AtomicBool>,
+    ice_config: Option<IceConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let udp = UdpSocket::bind("0.0.0.0:0")?;
     udp.set_nonblocking(true)?;
     let local_addr = udp.local_addr()?;
+    let tokio_udp = tokio::net::UdpSocket::from_std(udp)?;
 
     let mut rtc = Rtc::new(Instant::now());
     rtc.add_local_candidate(Candidate::host(local_addr, "udp").expect("valid candidate"));
+
+    let mut relay: Option<TurnRelay> = None;
+
+    if let Some(config) = &ice_config {
+        let (stun_servers, turn_servers) = ice::collect_servers(config);
+
+        for stun_addr in stun_servers.iter().take(1) {
+            match turn::stun_binding(*stun_addr, &tokio_udp).await {
+                Ok(srflx) => {
+                    eprintln!("STUN srflx: {srflx}");
+                    rtc.add_local_candidate(
+                        Candidate::server_reflexive(srflx, local_addr, "udp")
+                            .expect("valid candidate"),
+                    );
+                    break;
+                }
+                Err(e) => eprintln!("STUN binding failed: {e}"),
+            }
+        }
+
+        for ts in &turn_servers {
+            let result = match ts.transport {
+                Transport::Udp => {
+                    TurnRelay::allocate_udp(ts.addr, &ts.username, &ts.credential).await
+                }
+                Transport::Tcp => {
+                    TurnRelay::allocate_tcp(
+                        ts.addr, ts.tls, &ts.hostname, &ts.username, &ts.credential,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(r) => {
+                    rtc.add_local_candidate(
+                        Candidate::relayed(r.relay_addr, local_addr, "udp")
+                            .expect("valid candidate"),
+                    );
+                    relay = Some(r);
+                    break;
+                }
+                Err(e) => eprintln!("TURN allocate ({:?}) failed: {e}", ts.transport),
+            }
+        }
+    }
 
     let offer: SdpOffer = loop {
         match signal_rx.recv().await {
@@ -47,19 +96,25 @@ pub async fn handle_peer(
     let msg = signaling::build_signed_message(&signing_key, &peer_session_id, &signal_data);
     signal_tx.send(msg).map_err(|e| format!("send failed: {e}"))?;
 
-    let tokio_udp = tokio::net::UdpSocket::from_std(udp)?;
-
     let mut blit_conn: Option<UnixStream> = None;
     let mut blit_channel: Option<ChannelId> = None;
     let mut buf = vec![0u8; 65535];
     let mut signaling_alive = true;
+
+    let relay_addr = relay.as_ref().map(|r| r.relay_addr);
 
     loop {
         let timeout = loop {
             match rtc.poll_output()? {
                 Output::Timeout(v) => break v,
                 Output::Transmit(t) => {
-                    tokio_udp.send_to(&t.contents, t.destination).await?;
+                    if relay_addr == Some(t.source) {
+                        if let Some(r) = &relay {
+                            let _ = r.send_tx.send((t.destination, t.contents.to_vec()));
+                        }
+                    } else {
+                        tokio_udp.send_to(&t.contents, t.destination).await?;
+                    }
                     continue;
                 }
                 Output::Event(ev) => {
@@ -139,6 +194,26 @@ pub async fn handle_peer(
             }
             _ = tokio::time::sleep(sleep_dur) => {
                 rtc.handle_input(Input::Timeout(Instant::now()))?;
+            }
+            turn_data = async {
+                if let Some(r) = &mut relay {
+                    r.recv_rx.recv().await
+                } else {
+                    std::future::pending::<Option<(std::net::SocketAddr, Vec<u8>)>>().await
+                }
+            } => {
+                if let Some((peer_addr, data)) = turn_data {
+                    if let Some(ra) = relay_addr {
+                        if let Ok(receive) = Receive::new(
+                            str0m::net::Protocol::Udp,
+                            peer_addr,
+                            ra,
+                            &data,
+                        ) {
+                            rtc.handle_input(Input::Receive(Instant::now(), receive))?;
+                        }
+                    }
+                }
             }
             result = async {
                 if let Some(conn) = &mut blit_conn {
