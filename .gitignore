@@ -1,6 +1,6 @@
 /.blit-dev.sock
 /.direnv/
-/browser/pkg/
+/crates/browser/pkg/
 /e2e/playwright-report/
 /e2e/test-results/
 /result

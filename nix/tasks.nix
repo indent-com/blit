@@ -33,7 +33,7 @@ let
   "homepage": "https://blit.sh",
   "license": "MIT",
   "author": "Indent <oss@indent.com> (https://indent.com)",
-  "repository": {"type":"git","url":"git+https://github.com/indent-com/blit.git","directory":"browser"},
+  "repository": {"type":"git","url":"git+https://github.com/indent-com/blit.git","directory":"crates/browser"},
   "bugs": {"url":"https://github.com/indent-com/blit/issues"}
 }
 PKGJSON
@@ -57,7 +57,7 @@ PKGJSON
       cp ${browserWasm}/blit_browser_bg.wasm.d.ts "$wasm"/ 2>/dev/null || true
       echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > "$wasm/package.json"
 
-      cp -a ${../react}/* "$tmp"/
+      cp -a ${../js/react}/* "$tmp"/
       chmod -R u+w "$tmp"
 
       cd "$tmp"
@@ -232,8 +232,8 @@ in {
     runtimeInputs = [ rustToolchain ];
     text = ''
       echo "=== Setting up web-app dist ==="
-      mkdir -p web-app/dist
-      cp ${webAppDist}/index.html web-app/dist/
+      mkdir -p js/web-app/dist
+      cp ${webAppDist}/index.html js/web-app/dist/
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
@@ -245,8 +245,8 @@ in {
     runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun ];
     text = ''
       echo "=== Setting up web-app dist ==="
-      mkdir -p web-app/dist
-      cp ${webAppDist}/index.html web-app/dist/
+      mkdir -p js/web-app/dist
+      cp ${webAppDist}/index.html js/web-app/dist/
 
       echo "=== Manpage build ==="
       for f in man/*.scd; do
@@ -257,14 +257,14 @@ in {
       cargo test --workspace
       echo ""
       echo "=== React tests ==="
-      mkdir -p browser/pkg
-      if [ ! -f browser/pkg/package.json ]; then
-        echo '{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}' > browser/pkg/package.json
+      mkdir -p crates/browser/pkg
+      if [ ! -f crates/browser/pkg/package.json ]; then
+        echo '{"name":"blit-browser","version":"0.0.0","main":"blit_browser.js"}' > crates/browser/pkg/package.json
       fi
-      if [ ! -f browser/pkg/blit_browser.js ]; then
-        touch browser/pkg/blit_browser.js
+      if [ ! -f crates/browser/pkg/blit_browser.js ]; then
+        touch crates/browser/pkg/blit_browser.js
       fi
-      (cd react && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
+      (cd js/react && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
 
       export BLIT_SERVER="${blit-server}/bin/blit-server"
       echo ""

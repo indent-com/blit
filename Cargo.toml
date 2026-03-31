@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "remote",
-    "alacritty-driver",
-    "server",
-    "gateway",
-    "browser",
-    "demo",
-    "cli",
-    "fonts",
-    "webserver",
+    "crates/remote",
+    "crates/alacritty-driver",
+    "crates/server",
+    "crates/gateway",
+    "crates/browser",
+    "crates/demo",
+    "crates/cli",
+    "crates/fonts",
+    "crates/webserver",
 ]
 
 [workspace.package]
@@ -18,10 +18,10 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.12.2", path = "remote" }
-blit-alacritty = { version = "0.12.2", path = "alacritty-driver" }
-blit-fonts = { version = "0.12.2", path = "fonts" }
-blit-webserver = { version = "0.12.2", path = "webserver" }
+blit-remote = { version = "0.12.2", path = "crates/remote" }
+blit-alacritty = { version = "0.12.2", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.12.2", path = "crates/fonts" }
+blit-webserver = { version = "0.12.2", path = "crates/webserver" }
 
 [profile.release]
 opt-level = "s"

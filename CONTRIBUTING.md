@@ -26,7 +26,7 @@ Run `cargo fmt` to auto-fix formatting before committing.
 TypeScript (React library):
 
 ```bash
-cd react && pnpm install && pnpm vitest run
+cd js/react && pnpm install && pnpm vitest run
 ```
 
 E2E (Playwright, requires built binaries):
@@ -67,10 +67,10 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt and `clippy -D 
 
 | Process        | What it does                                                | Port / socket        |
 | -------------- | ----------------------------------------------------------- | -------------------- |
-| `browser-wasm` | Watches `browser/src` + `remote/src`, rebuilds WASM         | n/a                  |
+| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM | n/a                  |
 | `server`       | `cargo watch` running `blit-server --release`               | `/tmp/blit-dev.sock` |
 | `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`) | `127.0.0.1:3266`     |
-| `web-app`      | Vite dev server for `web-app/`                              | printed by Vite      |
+| `web-app`      | Vite dev server for `js/web-app/`                         | printed by Vite      |
 
 ## Project structure
 
@@ -78,25 +78,25 @@ Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cl
 
 | File                          | Lines | Role                                                                                                             |
 | ----------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------- |
-| `server/src/main.rs`          | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control                                     |
-| `remote/src/lib.rs`           | ~3000 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
-| `cli/src/interactive.rs`      | ~1650 | Console TUI and browser mode                                                                                     |
-| `browser/src/lib.rs`          | ~1100 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
-| `alacritty-driver/src/lib.rs` | ~1100 | Terminal parsing wrapper around `alacritty_terminal`                                                             |
-| `cli/src/agent.rs`            | ~870  | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
-| `demo/src/main.rs`            | ~780  | Demo programs                                                                                                    |
-| `gateway/src/main.rs`         | ~700  | WebSocket/WebTransport proxy                                                                                     |
-| `fonts/src/lib.rs`            | ~600  | Font discovery and TTF/OTF parsing                                                                               |
-| `cli/src/main.rs`             | ~185  | Clap structs and dispatch                                                                                        |
-| `cli/src/transport.rs`        | ~130  | Transport abstraction (Unix/TCP/SSH)                                                                             |
-| `webserver/src/lib.rs`        | ~90   | Shared axum HTTP helpers                                                                                         |
+| `crates/server/src/main.rs`          | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control                                     |
+| `crates/remote/src/lib.rs`           | ~3000 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
+| `crates/cli/src/interactive.rs`      | ~1650 | Console TUI and browser mode                                                                                     |
+| `crates/browser/src/lib.rs`          | ~1100 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
+| `crates/alacritty-driver/src/lib.rs` | ~1100 | Terminal parsing wrapper around `alacritty_terminal`                                                             |
+| `crates/cli/src/agent.rs`            | ~870  | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
+| `crates/demo/src/main.rs`            | ~780  | Demo programs                                                                                                    |
+| `crates/gateway/src/main.rs`         | ~700  | WebSocket/WebTransport proxy                                                                                     |
+| `crates/fonts/src/lib.rs`            | ~600  | Font discovery and TTF/OTF parsing                                                                               |
+| `crates/cli/src/main.rs`             | ~185  | Clap structs and dispatch                                                                                        |
+| `crates/cli/src/transport.rs`        | ~130  | Transport abstraction (Unix/TCP/SSH)                                                                             |
+| `crates/webserver/src/lib.rs`        | ~90   | Shared axum HTTP helpers                                                                                         |
 
 ### Non-Rust code
 
 | Directory  | What                                                                                                               |
 | ---------- | ------------------------------------------------------------------------------------------------------------------ |
-| `react/`   | `blit-react` npm package — React library with hooks, transports, WebGL renderer. Tests in `react/src/__tests__/`.  |
-| `web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                               |
+| `js/react/`   | `blit-react` npm package — React library with hooks, transports, WebGL renderer. Tests in `js/react/src/__tests__/`.  |
+| `js/web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                               |
 | `e2e/`     | Playwright tests against the full stack (6 spec files)                                                             |
 | `nix/`     | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules |
 | `systemd/` | Socket-activated unit files (user-level and system-level templates)                                                |
@@ -132,7 +132,7 @@ This validates version consistency, bumps all files, runs `cargo test -p blit-se
 ## Guardrails
 
 - `cargo clippy -- -D warnings` is the CI gate. Fix all warnings before pushing.
-- The WASM crate (`browser/`) targets `wasm32-unknown-unknown` — don't add dependencies that pull in `std::net`, `std::fs`, etc.
-- `browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the web-app or React tests will work.
+- The WASM crate (`crates/browser/`) targets `wasm32-unknown-unknown` — don't add dependencies that pull in `std::net`, `std::fs`, etc.
+- `crates/browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the web-app or React tests will work.
 - The server uses raw `libc` calls (`openpty`, `waitpid`, `kill`, `ioctl`) — changes to PTY lifecycle code need careful attention to signal safety and fd leaks.
 - The background zombie reaper (`waitpid(-1, ..., WNOHANG)` every 5s in the server) can race with `cleanup_pty`'s `waitpid` for the specific child. This is intentional — `cleanup_pty` uses `WNOHANG` so it doesn't block if the reaper already collected the child.

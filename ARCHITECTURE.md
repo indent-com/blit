@@ -21,18 +21,18 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 
 | Crate            | Directory           | Kind          | Purpose                                                                                                              |
 | ---------------- | ------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `blit-remote`    | `remote/`           | lib           | Wire protocol: message builders/parsers, frame containers, state primitives, LZ4 compression                         |
-| `blit-alacritty` | `alacritty-driver/` | lib           | Terminal parsing backend wrapping `alacritty_terminal`; snapshot generation, scrollback, title/mode tracking, search |
-| `blit-browser`   | `browser/`          | cdylib (WASM) | Applies compressed frame diffs, produces WebGL vertex data, manages glyph atlas                                      |
-| `blit-react`     | `react/`            | npm           | Workspace-based React client library: connections, sessions, transports, rendering                                   |
-| `blit-server`    | `server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
-| `blit-gateway`   | `gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
-| `blit` (CLI)     | `cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway                                           |
-| `blit-fonts`     | `fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
-| `blit-webserver` | `webserver/`        | lib           | Shared axum HTTP helpers for serving assets and fonts                                                                |
-| `blit-demo`      | `demo/`             | bin           | Demo programs: `chaos`, `emojiblast`, `netdash`                                                                      |
+| `blit-remote`    | `crates/remote/`           | lib           | Wire protocol: message builders/parsers, frame containers, state primitives, LZ4 compression                         |
+| `blit-alacritty` | `crates/alacritty-driver/` | lib           | Terminal parsing backend wrapping `alacritty_terminal`; snapshot generation, scrollback, title/mode tracking, search |
+| `blit-browser`   | `crates/browser/`          | cdylib (WASM) | Applies compressed frame diffs, produces WebGL vertex data, manages glyph atlas                                      |
+| `blit-react`     | `js/react/`              | npm           | Workspace-based React client library: connections, sessions, transports, rendering                                   |
+| `blit-server`    | `crates/server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
+| `blit-gateway`   | `crates/gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
+| `blit` (CLI)     | `crates/cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway                                           |
+| `blit-fonts`     | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
+| `blit-webserver` | `crates/webserver/`        | lib           | Shared axum HTTP helpers for serving assets and fonts                                                                |
+| `blit-demo`      | `crates/demo/`             | bin           | Demo programs: `chaos`, `emojiblast`, `netdash`                                                                      |
 
-Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `src/bin/`; `blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`).
+Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `crates/demo/src/bin/`; `blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`).
 
 ### Dependency graph
 
@@ -60,10 +60,10 @@ All messages use a custom binary format defined in `blit-remote`. There is no pr
 
 Every non-WebSocket transport wraps messages in a **4-byte little-endian length prefix** followed by the payload. WebSocket provides its own framing, so the length prefix is omitted there. This framing is identical across all components:
 
-- Server: `read_frame` / `write_frame` in `server/src/main.rs`
-- CLI: `cli/src/transport.rs`
-- Gateway: `gateway/src/main.rs`
-- Browser WebTransport/WebRTC: `react/src/transports/`
+- Server: `read_frame` / `write_frame` in `crates/server/src/main.rs`
+- CLI: `crates/cli/src/transport.rs`
+- Gateway: `crates/gateway/src/main.rs`
+- Browser WebTransport/WebRTC: `js/react/src/transports/`
 
 Maximum frame size is 16 MiB.
 
@@ -228,11 +228,11 @@ The React library includes a `WebRtcDataChannelTransport`. An ordered DataChanne
 
 ### Transport abstraction
 
-On the Rust side, `blit-cli` defines a `Transport` enum (in `cli/src/transport.rs`) over `UnixStream`, `TcpStream`, and SSH `Child` process. All variants are split into `Box<dyn AsyncRead> + Box<dyn AsyncWrite>` via a `split()` method -- the rest of the client is transport-agnostic.
+On the Rust side, `blit-cli` defines a `Transport` enum (in `crates/cli/src/transport.rs`) over `UnixStream`, `TcpStream`, and SSH `Child` process. All variants are split into `Box<dyn AsyncRead> + Box<dyn AsyncWrite>` via a `split()` method -- the rest of the client is transport-agnostic.
 
 ### Agent subcommands
 
-`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `resize`) in `cli/src/agent.rs` for programmatic control of PTYs. These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. All subcommands accept the same transport options (`--socket`, `--tcp`, `--ssh`) as the interactive modes.
+`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `resize`) in `crates/cli/src/agent.rs` for programmatic control of PTYs. These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. All subcommands accept the same transport options (`--socket`, `--tcp`, `--ssh`) as the interactive modes.
 
 On the TypeScript side, the `BlitTransport` interface abstracts over WebSocket, WebTransport, and WebRTC:
 

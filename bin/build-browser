@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Build WASM module
-(cd browser && wasm-pack build --target web --release --out-dir pkg)
+(cd crates/browser && wasm-pack build --target web --release --out-dir pkg)
 
 # Build React web app
-(cd web-app && npm install --prefer-offline && npm run build)
+(cd js/web-app && npm install --prefer-offline && npm run build)

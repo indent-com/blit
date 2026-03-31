@@ -2,23 +2,23 @@ version: "0.5"
 
 processes:
   browser-wasm:
-    command: cargo watch -w browser/src -w remote/src -s "./bin/build-browser"
+    command: cargo watch -w crates/browser/src -w crates/remote/src -s "./bin/build-browser"
     availability:
       restart: always
     readiness_probe:
       exec:
-        command: test -f browser/pkg/blit_browser.js
+        command: test -f crates/browser/pkg/blit_browser.js
       initial_delay_seconds: 5
       period_seconds: 2
       failure_threshold: 300
 
   server:
-    command: cargo watch -w server/src -w remote/src -w alacritty-driver/src -x "run -p blit-server --release -- --socket /tmp/blit-dev.sock"
+    command: cargo watch -w crates/server/src -w crates/remote/src -w crates/alacritty-driver/src -x "run -p blit-server --release -- --socket /tmp/blit-dev.sock"
     availability:
       restart: always
 
   gateway:
-    command: cargo watch -w gateway/src -w webserver/src -x "run -p blit-gateway --release"
+    command: cargo watch -w crates/gateway/src -w crates/webserver/src -x "run -p blit-gateway --release"
     environment:
       - BLIT_PASS=${BLIT_PASS:-dev}
       - BLIT_SOCK=/tmp/blit-dev.sock
@@ -40,7 +40,7 @@ processes:
       failure_threshold: 300
 
   web-app:
-    command: cd web-app && npx vite --host
+    command: cd js/web-app && npx vite --host
     environment:
       - VITE_BLIT_GATEWAY=localhost:3266
     depends_on:

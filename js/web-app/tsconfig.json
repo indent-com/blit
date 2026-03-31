@@ -15,7 +15,7 @@
     "baseUrl": ".",
     "paths": {
       "blit-react": ["../react/src/index.ts"],
-      "blit-browser": ["../browser/pkg/blit_browser.d.ts"]
+      "blit-browser": ["../../crates/browser/pkg/blit_browser.d.ts"]
     }
   },
   "include": ["src"]

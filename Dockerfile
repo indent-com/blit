@@ -3,11 +3,9 @@ RUN apk add --no-cache musl-dev curl wasm-pack binaryen
 RUN rustup target add wasm32-unknown-unknown
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY server server
-COPY gateway gateway
-COPY browser browser
+COPY crates crates
 COPY web web
-RUN cd browser && wasm-pack build --target web --release --out-dir ../web
+RUN cd crates/browser && wasm-pack build --target web --release --out-dir ../../web
 RUN cargo build --release -p blit-server -p blit-gateway
 
 FROM alpine:latest

@@ -12,7 +12,7 @@
         cargoLock = cargoLockConfig;
         nativeBuildInputs = [ pkgs.wasm-pack pkgs.wasm-bindgen-cli pkgs.binaryen ];
         buildPhase = ''
-          cd browser
+          cd crates/browser
           HOME=$TMPDIR wasm-pack build --target web --release --out-dir $out
         '';
         dontInstall = true;
@@ -108,12 +108,12 @@
       };
 
       reactNpmDeps = pkgs.fetchNpmDeps {
-        src = ../react;
-        hash = "sha256-aMWhMNeY9NUyTxhPbooD4ygcoNLzLU1LZXmxttB7XwY=";
+        src = ../js/react;
+        hash = "sha256-IWWleRFdKi/db+uzytd5KZmo/mfVpBT/LOZzZHY+Ewg=";
       };
 
       webAppNpmDeps = pkgs.fetchNpmDeps {
-        src = ../web-app;
+        src = ../js/web-app;
         hash = "sha256-LluQX9Lpmt9nlJRJRByr0HWHTa4QEoe72Wz1hAiFeeQ=";
       };
 
@@ -125,36 +125,36 @@
         buildPhase = ''
           export HOME=$TMPDIR
 
-          mkdir -p browser/pkg/snippets
-          cp ${browserWasm}/blit_browser.js browser/pkg/
-          cp ${browserWasm}/blit_browser_bg.wasm browser/pkg/
-          cp ${browserWasm}/blit_browser.d.ts browser/pkg/
-          cp ${browserWasm}/blit_browser_bg.wasm.d.ts browser/pkg/
-          echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > browser/pkg/package.json
+          mkdir -p crates/browser/pkg/snippets
+          cp ${browserWasm}/blit_browser.js crates/browser/pkg/
+          cp ${browserWasm}/blit_browser_bg.wasm crates/browser/pkg/
+          cp ${browserWasm}/blit_browser.d.ts crates/browser/pkg/
+          cp ${browserWasm}/blit_browser_bg.wasm.d.ts crates/browser/pkg/
+          echo '{"name":"blit-browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
           for d in ${browserWasm}/snippets/blit-browser-*/; do
             name=$(basename "$d")
-            mkdir -p "browser/pkg/snippets/$name"
-            cp "$d"/* "browser/pkg/snippets/$name/"
+            mkdir -p "crates/browser/pkg/snippets/$name"
+            cp "$d"/* "crates/browser/pkg/snippets/$name/"
           done
 
           cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
           chmod -R u+w "$TMPDIR/react-cache"
-          (cd react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
+          (cd js/react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
 
           cp -r ${webAppNpmDeps} "$TMPDIR/webapp-cache"
           chmod -R u+w "$TMPDIR/webapp-cache"
-          (cd web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
+          (cd js/web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
         '';
         installPhase = ''
           mkdir -p $out
-          cp web-app/dist/index.html $out/
+          cp js/web-app/dist/index.html $out/
         '';
         doCheck = false;
       };
 
       copyWebAppDist = ''
-        mkdir -p web-app/dist
-        cp ${webAppDist}/index.html web-app/dist/
+        mkdir -p js/web-app/dist
+        cp ${webAppDist}/index.html js/web-app/dist/
       '';
 
       blit-cli-static = mkStaticBin {

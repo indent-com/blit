@@ -20,8 +20,8 @@ importers:
         specifier: ^3.0.0
         version: 3.2.4(vitest@3.2.4(jsdom@25.0.1))
       blit-browser:
-        specifier: file:../browser/pkg
-        version: file:../browser/pkg
+        specifier: file:../../crates/browser/pkg
+        version: file:../../crates/browser/pkg
       jsdom:
         specifier: ^25.0.0
         version: 25.0.1
@@ -849,8 +849,8 @@ packages:
       }
     engines: { node: 18 || 20 || >=22 }
 
-  blit-browser@file:../browser/pkg:
-    resolution: { directory: ../browser/pkg, type: directory }
+  blit-browser@file:../../crates/browser/pkg:
+    resolution: { directory: ../../crates/browser/pkg, type: directory }
 
   brace-expansion@2.0.2:
     resolution:
@@ -2259,7 +2259,7 @@ snapshots:
 
   balanced-match@4.0.4: {}
 
-  blit-browser@file:../browser/pkg: {}
+  blit-browser@file:../../crates/browser/pkg: {}
 
   brace-expansion@2.0.2:
     dependencies:

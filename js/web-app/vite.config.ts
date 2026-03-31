@@ -4,8 +4,8 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 
-const wasmPath = resolve(__dirname, "../browser/pkg/blit_browser_bg.wasm");
-const snippetsDir = resolve(__dirname, "../browser/pkg/snippets");
+const wasmPath = resolve(__dirname, "../../crates/browser/pkg/blit_browser_bg.wasm");
+const snippetsDir = resolve(__dirname, "../../crates/browser/pkg/snippets");
 const isDev =
   process.env.NODE_ENV !== "production" && !process.argv.includes("build");
 
@@ -51,14 +51,14 @@ export default bin.buffer;
   resolve: {
     alias: {
       "blit-react": resolve(__dirname, "../react/src"),
-      "blit-browser": resolve(__dirname, "../browser/pkg/blit_browser.js"),
+      "blit-browser": resolve(__dirname, "../../crates/browser/pkg/blit_browser.js"),
     },
   },
   server: {
     port: 3265,
     fs: {
       // Allow serving the WASM file from outside the web-app directory.
-      allow: [resolve(__dirname, "..")],
+      allow: [resolve(__dirname, "../..")],
     },
   },
   build: {
