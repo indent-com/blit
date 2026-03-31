@@ -169,7 +169,7 @@ fn main() {
 
     let mut cmd = Command::new(&forwarder_bin);
     cmd.arg("--socket").arg(&sock_path);
-    cmd.arg("--passphrase").arg(&passphrase);
+    cmd.env("BLITZ_PASSPHRASE", &passphrase);
     cmd.arg("--signal-url").arg(&cli.signal_url);
     cmd.arg("--url").arg(&cli.url);
     if cli.quiet {
