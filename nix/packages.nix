@@ -205,6 +205,7 @@
           pkgs.cargo-edit
           pkgs.cargo-watch
           pkgs.curl
+          pkgs.flyctl
           pkgs.nodejs
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
