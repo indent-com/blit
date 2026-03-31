@@ -19,6 +19,7 @@ blit start --cols 200                     # start default shell, print session I
 blit start --cols 200 htop                # start a specific command
 blit start -t build --cols 200 make -j8   # tag it for later reference
 blit start --rows 40 --cols 200 htop      # control terminal dimensions
+blit start --wait --cols 200 make test    # block until command exits, propagate exit code
 blit show 3                               # current viewport text (plain)
 blit show 3 --ansi                        # current viewport with ANSI colors
 blit history 3                            # full scrollback + viewport
@@ -56,9 +57,15 @@ ID=$(blit start --cols 200)            # start a shell
 
 The command runs asynchronously — `start` returns as soon as the PTY is created, not when the command finishes. Poll with `show` or `history` to read output.
 
-### Waiting for output
+### Waiting for completion
 
-There is no built-in "wait for command to finish" mechanism. Poll until the session exits or a known marker appears:
+For one-shot commands where you only need the exit code, use `--wait`:
+
+```bash
+blit start --wait --cols 200 make test   # blocks until done, exits with make's exit code
+```
+
+When you need to read the output, poll until the session exits or a known marker appears:
 
 ```bash
 # For one-shot commands: poll until the process exits
@@ -124,10 +131,11 @@ blit --ssh dev-server start bash
 
 - `list` prints tab-separated values with a header row. Parse on `\t`.
   - STATUS column: `running`, `exited(N)` (normal exit with code N), `signal(N)` (killed by signal N), or `exited` (exit status unknown).
-- `start` prints a single integer (the new session ID) to stdout.
+- `start` prints a single integer (the new session ID) to stdout. With `--wait`, it then blocks until the command exits and uses its exit code (signal deaths exit with 128 + signal number).
 - `show` and `history` print terminal text to stdout, one line per terminal row. Trailing whitespace per row is trimmed.
 - `send`, `restart`, and `close` produce no stdout on success.
 - All errors go to stderr. Exit code is non-zero on failure.
+
 
 ## Escape sequences
 
