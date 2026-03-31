@@ -10,7 +10,7 @@ _blit_ [OPTIONS] [HOST]
 
 _blit_ [OPTIONS] _list_
 
-_blit_ [OPTIONS] _start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
+_blit_ [OPTIONS] _start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_--wait_ _--timeout_ _N_] [_COMMAND..._]
 
 _blit_ [OPTIONS] _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 
@@ -19,6 +19,8 @@ _blit_ [OPTIONS] _history_ [_--ansi_] [_--from-start_ _N_ | _--from-end_ _N_] [_
 _blit_ [OPTIONS] _send_ _ID_ _TEXT_
 
 _blit_ [OPTIONS] _restart_ _ID_
+
+_blit_ [OPTIONS] _wait_ _--timeout_ _N_ [_--pattern_ _REGEX_] _ID_
 
 _blit_ [OPTIONS] _close_ _ID_
 
@@ -72,10 +74,12 @@ _list_
 List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,
 STATUS.
 
-_start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_COMMAND..._]
+_start_ [_--tag_ _TAG_] [_--rows_ _N_] [_--cols_ _N_] [_--wait_ _--timeout_ _N_] [_COMMAND..._]
 Start a new PTY and print its session ID. If _COMMAND_ is omitted, the
 user's default shell is started. The default size is 24 rows by 80
-columns.
+columns. With _--wait_ _--timeout_ _N_, block until the process exits
+(or until _N_ seconds elapse). Exit code is the process's exit code, or
+124 on timeout.
 
 _show_ [_--ansi_] [_--rows_ _N_] [_--cols_ _N_] _ID_
 Dump the current visible terminal text for session _ID_. With _--ansi_,
@@ -93,11 +97,20 @@ columns when either flag is given.
 
 _send_ _ID_ _TEXT_
 Send keystrokes to session _ID_. _TEXT_ supports C-style escapes
-(_\\n_, _\\t_, _\\x1b_). Use _-_ to read from stdin.
+(_\\n_, _\\t_, _\\x1b_). Use _-_ to read from stdin. Returns an error
+if the session has already exited.
+
+_wait_ _--timeout_ _N_ [_--pattern_ _REGEX_] _ID_
+Block until session _ID_ exits or _N_ seconds elapse. Prints the exit
+status (e.g. _exited(0)_, _signal(9)_) to stdout and exits with the
+process's exit code. Exit code 124 on timeout. With _--pattern_, instead
+match _REGEX_ against new output produced after the wait begins; on
+match, print the matching line and exit 0.
 
 _restart_ _ID_
 Restart an exited session. The original command, terminal size, and tag
-are preserved. Fails if the session is still running.
+are preserved. The session ID is reused but terminal scrollback is *not*
+cleared — old output persists. Fails if the session is still running.
 
 _close_ _ID_
 Close and remove session _ID_.
