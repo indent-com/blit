@@ -8,20 +8,25 @@ REGION="${FLY_REGION:-iad}"
 echo "=== Creating Fly app: $APP ==="
 fly apps create "$APP" --machines 2>/dev/null || echo "App $APP already exists, continuing..."
 
-echo ""
-echo "=== Provisioning Upstash Redis ==="
-fly redis create --name "$APP-redis" --region "$REGION" --no-replicas 2>&1 | tee /tmp/blitz-redis-output.txt || true
-REDIS_URL=$(grep -oP 'redis://\S+' /tmp/blitz-redis-output.txt | head -1 || true)
-rm -f /tmp/blitz-redis-output.txt
-
-if [ -n "$REDIS_URL" ]; then
+if ! fly secrets list -a "$APP" 2>/dev/null | grep -q REDIS_URL; then
   echo ""
-  echo "=== Setting REDIS_URL ==="
-  fly secrets set REDIS_URL="$REDIS_URL" -a "$APP" --stage
+  echo "=== Provisioning Upstash Redis ==="
+  fly redis create --name "$APP-redis" --region "$REGION" --no-replicas 2>&1 | tee /tmp/blitz-redis-output.txt || true
+  REDIS_URL=$(grep -oP 'redis://\S+' /tmp/blitz-redis-output.txt | head -1 || true)
+  rm -f /tmp/blitz-redis-output.txt
+
+  if [ -n "$REDIS_URL" ]; then
+    echo ""
+    echo "=== Setting REDIS_URL ==="
+    fly secrets set REDIS_URL="$REDIS_URL" -a "$APP" --stage
+  else
+    echo ""
+    echo "Could not auto-detect REDIS_URL from output."
+    echo "Set it manually: fly secrets set REDIS_URL=redis://... -a $APP"
+  fi
 else
   echo ""
-  echo "Could not auto-detect REDIS_URL from output."
-  echo "Set it manually: fly secrets set REDIS_URL=redis://... -a $APP"
+  echo "REDIS_URL already set, skipping Redis provisioning."
 fi
 
 if [ -n "${CF_TURN_TOKEN_ID:-}" ] && [ -n "${CF_TURN_API_TOKEN:-}" ]; then

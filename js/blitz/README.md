@@ -14,16 +14,18 @@ Install [flyctl](https://fly.io/docs/flyctl/install/), then:
 
 ```bash
 cd js/blitz
-./bin/setup
+./bin/blitz-signaling-setup
 ```
 
-This creates the Fly app, provisions Redis, and deploys. Optionally set
-Cloudflare TURN credentials first:
+This creates the Fly app, provisions Redis, and deploys. The script is
+idempotent — re-running it skips already-provisioned resources and redeploys.
+
+Optionally set Cloudflare TURN credentials first:
 
 ```bash
 export CF_TURN_TOKEN_ID=...
 export CF_TURN_API_TOKEN=...
-./bin/setup
+./bin/blitz-signaling-setup
 ```
 
 To enable continuous deployment from GitHub Actions:
