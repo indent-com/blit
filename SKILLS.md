@@ -44,7 +44,7 @@ These are the two ways to read terminal output. Getting this distinction right i
 |---|---|---|
 | **What it returns** | Current viewport — exactly what a human would see on screen right now | Full scrollback buffer + viewport |
 | **When to use** | Quick glance at current state (e.g. is the prompt back?) | Reading command output that may have scrolled off-screen |
-| **Gotcha** | If a command produced more output than fits on screen, earlier output is lost | Without `--limit`, returns everything — can be megabytes for long-running sessions. **Always use `--from-end 0 --limit N`** to cap output size. |
+| **Gotcha** | If a command produced more output than fits on screen, earlier output is lost | Without `--limit`, returns everything — can be megabytes for long-running sessions. Unless processing the output, always use `--limit` with `--from-end` or `--from-start` to cap output size. |
 
 **Rule of thumb:** Use `history --from-end 0 --limit N` when you need recent output. Use `show` when you only care about what's visible right now (e.g. checking for a prompt).
 
