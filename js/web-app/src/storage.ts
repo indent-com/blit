@@ -8,9 +8,9 @@ export const FONT_KEY = "blit.fontFamily";
 export const FONT_SIZE_KEY = "blit.fontSize";
 export const FONT_SMOOTHING_KEY = "blit.fontSmoothing";
 
-/** Remote hostname: injected by CLI, or falls back to location.hostname for gateway. */
+/** Remote hostname: from config endpoint, localStorage fallback, or location.hostname for gateway. */
 export function blitHost(): string {
-  return readStorage(HOST_KEY) || location.hostname;
+  return cachedConfig?.host || readStorage(HOST_KEY) || location.hostname;
 }
 
 export function readStorage(key: string): string | null {
@@ -46,9 +46,29 @@ export function wtUrl(): string {
   return "https://" + gatewayHost + location.pathname;
 }
 
-/** SHA-256 cert hash injected by the gateway for self-signed certs. */
+export interface BlitConfig {
+  passphrase?: string;
+  host?: string;
+  certHash?: string;
+}
+
+let cachedConfig: BlitConfig | null = null;
+
+export async function fetchConfig(): Promise<BlitConfig> {
+  if (cachedConfig) return cachedConfig;
+  try {
+    const resp = await fetch(basePath + "_blit/config");
+    if (resp.ok) {
+      cachedConfig = await resp.json();
+      return cachedConfig!;
+    }
+  } catch {}
+  cachedConfig = {};
+  return cachedConfig;
+}
+
 export function wtCertHash(): string | undefined {
-  return (window as unknown as { __blitCertHash?: string }).__blitCertHash;
+  return cachedConfig?.certHash;
 }
 
 export function preferredPalette(): TerminalPalette {
