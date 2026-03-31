@@ -6,6 +6,8 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 const DEFAULT_SIGNAL_URL: &str = "wss://cloud.blit.sh";
@@ -49,6 +51,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 struct PeerState {
     handle: tokio::task::JoinHandle<()>,
     signal_tx: mpsc::UnboundedSender<serde_json::Value>,
+    established: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -97,21 +100,39 @@ async fn main() {
         match event {
             signaling::Event::Registered { session_id } => {
                 eprintln!("registered with signaling server (session {session_id})");
-                for (id, state) in peers.drain() {
-                    eprintln!("aborting stale peer task: {id}");
-                    state.handle.abort();
+                let stale: Vec<String> = peers
+                    .iter()
+                    .filter(|(_, s)| !s.established.load(Ordering::Relaxed))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in stale {
+                    if let Some(state) = peers.remove(&id) {
+                        eprintln!("aborting peer still in signaling phase: {id}");
+                        state.handle.abort();
+                    }
                 }
             }
             signaling::Event::PeerJoined { session_id } => {
+                if let Some(existing) = peers.get(&session_id) {
+                    if existing.established.load(Ordering::Relaxed) {
+                        eprintln!("ignoring duplicate peer_joined for established peer: {session_id}");
+                        continue;
+                    }
+                    if let Some(old) = peers.remove(&session_id) {
+                        old.handle.abort();
+                    }
+                }
                 eprintln!("consumer joined: {session_id}");
                 let (peer_sig_tx, peer_sig_rx) = mpsc::unbounded_channel();
+                let established = Arc::new(AtomicBool::new(false));
                 let peer_id = session_id.clone();
                 let sock = sock_path.clone();
                 let out_tx = sig_send_tx.clone();
                 let key = signing_key.clone();
+                let est = established.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key).await
+                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key, est).await
                     {
                         eprintln!("peer {peer_id} error: {e}");
                     }
@@ -121,6 +142,7 @@ async fn main() {
                     PeerState {
                         handle,
                         signal_tx: peer_sig_tx,
+                        established,
                     },
                 );
             }

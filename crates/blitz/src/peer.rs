@@ -1,6 +1,8 @@
 use crate::signaling;
 use ed25519_dalek::SigningKey;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
@@ -18,6 +20,7 @@ pub async fn handle_peer(
     mut signal_rx: mpsc::UnboundedReceiver<serde_json::Value>,
     signal_tx: mpsc::UnboundedSender<String>,
     signing_key: SigningKey,
+    established: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let udp = UdpSocket::bind("0.0.0.0:0")?;
     udp.set_nonblocking(true)?;
@@ -49,6 +52,7 @@ pub async fn handle_peer(
     let mut blit_conn: Option<UnixStream> = None;
     let mut blit_channel: Option<ChannelId> = None;
     let mut buf = vec![0u8; 65535];
+    let mut signaling_alive = true;
 
     loop {
         let timeout = loop {
@@ -66,6 +70,7 @@ pub async fn handle_peer(
                                 blit_channel = Some(cid);
                                 let stream = UnixStream::connect(&sock_path).await?;
                                 blit_conn = Some(stream);
+                                established.store(true, Ordering::Relaxed);
                             }
                         }
                         Event::ChannelData(cd) => {
@@ -169,7 +174,13 @@ pub async fn handle_peer(
                     }
                 }
             }
-            sig = signal_rx.recv() => {
+            sig = async {
+                if signaling_alive {
+                    signal_rx.recv().await
+                } else {
+                    std::future::pending::<Option<serde_json::Value>>().await
+                }
+            } => {
                 match sig {
                     Some(data) => {
                         if let Some(candidate) = data.get("candidate") {
@@ -178,7 +189,13 @@ pub async fn handle_peer(
                             }
                         }
                     }
-                    None => return Ok(()),
+                    None => {
+                        signaling_alive = false;
+                        if !established.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        eprintln!("signaling channel closed, WebRTC connection continues");
+                    }
                 }
             }
         }
