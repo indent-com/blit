@@ -13,8 +13,7 @@ server-side authentication or user accounts.
 Install [flyctl](https://fly.io/docs/flyctl/install/), then:
 
 ```bash
-cd js/blitz
-./bin/blitz-signaling-setup
+./bin/setup-blitz-signaling
 ```
 
 This creates the Fly app, provisions Redis, and deploys. The script is
@@ -25,7 +24,7 @@ Optionally set Cloudflare TURN credentials first:
 ```bash
 export CF_TURN_TOKEN_ID=...
 export CF_TURN_API_TOKEN=...
-./bin/blitz-signaling-setup
+./bin/setup-blitz-signaling
 ```
 
 To enable continuous deployment from GitHub Actions:
