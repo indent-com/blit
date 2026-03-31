@@ -215,7 +215,7 @@ const server = Bun.serve<ClientData>({
       });
     }
 
-    if (url.pathname === "/" || url.pathname === "/install.sh") {
+    if (url.pathname === "/") {
       return new Response(INSTALL_SCRIPT, {
         headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
       });
