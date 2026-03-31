@@ -5,12 +5,17 @@ import nacl from "tweetnacl";
 const PORT = parseInt(process.env.PORT || "8000", 10);
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const SESSION_TTL = 600;
+const MAX_PAYLOAD_BYTES = 65536;
 
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
 const pubRedis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
 const subRedis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
 
 type Role = "producer" | "consumer";
+const OPPOSITE_ROLE: Record<Role, Role> = {
+  producer: "consumer",
+  consumer: "producer",
+};
 
 type ClientData = {
   channelId: string;
@@ -37,6 +42,10 @@ function getOrCreateChannel(channelId: string): Channel {
 
 function redisKey(prefix: string, ...parts: string[]): string {
   return `rendezvous:${prefix}:${parts.join(":")}`;
+}
+
+function channelPresenceTopic(channelId: string): string {
+  return redisKey("presence", channelId);
 }
 
 function toSessionTopic(channelId: string, sessionId: string): string {
@@ -81,14 +90,33 @@ async function unsubscribe(topic: string) {
   }
 }
 
-subRedis.on("message", (_topic: string, message: string) => {
+function broadcastToLocalPeers(
+  channelId: string,
+  excludeSessionId: string,
+  message: string,
+) {
+  const ch = channels.get(channelId);
+  if (!ch) return;
+  for (const map of [ch.producers, ch.consumers]) {
+    for (const [sid, ws] of map) {
+      if (sid !== excludeSessionId) ws.send(message);
+    }
+  }
+}
+
+subRedis.on("message", (topic: string, message: string) => {
   try {
     const envelope = JSON.parse(message);
-    const { channelId, targetSessionId, payload } = envelope;
-    const ch = channels.get(channelId);
-    if (!ch) {
+
+    if (topic.startsWith("rendezvous:presence:")) {
+      const channelId = topic.slice("rendezvous:presence:".length);
+      broadcastToLocalPeers(channelId, "", message);
       return;
     }
+
+    const { channelId, targetSessionId, payload } = envelope;
+    const ch = channels.get(channelId);
+    if (!ch) return;
 
     const target =
       ch.producers.get(targetSessionId) || ch.consumers.get(targetSessionId);
@@ -109,8 +137,14 @@ function relayToSession(channelId: string, sessionId: string, payload: string) {
   pubRedis.publish(toSessionTopic(channelId, sessionId), envelope);
 }
 
-function isValidChannelId(channelId: string): boolean {
-  return /^[0-9a-f]{64}$/i.test(channelId);
+function publishPresence(
+  channelId: string,
+  type: "peer_joined" | "peer_left",
+  role: Role,
+  sessionId: string,
+) {
+  const msg = JSON.stringify({ type, role, sessionId });
+  pubRedis.publish(channelPresenceTopic(channelId), msg);
 }
 
 const server = Bun.serve<ClientData>({
@@ -138,10 +172,6 @@ const server = Bun.serve<ClientData>({
     const channelId = match[1].toLowerCase();
     const role = match[2] as Role;
 
-    if (!isValidChannelId(channelId)) {
-      return new Response("Invalid channel ID", { status: 400 });
-    }
-
     const sessionId = crypto.randomUUID();
     const upgraded = server.upgrade(req, {
       data: { channelId, role, sessionId },
@@ -153,34 +183,38 @@ const server = Bun.serve<ClientData>({
   },
 
   websocket: {
+    maxPayloadLength: MAX_PAYLOAD_BYTES,
+
     async open(ws) {
       const { channelId, role, sessionId } = ws.data;
       const ch = getOrCreateChannel(channelId);
       const peers = role === "producer" ? ch.producers : ch.consumers;
-      const others = role === "producer" ? ch.consumers : ch.producers;
 
       peers.set(sessionId, ws);
       await subscribe(toSessionTopic(channelId, sessionId));
-      await redis.sadd(redisKey(role, channelId), sessionId);
-      await redis.expire(redisKey(role, channelId), SESSION_TTL);
+      await subscribe(channelPresenceTopic(channelId));
+
+      const memberKey = redisKey(role, channelId);
+      await redis.sadd(memberKey, sessionId);
+      await redis.expire(memberKey, SESSION_TTL);
 
       ws.send(
         JSON.stringify({ type: "registered", channelId, role, sessionId }),
       );
 
-      for (const [peerId] of others) {
+      const otherRole = OPPOSITE_ROLE[role];
+      const remoteMembers = await redis.smembers(redisKey(otherRole, channelId));
+      for (const peerId of remoteMembers) {
         ws.send(
           JSON.stringify({
             type: "peer_joined",
-            role: role === "producer" ? "consumer" : "producer",
+            role: otherRole,
             sessionId: peerId,
           }),
         );
       }
 
-      for (const [, other] of others) {
-        other.send(JSON.stringify({ type: "peer_joined", role, sessionId }));
-      }
+      publishPresence(channelId, "peer_joined", role, sessionId);
     },
 
     async message(ws, raw) {
@@ -247,22 +281,18 @@ const server = Bun.serve<ClientData>({
     async close(ws) {
       const { channelId, role, sessionId } = ws.data;
       const ch = channels.get(channelId);
-      if (!ch) {
-        return;
-      }
+      if (!ch) return;
 
       const peers = role === "producer" ? ch.producers : ch.consumers;
-      const others = role === "producer" ? ch.consumers : ch.producers;
 
       peers.delete(sessionId);
       await unsubscribe(toSessionTopic(channelId, sessionId));
       await redis.srem(redisKey(role, channelId), sessionId);
 
-      for (const [, other] of others) {
-        other.send(JSON.stringify({ type: "peer_left", role, sessionId }));
-      }
+      publishPresence(channelId, "peer_left", role, sessionId);
 
       if (ch.producers.size === 0 && ch.consumers.size === 0) {
+        await unsubscribe(channelPresenceTopic(channelId));
         channels.delete(channelId);
       }
     },
