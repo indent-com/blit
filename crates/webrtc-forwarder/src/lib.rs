@@ -4,7 +4,9 @@ pub mod signaling;
 mod turn;
 
 use ed25519_dalek::SigningKey;
-use sha2::{Digest, Sha256};
+use hmac::Hmac;
+use pbkdf2::pbkdf2;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,10 +23,13 @@ pub struct Config {
     pub quiet: bool,
 }
 
+const PBKDF2_SALT: &[u8] = b"https://blit.sh";
+const PBKDF2_ROUNDS: u32 = 100_000;
+
 fn derive_signing_key(passphrase: &str) -> SigningKey {
-    let mut hasher = Sha256::new();
-    hasher.update(passphrase.as_bytes());
-    let seed: [u8; 32] = hasher.finalize().into();
+    let mut seed = [0u8; 32];
+    pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), PBKDF2_SALT, PBKDF2_ROUNDS, &mut seed)
+        .expect("HMAC can be initialized with any key length");
     SigningKey::from_bytes(&seed)
 }
 

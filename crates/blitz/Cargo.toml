@@ -15,4 +15,6 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
 ureq = "3"

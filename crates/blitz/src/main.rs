@@ -1,5 +1,7 @@
 use clap::Parser;
-use sha2::{Digest, Sha256};
+use hmac::Hmac;
+use pbkdf2::pbkdf2;
+use sha2::Sha256;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 const DEFAULT_SIGNAL_URL: &str = "wss://cloud.blit.sh";
 const DEFAULT_URL_TEMPLATE: &str = "https://blit.sh/#{secret}";
 const REPO_BASE: &str = "https://repo.blit.sh";
+const PBKDF2_SALT: &[u8] = b"https://blit.sh";
+const PBKDF2_ROUNDS: u32 = 100_000;
 
 #[derive(Parser)]
 #[command(name = "blitz", version, about = "Share a terminal session via WebRTC")]
@@ -118,10 +122,9 @@ fn main() {
         None => {
             let server_bin = ensure_binary(os, arch, "blit-server", &dir);
 
-            let mut hasher = Sha256::new();
-            hasher.update(passphrase.as_bytes());
-            hasher.update(b"socket-path");
-            let hash: [u8; 32] = hasher.finalize().into();
+            let mut hash = [0u8; 32];
+            pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), PBKDF2_SALT, PBKDF2_ROUNDS, &mut hash)
+                .expect("HMAC can be initialized with any key length");
             let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
 
             let sock = format!(
