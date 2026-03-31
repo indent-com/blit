@@ -123,7 +123,7 @@ fn main() {
             let server_bin = ensure_binary(os, arch, "blit-server", &dir);
 
             let mut hash = [0u8; 32];
-            pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), PBKDF2_SALT, PBKDF2_ROUNDS, &mut hash)
+            pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), b"https://blit.sh/socket-path", PBKDF2_ROUNDS, &mut hash)
                 .expect("HMAC can be initialized with any key length");
             let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
 
