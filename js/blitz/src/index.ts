@@ -196,26 +196,38 @@ const server = Bun.serve<ClientData>({
 
   async fetch(req) {
     const url = new URL(req.url);
+    const cors = { "Access-Control-Allow-Origin": "*" };
+
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...cors,
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
 
     if (url.pathname === "/health") {
       try {
         await redis.ping();
-        return new Response("ok", { status: 200 });
+        return new Response("ok", { status: 200, headers: cors });
       } catch {
-        return new Response("redis unreachable", { status: 503 });
+        return new Response("redis unreachable", { status: 503, headers: cors });
       }
     }
 
     if (url.pathname === "/message") {
-      return Response.json({ template: MESSAGE_TEMPLATE });
+      return Response.json({ template: MESSAGE_TEMPLATE }, { headers: cors });
     }
 
     if (url.pathname === "/ice") {
       try {
         const config = await getIceServers();
-        return Response.json(config);
+        return Response.json(config, { headers: cors });
       } catch {
-        return Response.json({ iceServers: DEFAULT_ICE_SERVERS });
+        return Response.json({ iceServers: DEFAULT_ICE_SERVERS }, { headers: cors });
       }
     }
 
@@ -223,7 +235,7 @@ const server = Bun.serve<ClientData>({
       /^\/channel\/([0-9a-fA-F]{64})\/(producer|consumer)$/,
     );
     if (!match) {
-      return new Response("Not Found", { status: 404 });
+      return new Response("Not Found", { status: 404, headers: cors });
     }
 
     const channelId = match[1].toLowerCase();
