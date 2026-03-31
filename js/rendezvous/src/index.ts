@@ -110,7 +110,7 @@ subRedis.on("message", (topic: string, message: string) => {
 
     if (topic.startsWith("rendezvous:presence:")) {
       const channelId = topic.slice("rendezvous:presence:".length);
-      broadcastToLocalPeers(channelId, "", message);
+      broadcastToLocalPeers(channelId, envelope.sessionId, message);
       return;
     }
 
