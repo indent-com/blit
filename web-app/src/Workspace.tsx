@@ -493,18 +493,10 @@ function WorkspaceScreen({
         });
         workspace.focusSession(session.id);
         closeOverlay();
-      } catch (error) {
-        if (
-          connection?.status !== "disconnected" &&
-          connection?.status !== "error"
-        ) {
-          console.error("blit: failed to create PTY", error);
-        }
-      }
+      } catch {}
     },
     [
       closeOverlay,
-      connection?.status,
       primaryConnectionId,
       workspace,
       workspaceState.focusedSessionId,
@@ -526,17 +518,9 @@ function WorkspaceScreen({
             ? { cwdFromSessionId: workspaceState.focusedSessionId }
             : {}),
         });
-      } catch (error) {
-        if (
-          connection?.status !== "disconnected" &&
-          connection?.status !== "error"
-        ) {
-          console.error("blit: failed to create PTY", error);
-        }
-      }
+      } catch {}
     },
     [
-      connection?.status,
       primaryConnectionId,
       workspace,
       workspaceState.focusedSessionId,
@@ -590,11 +574,7 @@ function WorkspaceScreen({
       }
       if (mod && e.shiftKey && e.key === "Enter") {
         e.preventDefault();
-        if (bspFocusedPaneId) {
-          void createInPane(bspFocusedPaneId);
-        } else {
-          void createAndFocus();
-        }
+        void createAndFocus();
         return;
       }
       if (

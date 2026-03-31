@@ -10,7 +10,7 @@ use blit_remote::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
@@ -44,13 +44,6 @@ fn pty_write_all(fd: libc::c_int, mut data: &[u8]) {
         } else {
             break;
         }
-    }
-}
-
-struct OwnedFd(RawFd);
-impl AsRawFd for OwnedFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
     }
 }
 
@@ -156,11 +149,23 @@ impl PtyDriver for AlacrittyDriver {
 // ~2 frames, so this just needs to be bigger than that with some headroom.
 const OUTBOX_CAPACITY: usize = 8;
 const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 2;
-const PTY_READ_DRAIN_MAX_BYTES: usize = 256 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
-const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const PTY_CHANNEL_CAPACITY: usize = 64;
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+
+/// A chunk of data from the PTY reader, sent through a lock-free channel
+/// so the reader never contends with the delivery tick for the Session mutex.
+enum PtyInput {
+    /// Raw bytes from the PTY, with the reader's sync-scan tail for boundary
+    /// detection. The tick task calls `process()` + `respond_to_queries()`.
+    Data(Vec<u8>),
+    /// Data up to a sync-output-close boundary. `before` should be processed
+    /// and then a snapshot taken. `after` is remainder for the next chunk.
+    SyncBoundary { before: Vec<u8>, after: Vec<u8> },
+    /// The PTY fd hit EOF or an error — the child likely exited.
+    Eof,
+}
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -197,11 +202,10 @@ struct Pty {
     /// Client-chosen tag set at creation time.
     tag: String,
     dirty: bool,
-    pending_input: Vec<u8>,
     ready_frames: VecDeque<FrameState>,
-    sync_scan_tail: Vec<u8>,
-    draining: bool,
-    reader_handle: tokio::task::JoinHandle<()>,
+    /// Receives raw byte chunks from the PTY reader task without mutex contention.
+    byte_rx: mpsc::Receiver<PtyInput>,
+    reader_handle: std::thread::JoinHandle<()>,
     /// Cached (echo, icanon) from tcgetattr; refreshed every ~250ms.
     lflag_cache: (bool, bool),
     lflag_last: Instant,
@@ -489,10 +493,6 @@ fn should_snapshot_pty(dirty: bool, needful: bool, synced_output: bool) -> bool 
     dirty && needful && !synced_output
 }
 
-fn should_break_pty_drain(drained_bytes: usize, synced_output_open: bool) -> bool {
-    drained_bytes >= PTY_READ_DRAIN_MAX_BYTES && !synced_output_open
-}
-
 fn enqueue_ready_frame(queue: &mut VecDeque<FrameState>, frame: FrameState) -> bool {
     if queue.len() >= READY_FRAME_QUEUE_CAP {
         return false;
@@ -502,7 +502,7 @@ fn enqueue_ready_frame(queue: &mut VecDeque<FrameState>, frame: FrameState) -> b
 }
 
 fn pty_has_visual_update(pty: &Pty) -> bool {
-    pty.dirty || !pty.ready_frames.is_empty()
+    pty.dirty || !pty.ready_frames.is_empty() || !pty.byte_rx.is_empty()
 }
 
 /// Find the first `\x1b[?2026l` in `bytes`, handling sequences that span
@@ -1167,7 +1167,11 @@ fn spawn_pty(
     }
 
     state.2.write().unwrap().insert(id, master);
-    let reader_handle = tokio::spawn(pty_reader(master, id, state.clone()));
+    let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
+    let reader_handle = std::thread::spawn({
+        let notify = state.3.clone();
+        move || pty_reader(master, byte_tx, notify)
+    });
     let lflag_cache = pty_lflag(master);
 
     Some(Pty {
@@ -1176,10 +1180,8 @@ fn spawn_pty(
         driver: Box::new(AlacrittyDriver::new(rows, cols, scrollback)),
         tag: tag.to_owned(),
         dirty: true,
-        pending_input: Vec::new(),
         ready_frames: VecDeque::new(),
-        sync_scan_tail: Vec::new(),
-        draining: false,
+        byte_rx,
         reader_handle,
         lflag_cache,
         lflag_last: Instant::now(),
@@ -1192,7 +1194,7 @@ fn spawn_pty(
 }
 
 /// Spawn a new child process on a fresh PTY pair.
-/// Returns (master_fd, child_pid, reader_handle) for swapping into an existing Pty.
+/// Returns (master_fd, child_pid, reader_handle, byte_rx) for swapping into an existing Pty.
 fn respawn_child(
     shell: &str,
     rows: u16,
@@ -1200,7 +1202,7 @@ fn respawn_child(
     pty_id: u16,
     command: Option<&str>,
     state: AppState,
-) -> Option<(libc::c_int, libc::pid_t, tokio::task::JoinHandle<()>)> {
+) -> Option<(libc::c_int, libc::pid_t, std::thread::JoinHandle<()>, mpsc::Receiver<PtyInput>)> {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     unsafe {
@@ -1298,8 +1300,12 @@ fn respawn_child(
     }
 
     state.2.write().unwrap().insert(pty_id, master);
-    let reader_handle = tokio::spawn(pty_reader(master, pty_id, state));
-    Some((master, pid, reader_handle))
+    let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
+    let reader_handle = std::thread::spawn({
+        let notify = state.3.clone();
+        move || pty_reader(master, byte_tx, notify)
+    });
+    Some((master, pid, reader_handle, byte_rx))
 }
 
 fn respond_to_queries(fd: libc::c_int, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
@@ -1352,166 +1358,63 @@ fn respond_to_queries(fd: libc::c_int, data: &[u8], size: (u16, u16), cursor: (u
     }
 }
 
-async fn pty_reader(fd: libc::c_int, pty_id: u16, state: AppState) {
-    let async_fd = match AsyncFd::new(OwnedFd(fd)) {
-        Ok(f) => f,
-        Err(_) => {
-            cleanup_pty(pty_id, &state).await;
-            return;
-        }
-    };
+fn pty_reader(
+    fd: libc::c_int,
+    tx: mpsc::Sender<PtyInput>,
+    notify: Arc<Notify>,
+) {
+    // Use a dedicated OS thread with a plain blocking read() instead of
+    // tokio's AsyncFd (kqueue/epoll). On macOS, registering a kqueue watcher
+    // on the PTY master fd adds significant per-write overhead in the kernel's
+    // TTY layer — every slave write triggers a kevent notification. A blocking
+    // read in a dedicated thread avoids this entirely, matching what native
+    // terminals like Ghostty do.
 
-    let mut buf = vec![0u8; 256 * 1024];
-
-    loop {
-        let has_pending_input = {
-            let sess = state.1.lock().await;
-            sess.ptys
-                .get(&pty_id)
-                .map(|pty| !pty.pending_input.is_empty())
-                .unwrap_or(false)
-        };
-        let mut guard = if has_pending_input {
-            None
-        } else {
-            Some(match async_fd.readable().await {
-                Ok(g) => g,
-                Err(_) => break,
-            })
-        };
-
-        let mut exit = false;
-        let mut drained_any = false;
-        let mut drained_bytes = 0usize;
-        let mut blocked_on_ready_frames = false;
-        {
-            let mut sess = state.1.lock().await;
-            if let Some(pty) = sess.ptys.get_mut(&pty_id) {
-                pty.draining = true;
-            }
-        }
-        loop {
-            let (queue_full, pending_chunk, sync_scan_tail) = {
-                let mut sess = state.1.lock().await;
-                sess.ptys
-                    .get_mut(&pty_id)
-                    .map(|pty| {
-                        if pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP {
-                            return (true, None, pty.sync_scan_tail.clone());
-                        }
-                        let pending = if pty.pending_input.is_empty() {
-                            None
-                        } else {
-                            Some(std::mem::take(&mut pty.pending_input))
-                        };
-                        (false, pending, pty.sync_scan_tail.clone())
-                    })
-                    .unwrap_or((false, None, Vec::new()))
-            };
-            if queue_full {
-                blocked_on_ready_frames = true;
-                break;
-            }
-
-            let chunk_storage: Vec<u8>;
-            let chunk = if let Some(pending) = pending_chunk {
-                chunk_storage = pending;
-                chunk_storage.as_slice()
-            } else {
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n > 0 {
-                    &buf[..n as usize]
-                } else if n == 0 {
-                    exit = true;
-                    break;
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        if let Some(guard) = guard.as_mut() {
-                            guard.clear_ready();
-                        }
-                        break;
-                    } else {
-                        exit = true;
-                        break;
-                    }
-                }
-            };
-
-            let sync_boundary = find_sync_output_end(&sync_scan_tail, chunk);
-            let process_len = sync_boundary.unwrap_or(chunk.len());
-            let to_process = &chunk[..process_len];
-            let remainder = &chunk[process_len..];
-
-            if !to_process.is_empty() {
-                let mut synced_output_open = false;
-                let mut ready_frames_len = 0usize;
-                let mut sess = state.1.lock().await;
-                if let Some(pty) = sess.ptys.get_mut(&pty_id) {
-                    pty.driver.process(to_process);
-                    pty.mark_dirty();
-                    synced_output_open = pty.driver.synced_output();
-                    update_sync_scan_tail(&mut pty.sync_scan_tail, to_process);
-                    if !remainder.is_empty() {
-                        pty.pending_input.extend_from_slice(remainder);
-                    }
-                    if sync_boundary.is_some() && !synced_output_open {
-                        let frame = take_snapshot(pty);
-                        if enqueue_ready_frame(&mut pty.ready_frames, frame) {
-                            pty.clear_dirty();
-                            ready_frames_len = pty.ready_frames.len();
-                        } else {
-                            blocked_on_ready_frames = true;
-                        }
-                    }
-                    respond_to_queries(
-                        fd,
-                        to_process,
-                        pty.driver.size(),
-                        pty.driver.cursor_position(),
-                    );
-                }
-                drop(sess);
-                drained_any = true;
-                drained_bytes = drained_bytes.saturating_add(to_process.len());
-                if blocked_on_ready_frames || ready_frames_len >= READY_FRAME_QUEUE_CAP {
-                    break;
-                }
-                if should_break_pty_drain(drained_bytes, synced_output_open) {
-                    break;
-                }
-                if !synced_output_open {
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
-
-        {
-            let mut sess = state.1.lock().await;
-            if let Some(pty) = sess.ptys.get_mut(&pty_id) {
-                pty.draining = false;
-            }
-        }
-        if drained_any {
-            nudge_delivery(&state);
-            // Under a firehose workload the fd may still be readable immediately
-            // after this drain. Yield here so delivery can snapshot the
-            // just-finished drain boundary before we mark the PTY draining again.
-            tokio::task::yield_now().await;
-        } else if blocked_on_ready_frames {
-            nudge_delivery(&state);
-            tokio::time::sleep(SNAPSHOT_RETRY_INTERVAL).await;
-        }
-
-        if exit {
-            break;
-        }
+    // Ensure the fd is in blocking mode.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
     }
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    cleanup_pty(pty_id, &state).await;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sync_scan_tail = Vec::new();
+
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            let data = buf[..n as usize].to_vec();
+            let mut remaining = data;
+            loop {
+                if remaining.is_empty() {
+                    break;
+                }
+                if let Some(boundary) = find_sync_output_end(&sync_scan_tail, &remaining) {
+                    let before = remaining[..boundary].to_vec();
+                    let after = remaining[boundary..].to_vec();
+                    update_sync_scan_tail(&mut sync_scan_tail, &before);
+                    if tx.blocking_send(PtyInput::SyncBoundary { before, after: after.clone() }).is_err() {
+                        return;
+                    }
+                    notify.notify_one();
+                    remaining = after;
+                } else {
+                    update_sync_scan_tail(&mut sync_scan_tail, &remaining);
+                    if tx.blocking_send(PtyInput::Data(remaining)).is_err() {
+                        return;
+                    }
+                    notify.notify_one();
+                    break;
+                }
+            }
+        } else {
+            let _ = tx.blocking_send(PtyInput::Eof);
+            notify.notify_one();
+            return;
+        }
+    }
 }
 
+/// Split accumulated bytes at sync-output boundaries and send through the channel.
 async fn cleanup_pty(pty_id: u16, state: &AppState) {
     // Remove the fd so no more writes go to the closed master.
     state.2.write().unwrap().remove(&pty_id);
@@ -1961,6 +1864,68 @@ async fn tick(state: &AppState) -> TickOutcome {
             did_work = true;
         }
     }
+
+    // Drain bytes from PTY reader channels. This is the only place
+    // process() is called, so there is no contention with the readers.
+    let mut eof_ptys: Vec<u16> = Vec::new();
+    for &id in &ids {
+        let Some(pty) = sess.ptys.get_mut(&id) else {
+            continue;
+        };
+        while let Ok(input) = pty.byte_rx.try_recv() {
+            match input {
+                PtyInput::Data(data) => {
+                    respond_to_queries(
+                        pty.master_fd,
+                        &data,
+                        pty.driver.size(),
+                        pty.driver.cursor_position(),
+                    );
+                    pty.driver.process(&data);
+                    pty.mark_dirty();
+                    did_work = true;
+                }
+                PtyInput::SyncBoundary { before, after } => {
+                    if !before.is_empty() {
+                        respond_to_queries(
+                            pty.master_fd,
+                            &before,
+                            pty.driver.size(),
+                            pty.driver.cursor_position(),
+                        );
+                        pty.driver.process(&before);
+                        pty.mark_dirty();
+                    }
+                    if !pty.driver.synced_output() {
+                        let frame = take_snapshot(pty);
+                        enqueue_ready_frame(&mut pty.ready_frames, frame);
+                        pty.clear_dirty();
+                    }
+                    if !after.is_empty() {
+                        respond_to_queries(
+                            pty.master_fd,
+                            &after,
+                            pty.driver.size(),
+                            pty.driver.cursor_position(),
+                        );
+                        pty.driver.process(&after);
+                        pty.mark_dirty();
+                    }
+                    did_work = true;
+                }
+                PtyInput::Eof => {
+                    eof_ptys.push(id);
+                }
+            }
+        }
+    }
+    // Handle EOF outside the borrow loop.
+    drop(sess);
+    for id in eof_ptys {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cleanup_pty(id, state).await;
+    }
+    let mut sess = state.1.lock().await;
 
     // Only snapshot PTYs that have at least one client ready to consume a fresh
     // frame right now. This avoids burning CPU on snapshot+diff+compress work
@@ -2921,7 +2886,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     .filter(|p| p.exited)
                     .map(|p| (p.driver.size(), p.command.clone(), p.tag.clone()));
                 if let Some(((rows, cols), command, tag)) = restart_info {
-                    if let Some((master, child, reader)) = respawn_child(
+                    if let Some((master, child, reader, byte_rx)) = respawn_child(
                         &state.0.shell,
                         rows,
                         cols,
@@ -2935,6 +2900,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         pty.master_fd = master;
                         pty.child_pid = child;
                         pty.reader_handle = reader;
+                        pty.byte_rx = byte_rx;
                         pty.exited = false;
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
                         pty.lflag_cache = pty_lflag(master);
@@ -3041,7 +3007,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if let Some(pty) = sess.ptys.remove(&pid) {
                     if !pty.exited {
                         state.2.write().unwrap().remove(&pid);
-                        pty.reader_handle.abort();
+                        drop(pty.reader_handle); // thread exits when master fd is closed below
                         unsafe {
                             libc::kill(pty.child_pid, libc::SIGHUP);
                             libc::close(pty.master_fd);
@@ -3324,18 +3290,6 @@ mod tests {
     fn should_snapshot_pty_defers_synced_output() {
         assert!(!should_snapshot_pty(true, true, true));
         assert!(should_snapshot_pty(true, true, false));
-    }
-
-    #[test]
-    fn should_break_pty_drain_at_cap_when_not_synced() {
-        assert!(should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES, false));
-        assert!(should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES + 1, false));
-    }
-
-    #[test]
-    fn should_not_break_pty_drain_mid_synced_frame() {
-        assert!(!should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES, true));
-        assert!(!should_break_pty_drain(PTY_READ_DRAIN_MAX_BYTES * 8, true));
     }
 
     #[test]
