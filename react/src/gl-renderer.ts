@@ -24,8 +24,7 @@ in vec4 v_color;
 out vec4 fragColor;
 
 void main() {
-    vec3 c = pow(v_color.rgb, vec3(2.2));
-    fragColor = vec4(c * v_color.a, v_color.a);
+    fragColor = vec4(v_color.rgb * v_color.a, v_color.a);
 }
 `;
 
@@ -59,33 +58,14 @@ void main() {
     float minC = min(tex.r, min(tex.g, tex.b));
     float maxC = max(tex.r, max(tex.g, tex.b));
     float isGray = step(maxC - minC, 0.02);
-    vec3 fg_linear = pow(v_color.rgb, vec3(2.2));
-    vec3 tinted = fg_linear * tex.a;
-    fragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
+    float lum = dot(v_color.rgb, vec3(0.299, 0.587, 0.114));
+    float gamma = mix(0.75, 1.0, lum);
+    float adj_a = pow(tex.a, gamma);
+    vec3 tinted = v_color.rgb * adj_a;
+    fragColor = vec4(mix(tex.rgb, tinted, isGray), mix(tex.a, adj_a, isGray));
 }
 `;
 
-const BLIT_VS = `#version 300 es
-in vec2 a_pos;
-out vec2 v_uv;
-
-void main() {
-    v_uv = a_pos * 0.5 + 0.5;
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-`;
-
-const BLIT_FS = `#version 300 es
-precision mediump float;
-in vec2 v_uv;
-uniform sampler2D u_texture;
-out vec4 fragColor;
-
-void main() {
-    vec4 c = texture(u_texture, v_uv);
-    fragColor = vec4(pow(c.rgb, vec3(1.0/2.2)), c.a);
-}
-`;
 
 function compileShader(
   gl: WebGL2RenderingContext,
@@ -163,15 +143,13 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
 
   const rectProgram = createProgram(gl, RECT_VS, RECT_FS);
   const glyphProgram = createProgram(gl, GLYPH_VS, GLYPH_FS);
-  const blitProgram = createProgram(gl, BLIT_VS, BLIT_FS);
 
-  if (!rectProgram || !glyphProgram || !blitProgram) {
+  if (!rectProgram || !glyphProgram) {
     return { ...UNSUPPORTED };
   }
 
   const rectBuffer = gl.createBuffer()!;
   const glyphBuffer = gl.createBuffer()!;
-  const blitBuffer = gl.createBuffer()!;
   const atlasTexture = gl.createTexture()!;
 
   const rectPosLoc = gl.getAttribLocation(rectProgram, "a_pos");
@@ -183,9 +161,6 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   const glyphColorLoc = gl.getAttribLocation(glyphProgram, "a_color");
   const glyphResLoc = gl.getUniformLocation(glyphProgram, "u_resolution");
   const glyphTexLoc = gl.getUniformLocation(glyphProgram, "u_texture");
-
-  const blitPosLoc = gl.getAttribLocation(blitProgram, "a_pos");
-  const blitTexLoc = gl.getUniformLocation(blitProgram, "u_texture");
 
   const maxDim = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number || 4096;
 
@@ -208,49 +183,6 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  const srgbFbo = gl.createFramebuffer()!;
-  const srgbTexture = gl.createTexture()!;
-  let fboWidth = 0;
-  let fboHeight = 0;
-
-  function ensureFbo(w: number, h: number): void {
-    if (w === fboWidth && h === fboHeight) return;
-    fboWidth = w;
-    fboHeight = h;
-    gl!.bindTexture(gl!.TEXTURE_2D, srgbTexture);
-    gl!.texImage2D(
-      gl!.TEXTURE_2D,
-      0,
-      gl!.SRGB8_ALPHA8,
-      w,
-      h,
-      0,
-      gl!.RGBA,
-      gl!.UNSIGNED_BYTE,
-      null,
-    );
-    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_MIN_FILTER, gl!.NEAREST);
-    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_MAG_FILTER, gl!.NEAREST);
-    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_WRAP_S, gl!.CLAMP_TO_EDGE);
-    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_WRAP_T, gl!.CLAMP_TO_EDGE);
-    gl!.bindFramebuffer(gl!.FRAMEBUFFER, srgbFbo);
-    gl!.framebufferTexture2D(
-      gl!.FRAMEBUFFER,
-      gl!.COLOR_ATTACHMENT0,
-      gl!.TEXTURE_2D,
-      srgbTexture,
-      0,
-    );
-    gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
-  }
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, blitBuffer);
-  gl.bufferData(
-    gl.ARRAY_BUFFER,
-    new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
-    gl.STATIC_DRAW,
-  );
-
   let lastAtlasCanvas: HTMLCanvasElement | null = null;
   let lastAtlasVersion = -1;
 
@@ -262,7 +194,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     gl!.texImage2D(
       gl!.TEXTURE_2D,
       0,
-      gl!.SRGB8_ALPHA8,
+      gl!.RGBA,
       gl!.RGBA,
       gl!.UNSIGNED_BYTE,
       atlasCanvas,
@@ -386,21 +318,6 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     }
   }
 
-  function blitToScreen(): void {
-    gl!.bindFramebuffer(gl!.FRAMEBUFFER, null);
-    gl!.viewport(0, 0, canvas.width, canvas.height);
-    gl!.disable(gl!.BLEND);
-    gl!.useProgram(blitProgram);
-    gl!.activeTexture(gl!.TEXTURE0);
-    gl!.bindTexture(gl!.TEXTURE_2D, srgbTexture);
-    gl!.uniform1i(blitTexLoc, 0);
-    gl!.bindBuffer(gl!.ARRAY_BUFFER, blitBuffer);
-    gl!.enableVertexAttribArray(blitPosLoc);
-    gl!.vertexAttribPointer(blitPosLoc, 2, gl!.FLOAT, false, 0, 0);
-    gl!.drawArrays(gl!.TRIANGLES, 0, 6);
-    gl!.enable(gl!.BLEND);
-  }
-
   return {
     supported: true,
     maxDimension: maxDim,
@@ -425,13 +342,8 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       focused = true,
     ) {
       if (gl!.isContextLost()) return;
-      ensureFbo(canvas.width, canvas.height);
-      gl!.bindFramebuffer(gl!.FRAMEBUFFER, srgbFbo);
       gl!.viewport(0, 0, canvas.width, canvas.height);
-      const lr = Math.pow(bgColor[0] / 255, 2.2);
-      const lg = Math.pow(bgColor[1] / 255, 2.2);
-      const lb = Math.pow(bgColor[2] / 255, 2.2);
-      gl!.clearColor(lr, lg, lb, 1);
+      gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
       gl!.clear(gl!.COLOR_BUFFER_BIT);
       drawColoredTriangles(bgVerts);
       if (atlasCanvas) {
@@ -446,18 +358,13 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
         cell,
         focused,
       );
-      blitToScreen();
     },
     dispose() {
       gl!.deleteBuffer(rectBuffer);
       gl!.deleteBuffer(glyphBuffer);
-      gl!.deleteBuffer(blitBuffer);
       gl!.deleteTexture(atlasTexture);
-      gl!.deleteTexture(srgbTexture);
-      gl!.deleteFramebuffer(srgbFbo);
       gl!.deleteProgram(rectProgram);
       gl!.deleteProgram(glyphProgram);
-      gl!.deleteProgram(blitProgram);
     },
   };
 }
