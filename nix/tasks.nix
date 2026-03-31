@@ -249,6 +249,59 @@ in {
     '';
   };
 
+  setup-blitz-signaling = pkgs.writeShellApplication {
+    name = "setup-blitz-signaling";
+    runtimeInputs = [ pkgs.flyctl pkgs.git pkgs.gnugrep ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      APP="blitz-signaling"
+      REGION="''${FLY_REGION:-iad}"
+
+      echo "=== Creating Fly app: $APP ==="
+      flyctl apps create "$APP" --machines 2>/dev/null || echo "App $APP already exists, continuing..."
+
+      if ! flyctl secrets list -a "$APP" 2>/dev/null | grep -q REDIS_URL; then
+        echo ""
+        echo "=== Provisioning Upstash Redis ==="
+        tmp=$(mktemp)
+        flyctl redis create --name "$APP-redis" --region "$REGION" --no-replicas 2>&1 | tee "$tmp" || true
+        REDIS_URL=$(grep -oP 'redis://\S+' "$tmp" | head -1 || true)
+        rm -f "$tmp"
+
+        if [ -n "$REDIS_URL" ]; then
+          echo ""
+          echo "=== Setting REDIS_URL ==="
+          flyctl secrets set REDIS_URL="$REDIS_URL" -a "$APP" --stage
+        else
+          echo ""
+          echo "Could not auto-detect REDIS_URL from output."
+          echo "Set it manually: flyctl secrets set REDIS_URL=redis://... -a $APP"
+        fi
+      else
+        echo ""
+        echo "REDIS_URL already set, skipping Redis provisioning."
+      fi
+
+      if [ -n "''${CF_TURN_TOKEN_ID:-}" ] && [ -n "''${CF_TURN_API_TOKEN:-}" ]; then
+        echo ""
+        echo "=== Setting Cloudflare TURN credentials ==="
+        flyctl secrets set CF_TURN_TOKEN_ID="$CF_TURN_TOKEN_ID" CF_TURN_API_TOKEN="$CF_TURN_API_TOKEN" -a "$APP" --stage
+      fi
+
+      echo ""
+      echo "=== Deploying ==="
+      flyctl deploy "$root/ts/blitz-signaling" "$@"
+
+      echo ""
+      echo "=== Done ==="
+      echo "App URL: https://$APP.fly.dev"
+      echo ""
+      echo "To enable CD from GitHub Actions, add a deploy token:"
+      echo "  flyctl tokens create deploy -a $APP"
+      echo "  gh secret set FLY_API_TOKEN --repo <owner>/<repo>"
+    '';
+  };
+
   tests = pkgs.writeShellApplication {
     name = "blit-tests";
     runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun ];
