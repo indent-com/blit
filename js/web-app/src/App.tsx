@@ -45,9 +45,10 @@ export function App({ wasm }: { wasm: BlitWasmModule }) {
           writeStorage(PASS_KEY, pass);
           t.removeEventListener("statuschange", onStatus);
         } else if (status === "error") {
-          setAuthError(i18n("auth.failed"));
-          t.close();
+          setAuthError(t.lastError ?? i18n("auth.failed"));
           t.removeEventListener("statuschange", onStatus);
+          t.close();
+          setTransport(null);
         }
       };
       t.addEventListener("statuschange", onStatus);

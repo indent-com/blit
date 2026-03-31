@@ -265,9 +265,14 @@ export class WebTransportTransport implements BlitTransport {
     } catch (err) {
       if (this.disposed) return;
       this.cleanup();
-      this.lastError = err instanceof Error ? err.message : "Connection failed";
+      if (!this.authRejected) {
+        this.lastError =
+          err instanceof Error ? err.message : "Connection failed";
+      }
       this.setStatus("error");
-      this.scheduleReconnect();
+      if (!this.authRejected) {
+        this.scheduleReconnect();
+      }
     }
   }
 

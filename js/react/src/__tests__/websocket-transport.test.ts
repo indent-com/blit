@@ -143,6 +143,23 @@ describe("WebSocketTransport", () => {
     transport.close();
   });
 
+  it("does not reconnect after auth rejection", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
+      reconnectDelay: 500,
+    });
+    transport.connect();
+    const ws = latestSocket();
+    ws.simulateOpen();
+    ws.simulateMessage("auth");
+
+    expect(transport.authRejected).toBe(true);
+
+    const instancesBefore = MockWebSocket.instances.length;
+    vi.advanceTimersByTime(60000);
+    expect(MockWebSocket.instances.length).toBe(instancesBefore);
+    transport.close();
+  });
+
   it("transitions to error on server error and retries", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 500,

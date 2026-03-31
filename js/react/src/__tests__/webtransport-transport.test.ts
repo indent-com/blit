@@ -135,6 +135,55 @@ describe("WebTransportTransport", () => {
     expect(statuses).toContain("error");
   });
 
+  it("does not reconnect after auth rejection", async () => {
+    vi.useFakeTimers();
+    MockWebTransport.queueConnection(new Uint8Array([0]));
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "wrong",
+      { reconnectDelay: 500 },
+    );
+
+    transport.connect();
+    await flushPromises();
+
+    expect(transport.authRejected).toBe(true);
+    expect(transport.status).toBe("error");
+
+    const instancesBefore = MockWebTransport.instances.length;
+    vi.advanceTimersByTime(60000);
+    await flushPromises();
+    expect(MockWebTransport.instances.length).toBe(instancesBefore);
+    transport.close();
+    vi.useRealTimers();
+  });
+
+  it("does not reconnect when status listener closes transport during auth error", async () => {
+    vi.useFakeTimers();
+    MockWebTransport.queueConnection(new Uint8Array([0]));
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "wrong",
+      { reconnectDelay: 500 },
+    );
+    transport.addEventListener("statuschange", (status) => {
+      if (status === "error") {
+        transport.close();
+      }
+    });
+
+    transport.connect();
+    await flushPromises();
+
+    expect(transport.authRejected).toBe(true);
+
+    const instancesBefore = MockWebTransport.instances.length;
+    vi.advanceTimersByTime(60000);
+    await flushPromises();
+    expect(MockWebTransport.instances.length).toBe(instancesBefore);
+    vi.useRealTimers();
+  });
+
   it("clears authRejected and lastError on successful auth", async () => {
     MockWebTransport.queueConnection(new Uint8Array([1]));
     const transport = new WebTransportTransport(
