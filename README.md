@@ -1,6 +1,6 @@
 # blit
 
-Agent-friendly terminal streaming — as fast as the network and browser allow. The server parses PTY output, diffs it, and sends only what changed — LZ4-compressed, per-client paced, WebGL-rendered. Adapts to any transport (WebSocket, WebTransport, Unix socket, SSH) and security model. AI agents get a full set of [non-interactive CLI subcommands](SKILLS.md) to create, control, and read terminal sessions programmatically. Embed the React component in any web app with [`blit-react`](EMBEDDING.md).
+Agent-friendly terminal streaming — as fast as the network and browser allow. The server parses PTY output, diffs it, and sends only what changed — LZ4-compressed, per-client paced, WebGL-rendered. Adapts to any transport (WebSocket, WebTransport, WebRTC, Unix socket, SSH) and security model. AI agents get a full set of [non-interactive CLI subcommands](SKILLS.md) to create, control, and read terminal sessions programmatically. Embed the React component in any web app with [`blit-react`](EMBEDDING.md).
 
 ```bash
 blit-server &
