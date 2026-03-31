@@ -377,6 +377,13 @@ fn build_quinn_server_config(
     Ok(wt::quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
 }
 
+fn bind_v6only_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
+    sock.set_only_v6(true)?;
+    sock.bind(&addr.into())?;
+    Ok(sock.into())
+}
+
 /// Run the WebTransport server on both IPv4 and IPv6.
 /// For self-signed certs, regenerates every 13 days.
 async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: bool) {
@@ -431,14 +438,28 @@ async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: b
                 return;
             }
         };
-        let mut server6 = match wt::quinn::Endpoint::server(config, v6_addr) {
-            Ok(ep) => {
-                eprintln!("webtransport: listening on [{v6_addr}] (IPv6/QUIC)");
-                wt::Server::new(ep)
-            }
+        let mut server6 = match bind_v6only_udp(v6_addr) {
+            Ok(sock) => match wt::quinn::Endpoint::new(
+                wt::quinn::EndpointConfig::default(),
+                Some(config),
+                sock,
+                wt::quinn::default_runtime().unwrap(),
+            ) {
+                Ok(ep) => {
+                    eprintln!("webtransport: listening on [{v6_addr}] (IPv6/QUIC)");
+                    wt::Server::new(ep)
+                }
+                Err(e) => {
+                    eprintln!("webtransport: IPv6 endpoint failed (continuing IPv4-only): {e}");
+                    run_wt_accept_loop(&state, &mut server4, has_explicit_cert).await;
+                    if has_explicit_cert {
+                        return;
+                    }
+                    continue;
+                }
+            },
             Err(e) => {
                 eprintln!("webtransport: IPv6 bind failed (continuing IPv4-only): {e}");
-                // Fall back to IPv4-only
                 run_wt_accept_loop(&state, &mut server4, has_explicit_cert).await;
                 if has_explicit_cert {
                     return;
