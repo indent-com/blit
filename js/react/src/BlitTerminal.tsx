@@ -821,8 +821,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
         if (e.isComposing) return;
         if (e.key === "Dead") return;
 
-        // Ctrl+PageUp/PageDown: scroll the scrollback
-        if (e.ctrlKey && (e.key === "PageUp" || e.key === "PageDown")) {
+        // Shift+PageUp/PageDown: scroll the scrollback
+        if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
           const t2 = terminalRef.current;
           const maxScroll = t2 ? t2.scrollback_lines() : 0;
           if (maxScroll > 0 || scrollOffsetRef.current > 0) {
@@ -845,8 +845,8 @@ export const BlitTerminal = forwardRef<BlitTerminalHandle, BlitTerminalProps>(
           }
           return;
         }
-        // Ctrl+Home/End: jump to top/bottom of scrollback
-        if (e.ctrlKey && (e.key === "Home" || e.key === "End")) {
+        // Shift+Home/End: jump to top/bottom of scrollback
+        if (e.shiftKey && (e.key === "Home" || e.key === "End")) {
           const t2 = terminalRef.current;
           const maxScroll = t2 ? t2.scrollback_lines() : 0;
           if (maxScroll > 0 || scrollOffsetRef.current > 0) {

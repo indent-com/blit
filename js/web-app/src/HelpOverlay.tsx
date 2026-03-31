@@ -38,8 +38,8 @@ export function HelpOverlay({
       title: t("help.scrollback"),
       items: [
         ["Shift+Wheel", t("help.scroll")],
-        ["Ctrl+PageUp / PageDown", t("help.pageUpDown")],
-        ["Ctrl+Home / End", t("help.topBottom")],
+        ["Shift+PageUp / PageDown", t("help.pageUpDown")],
+        ["Shift+Home / End", t("help.topBottom")],
         ["Any key", t("help.exitScrollback")],
       ],
     },
