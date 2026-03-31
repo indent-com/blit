@@ -1,0 +1,17 @@
+{
+  "name": "blit-rendezvous",
+  "version": "0.1.0",
+  "description": "WebRTC signaling relay for blit terminal sharing",
+  "license": "MIT",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "ioredis": "^5.6.1",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.13"
+  }
+}
