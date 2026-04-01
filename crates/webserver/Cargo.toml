@@ -11,3 +11,7 @@ homepage.workspace = true
 blit-fonts = { workspace = true }
 axum = "0.8"
 percent-encoding = "2"
+brotli = "8"
+
+[build-dependencies]
+brotli = "8"

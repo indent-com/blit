@@ -9,6 +9,7 @@ import {
   wsUrl,
   wtUrl,
   wtCertHash,
+  fetchConfig,
 } from "./storage";
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
@@ -25,15 +26,24 @@ function createTransport(pass: string): BlitTransport {
 }
 
 export function App({ wasm }: { wasm: BlitWasmModule }) {
-  const savedPass = readStorage(PASS_KEY);
   const [transport, setTransport] = useState<BlitTransport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [configLoaded, setConfigLoaded] = useState(false);
   const passRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (!savedPass || transport) return;
-    setTransport(createTransport(savedPass));
-  }, [savedPass, transport]);
+    if (configLoaded) return;
+    let cancelled = false;
+    fetchConfig().then((cfg) => {
+      if (cancelled) return;
+      setConfigLoaded(true);
+      const pass = cfg.passphrase || readStorage(PASS_KEY);
+      if (pass) {
+        setTransport(createTransport(pass));
+      }
+    });
+    return () => { cancelled = true; };
+  }, [configLoaded]);
 
   const connect = useCallback(
     (pass: string) => {
