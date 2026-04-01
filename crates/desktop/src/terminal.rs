@@ -10,7 +10,6 @@ pub struct Terminal {
     pub glyph_verts: Vec<f32>,
 }
 
-#[allow(dead_code)]
 pub struct Selection {
     pub start_row: u16,
     pub start_col: u16,
@@ -40,7 +39,6 @@ impl Terminal {
         self.state.rows()
     }
 
-    #[allow(dead_code)]
     pub fn cols(&self) -> u16 {
         self.state.cols()
     }
@@ -69,7 +67,6 @@ impl Terminal {
         self.state.frame().scrollback_lines()
     }
 
-    #[allow(dead_code)]
     pub fn get_text(&self, sr: u16, sc: u16, er: u16, ec: u16) -> String {
         self.state.get_text(sr, sc, er, ec)
     }

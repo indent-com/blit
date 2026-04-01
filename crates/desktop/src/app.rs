@@ -31,9 +31,7 @@ pub struct App {
     connection_mgr: ConnectionManager,
     overlay: Option<OverlayKind>,
     palette: &'static Palette,
-    #[allow(dead_code)]
     font_family: String,
-    #[allow(dead_code)]
     font_size: f32,
     focused: Option<SessionKey>,
     lru: Vec<SessionKey>,

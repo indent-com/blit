@@ -105,17 +105,14 @@ pub fn resolve_color(
     }
 }
 
-#[allow(dead_code)]
 pub fn find_palette(id: &str) -> &'static Palette {
     PALETTES.iter().find(|p| p.id == id).unwrap_or(&PALETTES[0])
 }
 
-#[allow(dead_code)]
 pub fn dark_palettes() -> impl Iterator<Item = &'static Palette> {
     PALETTES.iter().filter(|p| p.dark)
 }
 
-#[allow(dead_code)]
 pub fn light_palettes() -> impl Iterator<Item = &'static Palette> {
     PALETTES.iter().filter(|p| !p.dark)
 }

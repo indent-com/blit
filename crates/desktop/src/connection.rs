@@ -112,7 +112,6 @@ impl ConnectionManager {
         tokio::spawn(connection_task(name, remote_clone, hub, cmd_rx, event_tx));
     }
 
-    #[allow(dead_code)]
     pub fn disconnect(&mut self, name: &str) {
         self.connections.remove(name);
     }
@@ -123,7 +122,6 @@ impl ConnectionManager {
         }
     }
 
-    #[allow(dead_code)]
     pub fn send_to_session(&self, key: &SessionKey, cmd: Command) {
         self.send(&key.remote, cmd);
     }

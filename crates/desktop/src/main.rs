@@ -1,12 +1,12 @@
+#![allow(dead_code, clippy::too_many_arguments, clippy::unnecessary_cast, clippy::manual_range_patterns)]
+
 mod app;
 mod atlas;
-#[allow(dead_code)]
 mod bsp;
 mod connection;
 mod input;
 mod overlay;
 mod palette;
-#[allow(dead_code)]
 mod remotes;
 mod renderer;
 mod statusbar;
