@@ -123,7 +123,7 @@
 
       reactNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/react;
-        hash = "sha256-u7BzwNeGBUloOy1Y0VVeJr/00DkmecgM+7MFKnjL54c=";
+        hash = "sha256-XXsVngHfFHD7+vGYG2I/qKZIrE50tLC9r1bx8Ouru8c=";
       };
 
       webAppNpmDeps = pkgs.fetchNpmDeps {
