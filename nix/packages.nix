@@ -258,16 +258,37 @@
         };
       };
 
+      skopeoPolicy = pkgs.writeText "containers-policy.json" ''{"default":[{"type":"insecureAcceptAnything"}]}'';
+
+      pushDemo = pkgs.writeShellApplication {
+        name = "push-demo";
+        runtimeInputs = [ pkgs.skopeo ];
+        text = ''
+          arch="''${1:?usage: push-demo <amd64|arm64> [version]}"
+          version="''${2:-}"
+          skopeo --policy ${skopeoPolicy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
+          skopeo --policy ${skopeoPolicy} copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:latest-$arch"
+          if [[ "$version" != "" ]]; then
+            skopeo --policy ${skopeoPolicy} copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:$version-$arch"
+          fi
+        '';
+      };
+
       publishDemo = pkgs.writeShellApplication {
         name = "publish-demo";
-        runtimeInputs = [ pkgs.skopeo ];
-        text = let
-          policy = pkgs.writeText "containers-policy.json" ''{"default":[{"type":"insecureAcceptAnything"}]}'';
-        in ''
-          skopeo --policy ${policy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
-          skopeo --policy ${policy} copy "docker-archive:${demoImage}" docker://docker.io/grab/blit-demo:latest
-          if [[ "''${1:-}" != "" ]]; then
-            skopeo --policy ${policy} copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:$1"
+        runtimeInputs = [ pkgs.manifest-tool pkgs.skopeo ];
+        text = ''
+          version="''${1:-}"
+          skopeo --policy ${skopeoPolicy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
+          manifest-tool push from-args \
+            --platforms linux/amd64,linux/arm64 \
+            --template "grab/blit-demo:latest-ARCH" \
+            --target "grab/blit-demo:latest"
+          if [[ "$version" != "" ]]; then
+            manifest-tool push from-args \
+              --platforms linux/amd64,linux/arm64 \
+              --template "grab/blit-demo:$version-ARCH" \
+              --target "grab/blit-demo:$version"
           fi
         '';
       };
@@ -278,6 +299,7 @@
         inherit blit-server blit-cli blit-gateway blit-webrtc-forwarder;
         inherit blit-server-static blit-cli-static blit-gateway-static blit-webrtc-forwarder-static;
         demo-image = demoImage;
+        push-demo = pushDemo;
         publish-demo = publishDemo;
         default = blit-cli;
       } // tasks;
