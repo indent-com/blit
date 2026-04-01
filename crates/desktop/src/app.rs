@@ -42,6 +42,8 @@ pub struct App {
     blink_visible: bool,
     last_blink: Instant,
     needs_redraw: bool,
+    cursor_position: (f64, f64),
+    mouse_buttons: u8,
 }
 
 impl App {
@@ -71,6 +73,8 @@ impl App {
             blink_visible: true,
             last_blink: Instant::now(),
             needs_redraw: true,
+            cursor_position: (0.0, 0.0),
+            mouse_buttons: 0,
         }
     }
 
@@ -359,6 +363,113 @@ impl App {
         (connected, connecting)
     }
 
+    fn handle_overlay_key(&mut self, key: &winit::keyboard::Key) {
+        use winit::keyboard::{Key, NamedKey};
+
+        enum OverlayResult {
+            None,
+            FocusSession(SessionKey),
+            NewTerminal,
+            Close,
+        }
+
+        let sessions = self.session_list();
+        let connected: Vec<String> = self.connection_mgr.connections.keys().cloned().collect();
+
+        let result = if let Some(OverlayKind::Switcher(sw)) = self.overlay.as_mut() {
+            match key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    if !sw.items.is_empty() {
+                        sw.selected = (sw.selected + 1) % sw.items.len();
+                    }
+                    OverlayResult::None
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if !sw.items.is_empty() {
+                        sw.selected = (sw.selected + sw.items.len() - 1) % sw.items.len();
+                    }
+                    OverlayResult::None
+                }
+                Key::Named(NamedKey::Enter) => {
+                    match sw.items.get(sw.selected) {
+                        Some(overlay::SwitcherItem::Session { key, .. }) => {
+                            OverlayResult::FocusSession(key.clone())
+                        }
+                        Some(overlay::SwitcherItem::Action { action, .. }) => {
+                            match action {
+                                overlay::SwitcherAction::NewTerminal => OverlayResult::NewTerminal,
+                                _ => OverlayResult::Close,
+                            }
+                        }
+                        _ => OverlayResult::None,
+                    }
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    sw.input.pop();
+                    sw.rebuild_items(&sessions, &connected, &[]);
+                    sw.selected = sw.selected.min(sw.items.len().saturating_sub(1));
+                    OverlayResult::None
+                }
+                Key::Character(ch) => {
+                    sw.input.push_str(ch.as_str());
+                    sw.rebuild_items(&sessions, &connected, &[]);
+                    sw.selected = 0;
+                    OverlayResult::None
+                }
+                _ => OverlayResult::None,
+            }
+        } else {
+            OverlayResult::None
+        };
+
+        match result {
+            OverlayResult::FocusSession(k) => {
+                self.connection_mgr.send(&k.remote, Command::Focus(k.pty_id));
+                self.focused = Some(k.clone());
+                self.push_lru(k);
+                self.overlay = None;
+            }
+            OverlayResult::NewTerminal => {
+                self.overlay = None;
+                self.handle_app_action(AppAction::NewTerminal);
+            }
+            OverlayResult::Close => {
+                self.overlay = None;
+            }
+            OverlayResult::None => {}
+        }
+    }
+
+    fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(u16, u16)> {
+        let atlas = self.atlas.as_ref()?;
+        let col = (x as f32 / atlas.cell_width) as i32;
+        let row = (y as f32 / atlas.cell_height) as i32;
+        let (rows, cols) = self.terminal_size();
+        if col < 0 || row < 0 {
+            return None;
+        }
+        Some((row.min(rows as i32 - 1) as u16, col.min(cols as i32 - 1) as u16))
+    }
+
+    fn send_mouse(&mut self, kind: u8, button: u8, col: u16, row: u16) {
+        if let Some(ref key) = self.focused.clone() {
+            self.connection_mgr.send(&key.remote, Command::Mouse {
+                pty_id: key.pty_id,
+                kind,
+                button,
+                col,
+                row,
+            });
+        }
+    }
+
+    fn focused_mouse_mode(&self) -> u8 {
+        self.focused.as_ref()
+            .and_then(|k| self.sessions.get(k))
+            .map(|t| t.mouse_mode())
+            .unwrap_or(0)
+    }
+
     fn render(&mut self) {
         if self.device.is_none() || self.queue.is_none() || self.surface.is_none()
             || self.renderer.is_none() || self.atlas.is_none()
@@ -421,19 +532,22 @@ impl App {
             connecting,
         );
 
-        renderer.update_atlas(device, queue, atlas);
-
         let bg_color = [
             self.palette.bg[0] as f32 / 255.0,
             self.palette.bg[1] as f32 / 255.0,
             self.palette.bg[2] as f32 / 255.0,
         ];
 
-        let overlay_bg = if let Some(ref ov) = self.overlay {
-            overlay::render_overlay_bg(ov, self.window_size.width as f32, self.window_size.height as f32, self.palette)
-        } else {
-            Vec::new()
-        };
+        let mut overlay_bg = Vec::new();
+        let mut overlay_glyph = Vec::new();
+        if let Some(ref ov) = self.overlay {
+            let w = self.window_size.width as f32;
+            let h = self.window_size.height as f32;
+            overlay_bg = overlay::render_overlay_bg(ov, w, h, self.palette);
+            overlay::render_overlay_glyphs(ov, &mut overlay_glyph, &mut overlay_bg, atlas, w, h, self.palette);
+        }
+
+        renderer.update_atlas(device, queue, atlas);
 
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
@@ -451,7 +565,7 @@ impl App {
             &all_cursor,
             &[],
             &overlay_bg,
-            &[],
+            &overlay_glyph,
             device,
         );
 
@@ -520,7 +634,8 @@ impl ApplicationHandler<()> for App {
                     }
                 }
 
-                if self.overlay.is_some() {
+                if self.overlay.is_some() && event.state == ElementState::Pressed {
+                    self.handle_overlay_key(&event.logical_key);
                     self.needs_redraw = true;
                     return;
                 }
@@ -548,6 +663,83 @@ impl ApplicationHandler<()> for App {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = (position.x, position.y);
+                let mouse_mode = self.focused_mouse_mode();
+                if mouse_mode >= 3 && self.mouse_buttons > 0 {
+                    if let Some((row, col)) = self.pixel_to_cell(position.x, position.y) {
+                        let drag_button = (self.mouse_buttons - 1) + 32;
+                        self.send_mouse(2, drag_button, col, row);
+                    }
+                } else if mouse_mode >= 4 {
+                    if let Some((row, col)) = self.pixel_to_cell(position.x, position.y) {
+                        self.send_mouse(2, 35, col, row);
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.overlay.is_some() {
+                    return;
+                }
+                let mouse_mode = self.focused_mouse_mode();
+                if mouse_mode == 0 {
+                    return;
+                }
+                let btn = match button {
+                    winit::event::MouseButton::Left => 0u8,
+                    winit::event::MouseButton::Middle => 1,
+                    winit::event::MouseButton::Right => 2,
+                    _ => return,
+                };
+                if let Some((row, col)) = self.pixel_to_cell(self.cursor_position.0, self.cursor_position.1) {
+                    match state {
+                        ElementState::Pressed => {
+                            self.mouse_buttons = btn + 1;
+                            self.send_mouse(0, btn, col, row);
+                        }
+                        ElementState::Released => {
+                            self.mouse_buttons = 0;
+                            if mouse_mode >= 2 {
+                                self.send_mouse(1, btn, col, row);
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.overlay.is_some() {
+                    return;
+                }
+                let mouse_mode = self.focused_mouse_mode();
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        let cell_h = self.atlas.as_ref().map(|a| a.cell_height).unwrap_or(20.0);
+                        pos.y as f32 / cell_h
+                    }
+                };
+                if mouse_mode > 0 {
+                    if let Some((row, col)) = self.pixel_to_cell(self.cursor_position.0, self.cursor_position.1) {
+                        let button = if lines > 0.0 { 64u8 } else { 65u8 };
+                        let ticks = lines.abs().ceil() as u32;
+                        for _ in 0..ticks.min(5) {
+                            self.send_mouse(0, button, col, row);
+                        }
+                    }
+                } else if let Some(ref key) = self.focused.clone() {
+                    if let Some(term) = self.sessions.get_mut(key) {
+                        let scroll_lines = (lines.abs() * 3.0).ceil() as u32;
+                        if lines > 0.0 {
+                            term.scroll_offset = (term.scroll_offset + scroll_lines).min(term.scrollback_lines());
+                        } else {
+                            term.scroll_offset = term.scroll_offset.saturating_sub(scroll_lines);
+                        }
+                        let offset = term.scroll_offset;
+                        self.connection_mgr.send(&key.remote, Command::Scroll { pty_id: key.pty_id, offset });
+                        self.needs_redraw = true;
                     }
                 }
             }

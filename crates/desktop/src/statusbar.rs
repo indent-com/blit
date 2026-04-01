@@ -85,7 +85,7 @@ pub fn render_status_bar(
     push_rect_quad_pub(bg_verts, dot_x, dot_y, dot_x + dot_size, dot_y + dot_size, dot_color[0], dot_color[1], dot_color[2], 1.0);
 }
 
-fn render_text(
+pub fn render_text(
     glyph_verts: &mut Vec<f32>,
     atlas: &mut GlyphAtlas,
     text: &str,

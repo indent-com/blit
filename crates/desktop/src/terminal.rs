@@ -63,6 +63,10 @@ impl Terminal {
         self.state.mode() & 2 != 0
     }
 
+    pub fn mouse_mode(&self) -> u8 {
+        ((self.state.mode() >> 4) & 7) as u8
+    }
+
     pub fn scrollback_lines(&self) -> u32 {
         self.state.frame().scrollback_lines()
     }
