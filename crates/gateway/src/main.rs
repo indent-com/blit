@@ -642,6 +642,7 @@ mod tests {
             sock_path: "/nonexistent.sock".into(),
             cors_origin: None,
             wt_cert_hash: std::sync::RwLock::new(None),
+            config_state: None,
         });
         build_app(state)
     }

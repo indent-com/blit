@@ -9,6 +9,12 @@ pub struct ConfigState {
     pub write_lock: tokio::sync::Mutex<()>,
 }
 
+impl Default for ConfigState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigState {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel::<String>(64);
@@ -90,7 +96,7 @@ fn spawn_watcher(tx: broadcast::Sender<String>) {
         loop {
             match nrx.recv() {
                 Ok(Ok(event)) => {
-                    let dominated = file_name.as_ref().map_or(true, |name| {
+                    let dominated = file_name.as_ref().is_none_or(|name| {
                         event.paths.iter().any(|p| p.file_name() == Some(name))
                     });
                     if !dominated {
