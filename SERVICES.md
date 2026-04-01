@@ -46,6 +46,10 @@ install.blit.sh/
 4. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
 5. Extracts and installs to `$BLIT_INSTALL_DIR` (default `/usr/local/bin`), escalating with `sudo`/`doas` if needed.
 
+### `blit upgrade`
+
+`blit upgrade` is the in-place self-update command. It fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_INSTALL_DIR` set to the directory of the currently running binary. This way the new version replaces the old one in the same location regardless of how it was originally installed. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
+
 ### How the site is built
 
 The `apt-repo` job in the release workflow assembles the entire site from build artifacts, signs the APT metadata with GPG, and deploys via GitHub Pages:
@@ -98,6 +102,18 @@ For protocol details, deployment instructions, and configuration, see [`js/blit-
 | `/ice` | STUN/TURN server config (Cloudflare TURN if configured) |
 | `/message` | Session URL template for client display |
 | `/health` | Liveness check (pings Redis) |
+
+## Static binaries via Nix + musl
+
+All release binaries are built with Nix, which makes the entire toolchain reproducible and keeps the build definitions small.
+
+On Linux, binaries are statically linked against **musl libc** via `pkgs.pkgsStatic`. Nix's `pkgsStatic` overlay cross-compiles the entire dependency closure against musl, producing fully self-contained executables with zero runtime dependencies — no glibc version issues, no `LD_LIBRARY_PATH`, works on any Linux kernel from the past decade. The `mkStaticBin` helper in [`nix/packages.nix`](nix/packages.nix) wraps this and includes a `postFixup` assertion that the output is genuinely statically linked (via `file`), failing the build if it isn't.
+
+On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed.
+
+The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) in [`nix/common.nix`](nix/common.nix). The same toolchain also includes `wasm32-unknown-unknown` for the browser WASM build.
+
+This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages are single-file, zero-dependency executables — download, `chmod +x`, run.
 
 ## GitHub Actions workflows
 
