@@ -211,6 +211,58 @@
         default = blit-cli;
       } // tasks;
 
+      demo-image =
+        let
+          fishConfig = pkgs.writeTextDir "etc/fish/config.fish" ''
+            function fish_greeting
+                cat /etc/blit-welcome 2>/dev/null
+            end
+          '';
+          welcomeFile = pkgs.writeTextDir "etc/blit-welcome" (
+            if builtins.pathExists ../welcome
+            then builtins.readFile ../welcome
+            else ""
+          );
+          passwd = pkgs.writeTextDir "etc/passwd" "blit:x:1000:1000:blit:/home/blit:/bin/fish\n";
+          group = pkgs.writeTextDir "etc/group" "blit:x:1000:\n";
+          homeDir = pkgs.runCommand "home-blit" {} "mkdir -p $out/home/blit";
+          tmpDir = pkgs.runCommand "tmp-dir" {} "mkdir -p $out/tmp";
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = "blit-demo";
+          tag = "latest";
+          contents = [
+            pkgs.busybox
+            pkgs.fish
+            pkgs.htop
+            pkgs.neovim
+            pkgs.git
+            pkgs.curl
+            pkgs.jq
+            pkgs.tree
+            blit-server
+            blit-gateway
+            fishConfig
+            welcomeFile
+            passwd
+            group
+            homeDir
+            tmpDir
+          ];
+          config = {
+            Env = [
+              "SHELL=/bin/fish"
+              "USER=blit"
+              "HOME=/home/blit"
+              "TERM=xterm-256color"
+            ];
+            User = "1000:1000";
+            WorkingDir = "/home/blit";
+            ExposedPorts = { "3264/tcp" = {}; };
+            Entrypoint = [ "/bin/sh" "-c" "blit-server & exec blit-gateway" ];
+          };
+        };
+
       devShells.default = pkgs.mkShell {
         buildInputs = [
           rustToolchain
