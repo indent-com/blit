@@ -559,9 +559,10 @@ export function SwitcherOverlay({
         key: `session:${session.id}`,
         title: sessionName(session),
         subtitle:
-          session.state === "exited"
+          session.command ??
+          (session.state === "exited"
             ? t("switcher.exitedTerminal")
-            : t("switcher.openTerminal"),
+            : t("switcher.openTerminal")),
         sessionId: session.id,
         exited: session.state === "exited",
         focused: session.id === focusedSessionId,
@@ -575,7 +576,8 @@ export function SwitcherOverlay({
     for (const session of visibleSessions) {
       if (
         session.tag.toLowerCase().includes(needle) ||
-        (session.title ?? "").toLowerCase().includes(needle)
+        (session.title ?? "").toLowerCase().includes(needle) ||
+        (session.command ?? "").toLowerCase().includes(needle)
       ) {
         seen.add(session.id);
         matches.push({
@@ -583,9 +585,10 @@ export function SwitcherOverlay({
           key: `session:${session.id}`,
           title: sessionName(session),
           subtitle:
-            session.state === "exited"
+            session.command ??
+            (session.state === "exited"
               ? t("switcher.exitedTerminal")
-              : t("switcher.openTerminal"),
+              : t("switcher.openTerminal")),
           sessionId: session.id,
           exited: session.state === "exited",
           focused: session.id === focusedSessionId,
@@ -603,9 +606,10 @@ export function SwitcherOverlay({
         key: `session:${session.id}`,
         title: sessionName(session),
         subtitle:
-          session.state === "exited"
+          session.command ??
+          (session.state === "exited"
             ? t("switcher.exitedTerminal")
-            : t("switcher.openTerminal"),
+            : t("switcher.openTerminal")),
         sessionId: session.id,
         exited: session.state === "exited",
         context: result.context,

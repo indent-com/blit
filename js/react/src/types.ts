@@ -88,6 +88,7 @@ export type BlitSession = {
   ptyId: number;
   tag: string;
   title: string | null;
+  command: string | null;
   state: "creating" | "active" | "exited" | "closed";
 };
 

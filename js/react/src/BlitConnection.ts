@@ -752,7 +752,8 @@ export class BlitConnection {
     if (bytes.length < 3) return;
 
     const count = bytes[1] | (bytes[2] << 8);
-    const entries: Array<{ ptyId: number; tag: string }> = [];
+    const entries: Array<{ ptyId: number; tag: string; command: string | null }> =
+      [];
     let offset = 3;
     for (let index = 0; index < count; index++) {
       if (offset + 4 > bytes.length) break;
@@ -761,7 +762,18 @@ export class BlitConnection {
       offset += 4;
       const tag = textDecoder.decode(bytes.subarray(offset, offset + tagLen));
       offset += tagLen;
-      entries.push({ ptyId, tag });
+      let command: string | null = null;
+      if (offset + 2 <= bytes.length) {
+        const cmdLen = bytes[offset] | (bytes[offset + 1] << 8);
+        offset += 2;
+        if (cmdLen > 0 && offset + cmdLen <= bytes.length) {
+          command = textDecoder.decode(
+            bytes.subarray(offset, offset + cmdLen),
+          );
+        }
+        offset += cmdLen;
+      }
+      entries.push({ ptyId, tag, command });
     }
 
     const livePtys = new Set(entries.map((entry) => entry.ptyId));
@@ -777,11 +789,12 @@ export class BlitConnection {
         ? (this.sessionsById.get(existingSessionId) ?? null)
         : null;
       if (!existingSession || existingSession.state === "closed") {
-        this.upsertLiveSession(entry.ptyId, entry.tag, "active");
+        this.upsertLiveSession(entry.ptyId, entry.tag, "active", entry.command);
         continue;
       }
       this.updateSession(existingSession.id, {
         tag: entry.tag,
+        command: entry.command,
         state: existingSession.state === "exited" ? "exited" : "active",
       });
     }
@@ -882,13 +895,14 @@ export class BlitConnection {
     ptyId: number,
     tag: string,
     state: BlitSession["state"],
+    command: string | null = null,
   ): InternalSession {
     const currentId = this.currentSessionIdByPtyId.get(ptyId);
     const current = currentId
       ? (this.sessionsById.get(currentId) ?? null)
       : null;
     if (current && current.state !== "closed") {
-      return this.updateSession(current.id, { tag, state });
+      return this.updateSession(current.id, { tag, command, state });
     }
 
     const session: InternalSession = {
@@ -897,6 +911,7 @@ export class BlitConnection {
       ptyId,
       tag,
       title: current?.title ?? null,
+      command,
       state,
     };
     this.currentSessionIdByPtyId.set(ptyId, session.id);

@@ -147,6 +147,16 @@ enum Command {
         id: u16,
     },
 
+    /// Send a signal to a session's leader process
+    Kill {
+        /// Session ID
+        id: u16,
+
+        /// Signal name or number (e.g. TERM, KILL, INT, 9)
+        #[arg(default_value = "TERM")]
+        signal: String,
+    },
+
     /// Close a session
     Close {
         /// Session ID
@@ -354,6 +364,7 @@ async fn main() {
                     agent::cmd_send(transport, id, text).await
                 }
                 Command::Restart { id } => agent::cmd_restart(transport, id).await,
+                Command::Kill { id, signal } => agent::cmd_kill(transport, id, &signal).await,
                 Command::Close { id } => agent::cmd_close(transport, id).await,
                 Command::Wait {
                     id,

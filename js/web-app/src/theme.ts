@@ -2,8 +2,9 @@ import type React from "react";
 import type { BlitSession, TerminalPalette } from "blit-react";
 
 export function sessionName(s: BlitSession): string {
-  if (s.title && s.tag && s.title !== s.tag) return `${s.tag}: ${s.title}`;
-  return s.title ?? s.tag ?? "Terminal";
+  const label = s.title ?? s.command;
+  if (label && s.tag && label !== s.tag) return `${s.tag}: ${label}`;
+  return label ?? s.tag ?? "Terminal";
 }
 
 export interface Theme {
