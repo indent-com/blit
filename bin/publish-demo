@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+nix build .#demo-image
+docker load < result
+docker push grab/blit-demo:latest
+
+if [[ "${1:-}" != "" ]]; then
+  docker tag grab/blit-demo:latest "grab/blit-demo:$1"
+  docker push "grab/blit-demo:$1"
+fi
