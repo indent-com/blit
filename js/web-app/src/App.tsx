@@ -13,7 +13,7 @@ import {
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
-import { createShareTransport } from "./webrtc-share";
+import { createShareTransport } from "@blit-sh/core";
 
 const DEFAULT_HUB = "wss://hub.blit.sh";
 

@@ -14,6 +14,8 @@
     "noEmit": true,
     "paths": {
       "@blit-sh/react": ["../react/src/index.ts"],
+      "@blit-sh/core": ["../core/src/index.ts"],
+      "@blit-sh/core/*": ["../core/src/*"],
       "@blit-sh/browser": ["../../crates/browser/pkg/blit_browser.d.ts"]
     }
   },

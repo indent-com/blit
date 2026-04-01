@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { BlitConnectionSnapshot, ConnectionId } from "../types";
+import type { BlitConnectionSnapshot, ConnectionId } from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "../BlitContext";
 
 export function useBlitConnection(

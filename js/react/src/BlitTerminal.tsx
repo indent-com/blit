@@ -7,20 +7,12 @@ import {
 } from "react";
 import type { Ref } from "react";
 import type { Terminal } from "@blit-sh/browser";
-import type { BlitTerminalProps, TerminalPalette } from "./types";
-import type { ConnectionStatus } from "./types";
-import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
-import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
-import {
-  measureCell,
-  cssFontFamily,
-  type CellMetrics,
-} from "./hooks/useBlitTerminal";
+import type { TerminalPalette, ConnectionStatus, CellMetrics, GlRenderer } from "@blit-sh/core";
+import { DEFAULT_FONT, DEFAULT_FONT_SIZE, MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE, measureCell, cssFontFamily, keyToBytes, encoder } from "@blit-sh/core";
+import type { BlitTerminalProps } from "./types";
 import { useBlitContext, useRequiredBlitWorkspace } from "./BlitContext";
 import { useBlitConnection } from "./hooks/useBlitConnection";
 import { useBlitSession } from "./hooks/useBlitSession";
-import type { GlRenderer } from "./gl-renderer";
-import { keyToBytes, encoder } from "./keyboard";
 
 // ---------------------------------------------------------------------------
 // Public handle exposed via ref

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { BlitSession } from "../types";
+import type { BlitSession } from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "../BlitContext";
 
 export function useBlitSessions(): readonly BlitSession[] {

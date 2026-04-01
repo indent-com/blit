@@ -1,18 +1,12 @@
 import { defineConfig } from "vitest/config";
-import { resolve } from "path";
 
 export default defineConfig({
-  resolve: {
-    alias: {
-      "@blit-sh/core": resolve(__dirname, "../core/src"),
-    },
-  },
   test: {
     environment: "jsdom",
     globals: true,
     coverage: {
       provider: "v8",
-      include: ["src/**/*.ts", "src/**/*.tsx"],
+      include: ["src/**/*.ts"],
       exclude: ["src/__tests__/**"],
       reporter: ["text", "html"],
       reportsDirectory: "coverage",

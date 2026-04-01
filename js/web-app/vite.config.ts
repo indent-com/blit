@@ -54,6 +54,7 @@ export default bin.buffer;
   resolve: {
     alias: {
       "@blit-sh/react": resolve(__dirname, "../react/src"),
+      "@blit-sh/core": resolve(__dirname, "../core/src"),
       "@blit-sh/browser": resolve(
         __dirname,
         "../../crates/browser/pkg/blit_browser.js",

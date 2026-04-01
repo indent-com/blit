@@ -36,7 +36,7 @@ import {
   type BSPAssignments,
   type BSPLayout,
 } from "./bsp/layout";
-import { leafCount } from "./bsp/dsl";
+import { leafCount } from "@blit-sh/core/bsp";
 import { t, tp } from "./i18n";
 
 const SOURCE_LABEL: Record<number, string> = {

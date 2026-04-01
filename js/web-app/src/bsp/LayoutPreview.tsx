@@ -1,4 +1,4 @@
-import { leafCount, type BSPNode } from "./dsl";
+import { leafCount, type BSPNode } from "@blit-sh/core/bsp";
 
 /**
  * Tiny visual preview of a BSP layout as nested rectangles.

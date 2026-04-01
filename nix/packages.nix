@@ -121,9 +121,14 @@
         cargoPkg = "blit-webrtc-forwarder";
       };
 
+      coreNpmDeps = pkgs.fetchNpmDeps {
+        src = ../js/core;
+        hash = "sha256-S3tUGZS2aLhF1m2FE47/sGEHPUw/9i0XtXZ/lmnX42s=";
+      };
+
       reactNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/react;
-        hash = "sha256-Xm56AGoE1A/rJ6r4kqT5+HO4h9EzpALvcXEhMI5ytBs=";
+        hash = "sha256-nKmD6eQbfXSOYSBaz3Y0YKuMT2ejDFonnB/cm0hIGJg=";
       };
 
       webAppNpmDeps = pkgs.fetchNpmDeps {
@@ -150,6 +155,10 @@
             mkdir -p "crates/browser/pkg/snippets/$name"
             cp "$d"/* "crates/browser/pkg/snippets/$name/"
           done
+
+          cp -r ${coreNpmDeps} "$TMPDIR/core-cache"
+          chmod -R u+w "$TMPDIR/core-cache"
+          (cd js/core && npm ci --cache "$TMPDIR/core-cache" && node node_modules/typescript/bin/tsc)
 
           cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
           chmod -R u+w "$TMPDIR/react-cache"

@@ -45,6 +45,34 @@ PKGJSON
     '';
   };
 
+  core-publish = pkgs.writeShellApplication {
+    name = "core-publish";
+    runtimeInputs = [ pkgs.nodejs ];
+    text = ''
+      tmp=$(mktemp -d)
+      trap 'rm -rf "$tmp"' EXIT
+
+      wasm="$tmp/blit-browser"
+      mkdir -p "$wasm"
+      cp ${browserWasm}/blit_browser.js ${browserWasm}/blit_browser.d.ts "$wasm"/
+      cp ${browserWasm}/blit_browser_bg.wasm.d.ts "$wasm"/ 2>/dev/null || true
+      echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > "$wasm/package.json"
+
+      cp -a ${../js/core}/* "$tmp"/
+      chmod -R u+w "$tmp"
+
+      cd "$tmp"
+      ${pkgs.nodejs}/bin/npm pkg set "devDependencies.@blit-sh/browser=file:$wasm"
+      npm install
+      npm run build
+
+      echo "Package contents:"
+      ls -lh dist/
+      echo ""
+      npm publish "$@"
+    '';
+  };
+
   react-publish = pkgs.writeShellApplication {
     name = "react-publish";
     runtimeInputs = [ pkgs.nodejs ];
@@ -58,11 +86,18 @@ PKGJSON
       cp ${browserWasm}/blit_browser_bg.wasm.d.ts "$wasm"/ 2>/dev/null || true
       echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > "$wasm/package.json"
 
+      # Build core first (react depends on it)
+      core="$tmp/core"
+      cp -a ${../js/core}/* "$core"/
+      chmod -R u+w "$core"
+      (cd "$core" && ${pkgs.nodejs}/bin/npm pkg set "devDependencies.@blit-sh/browser=file:$wasm" && npm install && npm run build)
+
       cp -a ${../js/react}/* "$tmp"/
       chmod -R u+w "$tmp"
 
       cd "$tmp"
       ${pkgs.nodejs}/bin/npm pkg set "devDependencies.@blit-sh/browser=file:$wasm"
+      ${pkgs.nodejs}/bin/npm pkg set "devDependencies.@blit-sh/core=file:$core"
       npm install
       npm run build
 
@@ -138,6 +173,9 @@ CTRL
       echo "=== Publishing @blit-sh/browser ==="
       ${browser-publish}/bin/browser-publish "$@"
       echo ""
+      echo "=== Publishing @blit-sh/core ==="
+      ${core-publish}/bin/core-publish "$@"
+      echo ""
       echo "=== Publishing @blit-sh/react ==="
       ${react-publish}/bin/react-publish "$@"
     '';
@@ -180,7 +218,7 @@ CTRL
     '';
   };
 in {
-  inherit browser-publish react-publish publish-npm-packages publish-crates;
+  inherit browser-publish core-publish react-publish publish-npm-packages publish-crates;
   inherit blit-server-deb blit-cli-deb blit-gateway-deb blit-webrtc-forwarder-deb;
 
   build-debs = pkgs.writeShellApplication {
@@ -321,7 +359,7 @@ in {
       echo "=== Rust tests ==="
       cargo test --workspace
       echo ""
-      echo "=== React tests ==="
+      echo "=== Core tests ==="
       mkdir -p crates/browser/pkg
       if [ ! -f crates/browser/pkg/package.json ]; then
         echo '{"name":"@blit-sh/browser","version":"0.0.0","main":"blit_browser.js"}' > crates/browser/pkg/package.json
@@ -329,6 +367,9 @@ in {
       if [ ! -f crates/browser/pkg/blit_browser.js ]; then
         touch crates/browser/pkg/blit_browser.js
       fi
+      (cd js/core && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
+      echo ""
+      echo "=== React tests ==="
       (cd js/react && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
 
       export BLIT_SERVER="${blit-server}/bin/blit-server"

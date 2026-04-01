@@ -3,7 +3,7 @@ import { renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { BlitWorkspaceProvider, useBlitContext } from "../BlitContext";
 import type { BlitContextValue } from "../BlitContext";
-import type { BlitWorkspace } from "../BlitWorkspace";
+import type { BlitWorkspace } from "@blit-sh/core";
 
 function wrapper(value: BlitContextValue) {
   return function Wrapper({ children }: { children: ReactNode }) {

@@ -1,5 +1,5 @@
 {
-  "name": "@blit-sh/react",
+  "name": "@blit-sh/core",
   "version": "0.16.3",
   "type": "module",
   "main": "dist/index.js",
@@ -9,18 +9,30 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./hooks": {
-      "types": "./dist/hooks/index.d.ts",
-      "default": "./dist/hooks/index.js"
+    "./transports": {
+      "types": "./dist/transports/index.d.ts",
+      "default": "./dist/transports/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./palettes": {
+      "types": "./dist/palettes.d.ts",
+      "default": "./dist/palettes.js"
+    },
+    "./bsp": {
+      "types": "./dist/bsp/index.d.ts",
+      "default": "./dist/bsp/index.js"
     }
   },
-  "description": "Low-latency terminal streaming — React components and hooks",
+  "description": "Low-latency terminal streaming — framework-agnostic core",
   "homepage": "https://blit.sh",
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/indent-com/blit.git",
-    "directory": "js/react"
+    "directory": "js/core"
   },
   "bugs": {
     "url": "https://github.com/indent-com/blit/issues"
@@ -28,9 +40,9 @@
   "keywords": [
     "terminal",
     "tty",
-    "react",
     "streaming",
-    "webgl"
+    "webgl",
+    "bsp"
   ],
   "sideEffects": false,
   "files": [
@@ -44,21 +56,16 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@blit-sh/core": ">=0.16.3",
-    "react": ">=18.0.0",
-    "react-dom": ">=18.0.0"
+    "@blit-sh/browser": ">=0.9.0"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "@blit-sh/core": "file:../core",
-    "@testing-library/react": "^16",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "@blit-sh/browser": "file:../../crates/browser/pkg",
-    "jsdom": "^29",
-    "react": "^19",
-    "react-dom": "^19",
-    "typescript": "^6",
     "@vitest/coverage-v8": "^4",
+    "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "jsdom": "^29.0.1",
+    "typescript": "^6",
     "vitest": "^4"
   },
   "license": "MIT",

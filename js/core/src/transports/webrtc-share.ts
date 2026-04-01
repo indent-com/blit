@@ -8,8 +8,8 @@
  */
 
 import nacl from "tweetnacl";
-import { createWebRtcDataChannelTransport } from "@blit-sh/react";
-import type { BlitTransport, ConnectionStatus } from "@blit-sh/react";
+import { createWebRtcDataChannelTransport } from "./webrtc";
+import type { BlitTransport, ConnectionStatus } from "../types";
 
 const PBKDF2_SALT = new TextEncoder().encode("https://blit.sh");
 const PBKDF2_ROUNDS = 100_000;
@@ -135,8 +135,8 @@ export function createShareTransport(
       ws = new WebSocket(wsUrl);
 
       await new Promise<void>((resolve, reject) => {
-        ws.onopen = () => resolve();
-        ws.onerror = () => reject(new Error("signaling connection failed"));
+        ws!.onopen = () => resolve();
+        ws!.onerror = () => reject(new Error("signaling connection failed"));
         if (disposed) reject(new Error("disposed"));
       });
 
@@ -148,7 +148,7 @@ export function createShareTransport(
       // Wait for registered + peer_joined
       const producerSessionId = await new Promise<string>((resolve, reject) => {
         let registered = false;
-        ws.onmessage = (e) => {
+        ws!.onmessage = (e) => {
           const m = JSON.parse(e.data as string) as ServerMessage;
           if (m.type === "registered") {
             registered = true;
@@ -158,7 +158,7 @@ export function createShareTransport(
             reject(new Error(m.message ?? "signaling error"));
           }
         };
-        ws.onclose = () =>
+        ws!.onclose = () =>
           reject(new Error("signaling closed before peer joined"));
       });
 
@@ -187,7 +187,7 @@ export function createShareTransport(
 
       // Send the offer via signaling
       const sdpData = { sdp: { type: offer.type, sdp: offer.sdp } };
-      ws.send(
+      ws!.send(
         buildSignedMessage(keypair.secretKey, producerSessionId, sdpData),
       );
 
@@ -199,7 +199,7 @@ export function createShareTransport(
       pc.onicecandidate = (e) => {
         if (!e.candidate || disposed) return;
         const candidateData = { candidate: e.candidate.toJSON() };
-        ws.send(
+        ws!.send(
           buildSignedMessage(
             keypair.secretKey,
             producerSessionId,
@@ -209,13 +209,13 @@ export function createShareTransport(
       };
 
       // Receive answer + remote ICE candidates
-      ws.onmessage = (e) => {
+      ws!.onmessage = (e) => {
         const m = JSON.parse(e.data as string) as ServerMessage;
         if (m.type !== "signal" || !m.data) return;
 
         if (m.data.sdp) {
           const sdp = m.data.sdp as { type?: string; sdp?: string };
-          pc.setRemoteDescription(
+          pc!.setRemoteDescription(
             new RTCSessionDescription({
               type: (sdp.type as RTCSdpType) ?? "answer",
               sdp: sdp.sdp as string,
@@ -223,7 +223,7 @@ export function createShareTransport(
           ).then(() => {
             remoteDescSet = true;
             for (const c of pendingCandidates) {
-              pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+              pc!.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
             }
             pendingCandidates.length = 0;
           }).catch((err) => {
@@ -234,14 +234,14 @@ export function createShareTransport(
         } else if (m.data.candidate) {
           const candidate = m.data.candidate as RTCIceCandidateInit;
           if (remoteDescSet) {
-            pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+            pc!.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
           } else {
             pendingCandidates.push(candidate);
           }
         }
       };
 
-      ws.onclose = () => {
+      ws!.onclose = () => {
         // Signaling done — WebRTC connection continues peer-to-peer
       };
 

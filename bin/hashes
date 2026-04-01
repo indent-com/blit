@@ -5,7 +5,7 @@ const root = (await $`git rev-parse --show-toplevel`.text()).trim();
 const packages = `${root}/nix/packages.nix`;
 let text = await Bun.file(packages).text();
 
-for (const dir of ["react", "web-app"]) {
+for (const dir of ["core", "react", "web-app"]) {
   const hash = (await $`prefetch-npm-deps ${root}/js/${dir}/package-lock.json`.quiet()).text().trim();
   console.log(`${dir}: ${hash}`);
   text = text.replace(

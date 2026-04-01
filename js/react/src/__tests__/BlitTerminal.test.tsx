@@ -1,31 +1,32 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BlitTerminal } from "../BlitTerminal";
-import { BlitWorkspace } from "../BlitWorkspace";
+import { BlitWorkspace } from "@blit-sh/core";
 import { BlitWorkspaceProvider } from "../BlitContext";
-import type { BlitWasmModule } from "../TerminalStore";
-import type { TerminalPalette, SessionId } from "../types";
-import { MockTransport } from "./mock-transport";
+import type { BlitWasmModule } from "@blit-sh/core";
+import type { TerminalPalette, SessionId } from "@blit-sh/core";
+import { MockTransport } from "../../../core/src/__tests__/mock-transport";
 
-vi.mock("../gl-renderer", () => ({
-  createGlRenderer: vi.fn(() => ({
-    supported: false,
-    resize: vi.fn(),
-    render: vi.fn(),
-    dispose: vi.fn(),
-  })),
-}));
-
-vi.mock("../hooks/useBlitTerminal", () => ({
-  measureCell: vi.fn(() => ({
-    w: 8,
-    h: 16,
-    pw: 8,
-    ph: 16,
-  })),
-  cssFontFamily: (f: string) => f,
-  CSS_GENERIC: new Set(["monospace"]),
-}));
+vi.mock("@blit-sh/core", async () => {
+  const actual = await vi.importActual<typeof import("@blit-sh/core")>("@blit-sh/core");
+  return {
+    ...actual,
+    createGlRenderer: vi.fn(() => ({
+      supported: false,
+      resize: vi.fn(),
+      render: vi.fn(),
+      dispose: vi.fn(),
+    })),
+    measureCell: vi.fn(() => ({
+      w: 8,
+      h: 16,
+      pw: 8,
+      ph: 16,
+    })),
+    cssFontFamily: (f: string) => f,
+    CSS_GENERIC: new Set(["monospace"]),
+  };
+});
 
 type FakeTerminal = {
   rows: number;

@@ -1,4 +1,4 @@
-import type { CellMetrics } from "./hooks/useBlitTerminal";
+import type { CellMetrics } from "./measure";
 
 const MAX_BATCH_VERTS = 65532;
 const GLYPH_FLOATS_PER_VERT = 8;

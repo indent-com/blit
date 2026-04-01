@@ -1,6 +1,6 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react";
-import type { TerminalPalette } from "./types";
-import type { BlitWorkspace } from "./BlitWorkspace";
+import type { TerminalPalette } from "@blit-sh/core";
+import type { BlitWorkspace } from "@blit-sh/core";
 
 export interface BlitContextValue {
   workspace?: BlitWorkspace;

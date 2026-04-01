@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { BlitWorkspaceSnapshot } from "../types";
+import type { BlitWorkspaceSnapshot } from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "../BlitContext";
 
 export function useBlitWorkspace() {
