@@ -1050,6 +1050,65 @@ export function BlitTerminal({
     let selAnchorStart: { row: number; col: number } | null = null;
     let selAnchorEnd: { row: number; col: number } | null = null;
 
+    let autoScrollTimer: ReturnType<typeof setInterval> | null = null;
+    let autoScrollDir: -1 | 0 | 1 = 0;
+    const AUTO_SCROLL_INTERVAL_MS = 50;
+    const AUTO_SCROLL_LINES = 3;
+
+    function stopAutoScroll() {
+      if (autoScrollTimer !== null) {
+        clearInterval(autoScrollTimer);
+        autoScrollTimer = null;
+      }
+      autoScrollDir = 0;
+    }
+
+    function startAutoScroll(dir: -1 | 1) {
+      if (autoScrollDir === dir && autoScrollTimer !== null) return;
+      stopAutoScroll();
+      autoScrollDir = dir;
+      autoScrollTimer = setInterval(() => {
+        if (!selecting || sessionId === null || status !== "connected") {
+          stopAutoScroll();
+          return;
+        }
+        const t = terminalRef.current;
+        if (!t) return;
+        const maxScroll = t.scrollback_lines();
+        const prev = scrollOffsetRef.current;
+        const next = Math.max(
+          0,
+          Math.min(maxScroll, prev + dir * AUTO_SCROLL_LINES),
+        );
+        if (next === prev) return;
+        scrollOffsetRef.current = next;
+        sendScroll(sessionId, next);
+        scrollFadeRef.current = 1;
+
+        const edgeRow = dir === 1 ? 0 : rowsRef.current - 1;
+        const edgeCol =
+          dir === 1 ? 0 : colsRef.current - 1;
+        const cell = { row: edgeRow, col: edgeCol };
+        if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
+          const { start: dragStart, end: dragEnd } = applyGranularity(cell);
+          const dragBefore =
+            dragStart.row < selAnchorStart.row ||
+            (dragStart.row === selAnchorStart.row &&
+              dragStart.col < selAnchorStart.col);
+          if (dragBefore) {
+            selStartRef.current = dragStart;
+            selEndRef.current = selAnchorEnd;
+          } else {
+            selStartRef.current = selAnchorStart;
+            selEndRef.current = dragEnd;
+          }
+        } else {
+          selEndRef.current = cell;
+        }
+        drawSelection();
+      }, AUTO_SCROLL_INTERVAL_MS);
+    }
+
     function clearSelection() {
       selStartRef.current = selEndRef.current = null;
       scheduleRender();
@@ -1227,6 +1286,18 @@ export function BlitTerminal({
         // on mousedown alone (which would pause full-screen terminal apps).
         if (sessionId !== null && blitConn && !blitConn.isFrozen(sessionId))
           blitConn.freeze(sessionId);
+
+        const rect = canvas.getBoundingClientRect();
+        if (e.clientY < rect.top) {
+          startAutoScroll(1);
+          return;
+        } else if (e.clientY > rect.bottom) {
+          startAutoScroll(-1);
+          return;
+        } else {
+          stopAutoScroll();
+        }
+
         const cell = mouseToCell(e);
         if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
           // Extend selection by word/line granularity from the anchor
@@ -1263,6 +1334,7 @@ export function BlitTerminal({
         return;
       }
       if (selecting) {
+        stopAutoScroll();
         selecting = false;
         selectingRef.current = false;
         if (selGranularity === 1) {
@@ -1386,6 +1458,7 @@ export function BlitTerminal({
         mouseDownButton = -1;
       }
       if (selecting) {
+        stopAutoScroll();
         selecting = false;
         selectingRef.current = false;
         clearSelection();
@@ -1412,6 +1485,7 @@ export function BlitTerminal({
       canvas.removeEventListener("contextmenu", handleContextMenu);
       canvas.removeEventListener("click", handleClick);
       if (scrollFadeTimerRef.current) clearTimeout(scrollFadeTimerRef.current);
+      stopAutoScroll();
     };
   }, [sessionId, status, sendScroll, blitConn, workspace, readOnly]);
 
