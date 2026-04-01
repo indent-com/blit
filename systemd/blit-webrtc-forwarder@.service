@@ -1,0 +1,12 @@
+[Unit]
+Description=blit WebRTC forwarder %i
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/blit/forwarder-%i.env
+ExecStart=blit-webrtc-forwarder --quiet
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

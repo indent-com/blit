@@ -109,8 +109,11 @@ CTRL
       systemdDir = ../systemd;
     in ''
       mkdir -p pkg/lib/systemd/system
-      cp "${systemdDir}/blit@.socket" "pkg/lib/systemd/system/blit@.socket"
-      cp "${systemdDir}/blit@.service" "pkg/lib/systemd/system/blit@.service"
+      cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
+      cp "${systemdDir}/blit-server@.service" "pkg/lib/systemd/system/blit-server@.service"
+      mkdir -p pkg/lib/systemd/user
+      cp "${systemdDir}/blit-server.socket" "pkg/lib/systemd/user/blit-server.socket"
+      cp "${systemdDir}/blit-server.service" "pkg/lib/systemd/user/blit-server.service"
     '';
   };
 
@@ -118,6 +121,13 @@ CTRL
     pname = "blit";
     binPkg = blit-cli-static;
     description = "blit terminal client";
+    extraInstall = let
+      systemdDir = ../systemd;
+    in ''
+      mkdir -p pkg/lib/systemd/user
+      cp "${systemdDir}/blit.socket" "pkg/lib/systemd/user/blit.socket"
+      cp "${systemdDir}/blit.service" "pkg/lib/systemd/user/blit.service"
+    '';
   };
 
   blit-gateway-deb = mkDeb {
@@ -130,6 +140,12 @@ CTRL
     pname = "blit-webrtc-forwarder";
     binPkg = blit-webrtc-forwarder-static;
     description = "blit WebRTC forwarder";
+    extraInstall = let
+      systemdDir = ../systemd;
+    in ''
+      mkdir -p pkg/lib/systemd/system
+      cp "${systemdDir}/blit-webrtc-forwarder@.service" "pkg/lib/systemd/system/blit-webrtc-forwarder@.service"
+    '';
   };
   publish-npm-packages = pkgs.writeShellApplication {
     name = "blit-publish-npm-packages";

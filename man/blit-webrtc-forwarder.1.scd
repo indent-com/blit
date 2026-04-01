@@ -21,7 +21,7 @@ for custom deployments where the server is managed separately.
 # OPTIONS
 
 _--socket_ _PATH_
-Path to the blit-server Unix socket (required).
+Path to the blit-server Unix socket. Can also be set via _BLIT_SOCK_.
 
 _--passphrase_ _PASSPHRASE_
 Session passphrase. Used to derive the Ed25519 signing key for
@@ -48,6 +48,9 @@ _--version_, _-V_
 Print version and exit.
 
 # ENVIRONMENT
+
+_BLIT_SOCK_
+Path to the blit-server Unix socket. Overridden by _--socket_.
 
 _BLIT_HUB_
 Signaling hub URL (default: _hub.blit.sh_). Overridden by _--hub_.
