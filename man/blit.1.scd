@@ -28,6 +28,8 @@ _blit_ [OPTIONS] _server_ [_--shell-flags_ _FLAGS_] [_--scrollback_ _N_] [_--fd-
 
 _blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_]
 
+_blit_ _upgrade_
+
 # DESCRIPTION
 
 _blit_ connects to a _blit-server_(1) instance and provides a terminal
@@ -137,6 +139,11 @@ default socket path, one is started automatically in-process. A sharing
 URL is printed to stdout. The passphrase can also be set via the
 _BLIT_PASSPHRASE_ environment variable. If omitted, a random passphrase
 is generated.
+
+_upgrade_
+Upgrade _blit_ to the latest version. Downloads and runs the install
+script from _https://blit.sh/install_, installing into the same
+directory as the currently running binary.
 
 # ENVIRONMENT
 

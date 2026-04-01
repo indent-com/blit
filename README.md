@@ -101,6 +101,8 @@ blit close 3                             # Close and remove a PTY
 blit share                               # Share via WebRTC (prints URL)
 blit share --passphrase mysecret         # Share with a specific passphrase
 
+blit upgrade                             # Upgrade blit to the latest version
+
 blit --ssh myhost list                   # Against a remote host
 blit --ssh myhost start htop
 blit --ssh myhost show 1
