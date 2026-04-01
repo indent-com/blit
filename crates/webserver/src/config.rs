@@ -6,13 +6,17 @@ use tokio::sync::broadcast;
 
 pub struct ConfigState {
     pub tx: broadcast::Sender<String>,
+    pub write_lock: tokio::sync::Mutex<()>,
 }
 
 impl ConfigState {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel::<String>(64);
         spawn_watcher(tx.clone());
-        Self { tx }
+        Self {
+            tx,
+            write_lock: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -162,6 +166,7 @@ pub async fn handle_config_ws(mut ws: WebSocket, token: &str, config: &ConfigSta
                         let text = text.trim();
                         if let Some(rest) = text.strip_prefix("set ") {
                             if let Some((k, v)) = rest.split_once(' ') {
+                                let _guard = config.write_lock.lock().await;
                                 let mut map = read_config();
                                 let k = k.trim().replace(['\n', '\r'], "");
                                 let v = v.trim().replace(['\n', '\r'], "");
