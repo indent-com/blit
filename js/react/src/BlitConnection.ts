@@ -9,6 +9,7 @@ import type {
   TerminalPalette,
 } from "./types";
 import {
+  FEATURE_COPY_RANGE,
   FEATURE_CREATE_NONCE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
@@ -20,6 +21,7 @@ import {
   S2C_HELLO,
   S2C_LIST,
   S2C_SEARCH_RESULTS,
+  S2C_TEXT,
   S2C_TITLE,
   S2C_UPDATE,
 } from "./types";
@@ -27,6 +29,7 @@ import {
   buildCloseMessage,
   buildClearResizeBatchMessage,
   buildClearResizeMessage,
+  buildCopyRangeMessage,
   buildCreate2Message,
   buildFocusMessage,
   buildInputMessage,
@@ -110,6 +113,10 @@ export class BlitConnection {
   private readonly pendingCreates = new Map<number, PendingCreate>();
   private readonly pendingCloses = new Map<SessionId, Array<() => void>>();
   private readonly pendingSearches = new Map<number, PendingSearch>();
+  private readonly pendingReads = new Map<
+    number,
+    { resolve: (text: string) => void; reject: (error: Error) => void }
+  >();
 
   private sessionCounter = 0;
   private nonceCounter = 0;
@@ -155,6 +162,7 @@ export class BlitConnection {
       status: transport.status,
       ready: false,
       supportsRestart: false,
+      supportsCopyRange: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -217,6 +225,7 @@ export class BlitConnection {
       connectionError("Connection disposed before PTY creation completed"),
     );
     this.rejectPendingSearches(connectionError("Connection disposed"));
+    this.rejectPendingReads(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
     this.store.destroy();
   }
@@ -272,6 +281,50 @@ export class BlitConnection {
         }),
       );
     });
+  }
+
+  copyRange(
+    sessionId: SessionId,
+    startTail: number,
+    startCol: number,
+    endTail: number,
+    endCol: number,
+  ): Promise<string> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(
+          `Cannot copy while transport is ${this.transport.status}`,
+        ),
+      );
+    }
+    const session = this.sessionsById.get(sessionId);
+    if (!session) {
+      return Promise.reject(connectionError("Unknown session"));
+    }
+    return new Promise<string>((resolve, reject) => {
+      let nonce = 0;
+      do {
+        nonce = this.nonceCounter = (this.nonceCounter + 1) & 0xffff;
+      } while (
+        this.pendingCreates.has(nonce) ||
+        this.pendingReads.has(nonce)
+      );
+      this.pendingReads.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildCopyRangeMessage(
+          nonce,
+          session.ptyId,
+          startTail,
+          startCol,
+          endTail,
+          endCol,
+        ),
+      );
+    });
+  }
+
+  supportsCopyRange(): boolean {
+    return (this.features & FEATURE_COPY_RANGE) !== 0;
   }
 
   async closeSession(sessionId: SessionId): Promise<void> {
@@ -706,8 +759,20 @@ export class BlitConnection {
         this.snapshot = {
           ...this.snapshot,
           supportsRestart: (features & FEATURE_RESTART) !== 0,
+          supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
         };
         this.emit();
+        return;
+      }
+      case S2C_TEXT: {
+        if (bytes.length < 13) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const text = textDecoder.decode(bytes.subarray(13));
+        const pending = this.pendingReads.get(nonce);
+        if (pending) {
+          this.pendingReads.delete(nonce);
+          pending.resolve(text);
+        }
         return;
       }
       default:
@@ -755,6 +820,7 @@ export class BlitConnection {
         connectionError(`Transport ${status} before PTY creation completed`),
       );
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
+      this.rejectPendingReads(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
     }
 
@@ -1044,6 +1110,13 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingSearches.clear();
+  }
+
+  private rejectPendingReads(error: Error): void {
+    for (const pending of this.pendingReads.values()) {
+      pending.reject(error);
+    }
+    this.pendingReads.clear();
   }
 
   private resolveAllPendingCloses(): void {

@@ -124,8 +124,9 @@ export function BlitTerminal({
   const showCursorRef = useRef(showCursor);
   showCursorRef.current = showCursor;
 
-  const selStartRef = useRef<{ row: number; col: number } | null>(null);
-  const selEndRef = useRef<{ row: number; col: number } | null>(null);
+  type SelPos = { row: number; col: number; tailOffset: number };
+  const selStartRef = useRef<SelPos | null>(null);
+  const selEndRef = useRef<SelPos | null>(null);
   const selectingRef = useRef(false);
   const hoveredUrlRef = useRef<{
     row: number;
@@ -646,15 +647,21 @@ export function BlitTerminal({
             const ss = selStartRef.current;
             const se = selEndRef.current;
             if (ss && se) {
-              let sr = ss.row,
+              const curScroll = scrollOffsetRef.current;
+              const rows = rowsRef.current;
+              const toViewRow = (p: typeof ss) =>
+                rows - 1 - p.tailOffset + curScroll;
+              let sr = toViewRow(ss),
                 sc = ss.col;
-              let er = se.row,
+              let er = toViewRow(se),
                 ec = se.col;
               if (sr > er || (sr === er && sc > ec)) {
                 [sr, sc, er, ec] = [er, ec, sr, sc];
               }
+              const r0 = Math.max(0, sr);
+              const r1 = Math.min(rows - 1, er);
               ctx.fillStyle = "rgba(100,150,255,0.3)";
-              for (let r = sr; r <= er; r++) {
+              for (let r = r0; r <= r1; r++) {
                 const c0 = r === sr ? sc : 0;
                 const c1 = r === er ? ec : colsRef.current - 1;
                 ctx.fillRect(
@@ -1044,11 +1051,18 @@ export function BlitTerminal({
     }
 
     let selecting = false;
-    // 1=char, 2=word, 3=line — set by click detail
     let selGranularity: 1 | 2 | 3 = 1;
-    // Anchor word/line boundaries for drag-extending
-    let selAnchorStart: { row: number; col: number } | null = null;
-    let selAnchorEnd: { row: number; col: number } | null = null;
+    let selAnchorStart: SelPos | null = null;
+    let selAnchorEnd: SelPos | null = null;
+
+    function cellToSel(cell: { row: number; col: number }): SelPos {
+      return {
+        row: cell.row,
+        col: cell.col,
+        tailOffset:
+          scrollOffsetRef.current + (rowsRef.current - 1 - cell.row),
+      };
+    }
 
     let autoScrollTimer: ReturnType<typeof setInterval> | null = null;
     let autoScrollDir: -1 | 0 | 1 = 0;
@@ -1084,17 +1098,20 @@ export function BlitTerminal({
         scrollOffsetRef.current = next;
         sendScroll(sessionId, next);
         scrollFadeRef.current = 1;
+        if (scrollFadeTimerRef.current)
+          clearTimeout(scrollFadeTimerRef.current);
+        scrollFadeTimerRef.current = setTimeout(() => {
+          scrollFadeRef.current = 0;
+          scheduleRender();
+        }, 1000);
 
         const edgeRow = dir === 1 ? 0 : rowsRef.current - 1;
-        const edgeCol =
-          dir === 1 ? 0 : colsRef.current - 1;
-        const cell = { row: edgeRow, col: edgeCol };
+        const edgeCol = dir === 1 ? 0 : colsRef.current - 1;
+        const edgeSel = cellToSel({ row: edgeRow, col: edgeCol });
         if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
-          const { start: dragStart, end: dragEnd } = applyGranularity(cell);
-          const dragBefore =
-            dragStart.row < selAnchorStart.row ||
-            (dragStart.row === selAnchorStart.row &&
-              dragStart.col < selAnchorStart.col);
+          const { start: dragStart, end: dragEnd } =
+            applyGranularitySel(edgeSel);
+          const dragBefore = selPosBefore(dragStart, selAnchorStart);
           if (dragBefore) {
             selStartRef.current = dragStart;
             selEndRef.current = selAnchorEnd;
@@ -1103,7 +1120,7 @@ export function BlitTerminal({
             selEndRef.current = dragEnd;
           }
         } else {
-          selEndRef.current = cell;
+          selEndRef.current = edgeSel;
         }
         drawSelection();
       }, AUTO_SCROLL_INTERVAL_MS);
@@ -1179,20 +1196,69 @@ export function BlitTerminal({
       return { start: cell, end: cell };
     }
 
+    function applyGranularitySel(pos: SelPos): {
+      start: SelPos;
+      end: SelPos;
+    } {
+      const curScroll = scrollOffsetRef.current;
+      const viewRow = rowsRef.current - 1 - pos.tailOffset + curScroll;
+      const cell = { row: viewRow, col: pos.col };
+      const { start, end } = applyGranularity(cell);
+      return {
+        start: { ...start, tailOffset: curScroll + (rowsRef.current - 1 - start.row) },
+        end: { ...end, tailOffset: curScroll + (rowsRef.current - 1 - end.row) },
+      };
+    }
+
+    function selPosBefore(a: SelPos, b: SelPos): boolean {
+      return (
+        a.tailOffset > b.tailOffset ||
+        (a.tailOffset === b.tailOffset && a.col < b.col)
+      );
+    }
+
     function copySelection() {
       if (!selStartRef.current || !selEndRef.current) return;
       const t = terminalRef.current;
       if (!t) return;
-      let sr = selStartRef.current.row,
-        sc = selStartRef.current.col;
-      let er = selEndRef.current.row,
-        ec = selEndRef.current.col;
-      if (sr > er || (sr === er && sc > ec)) {
-        [sr, sc, er, ec] = [er, ec, sr, sc];
+
+      let start = selStartRef.current;
+      let end = selEndRef.current;
+      if (selPosBefore(end, start)) {
+        [start, end] = [end, start];
       }
-      const text = t.get_text(sr, sc, er, ec);
-      if (text) {
-        navigator.clipboard.writeText(text);
+
+      const curScroll = scrollOffsetRef.current;
+      const rows = rowsRef.current;
+      const startViewRow = rows - 1 - start.tailOffset + curScroll;
+      const endViewRow = rows - 1 - end.tailOffset + curScroll;
+      const inViewport =
+        startViewRow >= 0 &&
+        startViewRow < rows &&
+        endViewRow >= 0 &&
+        endViewRow < rows;
+
+      if (inViewport) {
+        const text = t.get_text(
+          startViewRow,
+          start.col,
+          endViewRow,
+          end.col,
+        );
+        if (text) navigator.clipboard.writeText(text);
+      } else if (blitConn && sessionId !== null && blitConn.supportsCopyRange()) {
+        blitConn
+          .copyRange(
+            sessionId,
+            start.tailOffset,
+            start.col,
+            end.tailOffset,
+            end.col,
+          )
+          .then((text) => {
+            if (text) navigator.clipboard.writeText(text);
+          })
+          .catch(() => {});
       }
     }
 
@@ -1227,19 +1293,20 @@ export function BlitTerminal({
         selectingRef.current = true;
 
         const cell = mouseToCell(e);
+        const sel = cellToSel(cell);
         const detail = Math.min(e.detail, 3) as 1 | 2 | 3;
         selGranularity = detail;
 
         if (detail >= 2) {
-          const { start, end } = applyGranularity(cell);
+          const { start, end } = applyGranularitySel(sel);
           selStartRef.current = start;
           selEndRef.current = end;
           selAnchorStart = start;
           selAnchorEnd = end;
           drawSelection();
         } else {
-          selStartRef.current = cell;
-          selEndRef.current = cell;
+          selStartRef.current = sel;
+          selEndRef.current = sel;
           selAnchorStart = null;
           selAnchorEnd = null;
         }
@@ -1294,14 +1361,10 @@ export function BlitTerminal({
         }
 
         const cell = mouseToCell(e);
+        const sel = cellToSel(cell);
         if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
-          // Extend selection by word/line granularity from the anchor
-          const { start: dragStart, end: dragEnd } = applyGranularity(cell);
-          // Compare drag position vs anchor to determine direction
-          const dragBefore =
-            dragStart.row < selAnchorStart.row ||
-            (dragStart.row === selAnchorStart.row &&
-              dragStart.col < selAnchorStart.col);
+          const { start: dragStart, end: dragEnd } = applyGranularitySel(sel);
+          const dragBefore = selPosBefore(dragStart, selAnchorStart);
           if (dragBefore) {
             selStartRef.current = dragStart;
             selEndRef.current = selAnchorEnd;
@@ -1310,7 +1373,7 @@ export function BlitTerminal({
             selEndRef.current = dragEnd;
           }
         } else {
-          selEndRef.current = cell;
+          selEndRef.current = sel;
         }
         drawSelection();
       }
@@ -1333,13 +1396,13 @@ export function BlitTerminal({
         selecting = false;
         selectingRef.current = false;
         if (selGranularity === 1) {
-          selEndRef.current = mouseToCell(e);
+          selEndRef.current = cellToSel(mouseToCell(e));
         }
         drawSelection();
         if (
           selStartRef.current &&
           selEndRef.current &&
-          (selStartRef.current.row !== selEndRef.current.row ||
+          (selStartRef.current.tailOffset !== selEndRef.current.tailOffset ||
             selStartRef.current.col !== selEndRef.current.col)
         ) {
           copySelection();

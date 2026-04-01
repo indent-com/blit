@@ -2,10 +2,11 @@ use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as Al
 use blit_remote::{
     build_update_msg, msg_hello, FrameState, C2S_ACK, C2S_CLIENT_METRICS, C2S_CLOSE, C2S_CREATE,
     C2S_CREATE2, C2S_CREATE_AT, C2S_CREATE_N, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_MOUSE,
-    C2S_KILL, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
-    C2S_UNSUBSCRIBE,
-    CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
-    FEATURE_RESTART, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    C2S_COPY_RANGE, C2S_KILL, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH,
+    C2S_SUBSCRIBE, C2S_UNSUBSCRIBE,
+    CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE,
+    FEATURE_RESIZE_BATCH, FEATURE_RESTART, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED,
+    S2C_CREATED_N, S2C_LIST,
     S2C_READY, S2C_SEARCH_RESULTS, S2C_TEXT, S2C_TITLE,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -67,6 +68,14 @@ trait PtyDriver: Send {
         echo: bool,
         icanon: bool,
     ) -> Option<Vec<u8>>;
+    fn get_text_range(
+        &self,
+        start_tail: u32,
+        start_col: u16,
+        end_tail: u32,
+        end_col: u16,
+    ) -> String;
+    fn total_lines(&self) -> u32;
 }
 
 struct PtySearchResult {
@@ -140,6 +149,20 @@ impl PtyDriver for AlacrittyDriver {
         icanon: bool,
     ) -> Option<Vec<u8>> {
         AlacrittyDriver::mouse_event(self, type_, button, col, row, echo, icanon)
+    }
+
+    fn get_text_range(
+        &self,
+        start_tail: u32,
+        start_col: u16,
+        end_tail: u32,
+        end_col: u16,
+    ) -> String {
+        AlacrittyDriver::get_text_range(self, start_tail, start_col, end_tail, end_col)
+    }
+
+    fn total_lines(&self) -> u32 {
+        AlacrittyDriver::total_lines(self)
     }
 }
 
@@ -2204,7 +2227,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
         if let Some(c) = sess.clients.get(&client_id) {
             let _ = c.tx.try_send(msg_hello(
                 1,
-                FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH,
+                FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH | FEATURE_COPY_RANGE,
             ));
         }
         let mut initial_msgs = Vec::new();
@@ -2942,6 +2965,33 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     msg.extend_from_slice(&pid.to_le_bytes());
                     msg.extend_from_slice(&(total_lines as u32).to_le_bytes());
                     msg.extend_from_slice(&(start as u32).to_le_bytes());
+                    msg.extend_from_slice(text.as_bytes());
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = client.tx.try_send(msg);
+                    }
+                }
+            }
+            C2S_COPY_RANGE if data.len() >= 18 => {
+                let nonce = u16::from_le_bytes([data[1], data[2]]);
+                let pid = u16::from_le_bytes([data[3], data[4]]);
+                let start_tail =
+                    u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+                let start_col = u16::from_le_bytes([data[9], data[10]]);
+                let end_tail =
+                    u32::from_le_bytes([data[11], data[12], data[13], data[14]]);
+                let end_col = u16::from_le_bytes([data[15], data[16]]);
+
+                if let Some(pty) = sess.ptys.get(&pid) {
+                    let text =
+                        pty.driver.get_text_range(start_tail, start_col, end_tail, end_col);
+                    let total_lines = pty.driver.total_lines();
+
+                    let mut msg = Vec::with_capacity(13 + text.len());
+                    msg.push(S2C_TEXT);
+                    msg.extend_from_slice(&nonce.to_le_bytes());
+                    msg.extend_from_slice(&pid.to_le_bytes());
+                    msg.extend_from_slice(&total_lines.to_le_bytes());
+                    msg.extend_from_slice(&start_tail.to_le_bytes());
                     msg.extend_from_slice(text.as_bytes());
                     if let Some(client) = sess.clients.get(&client_id) {
                         let _ = client.tx.try_send(msg);

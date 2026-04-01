@@ -67,6 +67,13 @@ pub const CREATE2_HAS_COMMAND: u8 = 1 << 1;
 pub const C2S_READ: u8 = 0x19;
 pub const READ_ANSI: u8 = 1 << 0;
 pub const READ_TAIL: u8 = 1 << 1;
+/// Copy text from a range of absolute row/col positions in scrollback + viewport:
+/// [0x1B][nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]
+/// start_tail/end_tail: physical row distance from the bottom (0 = last row).
+/// start is the earlier position (closer to top), so start_tail >= end_tail.
+/// flags: reserved (0 for now).
+/// Server responds with S2C_TEXT using the same nonce.
+pub const C2S_COPY_RANGE: u8 = 0x1B;
 /// Send a signal to a PTY's session leader: [0x1A][pty_id:2][signal:4]
 /// signal is a raw libc signal number (e.g. SIGTERM=15, SIGKILL=9).
 pub const C2S_KILL: u8 = 0x1A;
@@ -99,6 +106,7 @@ pub const S2C_TEXT: u8 = 0x0A;
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;
 pub const FEATURE_RESIZE_BATCH: u32 = 1 << 2;
+pub const FEATURE_COPY_RANGE: u32 = 1 << 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -1572,6 +1580,27 @@ pub fn msg_read(nonce: u16, pty_id: u16, offset: u32, limit: u32, flags: u8) -> 
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&offset.to_le_bytes());
     msg.extend_from_slice(&limit.to_le_bytes());
+    msg.push(flags);
+    msg
+}
+
+pub fn msg_copy_range(
+    nonce: u16,
+    pty_id: u16,
+    start_tail: u32,
+    start_col: u16,
+    end_tail: u32,
+    end_col: u16,
+    flags: u8,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(18);
+    msg.push(C2S_COPY_RANGE);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&start_tail.to_le_bytes());
+    msg.extend_from_slice(&start_col.to_le_bytes());
+    msg.extend_from_slice(&end_tail.to_le_bytes());
+    msg.extend_from_slice(&end_col.to_le_bytes());
     msg.push(flags);
     msg
 }

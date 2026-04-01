@@ -500,6 +500,10 @@ impl TerminalDriver {
         self.modes.synced_output
     }
 
+    pub fn total_lines(&self) -> u32 {
+        self.term.grid().total_lines() as u32
+    }
+
     pub fn cursor_position(&self) -> (u16, u16) {
         let cursor = self.term.grid().cursor.point;
         (cursor.line.0 as u16, cursor.column.0 as u16)
@@ -537,6 +541,73 @@ impl TerminalDriver {
         let mut frame = self.build_frame(offset, rows as usize, cols as usize, 0, 0, 0);
         frame.set_scrollback_lines(scrollback_lines.min(u32::MAX as usize) as u32);
         frame
+    }
+
+    pub fn get_text_range(
+        &self,
+        start_tail: u32,
+        start_col: u16,
+        end_tail: u32,
+        end_col: u16,
+    ) -> String {
+        let grid = self.term.grid();
+        let total = grid.total_lines();
+        let screen = grid.screen_lines();
+        let history = total.saturating_sub(screen);
+        let cols = grid.columns();
+
+        let last_line = Line(screen as i32 - 1);
+        let tail_to_line = |tail: u32| -> Line {
+            Line(last_line.0 - tail as i32)
+        };
+
+        let start_line = tail_to_line(start_tail);
+        let end_line = tail_to_line(end_tail);
+
+        let min_line = -(history as i32);
+
+        let mut result = String::new();
+        let mut line_i = start_line.0.max(min_line);
+        let end_i = end_line.0.min(last_line.0);
+
+        while line_i <= end_i {
+            let line_idx = Line(line_i);
+            let grid_row = &grid[line_idx];
+            let c0 = if line_i == start_line.0 {
+                (start_col as usize).min(cols.saturating_sub(1))
+            } else {
+                0
+            };
+            let c1 = if line_i == end_line.0 {
+                (end_col as usize).min(cols.saturating_sub(1))
+            } else {
+                cols.saturating_sub(1)
+            };
+
+            let mut line_text = String::new();
+            for col_idx in c0..=c1 {
+                let cell = &grid_row[Column(col_idx)];
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                line_text.push(c);
+                for &zw in cell.zerowidth().into_iter().flatten() {
+                    line_text.push(zw);
+                }
+            }
+            result.push_str(line_text.trim_end());
+
+            let is_wrapped = grid_row
+                .last()
+                .is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE));
+            if line_i < end_i && !is_wrapped {
+                result.push('\n');
+            }
+
+            line_i += 1;
+        }
+        result
     }
 
     pub fn search_result(&self, query: &str) -> Option<SearchResult> {

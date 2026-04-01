@@ -97,6 +97,7 @@ export interface BlitConnectionSnapshot {
   status: ConnectionStatus;
   ready: boolean;
   supportsRestart: boolean;
+  supportsCopyRange: boolean;
   retryCount: number;
   /** Non-null when the last connection attempt failed with an explicit error message. */
   error: string | null;
@@ -172,6 +173,7 @@ export const C2S_CREATE_AT = 0x16;
 export const C2S_CREATE_N = 0x17;
 export const C2S_CREATE2 = 0x18;
 export const C2S_KILL = 0x1a;
+export const C2S_COPY_RANGE = 0x1b;
 export const CREATE2_HAS_SRC_PTY = 1 << 0;
 export const CREATE2_HAS_COMMAND = 1 << 1;
 
@@ -185,8 +187,10 @@ export const S2C_SEARCH_RESULTS = 0x05;
 export const S2C_CREATED_N = 0x06;
 export const S2C_HELLO = 0x07;
 export const S2C_EXITED = 0x08;
+export const S2C_TEXT = 0x0a;
 
 export const PROTOCOL_VERSION = 1;
 export const FEATURE_CREATE_NONCE = 1 << 0;
 export const FEATURE_RESTART = 1 << 1;
 export const FEATURE_RESIZE_BATCH = 1 << 2;
+export const FEATURE_COPY_RANGE = 1 << 3;

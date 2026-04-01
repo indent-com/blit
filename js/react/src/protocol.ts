@@ -13,6 +13,7 @@ import {
   C2S_SUBSCRIBE,
   C2S_UNSUBSCRIBE,
   C2S_SEARCH,
+  C2S_COPY_RANGE,
   C2S_CREATE2,
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
@@ -249,5 +250,26 @@ export function buildKillMessage(ptyId: number, signal: number): Uint8Array {
   msg[2] = (ptyId >> 8) & 0xff;
   const view = new DataView(msg.buffer);
   view.setInt32(3, signal, true);
+  return msg;
+}
+
+export function buildCopyRangeMessage(
+  nonce: number,
+  ptyId: number,
+  startTail: number,
+  startCol: number,
+  endTail: number,
+  endCol: number,
+): Uint8Array {
+  const msg = new Uint8Array(18);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_COPY_RANGE;
+  v.setUint16(1, nonce, true);
+  v.setUint16(3, ptyId, true);
+  v.setUint32(5, startTail, true);
+  v.setUint16(9, startCol, true);
+  v.setUint32(11, endTail, true);
+  v.setUint16(15, endCol, true);
+  msg[17] = 0;
   return msg;
 }
