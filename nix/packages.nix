@@ -222,11 +222,6 @@
           );
           passwd = pkgs.writeTextDir "etc/passwd" "blit:x:1000:1000:blit:/home/blit:/bin/fish\n";
           group = pkgs.writeTextDir "etc/group" "blit:x:1000:\n";
-          homeDir = pkgs.runCommand "home-blit" {} ''
-            mkdir -p $out/home/blit $out/tmp
-            chmod 1777 $out/tmp
-            chown 1000:1000 $out/home/blit
-          '';
         in
         pkgs.dockerTools.buildLayeredImage {
           name = "blit-demo";
@@ -246,8 +241,12 @@
             welcomeFile
             passwd
             group
-            homeDir
           ];
+          fakeRootCommands = ''
+            mkdir -p ./home/blit ./tmp
+            chown 1000:1000 ./home/blit
+            chmod 1777 ./tmp
+          '';
           config = {
             Env = [
               "SHELL=/bin/fish"
