@@ -49,7 +49,7 @@ export class WebSocketTransport implements BlitTransport {
 
   send(data: Uint8Array): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(data);
+      this.ws.send(data as Uint8Array<ArrayBuffer>);
     }
   }
 

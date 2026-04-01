@@ -152,11 +152,11 @@ pub async fn handle_peer(
                                         eprintln!("blit-server socket write failed");
                                         return Ok(());
                                     }
-                                    if !payload.is_empty() {
-                                        if conn.write_all(payload).await.is_err() {
-                                            eprintln!("blit-server socket write failed");
-                                            return Ok(());
-                                        }
+                                    if !payload.is_empty()
+                                        && conn.write_all(payload).await.is_err()
+                                    {
+                                        eprintln!("blit-server socket write failed");
+                                        return Ok(());
                                     }
                                 }
                             }
@@ -265,7 +265,7 @@ pub async fn handle_peer(
                     Some(data) => {
                         if let Some(candidate) = data.get("candidate") {
                             if let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
-                                let _ = rtc.add_remote_candidate(c);
+                                rtc.add_remote_candidate(c);
                             }
                         }
                     }

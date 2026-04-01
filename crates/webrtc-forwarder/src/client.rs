@@ -98,15 +98,12 @@ pub async fn connect(
         let (stun_servers, turn_servers) = ice::collect_servers(config);
 
         for stun_addr in stun_servers.iter().take(1) {
-            match turn::stun_binding(*stun_addr, &tokio_udp).await {
-                Ok(srflx) => {
-                    rtc.add_local_candidate(
-                        Candidate::server_reflexive(srflx, local_addr, "udp")
-                            .expect("valid candidate"),
-                    );
-                    break;
-                }
-                Err(_) => {}
+            if let Ok(srflx) = turn::stun_binding(*stun_addr, &tokio_udp).await {
+                rtc.add_local_candidate(
+                    Candidate::server_reflexive(srflx, local_addr, "udp")
+                        .expect("valid candidate"),
+                );
+                break;
             }
         }
 
@@ -122,16 +119,13 @@ pub async fn connect(
                     .await
                 }
             };
-            match result {
-                Ok(r) => {
-                    rtc.add_local_candidate(
-                        Candidate::relayed(r.relay_addr, local_addr, "udp")
-                            .expect("valid candidate"),
-                    );
-                    relay = Some(r);
-                    break;
-                }
-                Err(_) => {}
+            if let Ok(r) = result {
+                rtc.add_local_candidate(
+                    Candidate::relayed(r.relay_addr, local_addr, "udp")
+                        .expect("valid candidate"),
+                );
+                relay = Some(r);
+                break;
             }
         }
     }
@@ -177,7 +171,7 @@ pub async fn connect(
     for data in signal_rx_buf.drain(..) {
         if let Some(candidate) = data.get("candidate") {
             if let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
-                let _ = rtc.add_remote_candidate(c);
+                rtc.add_remote_candidate(c);
             }
         }
     }
@@ -207,6 +201,7 @@ pub async fn connect(
     Ok(app_half)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     mut rtc: Rtc,
     tokio_udp: tokio::net::UdpSocket,
@@ -362,7 +357,7 @@ async fn drive(
                                 if let Some(data) = m.data {
                                     if let Some(candidate) = data.get("candidate") {
                                         if let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
-                                            let _ = rtc.add_remote_candidate(c);
+                                            rtc.add_remote_candidate(c);
                                         }
                                     }
                                 }

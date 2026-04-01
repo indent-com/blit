@@ -2,7 +2,7 @@ use hmac::{Hmac, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use sha1::Sha1;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::io::{AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -129,7 +129,7 @@ impl StunWriter {
         self.attrs.extend_from_slice(&(value.len() as u16).to_be_bytes());
         self.attrs.extend_from_slice(value);
         let pad = (4 - (value.len() % 4)) % 4;
-        self.attrs.extend(std::iter::repeat(0).take(pad));
+        self.attrs.extend(std::iter::repeat_n(0, pad));
     }
 
     fn build(self) -> Vec<u8> {
@@ -178,6 +178,7 @@ fn parse_attrs(data: &[u8]) -> Vec<(u16, Vec<u8>)> {
     attrs
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_stun(data: &[u8]) -> Option<(u16, [u8; 12], Vec<(u16, Vec<u8>)>)> {
     if data.len() < 20 {
         return None;
@@ -405,6 +406,7 @@ async fn udp_refresh(
     Err("TURN refresh failed".into())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn udp_relay_task(
     socket: UdpSocket,
     server: SocketAddr,
@@ -428,15 +430,14 @@ async fn udp_relay_task(
             msg = send_rx.recv() => {
                 match msg {
                     Some((peer_addr, data)) => {
-                        if !permitted.contains(&peer_addr.ip()) {
-                            if udp_create_permission(
+                        if !permitted.contains(&peer_addr.ip())
+                            && udp_create_permission(
                                 &socket, server, peer_addr, &nonce, &realm, &key, &username,
                             )
                             .await
                             .is_ok()
-                            {
-                                permitted.insert(peer_addr.ip());
-                            }
+                        {
+                            permitted.insert(peer_addr.ip());
                         }
                         let indication = build_send_indication(peer_addr, &data);
                         let _ = socket.send_to(&indication, server).await;
@@ -470,7 +471,7 @@ async fn udp_relay_task(
 
 enum TcpStream {
     Plain(tokio::net::TcpStream),
-    Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
 impl TcpStream {
@@ -654,6 +655,7 @@ async fn tcp_refresh(
     Err("TURN refresh failed".into())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tcp_relay_task(
     mut stream: TcpStream,
     _relay_addr: SocketAddr,
@@ -675,15 +677,14 @@ async fn tcp_relay_task(
             msg = send_rx.recv() => {
                 match msg {
                     Some((peer_addr, data)) => {
-                        if !permitted.contains(&peer_addr.ip()) {
-                            if tcp_create_permission(
+                        if !permitted.contains(&peer_addr.ip())
+                            && tcp_create_permission(
                                 &mut stream, peer_addr, &nonce, &realm, &key, &username,
                             )
                             .await
                             .is_ok()
-                            {
-                                permitted.insert(peer_addr.ip());
-                            }
+                        {
+                            permitted.insert(peer_addr.ip());
                         }
                         let indication = build_send_indication(peer_addr, &data);
                         if stream.write_all(&indication).await.is_err() {
@@ -773,7 +774,7 @@ impl TurnRelay {
             let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
             let server_name = rustls::pki_types::ServerName::try_from(hostname.to_owned())?;
             let tls_stream = connector.connect(server_name, tcp).await?;
-            TcpStream::Tls(tls_stream)
+            TcpStream::Tls(Box::new(tls_stream))
         } else {
             TcpStream::Plain(tcp)
         };
