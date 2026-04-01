@@ -15,8 +15,6 @@ RUN apk add --no-cache \
     htop vim git jq wget tree file
 COPY --from=build /src/target/release/blit-server /usr/local/bin/
 COPY --from=build /src/target/release/blit-gateway /usr/local/bin/
-RUN curl -fsSL https://gist.githubusercontent.com/pcarrier/7e23654363be3cd134e28803a827ca49/raw -o /etc/blit-banner.txt
-COPY config/fish/config.fish /etc/fish/config.fish
 ENV SHELL=/usr/bin/fish
 EXPOSE 3264
 ENTRYPOINT ["sh", "-c", "blit-server & exec blit-gateway"]
