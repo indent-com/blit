@@ -26,6 +26,7 @@ pub struct Config {
     pub scrollback: usize,
     pub socket_path: String,
     pub fd_channel: Option<RawFd>,
+    pub verbose: bool,
 }
 
 fn pty_write_all(fd: libc::c_int, mut data: &[u8]) {
@@ -1459,9 +1460,7 @@ async fn cleanup_pty(pty_id: u16, state: &AppState) {
             return;
         }
         pty.exited = true;
-        // Reset mouse mode etc. so the client stops sending mouse events
-        // to the now-dead shell (e.g. mpv exits without disabling ?1003).
-        pty.driver.reset_modes();
+
         unsafe {
             libc::kill(pty.child_pid, libc::SIGHUP);
             libc::close(pty.master_fd);
@@ -1638,7 +1637,7 @@ fn recv_fd(channel: RawFd) -> RecvFdResult {
     }
 }
 
-fn bind_socket(sock_path: &str) -> UnixListener {
+fn bind_socket(sock_path: &str, verbose: bool) -> UnixListener {
     let _ = std::fs::remove_file(sock_path);
     let listener = UnixListener::bind(sock_path).unwrap_or_else(|e| {
         eprintln!("blit-server: cannot bind to {sock_path}: {e}");
@@ -1647,7 +1646,9 @@ fn bind_socket(sock_path: &str) -> UnixListener {
     if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)) {
         eprintln!("blit-server: warning: cannot set socket permissions: {e}");
     }
-    eprintln!("listening on {sock_path}");
+    if verbose {
+        eprintln!("listening on {sock_path}");
+    }
     listener
 }
 
@@ -1691,7 +1692,9 @@ pub async fn run(config: Config) {
 
     if let Some(channel_fd) = state.0.fd_channel {
         use std::os::unix::io::FromRawFd;
-        eprintln!("accepting clients via fd-channel (fd {channel_fd})");
+        if state.0.verbose {
+            eprintln!("accepting clients via fd-channel (fd {channel_fd})");
+        }
         let channel = unsafe { std::os::unix::net::UnixStream::from_raw_fd(channel_fd) };
         channel.set_nonblocking(true).unwrap();
         let async_channel = AsyncFd::new(channel).unwrap();
@@ -1721,7 +1724,9 @@ pub async fn run(config: Config) {
                 }
             }
         }
-        eprintln!("fd-channel closed, shutting down");
+        if state.0.verbose {
+            eprintln!("fd-channel closed, shutting down");
+        }
         return;
     }
 
@@ -1733,14 +1738,18 @@ pub async fn run(config: Config) {
             use std::os::unix::io::FromRawFd;
             let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
             std_listener.set_nonblocking(true).unwrap();
-            eprintln!("using socket activation (fd 3)");
+            if state.0.verbose {
+                eprintln!("using socket activation (fd 3)");
+            }
             UnixListener::from_std(std_listener).unwrap()
         } else {
-            eprintln!("LISTEN_FDS={fds}, expected 1; falling back to bind");
-            bind_socket(&state.0.socket_path)
+            if state.0.verbose {
+                eprintln!("LISTEN_FDS={fds}, expected 1; falling back to bind");
+            }
+            bind_socket(&state.0.socket_path, state.0.verbose)
         }
     } else {
-        bind_socket(&state.0.socket_path)
+        bind_socket(&state.0.socket_path, state.0.verbose)
     };
 
     loop {
@@ -2226,7 +2235,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
         }
     }
 
-    eprintln!("client connected");
+    if state.0.verbose {
+        eprintln!("client connected");
+    }
 
     while let Some(data) = read_frame(&mut reader).await {
         if data.is_empty() {
@@ -2306,11 +2317,13 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 }
                 out
             };
-            if do_log {
+            if do_log && config.verbose {
                 eprintln!(
                     "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={}",
                     sess.tick_fires, sess.tick_snaps,
                 );
+            }
+            if do_log {
                 sess.tick_fires = 0;
                 sess.tick_snaps = 0;
             }
@@ -2834,6 +2847,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         pty.child_pid = child;
                         pty.reader_handle = reader;
                         pty.byte_rx = byte_rx;
+                        pty.driver.reset_modes();
                         pty.exited = false;
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
                         pty.lflag_cache = pty_lflag(master);
@@ -2989,7 +3003,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
         }
     }
     sender.abort();
-    eprintln!("client disconnected");
+    if state.0.verbose {
+        eprintln!("client disconnected");
+    }
 }
 
 #[cfg(test)]

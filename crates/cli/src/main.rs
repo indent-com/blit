@@ -198,7 +198,7 @@ enum Command {
 
     /// Share a terminal session via WebRTC
     Share {
-        /// Passphrase for the session (default: random UUID)
+        /// Passphrase for the session (default: random)
         #[arg(long, env = "BLIT_PASSPHRASE")]
         passphrase: Option<String>,
 
@@ -251,6 +251,7 @@ async fn main() {
                         .ok()
                         .and_then(|s| s.parse().ok())
                 }),
+                verbose: false,
             };
             blit_server::run(config).await;
         }
@@ -266,7 +267,16 @@ async fn main() {
             verbose,
         }) => {
             let signal_url = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
-            let passphrase = passphrase.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let passphrase = passphrase.unwrap_or_else(|| {
+                use rand::RngExt as _;
+                const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+                let mut rng = rand::rng();
+                let bytes: [u8; 26] = rng.random();
+                bytes
+                    .iter()
+                    .map(|b| ALPHABET[(b & 0x1f) as usize] as char)
+                    .collect()
+            });
 
             let sock_path = cli.connect.socket.clone().unwrap_or_else(|| {
                 blit_server::default_socket_path()

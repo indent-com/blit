@@ -759,23 +759,17 @@ impl TerminalDriver {
             }
 
             let grid_row = &grid[line_idx];
+            let row_start = row * cols;
+
             for col_idx in 0..cols {
                 let cell = &grid_row[Column(col_idx)];
-                let flat = row * cols + col_idx;
+                let flat = row_start + col_idx;
                 encode_cell(
                     cell,
                     &mut cells[flat * CELL_SIZE..][..CELL_SIZE],
                     flat,
                     &mut overflow,
                 );
-
-                // Mark wide char spacers
-                if cell.flags.contains(CellFlags::WIDE_CHAR) && col_idx + 1 < cols {
-                    let spacer_flat = row * cols + col_idx + 1;
-                    let buf = &mut cells[spacer_flat * CELL_SIZE..][..CELL_SIZE];
-                    buf.fill(0);
-                    buf[1] |= 1 << 2; // continuation marker
-                }
             }
 
             // Line wrapping
@@ -1085,5 +1079,43 @@ mod integration_tests {
             "first cell should have content, got len={content_len}, f1={f1:#010b}"
         );
         assert_eq!(cells[8], b'H', "first cell content should be 'H'");
+    }
+
+    #[test]
+    fn welcome_emoji_width() {
+        let mut welcome: Vec<u8> = Vec::new();
+        welcome.extend_from_slice("╚═════╝ ╚══════╝╚═╝   ╚═╝ https://blit.sh\r\n".as_bytes());
+        welcome.extend_from_slice("          with \u{2764}\u{FE0F} from https://indent.com".as_bytes());
+
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        driver.process(&welcome);
+        let frame = driver.snapshot(true, true);
+
+        fn last_content_col(frame: &blit_remote::FrameState, row: u16, cols: u16) -> u16 {
+            let mut last = 0;
+            for col in 0..cols {
+                let content = frame.cell_content(row, col);
+                if content.trim() != "" {
+                    last = col;
+                }
+            }
+            last
+        }
+
+        let cols = frame.cols();
+        let line6_last = last_content_col(&frame, 0, cols);
+        let line7_last = last_content_col(&frame, 1, cols);
+
+        assert_eq!(
+            line6_last, line7_last,
+            "last content column should match: line6={line6_last}, line7={line7_last}"
+        );
+
+        let heart_col = 15usize;
+        let f1 = frame.cells()[(1 * cols as usize + heart_col) * CELL_SIZE + 1];
+        assert!(
+            f1 & (1 << 1) != 0,
+            "heart cell at col {heart_col} should have WIDE_CHAR flag, f1={f1:#010b}"
+        );
     }
 }

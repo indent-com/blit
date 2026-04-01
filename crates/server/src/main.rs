@@ -22,6 +22,7 @@ fn parse_config() -> blit_server::Config {
     let mut fd_channel: Option<RawFd> = std::env::var("BLIT_FD_CHANNEL")
         .ok()
         .map(|s| parse_fd_value(&s, "BLIT_FD_CHANNEL"));
+    let mut verbose = std::env::var("BLIT_VERBOSE").ok().map(|v| v == "1").unwrap_or(false);
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -32,6 +33,7 @@ fn parse_config() -> blit_server::Config {
             println!(
                 "  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)"
             );
+            println!("  --verbose, -v            Enable verbose logging (or set BLIT_VERBOSE=1)");
             println!("  --version, -V            Print version");
             std::process::exit(0);
         }
@@ -83,6 +85,11 @@ fn parse_config() -> blit_server::Config {
             continue;
         }
 
+        if arg == "--verbose" || arg == "-v" {
+            verbose = true;
+            continue;
+        }
+
         if arg.starts_with('-') {
             eprintln!("unrecognized argument: {arg}");
             eprintln!("{}", usage());
@@ -102,6 +109,7 @@ fn parse_config() -> blit_server::Config {
         scrollback,
         socket_path: socket_path.unwrap_or_else(blit_server::default_socket_path),
         fd_channel,
+        verbose,
     }
 }
 

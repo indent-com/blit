@@ -13,7 +13,7 @@ processes:
       failure_threshold: 300
 
   server:
-    command: cargo watch -w crates/server/src -w crates/remote/src -w crates/alacritty-driver/src -x "run -p blit-server --release -- --socket /tmp/blit-dev.sock"
+    command: cargo watch -w crates/server/src -w crates/remote/src -w crates/alacritty-driver/src -x "run -p blit-server --release -- --verbose --socket /tmp/blit-dev.sock"
     availability:
       restart: always
 

@@ -1167,7 +1167,7 @@ export function BlitTerminal({
         selecting = true;
         selectingRef.current = true;
         // Don't freeze yet — freeze on first drag movement so clicks
-        // don't pause video players (mpv -vo tct, etc.)
+        // don't pause full-screen terminal apps.
         const cell = mouseToCell(e);
         const detail = Math.min(e.detail, 3) as 1 | 2 | 3;
         selGranularity = detail;
@@ -1224,7 +1224,7 @@ export function BlitTerminal({
       }
       if (selecting) {
         // Freeze on first drag so selection text is stable, but not
-        // on mousedown alone (which would pause video players).
+        // on mousedown alone (which would pause full-screen terminal apps).
         if (sessionId !== null && blitConn && !blitConn.isFrozen(sessionId))
           blitConn.freeze(sessionId);
         const cell = mouseToCell(e);

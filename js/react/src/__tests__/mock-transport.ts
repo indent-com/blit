@@ -104,17 +104,20 @@ export class MockTransport implements BlitTransport {
     this.push(new Uint8Array([S2C_CLOSED, ptyId & 0xff, (ptyId >> 8) & 0xff]));
   }
 
-  pushList(entries: { ptyId: number; tag?: string }[]) {
+  pushList(entries: { ptyId: number; tag?: string; command?: string }[]) {
     const parts: number[] = [
       S2C_LIST,
       entries.length & 0xff,
       (entries.length >> 8) & 0xff,
     ];
-    for (const { ptyId, tag = "" } of entries) {
+    for (const { ptyId, tag = "", command = "" } of entries) {
       const tagBytes = new TextEncoder().encode(tag);
+      const cmdBytes = new TextEncoder().encode(command);
       parts.push(ptyId & 0xff, (ptyId >> 8) & 0xff);
       parts.push(tagBytes.length & 0xff, (tagBytes.length >> 8) & 0xff);
       for (const b of tagBytes) parts.push(b);
+      parts.push(cmdBytes.length & 0xff, (cmdBytes.length >> 8) & 0xff);
+      for (const b of cmdBytes) parts.push(b);
     }
     this.push(new Uint8Array(parts));
   }

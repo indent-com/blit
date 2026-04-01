@@ -119,9 +119,13 @@ describe("MockTransport", () => {
         "ab",
       );
       off += 6;
+      expect(bytes[off] | (bytes[off + 1] << 8)).toBe(0);
+      off += 2;
 
       expect(bytes[off] | (bytes[off + 1] << 8)).toBe(2);
       expect(bytes[off + 2] | (bytes[off + 3] << 8)).toBe(0);
+      off += 4;
+      expect(bytes[off] | (bytes[off + 1] << 8)).toBe(0);
     });
   });
 

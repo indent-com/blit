@@ -107,8 +107,8 @@ describe("wire format parsing", () => {
   describe("S2C_LIST", () => {
     it("parses multiple entries with tags", () => {
       // count=2
-      // entry 1: pty_id=1, tag_len=2, tag="ab"
-      // entry 2: pty_id=2, tag_len=0
+      // entry 1: pty_id=1, tag_len=2, tag="ab", cmd_len=0
+      // entry 2: pty_id=2, tag_len=0, cmd_len=0
       transport.push(
         new Uint8Array([
           S2C_LIST,
@@ -120,7 +120,11 @@ describe("wire format parsing", () => {
           0x00,
           0x61,
           0x62,
+          0x00,
+          0x00,
           0x02,
+          0x00,
+          0x00,
           0x00,
           0x00,
           0x00,
@@ -149,6 +153,8 @@ describe("wire format parsing", () => {
           0x00,
           0x00,
           0x00,
+          0x00,
+          0x00,
           // second entry missing
         ]),
       );
@@ -160,7 +166,7 @@ describe("wire format parsing", () => {
     it("handles long tags", () => {
       const tag = "x".repeat(300);
       const tagBytes = new TextEncoder().encode(tag);
-      const msg = new Uint8Array(3 + 4 + tagBytes.length);
+      const msg = new Uint8Array(3 + 4 + tagBytes.length + 2);
       msg[0] = S2C_LIST;
       msg[1] = 1;
       msg[2] = 0; // count=1
@@ -169,6 +175,8 @@ describe("wire format parsing", () => {
       msg[5] = tagBytes.length & 0xff;
       msg[6] = (tagBytes.length >> 8) & 0xff;
       msg.set(tagBytes, 7);
+      msg[7 + tagBytes.length] = 0x00; // cmd_len low
+      msg[7 + tagBytes.length + 1] = 0x00; // cmd_len high
       transport.push(msg);
       expect(conn.getSnapshot().sessions[0].tag).toBe(tag);
     });

@@ -171,6 +171,7 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
             .unwrap_or(10_000),
         socket_path: socket_path.to_string(),
         fd_channel: None,
+        verbose: false,
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {

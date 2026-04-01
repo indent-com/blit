@@ -665,6 +665,7 @@ mod tests {
                 let tag_bytes = pty.tag.as_bytes();
                 list_msg.extend_from_slice(&(tag_bytes.len() as u16).to_le_bytes());
                 list_msg.extend_from_slice(tag_bytes);
+                list_msg.extend_from_slice(&0u16.to_le_bytes());
             }
             write_frame(&mut self.writer, &list_msg).await;
 

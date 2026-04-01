@@ -1,0 +1,25 @@
+name: Publish demo image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Publish
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            nix run .#publish-demo -- "${GITHUB_REF#refs/tags/v}"
+          else
+            nix run .#publish-demo
+          fi

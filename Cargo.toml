@@ -26,6 +26,9 @@ blit-webserver = { version = "0.16.3", path = "crates/webserver" }
 blit-server = { version = "0.16.3", path = "crates/server" }
 blit-webrtc-forwarder = { version = "0.16.3", path = "crates/webrtc-forwarder" }
 
+[patch.crates-io]
+alacritty_terminal = { git = "https://github.com/indent-com/alacritty.git", branch = "blit/emoji-width-fix" }
+
 [profile.release]
 opt-level = 3
 lto = true

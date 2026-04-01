@@ -2458,12 +2458,14 @@ mod tests {
     fn parse_list_with_tags() {
         // 2 entries: id=1 tag="ab", id=2 tag=""
         let mut wire = vec![S2C_LIST, 0x02, 0x00];
-        // entry 1: id=1, tag_len=2, tag="ab"
+        // entry 1: id=1, tag_len=2, tag="ab", cmd_len=0
         wire.extend_from_slice(&1u16.to_le_bytes());
         wire.extend_from_slice(&2u16.to_le_bytes());
         wire.extend_from_slice(b"ab");
-        // entry 2: id=2, tag_len=0
+        wire.extend_from_slice(&0u16.to_le_bytes());
+        // entry 2: id=2, tag_len=0, cmd_len=0
         wire.extend_from_slice(&2u16.to_le_bytes());
+        wire.extend_from_slice(&0u16.to_le_bytes());
         wire.extend_from_slice(&0u16.to_le_bytes());
 
         let msg = parse_server_msg(&wire).unwrap();

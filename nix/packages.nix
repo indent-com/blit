@@ -202,12 +202,83 @@
                 blit-webrtc-forwarder-static
                 manPages webAppDist rustToolchain;
       };
+
+      demoImage = let
+        fishConfig = pkgs.writeTextDir "home/blit/.config/fish/config.fish" ''
+          function fish_greeting
+              cat /etc/blit-welcome 2>/dev/null
+          end
+        '';
+        welcomeFile = pkgs.writeTextDir "etc/blit-welcome" (
+          if builtins.pathExists ../welcome
+          then builtins.readFile ../welcome
+          else ""
+        );
+        passwd = pkgs.writeTextDir "etc/passwd" "blit:x:1000:1000:blit:/home/blit:/bin/fish\n";
+        group = pkgs.writeTextDir "etc/group" "blit:x:1000:\n";
+      in
+      pkgs.dockerTools.buildLayeredImage {
+        name = "grab/blit-demo";
+        tag = "latest";
+        maxLayers = 2;
+        contents = [
+          pkgs.dockerTools.caCertificates
+          pkgs.dockerTools.binSh
+          pkgs.busybox
+          pkgs.fish
+          pkgs.htop
+          pkgs.neovim
+          pkgs.git
+          pkgs.curl
+          pkgs.jq
+          pkgs.tree
+          pkgs.ncdu
+          blit-cli
+          fishConfig
+          welcomeFile
+          passwd
+          group
+        ];
+        fakeRootCommands = ''
+          mkdir -p ./home/blit ./tmp
+          chown -R 1000:1000 ./home/blit
+          chmod 1777 ./tmp
+        '';
+        config = {
+          Env = [
+            "SHELL=/bin/fish"
+            "USER=blit"
+            "HOME=/home/blit"
+            "TERM=xterm-256color"
+          ];
+          User = "1000:1000";
+          WorkingDir = "/home/blit";
+          ExposedPorts = { "3264/tcp" = {}; };
+          Entrypoint = [ "blit" "share" ];
+        };
+      };
+
+      publishDemo = pkgs.writeShellApplication {
+        name = "publish-demo";
+        runtimeInputs = [ pkgs.skopeo ];
+        text = let
+          policy = pkgs.writeText "containers-policy.json" ''{"default":[{"type":"insecureAcceptAnything"}]}'';
+        in ''
+          skopeo --policy ${policy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
+          skopeo --policy ${policy} copy "docker-archive:${demoImage}" docker://docker.io/grab/blit-demo:latest
+          if [[ "''${1:-}" != "" ]]; then
+            skopeo --policy ${policy} copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:$1"
+          fi
+        '';
+      };
     in
     {
       packages = {
         blit = blit-cli;
         inherit blit-server blit-cli blit-gateway blit-webrtc-forwarder;
         inherit blit-server-static blit-cli-static blit-gateway-static blit-webrtc-forwarder-static;
+        demo-image = demoImage;
+        publish-demo = publishDemo;
         default = blit-cli;
       } // tasks;
 
