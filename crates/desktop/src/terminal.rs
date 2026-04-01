@@ -10,6 +10,7 @@ pub struct Terminal {
     pub glyph_verts: Vec<f32>,
 }
 
+#[allow(dead_code)]
 pub struct Selection {
     pub start_row: u16,
     pub start_col: u16,
@@ -39,6 +40,7 @@ impl Terminal {
         self.state.rows()
     }
 
+    #[allow(dead_code)]
     pub fn cols(&self) -> u16 {
         self.state.cols()
     }
@@ -67,6 +69,7 @@ impl Terminal {
         self.state.frame().scrollback_lines()
     }
 
+    #[allow(dead_code)]
     pub fn get_text(&self, sr: u16, sc: u16, er: u16, ec: u16) -> String {
         self.state.get_text(sr, sc, er, ec)
     }
@@ -124,12 +127,12 @@ impl Terminal {
 
                 let mut fg = resolve_color(palette, fg_type, fg_r, fg_g, fg_b, true, dim);
                 let mut bg = resolve_color(palette, bg_type, bg_r, bg_g, bg_b, false, false);
-                let mut fg_is_default = fg_type == 0;
+                let mut _fg_is_default = fg_type == 0;
                 let mut bg_is_default = bg_type == 0;
 
                 if inverse {
                     std::mem::swap(&mut fg, &mut bg);
-                    std::mem::swap(&mut fg_is_default, &mut bg_is_default);
+                    std::mem::swap(&mut _fg_is_default, &mut bg_is_default);
                     bg_is_default = false;
                 }
 
@@ -150,7 +153,7 @@ impl Terminal {
                     }
                 }
 
-                if content_len > 0 && content_len < 7 {
+                if content_len > 0 && content_len <= 4 {
                     let text_bytes = &cells[idx + 8..idx + 8 + content_len as usize];
                     if text_bytes == b" " {
                         continue;
@@ -210,7 +213,7 @@ fn push_rect_quad(verts: &mut Vec<f32>, x1: f32, y1: f32, x2: f32, y2: f32, r: f
     verts.extend_from_slice(&v);
 }
 
-fn push_glyph_quad(
+pub fn push_glyph_quad(
     verts: &mut Vec<f32>,
     x1: f32, y1: f32, x2: f32, y2: f32,
     u1: f32, v1: f32, u2: f32, v2: f32,

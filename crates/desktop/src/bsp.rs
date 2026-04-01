@@ -88,7 +88,7 @@ pub fn assign_sessions<K: Clone + Eq + std::hash::Hash>(
     focused: Option<&K>,
     lru: &[K],
 ) -> HashMap<String, Option<K>> {
-    let mut used = std::collections::HashSet::new();
+    let mut used = std::collections::HashSet::<K>::new();
     let mut assignments = HashMap::new();
     let mut candidates: Vec<&K> = Vec::new();
     if let Some(f) = focused {
@@ -108,9 +108,8 @@ pub fn assign_sessions<K: Clone + Eq + std::hash::Hash>(
         }
         let mut assigned = false;
         for c in &candidates {
-            let key = format!("{:p}", *c as *const K);
-            if !used.contains(&key) {
-                used.insert(key);
+            if !used.contains(*c) {
+                used.insert((*c).clone());
                 assignments.insert(pane.id.clone(), Some((*c).clone()));
                 assigned = true;
                 break;

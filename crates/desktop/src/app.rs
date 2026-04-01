@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,11 +9,9 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
-use crate::atlas::GlyphAtlas;
-use crate::bsp::{self, BspLayout};
 use crate::connection::{Command, ConnectionManager, ConnectionStatus, ServerEvent, SessionKey};
 use crate::input::{self, AppAction};
-use crate::overlay::{self, OverlayKind, PaletteOverlay, FontOverlay, SwitcherOverlay, DisconnectedOverlay};
+use crate::overlay::{self, OverlayKind, SwitcherOverlay};
 use crate::palette::{self, Palette};
 use crate::remotes::RemoteConfig;
 use crate::renderer::Renderer;
@@ -26,14 +24,16 @@ pub struct App {
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
     renderer: Option<Renderer>,
-    atlas: Option<GlyphAtlas>,
-    bsp: Option<BspLayout>,
+    atlas: Option<crate::atlas::GlyphAtlas>,
     sessions: HashMap<SessionKey, Terminal>,
     titles: HashMap<SessionKey, String>,
+    exited: HashSet<SessionKey>,
     connection_mgr: ConnectionManager,
     overlay: Option<OverlayKind>,
     palette: &'static Palette,
+    #[allow(dead_code)]
     font_family: String,
+    #[allow(dead_code)]
     font_size: f32,
     focused: Option<SessionKey>,
     lru: Vec<SessionKey>,
@@ -56,9 +56,9 @@ impl App {
             config: None,
             renderer: None,
             atlas: None,
-            bsp: None,
             sessions: HashMap::new(),
             titles: HashMap::new(),
+            exited: HashSet::new(),
             connection_mgr: ConnectionManager::new(),
             overlay: None,
             palette: &palette::PALETTES[0],
@@ -116,7 +116,7 @@ impl App {
         surface.configure(&device, &config);
 
         let renderer = Renderer::new(&device, format);
-        let atlas = GlyphAtlas::new(&self.font_family, self.font_size);
+        let atlas = crate::atlas::GlyphAtlas::new(&self.font_family, self.font_size);
 
         self.surface = Some(surface);
         self.device = Some(device);
@@ -141,6 +141,14 @@ impl App {
             match event {
                 ServerEvent::StatusChanged(status) => {
                     self.connection_mgr.update_status(&remote, status);
+                    self.needs_redraw = true;
+                }
+                ServerEvent::ReconnectNeeded => {
+                    if let Some(handle) = self.connection_mgr.connections.get(&remote) {
+                        let r = handle.remote.clone();
+                        let hub = self.hub.clone();
+                        self.connection_mgr.connect(r, &hub);
+                    }
                 }
                 ServerEvent::SessionList(sessions) => {
                     for s in sessions {
@@ -153,6 +161,8 @@ impl App {
                         if self.focused.is_none() {
                             self.focused = Some(key.clone());
                             self.connection_mgr.send(&remote, Command::Focus(s.pty_id));
+                            let (rows, cols) = self.terminal_size();
+                            self.connection_mgr.send(&remote, Command::Resize { pty_id: s.pty_id, rows, cols });
                         }
                     }
                     self.needs_redraw = true;
@@ -164,6 +174,8 @@ impl App {
                     self.connection_mgr.send(&remote, Command::Subscribe(pty_id));
                     self.focused = Some(key.clone());
                     self.connection_mgr.send(&remote, Command::Focus(pty_id));
+                    let (rows, cols) = self.terminal_size();
+                    self.connection_mgr.send(&remote, Command::Resize { pty_id, rows, cols });
                     self.push_lru(key);
                     self.needs_redraw = true;
                 }
@@ -171,6 +183,7 @@ impl App {
                     let key = SessionKey { remote: remote.clone(), pty_id };
                     self.sessions.remove(&key);
                     self.titles.remove(&key);
+                    self.exited.remove(&key);
                     self.lru.retain(|k| k != &key);
                     if self.focused.as_ref() == Some(&key) {
                         self.focused = self.lru.first().cloned();
@@ -179,7 +192,7 @@ impl App {
                 }
                 ServerEvent::SessionExited { pty_id, .. } => {
                     let key = SessionKey { remote: remote.clone(), pty_id };
-                    self.titles.entry(key).and_modify(|t| t.push_str(" [exited]"));
+                    self.exited.insert(key);
                     self.needs_redraw = true;
                 }
                 ServerEvent::FrameUpdate { pty_id, payload } => {
@@ -187,11 +200,6 @@ impl App {
                     if let Some(term) = self.sessions.get_mut(&key) {
                         term.feed_frame(&payload);
                     }
-                    self.connection_mgr.send(&remote, Command::Resize {
-                        pty_id,
-                        rows: 0,
-                        cols: 0,
-                    });
                     self.needs_redraw = true;
                 }
                 ServerEvent::TitleChanged { pty_id, title } => {
@@ -319,10 +327,14 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn status_bar_height(&self) -> f32 {
+        self.atlas.as_ref().map(|a| a.cell_height).unwrap_or(20.0)
+    }
+
     fn terminal_size(&self) -> (u16, u16) {
         if let Some(ref atlas) = self.atlas {
             let cols = (self.window_size.width as f32 / atlas.cell_width) as u16;
-            let rows = ((self.window_size.height as f32 - 24.0) / atlas.cell_height) as u16;
+            let rows = ((self.window_size.height as f32 - self.status_bar_height()) / atlas.cell_height) as u16;
             (rows.max(1), cols.max(1))
         } else {
             (24, 80)
@@ -336,33 +348,41 @@ impl App {
         }).collect()
     }
 
+    fn any_connected(&self) -> (bool, bool) {
+        let mut connected = false;
+        let mut connecting = false;
+        for handle in self.connection_mgr.connections.values() {
+            match &handle.status {
+                ConnectionStatus::Connected => connected = true,
+                ConnectionStatus::Connecting => connecting = true,
+                ConnectionStatus::Disconnected(_) => {}
+            }
+        }
+        (connected, connecting)
+    }
+
     fn render(&mut self) {
-        let device = match self.device.as_ref() {
-            Some(d) => d,
-            None => return,
-        };
-        let queue = match self.queue.as_ref() {
-            Some(q) => q,
-            None => return,
-        };
-        let surface = match self.surface.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-        let renderer = match self.renderer.as_mut() {
-            Some(r) => r,
-            None => return,
-        };
-        let atlas = match self.atlas.as_mut() {
-            Some(a) => a,
-            None => return,
-        };
+        if self.device.is_none() || self.queue.is_none() || self.surface.is_none()
+            || self.renderer.is_none() || self.atlas.is_none()
+        {
+            return;
+        }
 
         let now = Instant::now();
         if now.duration_since(self.last_blink).as_millis() > 530 {
             self.blink_visible = !self.blink_visible;
             self.last_blink = now;
         }
+
+        let (rows, cols) = self.terminal_size();
+        let (connected, connecting) = self.any_connected();
+        let focused_name: Option<String> = self.focused.as_ref().and_then(|k| self.titles.get(k)).cloned();
+
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let surface = self.surface.as_ref().unwrap();
+        let renderer = self.renderer.as_mut().unwrap();
+        let atlas = self.atlas.as_mut().unwrap();
 
         renderer.update_resolution(queue, self.window_size.width as f32, self.window_size.height as f32);
 
@@ -387,6 +407,21 @@ impl App {
                 }
             }
         }
+        crate::statusbar::render_status_bar(
+            &mut all_bg,
+            &mut all_glyph,
+            atlas,
+            self.palette,
+            self.window_size.width as f32,
+            self.window_size.height as f32,
+            self.sessions.len(),
+            self.exited.len(),
+            focused_name.as_deref(),
+            cols,
+            rows,
+            connected,
+            connecting,
+        );
 
         renderer.update_atlas(device, queue, atlas);
 
@@ -441,8 +476,6 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        self.process_server_events();
-
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -513,9 +546,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.process_server_events();
-                self.render();
-                if let Some(ref w) = self.window {
-                    w.request_redraw();
+                if self.needs_redraw {
+                    self.render();
+                    self.needs_redraw = false;
+                }
+                let now = Instant::now();
+                if now.duration_since(self.last_blink).as_millis() > 530 {
+                    self.needs_redraw = true;
+                }
+                if self.needs_redraw {
+                    if let Some(ref w) = self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             _ => {}

@@ -1,4 +1,4 @@
-use winit::event::{ElementState, Modifiers};
+use winit::event::ElementState;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 pub enum AppAction {

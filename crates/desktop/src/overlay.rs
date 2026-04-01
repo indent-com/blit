@@ -1,4 +1,3 @@
-use crate::atlas::GlyphAtlas;
 use crate::connection::SessionKey;
 use crate::palette::Palette;
 use crate::terminal;
@@ -201,16 +200,4 @@ pub fn render_overlay_bg(
     verts
 }
 
-pub mod terminal_helpers {
-    pub fn push_rect_quad(verts: &mut Vec<f32>, x1: f32, y1: f32, x2: f32, y2: f32, r: f32, g: f32, b: f32, a: f32) {
-        let v = [
-            x1, y1, r, g, b, a,
-            x2, y1, r, g, b, a,
-            x1, y2, r, g, b, a,
-            x1, y2, r, g, b, a,
-            x2, y1, r, g, b, a,
-            x2, y2, r, g, b, a,
-        ];
-        verts.extend_from_slice(&v);
-    }
-}
+

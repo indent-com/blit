@@ -1,12 +1,15 @@
 mod app;
 mod atlas;
+#[allow(dead_code)]
 mod bsp;
 mod connection;
 mod input;
 mod overlay;
 mod palette;
+#[allow(dead_code)]
 mod remotes;
 mod renderer;
+mod statusbar;
 mod terminal;
 mod transport;
 
@@ -29,6 +32,9 @@ struct Cli {
 }
 
 fn main() {
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let _guard = rt.enter();
+
     let cli = Cli::parse();
     let remotes = load_remotes(cli.config.as_deref());
 

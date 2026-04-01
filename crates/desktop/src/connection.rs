@@ -60,6 +60,7 @@ pub enum ServerEvent {
     TitleChanged { pty_id: u16, title: String },
     SearchResults { request_id: u16, results: Vec<SearchResult> },
     StatusChanged(ConnectionStatus),
+    ReconnectNeeded,
     Ready,
 }
 
@@ -111,6 +112,7 @@ impl ConnectionManager {
         tokio::spawn(connection_task(name, remote_clone, hub, cmd_rx, event_tx));
     }
 
+    #[allow(dead_code)]
     pub fn disconnect(&mut self, name: &str) {
         self.connections.remove(name);
     }
@@ -121,6 +123,7 @@ impl ConnectionManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn send_to_session(&self, key: &SessionKey, cmd: Command) {
         self.send(&key.remote, cmd);
     }
@@ -139,80 +142,69 @@ async fn connection_task(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<(String, ServerEvent)>,
 ) {
-    let mut backoff_ms = 500u64;
-    let max_backoff_ms = 10_000u64;
+    let _ = event_tx.send((name.clone(), ServerEvent::StatusChanged(ConnectionStatus::Connecting)));
 
-    loop {
-        let _ = event_tx.send((name.clone(), ServerEvent::StatusChanged(ConnectionStatus::Connecting)));
+    let transport = match connect_remote(&remote, &hub).await {
+        Ok(t) => {
+            let _ = event_tx.send((name.clone(), ServerEvent::StatusChanged(ConnectionStatus::Connected)));
+            t
+        }
+        Err(e) => {
+            let _ = event_tx.send((
+                name.clone(),
+                ServerEvent::StatusChanged(ConnectionStatus::Disconnected(e)),
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let _ = event_tx.send((name.clone(), ServerEvent::ReconnectNeeded));
+            return;
+        }
+    };
 
-        let transport = match connect_remote(&remote, &hub).await {
-            Ok(t) => {
-                backoff_ms = 500;
-                let _ = event_tx.send((name.clone(), ServerEvent::StatusChanged(ConnectionStatus::Connected)));
-                t
-            }
-            Err(e) => {
-                let _ = event_tx.send((
-                    name.clone(),
-                    ServerEvent::StatusChanged(ConnectionStatus::Disconnected(e)),
-                ));
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 3 / 2).min(max_backoff_ms);
+    let (mut reader, mut writer) = transport.split();
+
+    let display_rate_msg = blit_remote::msg_display_rate(120);
+    let _ = write_frame(&mut writer, &display_rate_msg).await;
+
+    let name_r = name.clone();
+    let event_tx_r = event_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let frame = match read_frame(&mut reader).await {
+                Some(f) => f,
+                None => break,
+            };
+            if frame.is_empty() {
                 continue;
             }
-        };
-
-        let (mut reader, mut writer) = transport.split();
-
-        let display_rate_msg = blit_remote::msg_display_rate(120);
-        let _ = write_frame(&mut writer, &display_rate_msg).await;
-
-        let name_r = name.clone();
-        let event_tx_r = event_tx.clone();
-        let reader_task = tokio::spawn(async move {
-            loop {
-                let frame = match read_frame(&mut reader).await {
-                    Some(f) => f,
-                    None => break,
-                };
-                if frame.is_empty() {
-                    continue;
-                }
-                if let Some(evt) = parse_server_frame(&frame) {
-                    if event_tx_r.send((name_r.clone(), evt)).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-
-        let writer_task = tokio::spawn(async move {
-            while let Some(cmd) = cmd_rx.recv().await {
-                let msg = command_to_bytes(&cmd);
-                if !write_frame(&mut writer, &msg).await {
+            if let Some(evt) = parse_server_frame(&frame) {
+                if event_tx_r.send((name_r.clone(), evt)).is_err() {
                     break;
                 }
             }
-        });
-
-        tokio::select! {
-            _ = reader_task => {},
-            _ = writer_task => {},
         }
+    });
 
-        let _ = event_tx.send((
-            name.clone(),
-            ServerEvent::StatusChanged(ConnectionStatus::Disconnected("connection lost".into())),
-        ));
+    let writer_task = tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            let msg = command_to_bytes(&cmd);
+            if !write_frame(&mut writer, &msg).await {
+                break;
+            }
+        }
+    });
 
-        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 3 / 2).min(max_backoff_ms);
-
-        let (new_tx, new_rx) = mpsc::unbounded_channel::<Command>();
-        cmd_rx = new_rx;
-        let _ = event_tx.send((name.clone(), ServerEvent::StatusChanged(ConnectionStatus::Connecting)));
-        drop(new_tx);
+    tokio::select! {
+        _ = reader_task => {},
+        _ = writer_task => {},
     }
+
+    let _ = event_tx.send((
+        name.clone(),
+        ServerEvent::StatusChanged(ConnectionStatus::Disconnected("connection lost".into())),
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let _ = event_tx.send((name.clone(), ServerEvent::ReconnectNeeded));
 }
 
 fn parse_server_frame(data: &[u8]) -> Option<ServerEvent> {
