@@ -222,6 +222,8 @@
         tag = "latest";
         maxLayers = 2;
         contents = [
+          pkgs.dockerTools.caCertificates
+          pkgs.dockerTools.binSh
           pkgs.busybox
           pkgs.fish
           pkgs.htop
