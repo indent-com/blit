@@ -626,8 +626,8 @@ fn parse_expose_key(data: &[u8]) -> (ExposeAction, usize) {
     }
 }
 
-pub async fn run_console(socket: &Option<String>, tcp: &Option<String>, ssh: &Option<String>) {
-    let transport = match transport::connect(socket, tcp, ssh).await {
+pub async fn run_console(socket: &Option<String>, tcp: &Option<String>, ssh: &Option<String>, share: &Option<String>) {
+    let transport = match transport::connect(socket, tcp, ssh, share).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("blit: {e}");
@@ -641,6 +641,7 @@ pub async fn run_browser(
     socket: &Option<String>,
     tcp: &Option<String>,
     ssh: &Option<String>,
+    _share: &Option<String>,
     port: Option<u16>,
 ) {
     let token: String = {

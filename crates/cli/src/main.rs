@@ -36,6 +36,10 @@ struct ConnectOpts {
     /// Connect via SSH to a remote host
     #[arg(long, global = true)]
     ssh: Option<String>,
+
+    /// Connect via WebRTC to a shared session (passphrase)
+    #[arg(long, global = true)]
+    share: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -289,7 +293,7 @@ async fn main() {
         }
         Some(cmd) => {
             let conn = &cli.connect;
-            let transport = match transport::connect(&conn.socket, &conn.tcp, &conn.ssh).await {
+            let transport = match transport::connect(&conn.socket, &conn.tcp, &conn.ssh, &conn.share).await {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("blit: {e}");
@@ -317,7 +321,7 @@ async fn main() {
                             }
                         };
                         let transport2 =
-                            match transport::connect(&conn.socket, &conn.tcp, &conn.ssh).await {
+                            match transport::connect(&conn.socket, &conn.tcp, &conn.ssh, &conn.share).await {
                                 Ok(t) => t,
                                 Err(e) => {
                                     eprintln!("blit: {e}");
@@ -387,9 +391,9 @@ async fn main() {
         None => {
             let conn = &cli.connect;
             if cli.console {
-                interactive::run_console(&conn.socket, &conn.tcp, &conn.ssh).await;
+                interactive::run_console(&conn.socket, &conn.tcp, &conn.ssh, &conn.share).await;
             } else {
-                interactive::run_browser(&conn.socket, &conn.tcp, &conn.ssh, cli.port).await;
+                interactive::run_browser(&conn.socket, &conn.tcp, &conn.ssh, &conn.share, cli.port).await;
             }
         }
     }

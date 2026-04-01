@@ -6,6 +6,7 @@ pub enum Transport {
     Unix(tokio::net::UnixStream),
     Tcp(tokio::net::TcpStream),
     Ssh(tokio::process::Child),
+    Share(tokio::io::DuplexStream),
 }
 
 impl Transport {
@@ -31,6 +32,10 @@ impl Transport {
                     let _ = child.wait().await;
                 });
                 (Box::new(stdout), Box::new(stdin))
+            }
+            Transport::Share(s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
             }
         }
     }
@@ -93,7 +98,18 @@ pub async fn connect(
     socket: &Option<String>,
     tcp: &Option<String>,
     ssh: &Option<String>,
+    share: &Option<String>,
 ) -> Result<Transport, String> {
+    if let Some(passphrase) = share {
+        let stream = blit_webrtc_forwarder::client::connect(
+            passphrase,
+            blit_webrtc_forwarder::DEFAULT_SIGNAL_URL,
+        )
+        .await
+        .map_err(|e| format!("share: {e}"))?;
+        return Ok(Transport::Share(stream));
+    }
+
     if let Some(path) = socket {
         return Ok(Transport::Unix(
             tokio::net::UnixStream::connect(path)

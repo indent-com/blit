@@ -1,7 +1,8 @@
-mod ice;
+pub mod client;
+pub mod ice;
 mod peer;
 pub mod signaling;
-mod turn;
+pub mod turn;
 
 use ed25519_dalek::SigningKey;
 use hmac::Hmac;
@@ -26,14 +27,14 @@ pub struct Config {
 const PBKDF2_SALT: &[u8] = b"https://blit.sh";
 const PBKDF2_ROUNDS: u32 = 100_000;
 
-fn derive_signing_key(passphrase: &str) -> SigningKey {
+pub fn derive_signing_key(passphrase: &str) -> SigningKey {
     let mut seed = [0u8; 32];
     pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), PBKDF2_SALT, PBKDF2_ROUNDS, &mut seed)
         .expect("HMAC can be initialized with any key length");
     SigningKey::from_bytes(&seed)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
