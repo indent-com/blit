@@ -2317,11 +2317,13 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 }
                 out
             };
-            if do_log {
+            if do_log && config.verbose {
                 eprintln!(
                     "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={}",
                     sess.tick_fires, sess.tick_snaps,
                 );
+            }
+            if do_log {
                 sess.tick_fires = 0;
                 sess.tick_snaps = 0;
             }
