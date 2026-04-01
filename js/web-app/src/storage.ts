@@ -47,6 +47,7 @@ function configWsUrl(): string {
 }
 
 let configUnavailable = false;
+const pendingWrites = new Map<string, string>();
 
 export function connectConfigWs(): void {
   if (configWs || configUnavailable) return;
@@ -58,17 +59,26 @@ export function connectConfigWs(): void {
 
   ws.onopen = () => ws.send(pass);
 
+  const serverValues = new Map<string, string>();
+
   ws.onmessage = (ev) => {
     const msg = String(ev.data);
     if (msg === "ok") return;
     if (msg === "ready") {
       configReady = true;
+      for (const [key, value] of pendingWrites) {
+        if (serverValues.get(key) !== value) {
+          ws.send(`set ${key} ${value}`);
+        }
+      }
+      pendingWrites.clear();
       return;
     }
     const eq = msg.indexOf("=");
     if (eq > 0) {
       const key = msg.slice(0, eq);
       const value = msg.slice(eq + 1);
+      if (!configReady) serverValues.set(key, value);
       cache.set(key, value);
       notifyListeners(key, value);
     }
@@ -116,6 +126,8 @@ export function writeStorage(key: string, value: string) {
     cache.set(key, value);
     if (configWs && configWs.readyState === WebSocket.OPEN && configReady) {
       configWs.send(`set ${key} ${value}`);
+    } else if (configWs && !configReady) {
+      pendingWrites.set(key, value);
     }
   }
 }
