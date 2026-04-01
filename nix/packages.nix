@@ -230,7 +230,6 @@
           pkgs.scdoc
           pkgs.wasm-bindgen-cli
           pkgs.wasm-pack
-          pkgs.flyctl
         ];
 
         shellHook = ''
