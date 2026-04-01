@@ -250,6 +250,7 @@
             "USER=blit"
             "HOME=/home/blit"
             "TERM=xterm-256color"
+            "XDG_CONFIG_DIRS=/etc"
           ];
           User = "1000:1000";
           WorkingDir = "/home/blit";
