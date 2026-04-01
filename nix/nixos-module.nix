@@ -98,10 +98,10 @@ in {
 
   config = mkIf cfg.enable {
     systemd.services = builtins.listToAttrs (map (user: {
-      name = "blit@${user}";
+      name = "blit-server@${user}";
       value = {
         description = "blit terminal multiplexer for ${user}";
-        requires = [ "blit@${user}.socket" ];
+        requires = [ "blit-server@${user}.socket" ];
         serviceConfig = {
           Type = "simple";
           User = user;
@@ -118,8 +118,8 @@ in {
       name = "blit-gateway-${name}";
       value = {
         description = "blit gateway ${name} for ${gw.user}";
-        after = [ "blit@${gw.user}.socket" "network.target" ];
-        requires = [ "blit@${gw.user}.socket" ];
+        after = [ "blit-server@${gw.user}.socket" "network.target" ];
+        requires = [ "blit-server@${gw.user}.socket" ];
         wantedBy = [ "multi-user.target" ];
         serviceConfig = {
           Type = "simple";
@@ -140,7 +140,7 @@ in {
     }) cfg.gateways);
 
     systemd.sockets = builtins.listToAttrs (map (user: {
-      name = "blit@${user}";
+      name = "blit-server@${user}";
       value = {
         description = "blit terminal multiplexer socket for ${user}";
         wantedBy = [ "sockets.target" ];

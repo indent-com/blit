@@ -199,8 +199,9 @@ Clients (gateway, CLI) connect to this socket and exchange length-prefixed binar
 
 When `LISTEN_FDS=1` is set, the server adopts file descriptor 3 as the listening socket instead of binding its own. Two systemd unit pairs are provided:
 
-- `blit.socket` / `blit.service` -- user-level, socket at `%t/blit.sock`
-- `blit@.socket` / `blit@.service` -- system-wide, per-user, socket at `/run/blit/%i.sock`
+- `blit-server.socket` / `blit-server.service` -- user-level, socket at `%t/blit.sock` (runs `blit-server`)
+- `blit.socket` / `blit.service` -- user-level, socket at `%t/blit.sock` (runs `blit server`)
+- `blit-server@.socket` / `blit-server@.service` -- system-wide, per-user, socket at `/run/blit/%i.sock`
 
 ### fd-channel
 

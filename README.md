@@ -153,7 +153,7 @@ brew services start blit-gateway
 ### Debian / Ubuntu (systemd)
 
 ```bash
-sudo systemctl enable --now blit@alice.socket
+sudo systemctl enable --now blit-server@alice.socket
 ```
 
 ## How it compares
