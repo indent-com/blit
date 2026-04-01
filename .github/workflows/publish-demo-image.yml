@@ -6,7 +6,33 @@ on:
     tags: ["v*"]
 
 jobs:
-  publish:
+  build-push:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Push arch-specific image
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            nix run .#push-demo -- "${{ matrix.arch }}" "${GITHUB_REF#refs/tags/v}"
+          else
+            nix run .#push-demo -- "${{ matrix.arch }}"
+          fi
+
+  manifest:
+    needs: build-push
     runs-on: ubuntu-latest
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -16,7 +42,7 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Publish
+      - name: Create and push multi-arch manifest
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             nix run .#publish-demo -- "${GITHUB_REF#refs/tags/v}"
