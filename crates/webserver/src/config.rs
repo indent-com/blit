@@ -105,11 +105,22 @@ fn spawn_watcher(tx: broadcast::Sender<String>) {
     });
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub async fn handle_config_ws(mut ws: WebSocket, token: &str, config: &ConfigState) {
     let authed = loop {
         match ws.recv().await {
             Some(Ok(Message::Text(pass))) => {
-                if pass.trim() == token {
+                if constant_time_eq(pass.trim().as_bytes(), token.as_bytes()) {
                     let _ = ws.send(Message::Text("ok".into())).await;
                     break true;
                 } else {
