@@ -1,6 +1,6 @@
 [package]
 name = "blit-server"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2021"
 description = "blit terminal multiplexer server"
 license.workspace = true

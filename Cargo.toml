@@ -19,12 +19,12 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.16.2", path = "crates/remote" }
-blit-alacritty = { version = "0.16.2", path = "crates/alacritty-driver" }
-blit-fonts = { version = "0.16.2", path = "crates/fonts" }
-blit-webserver = { version = "0.16.2", path = "crates/webserver" }
-blit-server = { version = "0.16.2", path = "crates/server" }
-blit-webrtc-forwarder = { version = "0.16.2", path = "crates/webrtc-forwarder" }
+blit-remote = { version = "0.16.3", path = "crates/remote" }
+blit-alacritty = { version = "0.16.3", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.16.3", path = "crates/fonts" }
+blit-webserver = { version = "0.16.3", path = "crates/webserver" }
+blit-server = { version = "0.16.3", path = "crates/server" }
+blit-webrtc-forwarder = { version = "0.16.3", path = "crates/webrtc-forwarder" }
 
 [profile.release]
 opt-level = 3
