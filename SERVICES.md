@@ -233,7 +233,7 @@ sequenceDiagram
     CI->>CI: Build + push grab/blit-demo to Docker Hub
 ```
 
-## Secrets
+## Secrets and authentication
 
 | Secret | Used by | Purpose |
 | --- | --- | --- |
@@ -242,3 +242,5 @@ sequenceDiagram
 | `FLY_API_TOKEN` | deploy-blit-hub | Fly.io deploy token for blit-hub |
 | `DOCKERHUB_USERNAME` | publish-demo-image | Docker Hub credentials |
 | `DOCKERHUB_TOKEN` | publish-demo-image | Docker Hub credentials |
+
+`publish-crates` uses no stored secret. It authenticates to crates.io via OIDC trusted publishing — GitHub mints a short-lived ID token (enabled by the `id-token: write` permission on the release workflow) and exchanges it for a crates.io upload token. `publish-npm` works the same way, using `--provenance` to sign the npm package with the workflow's OIDC identity.
