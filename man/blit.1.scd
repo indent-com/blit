@@ -128,7 +128,7 @@ _share_ [_--passphrase_ _PASSPHRASE_] [_--signal-url_ _URL_] [_--url_ _TEMPLATE_
 Share a terminal session via WebRTC. If no server is running at the
 default socket path, one is started automatically in-process. A sharing
 URL is printed to stdout. The passphrase can also be set via the
-_BLITZ_PASSPHRASE_ environment variable. If omitted, a random passphrase
+_BLIT_PASSPHRASE_ environment variable. If omitted, a random passphrase
 is generated.
 
 # ENVIRONMENT
@@ -138,7 +138,7 @@ Unix socket path. Defaults to _$TMPDIR/blit.sock_, then
 _/tmp/blit-$USER.sock_, then _/run/blit/$USER.sock_, then
 _$XDG_RUNTIME_DIR/blit.sock_, then _/tmp/blit.sock_.
 
-_BLITZ_PASSPHRASE_
+_BLIT_PASSPHRASE_
 Passphrase for _share_. Overridden by _--passphrase_.
 
 _BLIT_DISPLAY_FPS_

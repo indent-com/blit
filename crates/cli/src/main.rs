@@ -182,7 +182,7 @@ enum Command {
     /// Share a terminal session via WebRTC
     Share {
         /// Passphrase for the session (default: random UUID)
-        #[arg(long, env = "BLITZ_PASSPHRASE")]
+        #[arg(long, env = "BLIT_PASSPHRASE")]
         passphrase: Option<String>,
 
         /// Signaling service URL

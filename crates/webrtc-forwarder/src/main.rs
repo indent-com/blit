@@ -8,8 +8,8 @@ struct Cli {
     #[arg(long)]
     socket: String,
 
-    /// Passphrase for the session (or set BLITZ_PASSPHRASE env var)
-    #[arg(long, env = "BLITZ_PASSPHRASE")]
+    /// Passphrase for the session (or set BLIT_PASSPHRASE env var)
+    #[arg(long, env = "BLIT_PASSPHRASE")]
     passphrase: String,
 
     /// Signaling service URL

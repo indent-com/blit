@@ -25,7 +25,7 @@ Path to the blit-server Unix socket (required).
 
 _--passphrase_ _PASSPHRASE_
 Session passphrase. Used to derive the Ed25519 signing key for
-signaling authentication. Can also be set via _BLITZ_PASSPHRASE_.
+signaling authentication. Can also be set via _BLIT_PASSPHRASE_.
 
 _--signal-url_ _URL_
 Signaling service URL (default: _wss://cloud.blit.sh_).
@@ -45,7 +45,7 @@ Print version and exit.
 
 # ENVIRONMENT
 
-_BLITZ_PASSPHRASE_
+_BLIT_PASSPHRASE_
 Session passphrase. Overridden by _--passphrase_.
 
 # SEE ALSO
