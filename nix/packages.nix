@@ -276,21 +276,19 @@
 
       publishDemo = pkgs.writeShellApplication {
         name = "publish-demo";
-        runtimeInputs = [ pkgs.manifest-tool pkgs.skopeo ];
+        runtimeInputs = [ pkgs.crane ];
         text = ''
           version="''${1:-}"
-          skopeo --policy ${skopeoPolicy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
-          mkdir -p "$HOME/.docker"
-          skopeo --policy ${skopeoPolicy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN" --authfile "$HOME/.docker/config.json"
-          manifest-tool push from-args \
-            --platforms linux/amd64,linux/arm64 \
-            --template "grab/blit-demo:latest-ARCH" \
-            --target "grab/blit-demo:latest"
+          crane auth login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
+          crane index append \
+            -t "docker.io/grab/blit-demo:latest" \
+            -m "docker.io/grab/blit-demo:latest-amd64" \
+            -m "docker.io/grab/blit-demo:latest-arm64"
           if [[ "$version" != "" ]]; then
-            manifest-tool push from-args \
-              --platforms linux/amd64,linux/arm64 \
-              --template "grab/blit-demo:$version-ARCH" \
-              --target "grab/blit-demo:$version"
+            crane index append \
+              -t "docker.io/grab/blit-demo:$version" \
+              -m "docker.io/grab/blit-demo:$version-amd64" \
+              -m "docker.io/grab/blit-demo:$version-arm64"
           fi
         '';
       };
