@@ -194,7 +194,7 @@ Building from source, running tests, dev environment setup, code conventions, an
 
 ## Docker sandbox
 
-The `grab/blit-demo` image runs unprivileged and launches `blit share` on startup. It includes fish, busybox, htop, neovim, git, curl, jq, and tree.
+The `grab/blit-demo` image runs unprivileged and launches `blit share` on startup. It includes fish, busybox, htop, neovim, git, curl, jq, tree, and ncdu.
 
 To build locally:
 
