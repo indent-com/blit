@@ -1,76 +1,5 @@
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use std::sync::LazyLock;
-
-const INDEX_HTML_BR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.br"));
-
-static INDEX_HTML: LazyLock<String> = LazyLock::new(|| {
-    let mut decompressed = Vec::new();
-    let mut reader = brotli::Decompressor::new(INDEX_HTML_BR, 4096);
-    std::io::Read::read_to_end(&mut reader, &mut decompressed).expect("brotli decompression");
-    String::from_utf8(decompressed).expect("index.html is valid UTF-8")
-});
-
-static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| html_etag(INDEX_HTML_BR));
-
-pub fn index_html() -> &'static str {
-    &INDEX_HTML
-}
-
-pub fn index_etag() -> &'static str {
-    &INDEX_ETAG
-}
-
-pub fn index_response(accept_encoding: Option<&str>, if_none_match: Option<&[u8]>) -> Response {
-    let etag = index_etag();
-    if let Some(inm) = if_none_match {
-        if inm == etag.as_bytes() {
-            return (
-                axum::http::StatusCode::NOT_MODIFIED,
-                [(header::ETAG, etag)],
-            )
-                .into_response();
-        }
-    }
-    if accepts_brotli(accept_encoding) {
-        (
-            [
-                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                (header::CONTENT_ENCODING, "br"),
-                (header::ETAG, etag),
-            ],
-            INDEX_HTML_BR,
-        )
-            .into_response()
-    } else {
-        (
-            [(header::ETAG, etag)],
-            Html(index_html().to_owned()),
-        )
-            .into_response()
-    }
-}
-
-fn accepts_brotli(accept_encoding: Option<&str>) -> bool {
-    accept_encoding
-        .map(|ae| {
-            ae.split(',').any(|e| {
-                let e = e.trim();
-                if !e.starts_with("br") {
-                    return false;
-                }
-                let rest = &e[2..];
-                if rest.is_empty() {
-                    return true;
-                }
-                if !rest.starts_with(';') {
-                    return false;
-                }
-                !rest.contains("q=0") || rest.contains("q=0.")
-            })
-        })
-        .unwrap_or(false)
-}
 
 /// Serve the monospace font family list as JSON.
 pub fn fonts_list_response(cors_origin: Option<&str>) -> Response {
@@ -143,6 +72,21 @@ fn add_cors(resp: &mut Response, origin: Option<&str>) {
     }
 }
 
+/// Serve HTML with ETag support. Returns 304 if the client's `If-None-Match`
+/// matches `etag`.
+pub fn html_response(html: &'static str, etag: &str, if_none_match: Option<&[u8]>) -> Response {
+    if let Some(inm) = if_none_match {
+        if inm == etag.as_bytes() {
+            return (
+                axum::http::StatusCode::NOT_MODIFIED,
+                [(axum::http::header::ETAG, etag)],
+            )
+                .into_response();
+        }
+    }
+    ([(axum::http::header::ETAG, etag)], Html(html)).into_response()
+}
+
 /// Try to match a font route from a raw request path (any prefix).
 /// Handles `/fonts`, `/vt/fonts`, `/font/Name`, `/vt/font/Name%20With%20Spaces`.
 /// Returns `Some(response)` if the path matched a font route, `None` otherwise.
@@ -165,10 +109,10 @@ pub fn try_font_route(path: &str, cors_origin: Option<&str>) -> Option<Response>
     None
 }
 
-/// Compute an ETag string from content bytes.
-pub fn html_etag(content: &[u8]) -> String {
+/// Compute an ETag string from HTML content.
+pub fn html_etag(html: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut h);
+    html.hash(&mut h);
     format!("\"blit-{:x}\"", h.finish())
 }

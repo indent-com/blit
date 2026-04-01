@@ -141,6 +141,18 @@ jobs:
           cp debs/*.deb repo/pool/
           cp .github/blit.gpg repo/blit.gpg
 
+          # Static binaries for direct download
+          mkdir -p repo/bin
+          for f in tarballs/*.tar.gz; do
+            cp "$f" repo/bin/
+          done
+
+          # Write version to /latest
+          echo "${GITHUB_REF_NAME#v}" > repo/latest
+
+          # Install script
+          cp install.sh repo/install
+
           cd repo
           dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
           dpkg-scanpackages --arch arm64 pool > dists/stable/main/binary-arm64/Packages
@@ -160,30 +172,6 @@ jobs:
           apt-ftparchive release dists/stable >> dists/stable/Release
           gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
           gpg --batch --yes --armor --clearsign --output dists/stable/InRelease dists/stable/Release
-
-      - name: Extract static binaries
-        run: |
-          for tarball in tarballs/*.tar.gz; do
-            filename=$(basename "$tarball" .tar.gz)
-            # filename format: {bin}_{version}_{os}_{arch}
-            os=$(echo "$filename" | rev | cut -d_ -f2 | rev)
-            arch=$(echo "$filename" | rev | cut -d_ -f1 | rev)
-            case "$os" in
-              darwin) uname_s=Darwin ;;
-              linux)  uname_s=Linux ;;
-              *)      uname_s="$os" ;;
-            esac
-            if [ "$os" = "darwin" ] && [ "$arch" = "aarch64" ]; then
-              uname_m=arm64
-            else
-              uname_m="$arch"
-            fi
-            mkdir -p "repo/$uname_s/$uname_m"
-            tar -xzf "$tarball" -C "repo/$uname_s/$uname_m/"
-          done
-          echo "${GITHUB_REF_NAME}" > repo/REVISION
-          echo "Static binaries:"
-          find repo/Darwin repo/Linux -type f 2>/dev/null | sort
 
       - uses: actions/upload-pages-artifact@v3
         with:

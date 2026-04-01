@@ -1,4 +1,4 @@
-# blit-cloud
+# blit-hub
 
 WebRTC signaling relay for blit terminal sharing. Routes WebRTC signaling
 messages (offers, answers, ICE candidates) between peers over WebSocket.
@@ -18,7 +18,7 @@ run the setup script:
 flyctl redis create
 
 # Deploy (REDIS_URL is required on first run)
-REDIS_URL=redis://... ./bin/setup-blit-cloud
+REDIS_URL=redis://... ./bin/setup-blit-hub
 ```
 
 The script is idempotent — re-running it skips secrets that are already set
@@ -36,7 +36,7 @@ Optional env vars for setup:
 To enable continuous deployment from GitHub Actions:
 
 ```bash
-flyctl tokens create deploy -a blit-cloud
+flyctl tokens create deploy -a blit-hub
 gh secret set FLY_API_TOKEN --repo <owner>/<repo>
 ```
 
@@ -44,7 +44,7 @@ gh secret set FLY_API_TOKEN --repo <owner>/<repo>
 
 ```bash
 docker run -d -p 6379:6379 redis:7
-cd js/blit-cloud
+cd js/blit-hub
 bun install
 bun run dev
 ```
@@ -52,7 +52,7 @@ bun run dev
 ## Protocol
 
 ```
-wss://cloud.blit.sh/channel/<64-char-hex-pubkey>/<producer|consumer>
+wss://hub.blit.sh/channel/<64-char-hex-pubkey>/<producer|consumer>
 ```
 
 On connect, the server assigns a session ID and sends presence notifications:

@@ -3,7 +3,7 @@ use axum::extract::{FromRequest, State, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use web_transport_quinn as wt;
@@ -37,6 +37,10 @@ impl axum::serve::Listener for NoDelayListener {
         self.0.local_addr()
     }
 }
+
+const INDEX_HTML: &str = include_str!("../../../js/web-app/dist/index.html");
+
+static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML));
 
 struct Config {
     passphrase: String,
@@ -181,10 +185,6 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         return resp;
     }
 
-    if path == "/_blit/config" || path.ends_with("/_blit/config") {
-        return blit_config_response(&state);
-    }
-
     let is_ws = request
         .headers()
         .get("upgrade")
@@ -197,32 +197,32 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
             Err(e) => e.into_response(),
         }
     } else {
-        let accept_encoding = request
-            .headers()
-            .get(axum::http::header::ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok());
-        let if_none_match = request
-            .headers()
-            .get(axum::http::header::IF_NONE_MATCH)
-            .map(|v| v.as_bytes());
-        blit_webserver::index_response(accept_encoding, if_none_match)
+        let etag = &*INDEX_ETAG;
+        let inm = request.headers().get(axum::http::header::IF_NONE_MATCH);
+        if inm.map(|v| v.as_bytes()) == Some(etag.as_bytes()) {
+            return (
+                axum::http::StatusCode::NOT_MODIFIED,
+                [(axum::http::header::ETAG, etag.as_str())],
+            )
+                .into_response();
+        }
+        // Inject WebTransport cert hash for self-signed certs
+        let wt_hash = state.wt_cert_hash.read().unwrap().clone();
+        if let Some(hash) = &wt_hash {
+            let html = INDEX_HTML.replacen(
+                "<script",
+                &format!("<script>window.__blitCertHash='{hash}'</script>\n<script"),
+                1,
+            );
+            (
+                [(axum::http::header::ETAG, etag.as_str())],
+                axum::response::Html(html),
+            )
+                .into_response()
+        } else {
+            blit_webserver::html_response(INDEX_HTML, etag, None)
+        }
     }
-}
-
-fn blit_config_response(state: &Config) -> Response {
-    let cert_hash = state.wt_cert_hash.read().unwrap().clone();
-    let json = match cert_hash {
-        Some(h) => format!("{{\"certHash\":\"{h}\"}}"),
-        None => "{}".to_string(),
-    };
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/json",
-        )],
-        json,
-    )
-        .into_response()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

@@ -1,0 +1,38 @@
+[package]
+name = "blit-webrtc-forwarder"
+version = "0.14.0"
+edition = "2021"
+description = "Forward a blit-server session over WebRTC"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "blit_webrtc_forwarder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blit-webrtc-forwarder"
+path = "src/main.rs"
+
+[dependencies]
+blit-remote = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+str0m = "0.18"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+hmac = "0.12"
+pbkdf2 = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"

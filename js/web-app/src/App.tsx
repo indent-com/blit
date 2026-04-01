@@ -9,13 +9,31 @@ import {
   wsUrl,
   wtUrl,
   wtCertHash,
-  fetchConfig,
 } from "./storage";
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
+import { createShareTransport } from "./webrtc-share";
 
-function createTransport(pass: string): BlitTransport {
+const DEFAULT_HUB = "wss://hub.blit.sh";
+
+/** Read hub URL injected by CLI, or fall back to the default. */
+function hubUrl(): string {
+  return (window as unknown as { __blitHub?: string }).__blitHub ?? DEFAULT_HUB;
+}
+
+/**
+ * Detect share mode from the URL hash. Layout state hashes start with
+ * a known key (`l=`, `p=`, or `a=`). Anything else is a share passphrase.
+ */
+function getSharePassphrase(): string | null {
+  const hash = location.hash.slice(1);
+  if (!hash) return null;
+  if (/^[lpa]=/.test(hash)) return null;
+  return decodeURIComponent(hash);
+}
+
+function createGatewayTransport(pass: string): BlitTransport {
   const certHash = wtCertHash();
   if (typeof WebTransport !== "undefined" && certHash) {
     return new WebTransportTransport(wtUrl(), pass, {
@@ -26,30 +44,55 @@ function createTransport(pass: string): BlitTransport {
 }
 
 export function App({ wasm }: { wasm: BlitWasmModule }) {
+  const sharePassphrase = getSharePassphrase();
+
+  // Share mode: bypass auth, connect via WebRTC
+  if (sharePassphrase) {
+    return <ShareApp wasm={wasm} passphrase={sharePassphrase} />;
+  }
+
+  // Gateway mode: auth screen + WebSocket/WebTransport
+  return <GatewayApp wasm={wasm} />;
+}
+
+function ShareApp({
+  wasm,
+  passphrase,
+}: {
+  wasm: BlitWasmModule;
+  passphrase: string;
+}) {
+  const [transport] = useState<BlitTransport>(() =>
+    createShareTransport(hubUrl(), passphrase),
+  );
+
+  return (
+    <Workspace
+      transport={transport}
+      wasm={wasm}
+      onAuthError={() => {
+        transport.close();
+      }}
+    />
+  );
+}
+
+function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
+  const savedPass = readStorage(PASS_KEY);
   const [transport, setTransport] = useState<BlitTransport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [configLoaded, setConfigLoaded] = useState(false);
   const passRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (configLoaded) return;
-    let cancelled = false;
-    fetchConfig().then((cfg) => {
-      if (cancelled) return;
-      setConfigLoaded(true);
-      const pass = cfg.passphrase || readStorage(PASS_KEY);
-      if (pass) {
-        setTransport(createTransport(pass));
-      }
-    });
-    return () => { cancelled = true; };
-  }, [configLoaded]);
+    if (!savedPass || transport) return;
+    setTransport(createGatewayTransport(savedPass));
+  }, [savedPass, transport]);
 
   const connect = useCallback(
     (pass: string) => {
       setAuthError(null);
       transport?.close();
-      const t = createTransport(pass);
+      const t = createGatewayTransport(pass);
       const onStatus = (status: string) => {
         if (status === "connected") {
           writeStorage(PASS_KEY, pass);

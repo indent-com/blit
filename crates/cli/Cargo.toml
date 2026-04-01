@@ -1,6 +1,6 @@
 [package]
 name = "blit-cli"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 description = "blit terminal client"
 license.workspace = true
@@ -19,5 +19,9 @@ libc = "0.2"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 rand = "0.10"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
+blit-server = { workspace = true }
+blit-webrtc-forwarder = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

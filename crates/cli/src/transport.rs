@@ -6,6 +6,7 @@ pub enum Transport {
     Unix(tokio::net::UnixStream),
     Tcp(tokio::net::TcpStream),
     Ssh(tokio::process::Child),
+    Share(tokio::io::DuplexStream),
 }
 
 impl Transport {
@@ -31,6 +32,10 @@ impl Transport {
                     let _ = child.wait().await;
                 });
                 (Box::new(stdout), Box::new(stdin))
+            }
+            Transport::Share(s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
             }
         }
     }
@@ -93,7 +98,17 @@ pub async fn connect(
     socket: &Option<String>,
     tcp: &Option<String>,
     ssh: &Option<String>,
+    share: &Option<String>,
+    hub: &str,
 ) -> Result<Transport, String> {
+    if let Some(passphrase) = share {
+        let hub = blit_webrtc_forwarder::normalize_hub(hub);
+        let stream = blit_webrtc_forwarder::client::connect(passphrase, &hub)
+            .await
+            .map_err(|e| format!("share: {e}"))?;
+        return Ok(Transport::Share(stream));
+    }
+
     if let Some(path) = socket {
         return Ok(Transport::Unix(
             tokio::net::UnixStream::connect(path)
@@ -111,7 +126,7 @@ pub async fn connect(
     }
 
     if let Some(host) = ssh {
-        let bridge = r#"sh -c 'if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else S=/tmp/blit.sock; fi; exec nc -U "$S" 2>/dev/null || socat - "UNIX-CONNECT:$S"'"#;
+        let bridge = r#"sh -c 'if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else S=/tmp/blit.sock; fi; if ! [ -S "$S" ]; then if command -v blit >/dev/null 2>&1; then blit server &  i=0; while ! [ -S "$S" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; elif command -v blit-server >/dev/null 2>&1; then blit-server & i=0; while ! [ -S "$S" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; fi; fi; exec nc -U "$S" 2>/dev/null || socat - "UNIX-CONNECT:$S"'"#;
         let child = tokio::process::Command::new("ssh")
             .arg("-T")
             .arg("-o")
@@ -132,9 +147,37 @@ pub async fn connect(
     }
 
     let path = default_local_socket();
+    if !std::path::Path::new(&path).exists() {
+        ensure_local_server(&path).await?;
+    }
     Ok(Transport::Unix(
         tokio::net::UnixStream::connect(&path)
             .await
             .map_err(|e| format!("cannot connect to {path}: {e}"))?,
     ))
+}
+
+/// Start a local blit-server if the socket doesn't exist yet.
+pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
+    if std::path::Path::new(socket_path).exists() {
+        return Ok(());
+    }
+    let config = blit_server::Config {
+        shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        shell_flags: std::env::var("BLIT_SHELL_FLAGS").unwrap_or_else(|_| "li".into()),
+        scrollback: std::env::var("BLIT_SCROLLBACK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000),
+        socket_path: socket_path.to_string(),
+        fd_channel: None,
+    };
+    tokio::spawn(blit_server::run(config));
+    for _ in 0..100 {
+        if std::path::Path::new(socket_path).exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err("server did not create socket in time".into())
 }

@@ -8,7 +8,7 @@ const CF_TURN_TOKEN_ID = process.env.CF_TURN_TOKEN_ID;
 const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN;
 const MESSAGE_TEMPLATE =
   process.env.MESSAGE_TEMPLATE ||
-  "Welcome to blit! Terminals are now available at https://blit.sh/#{secret}";
+  "Session available at https://blit.sh/#{secret}\nor blit --share {secret}";
 const ICE_TTL = 86400;
 const SESSION_TTL = 600;
 const MAX_PAYLOAD_BYTES = 65536;
@@ -214,7 +214,10 @@ const server = Bun.serve<ClientData>({
         await redis.ping();
         return new Response("ok", { status: 200, headers: cors });
       } catch {
-        return new Response("redis unreachable", { status: 503, headers: cors });
+        return new Response("redis unreachable", {
+          status: 503,
+          headers: cors,
+        });
       }
     }
 
@@ -227,7 +230,10 @@ const server = Bun.serve<ClientData>({
         const config = await getIceServers();
         return Response.json(config, { headers: cors });
       } catch {
-        return Response.json({ iceServers: DEFAULT_ICE_SERVERS }, { headers: cors });
+        return Response.json(
+          { iceServers: DEFAULT_ICE_SERVERS },
+          { headers: cors },
+        );
       }
     }
 
@@ -272,7 +278,9 @@ const server = Bun.serve<ClientData>({
       );
 
       const otherRole = OPPOSITE_ROLE[role];
-      const remoteMembers = await redis.smembers(redisKey(otherRole, channelId));
+      const remoteMembers = await redis.smembers(
+        redisKey(otherRole, channelId),
+      );
       for (const peerId of remoteMembers) {
         ws.send(
           JSON.stringify({
@@ -394,4 +402,4 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-Bun.write(Bun.stdout, `blit-cloud listening on port ${PORT}\n`);
+Bun.write(Bun.stdout, `blit-hub listening on port ${PORT}\n`);

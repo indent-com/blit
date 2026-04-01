@@ -1,4 +1,4 @@
-app = "blit-cloud"
+app = "blit-hub"
 primary_region = "iad"
 
 [build]

@@ -10,9 +10,11 @@ blit is a terminal streaming stack. The server parses PTY output into structured
 graph LR
     PTY <-->|stdin/stdout| S[blit-server]
     S <-->|Unix socket| G[blit-gateway]
-    G <-->|WebSocket / WebTransport / WebRTC| B[browser]
+    G <-->|WebSocket / WebTransport| B[browser]
     S <-->|Unix socket / TCP / SSH| C[blit-cli]
     C -->|embeds temp gateway| B
+    S <-->|Unix socket| F[blit-webrtc-forwarder]
+    F <-->|WebRTC DataChannel| B
 ```
 
 The server is the stateful half. It owns PTYs, scrollback, parsed terminal state, and per-client frame pacing. The gateway is stateless: it authenticates browser clients and proxies binary messages. This split means PTYs survive gateway restarts, the gateway can sit behind a reverse proxy, and the CLI can embed a temporary gateway when it needs browser access without a persistent deployment.
@@ -27,12 +29,13 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-react`     | `js/react/`              | npm           | Workspace-based React client library: connections, sessions, transports, rendering                                   |
 | `blit-server`    | `crates/server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
 | `blit-gateway`   | `crates/gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
-| `blit` (CLI)     | `crates/cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway                                           |
+| `blit` (CLI)     | `crates/cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway, `server`/`share` subcommands             |
+| `blit-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib + bin | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels to blit-server                  |
 | `blit-fonts`     | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
 | `blit-webserver` | `crates/webserver/`        | lib           | Shared axum HTTP helpers for serving assets and fonts                                                                |
 | `blit-demo`      | `crates/demo/`             | bin           | Demo programs: `chaos`, `emojiblast`, `netdash`                                                                      |
 
-Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `crates/demo/src/bin/`; `blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`).
+Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-demo` also has additional binaries in `crates/demo/src/bin/`; `blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`; `blit-webrtc-forwarder` is split into `lib.rs`, `main.rs`, `peer.rs`, `signaling.rs`, `ice.rs`, and `turn.rs`).
 
 ### Dependency graph
 
@@ -50,6 +53,10 @@ graph TD
     fonts[blit-fonts] --> webserver[blit-webserver]
     webserver --> gateway[blit-gateway]
     webserver --> cli
+
+    remote --> forwarder[blit-webrtc-forwarder]
+    server --> cli
+    forwarder --> cli
 ```
 
 ## Wire protocol
@@ -217,7 +224,17 @@ Self-signed certificates are auto-generated and rotated every 13 days. The certi
 
 ### WebRTC DataChannel
 
-The React library includes a `WebRtcDataChannelTransport`. An ordered DataChannel labeled `"blit"` carries length-prefixed frames. Auth is handled at the signaling layer, not the data channel. This transport exists for scenarios where WebSocket/WebTransport aren't available (e.g., peer-to-peer, NAT traversal).
+`blit-webrtc-forwarder` bridges a blit-server session to browsers over WebRTC using `str0m` (a sans-I/O WebRTC library). An ordered DataChannel labeled `"blit"` carries length-prefixed frames identical to the Unix socket protocol. The forwarder connects to blit-server via its Unix socket when a peer's data channel opens.
+
+**Signaling**: A single bidirectional WebSocket to `hub.blit.sh` carries JSON signaling messages (SDP offers/answers, ICE candidates). Messages are signed with Ed25519 (key derived from a passphrase via PBKDF2-SHA256, 100k rounds). The signaling server routes by public key.
+
+**NAT traversal**: The forwarder gathers host candidates, performs STUN binding for server-reflexive candidates, and attempts TURN allocation (UDP first, then TCP/TLS) for relay candidates. TURN allocations are refreshed every 4 minutes; TURN permissions are re-established on the same interval.
+
+**Lifecycle**: WebRTC peer connections are decoupled from the signaling WebSocket. An `established` flag (per peer) prevents tearing down active data channel sessions on WebSocket reconnect — only peers still in the signaling phase are aborted.
+
+The `blit share` CLI subcommand is the primary entry point. It auto-starts a blit-server if one isn't already running, then runs the forwarder in-process. The standalone `blit-webrtc-forwarder` binary is available for custom deployments.
+
+On the browser side, the React library includes a `WebRtcDataChannelTransport` that connects to the forwarder via the same signaling server.
 
 ### SSH tunneling (CLI)
 
@@ -232,7 +249,7 @@ On the Rust side, `blit-cli` defines a `Transport` enum (in `crates/cli/src/tran
 
 ### Agent subcommands
 
-`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `resize`) in `crates/cli/src/agent.rs` for programmatic control of PTYs. These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. All subcommands accept the same transport options (`--socket`, `--tcp`, `--ssh`) as the interactive modes.
+`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `wait`, `restart`) in `crates/cli/src/agent.rs` for programmatic control of PTYs. It also includes `server` (run blit-server in-process) and `share` (run blit-webrtc-forwarder in-process, auto-starting a server if needed). These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. All subcommands accept the same transport options (`--socket`, `--tcp`, `--ssh`) as the interactive modes.
 
 On the TypeScript side, the `BlitTransport` interface abstracts over WebSocket, WebTransport, and WebRTC:
 

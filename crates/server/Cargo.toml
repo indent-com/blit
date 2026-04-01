@@ -1,11 +1,15 @@
 [package]
 name = "blit-server"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 description = "blit terminal multiplexer server"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+
+[lib]
+name = "blit_server"
+path = "src/lib.rs"
 
 [dependencies]
 blit-remote = { workspace = true }

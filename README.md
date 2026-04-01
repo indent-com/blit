@@ -1,24 +1,44 @@
 # blit
 
-Agent-friendly terminal streaming — as fast as the network and browser allow. The server parses PTY output, diffs it, and sends only what changed — LZ4-compressed, per-client paced, WebGL-rendered. Adapts to any transport (WebSocket, WebTransport, WebRTC, Unix socket, SSH) and security model. AI agents get a full set of [non-interactive CLI subcommands](SKILLS.md) to create, control, and read terminal sessions programmatically. Embed the React component in any web app with [`blit-react`](EMBEDDING.md).
+Terminal streaming for browsers and AI agents. One binary, nothing to configure.
 
 ```bash
-blit-server &
-blit                # opens browser
+curl https://blit.sh/install | sh
+blit # opens a browser
 ```
 
-Or over SSH:
+Share a terminal over WebRTC:
+
+```bash
+blit share # prints a URL anyone can open
+```
+
+Connect to a remote host over SSH:
 
 ```bash
 blit --ssh myhost
 ```
 
+Control terminals programmatically:
+
+```bash
+blit start htop # start a terminal, print its ID
+blit show 1     # dump current terminal text
+blit send 1 "q" # send keystrokes
+```
+
+The server auto-starts when needed.
+
 ## Install
+
+```bash
+curl https://blit.sh/install | sh
+```
 
 ### macOS (Homebrew)
 
 ```bash
-brew install indent-com/tap/blit indent-com/tap/blit-gateway indent-com/tap/blit-server
+brew install indent-com/tap/blit
 ```
 
 ### Debian / Ubuntu (APT)
@@ -27,14 +47,13 @@ brew install indent-com/tap/blit indent-com/tap/blit-gateway indent-com/tap/blit
 curl -fsSL https://repo.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
 echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://repo.blit.sh/ stable main" \
   | sudo tee /etc/apt/sources.list.d/blit.list
-sudo apt update
-sudo apt install blit blit-server blit-gateway
+sudo apt update && sudo apt install blit
 ```
 
 ### Nix
 
 ```bash
-nix build .#blit-server      # or blit-cli, blit-gateway
+nix profile install github:indent-com/blit#blit
 ```
 
 Or jump to [nix-darwin](#nix-darwin) / [NixOS](#nixos) for service configuration.
@@ -42,83 +61,64 @@ Or jump to [nix-darwin](#nix-darwin) / [NixOS](#nixos) for service configuration
 ### From source
 
 ```bash
-nix develop        # or use direnv — .envrc is included
-cargo build --release -p blit-cli -p blit-server -p blit-gateway
+nix develop # or use direnv — .envrc is included
+cargo build --release -p blit-cli
 ```
 
 ## How it works
 
-**`blit-server`** hosts PTYs and tracks full parsed terminal state. For each connected client it computes a binary diff against what that client last saw and sends only the delta — LZ4-compressed, with scrolling encoded as copy-rect operations.
+`blit` hosts PTYs and tracks full parsed terminal state. For each connected browser it computes a binary diff against what that browser last saw and sends only the delta — LZ4-compressed, with scrolling encoded as copy-rect operations. WebGL-rendered in the browser.
 
-**`blit-gateway`** is a stateless WebSocket/WebTransport proxy that authenticates browser clients and forwards traffic to the server over a Unix socket. PTYs survive gateway restarts.
+Each client is paced independently based on render metrics it reports back: display rate, frame apply time, backlog depth. A phone on 3G doesn't stall a workstation on localhost. The focused session gets full frame rate; background sessions throttle down. Keystrokes go straight to the PTY — latency is bounded by link RTT.
 
-**`blit` (CLI)** connects to a local or remote server (over SSH if needed), embeds a temporary gateway, and opens the browser. No separate deployment required.
-
-**`blit-react`** is the React embedding library — the primary integration point for applications. See [EMBEDDING.md](EMBEDDING.md).
-
-The server paces each client independently based on render metrics the client reports back: display rate, frame apply time, backlog depth. A phone on 3G doesn't stall a workstation on localhost. The focused session gets full frame rate; background sessions throttle down. Keystrokes go straight to the PTY — latency is bounded by link RTT and nothing else.
+`blit` opens the browser with an embedded gateway. For persistent multi-user browser access, `blit-gateway` is a standalone proxy that handles passphrase auth, serves the web app, and optionally enables QUIC. `blit-server` can also run standalone for headless/daemon use. For embedding in your own app, [`blit-react`](EMBEDDING.md) is the React integration library.
 
 For wire protocol details, frame encoding, and transport internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Browser access
+## CLI subcommands
 
-Pick one, not both:
-
-- **`blit-gateway`**: standalone proxy for persistent browser access. Handles passphrase auth, serves the web app, optionally enables QUIC.
-- **`blit` (CLI)**: connects to the server, embeds a temporary gateway, opens the browser.
-
-With the gateway:
+All subcommands auto-start a local server if needed. For remote hosts, use `--ssh HOST`, `--tcp HOST:PORT`, or `--share PASSPHRASE`.
 
 ```bash
-BLIT_PASS=secret blit-gateway &
-blit-server
-# open http://localhost:3264
+blit list                                # List all PTYs (TSV: ID, TAG, TITLE, STATUS)
+blit start htop                          # Start a PTY running htop, print its ID
+blit start -t build make -j8             # Start with a tag
+blit start --rows 40 --cols 120 bash     # Start with a custom size
+blit start --wait --timeout 60 make -j8  # Start and block until exit
+blit show 3                              # Dump current visible terminal text
+blit show 3 --ansi                       # Include ANSI color/style codes
+blit history 3                           # Dump all scrollback + viewport
+blit history 3 --from-start 0 --limit 50 # First 50 lines
+blit history 3 --from-end 0 --limit 50   # Last 50 lines
+blit send 3 "q"                          # Send keystrokes (supports \n, \t, \x1b escapes)
+blit show 3 --rows 40 --cols 120         # Resize before capturing viewport
+blit history 3 --cols 200                # Resize before reading scrollback
+blit wait 3 --timeout 30                 # Block until session exits
+blit wait 3 --timeout 60 --pattern DONE  # Block until output matches regex
+blit restart 3                           # Restart an exited session
+blit close 3                             # Close and remove a PTY
+
+blit share                               # Share via WebRTC (prints URL)
+blit share --passphrase mysecret         # Share with a specific passphrase
+
+blit --ssh myhost list                   # Against a remote host
+blit --ssh myhost start htop
+blit --ssh myhost show 1
 ```
 
-If building from source, substitute `cargo run -p blit-server`, `cargo run -p blit-cli`, etc. For the dev environment with hot-reloading, see [CONTRIBUTING.md](CONTRIBUTING.md).
+Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
-## Running services
-
-### macOS (Homebrew)
-
-```bash
-brew services start blit-server
-brew services start blit-gateway
-```
-
-Configuration lives in env files under `$(brew --prefix)/etc/blit/`:
-
-```bash
-echo 'export BLIT_PASS="secret"' >> $(brew --prefix)/etc/blit/blit-gateway.env
-echo 'export BLIT_SCROLLBACK="50000"' >> $(brew --prefix)/etc/blit/blit-server.env
-brew services restart blit-gateway blit-server
-```
-
-### Debian / Ubuntu (systemd)
-
-```bash
-sudo systemctl enable --now blit@alice.socket
-```
-
-### Manual (systemd)
-
-```bash
-sudo cp systemd/blit@.socket systemd/blit@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now blit@alice.socket
-```
+If you're building an AI agent that drives terminals, [SKILLS.md](SKILLS.md) is a ready-made skill definition you can drop into your agent's tool list.
 
 ## Configuration
 
-### `blit-server`
+| Variable          | Default                                                                                                                | Purpose                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `BLIT_SOCK`       | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path                     |
+| `BLIT_SCROLLBACK` | `10000`                                                                                                                | Scrollback rows per PTY              |
+| `BLIT_HUB`        | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing |
 
-| Variable          | Default                                                                      | Purpose                     |
-| ----------------- | ---------------------------------------------------------------------------- | --------------------------- |
-| `SHELL`           | `/bin/sh`                                                                    | Shell to spawn for new PTYs |
-| `BLIT_SOCK`       | `$TMPDIR/blit.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit-$USER.sock` | Unix socket path            |
-| `BLIT_SCROLLBACK` | `10000`                                                                      | Scrollback rows per PTY     |
-
-### `blit-gateway`
+### `blit-gateway` (optional, for persistent multi-user browser access)
 
 | Variable        | Default                                                                      | Purpose                           |
 | --------------- | ---------------------------------------------------------------------------- | --------------------------------- |
@@ -130,95 +130,52 @@ sudo systemctl enable --now blit@alice.socket
 | `BLIT_TLS_CERT` | auto-generated                                                               | TLS cert for WebTransport         |
 | `BLIT_TLS_KEY`  | auto-generated                                                               | TLS key for WebTransport          |
 
-### `blit` (CLI)
+## Running as a service
 
-| Variable    | Default                                                                                                                | Purpose          |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `BLIT_SOCK` | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path |
-
-For SSH targets, `blit --ssh HOST` forwards the remote Unix socket over SSH and opens the browser with an embedded local gateway.
-
-## Agent subcommands
-
-The CLI includes non-interactive subcommands designed for programmatic / LLM agent use. All subcommands accept `--socket PATH`, `--tcp HOST:PORT`, or `--ssh HOST` to select the transport.
+### macOS (Homebrew)
 
 ```bash
-blit list                                      # List all PTYs (TSV: ID, TAG, TITLE, STATUS)
-blit start htop                                # Start a PTY running htop, print its ID
-blit start -t build make -j8                   # Start with a tag
-blit start --rows 40 --cols 120 bash           # Start with a custom size
-blit start --wait --timeout 60 make -j8        # Start and block until exit
-blit show 3                                    # Dump current visible terminal text
-blit show 3 --ansi                             # Include ANSI color/style codes
-blit history 3                                 # Dump all scrollback + viewport
-blit history 3 --from-start 0 --limit 50       # First 50 lines
-blit history 3 --from-end 0 --limit 50         # Last 50 lines
-blit history 3 --from-end 0 --limit 50 --ansi  # Last 50 with ANSI styling
-blit send 3 "q"                                # Send keystrokes (supports \n, \t, \x1b escapes)
-blit show 3 --rows 40 --cols 120               # Resize before capturing viewport
-blit history 3 --cols 200                      # Resize before reading scrollback
-blit wait 3 --timeout 30                       # Block until session exits
-blit wait 3 --timeout 60 --pattern 'DONE'      # Block until output matches regex
-blit restart 3                                 # Restart an exited session
-blit close 3                                   # Close and remove a PTY
-
-# Against a remote host
-blit --ssh myhost list
-blit --ssh myhost start htop
-blit --ssh myhost show 1
+brew services start blit-server
+brew services start blit-gateway
 ```
 
-Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
+### Debian / Ubuntu (systemd)
 
-If you're building an AI agent that drives terminals, [SKILLS.md](SKILLS.md) is a ready-made skill definition — drop it into your agent's tool list and it can create, control, and read blit sessions out of the box.
-
-## What lives in this repo
-
-| Directory                  | Package          | Role                                             |
-| -------------------------- | ---------------- | ------------------------------------------------ |
-| `crates/server/`           | `blit-server`    | PTY host and frame scheduler                     |
-| `crates/remote/`           | `blit-remote`    | Wire protocol and frame/state primitives         |
-| `crates/browser/`          | `blit-browser`   | WASM terminal runtime                            |
-| `crates/alacritty-driver/` | `blit-alacritty` | Terminal parsing backed by `alacritty_terminal`  |
-| `crates/gateway/`          | `blit-gateway`   | WebSocket/WebTransport proxy                     |
-| `crates/cli/`              | `blit`           | Browser client, agent subcommands, SSH tunnels   |
-| `crates/fonts/`            | `blit-fonts`     | Font discovery and metadata                      |
-| `crates/webserver/`        | `blit-webserver` | Shared HTTP helpers for serving assets and fonts |
-| `crates/demo/`             | `blit-demo`      | Sample programs and test content                 |
-| `js/react/`                | `blit-react`     | Workspace-based React client library             |
-| `js/web-app/`              |                  | Browser UI                                       |
+```bash
+sudo systemctl enable --now blit@alice.socket
+```
 
 ## How it compares
 
 |                               | blit                             | ttyd                | gotty               | Eternal Terminal      | Mosh                  | xterm.js + node-pty  |
 | ----------------------------- | -------------------------------- | ------------------- | ------------------- | --------------------- | --------------------- | -------------------- |
-| Architecture                  | PTY host + gateway               | Single binary       | Single binary       | Client + daemon       | Client + server       | Library (BYO server) |
+| Architecture                  | Single binary                    | Single binary       | Single binary       | Client + daemon       | Client + server       | Library (BYO server) |
 | Multiple PTYs                 | ✅ First-class                   | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual            |
 | Browser access                | ✅                               | ✅                  | ✅                  | ❌                    | ❌                    | ✅                   |
-| Protocol                      | Binary frame diffs               | Raw byte stream     | Raw byte stream     | SSH + prediction      | UDP + SSP             | Raw byte stream      |
-| Delta updates                 | ✅ Only changed cells sent       | ❌                  | ❌                  | ❌                    | ✅ State diffs        | ❌                   |
+| Delta updates                 | ✅ Only changed cells            | ❌                  | ❌                  | ❌                    | ✅ State diffs        | ❌                   |
 | LZ4 compression               | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
-| Copy-rect scrolling           | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | Per-client backpressure       | ✅ Render-metric pacing          | ❌                  | ❌                  | ⚠️ SSH flow control   | ❌                    | ❌                   |
-| Background session throttling | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
-| Server-side search            | ✅ Titles + visible + scrollback | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | WebGL rendering               | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ⚠️ Addon             |
-| Transport                     | WS, WebTransport, Unix           | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
-| WebTransport / QUIC           | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Transport                     | WS, WebTransport, WebRTC, Unix   | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
 | Embeddable (React)            | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
 | Agent / CLI subcommands       | ✅                               | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
-| Reconnect on disconnect       | ✅                               | ✅                  | ❌                  | ✅                    | ✅                    | ❌                   |
 | SSH tunneling built-in        | ✅                               | ❌                  | ❌                  | ✅                    | ✅                    | ❌                   |
 
-### Adjacent tools
+## What lives in this repo
 
-**tmux** is the classic terminal multiplexer — windows, panes, session detach/reattach, all over a Unix socket. It's purely terminal-native: no browser access, no wire protocol beyond its own client-server IPC. blit handles the browser streaming side, so the two are complementary — you can run tmux inside a blit PTY.
-
-**Zellij** is a terminal multiplexer (like tmux) — it manages panes, tabs, and layouts inside your existing terminal. It has a WASM plugin system, built-in search, multiplayer session sharing, and a beta web client. Where blit is a streaming stack that sends rendered frames to a browser, Zellij is a local-first workspace that happens to have a web escape hatch.
-
-**sshx** is a collaborative terminal sharing tool. You run a single command and get a shareable URL with an infinite canvas of terminals, live cursors, and end-to-end encryption (Argon2 + AES). It uses a managed cloud mesh for routing, so there's no self-hosting. The focus is real-time pair programming, not persistent server access.
-
-**tmate** is a tmux fork that gives you instant terminal sharing via a hosted relay. You get an SSH URL and a read-only web URL out of the box. It's the fastest path to "let someone else see my terminal" but doesn't do browser-native rendering, backpressure, or multi-session management.
+| Directory                  | Package                 | Role                                                             |
+| -------------------------- | ----------------------- | ---------------------------------------------------------------- |
+| `crates/cli/`              | `blit`                  | Browser client, agent subcommands, SSH tunnels, `server`/`share` |
+| `crates/server/`           | `blit-server`           | PTY host and frame scheduler (also embedded in `blit`)           |
+| `crates/gateway/`          | `blit-gateway`          | WebSocket/WebTransport proxy for multi-user access               |
+| `crates/webrtc-forwarder/` | `blit-webrtc-forwarder` | WebRTC bridge for NAT traversal (STUN/TURN)                      |
+| `crates/remote/`           | `blit-remote`           | Wire protocol and frame/state primitives                         |
+| `crates/browser/`          | `blit-browser`          | WASM terminal runtime                                            |
+| `crates/alacritty-driver/` | `blit-alacritty`        | Terminal parsing backed by `alacritty_terminal`                  |
+| `crates/fonts/`            | `blit-fonts`            | Font discovery and metadata                                      |
+| `crates/webserver/`        | `blit-webserver`        | Shared HTTP helpers for serving assets and fonts                 |
+| `js/react/`                | `blit-react`            | React client library ([EMBEDDING.md](EMBEDDING.md))              |
+| `js/web-app/`              |                         | Browser UI                                                       |
 
 ## Contributing
 
@@ -240,6 +197,8 @@ Building from source, running tests, dev environment setup, code conventions, an
 }
 ```
 
+See [`nix/darwin-module.nix`](nix/darwin-module.nix) for the full list of options.
+
 ## NixOS
 
 ```nix
@@ -257,3 +216,5 @@ Building from source, running tests, dev environment setup, code conventions, an
   };
 }
 ```
+
+See [`nix/nixos-module.nix`](nix/nixos-module.nix) for the full list of options.

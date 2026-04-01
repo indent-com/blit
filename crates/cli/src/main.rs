@@ -35,6 +35,14 @@ struct ConnectOpts {
     /// Connect via SSH to a remote host
     #[arg(long, global = true)]
     ssh: Option<String>,
+
+    /// Connect via WebRTC to a shared session (passphrase)
+    #[arg(long, global = true)]
+    share: Option<String>,
+
+    /// Signaling hub URL
+    #[arg(long, global = true, env = "BLIT_HUB", default_value = blit_webrtc_forwarder::DEFAULT_HUB_URL)]
+    hub: String,
 }
 
 #[derive(Subcommand)]
@@ -162,16 +170,100 @@ enum Command {
         #[arg(long)]
         pattern: Option<String>,
     },
+
+    /// Run the blit terminal multiplexer server
+    Server {
+        /// Shell flags (default: li, or set BLIT_SHELL_FLAGS)
+        #[arg(long)]
+        shell_flags: Option<String>,
+
+        /// Scrollback buffer size in lines
+        #[arg(long)]
+        scrollback: Option<usize>,
+
+        /// Accept clients via fd-passing on this file descriptor
+        #[arg(long)]
+        fd_channel: Option<i32>,
+    },
+
+    /// Share a terminal session via WebRTC
+    Share {
+        /// Passphrase for the session (default: random UUID)
+        #[arg(long, env = "BLIT_PASSPHRASE")]
+        passphrase: Option<String>,
+
+        /// Don't print the sharing URL
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Server {
+            shell_flags,
+            scrollback,
+            fd_channel,
+        }) => {
+            let socket_path = cli
+                .connect
+                .socket
+                .unwrap_or_else(blit_server::default_socket_path);
+            let config = blit_server::Config {
+                shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                shell_flags: shell_flags
+                    .or_else(|| std::env::var("BLIT_SHELL_FLAGS").ok())
+                    .unwrap_or_else(|| "li".into()),
+                scrollback: scrollback
+                    .or_else(|| {
+                        std::env::var("BLIT_SCROLLBACK")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(10_000),
+                socket_path,
+                fd_channel: fd_channel.or_else(|| {
+                    std::env::var("BLIT_FD_CHANNEL")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                }),
+            };
+            blit_server::run(config).await;
+        }
+        Some(Command::Share {
+            passphrase,
+            quiet,
+        }) => {
+            let signal_url = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
+            let passphrase = passphrase.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            let sock_path = cli.connect.socket.clone().unwrap_or_else(|| {
+                blit_server::default_socket_path()
+            });
+            if let Err(e) = transport::ensure_local_server(&sock_path).await {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+
+            blit_webrtc_forwarder::run(blit_webrtc_forwarder::Config {
+                sock_path,
+                signal_url,
+                passphrase,
+                url_template: Some(blit_webrtc_forwarder::DEFAULT_URL_TEMPLATE.to_string()),
+                quiet,
+            })
+            .await;
+        }
         Some(cmd) => {
             let conn = &cli.connect;
-            let transport = match transport::connect(&conn.socket, &conn.tcp, &conn.ssh).await {
+            let transport = match transport::connect(&conn.socket, &conn.tcp, &conn.ssh, &conn.share, &conn.hub).await {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("blit: {e}");
@@ -199,7 +291,7 @@ async fn main() {
                             }
                         };
                         let transport2 =
-                            match transport::connect(&conn.socket, &conn.tcp, &conn.ssh).await {
+                            match transport::connect(&conn.socket, &conn.tcp, &conn.ssh, &conn.share, &conn.hub).await {
                                 Ok(t) => t,
                                 Err(e) => {
                                     eprintln!("blit: {e}");
@@ -259,6 +351,7 @@ async fn main() {
                         std::process::exit(1);
                     }
                 },
+                Command::Server { .. } | Command::Share { .. } => unreachable!(),
             };
             if let Err(e) = result {
                 eprintln!("blit: {e}");
@@ -268,7 +361,10 @@ async fn main() {
         None => {
             let conn = &cli.connect;
             if cli.console {
-                interactive::run_console(&conn.socket, &conn.tcp, &conn.ssh).await;
+                interactive::run_console(&conn.socket, &conn.tcp, &conn.ssh, &conn.share, &conn.hub).await;
+            } else if let Some(passphrase) = &conn.share {
+                let hub = blit_webrtc_forwarder::normalize_hub(&conn.hub);
+                interactive::run_browser_share(passphrase, &hub, cli.port).await;
             } else {
                 interactive::run_browser(&conn.socket, &conn.tcp, &conn.ssh, cli.port).await;
             }

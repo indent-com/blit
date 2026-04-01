@@ -1,6 +1,6 @@
 [package]
 name = "blit-webserver"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 description = "Embedded web server for blit"
 license.workspace = true
@@ -11,7 +11,3 @@ homepage.workspace = true
 blit-fonts = { workspace = true }
 axum = "0.8"
 percent-encoding = "2"
-brotli = "8"
-
-[build-dependencies]
-brotli = "8"

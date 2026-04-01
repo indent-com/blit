@@ -1,10 +1,10 @@
-name: Deploy blit-cloud
+name: Deploy blit-hub
 
 on:
   push:
     branches: [main]
     paths:
-      - "js/blit-cloud/**"
+      - "js/blit-hub/**"
 
 jobs:
   deploy:
@@ -12,6 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
-      - run: nix run .#deploy-blit-cloud
+      - run: nix run .#deploy-blit-hub
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

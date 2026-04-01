@@ -10,6 +10,7 @@ members = [
     "crates/cli",
     "crates/fonts",
     "crates/webserver",
+    "crates/webrtc-forwarder",
 ]
 
 [workspace.package]
@@ -18,10 +19,12 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.13.1", path = "crates/remote" }
-blit-alacritty = { version = "0.13.1", path = "crates/alacritty-driver" }
-blit-fonts = { version = "0.13.1", path = "crates/fonts" }
-blit-webserver = { version = "0.13.1", path = "crates/webserver" }
+blit-remote = { version = "0.14.0", path = "crates/remote" }
+blit-alacritty = { version = "0.14.0", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.14.0", path = "crates/fonts" }
+blit-webserver = { version = "0.14.0", path = "crates/webserver" }
+blit-server = { version = "0.14.0", path = "crates/server" }
+blit-webrtc-forwarder = { version = "0.14.0", path = "crates/webrtc-forwarder" }
 
 [profile.release]
 opt-level = "s"
