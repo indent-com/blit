@@ -204,7 +204,7 @@
       };
     in
     {
-      demo-image = let
+      demoImage = let
         fishConfig = pkgs.writeTextDir "etc/fish/config.fish" ''
           function fish_greeting
               cat /etc/blit-welcome 2>/dev/null
@@ -255,13 +255,13 @@
         };
       };
 
-      publish-demo = let image = demo-image; in pkgs.writeShellApplication {
+      publishDemo = pkgs.writeShellApplication {
         name = "publish-demo";
         runtimeInputs = [ pkgs.skopeo ];
         text = ''
-          skopeo copy "docker-archive:${image}" docker://docker.io/grab/blit-demo:latest
+          skopeo copy "docker-archive:${demoImage}" docker://docker.io/grab/blit-demo:latest
           if [[ "''${1:-}" != "" ]]; then
-            skopeo copy "docker-archive:${image}" "docker://docker.io/grab/blit-demo:$1"
+            skopeo copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:$1"
           fi
         '';
       };
@@ -270,7 +270,8 @@
         blit = blit-cli;
         inherit blit-server blit-cli blit-gateway blit-webrtc-forwarder;
         inherit blit-server-static blit-cli-static blit-gateway-static blit-webrtc-forwarder-static;
-        inherit demo-image publish-demo;
+        demo-image = demoImage;
+        publish-demo = publishDemo;
         default = blit-cli;
       } // tasks;
 
