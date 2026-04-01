@@ -393,7 +393,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
         .text()
         .await?;
 
-    let tmp = std::env::temp_dir().join("blit-install.sh");
+    let tmp = std::env::temp_dir().join(format!("blit-install-{}.sh", std::process::id()));
     std::fs::write(&tmp, &script)?;
 
     #[cfg(unix)]
