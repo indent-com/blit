@@ -1,6 +1,6 @@
 [package]
 name = "blit-webrtc-forwarder"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Forward a blit-server session over WebRTC"
 license.workspace = true

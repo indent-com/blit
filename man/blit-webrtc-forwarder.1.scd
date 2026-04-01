@@ -6,7 +6,7 @@ blit-webrtc-forwarder - forward a blit-server session over WebRTC
 
 # SYNOPSIS
 
-_blit-webrtc-forwarder_ *--socket* _PATH_ *--passphrase* _PASSPHRASE_ [*--hub* _URL_] [*--url* _TEMPLATE_] [*--quiet*]
+_blit-webrtc-forwarder_ *--socket* _PATH_ *--passphrase* _PASSPHRASE_ [*--hub* _URL_] [*--url* _TEMPLATE_] [*--quiet*] [*--verbose*]
 
 # DESCRIPTION
 
@@ -36,6 +36,10 @@ the passphrase (default: _https://blit.sh/#{secret}_).
 
 _--quiet_
 Don't print the sharing URL.
+
+_--verbose_
+Print detailed connection diagnostics (ICE negotiation, STUN/TURN
+results, peer events) to stderr.
 
 _--help_, _-h_
 Print usage and exit.

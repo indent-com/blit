@@ -166,6 +166,8 @@ export function adjustWeights(
 // Persistence
 // ---------------------------------------------------------------------------
 
+import { readStorage, writeStorage } from "../storage";
+
 const LAYOUT_KEY = "blit.layout";
 const LAYOUT_HISTORY_KEY = "blit.layouts";
 type StoredRecentLayout = string | { name: string; dsl: string };
@@ -202,13 +204,12 @@ export function loadActiveLayout(): BSPLayout | null {
   }
 
   try {
-    const raw = localStorage.getItem(LAYOUT_KEY);
+    const raw = readStorage(LAYOUT_KEY);
     if (!raw) return null;
     const saved = JSON.parse(raw) as { name: string; dsl: string };
     return layoutFromDSLString(saved.dsl, saved.name);
   } catch {
-    // Backwards compat: try plain DSL string
-    const dsl = localStorage.getItem(LAYOUT_KEY);
+    const dsl = readStorage(LAYOUT_KEY);
     return dsl ? layoutFromDSLString(dsl) : null;
   }
 }
@@ -232,12 +233,12 @@ export function loadAssignmentsFromHash(): Record<string, string> | null {
 
 export function saveActiveLayout(layout: BSPLayout | null): void {
   if (layout) {
-    localStorage.setItem(
+    writeStorage(
       LAYOUT_KEY,
       JSON.stringify({ name: layout.name, dsl: layout.dsl }),
     );
   } else {
-    localStorage.removeItem(LAYOUT_KEY);
+    try { localStorage.removeItem(LAYOUT_KEY); } catch {}
   }
 }
 
@@ -247,7 +248,7 @@ export function saveToHistory(layout: BSPLayout | string): void {
 
 export function loadRecentLayouts(): BSPLayout[] {
   try {
-    const raw = localStorage.getItem(LAYOUT_HISTORY_KEY);
+    const raw = readStorage(LAYOUT_HISTORY_KEY);
     if (!raw) return [];
     const stored: StoredRecentLayout[] = JSON.parse(raw);
     return stored.flatMap((entry) => {
@@ -271,7 +272,7 @@ function pushRecentLayout(layout: BSPLayout | string): void {
       ? { name: layout, dsl: layout }
       : { name: layout.name, dsl: layout.dsl };
   try {
-    const raw = localStorage.getItem(LAYOUT_HISTORY_KEY);
+    const raw = readStorage(LAYOUT_HISTORY_KEY);
     const existing: StoredRecentLayout[] = raw ? JSON.parse(raw) : [];
     const next = [
       record,
@@ -280,10 +281,8 @@ function pushRecentLayout(layout: BSPLayout | string): void {
         return dsl !== record.dsl;
       }),
     ].slice(0, 10);
-    localStorage.setItem(LAYOUT_HISTORY_KEY, JSON.stringify(next));
-  } catch {
-    // ignore storage errors
-  }
+    writeStorage(LAYOUT_HISTORY_KEY, JSON.stringify(next));
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------

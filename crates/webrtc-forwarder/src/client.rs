@@ -192,7 +192,7 @@ pub async fn connect(
         )
         .await
         {
-            eprintln!("webrtc client error: {e}");
+            verbose!("webrtc client error: {e}");
         }
     });
 

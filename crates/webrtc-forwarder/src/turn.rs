@@ -456,7 +456,7 @@ async fn udp_relay_task(
             }
             _ = refresh_timer.tick() => {
                 if let Err(e) = udp_refresh(&socket, server, &nonce, &realm, &key, &username).await {
-                    eprintln!("TURN refresh failed: {e}");
+                    verbose!("TURN refresh failed: {e}");
                     break;
                 }
             }
@@ -706,7 +706,7 @@ async fn tcp_relay_task(
             }
             _ = refresh_timer.tick() => {
                 if let Err(e) = tcp_refresh(&mut stream, &nonce, &realm, &key, &username).await {
-                    eprintln!("TURN refresh failed: {e}");
+                    verbose!("TURN refresh failed: {e}");
                     break;
                 }
             }

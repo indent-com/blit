@@ -9,19 +9,17 @@ export function LayoutPreview({
   width = 48,
   height = 32,
   color = "currentColor",
-  opacity = 0.5,
+  bg,
   highlightIndex,
-  highlightOpacity,
 }: {
   node: BSPNode;
   width?: number;
   height?: number;
   color?: string;
-  opacity?: number;
-  /** Leaf index to highlight (brighter) in the preview. */
+  /** Background color for gaps between panes. */
+  bg?: string;
+  /** Leaf index to highlight (filled) in the preview. */
   highlightIndex?: number;
-  /** Opacity for the highlighted leaf (defaults to 1). */
-  highlightOpacity?: number;
 }) {
   const rects: Array<{
     x: number;
@@ -111,22 +109,22 @@ export function LayoutPreview({
 
   return (
     <svg width={width} height={height} style={{ flexShrink: 0 }}>
-      {rects.map((r, i) => (
-        <rect
-          key={i}
-          x={r.x}
-          y={r.y}
-          width={Math.max(0, r.w)}
-          height={Math.max(0, r.h)}
-          fill={color}
-          opacity={
-            r.leafIndex >= 0 && r.leafIndex === highlightIndex
-              ? (highlightOpacity ?? 1)
-              : opacity
-          }
-          rx={1}
-        />
-      ))}
+      {bg && <rect width={width} height={height} fill={bg} rx={1} />}
+      {rects.map((r, i) => {
+        const highlighted = r.leafIndex >= 0 && r.leafIndex === highlightIndex;
+        return (
+          <rect
+            key={i}
+            x={r.x + 0.5}
+            y={r.y + 0.5}
+            width={Math.max(0, r.w - 1)}
+            height={Math.max(0, r.h - 1)}
+            fill={highlighted ? color : bg ?? "none"}
+            stroke={color}
+            rx={1}
+          />
+        );
+      })}
     </svg>
   );
 }

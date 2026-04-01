@@ -1,6 +1,6 @@
 [package]
 name = "blit-webserver"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Embedded web server for blit"
 license.workspace = true
@@ -9,5 +9,8 @@ homepage.workspace = true
 
 [dependencies]
 blit-fonts = { workspace = true }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["sync", "time"] }
+futures-util = "0.3"
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 percent-encoding = "2"

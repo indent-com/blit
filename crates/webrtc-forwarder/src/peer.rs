@@ -53,7 +53,7 @@ pub async fn handle_peer(
                     );
                     break;
                 }
-                Err(e) => eprintln!("STUN binding failed: {e}"),
+                Err(e) => verbose!("STUN binding failed: {e}"),
             }
         }
 
@@ -78,7 +78,7 @@ pub async fn handle_peer(
                     relay = Some(r);
                     break;
                 }
-                Err(e) => eprintln!("TURN allocate ({:?}) failed: {e}", ts.transport),
+                Err(e) => verbose!("TURN allocate ({:?}) failed: {e}", ts.transport),
             }
         }
     }
@@ -125,7 +125,7 @@ pub async fn handle_peer(
                 Output::Event(ev) => {
                     match ev {
                         Event::ChannelOpen(cid, label) => {
-                            eprintln!("data channel opened: {label}");
+                            verbose!("data channel opened: {label}");
                             if label == "blit" {
                                 blit_channel = Some(cid);
                                 let stream = UnixStream::connect(&sock_path).await?;
@@ -149,13 +149,13 @@ pub async fn handle_peer(
                                     let payload = &data[4..4 + len];
                                     let frame_len = (payload.len() as u32).to_le_bytes();
                                     if conn.write_all(&frame_len).await.is_err() {
-                                        eprintln!("blit-server socket write failed");
+                                        verbose!("blit-server socket write failed");
                                         return Ok(());
                                     }
                                     if !payload.is_empty()
                                         && conn.write_all(payload).await.is_err()
                                     {
-                                        eprintln!("blit-server socket write failed");
+                                        verbose!("blit-server socket write failed");
                                         return Ok(());
                                     }
                                 }
@@ -163,12 +163,12 @@ pub async fn handle_peer(
                         }
                         Event::ChannelClose(cid) => {
                             if Some(cid) == blit_channel {
-                                eprintln!("blit data channel closed");
+                                verbose!("blit data channel closed");
                                 return Ok(());
                             }
                         }
                         Event::IceConnectionStateChange(state) => {
-                            eprintln!("ICE state: {state:?}");
+                            verbose!("ICE state: {state:?}");
                             if matches!(
                                 state,
                                 str0m::IceConnectionState::Disconnected
@@ -249,7 +249,7 @@ pub async fn handle_peer(
                         }
                     }
                     _ => {
-                        eprintln!("blit-server connection closed");
+                        verbose!("blit-server connection closed");
                         return Ok(());
                     }
                 }
@@ -274,7 +274,7 @@ pub async fn handle_peer(
                         if !established.load(Ordering::Relaxed) {
                             return Ok(());
                         }
-                        eprintln!("signaling channel closed, WebRTC connection continues");
+                        verbose!("signaling channel closed, WebRTC connection continues");
                     }
                 }
             }

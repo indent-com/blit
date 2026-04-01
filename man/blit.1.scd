@@ -26,7 +26,9 @@ _blit_ [OPTIONS] _close_ _ID_
 
 _blit_ [OPTIONS] _server_ [_--shell-flags_ _FLAGS_] [_--scrollback_ _N_] [_--fd-channel_ _FD_]
 
-_blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_]
+_blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_] [_--verbose_]
+
+_blit_ _upgrade_
 
 # DESCRIPTION
 
@@ -131,12 +133,18 @@ Run the blit terminal multiplexer server in-process. The server listens
 on the Unix socket specified by _--socket_ (or the default path). This is
 equivalent to running _blit-server_(1) as a standalone binary.
 
-_share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_]
+_share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_] [_--verbose_]
 Share a terminal session via WebRTC. If no server is running at the
 default socket path, one is started automatically in-process. A sharing
 URL is printed to stdout. The passphrase can also be set via the
 _BLIT_PASSPHRASE_ environment variable. If omitted, a random passphrase
-is generated.
+is generated. With _--verbose_, detailed connection diagnostics (ICE
+negotiation, STUN/TURN results, peer events) are printed to stderr.
+
+_upgrade_
+Upgrade _blit_ to the latest version. Downloads and runs the install
+script from _https://install.blit.sh_, installing into the same
+directory as the currently running binary.
 
 # ENVIRONMENT
 

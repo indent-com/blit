@@ -16,6 +16,7 @@ import {
 import type {
   BlitSearchResult,
   BlitSession,
+  BlitTerminalHandle,
   SessionId,
   TerminalPalette,
 } from "blit-react";
@@ -270,6 +271,78 @@ function ActionGlyph({
         </svg>
       );
   }
+}
+
+function PreviewTerminal({
+  sessionId,
+  palette,
+}: {
+  sessionId: SessionId;
+  palette: TerminalPalette;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<BlitTerminalHandle>(null);
+  const [termSize, setTermSize] = useState<{ w: number; h: number } | null>(
+    null,
+  );
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const update = () => {
+      const canvas = container.querySelector("canvas");
+      if (!canvas || canvas.width === 0 || canvas.height === 0) return;
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
+      const scale = Math.min(cw / canvas.width, ch / canvas.height, 1);
+      const w = Math.floor(canvas.width * scale);
+      const h = Math.floor(canvas.height * scale);
+      setTermSize((prev) =>
+        prev && prev.w === w && prev.h === h ? prev : { w, h },
+      );
+    };
+    const obs = new ResizeObserver(update);
+    obs.observe(container);
+    const mo = new MutationObserver(update);
+    mo.observe(container, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["width", "height"],
+    });
+    update();
+    return () => {
+      obs.disconnect();
+      mo.disconnect();
+    };
+  }, [sessionId]);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{
+        flex: 1,
+        minHeight: 0,
+        overflow: "hidden",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        pointerEvents: "none",
+        backgroundColor: `rgb(${palette.bg[0]},${palette.bg[1]},${palette.bg[2]})`,
+      }}
+    >
+      <BlitTerminal
+        ref={termRef}
+        sessionId={sessionId}
+        readOnly
+        showCursor={false}
+        style={
+          termSize
+            ? { width: termSize.w, height: termSize.h }
+            : { width: "100%", height: "100%" }
+        }
+      />
+    </div>
+  );
 }
 
 export function SwitcherOverlay({
@@ -791,7 +864,7 @@ export function SwitcherOverlay({
           width={iconSize}
           height={iconSize}
           color={theme.fg}
-          opacity={selected ? 0.82 : 0.56}
+          bg={theme.bg}
         />
       ) : item.type === "session" ? (
         <BlitTerminal
@@ -813,9 +886,8 @@ export function SwitcherOverlay({
             width={iconSize}
             height={iconSize}
             color={theme.fg}
-            opacity={selected ? 0.32 : 0.2}
+            bg={theme.bg}
             highlightIndex={item.paneIndex}
-            highlightOpacity={selected ? 0.82 : 0.56}
           />
         ) : (
           <PaneGlyph empty={item.empty} fg={theme.fg} dimFg={theme.dimFg} />
@@ -1348,7 +1420,7 @@ export function SwitcherOverlay({
                       width={160}
                       height={96}
                       color={theme.fg}
-                      opacity={0.68}
+                      bg={theme.bg}
                     />
                   </div>
                   <div
@@ -1433,9 +1505,8 @@ export function SwitcherOverlay({
                         width={160}
                         height={96}
                         color={theme.fg}
-                        opacity={0.2}
+                        bg={theme.bg}
                         highlightIndex={selectedItem.paneIndex}
-                        highlightOpacity={0.82}
                       />
                     </div>
                   )}
@@ -1483,17 +1554,9 @@ export function SwitcherOverlay({
                       )}
                     </div>
                   </div>
-                  <BlitTerminal
+                  <PreviewTerminal
                     sessionId={selectedItem.sessionId}
-                    readOnly
-                    showCursor={false}
-                    style={{
-                      width: "100%",
-                      flex: 1,
-                      minHeight: 0,
-                      pointerEvents: "none",
-                      alignSelf: "center",
-                    }}
+                    palette={palette}
                   />
                   {selectedItem.context && (
                     <div style={{ fontSize: fsSm, color: theme.dimFg }}>

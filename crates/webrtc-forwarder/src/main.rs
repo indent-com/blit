@@ -1,4 +1,4 @@
-use blit_webrtc_forwarder::{Config, DEFAULT_HUB_URL, DEFAULT_URL_TEMPLATE};
+use blit_webrtc_forwarder::{Config, DEFAULT_HUB_URL};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -16,13 +16,17 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_HUB_URL, env = "BLIT_HUB")]
     hub: String,
 
-    /// URL template to display (use {secret} as placeholder)
-    #[arg(long, default_value = DEFAULT_URL_TEMPLATE)]
-    url: String,
+    /// Override the message template (use {secret} as placeholder); skips hub fetch
+    #[arg(long)]
+    message: Option<String>,
 
     /// Don't print the sharing URL
     #[arg(long)]
     quiet: bool,
+
+    /// Print detailed connection diagnostics to stderr
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -32,8 +36,9 @@ async fn main() {
         sock_path: cli.socket,
         signal_url: blit_webrtc_forwarder::normalize_hub(&cli.hub),
         passphrase: cli.passphrase,
-        url_template: Some(cli.url),
+        message_override: cli.message,
         quiet: cli.quiet,
+        verbose: cli.verbose,
     })
     .await;
 }

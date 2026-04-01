@@ -70,6 +70,11 @@ in {
             default = null;
             description = "PEM private key file for WebTransport TLS. Auto-generated if null.";
           };
+          storeConfig = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Sync browser settings to ~/.config/blit/blit.conf.";
+          };
           package = mkOption {
             type = types.package;
             default = self.packages.${pkgs.system}.blit-gateway;
@@ -120,6 +125,8 @@ in {
             BLIT_SOCK = cfg.socketPath;
           } // lib.optionalAttrs (gw.fontDirs != []) {
             BLIT_FONT_DIRS = lib.concatStringsSep ":" gw.fontDirs;
+          } // lib.optionalAttrs gw.storeConfig {
+            BLIT_STORE_CONFIG = "1";
           } // lib.optionalAttrs gw.quic {
             BLIT_QUIC = "1";
           } // lib.optionalAttrs (gw.tlsCert != null) {

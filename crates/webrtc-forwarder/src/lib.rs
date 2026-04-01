@@ -1,3 +1,11 @@
+macro_rules! verbose {
+    ($($arg:tt)*) => {
+        if $crate::VERBOSE.load(::std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 pub mod client;
 pub mod ice;
 mod peer;
@@ -13,6 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+pub static VERBOSE: AtomicBool = AtomicBool::new(false);
+
 pub const DEFAULT_HUB_URL: &str = "hub.blit.sh";
 
 /// Resolve the machine's default local IP (the one the OS would route outbound traffic from).
@@ -22,7 +32,7 @@ pub fn default_local_ip() -> Option<std::net::IpAddr> {
     probe.connect("192.0.2.1:80").ok()?;
     Some(probe.local_addr().ok()?.ip())
 }
-pub const DEFAULT_URL_TEMPLATE: &str = "https://blit.sh/#{secret}";
+const DEFAULT_MESSAGE_TEMPLATE: &str = "https://blit.sh/#{secret}";
 
 pub fn normalize_hub(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');
@@ -45,8 +55,9 @@ pub struct Config {
     pub sock_path: String,
     pub signal_url: String,
     pub passphrase: String,
-    pub url_template: Option<String>,
+    pub message_override: Option<String>,
     pub quiet: bool,
+    pub verbose: bool,
 }
 
 const PBKDF2_SALT: &[u8] = b"https://blit.sh";
@@ -69,24 +80,57 @@ struct PeerState {
     established: Arc<AtomicBool>,
 }
 
+struct Message {
+    template: String,
+    fatal: bool,
+}
+
+async fn fetch_message(signal_url_base: &str) -> Option<Message> {
+    let base = signal_url_base
+        .trim_end_matches('/')
+        .replace("wss://", "https://")
+        .replace("ws://", "http://");
+    let url = format!("{base}/message");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", format!("blit/{}", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let template = body.get("template")?.as_str()?.to_string();
+    let fatal = body.get("fatal").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(Message { template, fatal })
+}
+
 pub async fn run(config: Config) {
+    VERBOSE.store(config.verbose, Ordering::Relaxed);
     let signing_key = derive_signing_key(&config.passphrase);
     let public_key_hex = hex_encode(signing_key.verifying_key().as_bytes());
 
     if !config.quiet {
-        if let Some(template) = &config.url_template {
-            let url = template.replace("{secret}", &config.passphrase);
-            println!("{url}");
+        let (template, fatal) = match &config.message_override {
+            Some(t) => (t.clone(), false),
+            None => match fetch_message(&config.signal_url).await {
+                Some(msg) => (msg.template, msg.fatal),
+                None => (DEFAULT_MESSAGE_TEMPLATE.to_string(), false),
+            },
+        };
+        let rendered = template.replace("{secret}", &config.passphrase);
+        println!("{rendered}");
+        if fatal {
+            std::process::exit(1);
         }
     }
 
     let ice_config = match ice::fetch_ice_config(&config.signal_url).await {
         Ok(cfg) => {
-            eprintln!("fetched ICE config ({} servers)", cfg.ice_servers.len());
+            verbose!("fetched ICE config ({} servers)", cfg.ice_servers.len());
             Some(cfg)
         }
         Err(e) => {
-            eprintln!("failed to fetch ICE config: {e}");
+            verbose!("failed to fetch ICE config: {e}");
             None
         }
     };
@@ -111,7 +155,7 @@ pub async fn run(config: Config) {
     while let Some(event) = sig_event_rx.recv().await {
         match event {
             signaling::Event::Registered { session_id } => {
-                eprintln!("registered with signaling server (session {session_id})");
+                verbose!("registered with signaling server (session {session_id})");
                 let stale: Vec<String> = peers
                     .iter()
                     .filter(|(_, s)| !s.established.load(Ordering::Relaxed))
@@ -119,7 +163,7 @@ pub async fn run(config: Config) {
                     .collect();
                 for id in stale {
                     if let Some(state) = peers.remove(&id) {
-                        eprintln!("aborting peer still in signaling phase: {id}");
+                        verbose!("aborting peer still in signaling phase: {id}");
                         state.handle.abort();
                     }
                 }
@@ -127,14 +171,14 @@ pub async fn run(config: Config) {
             signaling::Event::PeerJoined { session_id } => {
                 if let Some(existing) = peers.get(&session_id) {
                     if existing.established.load(Ordering::Relaxed) {
-                        eprintln!("ignoring duplicate peer_joined for established peer: {session_id}");
+                        verbose!("ignoring duplicate peer_joined for established peer: {session_id}");
                         continue;
                     }
                     if let Some(old) = peers.remove(&session_id) {
                         old.handle.abort();
                     }
                 }
-                eprintln!("consumer joined: {session_id}");
+                verbose!("consumer joined: {session_id}");
                 let (peer_sig_tx, peer_sig_rx) = mpsc::unbounded_channel();
                 let established = Arc::new(AtomicBool::new(false));
                 let peer_id = session_id.clone();
@@ -147,7 +191,7 @@ pub async fn run(config: Config) {
                     if let Err(e) =
                         peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key, est, ice).await
                     {
-                        eprintln!("peer {peer_id} error: {e}");
+                        verbose!("peer {peer_id} error: {e}");
                     }
                 });
                 peers.insert(
@@ -160,7 +204,7 @@ pub async fn run(config: Config) {
                 );
             }
             signaling::Event::PeerLeft { session_id } => {
-                eprintln!("consumer left: {session_id}");
+                verbose!("consumer left: {session_id}");
                 if let Some(state) = peers.remove(&session_id) {
                     state.handle.abort();
                 }
@@ -169,11 +213,11 @@ pub async fn run(config: Config) {
                 if let Some(state) = peers.get(&from) {
                     let _ = state.signal_tx.send(data);
                 } else {
-                    eprintln!("signal from unknown peer {from}, ignoring");
+                    verbose!("signal from unknown peer {from}, ignoring");
                 }
             }
             signaling::Event::Error { message } => {
-                eprintln!("signaling error: {message}");
+                verbose!("signaling error: {message}");
             }
         }
     }

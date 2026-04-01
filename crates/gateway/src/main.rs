@@ -45,10 +45,9 @@ static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag
 struct Config {
     passphrase: String,
     sock_path: String,
-    /// CORS origin for font routes. None = no CORS, Some("*") = allow all.
     cors_origin: Option<String>,
-    /// Live cert hash for WebTransport. Updated on cert rotation.
     wt_cert_hash: std::sync::RwLock<Option<String>>,
+    config_state: Option<blit_webserver::config::ConfigState>,
 }
 
 type AppState = Arc<Config>;
@@ -99,6 +98,7 @@ async fn main() {
             println!("  BLIT_QUIC       Set to 1 to enable WebTransport (QUIC/HTTP3)");
             println!("  BLIT_TLS_CERT   PEM certificate file (for WebTransport)");
             println!("  BLIT_TLS_KEY    PEM private key file (for WebTransport)");
+            println!("  BLIT_STORE_CONFIG  Set to 1 to sync browser settings to ~/.config/blit/blit.conf");
             std::process::exit(0);
         }
         if arg == "--version" || arg == "-V" {
@@ -130,11 +130,23 @@ async fn main() {
 
     let cors_origin = std::env::var("BLIT_CORS").ok();
 
+    let config_state = if std::env::var("BLIT_STORE_CONFIG")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("config sync enabled (BLIT_STORE_CONFIG=1)");
+        Some(blit_webserver::config::ConfigState::new())
+    } else {
+        None
+    };
+
     let state: AppState = Arc::new(Config {
         passphrase,
         sock_path,
         cors_origin,
         wt_cert_hash: std::sync::RwLock::new(None),
+        config_state,
     });
 
     // --- WebTransport (QUIC/HTTP3) — opt-in via BLIT_QUIC=1 ---
@@ -191,7 +203,16 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    if is_ws {
+    if is_ws && path.ends_with("/config") && state.config_state.is_some() {
+        match WebSocketUpgrade::from_request(request, &state).await {
+            Ok(ws) => ws.on_upgrade(move |socket| async move {
+                if let Some(ref cs) = state.config_state {
+                    blit_webserver::config::handle_config_ws(socket, &state.passphrase, cs).await;
+                }
+            }),
+            Err(e) => e.into_response(),
+        }
+    } else if is_ws {
         match WebSocketUpgrade::from_request(request, &state).await {
             Ok(ws) => ws.on_upgrade(move |socket| handle_ws(socket, state)),
             Err(e) => e.into_response(),

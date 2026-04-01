@@ -3,6 +3,7 @@ import {
   BlitTerminal,
   BlitWorkspaceProvider,
   BlitWorkspace,
+  PALETTES,
   useBlitConnection,
   useBlitFocusedSession,
   useBlitSessions,
@@ -24,6 +25,7 @@ import {
   FONT_KEY,
   FONT_SIZE_KEY,
   writeStorage,
+  useConfigValue,
   preferredPalette,
   preferredFont,
   preferredFontSize,
@@ -163,6 +165,26 @@ function WorkspaceScreen({
   const fontOverlayOriginRef = useRef<{ family: string; size: number } | null>(
     null,
   );
+
+  const remotePaletteId = useConfigValue(PALETTE_KEY);
+  const remoteFont = useConfigValue(FONT_KEY);
+  const remoteFontSize = useConfigValue(FONT_SIZE_KEY);
+
+  useEffect(() => {
+    if (!remotePaletteId) return;
+    const p = PALETTES.find((x) => x.id === remotePaletteId);
+    if (p) setPalette(p);
+  }, [remotePaletteId]);
+
+  useEffect(() => {
+    if (remoteFont?.trim()) setFont(remoteFont.trim());
+  }, [remoteFont]);
+
+  useEffect(() => {
+    if (!remoteFontSize) return;
+    const n = parseInt(remoteFontSize, 10);
+    if (n > 0) setFontSize(n);
+  }, [remoteFontSize]);
 
   const resolvedFontWithFallback =
     resolvedFont === DEFAULT_FONT

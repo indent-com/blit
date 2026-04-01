@@ -150,8 +150,7 @@ jobs:
           # Write version to /latest
           echo "${GITHUB_REF_NAME#v}" > repo/latest
 
-          # Install script
-          cp install.sh repo/install
+          cp install.sh repo/index.html
 
           cd repo
           dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages

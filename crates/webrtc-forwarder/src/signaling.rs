@@ -69,10 +69,10 @@ pub async fn connect(
     loop {
         match try_connect(&url, &key, &event_tx, &mut outgoing_rx).await {
             Ok(()) => {
-                eprintln!("signaling connection closed, reconnecting...");
+                verbose!("signaling connection closed, reconnecting...");
             }
             Err(e) => {
-                eprintln!("signaling connection error: {e}, reconnecting...");
+                verbose!("signaling connection error: {e}, reconnecting...");
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

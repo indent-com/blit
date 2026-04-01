@@ -465,6 +465,7 @@ impl BrowserConnector {
 struct BrowserState {
     token: String,
     connector: BrowserConnector,
+    config: blit_webserver::config::ConfigState,
 }
 
 enum Event {
@@ -690,6 +691,7 @@ pub async fn run_browser(
     let state = Arc::new(BrowserState {
         token: token.clone(),
         connector,
+        config: blit_webserver::config::ConfigState::new(),
     });
 
     fn js_escape(s: &str) -> String {
@@ -715,6 +717,14 @@ pub async fn run_browser(
         Box::leak(blit_webserver::html_etag(injected_html).into_boxed_str());
 
     let app = axum::Router::new()
+        .route("/config", get(move |
+            axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
+            ws: WebSocketUpgrade,
+        | async move {
+            ws.on_upgrade(move |socket| async move {
+                blit_webserver::config::handle_config_ws(socket, &state.token, &state.config).await;
+            })
+        }))
         .fallback(get(move |state, request| {
             browser_root_handler(state, request, injected_html, html_etag)
         }))
