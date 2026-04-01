@@ -85,6 +85,7 @@ export interface BlitTransport {
 export type BlitSession = {
   id: SessionId;
   connectionId: ConnectionId;
+  ptyId: number;
   tag: string;
   title: string | null;
   state: "creating" | "active" | "exited" | "closed";

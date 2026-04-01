@@ -79,8 +79,7 @@ type PendingSearch = {
   reject: (error: Error) => void;
 };
 
-/** Internal session with ptyId — not exposed to consumers. */
-type InternalSession = BlitSession & { ptyId: number };
+type InternalSession = BlitSession;
 
 function connectionError(message: string): Error {
   return new Error(message);
@@ -95,8 +94,7 @@ function isLiveSession(session: InternalSession): boolean {
 }
 
 function toPublicSession(s: InternalSession): BlitSession {
-  const { ptyId: _, ...pub } = s;
-  return pub;
+  return s;
 }
 
 export class BlitConnection {

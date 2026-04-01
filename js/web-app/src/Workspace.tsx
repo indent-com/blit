@@ -666,7 +666,11 @@ function WorkspaceScreen({
     if (layoutAssignments) {
       const a = Object.entries(layoutAssignments.assignments)
         .filter(([, sid]) => sid != null)
-        .map(([pane, sid]) => `${pane}:${sid}`)
+        .map(([pane, sid]) => {
+          const s = sessions.find((s) => s.id === sid);
+          return s ? `${pane}:${s.connectionId}:${s.ptyId}` : null;
+        })
+        .filter(Boolean)
         .join(",");
       if (a) parts.push(`a=${a}`);
     }

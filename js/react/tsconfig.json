@@ -4,7 +4,6 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "baseUrl": ".",
     "paths": {
       "blit-browser": ["../../crates/browser/pkg/blit_browser.d.ts"]
     },

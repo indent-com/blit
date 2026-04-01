@@ -12,7 +12,6 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "baseUrl": ".",
     "paths": {
       "blit-react": ["../react/src/index.ts"],
       "blit-browser": ["../../crates/browser/pkg/blit_browser.d.ts"]

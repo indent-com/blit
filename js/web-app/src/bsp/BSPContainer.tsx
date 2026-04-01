@@ -124,12 +124,24 @@ export function BSPContainer({
   const [root, setRoot] = useState(layout.root);
   const panes = useMemo(() => enumeratePanes(root), [root]);
   const paneIds = useMemo(() => panes.map((pane) => pane.id), [panes]);
+  // Hash assignments store connectionId:ptyId pairs. We resolve them to
+  // session IDs once sessions arrive from the server.
+  const pendingHashRef = useRef<Record<string, string> | null>(() => {
+    const ha = loadAssignmentsFromHash();
+    return ha;
+  });
+  // Evaluate the lazy initializer
+  if (typeof pendingHashRef.current === "function") {
+    pendingHashRef.current = (pendingHashRef.current as () => Record<string, string> | null)();
+  }
+
   const [layoutState, setLayoutState] = useState<BSPAssignments>(() => {
-    const hashAssignments = loadAssignmentsFromHash();
-    if (hashAssignments) {
+    // Don't resolve hash assignments yet — sessions haven't arrived.
+    // Start with empty assignments; the effect below will resolve them.
+    if (pendingHashRef.current) {
       const assignments: Record<string, SessionId | null> = {};
       for (const paneId of paneIds) {
-        assignments[paneId] = (hashAssignments[paneId] as SessionId) ?? null;
+        assignments[paneId] = null;
       }
       return { assignments };
     }
@@ -176,8 +188,39 @@ export function BSPContainer({
     [connectionId, sessions],
   );
 
+  // Resolve pending hash assignments (connectionId:ptyId) to session IDs
+  // once sessions arrive from the server.
+  useEffect(() => {
+    const pending = pendingHashRef.current;
+    if (!pending || liveSessions.length === 0) return;
+
+    const assignments: Record<string, SessionId | null> = {};
+    let resolved = 0;
+    for (const paneId of paneIds) {
+      const ref = pending[paneId];
+      if (!ref) { assignments[paneId] = null; continue; }
+      // ref is "connectionId:ptyId" — split on last colon since connectionId might contain colons
+      const lastColon = ref.lastIndexOf(":");
+      if (lastColon <= 0) { assignments[paneId] = null; continue; }
+      const connId = ref.slice(0, lastColon);
+      const ptyId = parseInt(ref.slice(lastColon + 1), 10);
+      const session = liveSessions.find(
+        (s) => s.connectionId === connId && s.ptyId === ptyId,
+      );
+      assignments[paneId] = session?.id ?? null;
+      if (session) resolved++;
+    }
+
+    if (resolved > 0) {
+      pendingHashRef.current = null;
+      setLayoutState({ assignments });
+    }
+  }, [liveSessions, paneIds]);
+
   useEffect(() => {
     if (!connected) return;
+    // Skip reconciliation while we still have pending hash assignments to resolve.
+    if (pendingHashRef.current) return;
     setLayoutState((previous) => {
       const next = reconcileAssignments({
         panes,
