@@ -1149,14 +1149,8 @@ export function BlitTerminal({
           [sr, sc, er, ec] = [er, ec, sr, sc];
         }
         const text = t.get_text(sr, sc, er, ec);
-        const html = t.get_html(sr, sc, er, ec);
         if (text) {
-          navigator.clipboard.write([
-            new ClipboardItem({
-              "text/plain": new Blob([text], { type: "text/plain" }),
-              "text/html": new Blob([html], { type: "text/html" }),
-            }),
-          ]);
+          navigator.clipboard.writeText(text);
         }
       }
 
