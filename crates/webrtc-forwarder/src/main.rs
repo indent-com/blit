@@ -5,7 +5,7 @@ use clap::Parser;
 #[command(name = "blit-webrtc-forwarder", version, about = "Forward a blit-server session over WebRTC")]
 struct Cli {
     /// Path to the blit-server Unix socket
-    #[arg(long)]
+    #[arg(long, env = "BLIT_SOCK")]
     socket: String,
 
     /// Passphrase for the session (or set BLIT_PASSPHRASE env var)

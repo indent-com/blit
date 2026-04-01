@@ -94,6 +94,44 @@ in {
       default = {};
       description = "Named blit-gateway instances connecting to blit-server sockets.";
     };
+
+    forwarders = mkOption {
+      type = types.attrsOf (types.submodule {
+        options = {
+          user = mkOption {
+            type = types.str;
+            description = "User whose blit-server socket to forward.";
+          };
+          passFile = mkOption {
+            type = types.path;
+            description = "File containing BLIT_PASSPHRASE=<passphrase>.";
+          };
+          hub = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Signaling hub URL. Defaults to hub.blit.sh.";
+          };
+          quiet = mkOption {
+            type = types.bool;
+            default = true;
+            description = "Don't print the sharing URL.";
+          };
+          verbose = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Print detailed connection diagnostics to stderr.";
+          };
+          package = mkOption {
+            type = types.package;
+            default = self.packages.${pkgs.system}.blit-webrtc-forwarder;
+            defaultText = "self.packages.\${system}.blit-webrtc-forwarder";
+            description = "The blit-webrtc-forwarder package to use.";
+          };
+        };
+      });
+      default = {};
+      description = "Named blit-webrtc-forwarder instances sharing blit-server sessions via WebRTC.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -137,7 +175,28 @@ in {
           AmbientCapabilities = lib.mkIf (gw.port < 1024) [ "CAP_NET_BIND_SERVICE" ];
         };
       };
-    }) cfg.gateways);
+    }) cfg.gateways)
+    // builtins.listToAttrs (lib.mapAttrsToList (name: fwd: {
+      name = "blit-webrtc-forwarder-${name}";
+      value = {
+        description = "blit WebRTC forwarder ${name} for ${fwd.user}";
+        after = [ "blit-server@${fwd.user}.socket" "network.target" ];
+        requires = [ "blit-server@${fwd.user}.socket" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "simple";
+          User = fwd.user;
+          ExecStart = "${fwd.package}/bin/blit-webrtc-forwarder"
+            + lib.optionalString fwd.quiet " --quiet"
+            + lib.optionalString fwd.verbose " --verbose";
+          Environment = [
+            "BLIT_SOCK=/run/blit/${fwd.user}.sock"
+          ] ++ lib.optional (fwd.hub != null) "BLIT_HUB=${fwd.hub}";
+          EnvironmentFile = fwd.passFile;
+          Restart = "on-failure";
+        };
+      };
+    }) cfg.forwarders);
 
     systemd.sockets = builtins.listToAttrs (map (user: {
       name = "blit-server@${user}";

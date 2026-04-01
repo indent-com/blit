@@ -86,6 +86,40 @@ in {
       default = {};
       description = "Named blit-gateway instances.";
     };
+
+    forwarders = mkOption {
+      type = types.attrsOf (types.submodule {
+        options = {
+          passFile = mkOption {
+            type = types.path;
+            description = "File containing BLIT_PASSPHRASE=<passphrase>.";
+          };
+          hub = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Signaling hub URL. Defaults to hub.blit.sh.";
+          };
+          quiet = mkOption {
+            type = types.bool;
+            default = true;
+            description = "Don't print the sharing URL.";
+          };
+          verbose = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Print detailed connection diagnostics to stderr.";
+          };
+          package = mkOption {
+            type = types.package;
+            default = self.packages.${pkgs.system}.blit-webrtc-forwarder;
+            defaultText = "self.packages.\${system}.blit-webrtc-forwarder";
+            description = "The blit-webrtc-forwarder package to use.";
+          };
+        };
+      });
+      default = {};
+      description = "Named blit-webrtc-forwarder instances sharing blit-server sessions via WebRTC.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -140,6 +174,31 @@ in {
           StandardErrorPath = "/tmp/blit-gateway-${name}.log";
         };
       };
-    }) cfg.gateways);
+    }) cfg.gateways)
+    // builtins.listToAttrs (lib.mapAttrsToList (name: fwd: {
+      name = "blit-webrtc-forwarder-${name}";
+      value = {
+        serviceConfig = {
+          Label = "com.blit.webrtc-forwarder.${name}";
+          ProgramArguments = [
+            "/bin/sh" "-c"
+            ''. ${fwd.passFile} && exec ${fwd.package}/bin/blit-webrtc-forwarder''
+              + lib.optionalString fwd.quiet " --quiet"
+              + lib.optionalString fwd.verbose " --verbose"
+          ];
+          EnvironmentVariables = {}
+            // lib.optionalAttrs (cfg.socketPath != null) {
+              BLIT_SOCK = cfg.socketPath;
+            }
+            // lib.optionalAttrs (fwd.hub != null) {
+              BLIT_HUB = fwd.hub;
+            };
+          RunAtLoad = true;
+          KeepAlive = true;
+          StandardOutPath = "/tmp/blit-webrtc-forwarder-${name}.log";
+          StandardErrorPath = "/tmp/blit-webrtc-forwarder-${name}.log";
+        };
+      };
+    }) cfg.forwarders);
   };
 }

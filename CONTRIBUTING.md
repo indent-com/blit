@@ -99,8 +99,8 @@ Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cl
 | `js/web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                 |
 | `e2e/`        | Playwright tests against the full stack (6 spec files)                                                               |
 | `nix/`        | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules   |
-| `systemd/`    | Socket-activated unit files (user-level and system-level templates)                                                  |
-| `man/`        | scdoc man pages for `blit`, `blit-server`, `blit-gateway`                                                            |
+| `systemd/`    | Socket-activated unit files (user-level and system-level templates) and service units                                |
+| `man/`        | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                   |
 | `bin/`        | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                               |
 
 ## Code conventions

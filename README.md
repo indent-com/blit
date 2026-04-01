@@ -154,6 +154,10 @@ brew services start blit-gateway
 
 ```bash
 sudo systemctl enable --now blit-server@alice.socket
+
+# Share via WebRTC: create /etc/blit/forwarder-alice.env with
+# BLIT_SOCK=/run/blit/alice.sock and BLIT_PASSPHRASE=<secret>, then:
+sudo systemctl enable --now blit-webrtc-forwarder@alice.service
 ```
 
 ## How it compares
@@ -216,6 +220,9 @@ docker run --rm grab/blit-demo
       port = 3264;
       passFile = "/path/to/blit-pass-env";
     };
+    forwarders.default = {
+      passFile = "/path/to/blit-forwarder-env";
+    };
   };
 }
 ```
@@ -235,6 +242,10 @@ See [`nix/darwin-module.nix`](nix/darwin-module.nix) for the full list of option
       user = "alice";
       port = 3264;
       passFile = "/run/secrets/blit-alice-pass";
+    };
+    forwarders.alice = {
+      user = "alice";
+      passFile = "/run/secrets/blit-alice-forwarder-pass";
     };
   };
 }

@@ -140,6 +140,12 @@ CTRL
     pname = "blit-webrtc-forwarder";
     binPkg = blit-webrtc-forwarder-static;
     description = "blit WebRTC forwarder";
+    extraInstall = let
+      systemdDir = ../systemd;
+    in ''
+      mkdir -p pkg/lib/systemd/system
+      cp "${systemdDir}/blit-webrtc-forwarder@.service" "pkg/lib/systemd/system/blit-webrtc-forwarder@.service"
+    '';
   };
   publish-npm-packages = pkgs.writeShellApplication {
     name = "blit-publish-npm-packages";
