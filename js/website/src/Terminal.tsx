@@ -383,20 +383,25 @@ function TabShell({
     [workspace],
   );
 
+  const [showShortcuts, setShowShortcuts] = useState(false);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.shiftKey && (e.key === "{" || e.key === "}")) {
+      if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
         e.preventDefault();
         if (visibleSessions.length < 2 || !focusedId) return;
         const idx = visibleSessions.findIndex((s) => s.id === focusedId);
         const next =
-          e.key === "}"
+          e.key === "]"
             ? visibleSessions[(idx + 1) % visibleSessions.length]
             : visibleSessions[
                 (idx - 1 + visibleSessions.length) % visibleSessions.length
               ];
         switchTab(next.id);
+      } else if (mod && e.key === "?") {
+        e.preventDefault();
+        setShowShortcuts((v) => !v);
       }
     };
     window.addEventListener("keydown", handler, true);
@@ -409,6 +414,8 @@ function TabShell({
   const border = rgba(palette.fg, 0.15);
   const accent = rgb(palette.ansi[12] ?? palette.ansi[4] ?? palette.fg);
   const tabHover = rgba(palette.fg, dark ? 0.06 : 0.04);
+  const red = palette.ansi[1] ?? palette.fg;
+  const green = palette.ansi[2] ?? palette.fg;
 
   const statusText =
     connection?.status === "connected"
@@ -483,7 +490,7 @@ function TabShell({
                   style={{
                     background: "none",
                     border: "none",
-                    color: dimFg,
+                    color: rgb(red),
                     cursor: "pointer",
                     padding: 0,
                     width: 18,
@@ -498,12 +505,10 @@ function TabShell({
                     transition: "background 0.15s, color 0.15s",
                   }}
                   onMouseEnter={(e) => {
-                    e.currentTarget.style.background = rgba(palette.fg, dark ? 0.15 : 0.1);
-                    e.currentTarget.style.color = fg;
+                    e.currentTarget.style.background = rgba(red, 0.2);
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.background = "none";
-                    e.currentTarget.style.color = dimFg;
                   }}
                   aria-label={`Close ${tabLabel(s)}`}
                 >
