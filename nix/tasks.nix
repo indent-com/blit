@@ -88,6 +88,7 @@ PKGJSON
 
       # Build core first (react depends on it)
       core="$tmp/core"
+      mkdir -p "$core"
       cp -a ${../js/core}/* "$core"/
       chmod -R u+w "$core"
       (cd "$core" && ${pkgs.nodejs}/bin/npm pkg set "devDependencies.@blit-sh/browser=file:$wasm" && npm install && npm run build)
