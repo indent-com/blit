@@ -66,13 +66,6 @@ nix profile install github:indent-com/blit#blit
 
 Or jump to [`nix/README.md`](nix/README.md) for nix-darwin / NixOS service configuration.
 
-### From source
-
-```bash
-nix develop # or use direnv — .envrc is included
-cargo build --release -p blit-cli
-```
-
 ## How it works
 
 `blit` hosts PTYs and tracks full parsed terminal state. For each connected browser it computes a binary diff against what that browser last saw and sends only the delta — LZ4-compressed, with scrolling encoded as copy-rect operations. WebGL-rendered in the browser.
