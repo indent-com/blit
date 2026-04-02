@@ -6,7 +6,9 @@ export type SurfaceFrameCallback = (
   frame: VideoFrame,
 ) => void;
 
-export type SurfaceEventCallback = (surfaces: ReadonlyMap<number, BlitSurface>) => void;
+export type SurfaceEventCallback = (
+  surfaces: ReadonlyMap<number, BlitSurface>,
+) => void;
 
 interface DecoderEntry {
   decoder: VideoDecoder;
@@ -110,11 +112,7 @@ export class SurfaceStore {
     }
   }
 
-  handleSurfaceResized(
-    surfaceId: number,
-    width: number,
-    height: number,
-  ): void {
+  handleSurfaceResized(surfaceId: number, width: number, height: number): void {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       surface.width = width;

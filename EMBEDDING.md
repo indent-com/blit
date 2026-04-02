@@ -154,7 +154,13 @@ function TerminalScreen() {
 ```tsx
 import { BlitSurfaceView } from "@blit-sh/react";
 
-function AppWindow({ connectionId, surfaceId }: { connectionId: string; surfaceId: number }) {
+function AppWindow({
+  connectionId,
+  surfaceId,
+}: {
+  connectionId: string;
+  surfaceId: number;
+}) {
   return (
     <BlitSurfaceView
       connectionId={connectionId}

@@ -164,10 +164,14 @@ function WorkspaceScreen({
       );
     }
     return sessions.filter(
-      (s) =>
-        s.state !== "closed" && s.id !== workspaceState.focusedSessionId,
+      (s) => s.state !== "closed" && s.id !== workspaceState.focusedSessionId,
     );
-  }, [activeLayout, layoutAssignments, sessions, workspaceState.focusedSessionId]);
+  }, [
+    activeLayout,
+    layoutAssignments,
+    sessions,
+    workspaceState.focusedSessionId,
+  ]);
 
   const toggleDebug = useCallback(() => setDebugPanel((value) => !value), []);
   const fontRequestVersionRef = useRef(0);
@@ -743,106 +747,110 @@ function WorkspaceScreen({
           fontFamily: resolvedFontWithFallback,
         }}
       >
-        <section style={{
-          ...layout.termContainer,
-          display: "flex",
-          flexDirection: "row",
-        }}>
+        <section
+          style={{
+            ...layout.termContainer,
+            display: "flex",
+            flexDirection: "row",
+          }}
+        >
           <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
-          {activeLayout ? (
-            <BSPContainer
-              layout={activeLayout}
-              onLayoutChange={setActiveLayout}
-              connectionId={primaryConnectionId}
-              palette={palette}
-              fontFamily={resolvedFontWithFallback}
-              fontSize={fontSize}
-              focusedSessionId={workspaceState.focusedSessionId}
-              lruSessionIds={lruRef.current}
-              manageVisibility={overlay !== "expose"}
-              onAssignmentsChange={setLayoutAssignments}
-              onFocusSession={(id) => workspace.focusSession(id)}
-              onFocusBySession={(fn) => {
-                focusBySessionRef.current = fn;
-              }}
-              onFocusPane={(fn) => {
-                focusPaneRef.current = fn;
-              }}
-              onMoveSessionToPane={(fn) => {
-                moveSessionToPaneRef.current = fn;
-              }}
-              onFocusedPaneChange={setBspFocusedPaneId}
-              onCreateInPane={createInPane}
-            />
-          ) : workspaceState.focusedSessionId != null ? (
-            <>
-              <BlitTerminal
-                ref={termCallbackRef}
-                sessionId={workspaceState.focusedSessionId}
-                onRender={countFrame}
-                style={{ width: "100%", height: "100%" }}
+            {activeLayout ? (
+              <BSPContainer
+                layout={activeLayout}
+                onLayoutChange={setActiveLayout}
+                connectionId={primaryConnectionId}
+                palette={palette}
                 fontFamily={resolvedFontWithFallback}
                 fontSize={fontSize}
-                palette={palette}
+                focusedSessionId={workspaceState.focusedSessionId}
+                lruSessionIds={lruRef.current}
+                manageVisibility={overlay !== "expose"}
+                onAssignmentsChange={setLayoutAssignments}
+                onFocusSession={(id) => workspace.focusSession(id)}
+                onFocusBySession={(fn) => {
+                  focusBySessionRef.current = fn;
+                }}
+                onFocusPane={(fn) => {
+                  focusPaneRef.current = fn;
+                }}
+                onMoveSessionToPane={(fn) => {
+                  moveSessionToPaneRef.current = fn;
+                }}
+                onFocusedPaneChange={setBspFocusedPaneId}
+                onCreateInPane={createInPane}
               />
-              {focusedSession?.state === "exited" && (
-                <div
-                  style={{
-                    position: "absolute",
-                    bottom: 32,
-                    left: "50%",
-                    transform: "translateX(-50%)",
-                    backgroundColor: theme.solidPanelBg,
-                    border: `1px solid ${theme.border}`,
-                    padding: `${chromeScale.controlY}px ${chromeScale.controlX}px`,
-                    fontSize: chromeScale.sm,
-                    zIndex: z.exitedBanner,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: chromeScale.gap,
-                  }}
-                >
-                  <mark
+            ) : workspaceState.focusedSessionId != null ? (
+              <>
+                <BlitTerminal
+                  ref={termCallbackRef}
+                  sessionId={workspaceState.focusedSessionId}
+                  onRender={countFrame}
+                  style={{ width: "100%", height: "100%" }}
+                  fontFamily={resolvedFontWithFallback}
+                  fontSize={fontSize}
+                  palette={palette}
+                />
+                {focusedSession?.state === "exited" && (
+                  <div
                     style={{
-                      ...ui.badge,
-                      backgroundColor: "rgba(255,100,100,0.3)",
+                      position: "absolute",
+                      bottom: 32,
+                      left: "50%",
+                      transform: "translateX(-50%)",
+                      backgroundColor: theme.solidPanelBg,
+                      border: `1px solid ${theme.border}`,
+                      padding: `${chromeScale.controlY}px ${chromeScale.controlX}px`,
+                      fontSize: chromeScale.sm,
+                      zIndex: z.exitedBanner,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: chromeScale.gap,
                     }}
                   >
-                    {t("workspace.exited")}
-                  </mark>
-                  {connection?.supportsRestart ? (
-                    <button
-                      onClick={() => handleRestartOrClose()}
-                      style={{ ...ui.btn, fontSize: chromeScale.md }}
+                    <mark
+                      style={{
+                        ...ui.badge,
+                        backgroundColor: "rgba(255,100,100,0.3)",
+                      }}
                     >
-                      {t("workspace.restart")} <kbd style={ui.kbd}>Enter</kbd>
+                      {t("workspace.exited")}
+                    </mark>
+                    {connection?.supportsRestart ? (
+                      <button
+                        onClick={() => handleRestartOrClose()}
+                        style={{ ...ui.btn, fontSize: chromeScale.md }}
+                      >
+                        {t("workspace.restart")} <kbd style={ui.kbd}>Enter</kbd>
+                      </button>
+                    ) : null}
+                    <button
+                      onClick={() =>
+                        void workspace.closeSession(focusedSession.id)
+                      }
+                      style={{
+                        ...ui.btn,
+                        fontSize: chromeScale.md,
+                        opacity: 0.5,
+                      }}
+                    >
+                      {t("workspace.close")} <kbd style={ui.kbd}>Esc</kbd>
                     </button>
-                  ) : null}
-                  <button
-                    onClick={() =>
-                      void workspace.closeSession(focusedSession.id)
-                    }
-                    style={{
-                      ...ui.btn,
-                      fontSize: chromeScale.md,
-                      opacity: 0.5,
-                    }}
-                  >
-                    {t("workspace.close")} <kbd style={ui.kbd}>Esc</kbd>
-                  </button>
-                </div>
-              )}
-            </>
-          ) : (
-            <EmptyState
-              theme={theme}
-              scale={chromeScale}
-              mod={/Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl"}
-              onCreate={() => void createAndFocus()}
-              onSwitcher={() => toggleOverlay("expose")}
-              onHelp={() => toggleOverlay("help")}
-            />
-          )}
+                  </div>
+                )}
+              </>
+            ) : (
+              <EmptyState
+                theme={theme}
+                scale={chromeScale}
+                mod={
+                  /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl"
+                }
+                onCreate={() => void createAndFocus()}
+                onSwitcher={() => toggleOverlay("expose")}
+                onHelp={() => toggleOverlay("help")}
+              />
+            )}
           </div>
           {(offScreenSessions.length > 0 || surfaces.length > 0) && (
             <PreviewPanel
@@ -1182,7 +1190,14 @@ function SessionThumbnail({
           opacity: 1,
         }}
       >
-        <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <span
+          style={{
+            flex: 1,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
           {label}
         </span>
         {session.state === "exited" && (
@@ -1257,7 +1272,14 @@ function SurfaceThumbnail({
           backgroundColor: expanded ? theme.selectedBg : "transparent",
         }}
       >
-        <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <span
+          style={{
+            flex: 1,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
           {surface.title || surface.appId || `Surface ${surface.surfaceId}`}
         </span>
         <span style={{ fontSize: scale.xs, color: theme.dimFg }}>

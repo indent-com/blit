@@ -8,7 +8,10 @@ export {
 
 export type { BlitWasmModule } from "./TerminalStore";
 export { SurfaceStore } from "./SurfaceStore";
-export type { SurfaceFrameCallback, SurfaceEventCallback } from "./SurfaceStore";
+export type {
+  SurfaceFrameCallback,
+  SurfaceEventCallback,
+} from "./SurfaceStore";
 
 export { measureCell, cssFontFamily } from "./measure";
 export type { CellMetrics } from "./measure";

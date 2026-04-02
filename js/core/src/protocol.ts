@@ -362,7 +362,10 @@ export function buildSurfaceResizeMessage(
   return msg;
 }
 
-export function buildSurfaceFocusMessage(sessionId: number, surfaceId: number): Uint8Array {
+export function buildSurfaceFocusMessage(
+  sessionId: number,
+  surfaceId: number,
+): Uint8Array {
   const msg = new Uint8Array(5);
   msg[0] = C2S_SURFACE_FOCUS;
   msg[1] = sessionId & 0xff;

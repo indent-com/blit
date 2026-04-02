@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 smithay = { version = "0.7.0", default-features = false, features = [
     "wayland_frontend",
     "desktop",
