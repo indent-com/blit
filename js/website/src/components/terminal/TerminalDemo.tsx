@@ -9,7 +9,6 @@ import {
 import {
   BlitTerminal,
   BlitWorkspaceProvider,
-  createBlitWorkspace,
   createBlitWorkspaceState,
   createBlitSessions,
 } from "@blit-sh/solid";
