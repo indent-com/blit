@@ -330,6 +330,23 @@
   padding: 1.2rem 1.2rem;
 }
 
+/* ── Syntax highlighting ── */
+
+.code-hl { color: var(--code-fg); }
+.hl-kw { color: #cf222e; }
+.hl-fn { color: #8250df; }
+.hl-str { color: #0a3069; }
+.hl-num { color: #0550ae; }
+.hl-cm { color: #6e7781; font-style: italic; }
+.hl-attr { color: #0550ae; }
+
+[data-theme="dark"] .hl-kw { color: #ff7b72; }
+[data-theme="dark"] .hl-fn { color: #d2a8ff; }
+[data-theme="dark"] .hl-str { color: #a5d6ff; }
+[data-theme="dark"] .hl-num { color: #79c0ff; }
+[data-theme="dark"] .hl-cm { color: #8b949e; }
+[data-theme="dark"] .hl-attr { color: #79c0ff; }
+
 /* ── Footer ── */
 
 .landing-footer {
