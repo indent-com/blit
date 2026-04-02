@@ -62,22 +62,29 @@ describe("BlitConnection", () => {
   });
 
   it("tracks retryCount on failed connection attempts", () => {
-    expect(conn.getSnapshot().retryCount).toBe(0);
-    // Simulate: connected → disconnected (not from connecting, no increment)
-    transport.setStatus("disconnected");
-    expect(conn.getSnapshot().retryCount).toBe(0);
-    // Retry: connecting → error (failed attempt)
-    transport.setStatus("connecting");
-    transport.setStatus("error");
-    expect(conn.getSnapshot().retryCount).toBe(1);
-    // Another retry: connecting → disconnected (failed attempt)
-    transport.setStatus("connecting");
-    transport.setStatus("disconnected");
-    expect(conn.getSnapshot().retryCount).toBe(2);
-    // Successful reconnect resets
-    transport.setStatus("connecting");
-    transport.setStatus("connected");
-    expect(conn.getSnapshot().retryCount).toBe(0);
+    vi.useFakeTimers();
+    try {
+      expect(conn.getSnapshot().retryCount).toBe(0);
+      // Simulate: disconnected from initial state → no increment (not from connecting)
+      transport.setStatus("disconnected");
+      expect(conn.getSnapshot().retryCount).toBe(0);
+      // Retry: connecting → error (failed attempt)
+      transport.setStatus("connecting");
+      transport.setStatus("error");
+      expect(conn.getSnapshot().retryCount).toBe(1);
+      // Another retry: connecting → disconnected (failed attempt)
+      transport.setStatus("connecting");
+      transport.setStatus("disconnected");
+      expect(conn.getSnapshot().retryCount).toBe(2);
+      // Successful reconnect followed by stable disconnect resets
+      transport.setStatus("connecting");
+      transport.setStatus("connected");
+      vi.advanceTimersByTime(5000);
+      transport.setStatus("disconnected");
+      expect(conn.getSnapshot().retryCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // --- Session tracking via CREATED/CLOSED ---

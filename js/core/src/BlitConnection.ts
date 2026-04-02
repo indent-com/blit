@@ -799,11 +799,15 @@ export class BlitConnection {
       status === "disconnected" ||
       status === "closed"
     ) {
-      const wasConnected = this.snapshot.status === "connected";
-      const stableMs = 5_000;
-      if (wasConnected && Date.now() - this.connectedAt >= stableMs) {
-        this.retryCount = 0;
-      } else {
+      const prev = this.snapshot.status;
+      if (prev === "connected") {
+        const stableMs = 5_000;
+        if (Date.now() - this.connectedAt >= stableMs) {
+          this.retryCount = 0;
+        } else {
+          this.retryCount++;
+        }
+      } else if (prev === "connecting" || prev === "authenticating") {
         this.retryCount++;
       }
     }
