@@ -451,6 +451,9 @@ in {
     name = "blit-tests";
     runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun pkgs.pkg-config pkgs.libxkbcommon pkgs.pixman ];
     text = ''
+      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
       cp ${webAppDist}/index.html js/web-app/dist/
