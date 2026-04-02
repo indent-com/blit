@@ -287,12 +287,16 @@ function TabShell({
 
   const statusText =
     connection?.status === "connected"
-      ? null
+      ? visibleSessions.length === 0
+        ? "Waiting for sessions..."
+        : null
       : connection?.status === "connecting"
         ? "Connecting..."
         : connection?.status === "error"
           ? `Error: ${connection.error ?? "unknown"}`
-          : connection?.status ?? "Initializing...";
+          : connection?.status === "disconnected"
+            ? "Disconnected"
+            : "Initializing...";
 
   return (
     <div
