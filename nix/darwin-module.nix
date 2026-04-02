@@ -182,9 +182,9 @@ in {
           Label = "com.blit.webrtc-forwarder.${name}";
           ProgramArguments = [
             "/bin/sh" "-c"
-            ''. ${fwd.passFile} && exec ${fwd.package}/bin/blit-webrtc-forwarder''
+            (''. ${fwd.passFile} && exec ${fwd.package}/bin/blit-webrtc-forwarder''
               + lib.optionalString fwd.quiet " --quiet"
-              + lib.optionalString fwd.verbose " --verbose"
+              + lib.optionalString fwd.verbose " --verbose")
           ];
           EnvironmentVariables = {}
             // lib.optionalAttrs (cfg.socketPath != null) {

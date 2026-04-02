@@ -6,6 +6,14 @@ on:
   pull_request:
 
 jobs:
+  nix-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Parse all Nix files
+        run: find . -name '*.nix' -exec nix-instantiate --parse {} + > /dev/null
+
   lint:
     runs-on: ubuntu-latest
     steps:

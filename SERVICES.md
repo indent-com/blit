@@ -132,7 +132,8 @@ Runs on every push to `main` and on every pull request. All jobs run in parallel
 
 ```mermaid
 flowchart LR
-    PR[Push / PR] --> lint[lint]
+    PR[Push / PR] --> nix[nix-syntax]
+    PR --> lint[lint]
     PR --> test_linux[test<br>ubuntu-latest]
     PR --> test_mac[test<br>macos-latest]
     PR --> e2e[e2e<br>+ Playwright report]
@@ -145,6 +146,7 @@ flowchart LR
 
 | Job | Runner | What it does |
 | --- | --- | --- |
+| `nix-syntax` | ubuntu-latest | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
 | `lint` | ubuntu-latest | `./bin/lint` — clippy, rustfmt, TS checks |
 | `test` | ubuntu-latest, macos-latest | `./bin/tests` — `cargo test --workspace` |
 | `e2e` | ubuntu-latest | `./bin/e2e` — Playwright against the full stack; uploads report artifact |
