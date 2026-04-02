@@ -139,9 +139,22 @@ pub async fn handle_peer(
                             if label == "blit" {
                                 blit_channel = Some(cid);
                                 #[cfg(unix)]
-                                { blit_conn = Some(tokio::net::UnixStream::connect(&sock_path).await?); }
+                                {
+                                    blit_conn =
+                                        Some(tokio::net::UnixStream::connect(&sock_path).await?);
+                                }
                                 #[cfg(windows)]
-                                { blit_conn = Some(tokio::net::windows::named_pipe::ClientOptions::new().open(&sock_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?); }
+                                {
+                                    blit_conn = Some(
+                                        tokio::net::windows::named_pipe::ClientOptions::new()
+                                            .open(&sock_path)
+                                            .map_err(
+                                                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                                    e.to_string().into()
+                                                },
+                                            )?,
+                                    );
+                                }
                                 established.store(true, Ordering::Relaxed);
                             }
                         }

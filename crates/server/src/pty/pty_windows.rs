@@ -1,21 +1,19 @@
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-};
+use tokio::sync::{Notify, mpsc};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    STARTUPINFOEXW,
+    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-use crate::{AppState, PtyInput, PTY_CHANNEL_CAPACITY};
+use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 
 #[derive(Clone, Copy)]
 pub struct PtyWriteTarget(pub HANDLE);
@@ -102,12 +100,7 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
 
 pub fn reap_zombies() {}
 
-pub fn respond_to_queries(
-    handle: &PtyHandle,
-    data: &[u8],
-    size: (u16, u16),
-    cursor: (u16, u16),
-) {
+pub fn respond_to_queries(handle: &PtyHandle, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
     for resp in crate::parse_terminal_queries(data, size, cursor) {
         pty_write_all(PtyWriteTarget(handle.input), resp.as_bytes());
     }
@@ -328,7 +321,11 @@ pub fn spawn_pty(
         output: output_read,
     };
 
-    state.2.write().unwrap().insert(id, PtyWriteTarget(handle.input));
+    state
+        .2
+        .write()
+        .unwrap()
+        .insert(id, PtyWriteTarget(handle.input));
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_output = SendHandle(handle.output);
     let notify = state.3.clone();
@@ -465,7 +462,11 @@ pub fn respawn_child(
         output: output_read,
     };
 
-    state.2.write().unwrap().insert(pty_id, PtyWriteTarget(handle.input));
+    state
+        .2
+        .write()
+        .unwrap()
+        .insert(pty_id, PtyWriteTarget(handle.input));
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_output = SendHandle(handle.output);
     let notify = state.3.clone();

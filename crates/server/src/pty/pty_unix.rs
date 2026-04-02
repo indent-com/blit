@@ -1,8 +1,8 @@
 use std::ffi::CString;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
-use crate::{AppState, PtyInput, PTY_CHANNEL_CAPACITY};
+use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 
 pub type PtyWriteTarget = libc::c_int;
 
@@ -82,7 +82,7 @@ fn set_qos_user_interactive() {
     #[cfg(target_os = "macos")]
     {
         const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
-        extern "C" {
+        unsafe extern "C" {
             fn pthread_set_qos_class_self_np(
                 qos_class: libc::c_uint,
                 relative_priority: libc::c_int,
@@ -140,17 +140,10 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
 }
 
 pub fn reap_zombies() {
-    unsafe {
-        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
-    }
+    unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
 }
 
-pub fn respond_to_queries(
-    handle: &PtyHandle,
-    data: &[u8],
-    size: (u16, u16),
-    cursor: (u16, u16),
-) {
+pub fn respond_to_queries(handle: &PtyHandle, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
     for resp in crate::parse_terminal_queries(data, size, cursor) {
         pty_write_all(handle.master_fd, resp.as_bytes());
     }
@@ -174,9 +167,7 @@ pub fn pty_reader(fd: PtyWriteTarget, tx: mpsc::Sender<PtyInput>, notify: Arc<No
                 if remaining.is_empty() {
                     break;
                 }
-                if let Some(boundary) =
-                    crate::find_sync_output_end(&sync_scan_tail, &remaining)
-                {
+                if let Some(boundary) = crate::find_sync_output_end(&sync_scan_tail, &remaining) {
                     let before = remaining[..boundary].to_vec();
                     let after = remaining[boundary..].to_vec();
                     crate::update_sync_scan_tail(&mut sync_scan_tail, &before);
@@ -269,11 +260,11 @@ pub fn spawn_pty(
         }
         set_qos_user_interactive();
         let effective_dir = dir.map(String::from);
-        if let Some(d) = effective_dir {
-            if let Ok(dir_c) = CString::new(d) {
-                unsafe {
-                    libc::chdir(dir_c.as_ptr());
-                }
+        if let Some(d) = effective_dir
+            && let Ok(dir_c) = CString::new(d)
+        {
+            unsafe {
+                libc::chdir(dir_c.as_ptr());
             }
         }
         unsafe {
@@ -304,18 +295,18 @@ pub fn spawn_pty(
                 libc::_exit(1);
             }
         }
-        if let Some(args) = argv {
-            if !args.is_empty() {
-                let cargs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
-                let ptrs: Vec<*const libc::c_char> = cargs
-                    .iter()
-                    .map(|c| c.as_ptr())
-                    .chain(std::iter::once(std::ptr::null()))
-                    .collect();
-                unsafe {
-                    libc::execvp(ptrs[0], ptrs.as_ptr());
-                    libc::_exit(1);
-                }
+        if let Some(args) = argv
+            && !args.is_empty()
+        {
+            let cargs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
+            let ptrs: Vec<*const libc::c_char> = cargs
+                .iter()
+                .map(|c| c.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
+            unsafe {
+                libc::execvp(ptrs[0], ptrs.as_ptr());
+                libc::_exit(1);
             }
         }
         let shell_c = CString::new(shell).unwrap();

@@ -29,9 +29,7 @@ impl IpcListener {
             eprintln!("blit-server: cannot bind to {path}: {e}");
             std::process::exit(1);
         });
-        if let Err(e) =
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        {
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
             eprintln!("blit-server: warning: cannot set socket permissions: {e}");
         }
         if verbose {
@@ -130,8 +128,7 @@ pub async fn run_fd_channel(channel_fd: RawFd, state: crate::AppState) {
         };
         match recv_fd(channel_fd) {
             RecvFdResult::Fd(client_fd) => {
-                let std_stream =
-                    unsafe { std::os::unix::net::UnixStream::from_raw_fd(client_fd) };
+                let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(client_fd) };
                 std_stream.set_nonblocking(true).unwrap();
                 let stream = tokio::net::UnixStream::from_std(std_stream).unwrap();
                 let state = state.clone();

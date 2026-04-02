@@ -34,7 +34,7 @@ fn term_size() -> (u16, u16) {
 #[cfg(windows)]
 fn term_size() -> (u16, u16) {
     use windows_sys::Win32::System::Console::{
-        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
     };
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -91,8 +91,8 @@ struct RawMode {
 impl RawMode {
     fn enter() -> Option<Self> {
         use windows_sys::Win32::System::Console::{
-            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_INPUT,
-            STD_INPUT_HANDLE,
+            ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+            SetConsoleMode,
         };
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
@@ -109,7 +109,7 @@ impl RawMode {
 #[cfg(windows)]
 impl Drop for RawMode {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
             SetConsoleMode(handle, self.saved);

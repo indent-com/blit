@@ -20,7 +20,11 @@ fn parse_config() -> blit_server::Config {
     let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
 
     let mut shell_flags = std::env::var("BLIT_SHELL_FLAGS").unwrap_or_else(|_| {
-        if cfg!(unix) { "li".into() } else { String::new() }
+        if cfg!(unix) {
+            "li".into()
+        } else {
+            String::new()
+        }
     });
     let scrollback = std::env::var("BLIT_SCROLLBACK")
         .ok()

@@ -239,15 +239,15 @@ flowchart TD
     REL --> BREW[update-homebrew<br>repository-dispatch to<br>indent-com/homebrew-tap]
 ```
 
-| Job               | Depends on                              | What it does                                                                                                    |
-| ----------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `build-debs`      | —                                       | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
-| `build-tarballs`  | —                                       | Nix-build static tarballs on 3 platform runners                                                                 |
-| `build-windows`   | —                                       | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
+| Job               | Depends on                                | What it does                                                                                                    |
+| ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `build-debs`      | —                                         | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
+| `build-tarballs`  | —                                         | Nix-build static tarballs on 3 platform runners                                                                 |
+| `build-windows`   | —                                         | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
 | `release`         | build-debs, build-tarballs, build-windows | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
-| `publish-crates`  | release                                 | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
-| `publish-npm`     | release                                 | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
-| `update-homebrew` | release                                 | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
+| `publish-crates`  | release                                   | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
+| `publish-npm`     | release                                   | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
+| `update-homebrew` | release                                   | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
 | `apt-repo`        | build-debs, build-tarballs, build-windows | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
 
 ### Deploy blit-hub (deploy-blit-hub.yml)

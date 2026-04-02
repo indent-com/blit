@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc};
 
-mod pty;
 mod ipc;
+mod pty;
 
+pub use ipc::{IpcListener, default_ipc_path};
 use pty::{PtyHandle, PtyWriteTarget};
-pub use ipc::{default_ipc_path, IpcListener};
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
 pub struct Config {
@@ -1609,7 +1609,10 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 }
 
-async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: S, state: AppState) {
+async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    state: AppState,
+) {
     let config = &state.0;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
