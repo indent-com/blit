@@ -131,6 +131,11 @@
         hash = "sha256-nKmD6eQbfXSOYSBaz3Y0YKuMT2ejDFonnB/cm0hIGJg=";
       };
 
+      websiteNpmDeps = pkgs.fetchNpmDeps {
+        src = ../js/website;
+        hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      };
+
       webAppNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/web-app;
         hash = "sha256-OgNos+GJ3tf5N3JZlygEdbAz2a6LQLoiBd87n29zYPg=";
@@ -175,6 +180,37 @@
         doCheck = false;
       };
 
+      websiteDist = pkgs.stdenv.mkDerivation {
+        pname = "blit-website";
+        inherit version;
+        src = ../.;
+        nativeBuildInputs = [ pkgs.nodejs ];
+        buildPhase = ''
+          export HOME=$TMPDIR
+
+          mkdir -p crates/browser/pkg/snippets
+          cp ${browserWasm}/blit_browser.js crates/browser/pkg/
+          cp ${browserWasm}/blit_browser_bg.wasm crates/browser/pkg/
+          cp ${browserWasm}/blit_browser.d.ts crates/browser/pkg/
+          cp ${browserWasm}/blit_browser_bg.wasm.d.ts crates/browser/pkg/
+          echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
+          for d in ${browserWasm}/snippets/blit-browser-*/; do
+            name=$(basename "$d")
+            mkdir -p "crates/browser/pkg/snippets/$name"
+            cp "$d"/* "crates/browser/pkg/snippets/$name/"
+          done
+
+          cp -r ${websiteNpmDeps} "$TMPDIR/website-cache"
+          chmod -R u+w "$TMPDIR/website-cache"
+          (cd js/website && npm ci --cache "$TMPDIR/website-cache" && node node_modules/vite/bin/vite.js build)
+        '';
+        installPhase = ''
+          mkdir -p $out
+          cp -r js/website/dist/* $out/
+        '';
+        doCheck = false;
+      };
+
       copyWebAppDist = ''
         mkdir -p js/web-app/dist
         cp ${webAppDist}/index.html js/web-app/dist/
@@ -209,7 +245,7 @@
         inherit pkgs version browserWasm blit-server blit-gateway
                 blit-server-static blit-cli-static blit-gateway-static
                 blit-webrtc-forwarder-static
-                manPages webAppDist rustToolchain;
+                manPages webAppDist websiteDist rustToolchain;
       };
 
       demoImage = let

@@ -1,7 +1,7 @@
 { pkgs, version, browserWasm, blit-server, blit-gateway
 , blit-server-static, blit-cli-static, blit-gateway-static
 , blit-webrtc-forwarder-static
-, manPages, webAppDist, rustToolchain
+, manPages, webAppDist, websiteDist, rustToolchain
 }:
 let
   browser-publish = pkgs.writeShellApplication {
@@ -234,7 +234,7 @@ CTRL
     '';
   };
 in {
-  inherit browser-publish core-publish react-publish publish-npm-packages publish-crates;
+  inherit browser-publish core-publish react-publish publish-npm-packages publish-crates deploy-website;
   inherit blit-server-deb blit-cli-deb blit-gateway-deb blit-webrtc-forwarder-deb;
 
   build-debs = pkgs.writeShellApplication {
@@ -308,6 +308,24 @@ in {
     text = ''
       root=$(git rev-parse --show-toplevel)
       flyctl deploy "$root/js/blit-hub" "$@"
+    '';
+  };
+
+  deploy-website = pkgs.writeShellApplication {
+    name = "deploy-website";
+    runtimeInputs = [ pkgs.nodejs ];
+    text = ''
+      tmp=$(mktemp -d)
+      trap 'rm -rf "$tmp"' EXIT
+
+      mkdir -p "$tmp/.vercel/output/static"
+      cp -r ${websiteDist}/* "$tmp/.vercel/output/static/"
+      cat > "$tmp/.vercel/output/config.json" <<'JSON'
+{"version":3,"routes":[{"handle":"filesystem"},{"src":"/(.*)", "dest":"/index.html"}]}
+JSON
+
+      cd "$tmp"
+      npx vercel deploy --prebuilt "$@"
     '';
   };
 
