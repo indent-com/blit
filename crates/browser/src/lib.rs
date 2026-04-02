@@ -957,13 +957,17 @@ impl Terminal {
         let frame = self.inner.frame();
         let cols = frame.cols();
         let mut map = Vec::with_capacity(cols as usize);
+        let mut last_non_space = 0;
         for col in 0..cols {
             let content = frame.cell_content(row, col);
-            let utf16_len = content.encode_utf16().count();
-            for _ in 0..utf16_len {
+            for _ in content.encode_utf16() {
                 map.push(col);
             }
+            if !content.trim_end().is_empty() {
+                last_non_space = map.len();
+            }
         }
+        map.truncate(last_non_space);
         map
     }
 
