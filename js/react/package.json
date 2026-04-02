@@ -28,7 +28,7 @@
       }
     }
   },
-  "description": "Low-latency terminal streaming \u2014 React components and hooks",
+  "description": "Low-latency terminal streaming — React components and hooks",
   "homepage": "https://blit.sh",
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {

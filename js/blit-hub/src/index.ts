@@ -287,8 +287,7 @@ const server = Bun.serve<ClientData>({
       const remoteMembers = new Set(
         await redis.smembers(redisKey(otherRole, channelId)),
       );
-      const localPeers =
-        otherRole === "producer" ? ch.producers : ch.consumers;
+      const localPeers = otherRole === "producer" ? ch.producers : ch.consumers;
       for (const sid of localPeers.keys()) remoteMembers.add(sid);
       for (const peerId of remoteMembers) {
         ws.send(

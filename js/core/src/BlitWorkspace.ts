@@ -17,10 +17,8 @@ import { WebSocketTransport } from "./transports/websocket";
 import { WebTransportTransport } from "./transports/webtransport";
 import { createShareTransport } from "./transports/webrtc-share";
 
-export interface AddBlitConnectionOptions extends Omit<
-  CreateBlitConnectionOptions,
-  "wasm" | "transport"
-> {
+export interface AddBlitConnectionOptions
+  extends Omit<CreateBlitConnectionOptions, "wasm" | "transport"> {
   transport?: BlitTransport | TransportConfig;
   wasm?: BlitWasmModule | Promise<BlitWasmModule>;
 }
@@ -408,7 +406,11 @@ export function createBlitWorkspace(
 function isTransportConfig(
   value: BlitTransport | TransportConfig | undefined,
 ): value is TransportConfig {
-  return value != null && "type" in value && typeof (value as TransportConfig).type === "string";
+  return (
+    value != null &&
+    "type" in value &&
+    typeof (value as TransportConfig).type === "string"
+  );
 }
 
 function resolveTransport(
@@ -422,11 +424,23 @@ function resolveTransport(
   }
   switch (config.type) {
     case "websocket":
-      return new WebSocketTransport(config.url, config.passphrase, config.options);
+      return new WebSocketTransport(
+        config.url,
+        config.passphrase,
+        config.options,
+      );
     case "webtransport":
-      return new WebTransportTransport(config.url, config.passphrase, config.options);
+      return new WebTransportTransport(
+        config.url,
+        config.passphrase,
+        config.options,
+      );
     case "share":
-      return createShareTransport(config.hubUrl, config.passphrase, config.debug);
+      return createShareTransport(
+        config.hubUrl,
+        config.passphrase,
+        config.debug,
+      );
     case "custom":
       return config.transport;
   }

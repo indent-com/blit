@@ -8,7 +8,6 @@ import { useBlitContext, useRequiredBlitWorkspace } from "./BlitContext";
 import { useBlitConnection } from "./hooks/useBlitConnection";
 import { useBlitSession } from "./hooks/useBlitSession";
 
-
 // ---------------------------------------------------------------------------
 // Public handle exposed via ref
 // ---------------------------------------------------------------------------

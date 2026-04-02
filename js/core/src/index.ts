@@ -43,11 +43,7 @@ export type {
   BlitTerminalSurfaceHandle,
 } from "./BlitTerminalSurface";
 
-export {
-  parseDSL,
-  serializeDSL,
-  leafCount,
-} from "./bsp/dsl";
+export { parseDSL, serializeDSL, leafCount } from "./bsp/dsl";
 export type { BSPNode, BSPSplit, BSPChild, BSPLeaf } from "./bsp/dsl";
 
 export {

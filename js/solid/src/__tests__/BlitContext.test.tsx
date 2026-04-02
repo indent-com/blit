@@ -9,10 +9,12 @@ function renderWithContext(value: BlitContextValue) {
   let captured: BlitContextValue = {};
   render(() => (
     <BlitWorkspaceProvider {...value}>
-      {(() => {
-        captured = useBlitContext();
-        return null;
-      })() as unknown as JSX.Element}
+      {
+        (() => {
+          captured = useBlitContext();
+          return null;
+        })() as unknown as JSX.Element
+      }
     </BlitWorkspaceProvider>
   ));
   return captured;

@@ -30,7 +30,7 @@
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  font-family: 'Fira Code', ui-monospace, monospace;
+  font-family: "Fira Code", ui-monospace, monospace;
   font-size: 14px;
   line-height: 1.7;
 }
@@ -55,9 +55,15 @@
   gap: 0.5rem;
 }
 
-.logo-bg { fill: var(--fg); }
-.logo-text { fill: var(--bg); }
-.logo-cursor { fill: var(--accent); }
+.logo-bg {
+  fill: var(--fg);
+}
+.logo-text {
+  fill: var(--bg);
+}
+.logo-cursor {
+  fill: var(--accent);
+}
 
 .landing-wordmark {
   font-weight: 700;
@@ -202,7 +208,7 @@
   padding: 2px 8px;
   border-radius: 3px;
   font-size: 12px;
-  font-family: 'Fira Code', ui-monospace, monospace;
+  font-family: "Fira Code", ui-monospace, monospace;
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -242,7 +248,7 @@
   border: none;
   outline: none;
   color: var(--fg);
-  font-family: 'Fira Code', ui-monospace, monospace;
+  font-family: "Fira Code", ui-monospace, monospace;
   font-size: 14px;
   padding: 0.45rem 0.75rem;
   width: 16rem;
@@ -278,7 +284,7 @@
   background: var(--accent);
   color: #fff;
   border: none;
-  font-family: 'Fira Code', ui-monospace, monospace;
+  font-family: "Fira Code", ui-monospace, monospace;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -408,7 +414,7 @@
 }
 
 .demo-pre code {
-  font-family: 'Fira Code', ui-monospace, monospace;
+  font-family: "Fira Code", ui-monospace, monospace;
   font-size: 13px;
   line-height: 1.65;
   color: var(--code-fg);
@@ -445,20 +451,47 @@
 
 /* ── Syntax highlighting ── */
 
-.code-hl { color: var(--code-fg); }
-.hl-kw { color: #cf222e; }
-.hl-fn { color: #8250df; }
-.hl-str { color: #0a3069; }
-.hl-num { color: #0550ae; }
-.hl-cm { color: #6e7781; font-style: italic; }
-.hl-attr { color: #0550ae; }
+.code-hl {
+  color: var(--code-fg);
+}
+.hl-kw {
+  color: #cf222e;
+}
+.hl-fn {
+  color: #8250df;
+}
+.hl-str {
+  color: #0a3069;
+}
+.hl-num {
+  color: #0550ae;
+}
+.hl-cm {
+  color: #6e7781;
+  font-style: italic;
+}
+.hl-attr {
+  color: #0550ae;
+}
 
-[data-theme="dark"] .hl-kw { color: #ff7b72; }
-[data-theme="dark"] .hl-fn { color: #d2a8ff; }
-[data-theme="dark"] .hl-str { color: #a5d6ff; }
-[data-theme="dark"] .hl-num { color: #79c0ff; }
-[data-theme="dark"] .hl-cm { color: #8b949e; }
-[data-theme="dark"] .hl-attr { color: #79c0ff; }
+[data-theme="dark"] .hl-kw {
+  color: #ff7b72;
+}
+[data-theme="dark"] .hl-fn {
+  color: #d2a8ff;
+}
+[data-theme="dark"] .hl-str {
+  color: #a5d6ff;
+}
+[data-theme="dark"] .hl-num {
+  color: #79c0ff;
+}
+[data-theme="dark"] .hl-cm {
+  color: #8b949e;
+}
+[data-theme="dark"] .hl-attr {
+  color: #79c0ff;
+}
 
 /* ── Footer ── */
 
@@ -496,8 +529,6 @@
   .demo-section {
     grid-template-columns: 1fr;
   }
-
-
 }
 
 @media (max-width: 640px) {

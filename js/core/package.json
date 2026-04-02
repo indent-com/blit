@@ -52,7 +52,7 @@
       }
     }
   },
-  "description": "Low-latency terminal streaming \u2014 framework-agnostic core",
+  "description": "Low-latency terminal streaming — framework-agnostic core",
   "homepage": "https://blit.sh",
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {

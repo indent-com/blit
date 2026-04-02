@@ -28,7 +28,7 @@
       }
     }
   },
-  "description": "Low-latency terminal streaming \u2014 Solid components and primitives",
+  "description": "Low-latency terminal streaming — Solid components and primitives",
   "homepage": "https://blit.sh",
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {

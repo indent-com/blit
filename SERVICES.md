@@ -96,12 +96,12 @@ For protocol details, deployment instructions, and configuration, see [`js/blit-
 
 ### Endpoints
 
-| Path | Purpose |
-| --- | --- |
-| `/channel/<pubkey>/<producer\|consumer>` | WebSocket upgrade for signaling |
-| `/ice` | STUN/TURN server config (Cloudflare TURN if configured) |
-| `/message` | Session URL template for client display |
-| `/health` | Liveness check (pings Redis) |
+| Path                                     | Purpose                                                 |
+| ---------------------------------------- | ------------------------------------------------------- |
+| `/channel/<pubkey>/<producer\|consumer>` | WebSocket upgrade for signaling                         |
+| `/ice`                                   | STUN/TURN server config (Cloudflare TURN if configured) |
+| `/message`                               | Session URL template for client display                 |
+| `/health`                                | Liveness check (pings Redis)                            |
 
 ## blit.sh
 
@@ -142,15 +142,15 @@ This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb`
 
 Seven workflow files live in `.github/workflows/`:
 
-| Workflow | Trigger | Purpose |
-| --- | --- | --- |
-| [`test.yml`](.github/workflows/test.yml) | Push to `main`, PRs | Lint, test, e2e, verify builds |
-| [`prepare-release.yml`](.github/workflows/prepare-release.yml) | Manual (`workflow_dispatch`) | Run `bin/release`, tag, and push — triggers `release.yml` |
-| [`release.yml`](.github/workflows/release.yml) | `v*` tag push | Build artifacts, create GitHub Release, publish packages, deploy install site |
-| [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml) | Push to `main` (paths: `js/blit-hub/**`) | Deploy signaling hub to Fly.io |
-| [`deploy-website.yml`](.github/workflows/deploy-website.yml) | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs) |
-| [`dev-check.yml`](.github/workflows/dev-check.yml) | Push to `main`, PRs | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI |
-| [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag | Build and push `grab/blit-demo` Docker image |
+| Workflow                                                             | Trigger                                                                                        | Purpose                                                                                       |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                |
+| [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, tag, and push — triggers `release.yml`                                     |
+| [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Build artifacts, create GitHub Release, publish packages, deploy install site                 |
+| [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                |
+| [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                        |
+| [`dev-check.yml`](.github/workflows/dev-check.yml)                   | Push to `main`, PRs                                                                            | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI |
+| [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag                                                                       | Build and push `grab/blit-demo` Docker image                                                  |
 
 ### CI (test.yml)
 
@@ -170,14 +170,14 @@ flowchart LR
     PR --> ci_tar_mac[build-tarballs<br>aarch64-darwin]
 ```
 
-| Job | Runner | What it does |
-| --- | --- | --- |
-| `nix-syntax` | ubuntu-latest | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
-| `lint` | ubuntu-latest | `./bin/lint` — clippy, rustfmt, TS checks |
-| `test` | ubuntu-latest, macos-latest | `./bin/tests` — `cargo test --workspace` |
-| `e2e` | ubuntu-latest | `./bin/e2e` — Playwright against the full stack; uploads report artifact |
-| `build-debs` | ubuntu-latest, ubuntu-24.04-arm | Verify `.deb` packages build (amd64 + arm64) |
-| `build-tarballs` | ubuntu-latest, ubuntu-24.04-arm, macos-latest | Verify static tarballs build (3 platforms) |
+| Job              | Runner                                        | What it does                                                                                                                |
+| ---------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `nix-syntax`     | ubuntu-latest                                 | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
+| `lint`           | ubuntu-latest                                 | `./bin/lint` — `cargo fmt --check` + `prettier --check` + clippy                                                            |
+| `test`           | ubuntu-latest, macos-latest                   | `./bin/tests` — `cargo test --workspace`                                                                                    |
+| `e2e`            | ubuntu-latest                                 | `./bin/e2e` — Playwright against the full stack; uploads report artifact                                                    |
+| `build-debs`     | ubuntu-latest, ubuntu-24.04-arm               | Verify `.deb` packages build (amd64 + arm64)                                                                                |
+| `build-tarballs` | ubuntu-latest, ubuntu-24.04-arm, macos-latest | Verify static tarballs build (3 platforms)                                                                                  |
 
 ### Dev check (dev-check.yml)
 
@@ -220,15 +220,15 @@ flowchart TD
     REL --> BREW[update-homebrew<br>repository-dispatch to<br>indent-com/homebrew-tap]
 ```
 
-| Job | Depends on | What it does |
-| --- | --- | --- |
-| `build-debs` | — | Nix-build `.deb` packages on native amd64 + arm64 runners |
-| `build-tarballs` | — | Nix-build static tarballs on 3 platform runners |
-| `release` | build-debs, build-tarballs | Downloads all artifacts, creates a GitHub Release with auto-generated notes |
-| `publish-crates` | release | `./bin/publish-crates` — publishes workspace crates to crates.io |
-| `publish-npm` | release | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
-| `update-homebrew` | release | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version |
-| `apt-repo` | build-debs, build-tarballs | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages |
+| Job               | Depends on                 | What it does                                                                                                    |
+| ----------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `build-debs`      | —                          | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
+| `build-tarballs`  | —                          | Nix-build static tarballs on 3 platform runners                                                                 |
+| `release`         | build-debs, build-tarballs | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
+| `publish-crates`  | release                    | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
+| `publish-npm`     | release                    | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
+| `update-homebrew` | release                    | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
+| `apt-repo`        | build-debs, build-tarballs | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
 
 ### Deploy blit-hub (deploy-blit-hub.yml)
 
@@ -294,15 +294,15 @@ sequenceDiagram
 
 ## Secrets and authentication
 
-| Secret | Used by | Purpose |
-| --- | --- | --- |
-| `GPG_PRIVATE_KEY` | apt-repo | Signs APT Release metadata |
-| `HOMEBREW_TAP_TOKEN` | update-homebrew | PAT for cross-repo dispatch to homebrew-tap |
-| `FLY_API_TOKEN` | deploy-blit-hub | Fly.io deploy token for blit-hub |
-| `DOCKERHUB_USERNAME` | publish-demo-image | Docker Hub credentials |
-| `DOCKERHUB_TOKEN` | publish-demo-image | Docker Hub credentials |
-| `VERCEL_TOKEN` | deploy-website | Vercel API token |
-| `VERCEL_ORG_ID` | deploy-website | Vercel organization ID |
-| `VERCEL_PROJECT_ID` | deploy-website | Vercel project ID |
+| Secret               | Used by            | Purpose                                     |
+| -------------------- | ------------------ | ------------------------------------------- |
+| `GPG_PRIVATE_KEY`    | apt-repo           | Signs APT Release metadata                  |
+| `HOMEBREW_TAP_TOKEN` | update-homebrew    | PAT for cross-repo dispatch to homebrew-tap |
+| `FLY_API_TOKEN`      | deploy-blit-hub    | Fly.io deploy token for blit-hub            |
+| `DOCKERHUB_USERNAME` | publish-demo-image | Docker Hub credentials                      |
+| `DOCKERHUB_TOKEN`    | publish-demo-image | Docker Hub credentials                      |
+| `VERCEL_TOKEN`       | deploy-website     | Vercel API token                            |
+| `VERCEL_ORG_ID`      | deploy-website     | Vercel organization ID                      |
+| `VERCEL_PROJECT_ID`  | deploy-website     | Vercel project ID                           |
 
 `publish-crates` uses no stored secret. It authenticates to crates.io via OIDC trusted publishing — GitHub mints a short-lived ID token (enabled by the `id-token: write` permission on the release workflow) and exchanges it for a crates.io upload token. `publish-npm` works the same way, using `--provenance` to sign the npm package with the workflow's OIDC identity.

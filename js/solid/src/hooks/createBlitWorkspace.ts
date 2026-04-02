@@ -1,8 +1,5 @@
 import { createSignal, onCleanup } from "solid-js";
-import type {
-  BlitWorkspace,
-  BlitWorkspaceSnapshot,
-} from "@blit-sh/core";
+import type { BlitWorkspace, BlitWorkspaceSnapshot } from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "../BlitContext";
 
 export function createBlitWorkspace(): BlitWorkspace {

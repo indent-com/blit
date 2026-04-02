@@ -258,9 +258,50 @@ PROJ
       pnpm dlx vercel deploy --prebuilt "''${token_args[@]}" "$@"
     '';
   };
+
+  fmt = pkgs.writeShellApplication {
+    name = "blit-fmt";
+    runtimeInputs = [ rustToolchain pkgs.prettier ];
+    text = ''
+      check=false
+      for arg in "$@"; do
+        case "$arg" in
+          --check) check=true ;;
+        esac
+      done
+
+      if [ "$check" = true ]; then
+        echo "=== cargo fmt --check ==="
+        cargo fmt -- --check
+        echo ""
+        echo "=== prettier --check ==="
+        prettier --check .
+      else
+        echo "=== cargo fmt ==="
+        cargo fmt
+        echo ""
+        echo "=== prettier --write ==="
+        prettier --write .
+      fi
+    '';
+  };
+
+  clippy = pkgs.writeShellApplication {
+    name = "blit-clippy";
+    runtimeInputs = [ rustToolchain ];
+    text = ''
+      echo "=== Setting up web-app dist ==="
+      mkdir -p js/web-app/dist
+      cp ${webAppDist}/index.html js/web-app/dist/
+
+      echo "=== Clippy ==="
+      cargo clippy --workspace -- -D warnings
+    '';
+  };
 in {
   inherit browser-publish js-publish publish-npm-packages publish-crates deploy-website;
   inherit blit-server-deb blit-cli-deb blit-gateway-deb blit-webrtc-forwarder-deb;
+  inherit fmt clippy;
 
   build-debs = pkgs.writeShellApplication {
     name = "blit-build-debs";
@@ -316,14 +357,10 @@ in {
 
   lint = pkgs.writeShellApplication {
     name = "blit-lint";
-    runtimeInputs = [ rustToolchain ];
     text = ''
-      echo "=== Setting up web-app dist ==="
-      mkdir -p js/web-app/dist
-      cp ${webAppDist}/index.html js/web-app/dist/
-
-      echo "=== Clippy ==="
-      cargo clippy --workspace -- -D warnings
+      ${fmt}/bin/blit-fmt --check
+      echo ""
+      ${clippy}/bin/blit-clippy
     '';
   };
 

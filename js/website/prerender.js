@@ -4,9 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const { render } = await import(
-  resolve(__dirname, "dist-ssr/entry-server.js")
-);
+const { render } = await import(resolve(__dirname, "dist-ssr/entry-server.js"));
 const html = render();
 
 const indexPath = resolve(__dirname, "dist/index.html");

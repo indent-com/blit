@@ -5,7 +5,8 @@ import type {
 } from "../types";
 import { C2S_DISPLAY_RATE } from "../types";
 
-export interface WebRtcDataChannelTransportOptions extends BlitTransportOptions {
+export interface WebRtcDataChannelTransportOptions
+  extends BlitTransportOptions {
   /** Data channel label. Default: "blit". */
   label?: string;
   /** Display rate to advertise to the server. Default: 120. */

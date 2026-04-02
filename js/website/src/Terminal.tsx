@@ -1,4 +1,11 @@
-import { useState, useEffect, useCallback, useRef, useSyncExternalStore, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useSyncExternalStore,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { ThemeToggle, type Theme } from "./theme";
 import {
   BlitTerminal,
@@ -42,16 +49,26 @@ class DebugLog implements BlitDebug {
     for (const l of this.listeners) l();
   }
 
-  log(msg: string, ...args: unknown[]) { this.push("log", msg, args); }
-  warn(msg: string, ...args: unknown[]) { this.push("warn", msg, args); }
-  error(msg: string, ...args: unknown[]) { this.push("error", msg, args); }
+  log(msg: string, ...args: unknown[]) {
+    this.push("log", msg, args);
+  }
+  warn(msg: string, ...args: unknown[]) {
+    this.push("warn", msg, args);
+  }
+  error(msg: string, ...args: unknown[]) {
+    this.push("error", msg, args);
+  }
 
   subscribe(listener: () => void) {
     this.listeners.add(listener);
-    return () => { this.listeners.delete(listener); };
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
-  getSnapshot() { return this.snapshot; }
+  getSnapshot() {
+    return this.snapshot;
+  }
 }
 
 function useDebugPanel() {
@@ -85,7 +102,10 @@ function DebugPanel({ log, onClose }: { log: DebugLog; onClose: () => void }) {
 
   const copyLog = () => {
     const text = entries
-      .map((e) => `${new Date(e.t).toISOString().slice(11, 23)} [${e.level}] ${e.msg}`)
+      .map(
+        (e) =>
+          `${new Date(e.t).toISOString().slice(11, 23)} [${e.level}] ${e.msg}`,
+      )
       .join("\n");
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
@@ -94,36 +114,79 @@ function DebugPanel({ log, onClose }: { log: DebugLog; onClose: () => void }) {
   };
 
   return (
-    <div style={{
-      position: "fixed", top: 0, right: 0, bottom: 0, width: 420,
-      background: "rgba(13,17,23,0.95)", borderLeft: "1px solid #30363d",
-      display: "flex", flexDirection: "column", zIndex: 9999,
-      fontFamily: "'Fira Code', ui-monospace, monospace", fontSize: 11,
-    }}>
-      <div style={{
-        padding: "8px 12px", borderBottom: "1px solid #30363d",
-        display: "flex", justifyContent: "space-between", alignItems: "center",
-        color: "#c9d1d9", fontWeight: 700, fontSize: 12,
-      }}>
+    <div
+      style={{
+        position: "fixed",
+        top: 0,
+        right: 0,
+        bottom: 0,
+        width: 420,
+        background: "rgba(13,17,23,0.95)",
+        borderLeft: "1px solid #30363d",
+        display: "flex",
+        flexDirection: "column",
+        zIndex: 9999,
+        fontFamily: "'Fira Code', ui-monospace, monospace",
+        fontSize: 11,
+      }}
+    >
+      <div
+        style={{
+          padding: "8px 12px",
+          borderBottom: "1px solid #30363d",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          color: "#c9d1d9",
+          fontWeight: 700,
+          fontSize: 12,
+        }}
+      >
         <span>blit debug</span>
         <div style={{ display: "flex", gap: 4 }}>
-          <button onClick={copyLog} style={{
-            background: "none", border: "1px solid #30363d", color: "#8b949e",
-            cursor: "pointer", fontSize: 11, padding: "2px 8px", borderRadius: 4,
-            fontFamily: "inherit",
-          }}>{copied ? "Copied!" : "Copy"}</button>
-          <button onClick={onClose} style={{
-            background: "none", border: "none", color: "#8b949e",
-            cursor: "pointer", fontSize: 14, padding: "2px 6px",
-          }}>✕</button>
+          <button
+            onClick={copyLog}
+            style={{
+              background: "none",
+              border: "1px solid #30363d",
+              color: "#8b949e",
+              cursor: "pointer",
+              fontSize: 11,
+              padding: "2px 8px",
+              borderRadius: 4,
+              fontFamily: "inherit",
+            }}
+          >
+            {copied ? "Copied!" : "Copy"}
+          </button>
+          <button
+            onClick={onClose}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#8b949e",
+              cursor: "pointer",
+              fontSize: 14,
+              padding: "2px 6px",
+            }}
+          >
+            ✕
+          </button>
         </div>
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}>
         {entries.map((e, i) => (
-          <div key={i} style={{
-            padding: "2px 12px", color: colors[e.level],
-            borderLeft: e.level !== "log" ? `2px solid ${colors[e.level]}` : "2px solid transparent",
-          }}>
+          <div
+            key={i}
+            style={{
+              padding: "2px 12px",
+              color: colors[e.level],
+              borderLeft:
+                e.level !== "log"
+                  ? `2px solid ${colors[e.level]}`
+                  : "2px solid transparent",
+            }}
+          >
             <span style={{ opacity: 0.5 }}>
               {new Date(e.t).toISOString().slice(11, 23)}
             </span>{" "}
@@ -155,10 +218,21 @@ const SHORTCUTS: [string, string][] = [
 
 const MOD_LABEL = navigator.userAgent.includes("Mac") ? "\u2318" : "Ctrl";
 
-function ShortcutsPanel({ onClose, dimFg, border }: { onClose: () => void; dimFg: string; border: string }) {
+function ShortcutsPanel({
+  onClose,
+  dimFg,
+  border,
+}: {
+  onClose: () => void;
+  dimFg: string;
+  border: string;
+}) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); onClose(); }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -168,25 +242,42 @@ function ShortcutsPanel({ onClose, dimFg, border }: { onClose: () => void; dimFg
     <div
       onClick={onClose}
       style={{
-        position: "fixed", inset: 0, zIndex: 9998,
-        display: "flex", alignItems: "center", justifyContent: "center",
+        position: "fixed",
+        inset: 0,
+        zIndex: 9998,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
         background: "rgba(0,0,0,0.5)",
       }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: "#0d1117", border: `1px solid ${border}`, borderRadius: 10,
-          padding: "20px 28px", minWidth: 300,
-          fontFamily: "'Fira Code', ui-monospace, monospace", fontSize: 13, color: "#c9d1d9",
+          background: "#0d1117",
+          border: `1px solid ${border}`,
+          borderRadius: 10,
+          padding: "20px 28px",
+          minWidth: 300,
+          fontFamily: "'Fira Code', ui-monospace, monospace",
+          fontSize: 13,
+          color: "#c9d1d9",
         }}
       >
-        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 16 }}>Keyboard shortcuts</div>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 16 }}>
+          Keyboard shortcuts
+        </div>
         <table style={{ borderSpacing: "0 8px" }}>
           <tbody>
             {SHORTCUTS.map(([key, desc]) => (
               <tr key={key}>
-                <td style={{ paddingRight: 24, color: dimFg, whiteSpace: "nowrap" }}>
+                <td
+                  style={{
+                    paddingRight: 24,
+                    color: dimFg,
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {key.replace(/Mod/g, MOD_LABEL)}
                 </td>
                 <td>{desc}</td>
@@ -202,8 +293,6 @@ function ShortcutsPanel({ onClose, dimFg, border }: { onClose: () => void; dimFg
 const GITHUB_DARK = PALETTES.find((p) => p.id === "github-dark")!;
 const GITHUB_LIGHT = PALETTES.find((p) => p.id === "github-light")!;
 
-
-
 function rgb([r, g, b]: [number, number, number]): string {
   return `rgb(${r}, ${g}, ${b})`;
 }
@@ -216,12 +305,22 @@ function tabLabel(s: BlitSession): string {
   return s.title ?? s.tag ?? "Terminal";
 }
 
-export function Terminal({ passphrase, dark, onToggleTheme }: { passphrase: string; dark: boolean; onToggleTheme: () => void }) {
+export function Terminal({
+  passphrase,
+  dark,
+  onToggleTheme,
+}: {
+  passphrase: string;
+  dark: boolean;
+  onToggleTheme: () => void;
+}) {
   const [wasm, setWasm] = useState<BlitWasmModule | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    initWasm().then(setWasm).catch((e) => setError(String(e)));
+    initWasm()
+      .then(setWasm)
+      .catch((e) => setError(String(e)));
   }, []);
 
   if (error) {
@@ -273,13 +372,23 @@ function TerminalInner({
   const [debugLog] = useState(() => new DebugLog());
   const [debugOpen, setDebugOpen] = useDebugPanel();
 
-  const [workspace] = useState(() => new BlitWorkspace({
-    wasm,
-    connections: [{
-      id: CONNECTION_ID,
-      transport: { type: "share", hubUrl: HUB_URL, passphrase, debug: debugLog },
-    }],
-  }));
+  const [workspace] = useState(
+    () =>
+      new BlitWorkspace({
+        wasm,
+        connections: [
+          {
+            id: CONNECTION_ID,
+            transport: {
+              type: "share",
+              hubUrl: HUB_URL,
+              passphrase,
+              debug: debugLog,
+            },
+          },
+        ],
+      }),
+  );
 
   const palette = dark ? GITHUB_DARK : GITHUB_LIGHT;
 
@@ -290,8 +399,15 @@ function TerminalInner({
       fontFamily={FONT_FAMILY}
       fontSize={FONT_SIZE}
     >
-      <TabShell palette={palette} dark={dark} passphrase={passphrase} onToggleTheme={onToggleTheme} />
-      {debugOpen && <DebugPanel log={debugLog} onClose={() => setDebugOpen(false)} />}
+      <TabShell
+        palette={palette}
+        dark={dark}
+        passphrase={passphrase}
+        onToggleTheme={onToggleTheme}
+      />
+      {debugOpen && (
+        <DebugPanel log={debugLog} onClose={() => setDebugOpen(false)} />
+      )}
     </BlitWorkspaceProvider>
   );
 }
@@ -339,7 +455,16 @@ function ShareButton({
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       title="Copy share link"
     >
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
         <path d="M4 12a2 2 0 1 1 0-4 2 2 0 0 1 0 4ZM12 6a2 2 0 1 1 0-4 2 2 0 0 1 0 4ZM12 16a2 2 0 1 1 0-4 2 2 0 0 1 0 4ZM5.7 9.3l4.6 3.4M10.3 5.3l-4.6 3.4" />
       </svg>
       {copied ? "Copied!" : "Share"}
@@ -392,13 +517,21 @@ function TabShell({
           cols: termRef.current?.cols ?? 80,
         })
         .then((s) => workspace.focusSession(s.id))
-        .finally(() => { creatingRef.current = false; });
+        .finally(() => {
+          creatingRef.current = false;
+        });
     } else if (visibleSessions.length > 0 && !focusedId) {
       const prev = prevFocusedRef.current;
       const idx = prev ? Math.min(prev.index, visibleSessions.length - 1) : 0;
       workspace.focusSession(visibleSessions[idx].id);
     }
-  }, [connection?.status, connection?.ready, visibleSessions.length, focusedId, workspace]);
+  }, [
+    connection?.status,
+    connection?.ready,
+    visibleSessions.length,
+    focusedId,
+    workspace,
+  ]);
 
   useEffect(() => {
     const desired = new Set<SessionId>();
@@ -451,9 +584,15 @@ function TabShell({
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.shiftKey && e.key === "Enter") {
         e.preventDefault();
-        workspace.createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
-          .then((s) => workspace.focusSession(s.id)).catch(() => {});
-      } else if (e.ctrlKey && e.shiftKey && (e.key === "?" || e.code === "Slash")) {
+        workspace
+          .createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
+          .then((s) => workspace.focusSession(s.id))
+          .catch(() => {});
+      } else if (
+        e.ctrlKey &&
+        e.shiftKey &&
+        (e.key === "?" || e.code === "Slash")
+      ) {
         e.preventDefault();
         setShowShortcuts((v) => !v);
       } else if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
@@ -517,113 +656,135 @@ function TabShell({
             gap: 2,
           }}
         >
-          <div style={{ display: "flex", flex: 1, overflowX: "auto", alignItems: "stretch" }}>
-          {visibleSessions.map((s) => {
-            const active = s.id === focusedId;
-            return (
-              <div
-                key={s.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "0 14px",
-                  cursor: "pointer",
-                  fontSize: 13,
-                  fontFamily: "'Fira Code', ui-monospace, monospace",
-                  color: active ? fg : dimFg,
-                  borderBottom: active ? `2px solid ${accent}` : "2px solid transparent",
-                  background: active ? rgba(palette.fg, dark ? 0.06 : 0.04) : "transparent",
-                  borderRadius: "6px 6px 0 0",
-                  transition: "background 0.15s",
-                  whiteSpace: "nowrap",
-                  userSelect: "none",
-                  flexShrink: 0,
-                }}
-                onClick={() => switchTab(s.id)}
-                onMouseEnter={(e) =>
-                  (e.currentTarget.style.background = tabHover)
-                }
-                onMouseLeave={(e) =>
-                  (e.currentTarget.style.background = "transparent")
-                }
-              >
-                <span style={{
-                  display: "inline-block",
-                  width: 7, height: 7, borderRadius: "50%",
-                  background: s.state === "active" ? rgb(green) : rgba(palette.fg, 0.3),
-                  flexShrink: 0,
-                }} />
-                <span>{tabLabel(s)}</span>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(s.id);
-                  }}
-                  style={{
-                    background: "none",
-                    border: "none",
-                    color: rgb(red),
-                    cursor: "pointer",
-                    padding: 0,
-                    width: 18,
-                    height: 18,
-                    fontSize: 12,
-                    lineHeight: "18px",
-                    textAlign: "center",
-                    borderRadius: "50%",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    transition: "background 0.15s, color 0.15s",
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.background = rgba(red, 0.2);
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = "none";
-                  }}
-                  aria-label={`Close ${tabLabel(s)}`}
-                >
-                  {"\u2715"}
-                </button>
-              </div>
-            );
-          })}
-          <button
-            onClick={() => {
-              workspace
-                .createSession({
-                  connectionId: CONNECTION_ID,
-                  rows: termRef.current?.rows ?? 24,
-                  cols: termRef.current?.cols ?? 80,
-                  ...(focusedId ? { cwdFromSessionId: focusedId } : {}),
-                })
-                .then((s) => workspace.focusSession(s.id))
-                .catch(() => {});
-            }}
+          <div
             style={{
-              background: "none",
-              border: "none",
-              color: dimFg,
-              cursor: "pointer",
-              padding: "0 10px",
-              fontSize: 18,
-              fontFamily: "'Fira Code', ui-monospace, monospace",
               display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              flexShrink: 0,
-              transition: "color 0.15s",
+              flex: 1,
+              overflowX: "auto",
+              alignItems: "stretch",
             }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = fg)}
-            onMouseLeave={(e) => (e.currentTarget.style.color = dimFg)}
-            aria-label="New tab"
           >
-            +
-          </button>
+            {visibleSessions.map((s) => {
+              const active = s.id === focusedId;
+              return (
+                <div
+                  key={s.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "0 14px",
+                    cursor: "pointer",
+                    fontSize: 13,
+                    fontFamily: "'Fira Code', ui-monospace, monospace",
+                    color: active ? fg : dimFg,
+                    borderBottom: active
+                      ? `2px solid ${accent}`
+                      : "2px solid transparent",
+                    background: active
+                      ? rgba(palette.fg, dark ? 0.06 : 0.04)
+                      : "transparent",
+                    borderRadius: "6px 6px 0 0",
+                    transition: "background 0.15s",
+                    whiteSpace: "nowrap",
+                    userSelect: "none",
+                    flexShrink: 0,
+                  }}
+                  onClick={() => switchTab(s.id)}
+                  onMouseEnter={(e) =>
+                    (e.currentTarget.style.background = tabHover)
+                  }
+                  onMouseLeave={(e) =>
+                    (e.currentTarget.style.background = "transparent")
+                  }
+                >
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: 7,
+                      height: 7,
+                      borderRadius: "50%",
+                      background:
+                        s.state === "active"
+                          ? rgb(green)
+                          : rgba(palette.fg, 0.3),
+                      flexShrink: 0,
+                    }}
+                  />
+                  <span>{tabLabel(s)}</span>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(s.id);
+                    }}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: rgb(red),
+                      cursor: "pointer",
+                      padding: 0,
+                      width: 18,
+                      height: 18,
+                      fontSize: 12,
+                      lineHeight: "18px",
+                      textAlign: "center",
+                      borderRadius: "50%",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      transition: "background 0.15s, color 0.15s",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = rgba(red, 0.2);
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = "none";
+                    }}
+                    aria-label={`Close ${tabLabel(s)}`}
+                  >
+                    {"\u2715"}
+                  </button>
+                </div>
+              );
+            })}
+            <button
+              onClick={() => {
+                workspace
+                  .createSession({
+                    connectionId: CONNECTION_ID,
+                    rows: termRef.current?.rows ?? 24,
+                    cols: termRef.current?.cols ?? 80,
+                    ...(focusedId ? { cwdFromSessionId: focusedId } : {}),
+                  })
+                  .then((s) => workspace.focusSession(s.id))
+                  .catch(() => {});
+              }}
+              style={{
+                background: "none",
+                border: "none",
+                color: dimFg,
+                cursor: "pointer",
+                padding: "0 10px",
+                fontSize: 18,
+                fontFamily: "'Fira Code', ui-monospace, monospace",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                transition: "color 0.15s",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = fg)}
+              onMouseLeave={(e) => (e.currentTarget.style.color = dimFg)}
+              aria-label="New tab"
+            >
+              +
+            </button>
           </div>
-          <ShareButton passphrase={passphrase} dimFg={dimFg} tabHover={tabHover} />
+          <ShareButton
+            passphrase={passphrase}
+            dimFg={dimFg}
+            tabHover={tabHover}
+          />
           <button
             onClick={() => setShowShortcuts(true)}
             style={{
@@ -639,12 +800,17 @@ function TabShell({
               transition: "background 0.1s",
             }}
             onMouseEnter={(e) => (e.currentTarget.style.background = tabHover)}
-            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            onMouseLeave={(e) =>
+              (e.currentTarget.style.background = "transparent")
+            }
             title="Keyboard shortcuts"
           >
             ?
           </button>
-          <ThemeToggle theme={dark ? "dark" : "light"} onToggle={onToggleTheme} />
+          <ThemeToggle
+            theme={dark ? "dark" : "light"}
+            onToggle={onToggleTheme}
+          />
         </div>
       )}
 
@@ -680,7 +846,9 @@ function TabShell({
           <div
             style={{
               position: "absolute",
-              bottom: 16, left: "50%", transform: "translateX(-50%)",
+              bottom: 16,
+              left: "50%",
+              transform: "translateX(-50%)",
               display: "flex",
               alignItems: "center",
               gap: 12,
@@ -702,8 +870,12 @@ function TabShell({
               tabIndex={0}
               style={EXITED_LABEL_STYLE}
               onClick={() => workspace.restartSession(focusedId!)}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.12)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.05)")}
+              onMouseEnter={(e) =>
+                (e.currentTarget.style.background = "rgba(255,255,255,0.12)")
+              }
+              onMouseLeave={(e) =>
+                (e.currentTarget.style.background = "rgba(255,255,255,0.05)")
+              }
             >
               Enter — reopen
             </span>
@@ -712,8 +884,12 @@ function TabShell({
               tabIndex={0}
               style={EXITED_LABEL_STYLE}
               onClick={() => workspace.closeSession(focusedId!)}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.12)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.05)")}
+              onMouseEnter={(e) =>
+                (e.currentTarget.style.background = "rgba(255,255,255,0.12)")
+              }
+              onMouseLeave={(e) =>
+                (e.currentTarget.style.background = "rgba(255,255,255,0.05)")
+              }
             >
               Esc — close
             </span>
