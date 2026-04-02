@@ -183,19 +183,11 @@ export function Landing({ theme, onToggleTheme }: { theme: Theme; onToggleTheme:
         <section className="demo-section">
           <div className="demo-block">
             <div className="demo-label">Get started</div>
-            <pre className="demo-pre"><code>{`$ curl -f https://install.blit.sh | sh
-$ blit            # opens a browser
-$ blit share      # share via WebRTC
-$ blit --ssh host # remote terminal`}</code></pre>
+            <pre className="demo-pre"><code><span className="prompt-char">$</span>{` curl -f https://install.blit.sh | sh\n`}<span className="prompt-char">$</span>{` blit            # opens a browser\n`}<span className="prompt-char">$</span>{` blit share      # share via WebRTC\n`}<span className="prompt-char">$</span>{` blit --ssh host # remote terminal`}</code></pre>
           </div>
           <div className="demo-block">
             <div className="demo-label">Agent API</div>
-            <pre className="demo-pre"><code>{`$ blit start -t build make -j8
-1
-$ blit wait 1 --pattern 'BUILD OK'
-$ blit show 1
-[100%] Built target app
-BUILD OK`}</code></pre>
+            <pre className="demo-pre"><code><span className="prompt-char">$</span>{` blit start -t build make -j8\n1\n`}<span className="prompt-char">$</span>{` blit wait 1 --pattern 'BUILD OK'\n`}<span className="prompt-char">$</span>{` blit show 1\n[100%] Built target app\nBUILD OK`}</code></pre>
           </div>
         </section>
 
