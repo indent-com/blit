@@ -18,6 +18,7 @@ export type ConnectionStatus =
   | "authenticating"
   | "connected"
   | "disconnected"
+  | "closed"
   | "error";
 
 export type ConnectionId = string;
@@ -119,6 +120,22 @@ export interface BlitSearchResult {
   scrollOffset: number | null;
   context: string;
 }
+
+export type TransportConfig =
+  | {
+      type: "websocket";
+      url: string;
+      passphrase: string;
+      options?: BlitTransportOptions;
+    }
+  | {
+      type: "webtransport";
+      url: string;
+      passphrase: string;
+      options?: BlitTransportOptions & { certHash?: string };
+    }
+  | { type: "share"; hubUrl: string; passphrase: string }
+  | { type: "custom"; transport: BlitTransport };
 
 export const DEFAULT_FONT = "ui-monospace, monospace";
 export const DEFAULT_FONT_SIZE = 13;

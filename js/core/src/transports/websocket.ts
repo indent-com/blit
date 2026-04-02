@@ -72,7 +72,7 @@ export class WebSocketTransport implements BlitTransport {
       this.ws.close();
       this.ws = null;
     }
-    this.setStatus("disconnected");
+    this.setStatus("closed");
   }
 
   addEventListener(

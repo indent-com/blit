@@ -6,16 +6,22 @@ import type {
   BlitConnectionSnapshot,
   BlitSearchResult,
   BlitSession,
+  BlitTransport,
   BlitWorkspaceSnapshot,
   ConnectionId,
   SessionId,
+  TransportConfig,
 } from "./types";
 import type { BlitWasmModule } from "./TerminalStore";
+import { WebSocketTransport } from "./transports/websocket";
+import { WebTransportTransport } from "./transports/webtransport";
+import { createShareTransport } from "./transports/webrtc-share";
 
 export interface AddBlitConnectionOptions extends Omit<
   CreateBlitConnectionOptions,
-  "wasm"
+  "wasm" | "transport"
 > {
+  transport?: BlitTransport | TransportConfig;
   wasm?: BlitWasmModule | Promise<BlitWasmModule>;
 }
 
@@ -77,8 +83,10 @@ export class BlitWorkspace {
       throw workspaceError(`Connection ${options.id} already exists`);
     }
 
+    const transport = resolveTransport(options.transport);
     const connection = new BlitConnection({
       ...options,
+      transport,
       wasm: options.wasm ?? this.defaultWasm,
     });
     this.connections.set(options.id, connection);
@@ -395,4 +403,31 @@ export function createBlitWorkspace(
   options: CreateBlitWorkspaceOptions,
 ): BlitWorkspace {
   return new BlitWorkspace(options);
+}
+
+function isTransportConfig(
+  value: BlitTransport | TransportConfig | undefined,
+): value is TransportConfig {
+  return value != null && "type" in value && typeof (value as TransportConfig).type === "string";
+}
+
+function resolveTransport(
+  config: BlitTransport | TransportConfig | undefined,
+): BlitTransport {
+  if (config == null) {
+    throw workspaceError("transport or TransportConfig is required");
+  }
+  if (!isTransportConfig(config)) {
+    return config;
+  }
+  switch (config.type) {
+    case "websocket":
+      return new WebSocketTransport(config.url, config.passphrase, config.options);
+    case "webtransport":
+      return new WebTransportTransport(config.url, config.passphrase, config.options);
+    case "share":
+      return createShareTransport(config.hubUrl, config.passphrase);
+    case "custom":
+      return config.transport;
+  }
 }

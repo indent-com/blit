@@ -80,7 +80,7 @@ export class WebTransportTransport implements BlitTransport {
     this.disposed = true;
     this.clearReconnectTimer();
     this.cleanup();
-    this.setStatus("disconnected");
+    this.setStatus("closed");
   }
 
   addEventListener(

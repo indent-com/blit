@@ -36,7 +36,7 @@ export class MockTransport implements BlitTransport {
   }
 
   close() {
-    this.setStatus("disconnected");
+    this.setStatus("closed");
   }
 
   addEventListener<K extends keyof BlitTransportEventMap>(

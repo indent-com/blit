@@ -229,11 +229,11 @@ describe("createWebRtcDataChannelTransport", () => {
     expect(new Uint8Array(onmsg.mock.calls[1][0])).toEqual(p2);
   });
 
-  it('close() sets status to "disconnected"', () => {
+  it('close() sets status to "closed"', () => {
     const t = create();
     channel.simulateOpen();
     t.close();
-    expect(t.status).toBe("disconnected");
+    expect(t.status).toBe("closed");
   });
 
   it('channel error sets status to "error"', () => {
@@ -315,7 +315,7 @@ describe("createWebRtcDataChannelTransport", () => {
     channel.onerror?.(new Event("error"));
     channel.onclose?.(new Event("close"));
 
-    expect(t.status).toBe("disconnected");
+    expect(t.status).toBe("closed");
     expect(statusCb).not.toHaveBeenCalled();
   });
 

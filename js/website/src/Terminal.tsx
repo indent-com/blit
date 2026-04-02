@@ -6,15 +6,16 @@ import {
   useBlitSessions,
   useBlitWorkspace,
   useBlitWorkspaceState,
+  useBlitWorkspaceConnection,
 } from "@blit-sh/react";
 import type { BlitTerminalHandle } from "@blit-sh/react";
-import { BlitWorkspace, PALETTES, createShareTransport } from "@blit-sh/core";
+import { BlitWorkspace, PALETTES } from "@blit-sh/core";
 import type {
-  BlitTransport,
   BlitSession,
   BlitWasmModule,
   SessionId,
   TerminalPalette,
+  TransportConfig,
 } from "@blit-sh/core";
 import { initWasm } from "./wasm";
 
@@ -105,17 +106,13 @@ function TerminalInner({
   dark: boolean;
 }) {
   const [workspace] = useState(() => new BlitWorkspace({ wasm }));
-  const [transport] = useState<BlitTransport>(() =>
-    createShareTransport(HUB_URL, passphrase),
-  );
+  const [transportConfig] = useState<TransportConfig>(() => ({
+    type: "share",
+    hubUrl: HUB_URL,
+    passphrase,
+  }));
 
-  useEffect(() => {
-    workspace.addConnection({ id: CONNECTION_ID, transport });
-    return () => {
-      workspace.removeConnection(CONNECTION_ID);
-      transport.close();
-    };
-  }, [workspace, transport]);
+  useBlitWorkspaceConnection(workspace, CONNECTION_ID, transportConfig);
 
   const palette = dark ? GITHUB_DARK : GITHUB_LIGHT;
 

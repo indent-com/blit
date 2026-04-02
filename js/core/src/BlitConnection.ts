@@ -794,7 +794,7 @@ export class BlitConnection {
       this.retryCount = 0;
       this.lastError = null;
     } else if (
-      (status === "error" || status === "disconnected") &&
+      (status === "error" || status === "disconnected" || status === "closed") &&
       (this.snapshot.status === "connecting" ||
         this.snapshot.status === "authenticating")
     ) {
@@ -815,7 +815,7 @@ export class BlitConnection {
       error: this.lastError,
     };
 
-    if (status === "disconnected" || status === "error") {
+    if (status === "disconnected" || status === "closed" || status === "error") {
       this.rejectPendingCreates(
         connectionError(`Transport ${status} before PTY creation completed`),
       );

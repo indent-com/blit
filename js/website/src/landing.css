@@ -311,6 +311,47 @@
   border: 1px solid var(--border);
 }
 
+/* ── Transport diagram ── */
+
+.transport-section {
+  padding: 2.5rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.transport-section h2 {
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 1rem;
+  color: var(--bright);
+}
+
+.transport-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 0.5rem;
+}
+
+.transport-card {
+  padding: 0.6rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  text-align: center;
+}
+
+.transport-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--bright);
+  margin-bottom: 0.2rem;
+}
+
+.transport-where {
+  font-size: 11px;
+  color: var(--dim);
+}
+
 /* ── Demo blocks ── */
 
 .demo-section {
@@ -431,6 +472,18 @@
   .demo-section {
     grid-template-columns: 1fr;
   }
+
+  .transport-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .transport-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+
 }
 
 @media (max-width: 640px) {

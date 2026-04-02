@@ -220,7 +220,7 @@ export function createWebRtcDataChannelTransport(
         channel = null;
       }
       pc.removeEventListener("connectionstatechange", onConnectionStateChange);
-      setStatus("disconnected");
+      setStatus("closed");
     },
 
     waitForSync() {

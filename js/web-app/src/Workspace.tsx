@@ -7,6 +7,7 @@ import {
   useBlitSessions,
   useBlitWorkspace,
   useBlitWorkspaceState,
+  useBlitWorkspaceConnection,
 } from "@blit-sh/react";
 import type { BlitTerminalHandle } from "@blit-sh/react";
 import { BlitWorkspace, PALETTES, DEFAULT_FONT } from "@blit-sh/core";
@@ -53,10 +54,6 @@ export type Overlay = "expose" | "palette" | "font" | "help" | null;
 
 const PRIMARY_CONNECTION_ID = "main";
 
-// Module-level cache so the workspace and connection survive HMR.
-let cachedWorkspace: BlitWorkspace | null = null;
-let cachedTransport: BlitTransport | null = null;
-
 const CSS_GENERIC = new Set([
   "serif",
   "sans-serif",
@@ -93,21 +90,8 @@ export function Workspace({
   wasm: BlitWasmModule;
   onAuthError: () => void;
 }) {
-  if (!cachedWorkspace) {
-    cachedWorkspace = new BlitWorkspace({ wasm });
-  }
-  const workspace = cachedWorkspace;
-
-  if (cachedTransport !== transport) {
-    if (cachedTransport) {
-      workspace.removeConnection(PRIMARY_CONNECTION_ID);
-    }
-    cachedTransport = transport;
-    workspace.addConnection({
-      id: PRIMARY_CONNECTION_ID,
-      transport,
-    });
-  }
+  const [workspace] = useState(() => new BlitWorkspace({ wasm }));
+  useBlitWorkspaceConnection(workspace, PRIMARY_CONNECTION_ID, transport);
 
   return (
     <BlitWorkspaceProvider workspace={workspace}>

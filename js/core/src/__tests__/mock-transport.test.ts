@@ -15,13 +15,13 @@ describe("MockTransport", () => {
     expect(Array.from(t.sent[0])).toEqual([1, 2, 3]);
   });
 
-  it("close sets disconnected", () => {
+  it("close sets closed", () => {
     const t = new MockTransport();
     const cb = vi.fn();
     t.addEventListener("statuschange", cb);
     t.close();
-    expect(t.status).toBe("disconnected");
-    expect(cb).toHaveBeenCalledWith("disconnected");
+    expect(t.status).toBe("closed");
+    expect(cb).toHaveBeenCalledWith("closed");
   });
 
   it("push delivers to message listeners", () => {

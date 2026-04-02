@@ -26,6 +26,7 @@ export type {
   ConnectionStatus,
   SessionId,
   TerminalPalette,
+  TransportConfig,
 } from "./types";
 
 export { PALETTES } from "./palettes";

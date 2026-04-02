@@ -370,7 +370,7 @@ describe("BlitConnection", () => {
 
   it("closes transport on hello with version > PROTOCOL_VERSION", () => {
     transport.pushHello(2, FEATURE_CREATE_NONCE);
-    expect(conn.getSnapshot().status).toBe("disconnected");
+    expect(conn.getSnapshot().status).toBe("closed");
   });
 
   it("accepts hello with version 1", () => {

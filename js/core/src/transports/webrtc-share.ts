@@ -307,7 +307,7 @@ export function createShareTransport(
       ws?.close();
       pc?.close();
       inner?.close();
-      setStatus("disconnected");
+      setStatus("closed");
     },
   };
 

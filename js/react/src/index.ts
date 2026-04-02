@@ -10,6 +10,7 @@ export {
   useBlitWorkspaceState,
 } from "./hooks/useBlitWorkspace";
 export { useBlitSession, useBlitFocusedSession } from "./hooks/useBlitSession";
+export { useBlitWorkspaceConnection } from "./hooks/useBlitWorkspaceConnection";
 
 export { BlitWorkspaceProvider } from "./BlitContext";
 export type { BlitContextValue, BlitProviderProps } from "./BlitContext";

@@ -218,6 +218,36 @@ export function Landing() {
           </div>
         </section>
 
+        <section className="transport-section">
+          <h2>Every transport you need</h2>
+          <div className="transport-grid">
+            <div className="transport-card">
+              <div className="transport-name">WebSocket</div>
+              <div className="transport-where">Browser &middot; CLI</div>
+            </div>
+            <div className="transport-card">
+              <div className="transport-name">WebTransport</div>
+              <div className="transport-where">Browser &middot; CLI</div>
+            </div>
+            <div className="transport-card">
+              <div className="transport-name">WebRTC</div>
+              <div className="transport-where">Browser (share)</div>
+            </div>
+            <div className="transport-card">
+              <div className="transport-name">Unix / TCP</div>
+              <div className="transport-where">CLI &middot; Scripts</div>
+            </div>
+            <div className="transport-card">
+              <div className="transport-name">SSH</div>
+              <div className="transport-where">CLI</div>
+            </div>
+            <div className="transport-card">
+              <div className="transport-name">Custom</div>
+              <div className="transport-where">Implement the interface</div>
+            </div>
+          </div>
+        </section>
+
         <section className="demo-section">
           <div className="demo-block">
             <div className="demo-label">Get started</div>
@@ -239,51 +269,27 @@ BUILD OK`}</code></pre>
 
         <section className="embed-section">
           <h2>Drop into any React app</h2>
-          <p className="embed-sub">
-            Choose your transport — WebSocket, WebTransport, WebRTC — or
-            implement the interface and bring your own.
-          </p>
           <pre className="demo-pre demo-pre--wide"><code className="code-hl">{
 }<span className="hl-kw">import</span>{" { "}
 <span className="hl-fn">BlitWorkspaceProvider</span>{", "}
-<span className="hl-fn">BlitTerminal</span>{`,\n         `}
-<span className="hl-fn">useBlitSessions</span>{", "}
-<span className="hl-fn">useBlitFocusedSession</span>{`,\n         `}
-<span className="hl-fn">useBlitWorkspace</span>{" } "}
+<span className="hl-fn">BlitTerminal</span>{",\n         "}
+<span className="hl-fn">useBlitFocusedSession</span>{" } "}
 <span className="hl-kw">from</span> <span className="hl-str">'@blit-sh/react'</span>{";\n"}
 <span className="hl-kw">import</span>{" { "}
-<span className="hl-fn">BlitWorkspace</span>{", "}
-<span className="hl-fn">WebSocketTransport</span>{" } "}
+<span className="hl-fn">BlitWorkspace</span>{" } "}
 <span className="hl-kw">from</span> <span className="hl-str">'@blit-sh/core'</span>{";\n\n"}
-<span className="hl-cm">{"// ● Connect to any blit server over WebSocket"}</span>{"\n"}
-<span className="hl-kw">const</span>{" transport = "}
-<span className="hl-kw">new</span> <span className="hl-fn">WebSocketTransport</span>{"(url, passphrase);\n"}
+<span className="hl-cm">{"// ● Create a workspace with a WebSocket connection"}</span>{"\n"}
 <span className="hl-kw">const</span>{" workspace = "}
-<span className="hl-kw">new</span> <span className="hl-fn">BlitWorkspace</span>{"({\n  wasm, connections: [{ id: "}
-<span className="hl-str">"default"</span>{", transport }],\n});\n\n"}
-<span className="hl-cm">{"// ● Wrap your app — all hooks and terminals read from this"}</span>{"\n"}
+<span className="hl-kw">new</span> <span className="hl-fn">BlitWorkspace</span>{"({\n  wasm,\n  connections: [{\n    id: "}
+<span className="hl-str">"ws"</span>{", type: "}
+<span className="hl-str">"websocket"</span>{", url, passphrase,\n  }],\n});\n\n"}
+<span className="hl-cm">{"// ● Render — that's it"}</span>{"\n"}
 {"<"}
 <span className="hl-fn">BlitWorkspaceProvider</span> <span className="hl-attr">workspace</span>{"={workspace}>\n  <"}
-<span className="hl-fn">Terminal</span>{" />\n</"}
-<span className="hl-fn">BlitWorkspaceProvider</span>{">\n\n"}
-<span className="hl-cm">{"// ● Open a session and render it — that's it"}</span>{"\n"}
-<span className="hl-kw">function</span> <span className="hl-fn">Terminal</span>{"() {\n"}
-{"  "}
-<span className="hl-kw">const</span>{" workspace = "}
-<span className="hl-fn">useBlitWorkspace</span>{"();\n"}
-{"  "}
-<span className="hl-kw">const</span>{" focused = "}
-<span className="hl-fn">useBlitFocusedSession</span>{"();\n\n"}
-{"  "}
-<span className="hl-fn">useEffect</span>{"(() => {\n    workspace."}
-<span className="hl-fn">createSession</span>{"({ connectionId: "}
-<span className="hl-str">"default"</span>{", rows: "}
-<span className="hl-num">24</span>{", cols: "}
-<span className="hl-num">80</span>{" });\n  }, []);\n\n"}
-{"  "}
-<span className="hl-kw">return</span>{" <"}
-<span className="hl-fn">BlitTerminal</span> <span className="hl-attr">sessionId</span>{"={focused?.id ?? "}
-<span className="hl-kw">null</span>{"} />;\n}"}
+<span className="hl-fn">BlitTerminal</span> <span className="hl-attr">sessionId</span>{"={"}
+<span className="hl-fn">useBlitFocusedSession</span>{"()?.id ?? "}
+<span className="hl-kw">null</span>{"} />\n</"}
+<span className="hl-fn">BlitWorkspaceProvider</span>{">"}
 </code></pre>
         </section>
       </main>

@@ -295,7 +295,7 @@ describe("WebSocketTransport", () => {
     vi.advanceTimersByTime(10000);
 
     expect(MockWebSocket.instances.length).toBe(instancesBefore);
-    expect(transport.status).toBe("disconnected");
+    expect(transport.status).toBe("closed");
   });
 
   it("reconnect delay increases with backoff", () => {

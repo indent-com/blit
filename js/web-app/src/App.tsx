@@ -70,9 +70,7 @@ function ShareApp({
     <Workspace
       transport={transport}
       wasm={wasm}
-      onAuthError={() => {
-        transport.close();
-      }}
+      onAuthError={() => {}}
     />
   );
 }
@@ -91,7 +89,6 @@ function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
   const connect = useCallback(
     (pass: string) => {
       setAuthError(null);
-      transport?.close();
       const t = createGatewayTransport(pass);
       const onStatus = (status: string) => {
         if (status === "connected") {
@@ -100,14 +97,13 @@ function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
         } else if (status === "error") {
           setAuthError(t.lastError ?? i18n("auth.failed"));
           t.removeEventListener("statuschange", onStatus);
-          t.close();
           setTransport(null);
         }
       };
       t.addEventListener("statuschange", onStatus);
       setTransport(t);
     },
-    [transport],
+    [],
   );
 
   if (!transport) {
@@ -125,7 +121,6 @@ function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
       transport={transport}
       wasm={wasm}
       onAuthError={() => {
-        transport.close();
         writeStorage(PASS_KEY, "");
         setTransport(null);
         setAuthError(i18n("auth.failed"));
