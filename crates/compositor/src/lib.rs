@@ -622,6 +622,10 @@ pub fn spawn_compositor() -> CompositorHandle {
     let shutdown_clone = shutdown.clone();
 
     let thread = std::thread::spawn(move || {
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            let dir = std::env::temp_dir();
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
         run_compositor(event_tx, command_rx, socket_tx, shutdown_clone);
     });
 
