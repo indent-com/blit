@@ -11,6 +11,7 @@ const MESSAGE_TEMPLATE =
   "Session available at https://blit.sh/#{secret}\nor blit --share {secret}";
 const ICE_TTL = 86400;
 const SESSION_TTL = 600;
+const SESSION_REFRESH_INTERVAL = SESSION_TTL * 500; // refresh at half-TTL (ms)
 const MAX_PAYLOAD_BYTES = 65536;
 
 const DEFAULT_ICE_SERVERS = [
@@ -65,6 +66,7 @@ type ClientData = {
   channelId: string;
   role: Role;
   sessionId: string;
+  refreshTimer?: ReturnType<typeof setInterval>;
 };
 
 type Channel = {
@@ -273,14 +275,21 @@ const server = Bun.serve<ClientData>({
       await redis.sadd(memberKey, sessionId);
       await redis.expire(memberKey, SESSION_TTL);
 
+      ws.data.refreshTimer = setInterval(() => {
+        redis.expire(memberKey, SESSION_TTL).catch(() => {});
+      }, SESSION_REFRESH_INTERVAL);
+
       ws.send(
         JSON.stringify({ type: "registered", channelId, role, sessionId }),
       );
 
       const otherRole = OPPOSITE_ROLE[role];
-      const remoteMembers = await redis.smembers(
-        redisKey(otherRole, channelId),
+      const remoteMembers = new Set(
+        await redis.smembers(redisKey(otherRole, channelId)),
       );
+      const localPeers =
+        otherRole === "producer" ? ch.producers : ch.consumers;
+      for (const sid of localPeers.keys()) remoteMembers.add(sid);
       for (const peerId of remoteMembers) {
         ws.send(
           JSON.stringify({
@@ -356,7 +365,8 @@ const server = Bun.serve<ClientData>({
     },
 
     async close(ws) {
-      const { channelId, role, sessionId } = ws.data;
+      const { channelId, role, sessionId, refreshTimer } = ws.data;
+      if (refreshTimer) clearInterval(refreshTimer);
       const ch = channels.get(channelId);
       if (!ch) return;
 
