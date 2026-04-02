@@ -81,6 +81,7 @@ export default bin.buffer;
         __dirname,
         "../../crates/browser/pkg/blit_browser.js",
       ),
+      tweetnacl: localRequire.resolve("tweetnacl"),
     },
     dedupe: ["react", "react-dom"],
   },
