@@ -4,8 +4,8 @@ export default function StatusOverlay(props: {
 }) {
   return (
     <div
-      class={`absolute inset-0 z-50 flex items-center justify-center bg-[#0a0a0a] font-mono text-sm ${
-        props.isError ? "text-red-500" : "text-neutral-400"
+      class={`absolute inset-0 z-50 flex items-center justify-center bg-[var(--bg)] font-mono text-sm ${
+        props.isError ? "text-red-500" : "text-[var(--dim)]"
       }`}
     >
       {props.status}

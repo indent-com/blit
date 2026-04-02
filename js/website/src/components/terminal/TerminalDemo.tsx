@@ -28,7 +28,6 @@ import {
 import { createDebugLog, type DebugLog } from "./DebugPanel";
 import TabBar from "./TabBar";
 import StatusOverlay from "./StatusOverlay";
-import ShareButton from "./ShareButton";
 import ShortcutsPanel from "./ShortcutsPanel";
 import DebugPanel from "./DebugPanel";
 
@@ -195,6 +194,78 @@ function TerminalInner(props: {
 }
 
 // ---------------------------------------------------------------------------
+// ToolbarMenu: dropdown from the "..." button
+// ---------------------------------------------------------------------------
+
+function MenuRow(props: {
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={props.onClick}
+      class="flex w-full items-center px-3 py-1.5 bg-transparent border-none text-[var(--fg)] text-xs font-sans cursor-pointer rounded transition-colors hover:bg-[var(--surface)]"
+    >
+      {props.label}
+    </button>
+  );
+}
+
+function ToolbarMenu(props: {
+  onCopyLink: () => void;
+  copied: boolean;
+  onShortcuts: () => void;
+  dark: boolean;
+  onToggleTheme: () => void;
+  onClose: () => void;
+}) {
+  // Close menu on outside click
+  let menuRef!: HTMLDivElement;
+  onMount(() => {
+    const handler = (e: MouseEvent) => {
+      if (menuRef && !menuRef.contains(e.target as Node)) {
+        props.onClose();
+      }
+    };
+    // Defer to avoid catching the same click that opened the menu
+    requestAnimationFrame(() =>
+      document.addEventListener("click", handler, true),
+    );
+    onCleanup(() => document.removeEventListener("click", handler, true));
+  });
+
+  // Close on Escape
+  onMount(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); props.onClose(); }
+    };
+    window.addEventListener("keydown", handler);
+    onCleanup(() => window.removeEventListener("keydown", handler));
+  });
+
+  return (
+    <div
+      ref={menuRef}
+      class="absolute right-0 top-full mt-1 z-[100] min-w-[160px] rounded-lg border border-[var(--border)] bg-[var(--bg)] py-1 shadow-lg"
+    >
+      <MenuRow
+        label={props.copied ? "Copied!" : "Copy link"}
+        onClick={props.onCopyLink}
+      />
+      <MenuRow
+        label="Shortcuts"
+        onClick={props.onShortcuts}
+      />
+      <MenuRow
+        label={props.dark ? "Light mode" : "Dark mode"}
+        onClick={props.onToggleTheme}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // TabShell: manages sessions, tab bar, terminal rendering
 // ---------------------------------------------------------------------------
 
@@ -210,6 +281,9 @@ function TabShell(props: {
   const sessions = createBlitSessions(workspace);
 
   const [showShortcuts, setShowShortcuts] = createSignal(false);
+  const [menuOpen, setMenuOpen] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+  let copyTimeout: ReturnType<typeof setTimeout> | undefined;
 
   const visibleSessions = createMemo(() =>
     sessions().filter((s) => s.state !== "closed"),
@@ -360,58 +434,60 @@ function TabShell(props: {
   };
 
   return (
-    <div class="fixed inset-0 z-50 flex flex-col bg-[#0a0a0a]">
+    <div class="fixed inset-0 z-50 flex flex-col bg-[var(--bg)]">
       <Show when={visibleSessions().length > 0}>
-        <div class="flex items-stretch shrink-0">
+        <div class="flex items-stretch shrink-0 border-b border-[var(--border)] bg-[var(--surface)]">
           <div class="flex-1 min-w-0">
             <TabBar
               sessions={visibleSessions()}
               focusedSessionId={focusedId()}
               onSelect={handleSelectTab}
               onClose={handleCloseTab}
-              onNew={handleNewTab}
             />
           </div>
-          <ShareButton passphrase={props.passphrase} />
+          {/* New tab button */}
           <button
-            onClick={() => setShowShortcuts(true)}
-            class="bg-transparent border-none text-neutral-500 cursor-pointer px-2.5 text-sm font-mono font-bold shrink-0 transition-colors hover:text-neutral-300"
-            title="Keyboard shortcuts"
+            type="button"
+            onClick={handleNewTab}
+            class="flex w-9 shrink-0 cursor-pointer items-center justify-center border-none bg-transparent text-[var(--dim)] transition-colors hover:text-[var(--fg)]"
+            title="New tab"
           >
-            ?
+            <svg class="block" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
           </button>
-          <button
-            onClick={props.onToggleTheme}
-            class="flex items-center justify-center bg-transparent border-none text-neutral-500 cursor-pointer px-2.5 shrink-0 transition-colors hover:text-neutral-300"
-            aria-label={`Switch to ${props.dark() ? "light" : "dark"} mode`}
-          >
-            {props.dark() ? (
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-                <circle
-                  cx="8"
-                  cy="8"
-                  r="3.5"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                />
-                <path
-                  d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                />
+          {/* Menu button */}
+          <div class="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setMenuOpen((v) => !v)}
+              class="flex w-9 h-full cursor-pointer items-center justify-center border-l border-[var(--border)] bg-transparent border-y-0 border-r-0 text-[var(--dim)] transition-colors hover:text-[var(--fg)]"
+              title="Menu"
+            >
+              {/* Three vertical dots */}
+              <svg class="block" width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                <circle cx="8" cy="3" r="1.5" />
+                <circle cx="8" cy="8" r="1.5" />
+                <circle cx="8" cy="13" r="1.5" />
               </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-                <path
-                  d="M14 9.2A6 6 0 0 1 6.8 2 6 6 0 1 0 14 9.2Z"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            )}
-          </button>
+            </button>
+            <Show when={menuOpen()}>
+              <ToolbarMenu
+                onCopyLink={() => {
+                  const url = `${location.origin}/s#${encodeURIComponent(props.passphrase)}`;
+                  navigator.clipboard.writeText(url);
+                  setCopied(true);
+                  clearTimeout(copyTimeout);
+                  copyTimeout = setTimeout(() => setCopied(false), 2000);
+                }}
+                copied={copied()}
+                onShortcuts={() => { setShowShortcuts(true); setMenuOpen(false); }}
+                dark={props.dark()}
+                onToggleTheme={() => { props.onToggleTheme(); setMenuOpen(false); }}
+                onClose={() => setMenuOpen(false)}
+              />
+            </Show>
+          </div>
         </div>
       </Show>
 
@@ -429,12 +505,12 @@ function TabShell(props: {
           />
         </Show>
         <Show when={focusedExited()}>
-          <div class="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 z-[2] px-4 py-2 bg-[rgba(10,10,10,0.9)] backdrop-blur-sm border border-[#333] rounded-xl font-mono text-[13px] text-neutral-400 whitespace-nowrap">
+          <div class="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 z-[2] px-4 py-2 bg-[var(--bg)]/90 backdrop-blur-sm border border-[var(--border)] rounded-xl font-mono text-[13px] text-[var(--dim)] whitespace-nowrap">
             <span>Exited</span>
             <span
               role="button"
               tabIndex={0}
-              class="cursor-pointer px-3 py-1 rounded-md border border-white/15 bg-white/5 transition-colors hover:bg-white/10"
+              class="cursor-pointer px-3 py-1 rounded-md border border-[var(--border)] bg-[var(--surface)] transition-colors hover:brightness-110"
               onClick={() => workspace.restartSession(focusedId()!)}
             >
               Enter &mdash; reopen
@@ -442,7 +518,7 @@ function TabShell(props: {
             <span
               role="button"
               tabIndex={0}
-              class="cursor-pointer px-3 py-1 rounded-md border border-white/15 bg-white/5 transition-colors hover:bg-white/10"
+              class="cursor-pointer px-3 py-1 rounded-md border border-[var(--border)] bg-[var(--surface)] transition-colors hover:brightness-110"
               onClick={() => workspace.closeSession(focusedId()!)}
             >
               Esc &mdash; close

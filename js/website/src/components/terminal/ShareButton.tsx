@@ -16,7 +16,7 @@ export default function ShareButton(props: { passphrase: string }) {
   return (
     <button
       onClick={handleClick}
-      class="flex items-center gap-1.5 px-2.5 bg-transparent border-none text-neutral-500 cursor-pointer text-xs font-mono whitespace-nowrap shrink-0 transition-colors hover:text-neutral-300"
+      class="flex items-center gap-1.5 px-2.5 bg-transparent border-none text-[var(--dim)] cursor-pointer text-xs font-mono whitespace-nowrap shrink-0 transition-colors hover:text-[var(--fg)]"
       title="Copy share link"
     >
       <svg

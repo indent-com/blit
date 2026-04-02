@@ -18,14 +18,25 @@ function createStableTitle(
   titleAccessor: Accessor<string | null | undefined>,
   fallback: Accessor<string>,
 ): Accessor<string> {
-  const [stable, setStable] = createSignal<string | null>(null);
+  const initial = titleAccessor();
+  const [stable, setStable] = createSignal<string | null>(initial || null);
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let first = true;
 
   createEffect(() => {
     const title = titleAccessor();
     if (!title) return;
+    // Show the first title immediately — only debounce subsequent changes.
+    if (first) {
+      first = false;
+      setStable(title);
+      return;
+    }
     clearTimeout(timer);
-    timer = setTimeout(() => setStable(title), TITLE_DEBOUNCE_MS);
+    timer = setTimeout(() => {
+      setStable(title);
+      timer = undefined;
+    }, TITLE_DEBOUNCE_MS);
   });
 
   onCleanup(() => clearTimeout(timer));
@@ -38,14 +49,14 @@ function createStableTitle(
 // ---------------------------------------------------------------------------
 
 type DisplayTab = {
-  session: BlitSession;
+  sessionId: SessionId;
   liveIndex: number;
   exiting: boolean;
 };
 
 function createAnimatedTabs(sessionsAccessor: Accessor<readonly BlitSession[]>) {
   const [displayTabs, setDisplayTabs] = createSignal<DisplayTab[]>(
-    sessionsAccessor().map((s, i) => ({ session: s, liveIndex: i, exiting: false })),
+    sessionsAccessor().map((s, i) => ({ sessionId: s.id, liveIndex: i, exiting: false })),
   );
   const [enteringIds, setEnteringIds] = createSignal<Set<string>>(new Set());
   let prevIds = new Set(sessionsAccessor().map((s) => s.id));
@@ -68,32 +79,25 @@ function createAnimatedTabs(sessionsAccessor: Accessor<readonly BlitSession[]>) 
     prevIds = currentIds;
 
     if (added.size === 0 && removed.size === 0) {
-      // Only session data changed (title, etc) — update in place.
-      setDisplayTabs((prev) => {
-        let liveIdx = 0;
-        return prev.map((dt) => {
-          if (dt.exiting) return dt;
-          const updated = sessions.find((s) => s.id === dt.session.id);
-          if (!updated) return dt;
-          return { session: updated, liveIndex: liveIdx++, exiting: false };
-        });
-      });
+      // Only session data changed (title, etc) — no structural changes,
+      // so don't touch displayTabs at all. Tab components read session
+      // data reactively from the sessions prop.
       return;
     }
 
-    // Build new display list
+    // Build new display list — reuse existing DisplayTab objects so <For>
+    // doesn't remount Tab components.
     setDisplayTabs((prev) => {
       const result: DisplayTab[] = prev.map((dt) => {
-        if (removed.has(dt.session.id)) {
-          return { ...dt, exiting: true };
+        if (removed.has(dt.sessionId)) {
+          dt.exiting = true;
         }
-        const updated = sessions.find((s) => s.id === dt.session.id);
-        return updated ? { ...dt, session: updated } : dt;
+        return dt;
       });
 
       for (const s of sessions) {
         if (added.has(s.id)) {
-          result.push({ session: s, liveIndex: -1, exiting: false });
+          result.push({ sessionId: s.id, liveIndex: -1, exiting: false });
         }
       }
 
@@ -113,7 +117,7 @@ function createAnimatedTabs(sessionsAccessor: Accessor<readonly BlitSession[]>) 
       if (existing) clearTimeout(existing);
 
       const timer = setTimeout(() => {
-        setDisplayTabs((prev) => prev.filter((dt) => dt.session.id !== id));
+        setDisplayTabs((prev) => prev.filter((dt) => dt.sessionId !== id));
         exitTimers.delete(id);
       }, TAB_ANIMATION_MS + 50);
       exitTimers.set(id, timer);
@@ -136,7 +140,7 @@ function createAnimatedTabs(sessionsAccessor: Accessor<readonly BlitSession[]>) 
     displayTabs()
       .map((dt) => {
         if (dt.exiting) return "0fr";
-        if (enteringIds().has(dt.session.id)) return "0fr";
+        if (enteringIds().has(dt.sessionId)) return "0fr";
         return "1fr";
       })
       .join(" ");
@@ -149,7 +153,8 @@ function createAnimatedTabs(sessionsAccessor: Accessor<readonly BlitSession[]>) 
 // ---------------------------------------------------------------------------
 
 function Tab(props: {
-  session: BlitSession;
+  sessionId: SessionId;
+  getTitle: () => string | null | undefined;
   index: number;
   isFocused: boolean;
   exiting: boolean;
@@ -157,7 +162,7 @@ function Tab(props: {
   onClose: (id: SessionId) => void;
 }) {
   const label = createStableTitle(
-    () => props.session.title,
+    props.getTitle,
     () => `Tab ${props.index + 1}`,
   );
 
@@ -166,17 +171,17 @@ function Tab(props: {
       <div
         role="button"
         tabIndex={0}
-        onClick={() => !props.exiting && props.onSelect(props.session.id)}
+        onClick={() => !props.exiting && props.onSelect(props.sessionId)}
         onAuxClick={(e: MouseEvent) => {
           if (e.button === 1 && !props.exiting) {
             e.preventDefault();
-            props.onClose(props.session.id);
+            props.onClose(props.sessionId);
           }
         }}
-        class={`group relative flex h-full w-full min-w-0 cursor-pointer items-center whitespace-nowrap border-r border-r-[#222] font-sans text-xs transition-colors ${
+        class={`group relative flex h-full w-full min-w-0 cursor-pointer items-center whitespace-nowrap border-r border-r-[var(--border)] font-sans text-xs transition-colors ${
           props.isFocused
-            ? "bg-[#1a1a1a] font-medium text-neutral-200"
-            : "bg-transparent font-normal text-neutral-500 hover:bg-[#151515]"
+            ? "bg-[var(--bg)] font-medium text-[var(--fg)]"
+            : "bg-transparent font-normal text-[var(--dim)] hover:bg-[var(--bg)]"
         }`}
       >
         {/* Close button — left-aligned, visible on hover */}
@@ -185,9 +190,9 @@ function Tab(props: {
           tabIndex={-1}
           onClick={(e: MouseEvent) => {
             e.stopPropagation();
-            if (!props.exiting) props.onClose(props.session.id);
+            if (!props.exiting) props.onClose(props.sessionId);
           }}
-          class="absolute left-1.5 flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded border-none bg-transparent p-0 text-neutral-500 text-xs leading-none opacity-0 transition-[opacity,background-color,color] duration-100 hover:bg-neutral-700 hover:text-neutral-200 group-hover:opacity-100"
+          class="absolute left-1.5 flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded border-none bg-transparent p-0 text-[var(--dim)] text-xs leading-none opacity-0 transition-[opacity,background-color,color] duration-100 hover:bg-[var(--surface)] hover:text-[var(--fg)] group-hover:opacity-100"
         >
           {"\u00D7"}
         </button>
@@ -209,14 +214,13 @@ export default function TabBar(props: {
   focusedSessionId: SessionId | null;
   onSelect: (id: SessionId) => void;
   onClose: (id: SessionId) => void;
-  onNew: () => void;
 }) {
   const { displayTabs, gridTemplateColumns } = createAnimatedTabs(
     () => props.sessions,
   );
 
   return (
-    <div class="flex h-9 min-h-9 select-none items-stretch overflow-hidden border-b border-[#222] bg-[#111]">
+    <div class="flex h-9 min-h-9 select-none items-stretch overflow-hidden bg-[var(--surface)]">
       <div
         class="grid min-w-0 flex-1 items-stretch transition-[grid-template-columns] duration-200 ease-out"
         style={{ "grid-template-columns": gridTemplateColumns() }}
@@ -224,9 +228,10 @@ export default function TabBar(props: {
         <For each={displayTabs()}>
           {(dt) => (
             <Tab
-              session={dt.session}
+              sessionId={dt.sessionId}
+              getTitle={() => props.sessions.find((s) => s.id === dt.sessionId)?.title}
               index={dt.liveIndex}
-              isFocused={!dt.exiting && dt.session.id === props.focusedSessionId}
+              isFocused={!dt.exiting && dt.sessionId === props.focusedSessionId}
               exiting={dt.exiting}
               onSelect={props.onSelect}
               onClose={props.onClose}
@@ -234,14 +239,6 @@ export default function TabBar(props: {
           )}
         </For>
       </div>
-      <button
-        type="button"
-        onClick={props.onNew}
-        class="flex w-9 shrink-0 cursor-pointer items-center justify-center border-none bg-transparent text-lg text-neutral-500 transition-colors hover:text-neutral-300"
-        title="New tab"
-      >
-        +
-      </button>
     </div>
   );
 }

@@ -31,14 +31,14 @@ export default function ShortcutsPanel(props: { onClose: () => void }) {
     >
       <div
         onClick={(e: MouseEvent) => e.stopPropagation()}
-        class="bg-[#0d1117] border border-[#30363d] rounded-xl p-5 min-w-[300px] font-mono text-[13px] text-[#c9d1d9]"
+        class="bg-[var(--bg)] border border-[var(--border)] rounded-xl p-5 min-w-[300px] font-mono text-[13px] text-[var(--fg)]"
       >
         <div class="font-bold text-sm mb-4">Keyboard shortcuts</div>
         <table style={{ "border-spacing": "0 8px" }}>
           <tbody>
             {SHORTCUTS.map(([key, desc]) => (
               <tr>
-                <td class="pr-6 text-[#8b949e] whitespace-nowrap">
+                <td class="pr-6 text-[var(--dim)] whitespace-nowrap">
                   {key.replace(/Mod/g, MOD_LABEL)}
                 </td>
                 <td>{desc}</td>
