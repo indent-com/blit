@@ -1244,15 +1244,34 @@ export class BlitTerminalSurface {
       return t ? t.get_text(row, 0, row, this._cols - 1) : "";
     };
 
+    const getRowColMap = (row: number): Uint16Array | null => {
+      const t = this.terminal;
+      return t ? t.row_col_map(row) : null;
+    };
+
+    const colToTextIdx = (
+      colMap: Uint16Array,
+      col: number,
+    ): number => {
+      for (let i = 0; i < colMap.length; i++) {
+        if (colMap[i] === col) return i;
+      }
+      return -1;
+    };
+
     const wordBoundsAt = (row: number, col: number) => {
       const text = getRowText(row);
-      if (col >= text.length || !WORD_CHARS.test(text[col]))
+      const colMap = getRowColMap(row);
+      const idx = colMap ? colToTextIdx(colMap, col) : col;
+      if (idx < 0 || idx >= text.length || !WORD_CHARS.test(text[idx]))
         return { start: col, end: col };
-      let start = col;
+      let start = idx;
       while (start > 0 && WORD_CHARS.test(text[start - 1])) start--;
-      let end = col;
+      let end = idx;
       while (end < text.length - 1 && WORD_CHARS.test(text[end + 1])) end++;
-      return { start, end };
+      const startCol = colMap ? colMap[start] ?? start : start;
+      const endCol = colMap ? colMap[end] ?? end : end;
+      return { start: startCol, end: endCol };
     };
 
     const isWrapped = (row: number): boolean => {
@@ -1399,12 +1418,14 @@ export class BlitTerminalSurface {
 
     const urlAt = (row: number, col: number) => {
       const text = getRowText(row);
+      const colMap = getRowColMap(row);
       URL_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = URL_RE.exec(text)) !== null) {
-        const startCol = m.index;
         const raw = m[0].replace(/[.),:;]+$/, "");
-        const endCol = startCol + raw.length - 1;
+        const startCol = colMap ? colMap[m.index] ?? m.index : m.index;
+        const endIdx = m.index + raw.length - 1;
+        const endCol = colMap ? colMap[endIdx] ?? endIdx : endIdx;
         if (col >= startCol && col <= endCol)
           return { url: raw, startCol, endCol };
       }

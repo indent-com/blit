@@ -283,7 +283,7 @@ fn find_via_fc_match(family: &str) -> Option<Vec<FontVariant>> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = text.lines().collect();
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(lines.len() / 2);
     let mut seen = BTreeSet::new();
     for pair in lines.chunks(2) {
         if pair.len() < 2 {

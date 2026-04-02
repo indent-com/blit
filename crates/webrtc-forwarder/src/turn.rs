@@ -163,7 +163,7 @@ impl StunWriter {
 }
 
 fn parse_attrs(data: &[u8]) -> Vec<(u16, Vec<u8>)> {
-    let mut attrs = Vec::new();
+    let mut attrs = Vec::with_capacity(data.len() / 4);
     let mut off = 0;
     while off + 4 <= data.len() {
         let atype = u16::from_be_bytes([data[off], data[off + 1]]);

@@ -390,7 +390,7 @@ impl FrameState {
         if rect.rows == 0 || rect.cols == 0 {
             return;
         }
-        let mut wrapped = Vec::new();
+        let mut wrapped = Vec::with_capacity(lines.len());
         for line in lines {
             let line = line.as_ref();
             let out = wrap_text_lines(line, rect.cols as usize);
@@ -1791,7 +1791,7 @@ pub fn build_update_msg(
 /// Serialize overflow strings: [u16 count] [for each: u32 cell_index, u16 len, utf8 bytes]
 fn serialize_overflow_strings(frame: &FrameState) -> Vec<u8> {
     let count = frame.overflow.len().min(u16::MAX as usize);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(2 + count * 8);
     out.extend_from_slice(&(count as u16).to_le_bytes());
     for (&cell_idx, s) in frame.overflow.iter().take(count) {
         let bytes = s.as_bytes();

@@ -101,8 +101,8 @@ pub fn parse_ice_url(url: &str) -> Option<ParsedUrl> {
 }
 
 pub fn collect_servers(config: &IceConfig) -> (Vec<SocketAddr>, Vec<TurnServerInfo>) {
-    let mut stun_servers = Vec::new();
-    let mut turn_servers = Vec::new();
+    let mut stun_servers = Vec::with_capacity(config.ice_servers.len());
+    let mut turn_servers = Vec::with_capacity(config.ice_servers.len());
 
     for server in &config.ice_servers {
         for url in server.urls.iter() {

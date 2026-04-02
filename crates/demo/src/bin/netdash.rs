@@ -501,7 +501,7 @@ mod linux {
 
         fn feed(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
             self.pending.extend_from_slice(bytes);
-            let mut events = Vec::new();
+            let mut events = Vec::with_capacity(bytes.len());
 
             loop {
                 if self.pending.is_empty() {

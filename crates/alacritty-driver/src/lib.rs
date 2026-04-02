@@ -977,6 +977,9 @@ fn encode_cell(
     if flags.contains(CellFlags::WIDE_CHAR) {
         f1 |= 1 << 1;
     }
+    if flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+        f1 |= 1 << 2;
+    }
 
     // Encode character content — fast path for ASCII (most common).
     let c = cell.c;
@@ -1187,6 +1190,47 @@ mod integration_tests {
         assert!(
             f1 & (1 << 1) != 0,
             "heart cell at col {heart_col} should have WIDE_CHAR flag, f1={f1:#010b}"
+        );
+
+        let heart_content = frame.cell_content(1, heart_col as u16);
+        assert_eq!(
+            heart_content, "\u{2764}\u{FE0F}",
+            "cell_content should return the full emoji including variation selector"
+        );
+
+        let spacer_content = frame.cell_content(1, heart_col as u16 + 1);
+        assert_eq!(
+            spacer_content, "",
+            "wide char spacer should return empty string"
+        );
+
+        let mut line = String::new();
+        for col in 0..cols {
+            line.push_str(frame.cell_content(1, col));
+        }
+        let line = line.trim_end();
+        assert!(
+            line.contains("\u{2764}\u{FE0F}"),
+            "extracted text should contain the heart emoji: {line:?}"
+        );
+        assert!(
+            line.contains("https://indent.com"),
+            "extracted text should contain the URL: {line:?}"
+        );
+
+        let url_byte_start = line.find("https://indent.com").unwrap();
+        let url_char_start = line[..url_byte_start].encode_utf16().count();
+        let url_col_expected = 23usize;
+        let mut text_to_col = Vec::with_capacity(cols as usize);
+        for col in 0..cols {
+            let content = frame.cell_content(1, col);
+            for _ in content.encode_utf16() {
+                text_to_col.push(col);
+            }
+        }
+        assert_eq!(
+            text_to_col[url_char_start], url_col_expected as u16,
+            "URL char position {url_char_start} should map to column {url_col_expected}"
         );
     }
 }

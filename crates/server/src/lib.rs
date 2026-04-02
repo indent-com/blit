@@ -1829,7 +1829,7 @@ async fn tick(state: &AppState) -> TickOutcome {
 
     // Drain bytes from PTY reader channels. This is the only place
     // process() is called, so there is no contention with the readers.
-    let mut eof_ptys: Vec<u16> = Vec::new();
+    let mut eof_ptys: Vec<u16> = Vec::with_capacity(ids.len());
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
@@ -2230,7 +2230,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH | FEATURE_COPY_RANGE,
             ));
         }
-        let mut initial_msgs = Vec::new();
+        let mut initial_msgs = Vec::with_capacity(2 + sess.ptys.len() * 2);
         initial_msgs.push(sess.pty_list_msg());
         for (&id, pty) in &sess.ptys {
             let title = pty.driver.title();
@@ -2486,7 +2486,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if !entries.remainder().is_empty() {
                     continue;
                 }
-                let mut touched = Vec::new();
+                let mut touched = Vec::with_capacity((data.len() - 1) / 6);
                 for entry in entries {
                     let pid = u16::from_le_bytes([entry[0], entry[1]]);
                     if !sess.ptys.contains_key(&pid) {
@@ -2915,7 +2915,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                         }
                     };
 
-                    let mut all_lines: Vec<String> = Vec::new();
+                    let mut all_lines: Vec<String> = Vec::with_capacity(scrollback_lines + rows as usize);
 
                     let mut scroll_offset = scrollback_lines;
                     while scroll_offset > 0 {

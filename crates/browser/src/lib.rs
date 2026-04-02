@@ -953,6 +953,24 @@ impl Terminal {
         self.inner.is_wrapped(row)
     }
 
+    pub fn row_col_map(&self, row: u16) -> Vec<u16> {
+        let frame = self.inner.frame();
+        let cols = frame.cols();
+        let mut map = Vec::with_capacity(cols as usize);
+        let mut last_non_space = 0;
+        for col in 0..cols {
+            let content = frame.cell_content(row, col);
+            for _ in content.encode_utf16() {
+                map.push(col);
+            }
+            if !content.trim_end().is_empty() {
+                last_non_space = map.len();
+            }
+        }
+        map.truncate(last_non_space);
+        map
+    }
+
     pub fn get_text(&self, start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> String {
         let mut result = String::new();
         for row in start_row..=end_row.min(self.inner.rows().saturating_sub(1)) {
@@ -963,24 +981,10 @@ impl Terminal {
                 self.inner.cols().saturating_sub(1)
             };
             let mut line = String::new();
+            let frame = self.inner.frame();
             let mut col = c0;
             while col <= c1.min(self.inner.cols().saturating_sub(1)) {
-                let idx = (row as usize * self.inner.cols() as usize + col as usize) * CELL_SIZE;
-                let f1 = self.inner.cells()[idx + 1];
-                if f1 & 4 != 0 {
-                    col += 1;
-                    continue;
-                }
-                let content_len = ((f1 >> 3) & 7) as usize;
-                if content_len > 0 {
-                    if let Ok(s) =
-                        std::str::from_utf8(&self.inner.cells()[idx + 8..idx + 8 + content_len])
-                    {
-                        line.push_str(s);
-                    }
-                } else {
-                    line.push(' ');
-                }
+                line.push_str(frame.cell_content(row, col));
                 col += 1;
             }
             result.push_str(line.trim_end());
