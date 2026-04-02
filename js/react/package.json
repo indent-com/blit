@@ -51,7 +51,7 @@
     "react-dom": ">=18.0.0"
   },
   "devDependencies": {
-    "@blit-sh/core": "workspace:*",
+    "@blit-sh/core": "file:../core",
     "@testing-library/react": "^16",
     "@types/react": "^19",
     "@types/react-dom": "^19",

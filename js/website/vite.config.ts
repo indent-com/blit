@@ -14,6 +14,10 @@ const isDev =
 const isSsr = process.argv.includes("--ssr");
 
 const localRequire = createRequire(resolve(__dirname, "package.json"));
+const blitSourceDirs = [
+  resolve(__dirname, "../core/src"),
+  resolve(__dirname, "../react/src"),
+];
 
 export default defineConfig({
   plugins: [
@@ -53,9 +57,30 @@ export default bin.buffer;
         }
       },
     },
+    {
+      name: "resolve-external-bare-imports",
+      resolveId(id, importer) {
+        if (
+          !importer ||
+          id.startsWith(".") ||
+          id.startsWith("/") ||
+          id.startsWith("\0") ||
+          id.startsWith("virtual:")
+        )
+          return;
+        if (!blitSourceDirs.some((dir) => importer.startsWith(dir))) return;
+        try {
+          return localRequire.resolve(id);
+        } catch {
+          return;
+        }
+      },
+    },
   ],
   resolve: {
     alias: {
+      "@blit-sh/react": resolve(__dirname, "../react/src"),
+      "@blit-sh/core": resolve(__dirname, "../core/src"),
       "@blit-sh/browser": resolve(
         __dirname,
         "../../crates/browser/pkg/blit_browser.js",

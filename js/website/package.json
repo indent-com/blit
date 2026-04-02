@@ -8,8 +8,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@blit-sh/core": "workspace:*",
-    "@blit-sh/react": "workspace:*",
     "react": "^19",
     "react-dom": "^19",
     "tweetnacl": "^1.0.3"
