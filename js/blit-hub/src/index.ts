@@ -8,7 +8,7 @@ const CF_TURN_TOKEN_ID = process.env.CF_TURN_TOKEN_ID;
 const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN;
 const MESSAGE_TEMPLATE =
   process.env.MESSAGE_TEMPLATE ||
-  "Session available at https://blit.sh/#{secret}\nor blit --share {secret}";
+  "Session available at https://blit.sh/s#{secret}\nor blit --share {secret}";
 const ICE_TTL = 86400;
 const SESSION_TTL = 600;
 const SESSION_REFRESH_INTERVAL = SESSION_TTL * 500; // refresh at half-TTL (ms)

@@ -32,7 +32,7 @@ Signaling hub URL (default: _hub.blit.sh_).
 
 _--url_ _TEMPLATE_
 URL template for the sharing link. Use _{secret}_ as a placeholder for
-the passphrase (default: _https://blit.sh/#{secret}_).
+the passphrase (default: _https://blit.sh/s#{secret}_).
 
 _--quiet_
 Don't print the sharing URL.

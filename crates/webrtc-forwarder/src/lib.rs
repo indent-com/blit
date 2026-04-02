@@ -32,7 +32,7 @@ pub fn default_local_ip() -> Option<std::net::IpAddr> {
     probe.connect("192.0.2.1:80").ok()?;
     Some(probe.local_addr().ok()?.ip())
 }
-const DEFAULT_MESSAGE_TEMPLATE: &str = "https://blit.sh/#{secret}";
+const DEFAULT_MESSAGE_TEMPLATE: &str = "https://blit.sh/s#{secret}";
 
 pub fn normalize_hub(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');
