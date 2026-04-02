@@ -326,7 +326,6 @@ name = "blit-compositor"
 version = "0.17.1"
 dependencies = [
  "calloop",
- "openh264",
  "smithay",
 ]
 

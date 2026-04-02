@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import {
   BlitTerminal,
+  BlitSurfaceView,
   BlitWorkspaceProvider,
   useBlitConnection,
   useBlitFocusedSession,
@@ -14,6 +15,7 @@ import { BlitWorkspace, PALETTES, DEFAULT_FONT } from "@blit-sh/core";
 import type {
   BlitTransport,
   BlitSession,
+  BlitSurface,
   BlitWasmModule,
   SessionId,
   TerminalPalette,
@@ -118,6 +120,16 @@ function WorkspaceScreen({
   const sessions = useBlitSessions();
   const focusedSession = useBlitFocusedSession();
   const connection = useBlitConnection(primaryConnectionId);
+  const [surfaces, setSurfaces] = useState<BlitSurface[]>([]);
+
+  useEffect(() => {
+    const conn = workspace.getConnection(primaryConnectionId);
+    if (!conn) return;
+    const store = conn.surfaceStore;
+    const sync = () => setSurfaces([...store.getSurfaces().values()]);
+    sync();
+    return store.onChange(sync);
+  }, [workspace, primaryConnectionId]);
 
   const [palette, setPalette] = useState<TerminalPalette>(preferredPalette);
   const [font, setFont] = useState(preferredFont);
@@ -803,6 +815,24 @@ function WorkspaceScreen({
               onHelp={() => toggleOverlay("help")}
             />
           )}
+          {surfaces.length > 0 && (
+            <div style={{
+              position: "absolute",
+              inset: 0,
+              pointerEvents: "none",
+              zIndex: z.exitedBanner + 1,
+            }}>
+              {surfaces.map((s) => (
+                <SurfaceWindow
+                  key={`${s.sessionId}-${s.surfaceId}`}
+                  surface={s}
+                  connectionId={primaryConnectionId}
+                  theme={theme}
+                  scale={chromeScale}
+                />
+              ))}
+            </div>
+          )}
         </section>
         {overlay === "expose" && (
           <SwitcherOverlay
@@ -985,6 +1015,77 @@ function EmptyState({
       >
         {t("workspace.newTerminal")}
       </button>
+    </div>
+  );
+}
+
+function SurfaceWindow({
+  surface,
+  connectionId,
+  theme,
+  scale,
+}: {
+  surface: BlitSurface;
+  connectionId: string;
+  theme: ReturnType<typeof themeFor>;
+  scale: UIScale;
+}) {
+  const [pos, setPos] = useState({ x: 40, y: 40 });
+  const dragging = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    dragging.current = { startX: e.clientX, startY: e.clientY, origX: pos.x, origY: pos.y };
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }, [pos]);
+
+  const onPointerMove = useCallback((e: React.PointerEvent) => {
+    if (!dragging.current) return;
+    setPos({
+      x: dragging.current.origX + (e.clientX - dragging.current.startX),
+      y: dragging.current.origY + (e.clientY - dragging.current.startY),
+    });
+  }, []);
+
+  const onPointerUp = useCallback(() => {
+    dragging.current = null;
+  }, []);
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: pos.x,
+        top: pos.y,
+        pointerEvents: "auto",
+        border: `1px solid ${theme.border}`,
+        backgroundColor: theme.solidPanelBg,
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: scale.tightGap,
+          padding: `2px ${scale.tightGap}px`,
+          fontSize: scale.sm,
+          cursor: "grab",
+          userSelect: "none",
+          backgroundColor: theme.accent,
+          color: "#fff",
+        }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+      >
+        <span style={{ flex: 1 }}>{surface.title || surface.appId || `Surface ${surface.surfaceId}`}</span>
+      </div>
+      <BlitSurfaceView
+        connectionId={connectionId}
+        surfaceId={surface.surfaceId}
+        style={{ display: "block" }}
+      />
     </div>
   );
 }

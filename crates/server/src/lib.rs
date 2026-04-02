@@ -253,6 +253,7 @@ struct CompositorSession {
     #[allow(dead_code)]
     child_pid: libc::pid_t,
     encoders: HashMap<u16, SurfaceEncoder>,
+    created_at: Instant,
 }
 
 fn rgba_to_yuv420(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
@@ -1103,12 +1104,6 @@ fn spawn_compositor_child(
         } else {
             let prog = CString::new(command).unwrap();
             let c_ptrs = [prog.as_ptr(), std::ptr::null()];
-            unsafe {
-                libc::execvp(prog.as_ptr(), c_ptrs.as_ptr());
-            }
-        }
-        unsafe {
-            libc::_exit(127);
         }
     }
     pid
@@ -1178,6 +1173,10 @@ async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
         pty.mark_dirty();
         let msg = blit_remote::msg_exited(pty_id, pty.exit_status);
         sess.send_to_all(&msg);
+    }
+    if let Some(cs) = sess.compositor_sessions.remove(&pty_id) {
+        cs.handle.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = cs.handle.command_tx.send(CompositorCommand::Shutdown);
     }
 }
 
@@ -1770,7 +1769,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 } else {
                                     0
                                 };
-                                let timestamp = now.elapsed().as_millis() as u32;
+                                let timestamp = cs.created_at.elapsed().as_millis() as u32;
                                 outgoing.push(msg_surface_frame(
                                     comp_id,
                                     surface_id,
@@ -2224,6 +2223,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         handle: comp_handle,
                         child_pid: pty.handle.child_pid,
                         encoders: HashMap::new(),
+                        created_at: Instant::now(),
                     };
                     sess.compositor_sessions.insert(id, comp_session);
                     let mut msg = Vec::with_capacity(3 + pty.tag.len());
@@ -2308,6 +2308,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         handle: comp_handle,
                         child_pid: pty.handle.child_pid,
                         encoders: HashMap::new(),
+                        created_at: Instant::now(),
                     };
                     sess.compositor_sessions.insert(id, comp_session);
                     let tag_bytes = pty.tag.as_bytes();
@@ -2387,6 +2388,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         handle: comp_handle,
                         child_pid: pty.handle.child_pid,
                         encoders: HashMap::new(),
+                        created_at: Instant::now(),
                     };
                     sess.compositor_sessions.insert(id, comp_session);
                     let mut msg = Vec::with_capacity(3 + pty.tag.len());
@@ -2463,6 +2465,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         handle: comp_handle,
                         child_pid: pty.handle.child_pid,
                         encoders: HashMap::new(),
+                        created_at: Instant::now(),
                     };
                     sess.compositor_sessions.insert(id, comp_session);
                     let tag_bytes = pty.tag.as_bytes();
@@ -2491,11 +2494,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     need_nudge = true;
                 }
             }
-            C2S_SURFACE_INPUT if data.len() >= 8 => {
-                let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                let keycode = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
-                let pressed = data[7] != 0;
-                for cs in sess.compositor_sessions.values() {
+            C2S_SURFACE_INPUT if data.len() >= 10 => {
+                let session_id = u16::from_le_bytes([data[1], data[2]]);
+                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+                let keycode = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+                let pressed = data[9] != 0;
+                if let Some(cs) = sess.compositor_sessions.get(&session_id) {
                     let _ = cs.handle.command_tx.send(CompositorCommand::KeyInput {
                         surface_id,
                         keycode,
@@ -2503,13 +2507,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
             }
-            C2S_SURFACE_POINTER if data.len() >= 9 => {
-                let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                let ptype = data[3];
-                let button = data[4];
-                let x = u16::from_le_bytes([data[5], data[6]]) as f64;
-                let y = u16::from_le_bytes([data[7], data[8]]) as f64;
-                for cs in sess.compositor_sessions.values() {
+            C2S_SURFACE_POINTER if data.len() >= 11 => {
+                let session_id = u16::from_le_bytes([data[1], data[2]]);
+                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+                let ptype = data[5];
+                let button = data[6];
+                let x = u16::from_le_bytes([data[7], data[8]]) as f64;
+                let y = u16::from_le_bytes([data[9], data[10]]) as f64;
+                if let Some(cs) = sess.compositor_sessions.get(&session_id) {
                     match ptype {
                         0 | 1 => {
                             let _ = cs.handle.command_tx.send(CompositorCommand::PointerMotion {
@@ -2530,12 +2535,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
             }
-            C2S_SURFACE_POINTER_AXIS if data.len() >= 8 => {
-                let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                let axis = data[3];
-                let value_x100 = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            C2S_SURFACE_POINTER_AXIS if data.len() >= 10 => {
+                let session_id = u16::from_le_bytes([data[1], data[2]]);
+                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+                let axis = data[5];
+                let value_x100 = i32::from_le_bytes([data[6], data[7], data[8], data[9]]);
                 let value = value_x100 as f64 / 100.0;
-                for cs in sess.compositor_sessions.values() {
+                if let Some(cs) = sess.compositor_sessions.get(&session_id) {
                     let _ = cs.handle.command_tx.send(CompositorCommand::PointerAxis {
                         surface_id,
                         axis,
@@ -2543,11 +2549,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
             }
-            C2S_SURFACE_RESIZE if data.len() >= 7 => {
-                let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                let width = u16::from_le_bytes([data[3], data[4]]);
-                let height = u16::from_le_bytes([data[5], data[6]]);
-                for cs in sess.compositor_sessions.values() {
+            C2S_SURFACE_RESIZE if data.len() >= 9 => {
+                let session_id = u16::from_le_bytes([data[1], data[2]]);
+                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+                let width = u16::from_le_bytes([data[5], data[6]]);
+                let height = u16::from_le_bytes([data[7], data[8]]);
+                if let Some(cs) = sess.compositor_sessions.get(&session_id) {
                     let _ = cs.handle.command_tx.send(CompositorCommand::SurfaceResize {
                         surface_id,
                         width,
@@ -2555,33 +2562,35 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
             }
-            C2S_SURFACE_FOCUS if data.len() >= 3 => {
-                let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                for cs in sess.compositor_sessions.values() {
+            C2S_SURFACE_FOCUS if data.len() >= 5 => {
+                let session_id = u16::from_le_bytes([data[1], data[2]]);
+                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+                if let Some(cs) = sess.compositor_sessions.get(&session_id) {
                     let _ = cs.handle.command_tx.send(CompositorCommand::SurfaceFocus {
                         surface_id,
                     });
                 }
             }
-            C2S_CLIPBOARD if data.len() >= 7 => {
-                let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                let mime_len = u16::from_le_bytes([data[3], data[4]]) as usize;
-                if data.len() >= 5 + mime_len + 4 {
-                    let mime = std::str::from_utf8(&data[5..5 + mime_len]).unwrap_or("text/plain").to_string();
+            C2S_CLIPBOARD if data.len() >= 9 => {
+                let session_id = u16::from_le_bytes([data[1], data[2]]);
+                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+                let mime_len = u16::from_le_bytes([data[5], data[6]]) as usize;
+                if data.len() >= 7 + mime_len + 4 {
+                    let mime = std::str::from_utf8(&data[7..7 + mime_len]).unwrap_or("text/plain").to_string();
                     let data_len = u32::from_le_bytes([
-                        data[5 + mime_len],
-                        data[6 + mime_len],
                         data[7 + mime_len],
                         data[8 + mime_len],
+                        data[9 + mime_len],
+                        data[10 + mime_len],
                     ]) as usize;
-                    let payload_start = 9 + mime_len;
+                    let payload_start = 11 + mime_len;
                     if data.len() >= payload_start + data_len {
                         let payload = data[payload_start..payload_start + data_len].to_vec();
-                        for cs in sess.compositor_sessions.values() {
+                        if let Some(cs) = sess.compositor_sessions.get(&session_id) {
                             let _ = cs.handle.command_tx.send(CompositorCommand::ClipboardOffer {
                                 surface_id,
-                                mime_type: mime.clone(),
-                                data: payload.clone(),
+                                mime_type: mime,
+                                data: payload,
                             });
                         }
                     }

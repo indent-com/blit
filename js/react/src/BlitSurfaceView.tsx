@@ -80,9 +80,9 @@ export const BlitSurfaceView = forwardRef<
       let type = SURFACE_POINTER_MOVE;
       if (e.type === "mousedown") type = SURFACE_POINTER_DOWN;
       else if (e.type === "mouseup") type = SURFACE_POINTER_UP;
-      conn.sendSurfacePointer(surfaceId, type, e.button, x, y);
+      if (surface) conn.sendSurfacePointer(surface.sessionId, surfaceId, type, e.button, x, y);
     },
-    [conn, surfaceId],
+    [conn, surface, surfaceId],
   );
 
   const handleWheel = useCallback(
@@ -91,9 +91,9 @@ export const BlitSurfaceView = forwardRef<
       e.preventDefault();
       const axis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? 1 : 0;
       const value = axis === 0 ? e.deltaY : e.deltaX;
-      conn.sendSurfaceAxis(surfaceId, axis, Math.round(value * 100));
+      if (surface) conn.sendSurfaceAxis(surface.sessionId, surfaceId, axis, Math.round(value * 100));
     },
-    [conn, surfaceId],
+    [conn, surface, surfaceId],
   );
 
   const handleKeyDown = useCallback(
@@ -102,10 +102,10 @@ export const BlitSurfaceView = forwardRef<
       e.preventDefault();
       const keycode = domKeyToEvdev(e.code);
       if (keycode !== 0) {
-        conn.sendSurfaceInput(surfaceId, keycode, true);
+        if (surface) conn.sendSurfaceInput(surface.sessionId, surfaceId, keycode, true);
       }
     },
-    [conn, surfaceId],
+    [conn, surface, surfaceId],
   );
 
   const handleKeyUp = useCallback(
@@ -114,10 +114,10 @@ export const BlitSurfaceView = forwardRef<
       e.preventDefault();
       const keycode = domKeyToEvdev(e.code);
       if (keycode !== 0) {
-        conn.sendSurfaceInput(surfaceId, keycode, false);
+        if (surface) conn.sendSurfaceInput(surface.sessionId, surfaceId, keycode, false);
       }
     },
-    [conn, surfaceId],
+    [conn, surface, surfaceId],
   );
 
   return (
@@ -134,7 +134,7 @@ export const BlitSurfaceView = forwardRef<
       onWheel={handleWheel}
       onKeyDown={handleKeyDown}
       onKeyUp={handleKeyUp}
-      onFocus={() => conn?.sendSurfaceFocus(surfaceId)}
+      onFocus={() => surface && conn?.sendSurfaceFocus(surface.sessionId, surfaceId)}
     />
   );
 });

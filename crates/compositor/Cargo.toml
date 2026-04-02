@@ -13,4 +13,3 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "renderer_pixman",
 ] }
 calloop = "0.14"
-openh264 = "0.6"

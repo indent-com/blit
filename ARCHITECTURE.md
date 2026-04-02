@@ -336,7 +336,9 @@ Every PTY session has a companion headless Wayland compositor. The child process
 4. The server converts RGBA to YUV420, encodes via openh264 to H.264, and broadcasts `S2C_SURFACE_FRAME` to all connected clients.
 5. Input flows in reverse: `C2S_SURFACE_INPUT` / `C2S_SURFACE_POINTER` / `C2S_SURFACE_POINTER_AXIS` are translated to Wayland keyboard/pointer events via smithay.
 
-The compositor does not manage window layout, z-order, or decorations. Each surface is streamed independently and clients (browser, React embedders) handle windowing in their own UI.
+The compositor does not manage window layout, z-order, or decorations. Each surface is streamed independently and clients (browser, React embedders) handle windowing in their own UI. The compositor implements `wp_viewporter` (required by Chrome/Electron) and `xdg_decoration` (forces server-side decorations so clients don't waste space on title bars).
+
+The compositor only supports SHM (shared memory) buffer rendering. GPU-accelerated clients that use dmabuf/EGL buffers will not display. To run Chrome or Electron apps, launch them with `--disable-gpu --ozone-platform=wayland` to force SHM rendering.
 
 On the browser side, `SurfaceStore` in `@blit-sh/core` decodes H.264 frames via the WebCodecs `VideoDecoder` API (`avc1.42001f`, `optimizeForLatency: true`). The `BlitSurfaceView` React component renders decoded `VideoFrame`s to a canvas and forwards mouse/keyboard events back as surface commands.
 

@@ -11,6 +11,8 @@ use smithay::delegate_data_device;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_viewporter;
+use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::desktop::{Space, Window};
 use smithay::input::keyboard::{FilterResult, XkbConfig};
@@ -38,8 +40,11 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shm::{BufferData, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::viewporter::ViewporterState;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
 pub enum CompositorEvent {
     SurfaceCreated {
@@ -141,6 +146,10 @@ pub struct Compositor {
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
+    #[allow(dead_code)]
+    viewporter_state: ViewporterState,
+    #[allow(dead_code)]
+    xdg_decoration_state: XdgDecorationState,
     seat: Seat<Self>,
     output: Output,
     space: Space<Window>,
@@ -497,12 +506,37 @@ impl DataDeviceHandler for Compositor {
 impl ClientDndGrabHandler for Compositor {}
 impl ServerDndGrabHandler for Compositor {}
 
+impl XdgDecorationHandler for Compositor {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
 delegate_compositor!(Compositor);
 delegate_shm!(Compositor);
 delegate_xdg_shell!(Compositor);
 delegate_seat!(Compositor);
 delegate_data_device!(Compositor);
 delegate_output!(Compositor);
+delegate_viewporter!(Compositor);
+delegate_xdg_decoration!(Compositor);
 
 pub struct CompositorHandle {
     pub event_rx: mpsc::Receiver<CompositorEvent>,
@@ -549,6 +583,8 @@ fn run_compositor(
     let xdg_shell_state = XdgShellState::new::<Compositor>(&dh);
     let shm_state = ShmState::new::<Compositor>(&dh, vec![]);
     let data_device_state = DataDeviceState::new::<Compositor>(&dh);
+    let viewporter_state = ViewporterState::new::<Compositor>(&dh);
+    let xdg_decoration_state = XdgDecorationState::new::<Compositor>(&dh);
 
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "headless");
@@ -611,6 +647,8 @@ fn run_compositor(
         shm_state,
         seat_state,
         data_device_state,
+        viewporter_state,
+        xdg_decoration_state,
         seat,
         output,
         space,

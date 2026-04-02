@@ -281,17 +281,20 @@ export function buildCopyRangeMessage(
 }
 
 export function buildSurfaceInputMessage(
+  sessionId: number,
   surfaceId: number,
   keycode: number,
   pressed: boolean,
 ): Uint8Array {
-  const msg = new Uint8Array(8);
+  const msg = new Uint8Array(10);
   msg[0] = C2S_SURFACE_INPUT;
-  msg[1] = surfaceId & 0xff;
-  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[1] = sessionId & 0xff;
+  msg[2] = (sessionId >> 8) & 0xff;
+  msg[3] = surfaceId & 0xff;
+  msg[4] = (surfaceId >> 8) & 0xff;
   const v = new DataView(msg.buffer);
-  v.setUint32(3, keycode, true);
-  msg[7] = pressed ? 1 : 0;
+  v.setUint32(5, keycode, true);
+  msg[9] = pressed ? 1 : 0;
   return msg;
 }
 
@@ -300,79 +303,93 @@ export const SURFACE_POINTER_UP = 1;
 export const SURFACE_POINTER_MOVE = 2;
 
 export function buildSurfacePointerMessage(
+  sessionId: number,
   surfaceId: number,
   type: number,
   button: number,
   x: number,
   y: number,
 ): Uint8Array {
-  const msg = new Uint8Array(9);
+  const msg = new Uint8Array(11);
   msg[0] = C2S_SURFACE_POINTER;
-  msg[1] = surfaceId & 0xff;
-  msg[2] = (surfaceId >> 8) & 0xff;
-  msg[3] = type;
-  msg[4] = button;
-  msg[5] = x & 0xff;
-  msg[6] = (x >> 8) & 0xff;
-  msg[7] = y & 0xff;
-  msg[8] = (y >> 8) & 0xff;
+  msg[1] = sessionId & 0xff;
+  msg[2] = (sessionId >> 8) & 0xff;
+  msg[3] = surfaceId & 0xff;
+  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[5] = type;
+  msg[6] = button;
+  msg[7] = x & 0xff;
+  msg[8] = (x >> 8) & 0xff;
+  msg[9] = y & 0xff;
+  msg[10] = (y >> 8) & 0xff;
   return msg;
 }
 
 export function buildSurfaceAxisMessage(
+  sessionId: number,
   surfaceId: number,
   axis: number,
   valueX100: number,
 ): Uint8Array {
-  const msg = new Uint8Array(8);
+  const msg = new Uint8Array(10);
   msg[0] = C2S_SURFACE_POINTER_AXIS;
-  msg[1] = surfaceId & 0xff;
-  msg[2] = (surfaceId >> 8) & 0xff;
-  msg[3] = axis;
+  msg[1] = sessionId & 0xff;
+  msg[2] = (sessionId >> 8) & 0xff;
+  msg[3] = surfaceId & 0xff;
+  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[5] = axis;
   const v = new DataView(msg.buffer);
-  v.setInt32(4, valueX100, true);
+  v.setInt32(6, valueX100, true);
   return msg;
 }
 
 export function buildSurfaceResizeMessage(
+  sessionId: number,
   surfaceId: number,
   width: number,
   height: number,
 ): Uint8Array {
-  const msg = new Uint8Array(7);
+  const msg = new Uint8Array(9);
   msg[0] = C2S_SURFACE_RESIZE;
-  msg[1] = surfaceId & 0xff;
-  msg[2] = (surfaceId >> 8) & 0xff;
-  msg[3] = width & 0xff;
-  msg[4] = (width >> 8) & 0xff;
-  msg[5] = height & 0xff;
-  msg[6] = (height >> 8) & 0xff;
+  msg[1] = sessionId & 0xff;
+  msg[2] = (sessionId >> 8) & 0xff;
+  msg[3] = surfaceId & 0xff;
+  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[5] = width & 0xff;
+  msg[6] = (width >> 8) & 0xff;
+  msg[7] = height & 0xff;
+  msg[8] = (height >> 8) & 0xff;
   return msg;
 }
 
-export function buildSurfaceFocusMessage(surfaceId: number): Uint8Array {
-  const msg = new Uint8Array(3);
+export function buildSurfaceFocusMessage(sessionId: number, surfaceId: number): Uint8Array {
+  const msg = new Uint8Array(5);
   msg[0] = C2S_SURFACE_FOCUS;
-  msg[1] = surfaceId & 0xff;
-  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[1] = sessionId & 0xff;
+  msg[2] = (sessionId >> 8) & 0xff;
+  msg[3] = surfaceId & 0xff;
+  msg[4] = (surfaceId >> 8) & 0xff;
   return msg;
 }
 
 export function buildClipboardMessage(
+  sessionId: number,
   surfaceId: number,
   mimeType: string,
   data: Uint8Array,
 ): Uint8Array {
   const mimeBytes = textEncoder.encode(mimeType);
-  const msg = new Uint8Array(9 + mimeBytes.length + data.length);
+  const msg = new Uint8Array(11 + mimeBytes.length + data.length);
   msg[0] = C2S_CLIPBOARD;
-  msg[1] = surfaceId & 0xff;
-  msg[2] = (surfaceId >> 8) & 0xff;
-  msg[3] = mimeBytes.length & 0xff;
-  msg[4] = (mimeBytes.length >> 8) & 0xff;
-  msg.set(mimeBytes, 5);
+  msg[1] = sessionId & 0xff;
+  msg[2] = (sessionId >> 8) & 0xff;
+  msg[3] = surfaceId & 0xff;
+  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[5] = mimeBytes.length & 0xff;
+  msg[6] = (mimeBytes.length >> 8) & 0xff;
+  msg.set(mimeBytes, 7);
   const v = new DataView(msg.buffer);
-  v.setUint32(5 + mimeBytes.length, data.length, true);
-  msg.set(data, 9 + mimeBytes.length);
+  v.setUint32(7 + mimeBytes.length, data.length, true);
+  msg.set(data, 11 + mimeBytes.length);
   return msg;
 }

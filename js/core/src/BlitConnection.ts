@@ -667,28 +667,28 @@ export class BlitConnection {
     this.store.setPalette(p);
   }
 
-  sendSurfaceInput(surfaceId: number, keycode: number, pressed: boolean): void {
-    this.transport.send(buildSurfaceInputMessage(surfaceId, keycode, pressed));
+  sendSurfaceInput(sessionId: number, surfaceId: number, keycode: number, pressed: boolean): void {
+    this.transport.send(buildSurfaceInputMessage(sessionId, surfaceId, keycode, pressed));
   }
 
-  sendSurfacePointer(surfaceId: number, type: number, button: number, x: number, y: number): void {
-    this.transport.send(buildSurfacePointerMessage(surfaceId, type, button, x, y));
+  sendSurfacePointer(sessionId: number, surfaceId: number, type: number, button: number, x: number, y: number): void {
+    this.transport.send(buildSurfacePointerMessage(sessionId, surfaceId, type, button, x, y));
   }
 
-  sendSurfaceAxis(surfaceId: number, axis: number, valueX100: number): void {
-    this.transport.send(buildSurfaceAxisMessage(surfaceId, axis, valueX100));
+  sendSurfaceAxis(sessionId: number, surfaceId: number, axis: number, valueX100: number): void {
+    this.transport.send(buildSurfaceAxisMessage(sessionId, surfaceId, axis, valueX100));
   }
 
-  sendSurfaceResize(surfaceId: number, width: number, height: number): void {
-    this.transport.send(buildSurfaceResizeMessage(surfaceId, width, height));
+  sendSurfaceResize(sessionId: number, surfaceId: number, width: number, height: number): void {
+    this.transport.send(buildSurfaceResizeMessage(sessionId, surfaceId, width, height));
   }
 
-  sendSurfaceFocus(surfaceId: number): void {
-    this.transport.send(buildSurfaceFocusMessage(surfaceId));
+  sendSurfaceFocus(sessionId: number, surfaceId: number): void {
+    this.transport.send(buildSurfaceFocusMessage(sessionId, surfaceId));
   }
 
-  sendClipboard(surfaceId: number, mimeType: string, data: Uint8Array): void {
-    this.transport.send(buildClipboardMessage(surfaceId, mimeType, data));
+  sendClipboard(sessionId: number, surfaceId: number, mimeType: string, data: Uint8Array): void {
+    this.transport.send(buildClipboardMessage(sessionId, surfaceId, mimeType, data));
   }
 
   isReady(): boolean {

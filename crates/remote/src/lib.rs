@@ -78,23 +78,23 @@ pub const C2S_COPY_RANGE: u8 = 0x1B;
 /// signal is a raw libc signal number (e.g. SIGTERM=15, SIGKILL=9).
 pub const C2S_KILL: u8 = 0x1A;
 
-/// Keyboard input for a Wayland surface: [0x20][surface_id:2][data:N]
+/// Keyboard input for a Wayland surface: [0x20][session_id:2][surface_id:2][data:N]
 /// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
 pub const C2S_SURFACE_INPUT: u8 = 0x20;
-/// Pointer motion/button for a Wayland surface: [0x21][surface_id:2][type:1][button:1][x:2][y:2]
+/// Pointer motion/button for a Wayland surface: [0x21][session_id:2][surface_id:2][type:1][button:1][x:2][y:2]
 /// type: 0=down, 1=up, 2=move
 /// x,y: pixel coordinates relative to the surface origin
 pub const C2S_SURFACE_POINTER: u8 = 0x21;
-/// Pointer axis/scroll for a Wayland surface: [0x22][surface_id:2][axis:1][value_x100:4_signed]
+/// Pointer axis/scroll for a Wayland surface: [0x22][session_id:2][surface_id:2][axis:1][value_x100:4_signed]
 /// axis: 0=vertical, 1=horizontal
 /// value_x100: scroll amount * 100 (signed, positive = down/right)
 pub const C2S_SURFACE_POINTER_AXIS: u8 = 0x22;
-/// Resize a Wayland surface: [0x23][surface_id:2][width:2][height:2]
+/// Resize a Wayland surface: [0x23][session_id:2][surface_id:2][width:2][height:2]
 pub const C2S_SURFACE_RESIZE: u8 = 0x23;
-/// Set keyboard/pointer focus to a Wayland surface: [0x24][surface_id:2]
+/// Set keyboard/pointer focus to a Wayland surface: [0x24][session_id:2][surface_id:2]
 pub const C2S_SURFACE_FOCUS: u8 = 0x24;
 /// Send clipboard content to a Wayland surface:
-/// [0x25][surface_id:2][mime_len:2][mime:N][data_len:4][data:N]
+/// [0x25][session_id:2][surface_id:2][mime_len:2][mime:N][data_len:4][data:N]
 pub const C2S_CLIPBOARD: u8 = 0x25;
 
 pub const S2C_UPDATE: u8 = 0x00;
@@ -1927,23 +1927,26 @@ pub fn msg_s2c_clipboard(
     msg
 }
 
-pub fn msg_surface_input(surface_id: u16, data: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(3 + data.len());
+pub fn msg_surface_input(session_id: u16, surface_id: u16, data: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5 + data.len());
     msg.push(C2S_SURFACE_INPUT);
+    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(data);
     msg
 }
 
 pub fn msg_surface_pointer(
+    session_id: u16,
     surface_id: u16,
     event_type: u8,
     button: u8,
     x: u16,
     y: u16,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(8);
+    let mut msg = Vec::with_capacity(10);
     msg.push(C2S_SURFACE_POINTER);
+    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(event_type);
     msg.push(button);
@@ -1952,35 +1955,39 @@ pub fn msg_surface_pointer(
     msg
 }
 
-pub fn msg_surface_pointer_axis(surface_id: u16, axis: u8, value_x100: i32) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(8);
+pub fn msg_surface_pointer_axis(session_id: u16, surface_id: u16, axis: u8, value_x100: i32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(10);
     msg.push(C2S_SURFACE_POINTER_AXIS);
+    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(axis);
     msg.extend_from_slice(&value_x100.to_le_bytes());
     msg
 }
 
-pub fn msg_surface_resize(surface_id: u16, width: u16, height: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(7);
+pub fn msg_surface_resize(session_id: u16, surface_id: u16, width: u16, height: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9);
     msg.push(C2S_SURFACE_RESIZE);
+    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&width.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
     msg
 }
 
-pub fn msg_surface_focus(surface_id: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(3);
+pub fn msg_surface_focus(session_id: u16, surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5);
     msg.push(C2S_SURFACE_FOCUS);
+    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg
 }
 
-pub fn msg_c2s_clipboard(surface_id: u16, mime_type: &str, data: &[u8]) -> Vec<u8> {
+pub fn msg_c2s_clipboard(session_id: u16, surface_id: u16, mime_type: &str, data: &[u8]) -> Vec<u8> {
     let mime_bytes = mime_type.as_bytes();
-    let mut msg = Vec::with_capacity(9 + mime_bytes.len() + data.len());
+    let mut msg = Vec::with_capacity(11 + mime_bytes.len() + data.len());
     msg.push(C2S_CLIPBOARD);
+    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
     msg.extend_from_slice(mime_bytes);
