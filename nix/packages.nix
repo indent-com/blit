@@ -112,6 +112,7 @@
         extraArgs = {
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.pkgsStatic.libxkbcommon pkgs.pkgsStatic.pixman ];
+          RUSTFLAGS = "-C relocation-model=static";
         };
       };
 
@@ -209,6 +210,7 @@
           preBuild = copyWebAppDist;
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.pkgsStatic.libxkbcommon pkgs.pkgsStatic.pixman ];
+          RUSTFLAGS = "-C relocation-model=static";
         };
       };
 

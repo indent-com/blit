@@ -382,6 +382,7 @@ in {
 
   lint = pkgs.writeShellApplication {
     name = "blit-lint";
+    runtimeInputs = [ rustToolchain pkgs.pkg-config pkgs.libxkbcommon pkgs.pixman ];
     text = ''
       ${fmt}/bin/blit-fmt --check
       echo ""
@@ -448,7 +449,7 @@ in {
 
   tests = pkgs.writeShellApplication {
     name = "blit-tests";
-    runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun ];
+    runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun pkgs.pkg-config pkgs.libxkbcommon pkgs.pixman ];
     text = ''
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist

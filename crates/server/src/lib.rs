@@ -287,7 +287,7 @@ fn encode_surface_frame(
 ) -> Option<(Vec<u8>, bool)> {
     let w = width as usize;
     let h = height as usize;
-    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
+    if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
         return None;
     }
     let yuv = rgba_to_yuv420(pixels, w, h);
