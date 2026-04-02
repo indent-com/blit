@@ -132,7 +132,6 @@ export class BlitConnection {
   private hasConnected = false;
   private retryCount = 0;
   private lastError: string | null = null;
-  private connectedAt: number = 0;
 
   private snapshot: BlitConnectionSnapshot;
   private sessions: InternalSession[] = [];
@@ -792,24 +791,14 @@ export class BlitConnection {
 
     if (status === "connected") {
       this.hasConnected = true;
-      this.connectedAt = Date.now();
+      this.retryCount = 0;
       this.lastError = null;
     } else if (
-      status === "error" ||
-      status === "disconnected" ||
-      status === "closed"
+      (status === "error" || status === "disconnected" || status === "closed") &&
+      (this.snapshot.status === "connecting" ||
+        this.snapshot.status === "authenticating")
     ) {
-      const prev = this.snapshot.status;
-      if (prev === "connected") {
-        const stableMs = 5_000;
-        if (Date.now() - this.connectedAt >= stableMs) {
-          this.retryCount = 0;
-        } else {
-          this.retryCount++;
-        }
-      } else if (prev === "connecting" || prev === "authenticating") {
-        this.retryCount++;
-      }
+      this.retryCount++;
     }
 
     // Persist the error until a successful connection clears it.

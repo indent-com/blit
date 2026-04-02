@@ -329,7 +329,7 @@ describe("WebSocketTransport", () => {
     transport.close();
   });
 
-  it("successful reconnect resets the delay after stable connection", () => {
+  it("successful reconnect resets the delay after receiving data", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 100,
       reconnectBackoff: 2,
@@ -344,8 +344,8 @@ describe("WebSocketTransport", () => {
     ws = latestSocket();
     ws.simulateOpen();
     ws.simulateMessage("ok");
+    ws.simulateMessage(new ArrayBuffer(4));
 
-    vi.advanceTimersByTime(5000);
     ws.simulateClose();
 
     const countBefore = MockWebSocket.instances.length;
