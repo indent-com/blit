@@ -57,17 +57,17 @@ process-compose -U -u "$PC_SOCK" list
 
 echo ""
 echo "=== Smoke test: blit CLI ==="
-BLIT_ARGS="--socket $BLIT_SOCK"
+BLIT_ARGS=(--socket "$BLIT_SOCK")
 
 echo "  blit start echo hello"
-SESSION_ID=$(blit start $BLIT_ARGS echo hello)
+SESSION_ID=$(blit start "${BLIT_ARGS[@]}" echo hello)
 echo "  session: $SESSION_ID"
 
 echo "  blit wait"
-blit wait $BLIT_ARGS "$SESSION_ID" --timeout 30
+blit wait "${BLIT_ARGS[@]}" "$SESSION_ID" --timeout 30
 
 echo "  blit history"
-OUTPUT=$(blit history $BLIT_ARGS "$SESSION_ID" --from-start 0 --limit 50)
+OUTPUT=$(blit history "${BLIT_ARGS[@]}" "$SESSION_ID" --from-start 0 --limit 50)
 if echo "$OUTPUT" | grep -q "hello"; then
     echo "  output contains 'hello' ✓"
 else
@@ -77,10 +77,10 @@ else
 fi
 
 echo "  blit list"
-blit list $BLIT_ARGS
+blit list "${BLIT_ARGS[@]}"
 
 echo "  blit close"
-blit close $BLIT_ARGS "$SESSION_ID"
+blit close "${BLIT_ARGS[@]}" "$SESSION_ID"
 
 echo ""
 echo "=== dev-check passed ==="
