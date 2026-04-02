@@ -23,10 +23,17 @@ cargo fmt -- --check             # formatting (CI fails on any diff)
 
 Run `cargo fmt` to auto-fix formatting before committing.
 
-TypeScript (React library):
+TypeScript (JS workspace — core, react, solid):
 
 ```bash
-cd js/react && pnpm install && pnpm vitest run
+cd js && pnpm install && pnpm test
+```
+
+Or individual packages:
+
+```bash
+cd js && pnpm --filter @blit-sh/core run test
+cd js && pnpm --filter @blit-sh/react run test
 ```
 
 E2E (Playwright, requires built binaries):
@@ -44,7 +51,7 @@ Every `nix run` target has a corresponding script in `bin/`:
 ```bash
 ./bin/build-debs             # .deb packages -> dist/debs/
 ./bin/build-tarballs         # static tarballs -> dist/tarballs/
-./bin/publish-npm-packages   # npm publish @blit-sh/browser, @blit-sh/core, @blit-sh/react
+./bin/publish-npm-packages   # npm publish @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid, @blit-sh/solid
 ./bin/publish-crates         # cargo publish
 ```
 
@@ -98,8 +105,9 @@ Most Rust crates are one or two source files. `blit-cli` is split into four and 
 
 | Directory      | What                                                                                                                |
 | -------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `js/core/`     | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer             |
-| `js/react/`    | `@blit-sh/react` npm package — React bindings and hooks wrapping `@blit-sh/core`. Tests in `js/react/src/__tests__/` |
+| `js/core/`     | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer, `BlitTerminalSurface` |
+| `js/react/`    | `@blit-sh/react` npm package — thin React bindings wrapping `BlitTerminalSurface` from core. Tests in `js/react/src/__tests__/` |
+| `js/solid/`    | `@blit-sh/solid` npm package — thin Solid bindings wrapping `BlitTerminalSurface` from core |
 | `js/web-app/`  | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                |
 | `js/website/`  | Marketing/docs website (Vite + SSR with prerendering)                                                               |
 | `js/blit-hub/` | Signaling relay server (Bun, deployed to Fly.io). See [js/blit-hub/README.md](js/blit-hub/README.md)                |
@@ -122,13 +130,13 @@ Most Rust crates are one or two source files. `blit-cli` is split into four and 
 4. Client-side handling in `cli/src/agent.rs` (agent subcommands) and/or `cli/src/interactive.rs` (TUI)
 5. Update the protocol tables in [ARCHITECTURE.md](ARCHITECTURE.md)
 
-**Tests live next to the code.** `server/src/lib.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. React tests are in `react/src/__tests__/`.
+**Tests live next to the code.** `server/src/lib.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. Core tests are in `core/src/__tests__/`, React tests in `react/src/__tests__/`.
 
 **Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. Linux binaries are statically linked via musl; Nix verifies this at build time.
 
 ## Versioning and releases
 
-All workspace crates, `js/core/package.json`, `js/react/package.json`, and `nix/common.nix` share a single version number. The `bin/release` script bumps all of them atomically:
+All workspace crates, `js/core/package.json`, `js/react/package.json`, `js/solid/package.json`, and `nix/common.nix` share a single version number. The JS packages live in a pnpm workspace rooted at `js/` with a shared `js/pnpm-lock.yaml`. The `bin/release` script bumps all of them atomically:
 
 ```bash
 ./bin/release 0.12.0

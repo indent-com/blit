@@ -79,7 +79,7 @@ function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
   const savedPass = readStorage(PASS_KEY);
   const [transport, setTransport] = useState<BlitTransport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
-  const passRef = useRef<HTMLInputElement>(null);
+  const passRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!savedPass || transport) return;
@@ -135,7 +135,7 @@ function AuthScreen({
   onSubmit,
 }: {
   error: string | null;
-  passRef: React.RefObject<HTMLInputElement>;
+  passRef: React.RefObject<HTMLInputElement | null>;
   onSubmit: (pass: string) => void;
 }) {
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;

@@ -204,7 +204,7 @@ flowchart TD
 | `build-tarballs` | — | Nix-build static tarballs on 3 platform runners |
 | `release` | build-debs, build-tarballs | Downloads all artifacts, creates a GitHub Release with auto-generated notes |
 | `publish-crates` | release | `./bin/publish-crates` — publishes workspace crates to crates.io |
-| `publish-npm` | release | `./bin/publish-npm-packages` — publishes @blit-sh/react + @blit-sh/browser to npm |
+| `publish-npm` | release | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
 | `update-homebrew` | release | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version |
 | `apt-repo` | build-debs, build-tarballs | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages |
 

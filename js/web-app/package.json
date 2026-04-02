@@ -4,14 +4,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build"
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@blit-sh/core": "workspace:*",
+    "@blit-sh/react": "workspace:*",
     "react": "^19",
-    "react-dom": "^19",
-    "tweetnacl": "^1.0.3"
+    "react-dom": "^19"
   },
   "devDependencies": {
+    "@blit-sh/browser": "file:../../crates/browser/pkg",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^6",

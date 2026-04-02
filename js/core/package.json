@@ -2,31 +2,57 @@
   "name": "@blit-sh/core",
   "version": "0.17.1",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
     },
     "./transports": {
-      "types": "./dist/transports/index.d.ts",
-      "default": "./dist/transports/index.js"
+      "types": "./src/transports/index.ts",
+      "default": "./src/transports/index.ts"
     },
     "./types": {
-      "types": "./dist/types.d.ts",
-      "default": "./dist/types.js"
+      "types": "./src/types.ts",
+      "default": "./src/types.ts"
     },
     "./palettes": {
-      "types": "./dist/palettes.d.ts",
-      "default": "./dist/palettes.js"
+      "types": "./src/palettes.ts",
+      "default": "./src/palettes.ts"
     },
     "./bsp": {
-      "types": "./dist/bsp/index.d.ts",
-      "default": "./dist/bsp/index.js"
+      "types": "./src/bsp/index.ts",
+      "default": "./src/bsp/index.ts"
     }
   },
-  "description": "Low-latency terminal streaming — framework-agnostic core",
+  "publishConfig": {
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./transports": {
+        "types": "./dist/transports/index.d.ts",
+        "default": "./dist/transports/index.js"
+      },
+      "./types": {
+        "types": "./dist/types.d.ts",
+        "default": "./dist/types.js"
+      },
+      "./palettes": {
+        "types": "./dist/palettes.d.ts",
+        "default": "./dist/palettes.js"
+      },
+      "./bsp": {
+        "types": "./dist/bsp/index.d.ts",
+        "default": "./dist/bsp/index.js"
+      }
+    }
+  },
+  "description": "Low-latency terminal streaming \u2014 framework-agnostic core",
   "homepage": "https://blit.sh",
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {
@@ -51,6 +77,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest"
@@ -68,8 +95,5 @@
     "typescript": "^6",
     "vitest": "^4"
   },
-  "license": "MIT",
-  "overrides": {
-    "rollup": ">=4.59.0"
-  }
+  "license": "MIT"
 }

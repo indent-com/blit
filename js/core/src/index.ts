@@ -37,6 +37,12 @@ export { keyToBytes, encoder } from "./keyboard";
 
 export type { GlRenderer } from "./gl-renderer";
 
+export { BlitTerminalSurface } from "./BlitTerminalSurface";
+export type {
+  BlitTerminalSurfaceOptions,
+  BlitTerminalSurfaceHandle,
+} from "./BlitTerminalSurface";
+
 export {
   parseDSL,
   serializeDSL,

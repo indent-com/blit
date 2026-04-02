@@ -121,15 +121,10 @@ export function BSPContainer({
   const paneIds = useMemo(() => panes.map((pane) => pane.id), [panes]);
   // Hash assignments store connectionId:ptyId pairs. We resolve them to
   // session IDs once sessions arrive from the server.
-  const pendingHashRef = useRef<Record<string, string> | null>(() => {
-    const ha = loadAssignmentsFromHash();
-    return ha;
-  });
-  // Evaluate the lazy initializer
-  if (typeof pendingHashRef.current === "function") {
-    pendingHashRef.current = (
-      pendingHashRef.current as () => Record<string, string> | null
-    )();
+  const pendingHashRef = useRef<Record<string, string> | null>(null);
+  // Initialize on first render
+  if (pendingHashRef.current === null) {
+    pendingHashRef.current = loadAssignmentsFromHash();
   }
 
   const [layoutState, setLayoutState] = useState<BSPAssignments>(() => {

@@ -26,7 +26,9 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-remote`           | `crates/remote/`           | lib           | Wire protocol: message builders/parsers, frame containers, state primitives, LZ4 compression                         |
 | `blit-alacritty`        | `crates/alacritty-driver/` | lib           | Terminal parsing backend wrapping `alacritty_terminal`; snapshot generation, scrollback, title/mode tracking, search |
 | `@blit-sh/browser`      | `crates/browser/`          | cdylib (WASM) | Applies compressed frame diffs, produces WebGL vertex data, manages glyph atlas                                      |
-| `@blit-sh/react`        | `js/react/`                | npm           | Workspace-based React client library: connections, sessions, transports, rendering                                   |
+| `@blit-sh/core`         | `js/core/`                 | npm           | Framework-agnostic core: transports, workspace, connections, terminal surface, WebGL renderer                        |
+| `@blit-sh/react`        | `js/react/`                | npm           | Thin React wrapper: context provider, hooks, and `BlitTerminal` component delegating to core                        |
+| `@blit-sh/solid`        | `js/solid/`                | npm           | Thin Solid wrapper: context provider, primitives, and `BlitTerminal` component delegating to core                   |
 | `blit-server`           | `crates/server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
 | `blit-gateway`          | `crates/gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
 | `blit` (CLI)            | `crates/cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway, `server`/`share` subcommands             |
@@ -47,7 +49,9 @@ graph TD
     remote --> demo[blit-demo]
 
     alacritty --> server[blit-server]
-    browser --> react[@blit-sh/react]
+    browser --> core[@blit-sh/core]
+    core --> react[@blit-sh/react]
+    core --> solid[@blit-sh/solid]
     react --> webapp[web-app]
 
     fonts[blit-fonts] --> webserver[blit-webserver]
@@ -70,7 +74,7 @@ Every non-WebSocket transport wraps messages in a **4-byte little-endian length 
 - Server: `read_frame` / `write_frame` in `crates/server/src/main.rs`
 - CLI: `crates/cli/src/transport.rs`
 - Gateway: `crates/gateway/src/main.rs`
-- Browser WebTransport/WebRTC: `js/react/src/transports/`
+- Browser WebTransport/WebRTC: `js/core/src/transports/`
 
 Maximum frame size is 16 MiB.
 
@@ -236,7 +240,7 @@ Self-signed certificates are auto-generated and rotated every 13 days. The certi
 
 The `blit share` CLI subcommand is the primary entry point. It auto-starts a blit-server if one isn't already running, then runs the forwarder in-process. The standalone `blit-webrtc-forwarder` binary is available for custom deployments.
 
-On the browser side, the React library includes a `WebRtcDataChannelTransport` that connects to the forwarder via the same signaling server.
+On the browser side, `@blit-sh/core` includes a `WebRtcDataChannelTransport` that connects to the forwarder via the same signaling server.
 
 ### SSH tunneling (CLI)
 

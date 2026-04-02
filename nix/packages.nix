@@ -121,57 +121,45 @@
         cargoPkg = "blit-webrtc-forwarder";
       };
 
-      coreNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/core;
-        hash = "sha256-+CY2F1K1t6snH+2eokD+q6R36zbz8JiM3xS5MWtztgU=";
-      };
+      # Helper to set up WASM browser pkg for JS builds.
+      setupBrowserPkg = ''
+        mkdir -p crates/browser/pkg/snippets
+        cp ${browserWasm}/blit_browser.js crates/browser/pkg/
+        cp ${browserWasm}/blit_browser_bg.wasm crates/browser/pkg/
+        cp ${browserWasm}/blit_browser.d.ts crates/browser/pkg/
+        cp ${browserWasm}/blit_browser_bg.wasm.d.ts crates/browser/pkg/
+        echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
+        for d in ${browserWasm}/snippets/blit-browser-*/; do
+          name=$(basename "$d")
+          mkdir -p "crates/browser/pkg/snippets/$name"
+          cp "$d"/* "crates/browser/pkg/snippets/$name/"
+        done
+      '';
 
-      reactNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/react;
-        hash = "sha256-QFIF/VnM/XoovbY/sT8DWyQiKc2/bVhjjeVf2GVBZIs=";
-      };
-
-      websiteNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/website;
-        hash = "sha256-Ov0ZMh+i1u56wXbO5FTd9Z5Kahqq1AIi2HCwD+gMOJM=";
-      };
-
-      webAppNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/web-app;
-        hash = "sha256-OgNos+GJ3tf5N3JZlygEdbAz2a6LQLoiBd87n29zYPg=";
+      # Pre-fetch pnpm dependencies in a fixed-output derivation (has network
+      # access). The resulting store is used offline by webAppDist/websiteDist.
+      pnpmDeps = pkgs.pnpm.fetchDeps {
+        pname = "blit-js";
+        inherit version;
+        src = ../.;
+        pnpmWorkspace = "js";
+        postPatch = setupBrowserPkg;
+        hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # run nix build, use hash from error
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {
         pname = "blit-web-app";
         inherit version;
         src = ../.;
-        nativeBuildInputs = [ pkgs.nodejs ];
+        inherit pnpmDeps;
+        nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm pkgs.pnpm.configHook ];
+        pnpmRoot = "js";
+        postPatch = setupBrowserPkg;
         buildPhase = ''
-          export HOME=$TMPDIR
-
-          mkdir -p crates/browser/pkg/snippets
-          cp ${browserWasm}/blit_browser.js crates/browser/pkg/
-          cp ${browserWasm}/blit_browser_bg.wasm crates/browser/pkg/
-          cp ${browserWasm}/blit_browser.d.ts crates/browser/pkg/
-          cp ${browserWasm}/blit_browser_bg.wasm.d.ts crates/browser/pkg/
-          echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
-          for d in ${browserWasm}/snippets/blit-browser-*/; do
-            name=$(basename "$d")
-            mkdir -p "crates/browser/pkg/snippets/$name"
-            cp "$d"/* "crates/browser/pkg/snippets/$name/"
-          done
-
-          cp -r ${coreNpmDeps} "$TMPDIR/core-cache"
-          chmod -R u+w "$TMPDIR/core-cache"
-          (cd js/core && npm ci --cache "$TMPDIR/core-cache" && node node_modules/typescript/bin/tsc)
-
-          cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
-          chmod -R u+w "$TMPDIR/react-cache"
-          (cd js/react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
-
-          cp -r ${webAppNpmDeps} "$TMPDIR/webapp-cache"
-          chmod -R u+w "$TMPDIR/webapp-cache"
-          (cd js/web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
+          cd js
+          pnpm --filter @blit-sh/core run build
+          pnpm --filter @blit-sh/react run build
+          pnpm --filter blit-web-app run build
         '';
         installPhase = ''
           mkdir -p $out
@@ -184,25 +172,13 @@
         pname = "blit-website";
         inherit version;
         src = ../.;
-        nativeBuildInputs = [ pkgs.nodejs ];
+        inherit pnpmDeps;
+        nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm pkgs.pnpm.configHook ];
+        pnpmRoot = "js";
+        postPatch = setupBrowserPkg;
         buildPhase = ''
-          export HOME=$TMPDIR
-
-          mkdir -p crates/browser/pkg/snippets
-          cp ${browserWasm}/blit_browser.js crates/browser/pkg/
-          cp ${browserWasm}/blit_browser_bg.wasm crates/browser/pkg/
-          cp ${browserWasm}/blit_browser.d.ts crates/browser/pkg/
-          cp ${browserWasm}/blit_browser_bg.wasm.d.ts crates/browser/pkg/
-          echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
-          for d in ${browserWasm}/snippets/blit-browser-*/; do
-            name=$(basename "$d")
-            mkdir -p "crates/browser/pkg/snippets/$name"
-            cp "$d"/* "crates/browser/pkg/snippets/$name/"
-          done
-
-          cp -r ${websiteNpmDeps} "$TMPDIR/website-cache"
-          chmod -R u+w "$TMPDIR/website-cache"
-          (cd js/website && npm ci --cache "$TMPDIR/website-cache" && node node_modules/vite/bin/vite.js build && node node_modules/vite/bin/vite.js build --ssr src/entry-server.tsx && node prerender.js)
+          cd js
+          pnpm --filter blit-website run build
         '';
         installPhase = ''
           mkdir -p $out

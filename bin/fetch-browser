@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Pull the pre-built @blit-sh/browser package from npm into crates/browser/pkg/.
+# This is a convenience for developers who don't have the Rust/wasm-pack toolchain.
+# The Nix build and ./bin/build-browser produce the same files from source.
+
+version=$(node -e "console.log(JSON.parse(require('fs').readFileSync('js/core/package.json','utf8')).version)")
+echo "Fetching @blit-sh/browser@${version} from npm..."
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+(cd "$tmp" && npm pack "@blit-sh/browser@${version}" --silent)
+tar xzf "$tmp"/blit-sh-browser-*.tgz -C "$tmp"
+
+dest=crates/browser/pkg
+rm -rf "$dest"
+mkdir -p "$dest"
+cp -r "$tmp"/package/* "$dest"/
+
+echo "Installed @blit-sh/browser@${version} into ${dest}/"
+ls -lh "$dest"

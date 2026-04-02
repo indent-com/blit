@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "typecheck": "pnpm -r run typecheck",
+    "dev": "pnpm -r --parallel run dev"
+  }
+}

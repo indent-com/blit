@@ -10,3 +10,9 @@
 coverage/
 dist/
 node_modules/
+
+# tsc build artifacts that may leak into src/ directories
+js/*/src/**/*.js
+js/*/src/**/*.js.map
+js/*/src/**/*.d.ts
+js/*/src/**/*.d.ts.map

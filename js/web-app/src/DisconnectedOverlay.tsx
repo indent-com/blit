@@ -59,6 +59,8 @@ function describeStatusTransition(
         : retryCount > 0
           ? tp("disconnected.retryDisconnected", { count: retryCount })
           : t("disconnected.disconnectedFromServer");
+    case "closed":
+      return t("disconnected.disconnectedFromServer");
   }
 }
 

@@ -1,4 +1,4 @@
-import { act, cleanup, render } from "@testing-library/react";
+import { cleanup, render } from "@solidjs/testing-library";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BlitTerminal } from "../BlitTerminal";
 import { BlitWorkspace } from "@blit-sh/core";
@@ -120,47 +120,47 @@ describe("BlitTerminal", () => {
 
   it("renders with null sessionId without crashing", () => {
     const { workspace } = setup();
-    render(
+    render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
         <BlitTerminal sessionId={null} />
-      </BlitWorkspaceProvider>,
-    );
+      </BlitWorkspaceProvider>
+    ));
   });
 
   it("creates surface and attaches to container", () => {
     const { workspace } = setup();
-    render(
+    render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
         <BlitTerminal sessionId={null} />
-      </BlitWorkspaceProvider>,
-    );
+      </BlitWorkspaceProvider>
+    ));
     expect(mockAttach).toHaveBeenCalledTimes(1);
     expect(mockSetWorkspace).toHaveBeenCalledWith(workspace);
   });
 
   it("disposes surface on unmount", () => {
     const { workspace } = setup();
-    const { unmount } = render(
+    const { unmount } = render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
         <BlitTerminal sessionId={null} />
-      </BlitWorkspaceProvider>,
-    );
+      </BlitWorkspaceProvider>
+    ));
     unmount();
     expect(mockDispose).toHaveBeenCalledTimes(1);
   });
 
-  it("forwards sessionId changes to surface", async () => {
+  it("forwards sessionId changes to surface", () => {
     const { transport, workspace } = setup();
 
     transport.pushList([{ ptyId: 7, tag: "test" }]);
     const snap = workspace.getSnapshot();
     const sessionId = snap.sessions[0]?.id as SessionId;
 
-    render(
+    render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
         <BlitTerminal sessionId={sessionId} readOnly />
-      </BlitWorkspaceProvider>,
-    );
+      </BlitWorkspaceProvider>
+    ));
 
     expect(mockSetSessionId).toHaveBeenCalledWith(sessionId);
   });
@@ -179,11 +179,11 @@ describe("BlitTerminal", () => {
       ),
     };
 
-    render(
+    render(() => (
       <BlitWorkspaceProvider workspace={workspace} palette={palette}>
         <BlitTerminal sessionId={null} />
-      </BlitWorkspaceProvider>,
-    );
+      </BlitWorkspaceProvider>
+    ));
 
     expect(mockSetPalette).toHaveBeenCalledWith(palette);
   });
@@ -191,15 +191,15 @@ describe("BlitTerminal", () => {
   it("forwards font settings to surface", () => {
     const { workspace } = setup();
 
-    render(
+    render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
         <BlitTerminal
           sessionId={null}
           fontFamily="Test Mono"
           fontSize={14}
         />
-      </BlitWorkspaceProvider>,
-    );
+      </BlitWorkspaceProvider>
+    ));
 
     expect(mockSetFontFamily).toHaveBeenCalledWith("Test Mono");
     expect(mockSetFontSize).toHaveBeenCalledWith(14);

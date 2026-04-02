@@ -1,5 +1,5 @@
 {
-  "name": "@blit-sh/react",
+  "name": "@blit-sh/solid",
   "version": "0.17.1",
   "type": "module",
   "main": "src/index.ts",
@@ -28,13 +28,13 @@
       }
     }
   },
-  "description": "Low-latency terminal streaming \u2014 React components and hooks",
+  "description": "Low-latency terminal streaming \u2014 Solid components and primitives",
   "homepage": "https://blit.sh",
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/indent-com/blit.git",
-    "directory": "js/react"
+    "directory": "js/solid"
   },
   "bugs": {
     "url": "https://github.com/indent-com/blit/issues"
@@ -42,7 +42,8 @@
   "keywords": [
     "terminal",
     "tty",
-    "react",
+    "solid",
+    "solidjs",
     "streaming",
     "webgl"
   ],
@@ -55,25 +56,20 @@
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage",
     "test:watch": "vitest"
   },
   "peerDependencies": {
     "@blit-sh/core": "workspace:*",
-    "react": ">=18.0.0",
-    "react-dom": ">=18.0.0"
+    "solid-js": ">=1.8.0"
   },
   "devDependencies": {
     "@blit-sh/core": "workspace:*",
-    "@testing-library/react": "^16",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "@solidjs/testing-library": "^0.8",
     "jsdom": "^29",
-    "react": "^19",
-    "react-dom": "^19",
+    "solid-js": "^1.9.0",
     "typescript": "^6",
-    "@vitest/coverage-v8": "^4",
+    "vite-plugin-solid": "^2",
     "vitest": "^4"
   },
   "license": "MIT"

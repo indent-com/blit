@@ -2,9 +2,9 @@
 
 There are two distinct dimensions: embedding the frontend into your app, and embedding `blit-server` into your own service.
 
-## Your app, our components: `@blit-sh/react`
+## Your app, our components: `@blit-sh/react` / `@blit-sh/solid`
 
-`@blit-sh/react` is workspace-first. A `BlitWorkspace` owns connections, each connection owns sessions, and each `BlitTerminal` renders a session by ID.
+`@blit-sh/react` and `@blit-sh/solid` are workspace-first. Both are thin wrappers over `@blit-sh/core`'s `BlitTerminalSurface`. A `BlitWorkspace` owns connections, each connection owns sessions, and each `BlitTerminal` renders a session by ID.
 
 ```tsx
 import {
@@ -77,6 +77,66 @@ function TerminalScreen() {
 | `useBlitSessions()`                        | Read all sessions                                        |
 | `useBlitFocusedSession()`                  | Read the currently focused session                       |
 | `BlitTerminal`                             | Render one session by `sessionId`                        |
+
+### Solid API
+
+```tsx
+import {
+  BlitTerminal,
+  BlitWorkspaceProvider,
+  createBlitWorkspace,
+  createBlitWorkspaceState,
+  createBlitSessions,
+  useBlitFocusedSession,
+} from "@blit-sh/solid";
+import { BlitWorkspace } from "@blit-sh/core";
+import { createSignal, onCleanup, createEffect } from "solid-js";
+
+function EmbeddedBlit(props: { wasm: any; passphrase: string }) {
+  const workspace = new BlitWorkspace({
+    wasm: props.wasm,
+    connections: [{ id: "default", transport: { type: "websocket", url: "wss://example.com/blit", passphrase: props.passphrase } }],
+  });
+  onCleanup(() => workspace.dispose());
+
+  return (
+    <BlitWorkspaceProvider workspace={workspace}>
+      <TerminalScreen />
+    </BlitWorkspaceProvider>
+  );
+}
+
+function TerminalScreen() {
+  const workspace = createBlitWorkspace();
+  const sessions = createBlitSessions();
+  const focusedSession = () => useBlitFocusedSession(workspace);
+
+  createEffect(() => {
+    if (sessions().length > 0) return;
+    workspace.createSession({ connectionId: "default", rows: 24, cols: 80 });
+  });
+
+  return (
+    <BlitTerminal
+      sessionId={focusedSession()?.id ?? null}
+      style={{ width: "100%", height: "100vh" }}
+    />
+  );
+}
+```
+
+| API                                            | Purpose                                                  |
+| ---------------------------------------------- | -------------------------------------------------------- |
+| `new BlitWorkspace({ wasm, connections })`     | Create a workspace with one or more transports           |
+| `BlitWorkspaceProvider`                        | Put the workspace, palette, and font settings in context |
+| `createBlitWorkspace()`                        | Get the imperative workspace object from context         |
+| `createBlitWorkspaceState(workspace?)`         | Reactive signal tracking the workspace snapshot          |
+| `createBlitSessions(workspace?)`               | Reactive signal tracking all sessions                    |
+| `useBlitSession(workspace, sessionId)`         | Look up a single session by ID (non-reactive)            |
+| `useBlitFocusedSession(workspace)`             | Look up the focused session (non-reactive)               |
+| `useBlitConnection(workspace, sessionId)`      | Look up a connection snapshot (non-reactive)             |
+| `createBlitWorkspaceConnection(workspace, id, transport)` | Manage a connection lifecycle with `onCleanup`  |
+| `BlitTerminal`                                 | Render one session by `sessionId`                        |
 
 ### Workspace operations
 

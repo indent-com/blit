@@ -79,7 +79,7 @@ cargo build --release -p blit-cli
 
 Each client is paced independently based on render metrics it reports back: display rate, frame apply time, backlog depth. A phone on 3G doesn't stall a workstation on localhost. The focused session gets full frame rate; background sessions throttle down. Keystrokes go straight to the PTY — latency is bounded by link RTT.
 
-`blit` opens the browser with an embedded gateway. For persistent multi-user browser access, `blit-gateway` is a standalone proxy that handles passphrase auth, serves the web app, and optionally enables QUIC. `blit-server` can also run standalone for headless/daemon use. For embedding in your own app, [`@blit-sh/react`](EMBEDDING.md) is the React integration library.
+`blit` opens the browser with an embedded gateway. For persistent multi-user browser access, `blit-gateway` is a standalone proxy that handles passphrase auth, serves the web app, and optionally enables QUIC. `blit-server` can also run standalone for headless/daemon use. For embedding in your own app, [`@blit-sh/react`](EMBEDDING.md) and [`@blit-sh/solid`](EMBEDDING.md) provide framework bindings.
 
 For wire protocol details, frame encoding, and transport internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -172,7 +172,7 @@ sudo systemctl enable --now blit-webrtc-forwarder@alice.service
 | Per-client backpressure | ✅ Render-metric pacing        | ❌                  | ❌                  | ⚠️ SSH flow control   | ❌                    | ❌                   |
 | WebGL rendering         | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ⚠️ Addon             |
 | Transport               | WS, WebTransport, WebRTC, Unix | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
-| Embeddable (React)      | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
+| Embeddable (React/Solid)| ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
 | Agent / CLI subcommands | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | SSH tunneling built-in  | ✅                             | ❌                  | ❌                  | ✅                    | ✅                    | ❌                   |
 
@@ -189,7 +189,9 @@ sudo systemctl enable --now blit-webrtc-forwarder@alice.service
 | `crates/alacritty-driver/` | `blit-alacritty`        | Terminal parsing backed by `alacritty_terminal`                  |
 | `crates/fonts/`            | `blit-fonts`            | Font discovery and metadata                                      |
 | `crates/webserver/`        | `blit-webserver`        | Shared HTTP helpers for serving assets and fonts                 |
-| `js/react/`                | `@blit-sh/react`        | React client library ([EMBEDDING.md](EMBEDDING.md))              |
+| `js/core/`                 | `@blit-sh/core`         | Framework-agnostic core: workspace, transports, terminal surface |
+| `js/react/`                | `@blit-sh/react`        | React bindings ([EMBEDDING.md](EMBEDDING.md))                    |
+| `js/solid/`                | `@blit-sh/solid`        | Solid bindings ([EMBEDDING.md](EMBEDDING.md))                    |
 | `js/web-app/`              |                         | Browser UI                                                       |
 
 ## Contributing
