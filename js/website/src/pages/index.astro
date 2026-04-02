@@ -1,0 +1,22 @@
+---
+import Layout from "../layouts/Layout.astro";
+import Header from "../components/Header.astro";
+import Hero from "../components/Hero.astro";
+import WhyCards from "../components/WhyCards.astro";
+import DemoBlocks from "../components/DemoBlocks.astro";
+import EmbedSection from "../components/EmbedSection.astro";
+import Footer from "../components/Footer.astro";
+---
+
+<Layout>
+  <div class="flex flex-col min-h-screen">
+    <Header />
+    <main class="flex-1 max-w-4xl mx-auto px-6 w-full max-sm:px-4">
+      <Hero />
+      <WhyCards />
+      <DemoBlocks />
+      <EmbedSection />
+    </main>
+    <Footer />
+  </div>
+</Layout>

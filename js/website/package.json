@@ -3,23 +3,24 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build && vite build --ssr src/entry-server.tsx && node prerender.js",
-    "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "typecheck": "astro check && tsc --noEmit"
   },
   "dependencies": {
+    "@astrojs/solid-js": "^6",
     "@blit-sh/core": "workspace:*",
-    "@blit-sh/react": "workspace:*",
-    "react": "^19",
-    "react-dom": "^19"
+    "@blit-sh/solid": "workspace:*",
+    "astro": "^6",
+    "solid-js": "^1.9.0",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
+    "@astrojs/check": "^0.9",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "@vitejs/plugin-react": "^6",
-    "typescript": "^6",
-    "vite": "^8"
+    "@tailwindcss/vite": "^4",
+    "tailwindcss": "^4",
+    "typescript": "^6"
   }
 }

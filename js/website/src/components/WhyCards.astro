@@ -1,0 +1,55 @@
+---
+---
+
+<section
+  class="grid grid-cols-3 gap-3 py-10 border-t border-[var(--border)] max-md:grid-cols-1"
+>
+  <div
+    class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-md"
+  >
+    <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
+      Live state, not pixels
+    </h3>
+    <p class="text-[13px] leading-relaxed text-[var(--dim)]">
+      blit tracks the full parsed terminal grid and sends only what changed —
+      LZ4-compressed binary diffs. The browser gets real structured data: select
+      text, resize freely, type into it.
+    </p>
+  </div>
+  <div
+    class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-md"
+  >
+    <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
+      Share with one command
+    </h3>
+    <p class="text-[13px] leading-relaxed text-[var(--dim)]">
+      <code
+        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
+        >blit share</code
+      > prints a URL. Open it anywhere. WebRTC punches through NATs — no SSH keys,
+      no port forwarding, no tunnels. Full input for pair programming or AI agents.
+    </p>
+  </div>
+  <div
+    class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-md"
+  >
+    <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
+      Terminals as an API
+    </h3>
+    <p class="text-[13px] leading-relaxed text-[var(--dim)]">
+      Non-interactive CLI for scripts and LLMs. <code
+        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
+        >blit start</code
+      >, <code
+        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
+        >show</code
+      >, <code
+        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
+        >send</code
+      >, <code
+        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
+        >wait --pattern</code
+      >. Plain text out, zero exit on success. No screen-scraping.
+    </p>
+  </div>
+</section>

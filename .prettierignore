@@ -5,3 +5,5 @@ crates/browser/pkg/
 */browser/pkg/
 *.wasm
 pnpm-lock.yaml
+*.astro
+*.astro

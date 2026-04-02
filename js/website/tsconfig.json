@@ -1,20 +1,8 @@
 {
+  "extends": "astro/tsconfigs/strict",
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "jsx": "react-jsx",
-    "types": ["vite/client"],
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "paths": {
-      "@blit-sh/browser": ["../../crates/browser/pkg/blit_browser.d.ts"]
-    }
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js"
   },
-  "include": ["src"]
+  "include": ["src", "src/**/*.d.ts"]
 }

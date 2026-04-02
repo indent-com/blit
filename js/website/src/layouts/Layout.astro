@@ -1,0 +1,76 @@
+---
+import "../styles/global.css";
+import { Font } from "astro:assets";
+
+interface Props {
+  title?: string;
+  description?: string;
+  bodyClass?: string;
+  headContent?: string;
+}
+
+const {
+  title = "blit - terminal streaming for browsers and AI agents",
+  description = "Low-latency terminal streaming to any browser. Share with a link. Let AI agents drive them. One binary, zero config, instant.",
+  bodyClass = "min-h-screen bg-[var(--bg)] text-[var(--fg)] font-mono text-sm leading-relaxed",
+} = Astro.props;
+---
+
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://blit.sh" />
+    <meta property="og:title" content="blit — your terminal, everywhere" />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content="https://blit.sh/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="blit — your terminal, everywhere" />
+    <meta
+      name="twitter:description"
+      content="Low-latency terminal streaming to any browser. Share with a link. Let AI agents drive them."
+    />
+    <meta name="twitter:image" content="https://blit.sh/og.png" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='16' fill='%23222'/><text x='12' y='76' font-family='monospace' font-size='72' font-weight='bold' fill='%2358f'>b</text><rect x='60' y='24' width='8' height='52' rx='2' fill='%2358f' opacity='.7'/></svg>"
+    />
+    <Font cssVariable="--font-mono" />
+    <Font cssVariable="--font-sans" />
+    <style is:inline>
+      :root{--bg:#fff;--fg:#1f2328;--dim:#656d76;--bright:#1f2328;--border:#d1d9e0;--surface:#f6f8fa;--accent:#0969da;--green:#1a7f37;--code-bg:#f6f8fa;--code-fg:#1f2328;--hl-kw:#cf222e;--hl-fn:#8250df;--hl-str:#0a3069;--hl-num:#0550ae;--hl-cm:#6e7781;--hl-attr:#0550ae}
+      [data-theme="dark"]{--bg:#0d1117;--fg:#c9d1d9;--dim:#6e7681;--bright:#e6edf3;--border:#21262d;--surface:#161b22;--accent:#58a6ff;--green:#3fb950;--code-bg:#161b22;--code-fg:#e6edf3;--hl-kw:#ff7b72;--hl-fn:#d2a8ff;--hl-str:#a5d6ff;--hl-num:#79c0ff;--hl-cm:#8b949e;--hl-attr:#79c0ff}
+      [data-theme="dark"] .theme-icon-sun{display:inline}
+      [data-theme="dark"] .theme-icon-moon{display:none}
+      [data-theme="light"] .theme-icon-sun{display:none}
+      [data-theme="light"] .theme-icon-moon{display:inline}
+      .theme-icon-sun,.theme-icon-moon{display:none}
+    </style>
+    <script is:inline>
+      (function () {
+        function getCookie(name) {
+          var m = document.cookie.match('(?:^|; )' + name + '=([^;]*)');
+          return m ? m[1] : null;
+        }
+        var stored = getCookie("blit-theme") || localStorage.getItem("blit-theme");
+        var theme =
+          stored === "light" || stored === "dark"
+            ? stored
+            : window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+    <slot name="head" />
+  </head>
+  <body class:list={[bodyClass]}>
+    <slot />
+  </body>
+</html>
