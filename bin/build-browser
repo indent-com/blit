@@ -6,5 +6,5 @@ cd "$(dirname "$0")/.."
 (cd crates/browser && wasm-pack build --target web --release --out-dir pkg)
 
 # Install JS dependencies and build web app
-(cd js/web-app && npm install --prefer-offline && npm run build)
-(cd js/website && npm install --prefer-offline)
+(cd js && pnpm install --prefer-offline)
+(cd js/web-app && pnpm run build)

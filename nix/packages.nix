@@ -341,7 +341,6 @@
           pkgs.nodejs
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
-          pkgs.prefetch-npm-deps
           pkgs.process-compose
           pkgs.samply
           pkgs.scdoc

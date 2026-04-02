@@ -41,7 +41,7 @@ processes:
       failure_threshold: 300
 
   web-app:
-    command: cd js/web-app && npx vite --host
+    command: cd js/web-app && pnpm exec vite --host
     environment:
       - VITE_BLIT_GATEWAY=localhost:3266
     depends_on:
@@ -53,7 +53,7 @@ processes:
       restart: always
 
   website:
-    command: cd js/website && npx vite
+    command: cd js/website && pnpm exec vite
     depends_on:
       browser-wasm:
         condition: process_healthy

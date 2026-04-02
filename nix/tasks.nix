@@ -233,7 +233,7 @@ CTRL
 
   deploy-website = pkgs.writeShellApplication {
     name = "deploy-website";
-    runtimeInputs = [ pkgs.nodejs ];
+    runtimeInputs = [ pkgs.nodejs pkgs.pnpm ];
     text = ''
       tmp=$(mktemp -d)
       trap 'rm -rf "$tmp"' EXIT
@@ -255,7 +255,7 @@ PROJ
       if [ -n "''${VERCEL_TOKEN:-}" ]; then
         token_args+=(--token "$VERCEL_TOKEN")
       fi
-      npx vercel deploy --prebuilt "''${token_args[@]}" "$@"
+      pnpm dlx vercel deploy --prebuilt "''${token_args[@]}" "$@"
     '';
   };
 in {
@@ -310,7 +310,7 @@ in {
       (cd e2e && if ! pnpm install --frozen-lockfile 2>/dev/null; then pnpm install; fi)
 
       echo "=== Running Playwright ==="
-      (cd e2e && npx playwright test)
+      (cd e2e && pnpm exec playwright test)
     '';
   };
 
