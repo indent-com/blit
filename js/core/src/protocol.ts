@@ -1,6 +1,7 @@
 import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
+  C2S_CLIPBOARD,
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_KILL,
@@ -15,8 +16,14 @@ import {
   C2S_SEARCH,
   C2S_COPY_RANGE,
   C2S_CREATE2,
+  C2S_SURFACE_INPUT,
+  C2S_SURFACE_POINTER,
+  C2S_SURFACE_POINTER_AXIS,
+  C2S_SURFACE_RESIZE,
+  C2S_SURFACE_FOCUS,
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
+  CREATE2_HAS_COMPOSITOR,
 } from "./types";
 
 const textEncoder = new TextEncoder();
@@ -171,7 +178,7 @@ export function buildCreate2Message(
   nonce: number,
   rows: number,
   cols: number,
-  options?: { tag?: string; command?: string; srcPtyId?: number },
+  options?: { tag?: string; command?: string; srcPtyId?: number; compositor?: boolean },
 ): Uint8Array {
   const tagBytes = options?.tag
     ? textEncoder.encode(options.tag)
@@ -182,6 +189,7 @@ export function buildCreate2Message(
   const hasCmd = cmdText.length > 0;
   if (hasSrc) features |= CREATE2_HAS_SRC_PTY;
   if (hasCmd) features |= CREATE2_HAS_COMMAND;
+  if (options?.compositor) features |= CREATE2_HAS_COMPOSITOR;
   const cmdBytes = hasCmd ? textEncoder.encode(cmdText) : new Uint8Array(0);
   const msg = new Uint8Array(
     10 + tagBytes.length + (hasSrc ? 2 : 0) + cmdBytes.length,
@@ -271,5 +279,102 @@ export function buildCopyRangeMessage(
   v.setUint32(11, endTail, true);
   v.setUint16(15, endCol, true);
   msg[17] = 0;
+  return msg;
+}
+
+export function buildSurfaceInputMessage(
+  surfaceId: number,
+  keycode: number,
+  pressed: boolean,
+): Uint8Array {
+  const msg = new Uint8Array(8);
+  msg[0] = C2S_SURFACE_INPUT;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  const v = new DataView(msg.buffer);
+  v.setUint32(3, keycode, true);
+  msg[7] = pressed ? 1 : 0;
+  return msg;
+}
+
+export const SURFACE_POINTER_DOWN = 0;
+export const SURFACE_POINTER_UP = 1;
+export const SURFACE_POINTER_MOVE = 2;
+
+export function buildSurfacePointerMessage(
+  surfaceId: number,
+  type: number,
+  button: number,
+  x: number,
+  y: number,
+): Uint8Array {
+  const msg = new Uint8Array(9);
+  msg[0] = C2S_SURFACE_POINTER;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = type;
+  msg[4] = button;
+  msg[5] = x & 0xff;
+  msg[6] = (x >> 8) & 0xff;
+  msg[7] = y & 0xff;
+  msg[8] = (y >> 8) & 0xff;
+  return msg;
+}
+
+export function buildSurfaceAxisMessage(
+  surfaceId: number,
+  axis: number,
+  valueX100: number,
+): Uint8Array {
+  const msg = new Uint8Array(8);
+  msg[0] = C2S_SURFACE_POINTER_AXIS;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = axis;
+  const v = new DataView(msg.buffer);
+  v.setInt32(4, valueX100, true);
+  return msg;
+}
+
+export function buildSurfaceResizeMessage(
+  surfaceId: number,
+  width: number,
+  height: number,
+): Uint8Array {
+  const msg = new Uint8Array(7);
+  msg[0] = C2S_SURFACE_RESIZE;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = width & 0xff;
+  msg[4] = (width >> 8) & 0xff;
+  msg[5] = height & 0xff;
+  msg[6] = (height >> 8) & 0xff;
+  return msg;
+}
+
+export function buildSurfaceFocusMessage(surfaceId: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_SURFACE_FOCUS;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  return msg;
+}
+
+export function buildClipboardMessage(
+  surfaceId: number,
+  mimeType: string,
+  data: Uint8Array,
+): Uint8Array {
+  const mimeBytes = textEncoder.encode(mimeType);
+  const msg = new Uint8Array(9 + mimeBytes.length + data.length);
+  msg[0] = C2S_CLIPBOARD;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = mimeBytes.length & 0xff;
+  msg[4] = (mimeBytes.length >> 8) & 0xff;
+  msg.set(mimeBytes, 5);
+  const v = new DataView(msg.buffer);
+  v.setUint32(5 + mimeBytes.length, data.length, true);
+  msg.set(data, 9 + mimeBytes.length);
   return msg;
 }
