@@ -1,0 +1,40 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.13.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run bin/release
+        run: nix develop --command ./bin/release "$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Tag and push
+        run: |
+          git tag "v$VERSION"
+          git push origin main "v$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}

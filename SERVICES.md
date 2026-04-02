@@ -140,11 +140,12 @@ This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb`
 
 ## GitHub Actions workflows
 
-Five workflow files live in `.github/workflows/`:
+Six workflow files live in `.github/workflows/`:
 
 | Workflow | Trigger | Purpose |
 | --- | --- | --- |
 | [`test.yml`](.github/workflows/test.yml) | Push to `main`, PRs | Lint, test, e2e, verify builds |
+| [`prepare-release.yml`](.github/workflows/prepare-release.yml) | Manual (`workflow_dispatch`) | Run `bin/release`, tag, and push — triggers `release.yml` |
 | [`release.yml`](.github/workflows/release.yml) | `v*` tag push | Build artifacts, create GitHub Release, publish packages, deploy install site |
 | [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml) | Push to `main` (paths: `js/blit-hub/**`) | Deploy signaling hub to Fly.io |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml) | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs) |
@@ -176,6 +177,16 @@ flowchart LR
 | `e2e` | ubuntu-latest | `./bin/e2e` — Playwright against the full stack; uploads report artifact |
 | `build-debs` | ubuntu-latest, ubuntu-24.04-arm | Verify `.deb` packages build (amd64 + arm64) |
 | `build-tarballs` | ubuntu-latest, ubuntu-24.04-arm, macos-latest | Verify static tarballs build (3 platforms) |
+
+### Prepare release (prepare-release.yml)
+
+Manually triggered via `workflow_dispatch`. Takes a version string (e.g. `0.13.0`), runs `bin/release` to bump all version files and commit, then tags `v<version>` and pushes — which triggers the full `release.yml` pipeline.
+
+```mermaid
+flowchart LR
+    DISPATCH["workflow_dispatch<br>version: 0.13.0"] --> RELEASE["bin/release 0.13.0<br>bump + commit"] --> PUSH["git tag v0.13.0<br>git push"]
+    PUSH --> TAG["Triggers release.yml"]
+```
 
 ### Release (release.yml)
 
@@ -248,14 +259,15 @@ sequenceDiagram
     participant Git as Git / GitHub
     participant CI as GitHub Actions
 
-    Dev->>Rel: ./bin/release 0.12.0
+    Dev->>Git: Trigger prepare-release.yml<br>with version 0.12.0
+    Git->>CI: workflow_dispatch
+    CI->>Rel: ./bin/release 0.12.0
     Rel->>Rel: Validate version consistency across<br>Cargo.toml, package.json, nix/common.nix
     Rel->>Rel: Bump all version files
     Rel->>Rel: cargo test -p blit-server
     Rel->>Rel: Update npm hashes in nix/packages.nix
     Rel->>Git: git commit "release 0.12.0"
-
-    Dev->>Git: git tag v0.12.0 && git push --tags
+    CI->>Git: git tag v0.12.0 && git push
     Git->>CI: v* tag triggers release.yml + publish-demo-image.yml
 
     CI->>CI: Build .deb (amd64, arm64)
