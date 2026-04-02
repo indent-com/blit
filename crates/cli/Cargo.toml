@@ -15,7 +15,6 @@ path = "src/main.rs"
 blit-remote = { workspace = true }
 blit-webserver = { workspace = true }
 tokio = { version = "1", features = ["full"] }
-libc = "0.2"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 rand = "0.10"
@@ -26,3 +25,12 @@ blit-webrtc-forwarder = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }

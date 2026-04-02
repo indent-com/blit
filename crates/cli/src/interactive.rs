@@ -17,6 +17,7 @@ use crate::transport::{self, Transport, make_frame, read_frame};
 
 const WEB_INDEX_HTML: &str = include_str!("../../../js/web-app/dist/index.html");
 
+#[cfg(unix)]
 fn term_size() -> (u16, u16) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -30,10 +31,31 @@ fn term_size() -> (u16, u16) {
     (24, 80)
 }
 
+#[cfg(windows)]
+fn term_size() -> (u16, u16) {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(handle, &mut info) != 0 {
+            let rows = (info.srWindow.Bottom - info.srWindow.Top + 1) as u16;
+            let cols = (info.srWindow.Right - info.srWindow.Left + 1) as u16;
+            if rows > 0 && cols > 0 {
+                return (rows, cols);
+            }
+        }
+    }
+    (24, 80)
+}
+
+#[cfg(unix)]
 struct RawMode {
     saved: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn enter() -> Option<Self> {
         unsafe {
@@ -51,10 +73,46 @@ impl RawMode {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct RawMode {
+    saved: u32,
+}
+
+#[cfg(windows)]
+impl RawMode {
+    fn enter() -> Option<Self> {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+            SetConsoleMode,
+        };
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut saved: u32 = 0;
+            if GetConsoleMode(handle, &mut saved) == 0 {
+                return None;
+            }
+            SetConsoleMode(handle, ENABLE_VIRTUAL_TERMINAL_INPUT);
+            Some(Self { saved })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            SetConsoleMode(handle, self.saved);
         }
     }
 }
@@ -67,9 +125,7 @@ impl Drop for Cleanup {
                                \x1b[?1016l\x1b[?1006l\x1b[?1005l\
                                \x1b[?2004l\x1b>\x1b[?1l\x1b[?25h\x1b[0m\x1b[?1049l\
                                \x1b[999;1H\r\n";
-        unsafe {
-            libc::write(libc::STDOUT_FILENO, RESET.as_ptr().cast(), RESET.len());
-        }
+        write_all_stdout(RESET);
     }
 }
 
@@ -398,27 +454,8 @@ fn push_u16(out: &mut Vec<u8>, n: u16) {
 }
 
 fn write_all_stdout(buf: &[u8]) {
-    let mut off = 0;
-    while off < buf.len() {
-        let n = unsafe {
-            libc::write(
-                libc::STDOUT_FILENO,
-                buf[off..].as_ptr().cast(),
-                buf.len() - off,
-            )
-        };
-        if n > 0 {
-            off += n as usize;
-        } else if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        } else {
-            break;
-        }
-    }
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(buf);
 }
 
 fn digits(mut n: u16) -> u16 {
@@ -434,7 +471,8 @@ fn digits(mut n: u16) -> u16 {
 }
 
 enum BrowserConnector {
-    Unix(String),
+    Ipc(String),
+    #[cfg(unix)]
     SshForward {
         local_sock: String,
         _ssh_child: tokio::process::Child,
@@ -444,21 +482,18 @@ enum BrowserConnector {
 
 impl BrowserConnector {
     async fn connect(&self) -> Result<Transport, String> {
-        let path = match self {
-            Self::Unix(p) | Self::SshForward { local_sock: p, .. } => p,
+        match self {
+            #[cfg(unix)]
+            Self::SshForward { local_sock: p, .. } => transport::connect_ipc(p).await,
+            Self::Ipc(p) => transport::connect_ipc(p).await,
             Self::Tcp(addr) => {
                 let s = tokio::net::TcpStream::connect(addr.as_str())
                     .await
                     .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
                 let _ = s.set_nodelay(true);
-                return Ok(Transport::Tcp(s));
+                Ok(Transport::Tcp(s))
             }
-        };
-        Ok(Transport::Unix(
-            tokio::net::UnixStream::connect(path)
-                .await
-                .map_err(|e| format!("cannot connect to {path}: {e}"))?,
-        ))
+        }
     }
 }
 
@@ -666,20 +701,26 @@ pub async fn run_browser(
     let connector = if let Some(addr) = tcp {
         remote_host = Some(addr.split(':').next().unwrap_or(addr).to_string());
         BrowserConnector::Tcp(addr.clone())
-    } else if let Some(host) = ssh {
-        remote_host = Some(host.clone());
-        setup_ssh_forward(std::slice::from_ref(host)).await
+    } else if let Some(_host) = ssh {
+        #[cfg(unix)]
+        {
+            remote_host = Some(_host.clone());
+            setup_ssh_forward(std::slice::from_ref(_host)).await
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("blit: --ssh is not supported on this platform");
+            std::process::exit(1);
+        }
     } else if let Some(path) = socket {
-        BrowserConnector::Unix(path.clone())
+        BrowserConnector::Ipc(path.clone())
     } else {
         let path = transport::default_local_socket();
-        if !std::path::Path::new(&path).exists()
-            && let Err(e) = transport::ensure_local_server(&path).await
-        {
+        if let Err(e) = transport::ensure_local_server(&path).await {
             eprintln!("blit: {e}");
             std::process::exit(1);
         }
-        BrowserConnector::Unix(path)
+        BrowserConnector::Ipc(path)
     };
 
     let mut attempts = 0;
@@ -769,6 +810,7 @@ pub async fn run_browser(
     }
 }
 
+#[cfg(unix)]
 async fn setup_ssh_forward(ssh_args: &[String]) -> BrowserConnector {
     if ssh_args.is_empty() {
         eprintln!("blit: ssh requires a host argument");
@@ -898,7 +940,11 @@ fn open_browser(url: &str) {
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     eprintln!("blit: open {url} in your browser");
 }
 
@@ -1053,12 +1099,27 @@ async fn run(transport: Transport) {
 
     let ev_tx_sig = ev_tx;
     tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sig = signal(SignalKind::window_change()).expect("SIGWINCH");
-        loop {
-            sig.recv().await;
-            let (r, c) = term_size();
-            let _ = ev_tx_sig.send(Event::Resize(r, c)).await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sig = signal(SignalKind::window_change()).expect("SIGWINCH");
+            loop {
+                sig.recv().await;
+                let (r, c) = term_size();
+                let _ = ev_tx_sig.send(Event::Resize(r, c)).await;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut prev = term_size();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let cur = term_size();
+                if cur != prev {
+                    prev = cur;
+                    let _ = ev_tx_sig.send(Event::Resize(cur.0, cur.1)).await;
+                }
+            }
         }
     });
 

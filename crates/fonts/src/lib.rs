@@ -2,25 +2,39 @@ use std::collections::BTreeSet;
 
 pub fn font_dirs() -> Vec<String> {
     let mut dirs = Vec::new();
-    // BLIT_FONT_DIRS: colon-separated list of extra directories to search first
     if let Ok(extra) = std::env::var("BLIT_FONT_DIRS") {
-        for d in extra.split(':') {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for d in extra.split(sep) {
             let d = d.trim();
             if !d.is_empty() {
                 dirs.push(d.to_owned());
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        dirs.push(format!("{home}/Library/Fonts"));
-        dirs.push(format!("{home}/.local/share/fonts"));
-        dirs.push(format!("{home}/.fonts"));
+    #[cfg(unix)]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy();
+            dirs.push(format!("{home}/Library/Fonts"));
+            dirs.push(format!("{home}/.local/share/fonts"));
+            dirs.push(format!("{home}/.fonts"));
+        }
+        dirs.push("/Library/Fonts".into());
+        dirs.push("/System/Library/Fonts".into());
+        dirs.push("/usr/share/fonts".into());
+        dirs.push("/usr/local/share/fonts".into());
     }
-    dirs.push("/Library/Fonts".into());
-    dirs.push("/System/Library/Fonts".into());
-    dirs.push("/usr/share/fonts".into());
-    dirs.push("/usr/local/share/fonts".into());
+    #[cfg(windows)]
+    {
+        if let Ok(windir) = std::env::var("SYSTEMROOT") {
+            dirs.push(format!("{windir}\\Fonts"));
+        } else {
+            dirs.push(r"C:\Windows\Fonts".into());
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            dirs.push(format!(r"{local}\Microsoft\Windows\Fonts"));
+        }
+    }
     dirs
 }
 
@@ -258,6 +272,7 @@ fn subfamily_to_weight_style(subfamily: &str) -> (&'static str, &'static str) {
 }
 
 pub fn find_font_files(family: &str) -> Vec<FontVariant> {
+    #[cfg(unix)]
     if let Some(results) = find_via_fc_match(family)
         && !results.is_empty()
     {
@@ -273,6 +288,7 @@ pub fn find_font_files(family: &str) -> Vec<FontVariant> {
     results
 }
 
+#[cfg(unix)]
 fn find_via_fc_match(family: &str) -> Option<Vec<FontVariant>> {
     let output = std::process::Command::new("fc-match")
         .args(["--format", "%{file}\n%{style}\n", "-a", family])
@@ -358,6 +374,7 @@ fn find_in_dir_recursive(
 }
 
 pub fn list_font_families() -> Vec<String> {
+    #[cfg(unix)]
     if let Some(families) = list_via_fc_list() {
         return families;
     }
@@ -365,12 +382,14 @@ pub fn list_font_families() -> Vec<String> {
 }
 
 pub fn list_monospace_font_families() -> Vec<String> {
+    #[cfg(unix)]
     if let Some(families) = list_monospace_via_fc_list() {
         return families;
     }
     list_monospace_via_name_tables()
 }
 
+#[cfg(unix)]
 fn list_via_fc_list() -> Option<Vec<String>> {
     let output = std::process::Command::new("fc-list")
         .args(["--format", "%{family}\n"])
@@ -404,6 +423,7 @@ fn list_via_name_tables() -> Vec<String> {
     families.into_iter().collect()
 }
 
+#[cfg(unix)]
 fn list_monospace_via_fc_list() -> Option<Vec<String>> {
     let output = std::process::Command::new("fc-list")
         .args(["--format", "%{file}\n"])

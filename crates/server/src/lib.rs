@@ -9,41 +9,26 @@ use blit_remote::{
     build_update_msg, msg_hello,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::CString;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify, mpsc};
 
-type PtyFds = Arc<std::sync::RwLock<HashMap<u16, RawFd>>>;
+mod ipc;
+mod pty;
+
+pub use ipc::{IpcListener, default_ipc_path};
+use pty::{PtyHandle, PtyWriteTarget};
+
+type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
 pub struct Config {
     pub shell: String,
     pub shell_flags: String,
     pub scrollback: usize,
-    pub socket_path: String,
-    pub fd_channel: Option<RawFd>,
+    pub ipc_path: String,
+    #[cfg(unix)]
+    pub fd_channel: Option<std::os::unix::io::RawFd>,
     pub verbose: bool,
-}
-
-fn pty_write_all(fd: libc::c_int, mut data: &[u8]) {
-    while !data.is_empty() {
-        let ret = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if ret > 0 {
-            data = &data[ret as usize..];
-        } else if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        } else {
-            break;
-        }
-    }
 }
 
 trait PtyDriver: Send {
@@ -217,8 +202,7 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
 }
 
 struct Pty {
-    master_fd: libc::c_int,
-    child_pid: libc::pid_t,
+    handle: PtyHandle,
     driver: Box<dyn PtyDriver>,
     /// Client-chosen tag set at creation time.
     tag: String,
@@ -969,21 +953,7 @@ impl Session {
             }
         }
         if !pty.exited {
-            unsafe {
-                let ws = libc::winsize {
-                    ws_row: rows,
-                    ws_col: cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-                libc::ioctl(pty.master_fd, libc::TIOCSWINSZ, &ws);
-                let mut fg_pgid: libc::pid_t = 0;
-                libc::ioctl(pty.master_fd, libc::TIOCGPGRP, &mut fg_pgid);
-                if fg_pgid > 0 {
-                    libc::kill(-fg_pgid, libc::SIGWINCH);
-                }
-                libc::kill(-pty.child_pid, libc::SIGWINCH);
-            }
+            pty::resize_pty_os(&pty.handle, rows, cols);
         }
         true
     }
@@ -1031,357 +1001,10 @@ fn nudge_delivery(state: &AppState) {
     state.3.notify_one();
 }
 
-fn pty_cwd(pid: libc::pid_t) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/cwd"))
-            .ok()
-            .and_then(|p| p.into_os_string().into_string().ok())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CStr;
-        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        let ret = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDVNODEPATHINFO,
-                0,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                std::mem::size_of::<libc::proc_vnodepathinfo>() as i32,
-            )
-        };
-        if ret <= 0 {
-            return None;
-        }
-        let info = unsafe { &*(buf.as_ptr() as *const libc::proc_vnodepathinfo) };
-        let cstr =
-            unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) };
-        cstr.to_str().ok().map(|s| s.to_owned())
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-/// On macOS, child processes forked from a CLI tool (as opposed to a native
-/// .app with an NSWindow) don't inherit foreground-app scheduling: the kernel
-/// has no window association for the PTY session, so it schedules the children
-/// on efficiency cores with possible duty-cycling.  Explicitly requesting
-/// QOS_CLASS_USER_INTERACTIVE restores parity with terminals like Ghostty.
-fn set_qos_user_interactive() {
-    #[cfg(target_os = "macos")]
-    {
-        const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
-        unsafe extern "C" {
-            fn pthread_set_qos_class_self_np(
-                qos_class: libc::c_uint,
-                relative_priority: libc::c_int,
-            ) -> libc::c_int;
-        }
-        unsafe {
-            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_pty(
-    shell: &str,
-    rows: u16,
-    cols: u16,
-    id: u16,
-    tag: &str,
-    command: Option<&str>,
-    argv: Option<&[&str]>,
-    dir: Option<&str>,
-    scrollback: usize,
-    state: AppState,
-) -> Option<Pty> {
-    let mut master: libc::c_int = 0;
-    let mut slave: libc::c_int = 0;
-    unsafe {
-        if libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ) != 0
-        {
-            eprintln!("openpty failed for pty {id}");
-            return None;
-        }
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        libc::ioctl(master, libc::TIOCSWINSZ, &ws);
-    }
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        eprintln!("fork failed for pty {id}");
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
-        return None;
-    }
-
-    if pid == 0 {
-        unsafe {
-            libc::close(master);
-            libc::setsid();
-            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
-            libc::dup2(slave, 0);
-            libc::dup2(slave, 1);
-            libc::dup2(slave, 2);
-            if slave > 2 {
-                libc::close(slave);
-            }
-        }
-        set_qos_user_interactive();
-        let effective_dir = dir.map(String::from);
-        if let Some(d) = effective_dir
-            && let Ok(dir_c) = CString::new(d)
-        {
-            unsafe {
-                libc::chdir(dir_c.as_ptr());
-            }
-        }
-        // SAFETY: we are in the forked child process, which is single-threaded.
-        unsafe {
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("COLORTERM", "truecolor");
-            // Don't set COLUMNS/LINES — ncurses apps prioritize these over
-            // TIOCGWINSZ and won't resize properly if they're set to stale values.
-            std::env::remove_var("COLUMNS");
-            std::env::remove_var("LINES");
-            for (key, _) in std::env::vars() {
-                if key.starts_with("BLIT_") && key != "BLIT_HUB" && key != "BLIT_DISPLAY_FPS" {
-                    std::env::remove_var(&key);
-                }
-            }
-        }
-        let shell_flags = &state.0.shell_flags;
-        if let Some(command) = command {
-            let shell_c = CString::new(shell).unwrap();
-            let command_c = CString::new(command).unwrap();
-            let flag = CString::new(if shell_flags.is_empty() {
-                "-c".to_owned()
-            } else {
-                format!("-{}c", shell_flags)
-            })
-            .unwrap();
-            unsafe {
-                let p = shell_c.as_ptr();
-                let f = flag.as_ptr();
-                let c = command_c.as_ptr();
-                libc::execvp(p, [p, f, c, std::ptr::null()].as_ptr());
-                libc::_exit(1);
-            }
-        }
-        if let Some(args) = argv
-            && !args.is_empty()
-        {
-            let cargs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
-            let ptrs: Vec<*const libc::c_char> = cargs
-                .iter()
-                .map(|c| c.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect();
-            unsafe {
-                libc::execvp(ptrs[0], ptrs.as_ptr());
-                libc::_exit(1);
-            }
-        }
-        let shell_c = CString::new(shell).unwrap();
-        unsafe {
-            if shell_flags.is_empty() {
-                let p = shell_c.as_ptr();
-                libc::execvp(p, [p, std::ptr::null()].as_ptr());
-            } else {
-                let flag = CString::new(format!("-{}", shell_flags)).unwrap();
-                let p = shell_c.as_ptr();
-                let f = flag.as_ptr();
-                libc::execvp(p, [p, f, std::ptr::null()].as_ptr());
-            }
-            libc::_exit(1);
-        }
-    }
-
-    unsafe {
-        libc::close(slave);
-        let flags = libc::fcntl(master, libc::F_GETFL);
-        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-
-    unsafe {
-        libc::close(slave);
-        let flags = libc::fcntl(master, libc::F_GETFL);
-        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-
-    state.2.write().unwrap().insert(id, master);
-    let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
-    let reader_handle = std::thread::spawn({
-        let notify = state.3.clone();
-        move || pty_reader(master, byte_tx, notify)
-    });
-    let lflag_cache = pty_lflag(master);
-
-    Some(Pty {
-        master_fd: master,
-        child_pid: pid,
-        driver: Box::new(AlacrittyDriver::new(rows, cols, scrollback)),
-        tag: tag.to_owned(),
-        dirty: true,
-        ready_frames: VecDeque::new(),
-        byte_rx,
-        reader_handle,
-        lflag_cache,
-        lflag_last: Instant::now(),
-        last_title_send: Instant::now(),
-        title_pending: false,
-        exited: false,
-        exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
-        command: command.map(|s| s.to_owned()),
-    })
-}
-
-/// Spawn a new child process on a fresh PTY pair.
-/// Returns (master_fd, child_pid, reader_handle, byte_rx) for swapping into an existing Pty.
-fn respawn_child(
-    shell: &str,
-    rows: u16,
-    cols: u16,
-    pty_id: u16,
-    command: Option<&str>,
-    state: AppState,
-) -> Option<(
-    libc::c_int,
-    libc::pid_t,
-    std::thread::JoinHandle<()>,
-    mpsc::Receiver<PtyInput>,
-)> {
-    let mut master: libc::c_int = 0;
-    let mut slave: libc::c_int = 0;
-    unsafe {
-        if libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ) != 0
-        {
-            return None;
-        }
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        libc::ioctl(master, libc::TIOCSWINSZ, &ws);
-    }
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
-        return None;
-    }
-    if pid == 0 {
-        unsafe {
-            libc::close(master);
-            libc::setsid();
-            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
-            libc::dup2(slave, 0);
-            libc::dup2(slave, 1);
-            libc::dup2(slave, 2);
-            if slave > 2 {
-                libc::close(slave);
-            }
-        }
-        set_qos_user_interactive();
-        // SAFETY: we are in the forked child process, which is single-threaded.
-        unsafe {
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("COLORTERM", "truecolor");
-            std::env::remove_var("COLUMNS");
-            std::env::remove_var("LINES");
-            for (key, _) in std::env::vars() {
-                if key.starts_with("BLIT_") && key != "BLIT_HUB" && key != "BLIT_DISPLAY_FPS" {
-                    std::env::remove_var(&key);
-                }
-            }
-        }
-        let shell_flags = &state.0.shell_flags;
-        if let Some(cmd) = command {
-            let shell_c = CString::new(shell).unwrap();
-            let flag = CString::new(if shell_flags.is_empty() {
-                "-c".to_owned()
-            } else {
-                format!("-{}c", shell_flags)
-            })
-            .unwrap();
-            let cmd_c = CString::new(cmd).unwrap();
-            unsafe {
-                libc::execvp(
-                    shell_c.as_ptr(),
-                    [
-                        shell_c.as_ptr(),
-                        flag.as_ptr(),
-                        cmd_c.as_ptr(),
-                        std::ptr::null(),
-                    ]
-                    .as_ptr(),
-                );
-                libc::_exit(1);
-            }
-        }
-        let shell_c = CString::new(shell).unwrap();
-        unsafe {
-            if shell_flags.is_empty() {
-                let p = shell_c.as_ptr();
-                libc::execvp(p, [p, std::ptr::null()].as_ptr());
-            } else {
-                let flag = CString::new(format!("-{}", shell_flags)).unwrap();
-                let p = shell_c.as_ptr();
-                let f = flag.as_ptr();
-                libc::execvp(p, [p, f, std::ptr::null()].as_ptr());
-            }
-            libc::_exit(1);
-        }
-    }
-
-    unsafe {
-        libc::close(slave);
-        let flags = libc::fcntl(master, libc::F_GETFL);
-        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-
-    state.2.write().unwrap().insert(pty_id, master);
-    let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
-    let reader_handle = std::thread::spawn({
-        let notify = state.3.clone();
-        move || pty_reader(master, byte_tx, notify)
-    });
-    Some((master, pid, reader_handle, byte_rx))
-}
-
-fn respond_to_queries(fd: libc::c_int, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
-    // VT420 with features matching xterm-256color capabilities.
+fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> Vec<String> {
     const DA1_RESPONSE: &[u8] = b"\x1b[?64;1;2;6;9;15;18;21;22c";
 
+    let mut results = Vec::new();
     let mut i = 0;
     while i < data.len() {
         if data[i] != 0x1b || i + 2 >= data.len() || data[i + 1] != b'[' {
@@ -1423,72 +1046,13 @@ fn respond_to_queries(fd: libc::c_int, data: &[u8], size: (u16, u16), cursor: (u
             _ => None,
         };
         if let Some(r) = resp {
-            pty_write_all(fd, r.as_bytes());
+            results.push(r);
         }
     }
+    results
 }
 
-fn pty_reader(fd: libc::c_int, tx: mpsc::Sender<PtyInput>, notify: Arc<Notify>) {
-    // Use a dedicated OS thread with a plain blocking read() instead of
-    // tokio's AsyncFd (kqueue/epoll). On macOS, registering a kqueue watcher
-    // on the PTY master fd adds significant per-write overhead in the kernel's
-    // TTY layer — every slave write triggers a kevent notification. A blocking
-    // read in a dedicated thread avoids this entirely, matching what native
-    // terminals like Ghostty do.
-
-    // Ensure the fd is in blocking mode.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
-
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut sync_scan_tail = Vec::new();
-
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n > 0 {
-            let data = buf[..n as usize].to_vec();
-            let mut remaining = data;
-            loop {
-                if remaining.is_empty() {
-                    break;
-                }
-                if let Some(boundary) = find_sync_output_end(&sync_scan_tail, &remaining) {
-                    let before = remaining[..boundary].to_vec();
-                    let after = remaining[boundary..].to_vec();
-                    update_sync_scan_tail(&mut sync_scan_tail, &before);
-                    if tx
-                        .blocking_send(PtyInput::SyncBoundary {
-                            before,
-                            after: after.clone(),
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    notify.notify_one();
-                    remaining = after;
-                } else {
-                    update_sync_scan_tail(&mut sync_scan_tail, &remaining);
-                    if tx.blocking_send(PtyInput::Data(remaining)).is_err() {
-                        return;
-                    }
-                    notify.notify_one();
-                    break;
-                }
-            }
-        } else {
-            let _ = tx.blocking_send(PtyInput::Eof);
-            notify.notify_one();
-            return;
-        }
-    }
-}
-
-/// Split accumulated bytes at sync-output boundaries and send through the channel.
-async fn cleanup_pty(pty_id: u16, state: &AppState) {
-    // Remove the fd so no more writes go to the closed master.
+async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
     state.2.write().unwrap().remove(&pty_id);
     let mut sess = state.1.lock().await;
     if let Some(pty) = sess.ptys.get_mut(&pty_id) {
@@ -1496,42 +1060,17 @@ async fn cleanup_pty(pty_id: u16, state: &AppState) {
             return;
         }
         pty.exited = true;
-
-        unsafe {
-            libc::kill(pty.child_pid, libc::SIGHUP);
-            libc::close(pty.master_fd);
-            let mut wstatus: libc::c_int = 0;
-            if libc::waitpid(pty.child_pid, &mut wstatus, libc::WNOHANG) > 0 {
-                if libc::WIFEXITED(wstatus) {
-                    pty.exit_status = libc::WEXITSTATUS(wstatus);
-                } else if libc::WIFSIGNALED(wstatus) {
-                    pty.exit_status = -(libc::WTERMSIG(wstatus) as i32);
-                }
-            }
-        }
+        pty::close_pty(&pty.handle);
+        pty.exit_status = pty::collect_exit_status(&pty.handle);
         pty.mark_dirty();
         let msg = blit_remote::msg_exited(pty_id, pty.exit_status);
         sess.send_to_all(&msg);
     }
 }
 
-fn pty_lflag(fd: libc::c_int) -> (bool, bool) {
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut termios) == 0 {
-            (
-                termios.c_lflag & libc::ECHO != 0,
-                termios.c_lflag & libc::ICANON != 0,
-            )
-        } else {
-            (false, false)
-        }
-    }
-}
-
 fn take_snapshot(pty: &mut Pty) -> FrameState {
     if pty.lflag_last.elapsed() >= Duration::from_millis(250) {
-        pty.lflag_cache = pty_lflag(pty.master_fd);
+        pty.lflag_cache = pty::pty_lflag(&pty.handle);
         pty.lflag_last = Instant::now();
     }
     let (echo, icanon) = pty.lflag_cache;
@@ -1611,81 +1150,6 @@ fn try_send_update(
     }
 }
 
-pub fn default_socket_path() -> String {
-    if let Ok(dir) = std::env::var("TMPDIR") {
-        return format!("{dir}/blit.sock");
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return format!("{dir}/blit.sock");
-    }
-    if let Ok(user) = std::env::var("USER") {
-        return format!("/tmp/blit-{user}.sock");
-    }
-    "/tmp/blit.sock".into()
-}
-
-enum RecvFdResult {
-    Fd(RawFd),
-    WouldBlock,
-    Closed,
-}
-
-fn recv_fd(channel: RawFd) -> RecvFdResult {
-    unsafe {
-        let mut buf = [0u8; 1];
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let cmsg_space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
-        let mut cmsg_buf = vec![0u8; cmsg_space];
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space as _;
-        let n = libc::recvmsg(channel, &mut msg, libc::MSG_DONTWAIT);
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                return RecvFdResult::WouldBlock;
-            }
-            if err.raw_os_error() == Some(libc::EINTR) {
-                return RecvFdResult::WouldBlock;
-            }
-            return RecvFdResult::Closed;
-        }
-        if n == 0 {
-            return RecvFdResult::Closed;
-        }
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return RecvFdResult::Closed;
-        }
-        if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-            let fd_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
-            RecvFdResult::Fd(std::ptr::read_unaligned(fd_ptr))
-        } else {
-            RecvFdResult::Closed
-        }
-    }
-}
-
-fn bind_socket(sock_path: &str, verbose: bool) -> UnixListener {
-    let _ = std::fs::remove_file(sock_path);
-    let listener = UnixListener::bind(sock_path).unwrap_or_else(|e| {
-        eprintln!("blit-server: cannot bind to {sock_path}: {e}");
-        std::process::exit(1);
-    });
-    if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)) {
-        eprintln!("blit-server: warning: cannot set socket permissions: {e}");
-    }
-    if verbose {
-        eprintln!("listening on {sock_path}");
-    }
-    listener
-}
-
 pub async fn run(config: Config) {
     let state: AppState = Arc::new((
         config,
@@ -1720,75 +1184,30 @@ pub async fn run(config: Config) {
     tokio::spawn(async {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
+            pty::reap_zombies();
         }
     });
 
+    #[cfg(unix)]
     if let Some(channel_fd) = state.0.fd_channel {
-        use std::os::unix::io::FromRawFd;
-        if state.0.verbose {
-            eprintln!("accepting clients via fd-channel (fd {channel_fd})");
-        }
-        let channel = unsafe { std::os::unix::net::UnixStream::from_raw_fd(channel_fd) };
-        channel.set_nonblocking(true).unwrap();
-        let async_channel = AsyncFd::new(channel).unwrap();
-        loop {
-            let mut guard = match async_channel.readable().await {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("fd-channel error: {e}");
-                    break;
-                }
-            };
-            match recv_fd(channel_fd) {
-                RecvFdResult::Fd(client_fd) => {
-                    let std_stream =
-                        unsafe { std::os::unix::net::UnixStream::from_raw_fd(client_fd) };
-                    std_stream.set_nonblocking(true).unwrap();
-                    let stream = tokio::net::UnixStream::from_std(std_stream).unwrap();
-                    let state = state.clone();
-                    tokio::spawn(handle_client(stream, state));
-                    guard.retain_ready();
-                }
-                RecvFdResult::WouldBlock => {
-                    guard.clear_ready();
-                }
-                RecvFdResult::Closed => {
-                    break;
-                }
-            }
-        }
-        if state.0.verbose {
-            eprintln!("fd-channel closed, shutting down");
-        }
+        ipc::run_fd_channel(channel_fd, state).await;
         return;
     }
 
-    // systemd socket activation: if LISTEN_FDS is set, use fd 3.
-    // LISTEN_PID is checked but not required to match — some container runtimes
-    // and service managers don't set it to the final process PID.
-    let listener = if let Ok(fds) = std::env::var("LISTEN_FDS") {
-        if fds.trim() == "1" {
-            use std::os::unix::io::FromRawFd;
-            let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-            std_listener.set_nonblocking(true).unwrap();
-            if state.0.verbose {
-                eprintln!("using socket activation (fd 3)");
-            }
-            UnixListener::from_std(std_listener).unwrap()
+    #[cfg(unix)]
+    let listener = {
+        if let Some(l) = IpcListener::from_systemd_fd(state.0.verbose) {
+            l
         } else {
-            if state.0.verbose {
-                eprintln!("LISTEN_FDS={fds}, expected 1; falling back to bind");
-            }
-            bind_socket(&state.0.socket_path, state.0.verbose)
+            IpcListener::bind(&state.0.ipc_path, state.0.verbose)
         }
-    } else {
-        bind_socket(&state.0.socket_path, state.0.verbose)
     };
+    #[cfg(not(unix))]
+    let mut listener = IpcListener::bind(&state.0.ipc_path, state.0.verbose);
 
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
+        let stream = match listener.accept().await {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("accept error: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1848,8 +1267,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         while let Ok(input) = pty.byte_rx.try_recv() {
             match input {
                 PtyInput::Data(data) => {
-                    respond_to_queries(
-                        pty.master_fd,
+                    pty::respond_to_queries(
+                        &pty.handle,
                         &data,
                         pty.driver.size(),
                         pty.driver.cursor_position(),
@@ -1860,8 +1279,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
                 PtyInput::SyncBoundary { before, after } => {
                     if !before.is_empty() {
-                        respond_to_queries(
-                            pty.master_fd,
+                        pty::respond_to_queries(
+                            &pty.handle,
                             &before,
                             pty.driver.size(),
                             pty.driver.cursor_position(),
@@ -1875,8 +1294,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         pty.clear_dirty();
                     }
                     if !after.is_empty() {
-                        respond_to_queries(
-                            pty.master_fd,
+                        pty::respond_to_queries(
+                            &pty.handle,
                             &after,
                             pty.driver.size(),
                             pty.driver.cursor_position(),
@@ -1896,7 +1315,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     drop(sess);
     for id in eof_ptys {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        cleanup_pty(id, state).await;
+        cleanup_pty_internal(id, state).await;
     }
     let mut sess = state.1.lock().await;
 
@@ -2190,9 +1609,12 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 }
 
-async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
+async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    state: AppState,
+) {
     let config = &state.0;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOX_CAPACITY);
     let sender = tokio::spawn(async move {
@@ -2423,7 +1845,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     .mouse_event(type_, button, col, row, echo, icanon)
                     && let Some(&fd) = state.2.read().unwrap().get(&pid)
                 {
-                    pty_write_all(fd, &seq);
+                    pty::pty_write_all(fd, &seq);
                 }
             }
             continue;
@@ -2446,7 +1868,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 nudge_delivery(&state);
             }
             if let Some(&fd) = state.2.read().unwrap().get(&pid) {
-                pty_write_all(fd, &data[3..]);
+                pty::pty_write_all(fd, &data[3..]);
             }
             continue;
         }
@@ -2576,8 +1998,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 let Some(id) = sess.allocate_pty_id() else {
                     continue;
                 };
-                if let Some(pty) = spawn_pty(
+                if let Some(pty) = pty::spawn_pty(
                     &config.shell,
+                    &config.shell_flags,
                     rows,
                     cols,
                     id,
@@ -2650,8 +2073,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 let Some(id) = sess.allocate_pty_id() else {
                     continue;
                 };
-                if let Some(pty) = spawn_pty(
+                if let Some(pty) = pty::spawn_pty(
                     &config.shell,
+                    &config.shell_flags,
                     rows,
                     cols,
                     id,
@@ -2712,15 +2136,16 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 let src_start = 7 + tag_len;
                 let dir = if data.len() >= src_start + 2 {
                     let src_id = u16::from_le_bytes([data[src_start], data[src_start + 1]]);
-                    sess.ptys.get(&src_id).and_then(|p| pty_cwd(p.child_pid))
+                    sess.ptys.get(&src_id).and_then(|p| pty::pty_cwd(&p.handle))
                 } else {
                     None
                 };
                 let Some(id) = sess.allocate_pty_id() else {
                     continue;
                 };
-                if let Some(pty) = spawn_pty(
+                if let Some(pty) = pty::spawn_pty(
                     &config.shell,
+                    &config.shell_flags,
                     rows,
                     cols,
                     id,
@@ -2766,7 +2191,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 let dir = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
                     let src_id = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
                     cursor += 2;
-                    sess.ptys.get(&src_id).and_then(|p| pty_cwd(p.child_pid))
+                    sess.ptys.get(&src_id).and_then(|p| pty::pty_cwd(&p.handle))
                 } else {
                     None
                 };
@@ -2786,8 +2211,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 let Some(id) = sess.allocate_pty_id() else {
                     continue;
                 };
-                if let Some(pty) = spawn_pty(
+                if let Some(pty) = pty::spawn_pty(
                     &config.shell,
+                    &config.shell_flags,
                     rows,
                     cols,
                     id,
@@ -2879,8 +2305,9 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     .filter(|p| p.exited)
                     .map(|p| (p.driver.size(), p.command.clone(), p.tag.clone()));
                 if let Some(((rows, cols), command, tag)) = restart_info
-                    && let Some((master, child, reader, byte_rx)) = respawn_child(
+                    && let Some((new_handle, reader, byte_rx)) = pty::respawn_child(
                         &state.0.shell,
+                        &state.0.shell_flags,
                         rows,
                         cols,
                         pid,
@@ -2891,14 +2318,13 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                     let Some(pty) = sess.ptys.get_mut(&pid) else {
                         break;
                     };
-                    pty.master_fd = master;
-                    pty.child_pid = child;
+                    pty.handle = new_handle;
                     pty.reader_handle = reader;
                     pty.byte_rx = byte_rx;
                     pty.driver.reset_modes();
                     pty.exited = false;
                     pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
-                    pty.lflag_cache = pty_lflag(master);
+                    pty.lflag_cache = pty::pty_lflag(&pty.handle);
                     pty.lflag_last = Instant::now();
                     pty.mark_dirty();
                     if let Some(c) = sess.clients.get_mut(&client_id) {
@@ -3028,9 +2454,7 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if let Some(pty) = sess.ptys.get(&pid)
                     && !pty.exited
                 {
-                    unsafe {
-                        libc::kill(pty.child_pid, signal);
-                    }
+                    pty::kill_pty(&pty.handle, signal);
                 }
             }
             C2S_CLOSE if data.len() >= 3 => {
@@ -3038,11 +2462,8 @@ async fn handle_client(stream: tokio::net::UnixStream, state: AppState) {
                 if let Some(pty) = sess.ptys.remove(&pid) {
                     if !pty.exited {
                         state.2.write().unwrap().remove(&pid);
-                        drop(pty.reader_handle); // thread exits when master fd is closed below
-                        unsafe {
-                            libc::kill(pty.child_pid, libc::SIGHUP);
-                            libc::close(pty.master_fd);
-                        }
+                        drop(pty.reader_handle);
+                        pty::close_pty(&pty.handle);
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);

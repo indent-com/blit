@@ -49,6 +49,36 @@ jobs:
           path: e2e/test-results/
           retention-days: 7
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+      - name: Build web-app
+        shell: bash
+        run: |
+          cargo install wasm-pack
+          cd crates/browser
+          wasm-pack build --target web --release --out-dir pkg
+          cd ../..
+          cd js
+          pnpm install --frozen-lockfile
+          pnpm --filter @blit-sh/core run build
+          pnpm --filter @blit-sh/react run build
+          pnpm --filter blit-web-app run build
+      - run: cargo build --release -p blit-cli -p blit-server -p blit-gateway -p blit-webrtc-forwarder
+
   build-debs:
     strategy:
       matrix:

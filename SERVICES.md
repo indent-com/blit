@@ -30,20 +30,23 @@ For nix-darwin and NixOS service modules, see [`nix/README.md`](nix/README.md).
 `install.blit.sh` is an APT repository and binary download site hosted on **GitHub Pages**. It is rebuilt and deployed on every tagged release (`v*`). Users interact with it in three ways:
 
 1. **Curl installer** — `curl -sf https://install.blit.sh | sh` fetches the install script (served as `index.html`), which detects OS/arch, downloads the right tarball from `/bin/`, and installs it.
-2. **APT repository** — Debian/Ubuntu users add it as a signed APT source for `apt install blit`.
-3. **Direct download** — tarballs are available at `/bin/blit_<version>_<os>_<arch>.tar.gz`.
+2. **PowerShell installer** — `irm https://install.blit.sh/install.ps1 | iex` installs blit on Windows. Downloads the zip from `/bin/`, extracts `blit.exe` to `%LOCALAPPDATA%\blit\bin`, and adds it to the user `PATH`.
+3. **APT repository** — Debian/Ubuntu users add it as a signed APT source for `apt install blit`.
+4. **Direct download** — tarballs are available at `/bin/blit_<version>_<os>_<arch>.tar.gz`, Windows zips at `/bin/blit_<version>_windows_x86_64.zip`.
 
 ### File hierarchy
 
 ```
 install.blit.sh/
   index.html              # install.sh (curl installer served as the landing page)
+  install.ps1             # PowerShell installer for Windows
   latest                  # plain-text file containing the current version (e.g. "0.12.0")
   blit.gpg                # GPG public key for APT signature verification
   bin/
     blit_0.12.0_linux_x86_64.tar.gz
     blit_0.12.0_linux_aarch64.tar.gz
     blit_0.12.0_darwin_aarch64.tar.gz
+    blit_0.12.0_windows_x86_64.zip
   pool/
     blit_0.12.0_amd64.deb
     blit_0.12.0_arm64.deb
@@ -69,9 +72,18 @@ install.blit.sh/
 4. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
 5. Extracts and installs to `$BLIT_INSTALL_DIR` (default `/usr/local/bin`), escalating with `sudo`/`doas` if needed.
 
+### Windows installer
+
+[`install.ps1`](install.ps1) is the Windows equivalent:
+
+1. Fetches `/latest` to get the current version.
+2. Downloads the zip from `/bin/blit_<version>_windows_x86_64.zip`.
+3. Extracts `blit.exe` to `$BLIT_INSTALL_DIR` (default `%LOCALAPPDATA%\blit\bin`).
+4. Adds the install directory to the user `PATH` if not already present.
+
 ### `blit upgrade`
 
-`blit upgrade` is the in-place self-update command. It fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_INSTALL_DIR` set to the directory of the currently running binary. This way the new version replaces the old one in the same location regardless of how it was originally installed. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
+`blit upgrade` is the in-place self-update command. On Unix it fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_INSTALL_DIR` set to the directory of the currently running binary. On Windows it fetches `install.ps1` and runs it via PowerShell. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
 
 ### How the site is built
 
@@ -85,10 +97,11 @@ flowchart TD
         BT_X86[build-tarballs<br>ubuntu-latest / linux-x86_64]
         BT_ARM[build-tarballs<br>ubuntu-24.04-arm / linux-aarch64]
         BT_MAC[build-tarballs<br>macos-latest / macos-aarch64]
+        BW[build-windows<br>windows-latest / x86_64]
     end
 
     subgraph "apt-repo job"
-        DL[Download all deb + tarball artifacts]
+        DL[Download all deb + tarball + windows artifacts]
         REPO[Assemble repo/ directory]
         SIGN[GPG-sign Release metadata]
         PAGES[Deploy to GitHub Pages]
@@ -100,6 +113,7 @@ flowchart TD
     BT_X86 --> DL
     BT_ARM --> DL
     BT_MAC --> DL
+    BW --> DL
 ```
 
 ## hub.blit.sh
@@ -161,6 +175,8 @@ The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`,
 
 This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages are single-file, zero-dependency executables — download, `chmod +x`, run.
 
+On Windows, Nix isn't available, so the `build-windows` job uses `cargo build --release` directly on a `windows-latest` runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
+
 ## GitHub Actions workflows
 
 Seven workflow files live in `.github/workflows/`:
@@ -191,6 +207,7 @@ flowchart LR
     PR --> ci_tar_x86[build-tarballs<br>x86_64]
     PR --> ci_tar_arm[build-tarballs<br>aarch64]
     PR --> ci_tar_mac[build-tarballs<br>aarch64-darwin]
+    PR --> ci_win[build-windows<br>x86_64]
 ```
 
 | Job              | Runner                                        | What it does                                                                                                                |
@@ -201,6 +218,7 @@ flowchart LR
 | `e2e`            | ubuntu-latest                                 | `./bin/e2e` — Playwright against the full stack; uploads report artifact                                                    |
 | `build-debs`     | ubuntu-latest, ubuntu-24.04-arm               | Verify `.deb` packages build (amd64 + arm64)                                                                                |
 | `build-tarballs` | ubuntu-latest, ubuntu-24.04-arm, macos-latest | Verify static tarballs build (3 platforms)                                                                                  |
+| `build-windows`  | windows-latest                                | Verify Windows release build compiles (x86_64)                                                                              |
 
 ### Dev check (dev-check.yml)
 
@@ -228,30 +246,32 @@ Triggered by pushing a `v*` tag (created by `./bin/release <version>`):
 
 ```mermaid
 flowchart TD
-    TAG["v* tag push"] --> BD & BT
+    TAG["v* tag push"] --> BD & BT & BW
 
     subgraph "Build (parallel)"
         BD[build-debs<br>amd64 + arm64]
         BT[build-tarballs<br>linux-x86_64, linux-aarch64, macos-aarch64]
+        BW[build-windows<br>x86_64]
     end
 
-    BD & BT --> REL[release<br>Create GitHub Release<br>with .deb + .tar.gz]
-    BD & BT --> APT[apt-repo<br>Assemble APT repo<br>GPG sign, deploy Pages]
+    BD & BT & BW --> REL[release<br>Create GitHub Release<br>with .deb + .tar.gz + .zip]
+    BD & BT & BW --> APT[apt-repo<br>Assemble APT repo<br>GPG sign, deploy Pages]
 
     REL --> PUB_CRATES[publish-crates<br>crates.io]
     REL --> PUB_NPM[publish-npm<br>npm registry]
     REL --> BREW[update-homebrew<br>repository-dispatch to<br>indent-com/homebrew-tap]
 ```
 
-| Job               | Depends on                 | What it does                                                                                                    |
-| ----------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `build-debs`      | —                          | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
-| `build-tarballs`  | —                          | Nix-build static tarballs on 3 platform runners                                                                 |
-| `release`         | build-debs, build-tarballs | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
-| `publish-crates`  | release                    | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
-| `publish-npm`     | release                    | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
-| `update-homebrew` | release                    | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
-| `apt-repo`        | build-debs, build-tarballs | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
+| Job               | Depends on                                | What it does                                                                                                    |
+| ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `build-debs`      | —                                         | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
+| `build-tarballs`  | —                                         | Nix-build static tarballs on 3 platform runners                                                                 |
+| `build-windows`   | —                                         | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
+| `release`         | build-debs, build-tarballs, build-windows | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
+| `publish-crates`  | release                                   | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
+| `publish-npm`     | release                                   | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
+| `update-homebrew` | release                                   | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
+| `apt-repo`        | build-debs, build-tarballs, build-windows | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
 
 ### Deploy blit-hub (deploy-blit-hub.yml)
 
@@ -306,6 +326,7 @@ sequenceDiagram
 
     CI->>CI: Build .deb (amd64, arm64)
     CI->>CI: Build tarballs (linux-x86_64, linux-aarch64, macos-aarch64)
+    CI->>CI: Build Windows zips (x86_64)
     CI->>Git: Create GitHub Release with all artifacts
     CI->>CI: Publish crates to crates.io
     CI->>CI: Publish packages to npm

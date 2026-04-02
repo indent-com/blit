@@ -30,12 +30,17 @@ pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("BLIT_CONFIG") {
         return PathBuf::from(p);
     }
+    #[cfg(unix)]
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
             PathBuf::from(home).join(".config")
         });
+    #[cfg(windows)]
+    let base = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"));
     base.join("blit").join("blit.conf")
 }
 

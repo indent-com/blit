@@ -3,7 +3,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 pub enum Transport {
+    #[cfg(unix)]
     Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    NamedPipe(tokio::net::windows::named_pipe::NamedPipeClient),
     Tcp(tokio::net::TcpStream),
     Ssh(tokio::process::Child),
     Share(tokio::io::DuplexStream),
@@ -17,7 +20,13 @@ impl Transport {
         Box<dyn AsyncWrite + Unpin + Send>,
     ) {
         match self {
+            #[cfg(unix)]
             Transport::Unix(s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
+            }
+            #[cfg(windows)]
+            Transport::NamedPipe(s) => {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
@@ -41,6 +50,7 @@ impl Transport {
     }
 }
 
+#[cfg(unix)]
 pub fn default_local_socket() -> String {
     if let Ok(p) = std::env::var("BLIT_SOCK") {
         return p;
@@ -65,6 +75,15 @@ pub fn default_local_socket() -> String {
         return format!("{dir}/blit.sock");
     }
     "/tmp/blit.sock".into()
+}
+
+#[cfg(windows)]
+pub fn default_local_socket() -> String {
+    if let Ok(p) = std::env::var("BLIT_SOCK") {
+        return p;
+    }
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+    format!(r"\\.\pipe\blit-{user}")
 }
 
 pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
@@ -94,6 +113,26 @@ pub async fn write_frame(w: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> b
     w.write_all(&make_frame(payload)).await.is_ok()
 }
 
+pub async fn connect_ipc(path: &str) -> Result<Transport, String> {
+    #[cfg(unix)]
+    {
+        Ok(Transport::Unix(
+            tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(|e| format!("cannot connect to {path}: {e}"))?,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        Ok(Transport::NamedPipe(
+            ClientOptions::new()
+                .open(path)
+                .map_err(|e| format!("cannot connect to {path}: {e}"))?,
+        ))
+    }
+}
+
 pub async fn connect(
     socket: &Option<String>,
     tcp: &Option<String>,
@@ -110,11 +149,7 @@ pub async fn connect(
     }
 
     if let Some(path) = socket {
-        return Ok(Transport::Unix(
-            tokio::net::UnixStream::connect(path)
-                .await
-                .map_err(|e| format!("cannot connect to {path}: {e}"))?,
-        ));
+        return connect_ipc(path).await;
     }
 
     if let Some(addr) = tcp {
@@ -148,17 +183,10 @@ pub async fn connect(
 
     let path = default_local_socket();
     ensure_local_server(&path).await?;
-    Ok(Transport::Unix(
-        tokio::net::UnixStream::connect(&path)
-            .await
-            .map_err(|e| format!("cannot connect to {path}: {e}"))?,
-    ))
+    connect_ipc(&path).await
 }
 
-/// Start a local blit-server if the socket doesn't exist yet.
-///
-/// If the socket file exists but no server is listening (stale socket from a
-/// crashed process), the file is removed and a fresh server is spawned.
+#[cfg(unix)]
 pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
     if std::path::Path::new(socket_path).exists() {
         match tokio::net::UnixStream::connect(socket_path).await {
@@ -175,7 +203,8 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000),
-        socket_path: socket_path.to_string(),
+        ipc_path: socket_path.to_string(),
+        #[cfg(unix)]
         fd_channel: None,
         verbose: false,
     };
@@ -187,4 +216,29 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Err("server did not create socket in time".into())
+}
+
+#[cfg(windows)]
+pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
+    if connect_ipc(pipe_path).await.is_ok() {
+        return Ok(());
+    }
+    let config = blit_server::Config {
+        shell: std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
+        shell_flags: String::new(),
+        scrollback: std::env::var("BLIT_SCROLLBACK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000),
+        ipc_path: pipe_path.to_string(),
+        verbose: false,
+    };
+    tokio::spawn(blit_server::run(config));
+    for _ in 0..100 {
+        if connect_ipc(pipe_path).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err("server did not create pipe in time".into())
 }

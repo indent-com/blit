@@ -1,9 +1,11 @@
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 
 fn usage() -> &'static str {
     "usage: blit-server [--socket PATH] [--fd-channel FD] [--shell-flags FLAGS] [PATH]"
 }
 
+#[cfg(unix)]
 fn parse_fd_value(s: &str, label: &str) -> RawFd {
     s.parse::<RawFd>().unwrap_or_else(|_| {
         eprintln!("invalid fd number for {label}: {s}");
@@ -12,13 +14,24 @@ fn parse_fd_value(s: &str, label: &str) -> RawFd {
 }
 
 fn parse_config() -> blit_server::Config {
+    #[cfg(unix)]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let mut shell_flags = std::env::var("BLIT_SHELL_FLAGS").unwrap_or_else(|_| "li".into());
+    #[cfg(windows)]
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+
+    let mut shell_flags = std::env::var("BLIT_SHELL_FLAGS").unwrap_or_else(|_| {
+        if cfg!(unix) {
+            "li".into()
+        } else {
+            String::new()
+        }
+    });
     let scrollback = std::env::var("BLIT_SCROLLBACK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10_000);
-    let mut socket_path = std::env::var("BLIT_SOCK").ok();
+    let mut ipc_path = std::env::var("BLIT_SOCK").ok();
+    #[cfg(unix)]
     let mut fd_channel: Option<RawFd> = std::env::var("BLIT_FD_CHANNEL")
         .ok()
         .map(|s| parse_fd_value(&s, "BLIT_FD_CHANNEL"));
@@ -31,9 +44,9 @@ fn parse_config() -> blit_server::Config {
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             println!("{}", usage());
-            println!("  --socket PATH            Unix socket path (or set BLIT_SOCK)");
+            println!("  --socket PATH            IPC socket/pipe path (or set BLIT_SOCK)");
             println!(
-                "  --fd-channel FD          Accept clients via fd-passing on FD (or set BLIT_FD_CHANNEL)"
+                "  --fd-channel FD          Accept clients via fd-passing on FD (Unix only, or set BLIT_FD_CHANNEL)"
             );
             println!(
                 "  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)"
@@ -48,12 +61,12 @@ fn parse_config() -> blit_server::Config {
         }
 
         if let Some(value) = arg.strip_prefix("--socket=") {
-            socket_path = Some(value.to_owned());
+            ipc_path = Some(value.to_owned());
             continue;
         }
 
         if arg == "--socket" {
-            socket_path = Some(args.next().unwrap_or_else(|| {
+            ipc_path = Some(args.next().unwrap_or_else(|| {
                 eprintln!("missing value for --socket");
                 eprintln!("{}", usage());
                 std::process::exit(2);
@@ -61,11 +74,13 @@ fn parse_config() -> blit_server::Config {
             continue;
         }
 
+        #[cfg(unix)]
         if let Some(value) = arg.strip_prefix("--fd-channel=") {
             fd_channel = Some(parse_fd_value(value, "--fd-channel"));
             continue;
         }
 
+        #[cfg(unix)]
         if arg == "--fd-channel" {
             let value = args.next().unwrap_or_else(|| {
                 eprintln!("missing value for --fd-channel");
@@ -101,7 +116,7 @@ fn parse_config() -> blit_server::Config {
             std::process::exit(2);
         }
 
-        if socket_path.replace(arg).is_some() {
+        if ipc_path.replace(arg).is_some() {
             eprintln!("multiple socket paths provided");
             eprintln!("{}", usage());
             std::process::exit(2);
@@ -112,7 +127,8 @@ fn parse_config() -> blit_server::Config {
         shell,
         shell_flags,
         scrollback,
-        socket_path: socket_path.unwrap_or_else(blit_server::default_socket_path),
+        ipc_path: ipc_path.unwrap_or_else(blit_server::default_ipc_path),
+        #[cfg(unix)]
         fd_channel,
         verbose,
     }

@@ -11,8 +11,12 @@ use str0m::channel::ChannelId;
 use str0m::net::Receive;
 use str0m::{Candidate, Event, Input, Output, Rtc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+
+#[cfg(unix)]
+type IpcStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -107,7 +111,7 @@ pub async fn handle_peer(
         .send(msg)
         .map_err(|e| format!("send failed: {e}"))?;
 
-    let mut blit_conn: Option<UnixStream> = None;
+    let mut blit_conn: Option<IpcStream> = None;
     let mut blit_channel: Option<ChannelId> = None;
     let mut buf = vec![0u8; 65535];
     let mut signaling_alive = true;
@@ -134,8 +138,23 @@ pub async fn handle_peer(
                             verbose!("data channel opened: {label}");
                             if label == "blit" {
                                 blit_channel = Some(cid);
-                                let stream = UnixStream::connect(&sock_path).await?;
-                                blit_conn = Some(stream);
+                                #[cfg(unix)]
+                                {
+                                    blit_conn =
+                                        Some(tokio::net::UnixStream::connect(&sock_path).await?);
+                                }
+                                #[cfg(windows)]
+                                {
+                                    blit_conn = Some(
+                                        tokio::net::windows::named_pipe::ClientOptions::new()
+                                            .open(&sock_path)
+                                            .map_err(
+                                                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                                    e.to_string().into()
+                                                },
+                                            )?,
+                                    );
+                                }
                                 established.store(true, Ordering::Relaxed);
                             }
                         }

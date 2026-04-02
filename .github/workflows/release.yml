@@ -50,8 +50,54 @@ jobs:
           name: tarballs-${{ matrix.label }}
           path: dist/*.tar.gz
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+      - name: Build web-app
+        shell: bash
+        run: |
+          cargo install wasm-pack
+          cd crates/browser
+          wasm-pack build --target web --release --out-dir pkg
+          cd ../..
+          cd js
+          pnpm install --frozen-lockfile
+          pnpm --filter @blit-sh/core run build
+          pnpm --filter @blit-sh/react run build
+          pnpm --filter blit-web-app run build
+      - name: Build release binaries
+        run: cargo build --release -p blit-cli -p blit-server -p blit-gateway -p blit-webrtc-forwarder
+      - name: Package zips
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for bin in blit blit-server blit-gateway blit-webrtc-forwarder; do
+            cp "target/release/${bin}.exe" "${bin}.exe"
+            7z a "dist/${bin}_${version}_windows_x86_64.zip" "${bin}.exe"
+            rm "${bin}.exe"
+          done
+          ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+
   release:
-    needs: [build-debs, build-tarballs]
+    needs: [build-debs, build-tarballs, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -66,10 +112,16 @@ jobs:
           merge-multiple: true
           path: tarballs
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: windows
+
       - name: List artifacts
         run: |
           ls -lh debs/
           ls -lh tarballs/
+          ls -lh windows/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -77,6 +129,7 @@ jobs:
           files: |
             debs/*.deb
             tarballs/*.tar.gz
+            windows/*.zip
           generate_release_notes: true
 
   publish-crates:
@@ -110,7 +163,7 @@ jobs:
           client-payload: '{"version": "${{ github.ref_name }}"}'
 
   apt-repo:
-    needs: [build-debs, build-tarballs]
+    needs: [build-debs, build-tarballs, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,6 +179,11 @@ jobs:
           pattern: tarballs-*
           merge-multiple: true
           path: tarballs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: windows
 
       - name: Import GPG key
         run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
@@ -146,11 +204,15 @@ jobs:
           for f in tarballs/*.tar.gz; do
             cp "$f" repo/bin/
           done
+          for f in windows/*.zip; do
+            cp "$f" repo/bin/
+          done
 
           # Write version to /latest
           echo "${GITHUB_REF_NAME#v}" > repo/latest
 
           cp install.sh repo/index.html
+          cp install.ps1 repo/install.ps1
 
           cd repo
           dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages

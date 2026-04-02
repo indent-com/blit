@@ -15,5 +15,18 @@ path = "src/lib.rs"
 blit-remote = { workspace = true }
 blit-alacritty = { workspace = true }
 tokio = { version = "1", features = ["full"] }
-libc = "0.2"
 memchr = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }

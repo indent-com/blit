@@ -5,8 +5,30 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use web_transport_quinn as wt;
+
+#[cfg(unix)]
+type IpcStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+async fn connect_ipc(path: &str) -> Result<IpcStream, String> {
+    #[cfg(unix)]
+    {
+        UnixStream::connect(path)
+            .await
+            .map_err(|e| format!("cannot connect to {path}: {e}"))
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        ClientOptions::new()
+            .open(path)
+            .map_err(|e| format!("cannot connect to {path}: {e}"))
+    }
+}
 
 /// Wraps TcpListener to set TCP_NODELAY on every accepted connection,
 /// disabling Nagle's algorithm for low-latency frame delivery.
@@ -113,16 +135,24 @@ async fn main() {
         std::process::exit(1);
     });
     let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
-        if let Ok(dir) = std::env::var("TMPDIR") {
-            return format!("{dir}/blit.sock");
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = std::env::var("TMPDIR") {
+                return format!("{dir}/blit.sock");
+            }
+            if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+                return format!("{dir}/blit.sock");
+            }
+            if let Ok(user) = std::env::var("USER") {
+                return format!("/tmp/blit-{user}.sock");
+            }
+            "/tmp/blit.sock".into()
         }
-        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            return format!("{dir}/blit.sock");
+        #[cfg(windows)]
+        {
+            let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+            format!(r"\\.\pipe\blit-{user}")
         }
-        if let Ok(user) = std::env::var("USER") {
-            return format!("/tmp/blit-{user}.sock");
-        }
-        "/tmp/blit.sock".into()
     });
     let addr = std::env::var("BLIT_ADDR").unwrap_or_else(|_| "0.0.0.0:3264".into());
     let quic_enabled = std::env::var("BLIT_QUIC")
@@ -282,7 +312,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
     }
     eprintln!("client authenticated");
 
-    let stream = match UnixStream::connect(&state.sock_path).await {
+    let stream = match connect_ipc(&state.sock_path).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot connect to blit-server: {e}");
@@ -292,7 +322,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
         }
     };
     let _ = ws.send(Message::Text("ok".into())).await;
-    let (mut sock_reader, mut sock_writer) = stream.into_split();
+    let (mut sock_reader, mut sock_writer) = tokio::io::split(stream);
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     let mut ws_to_sock = tokio::spawn(async move {
@@ -583,8 +613,10 @@ async fn handle_webtransport_session(
     eprintln!("webtransport client authenticated");
 
     // --- Proxy to blit-server ---
-    let stream = UnixStream::connect(&state.sock_path).await?;
-    let (mut sock_reader, mut sock_writer) = stream.into_split();
+    let stream = connect_ipc(&state.sock_path)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let (mut sock_reader, mut sock_writer) = tokio::io::split(stream);
 
     // Client → server: read length-prefixed frames from WebTransport, forward to Unix socket
     let mut client_to_sock = tokio::spawn(async move {

@@ -199,7 +199,8 @@ enum Command {
         #[arg(long)]
         scrollback: Option<usize>,
 
-        /// Accept clients via fd-passing on this file descriptor
+        /// Accept clients via fd-passing on this file descriptor (Unix only)
+        #[cfg(unix)]
         #[arg(long)]
         fd_channel: Option<i32>,
     },
@@ -249,17 +250,29 @@ async fn main() {
         Command::Server {
             shell_flags,
             scrollback,
+            #[cfg(unix)]
             fd_channel,
         } => {
-            let socket_path = cli
+            let ipc_path = cli
                 .connect
                 .socket
-                .unwrap_or_else(blit_server::default_socket_path);
+                .unwrap_or_else(blit_server::default_ipc_path);
+
+            #[cfg(unix)]
+            let shell_default = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            #[cfg(windows)]
+            let shell_default = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+
+            #[cfg(unix)]
+            let flags_default = "li";
+            #[cfg(windows)]
+            let flags_default = "";
+
             let config = blit_server::Config {
-                shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                shell: shell_default,
                 shell_flags: shell_flags
                     .or_else(|| std::env::var("BLIT_SHELL_FLAGS").ok())
-                    .unwrap_or_else(|| "li".into()),
+                    .unwrap_or_else(|| flags_default.into()),
                 scrollback: scrollback
                     .or_else(|| {
                         std::env::var("BLIT_SCROLLBACK")
@@ -267,7 +280,8 @@ async fn main() {
                             .and_then(|s| s.parse().ok())
                     })
                     .unwrap_or(10_000),
-                socket_path,
+                ipc_path,
+                #[cfg(unix)]
                 fd_channel: fd_channel.or_else(|| {
                     std::env::var("BLIT_FD_CHANNEL")
                         .ok()
@@ -304,7 +318,7 @@ async fn main() {
                 .connect
                 .socket
                 .clone()
-                .unwrap_or_else(blit_server::default_socket_path);
+                .unwrap_or_else(blit_server::default_ipc_path);
             if let Err(e) = transport::ensure_local_server(&sock_path).await {
                 eprintln!("blit: {e}");
                 std::process::exit(1);
@@ -487,7 +501,16 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
             .exec();
         Err(format!("exec failed: {err}").into())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("powershell")
+            .args(["-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&tmp)
+            .env("BLIT_INSTALL_DIR", install_dir)
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let status = std::process::Command::new("sh")
             .arg(&tmp)

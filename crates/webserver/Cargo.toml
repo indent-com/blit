@@ -12,5 +12,5 @@ blit-fonts = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["sync", "time"] }
 futures-util = "0.3"
-notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+notify = "7"
 percent-encoding = "2"
