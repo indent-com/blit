@@ -24,16 +24,15 @@ export interface BlitProviderProps extends BlitContextValue {
 }
 
 export function BlitWorkspaceProvider(props: BlitProviderProps) {
+  const value: BlitContextValue = {
+    get workspace() { return props.workspace; },
+    get palette() { return props.palette; },
+    get fontFamily() { return props.fontFamily; },
+    get fontSize() { return props.fontSize; },
+    get advanceRatio() { return props.advanceRatio; },
+  };
   return (
-    <BlitContext.Provider
-      value={{
-        workspace: props.workspace,
-        palette: props.palette,
-        fontFamily: props.fontFamily,
-        fontSize: props.fontSize,
-        advanceRatio: props.advanceRatio,
-      }}
-    >
+    <BlitContext.Provider value={value}>
       {props.children}
     </BlitContext.Provider>
   );

@@ -121,31 +121,34 @@
         cargoPkg = "blit-webrtc-forwarder";
       };
 
-      coreNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/core;
-        hash = "sha256-hcA8zIYwk4eEd0Fx4B2eVuYHzW8Vi9KFVeSAJNj2ECo=";
+      jsPnpmDeps = pkgs.pnpm.fetchDeps {
+        pname = "blit-js";
+        inherit version;
+        src = ../.;
+        sourceRoot = "blit/js";
+        fetcherVersion = 3;
+        hash = "sha256-6HAXX6x56WYuNDYPJFkyPF6OGHFK2VEQZuYMcxCHXYE=";
+        prePnpmInstall = ''
+          chmod -R u+w ..
+          mkdir -p ../crates/browser/pkg
+          echo '{"name":"@blit-sh/browser","version":"0.0.0","main":"blit_browser.js"}' > ../crates/browser/pkg/package.json
+          touch ../crates/browser/pkg/blit_browser.js
+        '';
       };
 
-      reactNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/react;
-        hash = "sha256-JktyvG2qDeoBxz2rnEZ69toKni6++Dt0DlrMWld8WUQ=";
-      };
-
-      websiteNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/website;
-        hash = "sha256-Ov0ZMh+i1u56wXbO5FTd9Z5Kahqq1AIi2HCwD+gMOJM=";
-      };
-
-      webAppNpmDeps = pkgs.fetchNpmDeps {
-        src = ../js/web-app;
-        hash = "sha256-OgNos+GJ3tf5N3JZlygEdbAz2a6LQLoiBd87n29zYPg=";
-      };
+      installJsDeps = ''
+        export HOME=$TMPDIR
+        export STORE_PATH=$(mktemp -d)
+        ${pkgs.zstd}/bin/zstd -d ${jsPnpmDeps}/pnpm-store.tar.zst --stdout | tar -xf - -C "$STORE_PATH"
+        chmod -R +w "$STORE_PATH"
+        (cd js && pnpm config set store-dir "$STORE_PATH" && pnpm config set package-import-method clone-or-copy && pnpm install --offline --frozen-lockfile)
+      '';
 
       webAppDist = pkgs.stdenv.mkDerivation {
         pname = "blit-web-app";
         inherit version;
         src = ../.;
-        nativeBuildInputs = [ pkgs.nodejs ];
+        nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm ];
         buildPhase = ''
           export HOME=$TMPDIR
 
@@ -161,17 +164,8 @@
             cp "$d"/* "crates/browser/pkg/snippets/$name/"
           done
 
-          cp -r ${coreNpmDeps} "$TMPDIR/core-cache"
-          chmod -R u+w "$TMPDIR/core-cache"
-          (cd js/core && npm ci --cache "$TMPDIR/core-cache" && node node_modules/typescript/bin/tsc)
-
-          cp -r ${reactNpmDeps} "$TMPDIR/react-cache"
-          chmod -R u+w "$TMPDIR/react-cache"
-          (cd js/react && npm ci --cache "$TMPDIR/react-cache" && node node_modules/typescript/bin/tsc)
-
-          cp -r ${webAppNpmDeps} "$TMPDIR/webapp-cache"
-          chmod -R u+w "$TMPDIR/webapp-cache"
-          (cd js/web-app && npm ci --cache "$TMPDIR/webapp-cache" && node node_modules/vite/bin/vite.js build)
+          ${installJsDeps}
+          (cd js/web-app && pnpm vite build)
         '';
         installPhase = ''
           mkdir -p $out
@@ -184,7 +178,7 @@
         pname = "blit-website";
         inherit version;
         src = ../.;
-        nativeBuildInputs = [ pkgs.nodejs ];
+        nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm ];
         buildPhase = ''
           export HOME=$TMPDIR
 
@@ -200,9 +194,8 @@
             cp "$d"/* "crates/browser/pkg/snippets/$name/"
           done
 
-          cp -r ${websiteNpmDeps} "$TMPDIR/website-cache"
-          chmod -R u+w "$TMPDIR/website-cache"
-          (cd js/website && npm ci --cache "$TMPDIR/website-cache" && node node_modules/vite/bin/vite.js build && node node_modules/vite/bin/vite.js build --ssr src/entry-server.tsx && node prerender.js)
+          ${installJsDeps}
+          (cd js/website && pnpm vite build && pnpm vite build --ssr src/entry-server.tsx && node prerender.js)
         '';
         installPhase = ''
           mkdir -p $out
@@ -363,7 +356,6 @@
           pkgs.nodejs
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
-          pkgs.prefetch-npm-deps
           pkgs.process-compose
           pkgs.samply
           pkgs.scdoc

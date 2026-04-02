@@ -46,12 +46,12 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@blit-sh/core": ">=0.16.3",
+    "@blit-sh/core": ">=0.17.0",
     "react": ">=18.0.0",
     "react-dom": ">=18.0.0"
   },
   "devDependencies": {
-    "@blit-sh/core": "file:../core",
+    "@blit-sh/core": "workspace:*",
     "@testing-library/react": "^16",
     "@types/react": "^19",
     "@types/react-dom": "^19",

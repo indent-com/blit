@@ -403,7 +403,7 @@ in {
       echo "=== Rust tests ==="
       cargo test --workspace
       echo ""
-      echo "=== Core tests ==="
+      echo "=== JS tests ==="
       mkdir -p crates/browser/pkg
       if [ ! -f crates/browser/pkg/package.json ]; then
         echo '{"name":"@blit-sh/browser","version":"0.0.0","main":"blit_browser.js"}' > crates/browser/pkg/package.json
@@ -411,10 +411,13 @@ in {
       if [ ! -f crates/browser/pkg/blit_browser.js ]; then
         touch crates/browser/pkg/blit_browser.js
       fi
-      (cd js/core && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
+      (cd js && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; })
+      echo ""
+      echo "=== Core tests ==="
+      (cd js/core && pnpm vitest run)
       echo ""
       echo "=== React tests ==="
-      (cd js/react && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm vitest run)
+      (cd js/react && pnpm vitest run)
 
       export BLIT_SERVER="${blit-server}/bin/blit-server"
       echo ""

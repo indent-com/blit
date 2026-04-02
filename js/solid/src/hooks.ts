@@ -1,4 +1,4 @@
-import { createSignal, onCleanup } from "solid-js";
+import { createSignal, onCleanup, type Accessor } from "solid-js";
 import type {
   BlitWorkspaceSnapshot,
   BlitSession,
@@ -8,7 +8,7 @@ import type {
 } from "@blit-sh/core";
 import { useBlitContext } from "./BlitContext";
 
-export function useBlitWorkspaceState(): () => BlitWorkspaceSnapshot {
+export function useBlitWorkspaceState(): Accessor<BlitWorkspaceSnapshot> {
   const ctx = useBlitContext();
   const [snap, setSnap] = createSignal(ctx.workspace.getSnapshot());
   const unsub = ctx.workspace.subscribe(() => setSnap(ctx.workspace.getSnapshot()));
@@ -16,18 +16,20 @@ export function useBlitWorkspaceState(): () => BlitWorkspaceSnapshot {
   return snap;
 }
 
-export function useBlitSession(sessionId: SessionId | null | undefined): () => BlitSession | undefined {
+export function useBlitSession(sessionId: Accessor<SessionId | null | undefined>): Accessor<BlitSession | undefined> {
   const state = useBlitWorkspaceState();
   return () => {
-    if (sessionId == null) return undefined;
-    return state().sessions.find((s) => s.id === sessionId);
+    const id = sessionId();
+    if (id == null) return undefined;
+    return state().sessions.find((s) => s.id === id);
   };
 }
 
-export function useBlitConnection(connectionId: ConnectionId | null | undefined): () => BlitConnectionSnapshot | undefined {
+export function useBlitConnection(connectionId: Accessor<ConnectionId | null | undefined>): Accessor<BlitConnectionSnapshot | undefined> {
   const state = useBlitWorkspaceState();
   return () => {
-    if (connectionId == null) return undefined;
-    return state().connections.find((c) => c.id === connectionId);
+    const id = connectionId();
+    if (id == null) return undefined;
+    return state().connections.find((c) => c.id === id);
   };
 }

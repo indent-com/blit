@@ -428,6 +428,12 @@ export class TerminalView {
     conn.retain(sid);
     this.sessionCleanups.push(() => conn.release(sid));
 
+    if (!this._readOnly) {
+      this.viewId = conn.allocViewId();
+      const vid = this.viewId;
+      this.sessionCleanups.push(() => conn.removeView(sid, vid));
+    }
+
     const t = conn.getTerminal(sid);
     if (t) {
       this.terminal = t;
@@ -473,7 +479,6 @@ export class TerminalView {
     for (const fn of this.sessionCleanups) fn();
     this.sessionCleanups.length = 0;
     this.terminal = null;
-    this.viewId = null;
   }
 
   private handleResize = (): void => {
@@ -499,24 +504,14 @@ export class TerminalView {
   private setupResizeObserver(): void {
     if (this._readOnly) return;
 
-    if (!this.viewId && this.blitConn) {
-      this.viewId = this.blitConn.allocViewId();
-    }
-
     const observer = new ResizeObserver(this.handleResize);
     observer.observe(this.container);
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
 
-    const sid = this._sessionId;
-    const conn = this.blitConn;
-    const vid = this.viewId;
     this.cleanups.push(() => {
       observer.disconnect();
       window.removeEventListener("resize", this.handleResize);
-      if (sid !== null && conn && vid) {
-        conn.removeView(sid, vid);
-      }
     });
 
     const checkStatus = () => {

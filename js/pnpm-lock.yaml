@@ -36,7 +36,7 @@ importers:
         specifier: file:../../crates/browser/pkg
         version: blit-browser@file:../crates/browser/pkg
       '@blit-sh/core':
-        specifier: file:../core
+        specifier: workspace:*
         version: link:../core
       '@testing-library/react':
         specifier: ^16
@@ -72,7 +72,7 @@ importers:
         specifier: file:../../crates/browser/pkg
         version: blit-browser@file:../crates/browser/pkg
       '@blit-sh/core':
-        specifier: file:../core
+        specifier: workspace:*
         version: link:../core
       solid-js:
         specifier: ^1.9
