@@ -147,9 +147,7 @@ pub async fn connect(
     }
 
     let path = default_local_socket();
-    if !std::path::Path::new(&path).exists() {
-        ensure_local_server(&path).await?;
-    }
+    ensure_local_server(&path).await?;
     Ok(Transport::Unix(
         tokio::net::UnixStream::connect(&path)
             .await
@@ -158,9 +156,17 @@ pub async fn connect(
 }
 
 /// Start a local blit-server if the socket doesn't exist yet.
+///
+/// If the socket file exists but no server is listening (stale socket from a
+/// crashed process), the file is removed and a fresh server is spawned.
 pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
     if std::path::Path::new(socket_path).exists() {
-        return Ok(());
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(_) => return Ok(()),
+            Err(_) => {
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
     }
     let config = blit_server::Config {
         shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
