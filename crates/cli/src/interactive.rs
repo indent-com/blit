@@ -929,7 +929,6 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
         match ws.recv().await {
             Some(Ok(Message::Text(pass))) => {
                 if pass.trim() == state.token {
-                    let _ = ws.send(Message::Text("ok".into())).await;
                     break true;
                 } else {
                     let _ = ws.close().await;
@@ -955,6 +954,7 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
             return;
         }
     };
+    let _ = ws.send(Message::Text("ok".into())).await;
     eprintln!("blit: browser client connected");
 
     let (mut transport_reader, mut transport_writer) = transport.split();

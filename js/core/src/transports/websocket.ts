@@ -12,6 +12,7 @@ export class WebSocketTransport implements BlitTransport {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private currentDelay: number;
+  private connectedAt: number = 0;
   private disposed = false;
   private messageListeners = new Set<(data: ArrayBuffer) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
@@ -204,7 +205,7 @@ export class WebSocketTransport implements BlitTransport {
           this.clearConnectTimer();
           this.authRejected = false;
           this.lastError = null;
-          this.currentDelay = this.initialDelay;
+          this.connectedAt = Date.now();
           this.setStatus("connected");
         } else if (e.data === "auth") {
           this.authRejected = true;
@@ -240,11 +241,14 @@ export class WebSocketTransport implements BlitTransport {
       this.clearConnectTimer();
       this.ws = null;
       if (authenticated) {
+        const stableMs = 5_000;
+        if (Date.now() - this.connectedAt >= stableMs) {
+          this.currentDelay = this.initialDelay;
+        }
         this.setStatus("disconnected");
       } else {
         this.setStatus(this.authRejected ? "error" : "disconnected");
       }
-      // Always retry unless auth was explicitly rejected or reconnect is off.
       if (!this.authRejected) {
         this.scheduleReconnect();
       }
