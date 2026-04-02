@@ -426,7 +426,7 @@ function resolveTransport(
     case "webtransport":
       return new WebTransportTransport(config.url, config.passphrase, config.options);
     case "share":
-      return createShareTransport(config.hubUrl, config.passphrase);
+      return createShareTransport(config.hubUrl, config.passphrase, config.debug);
     case "custom":
       return config.transport;
   }

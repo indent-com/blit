@@ -18,6 +18,7 @@ export { createShareTransport } from "./transports/webrtc-share";
 export { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
 export type {
   BlitConnectionSnapshot,
+  BlitDebug,
   BlitSearchResult,
   BlitWorkspaceSnapshot,
   BlitTransport,

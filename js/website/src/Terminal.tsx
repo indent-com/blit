@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, type MouseEvent as ReactMouseEvent } from "react";
+import { useState, useEffect, useCallback, useRef, useSyncExternalStore, type MouseEvent as ReactMouseEvent } from "react";
 import {
   BlitTerminal,
   BlitWorkspaceProvider,
@@ -10,6 +10,7 @@ import {
 import type { BlitTerminalHandle } from "@blit-sh/react";
 import { BlitWorkspace, PALETTES } from "@blit-sh/core";
 import type {
+  BlitDebug,
   BlitSession,
   BlitWasmModule,
   SessionId,
@@ -19,6 +20,102 @@ import { initWasm } from "./wasm";
 
 const HUB_URL = "wss://hub.blit.sh";
 const CONNECTION_ID = "main";
+
+type DebugEntry = { t: number; level: "log" | "warn" | "error"; msg: string };
+
+class DebugLog implements BlitDebug {
+  private entries: DebugEntry[] = [];
+  private snapshot: readonly DebugEntry[] = [];
+  private listeners = new Set<() => void>();
+
+  private push(level: DebugEntry["level"], msg: string, args: unknown[]) {
+    const formatted = args.length
+      ? msg.replace(/%[sdo]/g, () => {
+          const a = args.shift();
+          return typeof a === "object" ? JSON.stringify(a) : String(a);
+        })
+      : msg;
+    this.entries.push({ t: Date.now(), level, msg: formatted });
+    if (this.entries.length > 500) this.entries.shift();
+    this.snapshot = [...this.entries];
+    for (const l of this.listeners) l();
+  }
+
+  log(msg: string, ...args: unknown[]) { this.push("log", msg, args); }
+  warn(msg: string, ...args: unknown[]) { this.push("warn", msg, args); }
+  error(msg: string, ...args: unknown[]) { this.push("error", msg, args); }
+
+  subscribe(listener: () => void) {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  getSnapshot() { return this.snapshot; }
+}
+
+function useDebugPanel() {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "d") {
+        e.preventDefault();
+        setOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+  return [open, setOpen] as const;
+}
+
+function DebugPanel({ log, onClose }: { log: DebugLog; onClose: () => void }) {
+  const entries = useSyncExternalStore(
+    (cb) => log.subscribe(cb),
+    () => log.getSnapshot(),
+  );
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [entries.length]);
+
+  const colors = { log: "#8b949e", warn: "#d29922", error: "#f85149" };
+
+  return (
+    <div style={{
+      position: "fixed", top: 0, right: 0, bottom: 0, width: 420,
+      background: "rgba(13,17,23,0.95)", borderLeft: "1px solid #30363d",
+      display: "flex", flexDirection: "column", zIndex: 9999,
+      fontFamily: "'Fira Code', monospace", fontSize: 11,
+    }}>
+      <div style={{
+        padding: "8px 12px", borderBottom: "1px solid #30363d",
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        color: "#c9d1d9", fontWeight: 700, fontSize: 12,
+      }}>
+        <span>blit debug</span>
+        <button onClick={onClose} style={{
+          background: "none", border: "none", color: "#8b949e",
+          cursor: "pointer", fontSize: 14, padding: "2px 6px",
+        }}>✕</button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}>
+        {entries.map((e, i) => (
+          <div key={i} style={{
+            padding: "2px 12px", color: colors[e.level],
+            borderLeft: e.level !== "log" ? `2px solid ${colors[e.level]}` : "2px solid transparent",
+          }}>
+            <span style={{ opacity: 0.5 }}>
+              {new Date(e.t).toISOString().slice(11, 23)}
+            </span>{" "}
+            {e.msg}
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
+    </div>
+  );
+}
 const FONT_FAMILY = "'Fira Code', monospace";
 const FONT_SIZE = 14;
 const AUTOCLOSE_DELAY = 1000;
@@ -103,11 +200,14 @@ function TerminalInner({
   passphrase: string;
   dark: boolean;
 }) {
+  const [debugLog] = useState(() => new DebugLog());
+  const [debugOpen, setDebugOpen] = useDebugPanel();
+
   const [workspace] = useState(() => new BlitWorkspace({
     wasm,
     connections: [{
       id: CONNECTION_ID,
-      transport: { type: "share", hubUrl: HUB_URL, passphrase },
+      transport: { type: "share", hubUrl: HUB_URL, passphrase, debug: debugLog },
     }],
   }));
 
@@ -121,6 +221,7 @@ function TerminalInner({
       fontSize={FONT_SIZE}
     >
       <TabShell palette={palette} dark={dark} passphrase={passphrase} />
+      {debugOpen && <DebugPanel log={debugLog} onClose={() => setDebugOpen(false)} />}
     </BlitWorkspaceProvider>
   );
 }

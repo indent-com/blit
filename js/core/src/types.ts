@@ -12,6 +12,12 @@ export interface TerminalPalette {
   ansi: Array<[number, number, number]>;
 }
 
+export interface BlitDebug {
+  log(msg: string, ...args: unknown[]): void;
+  warn(msg: string, ...args: unknown[]): void;
+  error(msg: string, ...args: unknown[]): void;
+}
+
 /** Connection lifecycle states. */
 export type ConnectionStatus =
   | "connecting"
@@ -134,7 +140,7 @@ export type TransportConfig =
       passphrase: string;
       options?: BlitTransportOptions & { certHash?: string };
     }
-  | { type: "share"; hubUrl: string; passphrase: string }
+  | { type: "share"; hubUrl: string; passphrase: string; debug?: BlitDebug }
   | { type: "custom"; transport: BlitTransport };
 
 export const DEFAULT_FONT = "ui-monospace, monospace";
