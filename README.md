@@ -11,7 +11,7 @@ docker run --rm grab/blit-demo
 Or install and run locally:
 
 ```bash
-curl https://install.blit.sh | sh
+curl -sf https://install.blit.sh | sh
 blit # opens a browser
 ```
 
@@ -40,7 +40,7 @@ The server auto-starts when needed.
 ## Install
 
 ```bash
-curl https://install.blit.sh | sh
+curl -sf https://install.blit.sh | sh
 ```
 
 ### macOS (Homebrew)

@@ -14,7 +14,7 @@ Drive terminal sessions programmatically through stateless CLI subcommands. Each
 ## Install
 
 ```bash
-curl https://install.blit.sh | sh
+curl -sf https://install.blit.sh | sh
 ```
 
 macOS (Homebrew):

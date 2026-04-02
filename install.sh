@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install blit — https://blit.sh
-# Usage: curl https://install.blit.sh | sh
+# Usage: curl -sf https://install.blit.sh | sh
 set -eu
 
 REPO="https://install.blit.sh"

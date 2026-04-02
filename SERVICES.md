@@ -6,7 +6,7 @@ This document describes the hosted services and CI/CD infrastructure that suppor
 
 `install.blit.sh` is an APT repository and binary download site hosted on **GitHub Pages**. It is rebuilt and deployed on every tagged release (`v*`). Users interact with it in three ways:
 
-1. **Curl installer** — `curl https://install.blit.sh | sh` fetches the install script (served as `index.html`), which detects OS/arch, downloads the right tarball from `/bin/`, and installs it.
+1. **Curl installer** — `curl -sf https://install.blit.sh | sh` fetches the install script (served as `index.html`), which detects OS/arch, downloads the right tarball from `/bin/`, and installs it.
 2. **APT repository** — Debian/Ubuntu users add it as a signed APT source for `apt install blit`.
 3. **Direct download** — tarballs are available at `/bin/blit_<version>_<os>_<arch>.tar.gz`.
 
