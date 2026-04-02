@@ -24,7 +24,16 @@ This is preferred over the official Nix installer because it enables flakes and 
 # macOS
 brew install direnv
 
-# Nix (if you prefer)
+# Linux (Debian/Ubuntu)
+sudo apt install direnv
+
+# Linux (Fedora)
+sudo dnf install direnv
+
+# Linux (Arch)
+sudo pacman -S direnv
+
+# Or via Nix on any platform
 nix profile install nixpkgs#direnv
 ```
 
