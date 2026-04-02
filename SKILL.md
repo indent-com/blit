@@ -17,13 +17,26 @@ Drive terminal sessions programmatically through stateless CLI subcommands. Each
 curl https://install.blit.sh | sh
 ```
 
-Platform-specific options:
+macOS (Homebrew):
 
-| Platform | Command |
-| --- | --- |
-| macOS (Homebrew) | `brew install indent-com/tap/blit` |
-| Debian / Ubuntu | See [README.md](README.md#debian--ubuntu-apt) |
-| Nix | `nix profile install github:indent-com/blit#blit` |
+```bash
+brew install indent-com/tap/blit
+```
+
+Debian / Ubuntu (APT):
+
+```bash
+curl -fsSL https://install.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
+echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://install.blit.sh/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/blit.list
+sudo apt update && sudo apt install blit
+```
+
+Nix:
+
+```bash
+nix profile install github:indent-com/blit#blit
+```
 
 ## Running commands
 
