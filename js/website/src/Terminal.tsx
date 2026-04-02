@@ -675,22 +675,23 @@ function TabShell({
           <div
             style={{
               position: "absolute",
-              bottom: 0, left: 0, right: 0,
+              bottom: 16, left: "50%", transform: "translateX(-50%)",
               display: "flex",
               alignItems: "center",
-              justifyContent: "center",
               gap: 12,
               zIndex: 2,
-              padding: "8px 0",
-              background: rgba(palette.bg, 0.85),
-              backdropFilter: "blur(4px)",
-              borderTop: `1px solid ${border}`,
+              padding: "8px 16px",
+              background: rgba(palette.bg, 0.9),
+              backdropFilter: "blur(8px)",
+              border: `1px solid ${border}`,
+              borderRadius: 10,
               fontFamily: "'Fira Code', monospace",
               fontSize: 13,
               color: dimFg,
+              whiteSpace: "nowrap",
             }}
           >
-            <span>Process exited</span>
+            <span>Exited</span>
             <span
               role="button"
               tabIndex={0}
