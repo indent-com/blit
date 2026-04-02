@@ -1,6 +1,31 @@
+Reading material:
+
+- ARCHITECTURE.md
+- EMBEDDING.md
+- README.md
+- SERVICES.md
+- SKILL.md
+- UNSAFE.md
+- js/blit-hub/README.md
+
 # Contributing to blit
 
 This document helps LLM agents (and humans) contribute to the blit codebase. It covers the development workflow, code conventions, and project structure. For the system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md). For user-facing documentation, see [README.md](README.md).
+
+## Documentation maintenance guide
+
+When making changes, update the relevant docs in the same PR.
+
+| Document                | Scope                                                                                                         | Update when...                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`             | User-facing overview: installation, usage, features                                                           | CLI flags, install methods, or supported platforms change                                                                    |
+| `ARCHITECTURE.md`       | System internals: data flow, crate responsibilities, transport layers, rendering pipeline                     | Crates are added/removed/renamed, data flow between components changes, or new transport/rendering mechanisms are introduced |
+| `CONTRIBUTING.md`       | Developer workflow: building, testing, code conventions, project structure                                    | Build steps, test commands, directory layout, or dev tooling changes                                                         |
+| `SERVICES.md`           | Hosted services and CI/CD: install.blit.sh, hub.blit.sh, GitHub Actions workflows, release lifecycle, secrets | CI jobs are added/removed/changed, deployment targets change, new secrets are introduced, or the release process is modified |
+| `EMBEDDING.md`          | Embedding blit in other apps: React components (`@blit-sh/react`), embedding `blit-server` as a library       | Public embedding APIs, component props, or integration patterns change                                                       |
+| `SKILL.md`              | LLM agent skill definition: how to drive terminal sessions via CLI subcommands                                | CLI subcommands used for programmatic terminal control change                                                                |
+| `UNSAFE.md`             | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                      | Unsafe code is added, removed, or its safety invariants change                                                               |
+| `js/blit-hub/README.md` | blit-hub signaling relay: protocol, deployment, configuration                                                 | Hub protocol, endpoints, deployment config, or environment variables change                                                  |
 
 ## Getting started
 
@@ -44,11 +69,13 @@ You'll need to re-run this every time you open a new terminal in the repo.
 ```bash
 cargo build                      # debug build, all crates
 cargo test --workspace           # all Rust tests
-cargo clippy --workspace -- -D warnings   # lint (CI fails on any warning)
-cargo fmt -- --check             # formatting (CI fails on any diff)
+./bin/clippy                     # clippy (CI fails on any warning)
+./bin/fmt --check                # formatting check (CI fails on any diff)
+./bin/fmt                        # auto-fix formatting
+./bin/lint                       # all of the above in one pass
 ```
 
-Run `cargo fmt` to auto-fix formatting before committing.
+`./bin/fmt` runs `cargo fmt` (Rust) and `prettier` (JS/TS/JSON/MD). `./bin/lint` runs fmt check + clippy together — this is what CI runs.
 
 TypeScript (JS workspace — core, react, solid):
 
@@ -69,7 +96,7 @@ E2E (Playwright, requires built binaries):
 ./bin/e2e
 ```
 
-CI runs all three: `./bin/lint`, `./bin/tests`, `./bin/e2e`. These delegate to `nix run .#lint`, etc.
+CI runs `./bin/lint`, `./bin/tests`, and `./bin/e2e`. These delegate to `nix run .#<task>`, etc.
 
 ## Packaging
 
@@ -93,7 +120,7 @@ nix build .#blit-server      # or blit-cli, blit-gateway
 nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
 ```
 
-There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt and `clippy -D warnings` are the only style enforcement.
+There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and `clippy -D warnings` are the style enforcement. `./bin/fmt` runs both formatters in one pass.
 
 ## Dev environment
 
@@ -119,30 +146,30 @@ Most Rust crates are one or two source files. `blit-cli` is split into four and 
 | `crates/cli/src/interactive.rs`      | ~1700 | Console TUI and browser mode                                                                                     |
 | `crates/cli/src/agent.rs`            | ~1300 | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
 | `crates/browser/src/lib.rs`          | ~1200 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
-| `crates/alacritty-driver/src/lib.rs` | ~1200 | Terminal parsing wrapper around `alacritty_terminal`                                                              |
+| `crates/alacritty-driver/src/lib.rs` | ~1200 | Terminal parsing wrapper around `alacritty_terminal`                                                             |
 | `crates/gateway/src/main.rs`         | ~750  | WebSocket/WebTransport proxy                                                                                     |
 | `crates/fonts/src/lib.rs`            | ~660  | Font discovery and TTF/OTF parsing                                                                               |
 | `crates/cli/src/main.rs`             | ~440  | Clap structs and dispatch                                                                                        |
 | `crates/webserver/src/lib.rs`        | ~120  | Shared axum HTTP helpers                                                                                         |
 | `crates/webserver/src/config.rs`     | ~210  | Server configuration types                                                                                       |
-| `crates/cli/src/transport.rs`        | ~180  | Transport abstraction (Unix/TCP/SSH)                                                                              |
+| `crates/cli/src/transport.rs`        | ~180  | Transport abstraction (Unix/TCP/SSH)                                                                             |
 
 ### Non-Rust code
 
-| Directory      | What                                                                                                                |
-| -------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `js/core/`     | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer, `BlitTerminalSurface` |
+| Directory      | What                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `js/core/`     | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer, `BlitTerminalSurface`  |
 | `js/react/`    | `@blit-sh/react` npm package — thin React bindings wrapping `BlitTerminalSurface` from core. Tests in `js/react/src/__tests__/` |
-| `js/solid/`    | `@blit-sh/solid` npm package — thin Solid bindings wrapping `BlitTerminalSurface` from core |
-| `js/web-app/`  | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                |
-| `js/website/`  | Marketing/docs website (Vite + SSR with prerendering)                                                               |
-| `js/blit-hub/` | Signaling relay server (Bun, deployed to Fly.io). See [js/blit-hub/README.md](js/blit-hub/README.md)                |
-| `e2e/`         | Playwright tests against the full stack (6 spec files)                                                              |
-| `examples/`    | fd-channel examples in Python and Bun                                                                               |
-| `nix/`         | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules |
-| `systemd/`     | Socket-activated unit files (user-level and system-level templates) and service units                                |
-| `man/`         | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                  |
-| `bin/`         | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                              |
+| `js/solid/`    | `@blit-sh/solid` npm package — thin Solid bindings wrapping `BlitTerminalSurface` from core                                     |
+| `js/web-app/`  | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                            |
+| `js/website/`  | Marketing/docs website (Vite + SSR with prerendering)                                                                           |
+| `js/blit-hub/` | Signaling relay server (Bun, deployed to Fly.io). See [js/blit-hub/README.md](js/blit-hub/README.md)                            |
+| `e2e/`         | Playwright tests against the full stack (6 spec files)                                                                          |
+| `examples/`    | fd-channel examples in Python and Bun                                                                                           |
+| `nix/`         | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules              |
+| `systemd/`     | Socket-activated unit files (user-level and system-level templates) and service units                                           |
+| `man/`         | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                              |
+| `bin/`         | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                                          |
 
 ## Code conventions
 
@@ -174,16 +201,17 @@ This validates version consistency, bumps all files, runs `cargo test -p blit-se
 
 PRs must be reviewed and pass the following CI checks before merging:
 
-| Check | What it covers |
-| --- | --- |
-| `e2e` | Playwright end-to-end tests (`./bin/e2e`) |
-| `dev-check` | Full-stack smoke test: starts dev services via `process-compose`, waits for health, exercises the CLI, then tears down (`./bin/dev-check`) |
-| `test (macos-latest)` | Rust and JS test suite on macOS |
-| `test (ubuntu-latest)` | Rust and JS test suite on Ubuntu |
+| Check                  | What it covers                                                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `lint`                 | Formatting (`cargo fmt --check` + `prettier --check`) and clippy (`./bin/lint`)                                                            |
+| `e2e`                  | Playwright end-to-end tests (`./bin/e2e`)                                                                                                  |
+| `dev-check`            | Full-stack smoke test: starts dev services via `process-compose`, waits for health, exercises the CLI, then tears down (`./bin/dev-check`) |
+| `test (macos-latest)`  | Rust and JS test suite on macOS                                                                                                            |
+| `test (ubuntu-latest)` | Rust and JS test suite on Ubuntu                                                                                                           |
 
 ## Guardrails
 
-- `cargo clippy -- -D warnings` is the CI gate. Fix all warnings before pushing.
+- `./bin/lint` is the CI gate (fmt + clippy). Run `./bin/fmt` to auto-fix formatting and `./bin/clippy` to check clippy warnings before pushing.
 - The WASM crate (`crates/browser/`) targets `wasm32-unknown-unknown` — don't add dependencies that pull in `std::net`, `std::fs`, etc.
 - `crates/browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the web-app or React tests will work.
 - The server uses raw `libc` calls (`openpty`, `waitpid`, `kill`, `ioctl`) — changes to PTY lifecycle code need careful attention to signal safety and fd leaks.

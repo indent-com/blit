@@ -162,19 +162,19 @@ sudo systemctl enable --now blit-webrtc-forwarder@alice.service
 
 ## How it compares
 
-|                         | blit                           | ttyd                | gotty               | Eternal Terminal      | Mosh                  | xterm.js + node-pty  |
-| ----------------------- | ------------------------------ | ------------------- | ------------------- | --------------------- | --------------------- | -------------------- |
-| Architecture            | Single binary                  | Single binary       | Single binary       | Client + daemon       | Client + server       | Library (BYO server) |
-| Multiple PTYs           | ✅ First-class                 | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual            |
-| Browser access          | ✅                             | ✅                  | ✅                  | ❌                    | ❌                    | ✅                   |
-| Delta updates           | ✅ Only changed cells          | ❌                  | ❌                  | ❌                    | ✅ State diffs        | ❌                   |
-| LZ4 compression         | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
-| Per-client backpressure | ✅ Render-metric pacing        | ❌                  | ❌                  | ⚠️ SSH flow control   | ❌                    | ❌                   |
-| WebGL rendering         | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ⚠️ Addon             |
-| Transport               | WS, WebTransport, WebRTC, Unix | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
-| Embeddable (React/Solid)| ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
-| Agent / CLI subcommands | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
-| SSH tunneling built-in  | ✅                             | ❌                  | ❌                  | ✅                    | ✅                    | ❌                   |
+|                          | blit                           | ttyd                | gotty               | Eternal Terminal      | Mosh                  | xterm.js + node-pty  |
+| ------------------------ | ------------------------------ | ------------------- | ------------------- | --------------------- | --------------------- | -------------------- |
+| Architecture             | Single binary                  | Single binary       | Single binary       | Client + daemon       | Client + server       | Library (BYO server) |
+| Multiple PTYs            | ✅ First-class                 | ❌ One per instance | ❌ One per instance | ❌ One per connection | ❌ One per connection | ⚠️ Manual            |
+| Browser access           | ✅                             | ✅                  | ✅                  | ❌                    | ❌                    | ✅                   |
+| Delta updates            | ✅ Only changed cells          | ❌                  | ❌                  | ❌                    | ✅ State diffs        | ❌                   |
+| LZ4 compression          | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| Per-client backpressure  | ✅ Render-metric pacing        | ❌                  | ❌                  | ⚠️ SSH flow control   | ❌                    | ❌                   |
+| WebGL rendering          | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ⚠️ Addon             |
+| Transport                | WS, WebTransport, WebRTC, Unix | WebSocket           | WebSocket           | TCP                   | UDP                   | WebSocket            |
+| Embeddable (React/Solid) | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ✅                   |
+| Agent / CLI subcommands  | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
+| SSH tunneling built-in   | ✅                             | ❌                  | ❌                  | ✅                    | ✅                    | ❌                   |
 
 ## What lives in this repo
 

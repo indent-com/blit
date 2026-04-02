@@ -169,7 +169,12 @@ export class BlitTerminalSurface {
     this._advanceRatio = options.advanceRatio;
 
     this.dpr = effectiveDpr();
-    this.cell = measureCell(this._fontFamily, this._fontSize, this.dpr, this._advanceRatio);
+    this.cell = measureCell(
+      this._fontFamily,
+      this._fontSize,
+      this.dpr,
+      this._advanceRatio,
+    );
   }
 
   // =========================================================================
@@ -604,8 +609,7 @@ export class BlitTerminalSurface {
   private applyPaletteToTerminal(t: Terminal | null): void {
     if (!t || !this._palette) return;
     t.set_default_colors(...this._palette.fg, ...this._palette.bg);
-    for (let i = 0; i < 16; i++)
-      t.set_ansi_color(i, ...this._palette.ansi[i]);
+    for (let i = 0; i < 16; i++) t.set_ansi_color(i, ...this._palette.ansi[i]);
     this.contentDirty = true;
     this.scheduleRender();
   }
@@ -767,8 +771,16 @@ export class BlitTerminalSurface {
       t.prepare_render_ops();
     }
 
-    const bgVerts = new Float32Array(mem.buffer, t.bg_verts_ptr(), t.bg_verts_len());
-    const glyphVerts = new Float32Array(mem.buffer, t.glyph_verts_ptr(), t.glyph_verts_len());
+    const bgVerts = new Float32Array(
+      mem.buffer,
+      t.bg_verts_ptr(),
+      t.bg_verts_len(),
+    );
+    const glyphVerts = new Float32Array(
+      mem.buffer,
+      t.glyph_verts_ptr(),
+      t.glyph_verts_len(),
+    );
     renderer.resize(pw, ph);
     renderer.render(
       bgVerts,
@@ -932,8 +944,7 @@ export class BlitTerminalSurface {
     const barW = this._scrollbarWidth;
     const barH = Math.max(barW, (viewportRows / totalLines) * canvasH);
     const maxScroll = totalLines - viewportRows;
-    const scrollFraction =
-      Math.min(this.scrollOffset, maxScroll) / maxScroll;
+    const scrollFraction = Math.min(this.scrollOffset, maxScroll) / maxScroll;
     const barY = (1 - scrollFraction) * (canvasH - barH);
     const barX = this._cols * cell.pw - barW - 2;
     this.scrollbarGeo = {
@@ -997,8 +1008,7 @@ export class BlitTerminalSurface {
         const maxScroll = t2 ? t2.scrollback_lines() : 0;
         if (maxScroll > 0 || this.scrollOffset > 0) {
           e.preventDefault();
-          const delta =
-            e.key === "PageUp" ? this._rows : -this._rows;
+          const delta = e.key === "PageUp" ? this._rows : -this._rows;
           this.scrollOffset = Math.max(
             0,
             Math.min(maxScroll, this.scrollOffset + delta),
@@ -1249,10 +1259,7 @@ export class BlitTerminalSurface {
       return t ? t.row_col_map(row) : null;
     };
 
-    const colToTextIdx = (
-      colMap: Uint16Array,
-      col: number,
-    ): number => {
+    const colToTextIdx = (colMap: Uint16Array, col: number): number => {
       for (let i = 0; i < colMap.length; i++) {
         if (colMap[i] === col) return i;
       }
@@ -1269,8 +1276,8 @@ export class BlitTerminalSurface {
       while (start > 0 && WORD_CHARS.test(text[start - 1])) start--;
       let end = idx;
       while (end < text.length - 1 && WORD_CHARS.test(text[end + 1])) end++;
-      const startCol = colMap ? colMap[start] ?? start : start;
-      const endCol = colMap ? colMap[end] ?? end : end;
+      const startCol = colMap ? (colMap[start] ?? start) : start;
+      const endCol = colMap ? (colMap[end] ?? end) : end;
       return { start: startCol, end: endCol };
     };
 
@@ -1423,9 +1430,9 @@ export class BlitTerminalSurface {
       let m: RegExpExecArray | null;
       while ((m = URL_RE.exec(text)) !== null) {
         const raw = m[0].replace(/[.),:;]+$/, "");
-        const startCol = colMap ? colMap[m.index] ?? m.index : m.index;
+        const startCol = colMap ? (colMap[m.index] ?? m.index) : m.index;
         const endIdx = m.index + raw.length - 1;
-        const endCol = colMap ? colMap[endIdx] ?? endIdx : endIdx;
+        const endCol = colMap ? (colMap[endIdx] ?? endIdx) : endIdx;
         if (col >= startCol && col <= endCol)
           return { url: raw, startCol, endCol };
       }
@@ -1497,13 +1504,7 @@ export class BlitTerminalSurface {
             lastMouseCell = cell;
             if (e.buttons) {
               const button =
-                e.buttons & 1
-                  ? 0
-                  : e.buttons & 2
-                    ? 2
-                    : e.buttons & 4
-                      ? 1
-                      : 0;
+                e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0;
               sendMouseEvent("move", e, button + 32);
               return;
             } else if (mode === 4) {
@@ -1527,8 +1528,7 @@ export class BlitTerminalSurface {
         const cell = mouseToCell(e);
         const sel = cellToSel(cell);
         if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
-          const { start: dragStart, end: dragEnd } =
-            applyGranularitySel(sel);
+          const { start: dragStart, end: dragEnd } = applyGranularitySel(sel);
           if (selPosBefore(dragStart, selAnchorStart)) {
             this.selStart = dragStart;
             this.selEnd = selAnchorEnd;

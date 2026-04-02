@@ -27,8 +27,8 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-alacritty`        | `crates/alacritty-driver/` | lib           | Terminal parsing backend wrapping `alacritty_terminal`; snapshot generation, scrollback, title/mode tracking, search |
 | `@blit-sh/browser`      | `crates/browser/`          | cdylib (WASM) | Applies compressed frame diffs, produces WebGL vertex data, manages glyph atlas                                      |
 | `@blit-sh/core`         | `js/core/`                 | npm           | Framework-agnostic core: transports, workspace, connections, terminal surface, WebGL renderer                        |
-| `@blit-sh/react`        | `js/react/`                | npm           | Thin React wrapper: context provider, hooks, and `BlitTerminal` component delegating to core                        |
-| `@blit-sh/solid`        | `js/solid/`                | npm           | Thin Solid wrapper: context provider, primitives, and `BlitTerminal` component delegating to core                   |
+| `@blit-sh/react`        | `js/react/`                | npm           | Thin React wrapper: context provider, hooks, and `BlitTerminal` component delegating to core                         |
+| `@blit-sh/solid`        | `js/solid/`                | npm           | Thin Solid wrapper: context provider, primitives, and `BlitTerminal` component delegating to core                    |
 | `blit-server`           | `crates/server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
 | `blit-gateway`          | `crates/gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
 | `blit` (CLI)            | `crates/cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway, `server`/`share` subcommands             |

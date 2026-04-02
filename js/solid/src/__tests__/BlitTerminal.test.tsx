@@ -25,9 +25,8 @@ const mockResendSize = vi.fn();
 const mockFocus = vi.fn();
 
 vi.mock("@blit-sh/core", async () => {
-  const actual = await vi.importActual<typeof import("@blit-sh/core")>(
-    "@blit-sh/core",
-  );
+  const actual =
+    await vi.importActual<typeof import("@blit-sh/core")>("@blit-sh/core");
   return {
     ...actual,
     BlitTerminalSurface: class {
@@ -193,11 +192,7 @@ describe("BlitTerminal", () => {
 
     render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
-        <BlitTerminal
-          sessionId={null}
-          fontFamily="Test Mono"
-          fontSize={14}
-        />
+        <BlitTerminal sessionId={null} fontFamily="Test Mono" fontSize={14} />
       </BlitWorkspaceProvider>
     ));
 

@@ -59,7 +59,11 @@ function App() {
           </div>
         }
       >
-        <Terminal passphrase={passphrase} dark={dark} onToggleTheme={toggleTheme} />
+        <Terminal
+          passphrase={passphrase}
+          dark={dark}
+          onToggleTheme={toggleTheme}
+        />
       </Suspense>
     );
   }

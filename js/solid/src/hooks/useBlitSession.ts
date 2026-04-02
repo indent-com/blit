@@ -1,8 +1,4 @@
-import type {
-  BlitSession,
-  BlitWorkspace,
-  SessionId,
-} from "@blit-sh/core";
+import type { BlitSession, BlitWorkspace, SessionId } from "@blit-sh/core";
 
 /**
  * Look up a single session by ID from the workspace's current snapshot.

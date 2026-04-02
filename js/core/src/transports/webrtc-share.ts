@@ -134,20 +134,32 @@ export function createShareTransport(
       const keypair = await deriveKeypair(passphrase);
       const pubHex = hexEncode(keypair.publicKey);
       dbg.log("pubkey: %s", pubHex);
-      const iceHttpUrl = hubWsUrl.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://").replace(/\/$/, "");
+      const iceHttpUrl = hubWsUrl
+        .replace(/^wss:\/\//, "https://")
+        .replace(/^ws:\/\//, "http://")
+        .replace(/\/$/, "");
       dbg.log("fetching ICE servers from %s/ice", iceHttpUrl);
       const iceServers = await fetchIceServers(hubWsUrl);
       dbg.log("ICE servers: %o", iceServers);
 
-      if (disposed) { dbg.warn("disposed before WS connect"); return; }
+      if (disposed) {
+        dbg.warn("disposed before WS connect");
+        return;
+      }
 
       const wsUrl = `${hubWsUrl.replace(/\/$/, "")}/channel/${pubHex}/consumer`;
       dbg.log("connecting to signaling hub: %s", wsUrl);
       ws = new WebSocket(wsUrl);
 
       await new Promise<void>((resolve, reject) => {
-        ws!.onopen = () => { dbg.log("signaling WS open"); resolve(); };
-        ws!.onerror = () => { dbg.error("signaling WS error"); reject(new Error("signaling connection failed")); };
+        ws!.onopen = () => {
+          dbg.log("signaling WS open");
+          resolve();
+        };
+        ws!.onerror = () => {
+          dbg.error("signaling WS error");
+          reject(new Error("signaling connection failed"));
+        };
         if (disposed) reject(new Error("disposed"));
       });
 
@@ -188,13 +200,20 @@ export function createShareTransport(
       }
 
       // Create RTCPeerConnection and data channel transport
-      dbg.log("creating RTCPeerConnection with %d ICE server(s)", iceServers.length);
+      dbg.log(
+        "creating RTCPeerConnection with %d ICE server(s)",
+        iceServers.length,
+      );
       pc = new RTCPeerConnection({ iceServers });
 
-      pc.onconnectionstatechange = () => dbg.log("pc.connectionState = %s", pc!.connectionState);
-      pc.oniceconnectionstatechange = () => dbg.log("pc.iceConnectionState = %s", pc!.iceConnectionState);
-      pc.onicegatheringstatechange = () => dbg.log("pc.iceGatheringState = %s", pc!.iceGatheringState);
-      pc.onsignalingstatechange = () => dbg.log("pc.signalingState = %s", pc!.signalingState);
+      pc.onconnectionstatechange = () =>
+        dbg.log("pc.connectionState = %s", pc!.connectionState);
+      pc.oniceconnectionstatechange = () =>
+        dbg.log("pc.iceConnectionState = %s", pc!.iceConnectionState);
+      pc.onicegatheringstatechange = () =>
+        dbg.log("pc.iceGatheringState = %s", pc!.iceGatheringState);
+      pc.onsignalingstatechange = () =>
+        dbg.log("pc.signalingState = %s", pc!.signalingState);
 
       const transport = createWebRtcDataChannelTransport(pc);
       inner = transport;
@@ -242,37 +261,53 @@ export function createShareTransport(
       // Receive answer + remote ICE candidates
       ws!.onmessage = (e) => {
         const m = JSON.parse(e.data as string) as ServerMessage;
-        dbg.log("signaling ← %s %o", m.type, m.data ? Object.keys(m.data) : "no data");
+        dbg.log(
+          "signaling ← %s %o",
+          m.type,
+          m.data ? Object.keys(m.data) : "no data",
+        );
         if (m.type !== "signal" || !m.data) return;
 
         if (m.data.sdp) {
           dbg.log("received remote SDP answer");
           const sdp = m.data.sdp as { type?: string; sdp?: string };
-          pc!.setRemoteDescription(
-            new RTCSessionDescription({
-              type: (sdp.type as RTCSdpType) ?? "answer",
-              sdp: sdp.sdp as string,
-            }),
-          ).then(() => {
-            remoteDescSet = true;
-            dbg.log("remote description set, flushing %d pending candidates", pendingCandidates.length);
-            for (const c of pendingCandidates) {
-              pc!.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
-            }
-            pendingCandidates.length = 0;
-          }).catch((err) => {
-            dbg.error("setRemoteDescription failed: %o", err);
-            if (disposed) return;
-            _lastError = err instanceof Error ? err.message : String(err);
-            setStatus("error");
-          });
+          pc!
+            .setRemoteDescription(
+              new RTCSessionDescription({
+                type: (sdp.type as RTCSdpType) ?? "answer",
+                sdp: sdp.sdp as string,
+              }),
+            )
+            .then(() => {
+              remoteDescSet = true;
+              dbg.log(
+                "remote description set, flushing %d pending candidates",
+                pendingCandidates.length,
+              );
+              for (const c of pendingCandidates) {
+                pc!.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+              }
+              pendingCandidates.length = 0;
+            })
+            .catch((err) => {
+              dbg.error("setRemoteDescription failed: %o", err);
+              if (disposed) return;
+              _lastError = err instanceof Error ? err.message : String(err);
+              setStatus("error");
+            });
         } else if (m.data.candidate) {
           const candidate = m.data.candidate as RTCIceCandidateInit;
           if (remoteDescSet) {
-            dbg.log("remote ICE candidate (applied): %s", (candidate as { candidate?: string }).candidate);
+            dbg.log(
+              "remote ICE candidate (applied): %s",
+              (candidate as { candidate?: string }).candidate,
+            );
             pc!.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
           } else {
-            dbg.log("remote ICE candidate (buffered): %s", (candidate as { candidate?: string }).candidate);
+            dbg.log(
+              "remote ICE candidate (buffered): %s",
+              (candidate as { candidate?: string }).candidate,
+            );
             pendingCandidates.push(candidate);
           }
         }

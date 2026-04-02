@@ -314,14 +314,60 @@ in {
     '';
   };
 
-  lint = pkgs.writeShellApplication {
-    name = "blit-lint";
+  fmt = pkgs.writeShellApplication {
+    name = "blit-fmt";
+    runtimeInputs = [ rustToolchain pkgs.prettier ];
+    text = ''
+      check=false
+      for arg in "$@"; do
+        case "$arg" in
+          --check) check=true ;;
+        esac
+      done
+
+      if [ "$check" = true ]; then
+        echo "=== cargo fmt --check ==="
+        cargo fmt -- --check
+        echo ""
+        echo "=== prettier --check ==="
+        prettier --check .
+      else
+        echo "=== cargo fmt ==="
+        cargo fmt
+        echo ""
+        echo "=== prettier --write ==="
+        prettier --write .
+      fi
+    '';
+  };
+
+  clippy = pkgs.writeShellApplication {
+    name = "blit-clippy";
     runtimeInputs = [ rustToolchain ];
     text = ''
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
       cp ${webAppDist}/index.html js/web-app/dist/
 
+      echo "=== Clippy ==="
+      cargo clippy --workspace -- -D warnings
+    '';
+  };
+
+  lint = pkgs.writeShellApplication {
+    name = "blit-lint";
+    runtimeInputs = [ rustToolchain pkgs.prettier ];
+    text = ''
+      echo "=== Setting up web-app dist ==="
+      mkdir -p js/web-app/dist
+      cp ${webAppDist}/index.html js/web-app/dist/
+
+      echo "=== cargo fmt --check ==="
+      cargo fmt -- --check
+      echo ""
+      echo "=== prettier --check ==="
+      prettier --check .
+      echo ""
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
     '';

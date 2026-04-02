@@ -66,13 +66,7 @@ function ShareApp({
     createShareTransport(hubUrl(), passphrase),
   );
 
-  return (
-    <Workspace
-      transport={transport}
-      wasm={wasm}
-      onAuthError={() => {}}
-    />
-  );
+  return <Workspace transport={transport} wasm={wasm} onAuthError={() => {}} />;
 }
 
 function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
@@ -86,25 +80,22 @@ function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
     setTransport(createGatewayTransport(savedPass));
   }, [savedPass, transport]);
 
-  const connect = useCallback(
-    (pass: string) => {
-      setAuthError(null);
-      const t = createGatewayTransport(pass);
-      const onStatus = (status: string) => {
-        if (status === "connected") {
-          writeStorage(PASS_KEY, pass);
-          t.removeEventListener("statuschange", onStatus);
-        } else if (status === "error") {
-          setAuthError(t.lastError ?? i18n("auth.failed"));
-          t.removeEventListener("statuschange", onStatus);
-          setTransport(null);
-        }
-      };
-      t.addEventListener("statuschange", onStatus);
-      setTransport(t);
-    },
-    [],
-  );
+  const connect = useCallback((pass: string) => {
+    setAuthError(null);
+    const t = createGatewayTransport(pass);
+    const onStatus = (status: string) => {
+      if (status === "connected") {
+        writeStorage(PASS_KEY, pass);
+        t.removeEventListener("statuschange", onStatus);
+      } else if (status === "error") {
+        setAuthError(t.lastError ?? i18n("auth.failed"));
+        t.removeEventListener("statuschange", onStatus);
+        setTransport(null);
+      }
+    };
+    t.addEventListener("statuschange", onStatus);
+    setTransport(t);
+  }, []);
 
   if (!transport) {
     return (

@@ -63,25 +63,19 @@ export function BlitTerminal(props: BlitTerminalProps) {
   createEffect(() => {
     const snap = snapshot();
     const session = props.sessionId
-      ? snap.sessions.find((s) => s.id === props.sessionId) ?? null
+      ? (snap.sessions.find((s) => s.id === props.sessionId) ?? null)
       : null;
-    const conn = session
-      ? workspace.getConnection(session.connectionId)
-      : null;
+    const conn = session ? workspace.getConnection(session.connectionId) : null;
     surface?.setConnection(conn);
   });
 
   // Forward prop changes.
   createEffect(() => surface?.setSessionId(props.sessionId));
-  createEffect(() =>
-    surface?.setPalette(props.palette ?? ctx.palette),
-  );
+  createEffect(() => surface?.setPalette(props.palette ?? ctx.palette));
   createEffect(() =>
     surface?.setFontFamily(props.fontFamily ?? ctx.fontFamily),
   );
-  createEffect(() =>
-    surface?.setFontSize(props.fontSize ?? ctx.fontSize),
-  );
+  createEffect(() => surface?.setFontSize(props.fontSize ?? ctx.fontSize));
   createEffect(() => surface?.setShowCursor(props.showCursor));
   createEffect(() => surface?.setOnRender(props.onRender));
   createEffect(() =>
@@ -93,10 +87,10 @@ export function BlitTerminal(props: BlitTerminalProps) {
   createEffect(() => {
     const snap = snapshot();
     const session = props.sessionId
-      ? snap.sessions.find((s) => s.id === props.sessionId) ?? null
+      ? (snap.sessions.find((s) => s.id === props.sessionId) ?? null)
       : null;
     const connection = session
-      ? snap.connections.find((c) => c.id === session.connectionId) ?? null
+      ? (snap.connections.find((c) => c.id === session.connectionId) ?? null)
       : null;
     if (
       connection?.status === "connected" &&
