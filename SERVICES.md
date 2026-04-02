@@ -140,7 +140,7 @@ This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb`
 
 ## GitHub Actions workflows
 
-Six workflow files live in `.github/workflows/`:
+Seven workflow files live in `.github/workflows/`:
 
 | Workflow | Trigger | Purpose |
 | --- | --- | --- |
@@ -149,6 +149,7 @@ Six workflow files live in `.github/workflows/`:
 | [`release.yml`](.github/workflows/release.yml) | `v*` tag push | Build artifacts, create GitHub Release, publish packages, deploy install site |
 | [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml) | Push to `main` (paths: `js/blit-hub/**`) | Deploy signaling hub to Fly.io |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml) | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs) |
+| [`dev-check.yml`](.github/workflows/dev-check.yml) | Push to `main`, PRs | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI |
 | [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag | Build and push `grab/blit-demo` Docker image |
 
 ### CI (test.yml)
@@ -177,6 +178,16 @@ flowchart LR
 | `e2e` | ubuntu-latest | `./bin/e2e` — Playwright against the full stack; uploads report artifact |
 | `build-debs` | ubuntu-latest, ubuntu-24.04-arm | Verify `.deb` packages build (amd64 + arm64) |
 | `build-tarballs` | ubuntu-latest, ubuntu-24.04-arm, macos-latest | Verify static tarballs build (3 platforms) |
+
+### Dev check (dev-check.yml)
+
+Runs on every push to `main` and on every pull request. Single job on `ubuntu-latest`:
+
+1. Installs the latest released `blit` CLI via `install.blit.sh`.
+2. Enters the Nix devshell and runs `bin/dev` (process-compose with `cargo watch`, WASM build, gateway, web-app, website).
+3. Polls `process-compose list` until all five services report Running.
+4. Smoke-tests with the `blit` CLI: starts a session, waits for it, verifies output, lists sessions, closes the session.
+5. Tears down process-compose.
 
 ### Prepare release (prepare-release.yml)
 

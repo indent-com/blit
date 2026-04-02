@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Runs bin/dev (process-compose), waits for every service to come up healthy,
+# smoke-tests with the blit CLI, then tears everything down.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+PC_SOCK="/tmp/blit-dev-check-pc.sock"
+BLIT_SOCK="/tmp/blit-dev.sock"
+TIMEOUT="${DEV_CHECK_TIMEOUT:-600}"
+
+cleanup() {
+    echo "=== Tearing down ==="
+    process-compose -U -u "$PC_SOCK" down 2>/dev/null || true
+    rm -f "$PC_SOCK" "$BLIT_SOCK"
+}
+trap cleanup EXIT INT TERM
+
+rm -f "$PC_SOCK" "$BLIT_SOCK"
+
+echo "=== Installing blit CLI ==="
+curl -sf https://install.blit.sh | sh
+BLIT="blit"
+
+echo "=== Starting bin/dev ==="
+./bin/dev -t=false -u "$PC_SOCK" &
+DEV_PID=$!
+
+echo "=== Waiting for all services to become healthy (timeout ${TIMEOUT}s) ==="
+start_time=$(date +%s)
+deadline=$((start_time + TIMEOUT))
+while true; do
+    now=$(date +%s)
+    elapsed=$((now - start_time))
+
+    if ! kill -0 "$DEV_PID" 2>/dev/null; then
+        echo "FATAL: bin/dev exited unexpectedly"
+        wait "$DEV_PID" || true
+        exit 1
+    fi
+
+    if [ "$now" -ge "$deadline" ]; then
+        echo "FATAL: timed out waiting for services after ${elapsed}s"
+        process-compose -U -u "$PC_SOCK" list 2>/dev/null || true
+        exit 1
+    fi
+
+    if status=$(process-compose -U -u "$PC_SOCK" list -o json 2>/dev/null); then
+        total=$(echo "$status" | jq 'length')
+        running=$(echo "$status" | jq '[.[] | select(.status == "Running")] | length')
+        echo "  services: $running/$total running (${elapsed}s)"
+        if [ "$total" -gt 0 ] && [ "$running" -eq "$total" ]; then
+            break
+        fi
+    fi
+
+    sleep 5
+done
+
+echo "=== All services running ==="
+process-compose -U -u "$PC_SOCK" list
+
+echo ""
+echo "=== Smoke test: blit CLI ==="
+BLIT_ARGS=(--socket "$BLIT_SOCK")
+
+echo "  blit start echo hello"
+SESSION_ID=$("$BLIT" start "${BLIT_ARGS[@]}" echo hello)
+echo "  session: $SESSION_ID"
+
+echo "  blit wait"
+"$BLIT" wait "${BLIT_ARGS[@]}" "$SESSION_ID" --timeout 30
+
+echo "  blit history"
+OUTPUT=$("$BLIT" history "${BLIT_ARGS[@]}" "$SESSION_ID" --from-start 0 --limit 50)
+if echo "$OUTPUT" | grep -q "hello"; then
+    echo "  output contains 'hello' ✓"
+else
+    echo "FATAL: expected 'hello' in output, got:"
+    echo "$OUTPUT"
+    exit 1
+fi
+
+echo "  blit list"
+"$BLIT" list "${BLIT_ARGS[@]}"
+
+echo "  blit close"
+"$BLIT" close "${BLIT_ARGS[@]}" "$SESSION_ID"
+
+echo ""
+echo "=== dev-check passed ==="
