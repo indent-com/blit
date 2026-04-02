@@ -2,7 +2,7 @@ import { useEffect, useState, useRef, useCallback, type FormEvent } from "react"
 import "./landing.css";
 
 const INSTALL_CMD = "curl -f https://install.blit.sh | sh";
-const DOCKER_CMD = "docker run --rm -p 8080:8080 grab/blit-demo";
+const DOCKER_CMD = "docker run --rm grab/blit-demo";
 
 function JoinForm() {
   const [secret, setSecret] = useState("");
