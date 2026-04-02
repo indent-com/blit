@@ -6,7 +6,7 @@ blit - terminal streaming client
 
 # SYNOPSIS
 
-_blit_ [OPTIONS] _open_ [_--console_] [_--port_ _PORT_]
+_blit_ [OPTIONS] _open_ [_--console_ | _--port_ _PORT_]
 
 _blit_ [OPTIONS] _list_
 
@@ -79,10 +79,10 @@ Output is plain text with no decoration. Errors go to stderr; non-zero exit
 on failure. The connection options (_--socket_, _--tcp_, _--ssh_) are accepted
 by all subcommands.
 
-_open_ [_--console_] [_--port_ _PORT_]
+_open_ [_--console_ | _--port_ _PORT_]
 Open the terminal UI. By default, opens a browser. With _--console_,
 renders directly to the terminal. _--port_ binds the embedded gateway to
-a specific port.
+a specific port. _--console_ and _--port_ are mutually exclusive.
 
 _list_
 List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,

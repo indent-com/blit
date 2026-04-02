@@ -222,11 +222,11 @@ enum Command {
     /// Open the terminal UI in the browser (default) or terminal
     Open {
         /// Render to terminal instead of opening browser (legacy mode)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "port")]
         console: bool,
 
         /// Bind browser UI to a specific port (default: random)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "console")]
         port: Option<u16>,
     },
 
