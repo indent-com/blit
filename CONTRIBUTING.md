@@ -44,8 +44,8 @@ Every `nix run` target has a corresponding script in `bin/`:
 ```bash
 ./bin/build-debs             # .deb packages -> dist/debs/
 ./bin/build-tarballs         # static tarballs -> dist/tarballs/
-./bin/browser-publish        # npm publish @blit-sh/browser
-./bin/react-publish          # npm publish @blit-sh/react
+./bin/publish-npm-packages   # npm publish @blit-sh/browser, @blit-sh/core, @blit-sh/react
+./bin/publish-crates         # cargo publish
 ```
 
 `build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
@@ -71,41 +71,48 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt and `clippy -D 
 | `server`       | `cargo watch` running `blit-server --release`                     | `/tmp/blit-dev.sock` |
 | `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`)       | `127.0.0.1:3266`     |
 | `web-app`      | Vite dev server for `js/web-app/`                                 | printed by Vite      |
+| `website`      | Vite dev server for `js/website/`                                 | printed by Vite      |
 
 ## Project structure
 
-Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cli` which is split into four and `blit-demo` which has extra binaries in `src/bin/`. There are no multi-level module trees.
+Most Rust crates are one or two source files. `blit-cli` is split into four and `blit-webrtc-forwarder` uses a multi-file module tree. `blit-demo` has extra binaries in `src/bin/`.
 
 | File                                 | Lines | Role                                                                                                             |
 | ------------------------------------ | ----- | ---------------------------------------------------------------------------------------------------------------- |
-| `crates/server/src/main.rs`          | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control                                     |
-| `crates/remote/src/lib.rs`           | ~3000 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
-| `crates/cli/src/interactive.rs`      | ~1650 | Console TUI and browser mode                                                                                     |
-| `crates/browser/src/lib.rs`          | ~1100 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
-| `crates/alacritty-driver/src/lib.rs` | ~1100 | Terminal parsing wrapper around `alacritty_terminal`                                                             |
-| `crates/cli/src/agent.rs`            | ~870  | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
+| `crates/server/src/lib.rs`           | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control                                     |
+| `crates/remote/src/lib.rs`           | ~3100 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
+| `crates/webrtc-forwarder/src/`       | ~2000 | WebRTC forwarder (7 files: signaling, ICE, TURN, peer management)                                                |
+| `crates/cli/src/interactive.rs`      | ~1700 | Console TUI and browser mode                                                                                     |
+| `crates/cli/src/agent.rs`            | ~1300 | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
+| `crates/browser/src/lib.rs`          | ~1200 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
+| `crates/alacritty-driver/src/lib.rs` | ~1200 | Terminal parsing wrapper around `alacritty_terminal`                                                              |
 | `crates/demo/src/main.rs`            | ~780  | Demo programs                                                                                                    |
-| `crates/gateway/src/main.rs`         | ~700  | WebSocket/WebTransport proxy                                                                                     |
-| `crates/fonts/src/lib.rs`            | ~600  | Font discovery and TTF/OTF parsing                                                                               |
-| `crates/cli/src/main.rs`             | ~185  | Clap structs and dispatch                                                                                        |
-| `crates/cli/src/transport.rs`        | ~130  | Transport abstraction (Unix/TCP/SSH)                                                                             |
-| `crates/webserver/src/lib.rs`        | ~90   | Shared axum HTTP helpers                                                                                         |
+| `crates/gateway/src/main.rs`         | ~750  | WebSocket/WebTransport proxy                                                                                     |
+| `crates/fonts/src/lib.rs`            | ~660  | Font discovery and TTF/OTF parsing                                                                               |
+| `crates/cli/src/main.rs`             | ~440  | Clap structs and dispatch                                                                                        |
+| `crates/webserver/src/lib.rs`        | ~120  | Shared axum HTTP helpers                                                                                         |
+| `crates/webserver/src/config.rs`     | ~210  | Server configuration types                                                                                       |
+| `crates/cli/src/transport.rs`        | ~180  | Transport abstraction (Unix/TCP/SSH)                                                                              |
 
 ### Non-Rust code
 
-| Directory     | What                                                                                                                 |
-| ------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `js/react/`   | `@blit-sh/react` npm package — React library with hooks, transports, WebGL renderer. Tests in `js/react/src/__tests__/`. |
-| `js/web-app/` | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                 |
-| `e2e/`        | Playwright tests against the full stack (6 spec files)                                                               |
-| `nix/`        | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules   |
-| `systemd/`    | Socket-activated unit files (user-level and system-level templates) and service units                                |
-| `man/`        | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                   |
-| `bin/`        | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                               |
+| Directory      | What                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `js/core/`     | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer             |
+| `js/react/`    | `@blit-sh/react` npm package — React bindings and hooks wrapping `@blit-sh/core`. Tests in `js/react/src/__tests__/` |
+| `js/web-app/`  | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                |
+| `js/website/`  | Marketing/docs website (Vite + SSR with prerendering)                                                               |
+| `js/blit-hub/` | Signaling relay server (Bun, deployed to Fly.io). See [js/blit-hub/README.md](js/blit-hub/README.md)                |
+| `e2e/`         | Playwright tests against the full stack (6 spec files)                                                              |
+| `examples/`    | fd-channel examples in Python and Bun                                                                               |
+| `nix/`         | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules |
+| `systemd/`     | Socket-activated unit files (user-level and system-level templates) and service units                                |
+| `man/`         | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                  |
+| `bin/`         | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                              |
 
 ## Code conventions
 
-**Single-file crates.** Don't introduce `mod` trees. If a crate grows, add a second file at the same level (like `cli/src/agent.rs`) and `mod` it from the root.
+**Flat crate layout.** Don't introduce deep `mod` trees. If a crate grows, add files at the same level (like `cli/src/agent.rs`) and `mod` them from the root. `blit-webrtc-forwarder` is the one exception with a multi-file module tree.
 
 **Wire protocol changes** touch multiple layers. A new message type requires:
 
@@ -115,13 +122,13 @@ Every Rust crate is a single source file (`lib.rs` or `main.rs`) except `blit-cl
 4. Client-side handling in `cli/src/agent.rs` (agent subcommands) and/or `cli/src/interactive.rs` (TUI)
 5. Update the protocol tables in [ARCHITECTURE.md](ARCHITECTURE.md)
 
-**Tests live next to the code.** `server/src/main.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. React tests are in `react/src/__tests__/`.
+**Tests live next to the code.** `server/src/lib.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. React tests are in `react/src/__tests__/`.
 
-**Release profile** uses `opt-level = "s"` and LTO. Linux binaries are statically linked via musl; Nix verifies this at build time.
+**Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. Linux binaries are statically linked via musl; Nix verifies this at build time.
 
 ## Versioning and releases
 
-All workspace crates, `react/package.json`, and `nix/common.nix` share a single version number. The `bin/release` script bumps all of them atomically:
+All workspace crates, `js/core/package.json`, `js/react/package.json`, and `nix/common.nix` share a single version number. The `bin/release` script bumps all of them atomically:
 
 ```bash
 ./bin/release 0.12.0
