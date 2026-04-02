@@ -1,0 +1,241 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --dim: #656d76;
+  --border: rgba(0, 0, 0, 0.12);
+  --surface: #f6f8fa;
+  --accent: #0969da;
+  --code-bg: #f0f2f5;
+  --code-fg: #1f2328;
+}
+
+[data-theme="dark"] {
+  --bg: #0d1117;
+  --fg: #c9d1d9;
+  --dim: #8b949e;
+  --border: rgba(255, 255, 255, 0.12);
+  --surface: #161b22;
+  --accent: #58a6ff;
+  --code-bg: #161b22;
+  --code-fg: #c9d1d9;
+}
+
+.landing {
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.landing-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.25rem 2rem;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 10;
+}
+
+.landing-logo {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.logo-bg {
+  fill: var(--fg);
+}
+
+.logo-text {
+  fill: var(--bg);
+}
+
+.logo-cursor {
+  fill: var(--accent);
+}
+
+.landing-wordmark {
+  font-family: 'Fira Code', monospace;
+  font-weight: 700;
+  font-size: 1.3rem;
+  letter-spacing: -0.02em;
+}
+
+.landing-nav a {
+  color: var(--dim);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: color 0.15s;
+}
+
+.landing-nav a:hover {
+  color: var(--fg);
+}
+
+.landing-main {
+  flex: 1;
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 0 2rem;
+  width: 100%;
+}
+
+.hero {
+  padding: 6rem 0 4rem;
+  text-align: center;
+}
+
+.hero h1 {
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+  max-width: 48rem;
+  margin: 0 auto;
+}
+
+.hero-sub {
+  margin-top: 1.25rem;
+  font-size: 1.1rem;
+  line-height: 1.6;
+  color: var(--dim);
+  max-width: 40rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.install-block {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 2.5rem;
+  padding: 0.7rem 1rem;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.9rem;
+  color: var(--code-fg);
+}
+
+.copy-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.copy-btn:hover {
+  color: var(--fg);
+  border-color: var(--dim);
+}
+
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 1.5rem;
+  padding: 3rem 0;
+}
+
+.feature {
+  padding: 1.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.feature h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.feature p {
+  font-size: 0.9rem;
+  line-height: 1.55;
+  color: var(--dim);
+}
+
+.feature code {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.82rem;
+  background: var(--code-bg);
+  padding: 0.15rem 0.35rem;
+  border-radius: 3px;
+}
+
+.quickstart {
+  padding: 2rem 0 4rem;
+}
+
+.quickstart h2 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: 1.25rem;
+}
+
+.code-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  overflow-x: auto;
+}
+
+.code-block pre {
+  margin: 0;
+}
+
+.code-block code {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.88rem;
+  line-height: 1.65;
+  color: var(--code-fg);
+}
+
+.landing-footer {
+  border-top: 1px solid var(--border);
+  padding: 1.5rem 2rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+.landing-footer a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.landing-footer a:hover {
+  text-decoration: underline;
+}
+
+@media (max-width: 640px) {
+  .landing-header {
+    padding: 1rem 1.25rem;
+  }
+
+  .landing-main {
+    padding: 0 1.25rem;
+  }
+
+  .hero {
+    padding: 3rem 0 2rem;
+  }
+
+  .install-block {
+    flex-direction: column;
+    text-align: center;
+    font-size: 0.8rem;
+  }
+}
