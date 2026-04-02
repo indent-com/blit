@@ -145,6 +145,59 @@ const EXITED_LABEL_STYLE: React.CSSProperties = {
   transition: "background 0.15s",
 };
 
+const SHORTCUTS: [string, string][] = [
+  ["Mod+Shift+Enter", "New terminal"],
+  ["Mod+[ / ]", "Previous / next tab"],
+  ["Mod+Shift+D", "Toggle debug panel"],
+  ["Mod+Shift+?", "Toggle this panel"],
+];
+
+const MOD_LABEL = navigator.userAgent.includes("Mac") ? "\u2318" : "Ctrl";
+
+function ShortcutsPanel({ onClose, dimFg, border }: { onClose: () => void; dimFg: string; border: string }) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); onClose(); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 9998,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        background: "rgba(0,0,0,0.5)",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "#0d1117", border: `1px solid ${border}`, borderRadius: 10,
+          padding: "20px 28px", minWidth: 300,
+          fontFamily: "'Fira Code', monospace", fontSize: 13, color: "#c9d1d9",
+        }}
+      >
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 16 }}>Keyboard shortcuts</div>
+        <table style={{ borderSpacing: "0 8px" }}>
+          <tbody>
+            {SHORTCUTS.map(([key, desc]) => (
+              <tr key={key}>
+                <td style={{ paddingRight: 24, color: dimFg, whiteSpace: "nowrap" }}>
+                  {key.replace(/Mod/g, MOD_LABEL)}
+                </td>
+                <td>{desc}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 const GITHUB_DARK = PALETTES.find((p) => p.id === "github-dark")!;
 const GITHUB_LIGHT = PALETTES.find((p) => p.id === "github-light")!;
 
@@ -317,6 +370,7 @@ function TabShell({
   const connection = useBlitConnection(CONNECTION_ID);
   const termRef = useRef<BlitTerminalHandle | null>(null);
 
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const visibleSessions = sessions.filter((s) => s.state !== "closed");
   const focusedId = state.focusedSessionId;
 
@@ -391,7 +445,13 @@ function TabShell({
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
+      if (mod && e.shiftKey && e.key === "Enter") {
+        e.preventDefault();
+        workspace.createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 });
+      } else if (mod && e.shiftKey && e.key === "?") {
+        e.preventDefault();
+        setShowShortcuts((v) => !v);
+      } else if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
         e.preventDefault();
         if (visibleSessions.length < 2 || !focusedId) return;
         const idx = visibleSessions.findIndex((s) => s.id === focusedId);
@@ -627,6 +687,13 @@ function TabShell({
           </div>
         )}
       </div>
+      {showShortcuts && (
+        <ShortcutsPanel
+          onClose={() => setShowShortcuts(false)}
+          dimFg={dimFg}
+          border={border}
+        />
+      )}
     </div>
   );
 }
