@@ -3,6 +3,9 @@ import react from "@vitejs/plugin-react";
 import { viteSingleFile } from "vite-plugin-singlefile";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { createRequire } from "node:module";
+
+const localRequire = createRequire(resolve(__dirname, "package.json"));
 
 const wasmPath = resolve(
   __dirname,
@@ -59,6 +62,7 @@ export default bin.buffer;
         __dirname,
         "../../crates/browser/pkg/blit_browser.js",
       ),
+      tweetnacl: localRequire.resolve("tweetnacl"),
     },
     dedupe: ["react", "react-dom"],
   },
