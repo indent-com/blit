@@ -98,14 +98,14 @@ pub async fn connect(
     socket: &Option<String>,
     tcp: &Option<String>,
     ssh: &Option<String>,
-    share: &Option<String>,
+    passphrase: &Option<String>,
     hub: &str,
 ) -> Result<Transport, String> {
-    if let Some(passphrase) = share {
+    if let Some(passphrase) = passphrase {
         let hub = blit_webrtc_forwarder::normalize_hub(hub);
         let stream = blit_webrtc_forwarder::client::connect(passphrase, &hub)
             .await
-            .map_err(|e| format!("share: {e}"))?;
+            .map_err(|e| format!("passphrase: {e}"))?;
         return Ok(Transport::Share(stream));
     }
 

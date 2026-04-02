@@ -5,21 +5,29 @@ mod transport;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "blit", version, about = "Terminal streaming client")]
+#[command(
+    name = "blit",
+    version,
+    about = "Terminal streaming for browsers and AI agents",
+    long_about = "Terminal streaming for browsers and AI agents.\n\n\
+        blit hosts PTYs and streams them to browsers over WebSocket, WebTransport, or WebRTC.\n\
+        It also exposes every terminal operation as a CLI subcommand for scripts and LLM agents.\n\n\
+        Quick start:\n  \
+          blit open              Open the terminal UI in a browser\n  \
+          blit share             Share a terminal session via WebRTC\n  \
+          blit start htop        Start a PTY and print its session ID\n  \
+          blit show 1            Dump current visible terminal text\n  \
+          blit learn             Print the full CLI reference\n  \
+          blit --help            Show this help",
+    subcommand_required = true,
+    arg_required_else_help = true,
+)]
 struct Cli {
     #[command(flatten)]
     connect: ConnectOpts,
 
     #[command(subcommand)]
-    command: Option<Command>,
-
-    /// Render to terminal instead of opening browser (legacy mode)
-    #[arg(long)]
-    console: bool,
-
-    /// Bind browser UI to a specific port (default: random)
-    #[arg(long)]
-    port: Option<u16>,
+    command: Command,
 }
 
 #[derive(Args, Clone)]
@@ -38,7 +46,7 @@ struct ConnectOpts {
 
     /// Connect via WebRTC to a shared session (passphrase)
     #[arg(long, global = true)]
-    share: Option<String>,
+    passphrase: Option<String>,
 
     /// Signaling hub URL
     #[arg(long, global = true, env = "BLIT_HUB", default_value = blit_webrtc_forwarder::DEFAULT_HUB_URL)]
@@ -211,6 +219,20 @@ enum Command {
         verbose: bool,
     },
 
+    /// Open the terminal UI in the browser (default) or terminal
+    Open {
+        /// Render to terminal instead of opening browser (legacy mode)
+        #[arg(long)]
+        console: bool,
+
+        /// Bind browser UI to a specific port (default: random)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+
+    /// Print the full CLI reference (usage guide for scripts and LLM agents)
+    Learn,
+
     /// Upgrade blit to the latest version
     Upgrade,
 }
@@ -224,11 +246,11 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Server {
+        Command::Server {
             shell_flags,
             scrollback,
             fd_channel,
-        }) => {
+        } => {
             let socket_path = cli
                 .connect
                 .socket
@@ -255,17 +277,17 @@ async fn main() {
             };
             blit_server::run(config).await;
         }
-        Some(Command::Upgrade) => {
+        Command::Upgrade => {
             if let Err(e) = cmd_upgrade().await {
                 eprintln!("blit: {e}");
                 std::process::exit(1);
             }
         }
-        Some(Command::Share {
+        Command::Share {
             passphrase,
             quiet,
             verbose,
-        }) => {
+        } => {
             let signal_url = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
             let passphrase = passphrase.unwrap_or_else(|| {
                 use rand::RngExt as _;
@@ -298,13 +320,13 @@ async fn main() {
             })
             .await;
         }
-        Some(cmd) => {
+        cmd @ (Command::List | Command::Start { .. } | Command::Show { .. } | Command::History { .. } | Command::Send { .. } | Command::Restart { .. } | Command::Kill { .. } | Command::Close { .. } | Command::Wait { .. }) => {
             let conn = &cli.connect;
             let transport = match transport::connect(
                 &conn.socket,
                 &conn.tcp,
                 &conn.ssh,
-                &conn.share,
+                &conn.passphrase,
                 &conn.hub,
             )
             .await
@@ -338,7 +360,7 @@ async fn main() {
                             &conn.socket,
                             &conn.tcp,
                             &conn.ssh,
-                            &conn.share,
+                            &conn.passphrase,
                             &conn.hub,
                         )
                         .await
@@ -402,30 +424,33 @@ async fn main() {
                         std::process::exit(1);
                     }
                 },
-                Command::Server { .. } | Command::Share { .. } | Command::Upgrade => unreachable!(),
+                _ => unreachable!(),
             };
             if let Err(e) = result {
                 eprintln!("blit: {e}");
                 std::process::exit(1);
             }
         }
-        None => {
+        Command::Open { console, port } => {
             let conn = &cli.connect;
-            if cli.console {
+            if console {
                 interactive::run_console(
                     &conn.socket,
                     &conn.tcp,
                     &conn.ssh,
-                    &conn.share,
+                    &conn.passphrase,
                     &conn.hub,
                 )
                 .await;
-            } else if let Some(passphrase) = &conn.share {
+            } else if let Some(passphrase) = &conn.passphrase {
                 let hub = blit_webrtc_forwarder::normalize_hub(&conn.hub);
-                interactive::run_browser_share(passphrase, &hub, cli.port).await;
+                interactive::run_browser_share(passphrase, &hub, port).await;
             } else {
-                interactive::run_browser(&conn.socket, &conn.tcp, &conn.ssh, cli.port).await;
+                interactive::run_browser(&conn.socket, &conn.tcp, &conn.ssh, port).await;
             }
+        }
+        Command::Learn => {
+            print!("{}", include_str!("learn.txt"));
         }
     }
 }

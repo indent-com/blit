@@ -12,7 +12,7 @@ Or install and run locally:
 
 ```bash
 curl -sf https://install.blit.sh | sh
-blit # opens a browser
+blit open # opens a browser
 ```
 
 Share a terminal over WebRTC:
@@ -24,7 +24,7 @@ blit share # prints a URL anyone can open
 Connect to a remote host over SSH:
 
 ```bash
-blit --ssh myhost
+blit open --ssh myhost
 ```
 
 Control terminals programmatically:
@@ -79,15 +79,18 @@ cargo build --release -p blit-cli
 
 Each client is paced independently based on render metrics it reports back: display rate, frame apply time, backlog depth. A phone on 3G doesn't stall a workstation on localhost. The focused session gets full frame rate; background sessions throttle down. Keystrokes go straight to the PTY — latency is bounded by link RTT.
 
-`blit` opens the browser with an embedded gateway. For persistent multi-user browser access, `blit-gateway` is a standalone proxy that handles passphrase auth, serves the web app, and optionally enables QUIC. `blit-server` can also run standalone for headless/daemon use. For embedding in your own app, [`@blit-sh/react`](EMBEDDING.md) and [`@blit-sh/solid`](EMBEDDING.md) provide framework bindings.
+`blit open` opens the browser with an embedded gateway. For persistent multi-user browser access, `blit-gateway` is a standalone proxy that handles passphrase auth, serves the web app, and optionally enables QUIC. `blit-server` can also run standalone for headless/daemon use. For embedding in your own app, [`@blit-sh/react`](EMBEDDING.md) and [`@blit-sh/solid`](EMBEDDING.md) provide framework bindings.
 
 For wire protocol details, frame encoding, and transport internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## CLI subcommands
 
-All subcommands auto-start a local server if needed. For remote hosts, use `--ssh HOST`, `--tcp HOST:PORT`, or `--share PASSPHRASE`.
+All subcommands auto-start a local server if needed. For remote hosts, use `--ssh HOST`, `--tcp HOST:PORT`, or `--passphrase PASSPHRASE`.
 
 ```bash
+blit open                                # Open the terminal UI in a browser
+blit open --console                      # Open in the current terminal instead
+
 blit list                                # List all PTYs (TSV: ID, TAG, TITLE, STATUS)
 blit start htop                          # Start a PTY running htop, print its ID
 blit start -t build make -j8             # Start with a tag
@@ -110,6 +113,7 @@ blit share                               # Share via WebRTC (prints URL)
 blit share --passphrase mysecret         # Share with a specific passphrase
 blit share --verbose                     # Share with connection diagnostics
 
+blit learn                               # Print the full CLI reference
 blit upgrade                             # Upgrade blit to the latest version
 
 blit --ssh myhost list                   # Against a remote host
@@ -119,7 +123,7 @@ blit --ssh myhost show 1
 
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
-If you're building an AI agent that drives terminals, [SKILL.md](SKILL.md) is a ready-made skill definition you can drop into your agent's tool list.
+If you're building an AI agent that drives terminals, run `blit learn` to print the full CLI reference, or see [SKILL.md](SKILL.md) for a skill definition you can drop into your agent's tool list.
 
 ## Configuration
 

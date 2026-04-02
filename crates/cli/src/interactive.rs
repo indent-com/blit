@@ -631,10 +631,10 @@ pub async fn run_console(
     socket: &Option<String>,
     tcp: &Option<String>,
     ssh: &Option<String>,
-    share: &Option<String>,
+    passphrase: &Option<String>,
     hub: &str,
 ) {
-    let transport = match transport::connect(socket, tcp, ssh, share, hub).await {
+    let transport = match transport::connect(socket, tcp, ssh, passphrase, hub).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("blit: {e}");

@@ -105,7 +105,7 @@ terminal session is shared:
 
 ```jsonc
 {
-  "template": "Session available at https://blit.sh/s#{secret}\nor blit --share {secret}",
+  "template": "Session available at https://blit.sh/s#{secret}\nor blit open --passphrase {secret}",
 }
 ```
 
