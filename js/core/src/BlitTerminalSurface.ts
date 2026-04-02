@@ -1460,6 +1460,7 @@ export class BlitTerminalSurface {
         return;
       }
       if (e.button === 0) {
+        e.preventDefault();
         clearSelection();
         selecting = true;
         this.selecting = true;
