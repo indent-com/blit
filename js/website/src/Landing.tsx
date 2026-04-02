@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback, type FormEvent } from "react"
 import "./landing.css";
 
 const INSTALL_CMD = "curl -f https://install.blit.sh | sh";
+const DOCKER_CMD = "docker run --rm -p 8080:8080 grab/blit-demo";
 
 function JoinForm() {
   const [secret, setSecret] = useState("");
@@ -20,7 +21,7 @@ function JoinForm() {
       <input
         className="join-input"
         type={visible ? "text" : "password"}
-        placeholder="Enter a session secret"
+        placeholder="session secret"
         value={secret}
         onChange={(e) => setSecret(e.target.value)}
         spellCheck={false}
@@ -50,6 +51,7 @@ function JoinForm() {
     </form>
   );
 }
+
 const THEME_KEY = "blit-theme";
 
 function getInitialTheme(): "light" | "dark" {
@@ -142,7 +144,7 @@ export function Landing() {
     <div className="landing">
       <header className="landing-header">
         <div className="landing-logo">
-          <svg viewBox="0 0 100 100" width="28" height="28">
+          <svg viewBox="0 0 100 100" width="24" height="24">
             <rect width="100" height="100" rx="16" fill="currentColor" className="logo-bg" />
             <text x="12" y="76" fontFamily="monospace" fontSize="72" fontWeight="bold" className="logo-text">b</text>
             <rect x="60" y="24" width="8" height="52" rx="2" className="logo-cursor" opacity="0.7" />
@@ -159,18 +161,26 @@ export function Landing() {
         <section className="hero">
           <h1>Your terminal, everywhere.</h1>
           <p className="hero-sub">
-            Open your terminal in any browser. Share it with a link.
-            Let AI agents drive it. One binary, zero config, instant.
+            Stream terminals to any browser. Share with a link.
+            Let AI agents drive them. One binary, zero config, instant.
           </p>
-          <div className="hero-install">
-            <div className="install-block">
-              <span className="install-prompt">$</span>
-              <code>{INSTALL_CMD}</code>
+
+          <div className="install-section">
+            <div className="install-row">
+              <span className="prompt-char">$</span>
+              <span className="install-cmd">{INSTALL_CMD}</span>
               <CopyButton text={INSTALL_CMD} />
             </div>
+            <div className="install-row">
+              <span className="prompt-char">$</span>
+              <span className="install-cmd">{DOCKER_CMD}</span>
+              <span className="install-comment"># try it now</span>
+              <CopyButton text={DOCKER_CMD} />
+            </div>
           </div>
-          <div className="hero-join">
-            <span className="hero-join-label">or join a session in your browser</span>
+
+          <div className="join-section">
+            <div className="join-label">or join a session in your browser</div>
             <JoinForm />
           </div>
         </section>
@@ -206,9 +216,9 @@ export function Landing() {
           <div className="demo-block">
             <div className="demo-label">Get started</div>
             <pre className="demo-pre"><code>{`$ curl -f https://install.blit.sh | sh
-$ blit                    # opens a browser
-$ blit share              # share via WebRTC
-$ blit --ssh myhost       # remote host`}</code></pre>
+$ blit            # opens a browser
+$ blit share      # share via WebRTC
+$ blit --ssh host # remote terminal`}</code></pre>
           </div>
           <div className="demo-block">
             <div className="demo-label">Agent API</div>

@@ -2,20 +2,24 @@
   --bg: #ffffff;
   --fg: #1f2328;
   --dim: #656d76;
-  --border: rgba(0, 0, 0, 0.1);
+  --bright: #1f2328;
+  --border: #d1d9e0;
   --surface: #f6f8fa;
   --accent: #0969da;
+  --green: #1a7f37;
   --code-bg: #f6f8fa;
   --code-fg: #1f2328;
 }
 
 [data-theme="dark"] {
   --bg: #0d1117;
-  --fg: #e6edf3;
-  --dim: #8b949e;
-  --border: rgba(255, 255, 255, 0.08);
+  --fg: #c9d1d9;
+  --dim: #6e7681;
+  --bright: #e6edf3;
+  --border: #21262d;
   --surface: #161b22;
   --accent: #58a6ff;
+  --green: #3fb950;
   --code-bg: #161b22;
   --code-fg: #e6edf3;
 }
@@ -26,6 +30,9 @@
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  font-family: 'Fira Code', monospace;
+  font-size: 14px;
+  line-height: 1.7;
 }
 
 /* ── Header ── */
@@ -34,11 +41,11 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 1rem 2rem;
+  padding: 0.6rem 1.5rem;
   border-bottom: 1px solid var(--border);
+  background: var(--surface);
   position: sticky;
   top: 0;
-  background: var(--bg);
   z-index: 10;
 }
 
@@ -53,9 +60,8 @@
 .logo-cursor { fill: var(--accent); }
 
 .landing-wordmark {
-  font-family: 'Fira Code', monospace;
   font-weight: 700;
-  font-size: 1.2rem;
+  font-size: 1rem;
   letter-spacing: -0.02em;
 }
 
@@ -68,9 +74,7 @@
 .landing-nav a {
   color: var(--dim);
   text-decoration: none;
-  font-size: 0.88rem;
-  font-weight: 500;
-  transition: color 0.15s;
+  font-size: 13px;
 }
 
 .landing-nav a:hover {
@@ -84,11 +88,10 @@
   background: none;
   border: 1px solid var(--border);
   color: var(--dim);
-  width: 32px;
-  height: 32px;
-  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
   cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
 }
 
 .theme-toggle:hover {
@@ -100,69 +103,81 @@
 
 .landing-main {
   flex: 1;
-  max-width: 56rem;
+  max-width: 64rem;
   margin: 0 auto;
-  padding: 0 2rem;
+  padding: 0 1.5rem;
   width: 100%;
 }
 
 /* ── Hero ── */
 
 .hero {
-  padding: 6rem 0 4rem;
-  text-align: center;
+  padding: 3.5rem 0 1.5rem;
 }
 
 .hero h1 {
-  font-size: clamp(2.2rem, 5vw, 3.4rem);
-  font-weight: 800;
-  line-height: 1.1;
-  letter-spacing: -0.04em;
+  font-size: clamp(1.6rem, 4vw, 2.4rem);
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+  color: var(--bright);
 }
 
 .hero-sub {
-  margin-top: 1.2rem;
-  font-size: 1.1rem;
-  line-height: 1.6;
+  margin-top: 0.75rem;
+  font-size: 13px;
+  line-height: 1.7;
   color: var(--dim);
-  max-width: 34rem;
-  margin-left: auto;
-  margin-right: auto;
+  max-width: 44rem;
 }
 
-.hero-install {
-  margin-top: 2.5rem;
+/* ── Install / Docker ── */
+
+.install-section {
+  margin-top: 2rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
 }
 
-.install-block {
-  display: inline-flex;
+.install-row {
+  display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.6rem 0.8rem;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-family: 'Fira Code', monospace;
-  font-size: 0.88rem;
-  color: var(--code-fg);
 }
 
-.install-prompt {
-  color: var(--dim);
+.install-row + .install-row {
+  margin-top: 0.4rem;
+}
+
+.prompt-char {
+  color: var(--green);
   user-select: none;
+  flex-shrink: 0;
+}
+
+.install-cmd {
+  flex: 1;
+  min-width: 0;
+}
+
+.install-comment {
+  color: var(--dim);
+  font-size: 13px;
+  font-style: italic;
 }
 
 .copy-btn {
   background: none;
   border: 1px solid var(--border);
   color: var(--dim);
-  padding: 0.25rem 0.5rem;
-  border-radius: 4px;
-  font-size: 0.78rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: 'Fira Code', monospace;
   cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
-  white-space: nowrap;
-  margin-left: 0.25rem;
+  flex-shrink: 0;
 }
 
 .copy-btn:hover {
@@ -172,27 +187,23 @@
 
 /* ── Join form ── */
 
-.hero-join {
+.join-section {
   margin-top: 1.5rem;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.5rem;
 }
 
-.hero-join-label {
-  font-size: 0.82rem;
+.join-label {
+  font-size: 13px;
   color: var(--dim);
+  margin-bottom: 0.4rem;
 }
 
 .join-form {
   display: inline-flex;
   align-items: center;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 4px;
   overflow: hidden;
-  background: var(--code-bg);
-  transition: border-color 0.15s;
+  background: var(--surface);
 }
 
 .join-form:focus-within {
@@ -205,9 +216,9 @@
   outline: none;
   color: var(--fg);
   font-family: 'Fira Code', monospace;
-  font-size: 0.88rem;
-  padding: 0.55rem 0.8rem;
-  width: 14rem;
+  font-size: 14px;
+  padding: 0.45rem 0.75rem;
+  width: 16rem;
 }
 
 .join-input::placeholder {
@@ -225,7 +236,6 @@
   color: var(--dim);
   padding: 0 0.5rem;
   cursor: pointer;
-  transition: color 0.15s;
 }
 
 .join-visibility:hover {
@@ -233,14 +243,14 @@
 }
 
 .join-btn {
-  padding: 0.55rem 1rem;
+  padding: 0.45rem 0.85rem;
   background: var(--accent);
   color: #fff;
   border: none;
-  font-size: 0.82rem;
+  font-family: 'Fira Code', monospace;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: opacity 0.15s;
 }
 
 .join-btn:hover:not(:disabled) {
@@ -257,32 +267,33 @@
 .why-section {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 1rem;
-  padding: 2rem 0 3rem;
+  gap: 0.75rem;
+  padding: 2.5rem 0;
+  border-top: 1px solid var(--border);
 }
 
 .why-card {
-  padding: 1.4rem;
+  padding: 1.1rem 1.2rem;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 6px;
 }
 
 .why-card h3 {
-  font-size: 0.95rem;
-  font-weight: 650;
-  margin-bottom: 0.5rem;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+  color: var(--bright);
 }
 
 .why-card p {
-  font-size: 0.88rem;
-  line-height: 1.55;
+  font-size: 13px;
+  line-height: 1.65;
   color: var(--dim);
 }
 
 .why-card code {
-  font-family: 'Fira Code', monospace;
-  font-size: 0.8rem;
+  font-size: 12px;
   background: var(--code-bg);
   padding: 0.1rem 0.3rem;
   border-radius: 3px;
@@ -294,35 +305,35 @@
 .demo-section {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  padding-bottom: 3rem;
+  gap: 0.75rem;
+  padding-bottom: 2.5rem;
 }
 
 .demo-block {
-  background: var(--code-bg);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 6px;
   overflow: hidden;
 }
 
 .demo-label {
-  font-size: 0.78rem;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
   color: var(--dim);
   padding: 0.6rem 1rem 0;
 }
 
 .demo-pre {
   margin: 0;
-  padding: 0.75rem 1rem 1rem;
+  padding: 0.6rem 1rem 0.8rem;
   overflow-x: auto;
 }
 
 .demo-pre code {
   font-family: 'Fira Code', monospace;
-  font-size: 0.82rem;
+  font-size: 13px;
   line-height: 1.65;
   color: var(--code-fg);
 }
@@ -330,28 +341,30 @@
 /* ── Embed ── */
 
 .embed-section {
-  padding-bottom: 4rem;
+  padding: 2.5rem 0 3rem;
+  border-top: 1px solid var(--border);
 }
 
 .embed-section h2 {
-  font-size: 1.3rem;
+  font-size: 1.1rem;
   font-weight: 700;
   letter-spacing: -0.02em;
-  margin-bottom: 0.4rem;
+  margin-bottom: 0.3rem;
+  color: var(--bright);
 }
 
 .embed-sub {
-  font-size: 0.92rem;
+  font-size: 13px;
   color: var(--dim);
-  line-height: 1.5;
-  margin-bottom: 1rem;
+  line-height: 1.6;
+  margin-bottom: 0.75rem;
 }
 
 .demo-pre--wide {
-  background: var(--code-bg);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1.2rem 1.2rem;
+  border-radius: 6px;
+  padding: 1rem 1.1rem;
 }
 
 /* ── Syntax highlighting ── */
@@ -375,12 +388,12 @@
 
 .landing-footer {
   border-top: 1px solid var(--border);
-  padding: 1.2rem 2rem;
+  padding: 1rem 1.5rem;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  font-size: 0.82rem;
+  font-size: 12px;
   color: var(--dim);
 }
 
@@ -391,7 +404,6 @@
 .landing-footer a {
   color: var(--dim);
   text-decoration: none;
-  transition: color 0.15s;
 }
 
 .landing-footer a:hover {
@@ -412,20 +424,23 @@
 
 @media (max-width: 640px) {
   .landing-header {
-    padding: 0.8rem 1.25rem;
+    padding: 0.6rem 1rem;
   }
 
   .landing-main {
-    padding: 0 1.25rem;
+    padding: 0 1rem;
   }
 
   .hero {
-    padding: 3.5rem 0 2.5rem;
+    padding: 2.5rem 0 1rem;
   }
 
-  .install-block {
-    flex-wrap: wrap;
-    justify-content: center;
-    font-size: 0.8rem;
+  .install-section {
+    padding: 0.75rem 1rem;
+    font-size: 12px;
+  }
+
+  .join-input {
+    width: 12rem;
   }
 }
