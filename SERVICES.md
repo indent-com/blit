@@ -2,6 +2,29 @@
 
 This document describes the hosted services and CI/CD infrastructure that support blit. For the system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md). For development workflow, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Running as a service
+
+### macOS (Homebrew)
+
+```bash
+brew services start blit-server
+brew services start blit-gateway
+```
+
+### Debian / Ubuntu (systemd)
+
+```bash
+sudo systemctl enable --now blit-server@alice.socket
+
+# Share via WebRTC: create /etc/blit/forwarder-alice.env with
+# BLIT_SOCK=/run/blit/alice.sock and BLIT_PASSPHRASE=<secret>, then:
+sudo systemctl enable --now blit-webrtc-forwarder@alice.service
+```
+
+### Nix
+
+For nix-darwin and NixOS service modules, see [`nix/README.md`](nix/README.md).
+
 ## install.blit.sh
 
 `install.blit.sh` is an APT repository and binary download site hosted on **GitHub Pages**. It is rebuilt and deployed on every tagged release (`v*`). Users interact with it in three ways:
