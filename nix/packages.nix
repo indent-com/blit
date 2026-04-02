@@ -123,12 +123,12 @@
 
       coreNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/core;
-        hash = "sha256-hcA8zIYwk4eEd0Fx4B2eVuYHzW8Vi9KFVeSAJNj2ECo=";
+        hash = "sha256-+CY2F1K1t6snH+2eokD+q6R36zbz8JiM3xS5MWtztgU=";
       };
 
       reactNpmDeps = pkgs.fetchNpmDeps {
         src = ../js/react;
-        hash = "sha256-JktyvG2qDeoBxz2rnEZ69toKni6++Dt0DlrMWld8WUQ=";
+        hash = "sha256-QFIF/VnM/XoovbY/sT8DWyQiKc2/bVhjjeVf2GVBZIs=";
       };
 
       websiteNpmDeps = pkgs.fetchNpmDeps {
