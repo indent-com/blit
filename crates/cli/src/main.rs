@@ -20,7 +20,7 @@ use clap::{Args, Parser, Subcommand};
           blit learn             Print the full CLI reference\n  \
           blit --help            Show this help",
     subcommand_required = true,
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(flatten)]
@@ -320,7 +320,15 @@ async fn main() {
             })
             .await;
         }
-        cmd @ (Command::List | Command::Start { .. } | Command::Show { .. } | Command::History { .. } | Command::Send { .. } | Command::Restart { .. } | Command::Kill { .. } | Command::Close { .. } | Command::Wait { .. }) => {
+        cmd @ (Command::List
+        | Command::Start { .. }
+        | Command::Show { .. }
+        | Command::History { .. }
+        | Command::Send { .. }
+        | Command::Restart { .. }
+        | Command::Kill { .. }
+        | Command::Close { .. }
+        | Command::Wait { .. }) => {
             let conn = &cli.connect;
             let transport = match transport::connect(
                 &conn.socket,

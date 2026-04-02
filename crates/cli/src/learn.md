@@ -103,12 +103,12 @@ blit list
 
 By default, `blit` connects to the local daemon via its default Unix socket. Use these global flags (before the subcommand) to connect elsewhere:
 
-| Flag                           | Description                            |
-| ------------------------------ | -------------------------------------- |
-| `-s`, `--socket <SOCKET>`      | Connect to a specific Unix socket      |
-| `--tcp <TCP>`                  | Connect via raw TCP (`HOST:PORT`)      |
-| `--ssh <SSH>`                  | Connect via SSH to a remote host       |
-| `--passphrase <PASSPHRASE>`    | Connect via WebRTC to a shared session |
+| Flag                        | Description                            |
+| --------------------------- | -------------------------------------- |
+| `-s`, `--socket <SOCKET>`   | Connect to a specific Unix socket      |
+| `--tcp <TCP>`               | Connect via raw TCP (`HOST:PORT`)      |
+| `--ssh <SSH>`               | Connect via SSH to a remote host       |
+| `--passphrase <PASSPHRASE>` | Connect via WebRTC to a shared session |
 
 ```bash
 blit --socket /tmp/blit.sock list
