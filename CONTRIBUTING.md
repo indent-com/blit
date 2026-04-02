@@ -18,26 +18,7 @@ curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix 
 
 This is preferred over the official Nix installer because it enables flakes and the nix command out of the box, configures uninstall support, and works reliably on both macOS and Linux without manual `nix.conf` edits.
 
-**2. Install [direnv](https://direnv.net/):**
-
-```bash
-# macOS
-brew install direnv
-
-# Linux (Debian/Ubuntu)
-sudo apt install direnv
-
-# Linux (Fedora)
-sudo dnf install direnv
-
-# Linux (Arch)
-sudo pacman -S direnv
-
-# Or via Nix on any platform
-nix profile install nixpkgs#direnv
-```
-
-Then [hook direnv into your shell](https://direnv.net/docs/hook.html) (add the one-liner to `.bashrc`, `.zshrc`, or your shell's equivalent).
+**2. [Install direnv](https://direnv.net/docs/installation.html)** and [hook it into your shell](https://direnv.net/docs/hook.html).
 
 **3. Allow the `.envrc`:**
 
