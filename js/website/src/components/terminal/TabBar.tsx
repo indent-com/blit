@@ -54,9 +54,15 @@ type DisplayTab = {
   exiting: boolean;
 };
 
-function createAnimatedTabs(sessionsAccessor: Accessor<readonly BlitSession[]>) {
+function createAnimatedTabs(
+  sessionsAccessor: Accessor<readonly BlitSession[]>,
+) {
   const [displayTabs, setDisplayTabs] = createSignal<DisplayTab[]>(
-    sessionsAccessor().map((s, i) => ({ sessionId: s.id, liveIndex: i, exiting: false })),
+    sessionsAccessor().map((s, i) => ({
+      sessionId: s.id,
+      liveIndex: i,
+      exiting: false,
+    })),
   );
   const [enteringIds, setEnteringIds] = createSignal<Set<string>>(new Set());
   let prevIds = new Set(sessionsAccessor().map((s) => s.id));
@@ -229,7 +235,9 @@ export default function TabBar(props: {
           {(dt) => (
             <Tab
               sessionId={dt.sessionId}
-              getTitle={() => props.sessions.find((s) => s.id === dt.sessionId)?.title}
+              getTitle={() =>
+                props.sessions.find((s) => s.id === dt.sessionId)?.title
+              }
               index={dt.liveIndex}
               isFocused={!dt.exiting && dt.sessionId === props.focusedSessionId}
               exiting={dt.exiting}

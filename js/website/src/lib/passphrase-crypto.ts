@@ -5,7 +5,10 @@ const STORAGE_KEY = "blit-share-key";
 /** Base64url encode (no padding). */
 function base64urlEncode(bytes: Uint8Array): string {
   const binary = String.fromCharCode(...bytes);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 /** Base64url decode. */
@@ -72,5 +75,7 @@ export function decryptPassphrase(ciphertext: string): string | null {
 
 /** Check if a hash looks like a raw UUID passphrase. */
 export function isRawPassphrase(hash: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(hash);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    hash,
+  );
 }

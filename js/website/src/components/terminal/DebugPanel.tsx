@@ -1,10 +1,4 @@
-import {
-  createSignal,
-  createEffect,
-  onMount,
-  onCleanup,
-  For,
-} from "solid-js";
+import { createSignal, createEffect, onMount, onCleanup, For } from "solid-js";
 
 type DebugEntry = { t: number; level: "log" | "warn" | "error"; msg: string };
 
@@ -35,14 +29,24 @@ export function createDebugLog(): DebugLog {
   }
 
   return {
-    log(msg: string, ...args: unknown[]) { push("log", msg, args); },
-    warn(msg: string, ...args: unknown[]) { push("warn", msg, args); },
-    error(msg: string, ...args: unknown[]) { push("error", msg, args); },
+    log(msg: string, ...args: unknown[]) {
+      push("log", msg, args);
+    },
+    warn(msg: string, ...args: unknown[]) {
+      push("warn", msg, args);
+    },
+    error(msg: string, ...args: unknown[]) {
+      push("error", msg, args);
+    },
     subscribe(listener: () => void) {
       listeners.add(listener);
-      return () => { listeners.delete(listener); };
+      return () => {
+        listeners.delete(listener);
+      };
     },
-    getSnapshot() { return snapshot; },
+    getSnapshot() {
+      return snapshot;
+    },
   };
 }
 

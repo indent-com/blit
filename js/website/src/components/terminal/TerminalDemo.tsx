@@ -13,11 +13,7 @@ import {
   createBlitSessions,
 } from "@blit-sh/solid";
 import { BlitWorkspace, PALETTES } from "@blit-sh/core";
-import type {
-  BlitSession,
-  BlitWasmModule,
-  SessionId,
-} from "@blit-sh/core";
+import type { BlitSession, BlitWasmModule, SessionId } from "@blit-sh/core";
 import { initWasm } from "../../lib/wasm";
 import {
   isRawPassphrase,
@@ -62,7 +58,8 @@ function resolvePassphrase(): PassphraseResult {
   if (decrypted === null) {
     return {
       ok: false,
-      error: "Cannot decrypt session link. This link was created on a different device.",
+      error:
+        "Cannot decrypt session link. This link was created on a different device.",
     };
   }
   return { ok: true, passphrase: decrypted };
@@ -118,10 +115,7 @@ export default function TerminalDemo() {
 // TerminalInner: workspace setup + tab shell
 // ---------------------------------------------------------------------------
 
-function TerminalInner(props: {
-  wasm: BlitWasmModule;
-  passphrase: string;
-}) {
+function TerminalInner(props: { wasm: BlitWasmModule; passphrase: string }) {
   const debugLog = createDebugLog();
   const [debugOpen, setDebugOpen] = createSignal(false);
 
@@ -196,10 +190,7 @@ function TerminalInner(props: {
 // ToolbarMenu: dropdown from the "..." button
 // ---------------------------------------------------------------------------
 
-function MenuRow(props: {
-  label: string;
-  onClick: () => void;
-}) {
+function MenuRow(props: { label: string; onClick: () => void }) {
   return (
     <button
       type="button"
@@ -237,7 +228,10 @@ function ToolbarMenu(props: {
   // Close on Escape
   onMount(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); props.onClose(); }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        props.onClose();
+      }
     };
     window.addEventListener("keydown", handler);
     onCleanup(() => window.removeEventListener("keydown", handler));
@@ -252,10 +246,7 @@ function ToolbarMenu(props: {
         label={props.copied ? "Copied!" : "Copy link"}
         onClick={props.onCopyLink}
       />
-      <MenuRow
-        label="Shortcuts"
-        onClick={props.onShortcuts}
-      />
+      <MenuRow label="Shortcuts" onClick={props.onShortcuts} />
       <MenuRow
         label={props.dark ? "Light mode" : "Dark mode"}
         onClick={props.onToggleTheme}
@@ -317,7 +308,9 @@ function TabShell(props: {
           cols: 80,
         })
         .then((s) => workspace.focusSession(s.id))
-        .finally(() => { creating = false; });
+        .finally(() => {
+          creating = false;
+        });
     } else if (visibleSessions().length > 0 && !focusedId()) {
       const idx = prevFocused
         ? Math.min(prevFocused.index, visibleSessions().length - 1)
@@ -337,9 +330,7 @@ function TabShell(props: {
   const focusedSession = createMemo(() =>
     sessions().find((s) => s.id === focusedId()),
   );
-  const focusedExited = createMemo(
-    () => focusedSession()?.state === "exited",
-  );
+  const focusedExited = createMemo(() => focusedSession()?.state === "exited");
 
   // Handle Enter/Esc on exited sessions
   createEffect(() => {
@@ -411,7 +402,8 @@ function TabShell(props: {
         ? "Connected \u2014 waiting for terminal sessions..."
         : null;
     }
-    if (conn.status === "connecting") return "Connecting \u2014 waiting for blit share...";
+    if (conn.status === "connecting")
+      return "Connecting \u2014 waiting for blit share...";
     if (conn.status === "error") return `Error: ${conn.error ?? "unknown"}`;
     if (conn.status === "disconnected") return "Disconnected";
     return "Connecting...";
@@ -451,7 +443,16 @@ function TabShell(props: {
             class="flex w-9 shrink-0 cursor-pointer items-center justify-center border-none bg-transparent text-[var(--dim)] transition-colors hover:text-[var(--fg)]"
             title="New tab"
           >
-            <svg class="block" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <svg
+              class="block"
+              width="14"
+              height="14"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            >
               <path d="M8 3v10M3 8h10" />
             </svg>
           </button>
@@ -464,7 +465,13 @@ function TabShell(props: {
               title="Menu"
             >
               {/* Three vertical dots */}
-              <svg class="block" width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <svg
+                class="block"
+                width="14"
+                height="14"
+                viewBox="0 0 16 16"
+                fill="currentColor"
+              >
                 <circle cx="8" cy="3" r="1.5" />
                 <circle cx="8" cy="8" r="1.5" />
                 <circle cx="8" cy="13" r="1.5" />
@@ -480,9 +487,15 @@ function TabShell(props: {
                   copyTimeout = setTimeout(() => setCopied(false), 2000);
                 }}
                 copied={copied()}
-                onShortcuts={() => { setShowShortcuts(true); setMenuOpen(false); }}
+                onShortcuts={() => {
+                  setShowShortcuts(true);
+                  setMenuOpen(false);
+                }}
                 dark={props.dark()}
-                onToggleTheme={() => { props.onToggleTheme(); setMenuOpen(false); }}
+                onToggleTheme={() => {
+                  props.onToggleTheme();
+                  setMenuOpen(false);
+                }}
                 onClose={() => setMenuOpen(false)}
               />
             </Show>

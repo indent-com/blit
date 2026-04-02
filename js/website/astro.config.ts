@@ -45,11 +45,18 @@ export default defineConfig({
           handler(id) {
             if (id !== "\0virtual:blit-wasm") return;
             // In SSR environments, WASM can't be loaded — return null stub
-            if (this.environment?.name === "server" || this.environment?.name === "ssr") {
+            if (
+              this.environment?.name === "server" ||
+              this.environment?.name === "ssr"
+            ) {
               return `export default null;`;
             }
             // Dev: serve WASM file directly via Vite's FS server
-            if (this.environment?.mode === "dev" || (!process.argv.includes("build") && process.env.NODE_ENV !== "production")) {
+            if (
+              this.environment?.mode === "dev" ||
+              (!process.argv.includes("build") &&
+                process.env.NODE_ENV !== "production")
+            ) {
               return `export default "/@fs${wasmPath}";`;
             }
             // Prod client build: inline WASM as base64
