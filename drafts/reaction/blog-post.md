@@ -53,9 +53,9 @@ A reconnecting client gets a snapshot of *the present*. Not twenty minutes of hi
 
 Session age becomes mostly irrelevant to attach time.
 
-## The second problem we didn't expect
+## The other half of the problem
 
-Reconnects were what started the project. But once the server owned terminal state, a second problem became visible — one we'd been living with without fully naming it.
+Reconnects were the most visible symptom, but they weren't the whole problem.
 
 If a client can't consume output as fast as the PTY produces it, something has to give.
 
