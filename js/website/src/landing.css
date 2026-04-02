@@ -232,6 +232,10 @@
   width: 16rem;
 }
 
+.join-input--masked {
+  -webkit-text-security: disc;
+}
+
 .join-input::placeholder {
   color: var(--dim);
   opacity: 0.6;

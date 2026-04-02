@@ -19,13 +19,16 @@ function JoinForm() {
   return (
     <form className="join-form" onSubmit={handleSubmit}>
       <input
-        className="join-input"
-        type={visible ? "text" : "password"}
+        className={`join-input${visible ? "" : " join-input--masked"}`}
+        type="text"
         placeholder="session secret"
         value={secret}
         onChange={(e) => setSecret(e.target.value)}
         spellCheck={false}
         autoComplete="off"
+        data-1p-ignore
+        data-lpignore="true"
+        data-form-type="other"
       />
       <button
         type="button"
