@@ -64,7 +64,7 @@ sudo apt update && sudo apt install blit
 nix profile install github:indent-com/blit#blit
 ```
 
-Or jump to [nix-darwin](#nix-darwin) / [NixOS](#nixos) for service configuration.
+Or jump to [`nix/README.md`](nix/README.md) for nix-darwin / NixOS service configuration.
 
 ### From source
 
@@ -83,47 +83,9 @@ Each client is paced independently based on render metrics it reports back: disp
 
 For wire protocol details, frame encoding, and transport internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## CLI subcommands
+## CLI reference
 
-All subcommands auto-start a local server if needed. For remote hosts, use `--ssh HOST`, `--tcp HOST:PORT`, or `--passphrase PASSPHRASE`.
-
-```bash
-blit open                                # Open the terminal UI in a browser
-blit open --console                      # Open in the current terminal instead
-
-blit list                                # List all PTYs (TSV: ID, TAG, TITLE, COMMAND, STATUS)
-blit start htop                          # Start a PTY running htop, print its ID
-blit start -t build make -j8             # Start with a tag
-blit start --rows 40 --cols 120 bash     # Start with a custom size
-blit start --wait --timeout 60 make -j8  # Start and block until exit
-blit show 3                              # Dump current visible terminal text
-blit show 3 --ansi                       # Include ANSI color/style codes
-blit history 3                           # Dump all scrollback + viewport
-blit history 3 --from-start 0 --limit 50 # First 50 lines
-blit history 3 --from-end 0 --limit 50   # Last 50 lines
-blit send 3 "q"                          # Send keystrokes (supports \n, \t, \x1b escapes)
-blit show 3 --rows 40 --cols 120         # Resize before capturing viewport
-blit history 3 --cols 200                # Resize before reading scrollback
-blit wait 3 --timeout 30                 # Block until session exits
-blit wait 3 --timeout 60 --pattern DONE  # Block until output matches regex
-blit restart 3                           # Restart an exited session
-blit close 3                             # Close and remove a PTY
-
-blit share                               # Share via WebRTC (prints URL)
-blit share --passphrase mysecret         # Share with a specific passphrase
-blit share --verbose                     # Share with connection diagnostics
-
-blit learn                               # Print the full CLI reference
-blit upgrade                             # Upgrade blit to the latest version
-
-blit --ssh myhost list                   # Against a remote host
-blit --ssh myhost start htop
-blit --ssh myhost show 1
-```
-
-Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
-
-If you're building an AI agent that drives terminals, run `blit learn` to print the full CLI reference, or see [SKILL.md](SKILL.md) for a skill definition you can drop into your agent's tool list.
+Run `blit learn` to print the full CLI reference. For the machine-readable version, see [SKILL.md](SKILL.md). All subcommands auto-start a local server if needed.
 
 ## Configuration
 
@@ -133,36 +95,7 @@ If you're building an AI agent that drives terminals, run `blit learn` to print 
 | `BLIT_SCROLLBACK` | `10000`                                                                                                                | Scrollback rows per PTY              |
 | `BLIT_HUB`        | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing |
 
-### `blit-gateway` (optional, for persistent multi-user browser access)
-
-| Variable        | Default                                                                      | Purpose                           |
-| --------------- | ---------------------------------------------------------------------------- | --------------------------------- |
-| `BLIT_PASS`     | required                                                                     | Browser passphrase                |
-| `BLIT_ADDR`     | `0.0.0.0:3264`                                                               | HTTP/WebSocket listen address     |
-| `BLIT_SOCK`     | `$TMPDIR/blit.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit-$USER.sock` | Upstream server socket            |
-| `BLIT_CORS`     | unset                                                                        | CORS origin for font routes       |
-| `BLIT_QUIC`     | unset                                                                        | Set to `1` to enable WebTransport |
-| `BLIT_TLS_CERT` | auto-generated                                                               | TLS cert for WebTransport         |
-| `BLIT_TLS_KEY`  | auto-generated                                                               | TLS key for WebTransport          |
-
-## Running as a service
-
-### macOS (Homebrew)
-
-```bash
-brew services start blit-server
-brew services start blit-gateway
-```
-
-### Debian / Ubuntu (systemd)
-
-```bash
-sudo systemctl enable --now blit-server@alice.socket
-
-# Share via WebRTC: create /etc/blit/forwarder-alice.env with
-# BLIT_SOCK=/run/blit/alice.sock and BLIT_PASSPHRASE=<secret>, then:
-sudo systemctl enable --now blit-webrtc-forwarder@alice.service
-```
+For `blit-gateway` configuration, running as a systemd/launchd service, and Nix module setup, see [SERVICES.md](SERVICES.md) and [`nix/README.md`](nix/README.md).
 
 ## How it compares
 
@@ -180,27 +113,9 @@ sudo systemctl enable --now blit-webrtc-forwarder@alice.service
 | Agent / CLI subcommands  | ✅                             | ❌                  | ❌                  | ❌                    | ❌                    | ❌                   |
 | SSH tunneling built-in   | ✅                             | ❌                  | ❌                  | ✅                    | ✅                    | ❌                   |
 
-## What lives in this repo
-
-| Directory                  | Package                 | Role                                                             |
-| -------------------------- | ----------------------- | ---------------------------------------------------------------- |
-| `crates/cli/`              | `blit`                  | Browser client, agent subcommands, SSH tunnels, `server`/`share` |
-| `crates/server/`           | `blit-server`           | PTY host and frame scheduler (also embedded in `blit`)           |
-| `crates/gateway/`          | `blit-gateway`          | WebSocket/WebTransport proxy for multi-user access               |
-| `crates/webrtc-forwarder/` | `blit-webrtc-forwarder` | WebRTC bridge for NAT traversal (STUN/TURN)                      |
-| `crates/remote/`           | `blit-remote`           | Wire protocol and frame/state primitives                         |
-| `crates/browser/`          | `blit-browser`          | WASM terminal runtime                                            |
-| `crates/alacritty-driver/` | `blit-alacritty`        | Terminal parsing backed by `alacritty_terminal`                  |
-| `crates/fonts/`            | `blit-fonts`            | Font discovery and metadata                                      |
-| `crates/webserver/`        | `blit-webserver`        | Shared HTTP helpers for serving assets and fonts                 |
-| `js/core/`                 | `@blit-sh/core`         | Framework-agnostic core: workspace, transports, terminal surface |
-| `js/react/`                | `@blit-sh/react`        | React bindings ([EMBEDDING.md](EMBEDDING.md))                    |
-| `js/solid/`                | `@blit-sh/solid`        | Solid bindings ([EMBEDDING.md](EMBEDDING.md))                    |
-| `js/web-app/`              |                         | Browser UI                                                       |
-
 ## Contributing
 
-Building from source, running tests, dev environment setup, code conventions, and release process are all covered in [CONTRIBUTING.md](CONTRIBUTING.md). CI/CD pipelines, the install site, and the signaling hub are documented in [SERVICES.md](SERVICES.md).
+Building from source, running tests, dev environment setup, code conventions, and release process are all covered in [CONTRIBUTING.md](CONTRIBUTING.md). CI/CD pipelines, the install site, and the signaling hub are documented in [SERVICES.md](SERVICES.md). The crate and package map is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Docker sandbox
 
@@ -213,48 +128,3 @@ nix build .#demo-image
 docker load < result
 docker run --rm grab/blit-demo
 ```
-
-## nix-darwin
-
-```nix
-{ inputs, ... }: {
-  imports = [ inputs.blit.darwinModules.blit ];
-
-  services.blit = {
-    enable = true;
-    gateways.default = {
-      port = 3264;
-      passFile = "/path/to/blit-pass-env";
-    };
-    forwarders.default = {
-      passFile = "/path/to/blit-forwarder-env";
-    };
-  };
-}
-```
-
-See [`nix/darwin-module.nix`](nix/darwin-module.nix) for the full list of options.
-
-## NixOS
-
-```nix
-{ inputs, ... }: {
-  imports = [ inputs.blit.nixosModules.blit ];
-
-  services.blit = {
-    enable = true;
-    users = [ "alice" "bob" ];
-    gateways.alice = {
-      user = "alice";
-      port = 3264;
-      passFile = "/run/secrets/blit-alice-pass";
-    };
-    forwarders.alice = {
-      user = "alice";
-      passFile = "/run/secrets/blit-alice-forwarder-pass";
-    };
-  };
-}
-```
-
-See [`nix/nixos-module.nix`](nix/nixos-module.nix) for the full list of options.

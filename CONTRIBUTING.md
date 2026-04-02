@@ -6,6 +6,7 @@ Reading material:
 - SERVICES.md
 - SKILL.md
 - UNSAFE.md
+- nix/README.md
 - js/blit-hub/README.md
 
 # Contributing to blit
@@ -16,17 +17,18 @@ This document helps LLM agents (and humans) contribute to the blit codebase. It 
 
 When making changes, update the relevant docs in the same PR.
 
-| Document                  | Scope                                                                                                         | Update when...                                                                                                               |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `README.md`               | User-facing overview: installation, usage, features                                                           | CLI flags, install methods, or supported platforms change                                                                    |
-| `ARCHITECTURE.md`         | System internals: data flow, crate responsibilities, transport layers, rendering pipeline                     | Crates are added/removed/renamed, data flow between components changes, or new transport/rendering mechanisms are introduced |
-| `CONTRIBUTING.md`         | Developer workflow: building, testing, code conventions, project structure                                    | Build steps, test commands, directory layout, or dev tooling changes                                                         |
-| `SERVICES.md`             | Hosted services and CI/CD: install.blit.sh, hub.blit.sh, GitHub Actions workflows, release lifecycle, secrets | CI jobs are added/removed/changed, deployment targets change, new secrets are introduced, or the release process is modified |
-| `EMBEDDING.md`            | Embedding blit in other apps: React components (`@blit-sh/react`), embedding `blit-server` as a library       | Public embedding APIs, component props, or integration patterns change                                                       |
-| `SKILL.md`                | LLM agent skill definition: install instructions and pointer to `blit learn`                                  | Install methods change or the `learn` subcommand output changes                                                              |
-| `crates/cli/src/learn.md` | Full CLI reference printed by `blit learn`: usage patterns, subcommand details, transport options, escapes    | CLI subcommands, flags, output conventions, or transport options change                                                      |
-| `UNSAFE.md`               | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                      | Unsafe code is added, removed, or its safety invariants change                                                               |
-| `js/blit-hub/README.md`   | blit-hub signaling relay: protocol, deployment, configuration                                                 | Hub protocol, endpoints, deployment config, or environment variables change                                                  |
+| Document                  | Scope                                                                                                      | Update when...                                                                                                               |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`               | User-facing overview: installation, usage, features                                                        | CLI flags, install methods, or supported platforms change                                                                    |
+| `ARCHITECTURE.md`         | System internals: data flow, crate responsibilities, transport layers, rendering pipeline                  | Crates are added/removed/renamed, data flow between components changes, or new transport/rendering mechanisms are introduced |
+| `CONTRIBUTING.md`         | Developer workflow: building, testing, code conventions, project structure                                 | Build steps, test commands, directory layout, or dev tooling changes                                                         |
+| `SERVICES.md`             | Hosted services, CI/CD, and running as a service (Homebrew, systemd)                                       | CI jobs are added/removed/changed, deployment targets change, new secrets are introduced, or the release process is modified |
+| `EMBEDDING.md`            | Embedding blit in other apps: React components (`@blit-sh/react`), embedding `blit-server` as a library    | Public embedding APIs, component props, or integration patterns change                                                       |
+| `SKILL.md`                | LLM agent skill definition: install instructions and pointer to `blit learn`                               | Install methods change or the `learn` subcommand output changes                                                              |
+| `crates/cli/src/learn.md` | Full CLI reference printed by `blit learn`: usage patterns, subcommand details, transport options, escapes | CLI subcommands, flags, output conventions, or transport options change                                                      |
+| `UNSAFE.md`               | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                   | Unsafe code is added, removed, or its safety invariants change                                                               |
+| `nix/README.md`           | nix-darwin and NixOS service module configuration examples                                                 | Nix module options or usage patterns change                                                                                  |
+| `js/blit-hub/README.md`   | blit-hub signaling relay: protocol, deployment, configuration                                              | Hub protocol, endpoints, deployment config, or environment variables change                                                  |
 
 ## Getting started
 
@@ -64,6 +66,16 @@ nix develop -c $SHELL
 ```
 
 You'll need to re-run this every time you open a new terminal in the repo.
+
+## Quick start
+
+Once you're in the dev shell, start the full stack with hot-reloading:
+
+```bash
+./bin/dev
+```
+
+This launches the server, gateway, WASM watcher, and Vite dev servers via `process-compose`. See [Dev environment](#dev-environment) for details on what each process does.
 
 ## Building and testing
 
