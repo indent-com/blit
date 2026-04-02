@@ -140,9 +140,8 @@ export function Landing() {
         <section className="hero">
           <h1>Your terminal, everywhere.</h1>
           <p className="hero-sub">
-            Stream terminals to any browser, fast. LZ4-compressed binary
-            diffs, WebGL rendering, per-client backpressure. One binary,
-            zero config.
+            Open your terminal in any browser. Share it with a link.
+            Let AI agents drive it. One binary, zero config, instant.
           </p>
           <div className="hero-install">
             <div className="install-block">
