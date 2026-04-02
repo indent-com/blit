@@ -4,6 +4,7 @@ Requires=blit-server.socket
 
 [Service]
 Type=simple
+WorkingDirectory=~
 ExecStart=blit-server
 # Keep running after all clients disconnect — PTYs stay alive.
 # Stop manually with: systemctl --user stop blit-server.service
