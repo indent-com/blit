@@ -204,10 +204,24 @@ CTRL
     text = ''
       if [ -n "''${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
         echo "=== Exchanging OIDC token for crates.io publish token ==="
-        oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://crates.io" | jq -r '.value')
-        token=$(curl -sS -X POST https://crates.io/api/v1/trusted_publishing/tokens \
-          -H "Authorization: Bearer $oidc" | jq -r '.token')
+        oidc_response=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://crates.io")
+        oidc=$(echo "$oidc_response" | jq -r '.value // empty')
+        if [ -z "''${oidc:-}" ]; then
+          echo "FATAL: failed to get OIDC token from GitHub"
+          echo "Response: $oidc_response"
+          exit 1
+        fi
+
+        token_response=$(curl -sS -X POST https://crates.io/api/v1/trusted_publishing/tokens \
+          -H "Content-Type: application/json" \
+          -d "{\"jwt\": \"$oidc\"}")
+        token=$(echo "$token_response" | jq -r '.token // empty')
+        if [ -z "''${token:-}" ]; then
+          echo "FATAL: failed to exchange OIDC token for crates.io publish token"
+          echo "Response: $token_response"
+          exit 1
+        fi
         export CARGO_REGISTRY_TOKEN="$token"
       fi
 
