@@ -119,7 +119,7 @@ blit --ssh myhost show 1
 
 Output is plain text with no decoration — designed to be easy for scripts and LLMs to parse. Errors go to stderr; non-zero exit on failure.
 
-If you're building an AI agent that drives terminals, [SKILLS.md](SKILLS.md) is a ready-made skill definition you can drop into your agent's tool list.
+If you're building an AI agent that drives terminals, [SKILL.md](SKILL.md) is a ready-made skill definition you can drop into your agent's tool list.
 
 ## Configuration
 

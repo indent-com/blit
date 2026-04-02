@@ -11,6 +11,33 @@ description: >
 
 Drive terminal sessions programmatically through stateless CLI subcommands. Each subcommand opens a fresh connection, performs one operation, and exits.
 
+## Install
+
+```bash
+curl https://install.blit.sh | sh
+```
+
+macOS (Homebrew):
+
+```bash
+brew install indent-com/tap/blit
+```
+
+Debian / Ubuntu (APT):
+
+```bash
+curl -fsSL https://install.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
+echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://install.blit.sh/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/blit.list
+sudo apt update && sudo apt install blit
+```
+
+Nix:
+
+```bash
+nix profile install github:indent-com/blit#blit
+```
+
 ## Running commands
 
 `blit start` creates a PTY and prints its session ID. Pass a command directly or omit it to start the user's default shell:
