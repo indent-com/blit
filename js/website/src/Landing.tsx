@@ -170,7 +170,7 @@ export function Landing() {
             One binary, zero config, instant.
           </p>
           <p className="hero-mit">
-            MIT-licensed. Every unsafe block{" "}
+            MIT-licensed. Wide chars, emoji, and Unicode done right. Every unsafe block{" "}
             <a href="https://github.com/indent-com/blit/blob/main/UNSAFE.md" target="_blank" rel="noopener noreferrer">audited</a>,
             every invariant documented.
           </p>
