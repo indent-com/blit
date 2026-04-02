@@ -352,13 +352,7 @@
           if [ -z "''${LANG-}" ]; then
             export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"
           fi
-          echo "blit dev shell"
-          echo "  dev:                dev  (server + gateway + browser assets, auto-reload on source change)"
-          echo "  build:              build"
-          echo "  run server:         cargo run -p blit-server"
-          echo "  run gateway:        BLIT_PASS=secret cargo run -p blit-gateway  # http://localhost:3264"
-          echo "  run cli:            cargo run -p blit-cli"
-          echo "  flamegraph:         flamegraph -- target/release/blit-server"
+          export PATH="$PWD/bin:$PATH"
         '';
       };
     };
