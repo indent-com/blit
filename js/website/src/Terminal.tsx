@@ -447,7 +447,8 @@ function TabShell({
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.shiftKey && e.key === "Enter") {
         e.preventDefault();
-        workspace.createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 });
+        workspace.createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
+          .then((s) => workspace.focusSession(s.id)).catch(() => {});
       } else if (mod && e.shiftKey && e.key === "?") {
         e.preventDefault();
         setShowShortcuts((v) => !v);
@@ -541,6 +542,12 @@ function TabShell({
                   (e.currentTarget.style.background = "transparent")
                 }
               >
+                <span style={{
+                  display: "inline-block",
+                  width: 7, height: 7, borderRadius: "50%",
+                  background: s.state === "active" ? rgb(green) : rgba(palette.fg, 0.3),
+                  flexShrink: 0,
+                }} />
                 <span>{tabLabel(s)}</span>
                 <button
                   onClick={(e) => {
