@@ -666,7 +666,14 @@ pub async fn run_browser(
     } else if let Some(path) = socket {
         BrowserConnector::Unix(path.clone())
     } else {
-        BrowserConnector::Unix(transport::default_local_socket())
+        let path = transport::default_local_socket();
+        if !std::path::Path::new(&path).exists() {
+            if let Err(e) = transport::ensure_local_server(&path).await {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        BrowserConnector::Unix(path)
     };
 
     let mut attempts = 0;
