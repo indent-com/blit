@@ -150,6 +150,7 @@ const SHORTCUTS: [string, string][] = [
   ["Mod+[ / ]", "Previous / next tab"],
   ["Mod+Shift+D", "Toggle debug panel"],
   ["Mod+Shift+?", "Toggle this panel"],
+  ["F1", "Toggle this panel"],
 ];
 
 const MOD_LABEL = navigator.userAgent.includes("Mac") ? "\u2318" : "Ctrl";
@@ -449,7 +450,7 @@ function TabShell({
         e.preventDefault();
         workspace.createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
           .then((s) => workspace.focusSession(s.id)).catch(() => {});
-      } else if (mod && e.shiftKey && e.key === "?") {
+      } else if ((mod && e.shiftKey && e.key === "?") || e.key === "F1") {
         e.preventDefault();
         setShowShortcuts((v) => !v);
       } else if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
@@ -509,8 +510,7 @@ function TabShell({
             borderBottom: `1px solid ${border}`,
             background: bg,
             flexShrink: 0,
-            minHeight: 42,
-            padding: "0 4px",
+            padding: "4px 4px 0",
             gap: 2,
           }}
         >
