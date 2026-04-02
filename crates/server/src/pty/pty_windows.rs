@@ -88,10 +88,11 @@ pub fn close_pty(handle: &PtyHandle) {
 }
 
 pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
+    const STILL_ACTIVE: u32 = 259;
     unsafe {
         WaitForSingleObject(handle.process, 1000);
         let mut exit_code: u32 = 0;
-        if GetExitCodeProcess(handle.process, &mut exit_code) != 0 {
+        if GetExitCodeProcess(handle.process, &mut exit_code) != 0 && exit_code != STILL_ACTIVE {
             exit_code as i32
         } else {
             blit_remote::EXIT_STATUS_UNKNOWN
@@ -188,8 +189,12 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 fn build_command_line(shell: &str, shell_flags: &str, command: Option<&str>) -> Vec<u16> {
+    let shell_lower = shell.to_ascii_lowercase();
+    let is_cmd = shell_lower.ends_with("cmd.exe") || shell_lower.ends_with("cmd");
     let cmd = if let Some(command) = command {
-        if shell_flags.is_empty() {
+        if is_cmd {
+            format!("{shell} /c {command}")
+        } else if shell_flags.is_empty() {
             format!("{shell} -c {command}")
         } else {
             format!("{shell} -{shell_flags}c {command}")
@@ -395,7 +400,7 @@ pub fn respawn_child(
             CloseHandle(output_write);
             return None;
         }
-        UpdateProcThreadAttribute(
+        if UpdateProcThreadAttribute(
             attr_list,
             0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
@@ -403,7 +408,15 @@ pub fn respawn_child(
             std::mem::size_of::<HPCON>(),
             std::ptr::null_mut(),
             std::ptr::null(),
-        );
+        ) == 0
+        {
+            ClosePseudoConsole(conpty);
+            CloseHandle(input_read);
+            CloseHandle(input_write);
+            CloseHandle(output_read);
+            CloseHandle(output_write);
+            return None;
+        }
     }
 
     let mut cmd_line = build_command_line(shell, shell_flags, command);

@@ -501,7 +501,16 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
             .exec();
         Err(format!("exec failed: {err}").into())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("powershell")
+            .args(["-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&tmp)
+            .env("BLIT_INSTALL_DIR", install_dir)
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let status = std::process::Command::new("sh")
             .arg(&tmp)

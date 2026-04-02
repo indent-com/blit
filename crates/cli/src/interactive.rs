@@ -701,9 +701,17 @@ pub async fn run_browser(
     let connector = if let Some(addr) = tcp {
         remote_host = Some(addr.split(':').next().unwrap_or(addr).to_string());
         BrowserConnector::Tcp(addr.clone())
-    } else if let Some(host) = ssh {
-        remote_host = Some(host.clone());
-        setup_ssh_forward(std::slice::from_ref(host)).await
+    } else if let Some(_host) = ssh {
+        #[cfg(unix)]
+        {
+            remote_host = Some(_host.clone());
+            setup_ssh_forward(std::slice::from_ref(_host)).await
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("blit: --ssh is not supported on this platform");
+            std::process::exit(1);
+        }
     } else if let Some(path) = socket {
         BrowserConnector::Ipc(path.clone())
     } else {
