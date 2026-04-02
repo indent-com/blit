@@ -97,7 +97,7 @@ function DebugPanel({ log, onClose }: { log: DebugLog; onClose: () => void }) {
       position: "fixed", top: 0, right: 0, bottom: 0, width: 420,
       background: "rgba(13,17,23,0.95)", borderLeft: "1px solid #30363d",
       display: "flex", flexDirection: "column", zIndex: 9999,
-      fontFamily: "'Fira Code', monospace", fontSize: 11,
+      fontFamily: "'Fira Code', ui-monospace, monospace", fontSize: 11,
     }}>
       <div style={{
         padding: "8px 12px", borderBottom: "1px solid #30363d",
@@ -134,7 +134,7 @@ function DebugPanel({ log, onClose }: { log: DebugLog; onClose: () => void }) {
     </div>
   );
 }
-const FONT_FAMILY = "'Fira Code', monospace";
+const FONT_FAMILY = "'Fira Code', ui-monospace, monospace";
 const FONT_SIZE = 14;
 const EXITED_LABEL_STYLE: React.CSSProperties = {
   cursor: "pointer",
@@ -177,7 +177,7 @@ function ShortcutsPanel({ onClose, dimFg, border }: { onClose: () => void; dimFg
         style={{
           background: "#0d1117", border: `1px solid ${border}`, borderRadius: 10,
           padding: "20px 28px", minWidth: 300,
-          fontFamily: "'Fira Code', monospace", fontSize: 13, color: "#c9d1d9",
+          fontFamily: "'Fira Code', ui-monospace, monospace", fontSize: 13, color: "#c9d1d9",
         }}
       >
         <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 16 }}>Keyboard shortcuts</div>
@@ -338,7 +338,7 @@ function ShareButton({
         color: dimFg,
         cursor: "pointer",
         fontSize: 12,
-        fontFamily: "'Fira Code', monospace",
+        fontFamily: "'Fira Code', ui-monospace, monospace",
         whiteSpace: "nowrap",
         transition: "background 0.1s",
         flexShrink: 0,
@@ -536,7 +536,7 @@ function TabShell({
                   padding: "0 14px",
                   cursor: "pointer",
                   fontSize: 13,
-                  fontFamily: "'Fira Code', monospace",
+                  fontFamily: "'Fira Code', ui-monospace, monospace",
                   color: active ? fg : dimFg,
                   borderBottom: active ? `2px solid ${accent}` : "2px solid transparent",
                   background: active ? rgba(palette.fg, dark ? 0.06 : 0.04) : "transparent",
@@ -615,7 +615,7 @@ function TabShell({
               cursor: "pointer",
               padding: "0 10px",
               fontSize: 18,
-              fontFamily: "'Fira Code', monospace",
+              fontFamily: "'Fira Code', ui-monospace, monospace",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
@@ -639,7 +639,7 @@ function TabShell({
               cursor: "pointer",
               padding: "0 10px",
               fontSize: 14,
-              fontFamily: "'Fira Code', monospace",
+              fontFamily: "'Fira Code', ui-monospace, monospace",
               fontWeight: 700,
               flexShrink: 0,
               transition: "background 0.1s",
@@ -663,7 +663,7 @@ function TabShell({
               alignItems: "center",
               justifyContent: "center",
               zIndex: 1,
-              fontFamily: "'Fira Code', monospace",
+              fontFamily: "'Fira Code', ui-monospace, monospace",
               fontSize: 14,
               color: dimFg,
             }}
@@ -695,7 +695,7 @@ function TabShell({
               backdropFilter: "blur(8px)",
               border: `1px solid ${border}`,
               borderRadius: 10,
-              fontFamily: "'Fira Code', monospace",
+              fontFamily: "'Fira Code', ui-monospace, monospace",
               fontSize: 13,
               color: dimFg,
               whiteSpace: "nowrap",

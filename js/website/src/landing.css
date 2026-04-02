@@ -30,7 +30,7 @@
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  font-family: 'Fira Code', monospace;
+  font-family: 'Fira Code', ui-monospace, monospace;
   font-size: 14px;
   line-height: 1.7;
 }
@@ -186,7 +186,7 @@
   padding: 2px 8px;
   border-radius: 3px;
   font-size: 12px;
-  font-family: 'Fira Code', monospace;
+  font-family: 'Fira Code', ui-monospace, monospace;
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -226,7 +226,7 @@
   border: none;
   outline: none;
   color: var(--fg);
-  font-family: 'Fira Code', monospace;
+  font-family: 'Fira Code', ui-monospace, monospace;
   font-size: 14px;
   padding: 0.45rem 0.75rem;
   width: 16rem;
@@ -262,7 +262,7 @@
   background: var(--accent);
   color: #fff;
   border: none;
-  font-family: 'Fira Code', monospace;
+  font-family: 'Fira Code', ui-monospace, monospace;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -392,7 +392,7 @@
 }
 
 .demo-pre code {
-  font-family: 'Fira Code', monospace;
+  font-family: 'Fira Code', ui-monospace, monospace;
   font-size: 13px;
   line-height: 1.65;
   color: var(--code-fg);
