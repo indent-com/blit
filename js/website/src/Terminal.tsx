@@ -449,7 +449,7 @@ function TabShell({
         e.preventDefault();
         workspace.createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
           .then((s) => workspace.focusSession(s.id)).catch(() => {});
-      } else if (e.ctrlKey && e.key === "?") {
+      } else if (e.ctrlKey && e.shiftKey && (e.key === "?" || e.code === "Slash")) {
         e.preventDefault();
         setShowShortcuts((v) => !v);
       } else if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
