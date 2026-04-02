@@ -35,17 +35,11 @@ That works fine when there's one client, it never disconnects, and the session i
 
 We were hitting all four. The architecture was fighting the product.
 
-## The wrong turns
+## The decision
 
-We didn't jump straight to "build a whole new terminal stack." We tried smaller things first.
+Once the problem was clear, the answer came quickly. The server needed to own the state. The client needed to receive diffs. The byte stream needed to stop being the unit of client communication.
 
-We tried server-side replay acceleration — pre-parsing history on the server and sending a compact representation. It helped with startup time but didn't solve the flow control problem. We still had a growing queue of stale output for slow clients.
-
-We looked at patching xterm.js to support state snapshots. Possible in theory, but xterm.js (reasonably) treats its internal state as private. Serializing and deserializing the full emulator state was fragile and fought the library's design.
-
-We considered a hybrid: keep xterm.js for rendering, but add a server-side emulator that could produce snapshots. This is closer to where we ended up, but it still meant maintaining two VT parsers that had to agree on every edge case. Unicode width tables, incomplete escape sequences, mode interactions — any divergence between the two parsers meant the snapshot wouldn't match what the browser would have computed on its own.
-
-At some point we realized we were building an increasingly elaborate support structure around a model that didn't fit. The server needed to own the state. The client needed to receive diffs. The byte stream needed to stop being the unit of client communication.
+There are smaller fixes you can imagine — capping replay length, snapshotting periodically, sending the last N bytes — but they're all tradeoffs between latency and correctness within the same model. The model was the problem.
 
 ## The core idea
 
