@@ -4,13 +4,40 @@ This document helps LLM agents (and humans) contribute to the blit codebase. It 
 
 ## Getting started
 
-The project uses Nix for all tooling. Enter the dev shell, then everything works:
+### Install Nix and direnv
+
+The project uses Nix for all tooling — the Rust toolchain, wasm-pack, pnpm, Node, process-compose, cargo-watch, and everything else. There is no `Makefile` that installs things piecemeal and no list of system dependencies to chase down. One `flake.nix` pins every tool to an exact revision, so every contributor builds with identical versions regardless of OS or distro. If it works in the dev shell, it works in CI.
+
+direnv makes this invisible. Instead of remembering to run `nix develop` every time you `cd` into the repo, direnv evaluates `.envrc`, enters the Nix dev shell, and adds `bin/` to your PATH automatically. Leave the directory and it restores your previous environment. The result: you open a terminal, `cd blit`, and every tool is just there.
+
+**1. Install the [Determinate Nix Installer](https://github.com/DeterminateSystems/nix-installer):**
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+This is preferred over the official Nix installer because it enables flakes and the nix command out of the box, configures uninstall support, and works reliably on both macOS and Linux without manual `nix.conf` edits.
+
+**2. [Install direnv](https://direnv.net/docs/installation.html)** and [hook it into your shell](https://direnv.net/docs/hook.html).
+
+**3. Allow the `.envrc`:**
+
+```bash
+cd blit
+direnv allow
+```
+
+The first run downloads and builds the toolchain (cached after that). Once you see `blit dev shell`, you're ready.
+
+### Without direnv
+
+If you'd rather not install direnv, you can enter the dev shell manually:
 
 ```bash
 nix develop -c $SHELL
 ```
 
-If you have direnv, `.envrc` handles this automatically and adds `bin/` to PATH.
+You'll need to re-run this every time you open a new terminal in the repo.
 
 ## Building and testing
 
