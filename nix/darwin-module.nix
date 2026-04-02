@@ -138,6 +138,7 @@ in {
           } // lib.optionalAttrs (cfg.shell != null) {
             SHELL = cfg.shell;
           };
+          WorkingDirectory = "~";
           RunAtLoad = true;
           KeepAlive = true;
           StandardOutPath = "/tmp/blit-server.log";

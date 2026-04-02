@@ -4,6 +4,7 @@ Requires=blit.socket
 
 [Service]
 Type=simple
+WorkingDirectory=~
 ExecStart=blit server
 Restart=no
 
