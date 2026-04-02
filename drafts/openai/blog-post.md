@@ -152,7 +152,8 @@ For embedding in your own app, `fd-channel` mode lets an external process pass p
 On the frontend, `@blit-sh/react` and `@blit-sh/solid` are intentionally thin wrappers over `@blit-sh/core`:
 
 ```tsx
-import { BlitTerminal, BlitWorkspace, BlitWorkspaceProvider } from "@blit-sh/react";
+import { BlitTerminal, BlitWorkspaceProvider } from "@blit-sh/react";
+import { BlitWorkspace } from "@blit-sh/core";
 
 <BlitWorkspaceProvider workspace={workspace}>
   <BlitTerminal sessionId={session.id} style={{ width: "100%", height: "100vh" }} />

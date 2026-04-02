@@ -176,7 +176,8 @@ The design falls out of one decision: **the server owns the state**.
 For embedding in another service, `fd-channel` mode lets an external process pass pre-connected client file descriptors into `blit-server` via `SCM_RIGHTS`. Your service can own auth and connection acceptance; `blit` owns the terminal machinery. On the frontend, the framework bindings are intentionally thin:
 
 ```tsx
-import { BlitTerminal, BlitWorkspace, BlitWorkspaceProvider } from "@blit-sh/react";
+import { BlitTerminal, BlitWorkspaceProvider } from "@blit-sh/react";
+import { BlitWorkspace } from "@blit-sh/core";
 
 <BlitWorkspaceProvider workspace={workspace}>
   <BlitTerminal sessionId={session.id} style={{ width: "100%", height: "100vh" }} />

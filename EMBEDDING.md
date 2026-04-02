@@ -9,13 +9,12 @@ There are two distinct dimensions: embedding the frontend into your app, and emb
 ```tsx
 import {
   BlitTerminal,
-  BlitWorkspace,
   BlitWorkspaceProvider,
-  WebSocketTransport,
   useBlitFocusedSession,
   useBlitSessions,
   useBlitWorkspace,
 } from "@blit-sh/react";
+import { BlitWorkspace, WebSocketTransport } from "@blit-sh/core";
 import { useEffect, useMemo } from "react";
 
 function EmbeddedBlit({ wasm, passphrase }: { wasm: any; passphrase: string }) {
