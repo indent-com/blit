@@ -31,7 +31,8 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
             args+=(--prod)
           fi
-          url=$(./bin/deploy-website "${args[@]}" 2>&1 | tee /dev/stderr | grep -o 'https://[^ ]*\.vercel\.app' | tail -1)
+          output=$(./bin/deploy-website "${args[@]}" 2>&1 | tee /dev/stderr) || exit $?
+          url=$(echo "$output" | grep -o 'https://[^ ]*\.vercel\.app' | tail -1)
           echo "url=$url" >> "$GITHUB_OUTPUT"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

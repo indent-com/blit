@@ -247,8 +247,18 @@ CTRL
 {"version":3,"routes":[{"handle":"filesystem"},{"src":"/(.*)", "dest":"/index.html"}]}
 JSON
 
+      if [ -n "''${VERCEL_ORG_ID:-}" ] && [ -n "''${VERCEL_PROJECT_ID:-}" ]; then
+        cat > "$tmp/.vercel/project.json" <<PROJ
+{"orgId":"$VERCEL_ORG_ID","projectId":"$VERCEL_PROJECT_ID"}
+PROJ
+      fi
+
       cd "$tmp"
-      npx vercel deploy --prebuilt "$@"
+      token_args=()
+      if [ -n "''${VERCEL_TOKEN:-}" ]; then
+        token_args+=(--token "$VERCEL_TOKEN")
+      fi
+      npx vercel deploy --prebuilt "''${token_args[@]}" "$@"
     '';
   };
 in {
