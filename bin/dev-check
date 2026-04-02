@@ -22,21 +22,24 @@ echo "=== Starting bin/dev ==="
 DEV_PID=$!
 
 echo "=== Waiting for all services to become healthy (timeout ${TIMEOUT}s) ==="
-elapsed=0
+start_time=$(date +%s)
+deadline=$((start_time + TIMEOUT))
 while true; do
+    now=$(date +%s)
+    elapsed=$((now - start_time))
+
     if ! kill -0 "$DEV_PID" 2>/dev/null; then
         echo "FATAL: bin/dev exited unexpectedly"
         wait "$DEV_PID" || true
         exit 1
     fi
 
-    if [ "$elapsed" -ge "$TIMEOUT" ]; then
-        echo "FATAL: timed out waiting for services"
+    if [ "$now" -ge "$deadline" ]; then
+        echo "FATAL: timed out waiting for services after ${elapsed}s"
         process-compose -U -u "$PC_SOCK" list 2>/dev/null || true
         exit 1
     fi
 
-    # Check if all services are Running via process-compose
     if status=$(process-compose -U -u "$PC_SOCK" list -o json 2>/dev/null); then
         total=$(echo "$status" | jq 'length')
         running=$(echo "$status" | jq '[.[] | select(.status == "Running")] | length')
@@ -47,7 +50,6 @@ while true; do
     fi
 
     sleep 5
-    elapsed=$((elapsed + 5))
 done
 
 echo "=== All services running ==="
