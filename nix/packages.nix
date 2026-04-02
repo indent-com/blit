@@ -165,7 +165,7 @@
         '';
         installPhase = ''
           mkdir -p $out
-          cp js/web-app/dist/index.html $out/
+          cp web-app/dist/index.html $out/
         '';
         doCheck = false;
       };
@@ -184,7 +184,7 @@
         '';
         installPhase = ''
           mkdir -p $out
-          cp -r js/website/dist/* $out/
+          cp -r website/dist/* $out/
         '';
         doCheck = false;
       };
