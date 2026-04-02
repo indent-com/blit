@@ -309,7 +309,7 @@ PROJ
       outdir="''${1:-coverage-report}"
 
       echo "=== Running tests with coverage ==="
-      cargo llvm-cov --no-report --workspace --branch
+      cargo llvm-cov --no-report --workspace
 
       echo ""
       echo "=== Coverage summary ==="
