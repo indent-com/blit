@@ -1,5 +1,6 @@
 Reading material:
 
+- AGENTS.md
 - ARCHITECTURE.md
 - CONTRIBUTING.md
 - EMBEDDING.md
