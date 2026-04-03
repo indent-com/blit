@@ -256,10 +256,17 @@ struct CachedSurfaceInfo {
     app_id: String,
 }
 
+struct BufferedSurfaceFrame {
+    msg: Vec<u8>,
+    is_keyframe: bool,
+}
+
 struct SharedCompositor {
     handle: CompositorHandle,
     encoders: HashMap<u16, SurfaceEncoder>,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
+    last_frames: HashMap<u16, BufferedSurfaceFrame>,
+    force_keyframe: bool,
     created_at: Instant,
 }
 
@@ -304,7 +311,7 @@ fn encode_surface_frame(
     let yuv = rgba_to_yuv420(pixels, w, h);
     let yuv_buf = openh264::formats::YUVBuffer::from_vec(yuv, w, h);
     let bitstream = enc.encoder.encode(&yuv_buf).ok()?;
-    let is_keyframe = enc.frame_count == 0;
+    let is_keyframe = bitstream.frame_type() == openh264::encoder::FrameType::IDR;
     enc.frame_count += 1;
     let nal_data = bitstream.to_vec();
     if nal_data.is_empty() {
@@ -376,6 +383,8 @@ struct ClientState {
     last_log: Instant,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
+    surface_next_send_at: Instant,
+    surface_needs_keyframe: bool,
 }
 
 struct InFlightFrame {
@@ -1002,6 +1011,8 @@ impl Session {
                 handle,
                 encoders: HashMap::new(),
                 surfaces: HashMap::new(),
+                last_frames: HashMap::new(),
+                force_keyframe: false,
                 created_at: Instant::now(),
             });
         }
@@ -1786,7 +1797,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         while let Ok(event) = cs.handle.event_rx.try_recv() {
             events.push(event);
         }
-        let mut outgoing: Vec<Vec<u8>> = Vec::new();
+        let mut broadcast: Vec<Vec<u8>> = Vec::new();
         for event in events {
             did_work = true;
             match event {
@@ -1798,7 +1809,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     width,
                     height,
                 } => {
-                    outgoing.push(msg_surface_created(
+                    broadcast.push(msg_surface_created(
                         0, surface_id, parent_id, width, height, &title, &app_id,
                     ));
                     cs.surfaces.insert(
@@ -1825,7 +1836,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.encoders.remove(&surface_id);
                     cs.surfaces.remove(&surface_id);
-                    outgoing.push(msg_surface_destroyed(0, surface_id));
+                    cs.last_frames.remove(&surface_id);
+                    broadcast.push(msg_surface_destroyed(0, surface_id));
                 }
                 CompositorEvent::SurfaceCommit {
                     surface_id,
@@ -1833,32 +1845,40 @@ async fn tick(state: &AppState) -> TickOutcome {
                     height,
                     pixels,
                 } => {
-                    if let Some(enc) = cs.encoders.get_mut(&surface_id)
-                        && let Some((nal_data, is_keyframe)) =
+                    if let Some(enc) = cs.encoders.get_mut(&surface_id) {
+                        if cs.force_keyframe {
+                            enc.encoder.force_intra_frame(true);
+                        }
+                        if let Some((nal_data, is_keyframe)) =
                             encode_surface_frame(enc, &pixels, width, height)
-                    {
-                        let flags = if is_keyframe {
-                            SURFACE_FRAME_FLAG_KEYFRAME
-                        } else {
-                            0
-                        };
-                        let timestamp = cs.created_at.elapsed().as_millis() as u32;
-                        outgoing.push(msg_surface_frame(
-                            0,
-                            surface_id,
-                            timestamp,
-                            flags,
-                            width as u16,
-                            height as u16,
-                            &nal_data,
-                        ));
+                        {
+                            let flags = if is_keyframe {
+                                SURFACE_FRAME_FLAG_KEYFRAME
+                            } else {
+                                0
+                            };
+                            let timestamp = cs.created_at.elapsed().as_millis() as u32;
+                            let msg = msg_surface_frame(
+                                0,
+                                surface_id,
+                                timestamp,
+                                flags,
+                                width as u16,
+                                height as u16,
+                                &nal_data,
+                            );
+                            cs.last_frames.insert(
+                                surface_id,
+                                BufferedSurfaceFrame { msg, is_keyframe },
+                            );
+                        }
                     }
                 }
                 CompositorEvent::SurfaceTitle { surface_id, title } => {
                     if let Some(info) = cs.surfaces.get_mut(&surface_id) {
                         info.title = title.clone();
                     }
-                    outgoing.push(msg_surface_title(0, surface_id, &title));
+                    broadcast.push(msg_surface_title(0, surface_id, &title));
                 }
                 CompositorEvent::SurfaceResized {
                     surface_id,
@@ -1869,19 +1889,82 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.width = width;
                         info.height = height;
                     }
-                    outgoing.push(msg_surface_resized(0, surface_id, width, height));
+                    broadcast.push(msg_surface_resized(0, surface_id, width, height));
                 }
                 CompositorEvent::ClipboardContent {
                     surface_id,
                     mime_type,
                     data,
                 } => {
-                    outgoing.push(msg_s2c_clipboard(0, surface_id, &mime_type, &data));
+                    broadcast.push(msg_s2c_clipboard(0, surface_id, &mime_type, &data));
                 }
             }
         }
-        for msg in &outgoing {
+        cs.force_keyframe = false;
+        for msg in &broadcast {
             sess.send_to_all(msg);
+        }
+    }
+
+    if sess.compositor.as_ref().is_some_and(|cs| !cs.last_frames.is_empty()) {
+        let surface_ids: Vec<u16> = sess
+            .compositor
+            .as_ref()
+            .unwrap()
+            .last_frames
+            .keys()
+            .copied()
+            .collect();
+        let client_ids: Vec<u32> = sess.clients.keys().copied().collect();
+        for cid in client_ids {
+            let Some(client) = sess.clients.get(&cid) else {
+                continue;
+            };
+            if !window_open(client) {
+                continue;
+            }
+            let surface_due = client.surface_next_send_at <= now;
+            if !surface_due {
+                let deadline = client.surface_next_send_at;
+                if deadline > now {
+                    next_deadline = Some(match next_deadline {
+                        Some(existing) => existing.min(deadline),
+                        None => deadline,
+                    });
+                }
+                continue;
+            }
+            let needs_keyframe = client.surface_needs_keyframe;
+            for &sid in &surface_ids {
+                let cs = sess.compositor.as_ref().unwrap();
+                let Some(frame) = cs.last_frames.get(&sid) else {
+                    continue;
+                };
+                if needs_keyframe && !frame.is_keyframe {
+                    continue;
+                }
+                let msg = frame.msg.clone();
+                let bytes = msg.len();
+                let Some(client) = sess.clients.get(&cid) else {
+                    break;
+                };
+                if !window_open(client) {
+                    break;
+                }
+                if client.tx.try_send(msg).is_ok() {
+                    let client = sess.clients.get_mut(&cid).unwrap();
+                    record_send(client, bytes, now, true);
+                    client.frames_sent = client.frames_sent.wrapping_add(1);
+                    if needs_keyframe {
+                        client.surface_needs_keyframe = false;
+                    }
+                    did_work = true;
+                }
+            }
+            if let Some(client) = sess.clients.get_mut(&cid) {
+                let interval = send_interval(client);
+                advance_deadline(&mut client.surface_next_send_at, now, interval);
+            }
         }
     }
 
@@ -1952,8 +2035,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 last_log: Instant::now(),
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
+                surface_next_send_at: Instant::now(),
+                surface_needs_keyframe: true,
             },
         );
+        if let Some(cs) = sess.compositor.as_mut() {
+            cs.force_keyframe = true;
+        }
         if let Some(c) = sess.clients.get(&client_id) {
             let _ = c.tx.try_send(msg_hello(
                 1,
@@ -1978,6 +2066,19 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             if pty.exited {
                 initial_msgs.push(blit_remote::msg_exited(id, pty.exit_status));
+            }
+        }
+        if let Some(cs) = sess.compositor.as_ref() {
+            for info in cs.surfaces.values() {
+                initial_msgs.push(msg_surface_created(
+                    0,
+                    info.surface_id,
+                    info.parent_id,
+                    info.width,
+                    info.height,
+                    &info.title,
+                    &info.app_id,
+                ));
             }
         }
         initial_msgs.push(vec![S2C_READY]);
@@ -2989,6 +3090,8 @@ mod tests {
             last_log: Instant::now(),
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
+            surface_next_send_at: Instant::now(),
+            surface_needs_keyframe: true,
         };
         (client, rx)
     }
