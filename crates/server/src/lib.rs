@@ -1847,7 +1847,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 } => {
                     if let Some(enc) = cs.encoders.get_mut(&surface_id) {
                         if cs.force_keyframe {
-                            enc.encoder.force_intra_frame(true);
+                            enc.encoder.force_intra_frame();
                         }
                         if let Some((nal_data, is_keyframe)) =
                             encode_surface_frame(enc, &pixels, width, height)
@@ -1867,10 +1867,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 height as u16,
                                 &nal_data,
                             );
-                            cs.last_frames.insert(
-                                surface_id,
-                                BufferedSurfaceFrame { msg, is_keyframe },
-                            );
+                            cs.last_frames
+                                .insert(surface_id, BufferedSurfaceFrame { msg, is_keyframe });
                         }
                     }
                 }
@@ -1906,7 +1904,11 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
-    if sess.compositor.as_ref().is_some_and(|cs| !cs.last_frames.is_empty()) {
+    if sess
+        .compositor
+        .as_ref()
+        .is_some_and(|cs| !cs.last_frames.is_empty())
+    {
         let surface_ids: Vec<u16> = sess
             .compositor
             .as_ref()
@@ -1915,7 +1917,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             .keys()
             .copied()
             .collect();
-        let client_ids: Vec<u32> = sess.clients.keys().copied().collect();
+        let client_ids: Vec<u64> = sess.clients.keys().copied().collect();
         for cid in client_ids {
             let Some(client) = sess.clients.get(&cid) else {
                 continue;
