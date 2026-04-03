@@ -1,0 +1,33 @@
+name: Tag release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.head_commit.message, 'release ')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version and create tag
+        run: |
+          version="${COMMIT_MSG#release }"
+          version="${version%%$'\n'*}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Not a release commit, skipping"
+            exit 0
+          fi
+          tag="v${version}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists, skipping"
+            exit 0
+          fi
+          git tag "$tag"
+          git push origin "$tag"
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}

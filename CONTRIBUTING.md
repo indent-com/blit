@@ -209,7 +209,14 @@ All workspace crates, `js/core/package.json`, `js/react/package.json`, `js/solid
 ./bin/release 0.12.0
 ```
 
-This validates version consistency, bumps all files, runs `cargo test -p blit-server`, and commits. CI on the resulting `v*` tag builds debs/tarballs, publishes to crates.io and npm, updates the Homebrew tap, and deploys the APT repo.
+This validates version consistency, bumps all files, runs `cargo test -p blit-server`, and commits.
+
+Releases go through a two-step process:
+
+1. The **Prepare release** workflow (`workflow_dispatch`) runs `bin/release`, pushes the result to a `release/<version>` branch, and opens a PR against `main`.
+2. When that PR is merged, the **Tag release** workflow detects the `release <version>` commit on `main`, creates and pushes a `v<version>` tag.
+
+CI on the resulting `v*` tag builds debs/tarballs, publishes to crates.io and npm, updates the Homebrew tap, and deploys the APT repo.
 
 ## CI checks
 
@@ -220,7 +227,6 @@ PRs must be reviewed and pass the following CI checks before merging:
 | `lint`                 | Formatting (`cargo fmt --check` + `prettier --check`) and clippy (`./bin/lint`)                                                            |
 | `e2e`                  | Playwright end-to-end tests (`./bin/e2e`)                                                                                                  |
 | `dev-check`            | Full-stack smoke test: starts dev services via `process-compose`, waits for health, exercises the CLI, then tears down (`./bin/dev-check`) |
-| `test (macos-latest)`  | Rust and JS test suite on macOS                                                                                                            |
 | `test (ubuntu-latest)` | Rust and JS test suite on Ubuntu                                                                                                           |
 
 ## Guardrails
