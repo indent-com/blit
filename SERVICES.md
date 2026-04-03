@@ -181,15 +181,15 @@ On Windows, Nix isn't available, so the `build-windows` job uses `cargo build --
 
 Seven workflow files live in `.github/workflows/`:
 
-| Workflow                                                             | Trigger                                                                                        | Purpose                                                                                       |
-| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                |
-| [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, push branch, open PR against `main`                                        |
+| Workflow                                                             | Trigger                                                                                        | Purpose                                                                                             |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                      |
+| [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, push branch, open PR against `main`                                              |
 | [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Verify tag signature, build artifacts, create GitHub Release, publish packages, deploy install site |
-| [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                |
-| [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                        |
-| [`dev-check.yml`](.github/workflows/dev-check.yml)                   | Push to `main`, PRs                                                                            | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI |
-| [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag                                                                       | Build and push `grab/blit-demo` Docker image                                                  |
+| [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                      |
+| [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                              |
+| [`dev-check.yml`](.github/workflows/dev-check.yml)                   | Push to `main`, PRs                                                                            | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI       |
+| [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag                                                                       | Build and push `grab/blit-demo` Docker image                                                        |
 
 ### CI (test.yml)
 
@@ -264,7 +264,7 @@ flowchart TD
 
 | Job               | Depends on                                | What it does                                                                                                    |
 | ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `verify-tag`      | —                                         | Checks the tag signature via the GitHub API; fails if unsigned or unverified                                     |
+| `verify-tag`      | —                                         | Checks the tag signature via the GitHub API; fails if unsigned or unverified                                    |
 | `build-debs`      | verify-tag                                | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
 | `build-tarballs`  | verify-tag                                | Nix-build static tarballs on 3 platform runners                                                                 |
 | `build-windows`   | verify-tag                                | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
