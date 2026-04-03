@@ -8,9 +8,8 @@ usage() {
     cat <<'EOF'
 Usage: ./bin/release-prepare <version>
 
-Triggers the prepare-release GitHub Actions workflow for the given version.
-The workflow runs bin/prepare-release, pushes a release/<version> branch,
-and opens a PR against main.
+Runs bin/prepare-release to bump all version files and commit, pushes a
+release/<version> branch to origin, and opens a PR against main.
 EOF
 }
 
@@ -35,9 +34,17 @@ version="$1"
 
 command -v gh >/dev/null 2>&1 || die "missing required command: gh"
 
-echo "Triggering prepare-release workflow for v$version..."
-gh workflow run prepare-release.yml -f version="$version"
+./bin/prepare-release "$version"
+
+branch="release/$version"
+git push origin "HEAD:refs/heads/$branch"
+
+gh pr create \
+    --base main \
+    --head "$branch" \
+    --title "release $version" \
+    --body "Automated release PR for v${version}."
 
 echo
-echo "Workflow dispatched. Watch progress at:"
-echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions/workflows/prepare-release.yml"
+echo "Release PR created. After it merges, run:"
+echo "  ./bin/release-tag $version"

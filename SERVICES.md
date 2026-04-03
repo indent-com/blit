@@ -179,12 +179,11 @@ On Windows, Nix isn't available, so the `build-windows` job uses `cargo build --
 
 ## GitHub Actions workflows
 
-Seven workflow files live in `.github/workflows/`:
+Six workflow files live in `.github/workflows/`:
 
 | Workflow                                                             | Trigger                                                                                        | Purpose                                                                                             |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                      |
-| [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, push branch, open PR against `main`                                              |
 | [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Verify tag signature, build artifacts, create GitHub Release, publish packages, deploy install site |
 | [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                      |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                              |
@@ -229,15 +228,6 @@ Runs on every push to `main` and on every pull request. Single job on `ubuntu-la
 3. Polls `process-compose list` until all five services report Running.
 4. Smoke-tests with the `blit` CLI: starts a session, waits for it, verifies output, lists sessions, closes the session.
 5. Tears down process-compose.
-
-### Prepare release (prepare-release.yml)
-
-Manually triggered via `workflow_dispatch`. Takes a version string (e.g. `0.13.0`), runs `bin/release` to bump all version files and commit, pushes to a `release/<version>` branch, and opens a PR against `main`.
-
-```mermaid
-flowchart LR
-    DISPATCH["workflow_dispatch<br>version: 0.13.0"] --> RELEASE["bin/release 0.13.0<br>bump + commit"] --> PR["Push release/0.13.0<br>Open PR"]
-```
 
 ### Release (release.yml)
 
@@ -315,14 +305,12 @@ sequenceDiagram
     participant CI as GitHub Actions
 
     Dev->>Dev: ./bin/release-prepare 0.12.0
-    Dev->>Git: Trigger prepare-release.yml<br>with version 0.12.0
-    Git->>CI: workflow_dispatch
-    CI->>Rel: ./bin/prepare-release 0.12.0
+    Dev->>Rel: ./bin/prepare-release 0.12.0
     Rel->>Rel: Validate version consistency across<br>Cargo.toml, package.json, nix/common.nix
     Rel->>Rel: Bump all version files
     Rel->>Rel: cargo test -p blit-server
     Rel->>Git: git commit "release 0.12.0"
-    CI->>Git: Push release/0.12.0 branch<br>Open PR against main
+    Dev->>Git: Push release/0.12.0 branch<br>Open PR against main
     Dev->>Git: Review and merge PR
     Dev->>Dev: ./bin/release-tag 0.12.0
     Dev->>Git: Signed tag v0.12.0 pushed

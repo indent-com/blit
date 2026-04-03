@@ -207,7 +207,7 @@ All workspace crates, `js/core/package.json`, `js/react/package.json`, `js/solid
 
 Releases go through a three-step process:
 
-1. **Prepare**: `./bin/release-prepare 0.12.0` triggers the `prepare-release.yml` GitHub Actions workflow. The workflow runs `bin/prepare-release` (version bumping, validation, tests), pushes the result to a `release/<version>` branch, and opens a PR against `main`.
+1. **Prepare**: `./bin/release-prepare 0.12.0` runs `bin/prepare-release` locally (version bumping, validation, tests), pushes a `release/<version>` branch, and opens a PR against `main`.
 2. **Tag**: After the PR is merged, run `./bin/release-tag 0.12.0` to create a signed tag and push it to origin.
 3. The `release.yml` workflow triggers on the `v*` tag push. It first verifies the tag signature via the GitHub API — unsigned or unverified tags fail the workflow immediately.
 
