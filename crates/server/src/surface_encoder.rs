@@ -342,7 +342,6 @@ mod vaapi {
     use ffmpeg_next::codec::context::Context as FfmpegContext;
     use ffmpeg_next::codec::encoder::video::Encoder as FfmpegVideoEncoder;
     use ffmpeg_next::error::EAGAIN;
-    use ffmpeg_next::packet::Mut as PacketMut;
     use ffmpeg_next::util::picture;
     use ffmpeg_next::{Dictionary, Error as FfmpegError, Packet, ffi, frame};
 
@@ -486,9 +485,6 @@ mod vaapi {
                             nal_data.extend_from_slice(data);
                         }
                         is_keyframe |= packet.is_key();
-                        unsafe {
-                            ffi::av_packet_unref(packet.as_mut_ptr());
-                        }
                     }
                     Err(FfmpegError::Other { errno }) if errno == EAGAIN => break,
                     Err(FfmpegError::Eof) => break,
