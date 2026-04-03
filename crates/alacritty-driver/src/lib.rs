@@ -632,8 +632,14 @@ impl TerminalDriver {
                 .and_then(|re| re.find(&self.title))
                 .map(|m| {
                     let idx = m.start();
-                    let start = idx.saturating_sub(SEARCH_CONTEXT_BEFORE);
-                    let end = (m.end() + SEARCH_CONTEXT_AFTER).min(self.title.len());
+                    let mut start = idx.saturating_sub(SEARCH_CONTEXT_BEFORE);
+                    while start > 0 && !self.title.is_char_boundary(start) {
+                        start -= 1;
+                    }
+                    let mut end = (m.end() + SEARCH_CONTEXT_AFTER).min(self.title.len());
+                    while end < self.title.len() && !self.title.is_char_boundary(end) {
+                        end += 1;
+                    }
                     let mut score = SEARCH_TITLE_BASE + SEARCH_TITLE_MATCH_BONUS;
                     if idx == 0 {
                         score += SEARCH_TITLE_PREFIX_BONUS;
@@ -754,12 +760,19 @@ impl TerminalDriver {
         }
         let text = text.trim_end().to_owned();
 
-        // Trim to context window around the match column
+        // Trim to context window around the match column.
+        // match_col is a grid column index (char-based), not a byte offset,
+        // so convert char indices to byte offsets to avoid panicking on
+        // multi-byte UTF-8 characters.
+        let char_count = text.chars().count();
         let match_col = m.start().column.0;
-        let start = match_col.saturating_sub(SEARCH_CONTEXT_BEFORE);
-        let end = (match_col + SEARCH_CONTEXT_AFTER).min(text.len());
-        if start < text.len() {
-            text[start..end.min(text.len())].to_owned()
+        let start_char = match_col.saturating_sub(SEARCH_CONTEXT_BEFORE);
+        let end_char = (match_col + SEARCH_CONTEXT_AFTER).min(char_count);
+        if start_char < char_count {
+            text.chars()
+                .skip(start_char)
+                .take(end_char.saturating_sub(start_char))
+                .collect()
         } else {
             text
         }
