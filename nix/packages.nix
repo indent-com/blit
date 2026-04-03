@@ -369,6 +369,8 @@
           if [ -z "''${LANG-}" ]; then
             export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"
           fi
+          export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           export PATH="$PWD/bin:$PATH"
         '';
       };
