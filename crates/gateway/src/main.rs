@@ -611,9 +611,15 @@ async fn handle_webtransport_session(
     eprintln!("webtransport client authenticated");
 
     // --- Proxy to blit-server ---
-    let stream = connect_ipc(&state.sock_path)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let stream = match connect_ipc(&state.sock_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot connect to blit-server: {e}");
+            session.close(1, e.as_bytes());
+            session.closed().await;
+            return Ok(());
+        }
+    };
     let (mut sock_reader, mut sock_writer) = tokio::io::split(stream);
 
     // Client → server: read length-prefixed frames from WebTransport, forward to Unix socket

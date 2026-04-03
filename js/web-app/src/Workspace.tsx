@@ -321,6 +321,19 @@ function WorkspaceScreen({
     }
   }, [connection?.error, onAuthError]);
 
+  // Debounce the "connected" status so the status bar doesn't flicker when
+  // the connection rapidly cycles through connected → disconnected.
+  const rawStatus = connection?.status ?? "disconnected";
+  const [stableStatus, setStableStatus] = useState(rawStatus);
+  useEffect(() => {
+    if (rawStatus !== "connected") {
+      setStableStatus(rawStatus);
+      return;
+    }
+    const timer = setTimeout(() => setStableStatus("connected"), 2000);
+    return () => clearTimeout(timer);
+  }, [rawStatus]);
+
   const termCallbackRef = useCallback((handle: BlitTerminalHandle | null) => {
     termRef.current = handle;
     if (handle && !overlayRef.current) {
@@ -853,11 +866,8 @@ function WorkspaceScreen({
           style={{
             ...layout.statusBar,
             padding: "0 1em",
-            backgroundColor: statusBarBg(
-              connection?.status ?? "disconnected",
-              theme,
-            ),
-            color: statusBarFg(connection?.status ?? "disconnected", theme),
+            backgroundColor: statusBarBg(stableStatus, theme),
+            color: statusBarFg(stableStatus, theme),
             borderTopColor: theme.subtleBorder,
             height: chromeScale.md + chromeScale.controlY * 2,
             fontSize: chromeScale.sm,
@@ -866,7 +876,7 @@ function WorkspaceScreen({
           <StatusBar
             sessions={sessions}
             focusedSession={focusedSession}
-            status={connection?.status ?? "disconnected"}
+            status={stableStatus}
             retryCount={connection?.retryCount ?? 0}
             error={connection?.error ?? null}
             onReconnect={() =>
