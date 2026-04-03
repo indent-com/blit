@@ -729,10 +729,42 @@ fn modifier_keycode(name: &str) -> Option<u32> {
     }
 }
 
+fn letter_to_keycode(ch: char) -> u32 {
+    match ch {
+        'a' => KEY_A,
+        'b' => KEY_B,
+        'c' => KEY_C,
+        'd' => KEY_D,
+        'e' => KEY_E,
+        'f' => KEY_F,
+        'g' => KEY_G,
+        'h' => KEY_H,
+        'i' => KEY_I,
+        'j' => KEY_J,
+        'k' => KEY_K,
+        'l' => KEY_L,
+        'm' => KEY_M,
+        'n' => KEY_N,
+        'o' => KEY_O,
+        'p' => KEY_P,
+        'q' => KEY_Q,
+        'r' => KEY_R,
+        's' => KEY_S,
+        't' => KEY_T,
+        'u' => KEY_U,
+        'v' => KEY_V,
+        'w' => KEY_W,
+        'x' => KEY_X,
+        'y' => KEY_Y,
+        'z' => KEY_Z,
+        _ => KEY_SPACE,
+    }
+}
+
 fn char_to_keycode(ch: char) -> Option<(u32, bool)> {
     let (kc, shift) = match ch {
-        'a'..='z' => (KEY_A + (ch as u32 - 'a' as u32), false),
-        'A'..='Z' => (KEY_A + (ch as u32 - 'A' as u32), true),
+        'a'..='z' => (letter_to_keycode(ch), false),
+        'A'..='Z' => (letter_to_keycode(ch.to_ascii_lowercase()), true),
         '0' => (KEY_0, false),
         '1'..='9' => (KEY_1 + (ch as u32 - '1' as u32), false),
         ' ' => (KEY_SPACE, false),

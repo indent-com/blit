@@ -343,7 +343,9 @@ impl Compositor {
                         let row_start = offset + row * stride;
                         let row_end = row_start + (width as usize * 4);
                         if row_end <= pixel_data.len() {
-                            rgba.extend_from_slice(&pixel_data[row_start..row_end]);
+                            for px in pixel_data[row_start..row_end].chunks_exact(4) {
+                                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                            }
                         }
                     }
                     result = Some((width, height, rgba));
@@ -399,7 +401,9 @@ impl CompositorHandler for Compositor {
                         let row_start = offset + row * stride;
                         let row_end = row_start + (width as usize * 4);
                         if row_end <= pixel_data.len() {
-                            rgba.extend_from_slice(&pixel_data[row_start..row_end]);
+                            for px in pixel_data[row_start..row_end].chunks_exact(4) {
+                                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                            }
                         }
                     }
                     committed_buffer = Some((width, height, rgba));
