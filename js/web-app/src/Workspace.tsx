@@ -349,7 +349,7 @@ function WorkspaceScreen({
   const termCallbackRef = useCallback((handle: BlitTerminalHandle | null) => {
     termRef.current = handle;
     if (handle && !overlayRef.current) {
-      handle.focus();
+      setTimeout(() => handle.focus(), 0);
     }
   }, []);
 
@@ -493,6 +493,8 @@ function WorkspaceScreen({
         });
         workspace.focusSession(session.id);
         closeOverlay();
+        await new Promise<void>((r) => setTimeout(r, 0));
+        termRef.current?.focus();
       } catch {}
     },
     [
