@@ -856,8 +856,9 @@ async fn setup_ssh_forward(ssh_args: &[String], remote_socket: Option<&str>) -> 
         path
     };
 
+    let escaped_sock = crate::transport::shell_escape(&remote_sock);
     let autostart_script = format!(
-        "sh -c 'S='\"'\"'{remote_sock}'\"'\"'; {}; echo ok'",
+        "sh -c 'S={escaped_sock}; {}; echo ok'",
         crate::transport::SSH_AUTOSTART
     );
     let autostart = tokio::process::Command::new("ssh")

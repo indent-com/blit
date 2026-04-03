@@ -113,17 +113,31 @@ pub async fn write_frame(w: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> b
     w.write_all(&make_frame(payload)).await.is_ok()
 }
 
+pub fn shell_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 pub const SSH_AUTOSTART: &str = "if ! [ -S \"$S\" ]; then if command -v blit >/dev/null 2>&1; then blit server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; elif command -v blit-server >/dev/null 2>&1; then blit-server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; fi; fi";
 
 pub const SSH_SOCK_SEARCH: &str = r#"if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else S=/tmp/blit.sock; fi"#;
 
 pub fn ssh_bridge_script(remote_socket: Option<&str>) -> String {
     let resolve = match remote_socket {
-        Some(path) => format!("S='{path}'"),
+        Some(path) => format!("S={}", shell_escape(path)),
         None => SSH_SOCK_SEARCH.to_string(),
     };
     format!(
-        "sh -c '{resolve}; {SSH_AUTOSTART}; exec nc -U \"$S\" 2>/dev/null || socat - \"UNIX-CONNECT:$S\"'"
+        "sh -c '{resolve}; {SSH_AUTOSTART}; if command -v nc >/dev/null 2>&1; then exec nc -U \"$S\"; else exec socat - \"UNIX-CONNECT:$S\"; fi'"
     )
 }
 
