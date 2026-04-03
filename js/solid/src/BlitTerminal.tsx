@@ -17,6 +17,8 @@ export interface BlitTerminalProps {
   scrollbarColor?: string;
   scrollbarWidth?: number;
   advanceRatio?: number;
+  /** Callback to receive the underlying BlitTerminalSurface after mount. */
+  surfaceRef?: (surface: BlitTerminalSurface | null) => void;
 }
 
 /**
@@ -50,9 +52,11 @@ export function BlitTerminal(props: BlitTerminalProps) {
 
     surface.setWorkspace(workspace);
     surface.attach(containerRef);
+    props.surfaceRef?.(surface);
   });
 
   onCleanup(() => {
+    props.surfaceRef?.(null);
     surface?.dispose();
     surface = null;
   });

@@ -13,7 +13,12 @@ import {
   createBlitSessions,
 } from "@blit-sh/solid";
 import { BlitWorkspace, PALETTES } from "@blit-sh/core";
-import type { BlitSession, BlitWasmModule, SessionId } from "@blit-sh/core";
+import type {
+  BlitSession,
+  BlitTerminalSurface,
+  BlitWasmModule,
+  SessionId,
+} from "@blit-sh/core";
 import { initWasm } from "../../lib/wasm";
 import {
   isRawPassphrase,
@@ -25,6 +30,7 @@ import TabBar from "./TabBar";
 import StatusOverlay from "./StatusOverlay";
 import ShortcutsPanel from "./ShortcutsPanel";
 import DebugPanel from "./DebugPanel";
+import MobileToolbar from "./MobileToolbar";
 
 const HUB_URL = "wss://hub.blit.sh";
 const CONNECTION_ID = "main";
@@ -49,8 +55,13 @@ function resolvePassphrase(): PassphraseResult {
   }
   if (isRawPassphrase(raw)) {
     // Raw UUID — encrypt and replace URL
-    const encrypted = encryptPassphrase(raw);
-    history.replaceState(null, "", `/s#${encodeURIComponent(encrypted)}`);
+    try {
+      const encrypted = encryptPassphrase(raw);
+      history.replaceState(null, "", `/s#${encodeURIComponent(encrypted)}`);
+    } catch (e) {
+      console.error("[blit] encryptPassphrase failed:", e);
+      // Fall through — still return the raw passphrase
+    }
     return { ok: true, passphrase: raw };
   }
   // Try to decrypt
@@ -342,6 +353,45 @@ function TabShell(props: {
   const [copied, setCopied] = createSignal(false);
   let copyTimeout: ReturnType<typeof setTimeout> | undefined;
 
+  // Mobile touch detection
+  const [isMobileTouch, setIsMobileTouch] = createSignal(false);
+  const [terminalSurface, setTerminalSurface] =
+    createSignal<BlitTerminalSurface | null>(null);
+  onMount(() => {
+    const check = () =>
+      ("ontouchstart" in window || navigator.maxTouchPoints > 0) &&
+      window.innerWidth < 768;
+    setIsMobileTouch(check());
+    const handler = () => setIsMobileTouch(check());
+    window.addEventListener("resize", handler);
+    onCleanup(() => window.removeEventListener("resize", handler));
+  });
+
+  // iOS keyboard viewport fix: track visualViewport to resize the app container
+  const [vpHeight, setVpHeight] = createSignal<number | null>(null);
+  const [vpOffset, setVpOffset] = createSignal(0);
+  onMount(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      setVpHeight(vv.height);
+      setVpOffset(vv.offsetTop);
+    };
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    onCleanup(() => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    });
+  });
+
+  // Keyboard open detection: visualViewport shrinks >150px from full height
+  const keyboardOpen = createMemo(() => {
+    const h = vpHeight();
+    if (h === null) return false;
+    return window.innerHeight - h > 150;
+  });
+
   const visibleSessions = createMemo(() =>
     sessions().filter((s) => s.state !== "closed"),
   );
@@ -507,7 +557,13 @@ function TabShell(props: {
   };
 
   return (
-    <div class="fixed inset-0 z-50 flex flex-col bg-[var(--bg)]">
+    <div
+      class="fixed inset-x-0 top-0 z-50 flex flex-col bg-[var(--bg)]"
+      style={{
+        height: isMobileTouch() && vpHeight() ? `${vpHeight()}px` : "100%",
+        top: isMobileTouch() && vpOffset() ? `${vpOffset()}px` : "0",
+      }}
+    >
       <Show when={visibleSessions().length > 0}>
         <div class="flex items-stretch shrink-0 border-b border-[var(--border)] bg-[var(--surface)]">
           <div class="flex-1 min-w-0">
@@ -602,6 +658,7 @@ function TabShell(props: {
             fontSize={FONT_SIZE}
             palette={props.palette()}
             style={{ width: "100%", height: "100%" }}
+            surfaceRef={setTerminalSurface}
           />
         </Show>
         <Show when={isDisconnected()}>
@@ -627,6 +684,14 @@ function TabShell(props: {
               Esc &mdash; close
             </span>
           </div>
+        </Show>
+        <Show when={isMobileTouch() && !isDisconnected()}>
+          <MobileToolbar
+            workspace={workspace}
+            focusedSessionId={focusedId}
+            surface={terminalSurface}
+            keyboardOpen={keyboardOpen}
+          />
         </Show>
       </div>
       <Show when={showShortcuts()}>

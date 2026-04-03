@@ -80,8 +80,10 @@ export function BlitTerminal({
       advanceRatio,
     });
     surfaceRef.current = surface;
+    props.surfaceRef?.(surface);
 
     return () => {
+      props.surfaceRef?.(null);
       surface.dispose();
       surfaceRef.current = null;
     };

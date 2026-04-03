@@ -33,7 +33,7 @@ export type {
 export { PALETTES } from "./palettes";
 
 export { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
-export { keyToBytes, encoder } from "./keyboard";
+export { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 
 export type { GlRenderer } from "./gl-renderer";
 

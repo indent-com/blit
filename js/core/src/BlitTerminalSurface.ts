@@ -5,7 +5,7 @@ import type { TerminalPalette, ConnectionStatus, SessionId } from "./types";
 import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
 import { measureCell, cssFontFamily, type CellMetrics } from "./measure";
 import type { GlRenderer } from "./gl-renderer";
-import { keyToBytes, encoder } from "./keyboard";
+import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,8 @@ export class BlitTerminalSurface {
 
   private wasmReady = false;
   private disposed = false;
+  private _ctrlModifier = false;
+  private _ctrlModifierListeners = new Set<(active: boolean) => void>();
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
@@ -202,6 +204,28 @@ export class BlitTerminalSurface {
 
   focus(): void {
     this.inputEl?.focus();
+  }
+
+  /**
+   * Set the Ctrl modifier state for the next typed character.
+   * When active, the next character typed via the soft keyboard will be
+   * converted to its Ctrl+char byte equivalent (e.g. 'c' → Ctrl+C = 0x03).
+   * The modifier auto-resets after one character is consumed.
+   */
+  setCtrlModifier(active: boolean): void {
+    if (this._ctrlModifier === active) return;
+    this._ctrlModifier = active;
+    for (const l of this._ctrlModifierListeners) l(active);
+  }
+
+  get ctrlModifier(): boolean {
+    return this._ctrlModifier;
+  }
+
+  /** Subscribe to Ctrl modifier state changes. Returns unsubscribe function. */
+  onCtrlModifierChange(listener: (active: boolean) => void): () => void {
+    this._ctrlModifierListeners.add(listener);
+    return () => this._ctrlModifierListeners.delete(listener);
   }
 
   /** Attach to a container element. Creates the canvas + textarea inside it. */
@@ -1003,6 +1027,22 @@ export class BlitTerminalSurface {
       if (e.isComposing) return;
       if (e.key === "Dead") return;
 
+      // Ctrl modifier from mobile toolbar: intercept the next printable key
+      if (
+        this._ctrlModifier &&
+        e.key.length === 1 &&
+        !e.ctrlKey &&
+        !e.metaKey
+      ) {
+        const bytes = ctrlCharToByte(e.key);
+        if (bytes) {
+          e.preventDefault();
+          this.sendInput(this._sessionId!, bytes);
+        }
+        this.setCtrlModifier(false);
+        return;
+      }
+
       if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
         const t2 = this.terminal;
         const maxScroll = t2 ? t2.scrollback_lines() : 0;
@@ -1080,6 +1120,22 @@ export class BlitTerminalSurface {
         ) {
           this.sendInput(this._sessionId, new Uint8Array([0x7f]));
         }
+        return;
+      }
+      // Ctrl modifier: convert the next typed character to Ctrl+char
+      if (
+        this._ctrlModifier &&
+        input.value &&
+        this._sessionId !== null &&
+        this.status === "connected"
+      ) {
+        const char = input.value[0];
+        const bytes = ctrlCharToByte(char);
+        if (bytes) {
+          this.sendInput(this._sessionId, bytes);
+        }
+        this.setCtrlModifier(false);
+        input.value = "";
         return;
       }
       if (inputEvent.inputType === "deleteContentBackward" && !input.value) {

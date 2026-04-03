@@ -1,6 +1,22 @@
 export const encoder = new TextEncoder();
 
 /**
+ * Convert a single character to its Ctrl+char byte representation.
+ * For a-z returns 0x01–0x1a, for special chars returns the standard mapping.
+ * Returns null if the character has no Ctrl equivalent.
+ */
+export function ctrlCharToByte(char: string): Uint8Array | null {
+  if (char.length !== 1) return null;
+  const code = char.toLowerCase().charCodeAt(0);
+  if (code >= 97 && code <= 122) return new Uint8Array([code - 96]); // a-z → 0x01-0x1a
+  if (char === "[") return new Uint8Array([0x1b]); // Ctrl+[ = Escape
+  if (char === "\\") return new Uint8Array([0x1c]);
+  if (char === "]") return new Uint8Array([0x1d]);
+  if (char === " " || char === "@") return new Uint8Array([0x00]); // Ctrl+Space / Ctrl+@
+  return null;
+}
+
+/**
  * Encode a keyboard event into the byte sequence expected by the terminal.
  * Returns null if the event should not be forwarded.
  */

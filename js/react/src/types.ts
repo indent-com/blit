@@ -1,5 +1,9 @@
 import type React from "react";
-import type { SessionId, TerminalPalette } from "@blit-sh/core";
+import type {
+  SessionId,
+  TerminalPalette,
+  BlitTerminalSurface,
+} from "@blit-sh/core";
 
 /** Options for the BlitTerminal component. */
 export interface BlitTerminalProps {
@@ -27,4 +31,6 @@ export interface BlitTerminalProps {
   scrollbarWidth?: number;
   /** Font advance-width / units-per-em ratio from font tables for native-accurate cell width. */
   advanceRatio?: number;
+  /** Callback to receive the underlying BlitTerminalSurface after mount. */
+  surfaceRef?: (surface: BlitTerminalSurface | null) => void;
 }
