@@ -46,11 +46,14 @@
         cargoLock = cargoLockConfig;
         nativeBuildInputs = blitServerNativeBuildInputs;
         buildInputs = blitServerBuildInputs;
+        env = pkgs.lib.optionalAttrs serverVaapiEnabled {
+          # buildRustPackage only forwards custom environment variables from the
+          # nested `env` attr; top-level attrs are ignored.
+          BINDGEN_EXTRA_CLANG_ARGS = bindgenClangArgs;
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        };
         postInstall = installManPages;
         doCheck = false;
-      } // pkgs.lib.optionalAttrs serverVaapiEnabled {
-        BINDGEN_EXTRA_CLANG_ARGS = bindgenClangArgs;
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       };
 
       blit-cli = rustPlatform.buildRustPackage {
