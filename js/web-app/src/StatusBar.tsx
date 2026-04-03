@@ -38,6 +38,11 @@ export function statusBarBg(status: ConnectionStatus, theme: Theme): string {
   return theme.error;
 }
 
+export function statusBarFg(status: ConnectionStatus, theme: Theme): string {
+  if (status === "connected") return theme.fg;
+  return theme.bg;
+}
+
 function statusText(status: ConnectionStatus): string | null {
   switch (status) {
     case "connected":
@@ -91,6 +96,7 @@ export function StatusBar({
 }) {
   const theme = themeFor(palette);
   const scale = uiScale(fontSize);
+  const connectionLabel = statusText(status);
   const visible = sessions.filter((session) => session.state !== "closed");
   const exited = visible.filter((session) => session.state === "exited").length;
   const buttonStyle = { ...ui.btn, fontSize: scale.sm };
@@ -161,7 +167,7 @@ export function StatusBar({
           "Aa"
         )}
       </button>
-      {statusText(status) && (
+      {connectionLabel && (
         <span
           role="status"
           aria-label={status}
@@ -172,7 +178,7 @@ export function StatusBar({
             whiteSpace: "nowrap",
           }}
         >
-          {statusText(status)}
+          {connectionLabel}
         </span>
       )}
       {debug && (
