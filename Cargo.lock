@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "blit-alacritty"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "alacritty_terminal",
  "blit-remote",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "blit-browser"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "blit-remote",
  "js-sys",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "blit-cli"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "axum",
  "blit-remote",
@@ -302,11 +302,11 @@ dependencies = [
 
 [[package]]
 name = "blit-fonts"
-version = "0.17.1"
+version = "0.18.0"
 
 [[package]]
 name = "blit-gateway"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "axum",
  "blit-webserver",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "blit-remote"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "lz4_flex",
  "unicode-width",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "blit-server"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "blit-alacritty",
  "blit-remote",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "blit-webrtc-forwarder"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "base64",
  "blit-remote",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "blit-webserver"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "axum",
  "blit-fonts",
