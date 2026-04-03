@@ -795,8 +795,12 @@ fn run_compositor(
     handle
         .insert_source(display_source, |_, display, state| {
             eprintln!("[compositor] dispatch_clients");
-            if let Err(e) = unsafe { display.get_mut().dispatch_clients(state) } {
+            let d = unsafe { display.get_mut() };
+            if let Err(e) = d.dispatch_clients(state) {
                 eprintln!("[compositor] dispatch_clients error: {e}");
+            }
+            if let Err(e) = d.flush_clients() {
+                eprintln!("[compositor] flush_clients error: {e}");
             }
             Ok(PostAction::Continue)
         })
