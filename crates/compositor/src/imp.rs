@@ -1203,7 +1203,6 @@ fn run_compositor(
         if let Err(e) = compositor.display_handle.flush_clients() {
             eprintln!("[compositor] flush error: {e}");
         }
-
     }
     eprintln!("[compositor] event loop exited");
 }
