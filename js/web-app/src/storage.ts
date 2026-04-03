@@ -1,8 +1,8 @@
 import { useSyncExternalStore } from "react";
 import { PALETTES, DEFAULT_FONT } from "@blit-sh/core";
 import type { TerminalPalette } from "@blit-sh/core";
+import { isEncrypted, decryptPassphrase } from "./passphrase-crypto";
 
-export const PASS_KEY = "blit.passphrase";
 export const HOST_KEY = "blit.host";
 export const PALETTE_KEY = "blit.palette";
 export const FONT_KEY = "blit.fontFamily";
@@ -38,20 +38,28 @@ function notifyListeners(key: string, value: string) {
 
 function configWsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const host =
-    (import.meta.env.VITE_BLIT_GATEWAY as string | undefined) ?? location.host;
   const base = location.pathname.endsWith("/")
     ? location.pathname
     : location.pathname + "/";
-  return proto + "//" + host + base + "config";
+  return proto + "//" + location.host + base + "config";
 }
 
 let configUnavailable = false;
 const pendingWrites = new Map<string, string>();
 
+function getPassphraseFromHash(): string | null {
+  const raw = location.hash.slice(1);
+  if (!raw) return null;
+  const first = raw.split("&")[0];
+  if (/^[lpa]=/.test(first)) return null;
+  const decoded = decodeURIComponent(first);
+  if (isEncrypted(decoded)) return decryptPassphrase(decoded);
+  return decoded;
+}
+
 export function connectConfigWs(): void {
   if (configWs || configUnavailable) return;
-  const pass = readLocal(PASS_KEY);
+  const pass = getPassphraseFromHash();
   if (!pass) return;
 
   const ws = new WebSocket(configWsUrl());
@@ -157,12 +165,9 @@ export function blitHost(): string {
 const gatewayHost =
   (import.meta.env.VITE_BLIT_GATEWAY as string | undefined) ?? location.host;
 
-export const basePath =
-  gatewayHost !== location.host
-    ? `//${gatewayHost}/`
-    : location.pathname.endsWith("/")
-      ? location.pathname
-      : location.pathname + "/";
+export const basePath = location.pathname.endsWith("/")
+  ? location.pathname
+  : location.pathname + "/";
 
 export function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -174,7 +179,7 @@ export function wtUrl(): string {
 }
 
 export function wtCertHash(): string | undefined {
-  return (window as unknown as { __blitCertHash?: string }).__blitCertHash;
+  return undefined;
 }
 
 export function preferredPalette(): TerminalPalette {

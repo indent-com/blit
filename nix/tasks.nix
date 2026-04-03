@@ -292,7 +292,7 @@ PROJ
     text = ''
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
-      cp ${webAppDist}/index.html js/web-app/dist/
+      cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/web-app/dist/
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
@@ -304,7 +304,7 @@ PROJ
     text = ''
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
-      cp ${webAppDist}/index.html js/web-app/dist/
+      cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/web-app/dist/
 
       outdir="''${1:-coverage-report}"
 
@@ -452,7 +452,7 @@ in {
     text = ''
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
-      cp ${webAppDist}/index.html js/web-app/dist/
+      cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/web-app/dist/
 
       echo "=== Manpage build ==="
       for f in man/*.scd; do

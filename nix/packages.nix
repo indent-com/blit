@@ -165,7 +165,7 @@
         '';
         installPhase = ''
           mkdir -p $out
-          cp web-app/dist/index.html $out/
+          cp web-app/dist/index.html web-app/dist/index.html.br $out/
         '';
         doCheck = false;
       };
@@ -191,7 +191,7 @@
 
       copyWebAppDist = ''
         mkdir -p js/web-app/dist
-        cp ${webAppDist}/index.html js/web-app/dist/
+        cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/web-app/dist/
       '';
 
       blit-cli-static = mkStaticBin {

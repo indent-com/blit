@@ -110,6 +110,9 @@ importers:
       react-dom:
         specifier: ^19
         version: 19.2.4(react@19.2.4)
+      tweetnacl:
+        specifier: ^1.0.3
+        version: 1.0.3
     devDependencies:
       '@blit-sh/browser':
         specifier: file:../../crates/browser/pkg

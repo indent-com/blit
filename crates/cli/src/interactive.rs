@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::transport::{self, Transport, make_frame, read_frame};
 
-const WEB_INDEX_HTML: &str = include_str!("../../../js/web-app/dist/index.html");
+const WEB_INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/web-app/dist/index.html.br");
 
 #[cfg(unix)]
 fn term_size() -> (u16, u16) {
@@ -501,6 +501,7 @@ struct BrowserState {
     token: String,
     connector: BrowserConnector,
     config: blit_webserver::config::ConfigState,
+    remote_host: Option<String>,
 }
 
 enum Event {
@@ -746,49 +747,57 @@ pub async fn run_browser(
         token: token.clone(),
         connector,
         config: blit_webserver::config::ConfigState::new(),
+        remote_host,
     });
 
-    fn js_escape(s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('\'', "\\'")
-            .replace('<', "\\x3c")
-            .replace('>', "\\x3e")
-    }
-    let host_injection = match &remote_host {
-        Some(h) => format!("localStorage.setItem('blit.host','{}');", js_escape(h)),
-        None => String::new(),
-    };
-    let injected_html = WEB_INDEX_HTML.replacen(
-        "<script",
-        &format!(
-            "<script>localStorage.setItem('blit.passphrase','{}');{host_injection}</script>\n<script",
-            js_escape(&token)
-        ),
-        1,
-    );
-    let injected_html: &'static str = Box::leak(injected_html.into_boxed_str());
     let html_etag: &'static str =
-        Box::leak(blit_webserver::html_etag(injected_html).into_boxed_str());
+        Box::leak(blit_webserver::html_etag(WEB_INDEX_HTML_BR).into_boxed_str());
 
     let app = axum::Router::new()
         .route(
             "/config",
             get(
                 move |axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
-                      ws: WebSocketUpgrade| async move {
-                    ws.on_upgrade(move |socket| async move {
-                        blit_webserver::config::handle_config_ws(
-                            socket,
-                            &state.token,
-                            &state.config,
+                      request: axum::extract::Request| async move {
+                    let is_ws = request
+                        .headers()
+                        .get("upgrade")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.eq_ignore_ascii_case("websocket"))
+                        .unwrap_or(false);
+                    if is_ws {
+                        match WebSocketUpgrade::from_request(request, &state).await {
+                            Ok(ws) => ws
+                                .on_upgrade(move |socket| async move {
+                                    blit_webserver::config::handle_config_ws(
+                                        socket,
+                                        &state.token,
+                                        &state.config,
+                                    )
+                                    .await;
+                                })
+                                .into_response(),
+                            Err(e) => e.into_response(),
+                        }
+                    } else {
+                        let mut json = String::from("{\"gateway\":true");
+                        if let Some(h) = &state.remote_host {
+                            json.push_str(",\"host\":\"");
+                            json.push_str(h);
+                            json.push('"');
+                        }
+                        json.push('}');
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            json,
                         )
-                        .await;
-                    })
+                            .into_response()
+                    }
                 },
             ),
         )
         .fallback(get(move |state, request| {
-            browser_root_handler(state, request, injected_html, html_etag)
+            browser_root_handler(state, request, html_etag)
         }))
         .with_state(state);
 
@@ -799,7 +808,7 @@ pub async fn run_browser(
             std::process::exit(1);
         });
     let addr = listener.local_addr().unwrap();
-    let url = format!("http://{addr}");
+    let url = format!("http://{addr}/#{token}");
     eprintln!("blit: serving browser UI at {url}");
 
     open_browser(&url);
@@ -920,24 +929,10 @@ async fn setup_ssh_forward(ssh_args: &[String], remote_socket: Option<&str>) -> 
 }
 
 pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
-    fn js_escape(s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('\'', "\\'")
-            .replace('<', "\\x3c")
-            .replace('>', "\\x3e")
-    }
-
-    let injected_html = WEB_INDEX_HTML.replacen(
-        "<script",
-        &format!(
-            "<script>window.__blitHub='{}';</script>\n<script",
-            js_escape(hub)
-        ),
-        1,
-    );
-    let injected_html: &'static str = Box::leak(injected_html.into_boxed_str());
     let html_etag: &'static str =
-        Box::leak(blit_webserver::html_etag(injected_html).into_boxed_str());
+        Box::leak(blit_webserver::html_etag(WEB_INDEX_HTML_BR).into_boxed_str());
+
+    let hub_json: &'static str = Box::leak(format!("{{\"hub\":\"{hub}\"}}").into_boxed_str());
 
     let bind_port = port.unwrap_or(0);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{bind_port}"))
@@ -947,19 +942,32 @@ pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
             std::process::exit(1);
         });
     let addr = listener.local_addr().unwrap();
-    let url = format!("http://{addr}/s#{passphrase}");
+    let url = format!("http://{addr}/#{passphrase}");
     eprintln!("blit: serving browser UI at {url}");
 
-    let app =
-        axum::Router::new().fallback(get(move |request: axum::extract::Request| async move {
+    let app = axum::Router::new()
+        .route(
+            "/config",
+            get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    hub_json,
+                )
+            }),
+        )
+        .fallback(get(move |request: axum::extract::Request| async move {
             if let Some(resp) = blit_webserver::try_font_route(request.uri().path(), None) {
                 return resp;
             }
             let inm = request
                 .headers()
-                .get("if-none-match")
-                .and_then(|v| v.to_str().ok().map(|s| s.as_bytes().to_vec()));
-            blit_webserver::html_response(injected_html, html_etag, inm.as_deref())
+                .get(axum::http::header::IF_NONE_MATCH)
+                .map(|v| v.as_bytes());
+            let ae = request
+                .headers()
+                .get(axum::http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok());
+            blit_webserver::html_response(WEB_INDEX_HTML_BR, html_etag, inm, ae)
         }));
 
     open_browser(&url);
@@ -986,7 +994,6 @@ fn open_browser(url: &str) {
 async fn browser_root_handler(
     axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
     request: axum::extract::Request,
-    index_html: &'static str,
     etag: &'static str,
 ) -> Response {
     if let Some(resp) = blit_webserver::try_font_route(request.uri().path(), None) {
@@ -1010,7 +1017,11 @@ async fn browser_root_handler(
             .headers()
             .get(axum::http::header::IF_NONE_MATCH)
             .map(|v| v.as_bytes());
-        blit_webserver::html_response(index_html, etag, inm)
+        let ae = request
+            .headers()
+            .get(axum::http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        blit_webserver::html_response(WEB_INDEX_HTML_BR, etag, inm, ae)
     }
 }
 

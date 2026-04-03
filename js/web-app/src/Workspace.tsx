@@ -679,11 +679,12 @@ function WorkspaceScreen({
         .join(",");
       if (a) parts.push(`a=${a}`);
     }
-    history.replaceState(
-      null,
-      "",
-      parts.length > 0 ? `#${parts.join("&")}` : location.pathname,
-    );
+    const existing = location.hash.slice(1);
+    const kept = existing.split("&").filter((s) => s && !/^[lpa]=/.test(s));
+    const merged = [...kept, ...parts];
+    if (merged.length > 0) {
+      history.replaceState(null, "", `#${merged.join("&")}`);
+    }
   }, [activeLayout, bspFocusedPaneId, connection?.status, layoutAssignments]);
 
   const debugStats = workspace.getConnectionDebugStats(

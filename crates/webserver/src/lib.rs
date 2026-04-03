@@ -74,9 +74,15 @@ fn add_cors(resp: &mut Response, origin: Option<&str>) {
     }
 }
 
-/// Serve HTML with ETag support. Returns 304 if the client's `If-None-Match`
-/// matches `etag`.
-pub fn html_response(html: &'static str, etag: &str, if_none_match: Option<&[u8]>) -> Response {
+/// Serve brotli-compressed HTML with ETag support. If the client accepts `br`
+/// encoding, the raw compressed bytes are sent; otherwise they are decompressed.
+/// Returns 304 if the client's `If-None-Match` matches `etag`.
+pub fn html_response(
+    html_br: &'static [u8],
+    etag: &str,
+    if_none_match: Option<&[u8]>,
+    accept_encoding: Option<&str>,
+) -> Response {
     if let Some(inm) = if_none_match
         && inm == etag.as_bytes()
     {
@@ -86,7 +92,28 @@ pub fn html_response(html: &'static str, etag: &str, if_none_match: Option<&[u8]
         )
             .into_response();
     }
-    ([(axum::http::header::ETAG, etag)], Html(html)).into_response()
+    let accepts_br = accept_encoding
+        .map(|ae| ae.split(',').any(|p| p.trim().starts_with("br")))
+        .unwrap_or(false);
+    if accepts_br {
+        (
+            [
+                (header::ETAG, etag.to_owned()),
+                (header::CONTENT_ENCODING, "br".to_owned()),
+                (header::CONTENT_TYPE, "text/html".to_owned()),
+            ],
+            html_br,
+        )
+            .into_response()
+    } else {
+        let mut decompressed = Vec::new();
+        let _ = brotli::BrotliDecompress(&mut std::io::Cursor::new(html_br), &mut decompressed);
+        (
+            [(header::ETAG, etag.to_owned())],
+            Html(String::from_utf8_lossy(&decompressed).into_owned()),
+        )
+            .into_response()
+    }
 }
 
 /// Try to match a font route from a raw request path (any prefix).
@@ -113,11 +140,11 @@ pub fn try_font_route(path: &str, cors_origin: Option<&str>) -> Option<Response>
     None
 }
 
-/// Compute an ETag string from HTML content.
-pub fn html_etag(html: &str) -> String {
+/// Compute an ETag string from content bytes.
+pub fn html_etag(data: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    html.hash(&mut h);
+    data.hash(&mut h);
     format!("\"blit-{:x}\"", h.finish())
 }
 
@@ -130,21 +157,21 @@ mod tests {
 
     #[test]
     fn etag_deterministic() {
-        let a = html_etag("<html>hello</html>");
-        let b = html_etag("<html>hello</html>");
+        let a = html_etag(b"<html>hello</html>");
+        let b = html_etag(b"<html>hello</html>");
         assert_eq!(a, b);
     }
 
     #[test]
     fn etag_different_for_different_content() {
-        let a = html_etag("aaa");
-        let b = html_etag("bbb");
+        let a = html_etag(b"aaa");
+        let b = html_etag(b"bbb");
         assert_ne!(a, b);
     }
 
     #[test]
     fn etag_format() {
-        let tag = html_etag("test");
+        let tag = html_etag(b"test");
         assert!(
             tag.starts_with("\"blit-"),
             "expected quoted blit- prefix, got {tag}"
@@ -156,23 +183,23 @@ mod tests {
 
     #[tokio::test]
     async fn html_response_200_without_etag_match() {
-        let etag = html_etag("hello");
-        let resp = html_response("hello", &etag, None);
+        let etag = html_etag(b"hello");
+        let resp = html_response(b"hello", &etag, None, None);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
     }
 
     #[tokio::test]
     async fn html_response_304_with_matching_etag() {
-        let etag = html_etag("hello");
-        let resp = html_response("hello", &etag, Some(etag.as_bytes()));
+        let etag = html_etag(b"hello");
+        let resp = html_response(b"hello", &etag, Some(etag.as_bytes()), None);
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
     async fn html_response_200_with_mismatched_etag() {
-        let etag = html_etag("hello");
-        let resp = html_response("hello", &etag, Some(b"\"wrong\""));
+        let etag = html_etag(b"hello");
+        let resp = html_response(b"hello", &etag, Some(b"\"wrong\""), None);
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

@@ -1,8 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { viteSingleFile } from "vite-plugin-singlefile";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 
 const wasmPath = resolve(
   __dirname,
@@ -50,6 +51,22 @@ export default bin.buffer;
         }
       },
     },
+    !isDev && {
+      name: "brotli-html",
+      closeBundle() {
+        const htmlPath = resolve(__dirname, "dist/index.html");
+        if (existsSync(htmlPath)) {
+          const html = readFileSync(htmlPath);
+          const compressed = brotliCompressSync(html, {
+            params: {
+              [zlibConstants.BROTLI_PARAM_QUALITY]:
+                zlibConstants.BROTLI_MAX_QUALITY,
+            },
+          });
+          writeFileSync(htmlPath + ".br", compressed);
+        }
+      },
+    },
   ].filter(Boolean),
   resolve: {
     alias: {
@@ -66,6 +83,16 @@ export default bin.buffer;
       // Allow serving the WASM file from outside the web-app directory.
       allow: [resolve(__dirname, "../..")],
     },
+    proxy: isDev
+      ? {
+          "/config": {
+            target: `http://${process.env.VITE_BLIT_GATEWAY || "localhost:3266"}`,
+            ws: true,
+          },
+          "/fonts": `http://${process.env.VITE_BLIT_GATEWAY || "localhost:3266"}`,
+          "/font": `http://${process.env.VITE_BLIT_GATEWAY || "localhost:3266"}`,
+        }
+      : undefined,
   },
   build: {
     outDir: resolve(__dirname, "dist"),

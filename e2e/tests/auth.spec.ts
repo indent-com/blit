@@ -50,7 +50,7 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
-  test("saved passphrase auto-connects on reload", async ({ page }) => {
+  test("passphrase in hash auto-connects on reload", async ({ page }) => {
     await page.goto("/");
     const passInput = page.locator('input[type="password"]');
     await expect(passInput).toBeVisible();
@@ -63,33 +63,44 @@ test.describe("Auth flow", () => {
       .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
+    const url = page.url();
+    expect(url).toContain("#");
+
     await page.reload();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
-  test("invalid saved passphrase shows error and input is usable", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await page.evaluate(() => {
-      localStorage.setItem("blit.passphrase", "bad-saved-pass");
-    });
-
-    await page.reload();
+  test("raw passphrase in hash is encrypted and connects", async ({ page }) => {
+    await page.goto("/#test-secret");
 
     const passInput = page.locator('input[type="password"]');
-    await expect(passInput).toBeVisible({ timeout: 10_000 });
-    await expect(passInput).not.toBeDisabled();
-
-    await passInput.focus();
-    await page.keyboard.type("test-secret");
-    await expect(passInput).toHaveValue("test-secret");
-
-    await passInput.press("Enter");
     await expect(passInput).toBeHidden({ timeout: 10_000 });
+
     const newTerminal = page
       .getByRole("button", { name: "New terminal" })
       .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+
+    const url = page.url();
+    expect(url).not.toContain("#test-secret");
+    expect(url).toContain("#e.");
+  });
+
+  test("encrypted hash survives reload", async ({ page }) => {
+    await page.goto("/#test-secret");
+
+    const newTerminal = page
+      .getByRole("button", { name: "New terminal" })
+      .first();
+    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+
+    const urlBefore = page.url();
+    expect(urlBefore).toContain("#e.");
+
+    await page.reload();
+    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+
+    const urlAfter = page.url();
+    expect(urlAfter).toContain("#e.");
   });
 });

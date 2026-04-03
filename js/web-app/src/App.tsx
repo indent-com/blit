@@ -1,101 +1,147 @@
-import { useState, useCallback, useRef, useEffect } from "react";
-import { WebSocketTransport, WebTransportTransport } from "@blit-sh/core";
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  WebSocketTransport,
+  WebTransportTransport,
+  createShareTransport,
+} from "@blit-sh/core";
 import type { BlitTransport } from "@blit-sh/core";
 import type { BlitWasmModule } from "@blit-sh/core";
-import {
-  PASS_KEY,
-  readStorage,
-  writeStorage,
-  wsUrl,
-  wtUrl,
-  wtCertHash,
-} from "./storage";
+import { wsUrl, wtUrl } from "./storage";
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
-import { createShareTransport } from "@blit-sh/core";
+import {
+  encryptPassphrase,
+  isEncrypted,
+  decryptPassphrase,
+} from "./passphrase-crypto";
 
-const DEFAULT_HUB = "wss://hub.blit.sh";
-
-/** Read hub URL injected by CLI, or fall back to the default. */
-function hubUrl(): string {
-  return (window as unknown as { __blitHub?: string }).__blitHub ?? DEFAULT_HUB;
+interface BlitConfig {
+  gateway?: boolean;
+  certHash?: string;
+  hub?: string;
+  host?: string;
 }
 
-/**
- * Detect share mode from the URL hash. Layout state hashes start with
- * a known key (`l=`, `p=`, or `a=`). Anything else is a share passphrase.
- */
-function getSharePassphrase(): string | null {
-  const hash = location.hash.slice(1);
-  if (!hash) return null;
-  if (/^[lpa]=/.test(hash)) return null;
-  return decodeURIComponent(hash);
+function readPassphrase(): string | null {
+  const raw = location.hash.slice(1);
+  if (!raw) return null;
+  const first = raw.split("&")[0];
+  if (/^[lpa]=/.test(first)) return null;
+  const decoded = decodeURIComponent(first);
+  if (isEncrypted(decoded)) return decryptPassphrase(decoded);
+  const encrypted = encryptPassphrase(decoded);
+  const rest = raw.split("&").slice(1);
+  const parts = [encodeURIComponent(encrypted), ...rest].filter(Boolean);
+  history.replaceState(null, "", `${location.pathname}#${parts.join("&")}`);
+  return decoded;
 }
 
-function createGatewayTransport(pass: string): BlitTransport {
-  const certHash = wtCertHash();
-  if (typeof WebTransport !== "undefined" && certHash) {
+readPassphrase();
+
+async function fetchConfig(): Promise<BlitConfig> {
+  const base = location.pathname.endsWith("/")
+    ? location.pathname
+    : location.pathname + "/";
+  const resp = await fetch(base + "config");
+  return resp.json();
+}
+
+function createTransport(pass: string, config: BlitConfig): BlitTransport {
+  if (config.hub) {
+    return createShareTransport(config.hub, pass);
+  }
+  if (typeof WebTransport !== "undefined" && config.certHash) {
     return new WebTransportTransport(wtUrl(), pass, {
-      serverCertificateHash: certHash,
+      serverCertificateHash: config.certHash,
     });
   }
   return new WebSocketTransport(wsUrl(), pass);
 }
 
 export function App({ wasm }: { wasm: BlitWasmModule }) {
-  const sharePassphrase = getSharePassphrase();
+  const [passphrase, setPassphrase] = useState(readPassphrase);
+  const [config, setConfig] = useState<BlitConfig | null>(null);
 
-  // Share mode: bypass auth, connect via WebRTC
-  if (sharePassphrase) {
-    return <ShareApp wasm={wasm} passphrase={sharePassphrase} />;
+  useEffect(() => {
+    const onHashChange = () => setPassphrase(readPassphrase());
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    fetchConfig().then(setConfig, () => setConfig({ gateway: true }));
+  }, []);
+
+  if (!config) return null;
+
+  if (passphrase) {
+    return <ConnectedApp wasm={wasm} passphrase={passphrase} config={config} />;
   }
 
-  // Gateway mode: auth screen + WebSocket/WebTransport
-  return <GatewayApp wasm={wasm} />;
+  return <AuthApp wasm={wasm} config={config} />;
 }
 
-function ShareApp({
+function ConnectedApp({
   wasm,
   passphrase,
+  config,
 }: {
   wasm: BlitWasmModule;
   passphrase: string;
+  config: BlitConfig;
 }) {
   const [transport] = useState<BlitTransport>(() =>
-    createShareTransport(hubUrl(), passphrase),
+    createTransport(passphrase, config),
   );
 
-  return <Workspace transport={transport} wasm={wasm} onAuthError={() => {}} />;
+  return (
+    <Workspace
+      transport={transport}
+      wasm={wasm}
+      onAuthError={() => {
+        history.replaceState(null, "", location.pathname);
+        window.location.reload();
+      }}
+    />
+  );
 }
 
-function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
-  const savedPass = readStorage(PASS_KEY);
+function AuthApp({
+  wasm,
+  config,
+}: {
+  wasm: BlitWasmModule;
+  config: BlitConfig;
+}) {
   const [transport, setTransport] = useState<BlitTransport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const passRef = useRef<HTMLInputElement | null>(null);
 
-  useEffect(() => {
-    if (!savedPass || transport) return;
-    setTransport(createGatewayTransport(savedPass));
-  }, [savedPass, transport]);
-
-  const connect = useCallback((pass: string) => {
-    setAuthError(null);
-    const t = createGatewayTransport(pass);
-    const onStatus = (status: string) => {
-      if (status === "connected") {
-        writeStorage(PASS_KEY, pass);
-        t.removeEventListener("statuschange", onStatus);
-      } else if (status === "error") {
-        setAuthError(t.lastError ?? i18n("auth.failed"));
-        t.removeEventListener("statuschange", onStatus);
-        setTransport(null);
-      }
-    };
-    t.addEventListener("statuschange", onStatus);
-    setTransport(t);
-  }, []);
+  const connect = useCallback(
+    (pass: string) => {
+      setAuthError(null);
+      const t = createTransport(pass, config);
+      const onStatus = (status: string) => {
+        if (status === "connected") {
+          const encrypted = encryptPassphrase(pass);
+          history.replaceState(
+            null,
+            "",
+            `${location.pathname}#${encodeURIComponent(encrypted)}`,
+          );
+          t.removeEventListener("statuschange", onStatus);
+        } else if (status === "error") {
+          setAuthError(t.lastError ?? i18n("auth.failed"));
+          t.removeEventListener("statuschange", onStatus);
+          setTransport(null);
+        }
+      };
+      t.addEventListener("statuschange", onStatus);
+      setTransport(t);
+    },
+    [config],
+  );
 
   if (!transport) {
     return (
@@ -112,7 +158,6 @@ function GatewayApp({ wasm }: { wasm: BlitWasmModule }) {
       transport={transport}
       wasm={wasm}
       onAuthError={() => {
-        writeStorage(PASS_KEY, "");
         setTransport(null);
         setAuthError(i18n("auth.failed"));
       }}
