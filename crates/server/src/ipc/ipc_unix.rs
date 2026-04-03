@@ -46,6 +46,16 @@ impl IpcListener {
             }
             return None;
         }
+        let pid = std::env::var("LISTEN_PID").ok()?;
+        if pid.trim() != std::process::id().to_string() {
+            if verbose {
+                eprintln!(
+                    "LISTEN_PID={pid} does not match our pid {}; falling back to bind",
+                    std::process::id()
+                );
+            }
+            return None;
+        }
         use std::os::unix::io::FromRawFd;
         let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
         std_listener.set_nonblocking(true).unwrap();
