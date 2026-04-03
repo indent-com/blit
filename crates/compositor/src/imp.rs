@@ -638,6 +638,180 @@ impl DmabufHandler for Compositor {
     }
 }
 
+fn with_dmabuf_plane_bytes<T>(
+    dmabuf: &Dmabuf,
+    plane_idx: usize,
+    f: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
+    let _ = dmabuf.sync_plane(
+        plane_idx,
+        smithay::backend::allocator::dmabuf::DmabufSyncFlags::START
+            | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
+    );
+    let mapping = dmabuf.map_plane(plane_idx, DmabufMappingMode::READ).ok()?;
+    let ptr = mapping.ptr() as *const u8;
+    let len = mapping.length();
+    let plane_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let result = f(plane_data);
+    let _ = dmabuf.sync_plane(
+        plane_idx,
+        smithay::backend::allocator::dmabuf::DmabufSyncFlags::END
+            | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
+    );
+    result
+}
+
+fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
+    let y = (y as i32 - 16).max(0);
+    let u = u as i32 - 128;
+    let v = v as i32 - 128;
+
+    let r = ((298 * y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((298 * y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((298 * y + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+
+    [r, g, b]
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let raw = bytes.get(offset..end)?;
+    Some(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn read_packed_rgba_dmabuf(
+    plane_data: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    y_inverted: bool,
+    format: Fourcc,
+) -> Option<Vec<u8>> {
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let src_row = if y_inverted { height - 1 - row } else { row };
+        let row_start = src_row * stride;
+        let row_end = row_start + (width * 4);
+        if row_end > plane_data.len() {
+            return None;
+        }
+
+        for col in 0..width {
+            let i = row_start + col * 4;
+            match format {
+                Fourcc::Argb8888 => {
+                    rgba.push(plane_data[i + 2]);
+                    rgba.push(plane_data[i + 1]);
+                    rgba.push(plane_data[i]);
+                    rgba.push(plane_data[i + 3]);
+                }
+                Fourcc::Xrgb8888 => {
+                    rgba.push(plane_data[i + 2]);
+                    rgba.push(plane_data[i + 1]);
+                    rgba.push(plane_data[i]);
+                    rgba.push(255);
+                }
+                Fourcc::Abgr8888 => {
+                    rgba.push(plane_data[i]);
+                    rgba.push(plane_data[i + 1]);
+                    rgba.push(plane_data[i + 2]);
+                    rgba.push(plane_data[i + 3]);
+                }
+                Fourcc::Xbgr8888 => {
+                    rgba.push(plane_data[i]);
+                    rgba.push(plane_data[i + 1]);
+                    rgba.push(plane_data[i + 2]);
+                    rgba.push(255);
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(rgba)
+}
+
+fn read_nv12_dmabuf(
+    y_plane: &[u8],
+    y_stride: usize,
+    uv_plane: &[u8],
+    uv_stride: usize,
+    width: usize,
+    height: usize,
+    y_inverted: bool,
+) -> Option<Vec<u8>> {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return None;
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let src_row = if y_inverted { height - 1 - row } else { row };
+        let y_row_start = src_row * y_stride;
+        let y_row_end = y_row_start + width;
+        if y_row_end > y_plane.len() {
+            return None;
+        }
+
+        let uv_row_start = (src_row / 2) * uv_stride;
+        let uv_row_end = uv_row_start + width;
+        if uv_row_end > uv_plane.len() {
+            return None;
+        }
+
+        for col in 0..width {
+            let y = y_plane[y_row_start + col];
+            let uv_idx = uv_row_start + (col / 2) * 2;
+            let u = uv_plane[uv_idx];
+            let v = uv_plane[uv_idx + 1];
+            let [r, g, b] = yuv420_to_rgb(y, u, v);
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    Some(rgba)
+}
+
+fn read_p010_dmabuf(
+    y_plane: &[u8],
+    y_stride: usize,
+    uv_plane: &[u8],
+    uv_stride: usize,
+    width: usize,
+    height: usize,
+    y_inverted: bool,
+) -> Option<Vec<u8>> {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return None;
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let src_row = if y_inverted { height - 1 - row } else { row };
+        let y_row_start = src_row * y_stride;
+        let y_row_end = y_row_start + width * 2;
+        if y_row_end > y_plane.len() {
+            return None;
+        }
+
+        let uv_row_start = (src_row / 2) * uv_stride;
+        let uv_row_end = uv_row_start + width * 2;
+        if uv_row_end > uv_plane.len() {
+            return None;
+        }
+
+        for col in 0..width {
+            let y = (read_le_u16(y_plane, y_row_start + col * 2)? >> 8) as u8;
+            let uv_idx = uv_row_start + (col / 2) * 4;
+            let u = (read_le_u16(uv_plane, uv_idx)? >> 8) as u8;
+            let v = (read_le_u16(uv_plane, uv_idx + 2)? >> 8) as u8;
+            let [r, g, b] = yuv420_to_rgb(y, u, v);
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    Some(rgba)
+}
+
 fn read_dmabuf_pixels(dmabuf: &Dmabuf) -> Option<(u32, u32, Vec<u8>)> {
     let size = dmabuf.size();
     let width = size.w as u32;
@@ -645,48 +819,67 @@ fn read_dmabuf_pixels(dmabuf: &Dmabuf) -> Option<(u32, u32, Vec<u8>)> {
     if width == 0 || height == 0 {
         return None;
     }
+
     let format = dmabuf.format();
-    let is_argb = matches!(format.code, Fourcc::Argb8888 | Fourcc::Xrgb8888);
-    let is_abgr = matches!(format.code, Fourcc::Abgr8888 | Fourcc::Xbgr8888);
-    if !is_argb && !is_abgr {
+    if !matches!(format.modifier, Modifier::Linear | Modifier::Invalid) {
         return None;
     }
 
-    let _ = dmabuf.sync_plane(
-        0,
-        smithay::backend::allocator::dmabuf::DmabufSyncFlags::START
-            | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
-    );
-    let mapping = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
-    let stride = dmabuf.strides().next().unwrap_or(width * 4) as usize;
-    let ptr = mapping.ptr() as *const u8;
-    let len = mapping.length();
-    let pixel_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for row in 0..height as usize {
-        let row_start = row * stride;
-        let row_end = row_start + (width as usize * 4);
-        if row_end > pixel_data.len() {
-            return None;
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let y_inverted = dmabuf.y_inverted();
+    let rgba = match format.code {
+        Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
+            let stride = dmabuf.strides().next().unwrap_or(width * 4) as usize;
+            with_dmabuf_plane_bytes(dmabuf, 0, |plane_data| {
+                read_packed_rgba_dmabuf(
+                    plane_data,
+                    stride,
+                    width_usize,
+                    height_usize,
+                    y_inverted,
+                    format.code,
+                )
+            })?
         }
-        if is_argb {
-            for col in 0..width as usize {
-                let i = row_start + col * 4;
-                rgba.push(pixel_data[i + 2]); // R (ARGB -> byte order is BGRA in LE)
-                rgba.push(pixel_data[i + 1]); // G
-                rgba.push(pixel_data[i]); // B
-                rgba.push(pixel_data[i + 3]); // A
-            }
-        } else {
-            rgba.extend_from_slice(&pixel_data[row_start..row_end]);
+        Fourcc::Nv12 => {
+            let mut strides = dmabuf.strides();
+            let y_stride = strides.next().unwrap_or(width) as usize;
+            let uv_stride = strides.next().unwrap_or(width) as usize;
+            with_dmabuf_plane_bytes(dmabuf, 0, |y_plane| {
+                with_dmabuf_plane_bytes(dmabuf, 1, |uv_plane| {
+                    read_nv12_dmabuf(
+                        y_plane,
+                        y_stride,
+                        uv_plane,
+                        uv_stride,
+                        width_usize,
+                        height_usize,
+                        y_inverted,
+                    )
+                })
+            })?
         }
-    }
-    let _ = dmabuf.sync_plane(
-        0,
-        smithay::backend::allocator::dmabuf::DmabufSyncFlags::END
-            | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
-    );
+        Fourcc::P010 => {
+            let mut strides = dmabuf.strides();
+            let y_stride = strides.next().unwrap_or(width * 2) as usize;
+            let uv_stride = strides.next().unwrap_or(width * 2) as usize;
+            with_dmabuf_plane_bytes(dmabuf, 0, |y_plane| {
+                with_dmabuf_plane_bytes(dmabuf, 1, |uv_plane| {
+                    read_p010_dmabuf(
+                        y_plane,
+                        y_stride,
+                        uv_plane,
+                        uv_stride,
+                        width_usize,
+                        height_usize,
+                        y_inverted,
+                    )
+                })
+            })?
+        }
+        _ => return None,
+    };
 
     Some((width, height, rgba))
 }
@@ -817,6 +1010,14 @@ fn run_compositor(
             modifier: Modifier::Linear,
         },
         DmabufFormat {
+            code: Fourcc::Nv12,
+            modifier: Modifier::Linear,
+        },
+        DmabufFormat {
+            code: Fourcc::P010,
+            modifier: Modifier::Linear,
+        },
+        DmabufFormat {
             code: Fourcc::Argb8888,
             modifier: Modifier::Invalid,
         },
@@ -830,6 +1031,14 @@ fn run_compositor(
         },
         DmabufFormat {
             code: Fourcc::Xbgr8888,
+            modifier: Modifier::Invalid,
+        },
+        DmabufFormat {
+            code: Fourcc::Nv12,
+            modifier: Modifier::Invalid,
+        },
+        DmabufFormat {
+            code: Fourcc::P010,
             modifier: Modifier::Invalid,
         },
     ];
@@ -951,5 +1160,45 @@ fn run_compositor(
         {
             eprintln!("[compositor] event loop error: {e}");
         }
+        if let Err(e) = compositor.display_handle.flush_clients() {
+            eprintln!("[compositor] flush_clients error: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Fourcc, read_nv12_dmabuf, read_p010_dmabuf, read_packed_rgba_dmabuf};
+
+    #[test]
+    fn xrgb_dmabuf_forces_opaque_alpha() {
+        let pixels = [
+            0x10, 0x20, 0x30, 0x00, //
+            0x40, 0x50, 0x60, 0x7f,
+        ];
+
+        let rgba = read_packed_rgba_dmabuf(&pixels, 8, 2, 1, false, Fourcc::Xrgb8888).unwrap();
+
+        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0xff, 0x60, 0x50, 0x40, 0xff]);
+    }
+
+    #[test]
+    fn nv12_black_decodes_to_opaque_black() {
+        let y_plane = [16, 16, 16, 16];
+        let uv_plane = [128, 128];
+
+        let rgba = read_nv12_dmabuf(&y_plane, 2, &uv_plane, 2, 2, 2, false).unwrap();
+
+        assert_eq!(rgba, vec![0, 0, 0, 255].repeat(4));
+    }
+
+    #[test]
+    fn p010_white_decodes_to_opaque_white() {
+        let y_plane = [0x00, 0xeb, 0x00, 0xeb, 0x00, 0xeb, 0x00, 0xeb];
+        let uv_plane = [0x00, 0x80, 0x00, 0x80];
+
+        let rgba = read_p010_dmabuf(&y_plane, 4, &uv_plane, 4, 2, 2, false).unwrap();
+
+        assert_eq!(rgba, vec![255, 255, 255, 255].repeat(4));
     }
 }

@@ -55,9 +55,9 @@ Two macOS-only calls that aren't in the `libc` crate:
 
 ## Dmabuf pixel reads in `compositor`
 
-`read_dmabuf_pixels` in [`crates/compositor/src/lib.rs`](crates/compositor/src/lib.rs) calls `dmabuf.map_plane()` to get a raw pointer and length, then uses `std::slice::from_raw_parts(ptr, len)` to create a byte slice from the mapped memory region.
+`read_dmabuf_pixels` in [`crates/compositor/src/imp.rs`](crates/compositor/src/imp.rs) calls `dmabuf.map_plane()` to get a raw pointer and length, then uses `std::slice::from_raw_parts(ptr, len)` to create byte slices from the mapped memory regions.
 
-The invariants: `map_plane` must return a valid mapping whose `ptr()` is non-null and `length()` accurately describes the mapped region. The mapping is bracketed by `sync_plane(START|READ)` / `sync_plane(END|READ)` to ensure cache coherence with the GPU. The slice must not outlive the `DmabufMapping` — currently it doesn't because both are local to the function.
+The invariants: `map_plane` must return a valid mapping whose `ptr()` is non-null and `length()` accurately describes the mapped region. Each mapping is bracketed by `sync_plane(START|READ)` / `sync_plane(END|READ)` to ensure cache coherence with the GPU. The slices must not outlive the `DmabufMapping` objects — currently they don't because both stay local to the helper closure that reads each plane.
 
 The SHM path in `commit()` uses the same pattern (`std::slice::from_raw_parts`) via `with_buffer_contents`, which smithay invokes with a pointer to the shared memory pool. The safety contract is the same: the slice is only used within the callback closure.
 
