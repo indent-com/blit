@@ -120,3 +120,100 @@ pub fn html_etag(html: &str) -> String {
     html.hash(&mut h);
     format!("\"blit-{:x}\"", h.finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    // ── html_etag ──
+
+    #[test]
+    fn etag_deterministic() {
+        let a = html_etag("<html>hello</html>");
+        let b = html_etag("<html>hello</html>");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn etag_different_for_different_content() {
+        let a = html_etag("aaa");
+        let b = html_etag("bbb");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn etag_format() {
+        let tag = html_etag("test");
+        assert!(
+            tag.starts_with("\"blit-"),
+            "expected quoted blit- prefix, got {tag}"
+        );
+        assert!(tag.ends_with('"'));
+    }
+
+    // ── html_response ──
+
+    #[tokio::test]
+    async fn html_response_200_without_etag_match() {
+        let etag = html_etag("hello");
+        let resp = html_response("hello", &etag, None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+    }
+
+    #[tokio::test]
+    async fn html_response_304_with_matching_etag() {
+        let etag = html_etag("hello");
+        let resp = html_response("hello", &etag, Some(etag.as_bytes()));
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn html_response_200_with_mismatched_etag() {
+        let etag = html_etag("hello");
+        let resp = html_response("hello", &etag, Some(b"\"wrong\""));
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── try_font_route ──
+
+    #[test]
+    fn font_route_fonts_bare() {
+        assert!(try_font_route("/fonts", None).is_some());
+    }
+
+    #[test]
+    fn font_route_fonts_prefixed() {
+        assert!(try_font_route("/vt/fonts", None).is_some());
+    }
+
+    #[test]
+    fn font_route_font_name() {
+        let resp = try_font_route("/font/Menlo", None);
+        assert!(resp.is_some());
+    }
+
+    #[test]
+    fn font_route_font_metrics() {
+        let resp = try_font_route("/font-metrics/Menlo", None);
+        assert!(resp.is_some());
+    }
+
+    #[test]
+    fn font_route_no_match() {
+        assert!(try_font_route("/api/sessions", None).is_none());
+        assert!(try_font_route("/", None).is_none());
+    }
+
+    #[test]
+    fn font_route_rejects_empty_name() {
+        assert!(try_font_route("/font/", None).is_none());
+        assert!(try_font_route("/font-metrics/", None).is_none());
+    }
+
+    #[test]
+    fn font_route_rejects_nested_path() {
+        assert!(try_font_route("/font/a/b", None).is_none());
+    }
+}

@@ -776,4 +776,108 @@ mod tests {
             "expected application/json, got {ct}"
         );
     }
+
+    #[tokio::test]
+    async fn etag_304_on_matching_if_none_match() {
+        let app = test_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = resp
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            304,
+            "expected 304 Not Modified with matching ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_200_on_mismatched_if_none_match() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .header("if-none-match", "\"wrong-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    fn test_app_with_cors(origin: &str) -> axum::Router {
+        let state: AppState = Arc::new(Config {
+            passphrase: "test".into(),
+            sock_path: "/nonexistent.sock".into(),
+            cors_origin: Some(origin.into()),
+            wt_cert_hash: std::sync::RwLock::new(None),
+            config_state: None,
+        });
+        build_app(state)
+    }
+
+    #[tokio::test]
+    async fn cors_header_present_on_font_route() {
+        let app = test_app_with_cors("*");
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/vt/fonts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let cors = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("expected CORS header");
+        assert_eq!(cors.to_str().unwrap(), "*");
+    }
+
+    #[tokio::test]
+    async fn no_cors_header_when_none() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/vt/fonts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "CORS header should not be present when cors_origin is None"
+        );
+    }
 }

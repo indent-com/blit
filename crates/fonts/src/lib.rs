@@ -672,4 +672,167 @@ mod tests {
         let font = build_test_font(&[(b"hhea", hhea), (b"hmtx", hmtx)]);
         assert!(!read_is_monospace(&font));
     }
+
+    // ── base64_encode ──
+
+    #[test]
+    fn base64_empty() {
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn base64_one_byte() {
+        assert_eq!(base64_encode(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn base64_two_bytes() {
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+    }
+
+    #[test]
+    fn base64_three_bytes() {
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+    }
+
+    #[test]
+    fn base64_rfc4648_vectors() {
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    // ── sfnt_offset ──
+
+    #[test]
+    fn sfnt_offset_too_short() {
+        assert_eq!(sfnt_offset(b"abc"), None);
+    }
+
+    #[test]
+    fn sfnt_offset_non_ttc() {
+        let font = build_test_font(&[]);
+        assert_eq!(sfnt_offset(&font), Some(0));
+    }
+
+    #[test]
+    fn sfnt_offset_ttc_header() {
+        let mut data = vec![0u8; 20];
+        data[0..4].copy_from_slice(b"ttcf");
+        data[12..16].copy_from_slice(&100u32.to_be_bytes());
+        assert_eq!(sfnt_offset(&data), Some(100));
+    }
+
+    #[test]
+    fn sfnt_offset_ttc_too_short() {
+        let mut data = vec![0u8; 14];
+        data[0..4].copy_from_slice(b"ttcf");
+        assert_eq!(sfnt_offset(&data), None);
+    }
+
+    // ── table_slice ──
+
+    #[test]
+    fn table_slice_found() {
+        let table_data = vec![1, 2, 3, 4];
+        let font = build_test_font(&[(b"test", table_data.clone())]);
+        let slice = table_slice(&font, b"test");
+        assert_eq!(slice, Some(table_data.as_slice()));
+    }
+
+    #[test]
+    fn table_slice_not_found() {
+        let font = build_test_font(&[(b"aaaa", vec![0])]);
+        assert_eq!(table_slice(&font, b"zzzz"), None);
+    }
+
+    #[test]
+    fn table_slice_empty_font() {
+        let font = build_test_font(&[]);
+        assert_eq!(table_slice(&font, b"test"), None);
+    }
+
+    // ── read_advance_ratio ──
+
+    #[test]
+    fn advance_ratio_basic() {
+        let mut head = vec![0u8; 20];
+        head[18..20].copy_from_slice(&1000u16.to_be_bytes());
+
+        let mut hhea = vec![0u8; 36];
+        hhea[34..36].copy_from_slice(&1u16.to_be_bytes());
+
+        let mut hmtx = vec![0u8; 4];
+        hmtx[0..2].copy_from_slice(&600u16.to_be_bytes());
+
+        let font = build_test_font(&[(b"head", head), (b"hhea", hhea), (b"hmtx", hmtx)]);
+        let ratio = read_advance_ratio(&font).unwrap();
+        assert!((ratio - 0.6).abs() < 1e-10);
+    }
+
+    #[test]
+    fn advance_ratio_skips_zero_advances() {
+        let mut head = vec![0u8; 20];
+        head[18..20].copy_from_slice(&1000u16.to_be_bytes());
+
+        let mut hhea = vec![0u8; 36];
+        hhea[34..36].copy_from_slice(&2u16.to_be_bytes());
+
+        let mut hmtx = vec![0u8; 8];
+        hmtx[0..2].copy_from_slice(&0u16.to_be_bytes());
+        hmtx[4..6].copy_from_slice(&500u16.to_be_bytes());
+
+        let font = build_test_font(&[(b"head", head), (b"hhea", hhea), (b"hmtx", hmtx)]);
+        let ratio = read_advance_ratio(&font).unwrap();
+        assert!((ratio - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn advance_ratio_no_head_table() {
+        let hhea = vec![0u8; 36];
+        let hmtx = vec![0u8; 4];
+        let font = build_test_font(&[(b"hhea", hhea), (b"hmtx", hmtx)]);
+        assert!(read_advance_ratio(&font).is_none());
+    }
+
+    #[test]
+    fn advance_ratio_zero_units_per_em() {
+        let head = vec![0u8; 20];
+        let hhea = vec![0u8; 36];
+        let hmtx = vec![0u8; 4];
+        let font = build_test_font(&[(b"head", head), (b"hhea", hhea), (b"hmtx", hmtx)]);
+        assert!(read_advance_ratio(&font).is_none());
+    }
+
+    // ── subfamily_to_weight_style (extra cases) ──
+
+    #[test]
+    fn subfamily_heavy() {
+        assert_eq!(subfamily_to_weight_style("Heavy"), ("bold", "normal"));
+    }
+
+    #[test]
+    fn subfamily_black() {
+        assert_eq!(subfamily_to_weight_style("Black"), ("bold", "normal"));
+    }
+
+    #[test]
+    fn subfamily_oblique() {
+        assert_eq!(subfamily_to_weight_style("Oblique"), ("normal", "italic"));
+    }
+
+    #[test]
+    fn subfamily_case_insensitive() {
+        assert_eq!(subfamily_to_weight_style("BOLD ITALIC"), ("bold", "italic"));
+        assert_eq!(subfamily_to_weight_style("bold italic"), ("bold", "italic"));
+    }
+
+    #[test]
+    fn subfamily_unrecognized() {
+        assert_eq!(subfamily_to_weight_style("Light"), ("normal", "normal"));
+        assert_eq!(subfamily_to_weight_style("Thin"), ("normal", "normal"));
+    }
 }

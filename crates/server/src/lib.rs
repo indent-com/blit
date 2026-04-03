@@ -3861,4 +3861,197 @@ mod tests {
             client.probe_frames,
         );
     }
+
+    // ── parse_terminal_queries ──
+
+    #[test]
+    fn parse_tq_da1_bare() {
+        let results = parse_terminal_queries(b"\x1b[c", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].starts_with("\x1b[?64;"));
+    }
+
+    #[test]
+    fn parse_tq_da1_with_zero_param() {
+        let results = parse_terminal_queries(b"\x1b[0c", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].starts_with("\x1b[?64;"));
+    }
+
+    #[test]
+    fn parse_tq_dsr_cursor_position() {
+        let results = parse_terminal_queries(b"\x1b[6n", (24, 80), (5, 10));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[6;11R");
+    }
+
+    #[test]
+    fn parse_tq_dsr_status() {
+        let results = parse_terminal_queries(b"\x1b[5n", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[0n");
+    }
+
+    #[test]
+    fn parse_tq_window_size_cells() {
+        let results = parse_terminal_queries(b"\x1b[18t", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn parse_tq_window_size_pixels() {
+        let results = parse_terminal_queries(b"\x1b[14t", (30, 100), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[4;480;800t");
+    }
+
+    #[test]
+    fn parse_tq_multiple_queries() {
+        let data = b"\x1b[c\x1b[6n\x1b[5n";
+        let results = parse_terminal_queries(data, (24, 80), (2, 3));
+        assert_eq!(results.len(), 3);
+        assert!(results[0].starts_with("\x1b[?64;"));
+        assert_eq!(results[1], "\x1b[3;4R");
+        assert_eq!(results[2], "\x1b[0n");
+    }
+
+    #[test]
+    fn parse_tq_question_mark_sequences_skipped() {
+        let results = parse_terminal_queries(b"\x1b[?1h", (24, 80), (0, 0));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_tq_unknown_final_byte_ignored() {
+        let results = parse_terminal_queries(b"\x1b[42z", (24, 80), (0, 0));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_tq_empty_input() {
+        let results = parse_terminal_queries(b"", (24, 80), (0, 0));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_tq_plain_text_no_csi() {
+        let results = parse_terminal_queries(b"hello world", (24, 80), (0, 0));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_tq_interleaved_with_text() {
+        let results = parse_terminal_queries(b"abc\x1b[cdef\x1b[6n", (24, 80), (1, 2));
+        assert_eq!(results.len(), 2);
+    }
+
+    // ── build_search_results_msg ──
+
+    #[test]
+    fn search_results_empty() {
+        let msg = build_search_results_msg(42, &[]);
+        assert_eq!(msg[0], S2C_SEARCH_RESULTS);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 42);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), 0);
+        assert_eq!(msg.len(), 5);
+    }
+
+    #[test]
+    fn search_results_single() {
+        let results = vec![SearchResultRow {
+            pty_id: 7,
+            score: 100,
+            primary_source: 1,
+            matched_sources: 3,
+            context: "hello".into(),
+            scroll_offset: Some(42),
+        }];
+        let msg = build_search_results_msg(1, &results);
+        assert_eq!(msg[0], S2C_SEARCH_RESULTS);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), 1);
+        let pty_id = u16::from_le_bytes([msg[5], msg[6]]);
+        assert_eq!(pty_id, 7);
+        let score = u32::from_le_bytes([msg[7], msg[8], msg[9], msg[10]]);
+        assert_eq!(score, 100);
+        assert_eq!(msg[11], 1);
+        assert_eq!(msg[12], 3);
+        let scroll = u32::from_le_bytes([msg[13], msg[14], msg[15], msg[16]]);
+        assert_eq!(scroll, 42);
+        let ctx_len = u16::from_le_bytes([msg[17], msg[18]]) as usize;
+        assert_eq!(ctx_len, 5);
+        assert_eq!(&msg[19..19 + ctx_len], b"hello");
+    }
+
+    #[test]
+    fn search_results_none_scroll_offset() {
+        let results = vec![SearchResultRow {
+            pty_id: 1,
+            score: 0,
+            primary_source: 0,
+            matched_sources: 0,
+            context: String::new(),
+            scroll_offset: None,
+        }];
+        let msg = build_search_results_msg(0, &results);
+        let scroll = u32::from_le_bytes([msg[13], msg[14], msg[15], msg[16]]);
+        assert_eq!(scroll, u32::MAX);
+    }
+
+    // ── allocate_pty_id ──
+
+    #[test]
+    fn allocate_pty_id_empty_session() {
+        let mut sess = Session::new();
+        assert_eq!(sess.allocate_pty_id(), Some(1));
+    }
+
+    // ── try_send_update ──
+
+    #[test]
+    fn try_send_no_change() {
+        let mut client = test_client();
+        let frame = sample_frame("x");
+        let now = Instant::now();
+        let outcome = try_send_update(&mut client, 1, frame, None, now, false);
+        assert!(matches!(outcome, SendOutcome::NoChange));
+    }
+
+    #[test]
+    fn try_send_sent() {
+        let (mut client, _rx) = test_client_with_capacity(8);
+        let frame = sample_frame("x");
+        let now = Instant::now();
+        let outcome = try_send_update(
+            &mut client,
+            1,
+            frame.clone(),
+            Some(vec![1, 2, 3]),
+            now,
+            true,
+        );
+        assert!(matches!(outcome, SendOutcome::Sent));
+        assert!(client.last_sent.contains_key(&1));
+    }
+
+    #[test]
+    fn try_send_backpressured() {
+        let (mut client, _rx) = test_client_with_capacity(1);
+        let frame = sample_frame("x");
+        let now = Instant::now();
+        let _ = client.tx.try_send(vec![0]);
+        let outcome = try_send_update(
+            &mut client,
+            1,
+            frame.clone(),
+            Some(vec![1, 2, 3]),
+            now,
+            true,
+        );
+        assert!(matches!(outcome, SendOutcome::Backpressured));
+        assert!(
+            client.last_sent.contains_key(&1),
+            "last_sent should advance even on backpressure"
+        );
+    }
 }
