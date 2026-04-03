@@ -87,6 +87,7 @@ merged=()
 for n in "${pr_numbers[@]}"; do
     head_ref="$(gh pr view "$n" --json headRefName --jq '.headRefName')"
     echo "Fetching PR #$n ($head_ref)…"
+    git branch -D "pr-$n" 2>/dev/null || true
     git fetch origin "pull/$n/head:pr-$n" --no-tags --quiet
 
     echo "Merging PR #$n ($head_ref)…"
