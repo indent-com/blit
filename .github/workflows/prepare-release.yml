@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   prepare:
@@ -32,9 +33,14 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
 
-      - name: Tag and push
+      - name: Push branch and open PR
         run: |
-          git tag "v$VERSION"
-          git push origin main "v$VERSION"
+          git push origin "HEAD:refs/heads/release/$VERSION"
+          gh pr create \
+            --base main \
+            --head "release/$VERSION" \
+            --title "release $VERSION" \
+            --body "Automated release PR for v${VERSION}."
         env:
           VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

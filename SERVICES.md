@@ -179,12 +179,13 @@ On Windows, Nix isn't available, so the `build-windows` job uses `cargo build --
 
 ## GitHub Actions workflows
 
-Seven workflow files live in `.github/workflows/`:
+Eight workflow files live in `.github/workflows/`:
 
 | Workflow                                                             | Trigger                                                                                        | Purpose                                                                                       |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                |
-| [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, tag, and push — triggers `release.yml`                                     |
+| [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, push branch, open PR against `main`                                        |
+| [`tag-release.yml`](.github/workflows/tag-release.yml)               | Push to `main`                                                                                 | Detect `release <version>` commits and create `v*` tag — triggers `release.yml`               |
 | [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Build artifacts, create GitHub Release, publish packages, deploy install site                 |
 | [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                        |
@@ -232,17 +233,26 @@ Runs on every push to `main` and on every pull request. Single job on `ubuntu-la
 
 ### Prepare release (prepare-release.yml)
 
-Manually triggered via `workflow_dispatch`. Takes a version string (e.g. `0.13.0`), runs `bin/release` to bump all version files and commit, then tags `v<version>` and pushes — which triggers the full `release.yml` pipeline.
+Manually triggered via `workflow_dispatch`. Takes a version string (e.g. `0.13.0`), runs `bin/release` to bump all version files and commit, pushes to a `release/<version>` branch, and opens a PR against `main`.
 
 ```mermaid
 flowchart LR
-    DISPATCH["workflow_dispatch<br>version: 0.13.0"] --> RELEASE["bin/release 0.13.0<br>bump + commit"] --> PUSH["git tag v0.13.0<br>git push"]
-    PUSH --> TAG["Triggers release.yml"]
+    DISPATCH["workflow_dispatch<br>version: 0.13.0"] --> RELEASE["bin/release 0.13.0<br>bump + commit"] --> PR["Push release/0.13.0<br>Open PR"]
+```
+
+### Tag release (tag-release.yml)
+
+Triggered on pushes to `main`. Checks whether the head commit message starts with `release ` followed by a semver string. If so, creates and pushes a `v<version>` tag — which triggers the full `release.yml` pipeline.
+
+```mermaid
+flowchart LR
+    MERGE["PR merged to main<br>release 0.13.0"] --> TAG["git tag v0.13.0<br>git push tag"]
+    TAG --> REL["Triggers release.yml"]
 ```
 
 ### Release (release.yml)
 
-Triggered by pushing a `v*` tag (created by `./bin/release <version>`):
+Triggered by pushing a `v*` tag:
 
 ```mermaid
 flowchart TD
@@ -319,9 +329,12 @@ sequenceDiagram
     Rel->>Rel: Validate version consistency across<br>Cargo.toml, package.json, nix/common.nix
     Rel->>Rel: Bump all version files
     Rel->>Rel: cargo test -p blit-server
-    Rel->>Rel: Update pnpm dep hash in nix/packages.nix
     Rel->>Git: git commit "release 0.12.0"
-    CI->>Git: git tag v0.12.0 && git push
+    CI->>Git: Push release/0.12.0 branch<br>Open PR against main
+    Dev->>Git: Review and merge PR
+    Git->>CI: Push to main triggers tag-release.yml
+    CI->>CI: Detect "release 0.12.0" commit
+    CI->>Git: git tag v0.12.0 && git push tag
     Git->>CI: v* tag triggers release.yml + publish-demo-image.yml
 
     CI->>CI: Build .deb (amd64, arm64)
