@@ -32,6 +32,8 @@ _blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_] [_--verbose_]
 
 _blit_ _learn_
 
+_blit_ _install_ _--ssh_ _HOST_
+
 _blit_ _upgrade_
 
 # DESCRIPTION
@@ -49,7 +51,8 @@ full CLI reference.
 # OPTIONS
 
 _--socket_ _PATH_, _-s_ _PATH_
-Connect to a specific Unix socket.
+Connect to a specific Unix socket. When combined with _--ssh_, specifies
+the socket path on the remote host instead of the default search order.
 
 _--tcp_ _HOST:PORT_
 Connect via raw TCP.
@@ -57,7 +60,9 @@ Connect via raw TCP.
 _--ssh_ _HOST_
 Connect to a remote _blit-server_ over SSH. The remote socket path is
 resolved using the same cascade as _BLIT_SOCK_ (see below), evaluated on
-the remote host as the SSH user.
+the remote host as the SSH user. If no server is running, _blit server_
+(or _blit-server_) is started automatically on the remote host. Can be
+combined with _--socket_ to target a specific remote socket path.
 
 _--passphrase_ _PASSPHRASE_
 Connect via WebRTC to a shared session using the given passphrase.
@@ -146,6 +151,13 @@ URL is printed to stdout. The passphrase can also be set via the
 _BLIT_PASSPHRASE_ environment variable. If omitted, a random passphrase
 is generated. With _--verbose_, detailed connection diagnostics (ICE
 negotiation, STUN/TURN results, peer events) are printed to stderr.
+
+_install_
+Install _blit_ on a remote host via SSH. Requires _--ssh_; other
+transports are rejected. Detects the remote OS via _uname_: on Linux and
+macOS the curl/wget install script is run; on Windows the PowerShell
+installer is used. The installer's stdin and stdout are connected to
+the local terminal for interactive prompts.
 
 _learn_
 Print the full CLI reference — a usage guide for scripts and LLM agents.

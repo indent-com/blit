@@ -25,6 +25,13 @@ Connect to a remote host over SSH:
 
 ```bash
 blit open --ssh myhost
+blit --ssh myhost --socket /tmp/custom.sock list   # specific remote socket
+```
+
+Install blit on a remote host:
+
+```bash
+blit install --ssh myhost
 ```
 
 Control terminals programmatically:
