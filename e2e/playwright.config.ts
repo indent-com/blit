@@ -32,7 +32,7 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,
     env: {
-      BLIT_PASS: "test-secret",
+      BLIT_PASSPHRASE: "test-secret",
       BLIT_ADDR: `127.0.0.1:${PORT}`,
     },
     stdout: "pipe",

@@ -928,11 +928,23 @@ async fn setup_ssh_forward(ssh_args: &[String], remote_socket: Option<&str>) -> 
     }
 }
 
+struct ShareState {
+    token: String,
+    config: blit_webserver::config::ConfigState,
+    hub_json: &'static str,
+}
+
 pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
     let html_etag: &'static str =
         Box::leak(blit_webserver::html_etag(WEB_INDEX_HTML_BR).into_boxed_str());
 
     let hub_json: &'static str = Box::leak(format!("{{\"hub\":\"{hub}\"}}").into_boxed_str());
+
+    let state = Arc::new(ShareState {
+        token: passphrase.to_owned(),
+        config: blit_webserver::config::ConfigState::new(),
+        hub_json,
+    });
 
     let bind_port = port.unwrap_or(0);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{bind_port}"))
@@ -948,12 +960,38 @@ pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
     let app = axum::Router::new()
         .route(
             "/config",
-            get(move || async move {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    hub_json,
-                )
-            }),
+            get(
+                move |axum::extract::State(state): axum::extract::State<Arc<ShareState>>,
+                      request: axum::extract::Request| async move {
+                    let is_ws = request
+                        .headers()
+                        .get("upgrade")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.eq_ignore_ascii_case("websocket"))
+                        .unwrap_or(false);
+                    if is_ws {
+                        match WebSocketUpgrade::from_request(request, &state).await {
+                            Ok(ws) => ws
+                                .on_upgrade(move |socket| async move {
+                                    blit_webserver::config::handle_config_ws(
+                                        socket,
+                                        &state.token,
+                                        &state.config,
+                                    )
+                                    .await;
+                                })
+                                .into_response(),
+                            Err(e) => e.into_response(),
+                        }
+                    } else {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            state.hub_json,
+                        )
+                            .into_response()
+                    }
+                },
+            ),
         )
         .fallback(get(move |request: axum::extract::Request| async move {
             if let Some(resp) = blit_webserver::try_font_route(request.uri().path(), None) {
@@ -968,7 +1006,8 @@ pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
                 .get(axum::http::header::ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok());
             blit_webserver::html_response(WEB_INDEX_HTML_BR, html_etag, inm, ae)
-        }));
+        }))
+        .with_state(state);
 
     open_browser(&url);
 
