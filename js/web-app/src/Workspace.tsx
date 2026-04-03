@@ -138,7 +138,8 @@ function WorkspaceScreen({
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [debugPanel, setDebugPanel] = useState(false);
   const [previewPanelOpen, setPreviewPanelOpen] = useState(true);
-  const [previewPanelWidth, setPreviewPanelWidth] = useState(SURFACE_PANEL_WIDTH);
+  const [previewPanelWidth, setPreviewPanelWidth] =
+    useState(SURFACE_PANEL_WIDTH);
   const [serverFonts, setServerFonts] = useState<string[]>([]);
   const [offlineVisible, setOfflineVisible] = useState(false);
   const [fontLoading, setFontLoading] = useState(false);
@@ -176,7 +177,10 @@ function WorkspaceScreen({
   ]);
 
   const toggleDebug = useCallback(() => setDebugPanel((value) => !value), []);
-  const togglePreviewPanel = useCallback(() => setPreviewPanelOpen((v) => !v), []);
+  const togglePreviewPanel = useCallback(
+    () => setPreviewPanelOpen((v) => !v),
+    [],
+  );
   const fontRequestVersionRef = useRef(0);
   const paletteOverlayOriginRef = useRef<TerminalPalette | null>(null);
   const fontOverlayOriginRef = useRef<{ family: string; size: number } | null>(
@@ -863,21 +867,21 @@ function WorkspaceScreen({
           </div>
           {previewPanelOpen &&
             (offScreenSessions.length > 0 || surfaces.length > 0) && (
-            <PreviewPanel
-              offScreenSessions={offScreenSessions}
-              surfaces={surfaces}
-              connectionId={primaryConnectionId}
-              theme={theme}
-              scale={chromeScale}
-              palette={palette}
-              fontFamily={resolvedFontWithFallback}
-              fontSize={fontSize}
-              onFocusSession={switchSession}
-              width={previewPanelWidth}
-              onResize={setPreviewPanelWidth}
-              onClose={togglePreviewPanel}
-            />
-          )}
+              <PreviewPanel
+                offScreenSessions={offScreenSessions}
+                surfaces={surfaces}
+                connectionId={primaryConnectionId}
+                theme={theme}
+                scale={chromeScale}
+                palette={palette}
+                fontFamily={resolvedFontWithFallback}
+                fontSize={fontSize}
+                onFocusSession={switchSession}
+                width={previewPanelWidth}
+                onResize={setPreviewPanelWidth}
+                onClose={togglePreviewPanel}
+              />
+            )}
         </section>
         {overlay === "expose" && (
           <SwitcherOverlay
@@ -1109,7 +1113,12 @@ function PreviewPanel({
 
       const onMove = (me: PointerEvent) => {
         const delta = startX - me.clientX;
-        onResize(Math.max(MIN_PANEL_WIDTH, Math.min(MAX_PANEL_WIDTH, startWidth + delta)));
+        onResize(
+          Math.max(
+            MIN_PANEL_WIDTH,
+            Math.min(MAX_PANEL_WIDTH, startWidth + delta),
+          ),
+        );
       };
 
       const onUp = () => {
@@ -1186,61 +1195,63 @@ function PreviewPanel({
           </button>
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
-        {offScreenSessions.length > 0 && (
-          <>
-            <div
-              style={{
-                padding: `${scale.controlY}px ${scale.tightGap}px`,
-                fontSize: scale.sm,
-                color: theme.dimFg,
-                borderBottom: `1px solid ${theme.subtleBorder}`,
-                userSelect: "none",
-              }}
-            >
-              Sessions ({offScreenSessions.length})
-            </div>
-            {offScreenSessions.map((s) => (
-              <SessionThumbnail
-                key={s.id}
-                session={s}
-                theme={theme}
-                scale={scale}
-                palette={palette}
-                fontFamily={fontFamily}
-                fontSize={fontSize}
-                onFocus={() => onFocusSession(s.id)}
-              />
-            ))}
-          </>
-        )}
-        {surfaces.length > 0 && (
-          <>
-            <div
-              style={{
-                padding: `${scale.controlY}px ${scale.tightGap}px`,
-                fontSize: scale.sm,
-                color: theme.dimFg,
-                borderBottom: `1px solid ${theme.subtleBorder}`,
-                userSelect: "none",
-              }}
-            >
-              Surfaces ({surfaces.length})
-            </div>
-            {surfaces.map((s) => (
-              <SurfaceThumbnail
-                key={`${s.sessionId}-${s.surfaceId}`}
-                surface={s}
-                connectionId={connectionId}
-                theme={theme}
-                scale={scale}
-                expanded={expandedId === s.surfaceId}
-                onToggle={() =>
-                  setExpandedId(expandedId === s.surfaceId ? null : s.surfaceId)
-                }
-              />
-            ))}
-          </>
-        )}
+          {offScreenSessions.length > 0 && (
+            <>
+              <div
+                style={{
+                  padding: `${scale.controlY}px ${scale.tightGap}px`,
+                  fontSize: scale.sm,
+                  color: theme.dimFg,
+                  borderBottom: `1px solid ${theme.subtleBorder}`,
+                  userSelect: "none",
+                }}
+              >
+                Sessions ({offScreenSessions.length})
+              </div>
+              {offScreenSessions.map((s) => (
+                <SessionThumbnail
+                  key={s.id}
+                  session={s}
+                  theme={theme}
+                  scale={scale}
+                  palette={palette}
+                  fontFamily={fontFamily}
+                  fontSize={fontSize}
+                  onFocus={() => onFocusSession(s.id)}
+                />
+              ))}
+            </>
+          )}
+          {surfaces.length > 0 && (
+            <>
+              <div
+                style={{
+                  padding: `${scale.controlY}px ${scale.tightGap}px`,
+                  fontSize: scale.sm,
+                  color: theme.dimFg,
+                  borderBottom: `1px solid ${theme.subtleBorder}`,
+                  userSelect: "none",
+                }}
+              >
+                Surfaces ({surfaces.length})
+              </div>
+              {surfaces.map((s) => (
+                <SurfaceThumbnail
+                  key={`${s.sessionId}-${s.surfaceId}`}
+                  surface={s}
+                  connectionId={connectionId}
+                  theme={theme}
+                  scale={scale}
+                  expanded={expandedId === s.surfaceId}
+                  onToggle={() =>
+                    setExpandedId(
+                      expandedId === s.surfaceId ? null : s.surfaceId,
+                    )
+                  }
+                />
+              ))}
+            </>
+          )}
         </div>
       </div>
     </div>
