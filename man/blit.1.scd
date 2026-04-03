@@ -30,6 +30,16 @@ _blit_ [OPTIONS] _server_ [_--shell-flags_ _FLAGS_] [_--scrollback_ _N_] [_--fd-
 
 _blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_] [_--verbose_]
 
+_blit_ [OPTIONS] _surfaces_
+
+_blit_ [OPTIONS] _capture_ [_--output_ _PATH_] _ID_
+
+_blit_ [OPTIONS] _click_ _ID_ _X_ _Y_
+
+_blit_ [OPTIONS] _key_ _ID_ _KEY_
+
+_blit_ [OPTIONS] _type_ _ID_ _TEXT_
+
 _blit_ _learn_
 
 _blit_ _install_ _--ssh_ _HOST_
@@ -151,6 +161,29 @@ URL is printed to stdout. The passphrase can also be set via the
 _BLIT_PASSPHRASE_ environment variable. If omitted, a random passphrase
 is generated. With _--verbose_, detailed connection diagnostics (ICE
 negotiation, STUN/TURN results, peer events) are printed to stderr.
+
+_surfaces_
+List all compositor surfaces. Output is TSV with columns: ID, PARENT, W,
+H, TITLE, APP_ID. Surfaces are GUI windows managed by the headless
+Wayland compositor.
+
+_capture_ [_--output_ _PATH_] _ID_
+Capture a screenshot of surface _ID_ as a PNG image. Writes to
+_surface-ID.png_ by default, or to _PATH_ if _--output_ is given. Prints
+the output path to stdout.
+
+_click_ _ID_ _X_ _Y_
+Send a left-click at pixel coordinates (_X_, _Y_) on surface _ID_.
+
+_key_ _ID_ _KEY_
+Send a key press and release to surface _ID_. _KEY_ is a key name
+(e.g. _Return_, _Escape_, _a_, _F1_) optionally prefixed with modifiers
+separated by _+_ (e.g. _ctrl+a_, _shift+Tab_, _ctrl+shift+c_).
+
+_type_ _ID_ _TEXT_
+Type _TEXT_ into surface _ID_ character by character. Special keys use
+xdotool-style braces: _{Return}_, _{ctrl+a}_, _{Escape}_. Literal
+braces are not supported.
 
 _install_
 Install _blit_ on a remote host via SSH. Requires _--ssh_; other

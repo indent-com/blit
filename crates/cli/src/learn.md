@@ -140,6 +140,56 @@ The installer's stdin/stdout are connected to your terminal, so password prompts
 blit install --ssh dev-server
 ```
 
+## GUI surface automation
+
+When a blit session runs GUI applications (via the headless Wayland compositor), you can list, screenshot, and interact with their windows.
+
+### Listing surfaces
+
+`blit surfaces` lists all compositor surfaces as TSV with columns: `ID`, `PARENT`, `W`, `H`, `TITLE`, `APP_ID`.
+
+```bash
+blit surfaces
+```
+
+### Capturing screenshots
+
+`blit capture ID` captures a surface as a PNG image. By default, the file is written to `surface-<ID>.png`. Use `--output` to specify a path:
+
+```bash
+blit capture 1                     # writes surface-1.png
+blit capture 1 --output /tmp/s.png # writes /tmp/s.png
+```
+
+### Clicking
+
+`blit click ID X Y` sends a left-click at pixel coordinates (X, Y) on a surface:
+
+```bash
+blit click 1 100 50
+```
+
+### Key presses
+
+`blit key ID KEY` sends a single key press and release. Supports modifier combinations with `+`:
+
+```bash
+blit key 1 Return
+blit key 1 ctrl+a
+blit key 1 shift+Tab
+blit key 1 ctrl+shift+c
+```
+
+### Typing text
+
+`blit type ID TEXT` types a string character by character. Special keys use xdotool-style `{braces}`:
+
+```bash
+blit type 1 "hello world"
+blit type 1 "hello{Return}"
+blit type 1 "{ctrl+a}replacement text{Return}"
+```
+
 ## Output conventions
 
 - `list` prints tab-separated values with a header row (`ID`, `TAG`, `TITLE`, `COMMAND`, `STATUS`). Parse on `\t`.
@@ -147,6 +197,9 @@ blit install --ssh dev-server
   - STATUS column: `running`, `exited(N)` (normal exit with code N), `signal(N)` (killed by signal N), or `exited` (exit status unknown).
 - `start` prints a single integer (the new session ID) to stdout.
 - `show` and `history` print terminal text to stdout, one line per terminal row. Trailing whitespace per row is trimmed.
+- `surfaces` prints tab-separated values with a header row (`ID`, `PARENT`, `W`, `H`, `TITLE`, `APP_ID`). Parse on `\t`.
+- `capture` writes a PNG file and prints the output path to stdout.
+- `click`, `key`, and `type` produce no stdout on success.
 - `send`, `restart`, `kill`, and `close` produce no stdout on success. `send` and `kill` return an error if the session has already exited.
 - `wait` prints the exit status (e.g. `exited(0)`) on success, or the matching line when `--pattern` is used. Exit code 124 on timeout.
 - All errors go to stderr. Exit code is non-zero on failure.
