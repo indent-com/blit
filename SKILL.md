@@ -30,6 +30,12 @@ echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architectu
 sudo apt update && sudo apt install blit
 ```
 
+Windows (PowerShell):
+
+```powershell
+irm https://install.blit.sh/install.ps1 | iex
+```
+
 Nix:
 
 ```bash

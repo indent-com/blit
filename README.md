@@ -65,6 +65,14 @@ echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architectu
 sudo apt update && sudo apt install blit
 ```
 
+### Windows (PowerShell)
+
+```powershell
+irm https://install.blit.sh/install.ps1 | iex
+```
+
+This downloads `blit.exe` to `%LOCALAPPDATA%\blit\bin` and adds it to your user `PATH`. Set `BLIT_INSTALL_DIR` to override the install location.
+
 ### Nix
 
 ```bash
