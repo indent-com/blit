@@ -280,6 +280,37 @@ fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     }
     buf
 }
+
+async fn request_surface_capture(
+    command_tx: std::sync::mpsc::Sender<CompositorCommand>,
+    surface_id: u16,
+) -> Option<(u32, u32, Vec<u8>)> {
+    request_surface_capture_with_timeout(command_tx, surface_id, Duration::from_secs(1)).await
+}
+
+async fn request_surface_capture_with_timeout(
+    command_tx: std::sync::mpsc::Sender<CompositorCommand>,
+    surface_id: u16,
+    timeout: Duration,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    command_tx
+        .send(CompositorCommand::Capture {
+            surface_id,
+            reply: tx,
+        })
+        .ok()?;
+
+    // The compositor replies through a blocking std::sync::mpsc channel.
+    // Wait for it off the async runtime so this request never stalls the
+    // tokio worker thread or holds the Session mutex while blocked.
+    tokio::task::spawn_blocking(move || rx.recv_timeout(timeout))
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
 struct ClientState {
     tx: mpsc::Sender<Vec<u8>>,
     lead: Option<u16>,
@@ -2275,6 +2306,43 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             continue;
         }
 
+        if data[0] == C2S_SURFACE_CAPTURE && data.len() >= 5 {
+            let surface_id = u16::from_le_bytes([data[3], data[4]]);
+            let (command_tx, client_tx) = {
+                let sess = state.1.lock().await;
+                (
+                    sess.compositor
+                        .as_ref()
+                        .map(|cs| cs.handle.command_tx.clone()),
+                    sess.clients.get(&client_id).map(|c| c.tx.clone()),
+                )
+            };
+
+            let mut reply_msg = vec![S2C_SURFACE_CAPTURE];
+            reply_msg.extend_from_slice(&surface_id.to_le_bytes());
+
+            if let Some(command_tx) = command_tx {
+                if let Some((w, h, pixels)) = request_surface_capture(command_tx, surface_id).await
+                {
+                    let png_data = encode_rgba_to_png(&pixels, w, h);
+                    reply_msg.extend_from_slice(&w.to_le_bytes());
+                    reply_msg.extend_from_slice(&h.to_le_bytes());
+                    reply_msg.extend_from_slice(&png_data);
+                } else {
+                    reply_msg.extend_from_slice(&0u32.to_le_bytes());
+                    reply_msg.extend_from_slice(&0u32.to_le_bytes());
+                }
+            } else {
+                reply_msg.extend_from_slice(&0u32.to_le_bytes());
+                reply_msg.extend_from_slice(&0u32.to_le_bytes());
+            }
+
+            if let Some(client_tx) = client_tx {
+                let _ = client_tx.try_send(reply_msg);
+            }
+            continue;
+        }
+
         let mut sess = state.1.lock().await;
         let mut need_nudge = false;
         match data[0] {
@@ -2740,36 +2808,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let _ = c.tx.try_send(msg);
                 }
             }
-            C2S_SURFACE_CAPTURE if data.len() >= 5 => {
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let mut reply_msg = vec![S2C_SURFACE_CAPTURE];
-                reply_msg.extend_from_slice(&surface_id.to_le_bytes());
-                if let Some(cs) = sess.compositor.as_ref() {
-                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                    let _ = cs.handle.command_tx.send(CompositorCommand::Capture {
-                        surface_id,
-                        reply: tx,
-                    });
-                    match rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                        Ok(Some((w, h, pixels))) => {
-                            let png_data = encode_rgba_to_png(&pixels, w, h);
-                            reply_msg.extend_from_slice(&w.to_le_bytes());
-                            reply_msg.extend_from_slice(&h.to_le_bytes());
-                            reply_msg.extend_from_slice(&png_data);
-                        }
-                        _ => {
-                            reply_msg.extend_from_slice(&0u32.to_le_bytes());
-                            reply_msg.extend_from_slice(&0u32.to_le_bytes());
-                        }
-                    }
-                } else {
-                    reply_msg.extend_from_slice(&0u32.to_le_bytes());
-                    reply_msg.extend_from_slice(&0u32.to_le_bytes());
-                }
-                if let Some(c) = sess.clients.get(&client_id) {
-                    let _ = c.tx.try_send(reply_msg);
-                }
-            }
             C2S_FOCUS if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 if sess.ptys.contains_key(&pid) {
@@ -3168,6 +3206,37 @@ mod tests {
         assert_eq!(client.scroll_offsets.get(&7), None);
         assert_eq!(client.last_sent.get(&7), Some(&history));
         assert_eq!(client.scroll_caches.get(&7), None);
+    }
+
+    #[tokio::test]
+    async fn request_surface_capture_returns_pixels_from_compositor() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let CompositorCommand::Capture { surface_id, reply } = command_rx.recv().unwrap()
+            else {
+                panic!("expected capture command");
+            };
+            assert_eq!(surface_id, 7);
+            let _ = reply.send(Some((2, 3, vec![1, 2, 3, 4])));
+        });
+
+        let result =
+            request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;
+
+        assert_eq!(result, Some((2, 3, vec![1, 2, 3, 4])));
+    }
+
+    #[tokio::test]
+    async fn request_surface_capture_returns_none_when_compositor_disconnects() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = command_rx.recv().unwrap();
+        });
+
+        let result =
+            request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;
+
+        assert_eq!(result, None);
     }
 
     // ── frame_window ──
