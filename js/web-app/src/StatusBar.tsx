@@ -43,26 +43,49 @@ export function statusBarFg(status: ConnectionStatus, theme: Theme): string {
   return theme.bg;
 }
 
-function statusText(status: ConnectionStatus): string | null {
+function retryLabel(retryCount: number): string {
+  return retryCount === 1
+    ? t("disconnected.retryOne")
+    : tp("disconnected.retryMany", { count: retryCount });
+}
+
+function statusText(
+  status: ConnectionStatus,
+  retryCount: number,
+  error: string | null,
+): string | null {
+  if (status === "connected") return null;
+
+  let base: string;
   switch (status) {
-    case "connected":
-      return null;
     case "connecting":
-      return t("status.connecting");
+      base = t("status.connecting");
+      break;
     case "authenticating":
-      return t("status.authenticating");
+      base = t("status.authenticating");
+      break;
     case "disconnected":
     case "closed":
-      return t("status.disconnected");
+      base = t("status.disconnected");
+      break;
     case "error":
-      return t("status.connectionFailed");
+      base = t("status.connectionFailed");
+      break;
   }
+
+  const parts: string[] = [];
+  if (retryCount > 0) parts.push(retryLabel(retryCount));
+  if (error && error !== "auth") parts.push(error);
+  return parts.length > 0 ? `${base} (${parts.join(" \u2014 ")})` : base;
 }
 
 export function StatusBar({
   sessions,
   focusedSession,
   status,
+  retryCount,
+  error,
+  onReconnect,
   metrics,
   palette,
   fontSize,
@@ -80,6 +103,9 @@ export function StatusBar({
   sessions: readonly BlitSession[];
   focusedSession: BlitSession | null;
   status: ConnectionStatus;
+  retryCount: number;
+  error: string | null;
+  onReconnect: () => void;
   metrics: Metrics;
   palette: TerminalPalette;
   fontSize: number;
@@ -96,7 +122,7 @@ export function StatusBar({
 }) {
   const theme = themeFor(palette);
   const scale = uiScale(fontSize);
-  const connectionLabel = statusText(status);
+  const connectionLabel = statusText(status, retryCount, error);
   const visible = sessions.filter((session) => session.state !== "closed");
   const exited = visible.filter((session) => session.state === "exited").length;
   const buttonStyle = { ...ui.btn, fontSize: scale.sm };
@@ -180,6 +206,14 @@ export function StatusBar({
         >
           {connectionLabel}
         </span>
+      )}
+      {connectionLabel && (
+        <button
+          onClick={onReconnect}
+          style={{ ...buttonStyle, fontSize: scale.xs, opacity: 0.85 }}
+        >
+          {t("disconnected.reconnectNow")}
+        </button>
       )}
       {debug && (
         <DebugPanel

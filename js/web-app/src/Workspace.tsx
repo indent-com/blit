@@ -39,7 +39,6 @@ import { SwitcherOverlay } from "./SwitcherOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
 import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
-import { DisconnectedOverlay } from "./DisconnectedOverlay";
 import { BSPContainer } from "./bsp/BSPContainer";
 import type { BSPAssignments, BSPLayout } from "./bsp/layout";
 import {
@@ -126,7 +125,6 @@ function WorkspaceScreen({
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [debugPanel, setDebugPanel] = useState(false);
   const [serverFonts, setServerFonts] = useState<string[]>([]);
-  const [offlineVisible, setOfflineVisible] = useState(false);
   const [fontLoading, setFontLoading] = useState(false);
   const [advanceRatio, setAdvanceRatio] = useState<number | undefined>(
     undefined,
@@ -317,34 +315,11 @@ function WorkspaceScreen({
     workspaceState.focusedSessionId,
   ]);
 
-  const hasConnectedRef = useRef(connection?.status === "connected");
   useEffect(() => {
-    const status = connection?.status;
-    if (!status) return;
-    if (status === "connected") {
-      hasConnectedRef.current = true;
-    } else if (connection?.error === "auth") {
+    if (connection?.error === "auth") {
       onAuthError();
     }
-  }, [connection?.status, connection?.error, onAuthError]);
-
-  useEffect(() => {
-    const status = connection?.status;
-    if (!status) return;
-
-    if (status === "connected") {
-      setOfflineVisible(false);
-      return;
-    }
-
-    if (
-      hasConnectedRef.current ||
-      (connection?.retryCount ?? 0) > 0 ||
-      (connection?.error != null && connection.error !== "auth")
-    ) {
-      setOfflineVisible(true);
-    }
-  }, [connection?.status, connection?.retryCount, connection?.error]);
+  }, [connection?.error, onAuthError]);
 
   const termCallbackRef = useCallback((handle: BlitTerminalHandle | null) => {
     termRef.current = handle;
@@ -874,18 +849,6 @@ function WorkspaceScreen({
             fontSize={fontSize}
           />
         )}
-        {offlineVisible && (
-          <DisconnectedOverlay
-            palette={palette}
-            fontSize={fontSize}
-            status={connection?.status ?? "disconnected"}
-            retryCount={connection?.retryCount ?? 0}
-            error={connection?.error ?? null}
-            onReconnect={() =>
-              workspace.reconnectConnection(primaryConnectionId)
-            }
-          />
-        )}
         <footer
           style={{
             ...layout.statusBar,
@@ -904,6 +867,11 @@ function WorkspaceScreen({
             sessions={sessions}
             focusedSession={focusedSession}
             status={connection?.status ?? "disconnected"}
+            retryCount={connection?.retryCount ?? 0}
+            error={connection?.error ?? null}
+            onReconnect={() =>
+              workspace.reconnectConnection(primaryConnectionId)
+            }
             metrics={metrics}
             palette={palette}
             fontSize={fontSize}
