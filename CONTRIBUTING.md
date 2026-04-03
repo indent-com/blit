@@ -183,7 +183,7 @@ Most Rust crates are one or two source files. `blit-cli` is split into five and 
 | `nix/`         | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules              |
 | `systemd/`     | Socket-activated unit files (user-level and system-level templates) and service units                                           |
 | `man/`         | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                              |
-| `bin/`         | Shell scripts wrapping `nix run` tasks plus the `release` orchestrator                                                          |
+| `bin/`         | Shell scripts wrapping `nix run` tasks plus release scripts (`release-prepare`, `release-tag`, `prepare-release`)                |
 
 ## Code conventions
 
@@ -203,18 +203,12 @@ Most Rust crates are one or two source files. `blit-cli` is split into five and 
 
 ## Versioning and releases
 
-All workspace crates, `js/core/package.json`, `js/react/package.json`, `js/solid/package.json`, and `nix/common.nix` share a single version number. The JS packages live in a pnpm workspace rooted at `js/` with a shared `js/pnpm-lock.yaml`. The `bin/release` script bumps all of them atomically:
-
-```bash
-./bin/release 0.12.0
-```
-
-This validates version consistency, bumps all files, runs `cargo test -p blit-server`, and commits.
+All workspace crates, `js/core/package.json`, `js/react/package.json`, `js/solid/package.json`, and `nix/common.nix` share a single version number. The JS packages live in a pnpm workspace rooted at `js/` with a shared `js/pnpm-lock.yaml`.
 
 Releases go through a three-step process:
 
-1. The **Prepare release** workflow (`workflow_dispatch`) runs `bin/release`, pushes the result to a `release/<version>` branch, and opens a PR against `main`.
-2. After the PR is merged, a maintainer creates and pushes a **signed tag**: `git tag -s v<version> && git push origin v<version>`.
+1. **Prepare**: `./bin/release-prepare 0.12.0` triggers the `prepare-release.yml` GitHub Actions workflow. The workflow runs `bin/prepare-release` (version bumping, validation, tests), pushes the result to a `release/<version>` branch, and opens a PR against `main`.
+2. **Tag**: After the PR is merged, run `./bin/release-tag 0.12.0` to create a signed tag and push it to origin.
 3. The `release.yml` workflow triggers on the `v*` tag push. It first verifies the tag signature via the GitHub API — unsigned or unverified tags fail the workflow immediately.
 
 CI on the verified tag builds debs/tarballs, publishes to crates.io and npm, updates the Homebrew tap, and deploys the APT repo.

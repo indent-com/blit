@@ -310,20 +310,22 @@ End-to-end flow from version bump to published artifacts:
 ```mermaid
 sequenceDiagram
     participant Dev as Developer
-    participant Rel as bin/release
+    participant Rel as bin/prepare-release
     participant Git as Git / GitHub
     participant CI as GitHub Actions
 
+    Dev->>Dev: ./bin/release-prepare 0.12.0
     Dev->>Git: Trigger prepare-release.yml<br>with version 0.12.0
     Git->>CI: workflow_dispatch
-    CI->>Rel: ./bin/release 0.12.0
+    CI->>Rel: ./bin/prepare-release 0.12.0
     Rel->>Rel: Validate version consistency across<br>Cargo.toml, package.json, nix/common.nix
     Rel->>Rel: Bump all version files
     Rel->>Rel: cargo test -p blit-server
     Rel->>Git: git commit "release 0.12.0"
     CI->>Git: Push release/0.12.0 branch<br>Open PR against main
     Dev->>Git: Review and merge PR
-    Dev->>Git: git tag -s v0.12.0 && git push origin v0.12.0
+    Dev->>Dev: ./bin/release-tag 0.12.0
+    Dev->>Git: Signed tag v0.12.0 pushed
     Git->>CI: v* tag triggers release.yml + publish-demo-image.yml
     CI->>CI: verify-tag: check signature via GitHub API
 

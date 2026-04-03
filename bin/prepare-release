@@ -6,12 +6,14 @@ cd "$script_dir/.."
 
 usage() {
     cat <<'EOF'
-Usage: ./bin/release <version>
+Usage: ./bin/prepare-release <version>
 
 Bumps the repo release version, prints the changes since the latest v* tag,
 runs the server verification suite, and commits the result as:
 
   release <version>
+
+This script is called by the prepare-release.yml GitHub Actions workflow.
 EOF
 }
 

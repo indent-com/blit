@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/release-prepare <version>
+
+Triggers the prepare-release GitHub Actions workflow for the given version.
+The workflow runs bin/prepare-release, pushes a release/<version> branch,
+and opens a PR against main.
+EOF
+}
+
+die() {
+    echo "release-prepare: $*" >&2
+    exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+version="$1"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "version must look like 0.8.0"
+
+command -v gh >/dev/null 2>&1 || die "missing required command: gh"
+
+echo "Triggering prepare-release workflow for v$version..."
+gh workflow run prepare-release.yml -f version="$version"
+
+echo
+echo "Workflow dispatched. Watch progress at:"
+echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions/workflows/prepare-release.yml"

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/release-tag <version>
+
+Creates a signed tag v<version> and pushes it to origin.
+Run this after the release PR has been merged to main.
+
+The tag push triggers the release.yml workflow which builds artifacts,
+publishes to crates.io and npm, and updates the Homebrew tap.
+EOF
+}
+
+die() {
+    echo "release-tag: $*" >&2
+    exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+version="$1"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "version must look like 0.8.0"
+
+tag="v$version"
+
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+    die "tag $tag already exists locally"
+fi
+
+git fetch origin main --quiet
+
+if ! git log origin/main --oneline --grep="^release $version$" | grep -q .; then
+    die "release commit for $version not found on origin/main — has the PR been merged?"
+fi
+
+echo "Creating signed tag $tag..."
+git tag -s "$tag" -m "$tag" origin/main
+
+echo "Pushing $tag to origin..."
+git push origin "$tag"
+
+echo
+echo "Done. The release workflow will run at:"
+echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions/workflows/release.yml"
