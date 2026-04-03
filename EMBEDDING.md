@@ -147,6 +147,43 @@ function TerminalScreen() {
 | `createBlitWorkspaceConnection(workspace, id, transport)` | Manage a connection lifecycle with `onCleanup`           |
 | `BlitTerminal`                                            | Render one session by `sessionId`                        |
 
+### Wayland surface rendering
+
+`BlitSurfaceView` renders a single Wayland surface from a compositor session. The server encodes each surface as H.264; the component decodes via WebCodecs and draws to a canvas.
+
+```tsx
+import { BlitSurfaceView } from "@blit-sh/react";
+
+function AppWindow({
+  connectionId,
+  surfaceId,
+}: {
+  connectionId: string;
+  surfaceId: number;
+}) {
+  return (
+    <BlitSurfaceView
+      connectionId={connectionId}
+      surfaceId={surfaceId}
+      style={{ width: 800, height: 600 }}
+    />
+  );
+}
+```
+
+Every session has a Wayland compositor available. Any command — shell, TUI, or GUI — can open Wayland surfaces:
+
+```tsx
+workspace.createSession({
+  connectionId: "default",
+  rows: 24,
+  cols: 80,
+  command: "my-gui-app",
+});
+```
+
+Surfaces created by the session appear in the connection's `surfaceStore`, keyed by the session's PTY ID. Each surface has a `surfaceId`, `parentId`, `title`, `appId`, `width`, and `height`.
+
 ### Workspace operations
 
 - `createSession({ connectionId, rows, cols, tag?, command?, cwdFromSessionId? })`

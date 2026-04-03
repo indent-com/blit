@@ -1,0 +1,15 @@
+[package]
+name = "blit-compositor"
+version = "0.18.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+smithay = { version = "0.7.0", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+    "renderer_pixman",
+] }
+calloop = "0.14"

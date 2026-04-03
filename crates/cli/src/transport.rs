@@ -236,6 +236,12 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000),
         ipc_path: socket_path.to_string(),
+        surface_h264_encoder: std::env::var("BLIT_SURFACE_H264_ENCODER")
+            .ok()
+            .and_then(|value| blit_server::SurfaceH264EncoderPreference::parse(&value))
+            .unwrap_or_default(),
+        vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         #[cfg(unix)]
         fd_channel: None,
         verbose: false,
@@ -263,6 +269,12 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000),
         ipc_path: pipe_path.to_string(),
+        surface_h264_encoder: std::env::var("BLIT_SURFACE_H264_ENCODER")
+            .ok()
+            .and_then(|value| blit_server::SurfaceH264EncoderPreference::parse(&value))
+            .unwrap_or_default(),
+        vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         verbose: false,
     };
     tokio::spawn(blit_server::run(config));

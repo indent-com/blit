@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
 use blit_remote::{
-    EXIT_STATUS_UNKNOWN, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_READY, S2C_TEXT, S2C_TITLE,
-    S2C_UPDATE, ServerMsg, TerminalState, msg_ack, msg_close, msg_create_n_command, msg_input,
-    msg_kill, msg_read, msg_resize, msg_restart, msg_subscribe, parse_server_msg,
+    C2S_SURFACE_CAPTURE, C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
+    EXIT_STATUS_UNKNOWN, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_READY, S2C_SURFACE_CAPTURE,
+    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, S2C_UPDATE, ServerMsg, TerminalState, msg_ack,
+    msg_close, msg_create2, msg_input, msg_kill, msg_read, msg_resize, msg_restart, msg_subscribe,
+    parse_server_msg,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -152,7 +154,7 @@ pub async fn cmd_start(
     let nonce: u16 = 1;
     let tag_str = tag.as_deref().unwrap_or("");
     let cmd_str = command.join("\0");
-    let msg = msg_create_n_command(nonce, rows, cols, tag_str, &cmd_str);
+    let msg = msg_create2(nonce, rows, cols, tag_str, &cmd_str, 0);
     conn.send(&msg).await?;
 
     loop {
@@ -548,6 +550,417 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+pub async fn cmd_surfaces(transport: Transport) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+
+    let mut msg = vec![C2S_SURFACE_LIST];
+    msg.extend_from_slice(&0u16.to_le_bytes());
+    conn.send(&msg).await?;
+
+    loop {
+        let data = conn.recv().await?;
+        if data.is_empty() {
+            continue;
+        }
+        if data[0] == S2C_SURFACE_LIST {
+            if let Some(ServerMsg::SurfaceList { entries }) = parse_server_msg(&data) {
+                println!("ID\tTITLE\tSIZE\tAPP_ID");
+                for e in &entries {
+                    println!(
+                        "{}\t{}\t{}x{}\t{}",
+                        e.surface_id, e.title, e.width, e.height, e.app_id
+                    );
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
+pub async fn cmd_capture(
+    transport: Transport,
+    id: u16,
+    output: Option<String>,
+) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+
+    let mut msg = vec![C2S_SURFACE_CAPTURE];
+    msg.extend_from_slice(&0u16.to_le_bytes());
+    msg.extend_from_slice(&id.to_le_bytes());
+    conn.send(&msg).await?;
+
+    loop {
+        let data = conn.recv().await?;
+        if data.is_empty() {
+            continue;
+        }
+        if data[0] == S2C_SURFACE_CAPTURE {
+            if let Some(ServerMsg::SurfaceCapture {
+                width,
+                height,
+                png_data,
+                ..
+            }) = parse_server_msg(&data)
+            {
+                if width == 0 && height == 0 {
+                    return Err(format!("surface {id} not found or has no buffer"));
+                }
+                let path = output.unwrap_or_else(|| format!("surface-{id}.png"));
+                std::fs::write(&path, png_data).map_err(|e| format!("write {path}: {e}"))?;
+                println!("{path}");
+            }
+            return Ok(());
+        }
+    }
+}
+
+pub async fn cmd_click(transport: Transport, id: u16, x: u16, y: u16) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+
+    for ptype in [0u8, 1u8] {
+        let mut msg = vec![C2S_SURFACE_POINTER];
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        msg.extend_from_slice(&id.to_le_bytes());
+        msg.push(ptype);
+        msg.push(0);
+        msg.extend_from_slice(&x.to_le_bytes());
+        msg.extend_from_slice(&y.to_le_bytes());
+        conn.send(&msg).await?;
+    }
+    Ok(())
+}
+
+pub async fn cmd_key(transport: Transport, id: u16, key: &str) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    let events = parse_key_combo(key)?;
+    for (keycode, pressed) in &events {
+        send_key_event(&mut conn, id, *keycode, *pressed).await?;
+    }
+    Ok(())
+}
+
+pub async fn cmd_type(transport: Transport, id: u16, text: &str) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    let events = parse_type_string(text)?;
+    for (keycode, pressed) in &events {
+        send_key_event(&mut conn, id, *keycode, *pressed).await?;
+    }
+    Ok(())
+}
+
+async fn send_key_event(
+    conn: &mut AgentConn,
+    surface_id: u16,
+    keycode: u32,
+    pressed: bool,
+) -> Result<(), String> {
+    let mut msg = vec![C2S_SURFACE_INPUT];
+    msg.extend_from_slice(&0u16.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&keycode.to_le_bytes());
+    msg.push(if pressed { 1 } else { 0 });
+    conn.send(&msg).await
+}
+
+fn parse_key_combo(key: &str) -> Result<Vec<(u32, bool)>, String> {
+    let parts: Vec<&str> = key.split('+').collect();
+    let mut modifiers = Vec::new();
+    let main_key = parts.last().ok_or("empty key")?;
+
+    for &part in &parts[..parts.len() - 1] {
+        let kc = modifier_keycode(part).ok_or_else(|| format!("unknown modifier: {part}"))?;
+        modifiers.push(kc);
+    }
+
+    let main_kc =
+        key_name_to_keycode(main_key).ok_or_else(|| format!("unknown key: {main_key}"))?;
+
+    let mut events = Vec::new();
+    for &kc in &modifiers {
+        events.push((kc, true));
+    }
+    events.push((main_kc, true));
+    events.push((main_kc, false));
+    for &kc in modifiers.iter().rev() {
+        events.push((kc, false));
+    }
+    Ok(events)
+}
+
+fn parse_type_string(text: &str) -> Result<Vec<(u32, bool)>, String> {
+    let mut events = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            let end = chars[i..]
+                .iter()
+                .position(|&c| c == '}')
+                .ok_or("unclosed { in type string")?;
+            let inner: String = chars[i + 1..i + end].iter().collect();
+            let combo = parse_key_combo(&inner)?;
+            events.extend(combo);
+            i += end + 1;
+        } else {
+            let ch = chars[i];
+            let (kc, need_shift) =
+                char_to_keycode(ch).ok_or_else(|| format!("unsupported character: {ch}"))?;
+            if need_shift {
+                events.push((KEY_LEFTSHIFT, true));
+            }
+            events.push((kc, true));
+            events.push((kc, false));
+            if need_shift {
+                events.push((KEY_LEFTSHIFT, false));
+            }
+            i += 1;
+        }
+    }
+    Ok(events)
+}
+
+fn modifier_keycode(name: &str) -> Option<u32> {
+    match name.to_lowercase().as_str() {
+        "ctrl" | "control" => Some(KEY_LEFTCTRL),
+        "shift" => Some(KEY_LEFTSHIFT),
+        "alt" => Some(KEY_LEFTALT),
+        "super" | "meta" => Some(KEY_LEFTMETA),
+        _ => None,
+    }
+}
+
+fn letter_to_keycode(ch: char) -> u32 {
+    match ch {
+        'a' => KEY_A,
+        'b' => KEY_B,
+        'c' => KEY_C,
+        'd' => KEY_D,
+        'e' => KEY_E,
+        'f' => KEY_F,
+        'g' => KEY_G,
+        'h' => KEY_H,
+        'i' => KEY_I,
+        'j' => KEY_J,
+        'k' => KEY_K,
+        'l' => KEY_L,
+        'm' => KEY_M,
+        'n' => KEY_N,
+        'o' => KEY_O,
+        'p' => KEY_P,
+        'q' => KEY_Q,
+        'r' => KEY_R,
+        's' => KEY_S,
+        't' => KEY_T,
+        'u' => KEY_U,
+        'v' => KEY_V,
+        'w' => KEY_W,
+        'x' => KEY_X,
+        'y' => KEY_Y,
+        'z' => KEY_Z,
+        _ => KEY_SPACE,
+    }
+}
+
+fn char_to_keycode(ch: char) -> Option<(u32, bool)> {
+    let (kc, shift) = match ch {
+        'a'..='z' => (letter_to_keycode(ch), false),
+        'A'..='Z' => (letter_to_keycode(ch.to_ascii_lowercase()), true),
+        '0' => (KEY_0, false),
+        '1'..='9' => (KEY_1 + (ch as u32 - '1' as u32), false),
+        ' ' => (KEY_SPACE, false),
+        '-' => (KEY_MINUS, false),
+        '=' => (KEY_EQUAL, false),
+        '[' => (KEY_LEFTBRACE, false),
+        ']' => (KEY_RIGHTBRACE, false),
+        ';' => (KEY_SEMICOLON, false),
+        '\'' => (KEY_APOSTROPHE, false),
+        ',' => (KEY_COMMA, false),
+        '.' => (KEY_DOT, false),
+        '/' => (KEY_SLASH, false),
+        '\\' => (KEY_BACKSLASH, false),
+        '`' => (KEY_GRAVE, false),
+        '\t' => (KEY_TAB, false),
+        '\n' => (KEY_ENTER, false),
+        '!' => (KEY_1, true),
+        '@' => (KEY_2, true),
+        '#' => (KEY_3, true),
+        '$' => (KEY_4, true),
+        '%' => (KEY_5, true),
+        '^' => (KEY_6, true),
+        '&' => (KEY_7, true),
+        '*' => (KEY_8, true),
+        '(' => (KEY_9, true),
+        ')' => (KEY_0, true),
+        '_' => (KEY_MINUS, true),
+        '+' => (KEY_EQUAL, true),
+        '{' => (KEY_LEFTBRACE, true),
+        '}' => (KEY_RIGHTBRACE, true),
+        ':' => (KEY_SEMICOLON, true),
+        '"' => (KEY_APOSTROPHE, true),
+        '<' => (KEY_COMMA, true),
+        '>' => (KEY_DOT, true),
+        '?' => (KEY_SLASH, true),
+        '|' => (KEY_BACKSLASH, true),
+        '~' => (KEY_GRAVE, true),
+        _ => return None,
+    };
+    Some((kc, shift))
+}
+
+fn key_name_to_keycode(name: &str) -> Option<u32> {
+    match name.to_lowercase().as_str() {
+        "a" => Some(KEY_A),
+        "b" => Some(KEY_B),
+        "c" => Some(KEY_C),
+        "d" => Some(KEY_D),
+        "e" => Some(KEY_E),
+        "f" => Some(KEY_F),
+        "g" => Some(KEY_G),
+        "h" => Some(KEY_H),
+        "i" => Some(KEY_I),
+        "j" => Some(KEY_J),
+        "k" => Some(KEY_K),
+        "l" => Some(KEY_L),
+        "m" => Some(KEY_M),
+        "n" => Some(KEY_N),
+        "o" => Some(KEY_O),
+        "p" => Some(KEY_P),
+        "q" => Some(KEY_Q),
+        "r" => Some(KEY_R),
+        "s" => Some(KEY_S),
+        "t" => Some(KEY_T),
+        "u" => Some(KEY_U),
+        "v" => Some(KEY_V),
+        "w" => Some(KEY_W),
+        "x" => Some(KEY_X),
+        "y" => Some(KEY_Y),
+        "z" => Some(KEY_Z),
+        "0" => Some(KEY_0),
+        "1" => Some(KEY_1),
+        "2" => Some(KEY_2),
+        "3" => Some(KEY_3),
+        "4" => Some(KEY_4),
+        "5" => Some(KEY_5),
+        "6" => Some(KEY_6),
+        "7" => Some(KEY_7),
+        "8" => Some(KEY_8),
+        "9" => Some(KEY_9),
+        "return" | "enter" => Some(KEY_ENTER),
+        "escape" | "esc" => Some(KEY_ESC),
+        "tab" => Some(KEY_TAB),
+        "backspace" | "bs" => Some(KEY_BACKSPACE),
+        "space" => Some(KEY_SPACE),
+        "up" => Some(KEY_UP),
+        "down" => Some(KEY_DOWN),
+        "left" => Some(KEY_LEFT),
+        "right" => Some(KEY_RIGHT),
+        "home" => Some(KEY_HOME),
+        "end" => Some(KEY_END),
+        "pageup" | "page_up" => Some(KEY_PAGEUP),
+        "pagedown" | "page_down" => Some(KEY_PAGEDOWN),
+        "insert" => Some(KEY_INSERT),
+        "delete" | "del" => Some(KEY_DELETE),
+        "f1" => Some(KEY_F1),
+        "f2" => Some(KEY_F2),
+        "f3" => Some(KEY_F3),
+        "f4" => Some(KEY_F4),
+        "f5" => Some(KEY_F5),
+        "f6" => Some(KEY_F6),
+        "f7" => Some(KEY_F7),
+        "f8" => Some(KEY_F8),
+        "f9" => Some(KEY_F9),
+        "f10" => Some(KEY_F10),
+        "f11" => Some(KEY_F11),
+        "f12" => Some(KEY_F12),
+        "minus" => Some(KEY_MINUS),
+        "equal" => Some(KEY_EQUAL),
+        "ctrl" | "control" => Some(KEY_LEFTCTRL),
+        "shift" => Some(KEY_LEFTSHIFT),
+        "alt" => Some(KEY_LEFTALT),
+        "super" | "meta" => Some(KEY_LEFTMETA),
+        _ => None,
+    }
+}
+
+const KEY_ESC: u32 = 1;
+const KEY_1: u32 = 2;
+const KEY_2: u32 = 3;
+const KEY_3: u32 = 4;
+const KEY_4: u32 = 5;
+const KEY_5: u32 = 6;
+const KEY_6: u32 = 7;
+const KEY_7: u32 = 8;
+const KEY_8: u32 = 9;
+const KEY_9: u32 = 10;
+const KEY_0: u32 = 11;
+const KEY_MINUS: u32 = 12;
+const KEY_EQUAL: u32 = 13;
+const KEY_BACKSPACE: u32 = 14;
+const KEY_TAB: u32 = 15;
+const KEY_Q: u32 = 16;
+const KEY_W: u32 = 17;
+const KEY_E: u32 = 18;
+const KEY_R: u32 = 19;
+const KEY_T: u32 = 20;
+const KEY_Y: u32 = 21;
+const KEY_U: u32 = 22;
+const KEY_I: u32 = 23;
+const KEY_O: u32 = 24;
+const KEY_P: u32 = 25;
+const KEY_LEFTBRACE: u32 = 26;
+const KEY_RIGHTBRACE: u32 = 27;
+const KEY_ENTER: u32 = 28;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_A: u32 = 30;
+const KEY_S: u32 = 31;
+const KEY_D: u32 = 32;
+const KEY_F: u32 = 33;
+const KEY_G: u32 = 34;
+const KEY_H: u32 = 35;
+const KEY_J: u32 = 36;
+const KEY_K: u32 = 37;
+const KEY_L: u32 = 38;
+const KEY_SEMICOLON: u32 = 39;
+const KEY_APOSTROPHE: u32 = 40;
+const KEY_GRAVE: u32 = 41;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_BACKSLASH: u32 = 43;
+const KEY_Z: u32 = 44;
+const KEY_X: u32 = 45;
+const KEY_C: u32 = 46;
+const KEY_V: u32 = 47;
+const KEY_B: u32 = 48;
+const KEY_N: u32 = 49;
+const KEY_M: u32 = 50;
+const KEY_COMMA: u32 = 51;
+const KEY_DOT: u32 = 52;
+const KEY_SLASH: u32 = 53;
+const KEY_LEFTALT: u32 = 56;
+const KEY_SPACE: u32 = 57;
+const KEY_F1: u32 = 59;
+const KEY_F2: u32 = 60;
+const KEY_F3: u32 = 61;
+const KEY_F4: u32 = 62;
+const KEY_F5: u32 = 63;
+const KEY_F6: u32 = 64;
+const KEY_F7: u32 = 65;
+const KEY_F8: u32 = 66;
+const KEY_F9: u32 = 67;
+const KEY_F10: u32 = 68;
+const KEY_F11: u32 = 87;
+const KEY_F12: u32 = 88;
+const KEY_HOME: u32 = 102;
+const KEY_UP: u32 = 103;
+const KEY_PAGEUP: u32 = 104;
+const KEY_LEFT: u32 = 105;
+const KEY_RIGHT: u32 = 106;
+const KEY_END: u32 = 107;
+const KEY_DOWN: u32 = 108;
+const KEY_PAGEDOWN: u32 = 109;
+const KEY_INSERT: u32 = 110;
+const KEY_DELETE: u32 = 111;
+const KEY_LEFTMETA: u32 = 125;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,7 +1223,7 @@ mod tests {
             mock.send_initial_burst().await;
 
             let data = mock.recv().await.unwrap();
-            assert_eq!(data[0], blit_remote::C2S_CREATE_N);
+            assert_eq!(data[0], blit_remote::C2S_CREATE2);
             let nonce = u16::from_le_bytes([data[1], data[2]]);
             assert_eq!(nonce, 1);
 
@@ -820,7 +1233,7 @@ mod tests {
         let transport = Transport::Unix(client);
         let mut conn = AgentConn::connect(transport).await.unwrap();
 
-        let msg = msg_create_n_command(1, 24, 80, "", "echo\0hello");
+        let msg = msg_create2(1, 24, 80, "", "echo\0hello", 0);
         conn.send(&msg).await.unwrap();
 
         loop {
@@ -851,7 +1264,7 @@ mod tests {
             mock.send_initial_burst().await;
 
             let data = mock.recv().await.unwrap();
-            assert_eq!(data[0], blit_remote::C2S_CREATE_N);
+            assert_eq!(data[0], blit_remote::C2S_CREATE2);
             let nonce = u16::from_le_bytes([data[1], data[2]]);
 
             let rows = u16::from_le_bytes([data[3], data[4]]);
@@ -859,8 +1272,8 @@ mod tests {
             assert_eq!(rows, 24);
             assert_eq!(cols, 80);
 
-            let tag_len = u16::from_le_bytes([data[7], data[8]]) as usize;
-            let tag = std::str::from_utf8(&data[9..9 + tag_len]).unwrap();
+            let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
+            let tag = std::str::from_utf8(&data[10..10 + tag_len]).unwrap();
             assert_eq!(tag, "mytag");
 
             mock.send_created_n(nonce, 7, "mytag").await;
@@ -869,7 +1282,7 @@ mod tests {
         let transport = Transport::Unix(client);
         let mut conn = AgentConn::connect(transport).await.unwrap();
 
-        let msg = msg_create_n_command(1, 24, 80, "mytag", "bash");
+        let msg = msg_create2(1, 24, 80, "mytag", "bash", 0);
         conn.send(&msg).await.unwrap();
 
         loop {

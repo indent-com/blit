@@ -9,6 +9,8 @@ blit is a terminal streaming stack. The server parses PTY output into structured
 ```mermaid
 graph LR
     PTY <-->|stdin/stdout| S[blit-server]
+    W[Wayland app] <-->|Wayland protocol| COMP[blit-compositor]
+    COMP <-->|channels| S
     S <-->|Unix socket| G[blit-gateway]
     G <-->|WebSocket / WebTransport| B[browser]
     S <-->|Unix socket / TCP / SSH| C[blit-cli]
@@ -35,8 +37,11 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib + bin     | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels to blit-server                         |
 | `blit-fonts`            | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
 | `blit-webserver`        | `crates/webserver/`        | lib           | Shared axum HTTP helpers for serving assets and fonts                                                                |
+| `blit-compositor`       | `crates/compositor/`       | lib           | Headless Wayland compositor (smithay): surface multiplexing, input injection, clipboard sync                         |
 
 Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`; `blit-webrtc-forwarder` is split into `lib.rs`, `main.rs`, `peer.rs`, `signaling.rs`, `ice.rs`, and `turn.rs`).
+
+`blit-compositor` uses smithay 0.7 as a headless Wayland compositor. A single compositor instance is shared across all PTY sessions in a connection, running on a dedicated OS thread with its own calloop event loop. Each xdg_toplevel surface gets an independent surface ID and H.264 video stream. The server keeps one H.264 encoder per surface and recreates it on resize; software encoding uses OpenH264 and the optional VA-API path uses FFmpeg's `h264_vaapi` encoder. The compositor communicates with the server via channels (`CompositorEvent` / `CompositorCommand`).
 
 ### Dependency graph
 
@@ -57,6 +62,8 @@ graph TD
     webserver --> cli
 
     remote --> forwarder[blit-webrtc-forwarder]
+    remote --> compositor[blit-compositor]
+    compositor --> server
     server --> cli
     forwarder --> cli
 ```
@@ -82,26 +89,32 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 
 **Client-to-server (C2S):**
 
-| Opcode | Name             | Layout                                                              |
-| ------ | ---------------- | ------------------------------------------------------------------- |
-| `0x00` | `INPUT`          | `[pty_id:2][data:N]`                                                |
-| `0x01` | `RESIZE`         | `[pty_id:2][rows:2][cols:2]...` (batch, repeating)                  |
-| `0x02` | `SCROLL`         | `[pty_id:2][offset:4]`                                              |
-| `0x03` | `ACK`            | (empty)                                                             |
-| `0x04` | `DISPLAY_RATE`   | `[fps:2]`                                                           |
-| `0x05` | `CLIENT_METRICS` | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                          |
-| `0x06` | `MOUSE`          | `[pty_id:2][type:1][button:1][col:2][row:2]`                        |
-| `0x07` | `RESTART`        | `[pty_id:2]`                                                        |
-| `0x10` | `CREATE`         | `[rows:2][cols:2][tag_len:2][tag:N]`                                |
-| `0x11` | `FOCUS`          | `[pty_id:2]`                                                        |
-| `0x12` | `CLOSE`          | `[pty_id:2]`                                                        |
-| `0x13` | `SUBSCRIBE`      | `[pty_id:2]`                                                        |
-| `0x14` | `UNSUBSCRIBE`    | `[pty_id:2]`                                                        |
-| `0x15` | `SEARCH`         | `[request_id:2][query:N]`                                           |
-| `0x16` | `CREATE_AT`      | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                  |
-| `0x17` | `CREATE_N`       | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                       |
-| `0x18` | `CREATE2`        | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
-| `0x19` | `READ`           | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                   |
+| Opcode | Name                   | Layout                                                              |
+| ------ | ---------------------- | ------------------------------------------------------------------- |
+| `0x00` | `INPUT`                | `[pty_id:2][data:N]`                                                |
+| `0x01` | `RESIZE`               | `[pty_id:2][rows:2][cols:2]...` (batch, repeating)                  |
+| `0x02` | `SCROLL`               | `[pty_id:2][offset:4]`                                              |
+| `0x03` | `ACK`                  | (empty)                                                             |
+| `0x04` | `DISPLAY_RATE`         | `[fps:2]`                                                           |
+| `0x05` | `CLIENT_METRICS`       | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                          |
+| `0x06` | `MOUSE`                | `[pty_id:2][type:1][button:1][col:2][row:2]`                        |
+| `0x07` | `RESTART`              | `[pty_id:2]`                                                        |
+| `0x10` | `CREATE`               | `[rows:2][cols:2][tag_len:2][tag:N]`                                |
+| `0x11` | `FOCUS`                | `[pty_id:2]`                                                        |
+| `0x12` | `CLOSE`                | `[pty_id:2]`                                                        |
+| `0x13` | `SUBSCRIBE`            | `[pty_id:2]`                                                        |
+| `0x14` | `UNSUBSCRIBE`          | `[pty_id:2]`                                                        |
+| `0x15` | `SEARCH`               | `[request_id:2][query:N]`                                           |
+| `0x16` | `CREATE_AT`            | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                  |
+| `0x17` | `CREATE_N`             | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                       |
+| `0x18` | `CREATE2`              | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
+| `0x19` | `READ`                 | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                   |
+| `0x20` | `SURFACE_INPUT`        | `[pty_id:2][surface_id:2][keycode:4][pressed:1]`                    |
+| `0x21` | `SURFACE_POINTER`      | `[pty_id:2][surface_id:2][type:1][button:1][x:2][y:2]`              |
+| `0x22` | `SURFACE_POINTER_AXIS` | `[pty_id:2][surface_id:2][axis:1][value:4]`                         |
+| `0x23` | `SURFACE_RESIZE`       | `[pty_id:2][surface_id:2][width:2][height:2]`                       |
+| `0x24` | `SURFACE_FOCUS`        | `[pty_id:2][surface_id:2]`                                          |
+| `0x25` | `CLIPBOARD`            | `[pty_id:2][surface_id:2][mime_len:2][mime:N][data:M]`              |
 
 `CREATE2` extends `CREATE` with a nonce for response correlation and optional fields gated by feature bits (`HAS_SRC_PTY`, `HAS_COMMAND`).
 
@@ -109,19 +122,25 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 
 **Server-to-client (S2C):**
 
-| Opcode | Name             | Layout                                                 |
-| ------ | ---------------- | ------------------------------------------------------ |
-| `0x00` | `UPDATE`         | `[pty_id:2][lz4-compressed-frame]`                     |
-| `0x01` | `CREATED`        | `[pty_id:2][tag:N]`                                    |
-| `0x02` | `CLOSED`         | `[pty_id:2]`                                           |
-| `0x03` | `LIST`           | `[count:2][entries...]`                                |
-| `0x04` | `TITLE`          | `[pty_id:2][title:N]`                                  |
-| `0x05` | `SEARCH_RESULTS` | `[request_id:2][results...]`                           |
-| `0x06` | `CREATED_N`      | `[nonce:2][pty_id:2][tag:N]`                           |
-| `0x07` | `HELLO`          | `[version:2][features:4]`                              |
-| `0x08` | `EXITED`         | `[pty_id:2][exit_status:4]`                            |
-| `0x09` | `READY`          | (empty)                                                |
-| `0x0A` | `TEXT`           | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]` |
+| Opcode | Name                | Layout                                                                                          |
+| ------ | ------------------- | ----------------------------------------------------------------------------------------------- |
+| `0x00` | `UPDATE`            | `[pty_id:2][lz4-compressed-frame]`                                                              |
+| `0x01` | `CREATED`           | `[pty_id:2][tag:N]`                                                                             |
+| `0x02` | `CLOSED`            | `[pty_id:2]`                                                                                    |
+| `0x03` | `LIST`              | `[count:2][entries...]`                                                                         |
+| `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                           |
+| `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results...]`                                                                    |
+| `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                    |
+| `0x07` | `HELLO`             | `[version:2][features:4]`                                                                       |
+| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                     |
+| `0x09` | `READY`             | (empty)                                                                                         |
+| `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                          |
+| `0x20` | `SURFACE_CREATED`   | `[pty_id:2][surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]` |
+| `0x21` | `SURFACE_DESTROYED` | `[pty_id:2][surface_id:2]`                                                                      |
+| `0x22` | `SURFACE_FRAME`     | `[pty_id:2][surface_id:2][timestamp:4][flags:1][w:2][h:2][h264_data:N]` (Annex B H.264, 4:2:0)  |
+| `0x23` | `SURFACE_TITLE`     | `[pty_id:2][surface_id:2][title:N]`                                                             |
+| `0x24` | `SURFACE_RESIZED`   | `[pty_id:2][surface_id:2][w:2][h:2]`                                                            |
+| `0x25` | `CLIPBOARD`         | `[pty_id:2][surface_id:2][mime_len:2][mime:N][data:M]`                                          |
 
 ### Feature negotiation
 
@@ -132,6 +151,7 @@ On connect, the server sends `S2C_HELLO` with a protocol version and a 4-byte fe
 | 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
 | 1   | `RESTART`      | Server supports `C2S_RESTART` to respawn exited PTYs           |
 | 2   | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE` |
+| 4   | `COMPOSITOR`   | Server supports headless Wayland compositor sessions           |
 
 ### Frame update encoding
 
@@ -305,6 +325,22 @@ The server mediates multi-client state:
 PTYs are created via `C2S_CREATE` or `C2S_CREATE2`. The server forks, sets up a PTY pair via `openpty`, execs the shell (or a custom command), and registers the master fd for async I/O. PTY output is fed through `alacritty_terminal` for VT parsing.
 
 When a PTY's subprocess exits, the server captures the exit status from `waitpid()` and sends `S2C_EXITED` with the exit code. The `exit_status` field is `WEXITSTATUS` for normal exits (0, 1, ...), a negative signal number for signal deaths (-9 for SIGKILL, -15 for SIGTERM), or `EXIT_STATUS_UNKNOWN` (`i32::MIN`) when the status couldn't be collected. The terminal state is retained — clients can still scroll and read. `C2S_RESTART` respawns the shell in the same slot. `C2S_CLOSE` dismisses the PTY entirely.
+
+### Compositor sessions
+
+A single headless Wayland compositor is shared across all PTY sessions in a connection. It is lazily spawned on the first PTY creation and shut down when all PTYs have exited. Every child process inherits the same `WAYLAND_DISPLAY`, so any program — shell, TUI, or GUI — can open Wayland surfaces regardless of which PTY launched it. The flow:
+
+1. `ensure_compositor()` lazily starts a smithay compositor on a dedicated OS thread, listening on a random `wayland-blit-*` socket. The compositor is reused for all subsequent PTYs.
+2. The server fork/execs the requested command with `WAYLAND_DISPLAY` pointing at the shared compositor socket.
+3. Each xdg_toplevel surface the client creates is assigned a surface ID. The compositor sends `SurfaceCommit` events containing RGBA pixel buffers.
+4. The server converts RGBA to YUV420, encodes via openh264 to H.264, and broadcasts `S2C_SURFACE_FRAME` to all connected clients.
+5. Input flows in reverse: `C2S_SURFACE_INPUT` / `C2S_SURFACE_POINTER` / `C2S_SURFACE_POINTER_AXIS` are translated to Wayland keyboard/pointer events via smithay.
+
+The compositor does not manage window layout, z-order, or decorations. Each surface is streamed independently and clients (browser, React embedders) handle windowing in their own UI. The compositor implements `wp_viewporter` (required by Chrome/Electron) and `xdg_decoration` (forces server-side decorations so clients don't waste space on title bars).
+
+The compositor supports both SHM (shared memory) and dmabuf (GPU) buffers. Dmabuf buffers are accepted via the `linux-dmabuf` protocol and read by mmapping the plane data. Supported pixel formats: ARGB8888, XRGB8888, ABGR8888, XBGR8888, NV12, and P010 with linear or implicit modifier. Explicit tiled or vendor-specific modifiers are not supported yet. Chrome and Electron apps work out of the box with `--ozone-platform=wayland`.
+
+On the browser side, `SurfaceStore` in `@blit-sh/core` decodes H.264 frames via the WebCodecs `VideoDecoder` API (`avc1.42001f`, `optimizeForLatency: true`). The `BlitSurfaceView` React component renders decoded `VideoFrame`s to a canvas and forwards mouse/keyboard events back as surface commands.
 
 ## Per-client frame pacing
 

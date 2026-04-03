@@ -103,6 +103,7 @@ export interface BlitConnectionSnapshot {
   ready: boolean;
   supportsRestart: boolean;
   supportsCopyRange: boolean;
+  supportsCompositor: boolean;
   retryCount: number;
   /** Non-null when the last connection attempt failed with an explicit error message. */
   error: string | null;
@@ -182,8 +183,35 @@ export const S2C_HELLO = 0x07;
 export const S2C_EXITED = 0x08;
 export const S2C_TEXT = 0x0a;
 
+export const C2S_SURFACE_INPUT = 0x20;
+export const C2S_SURFACE_POINTER = 0x21;
+export const C2S_SURFACE_POINTER_AXIS = 0x22;
+export const C2S_SURFACE_RESIZE = 0x23;
+export const C2S_SURFACE_FOCUS = 0x24;
+export const C2S_CLIPBOARD = 0x25;
+export const S2C_SURFACE_CREATED = 0x20;
+export const S2C_SURFACE_DESTROYED = 0x21;
+export const S2C_SURFACE_FRAME = 0x22;
+export const S2C_SURFACE_TITLE = 0x23;
+export const S2C_SURFACE_RESIZED = 0x24;
+export const S2C_CLIPBOARD_MSG = 0x25;
+export const SURFACE_FRAME_FLAG_KEYFRAME = 1 << 0;
+
 export const PROTOCOL_VERSION = 1;
 export const FEATURE_CREATE_NONCE = 1 << 0;
 export const FEATURE_RESTART = 1 << 1;
 export const FEATURE_RESIZE_BATCH = 1 << 2;
 export const FEATURE_COPY_RANGE = 1 << 3;
+export const FEATURE_COMPOSITOR = 1 << 4;
+
+export type BlitSurface = {
+  sessionId: u16;
+  surfaceId: u16;
+  parentId: u16;
+  title: string;
+  appId: string;
+  width: number;
+  height: number;
+};
+
+type u16 = number;

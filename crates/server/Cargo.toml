@@ -11,11 +11,19 @@ homepage.workspace = true
 name = "blit_server"
 path = "src/lib.rs"
 
+[features]
+default = []
+vaapi = ["dep:ffmpeg-next"]
+
 [dependencies]
 blit-remote = { workspace = true }
 blit-alacritty = { workspace = true }
+blit-compositor = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 memchr = "2"
+openh264 = "0.6"
+png = "0.17"
+ffmpeg-next = { version = "8.0.0", default-features = false, features = ["codec", "format"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

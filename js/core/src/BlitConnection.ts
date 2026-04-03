@@ -9,11 +9,13 @@ import type {
   TerminalPalette,
 } from "./types";
 import {
+  FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CREATE_NONCE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
   PROTOCOL_VERSION,
+  S2C_CLIPBOARD_MSG,
   S2C_CLOSED,
   S2C_CREATED,
   S2C_CREATED_N,
@@ -21,6 +23,11 @@ import {
   S2C_HELLO,
   S2C_LIST,
   S2C_SEARCH_RESULTS,
+  S2C_SURFACE_CREATED,
+  S2C_SURFACE_DESTROYED,
+  S2C_SURFACE_FRAME,
+  S2C_SURFACE_RESIZED,
+  S2C_SURFACE_TITLE,
   S2C_TEXT,
   S2C_TITLE,
   S2C_UPDATE,
@@ -40,7 +47,14 @@ import {
   buildRestartMessage,
   buildScrollMessage,
   buildSearchMessage,
+  buildSurfaceInputMessage,
+  buildSurfacePointerMessage,
+  buildSurfaceAxisMessage,
+  buildSurfaceResizeMessage,
+  buildSurfaceFocusMessage,
+  buildClipboardMessage,
 } from "./protocol";
+import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 
 const textDecoder = new TextDecoder();
@@ -106,6 +120,7 @@ export class BlitConnection {
 
   private readonly transport: BlitTransport;
   private readonly store: TerminalStore;
+  readonly surfaceStore = new SurfaceStore();
 
   private readonly listeners = new Set<() => void>();
   private readonly sessionsById = new Map<SessionId, InternalSession>();
@@ -163,6 +178,7 @@ export class BlitConnection {
       ready: false,
       supportsRestart: false,
       supportsCopyRange: false,
+      supportsCompositor: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -651,6 +667,67 @@ export class BlitConnection {
     this.store.setPalette(p);
   }
 
+  sendSurfaceInput(
+    sessionId: number,
+    surfaceId: number,
+    keycode: number,
+    pressed: boolean,
+  ): void {
+    this.transport.send(
+      buildSurfaceInputMessage(sessionId, surfaceId, keycode, pressed),
+    );
+  }
+
+  sendSurfacePointer(
+    sessionId: number,
+    surfaceId: number,
+    type: number,
+    button: number,
+    x: number,
+    y: number,
+  ): void {
+    this.transport.send(
+      buildSurfacePointerMessage(sessionId, surfaceId, type, button, x, y),
+    );
+  }
+
+  sendSurfaceAxis(
+    sessionId: number,
+    surfaceId: number,
+    axis: number,
+    valueX100: number,
+  ): void {
+    this.transport.send(
+      buildSurfaceAxisMessage(sessionId, surfaceId, axis, valueX100),
+    );
+  }
+
+  sendSurfaceResize(
+    sessionId: number,
+    surfaceId: number,
+    width: number,
+    height: number,
+  ): void {
+    this.transport.send(
+      buildSurfaceResizeMessage(sessionId, surfaceId, width, height),
+    );
+  }
+
+  sendSurfaceFocus(sessionId: number, surfaceId: number): void {
+    this.transport.send(buildSurfaceFocusMessage(sessionId, surfaceId));
+  }
+
+  sendClipboard(
+    sessionId: number,
+    surfaceId: number,
+    mimeType: string,
+    data: Uint8Array,
+  ): void {
+    this.transport.send(
+      buildClipboardMessage(sessionId, surfaceId, mimeType, data),
+    );
+  }
+
   isReady(): boolean {
     return this.store.isReady();
   }
@@ -757,8 +834,81 @@ export class BlitConnection {
           ...this.snapshot,
           supportsRestart: (features & FEATURE_RESTART) !== 0,
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
+          supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
         };
         this.emit();
+        return;
+      }
+      case S2C_SURFACE_CREATED: {
+        if (bytes.length < 13) return;
+        const view = new DataView(data);
+        const sessionId = view.getUint16(1, true);
+        const surfaceId = view.getUint16(3, true);
+        const parentId = view.getUint16(5, true);
+        const width = view.getUint16(7, true);
+        const height = view.getUint16(9, true);
+        const titleLen = view.getUint16(11, true);
+        const title = textDecoder.decode(bytes.subarray(13, 13 + titleLen));
+        let appId = "";
+        const appIdOffset = 13 + titleLen;
+        if (bytes.length >= appIdOffset + 2) {
+          const appIdLen = view.getUint16(appIdOffset, true);
+          appId = textDecoder.decode(
+            bytes.subarray(appIdOffset + 2, appIdOffset + 2 + appIdLen),
+          );
+        }
+        this.surfaceStore.handleSurfaceCreated(
+          sessionId,
+          surfaceId,
+          parentId,
+          width,
+          height,
+          title,
+          appId,
+        );
+        return;
+      }
+      case S2C_SURFACE_DESTROYED: {
+        if (bytes.length < 5) return;
+        const surfaceId = bytes[3] | (bytes[4] << 8);
+        this.surfaceStore.handleSurfaceDestroyed(surfaceId);
+        return;
+      }
+      case S2C_SURFACE_FRAME: {
+        if (bytes.length < 14) return;
+        const view = new DataView(data);
+        const surfaceId = view.getUint16(3, true);
+        const timestamp = view.getUint32(5, true);
+        const flags = bytes[9];
+        const width = view.getUint16(10, true);
+        const height = view.getUint16(12, true);
+        this.surfaceStore.handleSurfaceFrame(
+          surfaceId,
+          timestamp,
+          flags,
+          width,
+          height,
+          bytes.subarray(14),
+        );
+        return;
+      }
+      case S2C_SURFACE_TITLE: {
+        if (bytes.length < 5) return;
+        const surfaceId = bytes[3] | (bytes[4] << 8);
+        const title = textDecoder.decode(bytes.subarray(5));
+        this.surfaceStore.handleSurfaceTitle(surfaceId, title);
+        return;
+      }
+      case S2C_SURFACE_RESIZED: {
+        if (bytes.length < 9) return;
+        const view = new DataView(data);
+        const surfaceId = view.getUint16(3, true);
+        const width = view.getUint16(5, true);
+        const height = view.getUint16(7, true);
+        this.surfaceStore.handleSurfaceResized(surfaceId, width, height);
+        return;
+      }
+      case S2C_CLIPBOARD_MSG: {
         return;
       }
       case S2C_TEXT: {

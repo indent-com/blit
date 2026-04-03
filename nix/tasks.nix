@@ -300,8 +300,11 @@ PROJ
   };
   coverage = pkgs.writeShellApplication {
     name = "blit-coverage";
-    runtimeInputs = [ rustToolchain pkgs.cargo-llvm-cov pkgs.python3 ];
+    runtimeInputs = [ rustToolchain pkgs.cargo-llvm-cov pkgs.python3 pkgs.pkg-config pkgs.libxkbcommon pkgs.pixman ];
     text = ''
+      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/web-app/dist/
@@ -382,6 +385,7 @@ in {
 
   lint = pkgs.writeShellApplication {
     name = "blit-lint";
+    runtimeInputs = [ rustToolchain pkgs.pkg-config pkgs.libxkbcommon pkgs.pixman ];
     text = ''
       ${fmt}/bin/blit-fmt --check
       echo ""
@@ -448,8 +452,11 @@ in {
 
   tests = pkgs.writeShellApplication {
     name = "blit-tests";
-    runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun ];
+    runtimeInputs = [ rustToolchain pkgs.nodejs pkgs.pnpm pkgs.scdoc pkgs.python3 pkgs.bun pkgs.pkg-config pkgs.libxkbcommon pkgs.pixman ];
     text = ''
+      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
       echo "=== Setting up web-app dist ==="
       mkdir -p js/web-app/dist
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/web-app/dist/

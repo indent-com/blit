@@ -28,6 +28,7 @@ export function HelpOverlay({
         [`${mod}+Shift+{ / }`, t("help.prevNextTerminal")],
         ["Ctrl+[ / ]", t("help.prevNextPane")],
         ["Ctrl+Shift+`", t("help.debugPanel")],
+        ["Ctrl+Shift+B", t("help.previewPanel")],
         ["Ctrl+?", t("help.thisHelp")],
         ["Escape", t("help.closeOverlay")],
       ],

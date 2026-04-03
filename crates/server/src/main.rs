@@ -13,6 +13,14 @@ fn parse_fd_value(s: &str, label: &str) -> RawFd {
     })
 }
 
+fn parse_surface_encoder(value: &str) -> blit_server::SurfaceH264EncoderPreference {
+    blit_server::SurfaceH264EncoderPreference::parse(value).unwrap_or_else(|| {
+        eprintln!("invalid BLIT_SURFACE_H264_ENCODER value: {value}");
+        eprintln!("expected one of: auto, software, vaapi");
+        std::process::exit(2);
+    })
+}
+
 fn parse_config() -> blit_server::Config {
     #[cfg(unix)]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -39,6 +47,12 @@ fn parse_config() -> blit_server::Config {
         .ok()
         .map(|v| v == "1")
         .unwrap_or(false);
+    let surface_h264_encoder = std::env::var("BLIT_SURFACE_H264_ENCODER")
+        .ok()
+        .map(|value| parse_surface_encoder(&value))
+        .unwrap_or_default();
+    let vaapi_device =
+        std::env::var("BLIT_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -52,6 +66,12 @@ fn parse_config() -> blit_server::Config {
                 "  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)"
             );
             println!("  --verbose, -v            Enable verbose logging (or set BLIT_VERBOSE=1)");
+            println!(
+                "  BLIT_SURFACE_H264_ENCODER  H.264 surface encoder preference: auto|software|vaapi"
+            );
+            println!(
+                "  BLIT_VAAPI_DEVICE         VA-API render node (default: /dev/dri/renderD128)"
+            );
             println!("  --version, -V            Print version");
             std::process::exit(0);
         }
@@ -128,6 +148,8 @@ fn parse_config() -> blit_server::Config {
         shell_flags,
         scrollback,
         ipc_path: ipc_path.unwrap_or_else(blit_server::default_ipc_path),
+        surface_h264_encoder,
+        vaapi_device,
         #[cfg(unix)]
         fd_channel,
         verbose,

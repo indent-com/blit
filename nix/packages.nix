@@ -3,6 +3,18 @@
     let
       common = import ./common.nix { inherit inputs system; };
       inherit (common) pkgs version cargoLockConfig rustToolchain rustPlatform;
+      serverVaapiEnabled = pkgs.stdenv.isLinux;
+      bindgenClangArgs = pkgs.lib.optionalString pkgs.stdenv.isLinux
+        "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
+      blitServerCargoBuildFlags =
+        [ "-p" "blit-server" ]
+        ++ pkgs.lib.optionals serverVaapiEnabled [ "--features" "vaapi" ];
+      blitServerNativeBuildInputs =
+        [ pkgs.pkg-config ]
+        ++ pkgs.lib.optionals serverVaapiEnabled [ pkgs.llvmPackages.libclang ];
+      blitServerBuildInputs =
+        [ pkgs.libxkbcommon pkgs.pixman ]
+        ++ pkgs.lib.optionals serverVaapiEnabled [ pkgs.ffmpeg pkgs.libva ];
 
       browserWasm = rustPlatform.buildRustPackage {
         pname = "blit-browser";
@@ -30,8 +42,16 @@
         pname = "blit-server";
         inherit version;
         src = ../.;
-        cargoBuildFlags = [ "-p" "blit-server" ];
+        cargoBuildFlags = blitServerCargoBuildFlags;
         cargoLock = cargoLockConfig;
+        nativeBuildInputs = blitServerNativeBuildInputs;
+        buildInputs = blitServerBuildInputs;
+        env = pkgs.lib.optionalAttrs serverVaapiEnabled {
+          # buildRustPackage only forwards custom environment variables from the
+          # nested `env` attr; top-level attrs are ignored.
+          BINDGEN_EXTRA_CLANG_ARGS = bindgenClangArgs;
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        };
         postInstall = installManPages;
         doCheck = false;
       };
@@ -42,6 +62,8 @@
         src = ../.;
         cargoBuildFlags = [ "-p" "blit-cli" ];
         cargoLock = cargoLockConfig;
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.libxkbcommon pkgs.pixman ];
         preBuild = copyWebAppDist;
         postInstall = installManPages;
         doCheck = false;
@@ -105,6 +127,11 @@
       blit-server-static = mkStaticBin {
         pname = "blit-server";
         cargoPkg = "blit-server";
+        extraArgs = {
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.pkgsStatic.libxkbcommon pkgs.pkgsStatic.pixman ];
+          RUSTFLAGS = "-C relocation-model=static";
+        };
       };
 
       blit-webrtc-forwarder = rustPlatform.buildRustPackage {
@@ -197,7 +224,12 @@
       blit-cli-static = mkStaticBin {
         pname = "blit-cli";
         cargoPkg = "blit-cli";
-        extraArgs = { preBuild = copyWebAppDist; };
+        extraArgs = {
+          preBuild = copyWebAppDist;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.pkgsStatic.libxkbcommon pkgs.pkgsStatic.pixman ];
+          RUSTFLAGS = "-C relocation-model=static";
+        };
       };
 
       blit-gateway-static = mkStaticBin {
@@ -338,7 +370,10 @@
           pkgs.cargo-watch
           pkgs.curl
           pkgs.flyctl
+          pkgs.libxkbcommon
           pkgs.nodejs
+          pkgs.pixman
+          pkgs.pkg-config
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
           pkgs.process-compose
@@ -346,12 +381,20 @@
           pkgs.scdoc
           pkgs.wasm-bindgen-cli
           pkgs.wasm-pack
+        ] ++ pkgs.lib.optionals serverVaapiEnabled [
+          pkgs.ffmpeg
+          pkgs.libva
+          pkgs.llvmPackages.libclang
         ];
 
         shellHook = ''
           if [ -z "''${LANG-}" ]; then
             export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"
           fi
+          export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
+          export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+          export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           export PATH="$PWD/bin:$PATH"
         '';
       };

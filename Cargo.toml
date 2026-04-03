@@ -10,6 +10,7 @@ members = [
     "crates/fonts",
     "crates/webserver",
     "crates/webrtc-forwarder",
+    "crates/compositor",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ blit-fonts = { version = "0.18.0", path = "crates/fonts" }
 blit-webserver = { version = "0.18.0", path = "crates/webserver" }
 blit-server = { version = "0.18.0", path = "crates/server" }
 blit-webrtc-forwarder = { version = "0.18.0", path = "crates/webrtc-forwarder" }
+blit-compositor = { version = "0.18.0", path = "crates/compositor" }
 
 [patch.crates-io]
 alacritty_terminal = { git = "https://github.com/indent-com/alacritty.git", branch = "blit/emoji-width-fix" }

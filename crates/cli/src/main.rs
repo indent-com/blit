@@ -239,6 +239,49 @@ enum Command {
 
     /// Upgrade blit to the latest version
     Upgrade,
+
+    /// List all compositor surfaces (TSV: ID, TITLE, SIZE, APP_ID)
+    Surfaces,
+
+    /// Capture a screenshot of a surface as PNG
+    Capture {
+        /// Surface ID
+        id: u16,
+
+        /// Output file path (default: surface-<id>.png)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Click at coordinates on a surface
+    Click {
+        /// Surface ID
+        id: u16,
+
+        /// X coordinate (pixels)
+        x: u16,
+
+        /// Y coordinate (pixels)
+        y: u16,
+    },
+
+    /// Send a key press to a surface (e.g. Return, Escape, a, ctrl+a)
+    Key {
+        /// Surface ID
+        id: u16,
+
+        /// Key name (e.g. a, Return, Escape, F1, ctrl+a, shift+Tab)
+        key: String,
+    },
+
+    /// Type text into a surface (xdotool-style: {Return}, {ctrl+a} for special keys)
+    Type {
+        /// Surface ID
+        id: u16,
+
+        /// Text to type
+        text: String,
+    },
 }
 
 #[tokio::main]
@@ -284,6 +327,12 @@ async fn main() {
                     })
                     .unwrap_or(10_000),
                 ipc_path,
+                surface_h264_encoder: std::env::var("BLIT_SURFACE_H264_ENCODER")
+                    .ok()
+                    .and_then(|value| blit_server::SurfaceH264EncoderPreference::parse(&value))
+                    .unwrap_or_default(),
+                vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
+                    .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
                 #[cfg(unix)]
                 fd_channel: fd_channel.or_else(|| {
                     std::env::var("BLIT_FD_CHANNEL")
@@ -351,7 +400,12 @@ async fn main() {
         | Command::Restart { .. }
         | Command::Kill { .. }
         | Command::Close { .. }
-        | Command::Wait { .. }) => {
+        | Command::Wait { .. }
+        | Command::Surfaces
+        | Command::Capture { .. }
+        | Command::Click { .. }
+        | Command::Key { .. }
+        | Command::Type { .. }) => {
             let conn = &cli.connect;
             let transport = match transport::connect(
                 &conn.socket,
@@ -455,6 +509,11 @@ async fn main() {
                         std::process::exit(1);
                     }
                 },
+                Command::Surfaces => agent::cmd_surfaces(transport).await,
+                Command::Capture { id, output } => agent::cmd_capture(transport, id, output).await,
+                Command::Click { id, x, y } => agent::cmd_click(transport, id, x, y).await,
+                Command::Key { id, key } => agent::cmd_key(transport, id, &key).await,
+                Command::Type { id, text } => agent::cmd_type(transport, id, &text).await,
                 _ => unreachable!(),
             };
             if let Err(e) = result {

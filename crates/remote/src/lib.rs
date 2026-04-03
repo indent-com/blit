@@ -78,6 +78,29 @@ pub const C2S_COPY_RANGE: u8 = 0x1B;
 /// signal is a raw libc signal number (e.g. SIGTERM=15, SIGKILL=9).
 pub const C2S_KILL: u8 = 0x1A;
 
+/// Keyboard input for a Wayland surface: [0x20][session_id:2][surface_id:2][data:N]
+/// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
+pub const C2S_SURFACE_INPUT: u8 = 0x20;
+/// Pointer motion/button for a Wayland surface: [0x21][session_id:2][surface_id:2][type:1][button:1][x:2][y:2]
+/// type: 0=down, 1=up, 2=move
+/// x,y: pixel coordinates relative to the surface origin
+pub const C2S_SURFACE_POINTER: u8 = 0x21;
+/// Pointer axis/scroll for a Wayland surface: [0x22][session_id:2][surface_id:2][axis:1][value_x100:4_signed]
+/// axis: 0=vertical, 1=horizontal
+/// value_x100: scroll amount * 100 (signed, positive = down/right)
+pub const C2S_SURFACE_POINTER_AXIS: u8 = 0x22;
+/// Resize a Wayland surface: [0x23][session_id:2][surface_id:2][width:2][height:2]
+pub const C2S_SURFACE_RESIZE: u8 = 0x23;
+/// Set keyboard/pointer focus to a Wayland surface: [0x24][session_id:2][surface_id:2]
+pub const C2S_SURFACE_FOCUS: u8 = 0x24;
+/// Send clipboard content to a Wayland surface:
+/// [0x25][session_id:2][surface_id:2][mime_len:2][mime:N][data_len:4][data:N]
+pub const C2S_CLIPBOARD: u8 = 0x25;
+/// Request a list of all compositor surfaces: [0x26][session_id:2]
+pub const C2S_SURFACE_LIST: u8 = 0x26;
+/// Request a PNG screenshot of a surface: [0x27][session_id:2][surface_id:2]
+pub const C2S_SURFACE_CAPTURE: u8 = 0x27;
+
 pub const S2C_UPDATE: u8 = 0x00;
 pub const S2C_CREATED: u8 = 0x01;
 pub const S2C_CLOSED: u8 = 0x02;
@@ -103,10 +126,38 @@ pub const S2C_READY: u8 = 0x09;
 /// text: UTF-8 text, lines separated by \n
 pub const S2C_TEXT: u8 = 0x0A;
 
+/// A new Wayland toplevel surface was created:
+/// [0x20][session_id:2][surface_id:2][parent_id:2][width:2][height:2][title_len:2][title:N][app_id_len:2][app_id:N]
+/// parent_id: 0 = no parent (top-level), non-zero = dialog/child of that surface
+pub const S2C_SURFACE_CREATED: u8 = 0x20;
+/// A Wayland surface was destroyed: [0x21][session_id:2][surface_id:2]
+pub const S2C_SURFACE_DESTROYED: u8 = 0x21;
+/// An H.264-encoded video frame for a Wayland surface:
+/// [0x22][session_id:2][surface_id:2][timestamp:4][flags:1][width:2][height:2][data:N]
+/// flags: bit 0 = keyframe (IDR). data is H.264 Annex B NAL units.
+/// timestamp: milliseconds since compositor session start.
+pub const S2C_SURFACE_FRAME: u8 = 0x22;
+/// A Wayland surface's title changed: [0x23][session_id:2][surface_id:2][title:N]
+pub const S2C_SURFACE_TITLE: u8 = 0x23;
+/// A Wayland surface was resized by the app: [0x24][session_id:2][surface_id:2][width:2][height:2]
+pub const S2C_SURFACE_RESIZED: u8 = 0x24;
+/// Clipboard content from a Wayland surface:
+/// [0x25][session_id:2][surface_id:2][mime_len:2][mime:N][data_len:4][data:N]
+pub const S2C_CLIPBOARD: u8 = 0x25;
+/// List of all compositor surfaces:
+/// [0x26][count:2] repeated{ [surface_id:2][parent_id:2][width:2][height:2][title_len:2][title:N][app_id_len:2][app_id:N] }
+pub const S2C_SURFACE_LIST: u8 = 0x26;
+/// PNG screenshot of a surface: [0x27][surface_id:2][width:4][height:4][png_data:N]
+/// If the surface was not found or has no buffer, width=0 and height=0 with empty data.
+pub const S2C_SURFACE_CAPTURE: u8 = 0x27;
+
+pub const SURFACE_FRAME_FLAG_KEYFRAME: u8 = 1 << 0;
+
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;
 pub const FEATURE_RESIZE_BATCH: u32 = 1 << 2;
 pub const FEATURE_COPY_RANGE: u32 = 1 << 3;
+pub const FEATURE_COMPOSITOR: u32 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -1201,6 +1252,54 @@ pub enum ServerMsg<'a> {
         offset: u32,
         text: &'a str,
     },
+    SurfaceCreated {
+        session_id: u16,
+        surface_id: u16,
+        parent_id: u16,
+        width: u16,
+        height: u16,
+        title: &'a str,
+        app_id: &'a str,
+    },
+    SurfaceDestroyed {
+        session_id: u16,
+        surface_id: u16,
+    },
+    SurfaceFrame {
+        session_id: u16,
+        surface_id: u16,
+        timestamp: u32,
+        flags: u8,
+        width: u16,
+        height: u16,
+        data: &'a [u8],
+    },
+    SurfaceTitle {
+        session_id: u16,
+        surface_id: u16,
+        title: &'a str,
+    },
+    SurfaceResized {
+        session_id: u16,
+        surface_id: u16,
+        width: u16,
+        height: u16,
+    },
+    Clipboard {
+        session_id: u16,
+        surface_id: u16,
+        mime_type: &'a str,
+        data: &'a [u8],
+    },
+    SurfaceList {
+        entries: Vec<SurfaceListEntry>,
+    },
+    SurfaceCapture {
+        surface_id: u16,
+        width: u32,
+        height: u32,
+        png_data: &'a [u8],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1208,6 +1307,16 @@ pub struct PtyListEntry<'a> {
     pub pty_id: u16,
     pub tag: &'a str,
     pub command: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SurfaceListEntry {
+    pub surface_id: u16,
+    pub parent_id: u16,
+    pub width: u16,
+    pub height: u16,
+    pub title: String,
+    pub app_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1397,6 +1506,174 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 text,
             })
         }
+        S2C_SURFACE_CREATED => {
+            if data.len() < 15 {
+                return None;
+            }
+            let session_id = u16::from_le_bytes([data[1], data[2]]);
+            let surface_id = u16::from_le_bytes([data[3], data[4]]);
+            let parent_id = u16::from_le_bytes([data[5], data[6]]);
+            let width = u16::from_le_bytes([data[7], data[8]]);
+            let height = u16::from_le_bytes([data[9], data[10]]);
+            let title_len = u16::from_le_bytes([data[11], data[12]]) as usize;
+            let mut off = 13;
+            if off + title_len + 2 > data.len() {
+                return None;
+            }
+            let title = std::str::from_utf8(&data[off..off + title_len]).unwrap_or_default();
+            off += title_len;
+            let app_id_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+            off += 2;
+            if off + app_id_len > data.len() {
+                return None;
+            }
+            let app_id = std::str::from_utf8(&data[off..off + app_id_len]).unwrap_or_default();
+            Some(ServerMsg::SurfaceCreated {
+                session_id,
+                surface_id,
+                parent_id,
+                width,
+                height,
+                title,
+                app_id,
+            })
+        }
+        S2C_SURFACE_DESTROYED => {
+            if data.len() < 5 {
+                return None;
+            }
+            Some(ServerMsg::SurfaceDestroyed {
+                session_id: u16::from_le_bytes([data[1], data[2]]),
+                surface_id: u16::from_le_bytes([data[3], data[4]]),
+            })
+        }
+        S2C_SURFACE_FRAME => {
+            if data.len() < 12 {
+                return None;
+            }
+            Some(ServerMsg::SurfaceFrame {
+                session_id: u16::from_le_bytes([data[1], data[2]]),
+                surface_id: u16::from_le_bytes([data[3], data[4]]),
+                timestamp: u32::from_le_bytes([data[5], data[6], data[7], data[8]]),
+                flags: data[9],
+                width: u16::from_le_bytes([data[10], data[11]]),
+                height: u16::from_le_bytes([data[12], data[13]]),
+                data: data.get(14..).unwrap_or_default(),
+            })
+        }
+        S2C_SURFACE_TITLE => {
+            if data.len() < 5 {
+                return None;
+            }
+            let title = std::str::from_utf8(data.get(5..).unwrap_or_default()).unwrap_or_default();
+            Some(ServerMsg::SurfaceTitle {
+                session_id: u16::from_le_bytes([data[1], data[2]]),
+                surface_id: u16::from_le_bytes([data[3], data[4]]),
+                title,
+            })
+        }
+        S2C_SURFACE_RESIZED => {
+            if data.len() < 9 {
+                return None;
+            }
+            Some(ServerMsg::SurfaceResized {
+                session_id: u16::from_le_bytes([data[1], data[2]]),
+                surface_id: u16::from_le_bytes([data[3], data[4]]),
+                width: u16::from_le_bytes([data[5], data[6]]),
+                height: u16::from_le_bytes([data[7], data[8]]),
+            })
+        }
+        S2C_CLIPBOARD => {
+            if data.len() < 11 {
+                return None;
+            }
+            let session_id = u16::from_le_bytes([data[1], data[2]]);
+            let surface_id = u16::from_le_bytes([data[3], data[4]]);
+            let mime_len = u16::from_le_bytes([data[5], data[6]]) as usize;
+            let mut off = 7;
+            if off + mime_len + 4 > data.len() {
+                return None;
+            }
+            let mime_type = std::str::from_utf8(&data[off..off + mime_len]).unwrap_or_default();
+            off += mime_len;
+            let data_len =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                    as usize;
+            off += 4;
+            if off + data_len > data.len() {
+                return None;
+            }
+            Some(ServerMsg::Clipboard {
+                session_id,
+                surface_id,
+                mime_type,
+                data: &data[off..off + data_len],
+            })
+        }
+        S2C_SURFACE_LIST => {
+            if data.len() < 3 {
+                return None;
+            }
+            let count = u16::from_le_bytes([data[1], data[2]]) as usize;
+            let mut entries = Vec::with_capacity(count);
+            let mut offset = 3;
+            for _ in 0..count {
+                if offset + 8 > data.len() {
+                    break;
+                }
+                let surface_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                let parent_id = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
+                let width = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+                let height = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
+                offset += 8;
+                if offset + 2 > data.len() {
+                    break;
+                }
+                let title_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2;
+                if offset + title_len > data.len() {
+                    break;
+                }
+                let title =
+                    std::str::from_utf8(&data[offset..offset + title_len]).unwrap_or_default();
+                offset += title_len;
+                if offset + 2 > data.len() {
+                    break;
+                }
+                let app_id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2;
+                if offset + app_id_len > data.len() {
+                    break;
+                }
+                let app_id =
+                    std::str::from_utf8(&data[offset..offset + app_id_len]).unwrap_or_default();
+                offset += app_id_len;
+                entries.push(SurfaceListEntry {
+                    surface_id,
+                    parent_id,
+                    width,
+                    height,
+                    title: title.to_string(),
+                    app_id: app_id.to_string(),
+                });
+            }
+            Some(ServerMsg::SurfaceList { entries })
+        }
+        S2C_SURFACE_CAPTURE => {
+            if data.len() < 11 {
+                return None;
+            }
+            let surface_id = u16::from_le_bytes([data[1], data[2]]);
+            let width = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+            let height = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
+            let png_data = data.get(11..).unwrap_or_default();
+            Some(ServerMsg::SurfaceCapture {
+                surface_id,
+                width,
+                height,
+                png_data,
+            })
+        }
         _ => None,
     }
 }
@@ -1455,6 +1732,32 @@ pub fn msg_create_n(nonce: u16, rows: u16, cols: u16, tag: &str) -> Vec<u8> {
 pub fn msg_create_n_command(nonce: u16, rows: u16, cols: u16, tag: &str, command: &str) -> Vec<u8> {
     let mut msg = msg_create_n(nonce, rows, cols, tag);
     msg.extend_from_slice(command.as_bytes());
+    msg
+}
+
+pub fn msg_create2(
+    nonce: u16,
+    rows: u16,
+    cols: u16,
+    tag: &str,
+    command: &str,
+    features: u8,
+) -> Vec<u8> {
+    let tag_bytes = tag.as_bytes();
+    let cmd_bytes = command.as_bytes();
+    let has_cmd = !command.is_empty();
+    let feat = features | if has_cmd { CREATE2_HAS_COMMAND } else { 0 };
+    let mut msg = Vec::with_capacity(10 + tag_bytes.len() + cmd_bytes.len());
+    msg.push(C2S_CREATE2);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&rows.to_le_bytes());
+    msg.extend_from_slice(&cols.to_le_bytes());
+    msg.push(feat);
+    msg.extend_from_slice(&(tag_bytes.len() as u16).to_le_bytes());
+    msg.extend_from_slice(tag_bytes);
+    if has_cmd {
+        msg.extend_from_slice(cmd_bytes);
+    }
     msg
 }
 
@@ -1613,6 +1916,177 @@ pub fn msg_exited(pty_id: u16, exit_status: i32) -> Vec<u8> {
     msg.push(S2C_EXITED);
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&exit_status.to_le_bytes());
+    msg
+}
+
+pub fn msg_surface_created(
+    session_id: u16,
+    surface_id: u16,
+    parent_id: u16,
+    width: u16,
+    height: u16,
+    title: &str,
+    app_id: &str,
+) -> Vec<u8> {
+    let title_bytes = title.as_bytes();
+    let app_id_bytes = app_id.as_bytes();
+    let mut msg = Vec::with_capacity(15 + title_bytes.len() + app_id_bytes.len());
+    msg.push(S2C_SURFACE_CREATED);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&parent_id.to_le_bytes());
+    msg.extend_from_slice(&width.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(&(title_bytes.len() as u16).to_le_bytes());
+    msg.extend_from_slice(title_bytes);
+    msg.extend_from_slice(&(app_id_bytes.len() as u16).to_le_bytes());
+    msg.extend_from_slice(app_id_bytes);
+    msg
+}
+
+pub fn msg_surface_destroyed(session_id: u16, surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5);
+    msg.push(S2C_SURFACE_DESTROYED);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg
+}
+
+pub fn msg_surface_frame(
+    session_id: u16,
+    surface_id: u16,
+    timestamp: u32,
+    flags: u8,
+    width: u16,
+    height: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(14 + data.len());
+    msg.push(S2C_SURFACE_FRAME);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&timestamp.to_le_bytes());
+    msg.push(flags);
+    msg.extend_from_slice(&width.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
+pub fn msg_surface_title(session_id: u16, surface_id: u16, title: &str) -> Vec<u8> {
+    let title_bytes = title.as_bytes();
+    let mut msg = Vec::with_capacity(5 + title_bytes.len());
+    msg.push(S2C_SURFACE_TITLE);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(title_bytes);
+    msg
+}
+
+pub fn msg_surface_resized(session_id: u16, surface_id: u16, width: u16, height: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9);
+    msg.push(S2C_SURFACE_RESIZED);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&width.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg
+}
+
+pub fn msg_s2c_clipboard(
+    session_id: u16,
+    surface_id: u16,
+    mime_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mime_bytes = mime_type.as_bytes();
+    let mut msg = Vec::with_capacity(11 + mime_bytes.len() + data.len());
+    msg.push(S2C_CLIPBOARD);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
+    msg.extend_from_slice(mime_bytes);
+    msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
+pub fn msg_surface_input(session_id: u16, surface_id: u16, data: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5 + data.len());
+    msg.push(C2S_SURFACE_INPUT);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
+pub fn msg_surface_pointer(
+    session_id: u16,
+    surface_id: u16,
+    event_type: u8,
+    button: u8,
+    x: u16,
+    y: u16,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(10);
+    msg.push(C2S_SURFACE_POINTER);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(event_type);
+    msg.push(button);
+    msg.extend_from_slice(&x.to_le_bytes());
+    msg.extend_from_slice(&y.to_le_bytes());
+    msg
+}
+
+pub fn msg_surface_pointer_axis(
+    session_id: u16,
+    surface_id: u16,
+    axis: u8,
+    value_x100: i32,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(10);
+    msg.push(C2S_SURFACE_POINTER_AXIS);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(axis);
+    msg.extend_from_slice(&value_x100.to_le_bytes());
+    msg
+}
+
+pub fn msg_surface_resize(session_id: u16, surface_id: u16, width: u16, height: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9);
+    msg.push(C2S_SURFACE_RESIZE);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&width.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg
+}
+
+pub fn msg_surface_focus(session_id: u16, surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5);
+    msg.push(C2S_SURFACE_FOCUS);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg
+}
+
+pub fn msg_c2s_clipboard(
+    session_id: u16,
+    surface_id: u16,
+    mime_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mime_bytes = mime_type.as_bytes();
+    let mut msg = Vec::with_capacity(11 + mime_bytes.len() + data.len());
+    msg.push(C2S_CLIPBOARD);
+    msg.extend_from_slice(&session_id.to_le_bytes());
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
+    msg.extend_from_slice(mime_bytes);
+    msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    msg.extend_from_slice(data);
     msg
 }
 

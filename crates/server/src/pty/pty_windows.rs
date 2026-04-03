@@ -213,6 +213,7 @@ pub fn spawn_pty(
     dir: Option<&str>,
     scrollback: usize,
     state: AppState,
+    _wayland_display: Option<&str>,
 ) -> Option<crate::Pty> {
     let (input_read, input_write) = create_pipe_pair()?;
     let (output_read, output_write) = create_pipe_pair()?;
@@ -358,6 +359,7 @@ pub fn respawn_child(
     pty_id: u16,
     command: Option<&str>,
     state: AppState,
+    _wayland_display: Option<&str>,
 ) -> Option<(
     PtyHandle,
     std::thread::JoinHandle<()>,

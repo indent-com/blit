@@ -46,8 +46,7 @@ while true; do
 
     if status=$(process-compose -U -u "$PC_SOCK" list -o json 2>/dev/null); then
         total=$(echo "$status" | jq 'length')
-        running=$(echo "$status" | jq '[.[] | select(.status == "Running")] | length')
-        ready=$(echo "$status" | jq '[.[] | select(.status == "Running" and (.has_ready_probe == false or .is_ready == "Ready"))] | length')
+        ready=$(echo "$status" | jq '[.[] | select(.status == "Running" and ((.has_ready_probe | not) or .is_ready == "Ready"))] | length')
         echo "  services: $ready/$total ready (${elapsed}s)"
         if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
             break
