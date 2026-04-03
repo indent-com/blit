@@ -3,6 +3,18 @@
     let
       common = import ./common.nix { inherit inputs system; };
       inherit (common) pkgs version cargoLockConfig rustToolchain rustPlatform;
+      serverVaapiEnabled = pkgs.stdenv.isLinux;
+      bindgenClangArgs = pkgs.lib.optionalString pkgs.stdenv.isLinux
+        "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
+      blitServerCargoBuildFlags =
+        [ "-p" "blit-server" ]
+        ++ pkgs.lib.optionals serverVaapiEnabled [ "--features" "vaapi" ];
+      blitServerNativeBuildInputs =
+        [ pkgs.pkg-config ]
+        ++ pkgs.lib.optionals serverVaapiEnabled [ pkgs.llvmPackages.libclang ];
+      blitServerBuildInputs =
+        [ pkgs.libxkbcommon pkgs.pixman ]
+        ++ pkgs.lib.optionals serverVaapiEnabled [ pkgs.ffmpeg pkgs.libva ];
 
       browserWasm = rustPlatform.buildRustPackage {
         pname = "blit-browser";
@@ -30,14 +42,15 @@
         pname = "blit-server";
         inherit version;
         src = ../.;
-        cargoBuildFlags = [ "-p" "blit-server" "--features" "vaapi" ];
+        cargoBuildFlags = blitServerCargoBuildFlags;
         cargoLock = cargoLockConfig;
-        nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
-        buildInputs = [ pkgs.ffmpeg pkgs.libva pkgs.libxkbcommon pkgs.pixman ];
-        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        nativeBuildInputs = blitServerNativeBuildInputs;
+        buildInputs = blitServerBuildInputs;
         postInstall = installManPages;
         doCheck = false;
+      } // pkgs.lib.optionalAttrs serverVaapiEnabled {
+        BINDGEN_EXTRA_CLANG_ARGS = bindgenClangArgs;
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       };
 
       blit-cli = rustPlatform.buildRustPackage {
@@ -353,11 +366,8 @@
           pkgs.cargo-edit
           pkgs.cargo-watch
           pkgs.curl
-          pkgs.ffmpeg
           pkgs.flyctl
-          pkgs.libva
           pkgs.libxkbcommon
-          pkgs.llvmPackages.libclang
           pkgs.nodejs
           pkgs.pixman
           pkgs.pkg-config
@@ -368,13 +378,17 @@
           pkgs.scdoc
           pkgs.wasm-bindgen-cli
           pkgs.wasm-pack
+        ] ++ pkgs.lib.optionals serverVaapiEnabled [
+          pkgs.ffmpeg
+          pkgs.libva
+          pkgs.llvmPackages.libclang
         ];
 
         shellHook = ''
           if [ -z "''${LANG-}" ]; then
             export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"
           fi
-          export BINDGEN_EXTRA_CLANG_ARGS="-isystem ${pkgs.stdenv.cc.libc.dev}/include''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
+          export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
