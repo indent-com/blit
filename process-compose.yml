@@ -28,7 +28,7 @@ processes:
     environment:
       - BLIT_ADDR=127.0.0.1:3266
       - BLIT_CORS=*
-      - BLIT_PASS=${BLIT_PASS:-dev}
+      - BLIT_PASSPHRASE=${BLIT_PASSPHRASE:-dev}
       - BLIT_QUIC=1
       - BLIT_SOCK=/tmp/blit-dev.sock
       - BLIT_STORE_CONFIG=1

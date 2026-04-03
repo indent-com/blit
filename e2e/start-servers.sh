@@ -38,7 +38,7 @@ fi
 echo "blit-server started (pid=$SERVER_PID, socket=$BLIT_SOCK)"
 
 # Start blit-gateway
-export BLIT_PASS="${BLIT_PASS:-test-secret}"
+export BLIT_PASSPHRASE="${BLIT_PASSPHRASE:-test-secret}"
 export BLIT_ADDR="${BLIT_ADDR:-127.0.0.1:3274}"
 "${REPO_ROOT}/target/debug/blit-gateway" &
 GATEWAY_PID=$!

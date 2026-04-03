@@ -781,7 +781,8 @@ export class BlitConnection {
     this.store.handleStatusChange(status);
 
     const lastError =
-      status === "error" && this.transport.lastError
+      (status === "error" || status === "disconnected") &&
+      this.transport.lastError
         ? this.transport.lastError
         : null;
     const authRejected = status === "error" && this.transport.authRejected;
