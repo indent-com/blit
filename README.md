@@ -97,12 +97,12 @@ Run `blit learn` to print the full CLI reference. For the machine-readable versi
 
 ## Configuration
 
-| Variable          | Default                                                                                                                | Purpose                              |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `BLIT_SOCK`       | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path                     |
-| `BLIT_SCROLLBACK` | `10000`                                                                                                                | Scrollback rows per PTY              |
-| `BLIT_HUB`        | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing |
-| `BLIT_INSTALL_DIR` | `%LOCALAPPDATA%\blit\bin` (Windows)                                                                                   | Override install location (Windows PowerShell installer) |
+| Variable           | Default                                                                                                                | Purpose                                                  |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `BLIT_SOCK`        | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path                                         |
+| `BLIT_SCROLLBACK`  | `10000`                                                                                                                | Scrollback rows per PTY                                  |
+| `BLIT_HUB`         | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing                     |
+| `BLIT_INSTALL_DIR` | `%LOCALAPPDATA%\blit\bin` (Windows)                                                                                    | Override install location (Windows PowerShell installer) |
 
 For `blit-gateway` configuration, running as a systemd/launchd service, and Nix module setup, see [SERVICES.md](SERVICES.md) and [`nix/README.md`](nix/README.md).
 
