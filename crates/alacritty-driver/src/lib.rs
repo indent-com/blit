@@ -634,10 +634,10 @@ impl TerminalDriver {
                     let idx = m.start();
                     let match_char = self.title[..idx].chars().count();
                     let start_char = match_char.saturating_sub(SEARCH_CONTEXT_BEFORE);
-                    let end_char =
-                        (match_char + self.title[idx..m.end()].chars().count()
-                            + SEARCH_CONTEXT_AFTER)
-                            .min(self.title.chars().count());
+                    let end_char = (match_char
+                        + self.title[idx..m.end()].chars().count()
+                        + SEARCH_CONTEXT_AFTER)
+                        .min(self.title.chars().count());
                     let context: String = self
                         .title
                         .chars()
