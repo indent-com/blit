@@ -41,7 +41,7 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 
 Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`; `blit-webrtc-forwarder` is split into `lib.rs`, `main.rs`, `peer.rs`, `signaling.rs`, `ice.rs`, and `turn.rs`).
 
-`blit-compositor` uses smithay 0.7 as a headless Wayland compositor. A single compositor instance is shared across all PTY sessions in a connection, running on a dedicated OS thread with its own calloop event loop. Each xdg_toplevel surface gets an independent surface ID and H.264 video stream. The compositor communicates with the server via channels (`CompositorEvent` / `CompositorCommand`).
+`blit-compositor` uses smithay 0.7 as a headless Wayland compositor. A single compositor instance is shared across all PTY sessions in a connection, running on a dedicated OS thread with its own calloop event loop. Each xdg_toplevel surface gets an independent surface ID and H.264 video stream. The server keeps one H.264 encoder per surface and recreates it on resize; software encoding uses OpenH264 and the optional VA-API path uses FFmpeg's `h264_vaapi` encoder. The compositor communicates with the server via channels (`CompositorEvent` / `CompositorCommand`).
 
 ### Dependency graph
 
@@ -137,7 +137,7 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 | `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                          |
 | `0x20` | `SURFACE_CREATED`   | `[pty_id:2][surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]` |
 | `0x21` | `SURFACE_DESTROYED` | `[pty_id:2][surface_id:2]`                                                                      |
-| `0x22` | `SURFACE_FRAME`     | `[pty_id:2][surface_id:2][timestamp:4][flags:1][w:2][h:2][h264_data:N]`                         |
+| `0x22` | `SURFACE_FRAME`     | `[pty_id:2][surface_id:2][timestamp:4][flags:1][w:2][h:2][h264_data:N]` (Annex B H.264, 4:2:0)  |
 | `0x23` | `SURFACE_TITLE`     | `[pty_id:2][surface_id:2][title:N]`                                                             |
 | `0x24` | `SURFACE_RESIZED`   | `[pty_id:2][surface_id:2][w:2][h:2]`                                                            |
 | `0x25` | `CLIPBOARD`         | `[pty_id:2][surface_id:2][mime_len:2][mime:N][data:M]`                                          |

@@ -30,10 +30,12 @@
         pname = "blit-server";
         inherit version;
         src = ../.;
-        cargoBuildFlags = [ "-p" "blit-server" ];
+        cargoBuildFlags = [ "-p" "blit-server" "--features" "vaapi" ];
         cargoLock = cargoLockConfig;
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = [ pkgs.libxkbcommon pkgs.pixman ];
+        nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+        buildInputs = [ pkgs.ffmpeg pkgs.libva pkgs.libxkbcommon pkgs.pixman ];
+        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         postInstall = installManPages;
         doCheck = false;
       };
@@ -351,8 +353,11 @@
           pkgs.cargo-edit
           pkgs.cargo-watch
           pkgs.curl
+          pkgs.ffmpeg
           pkgs.flyctl
+          pkgs.libva
           pkgs.libxkbcommon
+          pkgs.llvmPackages.libclang
           pkgs.nodejs
           pkgs.pixman
           pkgs.pkg-config
@@ -369,6 +374,8 @@
           if [ -z "''${LANG-}" ]; then
             export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"
           fi
+          export BINDGEN_EXTRA_CLANG_ARGS="-isystem ${pkgs.stdenv.cc.libc.dev}/include''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
+          export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           export PATH="$PWD/bin:$PATH"

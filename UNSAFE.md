@@ -63,6 +63,12 @@ The SHM path in `commit()` uses the same pattern (`std::slice::from_raw_parts`) 
 
 `spawn_compositor` calls `std::env::set_var("XDG_RUNTIME_DIR", …)` inside an `unsafe` block when the variable is unset (e.g. macOS). This is called once at the start of the compositor thread before any Wayland socket is created. The invariant: no other thread reads `XDG_RUNTIME_DIR` concurrently at that point; the variable is only consumed by `ListeningSocketSource::new_auto` immediately after.
 
+## VA-API frame setup in `server`
+
+`crates/server/src/surface_encoder.rs` uses FFmpeg's raw C API to configure `AVHWFramesContext`, allocate VA-API-backed frames, and upload CPU-owned NV12 frames into those surfaces before calling `h264_vaapi`. The invariants: the server only creates encoders for even, non-zero dimensions; `av_buffer_ref` must copy the frames context into `AVCodecContext::hw_frames_ctx` before the temporary `AVBufferRef` is unreffed; and every raw pointer (`AVCodecContext`, `AVHWFramesContext`, `AVFrame`) is only dereferenced while the owning Rust wrapper or local buffer ref is still alive.
+
+The software upload path writes directly into FFmpeg-owned frame planes using the frame-reported `linesize` values, not packed-width assumptions. If that code ever ignores `linesize`, writes past `plane_height * stride`, or keeps slices alive across another FFmpeg call that reallocates the frame, it becomes immediate memory corruption.
+
 ## Audit checklist
 
 - **fd leaks** — every `openpty`/`dup2`/`close` path must close all fds on failure, including in the child after a failed `execvp` (which falls through to `_exit`).

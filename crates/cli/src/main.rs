@@ -327,6 +327,12 @@ async fn main() {
                     })
                     .unwrap_or(10_000),
                 ipc_path,
+                surface_h264_encoder: std::env::var("BLIT_SURFACE_H264_ENCODER")
+                    .ok()
+                    .and_then(|value| blit_server::SurfaceH264EncoderPreference::parse(&value))
+                    .unwrap_or_default(),
+                vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
+                    .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
                 #[cfg(unix)]
                 fd_channel: fd_channel.or_else(|| {
                     std::env::var("BLIT_FD_CHANNEL")

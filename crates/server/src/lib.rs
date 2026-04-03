@@ -21,9 +21,12 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 mod ipc;
 mod pty;
+mod surface_encoder;
 
 pub use ipc::{IpcListener, default_ipc_path};
 use pty::{PtyHandle, PtyWriteTarget};
+use surface_encoder::SurfaceEncoder;
+pub use surface_encoder::SurfaceH264EncoderPreference;
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
 pub struct Config {
@@ -31,6 +34,8 @@ pub struct Config {
     pub shell_flags: String,
     pub scrollback: usize,
     pub ipc_path: String,
+    pub surface_h264_encoder: SurfaceH264EncoderPreference,
+    pub vaapi_device: String,
     #[cfg(unix)]
     pub fd_channel: Option<std::os::unix::io::RawFd>,
     pub verbose: bool,
@@ -242,11 +247,6 @@ impl Pty {
     }
 }
 
-struct SurfaceEncoder {
-    encoder: openh264::encoder::Encoder,
-    frame_count: u64,
-}
-
 struct CachedSurfaceInfo {
     surface_id: u16,
     parent_id: u16,
@@ -260,7 +260,6 @@ struct BufferedSurfaceFrame {
     msg: Vec<u8>,
     is_keyframe: bool,
 }
-
 struct SharedCompositor {
     handle: CompositorHandle,
     encoders: HashMap<u16, SurfaceEncoder>,
@@ -268,56 +267,6 @@ struct SharedCompositor {
     last_frames: HashMap<u16, BufferedSurfaceFrame>,
     force_keyframe: bool,
     created_at: Instant,
-}
-
-fn rgba_to_yuv420(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let y_size = width * height;
-    let uv_size = (width / 2) * (height / 2);
-    let mut yuv = vec![0u8; y_size + uv_size * 2];
-    let (y_plane, uv_planes) = yuv.split_at_mut(y_size);
-    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
-
-    for row in 0..height {
-        for col in 0..width {
-            let i = (row * width + col) * 4;
-            let r = rgba[i] as i32;
-            let g = rgba[i + 1] as i32;
-            let b = rgba[i + 2] as i32;
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[row * width + col] = y.clamp(0, 255) as u8;
-            if row % 2 == 0 && col % 2 == 0 {
-                let ui = (row / 2) * (width / 2) + col / 2;
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                u_plane[ui] = u.clamp(0, 255) as u8;
-                v_plane[ui] = v.clamp(0, 255) as u8;
-            }
-        }
-    }
-    yuv
-}
-
-fn encode_surface_frame(
-    enc: &mut SurfaceEncoder,
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-) -> Option<(Vec<u8>, bool)> {
-    let w = width as usize;
-    let h = height as usize;
-    if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
-        return None;
-    }
-    let yuv = rgba_to_yuv420(pixels, w, h);
-    let yuv_buf = openh264::formats::YUVBuffer::from_vec(yuv, w, h);
-    let bitstream = enc.encoder.encode(&yuv_buf).ok()?;
-    let is_keyframe = bitstream.frame_type() == openh264::encoder::FrameType::IDR;
-    enc.frame_count += 1;
-    let nal_data = bitstream.to_vec();
-    if nal_data.is_empty() {
-        return None;
-    }
-    Some((nal_data, is_keyframe))
 }
 
 fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -331,7 +280,6 @@ fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     }
     buf
 }
-
 struct ClientState {
     tx: mpsc::Sender<Vec<u8>>,
     lead: Option<u16>,
@@ -1823,15 +1771,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                             app_id,
                         },
                     );
-                    if let Ok(enc) = openh264::encoder::Encoder::new() {
-                        cs.encoders.insert(
-                            surface_id,
-                            SurfaceEncoder {
-                                encoder: enc,
-                                frame_count: 0,
-                            },
-                        );
-                    }
+                    cs.encoders.remove(&surface_id);
+                    cs.last_frames.remove(&surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.encoders.remove(&surface_id);
@@ -1845,13 +1786,45 @@ async fn tick(state: &AppState) -> TickOutcome {
                     height,
                     pixels,
                 } => {
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.width = width as u16;
+                        info.height = height as u16;
+                    }
+                    let current_dimensions =
+                        cs.encoders.get(&surface_id).map(SurfaceEncoder::dimensions);
+                    if current_dimensions != Some((width, height)) {
+                        cs.encoders.remove(&surface_id);
+                        cs.last_frames.remove(&surface_id);
+                        match SurfaceEncoder::new(
+                            state.0.surface_h264_encoder,
+                            width,
+                            height,
+                            &state.0.vaapi_device,
+                            state.0.verbose,
+                        ) {
+                            Ok(encoder) => {
+                                if state.0.verbose {
+                                    eprintln!(
+                                        "[surface-encoder] using {} encoder for surface {surface_id} at {width}x{height}",
+                                        encoder.kind_name()
+                                    );
+                                }
+                                cs.encoders.insert(surface_id, encoder);
+                            }
+                            Err(err) => {
+                                if state.0.verbose {
+                                    eprintln!(
+                                        "[surface-encoder] failed to create encoder for surface {surface_id} at {width}x{height}: {err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if let Some(enc) = cs.encoders.get_mut(&surface_id) {
                         if cs.force_keyframe {
-                            enc.encoder.force_intra_frame();
+                            enc.request_keyframe();
                         }
-                        if let Some((nal_data, is_keyframe)) =
-                            encode_surface_frame(enc, &pixels, width, height)
-                        {
+                        if let Some((nal_data, is_keyframe)) = enc.encode(&pixels) {
                             let flags = if is_keyframe {
                                 SURFACE_FRAME_FLAG_KEYFRAME
                             } else {
@@ -1887,6 +1860,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.width = width;
                         info.height = height;
                     }
+                    cs.encoders.remove(&surface_id);
+                    cs.last_frames.remove(&surface_id);
                     broadcast.push(msg_surface_resized(0, surface_id, width, height));
                 }
                 CompositorEvent::ClipboardContent {
