@@ -211,12 +211,13 @@ All workspace crates, `js/core/package.json`, `js/react/package.json`, `js/solid
 
 This validates version consistency, bumps all files, runs `cargo test -p blit-server`, and commits.
 
-Releases go through a two-step process:
+Releases go through a three-step process:
 
 1. The **Prepare release** workflow (`workflow_dispatch`) runs `bin/release`, pushes the result to a `release/<version>` branch, and opens a PR against `main`.
-2. When that PR is merged, the **Tag release** workflow detects the `release <version>` commit on `main`, creates and pushes a `v<version>` tag.
+2. After the PR is merged, a maintainer creates and pushes a **signed tag**: `git tag -s v<version> && git push origin v<version>`.
+3. The `release.yml` workflow triggers on the `v*` tag push. It first verifies the tag signature via the GitHub API — unsigned or unverified tags fail the workflow immediately.
 
-CI on the resulting `v*` tag builds debs/tarballs, publishes to crates.io and npm, updates the Homebrew tap, and deploys the APT repo.
+CI on the verified tag builds debs/tarballs, publishes to crates.io and npm, updates the Homebrew tap, and deploys the APT repo.
 
 ## CI checks
 

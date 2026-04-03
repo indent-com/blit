@@ -179,14 +179,13 @@ On Windows, Nix isn't available, so the `build-windows` job uses `cargo build --
 
 ## GitHub Actions workflows
 
-Eight workflow files live in `.github/workflows/`:
+Seven workflow files live in `.github/workflows/`:
 
 | Workflow                                                             | Trigger                                                                                        | Purpose                                                                                       |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                |
 | [`prepare-release.yml`](.github/workflows/prepare-release.yml)       | Manual (`workflow_dispatch`)                                                                   | Run `bin/release`, push branch, open PR against `main`                                        |
-| [`tag-release.yml`](.github/workflows/tag-release.yml)               | Push to `main`                                                                                 | Detect `release <version>` commits and create `v*` tag — triggers `release.yml`               |
-| [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Build artifacts, create GitHub Release, publish packages, deploy install site                 |
+| [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Verify tag signature, build artifacts, create GitHub Release, publish packages, deploy install site |
 | [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                        |
 | [`dev-check.yml`](.github/workflows/dev-check.yml)                   | Push to `main`, PRs                                                                            | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI |
@@ -240,23 +239,14 @@ flowchart LR
     DISPATCH["workflow_dispatch<br>version: 0.13.0"] --> RELEASE["bin/release 0.13.0<br>bump + commit"] --> PR["Push release/0.13.0<br>Open PR"]
 ```
 
-### Tag release (tag-release.yml)
-
-Triggered on pushes to `main`. Checks whether the head commit message starts with `release ` followed by a semver string. If so, creates and pushes a `v<version>` tag — which triggers the full `release.yml` pipeline.
-
-```mermaid
-flowchart LR
-    MERGE["PR merged to main<br>release 0.13.0"] --> TAG["git tag v0.13.0<br>git push tag"]
-    TAG --> REL["Triggers release.yml"]
-```
-
 ### Release (release.yml)
 
-Triggered by pushing a `v*` tag:
+Triggered by pushing a `v*` tag. A `verify-tag` job checks the tag signature via the GitHub API before any builds start — unsigned or unverified tags fail the workflow immediately.
 
 ```mermaid
 flowchart TD
-    TAG["v* tag push"] --> BD & BT & BW
+    TAG["v* tag push"] --> VER[verify-tag<br>Check signature via GitHub API]
+    VER --> BD & BT & BW
 
     subgraph "Build (parallel)"
         BD[build-debs<br>amd64 + arm64]
@@ -274,9 +264,10 @@ flowchart TD
 
 | Job               | Depends on                                | What it does                                                                                                    |
 | ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `build-debs`      | —                                         | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
-| `build-tarballs`  | —                                         | Nix-build static tarballs on 3 platform runners                                                                 |
-| `build-windows`   | —                                         | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
+| `verify-tag`      | —                                         | Checks the tag signature via the GitHub API; fails if unsigned or unverified                                     |
+| `build-debs`      | verify-tag                                | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
+| `build-tarballs`  | verify-tag                                | Nix-build static tarballs on 3 platform runners                                                                 |
+| `build-windows`   | verify-tag                                | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
 | `release`         | build-debs, build-tarballs, build-windows | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
 | `publish-crates`  | release                                   | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
 | `publish-npm`     | release                                   | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
@@ -332,10 +323,9 @@ sequenceDiagram
     Rel->>Git: git commit "release 0.12.0"
     CI->>Git: Push release/0.12.0 branch<br>Open PR against main
     Dev->>Git: Review and merge PR
-    Git->>CI: Push to main triggers tag-release.yml
-    CI->>CI: Detect "release 0.12.0" commit
-    CI->>Git: git tag v0.12.0 && git push tag
+    Dev->>Git: git tag -s v0.12.0 && git push origin v0.12.0
     Git->>CI: v* tag triggers release.yml + publish-demo-image.yml
+    CI->>CI: verify-tag: check signature via GitHub API
 
     CI->>CI: Build .deb (amd64, arm64)
     CI->>CI: Build tarballs (linux-x86_64, linux-aarch64, macos-aarch64)

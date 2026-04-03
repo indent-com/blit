@@ -10,7 +10,26 @@ permissions:
   id-token: write
 
 jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify tag signature via GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+          state=$(gh api "repos/${repo}/git/refs/tags/${tag}" \
+            --jq '.object.sha' \
+            | xargs -I{} gh api "repos/${repo}/git/tags/{}" \
+              --jq '.verification.verified')
+          if [ "$state" != "true" ]; then
+            echo "::error::Tag ${tag} is not signed by a verified identity"
+            exit 1
+          fi
+
   build-debs:
+    needs: [verify-tag]
     strategy:
       matrix:
         include:
@@ -30,6 +49,7 @@ jobs:
           path: debs/*.deb
 
   build-tarballs:
+    needs: [verify-tag]
     strategy:
       matrix:
         include:
@@ -51,6 +71,7 @@ jobs:
           path: dist/*.tar.gz
 
   build-windows:
+    needs: [verify-tag]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
