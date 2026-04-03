@@ -330,7 +330,7 @@ function WorkspaceScreen({
       setStableStatus(rawStatus);
       return;
     }
-    const timer = setTimeout(() => setStableStatus("connected"), 2000);
+    const timer = setTimeout(() => setStableStatus("connected"), 500);
     return () => clearTimeout(timer);
   }, [rawStatus]);
 

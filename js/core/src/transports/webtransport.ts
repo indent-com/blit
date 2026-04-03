@@ -249,7 +249,7 @@ export class WebTransportTransport implements BlitTransport {
         .then((info: WebTransportCloseInfo) => {
           if (this.wt !== wt || this.disposed) return;
           this.cleanup();
-          if (info.reason) this.lastError = info.reason;
+          this.lastError = info.reason || null;
           this.setStatus(this.authRejected ? "error" : "disconnected");
           if (!this.authRejected) {
             this.scheduleReconnect();
