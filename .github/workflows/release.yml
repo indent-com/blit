@@ -234,6 +234,7 @@ jobs:
 
           cp install.sh repo/index.html
           cp install.ps1 repo/install.ps1
+          cp SKILL.md repo/SKILL.md
 
           cd repo
           dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages

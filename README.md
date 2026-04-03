@@ -1,5 +1,7 @@
 # blit
 
+Computer agents can jump to https://install.blit.sh/SKILL.md
+
 Terminal streaming for browsers and AI agents. One binary, nothing to configure.
 
 Try it now — no install needed:
@@ -90,10 +92,6 @@ Each client is paced independently based on render metrics it reports back: disp
 `blit open` opens the browser with an embedded gateway. For persistent multi-user browser access, `blit-gateway` is a standalone proxy that handles passphrase auth, serves the web app, and optionally enables QUIC. `blit-server` can also run standalone for headless/daemon use. For embedding in your own app, [`@blit-sh/react`](EMBEDDING.md) and [`@blit-sh/solid`](EMBEDDING.md) provide framework bindings.
 
 For wire protocol details, frame encoding, and transport internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
-
-## CLI reference
-
-Run `blit learn` to print the full CLI reference. For the machine-readable version, see [SKILL.md](SKILL.md). All subcommands auto-start a local server if needed.
 
 ## Configuration
 
