@@ -55,8 +55,34 @@ struct ConnectOpts {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List all terminal sessions (TSV: ID, TAG, TITLE, STATUS)
-    List,
+    /// Open the terminal UI in the browser (default) or terminal
+    Open {
+        /// Render to terminal instead of opening browser (legacy mode)
+        #[arg(long, conflicts_with = "port")]
+        console: bool,
+
+        /// Bind browser UI to a specific port (default: random)
+        #[arg(long, conflicts_with = "console")]
+        port: Option<u16>,
+    },
+
+    /// Share a terminal session via WebRTC
+    Share {
+        /// Passphrase for the session (default: random)
+        #[arg(long, env = "BLIT_PASSPHRASE")]
+        passphrase: Option<String>,
+
+        /// Don't print the sharing URL
+        #[arg(long)]
+        quiet: bool,
+
+        /// Print detailed connection diagnostics to stderr
+        #[arg(long)]
+        verbose: bool,
+    },
+
+    /// Print the full CLI reference (usage guide for scripts and LLM agents)
+    Learn,
 
     /// Start a new terminal session and print its ID
     Start {
@@ -83,6 +109,33 @@ enum Command {
         #[arg(long)]
         timeout: Option<u64>,
     },
+
+    /// Wait for a session to exit or match a pattern.
+    ///
+    /// Without --pattern, blocks until the PTY process exits and returns
+    /// its exit code. With --pattern, subscribes to output and exits when
+    /// the regex matches a line produced after the wait began.
+    Wait {
+        /// Session ID
+        id: u16,
+
+        /// Maximum seconds to wait before giving up (exit code 124)
+        #[arg(long)]
+        timeout: u64,
+
+        /// Regex pattern to match against new output lines
+        #[arg(long)]
+        pattern: Option<String>,
+    },
+
+    /// Close a session
+    Close {
+        /// Session ID
+        id: u16,
+    },
+
+    /// List all terminal sessions (TSV: ID, TAG, TITLE, STATUS)
+    List,
 
     /// Print the current visible text of a session
     Show {
@@ -165,30 +218,6 @@ enum Command {
         signal: String,
     },
 
-    /// Close a session
-    Close {
-        /// Session ID
-        id: u16,
-    },
-
-    /// Wait for a session to exit or match a pattern.
-    ///
-    /// Without --pattern, blocks until the PTY process exits and returns
-    /// its exit code. With --pattern, subscribes to output and exits when
-    /// the regex matches a line produced after the wait began.
-    Wait {
-        /// Session ID
-        id: u16,
-
-        /// Maximum seconds to wait before giving up (exit code 124)
-        #[arg(long)]
-        timeout: u64,
-
-        /// Regex pattern to match against new output lines
-        #[arg(long)]
-        pattern: Option<String>,
-    },
-
     /// Run the blit terminal multiplexer server
     Server {
         /// Shell flags (default: li, or set BLIT_SHELL_FLAGS)
@@ -204,35 +233,6 @@ enum Command {
         #[arg(long)]
         fd_channel: Option<i32>,
     },
-
-    /// Share a terminal session via WebRTC
-    Share {
-        /// Passphrase for the session (default: random)
-        #[arg(long, env = "BLIT_PASSPHRASE")]
-        passphrase: Option<String>,
-
-        /// Don't print the sharing URL
-        #[arg(long)]
-        quiet: bool,
-
-        /// Print detailed connection diagnostics to stderr
-        #[arg(long)]
-        verbose: bool,
-    },
-
-    /// Open the terminal UI in the browser (default) or terminal
-    Open {
-        /// Render to terminal instead of opening browser (legacy mode)
-        #[arg(long, conflicts_with = "port")]
-        console: bool,
-
-        /// Bind browser UI to a specific port (default: random)
-        #[arg(long, conflicts_with = "console")]
-        port: Option<u16>,
-    },
-
-    /// Print the full CLI reference (usage guide for scripts and LLM agents)
-    Learn,
 
     /// Install blit on a remote host via SSH
     Install,
