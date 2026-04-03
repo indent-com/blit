@@ -9,14 +9,20 @@ use smithay::backend::allocator::{Buffer, Fourcc, Modifier, Format as DmabufForm
 use smithay::backend::input::{Axis, ButtonState, KeyState};
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::delegate_compositor;
+use smithay::delegate_cursor_shape;
 use smithay::delegate_data_device;
 use smithay::delegate_dmabuf;
+use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
+use smithay::delegate_text_input_manager;
+use smithay::delegate_primary_selection;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_viewporter;
+use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
+use smithay::delegate_xdg_toplevel_icon;
 use smithay::desktop::{Space, Window};
 use smithay::input::keyboard::{FilterResult, XkbConfig};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -47,7 +53,16 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportN
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shm::{BufferData, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
+use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
+use smithay::wayland::selection::primary_selection::{PrimarySelectionHandler, PrimarySelectionState};
+use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
+use smithay::wayland::xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
 pub enum CompositorEvent {
@@ -161,6 +176,8 @@ pub struct Compositor {
     dmabuf_state: DmabufState,
     #[allow(dead_code)]
     dmabuf_global: DmabufGlobal,
+    primary_selection_state: PrimarySelectionState,
+    activation_state: XdgActivationState,
     seat: Seat<Self>,
     #[allow(dead_code)]
     output: Output,
@@ -674,15 +691,48 @@ fn read_dmabuf_pixels(dmabuf: &Dmabuf) -> Option<(u32, u32, Vec<u8>)> {
     Some((width, height, rgba))
 }
 
+impl PrimarySelectionHandler for Compositor {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+impl XdgActivationHandler for Compositor {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.activation_state
+    }
+
+    fn request_activation(
+        &mut self,
+        _token: XdgActivationToken,
+        _token_data: XdgActivationTokenData,
+        _surface: WlSurface,
+    ) {
+    }
+}
+
+impl FractionalScaleHandler for Compositor {
+    fn new_fractional_scale(&mut self, _surface: WlSurface) {}
+}
+
+impl XdgToplevelIconHandler for Compositor {}
+impl TabletSeatHandler for Compositor {}
+
 delegate_compositor!(Compositor);
+delegate_cursor_shape!(Compositor);
 delegate_shm!(Compositor);
 delegate_xdg_shell!(Compositor);
 delegate_seat!(Compositor);
 delegate_data_device!(Compositor);
+delegate_primary_selection!(Compositor);
 delegate_output!(Compositor);
 delegate_dmabuf!(Compositor);
+delegate_fractional_scale!(Compositor);
 delegate_viewporter!(Compositor);
+delegate_xdg_activation!(Compositor);
 delegate_xdg_decoration!(Compositor);
+delegate_xdg_toplevel_icon!(Compositor);
+delegate_text_input_manager!(Compositor);
 
 pub struct CompositorHandle {
     pub event_rx: mpsc::Receiver<CompositorEvent>,
@@ -741,6 +791,12 @@ fn run_compositor(
     let data_device_state = DataDeviceState::new::<Compositor>(&dh);
     let viewporter_state = ViewporterState::new::<Compositor>(&dh);
     let xdg_decoration_state = XdgDecorationState::new::<Compositor>(&dh);
+    let primary_selection_state = PrimarySelectionState::new::<Compositor>(&dh);
+    let activation_state = XdgActivationState::new::<Compositor>(&dh);
+    FractionalScaleManagerState::new::<Compositor>(&dh);
+    CursorShapeManagerState::new::<Compositor>(&dh);
+    XdgToplevelIconManager::new::<Compositor>(&dh);
+    TextInputManagerState::new::<Compositor>(&dh);
 
     let mut dmabuf_state = DmabufState::new();
     let dmabuf_formats = [
@@ -850,6 +906,8 @@ fn run_compositor(
         xdg_decoration_state,
         dmabuf_state,
         dmabuf_global,
+        primary_selection_state,
+        activation_state,
         seat,
         output,
         space,
