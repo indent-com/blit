@@ -184,7 +184,7 @@ export function wtUrl(): string {
 }
 
 export function wtCertHash(): string | undefined {
-  return (window as unknown as { __blitCertHash?: string }).__blitCertHash;
+  return undefined;
 }
 
 export function preferredPalette(): TerminalPalette {

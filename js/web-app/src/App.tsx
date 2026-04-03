@@ -1,17 +1,27 @@
-import { useState, useCallback, useRef } from "react";
-import { WebSocketTransport, WebTransportTransport } from "@blit-sh/core";
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  WebSocketTransport,
+  WebTransportTransport,
+  createShareTransport,
+} from "@blit-sh/core";
 import type { BlitTransport } from "@blit-sh/core";
 import type { BlitWasmModule } from "@blit-sh/core";
-import { wsUrl, wtUrl, wtCertHash } from "./storage";
+import { wsUrl, wtUrl, basePath } from "./storage";
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
-import { createShareTransport } from "@blit-sh/core";
 import {
   encryptPassphrase,
   isEncrypted,
   decryptPassphrase,
 } from "./passphrase-crypto";
+
+interface BlitConfig {
+  gateway?: boolean;
+  certHash?: string;
+  hub?: string;
+  host?: string;
+}
 
 let _cachedPassphrase: string | null | undefined;
 
@@ -42,11 +52,18 @@ function initPassphrase(): string | null {
 
 initPassphrase();
 
-function createGatewayTransport(pass: string): BlitTransport {
-  const certHash = wtCertHash();
-  if (typeof WebTransport !== "undefined" && certHash) {
+async function fetchConfig(): Promise<BlitConfig> {
+  const resp = await fetch(basePath + "config");
+  return resp.json();
+}
+
+function createTransport(pass: string, config: BlitConfig): BlitTransport {
+  if (config.hub) {
+    return createShareTransport(config.hub, pass);
+  }
+  if (typeof WebTransport !== "undefined" && config.certHash) {
     return new WebTransportTransport(wtUrl(), pass, {
-      serverCertificateHash: certHash,
+      serverCertificateHash: config.certHash,
     });
   }
   return new WebSocketTransport(wsUrl(), pass);
@@ -54,28 +71,33 @@ function createGatewayTransport(pass: string): BlitTransport {
 
 export function App({ wasm }: { wasm: BlitWasmModule }) {
   const [passphrase] = useState(initPassphrase);
+  const [config, setConfig] = useState<BlitConfig | null>(null);
+
+  useEffect(() => {
+    fetchConfig().then(setConfig);
+  }, []);
+
+  if (!config) return null;
 
   if (passphrase) {
-    return <ConnectedApp wasm={wasm} passphrase={passphrase} />;
+    return <ConnectedApp wasm={wasm} passphrase={passphrase} config={config} />;
   }
 
-  return <AuthApp wasm={wasm} />;
+  return <AuthApp wasm={wasm} config={config} />;
 }
 
 function ConnectedApp({
   wasm,
   passphrase,
+  config,
 }: {
   wasm: BlitWasmModule;
   passphrase: string;
+  config: BlitConfig;
 }) {
-  const [transport] = useState<BlitTransport>(() => {
-    const hubInjected = (window as unknown as { __blitHub?: string }).__blitHub;
-    if (hubInjected) {
-      return createShareTransport(hubInjected, passphrase);
-    }
-    return createGatewayTransport(passphrase);
-  });
+  const [transport] = useState<BlitTransport>(() =>
+    createTransport(passphrase, config),
+  );
 
   return (
     <Workspace
@@ -89,32 +111,41 @@ function ConnectedApp({
   );
 }
 
-function AuthApp({ wasm }: { wasm: BlitWasmModule }) {
+function AuthApp({
+  wasm,
+  config,
+}: {
+  wasm: BlitWasmModule;
+  config: BlitConfig;
+}) {
   const [transport, setTransport] = useState<BlitTransport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const passRef = useRef<HTMLInputElement | null>(null);
 
-  const connect = useCallback((pass: string) => {
-    setAuthError(null);
-    const t = createGatewayTransport(pass);
-    const onStatus = (status: string) => {
-      if (status === "connected") {
-        const encrypted = encryptPassphrase(pass);
-        history.replaceState(
-          null,
-          "",
-          `${location.pathname}#${encodeURIComponent(encrypted)}`,
-        );
-        t.removeEventListener("statuschange", onStatus);
-      } else if (status === "error") {
-        setAuthError(t.lastError ?? i18n("auth.failed"));
-        t.removeEventListener("statuschange", onStatus);
-        setTransport(null);
-      }
-    };
-    t.addEventListener("statuschange", onStatus);
-    setTransport(t);
-  }, []);
+  const connect = useCallback(
+    (pass: string) => {
+      setAuthError(null);
+      const t = createTransport(pass, config);
+      const onStatus = (status: string) => {
+        if (status === "connected") {
+          const encrypted = encryptPassphrase(pass);
+          history.replaceState(
+            null,
+            "",
+            `${location.pathname}#${encodeURIComponent(encrypted)}`,
+          );
+          t.removeEventListener("statuschange", onStatus);
+        } else if (status === "error") {
+          setAuthError(t.lastError ?? i18n("auth.failed"));
+          t.removeEventListener("statuschange", onStatus);
+          setTransport(null);
+        }
+      };
+      t.addEventListener("statuschange", onStatus);
+      setTransport(t);
+    },
+    [config],
+  );
 
   if (!transport) {
     return (

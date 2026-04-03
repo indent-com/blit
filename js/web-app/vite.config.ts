@@ -1,8 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { viteSingleFile } from "vite-plugin-singlefile";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 
 const wasmPath = resolve(
   __dirname,
@@ -47,6 +48,22 @@ export default bin.buffer;
             const candidate = join(snippetsDir, dir, file);
             if (existsSync(candidate)) return candidate;
           }
+        }
+      },
+    },
+    !isDev && {
+      name: "brotli-html",
+      closeBundle() {
+        const htmlPath = resolve(__dirname, "dist/index.html");
+        if (existsSync(htmlPath)) {
+          const html = readFileSync(htmlPath);
+          const compressed = brotliCompressSync(html, {
+            params: {
+              [zlibConstants.BROTLI_PARAM_QUALITY]:
+                zlibConstants.BROTLI_MAX_QUALITY,
+            },
+          });
+          writeFileSync(htmlPath + ".br", compressed);
         }
       },
     },

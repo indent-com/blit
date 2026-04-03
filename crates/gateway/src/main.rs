@@ -60,9 +60,9 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
-const INDEX_HTML: &str = include_str!("../../../js/web-app/dist/index.html");
+const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/web-app/dist/index.html.br");
 
-static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML));
+static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML_BR));
 
 struct Config {
     passphrase: String,
@@ -249,32 +249,30 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
             Ok(ws) => ws.on_upgrade(move |socket| handle_ws(socket, state)),
             Err(e) => e.into_response(),
         }
+    } else if path.ends_with("/config") {
+        let mut json = String::from("{\"gateway\":true");
+        if let Some(hash) = &*state.wt_cert_hash.read().unwrap() {
+            json.push_str(",\"certHash\":\"");
+            json.push_str(hash);
+            json.push('"');
+        }
+        json.push('}');
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json,
+        )
+            .into_response()
     } else {
         let etag = &*INDEX_ETAG;
-        let inm = request.headers().get(axum::http::header::IF_NONE_MATCH);
-        if inm.map(|v| v.as_bytes()) == Some(etag.as_bytes()) {
-            return (
-                axum::http::StatusCode::NOT_MODIFIED,
-                [(axum::http::header::ETAG, etag.as_str())],
-            )
-                .into_response();
-        }
-        // Inject WebTransport cert hash for self-signed certs
-        let wt_hash = state.wt_cert_hash.read().unwrap().clone();
-        if let Some(hash) = &wt_hash {
-            let html = INDEX_HTML.replacen(
-                "<script",
-                &format!("<script>window.__blitCertHash='{hash}'</script>\n<script"),
-                1,
-            );
-            (
-                [(axum::http::header::ETAG, etag.as_str())],
-                axum::response::Html(html),
-            )
-                .into_response()
-        } else {
-            blit_webserver::html_response(INDEX_HTML, etag, None)
-        }
+        let inm = request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .map(|v| v.as_bytes());
+        let ae = request
+            .headers()
+            .get(axum::http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        blit_webserver::html_response(INDEX_HTML_BR, etag, inm, ae)
     }
 }
 
