@@ -648,17 +648,27 @@ fn with_dmabuf_plane_bytes<T>(
         smithay::backend::allocator::dmabuf::DmabufSyncFlags::START
             | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
     );
+    struct PlaneSyncGuard<'a> {
+        dmabuf: &'a Dmabuf,
+        plane_idx: usize,
+    }
+
+    impl Drop for PlaneSyncGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.dmabuf.sync_plane(
+                self.plane_idx,
+                smithay::backend::allocator::dmabuf::DmabufSyncFlags::END
+                    | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
+            );
+        }
+    }
+
+    let _sync_guard = PlaneSyncGuard { dmabuf, plane_idx };
     let mapping = dmabuf.map_plane(plane_idx, DmabufMappingMode::READ).ok()?;
     let ptr = mapping.ptr() as *const u8;
     let len = mapping.length();
     let plane_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let result = f(plane_data);
-    let _ = dmabuf.sync_plane(
-        plane_idx,
-        smithay::backend::allocator::dmabuf::DmabufSyncFlags::END
-            | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
-    );
-    result
+    f(plane_data)
 }
 
 fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
