@@ -42,23 +42,40 @@ command -v gh >/dev/null 2>&1 || die "missing required command: gh"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "must be run inside the git repository"
 
-echo "Fetching latest main…"
-git fetch origin main
-
-pr_numbers=()
-mapfile -t pr_numbers < <(
-    gh pr list --label "$label" --state open --json number --jq '.[].number | tostring' \
+pr_data=()
+mapfile -t pr_data < <(
+    gh pr list --label "$label" --state open \
+        --json number,headRefName \
+        --jq '.[] | "\(.number)\t\(.headRefName)"' \
         | sort -n
 )
 
-if [[ ${#pr_numbers[@]} -eq 0 ]]; then
+if [[ ${#pr_data[@]} -eq 0 ]]; then
     die "no open PRs found with label \"$label\""
 fi
 
+pr_numbers=()
+declare -A pr_heads
+for entry in "${pr_data[@]}"; do
+    n="${entry%%	*}"
+    ref="${entry#*	}"
+    pr_numbers+=("$n")
+    pr_heads[$n]="$ref"
+done
+
 echo "Found ${#pr_numbers[@]} open PR(s) with label \"$label\":"
 for n in "${pr_numbers[@]}"; do
-    echo "  #$n"
+    echo "  #$n (${pr_heads[$n]})"
 done
+echo
+
+fetch_refspecs=("refs/heads/main:refs/remotes/origin/main")
+for n in "${pr_numbers[@]}"; do
+    fetch_refspecs+=("+refs/pull/$n/head:refs/heads/pr-$n")
+done
+
+echo "Fetching main + ${#pr_numbers[@]} PR head(s)…"
+git fetch origin --no-tags "${fetch_refspecs[@]}"
 echo
 
 stash_ref=""
@@ -77,6 +94,9 @@ cleanup() {
         echo "Restoring stashed changes…"
         git stash apply "$stash_ref" 2>/dev/null || true
     fi
+    for n in "${pr_numbers[@]}"; do
+        git branch -D "pr-$n" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 
@@ -85,10 +105,7 @@ git checkout -B "$branch" origin/main
 
 merged=()
 for n in "${pr_numbers[@]}"; do
-    head_ref="$(gh pr view "$n" --json headRefName --jq '.headRefName')"
-    echo "Fetching PR #$n ($head_ref)…"
-    git branch -D "pr-$n" 2>/dev/null || true
-    git fetch origin "pull/$n/head:pr-$n" --no-tags --quiet
+    head_ref="${pr_heads[$n]}"
 
     echo "Merging PR #$n ($head_ref)…"
     if ! git merge "pr-$n" --no-edit -m "Merge PR #$n ($head_ref)"; then
@@ -97,7 +114,6 @@ for n in "${pr_numbers[@]}"; do
         die "PR #$n ($head_ref) failed to merge cleanly. Aborting."
     fi
 
-    git branch -D "pr-$n" >/dev/null
     merged+=("$n")
     echo "  ✓ PR #$n merged"
     echo
