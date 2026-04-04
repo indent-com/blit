@@ -64,7 +64,8 @@ describe("BlitSurfaceView", () => {
 
     await waitFor(() => {
       expect(
-        addEventListenerSpy.mock.calls.filter(([type]) => type === "wheel").length,
+        addEventListenerSpy.mock.calls.filter(([type]) => type === "wheel")
+          .length,
       ).toBeGreaterThan(0);
     });
 
