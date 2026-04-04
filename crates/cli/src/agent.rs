@@ -693,6 +693,11 @@ fn parse_type_string(text: &str) -> Result<Vec<(u32, bool)>, String> {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '{' {
+            if chars.get(i + 1) == Some(&'{') {
+                append_char_events(&mut events, '{')?;
+                i += 2;
+                continue;
+            }
             let end = chars[i..]
                 .iter()
                 .position(|&c| c == '}')
@@ -702,21 +707,25 @@ fn parse_type_string(text: &str) -> Result<Vec<(u32, bool)>, String> {
             events.extend(combo);
             i += end + 1;
         } else {
-            let ch = chars[i];
-            let (kc, need_shift) =
-                char_to_keycode(ch).ok_or_else(|| format!("unsupported character: {ch}"))?;
-            if need_shift {
-                events.push((KEY_LEFTSHIFT, true));
-            }
-            events.push((kc, true));
-            events.push((kc, false));
-            if need_shift {
-                events.push((KEY_LEFTSHIFT, false));
-            }
+            append_char_events(&mut events, chars[i])?;
             i += 1;
         }
     }
     Ok(events)
+}
+
+fn append_char_events(events: &mut Vec<(u32, bool)>, ch: char) -> Result<(), String> {
+    let (kc, need_shift) =
+        char_to_keycode(ch).ok_or_else(|| format!("unsupported character: {ch}"))?;
+    if need_shift {
+        events.push((KEY_LEFTSHIFT, true));
+    }
+    events.push((kc, true));
+    events.push((kc, false));
+    if need_shift {
+        events.push((KEY_LEFTSHIFT, false));
+    }
+    Ok(())
 }
 
 fn modifier_keycode(name: &str) -> Option<u32> {
@@ -1729,5 +1738,35 @@ mod tests {
         assert_eq!(result.unwrap(), 0);
 
         mock.await.unwrap();
+    }
+
+    #[test]
+    fn test_parse_type_string_supports_literal_open_brace_escape() {
+        let events = parse_type_string("{{").unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                (KEY_LEFTSHIFT, true),
+                (KEY_LEFTBRACE, true),
+                (KEY_LEFTBRACE, false),
+                (KEY_LEFTSHIFT, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_type_string_still_supports_literal_close_brace() {
+        let events = parse_type_string("}").unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                (KEY_LEFTSHIFT, true),
+                (KEY_RIGHTBRACE, true),
+                (KEY_RIGHTBRACE, false),
+                (KEY_LEFTSHIFT, false),
+            ]
+        );
     }
 }

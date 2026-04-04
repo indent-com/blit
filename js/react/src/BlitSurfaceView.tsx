@@ -97,7 +97,7 @@ export const BlitSurfaceView = forwardRef<
   );
 
   const handleWheel = useCallback(
-    (e: React.WheelEvent<HTMLCanvasElement>) => {
+    (e: WheelEvent) => {
       if (!conn) return;
       e.preventDefault();
       const axis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? 1 : 0;
@@ -112,6 +112,18 @@ export const BlitSurfaceView = forwardRef<
     },
     [conn, surface, surfaceId],
   );
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // React 19 registers wheel listeners as passive, so install the
+    // native listener directly when the surface needs to prevent page scroll.
+    canvas.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener("wheel", handleWheel);
+    };
+  }, [handleWheel]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLCanvasElement>) => {
@@ -150,7 +162,6 @@ export const BlitSurfaceView = forwardRef<
       onMouseDown={handleMouseEvent}
       onMouseUp={handleMouseEvent}
       onMouseMove={handleMouseEvent}
-      onWheel={handleWheel}
       onKeyDown={handleKeyDown}
       onKeyUp={handleKeyUp}
       onFocus={() =>

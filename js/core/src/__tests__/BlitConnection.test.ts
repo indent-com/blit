@@ -8,6 +8,12 @@ import {
   C2S_SCROLL,
   C2S_FOCUS,
   C2S_CLOSE,
+  C2S_SURFACE_INPUT,
+  C2S_SURFACE_POINTER,
+  C2S_SURFACE_POINTER_AXIS,
+  C2S_SURFACE_RESIZE,
+  C2S_SURFACE_FOCUS,
+  C2S_CLIPBOARD,
   C2S_CREATE2,
   CREATE2_HAS_COMMAND,
   FEATURE_CREATE_NONCE,
@@ -364,6 +370,32 @@ describe("BlitConnection", () => {
     conn.focusSession(session.id);
     const msg = transport.sent.find((m) => m[0] === C2S_FOCUS)!;
     expect(msg[1] | (msg[2] << 8)).toBe(9);
+  });
+
+  it("surface helpers do not send while disconnected", () => {
+    transport.setStatus("disconnected");
+    const before = transport.sent.length;
+
+    conn.sendSurfaceInput(1, 2, 30, true);
+    conn.sendSurfacePointer(1, 2, 0, 0, 10, 20);
+    conn.sendSurfaceAxis(1, 2, 0, 1200);
+    conn.sendSurfaceResize(1, 2, 800, 600);
+    conn.sendSurfaceFocus(1, 2);
+    conn.sendClipboard(1, 2, "text/plain", new Uint8Array([1, 2, 3]));
+
+    expect(transport.sent).toHaveLength(before);
+    expect(
+      transport.sent.find((m) =>
+        [
+          C2S_SURFACE_INPUT,
+          C2S_SURFACE_POINTER,
+          C2S_SURFACE_POINTER_AXIS,
+          C2S_SURFACE_RESIZE,
+          C2S_SURFACE_FOCUS,
+          C2S_CLIPBOARD,
+        ].includes(m[0]!),
+      ),
+    ).toBeUndefined();
   });
 
   // --- S2C_HELLO ---

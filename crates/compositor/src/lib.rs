@@ -92,7 +92,7 @@ mod stub {
         pub event_rx: mpsc::Receiver<CompositorEvent>,
         pub command_tx: mpsc::Sender<CompositorCommand>,
         pub socket_name: String,
-        pub thread: std::thread::JoinHandle<()>,
+        pub thread: Option<std::thread::JoinHandle<()>>,
         pub shutdown: Arc<AtomicBool>,
     }
 

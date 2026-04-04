@@ -271,16 +271,20 @@ struct SharedCompositor {
     created_at: Instant,
 }
 
-fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let expected_len = width.checked_mul(height)?.checked_mul(4)? as usize;
+    if pixels.len() != expected_len {
+        return None;
+    }
     let mut buf = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().unwrap();
-        writer.write_image_data(pixels).unwrap();
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(pixels).ok()?;
     }
-    buf
+    Some(buf)
 }
 
 async fn request_surface_capture(
@@ -2478,10 +2482,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             if let Some(command_tx) = command_tx {
                 if let Some((w, h, pixels)) = request_surface_capture(command_tx, surface_id).await
                 {
-                    let png_data = encode_rgba_to_png(&pixels, w, h);
-                    reply_msg.extend_from_slice(&w.to_le_bytes());
-                    reply_msg.extend_from_slice(&h.to_le_bytes());
-                    reply_msg.extend_from_slice(&png_data);
+                    if let Some(png_data) = encode_rgba_to_png(&pixels, w, h) {
+                        reply_msg.extend_from_slice(&w.to_le_bytes());
+                        reply_msg.extend_from_slice(&h.to_le_bytes());
+                        reply_msg.extend_from_slice(&png_data);
+                    } else {
+                        reply_msg.extend_from_slice(&0u32.to_le_bytes());
+                        reply_msg.extend_from_slice(&0u32.to_le_bytes());
+                    }
                 } else {
                     reply_msg.extend_from_slice(&0u32.to_le_bytes());
                     reply_msg.extend_from_slice(&0u32.to_le_bytes());
@@ -3296,7 +3304,7 @@ mod tests {
             event_rx,
             command_tx,
             socket_name: "test-wayland".into(),
-            thread: std::thread::spawn(|| {}),
+            thread: Some(std::thread::spawn(|| {})),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -3423,6 +3431,19 @@ mod tests {
             request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;
 
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn encode_rgba_to_png_rejects_truncated_buffers() {
+        assert_eq!(encode_rgba_to_png(&[0, 0, 0, 0], 2, 2), None);
+    }
+
+    #[test]
+    fn encode_rgba_to_png_accepts_exact_rgba_buffers() {
+        let png = encode_rgba_to_png(&[0, 0, 0, 255], 1, 1).unwrap();
+
+        assert!(!png.is_empty());
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 
     #[tokio::test]

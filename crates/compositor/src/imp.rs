@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -43,8 +45,9 @@ use smithay::wayland::compositor::{
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus, set_data_device_selection,
 };
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::{SelectionHandler, SelectionTarget};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -157,6 +160,12 @@ struct ClientData {
     compositor_state: CompositorClientState,
 }
 
+#[derive(Clone)]
+pub struct ClipboardSelection {
+    mime_type: String,
+    data: Arc<[u8]>,
+}
+
 impl smithay::reexports::wayland_server::backend::ClientData for ClientData {
     fn initialized(&self, _client_id: smithay::reexports::wayland_server::backend::ClientId) {}
     fn disconnected(
@@ -191,6 +200,7 @@ pub struct Compositor {
     surfaces: HashMap<u64, SurfaceInfo>,
     surface_lookup: HashMap<u16, u64>,
     next_surface_id: u16,
+    pointer_location: (f64, f64),
 
     event_tx: mpsc::Sender<CompositorEvent>,
     loop_signal: LoopSignal,
@@ -199,14 +209,66 @@ pub struct Compositor {
     renderer: PixmanRenderer,
 }
 
+fn next_surface_id_candidate(next_surface_id: &mut u16) -> u16 {
+    if *next_surface_id == 0 {
+        *next_surface_id = 1;
+    }
+    let id = *next_surface_id;
+    *next_surface_id = id.wrapping_add(1);
+    if *next_surface_id == 0 {
+        *next_surface_id = 1;
+    }
+    id
+}
+
+fn next_available_surface_id(
+    next_surface_id: &mut u16,
+    surface_lookup: &HashMap<u16, u64>,
+) -> Option<u16> {
+    for _ in 0..u16::MAX {
+        let id = next_surface_id_candidate(next_surface_id);
+        if !surface_lookup.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
 impl Compositor {
     fn allocate_surface_id(&mut self) -> u16 {
-        let id = self.next_surface_id;
-        self.next_surface_id = self.next_surface_id.wrapping_add(1);
-        if self.next_surface_id == 0 {
-            self.next_surface_id = 1;
+        next_available_surface_id(&mut self.next_surface_id, &self.surface_lookup)
+            .expect("surface id space exhausted")
+    }
+
+    fn surface_wl_surface(&self, surface_id: u16) -> Option<WlSurface> {
+        let obj_id = *self.surface_lookup.get(&surface_id)?;
+        let info = self.surfaces.get(&obj_id)?;
+        Some(info.window.toplevel()?.wl_surface().clone())
+    }
+
+    fn surface_client(&self, surface_id: u16) -> Option<Client> {
+        self.surface_wl_surface(surface_id)?.client()
+    }
+
+    fn ensure_pointer_focus(&mut self, surface_id: u16) -> bool {
+        let Some(wl_surface) = self.surface_wl_surface(surface_id) else {
+            return false;
+        };
+        let pointer = self.seat.get_pointer().unwrap();
+        if pointer.current_focus().as_ref() == Some(&wl_surface) {
+            return true;
         }
-        id
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.motion(
+            self,
+            Some((wl_surface, (0.0, 0.0).into())),
+            &MotionEvent {
+                location: (self.pointer_location.0, self.pointer_location.1).into(),
+                serial,
+                time: elapsed_ms(),
+            },
+        );
+        true
     }
 
     fn handle_command(&mut self, cmd: CompositorCommand) {
@@ -243,6 +305,7 @@ impl Compositor {
                 }
             }
             CompositorCommand::PointerMotion { surface_id, x, y } => {
+                self.pointer_location = (x, y);
                 if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
                     && let Some(info) = self.surfaces.get(&obj_id)
                 {
@@ -289,10 +352,13 @@ impl Compositor {
                 }
             }
             CompositorCommand::PointerAxis {
-                surface_id: _,
+                surface_id,
                 axis,
                 value,
             } => {
+                if !self.ensure_pointer_focus(surface_id) {
+                    return;
+                }
                 let pointer = self.seat.get_pointer().unwrap();
                 let ax = if axis == 0 {
                     Axis::Vertical
@@ -330,7 +396,24 @@ impl Compositor {
                     );
                 }
             }
-            CompositorCommand::ClipboardOffer { .. } => {}
+            CompositorCommand::ClipboardOffer {
+                surface_id,
+                mime_type,
+                data,
+            } => {
+                if let Some(client) = self.surface_client(surface_id) {
+                    set_data_device_focus::<Self>(&self.display_handle, &self.seat, Some(client));
+                    set_data_device_selection::<Self>(
+                        &self.display_handle,
+                        &self.seat,
+                        vec![mime_type.clone()],
+                        ClipboardSelection {
+                            mime_type,
+                            data: Arc::from(data),
+                        },
+                    );
+                }
+            }
             CompositorCommand::Capture { surface_id, reply } => {
                 let result = if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
                     && let Some(info) = self.surfaces.get(&obj_id)
@@ -603,11 +686,32 @@ impl SeatHandler for Compositor {
     ) {
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        set_data_device_focus::<Self>(
+            &self.display_handle,
+            seat,
+            focused.and_then(|surface| surface.client()),
+        );
+    }
 }
 
 impl SelectionHandler for Compositor {
-    type SelectionUserData = ();
+    type SelectionUserData = ClipboardSelection;
+
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        selection: &Self::SelectionUserData,
+    ) {
+        if ty != SelectionTarget::Clipboard || mime_type != selection.mime_type {
+            return;
+        }
+        let mut file = std::fs::File::from(fd);
+        let _ = file.write_all(selection.data.as_ref());
+    }
 }
 
 impl DataDeviceHandler for Compositor {
@@ -960,8 +1064,18 @@ pub struct CompositorHandle {
     pub event_rx: mpsc::Receiver<CompositorEvent>,
     pub command_tx: mpsc::Sender<CompositorCommand>,
     pub socket_name: String,
-    pub thread: std::thread::JoinHandle<()>,
+    pub thread: Option<std::thread::JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for CompositorHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.command_tx.send(CompositorCommand::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub fn spawn_compositor() -> CompositorHandle {
@@ -1003,7 +1117,7 @@ pub fn spawn_compositor() -> CompositorHandle {
         event_rx,
         command_tx,
         socket_name,
-        thread,
+        thread: Some(thread),
         shutdown,
     }
 }
@@ -1164,6 +1278,7 @@ fn run_compositor(
         surfaces: HashMap::new(),
         surface_lookup: HashMap::new(),
         next_surface_id: 1,
+        pointer_location: (0.0, 0.0),
         event_tx,
         loop_signal: loop_signal.clone(),
         renderer,
@@ -1209,7 +1324,11 @@ fn run_compositor(
 
 #[cfg(test)]
 mod tests {
-    use super::{Fourcc, read_nv12_dmabuf, read_p010_dmabuf, read_packed_rgba_dmabuf};
+    use super::{
+        Fourcc, next_available_surface_id, read_nv12_dmabuf, read_p010_dmabuf,
+        read_packed_rgba_dmabuf,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn xrgb_dmabuf_forces_opaque_alpha() {
@@ -1241,5 +1360,27 @@ mod tests {
         let rgba = read_p010_dmabuf(&y_plane, 4, &uv_plane, 4, 2, 2, false).unwrap();
 
         assert_eq!(rgba, vec![255, 255, 255, 255].repeat(4));
+    }
+
+    #[test]
+    fn surface_id_allocator_wraps_without_colliding() {
+        let mut next_surface_id = u16::MAX;
+        let surface_lookup = HashMap::from([(u16::MAX, 1_u64)]);
+
+        let id = next_available_surface_id(&mut next_surface_id, &surface_lookup).unwrap();
+
+        assert_eq!(id, 1);
+        assert_eq!(next_surface_id, 2);
+    }
+
+    #[test]
+    fn surface_id_allocator_skips_live_ids() {
+        let mut next_surface_id = 2;
+        let surface_lookup = HashMap::from([(2, 20_u64), (3, 30_u64)]);
+
+        let id = next_available_surface_id(&mut next_surface_id, &surface_lookup).unwrap();
+
+        assert_eq!(id, 4);
+        assert_eq!(next_surface_id, 5);
     }
 }

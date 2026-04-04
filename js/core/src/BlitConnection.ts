@@ -673,6 +673,7 @@ export class BlitConnection {
     keycode: number,
     pressed: boolean,
   ): void {
+    if (this.transport.status !== "connected") return;
     this.transport.send(
       buildSurfaceInputMessage(sessionId, surfaceId, keycode, pressed),
     );
@@ -686,6 +687,7 @@ export class BlitConnection {
     x: number,
     y: number,
   ): void {
+    if (this.transport.status !== "connected") return;
     this.transport.send(
       buildSurfacePointerMessage(sessionId, surfaceId, type, button, x, y),
     );
@@ -697,6 +699,7 @@ export class BlitConnection {
     axis: number,
     valueX100: number,
   ): void {
+    if (this.transport.status !== "connected") return;
     this.transport.send(
       buildSurfaceAxisMessage(sessionId, surfaceId, axis, valueX100),
     );
@@ -708,12 +711,14 @@ export class BlitConnection {
     width: number,
     height: number,
   ): void {
+    if (this.transport.status !== "connected") return;
     this.transport.send(
       buildSurfaceResizeMessage(sessionId, surfaceId, width, height),
     );
   }
 
   sendSurfaceFocus(sessionId: number, surfaceId: number): void {
+    if (this.transport.status !== "connected") return;
     this.transport.send(buildSurfaceFocusMessage(sessionId, surfaceId));
   }
 
@@ -723,6 +728,7 @@ export class BlitConnection {
     mimeType: string,
     data: Uint8Array,
   ): void {
+    if (this.transport.status !== "connected") return;
     this.transport.send(
       buildClipboardMessage(sessionId, surfaceId, mimeType, data),
     );
