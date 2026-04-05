@@ -340,10 +340,20 @@ export class SurfaceStore {
       },
     });
     try {
-      decoder.configure({
+      const config: VideoDecoderConfig = {
         codec: codecString(codec),
         optimizeForLatency: true,
-      });
+      };
+      // The server sends Annex B bitstreams (start-code delimited NAL units).
+      // Without an explicit format hint WebCodecs defaults to length-prefixed
+      // containers (AVCC for H.264, HVCC for H.265) and platform decoders
+      // such as macOS VideoToolbox reject the data (-12909).
+      if (codec === "h264") {
+        (config as any).avc = { format: "annexb" };
+      } else if (codec === "h265") {
+        (config as any).hevc = { format: "annexb" };
+      }
+      decoder.configure(config);
     } catch (e) {
       console.warn(
         "[blit] surface decoder configure failed:",

@@ -507,6 +507,7 @@ impl SurfaceEncoder {
             } => self.encode_nv12(data, *y_stride, *uv_stride),
             PixelData::Bgra(bgra) => self.encode_bgra(bgra),
             PixelData::Rgba(rgba) => self.encode(rgba),
+            #[cfg(unix)]
             PixelData::DmaBuf {
                 fd,
                 fourcc,
@@ -514,6 +515,8 @@ impl SurfaceEncoder {
                 stride,
                 offset,
             } => self.encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset),
+            #[cfg(not(unix))]
+            PixelData::DmaBuf { .. } => None,
         }
     }
 
@@ -533,6 +536,7 @@ impl SurfaceEncoder {
                 y_stride,
                 uv_stride,
             } => self.flush_keyframe_nv12(data, *y_stride, *uv_stride),
+            #[cfg(unix)]
             PixelData::DmaBuf {
                 fd,
                 fourcc,
@@ -543,11 +547,14 @@ impl SurfaceEncoder {
                 // DmaBuf path always produces output on first call (no pipeline priming).
                 self.encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset)
             }
+            #[cfg(not(unix))]
+            PixelData::DmaBuf { .. } => None,
         }
     }
 
     /// Encode from a DMA-BUF fd — tries zero-copy GPU import first,
     /// falls back to CPU mmap readback if no GPU path is available.
+    #[cfg(unix)]
     fn encode_dmabuf(
         &mut self,
         fd: &std::os::fd::OwnedFd,
@@ -567,6 +574,7 @@ impl SurfaceEncoder {
 
     /// CPU-side fallback for DMA-BUF encoding: mmap the fd, read pixels,
     /// and encode through the normal BGRA/NV12 path.
+    #[cfg(unix)]
     fn encode_dmabuf_cpu_fallback(
         &mut self,
         fd: &std::os::fd::OwnedFd,
@@ -596,14 +604,16 @@ impl SurfaceEncoder {
         const DMA_BUF_SYNC_READ: u64 = 1;
         const DMA_BUF_SYNC_START: u64 = 0;
         const DMA_BUF_SYNC_END: u64 = 4;
-        // ioctl number for DMA_BUF_IOCTL_SYNC
+        // ioctl number for DMA_BUF_IOCTL_SYNC — use c_ulong and cast at
+        // call sites so this works on both x86_64 (ioctl takes c_ulong)
+        // and aarch64 (ioctl takes c_int).
         const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
 
         let sync_start = DmaBufSync {
             flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
         };
         unsafe {
-            libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+            libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_start);
         }
 
         // mmap the DMA-BUF for reading.
@@ -622,7 +632,7 @@ impl SurfaceEncoder {
                 flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
             };
             unsafe {
-                libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+                libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_end);
             }
             return None;
         }
@@ -675,7 +685,7 @@ impl SurfaceEncoder {
             flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
         };
         unsafe {
-            libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+            libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_end);
         }
 
         result

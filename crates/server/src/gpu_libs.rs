@@ -25,6 +25,7 @@ unsafe impl Send for DynLib {}
 unsafe impl Sync for DynLib {}
 
 impl DynLib {
+    #[cfg(unix)]
     fn open(names: &[&str]) -> Option<Self> {
         for name in names {
             let cname = std::ffi::CString::new(*name).ok()?;
@@ -37,6 +38,12 @@ impl DynLib {
         None
     }
 
+    #[cfg(not(unix))]
+    fn open(_names: &[&str]) -> Option<Self> {
+        None
+    }
+
+    #[cfg(unix)]
     unsafe fn sym<T>(&self, name: &str) -> Option<T> {
         let cname = std::ffi::CString::new(name).ok()?;
         let ptr = unsafe { libc::dlsym(self.handle, cname.as_ptr()) };
@@ -45,10 +52,16 @@ impl DynLib {
         }
         Some(unsafe { std::mem::transmute_copy(&ptr) })
     }
+
+    #[cfg(not(unix))]
+    unsafe fn sym<T>(&self, _name: &str) -> Option<T> {
+        None
+    }
 }
 
 impl Drop for DynLib {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::dlclose(self.handle);
         }

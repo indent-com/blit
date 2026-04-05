@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc};
 
+#[cfg(unix)]
 mod dmabuf_zerocopy;
 mod gpu_libs;
 mod ipc;

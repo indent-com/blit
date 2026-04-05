@@ -33,6 +33,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, PostAction};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Serial, Transform, SERIAL_COUNTER};
@@ -683,34 +684,10 @@ impl Compositor {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             let attrs = guard.current();
             if let Some(compositor::BufferAssignment::NewBuffer(buffer)) = attrs.buffer.as_ref() {
-                let shm_ok = with_buffer_contents(buffer, |ptr, len, data: BufferData| {
-                    let width = data.width as u32;
-                    let height = data.height as u32;
-                    let stride = data.stride as usize;
-                    let offset = data.offset as usize;
-                    let pixel_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                    let row_bytes = width as usize * 4;
-                    let bgra = if stride == row_bytes
-                        && offset == 0
-                        && pixel_data.len() >= row_bytes * height as usize
-                    {
-                        pixel_data[..row_bytes * height as usize].to_vec()
-                    } else {
-                        let mut packed = Vec::with_capacity(row_bytes * height as usize);
-                        for row in 0..height as usize {
-                            let row_start = offset + row * stride;
-                            let row_end = row_start + row_bytes;
-                            if row_end <= pixel_data.len() {
-                                packed.extend_from_slice(&pixel_data[row_start..row_end]);
-                            }
-                        }
-                        packed
-                    };
-                    result = Some((width, height, PixelData::Bgra(Arc::new(bgra))));
-                })
-                .is_ok();
-
-                if !shm_ok && let Ok(dmabuf) = get_dmabuf(buffer) {
+                result = read_shm_buffer(buffer);
+                if result.is_none()
+                    && let Ok(dmabuf) = get_dmabuf(buffer)
+                {
                     result = read_dmabuf_pixels(dmabuf);
                 }
             }
@@ -718,6 +695,46 @@ impl Compositor {
         // Convert to RGBA for the capture path (used only by dead-code Capture command).
         result.map(|(w, h, pd)| (w, h, pd.to_rgba(w, h)))
     }
+}
+
+/// Read an SHM buffer into `PixelData::Bgra`, forcing alpha=255 for
+/// XRGB8888 format (where the alpha byte is undefined and typically 0).
+fn read_shm_buffer(buffer: &wl_buffer::WlBuffer) -> Option<(u32, u32, PixelData)> {
+    let mut result = None;
+    let _ = with_buffer_contents(buffer, |ptr, len, data: BufferData| {
+        let width = data.width as u32;
+        let height = data.height as u32;
+        let stride = data.stride as usize;
+        let offset = data.offset as usize;
+        let pixel_data = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let row_bytes = width as usize * 4;
+        let mut bgra = if stride == row_bytes
+            && offset == 0
+            && pixel_data.len() >= row_bytes * height as usize
+        {
+            pixel_data[..row_bytes * height as usize].to_vec()
+        } else {
+            let mut packed = Vec::with_capacity(row_bytes * height as usize);
+            for row in 0..height as usize {
+                let row_start = offset + row * stride;
+                let row_end = row_start + row_bytes;
+                if row_end <= pixel_data.len() {
+                    packed.extend_from_slice(&pixel_data[row_start..row_end]);
+                }
+            }
+            packed
+        };
+        // XRGB8888: the alpha byte is undefined (clients typically leave it
+        // as 0).  Force opaque so that captures and any alpha-aware path
+        // treat pixels correctly.
+        if data.format == wl_shm::Format::Xrgb8888 {
+            for px in bgra.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+        result = Some((width, height, PixelData::Bgra(Arc::new(bgra))));
+    });
+    result
 }
 
 fn elapsed_ms() -> u32 {
@@ -756,36 +773,8 @@ impl CompositorHandler for Compositor {
             let attrs = guard.current();
             if let Some(compositor::BufferAssignment::NewBuffer(buffer)) = attrs.buffer.as_ref() {
                 if !have_pending {
-                    let shm_ok = with_buffer_contents(buffer, |ptr, len, data: BufferData| {
-                        let width = data.width as u32;
-                        let height = data.height as u32;
-                        let stride = data.stride as usize;
-                        let offset = data.offset as usize;
-                        let pixel_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-                        // Pass BGRA straight through — the encoder will convert
-                        // directly to YUV without an intermediate RGBA step.
-                        let row_bytes = width as usize * 4;
-                        let bgra = if stride == row_bytes
-                            && offset == 0
-                            && pixel_data.len() >= row_bytes * height as usize
-                        {
-                            // Fast path: contiguous, no stride padding — just copy.
-                            pixel_data[..row_bytes * height as usize].to_vec()
-                        } else {
-                            // Stride differs from width or there's an offset — pack rows.
-                            let mut packed = Vec::with_capacity(row_bytes * height as usize);
-                            for row in 0..height as usize {
-                                let row_start = offset + row * stride;
-                                let row_end = row_start + row_bytes;
-                                if row_end <= pixel_data.len() {
-                                    packed.extend_from_slice(&pixel_data[row_start..row_end]);
-                                }
-                            }
-                            packed
-                        };
-                        committed_buffer = Some((width, height, PixelData::Bgra(Arc::new(bgra))));
-                    })
-                    .is_ok();
+                    committed_buffer = read_shm_buffer(buffer);
+                    let shm_ok = committed_buffer.is_some();
 
                     if !shm_ok && let Ok(dmabuf) = get_dmabuf(buffer) {
                         committed_buffer = read_dmabuf_pixels(dmabuf);
