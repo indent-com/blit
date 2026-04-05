@@ -163,6 +163,13 @@ export class BlitWorkspace {
     await connection.closeSession(sessionId);
   }
 
+  closeSurface(connectionId: ConnectionId, surfaceId: number): void {
+    const connection = this.requireConnection(connectionId);
+    const surface = connection.surfaceStore.getSurfaces().get(surfaceId);
+    const sessionId = surface?.sessionId ?? 0;
+    connection.sendSurfaceClose(sessionId, surfaceId);
+  }
+
   restartSession(sessionId: SessionId): void {
     const session = this.getSession(sessionId);
     if (!session) return;
@@ -334,6 +341,8 @@ export class BlitWorkspace {
     for (const listener of this.listeners) listener();
   }
 
+  private _syncingFocus = false;
+
   private recomputeSnapshot(): void {
     const connections = [...this.connections.values()].map((connection) =>
       connection.getSnapshot(),
@@ -343,6 +352,7 @@ export class BlitWorkspace {
       connections,
       sessions,
     );
+    const previousFocusedSessionId = this.snapshot.focusedSessionId;
     this.snapshot = {
       connections,
       sessions,
@@ -352,6 +362,27 @@ export class BlitWorkspace {
         connections.every((connection) => connection.ready),
     };
     this.emit();
+
+    // When the workspace resolves focus via fallback (e.g. initial connect or
+    // session close), sync it to the owning connection so C2S_FOCUS reaches
+    // the server and client.lead is set correctly.
+    if (
+      focusedSessionId &&
+      focusedSessionId !== previousFocusedSessionId &&
+      !this._syncingFocus
+    ) {
+      this._syncingFocus = true;
+      try {
+        const session = sessions.find((s) => s.id === focusedSessionId);
+        if (session) {
+          this.connections
+            .get(session.connectionId)
+            ?.focusSession(focusedSessionId);
+        }
+      } finally {
+        this._syncingFocus = false;
+      }
+    }
   }
 
   private resolveFocusedSessionId(

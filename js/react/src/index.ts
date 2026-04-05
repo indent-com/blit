@@ -1,5 +1,10 @@
 export { BlitTerminal } from "./BlitTerminal";
 export type { BlitTerminalHandle } from "./BlitTerminal";
+export { BlitSurfaceView } from "./BlitSurfaceView";
+export type {
+  BlitSurfaceViewProps,
+  BlitSurfaceViewHandle,
+} from "./BlitSurfaceView";
 
 export type { BlitTerminalProps } from "./types";
 

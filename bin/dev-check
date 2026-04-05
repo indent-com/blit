@@ -4,25 +4,32 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PC_SOCK="/tmp/blit-dev-check-pc.sock"
-BLIT_SOCK="/tmp/blit-dev.sock"
+# Use a dedicated instance so dev-check never collides with a developer's
+# running ./bin/dev (instance 0).  Override DEV_INSTANCE for parallel CI.
+export DEV_INSTANCE="${DEV_INSTANCE:-99}"
+
+# bin/dev computes all concrete vars from the instance; we just need to know
+# the socket path for the smoke test and the PC socket for health polling.
+N="$DEV_INSTANCE"
+BLIT_DEV_SOCK="${BLIT_DEV_SOCK:-/tmp/blit-dev-${N}.sock}"
+PC_SOCK="/tmp/blit-dev-pc-${N}.sock"
 TIMEOUT="${DEV_CHECK_TIMEOUT:-600}"
 
 cleanup() {
     echo "=== Tearing down ==="
     process-compose -U -u "$PC_SOCK" down 2>/dev/null || true
-    rm -f "$PC_SOCK" "$BLIT_SOCK"
+    rm -f "$PC_SOCK" "$BLIT_DEV_SOCK"
 }
 trap cleanup EXIT INT TERM
 
-rm -f "$PC_SOCK" "$BLIT_SOCK"
+rm -f "$PC_SOCK" "$BLIT_DEV_SOCK"
 
 echo "=== Installing blit CLI ==="
 curl -sf https://install.blit.sh | sh
 BLIT="blit"
 
 echo "=== Starting bin/dev ==="
-./bin/dev -t=false -u "$PC_SOCK" &
+./bin/dev -t=false &
 DEV_PID=$!
 
 echo "=== Waiting for all services to become healthy (timeout ${TIMEOUT}s) ==="
@@ -46,8 +53,7 @@ while true; do
 
     if status=$(process-compose -U -u "$PC_SOCK" list -o json 2>/dev/null); then
         total=$(echo "$status" | jq 'length')
-        running=$(echo "$status" | jq '[.[] | select(.status == "Running")] | length')
-        ready=$(echo "$status" | jq '[.[] | select(.status == "Running" and (.has_ready_probe == false or .is_ready == "Ready"))] | length')
+        ready=$(echo "$status" | jq '[.[] | select(.status == "Running" and ((.has_ready_probe | not) or .is_ready == "Ready"))] | length')
         echo "  services: $ready/$total ready (${elapsed}s)"
         if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
             break
@@ -62,7 +68,7 @@ process-compose -U -u "$PC_SOCK" list
 
 echo ""
 echo "=== Smoke test: blit CLI ==="
-BLIT_ARGS=(--socket "$BLIT_SOCK")
+BLIT_ARGS=(--socket "$BLIT_DEV_SOCK")
 
 echo "  blit start echo hello"
 SESSION_ID=$("$BLIT" start "${BLIT_ARGS[@]}" echo hello)

@@ -1,7 +1,12 @@
+use crate::ProducerKeys;
 use crate::ice::{self, IceConfig, Transport};
 use crate::signaling;
 use crate::turn::{self, TurnRelay};
-use ed25519_dalek::SigningKey;
+use blit_remote::{
+    C2S_CLIPBOARD, C2S_CLOSE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_INPUT,
+    C2S_KILL, C2S_MOUSE, C2S_RESTART, C2S_SURFACE_CLOSE, C2S_SURFACE_INPUT, C2S_SURFACE_POINTER,
+    C2S_SURFACE_POINTER_AXIS,
+};
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,12 +25,34 @@ type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Returns `true` for C2S message tags that mutate state (input, create, kill,
+/// etc.).  Read-only consumers have these messages silently dropped.
+fn is_write_message(tag: u8) -> bool {
+    matches!(
+        tag,
+        C2S_INPUT
+            | C2S_MOUSE
+            | C2S_CLIPBOARD
+            | C2S_KILL
+            | C2S_RESTART
+            | C2S_CLOSE
+            | C2S_CREATE
+            | C2S_CREATE_AT
+            | C2S_CREATE_N
+            | C2S_CREATE2
+            | C2S_SURFACE_INPUT
+            | C2S_SURFACE_POINTER
+            | C2S_SURFACE_POINTER_AXIS
+            | C2S_SURFACE_CLOSE
+    )
+}
+
 pub async fn handle_peer(
     peer_session_id: String,
     sock_path: String,
     mut signal_rx: mpsc::UnboundedReceiver<serde_json::Value>,
     signal_tx: mpsc::UnboundedSender<String>,
-    signing_key: SigningKey,
+    keys: ProducerKeys,
     established: Arc<AtomicBool>,
     ice_config: Option<IceConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -91,22 +118,36 @@ pub async fn handle_peer(
         }
     }
 
-    let offer: SdpOffer = loop {
+    // Wait for the SDP offer.  Decrypt via ProducerKeys::open_sealed which
+    // tries both the RW and RO consumer keys — the one that works tells us
+    // the consumer's access level.
+    let (offer, consumer_access): (SdpOffer, crate::Access) = loop {
         match signal_rx.recv().await {
-            Some(data) => {
+            Some(raw) => {
+                let (data, access) = match keys.open_sealed(&raw) {
+                    Some(pair) => pair,
+                    None => {
+                        // Legacy unencrypted peer — treat as plaintext RW.
+                        (raw, crate::Access::ReadWrite)
+                    }
+                };
                 if let Some(sdp) = data.get("sdp") {
                     let offer: SdpOffer = serde_json::from_value(sdp.clone())?;
-                    break offer;
+                    break (offer, access);
                 }
             }
             None => return Ok(()),
         }
     };
 
+    verbose!("consumer access: {:?}", consumer_access,);
+
     let answer = rtc.sdp_api().accept_offer(offer)?;
     let answer_json = serde_json::to_value(&answer)?;
     let signal_data = serde_json::json!({ "sdp": answer_json });
-    let msg = signaling::build_signed_message(&signing_key, &peer_session_id, &signal_data);
+    // Seal the answer with the correct consumer key for this peer's access.
+    let bk = keys.box_keys_for(consumer_access);
+    let msg = signaling::build_sealed_message(&keys.signing, &peer_session_id, &signal_data, &bk);
     signal_tx
         .send(msg)
         .map_err(|e| format!("send failed: {e}"))?;
@@ -172,6 +213,14 @@ pub async fn handle_peer(
                                     continue;
                                 }
                                 let payload = &data[4..4 + len];
+
+                                // Enforce read-only: drop mutating messages.
+                                if consumer_access == crate::Access::ReadOnly
+                                    && !payload.is_empty()
+                                    && is_write_message(payload[0])
+                                {
+                                    continue;
+                                }
                                 let frame_len = (payload.len() as u32).to_le_bytes();
                                 if conn.write_all(&frame_len).await.is_err() {
                                     verbose!("blit-server socket write failed");
@@ -279,7 +328,11 @@ pub async fn handle_peer(
                 }
             } => {
                 match sig {
-                    Some(data) => {
+                    Some(raw) => {
+                        // Decrypt with the correct consumer key.
+                        let data = keys.open_sealed(&raw)
+                            .map(|(v, _)| v)
+                            .unwrap_or(raw);
                         if let Some(candidate) = data.get("candidate")
                             && let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
                                 rtc.add_remote_candidate(c);

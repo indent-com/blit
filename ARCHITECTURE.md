@@ -9,6 +9,8 @@ blit is a terminal streaming stack. The server parses PTY output into structured
 ```mermaid
 graph LR
     PTY <-->|stdin/stdout| S[blit-server]
+    W[Wayland app] <-->|Wayland protocol| COMP[blit-compositor]
+    COMP <-->|channels| S
     S <-->|Unix socket| G[blit-gateway]
     G <-->|WebSocket / WebTransport| B[browser]
     S <-->|Unix socket / TCP / SSH| C[blit-cli]
@@ -31,12 +33,15 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `@blit-sh/solid`        | `js/solid/`                | npm           | Thin Solid wrapper: context provider, primitives, and `BlitTerminal` component delegating to core                    |
 | `blit-server`           | `crates/server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
 | `blit-gateway`          | `crates/gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth                                                                    |
-| `blit` (CLI)            | `crates/cli/`              | bin           | Browser/console client, agent subcommands, SSH tunneling, embedded gateway, `server`/`share` subcommands             |
+| `blit` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH tunneling, embedded gateway, `server`/`share` subcommands                     |
 | `blit-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib + bin     | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels to blit-server                         |
 | `blit-fonts`            | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
 | `blit-webserver`        | `crates/webserver/`        | lib           | Shared axum HTTP helpers for serving assets and fonts                                                                |
+| `blit-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (smithay): surface multiplexing, input injection, clipboard sync            |
 
 Each Rust crate is a single `lib.rs` or `main.rs` with no multi-file module trees (`blit-cli` is split into `main.rs`, `transport.rs`, `interactive.rs`, and `agent.rs`; `blit-webrtc-forwarder` is split into `lib.rs`, `main.rs`, `peer.rs`, `signaling.rs`, `ice.rs`, and `turn.rs`).
+
+`blit-compositor` uses smithay 0.7 as an experimental headless Wayland compositor. A single compositor instance is shared across all PTY sessions in a connection, running on a dedicated OS thread with its own calloop event loop. Each xdg_toplevel surface gets an independent surface ID and video stream. The server keeps one encoder per surface and recreates it on resize. Encoder selection is controlled by `BLIT_SURFACE_ENCODERS` — a comma-separated priority list. The server tries each in order and uses the first that succeeds. The default priority is NVENC H.265 > H.265 VA-API > NVENC AV1 > AV1 (rav1e) > NVENC H.264 > H.264 VA-API > H.264 software (openh264). See the README for the full encoder table. The compositor communicates with the server via channels (`CompositorEvent` / `CompositorCommand`).
 
 ### Dependency graph
 
@@ -50,13 +55,15 @@ graph TD
     browser --> core[@blit-sh/core]
     core --> react[@blit-sh/react]
     core --> solid[@blit-sh/solid]
-    react --> webapp[web-app]
+    solid --> ui[@blit-sh/ui]
 
     fonts[blit-fonts] --> webserver[blit-webserver]
     webserver --> gateway[blit-gateway]
     webserver --> cli
 
     remote --> forwarder[blit-webrtc-forwarder]
+    remote --> compositor[blit-compositor]
+    compositor --> server
     server --> cli
     forwarder --> cli
 ```
@@ -82,26 +89,34 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 
 **Client-to-server (C2S):**
 
-| Opcode | Name             | Layout                                                              |
-| ------ | ---------------- | ------------------------------------------------------------------- |
-| `0x00` | `INPUT`          | `[pty_id:2][data:N]`                                                |
-| `0x01` | `RESIZE`         | `[pty_id:2][rows:2][cols:2]...` (batch, repeating)                  |
-| `0x02` | `SCROLL`         | `[pty_id:2][offset:4]`                                              |
-| `0x03` | `ACK`            | (empty)                                                             |
-| `0x04` | `DISPLAY_RATE`   | `[fps:2]`                                                           |
-| `0x05` | `CLIENT_METRICS` | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                          |
-| `0x06` | `MOUSE`          | `[pty_id:2][type:1][button:1][col:2][row:2]`                        |
-| `0x07` | `RESTART`        | `[pty_id:2]`                                                        |
-| `0x10` | `CREATE`         | `[rows:2][cols:2][tag_len:2][tag:N]`                                |
-| `0x11` | `FOCUS`          | `[pty_id:2]`                                                        |
-| `0x12` | `CLOSE`          | `[pty_id:2]`                                                        |
-| `0x13` | `SUBSCRIBE`      | `[pty_id:2]`                                                        |
-| `0x14` | `UNSUBSCRIBE`    | `[pty_id:2]`                                                        |
-| `0x15` | `SEARCH`         | `[request_id:2][query:N]`                                           |
-| `0x16` | `CREATE_AT`      | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                  |
-| `0x17` | `CREATE_N`       | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                       |
-| `0x18` | `CREATE2`        | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
-| `0x19` | `READ`           | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                   |
+| Opcode | Name                   | Layout                                                              |
+| ------ | ---------------------- | ------------------------------------------------------------------- |
+| `0x00` | `INPUT`                | `[pty_id:2][data:N]`                                                |
+| `0x01` | `RESIZE`               | `[pty_id:2][rows:2][cols:2]...` (batch, repeating)                  |
+| `0x02` | `SCROLL`               | `[pty_id:2][offset:4]`                                              |
+| `0x03` | `ACK`                  | (empty)                                                             |
+| `0x04` | `DISPLAY_RATE`         | `[fps:2]`                                                           |
+| `0x05` | `CLIENT_METRICS`       | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                          |
+| `0x06` | `MOUSE`                | `[pty_id:2][type:1][button:1][col:2][row:2]`                        |
+| `0x07` | `RESTART`              | `[pty_id:2]`                                                        |
+| `0x10` | `CREATE`               | `[rows:2][cols:2][tag_len:2][tag:N]`                                |
+| `0x11` | `FOCUS`                | `[pty_id:2]`                                                        |
+| `0x12` | `CLOSE`                | `[pty_id:2]`                                                        |
+| `0x13` | `SUBSCRIBE`            | `[pty_id:2]`                                                        |
+| `0x14` | `UNSUBSCRIBE`          | `[pty_id:2]`                                                        |
+| `0x15` | `SEARCH`               | `[request_id:2][query:N]`                                           |
+| `0x16` | `CREATE_AT`            | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                  |
+| `0x17` | `CREATE_N`             | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                       |
+| `0x18` | `CREATE2`              | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional]` |
+| `0x19` | `READ`                 | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                   |
+| `0x20` | `SURFACE_INPUT`        | `[pty_id:2][surface_id:2][keycode:4][pressed:1]`                    |
+| `0x21` | `SURFACE_POINTER`      | `[pty_id:2][surface_id:2][type:1][button:1][x:2][y:2]`              |
+| `0x22` | `SURFACE_POINTER_AXIS` | `[pty_id:2][surface_id:2][axis:1][value:4]`                         |
+| `0x23` | `SURFACE_RESIZE`       | `[pty_id:2][surface_id:2][width:2][height:2]`                       |
+| `0x24` | `SURFACE_FOCUS`        | `[pty_id:2][surface_id:2]`                                          |
+| `0x25` | `CLIPBOARD`            | `[pty_id:2][surface_id:2][mime_len:2][mime:N][data:M]`              |
+| `0x28` | `SURFACE_SUBSCRIBE`    | `[pty_id:2][surface_id:2]`                                          |
+| `0x29` | `SURFACE_UNSUBSCRIBE`  | `[pty_id:2][surface_id:2]`                                          |
 
 `CREATE2` extends `CREATE` with a nonce for response correlation and optional fields gated by feature bits (`HAS_SRC_PTY`, `HAS_COMMAND`).
 
@@ -109,29 +124,37 @@ Every message starts with a **1-byte opcode**. Fields are packed in little-endia
 
 **Server-to-client (S2C):**
 
-| Opcode | Name             | Layout                                                 |
-| ------ | ---------------- | ------------------------------------------------------ |
-| `0x00` | `UPDATE`         | `[pty_id:2][lz4-compressed-frame]`                     |
-| `0x01` | `CREATED`        | `[pty_id:2][tag:N]`                                    |
-| `0x02` | `CLOSED`         | `[pty_id:2]`                                           |
-| `0x03` | `LIST`           | `[count:2][entries...]`                                |
-| `0x04` | `TITLE`          | `[pty_id:2][title:N]`                                  |
-| `0x05` | `SEARCH_RESULTS` | `[request_id:2][results...]`                           |
-| `0x06` | `CREATED_N`      | `[nonce:2][pty_id:2][tag:N]`                           |
-| `0x07` | `HELLO`          | `[version:2][features:4]`                              |
-| `0x08` | `EXITED`         | `[pty_id:2][exit_status:4]`                            |
-| `0x09` | `READY`          | (empty)                                                |
-| `0x0A` | `TEXT`           | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]` |
+| Opcode | Name                | Layout                                                                                               |
+| ------ | ------------------- | ---------------------------------------------------------------------------------------------------- |
+| `0x00` | `UPDATE`            | `[pty_id:2][lz4-compressed-frame]`                                                                   |
+| `0x01` | `CREATED`           | `[pty_id:2][tag:N]`                                                                                  |
+| `0x02` | `CLOSED`            | `[pty_id:2]`                                                                                         |
+| `0x03` | `LIST`              | `[count:2][entries...]`                                                                              |
+| `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                |
+| `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results...]`                                                                         |
+| `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                         |
+| `0x07` | `HELLO`             | `[version:2][features:4]`                                                                            |
+| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                          |
+| `0x09` | `READY`             | (empty)                                                                                              |
+| `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                               |
+| `0x20` | `SURFACE_CREATED`   | `[pty_id:2][surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`      |
+| `0x21` | `SURFACE_DESTROYED` | `[pty_id:2][surface_id:2]`                                                                           |
+| `0x22` | `SURFACE_FRAME`     | `[pty_id:2][surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]` (codec in flags: H.264/H.265/AV1) |
+| `0x23` | `SURFACE_TITLE`     | `[pty_id:2][surface_id:2][title:N]`                                                                  |
+| `0x24` | `SURFACE_RESIZED`   | `[pty_id:2][surface_id:2][w:2][h:2]`                                                                 |
+| `0x25` | `CLIPBOARD`         | `[pty_id:2][surface_id:2][mime_len:2][mime:N][data:M]`                                               |
+| `0x28` | `SURFACE_APP_ID`    | `[pty_id:2][surface_id:2][app_id:N]`                                                                 |
 
 ### Feature negotiation
 
 On connect, the server sends `S2C_HELLO` with a protocol version and a 4-byte feature bitmask. Current features:
 
-| Bit | Name           | Meaning                                                        |
-| --- | -------------- | -------------------------------------------------------------- |
-| 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
-| 1   | `RESTART`      | Server supports `C2S_RESTART` to respawn exited PTYs           |
-| 2   | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE` |
+| Bit | Name           | Meaning                                                           |
+| --- | -------------- | ----------------------------------------------------------------- |
+| 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation    |
+| 1   | `RESTART`      | Server supports `C2S_RESTART` to respawn exited PTYs              |
+| 2   | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE`    |
+| 4   | `COMPOSITOR`   | Server supports experimental headless Wayland compositor sessions |
 
 ### Frame update encoding
 
@@ -220,6 +243,27 @@ This is the integration point for embedding `blit-server` inside another process
 
 The gateway opens a new Unix socket connection to `blit-server` for each authenticated browser client and proxies bidirectionally.
 
+#### Multi-destination routing
+
+Both gateways support multiple named destinations (each pointing to a different `blit-server` socket). The browser selects a destination via the WebSocket URL path:
+
+- `/d/{name}` — connect to the named destination
+- `/` (root) — connect to the first destination (sorted by name), for backward compatibility
+
+The CLI creates destinations with `blit open ssh:rabbit ssh:fox` (positional URIs). The standalone gateway uses `BLIT_DESTINATIONS="rabbit=/run/blit/rabbit.sock,fox=/run/blit/fox.sock"`. The `/config` GET endpoint returns a `destinations` array so the browser knows what's available:
+
+```json
+{
+  "gateway": true,
+  "destinations": [
+    { "id": "fox", "type": "gateway", "label": "fox" },
+    { "id": "rabbit", "type": "gateway", "label": "rabbit" }
+  ]
+}
+```
+
+The browser creates one `BlitConnection` (and one WebSocket) per destination. Session IDs are namespaced by connection (`"rabbit:1"`, `"fox:1"`), so they never collide.
+
 ### WebTransport (QUIC/HTTP3)
 
 Enabled with `BLIT_QUIC=1`. The gateway listens for QUIC connections on the same port as HTTP. A single bidirectional QUIC stream carries the session, using the same 4-byte length-prefixed framing as Unix sockets. Auth is a 2-byte-LE-length passphrase followed by a 1-byte response.
@@ -242,12 +286,13 @@ On the browser side, `@blit-sh/core` includes a `WebRtcDataChannelTransport` tha
 
 ### SSH tunneling (CLI)
 
-`blit-cli` can connect to a remote `blit-server` over SSH in two ways:
+`blit-cli` can connect to a remote `blit-server` over SSH.
 
-- **Console mode**: pipes through `ssh -T host 'nc -U $SOCK'` (or `socat`), using the SSH process's stdin/stdout as the byte stream. The remote socket path is resolved on the remote host using the same cascade (`$BLIT_SOCK` → `$TMPDIR/blit.sock` → `/tmp/blit-$USER.sock` → `/run/blit/$USER.sock` → `$XDG_RUNTIME_DIR/blit.sock` → `/tmp/blit.sock`), where `$USER` is the SSH user. When `--socket` is also provided, its value is used as the remote socket path directly, bypassing the cascade.
-- **Browser mode**: uses `ssh -L local.sock:remote.sock` to forward a local Unix socket to the remote server, then starts a local embedded gateway pointing at the forwarded socket. Supports `--socket` to override the remote path.
+`blit open` uses positional destination URIs (`ssh:[user@]host[:/path/to/socket]`). Each SSH destination sets up `ssh -L local.sock:remote.sock` to forward a local Unix socket to the remote server, then the embedded gateway proxies through it. Multiple SSH destinations can be opened in one session (`blit open ssh:rabbit ssh:fox`), each getting its own tunnel and gateway route.
 
-Both modes autostart a remote `blit server` (or `blit-server`) if no socket file exists at the resolved path.
+Agent subcommands use the `--ssh HOST` flag (`blit --ssh host list`, etc.) and pipe through `ssh -T host 'nc -U $SOCK'` (or `socat`), using the SSH process's stdin/stdout as the byte stream. The remote socket path is resolved on the remote host using the same cascade (`$BLIT_SOCK` → `$TMPDIR/blit.sock` → `/tmp/blit-$USER.sock` → `/run/blit/$USER.sock` → `$XDG_RUNTIME_DIR/blit.sock` → `/tmp/blit.sock`), where `$USER` is the SSH user. When `--socket` is also provided, its value is used as the remote socket path directly, bypassing the cascade.
+
+Both paths autostart a remote `blit server` (or `blit-server`) if no socket file exists at the resolved path.
 
 ### Transport abstraction
 
@@ -255,7 +300,7 @@ On the Rust side, `blit-cli` defines a `Transport` enum (in `crates/cli/src/tran
 
 ### Agent subcommands
 
-`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `wait`, `restart`) in `crates/cli/src/agent.rs` for programmatic control of PTYs. It also includes `server` (run blit-server in-process), `share` (run blit-webrtc-forwarder in-process, auto-starting a server if needed), and `install` (install blit on a remote host via `--ssh`). These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. All subcommands accept the same transport options (`--socket`, `--tcp`, `--ssh`) as the interactive modes; `--ssh` and `--socket` can be combined to target a specific remote socket path.
+`blit-cli` includes non-interactive subcommands (`list`, `start`, `show`, `history`, `send`, `close`, `wait`, `restart`) in `crates/cli/src/agent.rs` for programmatic control of PTYs. It also includes `server` (run blit-server in-process), `share` (run blit-webrtc-forwarder in-process, auto-starting a server if needed), and `install [user@]host` (install blit on a remote host via SSH). These connect, perform a single operation over the binary protocol, and exit. They are designed for LLM agents and scripts: output is plain text (TSV for `list`, raw terminal text for `show`/`history`), errors go to stderr, and exit codes indicate success or failure. Agent subcommands accept the transport flags `--socket`, `--tcp`, `--ssh` (mutually exclusive); `--ssh` accepts `[user@]host[:path/to/socket]` to optionally target a specific remote socket. `blit open` uses positional destination URIs instead.
 
 On the TypeScript side, the `BlitTransport` interface abstracts over WebSocket, WebTransport, and WebRTC:
 
@@ -283,12 +328,14 @@ Any implementation of this interface can be passed to `BlitWorkspace` as a conne
 
 `blit-server` is a single async Rust binary (tokio runtime) that manages PTYs and clients. It has no CLI subcommands and no RPC API beyond the binary protocol described above. Configuration is entirely via environment variables:
 
-| Variable          | Default                                             | Purpose                     |
-| ----------------- | --------------------------------------------------- | --------------------------- |
-| `SHELL`           | `/bin/sh`                                           | Shell to spawn for new PTYs |
-| `BLIT_SOCK`       | `$TMPDIR/blit.sock` or `$XDG_RUNTIME_DIR/blit.sock` | Unix socket path            |
-| `BLIT_SCROLLBACK` | `10000`                                             | Scrollback rows per PTY     |
-| `BLIT_FD_CHANNEL` | unset                                               | fd-channel file descriptor  |
+| Variable            | Default                                             | Purpose                     |
+| ------------------- | --------------------------------------------------- | --------------------------- |
+| `SHELL`             | `/bin/sh`                                           | Shell to spawn for new PTYs |
+| `BLIT_SOCK`         | `$TMPDIR/blit.sock` or `$XDG_RUNTIME_DIR/blit.sock` | Unix socket path            |
+| `BLIT_SCROLLBACK`   | `10000`                                             | Scrollback rows per PTY     |
+| `BLIT_VAAPI_DEVICE` | `/dev/dri/renderD128`                               | VA-API render node          |
+| `BLIT_CUDA_DEVICE`  | `0`                                                 | CUDA device ordinal (NVENC) |
+| `BLIT_FD_CHANNEL`   | unset                                               | fd-channel file descriptor  |
 
 ### How clients control the server
 
@@ -305,6 +352,38 @@ The server mediates multi-client state:
 PTYs are created via `C2S_CREATE` or `C2S_CREATE2`. The server forks, sets up a PTY pair via `openpty`, execs the shell (or a custom command), and registers the master fd for async I/O. PTY output is fed through `alacritty_terminal` for VT parsing.
 
 When a PTY's subprocess exits, the server captures the exit status from `waitpid()` and sends `S2C_EXITED` with the exit code. The `exit_status` field is `WEXITSTATUS` for normal exits (0, 1, ...), a negative signal number for signal deaths (-9 for SIGKILL, -15 for SIGTERM), or `EXIT_STATUS_UNKNOWN` (`i32::MIN`) when the status couldn't be collected. The terminal state is retained — clients can still scroll and read. `C2S_RESTART` respawns the shell in the same slot. `C2S_CLOSE` dismisses the PTY entirely.
+
+### Compositor sessions (experimental)
+
+A single experimental headless Wayland compositor is shared across all PTY sessions in a connection. It is lazily spawned on the first PTY creation and shut down when all PTYs have exited. Every child process inherits the same `WAYLAND_DISPLAY`, so any program — shell, TUI, or GUI — can open Wayland surfaces regardless of which PTY launched it. The flow:
+
+1. `ensure_compositor()` lazily starts a smithay compositor on a dedicated OS thread, listening on a random `wayland-blit-*` socket. The compositor is reused for all subsequent PTYs. Each compositor gets a monotonic `session_id` from a server-side counter; this ID is carried in all surface wire messages so the server can validate and (eventually) route to the correct compositor.
+2. The server fork/execs the requested command with `WAYLAND_DISPLAY` pointing at the shared compositor socket.
+3. Each xdg_toplevel surface the client creates is assigned a surface ID. The compositor sends `SurfaceCommit` events containing RGBA pixel buffers.
+4. The server converts RGBA to YUV420/NV12 and encodes via the configured encoder priority list (NVENC, VA-API, rav1e AV1, or openh264 H.264), delivering `S2C_SURFACE_FRAME` to subscribed clients.
+5. Input flows in reverse: `C2S_SURFACE_INPUT` / `C2S_SURFACE_POINTER` / `C2S_SURFACE_POINTER_AXIS` are translated to Wayland keyboard/pointer events via smithay.
+
+Surface frame production is demand-driven with no hardcoded rate limits. The pipeline:
+
+```
+server sends RequestFrame + wake()
+  → compositor fires wl_surface.frame callback (instant wake via LoopSignal)
+  → app paints and commits
+  → compositor sends SurfaceCommit + event_notify()
+  → delivery_notify wakes tick loop
+  → server encodes, delivers to ready clients
+  → loop
+```
+
+Each stage wakes the next via an OS-level signaling primitive (eventfd for the calloop LoopSignal, tokio Notify for the tick loop). `RequestFrame` is only sent for surfaces that have subscribers and no pending request, preventing hot-loops when the app hasn't painted yet. The effective frame rate is bounded by per-client pacing (RTT, bandwidth, display refresh rate) — the same machinery used for terminal frames.
+
+The compositor does not manage window layout, z-order, or decorations. Each surface is streamed independently and clients (browser, React embedders) handle windowing in their own UI. The compositor implements `wp_viewporter` (required by Chrome/Electron) and `xdg_decoration` (forces server-side decorations so clients don't waste space on title bars).
+
+The compositor supports both SHM (shared memory) and dmabuf (GPU) buffers. Dmabuf buffers are accepted via the `linux-dmabuf` protocol and read by mmapping the plane data. Supported pixel formats: ARGB8888, XRGB8888, ABGR8888, XBGR8888, NV12, and P010 with linear or implicit modifier. Explicit tiled or vendor-specific modifiers are not supported yet. Chrome and Electron apps work out of the box with `--ozone-platform=wayland`.
+
+On the browser side, `SurfaceStore` in `@blit-sh/core` decodes surface frames via the WebCodecs `VideoDecoder` API (H.264, H.265, or AV1 — codec detected per-frame from flags, `optimizeForLatency: true`). The `BlitSurfaceView` React/Solid component renders decoded `VideoFrame`s to a canvas and forwards mouse/keyboard events back as surface commands.
+
+`blit capture` returns a screenshot of any surface as PNG or AVIF (via `--format` / `--quality` flags, or inferred from the output file extension). The server encodes from the last committed pixel buffer — no live buffer read required. AVIF encoding uses the same rav1e backend as the AV1 video stream.
 
 ## Per-client frame pacing
 

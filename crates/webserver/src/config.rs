@@ -95,6 +95,13 @@ fn spawn_watcher(tx: broadcast::Sender<String>) {
         loop {
             match nrx.recv() {
                 Ok(Ok(event)) => {
+                    // Skip access events (open/read/close).  On Linux,
+                    // notify v7 watches with IN_OPEN; reading the config
+                    // file inside this callback would generate another
+                    // IN_OPEN event, creating an infinite hot loop.
+                    if matches!(event.kind, notify::EventKind::Access(_)) {
+                        continue;
+                    }
                     let dominated = file_name
                         .as_ref()
                         .is_none_or(|name| event.paths.iter().any(|p| p.file_name() == Some(name)));
@@ -122,7 +129,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 fn parse_config_str(contents: &str) -> HashMap<String, String> {

@@ -6,7 +6,7 @@ blit - terminal streaming client
 
 # SYNOPSIS
 
-_blit_ [OPTIONS] _open_ [_--console_ | _--port_ _PORT_]
+_blit_ [OPTIONS] _open_ [_--port_ _PORT_] [_DESTINATION..._]
 
 _blit_ [OPTIONS] _list_
 
@@ -30,6 +30,16 @@ _blit_ [OPTIONS] _server_ [_--shell-flags_ _FLAGS_] [_--scrollback_ _N_] [_--fd-
 
 _blit_ [OPTIONS] _share_ [_--passphrase_ _PASSPHRASE_] [_--quiet_] [_--verbose_]
 
+_blit_ [OPTIONS] _surfaces_
+
+_blit_ [OPTIONS] _capture_ [_--output_ _PATH_] _ID_
+
+_blit_ [OPTIONS] _click_ _ID_ _X_ _Y_
+
+_blit_ [OPTIONS] _key_ _ID_ _KEY_
+
+_blit_ [OPTIONS] _type_ _ID_ _TEXT_
+
 _blit_ _learn_
 
 _blit_ _install_ _--ssh_ _HOST_
@@ -40,9 +50,8 @@ _blit_ _upgrade_
 
 _blit_ is a terminal streaming tool for browsers and AI agents.
 
-_blit open_ connects to a _blit-server_(1) instance and opens the terminal
-UI in a browser. With _--console_, it renders directly to the terminal
-instead.
+_blit open_ connects to one or more _blit-server_(1) instances and opens the
+terminal UI in a browser.
 
 Most subcommands (_list_, _start_, _show_, _send_, etc.) are designed for
 programmatic use by scripts and LLM agents. Run _blit learn_ to print the
@@ -84,10 +93,32 @@ Output is plain text with no decoration. Errors go to stderr; non-zero exit
 on failure. The connection options (_--socket_, _--tcp_, _--ssh_) are accepted
 by all subcommands.
 
-_open_ [_--console_ | _--port_ _PORT_]
-Open the terminal UI. By default, opens a browser. With _--console_,
-renders directly to the terminal. _--port_ binds the embedded gateway to
-a specific port. _--console_ and _--port_ are mutually exclusive.
+_open_ [_--port_ _PORT_] [_DESTINATION..._]
+Open the terminal UI in a browser. _--port_ binds the embedded gateway
+to a specific port; default is a random available port.
+
+	With no arguments, connects to the local _blit-server_. Pass one or more
+	destination URIs to open multiple connections in a single browser session:
+
+	```
+	blit open ssh:rabbit ssh:fox
+	blit open ssh:alice@rabbit local
+	blit open prod=ssh:prod.example.com
+	```
+
+	Destination URI formats:
+
+	- _ssh:[user@]host[:/path/to/socket]_ — SSH tunnel to a remote host
+	- _tcp:host:port_ — raw TCP
+	- _socket:/path_ — explicit Unix socket
+	- _local_ — local server (auto-started if needed)
+
+	An explicit name can be given with _name=uri_. When omitted, the name
+	is derived from the URI (e.g. _ssh:rabbit_ → _rabbit_).
+
+	The global flags _--ssh_, _--tcp_, _--socket_ are not accepted by
+	_open_; use destination URIs instead. Those flags are for agent
+	subcommands (_list_, _start_, _show_, etc.).
 
 _list_
 List all terminal sessions. Output is TSV with columns: ID, TAG, TITLE,
@@ -152,6 +183,30 @@ _BLIT_PASSPHRASE_ environment variable. If omitted, a random passphrase
 is generated. With _--verbose_, detailed connection diagnostics (ICE
 negotiation, STUN/TURN results, peer events) are printed to stderr.
 
+_surfaces_
+List all compositor surfaces. Output is TSV with columns: ID, PARENT, W,
+H, TITLE, APP_ID. Surfaces are GUI windows managed by the experimental headless
+Wayland compositor.
+
+_capture_ [_--output_ _PATH_] _ID_
+Capture a screenshot of surface _ID_ as a PNG image. Writes to
+_surface-ID.png_ by default, or to _PATH_ if _--output_ is given. Prints
+the output path to stdout.
+
+_click_ [_--button_ _BUTTON_] _ID_ _X_ _Y_
+Send a click at pixel coordinates (_X_, _Y_) on surface _ID_. _BUTTON_
+is _left_ (default), _right_, or _middle_.
+
+_key_ _ID_ _KEY_
+Send a key press and release to surface _ID_. _KEY_ is a key name
+(e.g. _Return_, _Escape_, _a_, _F1_) optionally prefixed with modifiers
+separated by _+_ (e.g. _ctrl+a_, _shift+Tab_, _ctrl+shift+c_).
+
+_type_ _ID_ _TEXT_
+Type _TEXT_ into surface _ID_ character by character. Special keys use
+xdotool-style braces: _{Return}_, _{ctrl+a}_, _{Escape}_. Literal
+braces are not supported.
+
 _install_
 Install _blit_ on a remote host via SSH. Requires _--ssh_; other
 transports are rejected. Detects the remote OS via _uname_: on Linux and
@@ -180,10 +235,6 @@ Overridden by _--hub_.
 
 _BLIT_PASSPHRASE_
 Passphrase for _share_. Overridden by _--passphrase_.
-
-_BLIT_DISPLAY_FPS_
-Advertised client display rate in console mode (default: 240, clamped
-10–1000).
 
 # SEE ALSO
 

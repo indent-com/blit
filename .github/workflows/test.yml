@@ -65,7 +65,7 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: js/pnpm-lock.yaml
-      - name: Build web-app
+      - name: Build UI
         shell: bash
         run: |
           cargo install wasm-pack
@@ -75,8 +75,8 @@ jobs:
           cd js
           pnpm install --frozen-lockfile
           pnpm --filter @blit-sh/core run build
-          pnpm --filter @blit-sh/react run build
-          pnpm --filter blit-web-app run build
+          pnpm --filter @blit-sh/solid run build
+          pnpm --filter @blit-sh/ui run build
       - run: cargo build --release -p blit-cli -p blit-server -p blit-gateway -p blit-webrtc-forwarder
 
   build-debs:

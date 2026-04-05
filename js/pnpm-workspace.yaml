@@ -2,5 +2,5 @@ packages:
   - core
   - react
   - solid
-  - web-app
+  - ui
   - website

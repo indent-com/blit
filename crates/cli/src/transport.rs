@@ -127,9 +127,31 @@ pub fn shell_escape(s: &str) -> String {
     out
 }
 
-pub const SSH_AUTOSTART: &str = "if [ -S \"$S\" ]; then if command -v socat >/dev/null 2>&1; then socat /dev/null \"UNIX-CONNECT:$S\" 2>/dev/null || rm -f \"$S\"; elif command -v nc >/dev/null 2>&1 && nc -h 2>&1 | grep -q '\\-U'; then nc -z -U \"$S\" 2>/dev/null || rm -f \"$S\"; fi; fi; if ! [ -S \"$S\" ]; then if command -v blit >/dev/null 2>&1; then blit server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; elif command -v blit-server >/dev/null 2>&1; then blit-server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; fi; fi";
+pub const SSH_AUTOSTART: &str = "if [ -S \"$S\" ]; then if command -v nc >/dev/null 2>&1; then nc -z -U \"$S\" 2>/dev/null || rm -f \"$S\"; elif command -v socat >/dev/null 2>&1; then socat /dev/null \"UNIX-CONNECT:$S\" 2>/dev/null || rm -f \"$S\"; fi; fi; if ! [ -S \"$S\" ]; then if command -v blit >/dev/null 2>&1; then blit server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; elif command -v blit-server >/dev/null 2>&1; then blit-server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; fi; fi";
 
 pub const SSH_SOCK_SEARCH: &str = r#"if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else S=/tmp/blit.sock; fi"#;
+
+/// Parse a `--ssh` flag value: `[user@]host[:path/to/socket]`.
+///
+/// Returns `(ssh_target, remote_socket)` where `ssh_target` is the part
+/// passed to the `ssh` command (user@host or just host) and
+/// `remote_socket` is the optional socket path after `:` (same delimiter
+/// convention as scp).
+pub fn parse_ssh_arg(s: &str) -> (&str, Option<&str>) {
+    // Split on the first ':' that comes after any user@ prefix.
+    let colon_search_start = s.find('@').map(|a| a + 1).unwrap_or(0);
+    if let Some(rel) = s[colon_search_start..].find(':') {
+        let pos = colon_search_start + rel;
+        let path = &s[pos + 1..];
+        if path.is_empty() {
+            (s, None)
+        } else {
+            (&s[..pos], Some(path))
+        }
+    } else {
+        (s, None)
+    }
+}
 
 pub fn ssh_bridge_script(remote_socket: Option<&str>) -> String {
     let resolve = match remote_socket {
@@ -142,6 +164,11 @@ pub fn ssh_bridge_script(remote_socket: Option<&str>) -> String {
 }
 
 pub async fn connect_ssh(host: &str, remote_socket: Option<&str>) -> Result<Transport, String> {
+    if host.starts_with('-') {
+        return Err(format!(
+            "invalid ssh host '{host}': must not start with '-'"
+        ));
+    }
     let bridge = ssh_bridge_script(remote_socket);
     let child = tokio::process::Command::new("ssh")
         .arg("-T")
@@ -156,7 +183,7 @@ pub async fn connect_ssh(host: &str, remote_socket: Option<&str>) -> Result<Tran
         .arg(bridge)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .map_err(|e| format!("ssh: {e}"))?;
     Ok(Transport::Ssh(child))
@@ -197,8 +224,9 @@ pub async fn connect(
         return Ok(Transport::Share(stream));
     }
 
-    if let Some(host) = ssh {
-        return connect_ssh(host, socket.as_deref()).await;
+    if let Some(ssh_arg) = ssh {
+        let (host, remote_socket) = parse_ssh_arg(ssh_arg);
+        return connect_ssh(host, remote_socket).await;
     }
 
     if let Some(path) = socket {
@@ -236,9 +264,18 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000),
         ipc_path: socket_path.to_string(),
+        surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
+        surface_quality: std::env::var("BLIT_SURFACE_QUALITY")
+            .ok()
+            .and_then(|v| blit_server::SurfaceQuality::parse(&v))
+            .unwrap_or_default(),
+        vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         #[cfg(unix)]
         fd_channel: None,
         verbose: false,
+        max_connections: 0,
+        max_ptys: 0,
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {
@@ -263,7 +300,16 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000),
         ipc_path: pipe_path.to_string(),
+        surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
+        surface_quality: std::env::var("BLIT_SURFACE_QUALITY")
+            .ok()
+            .and_then(|v| blit_server::SurfaceQuality::parse(&v))
+            .unwrap_or_default(),
+        vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         verbose: false,
+        max_connections: 0,
+        max_ptys: 0,
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {
@@ -278,7 +324,6 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     // ── make_frame ──
 
@@ -423,5 +468,51 @@ mod tests {
     fn ssh_bridge_script_socket_with_quotes() {
         let script = ssh_bridge_script(Some("/tmp/it's.sock"));
         assert!(script.contains("'\"'\"'"));
+    }
+
+    // ── parse_ssh_arg ──
+
+    #[test]
+    fn parse_ssh_arg_host_only() {
+        assert_eq!(parse_ssh_arg("myhost"), ("myhost", None));
+    }
+
+    #[test]
+    fn parse_ssh_arg_user_host() {
+        assert_eq!(parse_ssh_arg("alice@rabbit"), ("alice@rabbit", None));
+    }
+
+    #[test]
+    fn parse_ssh_arg_absolute_socket() {
+        assert_eq!(
+            parse_ssh_arg("rabbit:/tmp/blit.sock"),
+            ("rabbit", Some("/tmp/blit.sock")),
+        );
+    }
+
+    #[test]
+    fn parse_ssh_arg_relative_socket() {
+        assert_eq!(parse_ssh_arg("rabbit:hello"), ("rabbit", Some("hello")),);
+    }
+
+    #[test]
+    fn parse_ssh_arg_user_host_absolute_socket() {
+        assert_eq!(
+            parse_ssh_arg("pcarrier@horse:/run/blit/pcarrier.sock"),
+            ("pcarrier@horse", Some("/run/blit/pcarrier.sock")),
+        );
+    }
+
+    #[test]
+    fn parse_ssh_arg_user_host_relative_socket() {
+        assert_eq!(
+            parse_ssh_arg("pcarrier@horse:hello"),
+            ("pcarrier@horse", Some("hello")),
+        );
+    }
+
+    #[test]
+    fn parse_ssh_arg_trailing_colon_ignored() {
+        assert_eq!(parse_ssh_arg("rabbit:"), ("rabbit:", None));
     }
 }

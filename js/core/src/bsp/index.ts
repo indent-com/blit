@@ -15,5 +15,8 @@ export {
   reconcileAssignments,
   adjustWeights,
   layoutFromDSL,
+  surfaceAssignment,
+  isSurfaceAssignment,
+  parseSurfaceAssignment,
 } from "./layout";
 export type { BSPLayout, BSPPane, BSPAssignments } from "./layout";

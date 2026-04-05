@@ -1,5 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# ---------------------------------------------------------------------------
+# Multi-instance support
+#
+# Set DEV_INSTANCE to run multiple dev stacks side-by-side.  Each instance
+# gets a block of ports starting at 10000 + (N * 10):
+#
+#   Instance 0 (default):  10000  10001  10002
+#   Instance 1:            10010  10011  10012
+#   Instance 2:            10020  10021  10022
+#   ...
+#
+# The blit-server Unix socket is /tmp/blit-dev.sock for instance 0,
+# /tmp/blit-dev-N.sock for instance N.
+#
+# DEV_INSTANCE is intentionally unprefixed: blit strips most BLIT_*
+# variables from child PTY sessions, but passes everything else through.
+# This means DEV_INSTANCE propagates into nested shells, so you always
+# know which instance you're inside and can pick a different one:
+#
+#   DEV_INSTANCE=1 ./bin/dev        # launch a second stack from within instance 0
+#
+# Examples:
+#   ./bin/dev                       # instance 0: ports 10000-10002
+#   DEV_INSTANCE=1 ./bin/dev        # instance 1: ports 10010-10012
+# ---------------------------------------------------------------------------
+
+N="${DEV_INSTANCE:-0}"
+
+if [ "$N" -eq 0 ]; then
+    export BLIT_DEV_SOCK="${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}"
+    PC_SOCK="/tmp/blit-dev-pc.sock"
+else
+    export BLIT_DEV_SOCK="${BLIT_DEV_SOCK:-/tmp/blit-dev-${N}.sock}"
+    PC_SOCK="/tmp/blit-dev-pc-${N}.sock"
+fi
+
+BASE=$(( 10000 + N * 10 ))
+export BLIT_DEV_UI_PORT="${BLIT_DEV_UI_PORT:-$(( BASE ))}"
+export BLIT_DEV_GW_PORT="${BLIT_DEV_GW_PORT:-$(( BASE + 1 ))}"
+export BLIT_DEV_SITE_PORT="${BLIT_DEV_SITE_PORT:-$(( BASE + 2 ))}"
+
+echo "blit dev stack (instance $N):"
+echo "  server socket : $BLIT_DEV_SOCK"
+echo "  ui            : http://127.0.0.1:$BLIT_DEV_UI_PORT"
+echo "  gateway       : http://127.0.0.1:$BLIT_DEV_GW_PORT"
+echo "  website       : http://127.0.0.1:$BLIT_DEV_SITE_PORT"
+echo "  pc socket     : $PC_SOCK"
+echo ""
+
 ./bin/build-browser
-exec process-compose -U up "$@"
+exec process-compose -U -u "$PC_SOCK" up "$@"

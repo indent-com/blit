@@ -4,6 +4,82 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 
+/// Build the environment array for a child process before fork().
+/// This avoids calling std::env::set_var/remove_var after fork() in a
+/// multi-threaded process (which is UB per POSIX — those functions are
+/// not async-signal-safe).
+fn build_child_env(wayland_display: Option<&str>) -> Vec<CString> {
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            k != "COLUMNS"
+                && k != "LINES"
+                && k != "DISPLAY"
+                && !(k.starts_with("BLIT_") && k != "BLIT_HUB")
+        })
+        .collect();
+    // Set/override entries.
+    let set = |env: &mut Vec<(String, String)>, key: &str, val: &str| {
+        if let Some(entry) = env.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = val.to_string();
+        } else {
+            env.push((key.to_string(), val.to_string()));
+        }
+    };
+    set(&mut env, "TERM", "xterm-256color");
+    set(&mut env, "COLORTERM", "truecolor");
+    if let Some(wd) = wayland_display {
+        let wd_path = std::path::Path::new(wd);
+        if let Some(dir) = wd_path.parent() {
+            let xdg = std::env::var_os("XDG_RUNTIME_DIR");
+            let needs_update = match &xdg {
+                Some(x) => std::path::Path::new(x) != dir,
+                None => true,
+            };
+            if needs_update {
+                set(&mut env, "XDG_RUNTIME_DIR", &dir.to_string_lossy());
+            }
+        }
+        set(&mut env, "WAYLAND_DISPLAY", wd);
+        // DISPLAY was already filtered out above.
+    }
+    env.into_iter()
+        .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
+        .collect()
+}
+
+/// Resolve a program name to an absolute path by searching $PATH.
+/// Called before fork() so the child can use execve (which doesn't search PATH).
+fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
+    if program.contains('/') {
+        return Some(std::path::PathBuf::from(program));
+    }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var.split(':') {
+        let candidate = std::path::Path::new(dir).join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Close all file descriptors >= `from` except those in the `keep` set.
+/// Called in the child after fork() to prevent leaking parent fds (IPC
+/// listener, other PTY masters, epoll fd, compositor fds, etc.).
+///
+/// Only uses async-signal-safe libc calls — no heap allocation, no Rust
+/// stdlib — because the child inherits locked allocator mutexes from
+/// other threads that no longer exist after fork().
+unsafe fn close_fds_except(from: libc::c_int, keep: &[libc::c_int]) {
+    let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } as libc::c_int;
+    let max_fd = if max_fd <= 0 { 4096 } else { max_fd };
+    for fd in from..max_fd {
+        if !keep.contains(&fd) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 pub type PtyWriteTarget = libc::c_int;
 
 pub struct PtyHandle {
@@ -212,6 +288,7 @@ pub fn spawn_pty(
     dir: Option<&str>,
     scrollback: usize,
     state: AppState,
+    wayland_display: Option<&str>,
 ) -> Option<crate::Pty> {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
@@ -236,6 +313,17 @@ pub fn spawn_pty(
         libc::ioctl(master, libc::TIOCSWINSZ, &ws);
     }
 
+    // Build the child's environment before fork() to avoid calling
+    // set_var/remove_var after fork in a multi-threaded process (UB per POSIX).
+    let child_env = build_child_env(wayland_display);
+    let child_envp: Vec<*const libc::c_char> = child_env
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    // Resolve the shell path before fork (execve doesn't search PATH).
+    let shell_path = resolve_in_path(shell);
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         eprintln!("fork failed for pty {id}");
@@ -257,6 +345,14 @@ pub fn spawn_pty(
             if slave > 2 {
                 libc::close(slave);
             }
+            // Close all inherited parent fds (IPC listener, other PTY masters,
+            // epoll fd, compositor fds, etc.) to prevent the child from
+            // accessing other sessions or accepting new connections.
+            close_fds_except(3, &[]);
+            // Reset SIGPIPE to default — the Rust runtime sets it to SIG_IGN,
+            // and child programs that rely on SIGPIPE (e.g. piped commands)
+            // would get EPIPE errors instead of being killed.
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
         set_qos_user_interactive();
         let effective_dir = dir.map(String::from);
@@ -267,19 +363,11 @@ pub fn spawn_pty(
                 libc::chdir(dir_c.as_ptr());
             }
         }
-        unsafe {
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("COLORTERM", "truecolor");
-            std::env::remove_var("COLUMNS");
-            std::env::remove_var("LINES");
-            for (key, _) in std::env::vars() {
-                if key.starts_with("BLIT_") && key != "BLIT_HUB" && key != "BLIT_DISPLAY_FPS" {
-                    std::env::remove_var(&key);
-                }
-            }
-        }
         if let Some(command) = command {
-            let shell_c = CString::new(shell).unwrap();
+            let shell_c = match &shell_path {
+                Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
+                None => CString::new(shell).unwrap(),
+            };
             let command_c = CString::new(command).unwrap();
             let flag = CString::new(if shell_flags.is_empty() {
                 "-c".to_owned()
@@ -291,7 +379,7 @@ pub fn spawn_pty(
                 let p = shell_c.as_ptr();
                 let f = flag.as_ptr();
                 let c = command_c.as_ptr();
-                libc::execvp(p, [p, f, c, std::ptr::null()].as_ptr());
+                libc::execve(p, [p, f, c, std::ptr::null()].as_ptr(), child_envp.as_ptr());
                 libc::_exit(1);
             }
         }
@@ -299,26 +387,32 @@ pub fn spawn_pty(
             && !args.is_empty()
         {
             let cargs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
-            let ptrs: Vec<*const libc::c_char> = cargs
-                .iter()
-                .map(|c| c.as_ptr())
+            // Resolve the first arg (program) via PATH.
+            let prog = resolve_in_path(args[0])
+                .map(|p| CString::new(p.to_string_lossy().as_ref()).unwrap())
+                .unwrap_or_else(|| cargs[0].clone());
+            let ptrs: Vec<*const libc::c_char> = std::iter::once(prog.as_ptr())
+                .chain(cargs[1..].iter().map(|c| c.as_ptr()))
                 .chain(std::iter::once(std::ptr::null()))
                 .collect();
             unsafe {
-                libc::execvp(ptrs[0], ptrs.as_ptr());
+                libc::execve(prog.as_ptr(), ptrs.as_ptr(), child_envp.as_ptr());
                 libc::_exit(1);
             }
         }
-        let shell_c = CString::new(shell).unwrap();
+        let shell_c = match &shell_path {
+            Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
+            None => CString::new(shell).unwrap(),
+        };
         unsafe {
             if shell_flags.is_empty() {
                 let p = shell_c.as_ptr();
-                libc::execvp(p, [p, std::ptr::null()].as_ptr());
+                libc::execve(p, [p, std::ptr::null()].as_ptr(), child_envp.as_ptr());
             } else {
                 let flag = CString::new(format!("-{}", shell_flags)).unwrap();
                 let p = shell_c.as_ptr();
                 let f = flag.as_ptr();
-                libc::execvp(p, [p, f, std::ptr::null()].as_ptr());
+                libc::execve(p, [p, f, std::ptr::null()].as_ptr(), child_envp.as_ptr());
             }
             libc::_exit(1);
         }
@@ -330,10 +424,10 @@ pub fn spawn_pty(
         libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    state.2.write().unwrap().insert(id, master);
+    state.pty_fds.write().unwrap().insert(id, master);
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_handle = std::thread::spawn({
-        let notify = state.3.clone();
+        let notify = state.delivery_notify.clone();
         move || pty_reader(master, byte_tx, notify)
     });
     let handle = PtyHandle {
@@ -360,6 +454,7 @@ pub fn spawn_pty(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn respawn_child(
     shell: &str,
     shell_flags: &str,
@@ -368,6 +463,7 @@ pub fn respawn_child(
     pty_id: u16,
     command: Option<&str>,
     state: AppState,
+    wayland_display: Option<&str>,
 ) -> Option<(
     PtyHandle,
     std::thread::JoinHandle<()>,
@@ -395,6 +491,15 @@ pub fn respawn_child(
         libc::ioctl(master, libc::TIOCSWINSZ, &ws);
     }
 
+    // Build the child's environment before fork() (same rationale as spawn_pty).
+    let child_env = build_child_env(wayland_display);
+    let child_envp: Vec<*const libc::c_char> = child_env
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let shell_path = resolve_in_path(shell);
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         unsafe {
@@ -414,21 +519,15 @@ pub fn respawn_child(
             if slave > 2 {
                 libc::close(slave);
             }
+            close_fds_except(3, &[]);
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
         set_qos_user_interactive();
-        unsafe {
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("COLORTERM", "truecolor");
-            std::env::remove_var("COLUMNS");
-            std::env::remove_var("LINES");
-            for (key, _) in std::env::vars() {
-                if key.starts_with("BLIT_") && key != "BLIT_HUB" && key != "BLIT_DISPLAY_FPS" {
-                    std::env::remove_var(&key);
-                }
-            }
-        }
         if let Some(cmd) = command {
-            let shell_c = CString::new(shell).unwrap();
+            let shell_c = match &shell_path {
+                Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
+                None => CString::new(shell).unwrap(),
+            };
             let flag = CString::new(if shell_flags.is_empty() {
                 "-c".to_owned()
             } else {
@@ -437,7 +536,7 @@ pub fn respawn_child(
             .unwrap();
             let cmd_c = CString::new(cmd).unwrap();
             unsafe {
-                libc::execvp(
+                libc::execve(
                     shell_c.as_ptr(),
                     [
                         shell_c.as_ptr(),
@@ -446,20 +545,24 @@ pub fn respawn_child(
                         std::ptr::null(),
                     ]
                     .as_ptr(),
+                    child_envp.as_ptr(),
                 );
                 libc::_exit(1);
             }
         }
-        let shell_c = CString::new(shell).unwrap();
+        let shell_c = match &shell_path {
+            Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
+            None => CString::new(shell).unwrap(),
+        };
         unsafe {
             if shell_flags.is_empty() {
                 let p = shell_c.as_ptr();
-                libc::execvp(p, [p, std::ptr::null()].as_ptr());
+                libc::execve(p, [p, std::ptr::null()].as_ptr(), child_envp.as_ptr());
             } else {
                 let flag = CString::new(format!("-{}", shell_flags)).unwrap();
                 let p = shell_c.as_ptr();
                 let f = flag.as_ptr();
-                libc::execvp(p, [p, f, std::ptr::null()].as_ptr());
+                libc::execve(p, [p, f, std::ptr::null()].as_ptr(), child_envp.as_ptr());
             }
             libc::_exit(1);
         }
@@ -471,10 +574,10 @@ pub fn respawn_child(
         libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    state.2.write().unwrap().insert(pty_id, master);
+    state.pty_fds.write().unwrap().insert(pty_id, master);
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_handle = std::thread::spawn({
-        let notify = state.3.clone();
+        let notify = state.delivery_notify.clone();
         move || pty_reader(master, byte_tx, notify)
     });
     let handle = PtyHandle {

@@ -45,7 +45,12 @@ pub fn normalize_hub(raw: &str) -> String {
     if trimmed.starts_with("http://") {
         return trimmed.replacen("http://", "ws://", 1);
     }
-    if trimmed.contains("localhost") || trimmed.contains("127.0.0.1") || trimmed.contains("[::1]") {
+    // Check if the host portion (before any path/port) is a localhost address.
+    // Use exact hostname matching to avoid false positives on hostnames like
+    // "notlocalhost.evil.com" or "127.0.0.1.evil.com".
+    let host = trimmed.split('/').next().unwrap_or(trimmed);
+    let host = host.split(':').next().unwrap_or(host);
+    if host == "localhost" || host == "127.0.0.1" || host == "[::1]" {
         return format!("ws://{trimmed}");
     }
     format!("wss://{trimmed}")
@@ -60,14 +65,199 @@ pub struct Config {
     pub verbose: bool,
 }
 
-const PBKDF2_SALT: &[u8] = b"https://blit.sh";
-const PBKDF2_ROUNDS: u32 = 100_000;
+// ── Key derivation ──────────────────────────────────────────────────────
+//
+// Two-level derivation from a passphrase.  See DESIGN.md.
+//
+// Level 1 (from passphrase):
+//   passphrase → Ed25519 signing key  (channel ID)
+//   passphrase → RW consumer X25519 sk
+//
+// Level 2 (from Ed25519 signing key — the "RO root"):
+//   ed25519_sk → Producer X25519 sk
+//   ed25519_sk → RO consumer X25519 sk
+//
+// The RO URL contains the Ed25519 signing key (base64url).  From it the RO
+// consumer can derive the producer pk and its own X25519 key, but CANNOT
+// reverse PBKDF2 to recover the passphrase or the RW consumer key.
+// This is a real cryptographic boundary.
 
-pub fn derive_signing_key(passphrase: &str) -> SigningKey {
-    let mut seed = [0u8; 32];
-    pbkdf2::<Hmac<Sha256>>(passphrase.as_bytes(), PBKDF2_SALT, PBKDF2_ROUNDS, &mut seed)
+const PBKDF2_ROUNDS: u32 = 100_000;
+const SALT_SIGNING: &[u8] = b"https://blit.sh";
+const SALT_CONSUMER_RW: &[u8] = b"blit-consumer-rw-x25519";
+const SALT_PRODUCER: &[u8] = b"blit-producer-x25519";
+const SALT_CONSUMER_RO: &[u8] = b"blit-consumer-ro-x25519";
+
+fn pbkdf2_derive_str(input: &str, salt: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    pbkdf2::<Hmac<Sha256>>(input.as_bytes(), salt, PBKDF2_ROUNDS, &mut out)
         .expect("HMAC can be initialized with any key length");
-    SigningKey::from_bytes(&seed)
+    out
+}
+
+fn pbkdf2_derive_bytes(input: &[u8], salt: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    pbkdf2::<Hmac<Sha256>>(input, salt, PBKDF2_ROUNDS, &mut out)
+        .expect("HMAC can be initialized with any key length");
+    out
+}
+
+/// Derive the Ed25519 signing key from a passphrase (level 1).
+pub fn derive_signing_key(passphrase: &str) -> SigningKey {
+    SigningKey::from_bytes(&pbkdf2_derive_str(passphrase, SALT_SIGNING))
+}
+
+/// Derive producer X25519 sk from the Ed25519 signing key (level 2).
+fn derive_producer_x25519(ed25519_sk: &SigningKey) -> crypto_box::SecretKey {
+    crypto_box::SecretKey::from(pbkdf2_derive_bytes(ed25519_sk.as_bytes(), SALT_PRODUCER))
+}
+
+/// Derive RW consumer X25519 sk from the passphrase (level 1).
+fn derive_consumer_rw_x25519(passphrase: &str) -> crypto_box::SecretKey {
+    crypto_box::SecretKey::from(pbkdf2_derive_str(passphrase, SALT_CONSUMER_RW))
+}
+
+/// Derive RO consumer X25519 sk from the Ed25519 signing key (level 2).
+fn derive_consumer_ro_x25519(ed25519_sk: &SigningKey) -> crypto_box::SecretKey {
+    crypto_box::SecretKey::from(pbkdf2_derive_bytes(ed25519_sk.as_bytes(), SALT_CONSUMER_RO))
+}
+
+/// Whether a consumer has full access or read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// All keys a producer needs.
+#[derive(Clone)]
+pub struct ProducerKeys {
+    pub signing: SigningKey,
+    pub our_secret: crypto_box::SecretKey,
+    pub consumer_rw_pk: crypto_box::PublicKey,
+    pub consumer_ro_pk: crypto_box::PublicKey,
+}
+
+impl ProducerKeys {
+    pub fn derive(passphrase: &str) -> Self {
+        let signing = derive_signing_key(passphrase);
+        let our_secret = derive_producer_x25519(&signing);
+        let consumer_rw_pk = derive_consumer_rw_x25519(passphrase).public_key();
+        let consumer_ro_pk = derive_consumer_ro_x25519(&signing).public_key();
+        Self {
+            signing,
+            our_secret,
+            consumer_rw_pk,
+            consumer_ro_pk,
+        }
+    }
+
+    /// The read-only token: the Ed25519 signing key encoded as base64url.
+    pub fn ro_token(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.signing.as_bytes())
+    }
+
+    /// Try to open a crypto_box sealed message from either consumer key.
+    /// Returns the decrypted JSON and the consumer's access level.
+    pub fn open_sealed(&self, data: &serde_json::Value) -> Option<(serde_json::Value, Access)> {
+        let box_rw = BoxKeys {
+            our_secret: self.our_secret.clone(),
+            their_public: self.consumer_rw_pk.clone(),
+        };
+        if let Some(v) = signaling::open_sealed_data(data, &box_rw) {
+            return Some((v, Access::ReadWrite));
+        }
+        let box_ro = BoxKeys {
+            our_secret: self.our_secret.clone(),
+            their_public: self.consumer_ro_pk.clone(),
+        };
+        if let Some(v) = signaling::open_sealed_data(data, &box_ro) {
+            return Some((v, Access::ReadOnly));
+        }
+        None
+    }
+
+    pub fn box_keys_for(&self, access: Access) -> BoxKeys {
+        let pk = match access {
+            Access::ReadWrite => self.consumer_rw_pk.clone(),
+            Access::ReadOnly => self.consumer_ro_pk.clone(),
+        };
+        BoxKeys {
+            our_secret: self.our_secret.clone(),
+            their_public: pk,
+        }
+    }
+}
+
+/// All keys a consumer needs.
+#[derive(Clone)]
+pub struct ConsumerKeys {
+    pub signing: SigningKey,
+    pub our_secret: crypto_box::SecretKey,
+    pub producer_pk: crypto_box::PublicKey,
+    pub access: Access,
+}
+
+impl ConsumerKeys {
+    /// Derive RW consumer keys from the passphrase.
+    pub fn derive_rw(passphrase: &str) -> Self {
+        let signing = derive_signing_key(passphrase);
+        let our_secret = derive_consumer_rw_x25519(passphrase);
+        let producer_pk = derive_producer_x25519(&signing).public_key();
+        Self {
+            signing,
+            our_secret,
+            producer_pk,
+            access: Access::ReadWrite,
+        }
+    }
+
+    /// Derive RO consumer keys from the Ed25519 signing key bytes.
+    /// This is what the RO token decodes to.
+    pub fn derive_ro(ed25519_sk_bytes: &[u8; 32]) -> Self {
+        let signing = SigningKey::from_bytes(ed25519_sk_bytes);
+        let our_secret = derive_consumer_ro_x25519(&signing);
+        let producer_pk = derive_producer_x25519(&signing).public_key();
+        Self {
+            signing,
+            our_secret,
+            producer_pk,
+            access: Access::ReadOnly,
+        }
+    }
+
+    pub fn box_keys(&self) -> BoxKeys {
+        BoxKeys {
+            our_secret: self.our_secret.clone(),
+            their_public: self.producer_pk.clone(),
+        }
+    }
+}
+
+/// Holds the X25519 keys needed for a single crypto_box direction.
+#[derive(Clone)]
+pub struct BoxKeys {
+    pub our_secret: crypto_box::SecretKey,
+    pub their_public: crypto_box::PublicKey,
+}
+
+/// Parse a secret string.  If it ends with `.ro`, the prefix is a base64url-
+/// encoded Ed25519 signing key (the read-only token).  Otherwise it's a
+/// passphrase granting full access.
+pub fn parse_consumer_secret(secret: &str) -> Result<ConsumerKeys, String> {
+    if let Some(token) = secret.strip_suffix(".ro") {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .map_err(|e| format!("invalid RO token: {e}"))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "RO token must decode to 32 bytes".to_string())?;
+        Ok(ConsumerKeys::derive_ro(&arr))
+    } else {
+        Ok(ConsumerKeys::derive_rw(secret))
+    }
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -106,8 +296,10 @@ async fn fetch_message(signal_url_base: &str) -> Option<Message> {
 
 pub async fn run(config: Config) {
     VERBOSE.store(config.verbose, Ordering::Relaxed);
-    let signing_key = derive_signing_key(&config.passphrase);
-    let public_key_hex = hex_encode(signing_key.verifying_key().as_bytes());
+    let keys = ProducerKeys::derive(&config.passphrase);
+    let public_key_hex = hex_encode(keys.signing.verifying_key().as_bytes());
+
+    let ro_secret = format!("{}.ro", keys.ro_token());
 
     let (template, fatal) = match &config.message_override {
         Some(t) => (t.clone(), false),
@@ -122,8 +314,10 @@ pub async fn run(config: Config) {
         std::process::exit(1);
     }
     if !config.quiet {
-        let rendered = template.replace("{secret}", &config.passphrase);
-        println!("{rendered}");
+        let rw_url = template.replace("{secret}", &config.passphrase);
+        let ro_url = template.replace("{secret}", &ro_secret);
+        println!("{rw_url}");
+        println!("{ro_url} (read-only)");
     }
 
     let ice_config = match ice::fetch_ice_config(&config.signal_url).await {
@@ -145,9 +339,12 @@ pub async fn run(config: Config) {
         public_key_hex,
     );
 
+    // Don't decrypt in the signaling transport layer — the peer handler does
+    // it via ProducerKeys::open_sealed so it can identify RW vs RO consumers.
     tokio::spawn(signaling::connect(
         signal_url,
-        signing_key.clone(),
+        keys.signing.clone(),
+        None,
         sig_event_tx,
         sig_send_rx,
     ));
@@ -188,12 +385,12 @@ pub async fn run(config: Config) {
                 let peer_id = session_id.clone();
                 let sock = config.sock_path.clone();
                 let out_tx = sig_send_tx.clone();
-                let key = signing_key.clone();
+                let pk = keys.clone();
                 let est = established.clone();
                 let ice = ice_config.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, key, est, ice)
+                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, pk, est, ice)
                             .await
                     {
                         verbose!("peer {peer_id} error: {e}");

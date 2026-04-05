@@ -63,6 +63,11 @@ test.describe("Auth flow", () => {
       .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
+    // The encrypted passphrase is written to the hash asynchronously
+    // after the WebSocket handshake completes — wait for it.
+    await page.waitForFunction(() => location.hash.length > 1, {
+      timeout: 5_000,
+    });
     const url = page.url();
     expect(url).toContain("#");
 

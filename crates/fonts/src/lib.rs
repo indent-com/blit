@@ -551,9 +551,11 @@ pub fn font_face_css(family: &str) -> Option<String> {
             _ => "font/ttf",
         };
         let b64 = base64_encode(data);
+        // Escape single quotes in the family name to prevent CSS injection.
+        let safe_family = family.replace('\\', "\\\\").replace('\'', "\\'");
         css.push_str(&format!(
             "@font-face {{ font-family: '{}'; font-weight: {}; font-style: {}; src: url('data:{};base64,{}'); }}\n",
-            family, variant.weight, variant.style, mime, b64,
+            safe_family, variant.weight, variant.style, mime, b64,
         ));
     }
     if css.is_empty() { None } else { Some(css) }
