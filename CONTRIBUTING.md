@@ -7,7 +7,7 @@ Reading material:
 - SKILL.md
 - UNSAFE.md
 - nix/README.md
-- js/blit-hub/README.md
+- js/hub/README.md
 
 # Contributing to blit
 
@@ -28,7 +28,7 @@ When making changes, update the relevant docs in the same PR.
 | `crates/cli/src/learn.md` | Full CLI reference printed by `blit learn`: usage patterns, subcommand details, transport options, escapes                                    | CLI subcommands, flags, output conventions, or transport options change                                                      |
 | `UNSAFE.md`               | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                                                      | Unsafe code is added, removed, or its safety invariants change                                                               |
 | `nix/README.md`           | nix-darwin and NixOS service module configuration examples                                                                                    | Nix module options or usage patterns change                                                                                  |
-| `js/blit-hub/README.md`   | blit-hub signaling relay: protocol, deployment, configuration                                                                                 | Hub protocol, endpoints, deployment config, or environment variables change                                                  |
+| `js/hub/README.md`        | blit-hub signaling relay: protocol, deployment, configuration                                                                                 | Hub protocol, endpoints, deployment config, or environment variables change                                                  |
 
 ## Getting started
 
@@ -139,51 +139,77 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and 
 
 `./bin/dev` starts the full stack with hot-reloading via `process-compose`:
 
-| Process        | What it does                                                      | Port / socket        |
-| -------------- | ----------------------------------------------------------------- | -------------------- |
-| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM | n/a                  |
-| `server`       | `cargo watch` running `blit-server --release`                     | `/tmp/blit-dev.sock` |
-| `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`)       | `127.0.0.1:3266`     |
-| `web-app`      | Vite dev server for `js/web-app/`                                 | printed by Vite      |
-| `website`      | Vite dev server for `js/website/`                                 | printed by Vite      |
+| Process        | What it does                                                      | Default port / socket |
+| -------------- | ----------------------------------------------------------------- | --------------------- |
+| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM | n/a                   |
+| `server`       | `cargo watch` running `blit-server --release`                     | `/tmp/blit-dev.sock`  |
+| `ui`           | Vite dev server for `js/ui/`                                      | `127.0.0.1:10000`     |
+| `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`)       | `127.0.0.1:10001`     |
+| `website`      | Astro dev server for `js/website/`                                | `127.0.0.1:10002`     |
+
+### Running multiple dev stacks
+
+Every port and socket path is derived from `DEV_INSTANCE` (default `0`). Each instance gets a block of ports at `10000 + (N * 5)`:
+
+| Instance | UI    | Gateway | Website |
+| -------- | ----- | ------- | ------- |
+| 0        | 10000 | 10001   | 10002   |
+| 1        | 10005 | 10006   | 10007   |
+| 2        | 10010 | 10011   | 10012   |
+
+```bash
+DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
+```
+
+`bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child PTY sessions, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
+
+| Variable             | Default (instance 0) | Description                   |
+| -------------------- | -------------------- | ----------------------------- |
+| `DEV_INSTANCE`       | `0`                  | Instance number (0, 1, 2, …)  |
+| `BLIT_DEV_SOCK`      | `/tmp/blit-dev.sock` | blit-server Unix socket       |
+| `BLIT_DEV_UI_PORT`   | `10000`              | Vite UI dev-server port       |
+| `BLIT_DEV_GW_PORT`   | `10001`              | blit-gateway port             |
+| `BLIT_DEV_SITE_PORT` | `10002`              | Astro website dev-server port |
 
 ## Project structure
 
 Most Rust crates are one or two source files. `blit-cli` is split into five and `blit-webrtc-forwarder` uses a multi-file module tree.
 
-| File                                 | Lines | Role                                                                                                             |
-| ------------------------------------ | ----- | ---------------------------------------------------------------------------------------------------------------- |
-| `crates/server/src/lib.rs`           | ~4400 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control                                     |
-| `crates/remote/src/lib.rs`           | ~3100 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction |
-| `crates/webrtc-forwarder/src/`       | ~2000 | WebRTC forwarder (7 files: signaling, ICE, TURN, peer management)                                                |
-| `crates/cli/src/interactive.rs`      | ~1700 | Console TUI and browser mode                                                                                     |
-| `crates/cli/src/agent.rs`            | ~1300 | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`                                           |
-| `crates/browser/src/lib.rs`          | ~1200 | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                               |
-| `crates/alacritty-driver/src/lib.rs` | ~1200 | Terminal parsing wrapper around `alacritty_terminal`                                                             |
-| `crates/gateway/src/main.rs`         | ~750  | WebSocket/WebTransport proxy                                                                                     |
-| `crates/fonts/src/lib.rs`            | ~660  | Font discovery and TTF/OTF parsing                                                                               |
-| `crates/cli/src/main.rs`             | ~490  | Clap structs and dispatch                                                                                        |
-| `crates/cli/src/learn.md`            | ~155  | CLI reference text printed by `blit learn`                                                                       |
-| `crates/webserver/src/lib.rs`        | ~120  | Shared axum HTTP helpers                                                                                         |
-| `crates/webserver/src/config.rs`     | ~210  | Server configuration types                                                                                       |
-| `crates/cli/src/transport.rs`        | ~190  | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                      |
+| File                                   | Role                                                                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `crates/server/src/lib.rs`             | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration                  |
+| `crates/server/src/surface_encoder.rs` | Surface video encoding: AV1 (rav1e), H.264/H.265 (openh264, VA-API, NVENC)                                            |
+| `crates/remote/src/lib.rs`             | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
+| `crates/compositor/src/imp.rs`         | Experimental headless Wayland compositor (smithay): surface tracking, input forwarding, protocol delegates            |
+| `crates/webrtc-forwarder/src/`         | WebRTC forwarder (7 files: signaling, ICE, TURN, peer management)                                                     |
+| `crates/cli/src/agent.rs`              | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `surfaces`, `capture`, `click`, `key`, `type` |
+| `crates/cli/src/main.rs`               | Clap structs, dispatch, embedded server/gateway                                                                       |
+| `crates/cli/src/interactive.rs`        | Browser mode                                                                                                          |
+| `crates/cli/src/transport.rs`          | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                           |
+| `crates/cli/src/learn.md`              | CLI reference text printed by `blit learn`                                                                            |
+| `crates/browser/src/lib.rs`            | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                    |
+| `crates/alacritty-driver/src/lib.rs`   | Terminal parsing wrapper around `alacritty_terminal`                                                                  |
+| `crates/gateway/src/main.rs`           | WebSocket/WebTransport proxy, multi-destination routing                                                               |
+| `crates/fonts/src/lib.rs`              | Font discovery and TTF/OTF parsing                                                                                    |
+| `crates/webserver/src/lib.rs`          | Shared axum HTTP helpers                                                                                              |
+| `crates/webserver/src/config.rs`       | Server configuration types                                                                                            |
 
 ### Non-Rust code
 
-| Directory      | What                                                                                                                            |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `js/core/`     | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer, `BlitTerminalSurface`  |
-| `js/react/`    | `@blit-sh/react` npm package — thin React bindings wrapping `BlitTerminalSurface` from core. Tests in `js/react/src/__tests__/` |
-| `js/solid/`    | `@blit-sh/solid` npm package — thin Solid bindings wrapping `BlitTerminalSurface` from core                                     |
-| `js/web-app/`  | Vite + React SPA — reference browser UI with BSP tiled layouts, overlays, status bar                                            |
-| `js/website/`  | Marketing/docs website (Vite + SSR with prerendering)                                                                           |
-| `js/blit-hub/` | Signaling relay server (Bun, deployed to Fly.io). See [js/blit-hub/README.md](js/blit-hub/README.md)                            |
-| `e2e/`         | Playwright tests against the full stack (6 spec files)                                                                          |
-| `examples/`    | fd-channel examples in Python and Bun                                                                                           |
-| `nix/`         | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules              |
-| `systemd/`     | Socket-activated unit files (user-level and system-level templates) and service units                                           |
-| `man/`         | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                              |
-| `bin/`         | Shell scripts wrapping `nix run` tasks plus release scripts (`release-prepare`, `release-tag`, `prepare-release`)               |
+| Directory     | What                                                                                                                            |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `js/core/`    | `@blit-sh/core` npm package — framework-agnostic core: transports, BSP layout, protocol, WebGL renderer, `BlitTerminalSurface`  |
+| `js/react/`   | `@blit-sh/react` npm package — thin React bindings wrapping `BlitTerminalSurface` from core. Tests in `js/react/src/__tests__/` |
+| `js/solid/`   | `@blit-sh/solid` npm package — thin Solid bindings wrapping `BlitTerminalSurface` from core                                     |
+| `js/ui/`      | Vite + Solid SPA — browser UI with BSP tiled layouts, overlays, status bar                                                      |
+| `js/website/` | Marketing/docs website (Vite + SSR with prerendering)                                                                           |
+| `js/hub/`     | Signaling relay server (Bun, deployed to Fly.io). See [js/hub/README.md](js/hub/README.md)                                      |
+| `e2e/`        | Playwright tests against the full stack (6 spec files)                                                                          |
+| `examples/`   | fd-channel examples in Python and Bun                                                                                           |
+| `nix/`        | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules              |
+| `systemd/`    | Socket-activated unit files (user-level and system-level templates) and service units                                           |
+| `man/`        | scdoc man pages for `blit`, `blit-server`, `blit-gateway`, `blit-webrtc-forwarder`                                              |
+| `bin/`        | Shell scripts wrapping `nix run` tasks plus release scripts (`release-prepare`, `release-tag`, `prepare-release`)               |
 
 ## Code conventions
 
@@ -228,6 +254,56 @@ PRs must be reviewed and pass the following CI checks before merging:
 
 - `./bin/lint` is the CI gate (fmt + clippy). Run `./bin/fmt` to auto-fix formatting and `./bin/clippy` to check clippy warnings before pushing.
 - The WASM crate (`crates/browser/`) targets `wasm32-unknown-unknown` — don't add dependencies that pull in `std::net`, `std::fs`, etc.
-- `crates/browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the web-app or React tests will work.
+- `crates/browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the UI or React tests will work.
 - The server uses raw `libc` calls (`openpty`, `waitpid`, `kill`, `ioctl`) — changes to PTY lifecycle code need careful attention to signal safety and fd leaks.
 - The background zombie reaper (`waitpid(-1, ..., WNOHANG)` every 5s in the server) can race with `cleanup_pty`'s `waitpid` for the specific child. This is intentional — `cleanup_pty` uses `WNOHANG` so it doesn't block if the reaper already collected the child.
+
+## Wayland compositor (experimental)
+
+The experimental headless Wayland compositor (`crates/compositor/`) is `#[cfg(unix)]` only — it compiles to a stub on Windows. It uses [smithay](https://github.com/Smithay/smithay) and runs as a thread per session.
+
+### How it works
+
+1. When the first PTY in a session is created, `ensure_compositor()` spawns a compositor thread with a calloop event loop.
+2. The compositor creates a Wayland listening socket (`/tmp/wayland-N`) and sets `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` in the PTY child environment.
+3. GUI apps launched inside the session connect to this socket and create `xdg_toplevel` windows.
+4. On each `wl_surface.commit`, the compositor reads the buffer pixels (via SHM or dmabuf) and sends a `CompositorEvent::SurfaceCommit` to the server.
+5. The server encodes the pixels as H.264 or AV1 and stores the encoded frame in `last_frames`. The tick loop sends frames to connected browser clients using the same pacing/congestion-control system as terminal updates.
+6. Browser clients decode frames via WebCodecs and render to a `<canvas>`.
+
+### Key data flow
+
+```
+Wayland app → compositor thread → CompositorEvent::SurfaceCommit
+  → server tick: SurfaceEncoder::encode() → last_frames
+  → server tick: pacing check → msg_surface_frame → gateway WS → browser
+  → browser: SurfaceStore → VideoDecoder → canvas
+```
+
+### Surface encoding
+
+`crates/server/src/surface_encoder.rs` wraps seven backends behind a common `SurfaceEncoder` interface:
+
+- **NVENC AV1 / H.265 / H.264** — NVIDIA GPU hardware encoding via FFmpeg
+- **H.265 VA-API** — Intel/AMD GPU hardware encoding via FFmpeg/libva
+- **H.264 VA-API** — Intel/AMD GPU hardware encoding via FFmpeg/libva
+- **AV1 (rav1e)** — software, handles odd dimensions
+- **H.264 software (openh264)** — software fallback, max 3840x2160
+
+`BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `nvenc-h265,h265-vaapi,nvenc-av1,av1,nvenc-h264,h264-vaapi,h264-software`. `BLIT_SURFACE_QUALITY` (low/medium/high/lossless) controls rav1e speed/quantizer presets. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
+
+### Testing surfaces without a browser
+
+```bash
+blit -s /tmp/blit-dev.sock start bash
+blit -s /tmp/blit-dev.sock send 1 'foot &\n'
+blit -s /tmp/blit-dev.sock surfaces          # list surfaces (TSV)
+blit -s /tmp/blit-dev.sock capture 1         # screenshot → surface-1.png
+blit -s /tmp/blit-dev.sock click 1 100 50    # click at (x, y)
+blit -s /tmp/blit-dev.sock key 1 Return      # press a key
+blit -s /tmp/blit-dev.sock type 1 'hello'    # type text
+```
+
+### Wire protocol surface messages
+
+Surface messages use opcodes `0x20`–`0x28` (S2C) and `0x20`–`0x29` (C2S). See the constants in `crates/remote/src/lib.rs`. A new client receives `S2C_SURFACE_CREATED` for each existing surface during the initial state sync, followed by keyframes via the normal pacing loop.

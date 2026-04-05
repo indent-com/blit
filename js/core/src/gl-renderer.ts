@@ -126,6 +126,170 @@ const UNSUPPORTED: GlRenderer = {
   dispose() {},
 };
 
+// ---------------------------------------------------------------------------
+// Canvas 2D fallback renderer
+// ---------------------------------------------------------------------------
+
+/**
+ * Software fallback when WebGL2 is not available (e.g. headless compositor
+ * without GPU).  Reads the same vertex buffers produced by the WASM terminal
+ * and paints them with Canvas 2D.
+ */
+export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
+  const ctx = canvas.getContext("2d", { alpha: true });
+  if (!ctx) return { ...UNSUPPORTED };
+
+  // Reusable scratch canvas for glyph tinting.
+  const tmp = document.createElement("canvas");
+  const tctx = tmp.getContext("2d", { willReadFrequently: false })!;
+
+  const BG_FPV = 6; // x y r g b a
+  const GL_FPV = 8; // x y u v r g b a
+
+  function drawBgRects(data: Float32Array): void {
+    const stride = BG_FPV * 6; // 6 verts per rect
+    for (let i = 0; i < data.length; i += stride) {
+      // First vertex gives top-left and color.
+      const x0 = data[i];
+      const y0 = data[i + 1];
+      const r = data[i + 2];
+      const g = data[i + 3];
+      const b = data[i + 4];
+      const a = data[i + 5];
+      // Fifth vertex (index 4, offset 24) gives bottom-right.
+      const x1 = data[i + 24 + 0];
+      const y1 = data[i + 24 + 1];
+      ctx!.fillStyle = `rgba(${(r * 255) | 0},${(g * 255) | 0},${(b * 255) | 0},${a})`;
+      ctx!.fillRect(x0, y0, x1 - x0, y1 - y0);
+    }
+  }
+
+  function drawGlyphs(data: Float32Array, atlas: HTMLCanvasElement): void {
+    const aw = atlas.width;
+    const ah = atlas.height;
+    if (aw === 0 || ah === 0) return;
+
+    const stride = GL_FPV * 6; // 6 verts per glyph quad
+    for (let i = 0; i < data.length; i += stride) {
+      // Vertex 0 (top-left): x, y, u, v, r, g, b, a
+      const dx0 = data[i];
+      const dy0 = data[i + 1];
+      const u0 = data[i + 2];
+      const v0 = data[i + 3];
+      const cr = data[i + 4];
+      const cg = data[i + 5];
+      const cb = data[i + 6];
+      // Vertex 5 (bottom-right): offset = 5 * GL_FPV = 40
+      const dx1 = data[i + 40];
+      const dy1 = data[i + 41];
+      const u1 = data[i + 42];
+      const v1 = data[i + 43];
+
+      const sx = u0 * aw;
+      const sy = v0 * ah;
+      const sw = (u1 - u0) * aw;
+      const sh = (v1 - v0) * ah;
+      const dw = dx1 - dx0;
+      const dh = dy1 - dy0;
+      if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) continue;
+
+      const tw = Math.ceil(sw);
+      const th = Math.ceil(sh);
+      if (tmp.width < tw) tmp.width = tw;
+      if (tmp.height < th) tmp.height = th;
+
+      // Copy glyph from atlas.
+      tctx.globalCompositeOperation = "copy";
+      tctx.drawImage(atlas, sx, sy, sw, sh, 0, 0, tw, th);
+      // Tint: replace colour while keeping alpha (white text -> fg colour;
+      // colour emoji get tinted too – acceptable for a fallback renderer).
+      tctx.globalCompositeOperation = "source-in";
+      tctx.fillStyle = `rgb(${(cr * 255) | 0},${(cg * 255) | 0},${(cb * 255) | 0})`;
+      tctx.fillRect(0, 0, tw, th);
+
+      ctx!.drawImage(tmp, 0, 0, tw, th, dx0, dy0, dw, dh);
+    }
+  }
+
+  function renderCursor(
+    visible: boolean,
+    col: number,
+    row: number,
+    style: number,
+    blinkOn: boolean,
+    cell: CellMetrics,
+    focused: boolean,
+  ): void {
+    if (!visible) return;
+    const x = col * cell.pw;
+    const y = row * cell.ph;
+
+    if (!focused) {
+      const t = Math.max(1, Math.round(cell.pw * 0.08));
+      ctx!.fillStyle = "rgba(153,153,153,0.6)";
+      ctx!.fillRect(x, y, cell.pw, t);
+      ctx!.fillRect(x, y + cell.ph - t, cell.pw, t);
+      ctx!.fillRect(x, y, t, cell.ph);
+      ctx!.fillRect(x + cell.pw - t, y, t, cell.ph);
+      return;
+    }
+
+    const blinks = style === 0 || style === 1 || style === 3 || style === 5;
+    if (blinks && !blinkOn) return;
+    if (style === 3 || style === 4) {
+      const h = Math.max(1, Math.round(cell.ph * 0.12));
+      ctx!.fillStyle = "rgba(204,204,204,0.8)";
+      ctx!.fillRect(x, y + cell.ph - h, cell.pw, h);
+    } else if (style === 5 || style === 6) {
+      const w = Math.max(1, Math.round(cell.pw * 0.12));
+      ctx!.fillStyle = "rgba(204,204,204,0.8)";
+      ctx!.fillRect(x, y, w, cell.ph);
+    } else {
+      ctx!.fillStyle = "rgba(204,204,204,0.5)";
+      ctx!.fillRect(x, y, cell.pw, cell.ph);
+    }
+  }
+
+  return {
+    supported: true,
+    maxDimension: 32767,
+    resize(width: number, height: number) {
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+    },
+    render(
+      bgVerts,
+      glyphVerts,
+      atlasCanvas,
+      _atlasVersion,
+      cursorVisible,
+      cursorCol,
+      cursorRow,
+      cursorStyle,
+      cursorBlinkOn,
+      cell,
+      bgColor,
+      focused = true,
+    ) {
+      ctx!.clearRect(0, 0, canvas.width, canvas.height);
+      ctx!.fillStyle = `rgb(${bgColor[0]},${bgColor[1]},${bgColor[2]})`;
+      ctx!.fillRect(0, 0, canvas.width, canvas.height);
+      drawBgRects(bgVerts);
+      if (atlasCanvas) drawGlyphs(glyphVerts, atlasCanvas);
+      renderCursor(
+        cursorVisible,
+        cursorCol,
+        cursorRow,
+        cursorStyle,
+        cursorBlinkOn,
+        cell,
+        focused,
+      );
+    },
+    dispose() {},
+  };
+}
+
 export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   const gl = canvas.getContext("webgl2", {
     alpha: true,

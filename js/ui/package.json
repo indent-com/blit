@@ -1,0 +1,24 @@
+{
+  "name": "@blit-sh/ui",
+  "version": "0.18.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@blit-sh/core": "workspace:*",
+    "@blit-sh/solid": "workspace:*",
+    "solid-js": "^1.9.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "typescript": "^6",
+    "vite": "^8",
+    "vite-plugin-solid": "^2",
+    "vite-plugin-singlefile": "^2"
+  }
+}

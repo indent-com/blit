@@ -13,6 +13,14 @@ fn parse_fd_value(s: &str, label: &str) -> RawFd {
     })
 }
 
+fn parse_surface_encoders(value: &str) -> Vec<blit_server::SurfaceEncoderPreference> {
+    blit_server::SurfaceEncoderPreference::parse_list(value).unwrap_or_else(|err| {
+        eprintln!("invalid BLIT_SURFACE_ENCODERS value: {err}");
+        eprintln!("expected comma-separated list of: nvenc-av1, nvenc-h265, nvenc-h264, h265-vaapi, h264-vaapi, av1, h264-software");
+        std::process::exit(2);
+    })
+}
+
 fn parse_config() -> blit_server::Config {
     #[cfg(unix)]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -39,6 +47,23 @@ fn parse_config() -> blit_server::Config {
         .ok()
         .map(|v| v == "1")
         .unwrap_or(false);
+    let surface_encoders = std::env::var("BLIT_SURFACE_ENCODERS")
+        .or_else(|_| std::env::var("BLIT_SURFACE_ENCODER"))
+        .ok()
+        .map(|value| parse_surface_encoders(&value))
+        .unwrap_or_else(blit_server::SurfaceEncoderPreference::defaults);
+    let surface_quality = std::env::var("BLIT_SURFACE_QUALITY")
+        .ok()
+        .map(|v| {
+            blit_server::SurfaceQuality::parse(&v).unwrap_or_else(|| {
+                eprintln!("invalid BLIT_SURFACE_QUALITY value: {v}");
+                eprintln!("expected one of: low, medium, high, lossless");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or_default();
+    let vaapi_device =
+        std::env::var("BLIT_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -52,6 +77,13 @@ fn parse_config() -> blit_server::Config {
                 "  --shell-flags FLAGS      Shell flags (default: li, or set BLIT_SHELL_FLAGS)"
             );
             println!("  --verbose, -v            Enable verbose logging (or set BLIT_VERBOSE=1)");
+            println!(
+                "  BLIT_SURFACE_ENCODERS      Comma-separated encoder priority list (default: nvenc-h265,h265-vaapi,nvenc-av1,nvenc-h264,h264-vaapi,h264-software,av1)"
+            );
+            println!(
+                "  BLIT_VAAPI_DEVICE         VA-API render node (default: /dev/dri/renderD128)"
+            );
+            println!("  BLIT_CUDA_DEVICE          CUDA device ordinal for NVENC (default: 0)");
             println!("  --version, -V            Print version");
             std::process::exit(0);
         }
@@ -123,14 +155,28 @@ fn parse_config() -> blit_server::Config {
         }
     }
 
+    let max_connections = std::env::var("BLIT_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let max_ptys = std::env::var("BLIT_MAX_PTYS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
     blit_server::Config {
         shell,
         shell_flags,
         scrollback,
         ipc_path: ipc_path.unwrap_or_else(blit_server::default_ipc_path),
+        surface_encoders,
+        surface_quality,
+        vaapi_device,
         #[cfg(unix)]
         fd_channel,
         verbose,
+        max_connections,
+        max_ptys,
     }
 }
 

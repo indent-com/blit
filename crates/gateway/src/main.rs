@@ -60,16 +60,35 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
-const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/web-app/dist/index.html.br");
+const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
 
 static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML_BR));
 
 struct Config {
     passphrase: String,
-    sock_path: String,
+    /// Named destinations: name -> socket path.
+    /// When only BLIT_SOCK is set, this has one entry: "default" -> sock_path.
+    destinations: std::collections::HashMap<String, String>,
     cors_origin: Option<String>,
     wt_cert_hash: std::sync::RwLock<Option<String>>,
     config_state: Option<blit_webserver::config::ConfigState>,
+}
+
+impl Config {
+    /// Get the socket path for a named destination, or the default.
+    fn sock_path_for(&self, name: Option<&str>) -> Option<&str> {
+        if let Some(name) = name {
+            self.destinations.get(name).map(|s| s.as_str())
+        } else {
+            // Root path -> first destination (sorted for determinism).
+            let mut names: Vec<&String> = self.destinations.keys().collect();
+            names.sort();
+            names
+                .first()
+                .and_then(|n| self.destinations.get(*n))
+                .map(|s| s.as_str())
+        }
+    }
 }
 
 type AppState = Arc<Config>;
@@ -112,10 +131,11 @@ async fn main() {
             );
             println!();
             println!("All configuration is via environment variables:");
-            println!("  BLIT_PASSPHRASE Browser passphrase (required)");
-            println!("  BLIT_ADDR       Listen address (default: 0.0.0.0:3264)");
-            println!("  BLIT_SOCK       Upstream server socket");
-            println!("  BLIT_FONT_DIRS  Colon-separated extra font directories");
+            println!("  BLIT_PASSPHRASE    Browser passphrase (required)");
+            println!("  BLIT_ADDR          Listen address (default: 0.0.0.0:3264)");
+            println!("  BLIT_SOCK          Upstream server socket (single destination)");
+            println!("  BLIT_DESTINATIONS  Named destinations (name1=/path1,name2=/path2)");
+            println!("  BLIT_FONT_DIRS     Colon-separated extra font directories");
             println!("  BLIT_CORS       CORS origin for font routes (* or specific origin)");
             println!("  BLIT_QUIC       Set to 1 to enable WebTransport (QUIC/HTTP3)");
             println!("  BLIT_TLS_CERT   PEM certificate file (for WebTransport)");
@@ -134,26 +154,58 @@ async fn main() {
         eprintln!("BLIT_PASSPHRASE environment variable required");
         std::process::exit(1);
     });
-    let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = std::env::var("TMPDIR") {
-                return format!("{dir}/blit.sock");
+    // Parse destinations: BLIT_DESTINATIONS takes precedence over BLIT_SOCK.
+    // BLIT_DESTINATIONS format: "name1=/path/to/sock1,name2=/path/to/sock2"
+    let destinations = if let Ok(dests) = std::env::var("BLIT_DESTINATIONS") {
+        let mut map = std::collections::HashMap::new();
+        for entry in dests.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
             }
-            if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-                return format!("{dir}/blit.sock");
+            if let Some(eq) = entry.find('=') {
+                let name = entry[..eq].trim().to_string();
+                let path = entry[eq + 1..].trim().to_string();
+                if name.is_empty() || path.is_empty() {
+                    eprintln!("blit-gateway: invalid BLIT_DESTINATIONS entry: '{entry}'");
+                    std::process::exit(1);
+                }
+                map.insert(name, path);
+            } else {
+                eprintln!("blit-gateway: BLIT_DESTINATIONS entry missing '=': '{entry}'");
+                std::process::exit(1);
             }
-            if let Ok(user) = std::env::var("USER") {
-                return format!("/tmp/blit-{user}.sock");
-            }
-            "/tmp/blit.sock".into()
         }
-        #[cfg(windows)]
-        {
-            let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
-            format!(r"\\.\pipe\blit-{user}")
+        if map.is_empty() {
+            eprintln!("blit-gateway: BLIT_DESTINATIONS is empty");
+            std::process::exit(1);
         }
-    });
+        map
+    } else {
+        let sock_path = std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
+            #[cfg(unix)]
+            {
+                if let Ok(dir) = std::env::var("TMPDIR") {
+                    return format!("{dir}/blit.sock");
+                }
+                if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+                    return format!("{dir}/blit.sock");
+                }
+                if let Ok(user) = std::env::var("USER") {
+                    return format!("/tmp/blit-{user}.sock");
+                }
+                "/tmp/blit.sock".into()
+            }
+            #[cfg(windows)]
+            {
+                let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+                format!(r"\\.\pipe\blit-{user}")
+            }
+        });
+        let mut map = std::collections::HashMap::new();
+        map.insert("default".into(), sock_path);
+        map
+    };
     let addr = std::env::var("BLIT_ADDR").unwrap_or_else(|_| "0.0.0.0:3264".into());
     let quic_enabled = std::env::var("BLIT_QUIC")
         .ok()
@@ -175,7 +227,7 @@ async fn main() {
 
     let state: AppState = Arc::new(Config {
         passphrase,
-        sock_path,
+        destinations,
         cors_origin,
         wt_cert_hash: std::sync::RwLock::new(None),
         config_state,
@@ -222,10 +274,32 @@ fn build_app(state: AppState) -> axum::Router {
         .with_state(state)
 }
 
-async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    let path = request.uri().path();
+/// Resolve which destination a request is for from the path.
+/// `/d/{name}` or `/<prefix>/d/{name}` -> named destination.
+/// Everything else -> None (default/first destination).
+fn resolve_destination_name(path: &str) -> Option<String> {
+    // Look for "/d/" anywhere in the path (supports base-path prefixes).
+    if let Some(pos) = path.find("/d/") {
+        let rest = &path[pos + 3..];
+        let name = rest.split('/').next().unwrap_or(rest);
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
 
-    if let Some(resp) = blit_webserver::try_font_route(path, state.cors_origin.as_deref()) {
+/// Minimal JSON string escaping for destination names.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let path = request.uri().path().to_string();
+
+    if let Some(resp) = blit_webserver::try_font_route(&path, state.cors_origin.as_deref()) {
         return resp;
     }
 
@@ -245,8 +319,11 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
             Err(e) => e.into_response(),
         }
     } else if is_ws {
+        let dest_name = resolve_destination_name(&path);
         match WebSocketUpgrade::from_request(request, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| handle_ws(socket, state)),
+            Ok(ws) => ws
+                .max_message_size(MAX_FRAME_SIZE)
+                .on_upgrade(move |socket| handle_ws(socket, state, dest_name)),
             Err(e) => e.into_response(),
         }
     } else if path.ends_with("/config") {
@@ -256,7 +333,23 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
             json.push_str(hash);
             json.push('"');
         }
-        json.push('}');
+        // Include destinations array.
+        json.push_str(",\"destinations\":[");
+        let mut names: Vec<&String> = state.destinations.keys().collect();
+        names.sort();
+        let mut first = true;
+        for name in &names {
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push_str("{\"id\":\"");
+            json.push_str(&json_escape(name));
+            json.push_str("\",\"type\":\"gateway\",\"label\":\"");
+            json.push_str(&json_escape(name));
+            json.push_str("\"}");
+        }
+        json.push_str("]}");
         (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             json,
@@ -287,33 +380,59 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-async fn handle_ws(mut ws: WebSocket, state: AppState) {
-    let authed = loop {
-        match ws.recv().await {
-            Some(Ok(Message::Text(pass))) => {
-                if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
-                    break true;
-                } else {
-                    let _ = ws.send(Message::Text("auth".into())).await;
-                    let _ = ws.close().await;
-                    break false;
+async fn handle_ws(mut ws: WebSocket, state: AppState, dest_name: Option<String>) {
+    let authed = match tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match ws.recv().await {
+                Some(Ok(Message::Text(pass))) => {
+                    if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
+                        break true;
+                    } else {
+                        let _ = ws.send(Message::Text("auth".into())).await;
+                        let _ = ws.close().await;
+                        break false;
+                    }
                 }
+                Some(Ok(Message::Ping(d))) => {
+                    let _ = ws.send(Message::Pong(d)).await;
+                }
+                _ => break false,
             }
-            Some(Ok(Message::Ping(d))) => {
-                let _ = ws.send(Message::Pong(d)).await;
-            }
-            _ => break false,
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = ws.close().await;
+            false
         }
     };
     if !authed {
         return;
     }
-    eprintln!("client authenticated");
 
-    let stream = match connect_ipc(&state.sock_path).await {
+    let sock_path = match state.sock_path_for(dest_name.as_deref()) {
+        Some(p) => p.to_string(),
+        None => {
+            let label = dest_name.as_deref().unwrap_or("default");
+            eprintln!("unknown destination '{label}'");
+            let _ = ws
+                .send(Message::Text(
+                    format!("error:unknown destination '{label}'").into(),
+                ))
+                .await;
+            let _ = ws.close().await;
+            return;
+        }
+    };
+    let dest_label = dest_name.as_deref().unwrap_or("default");
+    eprintln!("client authenticated for '{dest_label}'");
+
+    let stream = match connect_ipc(&sock_path).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("cannot connect to blit-server: {e}");
+            eprintln!("cannot connect to blit-server for '{dest_label}': {e}");
             let _ = ws.send(Message::Text(format!("error:{e}").into())).await;
             let _ = ws.close().await;
             return;
@@ -352,7 +471,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState) {
     ws_to_sock.abort();
     sock_to_ws.abort();
 
-    eprintln!("client disconnected");
+    eprintln!("client disconnected from '{dest_label}'");
 }
 
 // ---------------------------------------------------------------------------
@@ -585,25 +704,35 @@ async fn handle_webtransport_session(
     // Accept a bidirectional stream for the blit protocol
     let (mut send, mut recv) = session.accept_bi().await?;
 
-    // --- Authentication ---
-    // Read passphrase: 2-byte LE length + UTF-8 string
-    let mut len_buf = [0u8; 2];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| format!("auth read len: {e}"))?;
-    let pass_len = u16::from_le_bytes(len_buf) as usize;
-    if pass_len > 4096 {
-        return Err("passphrase too long".into());
-    }
-    let mut pass_buf = vec![0u8; pass_len];
-    recv.read_exact(&mut pass_buf)
-        .await
-        .map_err(|e| format!("auth read pass: {e}"))?;
-    let pass = std::str::from_utf8(&pass_buf).unwrap_or("");
+    // --- Authentication (with 30s timeout to prevent idle connection exhaustion) ---
+    let auth_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        // Read passphrase: 2-byte LE length + UTF-8 string
+        let mut len_buf = [0u8; 2];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("auth read len: {e}"))?;
+        let pass_len = u16::from_le_bytes(len_buf) as usize;
+        if pass_len > 4096 {
+            return Err::<(), String>("passphrase too long".into());
+        }
+        let mut pass_buf = vec![0u8; pass_len];
+        recv.read_exact(&mut pass_buf)
+            .await
+            .map_err(|e| format!("auth read pass: {e}"))?;
+        let pass = std::str::from_utf8(&pass_buf).unwrap_or("");
 
-    if !constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
-        send.write_all(&[0]).await.ok(); // 0 = rejected
-        return Err("authentication failed".into());
+        if !constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
+            send.write_all(&[0]).await.ok(); // 0 = rejected
+            return Err("authentication failed".into());
+        }
+        Ok(())
+    })
+    .await;
+
+    match auth_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err("authentication timed out".into()),
     }
     send.write_all(&[1])
         .await
@@ -611,7 +740,9 @@ async fn handle_webtransport_session(
     eprintln!("webtransport client authenticated");
 
     // --- Proxy to blit-server ---
-    let stream = match connect_ipc(&state.sock_path).await {
+    // WebTransport doesn't support path-based routing yet — use default destination.
+    let default_sock = state.sock_path_for(None).unwrap_or("").to_string();
+    let stream = match connect_ipc(&default_sock).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot connect to blit-server: {e}");
@@ -675,9 +806,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_app() -> axum::Router {
+        let mut destinations = std::collections::HashMap::new();
+        destinations.insert("default".into(), "/nonexistent.sock".into());
         let state: AppState = Arc::new(Config {
             passphrase: "test".into(),
-            sock_path: "/nonexistent.sock".into(),
+            destinations,
             cors_origin: None,
             wt_cert_hash: std::sync::RwLock::new(None),
             config_state: None,
@@ -837,9 +970,11 @@ mod tests {
     }
 
     fn test_app_with_cors(origin: &str) -> axum::Router {
+        let mut destinations = std::collections::HashMap::new();
+        destinations.insert("default".into(), "/nonexistent.sock".into());
         let state: AppState = Arc::new(Config {
             passphrase: "test".into(),
-            sock_path: "/nonexistent.sock".into(),
+            destinations,
             cors_origin: Some(origin.into()),
             wt_cert_hash: std::sync::RwLock::new(None),
             config_state: None,
@@ -883,5 +1018,76 @@ mod tests {
             resp.headers().get("access-control-allow-origin").is_none(),
             "CORS header should not be present when cors_origin is None"
         );
+    }
+
+    #[tokio::test]
+    async fn config_returns_destinations() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body_str.contains("\"gateway\":true"),
+            "missing gateway:true"
+        );
+        assert!(
+            body_str.contains("\"destinations\":["),
+            "missing destinations array"
+        );
+        assert!(
+            body_str.contains("\"id\":\"default\""),
+            "missing default destination"
+        );
+        assert!(
+            body_str.contains("\"type\":\"gateway\""),
+            "missing gateway type"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_returns_multiple_destinations() {
+        let mut destinations = std::collections::HashMap::new();
+        destinations.insert("rabbit".into(), "/tmp/rabbit.sock".into());
+        destinations.insert("fox".into(), "/tmp/fox.sock".into());
+        let state: AppState = Arc::new(Config {
+            passphrase: "test".into(),
+            destinations,
+            cors_origin: None,
+            wt_cert_hash: std::sync::RwLock::new(None),
+            config_state: None,
+        });
+        let app = build_app(state);
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body_str.contains("\"id\":\"fox\""),
+            "missing fox destination"
+        );
+        assert!(
+            body_str.contains("\"id\":\"rabbit\""),
+            "missing rabbit destination"
+        );
+        // Fox should come before rabbit (sorted).
+        let fox_pos = body_str.find("\"id\":\"fox\"").unwrap();
+        let rabbit_pos = body_str.find("\"id\":\"rabbit\"").unwrap();
+        assert!(fox_pos < rabbit_pos, "destinations not sorted by name");
     }
 }

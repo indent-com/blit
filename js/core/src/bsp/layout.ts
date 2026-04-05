@@ -31,6 +31,29 @@ function preset(name: string, dsl: string): BSPLayout {
   return { name, dsl, ...parseDSL(dsl) };
 }
 
+// ---------------------------------------------------------------------------
+// Surface assignment helpers
+// ---------------------------------------------------------------------------
+
+const SURFACE_PREFIX = "surface:";
+
+/** Create a BSP assignment value representing a compositor surface. */
+export function surfaceAssignment(surfaceId: number): string {
+  return `${SURFACE_PREFIX}${surfaceId}`;
+}
+
+/** Check whether a BSP assignment value represents a surface. */
+export function isSurfaceAssignment(value: string | null): boolean {
+  return value != null && value.startsWith(SURFACE_PREFIX);
+}
+
+/** Extract the numeric surface ID from a surface assignment string, or null. */
+export function parseSurfaceAssignment(value: string | null): number | null {
+  if (value == null || !value.startsWith(SURFACE_PREFIX)) return null;
+  const n = parseInt(value.slice(SURFACE_PREFIX.length), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function enumeratePanes(
   node: BSPNode,
   path: readonly number[] = [],
@@ -98,21 +121,35 @@ export function reconcileAssignments({
   previous,
   liveSessionIds,
   knownSessionIds,
+  liveSurfaceIds,
 }: {
   panes: readonly BSPPane[];
   previous: BSPAssignments;
   liveSessionIds: readonly string[];
   knownSessionIds: readonly string[];
+  /** When provided, surface assignments for destroyed surfaces are cleared. */
+  liveSurfaceIds?: readonly number[];
 }): BSPAssignments {
   const live = new Set(liveSessionIds);
   const known = new Set(knownSessionIds);
+  const liveSurfaces = liveSurfaceIds ? new Set(liveSurfaceIds) : null;
   const assignments: Record<string, string | null> = {};
 
   for (const pane of panes) {
-    const sessionId = previous.assignments[pane.id];
-    const keep =
-      sessionId != null && (live.has(sessionId) || !known.has(sessionId));
-    assignments[pane.id] = keep ? sessionId : null;
+    const value = previous.assignments[pane.id];
+    if (isSurfaceAssignment(value)) {
+      // Remove surface assignments when the surface no longer exists.
+      if (liveSurfaces) {
+        const sid = parseSurfaceAssignment(value);
+        assignments[pane.id] =
+          sid != null && liveSurfaces.has(sid) ? value : null;
+      } else {
+        assignments[pane.id] = value;
+      }
+      continue;
+    }
+    const keep = value != null && (live.has(value) || !known.has(value));
+    assignments[pane.id] = keep ? value : null;
   }
 
   return { assignments };

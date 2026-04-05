@@ -1,6 +1,6 @@
 [package]
 name = "blit-webrtc-forwarder"
-version = "0.19.0"
+version = "0.20.0"
 edition.workspace = true
 description = "Forward a blit-server session over WebRTC"
 license.workspace = true
@@ -36,3 +36,5 @@ md-5 = "0.10"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"
+crypto_box = "0.9"
+rand = "0.8"

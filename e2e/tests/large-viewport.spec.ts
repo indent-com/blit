@@ -14,6 +14,8 @@ async function authenticate(page: import("@playwright/test").Page) {
       .first()
       .or(page.locator("canvas").first()),
   ).toBeVisible({ timeout: 10_000 });
+  // Wait for the DOM to stabilise after connection setup.
+  await page.waitForTimeout(500);
   const canvas = page.locator("canvas").first();
   if (!(await canvas.isVisible().catch(() => false))) {
     await page.getByRole("button", { name: "New terminal" }).first().click();

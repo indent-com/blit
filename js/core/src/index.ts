@@ -7,6 +7,11 @@ export {
 } from "./BlitConnection";
 
 export type { BlitWasmModule } from "./TerminalStore";
+export { SurfaceStore } from "./SurfaceStore";
+export type {
+  SurfaceFrameCallback,
+  SurfaceEventCallback,
+} from "./SurfaceStore";
 
 export { measureCell, cssFontFamily } from "./measure";
 export type { CellMetrics } from "./measure";
@@ -20,6 +25,7 @@ export type {
   BlitConnectionSnapshot,
   BlitDebug,
   BlitSearchResult,
+  BlitSurface,
   BlitWorkspaceSnapshot,
   BlitTransport,
   BlitSession,
@@ -29,6 +35,12 @@ export type {
   TerminalPalette,
   TransportConfig,
 } from "./types";
+
+export {
+  SURFACE_POINTER_DOWN,
+  SURFACE_POINTER_UP,
+  SURFACE_POINTER_MOVE,
+} from "./protocol";
 
 export { PALETTES } from "./palettes";
 
@@ -42,6 +54,13 @@ export type {
   BlitTerminalSurfaceOptions,
   BlitTerminalSurfaceHandle,
 } from "./BlitTerminalSurface";
+
+export {
+  BlitSurfaceCanvas,
+  detectCodecSupport,
+  getCodecSupport,
+} from "./BlitSurfaceCanvas";
+export type { BlitSurfaceCanvasOptions } from "./BlitSurfaceCanvas";
 
 export { parseDSL, serializeDSL, leafCount } from "./bsp/dsl";
 export type { BSPNode, BSPSplit, BSPChild, BSPLeaf } from "./bsp/dsl";

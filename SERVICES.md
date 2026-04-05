@@ -118,11 +118,11 @@ flowchart TD
 
 ## hub.blit.sh
 
-`hub.blit.sh` is the WebRTC signaling relay that enables `blit share`. It runs on **Fly.io** and is deployed automatically when code under `js/blit-hub/` changes on `main`.
+`hub.blit.sh` is the WebRTC signaling relay that enables `blit share`. It runs on **Fly.io** and is deployed automatically when code under `js/hub/` changes on `main`.
 
 The hub routes WebRTC signaling messages (offers, answers, ICE candidates) between peers over WebSocket. Channels are identified by ed25519 public keys, and the server verifies NaCl `crypto_sign` envelopes before relaying — no server-side accounts needed.
 
-For protocol details, deployment instructions, and configuration, see [`js/blit-hub/README.md`](js/blit-hub/README.md).
+For protocol details, deployment instructions, and configuration, see [`js/hub/README.md`](js/hub/README.md).
 
 ### Architecture
 
@@ -185,7 +185,7 @@ Six workflow files live in `.github/workflows/`:
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                      |
 | [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Verify tag signature, build artifacts, create GitHub Release, publish packages, deploy install site |
-| [`deploy-blit-hub.yml`](.github/workflows/deploy-blit-hub.yml)       | Push to `main` (paths: `js/blit-hub/**`)                                                       | Deploy signaling hub to Fly.io                                                                      |
+| [`deploy-hub.yml`](.github/workflows/deploy-hub.yml)                 | Push to `main` (paths: `js/hub/**`)                                                            | Deploy signaling hub to Fly.io                                                                      |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                              |
 | [`dev-check.yml`](.github/workflows/dev-check.yml)                   | Push to `main`, PRs                                                                            | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI       |
 | [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag                                                                       | Build and push `grab/blit-demo` Docker image                                                        |
@@ -224,7 +224,7 @@ flowchart LR
 Runs on every push to `main` and on every pull request. Single job on `ubuntu-latest`:
 
 1. Installs the latest released `blit` CLI via `install.blit.sh`.
-2. Enters the Nix devshell and runs `bin/dev` (process-compose with `cargo watch`, WASM build, gateway, web-app, website).
+2. Enters the Nix devshell and runs `bin/dev` (process-compose with `cargo watch`, WASM build, gateway, ui, website).
 3. Polls `process-compose list` until all five services report Running.
 4. Smoke-tests with the `blit` CLI: starts a session, waits for it, verifies output, lists sessions, closes the session.
 5. Tears down process-compose.
@@ -264,13 +264,13 @@ flowchart TD
 | `update-homebrew` | release                                   | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
 | `apt-repo`        | build-debs, build-tarballs, build-windows | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
 
-### Deploy blit-hub (deploy-blit-hub.yml)
+### Deploy hub (deploy-hub.yml)
 
-Single job, triggered only when files under `js/blit-hub/` change on `main`:
+Single job, triggered only when files under `js/hub/` change on `main`:
 
 ```mermaid
 flowchart LR
-    PUSH["Push to main<br>(js/blit-hub/**)"] --> DEPLOY["nix run .#deploy-blit-hub<br>via flyctl"]
+    PUSH["Push to main<br>(js/hub/**)"] --> DEPLOY["nix run .#deploy-hub<br>via flyctl"]
 ```
 
 ### Deploy website (deploy-website.yml)
@@ -335,7 +335,7 @@ sequenceDiagram
 | -------------------- | ------------------ | ------------------------------------------- |
 | `GPG_PRIVATE_KEY`    | apt-repo           | Signs APT Release metadata                  |
 | `HOMEBREW_TAP_TOKEN` | update-homebrew    | PAT for cross-repo dispatch to homebrew-tap |
-| `FLY_API_TOKEN`      | deploy-blit-hub    | Fly.io deploy token for blit-hub            |
+| `FLY_API_TOKEN`      | deploy-hub         | Fly.io deploy token for blit-hub            |
 | `DOCKERHUB_USERNAME` | publish-demo-image | Docker Hub credentials                      |
 | `DOCKERHUB_TOKEN`    | publish-demo-image | Docker Hub credentials                      |
 | `VERCEL_TOKEN`       | deploy-website     | Vercel API token                            |

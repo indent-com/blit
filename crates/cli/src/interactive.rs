@@ -1,10 +1,4 @@
-use blit_remote::{
-    C2S_DISPLAY_RATE, CELL_SIZE, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_HELLO, S2C_LIST,
-    S2C_TITLE, S2C_UPDATE, TerminalState, msg_ack, msg_close, msg_create, msg_focus, msg_input,
-    msg_resize,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::io::AsyncWriteExt;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{FromRequest, WebSocketUpgrade};
@@ -15,460 +9,18 @@ use std::sync::Arc;
 
 use crate::transport::{self, Transport, make_frame, read_frame};
 
-const WEB_INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/web-app/dist/index.html.br");
-
-#[cfg(unix)]
-fn term_size() -> (u16, u16) {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
-            && ws.ws_row > 0
-            && ws.ws_col > 0
-        {
-            return (ws.ws_row, ws.ws_col);
-        }
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    (24, 80)
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
-#[cfg(windows)]
-fn term_size() -> (u16, u16) {
-    use windows_sys::Win32::System::Console::{
-        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
-    };
-    unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-        if GetConsoleScreenBufferInfo(handle, &mut info) != 0 {
-            let rows = (info.srWindow.Bottom - info.srWindow.Top + 1) as u16;
-            let cols = (info.srWindow.Right - info.srWindow.Left + 1) as u16;
-            if rows > 0 && cols > 0 {
-                return (rows, cols);
-            }
-        }
-    }
-    (24, 80)
-}
-
-#[cfg(unix)]
-struct RawMode {
-    saved: libc::termios,
-}
-
-#[cfg(unix)]
-impl RawMode {
-    fn enter() -> Option<Self> {
-        unsafe {
-            let mut saved: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut saved) != 0 {
-                return None;
-            }
-            let mut raw = saved;
-            libc::cfmakeraw(&mut raw);
-            raw.c_cc[libc::VMIN] = 1;
-            raw.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
-            Some(Self { saved })
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
-        }
-    }
-}
-
-#[cfg(windows)]
-struct RawMode {
-    saved: u32,
-}
-
-#[cfg(windows)]
-impl RawMode {
-    fn enter() -> Option<Self> {
-        use windows_sys::Win32::System::Console::{
-            ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
-            SetConsoleMode,
-        };
-        unsafe {
-            let handle = GetStdHandle(STD_INPUT_HANDLE);
-            let mut saved: u32 = 0;
-            if GetConsoleMode(handle, &mut saved) == 0 {
-                return None;
-            }
-            SetConsoleMode(handle, ENABLE_VIRTUAL_TERMINAL_INPUT);
-            Some(Self { saved })
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
-        unsafe {
-            let handle = GetStdHandle(STD_INPUT_HANDLE);
-            SetConsoleMode(handle, self.saved);
-        }
-    }
-}
-
-struct Cleanup;
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        const RESET: &[u8] = b"\x1b[ q\
-                               \x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
-                               \x1b[?1016l\x1b[?1006l\x1b[?1005l\
-                               \x1b[?2004l\x1b>\x1b[?1l\x1b[?25h\x1b[0m\x1b[?1049l\
-                               \x1b[999;1H\r\n";
-        write_all_stdout(RESET);
-    }
-}
-
-struct Renderer {
-    prev_rows: u16,
-    prev_cols: u16,
-    prev_mode: u16,
-    cur_row: u16,
-    cur_col: u16,
-    cur_fg: u64,
-    cur_bg: u64,
-    cur_attrs: u8,
-    attrs_known: bool,
-    entered_altscreen: bool,
-}
-
-impl Renderer {
-    fn new() -> Self {
-        Self {
-            prev_rows: 0,
-            prev_cols: 0,
-            prev_mode: 0,
-            cur_row: u16::MAX,
-            cur_col: u16::MAX,
-            cur_fg: u64::MAX,
-            cur_bg: u64::MAX,
-            cur_attrs: 0,
-            attrs_known: false,
-            entered_altscreen: false,
-        }
-    }
-
-    fn render(&mut self, screen: &TerminalState, out: &mut Vec<u8>) {
-        let cols = screen.cols();
-        let resized = screen.rows() != self.prev_rows || cols != self.prev_cols;
-
-        if !self.entered_altscreen {
-            out.extend_from_slice(b"\x1b[?1049h\x1b[?25l");
-            self.entered_altscreen = true;
-        }
-
-        if resized {
-            out.extend_from_slice(b"\x1b[2J");
-            self.prev_rows = screen.rows();
-            self.prev_cols = cols;
-            self.attrs_known = false;
-            self.cur_fg = u64::MAX;
-            self.cur_bg = u64::MAX;
-        }
-
-        out.extend_from_slice(b"\x1b[?2026h");
-
-        self.sync_modes(screen.mode(), out);
-
-        let total = screen.rows() as usize * cols as usize;
-        let cols_usize = cols as usize;
-
-        let cells = screen.cells();
-        for i in 0..total {
-            let off = i * CELL_SIZE;
-            let cell = &cells[off..off + CELL_SIZE];
-            let row = (i / cols_usize) as u16;
-            let col = (i % cols_usize) as u16;
-            if cell[1] & 4 != 0 {
-                let prev_wide = col > 0 && {
-                    let prev_off = off - CELL_SIZE;
-                    cells[prev_off + 1] & 2 != 0
-                };
-                if prev_wide {
-                    continue;
-                }
-                self.move_to(row, col, out);
-                self.set_sgr(0, 0, 0, out);
-                out.push(b' ');
-                self.cur_col = col.saturating_add(1);
-                continue;
-            }
-            self.move_to(row, col, out);
-            self.emit_cell(cell, i, screen.frame(), out);
-        }
-
-        let cursor_visible = screen.mode() & 1 != 0;
-        let prev_visible = self.prev_mode & 1 != 0;
-        if cursor_visible != prev_visible {
-            out.extend_from_slice(if cursor_visible {
-                b"\x1b[?25h"
-            } else {
-                b"\x1b[?25l"
-            });
-        }
-
-        let cursor_style = (screen.mode() >> 12) & 7;
-        let prev_cursor_style = (self.prev_mode >> 12) & 7;
-        if cursor_style != prev_cursor_style {
-            out.extend_from_slice(b"\x1b[");
-            push_u16(out, cursor_style);
-            out.extend_from_slice(b" q");
-        }
-
-        self.move_to(screen.cursor_row(), screen.cursor_col(), out);
-
-        let app_cur = screen.mode() & 2 != 0;
-        let prev_app_cur = self.prev_mode & 2 != 0;
-        if app_cur != prev_app_cur {
-            out.extend_from_slice(if app_cur { b"\x1b[?1h" } else { b"\x1b[?1l" });
-        }
-
-        let app_keypad = screen.mode() & 4 != 0;
-        let prev_app_keypad = self.prev_mode & 4 != 0;
-        if app_keypad != prev_app_keypad {
-            out.extend_from_slice(if app_keypad { b"\x1b=" } else { b"\x1b>" });
-        }
-
-        self.prev_mode = screen.mode();
-
-        out.extend_from_slice(b"\x1b[?2026l");
-    }
-
-    fn emit_cell(
-        &mut self,
-        cell: &[u8],
-        cell_index: usize,
-        frame: &blit_remote::FrameState,
-        out: &mut Vec<u8>,
-    ) {
-        let f0 = cell[0];
-        let f1 = cell[1];
-
-        let fg_type = f0 & 3;
-        let bg_type = (f0 >> 2) & 3;
-        let bold = (f0 >> 4) & 1;
-        let dim = (f0 >> 5) & 1;
-        let italic = (f0 >> 6) & 1;
-        let underline = (f0 >> 7) & 1;
-        let inverse = f1 & 1;
-        let wide = (f1 >> 1) & 1;
-        let content_len = ((f1 >> 3) & 7) as usize;
-
-        let attrs: u8 = bold | (dim << 1) | (italic << 2) | (underline << 3);
-
-        let (fg_packed, bg_packed) = if inverse != 0 {
-            (
-                pack_color(bg_type, cell[5], cell[6], cell[7]),
-                pack_color(fg_type, cell[2], cell[3], cell[4]),
-            )
-        } else {
-            (
-                pack_color(fg_type, cell[2], cell[3], cell[4]),
-                pack_color(bg_type, cell[5], cell[6], cell[7]),
-            )
-        };
-
-        self.set_sgr(attrs, fg_packed, bg_packed, out);
-
-        if content_len == 7 {
-            if let Some(s) = frame.overflow().get(&cell_index) {
-                out.extend_from_slice(s.as_bytes());
-            } else {
-                out.push(b' ');
-            }
-        } else if content_len > 0 && content_len <= 4 {
-            if let Ok(s) = std::str::from_utf8(&cell[8..8 + content_len]) {
-                out.extend_from_slice(s.as_bytes());
-            } else {
-                out.push(b'?');
-            }
-        } else {
-            out.push(b' ');
-        }
-        self.cur_col = self.cur_col.saturating_add(if wide != 0 { 2 } else { 1 });
-    }
-
-    fn set_sgr(&mut self, attrs: u8, fg: u64, bg: u64, out: &mut Vec<u8>) {
-        if self.attrs_known && self.cur_attrs == attrs && self.cur_fg == fg && self.cur_bg == bg {
-            return;
-        }
-
-        let need_reset = !self.attrs_known || (self.cur_attrs & !attrs) != 0;
-
-        if need_reset {
-            out.extend_from_slice(b"\x1b[0m");
-            self.cur_attrs = 0;
-            self.cur_fg = u64::MAX;
-            self.cur_bg = u64::MAX;
-            self.attrs_known = true;
-        }
-
-        if attrs & 1 != 0 && self.cur_attrs & 1 == 0 {
-            out.extend_from_slice(b"\x1b[1m");
-        }
-        if attrs & 2 != 0 && self.cur_attrs & 2 == 0 {
-            out.extend_from_slice(b"\x1b[2m");
-        }
-        if attrs & 4 != 0 && self.cur_attrs & 4 == 0 {
-            out.extend_from_slice(b"\x1b[3m");
-        }
-        if attrs & 8 != 0 && self.cur_attrs & 8 == 0 {
-            out.extend_from_slice(b"\x1b[4m");
-        }
-        if attrs & 16 != 0 && self.cur_attrs & 16 == 0 {
-            out.extend_from_slice(b"\x1b[7m");
-        }
-        self.cur_attrs = attrs;
-
-        if fg != self.cur_fg {
-            emit_color(fg, true, out);
-            self.cur_fg = fg;
-        }
-        if bg != self.cur_bg {
-            emit_color(bg, false, out);
-            self.cur_bg = bg;
-        }
-    }
-
-    fn sync_modes(&mut self, mode: u16, out: &mut Vec<u8>) {
-        let bp = (mode >> 3) & 1;
-        let prev_bp = (self.prev_mode >> 3) & 1;
-        if bp != prev_bp {
-            out.extend_from_slice(if bp != 0 {
-                b"\x1b[?2004h"
-            } else {
-                b"\x1b[?2004l"
-            });
-        }
-
-        let mouse = (mode >> 4) & 7;
-        let prev_mouse = (self.prev_mode >> 4) & 7;
-        if mouse != prev_mouse {
-            match prev_mouse {
-                1 => out.extend_from_slice(b"\x1b[?9l"),
-                2 => out.extend_from_slice(b"\x1b[?1000l"),
-                3 => out.extend_from_slice(b"\x1b[?1002l"),
-                4 => out.extend_from_slice(b"\x1b[?1003l"),
-                _ => {}
-            }
-            match mouse {
-                1 => out.extend_from_slice(b"\x1b[?9h"),
-                2 => out.extend_from_slice(b"\x1b[?1000h"),
-                3 => out.extend_from_slice(b"\x1b[?1002h"),
-                4 => out.extend_from_slice(b"\x1b[?1003h"),
-                _ => {}
-            }
-        }
-
-        let enc = (mode >> 7) & 3;
-        let prev_enc = (self.prev_mode >> 7) & 3;
-        if enc != prev_enc {
-            match prev_enc {
-                1 => out.extend_from_slice(b"\x1b[?1005l"),
-                2 => out.extend_from_slice(b"\x1b[?1006l"),
-                3 => out.extend_from_slice(b"\x1b[?1016l"),
-                _ => {}
-            }
-            match enc {
-                1 => out.extend_from_slice(b"\x1b[?1005h"),
-                2 => out.extend_from_slice(b"\x1b[?1006h"),
-                3 => out.extend_from_slice(b"\x1b[?1016h"),
-                _ => {}
-            }
-        }
-    }
-
-    fn move_to(&mut self, row: u16, col: u16, out: &mut Vec<u8>) {
-        if self.cur_row == row && self.cur_col == col {
-            return;
-        }
-        out.extend_from_slice(b"\x1b[");
-        push_u16(out, row + 1);
-        out.push(b';');
-        push_u16(out, col + 1);
-        out.push(b'H');
-        self.cur_row = row;
-        self.cur_col = col;
-    }
-}
-
-fn pack_color(color_type: u8, r: u8, g: u8, b: u8) -> u64 {
-    ((color_type as u64) << 24) | ((r as u64) << 16) | ((g as u64) << 8) | b as u64
-}
-
-fn emit_color(packed: u64, is_fg: bool, out: &mut Vec<u8>) {
-    let color_type = ((packed >> 24) & 0xff) as u8;
-    let r = ((packed >> 16) & 0xff) as u8;
-    let g = ((packed >> 8) & 0xff) as u8;
-    let b = (packed & 0xff) as u8;
-    let base: u8 = if is_fg { 38 } else { 48 };
-    let default_seq: &[u8] = if is_fg { b"\x1b[39m" } else { b"\x1b[49m" };
-    match color_type {
-        0 => out.extend_from_slice(default_seq),
-        1 => {
-            out.extend_from_slice(b"\x1b[");
-            push_u16(out, base as u16);
-            out.extend_from_slice(b";5;");
-            push_u16(out, r as u16);
-            out.push(b'm');
-        }
-        2 => {
-            out.extend_from_slice(b"\x1b[");
-            push_u16(out, base as u16);
-            out.extend_from_slice(b";2;");
-            push_u16(out, r as u16);
-            out.push(b';');
-            push_u16(out, g as u16);
-            out.push(b';');
-            push_u16(out, b as u16);
-            out.push(b'm');
-        }
-        _ => out.extend_from_slice(default_seq),
-    }
-}
-
-fn push_u16(out: &mut Vec<u8>, n: u16) {
-    let mut buf = [0u8; 5];
-    let mut pos = buf.len();
-    let mut v = n;
-    if v == 0 {
-        out.push(b'0');
-        return;
-    }
-    while v > 0 {
-        pos -= 1;
-        buf[pos] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    out.extend_from_slice(&buf[pos..]);
-}
-
-fn write_all_stdout(buf: &[u8]) {
-    use std::io::Write;
-    let _ = std::io::stdout().write_all(buf);
-}
-
-fn digits(mut n: u16) -> u16 {
-    if n == 0 {
-        return 1;
-    }
-    let mut d = 0;
-    while n > 0 {
-        d += 1;
-        n /= 10;
-    }
-    d
-}
+const WEB_INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
 
 enum BrowserConnector {
     Ipc(String),
@@ -497,195 +49,20 @@ impl BrowserConnector {
     }
 }
 
+struct DestinationInfo {
+    connector: BrowserConnector,
+    label: String,
+}
+
 struct BrowserState {
     token: String,
-    connector: BrowserConnector,
+    destinations: std::collections::HashMap<String, DestinationInfo>,
     config: blit_webserver::config::ConfigState,
-    remote_host: Option<String>,
 }
 
-enum Event {
-    Stdin(Vec<u8>),
-    Resize(u16, u16),
-}
+pub async fn run_browser(dests: Vec<crate::NamedDestination>, port: Option<u16>) {
+    use crate::{Destination, NamedDestination};
 
-struct Expose {
-    open: bool,
-    selected: usize,
-    lru: Vec<u16>,
-    titles: std::collections::HashMap<u16, String>,
-}
-
-impl Expose {
-    fn new() -> Self {
-        Self {
-            open: false,
-            selected: 0,
-            lru: Vec::new(),
-            titles: std::collections::HashMap::new(),
-        }
-    }
-
-    fn touch(&mut self, id: u16) {
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
-            self.lru.remove(pos);
-        }
-        self.lru.insert(0, id);
-    }
-
-    fn remove(&mut self, id: u16) {
-        self.lru.retain(|&x| x != id);
-        self.titles.remove(&id);
-    }
-
-    fn sync(&mut self, ptys: &[u16]) {
-        let active: std::collections::HashSet<u16> = ptys.iter().copied().collect();
-        self.lru.retain(|id| active.contains(id));
-        for &id in ptys {
-            if !self.lru.contains(&id) {
-                self.lru.push(id);
-            }
-        }
-    }
-
-    fn visible_ids(&self) -> &[u16] {
-        &self.lru
-    }
-
-    fn clamp_selection(&mut self) {
-        let len = self.lru.len();
-        if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
-        }
-    }
-
-    fn render(&self, rows: u16, cols: u16, focused: Option<u16>, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
-        let ids = self.visible_ids();
-        if ids.is_empty() {
-            let msg = b"  No PTYs.  Press Ctrl-N to create one.";
-            let r = rows / 2;
-            out.extend_from_slice(b"\x1b[");
-            push_u16(out, r + 1);
-            out.extend_from_slice(b";1H\x1b[90m");
-            out.extend_from_slice(msg);
-            out.extend_from_slice(b"\x1b[0m");
-            return;
-        }
-
-        let max_id_width = ids.iter().copied().map(digits).max().unwrap_or(1) as usize;
-
-        let list_height = ids.len() as u16;
-        let top_row = rows.saturating_sub(list_height) / 2;
-
-        for (i, &id) in ids.iter().enumerate() {
-            let row = top_row + i as u16;
-            if row >= rows {
-                break;
-            }
-            let is_selected = i == self.selected;
-            let is_focused = focused == Some(id);
-
-            out.extend_from_slice(b"\x1b[");
-            push_u16(out, row + 1);
-            out.extend_from_slice(b";1H");
-
-            if is_selected {
-                out.extend_from_slice(b"\x1b[7m");
-            }
-            if is_focused {
-                out.extend_from_slice(b"\x1b[1m");
-            }
-
-            let id_str = format!("{id:>width$}", width = max_id_width);
-            let title = self
-                .titles
-                .get(&id)
-                .map(|s| s.as_str())
-                .unwrap_or("(no title)");
-
-            let line = format!("  {id_str}  {title}");
-            let max_len = cols as usize;
-            if line.len() <= max_len {
-                out.extend_from_slice(line.as_bytes());
-                let pad = max_len - line.len();
-                for _ in 0..pad {
-                    out.push(b' ');
-                }
-            } else {
-                out.extend_from_slice(&line.as_bytes()[..max_len]);
-            }
-
-            out.extend_from_slice(b"\x1b[0m");
-        }
-    }
-}
-
-enum ExposeAction {
-    None,
-    Close,
-    Up,
-    Down,
-    Select,
-    Create,
-    Kill,
-    Quit,
-}
-
-fn parse_expose_key(data: &[u8]) -> (ExposeAction, usize) {
-    if data.is_empty() {
-        return (ExposeAction::None, 0);
-    }
-    match data[0] {
-        0x1b => {
-            if data.len() >= 3 && data[1] == b'[' {
-                match data[2] {
-                    b'A' => (ExposeAction::Up, 3),
-                    b'B' => (ExposeAction::Down, 3),
-                    _ => (ExposeAction::None, 3),
-                }
-            } else if data.len() >= 2 {
-                (ExposeAction::Close, 2)
-            } else {
-                (ExposeAction::Close, 1)
-            }
-        }
-        b'\r' | b'\n' => (ExposeAction::Select, 1),
-        b'j' => (ExposeAction::Down, 1),
-        b'k' => (ExposeAction::Up, 1),
-        b'q' => (ExposeAction::Quit, 1),
-        0x0B => (ExposeAction::Close, 1),  // Ctrl-K
-        0x0E => (ExposeAction::Create, 1), // Ctrl-N
-        0x04 => (ExposeAction::Kill, 1),   // Ctrl-D
-        _ => (ExposeAction::None, 1),
-    }
-}
-
-pub async fn run_console(
-    socket: &Option<String>,
-    tcp: &Option<String>,
-    ssh: &Option<String>,
-    passphrase: &Option<String>,
-    hub: &str,
-) {
-    let transport = match transport::connect(socket, tcp, ssh, passphrase, hub).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("blit: {e}");
-            std::process::exit(1);
-        }
-    };
-    run(transport).await;
-}
-
-pub async fn run_browser(
-    socket: &Option<String>,
-    tcp: &Option<String>,
-    ssh: &Option<String>,
-    port: Option<u16>,
-) {
     let token: String = {
         use rand::RngExt as _;
         rand::rng()
@@ -697,57 +74,72 @@ pub async fn run_browser(
 
     let bind_port: u16 = port.unwrap_or(0);
 
-    let mut remote_host: Option<String> = None;
-
-    let connector = if let Some(_host) = ssh {
-        #[cfg(unix)]
-        {
-            remote_host = Some(_host.clone());
-            setup_ssh_forward(std::slice::from_ref(_host), socket.as_deref()).await
-        }
-        #[cfg(not(unix))]
-        {
-            eprintln!("blit: --ssh is not supported on this platform");
-            std::process::exit(1);
-        }
-    } else if let Some(addr) = tcp {
-        remote_host = Some(addr.split(':').next().unwrap_or(addr).to_string());
-        BrowserConnector::Tcp(addr.clone())
-    } else if let Some(path) = socket {
-        BrowserConnector::Ipc(path.clone())
-    } else {
-        let path = transport::default_local_socket();
-        if let Err(e) = transport::ensure_local_server(&path).await {
-            eprintln!("blit: {e}");
-            std::process::exit(1);
-        }
-        BrowserConnector::Ipc(path)
-    };
-
-    let mut attempts = 0;
-    loop {
-        match connector.connect().await {
-            Ok(_transport) => break,
-            Err(e) if attempts < 30 => {
-                attempts += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if attempts == 30 {
-                    eprintln!("blit: {e}");
+    // Build one BrowserConnector per destination.
+    let mut destinations = std::collections::HashMap::new();
+    for NamedDestination { name, dest } in &dests {
+        let (connector, label) = match dest {
+            Destination::Ssh { user, host, socket } => {
+                #[cfg(unix)]
+                {
+                    let ssh_target = match user {
+                        Some(u) => format!("{u}@{host}"),
+                        None => host.clone(),
+                    };
+                    let connector =
+                        setup_ssh_forward(std::slice::from_ref(&ssh_target), socket.as_deref())
+                            .await;
+                    (connector, host.clone())
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (user, host, socket);
+                    eprintln!("blit: SSH destinations are not supported on this platform");
                     std::process::exit(1);
                 }
             }
-            Err(e) => {
-                eprintln!("blit: {e}");
-                std::process::exit(1);
+            Destination::Tcp(addr) => {
+                let label = addr.split(':').next().unwrap_or(addr).to_string();
+                (BrowserConnector::Tcp(addr.clone()), label)
+            }
+            Destination::Socket(path) => (BrowserConnector::Ipc(path.clone()), name.clone()),
+            Destination::Local => {
+                let path = transport::default_local_socket();
+                if let Err(e) = transport::ensure_local_server(&path).await {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+                (BrowserConnector::Ipc(path), "local".into())
+            }
+        };
+        destinations.insert(name.clone(), DestinationInfo { connector, label });
+    }
+
+    // Test each connector (up to 30 attempts per destination).
+    for (name, info) in &destinations {
+        let mut attempts = 0;
+        loop {
+            match info.connector.connect().await {
+                Ok(_) => break,
+                Err(e) if attempts < 30 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if attempts == 30 {
+                        eprintln!("blit: destination '{name}': {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("blit: destination '{name}': {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }
 
     let state = Arc::new(BrowserState {
         token: token.clone(),
-        connector,
+        destinations,
         config: blit_webserver::config::ConfigState::new(),
-        remote_host,
     });
 
     let html_etag: &'static str =
@@ -780,18 +172,7 @@ pub async fn run_browser(
                             Err(e) => e.into_response(),
                         }
                     } else {
-                        let mut json = String::from("{\"gateway\":true");
-                        if let Some(h) = &state.remote_host {
-                            json.push_str(",\"host\":\"");
-                            json.push_str(h);
-                            json.push('"');
-                        }
-                        json.push('}');
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            json,
-                        )
-                            .into_response()
+                        config_json_response(&state)
                     }
                 },
             ),
@@ -817,6 +198,40 @@ pub async fn run_browser(
         r = axum::serve(listener, app) => { if let Err(e) = r { eprintln!("blit: serve error: {e}"); } }
         _ = tokio::signal::ctrl_c() => {}
     }
+}
+
+/// Build the JSON /config response advertising all destinations.
+fn config_json_response(state: &BrowserState) -> Response {
+    let mut json = String::from("{\"gateway\":true,\"destinations\":[");
+    let mut first = true;
+    // Iterate in deterministic order for stable config responses.
+    let mut names: Vec<&String> = state.destinations.keys().collect();
+    names.sort();
+    for name in names {
+        let info = &state.destinations[name];
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push_str("{\"id\":\"");
+        json.push_str(&json_escape(name));
+        json.push_str("\",\"type\":\"gateway\",\"label\":\"");
+        json.push_str(&json_escape(&info.label));
+        json.push_str("\"}");
+    }
+    json.push_str("]}");
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json,
+    )
+        .into_response()
+}
+
+/// Minimal JSON string escaping for destination names.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(unix)]
@@ -928,23 +343,14 @@ async fn setup_ssh_forward(ssh_args: &[String], remote_socket: Option<&str>) -> 
     }
 }
 
-struct ShareState {
-    token: String,
-    config: blit_webserver::config::ConfigState,
-    hub_json: &'static str,
-}
-
 pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
     let html_etag: &'static str =
         Box::leak(blit_webserver::html_etag(WEB_INDEX_HTML_BR).into_boxed_str());
 
     let hub_json: &'static str = Box::leak(format!("{{\"hub\":\"{hub}\"}}").into_boxed_str());
 
-    let state = Arc::new(ShareState {
-        token: passphrase.to_owned(),
-        config: blit_webserver::config::ConfigState::new(),
-        hub_json,
-    });
+    let config = Arc::new(blit_webserver::config::ConfigState::new());
+    let passphrase = passphrase.to_owned();
 
     let bind_port = port.unwrap_or(0);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{bind_port}"))
@@ -960,38 +366,43 @@ pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
     let app = axum::Router::new()
         .route(
             "/config",
-            get(
-                move |axum::extract::State(state): axum::extract::State<Arc<ShareState>>,
-                      request: axum::extract::Request| async move {
-                    let is_ws = request
-                        .headers()
-                        .get("upgrade")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v.eq_ignore_ascii_case("websocket"))
-                        .unwrap_or(false);
-                    if is_ws {
-                        match WebSocketUpgrade::from_request(request, &state).await {
-                            Ok(ws) => ws
-                                .on_upgrade(move |socket| async move {
-                                    blit_webserver::config::handle_config_ws(
-                                        socket,
-                                        &state.token,
-                                        &state.config,
-                                    )
-                                    .await;
-                                })
-                                .into_response(),
-                            Err(e) => e.into_response(),
+            get({
+                let config = config;
+                let passphrase = passphrase.clone();
+                move |request: axum::extract::Request| {
+                    let config = config.clone();
+                    let passphrase = passphrase.clone();
+                    async move {
+                        let is_ws = request
+                            .headers()
+                            .get("upgrade")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v.eq_ignore_ascii_case("websocket"))
+                            .unwrap_or(false);
+                        if is_ws {
+                            match WebSocketUpgrade::from_request(request, &()).await {
+                                Ok(ws) => ws
+                                    .on_upgrade(move |socket| async move {
+                                        blit_webserver::config::handle_config_ws(
+                                            socket,
+                                            &passphrase,
+                                            &config,
+                                        )
+                                        .await;
+                                    })
+                                    .into_response(),
+                                Err(e) => e.into_response(),
+                            }
+                        } else {
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                hub_json,
+                            )
+                                .into_response()
                         }
-                    } else {
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            state.hub_json,
-                        )
-                            .into_response()
                     }
-                },
-            ),
+                }
+            }),
         )
         .fallback(get(move |request: axum::extract::Request| async move {
             if let Some(resp) = blit_webserver::try_font_route(request.uri().path(), None) {
@@ -1006,8 +417,7 @@ pub async fn run_browser_share(passphrase: &str, hub: &str, port: Option<u16>) {
                 .get(axum::http::header::ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok());
             blit_webserver::html_response(WEB_INDEX_HTML_BR, html_etag, inm, ae)
-        }))
-        .with_state(state);
+        }));
 
     open_browser(&url);
 
@@ -1030,12 +440,27 @@ fn open_browser(url: &str) {
     eprintln!("blit: open {url} in your browser");
 }
 
+/// Resolve which destination a request is for.
+/// `/d/{name}` -> named destination.
+/// `/` (root) -> first destination (backward compat for old browsers).
+fn resolve_destination_name(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix("/d/") {
+        let name = rest.split('/').next().unwrap_or(rest);
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 async fn browser_root_handler(
     axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
     request: axum::extract::Request,
     etag: &'static str,
 ) -> Response {
-    if let Some(resp) = blit_webserver::try_font_route(request.uri().path(), None) {
+    let path = request.uri().path().to_string();
+
+    if let Some(resp) = blit_webserver::try_font_route(&path, None) {
         return resp;
     }
 
@@ -1047,8 +472,10 @@ async fn browser_root_handler(
         .unwrap_or(false);
 
     if is_ws {
+        // Determine which destination this WebSocket is for.
+        let dest_name = resolve_destination_name(&path);
         match WebSocketUpgrade::from_request(request, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| browser_handle_ws(socket, state)),
+            Ok(ws) => ws.on_upgrade(move |socket| browser_handle_ws(socket, state, dest_name)),
             Err(e) => e.into_response(),
         }
     } else {
@@ -1064,11 +491,12 @@ async fn browser_root_handler(
     }
 }
 
-async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
+async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>, dest_name: Option<String>) {
+    // Authenticate.
     let authed = loop {
         match ws.recv().await {
             Some(Ok(Message::Text(pass))) => {
-                if pass.trim() == state.token {
+                if constant_time_eq(pass.trim().as_bytes(), state.token.as_bytes()) {
                     break true;
                 } else {
                     let _ = ws.close().await;
@@ -1085,17 +513,49 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
         return;
     }
 
-    let transport = match state.connector.connect().await {
+    // Resolve the connector for this destination.
+    let connector = if let Some(ref name) = dest_name {
+        match state.destinations.get(name) {
+            Some(info) => &info.connector,
+            None => {
+                let _ = ws
+                    .send(Message::Text(
+                        format!("error:unknown destination '{name}'").into(),
+                    ))
+                    .await;
+                let _ = ws.close().await;
+                return;
+            }
+        }
+    } else {
+        // Root path -> first destination (sorted for determinism).
+        let mut names: Vec<&String> = state.destinations.keys().collect();
+        names.sort();
+        match names.first().and_then(|n| state.destinations.get(*n)) {
+            Some(info) => &info.connector,
+            None => {
+                let _ = ws
+                    .send(Message::Text("error:no destinations configured".into()))
+                    .await;
+                let _ = ws.close().await;
+                return;
+            }
+        }
+    };
+
+    let transport = match connector.connect().await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("blit: transport connect failed: {e}");
+            let dest_label = dest_name.as_deref().unwrap_or("default");
+            eprintln!("blit: transport connect failed for '{dest_label}': {e}");
             let _ = ws.send(Message::Text(format!("error:{e}").into())).await;
             let _ = ws.close().await;
             return;
         }
     };
+    let dest_label = dest_name.as_deref().unwrap_or("default");
     let _ = ws.send(Message::Text("ok".into())).await;
-    eprintln!("blit: browser client connected");
+    eprintln!("blit: browser client connected to '{dest_label}'");
 
     let (mut transport_reader, mut transport_writer) = transport.split();
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -1123,13 +583,13 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
                 Ok(Message::Binary(d)) => {
                     let frame = make_frame(&d);
                     if transport_writer.write_all(&frame).await.is_err() {
-                        eprintln!("blit: ws→transport: write failed");
+                        eprintln!("blit: ws->transport: write failed");
                         break;
                     }
                 }
                 Ok(Message::Close(_)) => break,
                 Err(e) => {
-                    eprintln!("blit: ws→transport: ws error: {e}");
+                    eprintln!("blit: ws->transport: ws error: {e}");
                     break;
                 }
                 _ => continue,
@@ -1144,750 +604,5 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     transport_to_ws.abort();
     ws_to_transport.abort();
 
-    eprintln!("blit: browser client disconnected");
-}
-
-async fn run(transport: Transport) {
-    let (mut server_reader, server_writer) = transport.split();
-
-    let _raw = RawMode::enter();
-    let _cleanup = Cleanup;
-
-    let (rows, cols) = term_size();
-
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(128);
-
-    let (ev_tx, mut ev_rx) = mpsc::channel::<Event>(64);
-
-    let mut writer = server_writer;
-    tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if writer.write_all(&frame).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let ev_tx_stdin = ev_tx.clone();
-    tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let _ = ev_tx_stdin.send(Event::Stdin(buf[..n].to_vec())).await;
-                }
-            }
-        }
-    });
-
-    let ev_tx_sig = ev_tx;
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sig = signal(SignalKind::window_change()).expect("SIGWINCH");
-            loop {
-                sig.recv().await;
-                let (r, c) = term_size();
-                let _ = ev_tx_sig.send(Event::Resize(r, c)).await;
-            }
-        }
-        #[cfg(windows)]
-        {
-            let mut prev = term_size();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let cur = term_size();
-                if cur != prev {
-                    prev = cur;
-                    let _ = ev_tx_sig.send(Event::Resize(cur.0, cur.1)).await;
-                }
-            }
-        }
-    });
-
-    let fps: u16 = std::env::var("BLIT_DISPLAY_FPS")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|fps| (10..=1000).contains(fps))
-        .unwrap_or(240);
-    let _ = frame_tx
-        .send(make_frame(&[C2S_DISPLAY_RATE, fps as u8, (fps >> 8) as u8]))
-        .await;
-
-    let mut screen = TerminalState::new(rows, cols);
-    let mut renderer = Renderer::new();
-    let mut out_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
-    let mut focused_pty: Option<u16> = None;
-    let mut current_title = String::new();
-    let mut ptys: Vec<u16> = Vec::new();
-    let mut expose = Expose::new();
-    let mut cur_rows = rows;
-    let mut cur_cols = cols;
-    let mut stdout = tokio::io::stdout();
-
-    loop {
-        tokio::select! {
-            frame = read_frame(&mut server_reader) => {
-                let frame = match frame { Some(f) => f, None => break };
-                if frame.is_empty() { continue; }
-                handle_server_msg(
-                    &frame, &mut screen, &mut renderer, &mut out_buf,
-                    &mut focused_pty, &mut ptys, &mut current_title, &frame_tx,
-                    &mut stdout, cur_rows, cur_cols, &mut expose,
-                ).await;
-            }
-            ev = ev_rx.recv() => {
-                match ev {
-                    Some(Event::Stdin(data)) => {
-                        if handle_stdin(
-                            &data, &mut expose, &mut focused_pty, &ptys,
-                            &mut renderer, &mut screen, &mut out_buf,
-                            &frame_tx, &mut stdout, cur_rows, cur_cols,
-                        ).await { break; }
-                    }
-                    Some(Event::Resize(r, c)) => {
-                        cur_rows = r;
-                        cur_cols = c;
-                        if expose.open {
-                            out_buf.clear();
-                            expose.render(r, c, focused_pty, &mut out_buf);
-                            if !out_buf.is_empty() {
-                                let _ = stdout.write_all(&out_buf).await;
-                                let _ = stdout.flush().await;
-                            }
-                        }
-                        if let Some(id) = focused_pty {
-                            let _ = frame_tx.send(make_frame(&msg_resize(id, r, c))).await;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_stdin(
-    data: &[u8],
-    expose: &mut Expose,
-    focused_pty: &mut Option<u16>,
-    ptys: &[u16],
-    renderer: &mut Renderer,
-    screen: &mut TerminalState,
-    out_buf: &mut Vec<u8>,
-    frame_tx: &mpsc::Sender<Vec<u8>>,
-    stdout: &mut tokio::io::Stdout,
-    rows: u16,
-    cols: u16,
-) -> bool {
-    if !expose.open {
-        if let Some(pos) = data.iter().position(|&b| b == 0x0B) {
-            if pos > 0
-                && let Some(id) = *focused_pty
-            {
-                let _ = frame_tx
-                    .send(make_frame(&msg_input(id, &data[..pos])))
-                    .await;
-            }
-            expose.sync(ptys);
-            expose.open = true;
-            if let Some(id) = *focused_pty {
-                expose.selected = expose.lru.iter().position(|&x| x == id).unwrap_or(0);
-            }
-            out_buf.clear();
-            out_buf.extend_from_slice(b"\x1b[?25l");
-            expose.render(rows, cols, *focused_pty, out_buf);
-            let _ = stdout.write_all(out_buf).await;
-            let _ = stdout.flush().await;
-            if pos + 1 < data.len()
-                && handle_expose_input(
-                    &data[pos + 1..],
-                    expose,
-                    focused_pty,
-                    renderer,
-                    screen,
-                    out_buf,
-                    frame_tx,
-                    stdout,
-                    rows,
-                    cols,
-                )
-                .await
-            {
-                return true;
-            }
-            return false;
-        }
-        if let Some(id) = *focused_pty {
-            let _ = frame_tx.send(make_frame(&msg_input(id, data))).await;
-        }
-    } else {
-        if handle_expose_input(
-            data,
-            expose,
-            focused_pty,
-            renderer,
-            screen,
-            out_buf,
-            frame_tx,
-            stdout,
-            rows,
-            cols,
-        )
-        .await
-        {
-            return true;
-        }
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_expose_input(
-    data: &[u8],
-    expose: &mut Expose,
-    focused_pty: &mut Option<u16>,
-    renderer: &mut Renderer,
-    screen: &mut TerminalState,
-    out_buf: &mut Vec<u8>,
-    frame_tx: &mpsc::Sender<Vec<u8>>,
-    stdout: &mut tokio::io::Stdout,
-    rows: u16,
-    cols: u16,
-) -> bool {
-    let mut off = 0;
-    while off < data.len() {
-        let (action, consumed) = parse_expose_key(&data[off..]);
-        if consumed == 0 {
-            break;
-        }
-        off += consumed;
-
-        match action {
-            ExposeAction::None => {}
-            ExposeAction::Close => {
-                close_expose(
-                    expose,
-                    focused_pty,
-                    renderer,
-                    screen,
-                    out_buf,
-                    frame_tx,
-                    stdout,
-                    rows,
-                    cols,
-                )
-                .await;
-                if off < data.len()
-                    && let Some(id) = *focused_pty
-                {
-                    let _ = frame_tx
-                        .send(make_frame(&msg_input(id, &data[off..])))
-                        .await;
-                }
-                return false;
-            }
-            ExposeAction::Up => {
-                if expose.selected > 0 {
-                    expose.selected -= 1;
-                }
-            }
-            ExposeAction::Down => {
-                let len = expose.visible_ids().len();
-                if len > 0 && expose.selected < len - 1 {
-                    expose.selected += 1;
-                }
-            }
-            ExposeAction::Select => {
-                let ids = expose.visible_ids();
-                if let Some(&id) = ids.get(expose.selected) {
-                    *focused_pty = Some(id);
-                    expose.touch(id);
-                    let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
-                    let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
-                }
-                close_expose(
-                    expose,
-                    focused_pty,
-                    renderer,
-                    screen,
-                    out_buf,
-                    frame_tx,
-                    stdout,
-                    rows,
-                    cols,
-                )
-                .await;
-                return false;
-            }
-            ExposeAction::Create => {
-                let _ = frame_tx.send(make_frame(&msg_create(rows, cols))).await;
-            }
-            ExposeAction::Kill => {
-                let ids = expose.visible_ids().to_vec();
-                if let Some(&id) = ids.get(expose.selected) {
-                    let _ = frame_tx.send(make_frame(&msg_close(id))).await;
-                }
-            }
-            ExposeAction::Quit => {
-                return true;
-            }
-        }
-    }
-    if expose.open {
-        expose.clamp_selection();
-        out_buf.clear();
-        expose.render(rows, cols, *focused_pty, out_buf);
-        if !out_buf.is_empty() {
-            let _ = stdout.write_all(out_buf).await;
-            let _ = stdout.flush().await;
-        }
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn close_expose(
-    expose: &mut Expose,
-    focused_pty: &mut Option<u16>,
-    renderer: &mut Renderer,
-    screen: &mut TerminalState,
-    out_buf: &mut Vec<u8>,
-    frame_tx: &mpsc::Sender<Vec<u8>>,
-    stdout: &mut tokio::io::Stdout,
-    rows: u16,
-    cols: u16,
-) {
-    expose.open = false;
-    out_buf.clear();
-    renderer.render(screen, out_buf);
-    if !out_buf.is_empty() {
-        let _ = stdout.write_all(out_buf).await;
-        let _ = stdout.flush().await;
-    }
-    if let Some(id) = *focused_pty {
-        let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_server_msg(
-    frame: &[u8],
-    screen: &mut TerminalState,
-    renderer: &mut Renderer,
-    out_buf: &mut Vec<u8>,
-    focused_pty: &mut Option<u16>,
-    ptys: &mut Vec<u16>,
-    current_title: &mut String,
-    frame_tx: &mpsc::Sender<Vec<u8>>,
-    stdout: &mut tokio::io::Stdout,
-    rows: u16,
-    cols: u16,
-    expose: &mut Expose,
-) {
-    match frame[0] {
-        S2C_LIST if frame.len() >= 3 => {
-            let count = u16::from_le_bytes([frame[1], frame[2]]) as usize;
-            ptys.clear();
-            let mut off = 3;
-            for _ in 0..count {
-                if off + 4 > frame.len() {
-                    break;
-                }
-                let id = u16::from_le_bytes([frame[off], frame[off + 1]]);
-                let tag_len = u16::from_le_bytes([frame[off + 2], frame[off + 3]]) as usize;
-                off += 4 + tag_len;
-                ptys.push(id);
-            }
-            expose.sync(ptys);
-            if let Some(&id) = ptys.first() {
-                *focused_pty = Some(id);
-                expose.touch(id);
-                let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
-                let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
-            } else {
-                let _ = frame_tx.send(make_frame(&msg_create(rows, cols))).await;
-            }
-        }
-
-        S2C_CREATED if frame.len() >= 3 => {
-            let id = u16::from_le_bytes([frame[1], frame[2]]);
-            if !ptys.contains(&id) {
-                ptys.push(id);
-            }
-            expose.sync(ptys);
-            if focused_pty.is_none() || expose.open {
-                *focused_pty = Some(id);
-                expose.touch(id);
-                let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
-                let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
-                if expose.open {
-                    expose.open = false;
-                    out_buf.clear();
-                    renderer.render(screen, out_buf);
-                    if !out_buf.is_empty() {
-                        let _ = stdout.write_all(out_buf).await;
-                        let _ = stdout.flush().await;
-                    }
-                }
-            }
-        }
-
-        S2C_CREATED_N if frame.len() >= 5 => {
-            let id = u16::from_le_bytes([frame[3], frame[4]]);
-            if !ptys.contains(&id) {
-                ptys.push(id);
-            }
-            expose.sync(ptys);
-            if focused_pty.is_none() || expose.open {
-                *focused_pty = Some(id);
-                expose.touch(id);
-                let _ = frame_tx.send(make_frame(&msg_focus(id))).await;
-                let _ = frame_tx.send(make_frame(&msg_resize(id, rows, cols))).await;
-                if expose.open {
-                    expose.open = false;
-                    out_buf.clear();
-                    renderer.render(screen, out_buf);
-                    if !out_buf.is_empty() {
-                        let _ = stdout.write_all(out_buf).await;
-                        let _ = stdout.flush().await;
-                    }
-                }
-            }
-        }
-
-        S2C_HELLO => {}
-
-        S2C_CLOSED if frame.len() >= 3 => {
-            let id = u16::from_le_bytes([frame[1], frame[2]]);
-            ptys.retain(|&x| x != id);
-            expose.remove(id);
-            expose.sync(ptys);
-            if expose.open {
-                expose.clamp_selection();
-                out_buf.clear();
-                expose.render(rows, cols, *focused_pty, &mut *out_buf);
-                if !out_buf.is_empty() {
-                    let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
-                }
-            }
-            if *focused_pty == Some(id) {
-                *focused_pty = expose
-                    .lru
-                    .first()
-                    .copied()
-                    .or_else(|| ptys.first().copied());
-                if let Some(new_id) = *focused_pty {
-                    let _ = frame_tx.send(make_frame(&msg_focus(new_id))).await;
-                    let _ = frame_tx
-                        .send(make_frame(&msg_resize(new_id, rows, cols)))
-                        .await;
-                }
-            }
-        }
-
-        S2C_TITLE if frame.len() >= 3 => {
-            let id = u16::from_le_bytes([frame[1], frame[2]]);
-            if let Ok(title) = std::str::from_utf8(&frame[3..]) {
-                expose.titles.insert(id, title.to_owned());
-                if expose.open {
-                    out_buf.clear();
-                    expose.render(rows, cols, *focused_pty, &mut *out_buf);
-                    if !out_buf.is_empty() {
-                        let _ = stdout.write_all(out_buf).await;
-                        let _ = stdout.flush().await;
-                    }
-                }
-            }
-            if *focused_pty == Some(id)
-                && let Ok(title) = std::str::from_utf8(&frame[3..])
-            {
-                current_title.clear();
-                current_title.push_str(title);
-                if !expose.open {
-                    out_buf.clear();
-                    out_buf.extend_from_slice(b"\x1b]0;");
-                    out_buf.extend_from_slice(title.as_bytes());
-                    out_buf.push(b'\x07');
-                    write_all_stdout(out_buf);
-                }
-            }
-        }
-
-        S2C_UPDATE if frame.len() >= 3 => {
-            let id = u16::from_le_bytes([frame[1], frame[2]]);
-            if *focused_pty != Some(id) {
-                let _ = frame_tx.send(make_frame(&msg_ack())).await;
-                return;
-            }
-
-            screen.feed_compressed(&frame[3..]);
-
-            if !expose.open {
-                out_buf.clear();
-
-                if screen.title() != current_title {
-                    current_title.clear();
-                    current_title.push_str(screen.title());
-                    out_buf.extend_from_slice(b"\x1b]0;");
-                    out_buf.extend_from_slice(screen.title().as_bytes());
-                    out_buf.push(b'\x07');
-                }
-
-                renderer.render(screen, out_buf);
-
-                if !out_buf.is_empty() {
-                    let _ = stdout.write_all(out_buf).await;
-                    let _ = stdout.flush().await;
-                }
-            }
-
-            let _ = frame_tx.send(make_frame(&msg_ack())).await;
-        }
-
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn output_contains(out: &[u8], needle: &[u8]) -> bool {
-        out.windows(needle.len()).any(|w| w == needle)
-    }
-
-    #[test]
-    fn first_render_shows_cursor_when_visible() {
-        let mut renderer = Renderer::new();
-        let mut screen = TerminalState::new(4, 10);
-        screen.frame_mut().set_mode(1);
-
-        let mut out = Vec::new();
-        renderer.render(&screen, &mut out);
-
-        assert!(
-            output_contains(&out, b"\x1b[?25h"),
-            "cursor show sequence missing from first render output"
-        );
-    }
-
-    #[test]
-    fn cursor_stays_visible_across_renders() {
-        let mut renderer = Renderer::new();
-        let mut screen = TerminalState::new(4, 10);
-        screen.frame_mut().set_mode(1);
-
-        let mut out = Vec::new();
-        renderer.render(&screen, &mut out);
-
-        out.clear();
-        renderer.render(&screen, &mut out);
-
-        assert!(
-            !output_contains(&out, b"\x1b[?25l"),
-            "cursor hide emitted when cursor should stay visible"
-        );
-    }
-
-    #[test]
-    fn cursor_hidden_then_shown() {
-        let mut renderer = Renderer::new();
-        let mut screen = TerminalState::new(4, 10);
-        screen.frame_mut().set_mode(0);
-
-        let mut out = Vec::new();
-        renderer.render(&screen, &mut out);
-
-        screen.frame_mut().set_mode(1);
-        out.clear();
-        renderer.render(&screen, &mut out);
-
-        assert!(
-            output_contains(&out, b"\x1b[?25h"),
-            "cursor show missing after mode change"
-        );
-    }
-
-    #[test]
-    fn cursor_positioned_at_screen_cursor() {
-        let mut renderer = Renderer::new();
-        let mut screen = TerminalState::new(4, 10);
-        screen.frame_mut().set_mode(1);
-        screen.frame_mut().set_cursor(2, 5);
-
-        let mut out = Vec::new();
-        renderer.render(&screen, &mut out);
-
-        assert!(
-            output_contains(&out, b"\x1b[3;6H"),
-            "cursor not positioned at expected row=2 col=5"
-        );
-    }
-
-    #[test]
-    fn make_frame_empty_payload() {
-        let f = make_frame(&[]);
-        assert_eq!(f, vec![0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn make_frame_small_payload() {
-        let f = make_frame(&[0xAB, 0xCD]);
-        assert_eq!(f.len(), 6);
-        assert_eq!(&f[..4], &2u32.to_le_bytes());
-        assert_eq!(&f[4..], &[0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn make_frame_256_byte_payload() {
-        let payload = vec![0x42; 256];
-        let f = make_frame(&payload);
-        assert_eq!(f.len(), 260);
-        assert_eq!(u32::from_le_bytes([f[0], f[1], f[2], f[3]]), 256);
-        assert!(f[4..].iter().all(|&b| b == 0x42));
-    }
-
-    #[test]
-    fn pack_color_default() {
-        let p = pack_color(0, 0, 0, 0);
-        assert_eq!(p, 0);
-    }
-
-    #[test]
-    fn pack_color_indexed() {
-        let p = pack_color(1, 42, 0, 0);
-        assert_eq!(p, (1u64 << 24) | (42u64 << 16));
-    }
-
-    #[test]
-    fn pack_color_rgb() {
-        let p = pack_color(2, 0xFF, 0x80, 0x40);
-        assert_eq!(p, (2u64 << 24) | (0xFFu64 << 16) | (0x80u64 << 8) | 0x40u64);
-    }
-
-    #[test]
-    fn emit_color_default_fg() {
-        let packed = pack_color(0, 0, 0, 0);
-        let mut out = Vec::new();
-        emit_color(packed, true, &mut out);
-        assert_eq!(out, b"\x1b[39m");
-    }
-
-    #[test]
-    fn emit_color_default_bg() {
-        let packed = pack_color(0, 0, 0, 0);
-        let mut out = Vec::new();
-        emit_color(packed, false, &mut out);
-        assert_eq!(out, b"\x1b[49m");
-    }
-
-    #[test]
-    fn emit_color_indexed_fg() {
-        let packed = pack_color(1, 196, 0, 0);
-        let mut out = Vec::new();
-        emit_color(packed, true, &mut out);
-        assert_eq!(out, b"\x1b[38;5;196m");
-    }
-
-    #[test]
-    fn emit_color_indexed_bg() {
-        let packed = pack_color(1, 42, 0, 0);
-        let mut out = Vec::new();
-        emit_color(packed, false, &mut out);
-        assert_eq!(out, b"\x1b[48;5;42m");
-    }
-
-    #[test]
-    fn emit_color_rgb_fg() {
-        let packed = pack_color(2, 10, 20, 30);
-        let mut out = Vec::new();
-        emit_color(packed, true, &mut out);
-        assert_eq!(out, b"\x1b[38;2;10;20;30m");
-    }
-
-    #[test]
-    fn emit_color_rgb_bg() {
-        let packed = pack_color(2, 255, 128, 0);
-        let mut out = Vec::new();
-        emit_color(packed, false, &mut out);
-        assert_eq!(out, b"\x1b[48;2;255;128;0m");
-    }
-
-    #[test]
-    fn emit_color_unknown_type_falls_back_to_default() {
-        let packed = pack_color(3, 1, 2, 3);
-        let mut out = Vec::new();
-        emit_color(packed, true, &mut out);
-        assert_eq!(out, b"\x1b[39m");
-    }
-
-    #[test]
-    fn push_u16_zero() {
-        let mut out = Vec::new();
-        push_u16(&mut out, 0);
-        assert_eq!(out, b"0");
-    }
-
-    #[test]
-    fn push_u16_one() {
-        let mut out = Vec::new();
-        push_u16(&mut out, 1);
-        assert_eq!(out, b"1");
-    }
-
-    #[test]
-    fn push_u16_255() {
-        let mut out = Vec::new();
-        push_u16(&mut out, 255);
-        assert_eq!(out, b"255");
-    }
-
-    #[test]
-    fn push_u16_max() {
-        let mut out = Vec::new();
-        push_u16(&mut out, 65535);
-        assert_eq!(out, b"65535");
-    }
-
-    #[test]
-    fn push_u16_power_of_ten() {
-        let mut out = Vec::new();
-        push_u16(&mut out, 1000);
-        assert_eq!(out, b"1000");
-    }
-
-    #[test]
-    fn digits_zero() {
-        assert_eq!(digits(0), 1);
-    }
-
-    #[test]
-    fn digits_single() {
-        assert_eq!(digits(1), 1);
-        assert_eq!(digits(9), 1);
-    }
-
-    #[test]
-    fn digits_double() {
-        assert_eq!(digits(10), 2);
-        assert_eq!(digits(99), 2);
-    }
-
-    #[test]
-    fn digits_triple() {
-        assert_eq!(digits(100), 3);
-        assert_eq!(digits(999), 3);
-    }
-
-    #[test]
-    fn digits_large() {
-        assert_eq!(digits(10000), 5);
-        assert_eq!(digits(65535), 5);
-    }
+    eprintln!("blit: browser client disconnected from '{dest_label}'");
 }

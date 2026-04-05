@@ -103,41 +103,141 @@ blit list
 
 By default, `blit` connects to the local daemon via its default Unix socket. Use these global flags (before the subcommand) to connect elsewhere:
 
-| Flag                        | Description                            |
-| --------------------------- | -------------------------------------- |
-| `-s`, `--socket <SOCKET>`   | Connect to a specific Unix socket      |
-| `--tcp <TCP>`               | Connect via raw TCP (`HOST:PORT`)      |
-| `--ssh <SSH>`               | Connect via SSH to a remote host       |
-| `--passphrase <PASSPHRASE>` | Connect via WebRTC to a shared session |
+| Flag                        | Description                                      |
+| --------------------------- | ------------------------------------------------ |
+| `-s`, `--socket <SOCKET>`   | Connect to a specific Unix socket                |
+| `--tcp <TCP>`               | Connect via raw TCP (`HOST:PORT`)                |
+| `--ssh <SSH>`               | Connect via SSH (`[user@]host[:path/to/socket]`) |
+| `--passphrase <PASSPHRASE>` | Connect via WebRTC to a shared session           |
+
+`--ssh` and `--socket` are mutually exclusive.
 
 ```bash
 blit --socket /tmp/blit.sock list
 blit --tcp 192.168.1.10:7890 show 1
 blit --ssh dev-server start bash
+blit --ssh dev-server:/tmp/custom.sock list
 blit --passphrase mypassphrase list
 ```
 
 `--ssh` tunnels the blit protocol over SSH: it spawns `ssh -T HOST` with an inline script that connects to the remote blit Unix socket via `nc -U` (falling back to `socat`). SSH connection multiplexing is enabled (`ControlMaster=auto`, `ControlPersist=300s`) so subsequent commands reuse the same SSH connection. If no blit daemon is running on the remote host, `--ssh` will attempt to autostart one by running `blit server` (or `blit-server`) in the background.
 
-Combine `--ssh` with `--socket` to connect to a specific socket path on the remote host instead of the default search order:
+Append `:path/to/socket` to the host to connect to a specific socket path on the remote host instead of the default search order:
 
 ```bash
-blit --ssh dev-server --socket /tmp/custom.sock list
+blit --ssh dev-server:/tmp/custom.sock list
 ```
 
 `--passphrase` connects via WebRTC using a passphrase for peer-to-peer session sharing. Both sides must use the same passphrase and signaling hub (set via `--hub` or `BLIT_HUB`).
 
+## Multi-destination browser sessions
+
+`blit open` accepts positional destination URIs to open multiple connections in a single browser session:
+
+```bash
+blit open ssh:rabbit ssh:fox            # two SSH hosts
+blit open ssh:alice@rabbit local        # remote + local
+blit open prod=ssh:prod.example.com     # explicit name
+```
+
+URI formats:
+
+| URI                                | Description                           |
+| ---------------------------------- | ------------------------------------- |
+| `ssh:[user@]host[:path/to/socket]` | SSH tunnel to a remote host           |
+| `tcp:host:port`                    | Raw TCP connection                    |
+| `socket:/path`                     | Explicit Unix socket                  |
+| `local`                            | Local server (auto-started if needed) |
+
+Names are auto-derived from the URI (e.g. `ssh:rabbit` → `rabbit`). Use `name=uri` to override.
+
+The global flags `--ssh`, `--tcp`, `--socket` are not accepted by `open`; use destination URIs instead. Those flags are for agent subcommands (`list`, `start`, `show`, etc.).
+
 ## Remote installation
 
-`blit install --ssh HOST` installs blit on a remote host. It detects the remote OS via `uname`, then runs the appropriate installer interactively over SSH:
+`blit install [user@]host` installs blit on a remote host. It detects the remote OS via `uname`, then runs the appropriate installer interactively over SSH:
 
 - **Linux / macOS** — `curl -sf https://install.blit.sh | sh` (falls back to `wget`)
 - **Windows** — `irm https://install.blit.sh/install.ps1 | iex` via PowerShell
 
-The installer's stdin/stdout are connected to your terminal, so password prompts and other interactions work normally. Only `--ssh` is supported — other transports (`--tcp`, `--socket`, `--passphrase`) will fail with an error.
+The installer's stdin/stdout are connected to your terminal, so password prompts and other interactions work normally.
 
 ```bash
-blit install --ssh dev-server
+blit install dev-server
+blit install pcarrier@dev-server
+```
+
+## GUI surface automation
+
+When a blit session runs GUI applications (via the experimental headless Wayland compositor), you can list, screenshot, and interact with their windows.
+
+### Launching Chromium-based apps
+
+Chromium and Electron apps need `--ozone-platform=wayland` to connect to the compositor:
+
+```bash
+chromium --ozone-platform=wayland http://example.com &
+```
+
+On machines without a GPU, add flags to software-render WebGL via SwiftShader:
+
+```bash
+chromium --ozone-platform=wayland --ignore-gpu-blocklist --enable-unsafe-swiftshader http://example.com &
+```
+
+For Electron apps, pass the same flags after `--`.
+
+### Listing surfaces
+
+`blit surfaces` lists all compositor surfaces as TSV with columns: `ID`, `PARENT`, `W`, `H`, `TITLE`, `APP_ID`.
+
+```bash
+blit surfaces
+```
+
+### Capturing screenshots
+
+`blit capture ID` captures a surface as a PNG image. By default, the file is written to `surface-<ID>.png`. Use `--output` to specify a path:
+
+```bash
+blit capture 1                     # writes surface-1.png
+blit capture 1 --output /tmp/s.png # writes /tmp/s.png
+```
+
+### Clicking
+
+`blit click ID X Y` sends a left-click at pixel coordinates (X, Y) on a surface:
+
+```bash
+blit click 1 100 50
+```
+
+Use `--button` to send a right-click or middle-click:
+
+```bash
+blit click --button right 1 100 50   # right-click (context menu)
+blit click --button middle 1 100 50  # middle-click
+```
+
+### Key presses
+
+`blit key ID KEY` sends a single key press and release. Supports modifier combinations with `+`:
+
+```bash
+blit key 1 Return
+blit key 1 ctrl+a
+blit key 1 shift+Tab
+blit key 1 ctrl+shift+c
+```
+
+### Typing text
+
+`blit type ID TEXT` types a string character by character. Special keys use xdotool-style `{braces}`:
+
+```bash
+blit type 1 "hello world"
+blit type 1 "hello{Return}"
+blit type 1 "{ctrl+a}replacement text{Return}"
 ```
 
 ## Output conventions
@@ -147,6 +247,9 @@ blit install --ssh dev-server
   - STATUS column: `running`, `exited(N)` (normal exit with code N), `signal(N)` (killed by signal N), or `exited` (exit status unknown).
 - `start` prints a single integer (the new session ID) to stdout.
 - `show` and `history` print terminal text to stdout, one line per terminal row. Trailing whitespace per row is trimmed.
+- `surfaces` prints tab-separated values with a header row (`ID`, `PARENT`, `W`, `H`, `TITLE`, `APP_ID`). Parse on `\t`.
+- `capture` writes a PNG file and prints the output path to stdout.
+- `click`, `key`, and `type` produce no stdout on success.
 - `send`, `restart`, `kill`, and `close` produce no stdout on success. `send` and `kill` return an error if the session has already exited.
 - `wait` prints the exit status (e.g. `exited(0)`) on success, or the matching line when `--pattern` is used. Exit code 124 on timeout.
 - All errors go to stderr. Exit code is non-zero on failure.

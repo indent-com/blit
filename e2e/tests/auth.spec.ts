@@ -63,6 +63,11 @@ test.describe("Auth flow", () => {
       .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
+    // The encrypted passphrase is written to the hash asynchronously
+    // after the WebSocket handshake completes — wait for it.
+    await page.waitForFunction(() => location.hash.length > 1, {
+      timeout: 5_000,
+    });
     const url = page.url();
     expect(url).toContain("#");
 
@@ -83,7 +88,7 @@ test.describe("Auth flow", () => {
 
     const url = page.url();
     expect(url).not.toContain("#test-secret");
-    expect(url).toContain("#e.");
+    expect(url).toContain("#e=");
   });
 
   test("encrypted hash survives reload", async ({ page }) => {
@@ -95,12 +100,12 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
     const urlBefore = page.url();
-    expect(urlBefore).toContain("#e.");
+    expect(urlBefore).toContain("#e=");
 
     await page.reload();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
     const urlAfter = page.url();
-    expect(urlAfter).toContain("#e.");
+    expect(urlAfter).toContain("#e=");
   });
 });

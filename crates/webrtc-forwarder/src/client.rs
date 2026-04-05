@@ -1,3 +1,4 @@
+use crate::BoxKeys;
 use crate::ice;
 use crate::signaling;
 use crate::turn::{self, TurnRelay};
@@ -31,8 +32,11 @@ pub async fn connect(
     passphrase: &str,
     signal_url: &str,
 ) -> Result<tokio::io::DuplexStream, BoxError> {
-    let signing_key = crate::derive_signing_key(passphrase);
+    let consumer =
+        crate::parse_consumer_secret(passphrase).map_err(|e| -> BoxError { e.into() })?;
+    let signing_key = consumer.signing.clone();
     let public_key_hex = crate::hex_encode(signing_key.verifying_key().as_bytes());
+    let box_keys = Some(consumer.box_keys());
 
     let ice_config = ice::fetch_ice_config(signal_url).await.ok();
 
@@ -138,7 +142,12 @@ pub async fn connect(
 
     let offer_json = serde_json::to_value(&offer)?;
     let signal_data = serde_json::json!({ "sdp": offer_json });
-    let msg = signaling::build_signed_message(&signing_key, &forwarder_session_id, &signal_data);
+    let msg = match &box_keys {
+        Some(bk) => {
+            signaling::build_sealed_message(&signing_key, &forwarder_session_id, &signal_data, bk)
+        }
+        None => signaling::build_signed_message(&signing_key, &forwarder_session_id, &signal_data),
+    };
     ws_write.send(Message::Text(msg.into())).await?;
 
     let mut answer_pending = Some(pending);
@@ -152,8 +161,13 @@ pub async fn connect(
         if let Message::Text(t) = msg
             && let Ok(m) = serde_json::from_str::<ServerMessage>(&t)
             && m.msg_type == "signal"
-            && let Some(data) = m.data
+            && let Some(raw) = m.data
         {
+            // Try to open a crypto_box sealed payload; fall back to plaintext.
+            let data = box_keys
+                .as_ref()
+                .and_then(|bk| signaling::open_sealed_data(&raw, bk))
+                .unwrap_or(raw);
             if let Some(sdp) = data.get("sdp") {
                 let answer = serde_json::from_value(sdp.clone())?;
                 if let Some(p) = answer_pending.take() {
@@ -189,6 +203,7 @@ pub async fn connect(
             ws_read,
             ws_write,
             ready_tx,
+            box_keys,
         )
         .await
         {
@@ -220,6 +235,7 @@ async fn drive(
         Message,
     >,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    box_keys: Option<BoxKeys>,
 ) -> Result<(), BoxError> {
     let (mut drv_read, mut drv_write) = tokio::io::split(driver_half);
     let mut buf = vec![0u8; 65535];
@@ -352,18 +368,23 @@ async fn drive(
                     Some(Ok(Message::Text(t))) => {
                         if let Ok(m) = serde_json::from_str::<ServerMessage>(&t)
                             && m.msg_type == "signal"
-                                && let Some(data) = m.data
-                                    && let Some(candidate) = data.get("candidate")
-                                        && let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone()) {
-                                            rtc.add_remote_candidate(c);
-                                        }
+                                && let Some(raw) = m.data
+                        {
+                            let data = box_keys
+                                .as_ref()
+                                .and_then(|bk| signaling::open_sealed_data(&raw, bk))
+                                .unwrap_or(raw);
+                            if let Some(candidate) = data.get("candidate")
+                                && let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone())
+                            {
+                                rtc.add_remote_candidate(c);
+                            }
+                        }
                     }
                     None | Some(Err(_)) => {
                         signaling_alive = false;
-                        if ready.is_some() {
-                            if let Some(tx) = ready.take() {
-                                let _ = tx.send(Err("signaling lost before channel open".into()));
-                            }
+                        if let Some(tx) = ready.take() {
+                            let _ = tx.send(Err("signaling lost before channel open".into()));
                             return Ok(());
                         }
                     }

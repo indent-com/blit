@@ -5,6 +5,6 @@ cd "$(dirname "$0")/.."
 # Build WASM module
 (cd crates/browser && wasm-pack build --target web --release --out-dir pkg)
 
-# Install JS dependencies and build web app
+# Install JS dependencies and build UI
 (cd js && pnpm install --prefer-offline)
-(cd js/web-app && pnpm run build)
+(cd js/ui && pnpm run build)

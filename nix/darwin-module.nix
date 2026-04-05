@@ -149,7 +149,7 @@ in
           ProgramArguments = [
             "/bin/sh"
             "-lc"
-            ''cd; [ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; exec ${cfg.package}/bin/blit-server''
+            ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; exec ${cfg.package}/bin/blit-server''
           ];
           EnvironmentVariables = {
             BLIT_SCROLLBACK = toString cfg.scrollback;
@@ -160,6 +160,7 @@ in
           // lib.optionalAttrs (cfg.shell != null) {
             SHELL = cfg.shell;
           };
+          WorkingDirectory = "~";
           RunAtLoad = true;
           KeepAlive = true;
           StandardOutPath = "/tmp/blit-server.log";

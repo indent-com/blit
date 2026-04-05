@@ -1,6 +1,9 @@
 export { BlitTerminal } from "./BlitTerminal";
 export type { BlitTerminalProps } from "./BlitTerminal";
 
+export { BlitSurfaceView } from "./BlitSurfaceView";
+export type { BlitSurfaceViewProps } from "./BlitSurfaceView";
+
 export { useBlitConnection } from "./hooks/useBlitConnection";
 export { createBlitSessions } from "./hooks/createBlitSessions";
 export {

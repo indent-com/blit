@@ -8,7 +8,11 @@ import {
   buildSubscribeMessage,
   buildUnsubscribeMessage,
 } from "./protocol";
-import { createGlRenderer, type GlRenderer } from "./gl-renderer";
+import {
+  createGlRenderer,
+  createCanvas2dRenderer,
+  type GlRenderer,
+} from "./gl-renderer";
 
 export type BlitWasmModule = typeof import("@blit-sh/browser");
 
@@ -263,6 +267,9 @@ export class TerminalStore {
       this.sharedCanvas = document.createElement("canvas");
     }
     this.sharedRenderer = createGlRenderer(this.sharedCanvas);
+    if (!this.sharedRenderer.supported) {
+      this.sharedRenderer = createCanvas2dRenderer(this.sharedCanvas);
+    }
     if (!this.sharedRenderer.supported) return null;
     return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
   }

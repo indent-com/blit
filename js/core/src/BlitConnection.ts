@@ -9,11 +9,13 @@ import type {
   TerminalPalette,
 } from "./types";
 import {
+  FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CREATE_NONCE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
   PROTOCOL_VERSION,
+  S2C_CLIPBOARD_MSG,
   S2C_CLOSED,
   S2C_CREATED,
   S2C_CREATED_N,
@@ -21,6 +23,12 @@ import {
   S2C_HELLO,
   S2C_LIST,
   S2C_SEARCH_RESULTS,
+  S2C_SURFACE_APP_ID,
+  S2C_SURFACE_CREATED,
+  S2C_SURFACE_DESTROYED,
+  S2C_SURFACE_FRAME,
+  S2C_SURFACE_RESIZED,
+  S2C_SURFACE_TITLE,
   S2C_TEXT,
   S2C_TITLE,
   S2C_UPDATE,
@@ -40,7 +48,18 @@ import {
   buildRestartMessage,
   buildScrollMessage,
   buildSearchMessage,
+  buildSurfaceInputMessage,
+  buildSurfacePointerMessage,
+  buildSurfaceAxisMessage,
+  buildSurfaceResizeMessage,
+  buildSurfaceFocusMessage,
+  buildSurfaceCloseMessage,
+  buildSurfaceSubscribeMessage,
+  buildSurfaceUnsubscribeMessage,
+  buildSurfaceAckMessage,
+  buildClipboardMessage,
 } from "./protocol";
+import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 
 const textDecoder = new TextDecoder();
@@ -104,8 +123,9 @@ function toPublicSession(s: InternalSession): BlitSession {
 export class BlitConnection {
   readonly id: ConnectionId;
 
-  private readonly transport: BlitTransport;
+  readonly transport: BlitTransport;
   private readonly store: TerminalStore;
+  readonly surfaceStore = new SurfaceStore();
 
   private readonly listeners = new Set<() => void>();
   private readonly sessionsById = new Map<SessionId, InternalSession>();
@@ -163,6 +183,7 @@ export class BlitConnection {
       ready: false,
       supportsRestart: false,
       supportsCopyRange: false,
+      supportsCompositor: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -228,6 +249,7 @@ export class BlitConnection {
     this.rejectPendingReads(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
     this.store.destroy();
+    this.surfaceStore.destroy();
   }
 
   setVisibleSessionIds(sessionIds: Iterable<SessionId>): void {
@@ -246,11 +268,18 @@ export class BlitConnection {
     return s ? toPublicSession(s) : null;
   }
 
-  getDebugStats(
-    sessionId: SessionId | null,
-  ): ReturnType<TerminalStore["getDebugStats"]> {
+  getDebugStats(sessionId: SessionId | null): ReturnType<
+    TerminalStore["getDebugStats"]
+  > & {
+    surfaces: ReturnType<
+      import("./SurfaceStore").SurfaceStore["getDebugStats"]
+    >;
+  } {
     const session = sessionId ? this.sessionsById.get(sessionId) : null;
-    return this.store.getDebugStats(session?.ptyId ?? null);
+    return {
+      ...this.store.getDebugStats(session?.ptyId ?? null),
+      surfaces: this.surfaceStore.getDebugStats(),
+    };
   }
 
   async createSession(options: CreateSessionOptions): Promise<BlitSession> {
@@ -651,6 +680,112 @@ export class BlitConnection {
     this.store.setPalette(p);
   }
 
+  sendSurfaceInput(
+    sessionId: number,
+    surfaceId: number,
+    keycode: number,
+    pressed: boolean,
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildSurfaceInputMessage(sessionId, surfaceId, keycode, pressed),
+    );
+  }
+
+  sendSurfacePointer(
+    sessionId: number,
+    surfaceId: number,
+    type: number,
+    button: number,
+    x: number,
+    y: number,
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildSurfacePointerMessage(sessionId, surfaceId, type, button, x, y),
+    );
+  }
+
+  sendSurfaceAxis(
+    sessionId: number,
+    surfaceId: number,
+    axis: number,
+    valueX100: number,
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildSurfaceAxisMessage(sessionId, surfaceId, axis, valueX100),
+    );
+  }
+
+  sendSurfaceResize(
+    sessionId: number,
+    surfaceId: number,
+    width: number,
+    height: number,
+    scale120: number = 0,
+    codecSupport: number = 0,
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildSurfaceResizeMessage(
+        sessionId,
+        surfaceId,
+        width,
+        height,
+        scale120,
+        codecSupport,
+      ),
+    );
+  }
+
+  sendSurfaceFocus(sessionId: number, surfaceId: number): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceFocusMessage(sessionId, surfaceId));
+  }
+
+  sendSurfaceClose(sessionId: number, surfaceId: number): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceCloseMessage(sessionId, surfaceId));
+  }
+
+  private surfaceSubRefCounts = new Map<number, number>();
+
+  sendSurfaceSubscribe(sessionId: number, surfaceId: number): void {
+    const prev = this.surfaceSubRefCounts.get(surfaceId) ?? 0;
+    this.surfaceSubRefCounts.set(surfaceId, prev + 1);
+    if (prev === 0 && this.transport.status === "connected") {
+      this.transport.send(buildSurfaceSubscribeMessage(sessionId, surfaceId));
+    }
+  }
+
+  sendSurfaceUnsubscribe(sessionId: number, surfaceId: number): void {
+    const prev = this.surfaceSubRefCounts.get(surfaceId) ?? 0;
+    const next = Math.max(0, prev - 1);
+    if (next === 0) {
+      this.surfaceSubRefCounts.delete(surfaceId);
+      if (this.transport.status === "connected") {
+        this.transport.send(
+          buildSurfaceUnsubscribeMessage(sessionId, surfaceId),
+        );
+      }
+    } else {
+      this.surfaceSubRefCounts.set(surfaceId, next);
+    }
+  }
+
+  sendClipboard(
+    sessionId: number,
+    surfaceId: number,
+    mimeType: string,
+    data: Uint8Array,
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildClipboardMessage(sessionId, surfaceId, mimeType, data),
+    );
+  }
+
   isReady(): boolean {
     return this.store.isReady();
   }
@@ -757,8 +892,119 @@ export class BlitConnection {
           ...this.snapshot,
           supportsRestart: (features & FEATURE_RESTART) !== 0,
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
+          supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
         };
         this.emit();
+        return;
+      }
+      case S2C_SURFACE_CREATED: {
+        try {
+          if (bytes.length < 13) return;
+          const view = new DataView(data);
+          const sessionId = view.getUint16(1, true);
+          const surfaceId = view.getUint16(3, true);
+          const parentId = view.getUint16(5, true);
+          const width = view.getUint16(7, true);
+          const height = view.getUint16(9, true);
+          const titleLen = view.getUint16(11, true);
+          const title = textDecoder.decode(bytes.subarray(13, 13 + titleLen));
+          let appId = "";
+          const appIdOffset = 13 + titleLen;
+          if (bytes.length >= appIdOffset + 2) {
+            const appIdLen = view.getUint16(appIdOffset, true);
+            appId = textDecoder.decode(
+              bytes.subarray(appIdOffset + 2, appIdOffset + 2 + appIdLen),
+            );
+          }
+          this.surfaceStore.handleSurfaceCreated(
+            sessionId,
+            surfaceId,
+            parentId,
+            width,
+            height,
+            title,
+            appId,
+          );
+        } catch {
+          // Surface errors must never block terminal message processing.
+        }
+        return;
+      }
+      case S2C_SURFACE_DESTROYED: {
+        try {
+          if (bytes.length < 5) return;
+          const surfaceId = bytes[3] | (bytes[4] << 8);
+          this.surfaceStore.handleSurfaceDestroyed(surfaceId);
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_FRAME: {
+        try {
+          if (bytes.length < 14) return;
+          const view = new DataView(data);
+          const surfaceId = view.getUint16(3, true);
+          const timestamp = view.getUint32(5, true);
+          const flags = bytes[9];
+          const width = view.getUint16(10, true);
+          const height = view.getUint16(12, true);
+          this.surfaceStore.handleSurfaceFrame(
+            surfaceId,
+            timestamp,
+            flags,
+            width,
+            height,
+            bytes.subarray(14),
+          );
+          this.transport.send(buildSurfaceAckMessage(surfaceId));
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_TITLE: {
+        try {
+          if (bytes.length < 5) return;
+          const surfaceId = bytes[3] | (bytes[4] << 8);
+          const title = textDecoder.decode(bytes.subarray(5));
+          this.surfaceStore.handleSurfaceTitle(surfaceId, title);
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_APP_ID: {
+        try {
+          if (bytes.length < 5) return;
+          const surfaceId = bytes[3] | (bytes[4] << 8);
+          const appId = textDecoder.decode(bytes.subarray(5));
+          this.surfaceStore.handleSurfaceAppId(surfaceId, appId);
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_RESIZED: {
+        try {
+          if (bytes.length < 9) return;
+          const view = new DataView(data);
+          const surfaceId = view.getUint16(3, true);
+          const width = view.getUint16(5, true);
+          const height = view.getUint16(7, true);
+          this.surfaceStore.handleSurfaceResized(surfaceId, width, height);
+        } catch {}
+        return;
+      }
+      case S2C_CLIPBOARD_MSG: {
+        try {
+          if (bytes.length < 11) return;
+          const view = new DataView(data);
+          const mimeLen = view.getUint16(5, true);
+          if (bytes.length < 7 + mimeLen + 4) return;
+          const mimeType = textDecoder.decode(bytes.subarray(7, 7 + mimeLen));
+          const dataLen = view.getUint32(7 + mimeLen, true);
+          const dataStart = 11 + mimeLen;
+          if (bytes.length < dataStart + dataLen) return;
+          if (mimeType.startsWith("text/") || mimeType === "UTF8_STRING") {
+            const text = textDecoder.decode(
+              bytes.subarray(dataStart, dataStart + dataLen),
+            );
+            navigator.clipboard.writeText(text).catch(() => {});
+          }
+        } catch {}
         return;
       }
       case S2C_TEXT: {
@@ -826,6 +1072,7 @@ export class BlitConnection {
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
+      this.surfaceStore.destroy();
     }
 
     this.emit();
@@ -900,7 +1147,11 @@ export class BlitConnection {
     );
     this.emit();
 
-    if (nextFocus && nextFocus !== previousFocus) {
+    // Always re-send focus to the server. After a reconnection the server
+    // has a fresh ClientState with lead=None and needs to be told which
+    // session this client is focused on, even if the focus didn't change
+    // from the client's perspective.
+    if (nextFocus) {
       const session = this.sessionsById.get(nextFocus);
       if (session && this.transport.status === "connected") {
         this.transport.send(buildFocusMessage(session.ptyId));

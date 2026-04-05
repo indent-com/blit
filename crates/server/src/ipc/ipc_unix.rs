@@ -25,10 +25,16 @@ pub struct IpcListener {
 impl IpcListener {
     pub fn bind(path: &str, verbose: bool) -> Self {
         let _ = std::fs::remove_file(path);
+        // Set a restrictive umask before bind so the socket is created with
+        // 0700 permissions atomically, closing the race window between bind
+        // and the subsequent chmod.
+        let old_umask = unsafe { libc::umask(0o077) };
         let listener = UnixListener::bind(path).unwrap_or_else(|e| {
+            unsafe { libc::umask(old_umask) };
             eprintln!("blit-server: cannot bind to {path}: {e}");
             std::process::exit(1);
         });
+        unsafe { libc::umask(old_umask) };
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
             eprintln!("blit-server: warning: cannot set socket permissions: {e}");
         }
@@ -122,7 +128,7 @@ fn recv_fd(channel: RawFd) -> RecvFdResult {
 
 pub async fn run_fd_channel(channel_fd: RawFd, state: crate::AppState) {
     use std::os::unix::io::FromRawFd;
-    if state.0.verbose {
+    if state.config.verbose {
         eprintln!("accepting clients via fd-channel (fd {channel_fd})");
     }
     let channel = unsafe { std::os::unix::net::UnixStream::from_raw_fd(channel_fd) };
@@ -153,7 +159,7 @@ pub async fn run_fd_channel(channel_fd: RawFd, state: crate::AppState) {
             }
         }
     }
-    if state.0.verbose {
+    if state.config.verbose {
         eprintln!("fd-channel closed, shutting down");
     }
 }
