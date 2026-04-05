@@ -6,4 +6,4 @@ crates/browser/pkg/
 *.wasm
 pnpm-lock.yaml
 *.astro
-*.astro
+man/
