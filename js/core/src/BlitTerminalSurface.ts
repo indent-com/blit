@@ -806,14 +806,25 @@ export class BlitTerminalSurface {
       t.glyph_verts_len(),
     );
     renderer.resize(pw, ph);
+    const predictedLen = this.predicted.length;
+    let effectiveCursorCol = t.cursor_col;
+    let effectiveCursorRow = t.cursor_row;
+    if (predictedLen > 0 && this._cols > 0) {
+      const abs = t.cursor_col + predictedLen;
+      effectiveCursorCol = abs % this._cols;
+      effectiveCursorRow = Math.min(
+        t.cursor_row + Math.floor(abs / this._cols),
+        this._rows - 1,
+      );
+    }
     renderer.render(
       bgVerts,
       glyphVerts,
       t.glyph_atlas_canvas(),
       t.glyph_atlas_version(),
       t.cursor_visible(),
-      t.cursor_col,
-      t.cursor_row,
+      effectiveCursorCol,
+      effectiveCursorRow,
       t.cursor_style(),
       this.cursorBlinkOn,
       cell,

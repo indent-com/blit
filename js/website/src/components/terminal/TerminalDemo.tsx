@@ -706,6 +706,7 @@ function TabShell(props: {
             fontFamily={FONT_FAMILY}
             fontSize={FONT_SIZE}
             palette={props.palette()}
+            readOnly={props.readOnly}
             style={{ width: "100%", height: "100%" }}
             surfaceRef={setTerminalSurface}
           />
