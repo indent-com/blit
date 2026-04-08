@@ -239,17 +239,6 @@ Releases go through a three-step process:
 
 CI on the verified tag builds debs/tarballs, publishes to crates.io and npm, updates the Homebrew tap, and deploys the APT repo.
 
-## CI checks
-
-PRs must be reviewed and pass the following CI checks before merging:
-
-| Check                  | What it covers                                                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `lint`                 | Formatting (`cargo fmt --check` + `prettier --check`) and clippy (`./bin/lint`)                                                            |
-| `e2e`                  | Playwright end-to-end tests (`./bin/e2e`)                                                                                                  |
-| `dev-check`            | Full-stack smoke test: starts dev services via `process-compose`, waits for health, exercises the CLI, then tears down (`./bin/dev-check`) |
-| `test (ubuntu-latest)` | Rust and JS test suite on Ubuntu                                                                                                           |
-
 ## Guardrails
 
 - `./bin/lint` is the CI gate (fmt + clippy). Run `./bin/fmt` to auto-fix formatting and `./bin/clippy` to check clippy warnings before pushing.

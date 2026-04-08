@@ -45,10 +45,12 @@ async function pbkdf2Derive(
 interface DerivedKeys {
   /** Ed25519 signing keypair — public key is the hub channel ID. */
   signing: nacl.SignKeyPair;
-  /** Our X25519 secret key (RW consumer). */
+  /** Our X25519 secret key (RW or RO consumer). */
   ourX25519Secret: Uint8Array;
   /** Producer's X25519 public key (derived from Ed25519 seed). */
   producerX25519Public: Uint8Array;
+  /** True when this is a read-only consumer key. */
+  readOnly: boolean;
 }
 
 /** Derive all keys needed for a RW consumer from a passphrase. */
@@ -77,7 +79,59 @@ async function deriveKeys(passphrase: string): Promise<DerivedKeys> {
   );
   const producerX25519Public = nacl.scalarMult.base(producerX25519Secret);
 
-  return { signing, ourX25519Secret, producerX25519Public };
+  return { signing, ourX25519Secret, producerX25519Public, readOnly: false };
+}
+
+/** Base64url decode (no padding). */
+function base64urlDecode(str: string): Uint8Array {
+  const padded = str.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Derive all keys needed for a RO consumer from a read-only token.
+ *
+ * The RO token is the base64url-encoded Ed25519 signing key (seed).
+ * Mirrors Rust's `ConsumerKeys::derive_ro`.
+ */
+async function deriveKeysFromRoToken(token: string): Promise<DerivedKeys> {
+  const ed25519Seed = base64urlDecode(token);
+  if (ed25519Seed.length !== 32) {
+    throw new Error(
+      `Invalid RO token: expected 32 bytes, got ${ed25519Seed.length}`,
+    );
+  }
+  const signing = nacl.sign.keyPair.fromSeed(ed25519Seed);
+
+  // Level 2 (from Ed25519 seed): RO consumer X25519 sk.
+  const ourX25519Secret = await pbkdf2Derive(
+    ed25519Seed,
+    new TextEncoder().encode("blit-consumer-ro-x25519"),
+  );
+
+  // Level 2 (from Ed25519 seed): producer X25519 sk → derive its public key.
+  const producerX25519Secret = await pbkdf2Derive(
+    ed25519Seed,
+    new TextEncoder().encode("blit-producer-x25519"),
+  );
+  const producerX25519Public = nacl.scalarMult.base(producerX25519Secret);
+
+  return { signing, ourX25519Secret, producerX25519Public, readOnly: true };
+}
+
+/**
+ * Detect and parse a read-only token (ends with `.ro`) from the passphrase
+ * field, then derive the appropriate keys.
+ */
+async function deriveConsumerKeys(passphrase: string): Promise<DerivedKeys> {
+  if (passphrase.endsWith(".ro")) {
+    const token = passphrase.slice(0, -3);
+    return deriveKeysFromRoToken(token);
+  }
+  return deriveKeys(passphrase);
 }
 
 function hexEncode(bytes: Uint8Array): string {
@@ -256,8 +310,12 @@ export function createShareTransport(
   async function doConnect(generation: number) {
     try {
       if (!cachedKeys) {
-        dbg.log("deriving keys from passphrase");
-        cachedKeys = await deriveKeys(passphrase);
+        dbg.log(
+          passphrase.endsWith(".ro")
+            ? "deriving keys from RO token"
+            : "deriving keys from passphrase",
+        );
+        cachedKeys = await deriveConsumerKeys(passphrase);
       }
       const keys = cachedKeys;
       // Connect to the producer's channel (the passphrase-derived Ed25519
