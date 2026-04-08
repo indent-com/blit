@@ -1,0 +1,51 @@
+---
+import CopyButton from "./CopyButton.tsx";
+
+const methods = [
+  {
+    label: "curl (Linux / macOS)",
+    cmd: "curl -sf https://install.blit.sh | sh",
+  },
+  {
+    label: "Homebrew (macOS)",
+    cmd: "brew install indent-com/tap/blit",
+  },
+  {
+    label: "APT (Debian / Ubuntu)",
+    cmd: `curl -fsSL https://install.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
+echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://install.blit.sh/ stable main" \\
+  | sudo tee /etc/apt/sources.list.d/blit.list
+sudo apt update && sudo apt install blit`,
+  },
+  {
+    label: "Windows (PowerShell)",
+    cmd: "irm https://install.blit.sh/install.ps1 | iex",
+  },
+  {
+    label: "Nix",
+    cmd: "nix profile install github:indent-com/blit#blit",
+  },
+];
+---
+
+<section class="py-10 border-t border-[var(--border)]">
+  <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
+    Install
+  </h2>
+  <p class="text-[13px] text-[var(--dim)] mb-4">
+    One binary, no runtime dependencies. Auto-starts the server when needed.
+  </p>
+  <div class="flex flex-col gap-2">
+    {methods.map(({ label, cmd }) => (
+      <div class="bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3">
+        <div class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2">
+          {label}
+        </div>
+        <div class="flex items-start gap-2">
+          <pre class="flex-1 min-w-0 m-0 text-[13px] leading-relaxed text-[var(--code-fg)] whitespace-pre-wrap break-all font-mono">{cmd}</pre>
+          <CopyButton text={cmd} client:load />
+        </div>
+      </div>
+    ))}
+  </div>
+</section>

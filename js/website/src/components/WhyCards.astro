@@ -2,54 +2,58 @@
 ---
 
 <section
-  class="grid grid-cols-3 gap-3 py-10 border-t border-[var(--border)] max-md:grid-cols-1"
+  class="grid grid-cols-2 gap-3 py-10 border-t border-[var(--border)] max-md:grid-cols-1"
 >
-  <div
-    class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-md"
-  >
+  <div class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-lg">
     <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
       Live state, not pixels
     </h3>
     <p class="text-[13px] leading-relaxed text-[var(--dim)]">
       blit tracks the full parsed terminal grid and sends only what changed —
-      LZ4-compressed binary diffs. The browser gets real structured data: select
-      text, resize freely, type into it.
+      LZ4-compressed binary diffs. The browser gets real structured data:
+      select text, resize freely, type into it. Each client is paced by its
+      own render metrics so a phone on 3G never stalls a workstation on localhost.
     </p>
   </div>
-  <div
-    class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-md"
-  >
+
+  <div class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-lg">
     <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
       Share with one command
     </h3>
     <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-      <code
-        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
-        >blit share</code
-      > prints a URL. Open it anywhere. WebRTC punches through NATs — no SSH keys,
-      no port forwarding, no tunnels. Full input for pair programming or AI agents.
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit share</code> prints a URL anyone can open.
+      WebRTC punches through NATs — no SSH keys, no port forwarding.
+      Connect to named remote SSH hosts with <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit remote add</code>.
+      Auto-installs on first connection.
     </p>
   </div>
-  <div
-    class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-md"
-  >
+
+  <div class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-lg">
     <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
       Terminals as an API
     </h3>
     <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-      Non-interactive CLI for scripts and LLMs. <code
-        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
-        >blit start</code
-      >, <code
-        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
-        >show</code
-      >, <code
-        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
-        >send</code
-      >, <code
-        class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]"
-        >wait --pattern</code
-      >. Plain text out, zero exit on success. No screen-scraping.
+      Non-interactive subcommands for scripts and LLMs.
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit start</code>,
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">show</code>,
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">send</code>,
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">wait --pattern</code>.
+      We publish a <a href="https://install.blit.sh/SKILL.md" target="_blank" rel="noopener noreferrer" class="text-[var(--accent)] no-underline hover:underline">computer agent skill</a> — drop it straight into any AI agent.
+    </p>
+  </div>
+
+  <div class="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-lg">
+    <h3 class="text-[13px] font-bold mb-1.5 text-[var(--bright)]">
+      Headless Wayland compositor
+    </h3>
+    <p class="text-[13px] leading-relaxed text-[var(--dim)]">
+      On Linux and macOS, every blit session includes an experimental headless
+      Wayland compositor. Launch GUI apps —
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit start foot</code> —
+      then screenshot, click, and type into them via
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit capture</code> /
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit click</code>.
+      Streamed as H.264 / H.265 / AV1 video. No display, no GPU required.
     </p>
   </div>
 </section>
