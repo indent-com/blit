@@ -116,6 +116,14 @@ pub const C2S_SURFACE_REQUEST_KEYFRAME: u8 = 0x2C;
 /// Request close of a Wayland surface (sends xdg_toplevel close event):
 /// [0x2B][session_id:2][surface_id:2]
 pub const C2S_SURFACE_CLOSE: u8 = 0x2B;
+/// Client feature/capability advertisement: [0x2D][payload:N]
+/// Currently defined payload bytes:
+///   [0] codec_support — bitmask of CODEC_SUPPORT_* flags the client can
+///       decode.  0 = accept anything (legacy).
+/// Sent once after connection when capability probing completes.  The
+/// message is extensible: the server ignores trailing bytes it doesn't
+/// understand, and missing bytes default to 0.
+pub const C2S_CLIENT_FEATURES: u8 = 0x2D;
 
 pub const S2C_UPDATE: u8 = 0x00;
 pub const S2C_CREATED: u8 = 0x01;

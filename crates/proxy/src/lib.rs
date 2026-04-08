@@ -41,6 +41,103 @@ pub fn proxy_socket_path() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-start helpers (shared by blit-cli and blit-gateway)
+// ---------------------------------------------------------------------------
+
+/// Returns true if a proxy is already listening at `path`.
+pub async fn proxy_alive(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::path::Path::new(path).exists() && tokio::net::UnixStream::connect(path).await.is_ok()
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        ClientOptions::new().open(path).is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Ensure a blit-proxy daemon is running, spawning one if necessary.
+///
+/// `proxy_bin` is the path to the binary that accepts a `proxy-daemon`
+/// subcommand (typically `std::env::current_exe()`).  When the binary is
+/// the standalone `blit-proxy` it should be invoked without arguments;
+/// when it is the `blit` CLI it needs the `proxy-daemon` subcommand.
+///
+/// Returns the socket path on success.
+pub async fn ensure_proxy(
+    proxy_bin: &std::path::Path,
+    use_subcommand: bool,
+) -> Result<String, String> {
+    let sock = proxy_socket_path();
+
+    if proxy_alive(&sock).await {
+        return Ok(sock);
+    }
+
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&sock);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(proxy_bin);
+        if use_subcommand {
+            cmd.arg("proxy-daemon");
+        }
+        // SAFETY: pre_exec runs in the child between fork and exec.
+        // setsid() is async-signal-safe per POSIX.
+        unsafe {
+            cmd.env("BLIT_PROXY_IDLE", "300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .map_err(|e| format!("blit-proxy: spawn failed: {e}"))?;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = std::process::Command::new(proxy_bin);
+        if use_subcommand {
+            cmd.arg("proxy-daemon");
+        }
+        cmd.env("BLIT_PROXY_IDLE", "300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("blit-proxy: spawn failed: {e}"))?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    return Err("blit-proxy auto-start is not supported on this platform".into());
+
+    // Wait up to 5 s for the socket/pipe to appear.
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if proxy_alive(&sock).await {
+            return Ok(sock);
+        }
+    }
+    Err(format!("blit-proxy did not become ready at {sock} in time"))
+}
+
+// ---------------------------------------------------------------------------
 // Upstream connection
 // ---------------------------------------------------------------------------
 
@@ -152,9 +249,6 @@ impl SharePool {
                 self.pool_size.saturating_sub(idle.len())
             };
             for _ in 0..need {
-                if self.active.load(Ordering::Relaxed) > 0 {
-                    break;
-                }
                 match blit_webrtc_forwarder::client::Session::establish(&self.passphrase, &self.hub)
                     .await
                 {
@@ -395,7 +489,6 @@ async fn connect_upstream(uri: &str) -> Result<UpstreamConn, String> {
         return connect_share(rest).await;
     }
 
-    #[cfg(unix)]
     if let Some(rest) = uri.strip_prefix("ssh:") {
         return connect_ssh(rest).await;
     }
@@ -460,107 +553,34 @@ async fn connect_share(rest: &str) -> Result<UpstreamConn, String> {
 }
 
 // ---------------------------------------------------------------------------
-// SSH stdio bridge
+// SSH via embedded client (cross-platform)
 // ---------------------------------------------------------------------------
 
-/// Shell snippet that locates the blit-server Unix socket on the remote host.
-#[cfg(unix)]
-const SSH_SOCK_SEARCH: &str = r#"if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else S=/tmp/blit.sock; fi"#;
-
-/// Shell snippet that starts blit-server on the remote if the socket is absent/stale.
-#[cfg(unix)]
-const SSH_AUTOSTART: &str = "if [ -S \"$S\" ]; then if command -v nc >/dev/null 2>&1; then nc -z -U \"$S\" 2>/dev/null || rm -f \"$S\"; elif command -v socat >/dev/null 2>&1; then socat /dev/null \"UNIX-CONNECT:$S\" 2>/dev/null || rm -f \"$S\"; fi; fi; if ! [ -S \"$S\" ]; then if command -v blit >/dev/null 2>&1; then blit server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; elif command -v blit-server >/dev/null 2>&1; then blit-server & i=0; while ! [ -S \"$S\" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; fi; fi";
-
-/// Escape a string for use inside double quotes in a POSIX shell.
-/// Handles `\`, `$`, `` ` ``, and `"`.  Used instead of single-quote
-/// escaping because the result is embedded inside an outer `sh -c '…'`
-/// wrapper where nested single quotes would break.
-#[cfg(unix)]
-fn dq_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' | '$' | '`' | '"' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+/// Shared SSH connection pool for the proxy.  Connections are multiplexed
+/// over a single TCP+SSH session per host, matching the gateway's behaviour.
+fn ssh_pool() -> &'static blit_ssh::SshPool {
+    static POOL: std::sync::OnceLock<blit_ssh::SshPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(blit_ssh::SshPool::new)
 }
 
-/// Parse `[user@]host[:socket_path]` from an `ssh:` URI remainder.
-/// Returns `(ssh_target, remote_socket)`.
-#[cfg(unix)]
-fn parse_ssh_target(rest: &str) -> (&str, Option<&str>) {
-    let colon_search_start = rest.find('@').map(|a| a + 1).unwrap_or(0);
-    if let Some(rel) = rest[colon_search_start..].find(':') {
-        let pos = colon_search_start + rel;
-        let path = &rest[pos + 1..];
-        if path.is_empty() {
-            (rest, None)
-        } else {
-            (&rest[..pos], Some(path))
-        }
-    } else {
-        (rest, None)
-    }
-}
-
-/// Connect to a remote blit-server via an SSH stdio bridge.
+/// Connect to a remote blit-server via the embedded SSH client.
 ///
-/// Spawns `ssh <host> -- sh -c '…find-socket…; nc -U "$S"'` and wraps
-/// the child's stdin/stdout as an `UpstreamConn`.
-#[cfg(unix)]
+/// Uses `direct-streamlocal` channel forwarding (no external `ssh`, `nc`, or
+/// `socat` required).  The connection is multiplexed and pooled so subsequent
+/// calls to the same host reuse the TCP+SSH session.
 async fn connect_ssh(rest: &str) -> Result<UpstreamConn, String> {
     if rest.is_empty() {
         return Err("ssh: destination requires a host".into());
     }
-    let (host, remote_socket) = parse_ssh_target(rest);
-    if host.starts_with('-') {
-        return Err(format!(
-            "invalid ssh host '{host}': must not start with '-'"
-        ));
-    }
-    let resolve = match remote_socket {
-        Some(path) => format!("S=\"{}\"", dq_escape(path)),
-        None => SSH_SOCK_SEARCH.to_string(),
-    };
-    let bridge = format!(
-        "sh -c '{resolve}; {SSH_AUTOSTART}; if command -v nc >/dev/null 2>&1; then exec nc -U \"$S\"; else exec socat - \"UNIX-CONNECT:$S\"; fi'"
-    );
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-T")
-        .arg("-o")
-        .arg("ControlMaster=auto")
-        .arg("-o")
-        .arg("ControlPath=/tmp/blit-ssh-%r@%h:%p")
-        .arg("-o")
-        .arg("ControlPersist=300")
-        .arg(host)
-        .arg("--")
-        .arg(&bridge)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("ssh: {e}"))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ssh: could not get stdin".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ssh: could not get stdout".to_string())?;
-    // Keep the child alive by moving it into a background task that waits on it.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    let (user, host, socket) = blit_ssh::parse_ssh_uri(rest);
+    let stream = ssh_pool()
+        .connect(&host, user.as_deref(), socket.as_deref())
+        .await
+        .map_err(|e| format!("ssh:{rest}: {e}"))?;
+    let (r, w) = tokio::io::split(stream);
     Ok(UpstreamConn {
-        reader: Box::new(stdout),
-        writer: Box::new(stdin),
+        reader: Box::new(r),
+        writer: Box::new(w),
     })
 }
 

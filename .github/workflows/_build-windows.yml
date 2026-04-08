@@ -1,0 +1,57 @@
+name: Build Windows
+
+on:
+  workflow_call:
+    inputs:
+      upload:
+        type: boolean
+        default: false
+
+jobs:
+  build-windows:
+    runs-on: blacksmith-8vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@wasm-pack
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+      - name: Build UI
+        shell: bash
+        run: |
+          cd crates/browser
+          wasm-pack build --target web --release --out-dir pkg
+          cd ../..
+          cd js
+          pnpm install --frozen-lockfile
+          pnpm --filter @blit-sh/core run build
+          pnpm --filter @blit-sh/solid run build
+          pnpm --filter @blit-sh/ui run build
+      - name: Build release binaries
+        run: cargo build --release -p blit-cli
+      - name: Package zips
+        if: ${{ inputs.upload }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for bin in blit; do
+            cp "target/release/${bin}.exe" "${bin}.exe"
+            7z a "dist/${bin}_${version}_windows_x86_64.zip" "${bin}.exe"
+            rm "${bin}.exe"
+          done
+          ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload }}
+        with:
+          name: windows-x86_64
+          path: dist/*.zip

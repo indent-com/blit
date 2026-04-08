@@ -10,7 +10,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use russh::client;
-use russh::keys::{self, PrivateKeyWithHashAlg, agent};
+#[cfg(unix)]
+use russh::keys::agent;
+use russh::keys::{self, PrivateKeyWithHashAlg};
 
 // ── Error ──────────────────────────────────────────────────────────────
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
-// fd-channel example: spawn blit-server, pass a client fd via SCM_RIGHTS,
+// fd-channel example: spawn blit server, pass a client fd via SCM_RIGHTS,
 // and verify the protocol handshake (HELLO, LIST, READY, CREATE/CREATED).
 
 import { spawn } from "bun";
 import { dlopen, FFIType, ptr } from "bun:ffi";
 
-const BLIT_SERVER = process.env.BLIT_SERVER ?? "blit-server";
+const BLIT_SERVER = process.env.BLIT_SERVER ?? "blit";
 
 const DARWIN = process.platform === "darwin";
 
@@ -156,7 +156,7 @@ const [channelTheirs, channelOurs] = socketpair();
 // makes Bun dup2 the fd to 3 in the child process.
 const CHANNEL_FD = 3;
 
-const server = spawn([BLIT_SERVER], {
+const server = spawn([BLIT_SERVER, "server"], {
   env: { ...process.env, BLIT_FD_CHANNEL: String(CHANNEL_FD) },
   stdio: ["inherit", "inherit", "inherit", Bun.file(channelTheirs)],
 });

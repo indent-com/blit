@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 #   Instance 2:            10020  10021  10022
 #   ...
 #
-# The blit-server Unix socket is /tmp/blit-dev.sock for instance 0,
+# The blit server Unix socket is /tmp/blit-dev.sock for instance 0,
 # /tmp/blit-dev-N.sock for instance N.
 #
 # DEV_INSTANCE is intentionally unprefixed: blit strips most BLIT_*
@@ -43,13 +43,9 @@ export BLIT_DEV_UI_PORT="${BLIT_DEV_UI_PORT:-$(( BASE ))}"
 export BLIT_DEV_GW_PORT="${BLIT_DEV_GW_PORT:-$(( BASE + 1 ))}"
 export BLIT_DEV_SITE_PORT="${BLIT_DEV_SITE_PORT:-$(( BASE + 2 ))}"
 
-echo "blit dev stack (instance $N):"
-echo "  server socket : $BLIT_DEV_SOCK"
-echo "  ui            : http://127.0.0.1:$BLIT_DEV_UI_PORT"
-echo "  gateway       : http://127.0.0.1:$BLIT_DEV_GW_PORT"
-echo "  website       : http://127.0.0.1:$BLIT_DEV_SITE_PORT"
-echo "  pc socket     : $PC_SOCK"
-echo ""
+# Enable WebRTC forwarder when BLIT_PASSPHRASE is set
+if [ -n "${BLIT_PASSPHRASE:-}" ]; then
+    export BLIT_DEV_SHARE=1
+fi
 
-./bin/build-browser
 exec process-compose -U -u "$PC_SOCK" up "$@"

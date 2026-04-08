@@ -1,9 +1,11 @@
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod imp;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+mod render;
+#[cfg(target_os = "linux")]
 pub use imp::*;
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 mod stub {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -37,6 +39,15 @@ mod stub {
             stride: u32,
             offset: u32,
         },
+    }
+
+    #[derive(Clone)]
+    pub struct PixelLayer {
+        pub x: i32,
+        pub y: i32,
+        pub width: u32,
+        pub height: u32,
+        pub pixels: PixelData,
     }
 
     impl PixelData {
@@ -175,10 +186,22 @@ mod stub {
     pub fn spawn_compositor(
         _verbose: bool,
         _event_notify: Arc<dyn Fn() + Send + Sync>,
+        _gpu_device: &str,
     ) -> CompositorHandle {
-        unimplemented!("compositor is only supported on Unix")
+        let (event_tx, event_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Drop the sender immediately so event_rx.recv() returns Err.
+        drop(event_tx);
+        CompositorHandle {
+            event_rx,
+            command_tx,
+            socket_name: String::new(),
+            thread: std::thread::spawn(|| {}),
+            shutdown,
+        }
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub use stub::*;

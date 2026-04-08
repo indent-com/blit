@@ -25,6 +25,7 @@ import {
   C2S_SURFACE_UNSUBSCRIBE,
   C2S_SURFACE_ACK,
   C2S_SURFACE_CLOSE,
+  C2S_CLIENT_FEATURES,
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
 } from "./types";
@@ -456,5 +457,12 @@ export function buildClipboardMessage(
   const v = new DataView(msg.buffer);
   v.setUint32(7 + mimeBytes.length, data.length, true);
   msg.set(data, 11 + mimeBytes.length);
+  return msg;
+}
+
+export function buildClientFeaturesMessage(codecSupport: number): Uint8Array {
+  const msg = new Uint8Array(2);
+  msg[0] = C2S_CLIENT_FEATURES;
+  msg[1] = codecSupport & 0xff;
   return msg;
 }

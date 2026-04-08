@@ -426,10 +426,13 @@ pub fn spawn_pty(
 
     state.pty_fds.write().unwrap().insert(id, master);
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
-    let reader_handle = std::thread::spawn({
-        let notify = state.delivery_notify.clone();
-        move || pty_reader(master, byte_tx, notify)
-    });
+    let reader_handle = std::thread::Builder::new()
+        .name(format!("pty-reader-{id}"))
+        .spawn({
+            let notify = state.delivery_notify.clone();
+            move || pty_reader(master, byte_tx, notify)
+        })
+        .expect("failed to spawn pty-reader thread");
     let handle = PtyHandle {
         master_fd: master,
         child_pid: pid,
@@ -576,10 +579,13 @@ pub fn respawn_child(
 
     state.pty_fds.write().unwrap().insert(pty_id, master);
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
-    let reader_handle = std::thread::spawn({
-        let notify = state.delivery_notify.clone();
-        move || pty_reader(master, byte_tx, notify)
-    });
+    let reader_handle = std::thread::Builder::new()
+        .name(format!("pty-reader-{pty_id}"))
+        .spawn({
+            let notify = state.delivery_notify.clone();
+            move || pty_reader(master, byte_tx, notify)
+        })
+        .expect("failed to spawn pty-reader thread");
     let handle = PtyHandle {
         master_fd: master,
         child_pid: pid,

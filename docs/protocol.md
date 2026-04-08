@@ -12,10 +12,10 @@ Every non-WebSocket transport wraps messages in a **4-byte little-endian length 
 
 WebSocket provides its own framing, so the length prefix is omitted over WebSocket — each binary WebSocket frame is exactly one blit message. This framing convention is shared by:
 
-- `blit-server` (`crates/server/src/main.rs`)
+- `blit-server` (`crates/server/src/lib.rs`)
 - `blit-cli` (`crates/cli/src/transport.rs`)
-- `blit-gateway` (`crates/gateway/src/main.rs`)
-- `blit-proxy` (`crates/proxy/src/main.rs`)
+- `blit-gateway` (`crates/gateway/src/lib.rs`)
+- `blit-proxy` (`crates/proxy/src/lib.rs`)
 - Browser WebTransport/WebRTC (`js/core/src/transports/`)
 
 Maximum frame size: **16 MiB**.
@@ -172,6 +172,61 @@ When `content_len == 7`, the cell's text exceeds 4 bytes. Bytes 8–11 hold an F
 - Bit 10: PTY canonical mode (`tcgetattr ICANON`)
 
 Mode bits are tracked by `ModeTracker` in `blit-alacritty`, which intercepts CSI/DCS sequences from raw PTY output.
+
+## Multiplexed WebSocket (`/mux`)
+
+The `/mux` WebSocket endpoint carries traffic for **all** gateway destinations over a single connection. This replaces the legacy model where the browser opened one WebSocket per remote (`/d/<name>`).
+
+### Authentication
+
+Same as the per-destination handler: the browser sends the passphrase as a text frame. The server responds with `"mux"` (not `"ok"`) to confirm multiplexed mode. After auth, all subsequent frames are binary.
+
+### Framing
+
+Every binary frame is prefixed with a **2-byte LE channel ID**:
+
+```
+[channel_id:2 LE][payload:N]        channel_id < 0xFFFF → data
+[0xFFFF][control_opcode:1][...]      channel_id = 0xFFFF → control
+```
+
+Data frames carry raw blit protocol messages (starting with the usual 1-byte opcode). The gateway strips the channel prefix before forwarding to the upstream blit server and prepends it to responses.
+
+### Control messages
+
+| Direction | Opcode | Name     | Layout                               |
+| --------- | ------ | -------- | ------------------------------------ |
+| C → S     | `0x01` | `OPEN`   | `[channel_id:2][name_len:2][name:N]` |
+| C → S     | `0x02` | `CLOSE`  | `[channel_id:2]`                     |
+| S → C     | `0x81` | `OPENED` | `[channel_id:2]`                     |
+| S → C     | `0x82` | `CLOSED` | `[channel_id:2]`                     |
+| S → C     | `0x83` | `ERROR`  | `[channel_id:2][msg_len:2][msg:N]`   |
+
+The client assigns channel IDs (starting from 0). `OPEN` maps a channel ID to a named destination; the server connects upstream and responds with `OPENED` or `ERROR`. `CLOSE` tears down a channel. The server also sends `CLOSED` when the upstream connection drops.
+
+### Lifecycle
+
+```
+Browser                          Gateway                    blit server
+  |                                 |                            |
+  |-- WS /mux ------------------->|                            |
+  |   (text: passphrase)          |                            |
+  |<-- text: "mux" ---------------|                            |
+  |                                |                            |
+  |  [0xFFFF][OPEN][0][local]     |                            |
+  |  --------------------------->  |-- Unix socket ----------->|
+  |<-- [0xFFFF][OPENED][0]        |                            |
+  |                                |                            |
+  |  [0xFFFF][OPEN][1][rabbit]    |                            |
+  |  --------------------------->  |-- SSH streamlocal ------->|
+  |<-- [0xFFFF][OPENED][1]        |                            |
+  |                                |                            |
+  |  [0][C2S_INPUT ...]           |-- write_frame(payload) -->|
+  |<-- [0][S2C_UPDATE ...]        |<-- read_frame ------------|
+  |<-- [1][S2C_HELLO ...]         |<-- read_frame ------------|
+```
+
+The legacy `/d/<name>` endpoint remains available for backward compatibility and embedding scenarios.
 
 ## ACK and flow control
 

@@ -1,4 +1,10 @@
-import { onMount, onCleanup, createEffect, type JSX } from "solid-js";
+import {
+  onMount,
+  onCleanup,
+  createEffect,
+  createSignal,
+  type JSX,
+} from "solid-js";
 import { BlitTerminalSurface } from "@blit-sh/core";
 import type { SessionId, TerminalPalette } from "@blit-sh/core";
 import { useBlitContext, useRequiredBlitWorkspace } from "./BlitContext";
@@ -34,10 +40,13 @@ export function BlitTerminal(props: BlitTerminalProps) {
   const snapshot = createBlitWorkspaceState(workspace);
 
   let containerRef!: HTMLDivElement;
-  let surface: BlitTerminalSurface | null = null;
+  // Use a signal so that effects re-run when the surface is created in
+  // onMount.  Without this, effects that run during component init see
+  // `null` and never retry after the surface is attached.
+  const [surface, setSurface] = createSignal<BlitTerminalSurface | null>(null);
 
   onMount(() => {
-    surface = new BlitTerminalSurface({
+    const s = new BlitTerminalSurface({
       sessionId: props.sessionId,
       fontFamily: props.fontFamily ?? ctx.fontFamily,
       fontSize: props.fontSize ?? ctx.fontSize,
@@ -50,48 +59,51 @@ export function BlitTerminal(props: BlitTerminalProps) {
       advanceRatio: props.advanceRatio ?? ctx.advanceRatio,
     });
 
-    surface.setWorkspace(workspace);
-    surface.attach(containerRef);
-    props.surfaceRef?.(surface);
+    s.setWorkspace(workspace);
+    s.attach(containerRef);
+    setSurface(s);
+    props.surfaceRef?.(s);
   });
 
   onCleanup(() => {
     props.surfaceRef?.(null);
-    surface?.dispose();
-    surface = null;
+    surface()?.dispose();
+    setSurface(null);
   });
 
   // Forward connection changes. Reading snapshot() inside createEffect makes
   // this reactive — it re-runs whenever the workspace snapshot changes
   // (connection status transitions, new sessions, etc.).
   createEffect(() => {
+    const s = surface();
     const snap = snapshot();
     const session = props.sessionId
-      ? (snap.sessions.find((s) => s.id === props.sessionId) ?? null)
+      ? (snap.sessions.find((ss) => ss.id === props.sessionId) ?? null)
       : null;
     const conn = session ? workspace.getConnection(session.connectionId) : null;
-    surface?.setConnection(conn);
+    s?.setConnection(conn);
   });
 
   // Forward prop changes.
-  createEffect(() => surface?.setSessionId(props.sessionId));
-  createEffect(() => surface?.setPalette(props.palette ?? ctx.palette));
+  createEffect(() => surface()?.setSessionId(props.sessionId));
+  createEffect(() => surface()?.setPalette(props.palette ?? ctx.palette));
   createEffect(() =>
-    surface?.setFontFamily(props.fontFamily ?? ctx.fontFamily),
+    surface()?.setFontFamily(props.fontFamily ?? ctx.fontFamily),
   );
-  createEffect(() => surface?.setFontSize(props.fontSize ?? ctx.fontSize));
-  createEffect(() => surface?.setShowCursor(props.showCursor));
-  createEffect(() => surface?.setOnRender(props.onRender));
+  createEffect(() => surface()?.setFontSize(props.fontSize ?? ctx.fontSize));
+  createEffect(() => surface()?.setShowCursor(props.showCursor));
+  createEffect(() => surface()?.setOnRender(props.onRender));
   createEffect(() =>
-    surface?.setAdvanceRatio(props.advanceRatio ?? ctx.advanceRatio),
+    surface()?.setAdvanceRatio(props.advanceRatio ?? ctx.advanceRatio),
   );
-  createEffect(() => surface?.setReadOnly(props.readOnly));
+  createEffect(() => surface()?.setReadOnly(props.readOnly));
 
   // Re-send dimensions when connection becomes ready.
   createEffect(() => {
+    const s = surface();
     const snap = snapshot();
     const session = props.sessionId
-      ? (snap.sessions.find((s) => s.id === props.sessionId) ?? null)
+      ? (snap.sessions.find((ss) => ss.id === props.sessionId) ?? null)
       : null;
     const connection = session
       ? (snap.connections.find((c) => c.id === session.connectionId) ?? null)
@@ -101,7 +113,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
       props.sessionId !== null &&
       !props.readOnly
     ) {
-      surface?.resendSize();
+      s?.resendSize();
     }
   });
 

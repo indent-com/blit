@@ -3,10 +3,12 @@ use axum::extract::{FromRequest, State, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::task::JoinHandle;
 use web_transport_quinn as wt;
 
 // ---------------------------------------------------------------------------
@@ -151,12 +153,25 @@ impl Config {
                 user,
                 host,
                 socket,
-            } => ConnectorSnapshot::Ssh {
-                pool: pool.clone(),
-                user: user.clone(),
-                host: host.clone(),
-                socket: socket.clone(),
-            },
+            } => {
+                if let Some(proxy) = &self.proxy_sock {
+                    let mut uri = format!("ssh:{host}");
+                    if let Some(u) = user {
+                        uri = format!("ssh:{u}@{host}");
+                    }
+                    if let Some(s) = socket {
+                        uri.push_str(&format!("/{s}"));
+                    }
+                    ConnectorSnapshot::Proxied(proxy.clone(), uri)
+                } else {
+                    ConnectorSnapshot::Ssh {
+                        pool: pool.clone(),
+                        user: user.clone(),
+                        host: host.clone(),
+                        socket: socket.clone(),
+                    }
+                }
+            }
             // For proxiable connectors, route through blit-proxy when enabled.
             conn => {
                 if let Some(proxy) = &self.proxy_sock {
@@ -409,50 +424,10 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
     writer.write_all(&buf).await.is_ok()
 }
 
-#[tokio::main]
-async fn main() {
-    for arg in std::env::args().skip(1) {
-        if arg == "--help" || arg == "-h" {
-            println!(
-                "blit-gateway {} — terminal streaming WebSocket gateway",
-                env!("CARGO_PKG_VERSION")
-            );
-            println!();
-            println!("All configuration is via environment variables:");
-            println!("  BLIT_PASSPHRASE        Browser passphrase (required)");
-            println!("  BLIT_ADDR              Listen address (default: 0.0.0.0:3264)");
-            println!(
-                "  BLIT_REMOTES           Path to remotes file (default: ~/.config/blit/blit.remotes)"
-            );
-            println!("  BLIT_FONT_DIRS         Colon-separated extra font directories");
-            println!("  BLIT_CORS              CORS origin for font routes (* or specific origin)");
-            println!("  BLIT_QUIC              Set to 1 to enable WebTransport (QUIC/HTTP3)");
-            println!("  BLIT_TLS_CERT          PEM certificate file (for WebTransport)");
-            println!("  BLIT_TLS_KEY           PEM private key file (for WebTransport)");
-            println!(
-                "  BLIT_STORE_CONFIG      Set to 1 to sync browser settings to ~/.config/blit/blit.conf"
-            );
-            println!(
-                "  BLIT_PROXY             Set to 1 to route upstream connections via blit-proxy"
-            );
-            println!(
-                "  BLIT_PROXY_SOCK        blit-proxy socket path (default: $XDG_RUNTIME_DIR/blit-proxy.sock)"
-            );
-            println!("  BLIT_GATEWAY_WEBRTC    Set to 1 to proxy share: remotes via WebRTC");
-            println!(
-                "  BLIT_HUB               Signaling hub URL for share: remotes (default: hub.blit.sh)"
-            );
-            std::process::exit(0);
-        }
-        if arg == "--version" || arg == "-V" {
-            println!("blit-gateway {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
-        }
-    }
-
-    // Install the rustls crypto provider required by blit-webrtc-forwarder.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
+/// Run the gateway.  Reads all configuration from environment variables
+/// (`BLIT_PASSPHRASE`, `BLIT_ADDR`, `BLIT_REMOTES`, …).  Does not return
+/// under normal operation.
+pub async fn run() {
     let passphrase = std::env::var("BLIT_PASSPHRASE").unwrap_or_else(|_| {
         eprintln!("BLIT_PASSPHRASE environment variable required");
         std::process::exit(1);
@@ -491,25 +466,23 @@ async fn main() {
     let cors_origin = std::env::var("BLIT_CORS").ok();
     let config_state = blit_webserver::config::ConfigState::new();
 
-    // When BLIT_PROXY=1, route all proxiable upstream connections through
-    // a blit-proxy process at the well-known socket path.
-    let proxy_sock: Option<String> = if std::env::var("BLIT_PROXY").ok().as_deref() == Some("1") {
-        #[cfg(unix)]
-        {
-            let sock = std::env::var("BLIT_PROXY_SOCK").unwrap_or_else(|_| {
-                let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-                format!("{dir}/blit-proxy.sock")
-            });
-            eprintln!("blit-gateway: proxy enabled → {sock}");
-            Some(sock)
-        }
-        #[cfg(not(unix))]
-        {
-            eprintln!("blit-gateway: BLIT_PROXY=1 is not supported on this platform");
-            None
-        }
-    } else {
+    // Route all proxiable upstream connections through blit-proxy unless
+    // explicitly disabled with BLIT_PROXY=0.  The proxy is auto-started as
+    // a daemon via `blit proxy-daemon` (same binary).
+    let proxy_sock: Option<String> = if std::env::var("BLIT_PROXY").ok().as_deref() == Some("0") {
         None
+    } else {
+        let exe = std::env::current_exe().unwrap_or_default();
+        match blit_proxy::ensure_proxy(&exe, true).await {
+            Ok(sock) => {
+                eprintln!("blit gateway: proxy enabled → {sock}");
+                Some(sock)
+            }
+            Err(e) => {
+                eprintln!("blit gateway: proxy auto-start failed: {e}");
+                None
+            }
+        }
     };
 
     let state: AppState = Arc::new(Config {
@@ -565,7 +538,7 @@ async fn main() {
     let tcp = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("blit-gateway: cannot bind to {addr}: {e}");
+            eprintln!("blit gateway: cannot bind to {addr}: {e}");
             std::process::exit(1);
         });
     let listener = NoDelayListener(tcp);
@@ -580,7 +553,7 @@ async fn main() {
     );
 
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("blit-gateway: serve error: {e}");
+        eprintln!("blit gateway: serve error: {e}");
         std::process::exit(1);
     }
 }
@@ -641,6 +614,52 @@ fn resolve_destination_name(path: &str) -> Option<String> {
     None
 }
 
+/// Returns true when `path` ends with `/mux` (or equals `/mux`).
+fn is_mux_path(path: &str) -> bool {
+    path == "/mux" || path.ends_with("/mux")
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexed WebSocket protocol constants.
+// ---------------------------------------------------------------------------
+
+/// Reserved channel ID for control messages.
+const MUX_CONTROL: u16 = 0xFFFF;
+
+/// Client → Server: open a channel.  `[channel_id:2][name_len:2][name:N]`
+const MUX_C2S_OPEN: u8 = 0x01;
+/// Client → Server: close a channel. `[channel_id:2]`
+const MUX_C2S_CLOSE: u8 = 0x02;
+
+/// Server → Client: channel opened.  `[channel_id:2]`
+const MUX_S2C_OPENED: u8 = 0x81;
+/// Server → Client: channel closed.  `[channel_id:2]`
+const MUX_S2C_CLOSED: u8 = 0x82;
+/// Server → Client: channel error.   `[channel_id:2][msg_len:2][msg:N]`
+const MUX_S2C_ERROR: u8 = 0x83;
+
+/// Build a mux control frame.
+fn mux_control(opcode: u8, ch: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.extend_from_slice(&MUX_CONTROL.to_le_bytes());
+    buf.push(opcode);
+    buf.extend_from_slice(&ch.to_le_bytes());
+    buf
+}
+
+/// Build a mux error control frame.
+fn mux_error(ch: u16, msg: &str) -> Vec<u8> {
+    let msg_bytes = msg.as_bytes();
+    let msg_len = msg_bytes.len().min(u16::MAX as usize);
+    let mut buf = Vec::with_capacity(7 + msg_len);
+    buf.extend_from_slice(&MUX_CONTROL.to_le_bytes());
+    buf.push(MUX_S2C_ERROR);
+    buf.extend_from_slice(&ch.to_le_bytes());
+    buf.extend_from_slice(&(msg_len as u16).to_le_bytes());
+    buf.extend_from_slice(&msg_bytes[..msg_len]);
+    buf
+}
+
 /// Minimal JSON string escaping for destination names.
 #[allow(dead_code)]
 fn json_escape(s: &str) -> String {
@@ -677,6 +696,13 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
                 )
                 .await;
             }),
+            Err(e) => e.into_response(),
+        }
+    } else if is_ws && is_mux_path(&path) {
+        match WebSocketUpgrade::from_request(request, &state).await {
+            Ok(ws) => ws
+                .max_message_size(MAX_FRAME_SIZE + 2) // +2 for channel ID prefix
+                .on_upgrade(move |socket| handle_mux_ws(socket, state)),
             Err(e) => e.into_response(),
         }
     } else if is_ws {
@@ -772,7 +798,7 @@ async fn handle_ws(mut ws: WebSocket, state: AppState, dest_name: Option<String>
     let (mut sock_reader, mut sock_writer) = match connector.connect().await {
         Ok(rw) => rw,
         Err(e) => {
-            eprintln!("cannot connect to blit-server for '{dest_label}': {e}");
+            eprintln!("cannot connect to blit server for '{dest_label}': {e}");
             let _ = ws.send(Message::Text(format!("error:{e}").into())).await;
             let _ = ws.close().await;
             return;
@@ -811,6 +837,229 @@ async fn handle_ws(mut ws: WebSocket, state: AppState, dest_name: Option<String>
     sock_to_ws.abort();
 
     eprintln!("client disconnected from '{dest_label}'");
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexed WebSocket handler.
+// ---------------------------------------------------------------------------
+
+/// State for a single multiplexed channel inside a mux session.
+struct MuxChannelState {
+    /// Send payloads to be written upstream.
+    writer_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Upstream writer task handle.
+    writer_task: JoinHandle<()>,
+    /// Upstream reader task handle.
+    reader_task: JoinHandle<()>,
+}
+
+impl MuxChannelState {
+    fn shutdown(self) {
+        // Dropping writer_tx causes the writer task to end.
+        drop(self.writer_tx);
+        self.writer_task.abort();
+        self.reader_task.abort();
+    }
+}
+
+async fn handle_mux_ws(mut ws: WebSocket, state: AppState) {
+    // --- Authentication (identical to handle_ws) ---
+    let authed = match tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match ws.recv().await {
+                Some(Ok(Message::Text(pass))) => {
+                    if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
+                        break true;
+                    } else {
+                        let _ = ws.send(Message::Text("auth".into())).await;
+                        let _ = ws.close().await;
+                        break false;
+                    }
+                }
+                Some(Ok(Message::Ping(d))) => {
+                    let _ = ws.send(Message::Pong(d)).await;
+                }
+                _ => break false,
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = ws.close().await;
+            false
+        }
+    };
+    if !authed {
+        return;
+    }
+
+    // Signal mux mode (distinct from "ok" used by the legacy per-destination handler).
+    let _ = ws.send(Message::Text("mux".into())).await;
+    eprintln!("mux client authenticated");
+
+    let (mut ws_tx, mut ws_rx) = ws.split();
+
+    // All upstream reader tasks feed frames into this channel; the main loop
+    // drains it into ws_tx.  Each frame is already prefixed with the 2-byte
+    // channel ID.
+    let (merge_tx, mut merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Browser → upstream: demux by channel ID.
+            msg = ws_rx.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+                match msg {
+                    Message::Binary(data) => {
+                        if data.len() < 2 { continue; }
+                        let ch_id = u16::from_le_bytes([data[0], data[1]]);
+                        let payload = &data[2..];
+
+                        if ch_id == MUX_CONTROL {
+                            // Control message.
+                            if payload.is_empty() { continue; }
+                            match payload[0] {
+                                MUX_C2S_OPEN => {
+                                    if payload.len() < 5 { continue; }
+                                    let open_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                                    let name_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
+                                    if payload.len() < 5 + name_len { continue; }
+                                    let name = std::str::from_utf8(&payload[5..5 + name_len])
+                                        .unwrap_or("");
+
+                                    // Close any previous channel with the same ID (re-open).
+                                    if let Some(prev) = channels.remove(&open_ch) {
+                                        prev.shutdown();
+                                    }
+
+                                    mux_open_channel(
+                                        open_ch,
+                                        name,
+                                        &state,
+                                        &merge_tx,
+                                        &mut channels,
+                                    )
+                                    .await;
+                                }
+                                MUX_C2S_CLOSE => {
+                                    if payload.len() < 3 { continue; }
+                                    let close_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                                    if let Some(ch) = channels.remove(&close_ch) {
+                                        ch.shutdown();
+                                    }
+                                    let _ = merge_tx.send(mux_control(MUX_S2C_CLOSED, close_ch));
+                                }
+                                _ => {} // Unknown control opcode — ignore.
+                            }
+                        } else if let Some(ch) = channels.get(&ch_id) {
+                            // Data frame — forward payload to upstream writer.
+                            let _ = ch.writer_tx.send(payload.to_vec());
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Upstream → browser: forward merged frames to the WebSocket.
+            frame = merge_rx.recv() => {
+                match frame {
+                    Some(data) => {
+                        if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Clean up all channels.
+    for (_, ch) in channels {
+        ch.shutdown();
+    }
+    eprintln!("mux client disconnected");
+}
+
+/// Open a multiplexed channel: connect to the upstream destination and wire
+/// reader/writer tasks that bridge the channel to the merge queue.
+async fn mux_open_channel(
+    ch_id: u16,
+    name: &str,
+    state: &AppState,
+    merge_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    channels: &mut HashMap<u16, MuxChannelState>,
+) {
+    let connector = match state.connector_for(name) {
+        Some(c) => c,
+        None => {
+            eprintln!("mux: unknown destination '{name}'");
+            let _ = merge_tx.send(mux_error(ch_id, &format!("unknown destination '{name}'")));
+            return;
+        }
+    };
+
+    let (sock_reader, sock_writer) = match connector.connect().await {
+        Ok(rw) => rw,
+        Err(e) => {
+            eprintln!("mux: cannot connect to '{name}': {e}");
+            let _ = merge_tx.send(mux_error(ch_id, &e));
+            return;
+        }
+    };
+
+    // Writer task: drains payloads from the browser into the upstream socket.
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer_task = tokio::spawn(async move {
+        let mut w = sock_writer;
+        while let Some(payload) = writer_rx.recv().await {
+            if !write_frame(&mut w, &payload).await {
+                break;
+            }
+        }
+    });
+
+    // Send OPENED *before* starting the reader so the browser receives it
+    // before any data frames from the upstream.
+    let _ = merge_tx.send(mux_control(MUX_S2C_OPENED, ch_id));
+
+    // Reader task: reads length-prefixed frames from the upstream socket,
+    // prepends the channel ID, and feeds them into the merge queue.
+    let reader_merge_tx = merge_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        let mut r = sock_reader;
+        while let Some(data) = read_frame(&mut r).await {
+            let mut frame = Vec::with_capacity(2 + data.len());
+            frame.extend_from_slice(&ch_id.to_le_bytes());
+            frame.extend_from_slice(&data);
+            if reader_merge_tx.send(frame).is_err() {
+                break;
+            }
+        }
+        // Upstream EOF — notify the browser.
+        let _ = reader_merge_tx.send(mux_control(MUX_S2C_CLOSED, ch_id));
+    });
+
+    channels.insert(
+        ch_id,
+        MuxChannelState {
+            writer_tx,
+            writer_task,
+            reader_task,
+        },
+    );
+
+    eprintln!("mux: channel {ch_id} opened for '{name}'");
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,7 +1338,7 @@ async fn handle_webtransport_session(
     };
     eprintln!("webtransport client authenticated for '{dest_label}'");
 
-    // --- Proxy to blit-server ---
+    // --- Proxy to blit server ---
     let connector = match state.connector_for(dest_label) {
         Some(c) => c,
         None => {
@@ -1102,7 +1351,7 @@ async fn handle_webtransport_session(
     let (mut sock_reader, mut sock_writer) = match connector.connect().await {
         Ok(rw) => rw,
         Err(e) => {
-            eprintln!("webtransport: cannot connect to blit-server for '{dest_label}': {e}");
+            eprintln!("webtransport: cannot connect to blit server for '{dest_label}': {e}");
             session.close(1, e.as_bytes());
             session.closed().await;
             return Ok(());

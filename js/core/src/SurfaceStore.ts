@@ -1,4 +1,4 @@
-import type { BlitSurface } from "./types";
+import type { BlitSurface, ConnectionId } from "./types";
 import {
   SURFACE_FRAME_FLAG_KEYFRAME,
   SURFACE_FRAME_CODEC_MASK,
@@ -47,7 +47,10 @@ function codecString(codec: SurfaceCodec): string {
   // hev1 / avc3: parameter sets in-band (description optional but provided
   // on keyframes for platform decoders that need it up front).
   if (codec === "h265") return "hev1.1.6.L93.B0"; // Main profile, level 3.1
-  return "avc3.42001f"; // Constrained Baseline, level 3.1
+  // Constrained Baseline, level 5.2.  Using avc1 (description out-of-band)
+  // rather than avc3 (in-band) because many WebCodecs implementations
+  // require an explicit AVCDecoderConfigurationRecord description.
+  return "avc1.420034";
 }
 
 // ---------------------------------------------------------------------------
@@ -221,14 +224,64 @@ function buildHvccDescription(
   return buf;
 }
 
+/** H.264 NAL unit type (5 low bits of the first byte). */
+function h264NalType(nal: Uint8Array): number {
+  return nal[0] & 0x1f;
+}
+
+/**
+ * Build an AVCDecoderConfigurationRecord (ISO 14496-15 §5.3.3.1)
+ * from raw SPS and PPS NAL units (without start codes).
+ */
+function buildAvccDescription(sps: Uint8Array, pps: Uint8Array): ArrayBuffer {
+  // Parse profile/level from SPS NAL (bytes 1-3 after the NAL type byte).
+  const profileIdc = sps[1];
+  const profileCompat = sps[2];
+  const levelIdc = sps[3];
+
+  const size = 6 + 1 + 2 + sps.length + 1 + 2 + pps.length;
+  const buf = new ArrayBuffer(size);
+  const v = new DataView(buf);
+  const u = new Uint8Array(buf);
+  let o = 0;
+
+  v.setUint8(o++, 1); // configurationVersion
+  v.setUint8(o++, profileIdc); // AVCProfileIndication
+  v.setUint8(o++, profileCompat); // profile_compatibility
+  v.setUint8(o++, levelIdc); // AVCLevelIndication
+  v.setUint8(o++, 0xff); // 6 reserved bits (111111) + lengthSizeMinusOne=3
+  v.setUint8(o++, 0xe1); // 3 reserved bits (111) + numOfSequenceParameterSets=1
+  v.setUint16(o, sps.length); // sequenceParameterSetLength
+  o += 2;
+  u.set(sps, o); // sequenceParameterSetNALUnit
+  o += sps.length;
+  v.setUint8(o++, 1); // numOfPictureParameterSets
+  v.setUint16(o, pps.length); // pictureParameterSetLength
+  o += 2;
+  u.set(pps, o); // pictureParameterSetNALUnit
+
+  return buf;
+}
+
 export class SurfaceStore {
   private surfaces = new Map<number, BlitSurface>();
+  private connectionId: ConnectionId = "";
   private decoders = new Map<number, DecoderEntry>();
   private canvases = new Map<number, CanvasEntry>();
   private frameListeners = new Set<SurfaceFrameCallback>();
   private eventListeners = new Set<SurfaceEventCallback>();
   private _diag = { received: 0, decoded: 0, output: 0, dropped: 0, errors: 0 };
   private _diagTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Monotonically increasing counter bumped on every disconnect.  Consumers
+   * (e.g. {@link BlitSurfaceCanvas}) compare their last-seen generation to
+   * detect reconnects and re-subscribe for video frames.
+   */
+  private _generation = 0;
+  get generation(): number {
+    return this._generation;
+  }
 
   /**
    * Whether the browser can decode surface video frames (WebCodecs + secure
@@ -321,6 +374,10 @@ export class SurfaceStore {
     return this.canvases.get(surfaceId)?.canvas ?? null;
   }
 
+  setConnectionId(id: ConnectionId): void {
+    this.connectionId = id;
+  }
+
   handleSurfaceCreated(
     sessionId: number,
     surfaceId: number,
@@ -331,6 +388,7 @@ export class SurfaceStore {
     appId: string,
   ): void {
     this.surfaces.set(surfaceId, {
+      connectionId: this.connectionId,
       sessionId,
       surfaceId,
       parentId,
@@ -340,9 +398,18 @@ export class SurfaceStore {
       height,
     });
     this.ensureCanvas(surfaceId, width, height);
+    // Track that this surface was re-announced after reconnect so
+    // reconcileAfterList() knows to keep it.
+    this._reconnectSeen?.add(surfaceId);
     // Don't init decoder yet — we'll init on the first frame when we know
     // the codec from the flags byte.
-    this.emitChange();
+
+    // Suppress change notifications during the reconnect window so the UI
+    // doesn't see a mix of stale + re-announced surfaces.  A single
+    // emitChange() fires from reconcileAfterList() once S2C_LIST arrives.
+    if (!this._reconnectSeen) {
+      this.emitChange();
+    }
   }
 
   handleSurfaceDestroyed(surfaceId: number): void {
@@ -397,14 +464,59 @@ export class SurfaceStore {
     this.ensureCanvas(surfaceId, width, height);
 
     try {
+      // Convert Annex B → length-prefixed NALs.  WebCodecs always expects
+      // length-prefixed containers (AVCC for H.264, HVCC for H.265) — the
+      // annexb format hint is not universally supported.
+      const nals = splitNALs(data);
+      const frameData = toLengthPrefixed(nals);
+
+      // On keyframes, extract parameter sets and (re)configure the decoder
+      // with a description.  WebCodecs requires this even for avc3/hev1 on
+      // many platforms.
+      if (isKey) {
+        let description: ArrayBuffer | undefined;
+        if (codec === "h264") {
+          let sps: Uint8Array | undefined;
+          let pps: Uint8Array | undefined;
+          for (const nal of nals) {
+            const t = h264NalType(nal);
+            if (t === 7) sps = nal;
+            else if (t === 8) pps = nal;
+          }
+          if (sps && pps) description = buildAvccDescription(sps, pps);
+        } else if (codec === "h265") {
+          description = this.buildHevcDescription(nals);
+        }
+        if (description) {
+          const descKey = Array.from(new Uint8Array(description)).join(",");
+          if (descKey !== entry.lastDescription) {
+            entry.lastDescription = descKey;
+            entry.decoder.configure({
+              codec: codecString(codec),
+              optimizeForLatency: true,
+              description,
+            });
+          }
+        }
+      }
+
       const chunk = new EncodedVideoChunk({
         type: isKey ? "key" : "delta",
         timestamp: _timestamp * 1000,
-        data,
+        data: frameData,
       });
       entry.decoder.decode(chunk);
       this._diag.decoded++;
-    } catch {
+    } catch (e) {
+      console.warn(
+        "[blit] surface decode error:",
+        surfaceId,
+        codec,
+        `${width}x${height}`,
+        isKey ? "key" : "delta",
+        `${data.length}B`,
+        e,
+      );
       if (entry) entry.pendingKeyframe = true;
       this._diag.errors++;
     }
@@ -414,7 +526,7 @@ export class SurfaceStore {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       this.surfaces.set(surfaceId, { ...surface, title });
-      this.emitChange();
+      if (!this._reconnectSeen) this.emitChange();
     }
   }
 
@@ -422,7 +534,7 @@ export class SurfaceStore {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       this.surfaces.set(surfaceId, { ...surface, appId });
-      this.emitChange();
+      if (!this._reconnectSeen) this.emitChange();
     }
   }
 
@@ -440,7 +552,7 @@ export class SurfaceStore {
         Math.abs(surface.height - height) > 1;
       this.surfaces.set(surfaceId, { ...surface, width, height });
       this.ensureCanvas(surfaceId, width, height);
-      if (significant) this.emitChange();
+      if (significant && !this._reconnectSeen) this.emitChange();
     }
   }
 
@@ -459,21 +571,67 @@ export class SurfaceStore {
     return undefined;
   }
 
+  /** Surface IDs announced since the last disconnect.  Non-null only
+   *  between a disconnect and the first reconcile (S2C_LIST arrival). */
+  private _reconnectSeen: Set<number> | null = null;
+
+  /**
+   * Soft reset for disconnect/reconnect cycles: close decoders but keep
+   * surfaces so the UI doesn't flicker.  Fresh surface info from the
+   * server will replace stale entries on reconnect.  The generation counter
+   * is bumped so that {@link BlitSurfaceCanvas} instances detect the
+   * reconnect and re-subscribe for video frames.
+   */
+  handleDisconnect(): void {
+    for (const entry of this.decoders.values()) {
+      entry.decoder.close();
+    }
+    this.decoders.clear();
+    this._generation++;
+    // Start tracking which surfaces the server re-announces after reconnect.
+    if (this.surfaces.size > 0) {
+      this._reconnectSeen = new Set();
+    }
+  }
+
+  /**
+   * Called after the initial session list arrives (S2C_LIST) to prune
+   * surfaces that existed before disconnect but were not re-announced.
+   */
+  reconcileAfterList(): void {
+    const seen = this._reconnectSeen;
+    if (!seen) return;
+    this._reconnectSeen = null;
+
+    for (const surfaceId of [...this.surfaces.keys()]) {
+      if (!seen.has(surfaceId)) {
+        this.surfaces.delete(surfaceId);
+        this.canvases.delete(surfaceId);
+        const entry = this.decoders.get(surfaceId);
+        if (entry) {
+          entry.decoder.close();
+          this.decoders.delete(surfaceId);
+        }
+      }
+    }
+    // Always emit — even when nothing was pruned — because
+    // handleSurfaceCreated/Title/AppId/Resized suppress notifications
+    // while _reconnectSeen is active, so the UI needs a single
+    // catch-up notification once the reconciliation window closes.
+    this.emitChange();
+  }
+
+  /**
+   * Full teardown — only called when the connection is permanently disposed.
+   */
   destroy(): void {
     if (this._diagTimer !== null) {
       clearInterval(this._diagTimer);
       this._diagTimer = null;
     }
-    for (const entry of this.decoders.values()) {
-      entry.decoder.close();
-    }
-    this.decoders.clear();
+    this.handleDisconnect();
     this.canvases.clear();
     this.surfaces.clear();
-    // Preserve eventListeners and frameListeners — they are owned by
-    // long-lived UI components (e.g. the Workspace surface aggregation
-    // effect) and must survive disconnect/reconnect cycles.  Notify
-    // listeners so they see the now-empty surface set.
     this.emitChange();
   }
 
@@ -540,7 +698,7 @@ export class SurfaceStore {
           frame.close();
         }
 
-        // Notify listeners — they blit from getCanvas().
+        // Notify frame listeners so they blit from getCanvas().
         for (const listener of this.frameListeners) {
           try {
             listener(surfaceId);

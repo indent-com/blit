@@ -195,37 +195,40 @@ where
     let watch_dir = path.parent().unwrap_or(&path).to_path_buf();
     let file_name = path.file_name().map(|n| n.to_os_string());
 
-    std::thread::spawn(move || {
-        let (ntx, nrx) = std::sync::mpsc::channel();
-        let mut watcher = match notify::recommended_watcher(ntx) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("blit: {label} watcher failed: {e}");
+    std::thread::Builder::new()
+        .name(format!("{label}-watcher"))
+        .spawn(move || {
+            let (ntx, nrx) = std::sync::mpsc::channel();
+            let mut watcher = match notify::recommended_watcher(ntx) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("blit: {label} watcher failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+                eprintln!("blit: {label} watch failed: {e}");
                 return;
             }
-        };
-        if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
-            eprintln!("blit: {label} watch failed: {e}");
-            return;
-        }
-        loop {
-            match nrx.recv() {
-                Ok(Ok(event)) => {
-                    if matches!(event.kind, notify::EventKind::Access(_)) {
-                        continue;
+            loop {
+                match nrx.recv() {
+                    Ok(Ok(event)) => {
+                        if matches!(event.kind, notify::EventKind::Access(_)) {
+                            continue;
+                        }
+                        let matches = file_name.as_ref().is_none_or(|name| {
+                            event.paths.iter().any(|p| p.file_name() == Some(name))
+                        });
+                        if matches {
+                            on_change();
+                        }
                     }
-                    let matches = file_name
-                        .as_ref()
-                        .is_none_or(|name| event.paths.iter().any(|p| p.file_name() == Some(name)));
-                    if matches {
-                        on_change();
-                    }
+                    Ok(Err(_)) => continue,
+                    Err(_) => break,
                 }
-                Ok(Err(_)) => continue,
-                Err(_) => break,
             }
-        }
-    });
+        })
+        .expect("failed to spawn file-watcher thread");
 }
 
 fn spawn_watcher(tx: broadcast::Sender<String>) {

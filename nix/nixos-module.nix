@@ -14,7 +14,7 @@ let
     mkIf
     ;
 
-  # blit-server loads GPU encoder libraries via dlopen at runtime:
+  # blit server loads GPU encoder libraries via dlopen at runtime:
   #   VA-API:  libva.so.2, libva-drm.so.2  (from pkgs.libva)
   #   NVENC:   libcuda.so.1, libnvidia-encode.so.1  (from the GPU driver)
   # On NixOS these live under /nix/store and are not in the default
@@ -29,9 +29,9 @@ in
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.blit-server;
-      defaultText = "self.packages.\${system}.blit-server";
-      description = "The blit-server package to use.";
+      default = self.packages.${pkgs.system}.blit;
+      defaultText = "self.packages.\${system}.blit";
+      description = "The blit package to use.";
     };
 
     users = mkOption {
@@ -43,7 +43,7 @@ in
       ];
       description = ''
         Users to enable blit for. Each user gets a socket-activated
-        blit-server instance at /run/blit/<user>.sock.
+        blit server instance at /run/blit/<user>.sock.
       '';
     };
 
@@ -63,14 +63,17 @@ in
     gpuLibraries = mkOption {
       type = types.listOf types.package;
       default = lib.optionals pkgs.stdenv.isLinux [
+        pkgs.libglvnd
         pkgs.libva
+        pkgs.libgbm
       ];
-      defaultText = "[ pkgs.libva ] (Linux only)";
+      defaultText = "[ pkgs.libglvnd pkgs.libva pkgs.libgbm ] (Linux only)";
       description = ''
-        Libraries to make available to blit-server via LD_LIBRARY_PATH
-        for hardware-accelerated video encoding.  blit-server loads
-        encoder backends (VA-API, NVENC) via dlopen at runtime; on
-        NixOS these shared objects are not in the default search path.
+        Libraries to make available to blit server via LD_LIBRARY_PATH
+        for hardware-accelerated video encoding and GPU compositing.
+        blit server loads VA-API, EGL, GLESv2, and GBM via dlopen at
+        runtime; on NixOS these shared objects are not in the default
+        search path.
 
         Set to an empty list to disable hardware acceleration and use
         only software encoders (openh264, rav1e).
@@ -172,15 +175,15 @@ in
             };
             package = mkOption {
               type = types.package;
-              default = self.packages.${pkgs.system}.blit-gateway;
-              defaultText = "self.packages.\${system}.blit-gateway";
-              description = "The blit-gateway package to use.";
+              default = self.packages.${pkgs.system}.blit;
+              defaultText = "self.packages.\${system}.blit";
+              description = "The blit package to use for the gateway.";
             };
           };
         }
       );
       default = { };
-      description = "Named blit-gateway instances connecting to blit-server sockets.";
+      description = "Named blit gateway instances connecting to blit server sockets.";
     };
 
     forwarders = mkOption {
@@ -189,7 +192,7 @@ in
           options = {
             user = mkOption {
               type = types.str;
-              description = "User whose blit-server socket to forward.";
+              description = "                User whose blit server socket to forward.";
             };
             passFile = mkOption {
               type = types.path;
@@ -217,15 +220,15 @@ in
             };
             package = mkOption {
               type = types.package;
-              default = self.packages.${pkgs.system}.blit-webrtc-forwarder;
-              defaultText = "self.packages.\${system}.blit-webrtc-forwarder";
-              description = "The blit-webrtc-forwarder package to use.";
+              default = self.packages.${pkgs.system}.blit;
+              defaultText = "self.packages.\${system}.blit";
+              description = "The blit package to use for the forwarder.";
             };
           };
         }
       );
       default = { };
-      description = "Named blit-webrtc-forwarder instances sharing blit-server sessions via WebRTC.";
+      description = "Named blit-webrtc-forwarder instances sharing blit server sessions via WebRTC.";
     };
   };
 
@@ -241,11 +244,7 @@ in
               Type = "simple";
               User = user;
               WorkingDirectory = "~";
-              ExecStart =
-                let
-                  serverBin = "${cfg.package}/bin/blit-server";
-                in
-                "${serverBin}";
+              ExecStart = "${cfg.package}/bin/blit server";
               Environment =
                 lib.optional (cfg.shell != null) "SHELL=${cfg.shell}"
                 ++ [
@@ -270,7 +269,7 @@ in
               wantedBy = [ "multi-user.target" ];
               serviceConfig = {
                 Type = "simple";
-                ExecStart = "${gw.package}/bin/blit-gateway";
+                ExecStart = "${gw.package}/bin/blit gateway";
                 Environment = [
                   "BLIT_ADDR=${gw.addr}:${toString gw.port}"
                 ]
@@ -308,7 +307,7 @@ in
               Type = "simple";
               User = fwd.user;
               ExecStart =
-                "${fwd.package}/bin/blit-webrtc-forwarder"
+                "${fwd.package}/bin/blit share"
                 + lib.optionalString fwd.quiet " --quiet"
                 + lib.optionalString fwd.verbose " --verbose";
               Environment = [

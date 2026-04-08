@@ -1,16 +1,21 @@
 [package]
 name = "blit-gateway"
-version = "0.21.0"
+version = "0.22.0"
 edition.workspace = true
 description = "blit WebSocket/WebTransport gateway"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[lib]
+name = "blit_gateway"
+path = "src/lib.rs"
+
 [dependencies]
 blit-webserver = { workspace = true }
 blit-webrtc-forwarder = { workspace = true }
 blit-ssh = { workspace = true }
+blit-proxy = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"

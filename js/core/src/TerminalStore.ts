@@ -223,6 +223,22 @@ export class TerminalStore {
     terminal.feed_compressed(payload);
     this.noteAppliedFrame(this.nowMs() - applyStart);
     for (const listener of this.dirtyListeners) listener(ptyId);
+
+    // ACK immediately after applying the frame.  The server's congestion
+    // window stalls permanently if ACKs are delayed until noteFrameRendered()
+    // because that only fires when a BlitTerminalSurface actually renders —
+    // and a terminal for a *different* PTY having a dirty listener doesn't
+    // help the PTY that received this update.  The server uses separate
+    // metrics (browser_backlog, apply_ms) for pacing; the ACK just prevents
+    // the inflight window from filling up.
+    //
+    // Only drain ACKs here — do NOT reset pendingAppliedFrames / ackAheadFrames.
+    // Those counters reflect unrendered backlog and are cleared when the UI
+    // actually paints via noteFrameRendered().
+    while (this.pendingAcks > 0 && this.delegate.getStatus() === "connected") {
+      this.pendingAcks--;
+      this.delegate.send(buildAckMessage());
+    }
   }
 
   handleStatusChange(status: ConnectionStatus): void {

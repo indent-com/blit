@@ -194,6 +194,7 @@ export const C2S_SURFACE_UNSUBSCRIBE = 0x29;
 export const C2S_SURFACE_ACK = 0x2a;
 export const C2S_SURFACE_CLOSE = 0x2b;
 export const C2S_SURFACE_REQUEST_KEYFRAME = 0x2c;
+export const C2S_CLIENT_FEATURES = 0x2d;
 export const S2C_SURFACE_CREATED = 0x20;
 export const S2C_SURFACE_DESTROYED = 0x21;
 export const S2C_SURFACE_FRAME = 0x22;
@@ -221,6 +222,7 @@ export const FEATURE_COPY_RANGE = 1 << 3;
 export const FEATURE_COMPOSITOR = 1 << 4;
 
 export type BlitSurface = {
+  connectionId: ConnectionId;
   sessionId: u16;
   surfaceId: u16;
   parentId: u16;

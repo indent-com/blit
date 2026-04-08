@@ -1,9 +1,9 @@
 use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
 use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use blit_remote::{
-    C2S_ACK, C2S_CLIENT_METRICS, C2S_CLIPBOARD, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE,
-    C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL,
-    C2S_MOUSE, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
+    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD, C2S_CLOSE, C2S_COPY_RANGE,
+    C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT,
+    C2S_KILL, C2S_MOUSE, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
     C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
     C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_REQUEST_KEYFRAME,
     C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE,
@@ -303,6 +303,10 @@ struct SharedCompositor {
     created_at: Instant,
     /// Monotonically increasing counter for pixel generations.
     pixel_generation: u64,
+    /// Last time we sent blanket RequestFrame for all surfaces (including
+    /// those without subscribers).  Throttled to prevent hot-looping when
+    /// apps commit at high rates without any client consuming frames.
+    last_blanket_frame_request: Instant,
 }
 
 fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -1077,7 +1081,6 @@ struct SearchResultRow {
 }
 
 struct TickOutcome {
-    did_work: bool,
     next_deadline: Option<Instant>,
 }
 
@@ -1103,11 +1106,12 @@ impl Session {
         &mut self,
         verbose: bool,
         event_notify: Arc<dyn Fn() + Send + Sync>,
+        gpu_device: &str,
     ) -> &str {
         if self.compositor.is_none() {
             let session_id = self.next_compositor_id;
             self.next_compositor_id = self.next_compositor_id.wrapping_add(1);
-            let handle = blit_compositor::spawn_compositor(verbose, event_notify);
+            let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             self.compositor = Some(SharedCompositor {
                 session_id,
                 handle,
@@ -1116,6 +1120,7 @@ impl Session {
                 pending_frame_requests: HashSet::new(),
                 created_at: Instant::now(),
                 pixel_generation: 0,
+                last_blanket_frame_request: Instant::now(),
             });
         }
         &self.compositor.as_ref().unwrap().handle.socket_name
@@ -1583,14 +1588,8 @@ pub async fn run(config: Config) {
             } else {
                 delivery_state.delivery_notify.notified().await;
             }
-            loop {
-                let outcome = tick(&delivery_state).await;
-                next_deadline = outcome.next_deadline;
-                if !outcome.did_work {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            let outcome = tick(&delivery_state).await;
+            next_deadline = outcome.next_deadline;
         }
     });
 
@@ -1654,7 +1653,6 @@ pub async fn run(config: Config) {
 async fn tick(state: &AppState) -> TickOutcome {
     let mut sess = state.session.lock().await;
     sess.tick_fires += 1;
-    let mut did_work = false;
     let mut next_deadline: Option<Instant> = None;
     let now = Instant::now();
 
@@ -1685,7 +1683,6 @@ async fn tick(state: &AppState) -> TickOutcome {
             pty.last_title_send = now;
             pty.title_pending = false;
             sess.send_to_all(&msg);
-            did_work = true;
         }
     }
 
@@ -1707,7 +1704,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     );
                     pty.driver.process(&data);
                     pty.mark_dirty();
-                    did_work = true;
                 }
                 PtyInput::SyncBoundary { before, after } => {
                     if !before.is_empty() {
@@ -1735,7 +1731,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         pty.driver.process(&after);
                         pty.mark_dirty();
                     }
-                    did_work = true;
                 }
                 PtyInput::Eof => {
                     eof_ptys.push(id);
@@ -1780,7 +1775,6 @@ async fn tick(state: &AppState) -> TickOutcome {
         {
             snapshots.insert(id, frame);
             sess.tick_snaps += 1;
-            did_work = true;
             continue;
         }
         if !should_snapshot_pty(
@@ -1796,7 +1790,6 @@ async fn tick(state: &AppState) -> TickOutcome {
         snapshots.insert(id, take_snapshot(pty));
         pty.clear_dirty();
         sess.tick_snaps += 1;
-        did_work = true;
     }
 
     let client_ids: Vec<u64> = sess.clients.keys().copied().collect();
@@ -1888,7 +1881,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     SendOutcome::NoChange
                 };
                 match outcome {
-                    SendOutcome::Sent => did_work = true,
+                    SendOutcome::Sent => {}
                     SendOutcome::Backpressured => {
                         if let Some(pty) = sess.ptys.get_mut(&scroll_pid) {
                             pty.mark_dirty();
@@ -1928,7 +1921,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         continue;
                     };
                     match try_send_update(c, pid, cur, msg, now, true) {
-                        SendOutcome::Sent => did_work = true,
+                        SendOutcome::Sent => {}
                         SendOutcome::Backpressured => {
                             if let Some(pty) = sess.ptys.get_mut(&pid) {
                                 pty.mark_dirty();
@@ -2022,7 +2015,6 @@ async fn tick(state: &AppState) -> TickOutcome {
             match try_send_update(c, pid, cur, msg, now, false) {
                 SendOutcome::Sent => {
                     record_preview_send(c, pid, now);
-                    did_work = true;
                 }
                 SendOutcome::Backpressured => {
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
@@ -2046,7 +2038,6 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
         let mut broadcast: Vec<Vec<u8>> = Vec::new();
         for event in events {
-            did_work = true;
             match event {
                 CompositorEvent::SurfaceCreated {
                     surface_id,
@@ -2098,8 +2089,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.width = width as u16;
                         info.height = height as u16;
                     }
-                    // Dimension changes will be caught by the per-client
-                    // encode loop which compares source_dimensions().
                     cs.pixel_generation += 1;
                     cs.last_pixels.insert(
                         surface_id,
@@ -2349,11 +2338,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if job.needs_keyframe {
                             job.encoder.request_keyframe();
                         }
-                        let nal_data = if job.needs_keyframe {
-                            job.encoder.encode_keyframe_pixels(&job.pixels)
-                        } else {
-                            job.encoder.encode_pixels(&job.pixels)
-                        };
+                        let nal_data = job.encoder.encode_pixels(&job.pixels);
                         let codec_flag = job.encoder.codec_flag();
                         let encode_ms = t0.elapsed().as_millis();
 
@@ -2508,6 +2493,20 @@ async fn tick(state: &AppState) -> TickOutcome {
         // RequestFrame → commit → SurfaceCommit wakes tick → no client
         // ready → RequestFrame again → 100% CPU.
         let mut wanted: HashSet<u16> = HashSet::new();
+        let mut blanket_requested = false;
+        // Request frames for all known surfaces so Wayland apps can make
+        // rendering progress (browsers need frame callbacks to load pages).
+        // Throttled to 5 Hz to prevent a hot loop when apps commit at high
+        // rates without any client consuming frames.
+        const BLANKET_FRAME_INTERVAL: Duration = Duration::from_millis(200);
+        if let Some(cs) = sess.compositor.as_ref()
+            && now.duration_since(cs.last_blanket_frame_request) >= BLANKET_FRAME_INTERVAL
+        {
+            for &sid in cs.surfaces.keys() {
+                wanted.insert(sid);
+            }
+            blanket_requested = true;
+        }
         for client in sess.clients.values() {
             if !window_open(client) {
                 continue;
@@ -2527,6 +2526,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 wanted.insert(sid);
             }
         }
+
         // Only send RequestFrame for surfaces that don't already have a
         // pending request.  This prevents hot-looping when the app hasn't
         // committed in response to the previous frame callback.
@@ -2545,13 +2545,13 @@ async fn tick(state: &AppState) -> TickOutcome {
             if sent_any {
                 cs.handle.wake();
             }
+            if blanket_requested {
+                cs.last_blanket_frame_request = now;
+            }
         }
     }
 
-    TickOutcome {
-        did_work,
-        next_deadline,
-    }
+    TickOutcome { next_deadline }
 }
 
 async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -2918,14 +2918,32 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let mut reply_msg = vec![S2C_SURFACE_CAPTURE];
             reply_msg.extend_from_slice(&surface_id.to_le_bytes());
 
-            let sess = state.session.lock().await;
-            let captured = sess
-                .compositor
-                .as_ref()
-                .and_then(|cs| cs.last_pixels.get(&surface_id))
-                .map(|lp| (lp.width, lp.height, lp.pixels.to_rgba(lp.width, lp.height)));
-            let client_tx = sess.clients.get(&client_id).map(|c| c.tx.clone());
-            drop(sess);
+            eprintln!("[capture] acquiring lock for surface {surface_id}");
+            let snapshot = {
+                let sess = state.session.lock().await;
+                eprintln!("[capture] lock acquired");
+                sess.compositor
+                    .as_ref()
+                    .and_then(|cs| cs.last_pixels.get(&surface_id))
+                    .map(|lp| (lp.width, lp.height, lp.pixels.clone()))
+            };
+
+            // Convert to RGBA for capture.  The compositor already composed
+            // the surface tree via GlesRenderer — we just need the format
+            // conversion.
+            eprintln!("[capture] converting to RGBA");
+            let captured = snapshot.map(|(w, h, pixels)| {
+                eprintln!("[capture] to_rgba {w}x{h}");
+                let rgba = pixels.to_rgba(w, h);
+                eprintln!("[capture] to_rgba done: {} bytes", rgba.len());
+                (w, h, rgba)
+            });
+            eprintln!("[capture] acquiring client_tx lock");
+            let client_tx = {
+                let sess = state.session.lock().await;
+                eprintln!("[capture] client_tx lock acquired");
+                sess.clients.get(&client_id).map(|c| c.tx.clone())
+            };
 
             if let Some((w, h, rgba_pixels)) = captured {
                 let image_data = encode_capture(&rgba_pixels, w, h, format, quality);
@@ -2938,7 +2956,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
 
             if let Some(client_tx) = client_tx {
-                let _ = client_tx.try_send(reply_msg);
+                eprintln!("[capture] sending reply: {} bytes", reply_msg.len());
+                match client_tx.try_send(reply_msg) {
+                    Ok(()) => eprintln!("[capture] sent OK"),
+                    Err(e) => eprintln!("[capture] try_send failed: {e}"),
+                }
+            } else {
+                eprintln!("[capture] no client_tx");
             }
             continue;
         }
@@ -3031,7 +3055,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     continue;
                 };
                 let socket_name = sess
-                    .ensure_compositor(config.verbose, notify_for_compositor.clone())
+                    .ensure_compositor(
+                        config.verbose,
+                        notify_for_compositor.clone(),
+                        &config.vaapi_device,
+                    )
                     .to_string();
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -3109,7 +3137,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     continue;
                 };
                 let socket_name = sess
-                    .ensure_compositor(config.verbose, notify_for_compositor.clone())
+                    .ensure_compositor(
+                        config.verbose,
+                        notify_for_compositor.clone(),
+                        &config.vaapi_device,
+                    )
                     .to_string();
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -3182,7 +3214,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     continue;
                 };
                 let socket_name = sess
-                    .ensure_compositor(config.verbose, notify_for_compositor.clone())
+                    .ensure_compositor(
+                        config.verbose,
+                        notify_for_compositor.clone(),
+                        &config.vaapi_device,
+                    )
                     .to_string();
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -3252,7 +3288,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     continue;
                 };
                 let socket_name = sess
-                    .ensure_compositor(config.verbose, notify_for_compositor.clone())
+                    .ensure_compositor(
+                        config.verbose,
+                        notify_for_compositor.clone(),
+                        &config.vaapi_device,
+                    )
                     .to_string();
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -3448,12 +3488,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.surface_subscriptions.insert(surface_id);
-                }
-                // Force a keyframe so the new subscriber gets a decodable frame.
-                // The client's surface_needs_keyframe is already true on subscribe.
-                // Just wake the tick loop to deliver immediately.
-                if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.surface_needs_keyframe = true;
+                }
+                // Clear pending_frame_requests so the tick loop sends a fresh
+                // RequestFrame.  Without this, a stale entry from a previous
+                // subscribe/unsubscribe cycle prevents the compositor from
+                // firing frame callbacks, deadlocking the encode pipeline.
+                if let Some(cs) = sess.compositor.as_mut() {
+                    cs.pending_frame_requests.remove(&surface_id);
                 }
                 state.delivery_notify.notify_one();
             }
@@ -3484,6 +3526,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     record_ack(c);
                 }
                 state.delivery_notify.notify_one();
+            }
+            C2S_CLIENT_FEATURES if data.len() >= 2 => {
+                // Byte 0: codec_support bitmask.  Future bytes are ignored
+                // if unknown, defaulting to 0 when absent.
+                let codec_support = data[1];
+                if let Some(c) = sess.clients.get_mut(&client_id) {
+                    c.surface_codec_support = codec_support;
+                }
             }
             C2S_CLIPBOARD if data.len() >= 9 => {
                 let session_id = u16::from_le_bytes([data[1], data[2]]);
@@ -4030,14 +4080,17 @@ mod tests {
     #[tokio::test]
     async fn request_surface_capture_returns_pixels_from_compositor() {
         let (command_tx, command_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let CompositorCommand::Capture { surface_id, reply } = command_rx.recv().unwrap()
-            else {
-                panic!("expected capture command");
-            };
-            assert_eq!(surface_id, 7);
-            let _ = reply.send(Some((2, 3, vec![1, 2, 3, 4])));
-        });
+        std::thread::Builder::new()
+            .name("test-capture-reply".into())
+            .spawn(move || {
+                let CompositorCommand::Capture { surface_id, reply } = command_rx.recv().unwrap()
+                else {
+                    panic!("expected capture command");
+                };
+                assert_eq!(surface_id, 7);
+                let _ = reply.send(Some((2, 3, vec![1, 2, 3, 4])));
+            })
+            .unwrap();
 
         let result =
             request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;
@@ -4048,9 +4101,12 @@ mod tests {
     #[tokio::test]
     async fn request_surface_capture_returns_none_when_compositor_disconnects() {
         let (command_tx, command_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = command_rx.recv().unwrap();
-        });
+        std::thread::Builder::new()
+            .name("test-capture-drop".into())
+            .spawn(move || {
+                let _ = command_rx.recv().unwrap();
+            })
+            .unwrap();
 
         let result =
             request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;

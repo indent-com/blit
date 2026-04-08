@@ -1,15 +1,10 @@
 ---
-const getStarted = `<span class="text-[var(--green)] select-none">$</span> curl -sf https://install.blit.sh | sh
-<span class="text-[var(--green)] select-none">$</span> blit open         <span class="text-[var(--hl-cm)]"># opens a browser</span>
-<span class="text-[var(--green)] select-none">$</span> blit share        <span class="text-[var(--hl-cm)]"># share via WebRTC</span>
-<span class="text-[var(--green)] select-none">$</span> blit --ssh host   <span class="text-[var(--hl-cm)]"># remote terminal</span>`;
+const remotes = `<span class="text-[var(--green)] select-none">$</span> blit share
+Session: https://blit.sh/s#rf6e…
+Read-only: https://blit.sh/s#EMPs…
 
-const remotes = `<span class="text-[var(--green)] select-none">$</span> blit remote add rabbit ssh:rabbit
-<span class="text-[var(--green)] select-none">$</span> blit remote add prod ssh:alice@prod.co
-<span class="text-[var(--green)] select-none">$</span> blit remote set-default rabbit
-
-<span class="text-[var(--green)] select-none">$</span> blit open          <span class="text-[var(--hl-cm)]"># local + all remotes</span>
-<span class="text-[var(--green)] select-none">$</span> blit --on prod list`;
+<span class="text-[var(--green)] select-none">$</span> blit remote add dev ssh:dev
+<span class="text-[var(--green)] select-none">$</span> blit --on dev list`;
 
 const agentApi = `<span class="text-[var(--green)] select-none">$</span> blit start -t build make -j8
 1
@@ -18,65 +13,33 @@ const agentApi = `<span class="text-[var(--green)] select-none">$</span> blit st
 [100%] Built target app
 BUILD OK`;
 
-const guiStreaming = `<span class="text-[var(--green)] select-none">$</span> blit start foot        <span class="text-[var(--hl-cm)]"># launch Wayland terminal</span>
-<span class="text-[var(--green)] select-none">$</span> blit surfaces          <span class="text-[var(--hl-cm)]"># list graphical windows</span>
-1  foot  800x600
-<span class="text-[var(--green)] select-none">$</span> blit capture 1         <span class="text-[var(--hl-cm)]"># screenshot</span>
-<span class="text-[var(--green)] select-none">$</span> blit click 1 100 50
-<span class="text-[var(--green)] select-none">$</span> blit type 1 "hello{Return}"`;
+const blocks = [
+  {
+    title: "Share & connect",
+    desc: "WebRTC punches through NATs — no SSH keys, no port forwarding. Named remotes for SSH hosts, auto-installed on first connection.",
+    code: remotes,
+  },
+  {
+    title: "Terminals as an API",
+    desc: "Non-interactive subcommands for scripts and LLMs. Parsed terminal grid, LZ4-compressed binary diffs — not pixels.",
+    code: agentApi,
+  },
+];
 ---
 
 <section class="pb-10">
-  <h2 class="text-base font-bold tracking-tight mb-4 text-[var(--bright)] border-t border-[var(--border)] pt-10">
-    Quick start
-  </h2>
-  <div class="grid grid-cols-2 gap-3 max-md:grid-cols-1">
-    <div
-      class="bg-[var(--surface)] border border-[var(--border)] rounded-lg overflow-hidden"
-    >
-      <div
-        class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] px-4 pt-3 pb-1"
-      >
-        Get started
+  <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+    {blocks.map(({ title, desc, code }) => (
+      <div class="bg-[var(--surface)] border border-[var(--border)] rounded-lg overflow-hidden flex flex-col">
+        <div class="px-4 pt-3 pb-2">
+          <div class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)]">
+            {title}
+          </div>
+          <p class="text-[12px] leading-relaxed text-[var(--dim)] mt-1 mb-0">{desc}</p>
+        </div>
+        <pre
+          class="m-0 px-4 py-2.5 overflow-x-auto flex-1"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={code} /></pre>
       </div>
-      <pre
-        class="m-0 px-4 py-2.5 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={getStarted} /></pre>
-    </div>
-
-    <div
-      class="bg-[var(--surface)] border border-[var(--border)] rounded-lg overflow-hidden"
-    >
-      <div
-        class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] px-4 pt-3 pb-1"
-      >
-        Named remotes
-      </div>
-      <pre
-        class="m-0 px-4 py-2.5 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={remotes} /></pre>
-    </div>
-
-    <div
-      class="bg-[var(--surface)] border border-[var(--border)] rounded-lg overflow-hidden"
-    >
-      <div
-        class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] px-4 pt-3 pb-1"
-      >
-        Agent / Script API
-      </div>
-      <pre
-        class="m-0 px-4 py-2.5 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={agentApi} /></pre>
-    </div>
-
-    <div
-      class="bg-[var(--surface)] border border-[var(--border)] rounded-lg overflow-hidden"
-    >
-      <div
-        class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] px-4 pt-3 pb-1"
-      >
-        GUI app streaming
-      </div>
-      <pre
-        class="m-0 px-4 py-2.5 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={guiStreaming} /></pre>
-    </div>
+    ))}
   </div>
 </section>

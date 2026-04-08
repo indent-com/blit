@@ -6,5 +6,5 @@ Requires=blit-server@%i.socket
 Type=simple
 User=%i
 WorkingDirectory=~
-ExecStart=blit-server
+ExecStart=blit server
 Restart=no

@@ -58,9 +58,11 @@ import {
   buildSurfaceUnsubscribeMessage,
   buildSurfaceAckMessage,
   buildClipboardMessage,
+  buildClientFeaturesMessage,
 } from "./protocol";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
+import { detectCodecSupport } from "./BlitSurfaceCanvas";
 
 const textDecoder = new TextDecoder();
 
@@ -166,6 +168,7 @@ export class BlitConnection {
   }: CreateBlitConnectionOptions) {
     this.id = id;
     this.transport = transport;
+    this.surfaceStore.setConnectionId(id);
     this.store = new TerminalStore(
       {
         send: (data) => {
@@ -786,6 +789,17 @@ export class BlitConnection {
     );
   }
 
+  /**
+   * Advertise client capabilities to the server.  Currently carries the
+   * video codec support bitmask so the server picks a compatible encoder.
+   * Called automatically when the connection is established and codec
+   * probing completes.
+   */
+  sendClientFeatures(codecSupport: number): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildClientFeaturesMessage(codecSupport));
+  }
+
   isReady(): boolean {
     return this.store.isReady();
   }
@@ -1037,6 +1051,11 @@ export class BlitConnection {
       this.hasConnected = true;
       this.retryCount = 0;
       this.lastError = null;
+      // Eagerly detect supported codecs and inform the server so it picks
+      // a compatible encoder before any surface subscribe arrives.
+      detectCodecSupport().then((mask) => {
+        this.sendClientFeatures(mask);
+      });
     } else if (
       (status === "error" ||
         status === "disconnected" ||
@@ -1072,7 +1091,12 @@ export class BlitConnection {
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
-      this.surfaceStore.destroy();
+      this.surfaceStore.handleDisconnect();
+      // All surface subscriptions are implicitly dropped when the transport
+      // dies.  Clear the ref-counts so that re-subscribes after reconnect
+      // are sent correctly (the check `if (prev === 0 ...)` would otherwise
+      // skip re-sending since the old count is still > 0).
+      this.surfaceSubRefCounts.clear();
     }
 
     this.emit();
@@ -1144,6 +1168,12 @@ export class BlitConnection {
     this.store.setLead(
       nextFocus ? (this.sessionsById.get(nextFocus)?.ptyId ?? null) : null,
     );
+
+    // Prune surfaces that existed before a disconnect but were not
+    // re-announced by the server.  S2C_SURFACE_CREATED messages arrive
+    // before S2C_LIST, so any surface not seen by now is gone.
+    this.surfaceStore.reconcileAfterList();
+
     this.emit();
 
     // Always re-send focus to the server. After a reconnection the server

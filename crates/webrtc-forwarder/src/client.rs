@@ -572,6 +572,12 @@ async fn drive(
     // Once false we stop polling cmd_rx but keep running until all channels close.
     let mut session_alive = true;
 
+    // Reusable sleep future — avoids allocating/dropping a TimerEntry on every
+    // loop iteration, which was responsible for ~15% of steady-state CPU
+    // (timer wheel mutex contention + entry alloc/drop).
+    let sleep = tokio::time::sleep(std::time::Duration::ZERO);
+    tokio::pin!(sleep);
+
     // Separate channel for per-channel pump tasks to send app data back to
     // the drive loop, so we don't need to hold a cmd_tx clone (which would
     // prevent cmd_rx from ever returning None on Session drop).
@@ -619,7 +625,8 @@ async fn drive(
                             if label == "blit"
                                 && let Some(reply_tx) = pending_open.remove(&cid)
                             {
-                                let (app_half, mut driver_half) = tokio::io::duplex(256 * 1024);
+                                let (app_half, mut driver_half) =
+                                    tokio::io::duplex(256 * 1024 * 1024);
                                 // write_tx: drive task → app half (DataChannel → app).
                                 let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
                                 // app_tx: reader task → drive task (app → DataChannel).
@@ -703,7 +710,8 @@ async fn drive(
             }
         };
 
-        let sleep_dur = timeout.saturating_duration_since(Instant::now());
+        let deadline = tokio::time::Instant::from_std(timeout);
+        sleep.as_mut().reset(deadline);
 
         tokio::select! {
             result = tokio_udp4.recv_from(&mut buf4) => {
@@ -736,7 +744,7 @@ async fn drive(
                     rtc.handle_input(Input::Receive(Instant::now(), receive))?;
                 }
             }
-            _ = tokio::time::sleep(sleep_dur) => {
+            _ = &mut sleep => {
                 rtc.handle_input(Input::Timeout(Instant::now()))?;
             }
             turn_data = async {

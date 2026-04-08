@@ -3,60 +3,44 @@ import JoinForm from "./JoinForm.tsx";
 import CopyButton from "./CopyButton.tsx";
 
 const INSTALL_CMD = "curl -sf https://install.blit.sh | sh";
+const INSTALL_PS = "irm https://install.blit.sh/install.ps1 | iex";
 const DOCKER_CMD = "docker run --rm grab/blit-demo";
 ---
 
 <section class="pt-16 pb-8 [container-type:inline-size]">
   <div class="mb-2 text-[11px] font-bold uppercase tracking-widest text-[var(--accent)] opacity-80">
-    Terminal multiplexer · Wayland compositor · Agent runtime
+    Stream · Share · Automate
   </div>
   <h1 class="text-[clamp(2.8rem,8cqw,7rem)] font-bold leading-[1.05] tracking-tight text-[var(--bright)]">
-    Your terminal,<br />everywhere.
+    Terminals for the Web and machines.
   </h1>
   <p class="mt-4 text-[14px] leading-relaxed text-[var(--dim)]">
     Low-latency terminal streaming to any browser. Share a session with one
-    command. Drive it from AI agents. Tunnel into remote SSH hosts. One
-    binary, zero config.
+    command. Drive it from AI agents. Tunnel into remote SSH hosts or
+    connect through NAT-friendly sharing. One binary, zero config.
   </p>
   <p class="mt-2 text-xs text-[var(--dim)] opacity-60">
-    MIT-licensed · Wide chars, emoji &amp; Unicode · Every unsafe block{" "}
-    <a
-      href="https://github.com/indent-com/blit/blob/main/UNSAFE.md"
-      target="_blank"
-      rel="noopener noreferrer"
-      class="text-[var(--accent)] no-underline hover:underline">audited</a
-    >
+    MIT-licensed · Wide chars, emoji &amp; Unicode
   </p>
 
-  <div class="mt-8 flex gap-3 max-sm:flex-col">
-    <div
-      class="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3"
-    >
-      <div
-        class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2"
-      >
-        Install
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-[var(--green)] select-none shrink-0">$</span>
-        <span class="flex-1 min-w-0 text-[13px]">{INSTALL_CMD}</span>
-        <CopyButton text={INSTALL_CMD} client:load />
-      </div>
+  <div class="mt-8 bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3 flex flex-col gap-1.5">
+    <div class="flex items-center gap-2">
+      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-16">Try it</span>
+      <span class="text-[var(--green)] select-none shrink-0">$</span>
+      <span class="flex-1 min-w-0 text-[13px]">{DOCKER_CMD}</span>
+      <CopyButton text={DOCKER_CMD} client:load />
     </div>
-
-    <div
-      class="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3"
-    >
-      <div
-        class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2"
-      >
-        Try without installing
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-[var(--green)] select-none shrink-0">$</span>
-        <span class="flex-1 min-w-0 text-[13px]">{DOCKER_CMD}</span>
-        <CopyButton text={DOCKER_CMD} client:load />
-      </div>
+    <div class="flex items-center gap-2 pt-1.5 border-t border-[var(--border)]">
+      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-16">Install</span>
+      <span class="text-[var(--green)] select-none shrink-0">$</span>
+      <span class="flex-1 min-w-0 text-[13px]">{INSTALL_CMD}</span>
+      <CopyButton text={INSTALL_CMD} client:load />
+    </div>
+    <div class="flex items-center gap-2 pt-1.5 border-t border-[var(--border)]">
+      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-16"></span>
+      <span class="text-[var(--green)] select-none shrink-0">&gt;</span>
+      <span class="flex-1 min-w-0 text-[13px]">{INSTALL_PS}</span>
+      <CopyButton text={INSTALL_PS} client:load />
     </div>
   </div>
 

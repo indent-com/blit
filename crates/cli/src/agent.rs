@@ -1458,11 +1458,10 @@ mod tests {
             if let Some(ServerMsg::CreatedN {
                 nonce: n, pty_id, ..
             }) = parse_server_msg(&data)
+                && n == 1
             {
-                if n == 1 {
-                    assert_eq!(pty_id, 5);
-                    break;
-                }
+                assert_eq!(pty_id, 5);
+                break;
             }
         }
 
@@ -1504,11 +1503,10 @@ mod tests {
             if let Some(ServerMsg::CreatedN {
                 nonce: n, pty_id, ..
             }) = parse_server_msg(&data)
+                && n == 1
             {
-                if n == 1 {
-                    assert_eq!(pty_id, 7);
-                    break;
-                }
+                assert_eq!(pty_id, 7);
+                break;
             }
         }
 
@@ -1713,23 +1711,21 @@ mod tests {
 
         loop {
             let data = conn.recv().await.unwrap();
-            if data[0] == S2C_TEXT {
-                if let Some(ServerMsg::Text {
+            if data[0] == S2C_TEXT
+                && let Some(ServerMsg::Text {
                     nonce,
                     text,
                     total_lines,
                     offset,
                     ..
                 }) = parse_server_msg(&data)
-                {
-                    if nonce == 1 {
-                        assert_eq!(total_lines, 3);
-                        assert_eq!(offset, 0);
-                        assert!(text.contains("line1"), "got: {text}");
-                        assert!(text.contains("line3"), "got: {text}");
-                        break;
-                    }
-                }
+                && nonce == 1
+            {
+                assert_eq!(total_lines, 3);
+                assert_eq!(offset, 0);
+                assert!(text.contains("line1"), "got: {text}");
+                assert!(text.contains("line3"), "got: {text}");
+                break;
             }
         }
 

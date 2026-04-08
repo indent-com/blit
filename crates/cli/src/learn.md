@@ -9,7 +9,7 @@ Drive terminal sessions programmatically through stateless CLI subcommands. Each
 | Platform | Arch          | Wayland compositor | Notes                 |
 | -------- | ------------- | ------------------ | --------------------- |
 | Linux    | x86_64, arm64 | Yes                | Full features         |
-| macOS    | arm64         | Yes                | Full features         |
+| macOS    | arm64         | No                 | PTY multiplexing only |
 | Windows  | x86_64        | No                 | PTY multiplexing only |
 
 ## Running commands
@@ -227,7 +227,7 @@ blit install pcarrier@dev-server
 
 ## GUI surface automation
 
-On Linux and macOS, every blit PTY session includes an experimental headless Wayland compositor. GUI applications launched inside a session automatically connect to it via `WAYLAND_DISPLAY` (set in the PTY environment). Their windows are captured, encoded as H.264 or AV1 video, and streamed to connected browser clients in real time. The compositor is not available on Windows.
+On Linux, every blit PTY session includes an experimental headless Wayland compositor. GUI applications launched inside a session automatically connect to it via `WAYLAND_DISPLAY` (set in the PTY environment). Their windows are captured, encoded as H.264 or AV1 video, and streamed to connected browser clients in real time. The compositor is not available on macOS or Windows.
 
 No special flags are needed — the compositor starts on the first PTY creation and shuts down when all PTYs exit.
 

@@ -5,9 +5,11 @@ use axum::extract::{FromRequest, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 
-use crate::transport::{self, Transport, make_frame, read_frame};
+use crate::transport::{self, Transport, make_frame, read_frame, write_frame};
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -317,7 +319,12 @@ async fn browser_root_handler(
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
 
-    if is_ws {
+    if is_ws && (path == "/mux" || path.ends_with("/mux")) {
+        match WebSocketUpgrade::from_request(request, &state).await {
+            Ok(ws) => ws.on_upgrade(move |socket| browser_handle_mux_ws(socket, state)),
+            Err(e) => e.into_response(),
+        }
+    } else if is_ws {
         let dest_name = resolve_destination_name(&path);
         match WebSocketUpgrade::from_request(request, &state).await {
             Ok(ws) => ws.on_upgrade(move |socket| browser_handle_ws(socket, state, dest_name)),
@@ -440,4 +447,224 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>, dest_nam
     ws_to_transport.abort();
 
     eprintln!("blit: browser client disconnected from '{dest_label}'");
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexed WebSocket handler.
+// ---------------------------------------------------------------------------
+
+const MUX_CONTROL: u16 = 0xFFFF;
+
+const MUX_C2S_OPEN: u8 = 0x01;
+const MUX_C2S_CLOSE: u8 = 0x02;
+
+const MUX_S2C_OPENED: u8 = 0x81;
+const MUX_S2C_CLOSED: u8 = 0x82;
+const MUX_S2C_ERROR: u8 = 0x83;
+
+fn mux_control(opcode: u8, ch: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.extend_from_slice(&MUX_CONTROL.to_le_bytes());
+    buf.push(opcode);
+    buf.extend_from_slice(&ch.to_le_bytes());
+    buf
+}
+
+fn mux_error(ch: u16, msg: &str) -> Vec<u8> {
+    let msg_bytes = msg.as_bytes();
+    let msg_len = msg_bytes.len().min(u16::MAX as usize);
+    let mut buf = Vec::with_capacity(7 + msg_len);
+    buf.extend_from_slice(&MUX_CONTROL.to_le_bytes());
+    buf.push(MUX_S2C_ERROR);
+    buf.extend_from_slice(&ch.to_le_bytes());
+    buf.extend_from_slice(&(msg_len as u16).to_le_bytes());
+    buf.extend_from_slice(&msg_bytes[..msg_len]);
+    buf
+}
+
+struct MuxChannelState {
+    writer_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    writer_task: JoinHandle<()>,
+    reader_task: JoinHandle<()>,
+}
+
+impl MuxChannelState {
+    fn shutdown(self) {
+        drop(self.writer_tx);
+        self.writer_task.abort();
+        self.reader_task.abort();
+    }
+}
+
+async fn browser_handle_mux_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
+    // --- Authentication ---
+    let authed = loop {
+        match ws.recv().await {
+            Some(Ok(Message::Text(pass))) => {
+                if constant_time_eq(pass.trim().as_bytes(), state.token.as_bytes()) {
+                    break true;
+                } else {
+                    let _ = ws.close().await;
+                    break false;
+                }
+            }
+            Some(Ok(Message::Ping(d))) => {
+                let _ = ws.send(Message::Pong(d)).await;
+            }
+            _ => break false,
+        }
+    };
+    if !authed {
+        return;
+    }
+
+    let _ = ws.send(Message::Text("mux".into())).await;
+    eprintln!("blit: mux client authenticated");
+
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (merge_tx, mut merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            msg = ws_rx.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+                match msg {
+                    Message::Binary(data) => {
+                        if data.len() < 2 { continue; }
+                        let ch_id = u16::from_le_bytes([data[0], data[1]]);
+                        let payload = &data[2..];
+
+                        if ch_id == MUX_CONTROL {
+                            if payload.is_empty() { continue; }
+                            match payload[0] {
+                                MUX_C2S_OPEN => {
+                                    if payload.len() < 5 { continue; }
+                                    let open_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                                    let name_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
+                                    if payload.len() < 5 + name_len { continue; }
+                                    let name = std::str::from_utf8(&payload[5..5 + name_len])
+                                        .unwrap_or("");
+
+                                    if let Some(prev) = channels.remove(&open_ch) {
+                                        prev.shutdown();
+                                    }
+
+                                    cli_mux_open_channel(
+                                        open_ch,
+                                        name,
+                                        &state,
+                                        &merge_tx,
+                                        &mut channels,
+                                    )
+                                    .await;
+                                }
+                                MUX_C2S_CLOSE => {
+                                    if payload.len() < 3 { continue; }
+                                    let close_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                                    if let Some(ch) = channels.remove(&close_ch) {
+                                        ch.shutdown();
+                                    }
+                                    let _ = merge_tx.send(mux_control(MUX_S2C_CLOSED, close_ch));
+                                }
+                                _ => {}
+                            }
+                        } else if let Some(ch) = channels.get(&ch_id) {
+                            let _ = ch.writer_tx.send(payload.to_vec());
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+
+            frame = merge_rx.recv() => {
+                match frame {
+                    Some(data) => {
+                        if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    for (_, ch) in channels {
+        ch.shutdown();
+    }
+    eprintln!("blit: mux client disconnected");
+}
+
+async fn cli_mux_open_channel(
+    ch_id: u16,
+    name: &str,
+    state: &Arc<BrowserState>,
+    merge_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    channels: &mut HashMap<u16, MuxChannelState>,
+) {
+    let connector = {
+        let dests = state.destinations.read().unwrap();
+        match dests.get(name) {
+            Some(info) => info.connector.clone(),
+            None => {
+                eprintln!("blit: mux: unknown destination '{name}'");
+                let _ = merge_tx.send(mux_error(ch_id, &format!("unknown destination '{name}'")));
+                return;
+            }
+        }
+    };
+
+    let transport = match connector.connect().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("blit: mux: cannot connect to '{name}': {e}");
+            let _ = merge_tx.send(mux_error(ch_id, &e));
+            return;
+        }
+    };
+
+    let (mut sock_reader, mut sock_writer) = transport.split();
+
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer_task = tokio::spawn(async move {
+        while let Some(payload) = writer_rx.recv().await {
+            if !write_frame(&mut sock_writer, &payload).await {
+                break;
+            }
+        }
+    });
+
+    let _ = merge_tx.send(mux_control(MUX_S2C_OPENED, ch_id));
+
+    let reader_merge_tx = merge_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        while let Some(data) = read_frame(&mut sock_reader).await {
+            let mut frame = Vec::with_capacity(2 + data.len());
+            frame.extend_from_slice(&ch_id.to_le_bytes());
+            frame.extend_from_slice(&data);
+            if reader_merge_tx.send(frame).is_err() {
+                break;
+            }
+        }
+        let _ = reader_merge_tx.send(mux_control(MUX_S2C_CLOSED, ch_id));
+    });
+
+    channels.insert(
+        ch_id,
+        MuxChannelState {
+            writer_tx,
+            writer_task,
+            reader_task,
+        },
+    );
+
+    eprintln!("blit: mux: channel {ch_id} opened for '{name}'");
 }

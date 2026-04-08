@@ -67,6 +67,7 @@ export function ConnectingOverlay(props: {
   palette: TerminalPalette;
   fontSize: number;
   onDismiss: () => void;
+  onReconnect?: () => void;
 }) {
   const theme = () => themeFor(props.palette);
   const dark = () => props.palette.dark;

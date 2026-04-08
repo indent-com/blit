@@ -24,13 +24,28 @@ use std::ptr;
 
 // Profiles
 const VAProfileH264ConstrainedBaseline: i32 = 6;
+const VA_PROFILE_NONE: i32 = -1;
 
 // Entrypoints
 const VAEntrypointEncSliceLP: i32 = 8;
 const VAEntrypointEncSlice: i32 = 6;
+const VA_ENTRYPOINT_VIDEO_PROC: i32 = 10;
 
 // RT formats
 const VA_RT_FORMAT_YUV420: u32 = 0x00000001;
+const VA_RT_FORMAT_RGB32: u32 = 0x00000100;
+
+// VASurfaceAttrib type enum (VASurfaceAttribType in va.h):
+//   None=0, PixelFormat=1, MinWidth=2, MaxWidth=3, MinHeight=4, MaxHeight=5,
+//   MemoryType=6, ExternalBufferDescriptor=7
+const VA_SURFACE_ATTRIB_MEM_TYPE: u32 = 6;
+const VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS: u32 = 7;
+const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x00000002;
+const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME: u32 = 0x20000000;
+const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x40000000;
+
+// VAProcPipelineParameterBuffer type
+const VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE: i32 = 41;
 
 // Buffer types
 const VAEncCodedBufferType: i32 = 21;
@@ -59,6 +74,737 @@ const VAIMG_PITCHES_OFF: usize = 68;
 const VAIMG_OFFSETS_OFF: usize = 80;
 const VAIMG_ID_OFF: usize = 0;
 
+// VA-API fourcc values differ from DRM fourcc values.
+// DRM uses little-endian channel order in the name; VA-API uses memory order.
+// DRM AR24 (ARGB8888) = [B,G,R,A] in memory = VA_FOURCC_BGRA.
+// DRM AB24 (ABGR8888) = [R,G,B,A] in memory = VA_FOURCC_RGBA.
+const VA_FOURCC_BGRA: u32 = u32::from_le_bytes(*b"BGRA"); // DRM ARGB8888
+const VA_FOURCC_BGRX: u32 = u32::from_le_bytes(*b"BGRX"); // DRM XRGB8888
+const VA_FOURCC_RGBA: u32 = u32::from_le_bytes(*b"RGBA"); // DRM ABGR8888
+const VA_FOURCC_RGBX: u32 = u32::from_le_bytes(*b"RGBX"); // DRM XBGR8888
+
+/// Translate a DRM fourcc to VA-API fourcc for packed surface import.
+fn drm_fourcc_to_va(drm: u32) -> Option<u32> {
+    use blit_compositor::drm_fourcc::*;
+    match drm {
+        ARGB8888 => Some(VA_FOURCC_BGRA),
+        XRGB8888 => Some(VA_FOURCC_BGRX),
+        ABGR8888 => Some(VA_FOURCC_RGBA),
+        XBGR8888 => Some(VA_FOURCC_RGBX),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VA-API VPP structs (for DMA-BUF import and BGRA→NV12 conversion on GPU)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct VASurfaceAttrib {
+    type_: u32,
+    flags: u32,
+    value: VAGenericValue,
+}
+
+#[repr(C)]
+struct VAGenericValue {
+    type_: u32, // VAGenericValueType (0=int, 1=float, 2=ptr, 3=func)
+    value: VAGenericValueInner,
+}
+
+#[repr(C)]
+union VAGenericValueInner {
+    i: i32,
+    f: f32,
+    p: *mut c_void,
+}
+
+/// Legacy PRIME import descriptor (DRM_PRIME).
+#[repr(C)]
+struct VASurfaceAttribExternalBuffers {
+    pixel_format: u32,
+    width: u32,
+    height: u32,
+    data_size: u32,
+    num_planes: u32,
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    buffers: *mut libc::uintptr_t,
+    num_buffers: u32,
+    flags: u32,
+    private_data: *mut c_void,
+}
+
+/// Modern PRIME_2 import descriptor (VADRMPRIMESurfaceDescriptor).
+/// Includes modifier, used with VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2.
+#[repr(C)]
+struct VADRMPRIMESurfaceDescriptor {
+    fourcc: u32,
+    width: u32,
+    height: u32,
+    num_objects: u32,
+    objects: [DRMObject; 4],
+    num_layers: u32,
+    layers: [DRMLayer; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct DRMObject {
+    fd: i32,
+    size: u32,
+    drm_format_modifier: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct DRMLayer {
+    drm_format: u32,
+    num_planes: u32,
+    object_index: [u32; 4],
+    offset: [u32; 4],
+    pitch: [u32; 4],
+}
+
+/// VAProcPipelineParameterBuffer — enough fields for a simple BGRA→NV12 blit.
+/// We zero-init the full struct so padding and unused fields are safe.
+#[repr(C)]
+struct VAProcPipelineParameterBuffer {
+    surface: u32, // input VASurfaceID
+    surface_region: *const c_void,
+    surface_color_standard: u32,
+    output_region: *const c_void,
+    output_background_color: u32,
+    output_color_standard: u32,
+    pipeline_flags: u32,
+    filter_flags: u32,
+    filters: *mut u32,
+    num_filters: u32,
+    forward_references: *mut u32,
+    num_forward_references: u32,
+    backward_references: *mut u32,
+    num_backward_references: u32,
+    rotation_state: u32,
+    blend_state: *const c_void,
+    mirror_state: u32,
+    additional_outputs: *mut u32,
+    num_additional_outputs: u32,
+    input_color_properties: u64,
+    output_color_properties: u64,
+    processing_mode: u32,
+    output_hdr_metadata: *const c_void,
+}
+
+// ---------------------------------------------------------------------------
+// VPP context — BGRA DMA-BUF → NV12 VASurface on the GPU
+// ---------------------------------------------------------------------------
+
+/// VA-API Video Processing Pipeline context.
+/// Shares the VADisplay with the encoder; convert_dmabuf() takes a BGRA
+/// DMA-BUF fd and returns an NV12 VASurface ready to be encoded.
+struct VppContext {
+    va: &'static crate::gpu_libs::VaFns,
+    display: VADisplay,
+    config: u32,
+    context: u32,
+    /// Pool of NV12 output surfaces (round-robin).
+    nv12_surfaces: [u32; 4],
+    next_surf: usize,
+    width: u32,
+    height: u32,
+}
+
+impl VppContext {
+    /// Try to create a VPP context on an existing VADisplay.
+    /// Returns None if VAEntrypointVideoProc is unavailable.
+    unsafe fn try_new(
+        va: &'static crate::gpu_libs::VaFns,
+        display: VADisplay,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        // Check VideoProc entrypoint is available on VAProfileNone.
+        let mut eps = [0i32; 16];
+        let mut n = 0i32;
+        let st = unsafe {
+            (va.vaQueryConfigEntrypoints)(display, VA_PROFILE_NONE, eps.as_mut_ptr(), &mut n)
+        };
+        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+            return None;
+        }
+        if !eps[..n as usize].contains(&VA_ENTRYPOINT_VIDEO_PROC) {
+            eprintln!("[vaapi-vpp] VAEntrypointVideoProc not available — dmabuf zerocopy disabled");
+            return None;
+        }
+
+        // Config for VPP (no profile, VideoProc entrypoint).
+        let mut config = 0u32;
+        let st = unsafe {
+            (va.vaCreateConfig)(
+                display,
+                VA_PROFILE_NONE,
+                VA_ENTRYPOINT_VIDEO_PROC,
+                ptr::null_mut(),
+                0,
+                &mut config,
+            )
+        };
+        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+            return None;
+        }
+
+        // Allocate pool of NV12 output surfaces.
+        let mut nv12_surfaces = [0u32; 4];
+        let st = unsafe {
+            (va.vaCreateSurfaces)(
+                display,
+                VA_RT_FORMAT_YUV420,
+                width,
+                height,
+                nv12_surfaces.as_mut_ptr(),
+                4,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+            unsafe {
+                (va.vaDestroyConfig)(display, config);
+            }
+            return None;
+        }
+
+        // VPP context.
+        let mut context = 0u32;
+        let st = unsafe {
+            (va.vaCreateContext)(
+                display,
+                config,
+                width as i32,
+                height as i32,
+                0,
+                nv12_surfaces.as_mut_ptr(),
+                4,
+                &mut context,
+            )
+        };
+        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+            unsafe {
+                (va.vaDestroySurfaces)(display, nv12_surfaces.as_mut_ptr(), 4);
+                (va.vaDestroyConfig)(display, config);
+            }
+            return None;
+        }
+
+        eprintln!("[vaapi-vpp] initialized {width}x{height} BGRA→NV12 VPP");
+        Some(Self {
+            va,
+            display,
+            config,
+            context,
+            nv12_surfaces,
+            next_surf: 0,
+            width,
+            height,
+        })
+    }
+
+    /// Import a BGRA/XRGB DMA-BUF, run VPP BGRA→NV12, return the NV12 surface.
+    /// The returned VASurfaceID is from the internal pool; it must be consumed
+    /// (encoded) before the next call.
+    /// Uses VADRMPRIMESurfaceDescriptor (PRIME_2) for modifier-aware import.
+    ///
+    /// `src_width`/`src_height` are the actual DMA-BUF dimensions (may differ
+    /// from the VPP output size).  VPP scales as needed.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn convert_dmabuf(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        fourcc: u32,
+        modifier: u64,
+        stride: u32,
+        offset: u32,
+        src_width: u32,
+        src_height: u32,
+    ) -> Option<u32> {
+        let va = self.va;
+        let import_w = if src_width > 0 { src_width } else { self.width };
+        let import_h = if src_height > 0 {
+            src_height
+        } else {
+            self.height
+        };
+
+        // Translate DRM fourcc → VA-API fourcc.
+        let va_fourcc = drm_fourcc_to_va(fourcc)?;
+        // AMD's Mesa VA-API only supports BGRA/BGRX for PRIME RGB surface
+        // import.  Map RGBA/RGBX → BGRA/BGRX.  The R/B channels swap in
+        // the VPP BGRA→NV12 conversion, producing slightly off chroma, but
+        // the import succeeds and we get zero-copy GPU encoding.
+        // Also remap the DRM layer fourcc for the same reason — AMD rejects
+        // ABGR8888/XBGR8888 in the PRIME_2 descriptor.
+        let (surface_fourcc, layer_drm_fourcc) = match va_fourcc {
+            VA_FOURCC_RGBA => (VA_FOURCC_BGRA, blit_compositor::drm_fourcc::ARGB8888),
+            VA_FOURCC_RGBX => (VA_FOURCC_BGRX, blit_compositor::drm_fourcc::XRGB8888),
+            _ => (va_fourcc, fourcc),
+        };
+
+        // Use PRIME_2 (VADRMPRIMESurfaceDescriptor) — supports explicit modifiers
+        // and is required by Mesa radeonsi for DMA-BUF import.
+        // The descriptor uses DRM fourcc in the layer; the surface uses VA fourcc.
+        //
+        // Use lseek to get the actual DMA-BUF size; some drivers allocate with
+        // extra GPU padding so stride*height underestimates.
+        let actual_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        let buf_size = if actual_size > 0 {
+            actual_size as u32
+        } else {
+            stride * import_h
+        };
+
+        // Previously, a readlink guard rejected non-DRM fds (e.g. Vulkan WSI
+        // anonymous /dmabuf).  Removed — let vaCreateSurfaces attempt PRIME_2
+        // import for any fd.  If the driver can't import it, it returns an
+        // error and the caller falls back to CPU readback.
+
+        // VA-API PRIME import only works with DRM GEM-backed fds (from a
+        // GPU render node).  Anonymous DMA-BUF heap fds ("/dmabuf:") are
+        // CPU-accessible but not importable by VA-API — skip early so the
+        // caller falls through to the CPU mmap fallback without the
+        // overhead of a failed vaCreateSurfaces call.
+        {
+            let mut link_buf = [0u8; 256];
+            let path = format!("/proc/self/fd/{fd}\0");
+            let n = unsafe {
+                libc::readlink(
+                    path.as_ptr() as *const _,
+                    link_buf.as_mut_ptr() as *mut _,
+                    255,
+                )
+            };
+            if n > 0 {
+                let link = &link_buf[..n as usize];
+                if !link.starts_with(b"/dev/dri/") {
+                    return None;
+                }
+            }
+        }
+
+        let mut desc = VADRMPRIMESurfaceDescriptor {
+            fourcc: surface_fourcc,
+            width: import_w,
+            height: import_h,
+            num_objects: 1,
+            objects: [
+                DRMObject {
+                    fd,
+                    size: buf_size,
+                    // Pass the modifier through as-is.  Linear (0x0) is the
+                    // correct modifier for Vulkan WSI buffers on AMD.
+                    drm_format_modifier: modifier,
+                },
+                DRMObject::default(),
+                DRMObject::default(),
+                DRMObject::default(),
+            ],
+            num_layers: 1,
+            layers: [
+                DRMLayer {
+                    drm_format: layer_drm_fourcc,
+                    num_planes: 1,
+                    object_index: [0, 0, 0, 0],
+                    offset: [offset, 0, 0, 0],
+                    pitch: [stride, 0, 0, 0],
+                },
+                DRMLayer::default(),
+                DRMLayer::default(),
+                DRMLayer::default(),
+            ],
+        };
+        let attribs = [
+            VASurfaceAttrib {
+                type_: VA_SURFACE_ATTRIB_MEM_TYPE,
+                flags: VA_SURFACE_ATTRIB_SETTABLE,
+                value: VAGenericValue {
+                    type_: 0, // VAGenericValueTypeInteger
+                    value: VAGenericValueInner {
+                        i: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
+                    },
+                },
+            },
+            VASurfaceAttrib {
+                type_: VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS,
+                flags: VA_SURFACE_ATTRIB_SETTABLE,
+                value: VAGenericValue {
+                    type_: 2, // VAGenericValueTypePointer
+                    value: VAGenericValueInner {
+                        p: &mut desc as *mut _ as *mut c_void,
+                    },
+                },
+            },
+        ];
+        let mut bgra_surf = 0u32;
+        let st = unsafe {
+            (va.vaCreateSurfaces)(
+                self.display,
+                VA_RT_FORMAT_RGB32,
+                import_w,
+                import_h,
+                &mut bgra_surf,
+                1,
+                attribs.as_ptr() as *mut c_void,
+                2,
+            )
+        };
+        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+            eprintln!(
+                "[vpp] PRIME_2 failed (st={st}) fd={fd} {import_w}x{import_h} drm=0x{fourcc:08x} va=0x{surface_fourcc:08x} layer=0x{layer_drm_fourcc:08x} modifier=0x{modifier:016x} stride={stride} buf_size={buf_size}",
+            );
+            // Fallback: PRIME_1 (legacy) import — doesn't carry modifier info
+            // but works with more fd types on some drivers.
+            let mut ext_buf = VASurfaceAttribExternalBuffers {
+                pixel_format: surface_fourcc,
+                width: import_w,
+                height: import_h,
+                data_size: buf_size,
+                num_planes: 1,
+                pitches: [stride, 0, 0, 0],
+                offsets: [offset, 0, 0, 0],
+                buffers: &mut (fd as libc::uintptr_t) as *mut _,
+                num_buffers: 1,
+                flags: 0,
+                private_data: ptr::null_mut(),
+            };
+            let attribs_p1 = [
+                VASurfaceAttrib {
+                    type_: VA_SURFACE_ATTRIB_MEM_TYPE,
+                    flags: VA_SURFACE_ATTRIB_SETTABLE,
+                    value: VAGenericValue {
+                        type_: 0,
+                        value: VAGenericValueInner {
+                            i: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32,
+                        },
+                    },
+                },
+                VASurfaceAttrib {
+                    type_: VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS,
+                    flags: VA_SURFACE_ATTRIB_SETTABLE,
+                    value: VAGenericValue {
+                        type_: 2,
+                        value: VAGenericValueInner {
+                            p: &mut ext_buf as *mut _ as *mut c_void,
+                        },
+                    },
+                },
+            ];
+            let st2 = unsafe {
+                (va.vaCreateSurfaces)(
+                    self.display,
+                    VA_RT_FORMAT_RGB32,
+                    import_w,
+                    import_h,
+                    &mut bgra_surf,
+                    1,
+                    attribs_p1.as_ptr() as *mut c_void,
+                    2,
+                )
+            };
+            if st2 != crate::gpu_libs::VA_STATUS_SUCCESS {
+                eprintln!("[vpp] PRIME_1 also failed (st={st2}) fd={fd} {import_w}x{import_h}");
+                return None;
+            }
+        }
+
+        let nv12_surf = self.nv12_surfaces[self.next_surf];
+        self.next_surf = (self.next_surf + 1) % self.nv12_surfaces.len();
+
+        // Build VPP pipeline param buffer: bgra_surf → nv12_surf.
+        let params = VAProcPipelineParameterBuffer {
+            surface: bgra_surf,
+            surface_region: ptr::null(),
+            surface_color_standard: 0,
+            output_region: ptr::null(),
+            output_background_color: 0,
+            output_color_standard: 0,
+            pipeline_flags: 0,
+            filter_flags: 0,
+            filters: ptr::null_mut(),
+            num_filters: 0,
+            forward_references: ptr::null_mut(),
+            num_forward_references: 0,
+            backward_references: ptr::null_mut(),
+            num_backward_references: 0,
+            rotation_state: 0,
+            blend_state: ptr::null(),
+            mirror_state: 0,
+            additional_outputs: ptr::null_mut(),
+            num_additional_outputs: 0,
+            input_color_properties: 0,
+            output_color_properties: 0,
+            processing_mode: 0,
+            output_hdr_metadata: ptr::null(),
+        };
+        let mut buf_id = 0u32;
+        let st = unsafe {
+            (va.vaCreateBuffer)(
+                self.display,
+                self.context,
+                VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE,
+                std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
+                1,
+                // params is on the stack; VA-API copies on vaCreateBuffer
+                &params as *const _ as *mut c_void,
+                &mut buf_id,
+            )
+        };
+        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+            unsafe {
+                (va.vaDestroySurfaces)(self.display, &mut bgra_surf, 1);
+            }
+            return None;
+        }
+
+        // Submit VPP.
+        let ok = unsafe {
+            (va.vaBeginPicture)(self.display, self.context, nv12_surf)
+                == crate::gpu_libs::VA_STATUS_SUCCESS
+                && (va.vaRenderPicture)(self.display, self.context, &mut buf_id, 1)
+                    == crate::gpu_libs::VA_STATUS_SUCCESS
+                && (va.vaEndPicture)(self.display, self.context)
+                    == crate::gpu_libs::VA_STATUS_SUCCESS
+                && (va.vaSyncSurface)(self.display, nv12_surf) == crate::gpu_libs::VA_STATUS_SUCCESS
+        };
+
+        unsafe {
+            (va.vaDestroyBuffer)(self.display, buf_id);
+            (va.vaDestroySurfaces)(self.display, &mut bgra_surf, 1);
+        }
+
+        if ok { Some(nv12_surf) } else { None }
+    }
+}
+
+impl Drop for VppContext {
+    fn drop(&mut self) {
+        unsafe {
+            let va = self.va;
+            (va.vaDestroyContext)(self.display, self.context);
+            (va.vaDestroySurfaces)(self.display, self.nv12_surfaces.as_mut_ptr(), 4);
+            (va.vaDestroyConfig)(self.display, self.config);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone DMA-BUF → RGBA readback via VPP (used by capture path)
+// ---------------------------------------------------------------------------
+
+/// Import a DMA-BUF fd via VA-API, then read back the pixels as RGBA.
+/// Opens a temporary VA display, imports the buffer, and uses vaDeriveImage
+/// + vaMapBuffer for CPU readback.  Returns None on any failure.
+#[allow(clippy::too_many_arguments)]
+pub fn vpp_readback_dmabuf(
+    vaapi_device: &str,
+    fd: std::os::fd::RawFd,
+    fourcc: u32,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let va = crate::gpu_libs::va()?;
+    let va_drm = crate::gpu_libs::va_drm()?;
+    let va_fourcc = drm_fourcc_to_va(fourcc)?;
+
+    // Open render node + init display
+    let drm_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(vaapi_device)
+        .ok()?;
+    use std::os::fd::AsRawFd;
+    let display = unsafe { (va_drm.vaGetDisplayDRM)(drm_fd.as_raw_fd()) };
+    if display.is_null() {
+        return None;
+    }
+    let mut major = 0i32;
+    let mut minor = 0i32;
+    let st = unsafe { (va.vaInitialize)(display, &mut major, &mut minor) };
+    if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+        return None;
+    }
+
+    // Build PRIME_2 descriptor
+    let actual_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    let buf_size = if actual_size > 0 {
+        actual_size as u32
+    } else {
+        stride * height
+    };
+    let mut desc = VADRMPRIMESurfaceDescriptor {
+        fourcc: va_fourcc,
+        width,
+        height,
+        num_objects: 1,
+        objects: [
+            DRMObject {
+                fd,
+                size: buf_size,
+                drm_format_modifier: modifier,
+            },
+            DRMObject::default(),
+            DRMObject::default(),
+            DRMObject::default(),
+        ],
+        num_layers: 1,
+        layers: [
+            DRMLayer {
+                drm_format: fourcc,
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [offset, 0, 0, 0],
+                pitch: [stride, 0, 0, 0],
+            },
+            DRMLayer::default(),
+            DRMLayer::default(),
+            DRMLayer::default(),
+        ],
+    };
+    let attribs = [
+        VASurfaceAttrib {
+            type_: VA_SURFACE_ATTRIB_MEM_TYPE,
+            flags: VA_SURFACE_ATTRIB_SETTABLE,
+            value: VAGenericValue {
+                type_: 0,
+                value: VAGenericValueInner {
+                    i: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
+                },
+            },
+        },
+        VASurfaceAttrib {
+            type_: VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS,
+            flags: VA_SURFACE_ATTRIB_SETTABLE,
+            value: VAGenericValue {
+                type_: 2,
+                value: VAGenericValueInner {
+                    p: &mut desc as *mut _ as *mut c_void,
+                },
+            },
+        },
+    ];
+    let mut surf = 0u32;
+    let st = unsafe {
+        (va.vaCreateSurfaces)(
+            display,
+            VA_RT_FORMAT_RGB32,
+            width,
+            height,
+            &mut surf,
+            1,
+            attribs.as_ptr() as *mut c_void,
+            2,
+        )
+    };
+    if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+        unsafe { (va.vaTerminate)(display) };
+        return None;
+    }
+
+    // Sync + derive image + map buffer
+    unsafe { (va.vaSyncSurface)(display, surf) };
+    let mut image = [0u8; VA_IMAGE_SIZE];
+    let st = unsafe { (va.vaDeriveImage)(display, surf, image.as_mut_ptr() as *mut c_void) };
+    if st != crate::gpu_libs::VA_STATUS_SUCCESS {
+        unsafe {
+            (va.vaDestroySurfaces)(display, &mut surf, 1);
+            (va.vaTerminate)(display);
+        }
+        return None;
+    }
+    let image_buf = u32::from_ne_bytes(image[VAIMG_BUF_OFF..VAIMG_BUF_OFF + 4].try_into().unwrap());
+    let pitch = u32::from_ne_bytes(
+        image[VAIMG_PITCHES_OFF..VAIMG_PITCHES_OFF + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let img_offset = u32::from_ne_bytes(
+        image[VAIMG_OFFSETS_OFF..VAIMG_OFFSETS_OFF + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let image_id = u32::from_ne_bytes(image[VAIMG_ID_OFF..VAIMG_ID_OFF + 4].try_into().unwrap());
+
+    let mut map_ptr: *mut c_void = std::ptr::null_mut();
+    let st = unsafe { (va.vaMapBuffer)(display, image_buf, &mut map_ptr) };
+    if st != crate::gpu_libs::VA_STATUS_SUCCESS || map_ptr.is_null() {
+        unsafe {
+            (va.vaDestroyImage)(display, image_id);
+            (va.vaDestroySurfaces)(display, &mut surf, 1);
+            (va.vaTerminate)(display);
+        }
+        return None;
+    }
+
+    // Read pixels — VA-API BGRA → RGBA
+    let w = width as usize;
+    let h = height as usize;
+    let row_bytes = w * 4;
+    let slice = unsafe { std::slice::from_raw_parts(map_ptr as *const u8, pitch * h + img_offset) };
+    let is_bgr = matches!(va_fourcc, VA_FOURCC_BGRA | VA_FOURCC_BGRX);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        let src = &slice[img_offset + row * pitch..img_offset + row * pitch + row_bytes];
+        if is_bgr {
+            for px in src.chunks_exact(4) {
+                rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+            }
+        } else {
+            for px in src.chunks_exact(4) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+    }
+
+    unsafe {
+        (va.vaUnmapBuffer)(display, image_buf);
+        (va.vaDestroyImage)(display, image_id);
+        (va.vaDestroySurfaces)(display, &mut surf, 1);
+        (va.vaTerminate)(display);
+    }
+
+    Some(rgba)
+}
+
+/// Like `vpp_readback_dmabuf` but returns BGRA instead of RGBA.
+#[allow(clippy::too_many_arguments)]
+pub fn vpp_readback_dmabuf_as_bgra(
+    vaapi_device: &str,
+    fd: std::os::fd::RawFd,
+    fourcc: u32,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let mut rgba = vpp_readback_dmabuf(
+        vaapi_device,
+        fd,
+        fourcc,
+        modifier,
+        stride,
+        offset,
+        width,
+        height,
+    )?;
+    // RGBA → BGRA
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Some(rgba)
+}
+
 // ---------------------------------------------------------------------------
 // Helper: write a value at an offset in a byte buffer
 // ---------------------------------------------------------------------------
@@ -86,6 +832,193 @@ const NUM_REF_SURFACES: usize = 2;
 const NUM_INPUT_SURFACES: usize = 1;
 const TOTAL_SURFACES: usize = NUM_REF_SURFACES + NUM_INPUT_SURFACES;
 
+// ---------------------------------------------------------------------------
+// Minimal H.264 bitstream writer for SPS/PPS NAL generation
+// ---------------------------------------------------------------------------
+
+struct BitstreamWriter {
+    buf: Vec<u8>,
+    byte: u8,
+    bits_left: u8,
+}
+
+impl BitstreamWriter {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(32),
+            byte: 0,
+            bits_left: 8,
+        }
+    }
+
+    fn write_bit(&mut self, b: u8) {
+        self.byte |= (b & 1) << (self.bits_left - 1);
+        self.bits_left -= 1;
+        if self.bits_left == 0 {
+            self.buf.push(self.byte);
+            self.byte = 0;
+            self.bits_left = 8;
+        }
+    }
+
+    fn write_bits(&mut self, val: u32, n: u8) {
+        for i in (0..n).rev() {
+            self.write_bit(((val >> i) & 1) as u8);
+        }
+    }
+
+    fn write_ue(&mut self, val: u32) {
+        let x = val + 1;
+        let leading = 31 - x.leading_zeros(); // number of leading zeros
+        for _ in 0..leading {
+            self.write_bit(0);
+        }
+        self.write_bits(x, leading as u8 + 1);
+    }
+
+    fn write_se(&mut self, val: i32) {
+        if val > 0 {
+            self.write_ue((val as u32) * 2 - 1);
+        } else {
+            self.write_ue((-val as u32) * 2);
+        }
+    }
+
+    /// Append RBSP trailing bits (1 + alignment zeros) and return the bytes.
+    fn finish(mut self) -> Vec<u8> {
+        self.write_bit(1); // rbsp_stop_one_bit
+        if self.bits_left < 8 {
+            self.buf.push(self.byte);
+        }
+        self.buf
+    }
+}
+
+/// Build an Annex B SPS NAL for Constrained Baseline H.264.
+fn build_h264_sps_nal(width_in_mbs: u16, height_in_mbs: u16, width: u32, height: u32) -> Vec<u8> {
+    let max_fs = width_in_mbs as u32 * height_in_mbs as u32;
+    let level_idc: u8 = if max_fs <= 1620 {
+        31
+    } else if max_fs <= 8192 {
+        40
+    } else if max_fs <= 22080 {
+        50
+    } else if max_fs <= 36864 {
+        51
+    } else {
+        52
+    };
+
+    let mut w = BitstreamWriter::new();
+    // profile_idc
+    w.write_bits(66, 8);
+    // constraint_set0_flag=1, constraint_set1_flag=1, others=0, reserved=0
+    w.write_bits(0b11000000, 8);
+    // level_idc
+    w.write_bits(level_idc as u32, 8);
+    // seq_parameter_set_id
+    w.write_ue(0);
+    // log2_max_frame_num_minus4
+    w.write_ue(0);
+    // pic_order_cnt_type
+    w.write_ue(2);
+    // max_num_ref_frames
+    w.write_ue(1);
+    // gaps_in_frame_num_value_allowed_flag
+    w.write_bit(0);
+    // pic_width_in_mbs_minus1
+    w.write_ue(width_in_mbs as u32 - 1);
+    // pic_height_in_map_units_minus1
+    w.write_ue(height_in_mbs as u32 - 1);
+    // frame_mbs_only_flag
+    w.write_bit(1);
+    // direct_8x8_inference_flag
+    w.write_bit(1);
+
+    // Frame cropping
+    let crop_w = width_in_mbs as u32 * 16;
+    let crop_h = height_in_mbs as u32 * 16;
+    if crop_w != width || crop_h != height {
+        w.write_bit(1); // frame_cropping_flag
+        w.write_ue(0); // left
+        w.write_ue((crop_w - width) / 2); // right (chroma samples for 4:2:0)
+        w.write_ue(0); // top
+        w.write_ue((crop_h - height) / 2); // bottom
+    } else {
+        w.write_bit(0);
+    }
+
+    // vui_parameters_present_flag
+    w.write_bit(0);
+
+    let rbsp = w.finish();
+
+    // Assemble: start code + NAL header + RBSP
+    let mut nal = Vec::with_capacity(4 + 1 + rbsp.len());
+    nal.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    nal.push(0x67); // forbidden=0, nal_ref_idc=3, nal_unit_type=7 (SPS)
+    nal.extend_from_slice(&rbsp);
+    nal
+}
+
+/// Build an Annex B PPS NAL for Constrained Baseline H.264.
+fn build_h264_pps_nal() -> Vec<u8> {
+    let mut w = BitstreamWriter::new();
+    // pic_parameter_set_id
+    w.write_ue(0);
+    // seq_parameter_set_id
+    w.write_ue(0);
+    // entropy_coding_mode_flag (0 = CAVLC)
+    w.write_bit(0);
+    // bottom_field_pic_order_in_frame_present_flag
+    w.write_bit(0);
+    // num_slice_groups_minus1
+    w.write_ue(0);
+    // num_ref_idx_l0_default_active_minus1
+    w.write_ue(0);
+    // num_ref_idx_l1_default_active_minus1
+    w.write_ue(0);
+    // weighted_pred_flag
+    w.write_bit(0);
+    // weighted_bipred_idc
+    w.write_bits(0, 2);
+    // pic_init_qp_minus26
+    w.write_se(0);
+    // pic_init_qs_minus26
+    w.write_se(0);
+    // chroma_qp_index_offset
+    w.write_se(0);
+    // deblocking_filter_control_present_flag
+    w.write_bit(1);
+    // constrained_intra_pred_flag
+    w.write_bit(0);
+    // redundant_pic_cnt_present_flag
+    w.write_bit(0);
+
+    let rbsp = w.finish();
+
+    let mut nal = Vec::with_capacity(4 + 1 + rbsp.len());
+    nal.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    nal.push(0x68); // forbidden=0, nal_ref_idc=3, nal_unit_type=8 (PPS)
+    nal.extend_from_slice(&rbsp);
+    nal
+}
+
+/// Find the position of the first Annex B start code (00 00 01 or 00 00 00 01).
+fn find_annex_b_start(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(2) {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                return Some(i);
+            }
+            if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 pub struct VaapiDirectEncoder {
     va: &'static gpu_libs::VaFns,
     display: VADisplay,
@@ -102,6 +1035,9 @@ pub struct VaapiDirectEncoder {
     force_idr: bool,
     cur_ref_idx: usize,
     _drm_fd: OwnedFd,
+    /// Optional VA-API VPP context for zero-copy DMA-BUF import.
+    /// Present when VAEntrypointVideoProc is supported by the driver.
+    vpp: Option<VppContext>,
 }
 
 unsafe impl Send for VaapiDirectEncoder {}
@@ -267,11 +1203,35 @@ impl VaapiDirectEncoder {
             force_idr: false,
             cur_ref_idx: 0,
             _drm_fd: drm_fd,
+            // Try to init VPP on the same display for zero-copy DMA-BUF import.
+            vpp: unsafe { VppContext::try_new(va, display, width, height) },
         })
     }
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Encode directly from a DMA-BUF fd (zero-copy GPU path).
+    ///
+    /// Imports the DMA-BUF as a BGRA VASurface, uses the VPP to convert
+    /// to NV12 on the GPU, then encodes the NV12 surface.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_dmabuf_fd(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        fourcc: u32,
+        modifier: u64,
+        stride: u32,
+        offset: u32,
+        src_width: u32,
+        src_height: u32,
+    ) -> Option<(Vec<u8>, bool)> {
+        let vpp = self.vpp.as_mut()?;
+        let nv12_surf = unsafe {
+            vpp.convert_dmabuf(fd, fourcc, modifier, stride, offset, src_width, src_height)?
+        };
+        self.encode_surface(nv12_surf)
     }
 
     /// Encode an NV12 frame (Y + UV interleaved planes).
@@ -513,7 +1473,7 @@ impl VaapiDirectEncoder {
         }
 
         // Read bitstream
-        let nal_data = self.read_coded_buffer()?;
+        let mut nal_data = self.read_coded_buffer()?;
 
         self.destroy_buffers(&buffers);
 
@@ -524,7 +1484,34 @@ impl VaapiDirectEncoder {
         if nal_data.is_empty() {
             None
         } else {
-            Some((nal_data, is_idr))
+            // AMD VA-API outputs slice NALs with header byte 0x00 instead of
+            // the correct H.264 NAL header.  Patch the first NAL header.
+            if let Some(pos) = find_annex_b_start(&nal_data) {
+                let hdr_pos = pos + if nal_data[pos + 2] == 1 { 3 } else { 4 };
+                if hdr_pos < nal_data.len() {
+                    nal_data[hdr_pos] = if is_idr {
+                        0x65 // nal_ref_idc=3, nal_unit_type=5 (IDR)
+                    } else {
+                        0x41 // nal_ref_idc=2, nal_unit_type=1 (non-IDR)
+                    };
+                }
+            }
+
+            if is_idr {
+                // Prepend SPS + PPS NALs so the browser decoder can initialize.
+                // AMD VA-API doesn't include these in the coded buffer.
+                let mut out = build_h264_sps_nal(
+                    self.width_in_mbs,
+                    self.height_in_mbs,
+                    self.width,
+                    self.height,
+                );
+                out.extend_from_slice(&build_h264_pps_nal());
+                out.extend_from_slice(&nal_data);
+                Some((out, true))
+            } else {
+                Some((nal_data, false))
+            }
         }
     }
 
@@ -533,8 +1520,21 @@ impl VaapiDirectEncoder {
 
         // seq_parameter_set_id (offset 0, u8)
         w8(&mut sps, 0, 0);
-        // level_idc (offset 1, u8) — 3.1
-        w8(&mut sps, 1, 31);
+        // level_idc — pick the minimum H.264 level that can handle the
+        // configured resolution (MaxFS = width_mbs * height_mbs).
+        let max_fs = self.width_in_mbs as u32 * self.height_in_mbs as u32;
+        let level_idc: u8 = if max_fs <= 1620 {
+            31 // Level 3.1: 1280×720
+        } else if max_fs <= 8192 {
+            40 // Level 4.0: 2048×1080
+        } else if max_fs <= 22080 {
+            50 // Level 5.0: 3672×1536
+        } else if max_fs <= 36864 {
+            51 // Level 5.1: 4096×2160
+        } else {
+            52 // Level 5.2: 4096×2304
+        };
+        w8(&mut sps, 1, level_idc);
         // intra_period (offset 4, u32)
         w32(&mut sps, 4, 120);
         // intra_idr_period (offset 8, u32)
@@ -763,6 +1763,9 @@ impl VaapiDirectEncoder {
 
 impl Drop for VaapiDirectEncoder {
     fn drop(&mut self) {
+        // Drop VPP context first — it shares our VA display handle and must
+        // be destroyed before vaTerminate() invalidates the display.
+        self.vpp.take();
         unsafe {
             (self.va.vaDestroyBuffer)(self.display, self.coded_buf);
             (self.va.vaDestroyContext)(self.display, self.context);
@@ -818,6 +1821,7 @@ pub struct VaapiHevcEncoder {
     log2_min_cb_minus3: u8,
     log2_diff_max_min_cb: u8,
     _drm_fd: OwnedFd,
+    vpp: Option<VppContext>,
 }
 
 unsafe impl Send for VaapiHevcEncoder {}
@@ -993,11 +1997,30 @@ impl VaapiHevcEncoder {
             log2_min_cb_minus3,
             log2_diff_max_min_cb,
             _drm_fd: drm_fd,
+            vpp: unsafe { VppContext::try_new(va, display, width, height) },
         })
     }
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_dmabuf_fd(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        fourcc: u32,
+        modifier: u64,
+        stride: u32,
+        offset: u32,
+        src_width: u32,
+        src_height: u32,
+    ) -> Option<(Vec<u8>, bool)> {
+        let vpp = self.vpp.as_mut()?;
+        let nv12_surf = unsafe {
+            vpp.convert_dmabuf(fd, fourcc, modifier, stride, offset, src_width, src_height)?
+        };
+        self.encode_surface(nv12_surf)
     }
 
     pub fn encode_nv12(
@@ -1516,6 +2539,9 @@ impl VaapiHevcEncoder {
 
 impl Drop for VaapiHevcEncoder {
     fn drop(&mut self) {
+        // Drop VPP context first — it shares our VA display handle and must
+        // be destroyed before vaTerminate() invalidates the display.
+        self.vpp.take();
         unsafe {
             (self.va.vaDestroyBuffer)(self.display, self.coded_buf);
             (self.va.vaDestroyContext)(self.display, self.context);

@@ -7,8 +7,8 @@ This document describes the hosted services and CI/CD infrastructure that suppor
 ### macOS (Homebrew)
 
 ```bash
-brew services start blit-server
-brew services start blit-gateway
+brew services start blit server
+brew services start blit gateway
 ```
 
 ### Debian / Ubuntu (systemd)
@@ -21,9 +21,9 @@ sudo systemctl enable --now blit-server@alice.socket
 sudo systemctl enable --now blit-webrtc-forwarder@alice.service
 ```
 
-### Multi-remote gateway (blit-gateway)
+### Multi-remote gateway (blit gateway)
 
-`blit-gateway` can front multiple remote hosts in a single browser UI.
+`blit gateway` can front multiple remote hosts in a single browser UI.
 Configure remotes in `~/.config/blit/blit.remotes` (same file used by `blit open`):
 
 ```
@@ -32,7 +32,7 @@ hound = ssh:alice@hound
 ```
 
 ```bash
-BLIT_PASSPHRASE=secret blit-gateway
+BLIT_PASSPHRASE=secret blit gateway
 ```
 
 SSH remotes are connected via the embedded SSH client (russh) with
@@ -47,7 +47,7 @@ rabbit = share:anothersecret?hub=wss://custom.hub
 ```
 
 ```bash
-BLIT_GATEWAY_WEBRTC=1 BLIT_PASSPHRASE=secret blit-gateway
+BLIT_GATEWAY_WEBRTC=1 BLIT_PASSPHRASE=secret blit gateway
 ```
 
 The gateway connects as a WebRTC consumer (using the passphrase-derived channel
@@ -127,13 +127,11 @@ The `apt-repo` job in the release workflow assembles the entire site from build 
 
 ```mermaid
 flowchart TD
-    subgraph "Build phase (parallel, native runners)"
-        BD_AMD[build-debs<br>ubuntu-latest / amd64]
-        BD_ARM[build-debs<br>ubuntu-24.04-arm / arm64]
-        BT_X86[build-tarballs<br>ubuntu-latest / linux-x86_64]
-        BT_ARM[build-tarballs<br>ubuntu-24.04-arm / linux-aarch64]
-        BT_MAC[build-tarballs<br>macos-latest / macos-aarch64]
-        BW[build-windows<br>windows-latest / x86_64]
+    subgraph "Build phase (reusable workflows)"
+        BP_X86[build-packages<br>linux-x86_64<br>debs + tarballs]
+        BP_ARM[build-packages<br>linux-aarch64<br>debs + tarballs]
+        BP_MAC[build-packages<br>macos-aarch64<br>tarballs only]
+        BW[build-windows<br>x86_64]
     end
 
     subgraph "apt-repo job"
@@ -144,11 +142,9 @@ flowchart TD
         DL --> REPO --> SIGN --> PAGES
     end
 
-    BD_AMD --> DL
-    BD_ARM --> DL
-    BT_X86 --> DL
-    BT_ARM --> DL
-    BT_MAC --> DL
+    BP_X86 --> DL
+    BP_ARM --> DL
+    BP_MAC --> DL
     BW --> DL
 ```
 
@@ -211,59 +207,51 @@ The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`,
 
 This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages are single-file, zero-dependency executables — download, `chmod +x`, run.
 
-On Windows, Nix isn't available, so the `build-windows` job uses `cargo build --release` directly on a `windows-latest` runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
+On Windows, Nix isn't available, so the `_build-windows.yml` reusable workflow uses `cargo build --release` directly on a Windows runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
 
 ## GitHub Actions workflows
 
-Six workflow files live in `.github/workflows/`:
+Seven workflow files live in `.github/workflows/`. The three `_`-prefixed files are reusable workflows called by `ci.yml` and `release.yml`:
 
 | Workflow                                                             | Trigger                                                                                        | Purpose                                                                                             |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| [`test.yml`](.github/workflows/test.yml)                             | Push to `main`, PRs                                                                            | Lint, test, e2e, verify builds                                                                      |
+| [`ci.yml`](.github/workflows/ci.yml)                                 | Push to `main`, PRs                                                                            | Lint, test, e2e, coverage, dev-check, verify builds                                                 |
 | [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Verify tag signature, build artifacts, create GitHub Release, publish packages, deploy install site |
 | [`deploy-hub.yml`](.github/workflows/deploy-hub.yml)                 | Push to `main` (paths: `js/hub/**`)                                                            | Deploy signaling hub to Fly.io                                                                      |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                              |
-| [`dev-check.yml`](.github/workflows/dev-check.yml)                   | Push to `main`, PRs                                                                            | Start the full dev stack (`bin/dev`), verify all services come up, smoke-test with `blit` CLI       |
 | [`publish-demo-image.yml`](.github/workflows/publish-demo-image.yml) | Push to `main`, `v*` tag                                                                       | Build and push `grab/blit-demo` Docker image                                                        |
+| [`_build-packages.yml`](.github/workflows/_build-packages.yml)       | Called by `ci.yml`, `release.yml`                                                              | Build debs + tarballs (one job per arch, shares Nix cache)                                          |
+| [`_build-windows.yml`](.github/workflows/_build-windows.yml)         | Called by `ci.yml`, `release.yml`                                                              | Build Windows release binary                                                                        |
 
-### CI (test.yml)
+### CI (ci.yml)
 
-Runs on every push to `main` and on every pull request. All jobs run in parallel:
+Runs on every push to `main` and on every pull request. Consolidates what was previously separate `test.yml`, `dev-check.yml`, and `coverage.yml` workflows. Build jobs are delegated to reusable workflows (`_build-packages.yml`, `_build-windows.yml`) shared with the release pipeline. On Linux, each architecture builds both debs and tarballs in a single job so they share the Nix store cache.
 
 ```mermaid
 flowchart LR
     PR[Push / PR] --> nix[nix-syntax]
     PR --> lint[lint]
-    PR --> test_linux[test<br>ubuntu-latest]
-    PR --> test_mac[test<br>macos-latest]
+    PR --> dev[dev-check]
+    PR --> test_linux[test<br>linux]
+    PR --> test_mac[test<br>macOS]
     PR --> e2e[e2e<br>+ Playwright report]
-    PR --> ci_debs_x86[build-debs<br>x86_64]
-    PR --> ci_debs_arm[build-debs<br>aarch64]
-    PR --> ci_tar_x86[build-tarballs<br>x86_64]
-    PR --> ci_tar_arm[build-tarballs<br>aarch64]
-    PR --> ci_tar_mac[build-tarballs<br>aarch64-darwin]
-    PR --> ci_win[build-windows<br>x86_64]
+    PR --> cov[coverage<br>+ PR comment]
+    PR --> pkg_x86[build-packages<br>linux-x86_64]
+    PR --> pkg_arm[build-packages<br>linux-aarch64]
+    PR --> pkg_mac[build-packages<br>macos-aarch64]
+    PR --> win[build-windows<br>x86_64]
 ```
 
-| Job              | Runner                                        | What it does                                                                                                                |
-| ---------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `nix-syntax`     | ubuntu-latest                                 | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
-| `lint`           | ubuntu-latest                                 | `./bin/lint` — `cargo fmt --check` + `prettier --check` + clippy                                                            |
-| `test`           | ubuntu-latest, macos-latest                   | `./bin/tests` — `cargo test --workspace`                                                                                    |
-| `e2e`            | ubuntu-latest                                 | `./bin/e2e` — Playwright against the full stack; uploads report artifact                                                    |
-| `build-debs`     | ubuntu-latest, ubuntu-24.04-arm               | Verify `.deb` packages build (amd64 + arm64)                                                                                |
-| `build-tarballs` | ubuntu-latest, ubuntu-24.04-arm, macos-latest | Verify static tarballs build (3 platforms)                                                                                  |
-| `build-windows`  | windows-latest                                | Verify Windows release build compiles (x86_64)                                                                              |
-
-### Dev check (dev-check.yml)
-
-Runs on every push to `main` and on every pull request. Single job on `ubuntu-latest`:
-
-1. Installs the latest released `blit` CLI via `install.blit.sh`.
-2. Enters the Nix devshell and runs `bin/dev` (process-compose with `cargo watch`, WASM build, gateway, ui, website).
-3. Polls `process-compose list` until all five services report Running.
-4. Smoke-tests with the `blit` CLI: starts a session, waits for it, verifies output, lists sessions, closes the session.
-5. Tears down process-compose.
+| Job              | Runner                    | What it does                                                                                                                |
+| ---------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `nix-syntax`     | ubuntu (4 vCPU)           | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
+| `lint`           | ubuntu (4 vCPU)           | `./bin/lint` — `cargo fmt --check` + `prettier --check` + clippy                                                            |
+| `dev-check`      | ubuntu (8 vCPU)           | Enters the Nix devshell and runs `bin/dev-check` (smoke-tests the full dev stack)                                           |
+| `test`           | ubuntu (8 vCPU), macOS    | `./bin/tests` — `cargo test --workspace`                                                                                    |
+| `e2e`            | ubuntu (8 vCPU)           | `./bin/e2e` — Playwright against the full stack; uploads report artifact                                                    |
+| `coverage`       | ubuntu (8 vCPU)           | `./bin/coverage` — runs tests with coverage; uploads HTML report and posts summary on PRs                                   |
+| `build-packages` | ubuntu (8 vCPU) ×2, macOS | Verify debs + tarballs build (debs on Linux only, tarballs on all 3 platforms)                                              |
+| `build-windows`  | windows (8 vCPU)          | Verify Windows release build compiles (x86_64)                                                                              |
 
 ### Release (release.yml)
 
@@ -272,33 +260,31 @@ Triggered by pushing a `v*` tag. A `verify-tag` job checks the tag signature via
 ```mermaid
 flowchart TD
     TAG["v* tag push"] --> VER[verify-tag<br>Check signature via GitHub API]
-    VER --> BD & BT & BW
+    VER --> BP & BW
 
-    subgraph "Build (parallel)"
-        BD[build-debs<br>amd64 + arm64]
-        BT[build-tarballs<br>linux-x86_64, linux-aarch64, macos-aarch64]
+    subgraph "Build (parallel, reusable workflows)"
+        BP[build-packages<br>debs + tarballs per arch]
         BW[build-windows<br>x86_64]
     end
 
-    BD & BT & BW --> REL[release<br>Create GitHub Release<br>with .deb + .tar.gz + .zip]
-    BD & BT & BW --> APT[apt-repo<br>Assemble APT repo<br>GPG sign, deploy Pages]
+    BP & BW --> REL[release<br>Create GitHub Release<br>with .deb + .tar.gz + .zip]
+    BP & BW --> APT[apt-repo<br>Assemble APT repo<br>GPG sign, deploy Pages]
 
     REL --> PUB_CRATES[publish-crates<br>crates.io]
     REL --> PUB_NPM[publish-npm<br>npm registry]
     REL --> BREW[update-homebrew<br>repository-dispatch to<br>indent-com/homebrew-tap]
 ```
 
-| Job               | Depends on                                | What it does                                                                                                    |
-| ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `verify-tag`      | —                                         | Checks the tag signature via the GitHub API; fails if unsigned or unverified                                    |
-| `build-debs`      | verify-tag                                | Nix-build `.deb` packages on native amd64 + arm64 runners                                                       |
-| `build-tarballs`  | verify-tag                                | Nix-build static tarballs on 3 platform runners                                                                 |
-| `build-windows`   | verify-tag                                | `cargo build --release` on `windows-latest`, packages `.exe` files into zips                                    |
-| `release`         | build-debs, build-tarballs, build-windows | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
-| `publish-crates`  | release                                   | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
-| `publish-npm`     | release                                   | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
-| `update-homebrew` | release                                   | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
-| `apt-repo`        | build-debs, build-tarballs, build-windows | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
+| Job               | Depends on                    | What it does                                                                                                    |
+| ----------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `verify-tag`      | —                             | Checks the tag signature via the GitHub API; fails if unsigned or unverified                                    |
+| `build-packages`  | verify-tag                    | Reusable workflow: Nix-builds debs + tarballs per architecture (3 runners, shares Nix cache within each)        |
+| `build-windows`   | verify-tag                    | Reusable workflow: `cargo build --release` on Windows, packages `.exe` files into zips                          |
+| `release`         | build-packages, build-windows | Downloads all artifacts, creates a GitHub Release with auto-generated notes                                     |
+| `publish-crates`  | release                       | `./bin/publish-crates` — publishes workspace crates to crates.io                                                |
+| `publish-npm`     | release                       | `./bin/publish-npm-packages` — publishes @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid to npm |
+| `update-homebrew` | release                       | Sends a `repository-dispatch` event to `indent-com/homebrew-tap` with the new version                           |
+| `apt-repo`        | build-packages, build-windows | Assembles the APT repo directory, GPG-signs metadata, deploys to GitHub Pages                                   |
 
 ### Deploy hub (deploy-hub.yml)
 
