@@ -260,4 +260,8 @@ jobs:
         with:
           path: repo
 
+  deploy-pages:
+    needs: [apt-repo]
+    runs-on: ubuntu-latest
+    steps:
       - uses: actions/deploy-pages@v4
