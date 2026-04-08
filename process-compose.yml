@@ -74,7 +74,7 @@ processes:
       restart: always
 
   website:
-    command: cd js && pnpm install --frozen-lockfile && cd website && pnpm exec astro dev --port ${BLIT_DEV_SITE_PORT:-3267}
+    command: cd js && pnpm install --frozen-lockfile && cd website && pnpm exec astro dev --host --port ${BLIT_DEV_SITE_PORT:-3267}
     depends_on:
       browser-wasm:
         condition: process_healthy

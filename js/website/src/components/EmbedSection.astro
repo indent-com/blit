@@ -3,7 +3,7 @@ const embedCode = `<span class="text-[var(--hl-kw)]">import</span> { <span class
          <span class="text-[var(--hl-fn)]">useBlitFocusedSession</span> } <span class="text-[var(--hl-kw)]">from</span> <span class="text-[var(--hl-str)]">'@blit-sh/react'</span>;
 <span class="text-[var(--hl-kw)]">import</span> { <span class="text-[var(--hl-fn)]">BlitWorkspace</span> } <span class="text-[var(--hl-kw)]">from</span> <span class="text-[var(--hl-str)]">'@blit-sh/core'</span>;
 
-<span class="text-[var(--hl-cm)] italic">// ● Create a workspace with a WebSocket connection</span>
+<span class="text-[var(--hl-cm)] italic">// Create a workspace with a WebSocket connection</span>
 <span class="text-[var(--hl-kw)]">const</span> workspace = <span class="text-[var(--hl-kw)]">new</span> <span class="text-[var(--hl-fn)]">BlitWorkspace</span>({
   wasm,
   connections: [{
@@ -12,16 +12,21 @@ const embedCode = `<span class="text-[var(--hl-kw)]">import</span> { <span class
   }],
 });
 
-<span class="text-[var(--hl-cm)] italic">// ● Render — that's it</span>
+<span class="text-[var(--hl-cm)] italic">// Render — that's it</span>
 &lt;<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span> <span class="text-[var(--hl-attr)]">workspace</span>={workspace}&gt;
   &lt;<span class="text-[var(--hl-fn)]">BlitTerminal</span> <span class="text-[var(--hl-attr)]">sessionId</span>={<span class="text-[var(--hl-fn)]">useBlitFocusedSession</span>()?.id ?? <span class="text-[var(--hl-kw)]">null</span>} /&gt;
 &lt;/<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span>&gt;`;
 ---
 
 <section class="py-10 border-t border-[var(--border)]">
-  <h2 class="text-lg font-bold tracking-tight mb-1 text-[var(--bright)]">
-    Drop into any React app
+  <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
+    Drop into any React or Solid app
   </h2>
+  <p class="text-[13px] text-[var(--dim)] mb-4">
+    <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">@blit-sh/react</code> and
+    <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">@blit-sh/solid</code> provide
+    framework bindings. WebGL-rendered, fully interactive, zero DOM manipulation.
+  </p>
   <pre
-    class="bg-[var(--surface)] border border-[var(--border)] rounded-md p-4 mt-3 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={embedCode} /></pre>
+    class="bg-[var(--surface)] border border-[var(--border)] rounded-lg p-4 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={embedCode} /></pre>
 </section>
