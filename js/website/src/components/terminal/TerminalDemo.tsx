@@ -45,7 +45,7 @@ const GITHUB_LIGHT = PALETTES.find((p) => p.id === "github-light")!;
 // ---------------------------------------------------------------------------
 
 type PassphraseResult =
-  | { ok: true; passphrase: string }
+  | { ok: true; passphrase: string; readOnly: boolean }
   | { ok: false; error: string };
 
 function resolvePassphrase(): PassphraseResult {
@@ -62,7 +62,16 @@ function resolvePassphrase(): PassphraseResult {
           "Cannot decrypt session link. This link was created on a different device.",
       };
     }
-    return { ok: true, passphrase: decrypted };
+    return {
+      ok: true,
+      passphrase: decrypted,
+      readOnly: decrypted.endsWith(".ro"),
+    };
+  }
+  // Read-only token — share as-is, do not encrypt (the token has no local
+  // device binding and is intended to be passed around as a URL).
+  if (raw.endsWith(".ro")) {
+    return { ok: true, passphrase: raw, readOnly: true };
   }
   // Raw passphrase — encrypt and replace URL
   try {
@@ -72,7 +81,7 @@ function resolvePassphrase(): PassphraseResult {
     console.error("[blit] encryptPassphrase failed:", e);
     // Fall through — still return the raw passphrase
   }
-  return { ok: true, passphrase: raw };
+  return { ok: true, passphrase: raw, readOnly: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +123,14 @@ export default function TerminalDemo() {
       <Show when={result()?.ok && wasm()}>
         <TerminalInner
           wasm={wasm()!}
-          passphrase={(result() as { ok: true; passphrase: string }).passphrase}
+          passphrase={
+            (result() as { ok: true; passphrase: string; readOnly: boolean })
+              .passphrase
+          }
+          readOnly={
+            (result() as { ok: true; passphrase: string; readOnly: boolean })
+              .readOnly
+          }
         />
       </Show>
     </>
@@ -125,7 +141,11 @@ export default function TerminalDemo() {
 // TerminalInner: workspace setup + tab shell
 // ---------------------------------------------------------------------------
 
-function TerminalInner(props: { wasm: BlitWasmModule; passphrase: string }) {
+function TerminalInner(props: {
+  wasm: BlitWasmModule;
+  passphrase: string;
+  readOnly: boolean;
+}) {
   const debugLog = createDebugLog();
   const [debugOpen, setDebugOpen] = createSignal(false);
 
@@ -187,6 +207,7 @@ function TerminalInner(props: { wasm: BlitWasmModule; passphrase: string }) {
         palette={palette}
         dark={dark}
         passphrase={props.passphrase}
+        readOnly={props.readOnly}
         onToggleTheme={toggleTheme}
       />
       <Show when={debugOpen()}>
@@ -269,7 +290,7 @@ function ToolbarMenu(props: {
 // DisconnectedOverlay: backdrop-blurred overlay with restart command
 // ---------------------------------------------------------------------------
 
-function DisconnectedOverlay(props: { passphrase: string }) {
+function DisconnectedOverlay(props: { passphrase: string; readOnly: boolean }) {
   const [copied, setCopied] = createSignal(false);
   let timeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -297,36 +318,40 @@ function DisconnectedOverlay(props: { passphrase: string }) {
             Session disconnected
           </span>
           <span class="font-mono text-xs text-[var(--dim)]">
-            Restart the share session to reconnect
+            {props.readOnly
+              ? "Waiting for the host to restart the share session"
+              : "Restart the share session to reconnect"}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={handleCopy}
-          class="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg)] px-4 py-2 font-mono text-xs text-[var(--fg)] cursor-pointer transition-colors hover:border-[var(--dim)]"
-        >
-          <svg
-            class="shrink-0"
-            width="14"
-            height="14"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
+        <Show when={!props.readOnly}>
+          <button
+            type="button"
+            onClick={handleCopy}
+            class="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg)] px-4 py-2 font-mono text-xs text-[var(--fg)] cursor-pointer transition-colors hover:border-[var(--dim)]"
           >
-            {copied() ? (
-              <path d="M4 8.5l2.5 2.5L12 5" />
-            ) : (
-              <>
-                <rect x="5" y="5" width="8" height="8" rx="1.5" />
-                <path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" />
-              </>
-            )}
-          </svg>
-          {copied() ? "Copied!" : "Copy restart command"}
-        </button>
+            <svg
+              class="shrink-0"
+              width="14"
+              height="14"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              {copied() ? (
+                <path d="M4 8.5l2.5 2.5L12 5" />
+              ) : (
+                <>
+                  <rect x="5" y="5" width="8" height="8" rx="1.5" />
+                  <path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" />
+                </>
+              )}
+            </svg>
+            {copied() ? "Copied!" : "Copy restart command"}
+          </button>
+        </Show>
       </div>
     </div>
   );
@@ -341,6 +366,7 @@ function TabShell(props: {
   palette: () => typeof GITHUB_DARK;
   dark: () => boolean;
   passphrase: string;
+  readOnly: boolean;
   onToggleTheme: () => void;
 }) {
   const workspace = props.workspace;
@@ -424,11 +450,12 @@ function TabShell(props: {
     }
   });
 
-  // Auto-create session when connected + no visible sessions
+  // Auto-create session when connected + no visible sessions (RW only)
   let creating = false;
   createEffect(() => {
     const conn = state().connections[0];
     if (
+      !props.readOnly &&
       conn?.status === "connected" &&
       conn?.ready &&
       visibleSessions().length === 0 &&
@@ -497,7 +524,7 @@ function TabShell(props: {
   onMount(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.shiftKey && e.key === "Enter") {
+      if (!props.readOnly && mod && e.shiftKey && e.key === "Enter") {
         e.preventDefault();
         workspace
           .createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
@@ -548,7 +575,9 @@ function TabShell(props: {
     if (!conn) return "Connecting...";
     if (conn.status === "connected") {
       return visibleSessions().length === 0
-        ? "Connected \u2014 waiting for terminal sessions..."
+        ? props.readOnly
+          ? "Connected \u2014 waiting for host to open a session..."
+          : "Connected \u2014 waiting for terminal sessions..."
         : null;
     }
     if (conn.status === "connecting")
@@ -561,6 +590,7 @@ function TabShell(props: {
   const handleSelectTab = (id: SessionId) => workspace.focusSession(id);
   const handleCloseTab = (id: SessionId) => workspace.closeSession(id);
   const handleNewTab = () => {
+    if (props.readOnly) return;
     const fid = focusedId();
     workspace
       .createSession({
@@ -592,31 +622,33 @@ function TabShell(props: {
               disabled={isDisconnected()}
             />
           </div>
-          {/* New tab button */}
-          <button
-            type="button"
-            onClick={handleNewTab}
-            class={`flex w-9 shrink-0 items-center justify-center border-none bg-transparent text-[var(--dim)] transition-colors ${
-              isDisconnected()
-                ? "opacity-50 pointer-events-none"
-                : "cursor-pointer hover:text-[var(--fg)]"
-            }`}
-            title="New tab"
-            disabled={isDisconnected()}
-          >
-            <svg
-              class="block"
-              width="14"
-              height="14"
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
+          {/* New tab button — hidden for read-only connections */}
+          <Show when={!props.readOnly}>
+            <button
+              type="button"
+              onClick={handleNewTab}
+              class={`flex w-9 shrink-0 items-center justify-center border-none bg-transparent text-[var(--dim)] transition-colors ${
+                isDisconnected()
+                  ? "opacity-50 pointer-events-none"
+                  : "cursor-pointer hover:text-[var(--fg)]"
+              }`}
+              title="New tab"
+              disabled={isDisconnected()}
             >
-              <path d="M8 3v10M3 8h10" />
-            </svg>
-          </button>
+              <svg
+                class="block"
+                width="14"
+                height="14"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              >
+                <path d="M8 3v10M3 8h10" />
+              </svg>
+            </button>
+          </Show>
           {/* Menu button */}
           <div class="relative shrink-0">
             <button
@@ -679,7 +711,10 @@ function TabShell(props: {
           />
         </Show>
         <Show when={isDisconnected()}>
-          <DisconnectedOverlay passphrase={props.passphrase} />
+          <DisconnectedOverlay
+            passphrase={props.passphrase}
+            readOnly={props.readOnly}
+          />
         </Show>
         <Show when={focusedExited() && !isDisconnected()}>
           <div class="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 z-[2] px-4 py-2 bg-[var(--bg)]/90 backdrop-blur-sm border border-[var(--border)] rounded-xl font-mono text-[13px] text-[var(--dim)] whitespace-nowrap">
