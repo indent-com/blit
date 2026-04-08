@@ -612,8 +612,7 @@ fn mark_share_remotes_proxiable(remotes_text: &str) -> String {
 /// Build a `share:` URI suitable for handing to blit-proxy.
 /// Embeds the hub URL as a query param only when it differs from the default.
 fn share_proxy_uri(passphrase: &str, signal_url: &str) -> String {
-    let default_hub =
-        blit_webrtc_forwarder::normalize_hub(blit_webrtc_forwarder::DEFAULT_HUB_URL);
+    let default_hub = blit_webrtc_forwarder::normalize_hub(blit_webrtc_forwarder::DEFAULT_HUB_URL);
     if signal_url == default_hub {
         format!("share:{passphrase}")
     } else {
