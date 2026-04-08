@@ -56,7 +56,9 @@ function isShareUri(uri: string): boolean {
 
 /** Returns a masked display string for share: URIs; passes other URIs through unchanged. */
 function maskUri(uri: string): string {
-  return isShareUri(uri) ? "share:\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" : uri;
+  return isShareUri(uri)
+    ? "share:\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+    : uri;
 }
 
 type LayoutItem = {

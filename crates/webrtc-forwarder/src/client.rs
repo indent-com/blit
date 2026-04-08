@@ -682,9 +682,7 @@ async fn drive(
                             }
                             // If the Session was already dropped and this was
                             // the last channel, there is nothing left to do.
-                            if !session_alive
-                                && channel_tasks.is_empty()
-                                && pending_open.is_empty()
+                            if !session_alive && channel_tasks.is_empty() && pending_open.is_empty()
                             {
                                 return Ok(());
                             }
