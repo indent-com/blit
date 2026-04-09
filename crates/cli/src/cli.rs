@@ -9,12 +9,12 @@ use clap::{Args, Parser, Subcommand};
         blit hosts PTYs and streams them to browsers over WebSocket, WebTransport, or WebRTC.\n\
         It also exposes every terminal operation as a CLI subcommand for scripts and LLM agents.\n\n\
         Quick start:\n  \
-          blit open              Open the terminal UI in a browser\n  \
-          blit share             Share a terminal session via WebRTC\n  \
-          blit start htop        Start a PTY and print its session ID\n  \
-          blit show 1            Dump current visible terminal text\n  \
-          blit learn             Print the full CLI reference\n  \
-          blit --help            Show this help",
+          blit open                 Open the terminal UI in a browser\n  \
+          blit share                Share a terminal via WebRTC\n  \
+          blit terminal start htop  Start a PTY and print its terminal ID\n  \
+          blit terminal show 1      Dump current visible terminal text\n  \
+          blit learn                Print the full CLI reference\n  \
+          blit --help               Show this help",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -39,42 +39,48 @@ pub struct ConnectOpts {
 }
 
 #[derive(Subcommand)]
-pub enum RecordTarget {
-    /// Record raw encoded video from a compositor surface
-    ///
-    /// Writes Annex B (H.264/H.265) or OBU (AV1) that ffplay can play directly.
-    Surface {
-        /// Surface ID
-        id: u16,
-
-        /// Output file path (default: surface-<id>.h264 / .h265)
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Maximum number of frames to record [default: 30]
-        #[arg(short, long, default_value_t = 30)]
-        frames: u32,
-    },
-
-    /// Record timestamped terminal output
-    ///
-    /// Writes a compact binary format (BLITREC) with microsecond timestamps.
-    Pty {
-        /// PTY session ID
-        id: u16,
-
-        /// Output file path (default: pty-<id>.blitrec)
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Maximum number of update frames to record [default: 30]
-        #[arg(short, long, default_value_t = 30)]
-        frames: u32,
-    },
-}
-
-#[derive(Subcommand)]
 pub enum Command {
+    /// Manage terminals (PTYs)
+    #[command(alias = "t")]
+    Terminal {
+        #[command(subcommand)]
+        command: Option<TerminalCommand>,
+    },
+
+    /// Manage compositor surfaces
+    #[command(alias = "s")]
+    Surface {
+        #[command(subcommand)]
+        command: Option<SurfaceCommand>,
+    },
+
+    /// Manage the clipboard
+    #[command(alias = "c")]
+    Clipboard {
+        #[command(subcommand)]
+        command: Option<ClipboardCommand>,
+    },
+
+    /// Manage named remotes in blit.remotes
+    ///
+    /// Named remotes let you refer to frequently-used destinations by a short
+    /// name instead of a full URI.  They are stored in ~/.config/blit/blit.remotes
+    /// (mode 0o600) and can also be set as the default target via `blit.conf`.
+    ///
+    /// Examples:
+    ///   blit remote add rabbit ssh:rabbit
+    ///   blit remote add prod ssh:alice@prod.example.com
+    ///   blit remote add lab share:mysecret
+    ///   blit remote list
+    ///   blit remote remove rabbit
+    ///   blit --on rabbit terminal list
+    ///   blit remote set-default rabbit
+    #[command(alias = "r")]
+    Remote {
+        #[command(subcommand)]
+        command: Option<RemoteCommand>,
+    },
+
     #[command(
         about = "Open the terminal UI in the browser",
         long_about = "Open the terminal UI in the browser\n\n\
@@ -92,9 +98,9 @@ pub enum Command {
         port: Option<u16>,
     },
 
-    /// Share a terminal session via WebRTC
+    /// Share a terminal via WebRTC
     Share {
-        /// Passphrase for the session (default: random)
+        /// Share passphrase (default: random)
         #[arg(long, env = "BLIT_PASSPHRASE")]
         passphrase: Option<String>,
 
@@ -110,12 +116,85 @@ pub enum Command {
     /// Print the full CLI reference (usage guide for scripts and LLM agents)
     Learn,
 
-    /// Start a new terminal session and print its ID
+    /// Run the blit terminal multiplexer server
+    Server {
+        /// IPC socket/pipe path (or set BLIT_SOCK)
+        #[arg(long)]
+        socket: Option<String>,
+
+        /// Shell flags (default: li, or set BLIT_SHELL_FLAGS)
+        #[arg(long)]
+        shell_flags: Option<String>,
+
+        /// Scrollback buffer size in lines
+        #[arg(long)]
+        scrollback: Option<usize>,
+
+        /// Accept clients via fd-passing on this file descriptor (Unix only)
+        #[cfg(unix)]
+        #[arg(long)]
+        fd_channel: Option<i32>,
+
+        /// Enable verbose logging
+        #[arg(long, short)]
+        verbose: bool,
+    },
+
+    /// Shut down the blit server
+    Quit,
+
+    #[command(
+        about = "Install blit on a remote host via SSH, or print install commands",
+        long_about = "Install blit on a remote host via SSH, or print install commands.\n\n\
+            With a host argument, connects via SSH and runs the installer remotely.\n\
+            Without a host argument, prints the one-liner install commands for each\n\
+            platform so you can copy and run them by hand."
+    )]
+    Install {
+        /// SSH target ([user@]host). Omit to print install commands for each platform.
+        host: Option<String>,
+    },
+
+    /// Upgrade blit to the latest version
+    Upgrade,
+
+    /// Run the WebSocket/WebTransport gateway
+    ///
+    /// All configuration is via environment variables:
+    ///   BLIT_PASSPHRASE   Browser passphrase (required)
+    ///   BLIT_ADDR         Listen address (default: 0.0.0.0:3264)
+    ///   BLIT_REMOTES      Path to remotes file
+    ///   BLIT_QUIC         Set to 1 for WebTransport
+    ///   BLIT_PROXY        Set to 0 to disable blit-proxy
+    Gateway,
+
+    /// Generate man pages and shell completions
+    ///
+    /// Writes man pages for all blit binaries and shell completions
+    /// (fish, bash, zsh) for the blit CLI into the given directory.
+    Generate {
+        /// Output directory (e.g. /usr/share)
+        output: String,
+    },
+
+    /// Run the connection-pool proxy daemon (internal; not for direct use)
+    #[command(hide = true)]
+    ProxyDaemon,
+}
+
+// ── Terminal subcommands ─────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum TerminalCommand {
+    /// List all terminals (TSV: ID, TAG, TITLE, STATUS)
+    List,
+
+    /// Start a new terminal and print its ID
     Start {
         /// Command to run (defaults to $SHELL or /bin/sh)
         command: Vec<String>,
 
-        /// Session tag / label
+        /// Terminal tag / label
         #[arg(long, short = 't')]
         tag: Option<String>,
 
@@ -136,36 +215,9 @@ pub enum Command {
         timeout: Option<u64>,
     },
 
-    /// Wait for a session to exit or match a pattern.
-    ///
-    /// Without --pattern, blocks until the PTY process exits and returns
-    /// its exit code. With --pattern, subscribes to output and exits when
-    /// the regex matches a line produced after the wait began.
-    Wait {
-        /// Session ID
-        id: u16,
-
-        /// Maximum seconds to wait before giving up (exit code 124)
-        #[arg(long)]
-        timeout: u64,
-
-        /// Regex pattern to match against new output lines
-        #[arg(long)]
-        pattern: Option<String>,
-    },
-
-    /// Close a session
-    Close {
-        /// Session ID
-        id: u16,
-    },
-
-    /// List all terminal sessions (TSV: ID, TAG, TITLE, STATUS)
-    List,
-
-    /// Print the current visible text of a session
+    /// Print the current visible text of a terminal
     Show {
-        /// Session ID
+        /// Terminal ID
         id: u16,
 
         /// Include ANSI color/style escape sequences in output
@@ -186,7 +238,7 @@ pub enum Command {
     /// Without position flags, prints everything. Use --from-beginning or
     /// --from-end to set a starting offset, and --limit to cap the output.
     History {
-        /// Session ID
+        /// Terminal ID
         id: u16,
 
         /// Start N lines from the top (oldest = 0)
@@ -214,29 +266,48 @@ pub enum Command {
         cols: Option<u16>,
     },
 
-    /// Send input to a session.
+    /// Send input to a terminal.
     ///
     /// Supports C-style escapes: \n \r \t \\ \0 \xHH.
+    /// \n sends CR (Enter), matching real terminal behavior. Use \x0a for literal LF.
     /// To control interactive programs like vim:
-    ///   blit send 3 '\x1b:wq\n'
-    ///   printf '\x1b:wq\n' | blit send 3 -
+    ///   blit terminal send 3 '\x1b:wq\n'
+    ///   printf '\x1b:wq\n' | blit terminal send 3 -
     Send {
-        /// Session ID
+        /// Terminal ID
         id: u16,
 
         /// Text to send (use - to read from stdin)
         text: String,
     },
 
-    /// Restart an exited session (re-runs the original command)
+    /// Wait for a terminal to exit or match a pattern.
+    ///
+    /// Without --pattern, blocks until the PTY process exits and returns
+    /// its exit code. With --pattern, subscribes to output and exits when
+    /// the regex matches a line produced after the wait began.
+    Wait {
+        /// Terminal ID
+        id: u16,
+
+        /// Maximum seconds to wait before giving up (exit code 124)
+        #[arg(long)]
+        timeout: u64,
+
+        /// Regex pattern to match against new output lines
+        #[arg(long)]
+        pattern: Option<String>,
+    },
+
+    /// Restart an exited terminal (re-runs the original command)
     Restart {
-        /// Session ID
+        /// Terminal ID
         id: u16,
     },
 
-    /// Send a signal to a session's leader process
+    /// Send a signal to a terminal's leader process
     Kill {
-        /// Session ID
+        /// Terminal ID
         id: u16,
 
         /// Signal name or number (e.g. TERM, KILL, INT, 9)
@@ -244,47 +315,46 @@ pub enum Command {
         signal: String,
     },
 
-    /// Run the blit terminal multiplexer server
-    Server {
-        /// IPC socket/pipe path (or set BLIT_SOCK)
-        #[arg(long)]
-        socket: Option<String>,
-
-        /// Shell flags (default: li, or set BLIT_SHELL_FLAGS)
-        #[arg(long)]
-        shell_flags: Option<String>,
-
-        /// Scrollback buffer size in lines
-        #[arg(long)]
-        scrollback: Option<usize>,
-
-        /// Accept clients via fd-passing on this file descriptor (Unix only)
-        #[cfg(unix)]
-        #[arg(long)]
-        fd_channel: Option<i32>,
-
-        /// Enable verbose logging
-        #[arg(long, short)]
-        verbose: bool,
+    /// Close a terminal
+    Close {
+        /// Terminal ID
+        id: u16,
     },
 
-    #[command(
-        about = "Install blit on a remote host via SSH, or print install commands",
-        long_about = "Install blit on a remote host via SSH, or print install commands.\n\n\
-            With a host argument, connects via SSH and runs the installer remotely.\n\
-            Without a host argument, prints the one-liner install commands for each\n\
-            platform so you can copy and run them by hand."
-    )]
-    Install {
-        /// SSH target ([user@]host). Omit to print install commands for each platform.
-        host: Option<String>,
+    /// Record timestamped terminal output
+    ///
+    /// Writes a compact binary format (BLITREC) with microsecond timestamps.
+    /// Records until --frames or --duration is reached, or Ctrl+C.
+    Record {
+        /// PTY terminal ID
+        id: u16,
+
+        /// Output file path (default: pty-<id>.blitrec)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Maximum number of frames to record (0 = unlimited)
+        #[arg(short, long, default_value_t = 0)]
+        frames: u32,
+
+        /// Maximum duration in seconds (0 = unlimited)
+        #[arg(short, long, default_value_t = 0.0)]
+        duration: f64,
     },
+}
 
-    /// Upgrade blit to the latest version
-    Upgrade,
+// ── Surface subcommands ──────────────────────────────────────────────────
 
+#[derive(Subcommand)]
+pub enum SurfaceCommand {
     /// List all compositor surfaces (TSV: ID, TITLE, SIZE, APP_ID)
-    Surfaces,
+    List,
+
+    /// Close a compositor surface (sends xdg_toplevel close event)
+    Close {
+        /// Surface ID
+        id: u16,
+    },
 
     /// Capture a screenshot of a surface
     Capture {
@@ -311,6 +381,12 @@ pub enum Command {
         /// Resize the surface to this height (pixels) before capturing
         #[arg(long)]
         height: Option<u16>,
+
+        /// Render scale in 120ths (wp_fractional_scale_v1 units).
+        /// 120 = 1x, 240 = 2x, 180 = 1.5x, etc.
+        /// Default (0) uses the compositor's current output scale.
+        #[arg(long, default_value_t = 0)]
+        scale: u16,
     },
 
     /// Click at coordinates on a surface
@@ -347,53 +423,70 @@ pub enum Command {
         text: String,
     },
 
-    /// Record encoded video or terminal output to a file
-    #[command(subcommand)]
-    Record(RecordTarget),
+    /// Record raw encoded video from a compositor surface
+    ///
+    /// Writes Annex B (H.264) or OBU (AV1) that ffplay can play directly.
+    /// Records until --frames or --duration is reached, or Ctrl+C.
+    Record {
+        /// Surface ID
+        id: u16,
 
-    /// Manage named remotes in blit.remotes
-    ///
-    /// Named remotes let you refer to frequently-used destinations by a short
-    /// name instead of a full URI.  They are stored in ~/.config/blit/blit.remotes
-    /// (mode 0o600) and can also be set as the default target via `blit.conf`.
-    ///
-    /// Examples:
-    ///   blit remote add rabbit ssh:rabbit
-    ///   blit remote add prod ssh:alice@prod.example.com
-    ///   blit remote add lab share:mysecret
-    ///   blit remote list
-    ///   blit remote remove rabbit
-    ///   blit --on rabbit list
-    ///   blit remote set-default rabbit
-    #[command(subcommand)]
-    Remote(RemoteCommand),
+        /// Output file path (default: surface-<id>.<codec>)
+        #[arg(short, long)]
+        output: Option<String>,
 
-    /// Run the WebSocket/WebTransport gateway
-    ///
-    /// All configuration is via environment variables:
-    ///   BLIT_PASSPHRASE   Browser passphrase (required)
-    ///   BLIT_ADDR         Listen address (default: 0.0.0.0:3264)
-    ///   BLIT_REMOTES      Path to remotes file
-    ///   BLIT_QUIC         Set to 1 for WebTransport
-    ///   BLIT_PROXY        Set to 0 to disable blit-proxy
-    Gateway,
+        /// Maximum number of frames to record (0 = unlimited)
+        #[arg(short, long, default_value_t = 0)]
+        frames: u32,
 
-    /// Generate man pages and shell completions
-    ///
-    /// Writes man pages for all blit binaries and shell completions
-    /// (fish, bash, zsh) for the blit CLI into the given directory.
-    Generate {
-        /// Output directory (e.g. /usr/share)
-        output: String,
+        /// Maximum duration in seconds (0 = unlimited)
+        #[arg(short, long, default_value_t = 0.0)]
+        duration: f64,
+
+        /// Codec(s) to announce as supported (comma-separated or repeated).
+        /// Accepted values: h264, av1.
+        /// Default: all codecs.
+        #[arg(short, long, value_delimiter = ',')]
+        codec: Vec<String>,
+    },
+}
+
+// ── Clipboard subcommands ────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum ClipboardCommand {
+    /// List available MIME types on the clipboard
+    List,
+
+    /// Read clipboard content
+    Get {
+        /// MIME type to retrieve (default: text/plain)
+        #[arg(long, default_value = "text/plain")]
+        mime: String,
     },
 
-    /// Run the connection-pool proxy daemon (internal; not for direct use)
-    #[command(hide = true)]
-    ProxyDaemon,
+    /// Set clipboard content
+    Set {
+        /// MIME type (default: text/plain;charset=utf-8)
+        #[arg(long, default_value = "text/plain;charset=utf-8")]
+        mime: String,
+
+        /// Text to set (if omitted, reads from stdin)
+        text: Option<String>,
+    },
 }
+
+// ── Remote subcommands ───────────────────────────────────────────────────
 
 #[derive(Subcommand)]
 pub enum RemoteCommand {
+    /// List all named remotes
+    List {
+        /// Show share passphrases in full instead of masking them
+        #[arg(long)]
+        reveal: bool,
+    },
+
     /// Add or update a named remote
     Add {
         /// Name for the remote
@@ -407,13 +500,6 @@ pub enum RemoteCommand {
     Remove {
         /// Name of the remote to remove
         name: String,
-    },
-
-    /// List all named remotes
-    List {
-        /// Show share passphrases in full instead of masking them
-        #[arg(long)]
-        reveal: bool,
     },
 
     /// Set the default remote in blit.conf

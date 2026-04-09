@@ -26,48 +26,58 @@ unsafe impl Sync for DynLib {}
 
 impl DynLib {
     #[cfg(unix)]
-    pub(crate) fn open(names: &[&str]) -> Option<Self> {
+    pub(crate) fn open(names: &[&str]) -> Result<Self, String> {
         Self::open_flags(names, libc::RTLD_NOW | libc::RTLD_LOCAL)
     }
 
-    /// Open with RTLD_GLOBAL — needed for GLVND so EGL and GL dispatch
-    /// tables are shared across libEGL.so and libGLESv2.so.
     #[cfg(unix)]
-    pub(crate) fn open_global(names: &[&str]) -> Option<Self> {
-        Self::open_flags(names, libc::RTLD_NOW | libc::RTLD_GLOBAL)
-    }
-
-    #[cfg(unix)]
-    fn open_flags(names: &[&str], flags: libc::c_int) -> Option<Self> {
+    fn open_flags(names: &[&str], flags: libc::c_int) -> Result<Self, String> {
+        let mut last_err = String::new();
         for name in names {
-            let cname = std::ffi::CString::new(*name).ok()?;
+            let Some(cname) = std::ffi::CString::new(*name).ok() else {
+                continue;
+            };
             let handle = unsafe { libc::dlopen(cname.as_ptr(), flags) };
             if !handle.is_null() {
-                eprintln!("[gpu-libs] loaded {name}");
-                return Some(Self { handle });
+                return Ok(Self { handle });
+            }
+            let err = unsafe { libc::dlerror() };
+            if !err.is_null() {
+                last_err = unsafe { std::ffi::CStr::from_ptr(err) }
+                    .to_string_lossy()
+                    .into_owned();
             }
         }
-        None
+        Err(last_err)
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn open(_names: &[&str]) -> Option<Self> {
-        None
+    pub(crate) fn open(_names: &[&str]) -> Result<Self, String> {
+        Err("dlopen not available on this platform".into())
     }
 
     #[cfg(unix)]
-    pub(crate) unsafe fn sym<T>(&self, name: &str) -> Option<T> {
-        let cname = std::ffi::CString::new(name).ok()?;
+    pub(crate) unsafe fn sym<T>(&self, name: &str) -> Result<T, String> {
+        let cname =
+            std::ffi::CString::new(name).map_err(|_| format!("invalid symbol name: {name}"))?;
         let ptr = unsafe { libc::dlsym(self.handle, cname.as_ptr()) };
         if ptr.is_null() {
-            return None;
+            let err = unsafe { libc::dlerror() };
+            let detail = if !err.is_null() {
+                unsafe { std::ffi::CStr::from_ptr(err) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "symbol not found".into()
+            };
+            return Err(format!("{name}: {detail}"));
         }
-        Some(unsafe { std::mem::transmute_copy(&ptr) })
+        Ok(unsafe { std::mem::transmute_copy(&ptr) })
     }
 
     #[cfg(not(unix))]
-    unsafe fn sym<T>(&self, _name: &str) -> Option<T> {
-        None
+    unsafe fn sym<T>(&self, _name: &str) -> Result<T, String> {
+        Err("dlsym not available on this platform".into())
     }
 }
 
@@ -89,6 +99,9 @@ pub type CUdevice = c_int;
 pub type CUcontext = *mut c_void;
 pub type CUdeviceptr = u64;
 
+/// Opaque handle for imported external memory (CUDA 10.0+).
+pub type CUexternalMemory = *mut c_void;
+
 pub struct CudaFns {
     pub cuInit: unsafe extern "C" fn(flags: c_uint) -> CUresult,
     pub cuDeviceGet: unsafe extern "C" fn(device: *mut CUdevice, ordinal: c_int) -> CUresult,
@@ -103,14 +116,37 @@ pub struct CudaFns {
         unsafe extern "C" fn(dst: CUdeviceptr, src: *const c_void, bytesize: usize) -> CUresult,
     pub cuMemAllocHost_v2: unsafe extern "C" fn(pp: *mut *mut c_void, bytesize: usize) -> CUresult,
     pub cuMemFreeHost: unsafe extern "C" fn(p: *mut c_void) -> CUresult,
+    pub cuMemAllocPitch_v2: unsafe extern "C" fn(
+        dptr: *mut CUdeviceptr,
+        pPitch: *mut usize,
+        WidthInBytes: usize,
+        Height: usize,
+        ElementSizeBytes: c_uint,
+    ) -> CUresult,
+    pub cuStreamSynchronize: unsafe extern "C" fn(hStream: *mut c_void) -> CUresult,
+    // External memory import (CUDA 10.0+) — used for zero-copy DMA-BUF import.
+    pub cuImportExternalMemory: Option<
+        unsafe extern "C" fn(
+            extMem_out: *mut CUexternalMemory,
+            memHandleDesc: *const c_void,
+        ) -> CUresult,
+    >,
+    pub cuExternalMemoryGetMappedBuffer: Option<
+        unsafe extern "C" fn(
+            devPtr: *mut CUdeviceptr,
+            extMem: CUexternalMemory,
+            bufferDesc: *const c_void,
+        ) -> CUresult,
+    >,
+    pub cuDestroyExternalMemory: Option<unsafe extern "C" fn(extMem: CUexternalMemory) -> CUresult>,
     _lib: DynLib,
 }
 
 impl CudaFns {
-    pub fn load() -> Option<Self> {
+    pub fn load() -> Result<Self, String> {
         let lib = DynLib::open(&["libcuda.so.1", "libcuda.so"])?;
         unsafe {
-            Some(Self {
+            Ok(Self {
                 cuInit: lib.sym("cuInit")?,
                 cuDeviceGet: lib.sym("cuDeviceGet")?,
                 cuCtxCreate_v2: lib.sym("cuCtxCreate_v2")?,
@@ -122,6 +158,12 @@ impl CudaFns {
                 cuMemcpyHtoD_v2: lib.sym("cuMemcpyHtoD_v2")?,
                 cuMemAllocHost_v2: lib.sym("cuMemAllocHost_v2")?,
                 cuMemFreeHost: lib.sym("cuMemFreeHost")?,
+                cuMemAllocPitch_v2: lib.sym("cuMemAllocPitch_v2")?,
+                cuStreamSynchronize: lib.sym("cuStreamSynchronize")?,
+                // Optional: only available with CUDA 10.0+ drivers.
+                cuImportExternalMemory: lib.sym("cuImportExternalMemory").ok(),
+                cuExternalMemoryGetMappedBuffer: lib.sym("cuExternalMemoryGetMappedBuffer").ok(),
+                cuDestroyExternalMemory: lib.sym("cuDestroyExternalMemory").ok(),
                 _lib: lib,
             })
         }
@@ -132,25 +174,20 @@ impl CudaFns {
 // NVENC API
 // ---------------------------------------------------------------------------
 
-/// Opaque NVENC encoder handle.
-pub type NvEncHandle = *mut c_void;
-
 /// NVENC uses a function-pointer table returned by NvEncodeAPICreateInstance.
-/// We store the two entry points loaded from libnvidia-encode.so and the
+/// We store the entry point loaded from libnvidia-encode.so and the
 /// function table is obtained at encoder creation time.
 pub struct NvEncFns {
     pub NvEncodeAPICreateInstance: unsafe extern "C" fn(functionList: *mut c_void) -> c_uint,
-    pub NvEncodeAPIGetMaxSupportedVersion: unsafe extern "C" fn(version: *mut u32) -> c_uint,
     _lib: DynLib,
 }
 
 impl NvEncFns {
-    pub fn load() -> Option<Self> {
+    pub fn load() -> Result<Self, String> {
         let lib = DynLib::open(&["libnvidia-encode.so.1", "libnvidia-encode.so"])?;
         unsafe {
-            Some(Self {
+            Ok(Self {
                 NvEncodeAPICreateInstance: lib.sym("NvEncodeAPICreateInstance")?,
-                NvEncodeAPIGetMaxSupportedVersion: lib.sym("NvEncodeAPIGetMaxSupportedVersion")?,
                 _lib: lib,
             })
         }
@@ -177,8 +214,6 @@ pub struct VaFns {
     pub vaInitialize:
         unsafe extern "C" fn(dpy: VADisplay, major: *mut c_int, minor: *mut c_int) -> VAStatus,
     pub vaTerminate: unsafe extern "C" fn(dpy: VADisplay) -> VAStatus,
-    pub vaQueryConfigProfiles:
-        unsafe extern "C" fn(dpy: VADisplay, profiles: *mut VAProfile, num: *mut c_int) -> VAStatus,
     pub vaQueryConfigEntrypoints: unsafe extern "C" fn(
         dpy: VADisplay,
         profile: VAProfile,
@@ -252,17 +287,23 @@ pub struct VaFns {
     ) -> VAStatus,
     pub vaEndPicture: unsafe extern "C" fn(dpy: VADisplay, context: VAContextID) -> VAStatus,
     pub vaSyncSurface: unsafe extern "C" fn(dpy: VADisplay, surface: VASurfaceID) -> VAStatus,
+    pub vaExportSurfaceHandle: unsafe extern "C" fn(
+        dpy: VADisplay,
+        surface: VASurfaceID,
+        mem_type: c_uint,
+        flags: c_uint,
+        descriptor: *mut c_void,
+    ) -> VAStatus,
     _lib: DynLib,
 }
 
 impl VaFns {
-    pub fn load() -> Option<Self> {
+    pub fn load() -> Result<Self, String> {
         let lib = DynLib::open(&["libva.so.2", "libva.so"])?;
         unsafe {
-            Some(Self {
+            Ok(Self {
                 vaInitialize: lib.sym("vaInitialize")?,
                 vaTerminate: lib.sym("vaTerminate")?,
-                vaQueryConfigProfiles: lib.sym("vaQueryConfigProfiles")?,
                 vaQueryConfigEntrypoints: lib.sym("vaQueryConfigEntrypoints")?,
                 vaCreateConfig: lib.sym("vaCreateConfig")?,
                 vaDestroyConfig: lib.sym("vaDestroyConfig")?,
@@ -280,6 +321,7 @@ impl VaFns {
                 vaRenderPicture: lib.sym("vaRenderPicture")?,
                 vaEndPicture: lib.sym("vaEndPicture")?,
                 vaSyncSurface: lib.sym("vaSyncSurface")?,
+                vaExportSurfaceHandle: lib.sym("vaExportSurfaceHandle")?,
                 _lib: lib,
             })
         }
@@ -293,10 +335,10 @@ pub struct VaDrmFns {
 }
 
 impl VaDrmFns {
-    pub fn load() -> Option<Self> {
+    pub fn load() -> Result<Self, String> {
         let lib = DynLib::open(&["libva-drm.so.2", "libva-drm.so"])?;
         unsafe {
-            Some(Self {
+            Ok(Self {
                 vaGetDisplayDRM: lib.sym("vaGetDisplayDRM")?,
                 _lib: lib,
             })
@@ -308,23 +350,31 @@ impl VaDrmFns {
 // Singleton accessors
 // ---------------------------------------------------------------------------
 
-static CUDA: OnceLock<Option<CudaFns>> = OnceLock::new();
-static NVENC: OnceLock<Option<NvEncFns>> = OnceLock::new();
-static VA: OnceLock<Option<VaFns>> = OnceLock::new();
-static VA_DRM: OnceLock<Option<VaDrmFns>> = OnceLock::new();
+static CUDA: OnceLock<Result<CudaFns, String>> = OnceLock::new();
+static NVENC: OnceLock<Result<NvEncFns, String>> = OnceLock::new();
+static VA: OnceLock<Result<VaFns, String>> = OnceLock::new();
+static VA_DRM: OnceLock<Result<VaDrmFns, String>> = OnceLock::new();
 
-pub fn cuda() -> Option<&'static CudaFns> {
-    CUDA.get_or_init(CudaFns::load).as_ref()
+pub fn cuda() -> Result<&'static CudaFns, &'static str> {
+    CUDA.get_or_init(CudaFns::load)
+        .as_ref()
+        .map_err(|e| e.as_str())
 }
 
-pub fn nvenc() -> Option<&'static NvEncFns> {
-    NVENC.get_or_init(NvEncFns::load).as_ref()
+pub fn nvenc() -> Result<&'static NvEncFns, &'static str> {
+    NVENC
+        .get_or_init(NvEncFns::load)
+        .as_ref()
+        .map_err(|e| e.as_str())
 }
 
-pub fn va() -> Option<&'static VaFns> {
-    VA.get_or_init(VaFns::load).as_ref()
+pub fn va() -> Result<&'static VaFns, &'static str> {
+    VA.get_or_init(VaFns::load).as_ref().map_err(|e| e.as_str())
 }
 
-pub fn va_drm() -> Option<&'static VaDrmFns> {
-    VA_DRM.get_or_init(VaDrmFns::load).as_ref()
+pub fn va_drm() -> Result<&'static VaDrmFns, &'static str> {
+    VA_DRM
+        .get_or_init(VaDrmFns::load)
+        .as_ref()
+        .map_err(|e| e.as_str())
 }

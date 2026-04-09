@@ -9,7 +9,12 @@
 
 import nacl from "tweetnacl";
 import { createWebRtcDataChannelTransport } from "./webrtc";
-import type { BlitDebug, BlitTransport, ConnectionStatus } from "../types";
+import {
+  noopDebug,
+  type BlitDebug,
+  type BlitTransport,
+  type ConnectionStatus,
+} from "../types";
 
 const PBKDF2_ROUNDS = 100_000;
 
@@ -246,7 +251,6 @@ async function fetchIceServers(hubWsUrl: string): Promise<RTCIceServer[]> {
  * `"disconnected"` or `"error"` state tears down old resources and re-runs
  * the full signaling + WebRTC handshake.
  */
-const noopDebug: BlitDebug = { log() {}, warn() {}, error() {} };
 
 export function createShareTransport(
   hubWsUrl: string,
@@ -263,15 +267,46 @@ export function createShareTransport(
   let started = false;
   let connectGeneration = 0;
   let cachedKeys: DerivedKeys | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectDelay = 1000;
+  const MAX_RECONNECT_DELAY = 30_000;
   const earlyMessages: ArrayBuffer[] = [];
   const messageListeners = new Set<(data: ArrayBuffer) => void>();
   const statusListeners = new Set<(status: ConnectionStatus) => void>();
+
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect() {
+    if (disposed || !started) return;
+    clearReconnectTimer();
+    dbg.log("scheduling reconnect in %dms", reconnectDelay);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (disposed) return;
+      // Bump generation *before* teardown so that status events emitted by
+      // the inner transport during close() are discarded by the stale-
+      // generation guard in the statuschange listener.
+      connectGeneration++;
+      teardown();
+      setStatus("connecting");
+      doConnect(connectGeneration);
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
+  }
 
   function setStatus(s: ConnectionStatus) {
     if (_status === s) return;
     dbg.log("status %s → %s", _status, s);
     _status = s;
     for (const l of statusListeners) l(s);
+    if (s === "disconnected" || s === "error") {
+      scheduleReconnect();
+    }
   }
 
   function dispatch(data: ArrayBuffer) {
@@ -357,9 +392,20 @@ export function createShareTransport(
       }
 
       // Wait for registered + peer_joined (producer role only).
+      // If the producer never shows up (server crashed), time out so the
+      // transport transitions to "disconnected" and the reconnect loop
+      // retries instead of hanging in "connecting" forever.
+      const PEER_JOIN_TIMEOUT_MS = 30_000;
       dbg.log("waiting for registered + peer_joined");
       const producerSessionId = await new Promise<string>((resolve, reject) => {
         let registered = false;
+        const timeout = setTimeout(() => {
+          dbg.warn(
+            "timed out waiting for producer after %dms",
+            PEER_JOIN_TIMEOUT_MS,
+          );
+          reject(new Error("timed out waiting for producer to join"));
+        }, PEER_JOIN_TIMEOUT_MS);
         ws!.onmessage = (e) => {
           const m = JSON.parse(e.data as string) as ServerMessage;
           dbg.log("signaling ← %s %o", m.type, m);
@@ -377,14 +423,17 @@ export function createShareTransport(
               return;
             }
             dbg.log("producer joined: %s", m.sessionId);
+            clearTimeout(timeout);
             resolve(m.sessionId!);
           } else if (m.type === "error") {
             dbg.error("signaling error: %s", m.message);
+            clearTimeout(timeout);
             reject(new Error(m.message ?? "signaling error"));
           }
         };
         ws!.onclose = () => {
           dbg.warn("signaling WS closed before peer joined");
+          clearTimeout(timeout);
           reject(new Error("signaling closed before peer joined"));
         };
       });
@@ -420,6 +469,10 @@ export function createShareTransport(
       );
       dcTransport.addEventListener("statuschange", (s: ConnectionStatus) => {
         if (disposed || generation !== connectGeneration) return;
+        if (s === "connected") {
+          reconnectDelay = 1000;
+          clearReconnectTimer();
+        }
         setStatus(s);
       });
 
@@ -562,8 +615,9 @@ export function createShareTransport(
           "reconnect requested (status=%s), tearing down and retrying",
           _status,
         );
-        teardown();
+        clearReconnectTimer();
         connectGeneration++;
+        teardown();
         setStatus("connecting");
         doConnect(connectGeneration);
       }
@@ -603,12 +657,25 @@ export function createShareTransport(
       }
     },
 
+    reconnect() {
+      if (disposed) return;
+      dbg.log("reconnect() called, tearing down and retrying immediately");
+      clearReconnectTimer();
+      reconnectDelay = 1000;
+      connectGeneration++;
+      teardown();
+      setStatus("connecting");
+      doConnect(connectGeneration);
+    },
+
     send(data: Uint8Array) {
       inner?.send(data);
     },
 
     close() {
       disposed = true;
+      clearReconnectTimer();
+      connectGeneration++;
       teardown();
       setStatus("closed");
     },

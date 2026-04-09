@@ -1,0 +1,12 @@
+[Unit]
+Description=blit share %i
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/blit/share-%i.env
+ExecStart=blit share --quiet
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

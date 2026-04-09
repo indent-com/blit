@@ -95,7 +95,7 @@ fn blit_gateway_cmd() -> Command {
 fn blit_webrtc_forwarder_cmd() -> Command {
     Command::new("blit-webrtc-forwarder")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Forward a blit-server session over WebRTC")
+        .about("Forward a blit-server terminal over WebRTC")
         .long_about(
             "blit-webrtc-forwarder connects to a blit-server(1) Unix socket and \
              bridges it to browsers over WebRTC data channels. It handles signaling, \
@@ -118,7 +118,7 @@ fn blit_webrtc_forwarder_cmd() -> Command {
                 .value_name("PASSPHRASE")
                 .env("BLIT_PASSPHRASE")
                 .required(true)
-                .help("Session passphrase"),
+                .help("Share passphrase"),
         )
         .arg(
             Arg::new("hub")

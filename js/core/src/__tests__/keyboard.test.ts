@@ -32,6 +32,39 @@ describe("keyToBytes", () => {
       const bytes = keyToBytes(makeEvent(" "), false);
       expect(bytes).toEqual(new TextEncoder().encode(" "));
     });
+
+    it("Shift+digit with correct e.key (normal browser) passes through", () => {
+      // When the browser correctly reports e.key="@" for Shift+2, we send it.
+      const bytes = keyToBytes(
+        makeEvent("@", {
+          shiftKey: true,
+          code: "Digit2",
+        } as Partial<KeyboardEvent>),
+        false,
+      );
+      expect(bytes).toEqual(new TextEncoder().encode("@"));
+    });
+
+    it("Shift+digit with wrong e.key (Brave bug) returns null", () => {
+      // Brave reports e.key="2" even with Shift held — bail out so the
+      // textarea input event can produce the correct character.
+      const bytes = keyToBytes(
+        makeEvent("2", {
+          shiftKey: true,
+          code: "Digit2",
+        } as Partial<KeyboardEvent>),
+        false,
+      );
+      expect(bytes).toBeNull();
+    });
+
+    it("unshifted digit key still works", () => {
+      const bytes = keyToBytes(
+        makeEvent("2", { code: "Digit2" } as Partial<KeyboardEvent>),
+        false,
+      );
+      expect(bytes).toEqual(new TextEncoder().encode("2"));
+    });
   });
 
   describe("simple keys", () => {

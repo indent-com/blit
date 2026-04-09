@@ -5,6 +5,7 @@ import {
   buildCandidateOrder,
   reconcileAssignments,
   adjustWeights,
+  surfaceAssignment,
   PRESETS,
 } from "../bsp/layout";
 import { parseDSL } from "../bsp/dsl";
@@ -186,6 +187,257 @@ describe("reconcileAssignments", () => {
     });
     expect(result.assignments["0"]).toBeNull();
     expect(result.assignments["1"]).toBeNull();
+  });
+
+  it("replaces dead sessions using sessionReplacements", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    // Simulate reconnect: old sessions s1/s2 are closed, new sessions s3/s4
+    // are live replacements for the same PTYs.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": "s2" } },
+      liveSessionIds: ["s3", "s4"],
+      knownSessionIds: ["s1", "s2", "s3", "s4"],
+      sessionReplacements: new Map([
+        ["s1", "s3"],
+        ["s2", "s4"],
+      ]),
+    });
+    expect(result.assignments["0"]).toBe("s3");
+    expect(result.assignments["1"]).toBe("s4");
+  });
+
+  it("falls back to null when replacement is not live", () => {
+    const { root } = parseDSL("shell");
+    const panes = enumeratePanes(root);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1" } },
+      liveSessionIds: [],
+      knownSessionIds: ["s1", "s2"],
+      sessionReplacements: new Map([["s1", "s2"]]),
+    });
+    expect(result.assignments["0"]).toBeNull();
+  });
+
+  it("keeps assignment unchanged when session is still live", () => {
+    const { root } = parseDSL("shell");
+    const panes = enumeratePanes(root);
+    // s1 is still live, so no replacement needed even though one exists.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1" } },
+      liveSessionIds: ["s1", "s3"],
+      knownSessionIds: ["s1", "s3"],
+      sessionReplacements: new Map([["s1", "s3"]]),
+    });
+    expect(result.assignments["0"]).toBe("s1");
+  });
+
+  it("keeps surface assignments when surface is live", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    const surf = surfaceAssignment("conn", 42);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": surf } },
+      liveSessionIds: ["s1"],
+      knownSessionIds: ["s1"],
+      liveSurfaceKeys: ["conn:42"],
+    });
+    expect(result.assignments["0"]).toBe("s1");
+    expect(result.assignments["1"]).toBe(surf);
+  });
+
+  it("clears surface assignments when surface is not live", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    const surf = surfaceAssignment("conn", 42);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": surf } },
+      liveSessionIds: ["s1"],
+      knownSessionIds: ["s1"],
+      liveSurfaceKeys: [],
+    });
+    expect(result.assignments["0"]).toBe("s1");
+    expect(result.assignments["1"]).toBeNull();
+  });
+
+  it("preserves surface assignments when liveSurfaceKeys is not provided", () => {
+    const { root } = parseDSL("shell");
+    const panes = enumeratePanes(root);
+    const surf = surfaceAssignment("conn", 42);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": surf } },
+      liveSessionIds: [],
+      knownSessionIds: [],
+    });
+    expect(result.assignments["0"]).toBe(surf);
+  });
+
+  it("preserves surface assignments when their connection is absent from readyConnectionIds", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    const surf = surfaceAssignment("remote1", 42);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": surf } },
+      liveSessionIds: ["s1"],
+      knownSessionIds: ["s1"],
+      liveSurfaceKeys: [],
+      // remote1 is not in readyConnectionIds — it was removed.
+      readyConnectionIds: new Set(["local"]),
+    });
+    expect(result.assignments["0"]).toBe("s1");
+    // Surface assignment preserved because remote1 is absent.
+    expect(result.assignments["1"]).toBe(surf);
+  });
+
+  it("preserves surface assignments when their connection is present but not ready (reconnecting)", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    const surf = surfaceAssignment("remote1", 42);
+    // Simulate: remote1 is reconnecting — present in the workspace but
+    // not yet ready.  Its surface list is temporarily empty.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": surf } },
+      liveSessionIds: ["s1"],
+      knownSessionIds: ["s1"],
+      liveSurfaceKeys: [],
+      // remote1 is present but NOT in readyConnectionIds (not ready yet).
+      readyConnectionIds: new Set(["local"]),
+    });
+    expect(result.assignments["0"]).toBe("s1");
+    // Surface preserved — remote1 is reconnecting, not genuinely gone.
+    expect(result.assignments["1"]).toBe(surf);
+  });
+
+  it("clears surface assignments when their connection is ready but surface is gone", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    const surf = surfaceAssignment("remote1", 42);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": surf } },
+      liveSessionIds: ["s1"],
+      knownSessionIds: ["s1"],
+      liveSurfaceKeys: ["remote1:99"],
+      // remote1 IS ready — surface 42 is genuinely gone.
+      readyConnectionIds: new Set(["local", "remote1"]),
+    });
+    expect(result.assignments["0"]).toBe("s1");
+    expect(result.assignments["1"]).toBeNull();
+  });
+
+  it("remaps sessions using sessionReplacements for removed-then-readded connections", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    // Simulate: remote was removed (old sessions s1/s2 are gone), then
+    // re-added with new sessions s3/s4 for the same PTYs.
+    // sessionReplacements was built from a durable key map.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s1", "1": "s2" } },
+      liveSessionIds: ["s3", "s4"],
+      // s1/s2 are NOT in knownSessionIds — they were fully destroyed.
+      knownSessionIds: ["s3", "s4"],
+      sessionReplacements: new Map([
+        ["s1", "s3"],
+        ["s2", "s4"],
+      ]),
+    });
+    expect(result.assignments["0"]).toBe("s3");
+    expect(result.assignments["1"]).toBe("s4");
+  });
+
+  it("preserves terminal assignments when their connection is absent from readyConnectionIds", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    // Simulate: remote1 was removed — its sessions are closed.
+    // The primary connection (local) is ready.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s-local", "1": "s-remote" } },
+      liveSessionIds: ["s-local"],
+      knownSessionIds: ["s-local", "s-remote"],
+      readyConnectionIds: new Set(["local"]),
+      sessionConnectionIds: new Map([
+        ["s-local", "local"],
+        ["s-remote", "remote1"],
+      ]),
+    });
+    expect(result.assignments["0"]).toBe("s-local");
+    // Terminal assignment preserved because remote1 is absent.
+    expect(result.assignments["1"]).toBe("s-remote");
+  });
+
+  it("preserves terminal assignments when their connection is present but not ready (reconnecting)", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    // Simulate: remote1 is reconnecting — present in the workspace but
+    // not yet ready.  Its sessions are momentarily closed.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s-local", "1": "s-remote" } },
+      liveSessionIds: ["s-local"],
+      knownSessionIds: ["s-local", "s-remote"],
+      // remote1 is present but NOT in readyConnectionIds (not ready yet).
+      readyConnectionIds: new Set(["local"]),
+      sessionConnectionIds: new Map([
+        ["s-local", "local"],
+        ["s-remote", "remote1"],
+      ]),
+    });
+    expect(result.assignments["0"]).toBe("s-local");
+    // Terminal preserved — remote1 is reconnecting, not genuinely gone.
+    expect(result.assignments["1"]).toBe("s-remote");
+  });
+
+  it("clears terminal assignments when their connection is ready and session is dead", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    // Simulate: remote1 is ready and the session is confirmed dead.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s-local", "1": "s-remote" } },
+      liveSessionIds: ["s-local"],
+      knownSessionIds: ["s-local", "s-remote"],
+      // remote1 IS ready — the terminal is genuinely gone.
+      readyConnectionIds: new Set(["local", "remote1"]),
+      sessionConnectionIds: new Map([
+        ["s-local", "local"],
+        ["s-remote", "remote1"],
+      ]),
+    });
+    expect(result.assignments["0"]).toBe("s-local");
+    expect(result.assignments["1"]).toBeNull();
+  });
+
+  it("prefers session replacement over connection-not-ready preservation", () => {
+    const { root } = parseDSL("line(a, b)");
+    const panes = enumeratePanes(root);
+    // If a replacement is available (same PTY, new session ID), use it
+    // even if the connection isn't ready.
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": "s-local", "1": "s-old" } },
+      liveSessionIds: ["s-local", "s-new"],
+      knownSessionIds: ["s-local", "s-old", "s-new"],
+      readyConnectionIds: new Set(["local"]),
+      sessionReplacements: new Map([["s-old", "s-new"]]),
+      sessionConnectionIds: new Map([
+        ["s-local", "local"],
+        ["s-old", "remote1"],
+        ["s-new", "remote1"],
+      ]),
+    });
+    expect(result.assignments["0"]).toBe("s-local");
+    // Replacement takes priority.
+    expect(result.assignments["1"]).toBe("s-new");
   });
 });
 

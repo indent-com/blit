@@ -129,6 +129,20 @@ export function keyToBytes(
   }
 
   if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // Some browsers (notably Brave) report the unshifted digit as e.key even
+    // when Shift is held (e.g. Shift+2 → e.key="2" instead of "@").  When we
+    // detect Shift + a digit key whose e.key is still a digit, bail out and
+    // let the browser's input event on the hidden textarea produce the correct
+    // character for the user's keyboard layout.
+    if (
+      e.shiftKey &&
+      e.key >= "0" &&
+      e.key <= "9" &&
+      e.code &&
+      e.code.startsWith("Digit")
+    ) {
+      return null;
+    }
     return encoder.encode(e.key);
   }
 

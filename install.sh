@@ -60,6 +60,12 @@ main() {
   $elevate mv "$tmp/blit" "$INSTALL_DIR/blit"
   $elevate chmod +x "$INSTALL_DIR/blit"
   echo "installed blit ${version} to $INSTALL_DIR/blit"
+
+  # Generate man pages and shell completions alongside the binary
+  share_dir="$(dirname "$INSTALL_DIR")/share"
+  if $elevate "$INSTALL_DIR/blit" generate "$share_dir" 2>/dev/null; then
+    echo "generated man pages and completions in $share_dir"
+  fi
 }
 
 pick_elevate() {

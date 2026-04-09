@@ -89,7 +89,6 @@ struct ResolvedConfig {
     user: Option<String>,
     port: Option<u16>,
     identity_files: Vec<PathBuf>,
-    #[allow(dead_code)]
     proxy_jump: Option<String>,
 }
 
@@ -336,25 +335,38 @@ impl SshPool {
 
         let key = format!("{effective_user}@{effective_host}:{effective_port}");
 
+        // Phase 1: check if we need a new SSH connection.
+        // Drop the lock before doing any network I/O so that connections to
+        // *other* hosts can proceed concurrently.
         let mut conns = self.inner.connections.lock().await;
-
-        // Try reusing an existing connection.
         let need_new = match conns.get(&key) {
             Some(cached) => cached.handle.is_closed(),
             None => true,
         };
 
         if need_new {
+            // Release the lock while establishing the TCP + SSH connection —
+            // this can take seconds (DNS, handshake, auth).
+            drop(conns);
             let handle =
                 establish_connection(effective_host, effective_port, &effective_user, &config)
                     .await?;
-            conns.insert(
-                key.clone(),
-                CachedConnection {
-                    handle,
-                    remote_socket: None,
-                },
-            );
+            conns = self.inner.connections.lock().await;
+            // Another task may have raced us for the same key — prefer the
+            // existing live connection to avoid duplicates.
+            let still_need = match conns.get(&key) {
+                Some(cached) => cached.handle.is_closed(),
+                None => true,
+            };
+            if still_need {
+                conns.insert(
+                    key.clone(),
+                    CachedConnection {
+                        handle,
+                        remote_socket: None,
+                    },
+                );
+            }
         }
 
         let cached = conns.get_mut(&key).unwrap();
@@ -435,6 +447,11 @@ async fn establish_connection(
     config: &ResolvedConfig,
 ) -> Result<client::Handle<SshHandler>, Error> {
     let ssh_config = client::Config {
+        // Detect dead connections behind NATs/firewalls instead of hanging
+        // indefinitely.  The SSH transport will send a keepalive packet
+        // every 15 s and give up after 3 consecutive misses (~45 s).
+        keepalive_interval: Some(std::time::Duration::from_secs(15)),
+        keepalive_max: 3,
         ..Default::default()
     };
 

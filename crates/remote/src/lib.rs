@@ -37,6 +37,10 @@ pub const C2S_SCROLL: u8 = 0x02;
 pub const C2S_ACK: u8 = 0x03;
 pub const C2S_DISPLAY_RATE: u8 = 0x04;
 pub const C2S_CLIENT_METRICS: u8 = 0x05;
+/// Application-level keepalive: [0x08].  No payload.
+/// Sent periodically by the client; the server treats it as a no-op
+/// (but its arrival resets any server-side receive timeout).
+pub const C2S_PING: u8 = 0x08;
 /// Mouse event: [0x06][pty_id:2][type:1][button:1][col:2][row:2]
 /// type: 0=down, 1=up, 2=move
 /// button: 0=left, 1=mid, 2=right, 3=release, 64=wheel_up, 65=wheel_down
@@ -78,44 +82,66 @@ pub const C2S_COPY_RANGE: u8 = 0x1B;
 /// signal is a raw libc signal number (e.g. SIGTERM=15, SIGKILL=9).
 pub const C2S_KILL: u8 = 0x1A;
 
-/// Keyboard input for a Wayland surface: [0x20][session_id:2][surface_id:2][data:N]
+/// Keyboard input for a Wayland surface: [0x20][surface_id:2][data:N]
 /// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
 pub const C2S_SURFACE_INPUT: u8 = 0x20;
-/// Pointer motion/button for a Wayland surface: [0x21][session_id:2][surface_id:2][type:1][button:1][x:2][y:2]
+/// Pointer motion/button for a Wayland surface: [0x21][surface_id:2][type:1][button:1][x:2][y:2]
 /// type: 0=down, 1=up, 2=move
 /// x,y: pixel coordinates relative to the surface origin
 pub const C2S_SURFACE_POINTER: u8 = 0x21;
-/// Pointer axis/scroll for a Wayland surface: [0x22][session_id:2][surface_id:2][axis:1][value_x100:4_signed]
+/// Pointer axis/scroll for a Wayland surface: [0x22][surface_id:2][axis:1][value_x100:4_signed]
 /// axis: 0=vertical, 1=horizontal
 /// value_x100: scroll amount * 100 (signed, positive = down/right)
 pub const C2S_SURFACE_POINTER_AXIS: u8 = 0x22;
-/// Resize a Wayland surface: [0x23][session_id:2][surface_id:2][width:2][height:2]
+/// Resize a Wayland surface: [0x23][surface_id:2][width:2][height:2][scale_120:2]
+/// scale_120: device pixel ratio in 1/120th units (120 = 1×, 240 = 2×).
 pub const C2S_SURFACE_RESIZE: u8 = 0x23;
-/// Set keyboard/pointer focus to a Wayland surface: [0x24][session_id:2][surface_id:2]
+/// Set keyboard/pointer focus to a Wayland surface: [0x24][surface_id:2]
 pub const C2S_SURFACE_FOCUS: u8 = 0x24;
-/// Send clipboard content to a Wayland surface:
-/// [0x25][session_id:2][surface_id:2][mime_len:2][mime:N][data_len:4][data:N]
-pub const C2S_CLIPBOARD: u8 = 0x25;
-/// Request a list of all compositor surfaces: [0x26][session_id:2]
+/// Set clipboard content:
+/// [0x25][mime_len:2][mime:N][data_len:4][data:N]
+pub const C2S_CLIPBOARD_SET: u8 = 0x25;
+/// Request a list of all compositor surfaces: [0x26]
 pub const C2S_SURFACE_LIST: u8 = 0x26;
 /// Request a screenshot of a surface:
-/// [0x27][session_id:2][surface_id:2]              — legacy (defaults to PNG lossless)
-/// [0x27][session_id:2][surface_id:2][format:1][quality:1] — extended
+/// [0x27][surface_id:2]              — legacy (defaults to PNG lossless)
+/// [0x27][surface_id:2][format:1][quality:1] — extended
 /// format: 0 = PNG, 1 = AVIF.  quality: 0 = lossless, 1–100 = lossy (AVIF only).
 pub const C2S_SURFACE_CAPTURE: u8 = 0x27;
 pub const CAPTURE_FORMAT_PNG: u8 = 0;
 pub const CAPTURE_FORMAT_AVIF: u8 = 1;
-/// Subscribe to surface frame updates: [0x28][session_id:2][surface_id:2]
+/// Subscribe to surface frame updates:
+/// [0x28][surface_id:2]                     — legacy (server defaults)
+/// [0x28][surface_id:2][codec:1][quality:1]  — extended
+///
+/// codec: CODEC_SUPPORT_* bitmask restricting which codecs the server may use
+///        for this surface.  0 = use connection-level default (from C2S_CLIENT_FEATURES).
+///
+/// quality: desired compression quality for this surface.
+///   0 = server default, 1 = low, 2 = medium, 3 = high, 4 = lossless.
+///   See `SURFACE_QUALITY_*` constants.
+///
+/// Re-subscribing to an already-subscribed surface updates the codec/quality
+/// preferences and forces encoder recreation.
 pub const C2S_SURFACE_SUBSCRIBE: u8 = 0x28;
-/// Unsubscribe from surface frame updates: [0x29][session_id:2][surface_id:2]
+
+/// Quality values for the `quality` byte in C2S_SURFACE_SUBSCRIBE.
+/// 0 means "use server default" (from BLIT_SURFACE_QUALITY env var).
+pub const SURFACE_QUALITY_DEFAULT: u8 = 0;
+pub const SURFACE_QUALITY_LOW: u8 = 1;
+pub const SURFACE_QUALITY_MEDIUM: u8 = 2;
+pub const SURFACE_QUALITY_HIGH: u8 = 3;
+pub const SURFACE_QUALITY_LOSSLESS: u8 = 4;
+/// Unsubscribe from surface frame updates: [0x29][surface_id:2]
 pub const C2S_SURFACE_UNSUBSCRIBE: u8 = 0x29;
-/// Acknowledge receipt of a surface video frame: [0x2A][surface_id:2]
+/// Acknowledge receipt of a surface video frame: [0x2A]
 pub const C2S_SURFACE_ACK: u8 = 0x2A;
-/// Request a keyframe for a surface: [0x2C][surface_id:2]
-pub const C2S_SURFACE_REQUEST_KEYFRAME: u8 = 0x2C;
 /// Request close of a Wayland surface (sends xdg_toplevel close event):
-/// [0x2B][session_id:2][surface_id:2]
+/// [0x2B][surface_id:2]
 pub const C2S_SURFACE_CLOSE: u8 = 0x2B;
+/// Request a list of MIME types available on the clipboard: [0x2C]
+/// Server responds with S2C_CLIPBOARD_LIST.
+pub const C2S_CLIPBOARD_LIST: u8 = 0x2C;
 /// Client feature/capability advertisement: [0x2D][payload:N]
 /// Currently defined payload bytes:
 ///   [0] codec_support — bitmask of CODEC_SUPPORT_* flags the client can
@@ -124,6 +150,19 @@ pub const C2S_SURFACE_CLOSE: u8 = 0x2B;
 /// message is extensible: the server ignores trailing bytes it doesn't
 /// understand, and missing bytes default to 0.
 pub const C2S_CLIENT_FEATURES: u8 = 0x2D;
+/// Composed text input for a Wayland surface (UTF-8):
+/// [0x2F][surface_id:2][text:N]
+/// The server synthesises the corresponding evdev key sequences (US-QWERTY)
+/// for ASCII characters.  Non-ASCII characters are delivered via
+/// zwp_text_input_v3 commit_string when available.
+pub const C2S_SURFACE_TEXT: u8 = 0x2F;
+/// Read clipboard content for a specific MIME type:
+/// [0x2E][mime_len:2][mime:N]
+/// Server responds with S2C_CLIPBOARD_CONTENT (0x25) containing the data.
+pub const C2S_CLIPBOARD_GET: u8 = 0x2E;
+/// Request server shutdown: [0x0F].  No payload.
+/// The server broadcasts S2C_QUIT to all connected clients and exits.
+pub const C2S_QUIT: u8 = 0x0F;
 
 pub const S2C_UPDATE: u8 = 0x00;
 pub const S2C_CREATED: u8 = 0x01;
@@ -143,6 +182,13 @@ pub const EXIT_STATUS_UNKNOWN: i32 = i32::MIN;
 /// Sent after the initial burst (HELLO, LIST, TITLE*, EXITED*) is complete.
 /// Clients can use this to know when the initial state has been fully transmitted.
 pub const S2C_READY: u8 = 0x09;
+/// Application-level keepalive: [0x0B].  No payload.
+/// Sent periodically by the server so clients can detect dead connections
+/// even when no other traffic is flowing (e.g. idle terminal, WebRTC).
+pub const S2C_PING: u8 = 0x0B;
+/// Server is shutting down: [0x0C].  No payload.
+/// Broadcast to all connected clients before the server exits.
+pub const S2C_QUIT: u8 = 0x0C;
 /// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
 /// nonce: echoed from C2S_READ request
 /// total_lines: total available lines (scrollback + viewport rows)
@@ -151,25 +197,25 @@ pub const S2C_READY: u8 = 0x09;
 pub const S2C_TEXT: u8 = 0x0A;
 
 /// A new Wayland toplevel surface was created:
-/// [0x20][session_id:2][surface_id:2][parent_id:2][width:2][height:2][title_len:2][title:N][app_id_len:2][app_id:N]
+/// [0x20][surface_id:2][parent_id:2][width:2][height:2][title_len:2][title:N][app_id_len:2][app_id:N]
 /// parent_id: 0 = no parent (top-level), non-zero = dialog/child of that surface
 pub const S2C_SURFACE_CREATED: u8 = 0x20;
-/// A Wayland surface was destroyed: [0x21][session_id:2][surface_id:2]
+/// A Wayland surface was destroyed: [0x21][surface_id:2]
 pub const S2C_SURFACE_DESTROYED: u8 = 0x21;
 /// An encoded video frame for a Wayland surface:
-/// [0x22][session_id:2][surface_id:2][timestamp:4][flags:1][width:2][height:2][data:N]
+/// [0x22][surface_id:2][timestamp:4][flags:1][width:2][height:2][data:N]
 /// flags: bit 0 = keyframe, bits 1-2 = codec (0 = H.264, 1 = AV1).
 /// timestamp: milliseconds since compositor session start.
 pub const S2C_SURFACE_FRAME: u8 = 0x22;
-/// A Wayland surface's title changed: [0x23][session_id:2][surface_id:2][title:N]
+/// A Wayland surface's title changed: [0x23][surface_id:2][title:N]
 pub const S2C_SURFACE_TITLE: u8 = 0x23;
-/// A Wayland surface was resized by the app: [0x24][session_id:2][surface_id:2][width:2][height:2]
+/// A Wayland surface was resized by the app: [0x24][surface_id:2][width:2][height:2]
 pub const S2C_SURFACE_RESIZED: u8 = 0x24;
-/// A Wayland surface's app_id changed: [0x28][session_id:2][surface_id:2][app_id:N]
+/// A Wayland surface's app_id changed: [0x28][surface_id:2][app_id:N]
 pub const S2C_SURFACE_APP_ID: u8 = 0x28;
-/// Clipboard content from a Wayland surface:
-/// [0x25][session_id:2][surface_id:2][mime_len:2][mime:N][data_len:4][data:N]
-pub const S2C_CLIPBOARD: u8 = 0x25;
+/// Clipboard content (response to C2S_CLIPBOARD_GET or unsolicited broadcast on change):
+/// [0x25][mime_len:2][mime:N][data_len:4][data:N]
+pub const S2C_CLIPBOARD_CONTENT: u8 = 0x25;
 /// List of all compositor surfaces:
 /// [0x26][count:2] repeated{ [surface_id:2][parent_id:2][width:2][height:2][title_len:2][title:N][app_id_len:2][app_id:N] }
 pub const S2C_SURFACE_LIST: u8 = 0x26;
@@ -178,24 +224,54 @@ pub const S2C_SURFACE_LIST: u8 = 0x26;
 /// If the surface was not found or has no buffer, width=0 and height=0 with empty data.
 pub const S2C_SURFACE_CAPTURE: u8 = 0x27;
 
+/// Cursor shape changed for a surface: [0x29][surface_id:2][shape_len:1][shape:N]
+/// shape is a CSS cursor keyword (e.g. "default", "pointer", "text").
+pub const S2C_SURFACE_CURSOR: u8 = 0x29;
+
+/// Encoder backend for a surface: [0x2A][surface_id:2][name:N]
+/// name is a short ASCII string like "h264-nvenc", "h264-vaapi", "h264-software", etc.
+/// Sent when a new encoder is created for a surface (initial subscribe or resize).
+pub const S2C_SURFACE_ENCODER: u8 = 0x2A;
+
+/// List of MIME types available on the clipboard:
+/// [0x2C][count:2] repeated{ [mime_len:2][mime:N] }
+pub const S2C_CLIPBOARD_LIST: u8 = 0x2C;
+
+// -- Audio forwarding ---------------------------------------------------
+
+/// Subscribe to audio: [0x30][bitrate_kbps:2]
+/// Audio is per-compositor (one mixed stream), not per-surface.
+/// The server begins sending S2C_AUDIO_FRAME.
+/// bitrate_kbps: 0 = server default.
+pub const C2S_AUDIO_SUBSCRIBE: u8 = 0x30;
+/// Unsubscribe from audio: [0x31]
+pub const C2S_AUDIO_UNSUBSCRIBE: u8 = 0x31;
+/// An encoded audio frame (Opus) from the compositor's mixed output:
+/// [0x30][timestamp:4][flags:1][data:N]
+/// timestamp: sample offset in 48 kHz ticks from an arbitrary epoch.
+/// flags: bits 1-2 = codec (0 = Opus). Other bits reserved.
+pub const S2C_AUDIO_FRAME: u8 = 0x30;
+
+pub const AUDIO_FRAME_CODEC_MASK: u8 = 0b110;
+pub const AUDIO_FRAME_CODEC_OPUS: u8 = 0 << 1;
+
 pub const SURFACE_FRAME_FLAG_KEYFRAME: u8 = 1 << 0;
 pub const SURFACE_FRAME_CODEC_MASK: u8 = 0b110;
 pub const SURFACE_FRAME_CODEC_H264: u8 = 0 << 1;
 pub const SURFACE_FRAME_CODEC_AV1: u8 = 1 << 1;
 pub const SURFACE_FRAME_CODEC_PNG: u8 = 2 << 1;
-pub const SURFACE_FRAME_CODEC_H265: u8 = 3 << 1;
 
-/// Bitmask for client-supported codecs in C2S_SURFACE_RESIZE.
-/// 0 means "accept anything" for backward compatibility.
+/// Bitmask for client-supported codecs in C2S_CLIENT_FEATURES and
+/// C2S_SURFACE_SUBSCRIBE.  0 means "accept anything".
 pub const CODEC_SUPPORT_H264: u8 = 1 << 0;
 pub const CODEC_SUPPORT_AV1: u8 = 1 << 1;
-pub const CODEC_SUPPORT_H265: u8 = 1 << 2;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;
 pub const FEATURE_RESIZE_BATCH: u32 = 1 << 2;
 pub const FEATURE_COPY_RANGE: u32 = 1 << 3;
 pub const FEATURE_COMPOSITOR: u32 = 1 << 4;
+pub const FEATURE_AUDIO: u32 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -1327,7 +1403,6 @@ pub enum ServerMsg<'a> {
         text: &'a str,
     },
     SurfaceCreated {
-        session_id: u16,
         surface_id: u16,
         parent_id: u16,
         width: u16,
@@ -1336,11 +1411,9 @@ pub enum ServerMsg<'a> {
         app_id: &'a str,
     },
     SurfaceDestroyed {
-        session_id: u16,
         surface_id: u16,
     },
     SurfaceFrame {
-        session_id: u16,
         surface_id: u16,
         timestamp: u32,
         flags: u8,
@@ -1349,24 +1422,19 @@ pub enum ServerMsg<'a> {
         data: &'a [u8],
     },
     SurfaceTitle {
-        session_id: u16,
         surface_id: u16,
         title: &'a str,
     },
     SurfaceAppId {
-        session_id: u16,
         surface_id: u16,
         app_id: &'a str,
     },
     SurfaceResized {
-        session_id: u16,
         surface_id: u16,
         width: u16,
         height: u16,
     },
-    Clipboard {
-        session_id: u16,
-        surface_id: u16,
+    ClipboardContent {
         mime_type: &'a str,
         data: &'a [u8],
     },
@@ -1379,6 +1447,10 @@ pub enum ServerMsg<'a> {
         height: u32,
         image_data: &'a [u8],
     },
+    ClipboardList {
+        mime_types: Vec<String>,
+    },
+    Quit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1590,16 +1662,15 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             })
         }
         S2C_SURFACE_CREATED => {
-            if data.len() < 15 {
+            if data.len() < 13 {
                 return None;
             }
-            let session_id = u16::from_le_bytes([data[1], data[2]]);
-            let surface_id = u16::from_le_bytes([data[3], data[4]]);
-            let parent_id = u16::from_le_bytes([data[5], data[6]]);
-            let width = u16::from_le_bytes([data[7], data[8]]);
-            let height = u16::from_le_bytes([data[9], data[10]]);
-            let title_len = u16::from_le_bytes([data[11], data[12]]) as usize;
-            let mut off = 13;
+            let surface_id = u16::from_le_bytes([data[1], data[2]]);
+            let parent_id = u16::from_le_bytes([data[3], data[4]]);
+            let width = u16::from_le_bytes([data[5], data[6]]);
+            let height = u16::from_le_bytes([data[7], data[8]]);
+            let title_len = u16::from_le_bytes([data[9], data[10]]) as usize;
+            let mut off = 11;
             if off + title_len + 2 > data.len() {
                 return None;
             }
@@ -1612,7 +1683,6 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             }
             let app_id = std::str::from_utf8(&data[off..off + app_id_len]).unwrap_or_default();
             Some(ServerMsg::SurfaceCreated {
-                session_id,
                 surface_id,
                 parent_id,
                 width,
@@ -1622,69 +1692,62 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             })
         }
         S2C_SURFACE_DESTROYED => {
-            if data.len() < 5 {
+            if data.len() < 3 {
                 return None;
             }
             Some(ServerMsg::SurfaceDestroyed {
-                session_id: u16::from_le_bytes([data[1], data[2]]),
-                surface_id: u16::from_le_bytes([data[3], data[4]]),
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
             })
         }
         S2C_SURFACE_FRAME => {
-            if data.len() < 14 {
+            if data.len() < 12 {
                 return None;
             }
             Some(ServerMsg::SurfaceFrame {
-                session_id: u16::from_le_bytes([data[1], data[2]]),
-                surface_id: u16::from_le_bytes([data[3], data[4]]),
-                timestamp: u32::from_le_bytes([data[5], data[6], data[7], data[8]]),
-                flags: data[9],
-                width: u16::from_le_bytes([data[10], data[11]]),
-                height: u16::from_le_bytes([data[12], data[13]]),
-                data: data.get(14..).unwrap_or_default(),
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
+                timestamp: u32::from_le_bytes([data[3], data[4], data[5], data[6]]),
+                flags: data[7],
+                width: u16::from_le_bytes([data[8], data[9]]),
+                height: u16::from_le_bytes([data[10], data[11]]),
+                data: data.get(12..).unwrap_or_default(),
             })
         }
         S2C_SURFACE_TITLE => {
-            if data.len() < 5 {
+            if data.len() < 3 {
                 return None;
             }
-            let title = std::str::from_utf8(data.get(5..).unwrap_or_default()).unwrap_or_default();
+            let title = std::str::from_utf8(data.get(3..).unwrap_or_default()).unwrap_or_default();
             Some(ServerMsg::SurfaceTitle {
-                session_id: u16::from_le_bytes([data[1], data[2]]),
-                surface_id: u16::from_le_bytes([data[3], data[4]]),
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
                 title,
             })
         }
         S2C_SURFACE_APP_ID => {
-            if data.len() < 5 {
+            if data.len() < 3 {
                 return None;
             }
-            let app_id = std::str::from_utf8(data.get(5..).unwrap_or_default()).unwrap_or_default();
+            let app_id = std::str::from_utf8(data.get(3..).unwrap_or_default()).unwrap_or_default();
             Some(ServerMsg::SurfaceAppId {
-                session_id: u16::from_le_bytes([data[1], data[2]]),
-                surface_id: u16::from_le_bytes([data[3], data[4]]),
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
                 app_id,
             })
         }
         S2C_SURFACE_RESIZED => {
-            if data.len() < 9 {
+            if data.len() < 7 {
                 return None;
             }
             Some(ServerMsg::SurfaceResized {
-                session_id: u16::from_le_bytes([data[1], data[2]]),
-                surface_id: u16::from_le_bytes([data[3], data[4]]),
-                width: u16::from_le_bytes([data[5], data[6]]),
-                height: u16::from_le_bytes([data[7], data[8]]),
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
+                width: u16::from_le_bytes([data[3], data[4]]),
+                height: u16::from_le_bytes([data[5], data[6]]),
             })
         }
-        S2C_CLIPBOARD => {
-            if data.len() < 11 {
+        S2C_CLIPBOARD_CONTENT => {
+            if data.len() < 7 {
                 return None;
             }
-            let session_id = u16::from_le_bytes([data[1], data[2]]);
-            let surface_id = u16::from_le_bytes([data[3], data[4]]);
-            let mime_len = u16::from_le_bytes([data[5], data[6]]) as usize;
-            let mut off = 7;
+            let mime_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+            let mut off = 3;
             if off + mime_len + 4 > data.len() {
                 return None;
             }
@@ -1697,9 +1760,7 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             if off + data_len > data.len() {
                 return None;
             }
-            Some(ServerMsg::Clipboard {
-                session_id,
-                surface_id,
+            Some(ServerMsg::ClipboardContent {
                 mime_type,
                 data: &data[off..off + data_len],
             })
@@ -1768,6 +1829,30 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 image_data,
             })
         }
+        S2C_CLIPBOARD_LIST => {
+            if data.len() < 3 {
+                return None;
+            }
+            let count = u16::from_le_bytes([data[1], data[2]]) as usize;
+            let mut mime_types = Vec::with_capacity(count);
+            let mut offset = 3;
+            for _ in 0..count {
+                if offset + 2 > data.len() {
+                    break;
+                }
+                let mime_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2;
+                if offset + mime_len > data.len() {
+                    break;
+                }
+                let mime =
+                    std::str::from_utf8(&data[offset..offset + mime_len]).unwrap_or_default();
+                mime_types.push(mime.to_string());
+                offset += mime_len;
+            }
+            Some(ServerMsg::ClipboardList { mime_types })
+        }
+        S2C_QUIT => Some(ServerMsg::Quit),
         _ => None,
     }
 }
@@ -2013,8 +2098,17 @@ pub fn msg_exited(pty_id: u16, exit_status: i32) -> Vec<u8> {
     msg
 }
 
+/// Build a C2S_QUIT message (client requests server shutdown).
+pub fn msg_quit() -> Vec<u8> {
+    vec![C2S_QUIT]
+}
+
+/// Build an S2C_QUIT message (server notifies clients of shutdown).
+pub fn msg_s2c_quit() -> Vec<u8> {
+    vec![S2C_QUIT]
+}
+
 pub fn msg_surface_created(
-    session_id: u16,
     surface_id: u16,
     parent_id: u16,
     width: u16,
@@ -2024,9 +2118,8 @@ pub fn msg_surface_created(
 ) -> Vec<u8> {
     let title_bytes = title.as_bytes();
     let app_id_bytes = app_id.as_bytes();
-    let mut msg = Vec::with_capacity(15 + title_bytes.len() + app_id_bytes.len());
+    let mut msg = Vec::with_capacity(13 + title_bytes.len() + app_id_bytes.len());
     msg.push(S2C_SURFACE_CREATED);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&parent_id.to_le_bytes());
     msg.extend_from_slice(&width.to_le_bytes());
@@ -2038,16 +2131,14 @@ pub fn msg_surface_created(
     msg
 }
 
-pub fn msg_surface_destroyed(session_id: u16, surface_id: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(5);
+pub fn msg_surface_destroyed(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
     msg.push(S2C_SURFACE_DESTROYED);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg
 }
 
 pub fn msg_surface_frame(
-    session_id: u16,
     surface_id: u16,
     timestamp: u32,
     flags: u8,
@@ -2055,9 +2146,8 @@ pub fn msg_surface_frame(
     height: u16,
     data: &[u8],
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(14 + data.len());
+    let mut msg = Vec::with_capacity(12 + data.len());
     msg.push(S2C_SURFACE_FRAME);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&timestamp.to_le_bytes());
     msg.push(flags);
@@ -2067,47 +2157,46 @@ pub fn msg_surface_frame(
     msg
 }
 
-pub fn msg_surface_title(session_id: u16, surface_id: u16, title: &str) -> Vec<u8> {
+pub fn msg_surface_title(surface_id: u16, title: &str) -> Vec<u8> {
     let title_bytes = title.as_bytes();
-    let mut msg = Vec::with_capacity(5 + title_bytes.len());
+    let mut msg = Vec::with_capacity(3 + title_bytes.len());
     msg.push(S2C_SURFACE_TITLE);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(title_bytes);
     msg
 }
 
-pub fn msg_surface_app_id(session_id: u16, surface_id: u16, app_id: &str) -> Vec<u8> {
+pub fn msg_surface_app_id(surface_id: u16, app_id: &str) -> Vec<u8> {
     let app_id_bytes = app_id.as_bytes();
-    let mut msg = Vec::with_capacity(5 + app_id_bytes.len());
+    let mut msg = Vec::with_capacity(3 + app_id_bytes.len());
     msg.push(S2C_SURFACE_APP_ID);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(app_id_bytes);
     msg
 }
 
-pub fn msg_surface_resized(session_id: u16, surface_id: u16, width: u16, height: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(9);
+pub fn msg_surface_encoder(surface_id: u16, encoder_name: &str) -> Vec<u8> {
+    let name_bytes = encoder_name.as_bytes();
+    let mut msg = Vec::with_capacity(3 + name_bytes.len());
+    msg.push(S2C_SURFACE_ENCODER);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(name_bytes);
+    msg
+}
+
+pub fn msg_surface_resized(surface_id: u16, width: u16, height: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(7);
     msg.push(S2C_SURFACE_RESIZED);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&width.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
     msg
 }
 
-pub fn msg_s2c_clipboard(
-    session_id: u16,
-    surface_id: u16,
-    mime_type: &str,
-    data: &[u8],
-) -> Vec<u8> {
+pub fn msg_s2c_clipboard_content(mime_type: &str, data: &[u8]) -> Vec<u8> {
     let mime_bytes = mime_type.as_bytes();
-    let mut msg = Vec::with_capacity(11 + mime_bytes.len() + data.len());
-    msg.push(S2C_CLIPBOARD);
-    msg.extend_from_slice(&session_id.to_le_bytes());
-    msg.extend_from_slice(&surface_id.to_le_bytes());
+    let mut msg = Vec::with_capacity(7 + mime_bytes.len() + data.len());
+    msg.push(S2C_CLIPBOARD_CONTENT);
     msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
     msg.extend_from_slice(mime_bytes);
     msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -2115,26 +2204,17 @@ pub fn msg_s2c_clipboard(
     msg
 }
 
-pub fn msg_surface_input(session_id: u16, surface_id: u16, data: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(5 + data.len());
+pub fn msg_surface_input(surface_id: u16, data: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3 + data.len());
     msg.push(C2S_SURFACE_INPUT);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(data);
     msg
 }
 
-pub fn msg_surface_pointer(
-    session_id: u16,
-    surface_id: u16,
-    event_type: u8,
-    button: u8,
-    x: u16,
-    y: u16,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(10);
+pub fn msg_surface_pointer(surface_id: u16, event_type: u8, button: u8, x: u16, y: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8);
     msg.push(C2S_SURFACE_POINTER);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(event_type);
     msg.push(button);
@@ -2143,15 +2223,9 @@ pub fn msg_surface_pointer(
     msg
 }
 
-pub fn msg_surface_pointer_axis(
-    session_id: u16,
-    surface_id: u16,
-    axis: u8,
-    value_x100: i32,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(10);
+pub fn msg_surface_pointer_axis(surface_id: u16, axis: u8, value_x100: i32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8);
     msg.push(C2S_SURFACE_POINTER_AXIS);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(axis);
     msg.extend_from_slice(&value_x100.to_le_bytes());
@@ -2161,63 +2235,90 @@ pub fn msg_surface_pointer_axis(
 /// `scale_120` is the device-pixel-ratio in 1/120th units, matching
 /// Wayland's `fractional_scale_v1` convention: 120 = 1×, 180 = 1.5×,
 /// 240 = 2×.  A value of 0 means "unspecified" (server defaults to 1×).
-///
-/// `codec_support` is a bitmask of codecs the client can decode
-/// (`CODEC_SUPPORT_*`).  0 means "accept anything".
-pub fn msg_surface_resize(
-    session_id: u16,
-    surface_id: u16,
-    width: u16,
-    height: u16,
-    scale_120: u16,
-    codec_support: u8,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(12);
+pub fn msg_surface_resize(surface_id: u16, width: u16, height: u16, scale_120: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9);
     msg.push(C2S_SURFACE_RESIZE);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&width.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
     msg.extend_from_slice(&scale_120.to_le_bytes());
-    msg.push(codec_support);
     msg
 }
 
-pub fn msg_surface_focus(session_id: u16, surface_id: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(5);
+pub fn msg_surface_focus(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
     msg.push(C2S_SURFACE_FOCUS);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg
 }
 
-pub fn msg_surface_subscribe(session_id: u16, surface_id: u16) -> Vec<u8> {
+pub fn msg_surface_subscribe(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_SURFACE_SUBSCRIBE);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg
+}
+
+/// Extended surface subscribe with per-surface codec and quality overrides.
+///
+/// `codec_support`: CODEC_SUPPORT_* bitmask (0 = use connection default).
+/// `quality`: SURFACE_QUALITY_* constant (0 = use server default).
+pub fn msg_surface_subscribe_ext(surface_id: u16, codec_support: u8, quality: u8) -> Vec<u8> {
     let mut msg = Vec::with_capacity(5);
     msg.push(C2S_SURFACE_SUBSCRIBE);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(codec_support);
+    msg.push(quality);
     msg
 }
 
-pub fn msg_surface_unsubscribe(session_id: u16, surface_id: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(5);
+pub fn msg_surface_unsubscribe(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
     msg.push(C2S_SURFACE_UNSUBSCRIBE);
-    msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg
 }
 
-pub fn msg_c2s_clipboard(
-    session_id: u16,
-    surface_id: u16,
-    mime_type: &str,
-    data: &[u8],
-) -> Vec<u8> {
-    let mime_bytes = mime_type.as_bytes();
-    let mut msg = Vec::with_capacity(11 + mime_bytes.len() + data.len());
-    msg.push(C2S_CLIPBOARD);
-    msg.extend_from_slice(&session_id.to_le_bytes());
+pub fn msg_surface_close(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_SURFACE_CLOSE);
     msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg
+}
+
+/// Build a C2S_CLIPBOARD_LIST message (request available MIME types).
+pub fn msg_c2s_clipboard_list() -> Vec<u8> {
+    vec![C2S_CLIPBOARD_LIST]
+}
+
+/// Build a C2S_CLIPBOARD_GET message (request clipboard content for a specific MIME type).
+pub fn msg_c2s_clipboard_get(mime_type: &str) -> Vec<u8> {
+    let mime_bytes = mime_type.as_bytes();
+    let mut msg = Vec::with_capacity(3 + mime_bytes.len());
+    msg.push(C2S_CLIPBOARD_GET);
+    msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
+    msg.extend_from_slice(mime_bytes);
+    msg
+}
+
+/// Build an S2C_CLIPBOARD_LIST message (response with available MIME types).
+pub fn msg_s2c_clipboard_list(mime_types: &[String]) -> Vec<u8> {
+    let count = mime_types.len().min(u16::MAX as usize);
+    let mut msg = Vec::with_capacity(3 + count * 20);
+    msg.push(S2C_CLIPBOARD_LIST);
+    msg.extend_from_slice(&(count as u16).to_le_bytes());
+    for mime in mime_types.iter().take(count) {
+        let bytes = mime.as_bytes();
+        msg.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        msg.extend_from_slice(bytes);
+    }
+    msg
+}
+
+pub fn msg_c2s_clipboard_set(mime_type: &str, data: &[u8]) -> Vec<u8> {
+    let mime_bytes = mime_type.as_bytes();
+    let mut msg = Vec::with_capacity(7 + mime_bytes.len() + data.len());
+    msg.push(C2S_CLIPBOARD_SET);
     msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
     msg.extend_from_slice(mime_bytes);
     msg.extend_from_slice(&(data.len() as u32).to_le_bytes());

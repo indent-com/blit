@@ -764,7 +764,6 @@ fn cached_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 
 pub struct TurnRelay {
     pub relay_addr: SocketAddr,
-    #[allow(dead_code)]
     pub server_addr: SocketAddr,
     pub send_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     pub recv_rx: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,

@@ -97,8 +97,11 @@ function createProgram(
   return null;
 }
 
+export type RendererBackend = "webgpu" | "webgl2" | "canvas2d";
+
 export interface GlRenderer {
   supported: boolean;
+  backend?: RendererBackend;
   maxDimension: number;
   resize(width: number, height: number): void;
   render(
@@ -252,6 +255,7 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
 
   return {
     supported: true,
+    backend: "canvas2d" as const,
     maxDimension: 32767,
     resize(width: number, height: number) {
       if (canvas.width !== width) canvas.width = width;
@@ -536,6 +540,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
 
   return {
     supported: true,
+    backend: "webgl2" as const,
     maxDimension: maxDim,
     resize(width: number, height: number) {
       const w = Math.min(width, maxDim);

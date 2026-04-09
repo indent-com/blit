@@ -3,8 +3,10 @@ import type {
   BlitWorkspace,
   BlitSession,
   SessionId,
+  ConnectionId,
   BSPAssignments,
 } from "@blit-sh/core";
+import { isSurfaceAssignment, parseSurfaceAssignment } from "./bsp/layout";
 import type { Overlay } from "./Workspace";
 
 export interface KeyboardShortcutHandlers {
@@ -27,8 +29,10 @@ export interface KeyboardShortcutHandlers {
   supportsRestart: () => boolean;
   /** Currently focused surface ID (null when a terminal is focused) */
   focusedSurfaceId: () => number | null;
+  /** Connection ID of the currently focused surface */
+  focusedSurfaceConnId: () => ConnectionId | null;
   /** Close / request-close the focused surface */
-  closeSurface: (surfaceId: number) => void;
+  closeSurface: (connectionId: ConnectionId, surfaceId: number) => void;
   /** Unfocus the surface and return to the terminal view */
   unfocusSurface: () => void;
 
@@ -43,6 +47,10 @@ export interface KeyboardShortcutHandlers {
   connectionCount: () => number;
   /** Focus a session by ID, updating BSP pane focus if a layout is active */
   focusBySession: (sessionId: SessionId) => void;
+  /** Clear the assignment for the focused BSP pane (remove term without closing) */
+  clearFocusedPaneAssignment: () => void;
+  /** Reset the audio pipeline on all connections to recover from stalled audio */
+  resetAudio: () => void;
 }
 
 /**
@@ -74,6 +82,12 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         h.togglePreviewPanel();
         return;
       }
+      // Ctrl+Shift+A: reset audio pipeline (recover from stalled audio).
+      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "A") {
+        e.preventDefault();
+        h.resetAudio();
+        return;
+      }
       if (mod && !e.shiftKey && e.key === "Enter") {
         e.preventDefault();
         if (h.overlay()) {
@@ -102,16 +116,28 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         }
         return;
       }
-      if (
-        e.key === "Enter" &&
-        !mod &&
-        !e.shiftKey &&
-        !h.overlay() &&
-        !h.activeLayout()
-      ) {
-        // Enter on an exited session restarts/closes it.
+      if (e.key === "Enter" && !mod && !e.shiftKey && !h.overlay()) {
+        // Enter on an exited session restarts/closes it (works in BSP layouts too).
         // When a surface is focused, Enter is not special.
         if (h.focusedSurfaceId() != null) return;
+        // In BSP mode, the focused pane may hold a surface assignment rather
+        // than a session.  Don't intercept Enter in that case either.
+        const fpId = h.bspFocusedPaneId();
+        if (fpId) {
+          const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
+          if (isSurfaceAssignment(assign)) return;
+        }
+        // Don't intercept Enter when an input/textarea/canvas is focused (e.g.
+        // the EmptyPane command input handles Enter itself, and the surface
+        // canvas forwards keys to the Wayland compositor).
+        const tag = document.activeElement?.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "CANVAS" ||
+          tag === "BUTTON"
+        )
+          return;
         const fid = h.focusedSessionId();
         const focused = fid ? h.sessions().find((s) => s.id === fid) : null;
         if ((focused && focused.state === "exited") || fid == null) {
@@ -120,13 +146,49 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           return;
         }
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "Q") {
+      // Ctrl+Shift+Q: remove the current term/surface from the focused BSP pane
+      // (unassign without closing).
+      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "Q") {
+        if (h.overlay()) return;
+        // Non-BSP surface focus: unfocus the surface (return to terminal view).
+        if (h.focusedSurfaceId() != null) {
+          e.preventDefault();
+          h.unfocusSurface();
+          return;
+        }
+        if (!h.activeLayout() || !h.bspFocusedPaneId()) return;
+        e.preventDefault();
+        h.clearFocusedPaneAssignment();
+        return;
+      }
+      // Ctrl+Alt+Shift+Q: close the focused terminal or surface entirely.
+      // Check e.code because Alt on Mac transforms the key value.
+      if (
+        e.ctrlKey &&
+        e.altKey &&
+        e.shiftKey &&
+        (e.key === "Q" || e.code === "KeyQ")
+      ) {
         if (h.overlay()) return;
         e.preventDefault();
+        // Non-BSP surface focus.
         const sid = h.focusedSurfaceId();
-        if (sid != null) {
-          h.closeSurface(sid);
+        const sConnId = h.focusedSurfaceConnId();
+        if (sid != null && sConnId != null) {
+          h.closeSurface(sConnId, sid);
           return;
+        }
+        // BSP pane may hold a surface assignment.
+        const fpId = h.bspFocusedPaneId();
+        if (fpId) {
+          const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
+          if (assign && isSurfaceAssignment(assign)) {
+            const parsed = parseSurfaceAssignment(assign);
+            if (parsed != null) {
+              h.closeSurface(parsed.connectionId, parsed.surfaceId);
+              return;
+            }
+          }
         }
         const fid = h.focusedSessionId();
         if (fid) void h.workspace.closeSession(fid);
@@ -213,10 +275,18 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           h.unfocusSurface();
           return;
         }
-        const fs = h.focusedSession();
-        if (fs?.state === "exited") {
-          e.preventDefault();
-          void h.workspace.closeSession(fs.id);
+        // When a BSP layout is active, BSPContainer handles Escape on
+        // exited sessions itself (it needs to clear the pane assignment
+        // before closing).  If we close here on the capture phase the
+        // session state flips to "closed" synchronously, which
+        // invalidates the BSPContainer effect before its bubble-phase
+        // handler can fire.
+        if (!h.activeLayout()) {
+          const fs = h.focusedSession();
+          if (fs?.state === "exited") {
+            e.preventDefault();
+            void h.workspace.closeSession(fs.id);
+          }
         }
       }
     };

@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, onMount } from "solid-js";
+import { createSignal, createEffect, onCleanup, onMount } from "solid-js";
 import type { BlitTransport } from "@blit-sh/core";
 
 export interface RenderSample {
@@ -22,7 +22,7 @@ export interface Metrics {
 
 const INTERVAL = 1000;
 
-export function createMetrics(transports: readonly BlitTransport[]): {
+export function createMetrics(transports: () => readonly BlitTransport[]): {
   metrics: () => Metrics;
   countFrame: (renderMs?: number) => void;
   timeline: RenderSample[];
@@ -59,16 +59,24 @@ export function createMetrics(transports: readonly BlitTransport[]): {
     }
   }
 
-  onMount(() => {
-    const onMessage = (data: ArrayBuffer) => {
-      bytes += data.byteLength;
-      const view = new Uint8Array(data);
-      if (view[0] === 0x00) updates++;
-      net.push({ t: performance.now(), bytes: data.byteLength, dir: "rx" });
-      if (net.length > NET_MAX) net.splice(0, net.length - NET_MAX);
-    };
-    for (const t of transports) t.addEventListener("message", onMessage);
+  const onMessage = (data: ArrayBuffer) => {
+    bytes += data.byteLength;
+    const view = new Uint8Array(data);
+    if (view[0] === 0x00) updates++;
+    net.push({ t: performance.now(), bytes: data.byteLength, dir: "rx" });
+    if (net.length > NET_MAX) net.splice(0, net.length - NET_MAX);
+  };
 
+  // Re-register transport listeners whenever the transport list changes.
+  createEffect(() => {
+    const current = transports();
+    for (const t of current) t.addEventListener("message", onMessage);
+    onCleanup(() => {
+      for (const t of current) t.removeEventListener("message", onMessage);
+    });
+  });
+
+  onMount(() => {
     const timer = setInterval(() => {
       setMetrics({
         bw: bytes,
@@ -84,10 +92,7 @@ export function createMetrics(transports: readonly BlitTransport[]): {
       renderMsMax = 0;
     }, INTERVAL);
 
-    onCleanup(() => {
-      for (const t of transports) t.removeEventListener("message", onMessage);
-      clearInterval(timer);
-    });
+    onCleanup(() => clearInterval(timer));
   });
 
   return { metrics, countFrame, timeline, net };

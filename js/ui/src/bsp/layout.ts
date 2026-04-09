@@ -75,14 +75,32 @@ export function loadFocusedPaneFromHash(): string | null {
   return parseHash().p || null;
 }
 
+/**
+ * Parse BSP pane assignments from the URL hash.
+ *
+ * New format (t:/s: prefixed):
+ *   a=0:t:hound:28,1.0:s:hound:42
+ *     → { "0": "t:hound:28", "1.0": "s:hound:42" }
+ *
+ * Legacy format (no prefix — treated as terminal):
+ *   a=0:hound:28,1:local:3
+ *     → { "0": "t:hound:28", "1": "t:local:3" }
+ */
 export function loadAssignmentsFromHash(): Record<string, string> | null {
   const a = parseHash().a;
   if (!a) return null;
   const result: Record<string, string> = {};
   for (const pair of a.split(",")) {
     const colon = pair.indexOf(":");
-    if (colon > 0) {
-      result[pair.slice(0, colon)] = pair.slice(colon + 1);
+    if (colon <= 0) continue;
+    const paneId = pair.slice(0, colon);
+    const rest = pair.slice(colon + 1);
+    if (rest.startsWith("t:") || rest.startsWith("s:")) {
+      // New format: "t:connectionId:ptyId" or "s:connectionId:surfaceId"
+      result[paneId] = rest;
+    } else {
+      // Legacy format: "connectionId:ptyId" — treat as terminal
+      result[paneId] = `t:${rest}`;
     }
   }
   return Object.keys(result).length > 0 ? result : null;

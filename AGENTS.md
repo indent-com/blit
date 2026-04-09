@@ -1,2 +1,2 @@
-Start from README.md like a normal person.
-Don't kill blit casually, you could be inside.
+README.md and markdown files referenced are helpful.
+Don't kill blit servers casually, you could be inside and disappear.

@@ -24,6 +24,25 @@ trap cleanup EXIT INT TERM
 
 rm -f "$PC_SOCK" "$BLIT_DEV_SOCK"
 
+# Ensure js/ui/dist/index.html{,.br} exist so `cargo build -p blit-cli` can
+# compile blit-gateway (which embeds them via include_bytes!).  On a fresh
+# checkout the dist hasn't been built yet — create minimal stubs.
+# The smoke test only exercises the CLI, not the web UI, so content doesn't
+# matter; it just needs to be a valid file the compiler can read.
+if [ ! -f js/ui/dist/index.html.br ]; then
+    echo "=== Creating stub js/ui/dist/index.html.br ==="
+    mkdir -p js/ui/dist
+    echo '<html><body>stub</body></html>' > js/ui/dist/index.html
+    # Use Python brotli compression if available, otherwise a raw copy
+    # (the gateway will serve bogus content, but the CLI smoke test never
+    # fetches the web UI).
+    python3 -c "
+import brotli, pathlib, sys
+html = pathlib.Path('js/ui/dist/index.html').read_bytes()
+pathlib.Path('js/ui/dist/index.html.br').write_bytes(brotli.compress(html))
+" 2>/dev/null || cp js/ui/dist/index.html js/ui/dist/index.html.br
+fi
+
 echo "=== Installing blit CLI ==="
 curl -sf https://install.blit.sh | sh
 BLIT="blit"
@@ -70,15 +89,15 @@ echo ""
 echo "=== Smoke test: blit CLI ==="
 export BLIT_SOCK="$BLIT_DEV_SOCK"
 
-echo "  blit start echo hello"
-SESSION_ID=$("$BLIT" start echo hello)
-echo "  session: $SESSION_ID"
+echo "  blit terminal start echo hello"
+SESSION_ID=$("$BLIT" terminal start echo hello)
+echo "  terminal: $SESSION_ID"
 
-echo "  blit wait"
-"$BLIT" wait "$SESSION_ID" --timeout 30
+echo "  blit terminal wait"
+"$BLIT" terminal wait "$SESSION_ID" --timeout 30
 
-echo "  blit history"
-OUTPUT=$("$BLIT" history "$SESSION_ID" --from-start 0 --limit 50)
+echo "  blit terminal history"
+OUTPUT=$("$BLIT" terminal history "$SESSION_ID" --from-start 0 --limit 50)
 if echo "$OUTPUT" | grep -q "hello"; then
     echo "  output contains 'hello' ✓"
 else
@@ -87,11 +106,11 @@ else
     exit 1
 fi
 
-echo "  blit list"
-"$BLIT" list
+echo "  blit terminal list"
+"$BLIT" terminal list
 
-echo "  blit close"
-"$BLIT" close "$SESSION_ID"
+echo "  blit terminal close"
+"$BLIT" terminal close "$SESSION_ID"
 
 echo ""
 echo "=== dev-check passed ==="

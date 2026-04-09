@@ -123,6 +123,9 @@ struct Config {
     /// WebSocket/WebTransport.  Without this flag, `share:` entries in
     /// blit.remotes are ignored by the gateway.
     webrtc_enabled: bool,
+    /// Broadcast notification triggered on SIGINT/SIGTERM so active
+    /// WebSocket/WebTransport handlers can send `S2C_QUIT` before exit.
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl Config {
@@ -352,6 +355,9 @@ impl ConnectorSnapshot {
 
 /// Connect to `upstream_uri` via the blit-proxy at `proxy_sock`.
 /// Performs the `target <uri>\n` / `ok\n` handshake.
+///
+/// If the proxy socket is unreachable, attempts to restart the proxy daemon
+/// via `blit_proxy::ensure_proxy` and retries once.
 #[cfg(unix)]
 async fn proxy_connect(
     proxy_sock: &str,
@@ -359,9 +365,26 @@ async fn proxy_connect(
 ) -> Result<(BoxedReader, BoxedWriter), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let mut stream = tokio::net::UnixStream::connect(proxy_sock)
-        .await
-        .map_err(|e| format!("blit-proxy {proxy_sock}: {e}"))?;
+    let mut stream = match tokio::net::UnixStream::connect(proxy_sock).await {
+        Ok(s) => s,
+        Err(first_err) => {
+            // Proxy socket is unreachable — attempt to restart the daemon.
+            let exe = std::env::current_exe().unwrap_or_default();
+            match blit_proxy::ensure_proxy(&exe, true).await {
+                Ok(sock) => {
+                    eprintln!("blit gateway: proxy restarted → {sock}");
+                    tokio::net::UnixStream::connect(&sock).await.map_err(|e| {
+                        format!("blit-proxy {sock}: {e} (after restart, original: {first_err})")
+                    })?
+                }
+                Err(re) => {
+                    return Err(format!(
+                        "blit-proxy {proxy_sock}: {first_err} (restart failed: {re})"
+                    ));
+                }
+            }
+        }
+    };
 
     let msg = format!("target {upstream_uri}\n");
     AsyncWriteExt::write_all(&mut stream, msg.as_bytes())
@@ -485,6 +508,8 @@ pub async fn run() {
         }
     };
 
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
     let state: AppState = Arc::new(Config {
         passphrase,
         destinations: std::sync::RwLock::new(destinations),
@@ -496,6 +521,7 @@ pub async fn run() {
         ssh_pool,
         hub_url,
         webrtc_enabled,
+        shutdown: shutdown.clone(),
     });
 
     // --- Reconcile destinations whenever blit.remotes changes ---
@@ -552,7 +578,25 @@ pub async fn run() {
         },
     );
 
-    if let Err(e) = axum::serve(listener, app).await {
+    let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = signal(SignalKind::terminate()).expect("signal handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("signal handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        // Notify all active handlers so they can send S2C_QUIT.
+        shutdown.notify_waiters();
+    });
+    if let Err(e) = graceful.await {
         eprintln!("blit gateway: serve error: {e}");
         std::process::exit(1);
     }
@@ -638,6 +682,12 @@ const MUX_S2C_CLOSED: u8 = 0x82;
 /// Server → Client: channel error.   `[channel_id:2][msg_len:2][msg:N]`
 const MUX_S2C_ERROR: u8 = 0x83;
 
+/// Blit protocol: server is shutting down (single byte, no payload).
+/// Injected into a channel's data stream when the upstream socket closes so
+/// the browser can immediately dismiss its state instead of waiting for a
+/// transport-level timeout.
+const S2C_QUIT: u8 = 0x0C;
+
 /// Build a mux control frame.
 fn mux_control(opcode: u8, ch: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5);
@@ -660,14 +710,6 @@ fn mux_error(ch: u16, msg: &str) -> Vec<u8> {
     buf
 }
 
-/// Minimal JSON string escaping for destination names.
-#[allow(dead_code)]
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-}
-
 async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let path = request.uri().path().to_string();
 
@@ -687,12 +729,17 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
                 let transform = state
                     .webrtc_enabled
                     .then_some(mark_share_remotes_proxiable as fn(&str) -> String);
+                let mut extra_init = Vec::new();
+                if let Some(hash) = state.wt_cert_hash.read().unwrap().as_ref() {
+                    extra_init.push(format!("wt={hash}"));
+                }
                 blit_webserver::config::handle_config_ws(
                     socket,
                     &state.passphrase,
                     &state.config_state,
                     Some(&state.remotes),
                     transform,
+                    &extra_init,
                 )
                 .await;
             }),
@@ -821,12 +868,26 @@ async fn handle_ws(mut ws: WebSocket, state: AppState, dest_name: Option<String>
         }
     });
 
+    let shutdown = state.shutdown.clone();
     let mut sock_to_ws = tokio::spawn(async move {
-        while let Some(data) = read_frame(&mut sock_reader).await {
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                frame = read_frame(&mut sock_reader) => {
+                    match frame {
+                        Some(data) => {
+                            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break, // upstream EOF
+                    }
+                }
+                _ = shutdown.notified() => break,
             }
         }
+        // Inject S2C_QUIT so the browser can immediately dismiss its state
+        // instead of waiting for a WebSocket close timeout.
+        let _ = ws_tx.send(Message::Binary(vec![S2C_QUIT].into())).await;
     });
 
     tokio::select! {
@@ -899,18 +960,58 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState) {
     let _ = ws.send(Message::Text("mux".into())).await;
     eprintln!("mux client authenticated");
 
-    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (ws_tx, mut ws_rx) = ws.split();
 
-    // All upstream reader tasks feed frames into this channel; the main loop
-    // drains it into ws_tx.  Each frame is already prefixed with the 2-byte
-    // channel ID.
-    let (merge_tx, mut merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // All upstream reader tasks feed frames into this channel; the writer
+    // task drains it into ws_tx.  Each frame is already prefixed with the
+    // 2-byte channel ID.
+    let (merge_tx, merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
+    let shutdown = state.shutdown.clone();
+
+    // Channel-open tasks are spawned into this JoinSet so the select loop
+    // stays non-blocking while (potentially slow) upstream connections are
+    // established.  Each task returns `(ch_id, Option<MuxChannelState>)`.
+    let mut open_tasks: tokio::task::JoinSet<(u16, Option<MuxChannelState>)> =
+        tokio::task::JoinSet::new();
+    // Abort handles for pending opens — lets us cancel an in-flight connect
+    // when the browser re-opens or closes the same channel ID.
+    let mut pending_opens: HashMap<u16, tokio::task::AbortHandle> = HashMap::new();
+
+    // Writer task: sends mux frames to the WebSocket.  Decoupled from the
+    // main loop so that slow WebSocket writes (TCP backpressure) never block
+    // processing of C2S messages — especially ACKs and client metrics that
+    // the server's pacing engine depends on.
+    let mut writer_task = tokio::spawn(async move {
+        let mut ws_tx = ws_tx;
+        let mut merge_rx = merge_rx;
+        while let Some(data) = merge_rx.recv().await {
+            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         tokio::select! {
             biased;
+
+            // Completed channel-open tasks — insert the channel state so
+            // that subsequent data frames can be forwarded.  Polled before
+            // ws_rx so the entry is in `channels` by the time the browser's
+            // first post-OPENED data frame arrives (OPENED travels through
+            // merge_tx → ws_tx → network → browser, giving us plenty of
+            // time).
+            result = open_tasks.join_next(), if !open_tasks.is_empty() => {
+                if let Some(Ok((ch_id, Some(ch_state)))) = result {
+                    pending_opens.remove(&ch_id);
+                    channels.insert(ch_id, ch_state);
+                } else if let Some(Ok((ch_id, None))) = result {
+                    pending_opens.remove(&ch_id);
+                }
+                // Err = task panicked or was aborted — already cleaned up.
+            }
 
             // Browser → upstream: demux by channel ID.
             msg = ws_rx.next() => {
@@ -934,25 +1035,35 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState) {
                                     let name_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
                                     if payload.len() < 5 + name_len { continue; }
                                     let name = std::str::from_utf8(&payload[5..5 + name_len])
-                                        .unwrap_or("");
+                                        .unwrap_or("")
+                                        .to_string();
 
+                                    // Cancel any in-flight open for this channel ID.
+                                    if let Some(abort) = pending_opens.remove(&open_ch) {
+                                        abort.abort();
+                                    }
                                     // Close any previous channel with the same ID (re-open).
                                     if let Some(prev) = channels.remove(&open_ch) {
                                         prev.shutdown();
                                     }
 
-                                    mux_open_channel(
-                                        open_ch,
-                                        name,
-                                        &state,
-                                        &merge_tx,
-                                        &mut channels,
-                                    )
-                                    .await;
+                                    let open_state = state.clone();
+                                    let open_merge_tx = merge_tx.clone();
+                                    let abort = open_tasks.spawn(async move {
+                                        let ch = mux_open_channel(
+                                            open_ch, name, open_state, open_merge_tx,
+                                        ).await;
+                                        (open_ch, ch)
+                                    });
+                                    pending_opens.insert(open_ch, abort);
                                 }
                                 MUX_C2S_CLOSE => {
                                     if payload.len() < 3 { continue; }
                                     let close_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                                    // Cancel any in-flight open for this channel ID.
+                                    if let Some(abort) = pending_opens.remove(&close_ch) {
+                                        abort.abort();
+                                    }
                                     if let Some(ch) = channels.remove(&close_ch) {
                                         ch.shutdown();
                                     }
@@ -970,21 +1081,26 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState) {
                 }
             }
 
-            // Upstream → browser: forward merged frames to the WebSocket.
-            frame = merge_rx.recv() => {
-                match frame {
-                    Some(data) => {
-                        if ws_tx.send(Message::Binary(data.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
+            // Writer task exited — WebSocket error or all senders dropped.
+            _ = &mut writer_task => break,
+
+            // Gateway is shutting down — send S2C_QUIT on every open channel
+            // via the writer task, then exit.
+            _ = shutdown.notified() => {
+                for &ch_id in channels.keys() {
+                    let mut quit_frame = Vec::with_capacity(3);
+                    quit_frame.extend_from_slice(&ch_id.to_le_bytes());
+                    quit_frame.push(S2C_QUIT);
+                    let _ = merge_tx.send(quit_frame);
                 }
+                break;
             }
         }
     }
 
-    // Clean up all channels.
+    // Clean up all channels and pending opens.
+    open_tasks.abort_all();
+    writer_task.abort();
     for (_, ch) in channels {
         ch.shutdown();
     }
@@ -993,28 +1109,45 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState) {
 
 /// Open a multiplexed channel: connect to the upstream destination and wire
 /// reader/writer tasks that bridge the channel to the merge queue.
+///
+/// Returns the channel state on success so the caller can insert it into the
+/// channel map.  On failure an error control frame is sent via `merge_tx`
+/// and `None` is returned.
+///
+/// Accepts owned types so the caller can `tokio::spawn` this without
+/// lifetime issues — this is critical for keeping the mux select-loop
+/// non-blocking while potentially slow connections (SSH, WebRTC, proxy)
+/// are established.
 async fn mux_open_channel(
     ch_id: u16,
-    name: &str,
-    state: &AppState,
-    merge_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    channels: &mut HashMap<u16, MuxChannelState>,
-) {
-    let connector = match state.connector_for(name) {
+    name: String,
+    state: AppState,
+    merge_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> Option<MuxChannelState> {
+    let connector = match state.connector_for(&name) {
         Some(c) => c,
         None => {
             eprintln!("mux: unknown destination '{name}'");
             let _ = merge_tx.send(mux_error(ch_id, &format!("unknown destination '{name}'")));
-            return;
+            return None;
         }
     };
 
-    let (sock_reader, sock_writer) = match connector.connect().await {
-        Ok(rw) => rw,
-        Err(e) => {
+    let connect_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), connector.connect()).await;
+
+    let (sock_reader, sock_writer) = match connect_result {
+        Ok(Ok(rw)) => rw,
+        Ok(Err(e)) => {
             eprintln!("mux: cannot connect to '{name}': {e}");
             let _ = merge_tx.send(mux_error(ch_id, &e));
-            return;
+            return None;
+        }
+        Err(_) => {
+            let msg = format!("connection to '{name}' timed out");
+            eprintln!("mux: {msg}");
+            let _ = merge_tx.send(mux_error(ch_id, &msg));
+            return None;
         }
     };
 
@@ -1046,20 +1179,23 @@ async fn mux_open_channel(
                 break;
             }
         }
-        // Upstream EOF — notify the browser.
+        // Upstream EOF — inject S2C_QUIT as a data frame so the browser's
+        // BlitConnection can immediately clear its session state, then send
+        // the mux-level CLOSED control frame.
+        let mut quit_frame = Vec::with_capacity(3);
+        quit_frame.extend_from_slice(&ch_id.to_le_bytes());
+        quit_frame.push(S2C_QUIT);
+        let _ = reader_merge_tx.send(quit_frame);
         let _ = reader_merge_tx.send(mux_control(MUX_S2C_CLOSED, ch_id));
     });
 
-    channels.insert(
-        ch_id,
-        MuxChannelState {
-            writer_tx,
-            writer_task,
-            reader_task,
-        },
-    );
-
     eprintln!("mux: channel {ch_id} opened for '{name}'");
+
+    Some(MuxChannelState {
+        writer_tx,
+        writer_task,
+        reader_task,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,21 +1419,16 @@ async fn run_wt_accept_loop(state: &AppState, server: &mut wt::Server, permanent
     }
 }
 
-async fn handle_webtransport_session(
-    request: wt::Request,
-    state: AppState,
+/// Authenticate a WebTransport bidirectional stream.
+///
+/// Protocol: client sends `[pass_len:2 LE][passphrase]`, server responds
+/// with `[1]` (ok) or `[0]` (rejected).  Returns `Ok(())` on success.
+async fn wt_authenticate(
+    send: &mut wt::SendStream,
+    recv: &mut wt::RecvStream,
+    passphrase: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Extract destination name from the URL path before consuming the request.
-    // Uses the same `/d/{name}` convention as the WebSocket handler.
-    let dest_name = resolve_destination_name(request.url.path());
-    let session = request.ok().await?;
-
-    // Accept a bidirectional stream for the blit protocol
-    let (mut send, mut recv) = session.accept_bi().await?;
-
-    // --- Authentication (with 30s timeout to prevent idle connection exhaustion) ---
     let auth_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        // Read passphrase: 2-byte LE length + UTF-8 string
         let mut len_buf = [0u8; 2];
         recv.read_exact(&mut len_buf)
             .await
@@ -1312,8 +1443,8 @@ async fn handle_webtransport_session(
             .map_err(|e| format!("auth read pass: {e}"))?;
         let pass = std::str::from_utf8(&pass_buf).unwrap_or("");
 
-        if !constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
-            send.write_all(&[0]).await.ok(); // 0 = rejected
+        if !constant_time_eq(pass.trim().as_bytes(), passphrase.as_bytes()) {
+            send.write_all(&[0]).await.ok();
             return Err("authentication failed".into());
         }
         Ok(())
@@ -1327,7 +1458,27 @@ async fn handle_webtransport_session(
     }
     send.write_all(&[1])
         .await
-        .map_err(|e| format!("auth write ok: {e}"))?; // 1 = ok
+        .map_err(|e| format!("auth write ok: {e}"))?;
+    Ok(())
+}
+
+async fn handle_webtransport_session(
+    request: wt::Request,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = request.url.path().to_string();
+    let is_mux = is_mux_path(&path);
+    let dest_name = resolve_destination_name(&path);
+    let session = request.ok().await?;
+
+    let (mut send, mut recv) = session.accept_bi().await?;
+
+    wt_authenticate(&mut send, &mut recv, &state.passphrase).await?;
+
+    if is_mux {
+        return handle_mux_wt(send, recv, state).await;
+    }
+
     let dest_label = match dest_name.as_deref() {
         Some(n) => n,
         None => {
@@ -1403,6 +1554,165 @@ async fn handle_webtransport_session(
     Ok(())
 }
 
+/// Handle the mux protocol over a WebTransport bidirectional stream.
+///
+/// The wire format wraps each mux frame in a length prefix:
+/// `[frame_len:4 LE][mux_frame]` where `mux_frame` has the same layout as
+/// a WebSocket binary message in the WS mux handler:
+/// `[channel_id:2 LE][payload]` for data, `[0xFFFF][opcode][...]` for control.
+async fn handle_mux_wt(
+    send: wt::SendStream,
+    mut recv: wt::RecvStream,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("mux-wt client authenticated");
+
+    let (merge_tx, merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
+    let shutdown = state.shutdown.clone();
+
+    // Channel-open tasks (same pattern as the WS mux handler).
+    let mut open_tasks: tokio::task::JoinSet<(u16, Option<MuxChannelState>)> =
+        tokio::task::JoinSet::new();
+    let mut pending_opens: HashMap<u16, tokio::task::AbortHandle> = HashMap::new();
+
+    // Reader task: reads length-prefixed mux frames from the WT stream.
+    let (client_frame_tx, mut client_frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let reader_task = tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if recv.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_FRAME_SIZE + 2 {
+                break;
+            }
+            let mut buf = vec![0u8; len];
+            if len > 0 && recv.read_exact(&mut buf).await.is_err() {
+                break;
+            }
+            if client_frame_tx.send(buf).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Writer task: sends length-prefixed mux frames to the WT stream.
+    // Decoupled from the main loop so that slow QUIC writes (flow control,
+    // congestion) never block processing of C2S messages — especially ACKs
+    // and client metrics that the server's pacing engine depends on.
+    let mut writer_task = tokio::spawn(async move {
+        let mut send = send;
+        let mut merge_rx = merge_rx;
+        while let Some(data) = merge_rx.recv().await {
+            let mut frame = Vec::with_capacity(4 + data.len());
+            frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&data);
+            if send.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Completed channel-open tasks (same as WS mux handler).
+            result = open_tasks.join_next(), if !open_tasks.is_empty() => {
+                if let Some(Ok((ch_id, Some(ch_state)))) = result {
+                    pending_opens.remove(&ch_id);
+                    channels.insert(ch_id, ch_state);
+                } else if let Some(Ok((ch_id, None))) = result {
+                    pending_opens.remove(&ch_id);
+                }
+            }
+
+            // Client → upstream: demux by channel ID.
+            msg = client_frame_rx.recv() => {
+                let data = match msg {
+                    Some(d) => d,
+                    None => break,
+                };
+                if data.len() < 2 { continue; }
+                let ch_id = u16::from_le_bytes([data[0], data[1]]);
+                let payload = &data[2..];
+
+                if ch_id == MUX_CONTROL {
+                    if payload.is_empty() { continue; }
+                    match payload[0] {
+                        MUX_C2S_OPEN => {
+                            if payload.len() < 5 { continue; }
+                            let open_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                            let name_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
+                            if payload.len() < 5 + name_len { continue; }
+                            let name = std::str::from_utf8(&payload[5..5 + name_len])
+                                .unwrap_or("")
+                                .to_string();
+
+                            if let Some(abort) = pending_opens.remove(&open_ch) {
+                                abort.abort();
+                            }
+                            if let Some(prev) = channels.remove(&open_ch) {
+                                prev.shutdown();
+                            }
+
+                            let open_state = state.clone();
+                            let open_merge_tx = merge_tx.clone();
+                            let abort = open_tasks.spawn(async move {
+                                let ch = mux_open_channel(
+                                    open_ch, name, open_state, open_merge_tx,
+                                ).await;
+                                (open_ch, ch)
+                            });
+                            pending_opens.insert(open_ch, abort);
+                        }
+                        MUX_C2S_CLOSE => {
+                            if payload.len() < 3 { continue; }
+                            let close_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                            if let Some(abort) = pending_opens.remove(&close_ch) {
+                                abort.abort();
+                            }
+                            if let Some(ch) = channels.remove(&close_ch) {
+                                ch.shutdown();
+                            }
+                            let _ = merge_tx.send(mux_control(MUX_S2C_CLOSED, close_ch));
+                        }
+                        _ => {}
+                    }
+                } else if let Some(ch) = channels.get(&ch_id) {
+                    let _ = ch.writer_tx.send(payload.to_vec());
+                }
+            }
+
+            // Writer task exited — QUIC stream error or all senders dropped.
+            _ = &mut writer_task => break,
+
+            // Gateway is shutting down — send S2C_QUIT on every open channel
+            // via the writer task, then exit.
+            _ = shutdown.notified() => {
+                for &ch_id in channels.keys() {
+                    let mut quit_frame = Vec::with_capacity(3);
+                    quit_frame.extend_from_slice(&ch_id.to_le_bytes());
+                    quit_frame.push(S2C_QUIT);
+                    let _ = merge_tx.send(quit_frame);
+                }
+                break;
+            }
+        }
+    }
+
+    open_tasks.abort_all();
+    reader_task.abort();
+    writer_task.abort();
+    for (_, ch) in channels {
+        ch.shutdown();
+    }
+    eprintln!("mux-wt client disconnected");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,6 +1732,7 @@ mod tests {
             ssh_pool: blit_ssh::SshPool::new(),
             hub_url: blit_webrtc_forwarder::normalize_hub(blit_webrtc_forwarder::DEFAULT_HUB_URL),
             webrtc_enabled: false,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         })
     }
 

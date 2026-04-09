@@ -51,7 +51,7 @@ type PassphraseResult =
 function resolvePassphrase(): PassphraseResult {
   const raw = decodeURIComponent(location.hash.slice(1));
   if (!raw) {
-    return { ok: false, error: "No session specified." };
+    return { ok: false, error: "No share link specified." };
   }
   if (isEncrypted(raw)) {
     const decrypted = decryptPassphrase(raw);
@@ -59,7 +59,7 @@ function resolvePassphrase(): PassphraseResult {
       return {
         ok: false,
         error:
-          "Cannot decrypt session link. This link was created on a different device.",
+          "Cannot decrypt link. This link was created on a different device.",
       };
     }
     return {
@@ -320,12 +320,12 @@ function DisconnectedOverlay(props: { passphrase: string; readOnly: boolean }) {
       <div class="flex flex-col items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-lg">
         <div class="flex flex-col items-center gap-1">
           <span class="font-mono text-sm font-medium text-[var(--fg)]">
-            Session disconnected
+            Disconnected
           </span>
           <span class="font-mono text-xs text-[var(--dim)]">
             {props.readOnly
-              ? "Waiting for the host to restart the share session"
-              : "Restart the share session to reconnect"}
+              ? "Waiting for the host to restart sharing"
+              : "Restart sharing to reconnect"}
           </span>
         </div>
         <Show when={!props.readOnly}>
@@ -581,8 +581,8 @@ function TabShell(props: {
     if (conn.status === "connected") {
       return visibleSessions().length === 0
         ? props.readOnly
-          ? "Connected \u2014 waiting for host to open a session..."
-          : "Connected \u2014 waiting for terminal sessions..."
+          ? "Connected \u2014 waiting for host to open a terminal..."
+          : "Connected \u2014 waiting for terminals..."
         : null;
     }
     if (conn.status === "connecting")

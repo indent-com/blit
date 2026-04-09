@@ -1,9 +1,5 @@
 import type { ConnectionId, BlitSurface } from "./types";
-import {
-  CODEC_SUPPORT_H264,
-  CODEC_SUPPORT_AV1,
-  CODEC_SUPPORT_H265,
-} from "./types";
+import { CODEC_SUPPORT_H264, CODEC_SUPPORT_AV1 } from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
 import {
@@ -29,7 +25,6 @@ export async function detectCodecSupport(): Promise<number> {
   const checks: [string, number][] = [
     ["avc1.42001f", CODEC_SUPPORT_H264],
     ["av01.0.01M.08", CODEC_SUPPORT_AV1],
-    ["hev1.1.6.L93.B0", CODEC_SUPPORT_H265],
   ];
   await Promise.all(
     checks.map(async ([codec, bit]) => {
@@ -208,15 +203,33 @@ export class BlitSurfaceCanvas {
 
   // subscriptions
   private unsubFrame: (() => void) | null = null;
+  private unsubCursor: (() => void) | null = null;
   private unsubChange: (() => void) | null = null;
+
+  /** Dirty flag for rAF-coalesced blits — avoids redundant drawImage calls
+   *  when multiple frames decode between display refreshes. */
+  private _blitDirty = false;
+  private _blitRafId: number | null = null;
+  /** True after the first frame has been blitted.  The very first decoded
+   *  frame is painted synchronously (bypassing rAF) to minimise
+   *  time-to-first-paint on remote connections. */
+  private _hasBlitFirstFrame = false;
   /** Cached store reference so we can keep the frame listener alive
    *  even when the connection is temporarily unavailable. */
   private _store: import("./SurfaceStore").SurfaceStore | null = null;
+  private _retryUnsub: (() => void) | undefined;
 
   /** The SurfaceStore generation at the time we last sent a subscribe.
    *  Used to detect reconnects (generation bumps on disconnect) so we
-   *  re-subscribe even when the surfaceId/sessionId haven't changed. */
+   *  re-subscribe even when the surfaceId hasn't changed. */
   private _subscribedGeneration = -1;
+
+  /** Hidden textarea used to capture IME composition.  Focus stays on
+   *  the canvas for normal typing; the textarea only receives focus when
+   *  an IME composition session is active. */
+  private textInput: HTMLTextAreaElement | null = null;
+  /** True while an IME composition session is active (focus is on textarea). */
+  private _isComposing = false;
 
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
@@ -228,6 +241,9 @@ export class BlitSurfaceCanvas {
   private boundFocus: (() => void) | null = null;
   private boundBlur: (() => void) | null = null;
   private boundContextMenu: ((e: Event) => void) | null = null;
+  private boundTextInput: ((e: Event) => void) | null = null;
+  private boundCompositionStart: ((e: Event) => void) | null = null;
+  private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
 
   constructor(options: BlitSurfaceCanvasOptions) {
     this._workspace = options.workspace;
@@ -269,6 +285,35 @@ export class BlitSurfaceCanvas {
       canvas.width = this.surface?.width || 640;
       canvas.height = this.surface?.height || 480;
     }
+    // Hidden textarea for capturing IME composition and properly-shifted
+    // characters.  Positioned behind the canvas so it doesn't interfere
+    // with rendering but still receives focus and keyboard events.
+    const ta = document.createElement("textarea");
+    ta.autocomplete = "off";
+    ta.setAttribute("autocorrect", "off");
+    ta.setAttribute("autocapitalize", "off");
+    ta.setAttribute("spellcheck", "false");
+    ta.tabIndex = -1;
+    ta.style.position = "absolute";
+    ta.style.left = "0";
+    ta.style.top = "0";
+    ta.style.width = "1px";
+    ta.style.height = "1px";
+    ta.style.opacity = "0";
+    ta.style.padding = "0";
+    ta.style.border = "none";
+    ta.style.outline = "none";
+    ta.style.resize = "none";
+    ta.style.overflow = "hidden";
+    ta.style.pointerEvents = "none";
+    ta.style.zIndex = "-1";
+    // Ensure the container is a positioning context for the textarea.
+    if (getComputedStyle(container).position === "static") {
+      container.style.position = "relative";
+    }
+    container.appendChild(ta);
+    this.textInput = ta;
+
     container.appendChild(canvas);
 
     this.canvas = canvas;
@@ -281,11 +326,19 @@ export class BlitSurfaceCanvas {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this._retryUnsub) {
+      this._retryUnsub();
+      this._retryUnsub = undefined;
+    }
     this.releaseAllKeys();
     this.releaseAllButtons();
     this.serverUnsubscribe();
     this.detachEvents();
     this.unsubscribeAll();
+    if (this.textInput && this.container) {
+      this.container.removeChild(this.textInput);
+    }
+    this.textInput = null;
     if (this.canvas && this.container) {
       this.container.removeChild(this.canvas);
     }
@@ -298,12 +351,14 @@ export class BlitSurfaceCanvas {
     if (this._connectionId === connectionId) return;
     this._connectionId = connectionId;
     this.resubscribe();
+    this.resendDisplaySize();
   }
 
   setSurfaceId(surfaceId: number): void {
     if (this._surfaceId === surfaceId) return;
     this._surfaceId = surfaceId;
     this.resubscribe();
+    this.resendDisplaySize();
   }
 
   /**
@@ -311,18 +366,13 @@ export class BlitSurfaceCanvas {
    * The server will respond with a SURFACE_RESIZED message that updates the
    * surface metadata and canvas size via the normal onChange path.
    */
-  requestResize(
-    width: number,
-    height: number,
-    scale120: number = 0,
-    codecSupport: number = 0,
-  ): void {
+  requestResize(width: number, height: number, scale120: number = 0): void {
     const w = Math.round(width);
     const h = Math.round(height);
     if (w <= 0 || h <= 0) return;
     // Stash the pending resize so it can be sent when the surface info
     // arrives (the ResizeObserver may fire before the surface is known).
-    this._pendingResize = { w, h, scale120, codecSupport };
+    this._pendingResize = { w, h, scale120 };
     this.flushPendingResize();
   }
 
@@ -330,23 +380,17 @@ export class BlitSurfaceCanvas {
     w: number;
     h: number;
     scale120: number;
-    codecSupport: number;
   } | null = null;
 
   private flushPendingResize(): void {
     if (!this._pendingResize) return;
     const conn = this.getConn();
-    if (!conn || !this.surface) return;
-    const { w, h, scale120, codecSupport } = this._pendingResize;
+    if (!conn || !this.surface) {
+      return;
+    }
+    const { w, h, scale120 } = this._pendingResize;
     this._pendingResize = null;
-    conn.sendSurfaceResize(
-      this.surface.sessionId,
-      this._surfaceId,
-      w,
-      h,
-      scale120,
-      codecSupport,
-    );
+    conn.sendSurfaceResize(this._surfaceId, w, h, scale120);
   }
 
   /**
@@ -383,6 +427,26 @@ export class BlitSurfaceCanvas {
     }
   }
 
+  /**
+   * Re-queue the current display size as a pending resize so it is sent to
+   * the server for the (possibly new) surface.  Analogous to how
+   * {@link BlitTerminalSurface} re-sends dimensions in
+   * `setupResizeObserver()` after a session change — the ResizeObserver
+   * only fires when the container's pixel dimensions change, but after a
+   * surfaceId/connectionId swap the server needs to learn the size for the
+   * new surface even if the container stayed the same size.
+   */
+  private resendDisplaySize(): void {
+    if (!this._displaySize) return;
+    const { width, height } = this._displaySize;
+    const scale120 =
+      typeof devicePixelRatio === "number"
+        ? Math.round(devicePixelRatio * 120)
+        : 0;
+    this._pendingResize = { w: width, h: height, scale120 };
+    this.flushPendingResize();
+  }
+
   // -----------------------------------------------------------------------
   // Connection helper
   // -----------------------------------------------------------------------
@@ -398,7 +462,31 @@ export class BlitSurfaceCanvas {
   private subscribe(): void {
     const conn = this.getConn();
     const store = conn?.surfaceStore ?? this._store;
-    if (!store) return;
+
+    if (!store) {
+      // Connection not ready yet — retry when workspace state changes.
+      if (this._workspace && !this._retryUnsub) {
+        this._retryUnsub = (this._workspace as any).subscribe(() => {
+          if (this.disposed) {
+            this._retryUnsub?.();
+            this._retryUnsub = undefined;
+            return;
+          }
+          const c = this.getConn();
+          if (c) {
+            this._retryUnsub?.();
+            this._retryUnsub = undefined;
+            this.subscribe();
+          }
+        });
+      }
+      return;
+    }
+    // Clear retry listener if it was set.
+    if (this._retryUnsub) {
+      this._retryUnsub();
+      this._retryUnsub = undefined;
+    }
     this._store = store;
 
     this.surface = store.getSurface(this._surfaceId);
@@ -408,7 +496,7 @@ export class BlitSurfaceCanvas {
     // is unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
     if (conn && this.surface && store.canDecodeVideo) {
-      conn.sendSurfaceSubscribe(this.surface.sessionId, this._surfaceId);
+      conn.sendSurfaceSubscribe(this._surfaceId);
       this._subscribedGeneration = store.generation;
     }
 
@@ -422,18 +510,16 @@ export class BlitSurfaceCanvas {
       this.surface = store.getSurface(this._surfaceId);
       // Subscribe (or re-subscribe) when:
       //  1. Surface info just arrived (late-subscribe: prev was undefined)
-      //  2. Session ID changed (surface recreated on the server)
-      //  3. Store generation changed (reconnect — the server dropped all
+      //  2. Store generation changed (reconnect — the server dropped all
       //     subscriptions but the surface reappeared with the same IDs)
       if (this.surface && store.canDecodeVideo) {
         const generationChanged =
           this._subscribedGeneration !== store.generation;
-        const sessionChanged =
-          !prev || prev.sessionId !== this.surface.sessionId;
-        if (sessionChanged || generationChanged) {
+        const surfaceNew = !prev;
+        if (surfaceNew || generationChanged) {
           const c = this.getConn();
           if (c) {
-            c.sendSurfaceSubscribe(this.surface.sessionId, this._surfaceId);
+            c.sendSurfaceSubscribe(this._surfaceId);
             this._subscribedGeneration = store.generation;
           }
           // Update canvas size to match actual surface dimensions,
@@ -453,17 +539,49 @@ export class BlitSurfaceCanvas {
 
     // Frame listener — must always be registered so decoded frames are
     // painted to the visible canvas regardless of connection state.
+    // Apply cursor changes from the compositor.
+    this.unsubCursor = store.onCursor((sid, shape) => {
+      if (sid !== this._surfaceId || !this.canvas) return;
+      this.canvas.style.cursor = shape;
+    });
+    // Apply initial cursor.
+    if (this.canvas) {
+      this.canvas.style.cursor = store.getCursor(this._surfaceId);
+    }
+
     this.unsubFrame = store.onFrame((sid) => {
       if (sid !== this._surfaceId) return;
-      this.blitFromStore(store);
+      // Paint the very first decoded frame synchronously to minimise
+      // time-to-first-paint.  Subsequent frames are coalesced via rAF
+      // so we don't drawImage more than once per display refresh.
+      if (!this._hasBlitFirstFrame) {
+        this._hasBlitFirstFrame = true;
+        this.blitFromStore(store);
+        return;
+      }
+      if (!this._blitDirty) {
+        this._blitDirty = true;
+        this._blitRafId = requestAnimationFrame(() => {
+          this._blitRafId = null;
+          this._blitDirty = false;
+          this.blitFromStore(store);
+        });
+      }
     });
   }
 
   private unsubscribeAll(): void {
     this.unsubFrame?.();
     this.unsubChange?.();
+    this.unsubCursor?.();
     this.unsubFrame = null;
     this.unsubChange = null;
+    this.unsubCursor = null;
+    if (this._blitRafId !== null) {
+      cancelAnimationFrame(this._blitRafId);
+      this._blitRafId = null;
+    }
+    this._blitDirty = false;
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */
@@ -509,13 +627,14 @@ export class BlitSurfaceCanvas {
   private resubscribe(): void {
     this.serverUnsubscribe();
     this.unsubscribeAll();
+    this._hasBlitFirstFrame = false;
     if (!this.disposed) this.subscribe();
   }
 
   private serverUnsubscribe(): void {
     const conn = this.getConn();
     if (!conn || !this.surface) return;
-    conn.sendSurfaceUnsubscribe(this.surface.sessionId, this._surfaceId);
+    conn.sendSurfaceUnsubscribe(this._surfaceId);
   }
 
   // -----------------------------------------------------------------------
@@ -524,6 +643,7 @@ export class BlitSurfaceCanvas {
 
   private attachEvents(): void {
     const canvas = this.canvas;
+    const ta = this.textInput;
     if (!canvas) return;
 
     this.boundMouseDown = (e) => this.handleMouse(e, SURFACE_POINTER_DOWN);
@@ -545,6 +665,30 @@ export class BlitSurfaceCanvas {
     canvas.addEventListener("focus", this.boundFocus);
     canvas.addEventListener("blur", this.boundBlur);
     canvas.addEventListener("contextmenu", this.boundContextMenu);
+
+    // Hidden textarea is only used for IME composition.  Focus stays on
+    // the canvas during normal typing; we redirect to the textarea when
+    // a composition session starts (detected via compositionstart on the
+    // canvas) and return focus to the canvas when it ends.
+    if (ta) {
+      this.boundTextInput = (e) => this.handleTextInput(e as InputEvent);
+      this.boundCompositionEnd = (e) => this.handleCompositionEnd(e);
+
+      ta.addEventListener("input", this.boundTextInput);
+      ta.addEventListener("compositionend", this.boundCompositionEnd);
+      // Also listen for keydown on textarea so keys during IME composition
+      // (e.g. Enter to confirm, Escape to cancel) still get routed.
+      ta.addEventListener("keydown", this.boundKeyDown);
+      ta.addEventListener("keyup", this.boundKeyUp);
+    }
+
+    // Detect IME composition start on the canvas and redirect focus
+    // to the textarea so the browser's IME UI can work.
+    this.boundCompositionStart = () => {
+      this._isComposing = true;
+      if (this.textInput) this.textInput.focus();
+    };
+    canvas.addEventListener("compositionstart", this.boundCompositionStart);
   }
 
   private detachEvents(): void {
@@ -565,6 +709,22 @@ export class BlitSurfaceCanvas {
     if (this.boundBlur) canvas.removeEventListener("blur", this.boundBlur);
     if (this.boundContextMenu)
       canvas.removeEventListener("contextmenu", this.boundContextMenu);
+    if (this.boundCompositionStart)
+      canvas.removeEventListener(
+        "compositionstart",
+        this.boundCompositionStart,
+      );
+
+    const ta = this.textInput;
+    if (ta) {
+      if (this.boundTextInput)
+        ta.removeEventListener("input", this.boundTextInput);
+      if (this.boundCompositionEnd)
+        ta.removeEventListener("compositionend", this.boundCompositionEnd);
+      if (this.boundKeyDown)
+        ta.removeEventListener("keydown", this.boundKeyDown);
+      if (this.boundKeyUp) ta.removeEventListener("keyup", this.boundKeyUp);
+    }
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
@@ -577,18 +737,28 @@ export class BlitSurfaceCanvas {
       this.pressedButtons.delete(e.button);
     }
     const rect = this.canvas.getBoundingClientRect();
-    // Send logical (CSS-pixel) coordinates — the compositor and CLI both
-    // operate in the Wayland surface's logical coordinate space.
-    const x = Math.round(e.clientX - rect.left);
-    const y = Math.round(e.clientY - rect.top);
-    conn.sendSurfacePointer(
-      this.surface.sessionId,
-      this._surfaceId,
-      type,
-      e.button,
-      x,
-      y,
-    );
+    // Convert CSS-pixel coordinates to canvas (physical) pixel coordinates.
+    const canvasX = (e.clientX - rect.left) * (this.canvas.width / rect.width);
+    const canvasY = (e.clientY - rect.top) * (this.canvas.height / rect.height);
+    // Compute the letterbox/pillarbox geometry (same as blitFromStore) so
+    // we map through the actual drawn region, not the full canvas.
+    const srcAR = this.surface.width / this.surface.height;
+    const dstAR = this.canvas.width / this.canvas.height;
+    let dw: number, dh: number, dx: number, dy: number;
+    if (srcAR > dstAR) {
+      dw = this.canvas.width;
+      dh = this.canvas.width / srcAR;
+      dx = 0;
+      dy = (this.canvas.height - dh) / 2;
+    } else {
+      dh = this.canvas.height;
+      dw = this.canvas.height * srcAR;
+      dx = (this.canvas.width - dw) / 2;
+      dy = 0;
+    }
+    const x = Math.round(((canvasX - dx) / dw) * this.surface.width);
+    const y = Math.round(((canvasY - dy) / dh) * this.surface.height);
+    conn.sendSurfacePointer(this._surfaceId, type, e.button, x, y);
   }
 
   /** Send synthetic pointer-up for any buttons still held.  Prevents the
@@ -599,7 +769,6 @@ export class BlitSurfaceCanvas {
     if (!conn || !this.surface) return;
     for (const button of this.pressedButtons) {
       conn.sendSurfacePointer(
-        this.surface.sessionId,
         this._surfaceId,
         SURFACE_POINTER_UP,
         button,
@@ -616,12 +785,7 @@ export class BlitSurfaceCanvas {
     e.preventDefault();
     const axis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? 1 : 0;
     const value = axis === 0 ? e.deltaY : e.deltaX;
-    conn.sendSurfaceAxis(
-      this.surface.sessionId,
-      this._surfaceId,
-      axis,
-      Math.round(value * 100),
-    );
+    conn.sendSurfaceAxis(this._surfaceId, axis, Math.round(value * 100));
   }
 
   private handleKey(e: KeyboardEvent, pressed: boolean): void {
@@ -631,8 +795,18 @@ export class BlitSurfaceCanvas {
     // Only forward input when interactive (resizable/focused mode).
     // Sidebar previews should not intercept keyboard or send events.
     if (!this._displaySize) return;
-    // Always prevent default so keystrokes never leak to the terminal
-    // textarea, even when the surface info hasn't arrived yet.
+
+    // Dead keys / ongoing IME composition: redirect focus to the hidden
+    // textarea so the browser's composition UI can work.  The textarea's
+    // compositionend handler sends the result and returns focus here.
+    if (pressed && (e.key === "Dead" || e.isComposing)) {
+      if (this.textInput) {
+        this._isComposing = true;
+        this.textInput.focus();
+      }
+      return;
+    }
+
     e.preventDefault();
     const conn = this.getConn();
     if (!conn || !this.surface) return;
@@ -644,6 +818,23 @@ export class BlitSurfaceCanvas {
       this.syncCapsLock(e, conn);
     }
 
+    // Printable character (no Ctrl/Alt/Meta): send the browser-resolved
+    // character via the text path.  This handles keyboard layout
+    // differences (e.g. Shift+2 → @ on US, " on UK) without depending
+    // on the compositor's US-QWERTY keymap.
+    if (
+      pressed &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      !e.metaKey &&
+      e.key.length === 1
+    ) {
+      conn.sendSurfaceText(this._surfaceId, e.key);
+      return;
+    }
+
+    // Everything else (modifiers, arrows, F-keys, Ctrl/Alt/Meta combos):
+    // send raw evdev keycode.
     const keycode = domKeyToEvdev(e.code);
     if (keycode !== 0) {
       if (pressed) {
@@ -651,13 +842,36 @@ export class BlitSurfaceCanvas {
       } else {
         this.pressedKeys.delete(keycode);
       }
-      conn.sendSurfaceInput(
-        this.surface.sessionId,
-        this._surfaceId,
-        keycode,
-        pressed,
-      );
+      conn.sendSurfaceInput(this._surfaceId, keycode, pressed);
     }
+  }
+
+  /** Handle text input from the hidden textarea (IME only). */
+  private handleTextInput(e: InputEvent): void {
+    // During IME composition, wait for compositionend.
+    if (e.isComposing) return;
+    // Non-composition input events on the textarea can be ignored —
+    // normal typing is handled via e.key in handleKey directly.
+    const ta = this.textInput;
+    if (ta) ta.value = "";
+  }
+
+  /** Handle IME composition end — send the composed text and return
+   *  focus to the canvas. */
+  private handleCompositionEnd(e: CompositionEvent): void {
+    this._isComposing = false;
+    const ta = this.textInput;
+    if (!ta) return;
+    if (e.data) {
+      const conn = this.getConn();
+      if (conn && this.surface) {
+        conn.sendSurfaceText(this._surfaceId, e.data);
+      }
+    }
+    ta.value = "";
+    // Return focus to the canvas so subsequent keystrokes go through
+    // the normal evdev / e.key path.
+    if (this.canvas) this.canvas.focus();
   }
 
   /** Send synthetic key-up for every key still held.  Prevents stuck
@@ -667,7 +881,7 @@ export class BlitSurfaceCanvas {
     const conn = this.getConn();
     if (!conn || !this.surface) return;
     for (const kc of this.pressedKeys) {
-      conn.sendSurfaceInput(this.surface.sessionId, this._surfaceId, kc, false);
+      conn.sendSurfaceInput(this._surfaceId, kc, false);
     }
     this.pressedKeys.clear();
   }
@@ -713,13 +927,8 @@ export class BlitSurfaceCanvas {
 
     if (needsSync) {
       const kc = EVDEV_MAP.CapsLock; // 58
-      conn.sendSurfaceInput(this.surface!.sessionId, this._surfaceId, kc, true);
-      conn.sendSurfaceInput(
-        this.surface!.sessionId,
-        this._surfaceId,
-        kc,
-        false,
-      );
+      conn.sendSurfaceInput(this._surfaceId, kc, true);
+      conn.sendSurfaceInput(this._surfaceId, kc, false);
     }
 
     // Update tracking to the expected compositor state after this event.
@@ -735,6 +944,6 @@ export class BlitSurfaceCanvas {
   private handleFocus(): void {
     const conn = this.getConn();
     if (!conn || !this.surface) return;
-    conn.sendSurfaceFocus(this.surface.sessionId, this._surfaceId);
+    conn.sendSurfaceFocus(this._surfaceId);
   }
 }

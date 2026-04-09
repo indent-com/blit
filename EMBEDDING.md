@@ -4,18 +4,17 @@ There are two distinct dimensions: embedding the frontend into your app, and emb
 
 ## Your app, our components: `@blit-sh/react` / `@blit-sh/solid`
 
-`@blit-sh/react` and `@blit-sh/solid` are workspace-first. Both are thin wrappers over `@blit-sh/core`'s `BlitTerminalSurface`. A `BlitWorkspace` owns connections, each connection owns sessions, and each `BlitTerminal` renders a session by ID.
+`@blit-sh/react` and `@blit-sh/solid` are workspace-first. Both are thin wrappers over `@blit-sh/core`'s `BlitTerminalSurface`. A `BlitWorkspace` owns connections, each connection owns terminals, and each `BlitTerminal` renders a terminal by ID.
 
 ```tsx
 import {
   BlitTerminal,
-  BlitWorkspace,
   BlitWorkspaceProvider,
-  WebSocketTransport,
   useBlitFocusedSession,
   useBlitSessions,
   useBlitWorkspace,
 } from "@blit-sh/react";
+import { BlitWorkspace, WebSocketTransport } from "@blit-sh/core";
 import { useEffect, useMemo } from "react";
 
 function EmbeddedBlit({ wasm, passphrase }: { wasm: any; passphrase: string }) {
@@ -67,16 +66,17 @@ function TerminalScreen() {
 
 ### React API
 
-| API                                        | Purpose                                                  |
-| ------------------------------------------ | -------------------------------------------------------- |
-| `new BlitWorkspace({ wasm, connections })` | Create a workspace with one or more transports           |
-| `BlitWorkspaceProvider`                    | Put the workspace, palette, and font settings in context |
-| `useBlitWorkspace()`                       | Get the imperative workspace object                      |
-| `useBlitWorkspaceState()`                  | Read the full reactive workspace snapshot                |
-| `useBlitConnection(connectionId?)`         | Read one connection snapshot                             |
-| `useBlitSessions()`                        | Read all sessions                                        |
-| `useBlitFocusedSession()`                  | Read the currently focused session                       |
-| `BlitTerminal`                             | Render one session by `sessionId`                        |
+| API                                                    | Purpose                                                  |
+| ------------------------------------------------------ | -------------------------------------------------------- |
+| `new BlitWorkspace({ wasm, connections })`             | Create a workspace with one or more transports           |
+| `BlitWorkspaceProvider`                                | Put the workspace, palette, and font settings in context |
+| `useBlitWorkspace()`                                   | Get the imperative workspace object                      |
+| `useBlitWorkspaceState()`                              | Read the full reactive workspace snapshot                |
+| `useBlitConnection(connectionId?)`                     | Read one connection snapshot                             |
+| `useBlitSessions()`                                    | Read all terminals                                       |
+| `useBlitFocusedSession()`                              | Read the currently focused terminal                      |
+| `useBlitWorkspaceConnection(workspace, id, transport)` | Manage a connection lifecycle with cleanup               |
+| `BlitTerminal`                                         | Render one terminal by `sessionId`                       |
 
 ### Solid API
 
@@ -140,16 +140,16 @@ function TerminalScreen() {
 | `BlitWorkspaceProvider`                                   | Put the workspace, palette, and font settings in context |
 | `createBlitWorkspace()`                                   | Get the imperative workspace object from context         |
 | `createBlitWorkspaceState(workspace?)`                    | Reactive signal tracking the workspace snapshot          |
-| `createBlitSessions(workspace?)`                          | Reactive signal tracking all sessions                    |
-| `useBlitSession(workspace, sessionId)`                    | Look up a single session by ID (non-reactive)            |
-| `useBlitFocusedSession(workspace)`                        | Look up the focused session (non-reactive)               |
+| `createBlitSessions(workspace?)`                          | Reactive signal tracking all terminals                   |
+| `useBlitSession(workspace, sessionId)`                    | Look up a single terminal by ID (non-reactive)           |
+| `useBlitFocusedSession(workspace)`                        | Look up the focused terminal (non-reactive)              |
 | `useBlitConnection(workspace, sessionId)`                 | Look up a connection snapshot (non-reactive)             |
 | `createBlitWorkspaceConnection(workspace, id, transport)` | Manage a connection lifecycle with `onCleanup`           |
-| `BlitTerminal`                                            | Render one session by `sessionId`                        |
+| `BlitTerminal`                                            | Render one terminal by `sessionId`                       |
 
 ### Wayland surface rendering (experimental)
 
-`BlitSurfaceView` renders a single Wayland surface from a compositor session. The server encodes each surface as H.264; the component decodes via WebCodecs and draws to a canvas.
+`BlitSurfaceView` renders a single Wayland surface from a terminal's compositor. The server encodes each surface as H.264 or AV1; the component decodes via WebCodecs and draws to a canvas.
 
 ```tsx
 import { BlitSurfaceView } from "@blit-sh/react";
@@ -171,7 +171,7 @@ function AppWindow({
 }
 ```
 
-Every session has an experimental Wayland compositor available. Any command — shell, TUI, or GUI — can open Wayland surfaces:
+Every terminal has an experimental Wayland compositor available. Any command — shell, TUI, or GUI — can open Wayland surfaces:
 
 ```tsx
 workspace.createSession({
@@ -182,7 +182,7 @@ workspace.createSession({
 });
 ```
 
-Surfaces created by the session appear in the connection's `surfaceStore`, keyed by the session's PTY ID. Each surface has a `surfaceId`, `parentId`, `title`, `appId`, `width`, and `height`.
+Surfaces created by the terminal appear in the connection's `surfaceStore`, keyed by the terminal's PTY ID. Each surface has a `surfaceId`, `parentId`, `title`, `appId`, `width`, and `height`.
 
 ### Workspace operations
 

@@ -5,13 +5,12 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.22.1";
+  version = "0.23.0";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
     outputHashes = {
       "alacritty_terminal-0.25.1" = "sha256-YjUnHTEIjeLyQY8gXCWf+3WQU5WYlbcYIKM0ZACqnTc=";
-      "smithay-0.7.0" = "sha256-DXWkR8MCfF4PGYy2zU9/wVL2qksurxnDtv2KXki0a8k=";
     };
   };
 
@@ -46,7 +45,8 @@ let
         || pkgs.lib.hasSuffix ".html.br" path
         || builtins.baseNameOf path == "learn.md"
         || pkgs.lib.hasInfix "/js/ui/dist/" path
-        || pkgs.lib.hasSuffix ".xkb" path;
+        || pkgs.lib.hasSuffix ".xkb" path
+        || pkgs.lib.hasSuffix ".spv" path;
     in
     pkgs.lib.cleanSourceWith {
       src = ../.;
@@ -59,6 +59,7 @@ let
     strictDeps = true;
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
+      pkgs.libopus # system Opus for audiopus_sys (avoids cmake source build)
       pkgs.libxkbcommon
       pkgs.pixman
     ]
@@ -67,6 +68,7 @@ let
       pkgs.libglvnd # EGL / GLESv2 dispatch
       pkgs.libva
       pkgs.libgbm # libgbm for GBM device / buffer allocation
+      pkgs.vulkan-loader # libvulkan.so.1 for Vulkan compositor renderer
     ];
     nativeCheckInputs = [ ];
   }
@@ -90,7 +92,20 @@ let
   );
 
   # Static (musl on Linux) Crane setup for release tarballs.
-  craneLibStatic = (inputs.crane.mkLib pkgs.pkgsStatic).overrideToolchain rustToolchain;
+  craneLibStatic = (inputs.crane.mkLib pkgs.pkgsStatic).overrideToolchain (
+    p:
+    p.rust-bin.stable.latest.default.override {
+      targets = [
+        "wasm32-unknown-unknown"
+        "x86_64-unknown-linux-musl"
+        "aarch64-unknown-linux-musl"
+      ];
+      extensions = [
+        "clippy"
+        "llvm-tools"
+      ];
+    }
+  );
 
   # Mesa's meson.build uses shared_library() for libgbm, which the musl
   # static toolchain cannot link.  Override to use library() so meson
@@ -102,11 +117,31 @@ let
     '';
   });
 
+  # Opus's meson.build doesn't support arm64 intrinsics, so the default
+  # -Dintrinsics=enabled fails on aarch64 in pkgsStatic.  Disable
+  # intrinsics and rtcd (runtime CPU detection depends on intrinsics).
+  staticLibopus =
+    if pkgs.stdenv.hostPlatform.isAarch64 then
+      pkgs.pkgsStatic.libopus.overrideAttrs (old: {
+        mesonFlags = builtins.map (
+          f:
+          if f == "-Dintrinsics=enabled" then
+            "-Dintrinsics=disabled"
+          else if f == "-Drtcd=enabled" then
+            "-Drtcd=disabled"
+          else
+            f
+        ) (old.mesonFlags or [ ]);
+      })
+    else
+      pkgs.pkgsStatic.libopus;
+
   commonArgsStatic = {
     inherit src version;
     strictDeps = true;
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
+      staticLibopus
       pkgs.pkgsStatic.libxkbcommon
       pkgs.pkgsStatic.pixman
     ]

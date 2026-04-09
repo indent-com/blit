@@ -1,4 +1,5 @@
-export { BlitWorkspace } from "./BlitWorkspace";
+export { BlitWorkspace, consoleLogger, nullLogger } from "./BlitWorkspace";
+export type { BlitLogger } from "./BlitWorkspace";
 
 export {
   SEARCH_SOURCE_TITLE,
@@ -7,10 +8,12 @@ export {
 } from "./BlitConnection";
 
 export type { BlitWasmModule } from "./TerminalStore";
+export { AudioPlayer } from "./AudioPlayer";
 export { SurfaceStore } from "./SurfaceStore";
 export type {
   SurfaceFrameCallback,
   SurfaceEventCallback,
+  SurfaceFrameSample,
 } from "./SurfaceStore";
 
 export { measureCell, cssFontFamily } from "./measure";
@@ -48,7 +51,8 @@ export { PALETTES } from "./palettes";
 export { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 export { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 
-export type { GlRenderer } from "./gl-renderer";
+export type { GlRenderer, RendererBackend } from "./gl-renderer";
+export { createWebGpuRenderer } from "./webgpu-renderer";
 
 export { BlitTerminalSurface } from "./BlitTerminalSurface";
 export type {

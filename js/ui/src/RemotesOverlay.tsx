@@ -1,4 +1,4 @@
-import { createSignal, For, Index, Show } from "solid-js";
+import { createSignal, Index, Show } from "solid-js";
 import type { ConnectionStatus, TerminalPalette } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { themeFor, ui, uiScale } from "./theme";
@@ -23,12 +23,16 @@ export function RemotesOverlay(props: {
   remotes: Remote[];
   defaultRemote: string | null;
   statuses?: ReadonlyMap<string, ConnectionStatus>;
+  gatewayStatus?: "connecting" | "connected" | "unavailable";
   palette: TerminalPalette;
   fontSize: number;
+  /** When true, show connection statuses only — no add/remove/reorder actions. */
+  readOnly?: boolean;
   onAdd: (name: string, uri: string) => void;
   onRemove: (name: string) => void;
   onSetDefault: (name: string) => void;
   onReorder: (names: string[]) => void;
+  onReconnect?: (name: string) => void;
   onClose: () => void;
 }) {
   const theme = () => themeFor(props.palette);
@@ -36,11 +40,10 @@ export function RemotesOverlay(props: {
 
   const [name, setName] = createSignal("");
   const [uri, setUri] = createSignal("");
-  // Per-remote reveal state: set of names whose URIs are currently shown.
   const [revealed, setRevealed] = createSignal<Set<string>>(new Set());
 
-  // Drag-and-drop state
-  const [dragOverIndex, setDragOverIndex] = createSignal<number | null>(null);
+  /** Insertion gap: 0 = before first row, 1 = between row 0 and 1, etc. */
+  const [dropGap, setDropGap] = createSignal<number | null>(null);
   let dragSourceIndex: number | null = null;
 
   let nameRef!: HTMLInputElement;
@@ -76,27 +79,38 @@ export function RemotesOverlay(props: {
   function handleDragOver(e: DragEvent, index: number) {
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    setDragOverIndex(index);
+    const target = e.currentTarget as HTMLElement;
+    const rect = target.getBoundingClientRect();
+    const midY = rect.top + rect.height / 2;
+    // Top half → insert before this row (gap = index), bottom half → after (gap = index + 1)
+    setDropGap(e.clientY < midY ? index : index + 1);
   }
 
-  function handleDragLeave() {
-    setDragOverIndex(null);
+  function handleDragLeave(_e: DragEvent) {
+    // No-op: dragOver on sibling rows will update the gap, and
+    // handleDragEnd / handleDrop reset state when the drag finishes.
+    // Clearing here would cause flicker when crossing between rows.
   }
 
-  function handleDrop(e: DragEvent, targetIndex: number) {
+  function handleDrop(e: DragEvent) {
     e.preventDefault();
-    setDragOverIndex(null);
-    if (dragSourceIndex === null || dragSourceIndex === targetIndex) return;
+    const gap = dropGap();
+    setDropGap(null);
+    if (dragSourceIndex === null || gap === null) return;
+    // Convert gap index to the target index in the post-removal array
+    let insertAt = gap;
+    if (insertAt > dragSourceIndex) insertAt--;
+    if (insertAt === dragSourceIndex) return;
     const names = props.remotes.map((r) => r.name);
     const [moved] = names.splice(dragSourceIndex, 1);
-    names.splice(targetIndex, 0, moved);
+    names.splice(insertAt, 0, moved);
     props.onReorder(names);
     dragSourceIndex = null;
   }
 
   function handleDragEnd() {
     dragSourceIndex = null;
-    setDragOverIndex(null);
+    setDropGap(null);
   }
 
   const inputStyle = () => ({
@@ -113,16 +127,25 @@ export function RemotesOverlay(props: {
     ...ui.btn,
     "font-size": `${scale().sm}px`,
     "border-radius": "0",
-    border: `1px solid ${theme().subtleBorder}`,
-    "background-color": theme().inputBg,
+    border: "none",
+    "background-color": "transparent",
     color: "inherit",
     padding: `${scale().controlY}px ${scale().controlX + 2}px`,
-    "flex-shrink": 0,
     cursor: "pointer",
     "white-space": "nowrap",
+    opacity: 0.7,
   });
 
   const hasShare = () => props.remotes.some((r) => isShareUri(r.uri));
+  const gatewayDown = () => props.gatewayStatus === "unavailable";
+
+  // Only include the reveal/hide column if any remote is a share URI.
+  const cols = () => {
+    if (props.readOnly) return "auto 1fr";
+    return hasShare()
+      ? "auto auto 1fr auto auto auto auto"
+      : "auto auto 1fr auto auto auto";
+  };
 
   return (
     <OverlayBackdrop
@@ -137,18 +160,69 @@ export function RemotesOverlay(props: {
           display: "flex",
           "flex-direction": "column",
           gap: `${scale().gap}px`,
-          "min-width": "28em",
-          "max-width": "42em",
-          width: "90vw",
+          width: "fit-content",
         }}
       >
         <OverlayHeader
           palette={props.palette}
           fontSize={props.fontSize}
-          title={t("remotes.title")}
-          subtitle={t("remotes.subtitle")}
+          title={
+            props.readOnly ? t("remotes.connectingTitle") : t("remotes.title")
+          }
           onClose={props.onClose}
         />
+
+        {/* Gateway status — only shown while not yet connected */}
+        <Show
+          when={
+            props.gatewayStatus && props.gatewayStatus !== "connected"
+              ? props.gatewayStatus
+              : undefined
+          }
+        >
+          {(gw) => {
+            const color = () =>
+              gw() === "connecting"
+                ? STATUS_COLORS.connecting
+                : STATUS_COLORS.error;
+            return (
+              <div
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  gap: `${scale().tightGap}px`,
+                  padding: `${scale().controlY}px ${scale().controlX}px`,
+                  border: `1px solid ${theme().subtleBorder}`,
+                  "background-color": theme().solidPanelBg,
+                  "font-size": `${scale().md}px`,
+                }}
+              >
+                <span
+                  title={t(`remotes.gateway.${gw()}`)}
+                  style={{
+                    display: "inline-block",
+                    width: "8px",
+                    height: "8px",
+                    "border-radius": "50%",
+                    "background-color": color(),
+                    "flex-shrink": 0,
+                  }}
+                />
+                <span style={{ "font-weight": 600 }}>
+                  {t("remotes.gateway")}
+                </span>
+                <span
+                  style={{
+                    "font-size": `${scale().sm}px`,
+                    color: theme().dimFg,
+                  }}
+                >
+                  {t(`remotes.gateway.${gw()}`)}
+                </span>
+              </div>
+            );
+          }}
+        </Show>
 
         {/* Existing remotes list */}
         <Show
@@ -170,15 +244,32 @@ export function RemotesOverlay(props: {
               >
                 {t("remotes.empty")}
               </div>
-              <div>{t("remotes.emptyHint")}</div>
+              <Show when={!gatewayDown()}>
+                <div>{t("remotes.emptyHint")}</div>
+              </Show>
             </div>
           }
         >
           <div
             role="list"
+            onDragOver={(e) => {
+              // Allow the list container itself to be a drop target so
+              // the cursor doesn't flicker when passing over insertion
+              // indicators or row gaps.
+              e.preventDefault();
+              if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+            }}
+            onDrop={handleDrop}
+            onDragLeave={(e) => {
+              // Clear insertion indicator when the cursor leaves the list entirely.
+              const related = e.relatedTarget as Node | null;
+              if (!related || !e.currentTarget.contains(related)) {
+                setDropGap(null);
+              }
+            }}
             style={{
               display: "grid",
-              gap: `${scale().tightGap}px`,
+              "grid-template-columns": cols(),
               "max-height": "60vh",
               "overflow-y": "auto",
             }}
@@ -194,7 +285,7 @@ export function RemotesOverlay(props: {
                 const isDefault = () => remote().name === effectiveDefault();
                 const displayUri = () =>
                   share() && !show()
-                    ? "share:\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+                    ? "share:\u2022\u2022\u2022\u2022"
                     : remote().uri;
                 const status = () => props.statuses?.get(remote().name) ?? null;
                 const statusColor = () => {
@@ -203,61 +294,86 @@ export function RemotesOverlay(props: {
                     ? (STATUS_COLORS[s] ?? theme().dimFg)
                     : theme().dimFg;
                 };
-                const isDragOver = () => dragOverIndex() === index;
+
+                const rowOpacity = () => (dragSourceIndex === index ? 0.5 : 1);
+                /** Whether the drop would actually move the item (not a no-op). */
+                const isActiveGap = (gap: number) =>
+                  dragSourceIndex !== null &&
+                  gap !== dragSourceIndex &&
+                  gap !== dragSourceIndex + 1;
+                const showGapBefore = () => {
+                  const gap = dropGap();
+                  return gap !== null && gap === index && isActiveGap(gap);
+                };
+                const showGapAfter = () => {
+                  const gap = dropGap();
+                  return (
+                    gap !== null &&
+                    gap === index + 1 &&
+                    index === props.remotes.length - 1 &&
+                    isActiveGap(gap)
+                  );
+                };
 
                 return (
                   <div
                     role="listitem"
-                    draggable={true}
+                    draggable={!props.readOnly}
                     onDragStart={(e) => handleDragStart(e, index)}
                     onDragOver={(e) => handleDragOver(e, index)}
                     onDragLeave={handleDragLeave}
-                    onDrop={(e) => handleDrop(e, index)}
+                    onDrop={handleDrop}
                     onDragEnd={handleDragEnd}
                     style={{
-                      display: "flex",
-                      "align-items": "stretch",
-                      gap: `${scale().tightGap}px`,
-                      border: `1px solid ${isDragOver() ? theme().accent : theme().subtleBorder}`,
-                      "background-color": isDragOver()
-                        ? theme().panelBg
-                        : theme().solidPanelBg,
-                      opacity: dragSourceIndex === index ? 0.5 : 1,
-                      transition: "border-color 0.1s, background-color 0.1s",
+                      display: "grid",
+                      "grid-template-columns": "subgrid",
+                      "grid-column": "1 / -1",
+                      "align-items": "center",
+                      "border-top": showGapBefore()
+                        ? `2px solid ${theme().accent}`
+                        : index > 0
+                          ? "none"
+                          : `1px solid ${theme().subtleBorder}`,
+                      "border-bottom": showGapAfter()
+                        ? `2px solid ${theme().accent}`
+                        : `1px solid ${theme().subtleBorder}`,
+                      "border-left": `1px solid ${theme().subtleBorder}`,
+                      "border-right": `1px solid ${theme().subtleBorder}`,
+                      "background-color": theme().solidPanelBg,
+                      opacity: rowOpacity(),
+                      transition: "opacity 0.1s",
                     }}
                   >
                     {/* Drag handle */}
-                    <div
-                      title={t("remotes.dragHandle")}
-                      style={{
-                        display: "flex",
-                        "align-items": "center",
-                        padding: `0 ${scale().controlX}px`,
-                        cursor: "grab",
-                        color: theme().dimFg,
-                        "font-size": `${scale().md}px`,
-                        "flex-shrink": 0,
-                        "user-select": "none",
-                        "border-right": `1px solid ${theme().subtleBorder}`,
-                      }}
-                    >
-                      ⠿
-                    </div>
+                    <Show when={!props.readOnly}>
+                      <div
+                        title={t("remotes.dragHandle")}
+                        style={{
+                          display: "flex",
+                          "align-items": "center",
+                          "align-self": "stretch",
+                          "justify-content": "center",
+                          padding: `0 ${scale().controlX}px`,
+                          cursor: "grab",
+                          color: theme().dimFg,
+                          "font-size": `${scale().md}px`,
+                          "user-select": "none",
+                          "border-right": `1px solid ${theme().subtleBorder}`,
+                        }}
+                      >
+                        ⠿
+                      </div>
+                    </Show>
 
-                    {/* Status + Name */}
+                    {/* Status dot + Name */}
                     <div
                       style={{
                         padding: `${scale().controlY}px ${scale().controlX}px`,
                         "font-size": `${scale().md}px`,
                         "font-weight": 600,
-                        "min-width": "6em",
-                        "flex-shrink": 0,
-                        "border-right": `1px solid ${theme().subtleBorder}`,
                         display: "flex",
                         "align-items": "center",
                         gap: `${scale().tightGap}px`,
-                        overflow: "hidden",
-                        "text-overflow": "ellipsis",
                         "white-space": "nowrap",
                       }}
                     >
@@ -275,95 +391,99 @@ export function RemotesOverlay(props: {
                       {remote().name}
                     </div>
 
-                    {/* URI (potentially masked) */}
-                    <div
-                      style={{
-                        padding: `${scale().controlY}px ${scale().controlX}px`,
-                        "font-size": `${scale().sm}px`,
-                        color: share() && !show() ? theme().dimFg : theme().fg,
-                        flex: 1,
-                        "min-width": 0,
-                        display: "flex",
-                        "align-items": "center",
-                        overflow: "hidden",
-                        "text-overflow": "ellipsis",
-                        "white-space": "nowrap",
-                        "font-family":
-                          share() && !show() ? "inherit" : "monospace, inherit",
-                        "letter-spacing":
-                          share() && !show() ? "0.05em" : "normal",
-                      }}
-                    >
-                      {displayUri()}
-                    </div>
+                    {/* URI */}
+                    <Show when={!props.readOnly}>
+                      <div
+                        style={{
+                          padding: `${scale().controlY}px ${scale().controlX}px`,
+                          "font-size": `${scale().sm}px`,
+                          color:
+                            share() && !show() ? theme().dimFg : theme().fg,
+                          overflow: "hidden",
+                          "text-overflow": "ellipsis",
+                          "white-space": "nowrap",
+                          "font-family":
+                            share() && !show()
+                              ? "inherit"
+                              : "monospace, inherit",
+                          "letter-spacing":
+                            share() && !show() ? "0.05em" : "normal",
+                        }}
+                      >
+                        {displayUri()}
+                      </div>
 
-                    {/* Default badge / Set as default button */}
-                    <Show
-                      when={isDefault()}
-                      fallback={
-                        <button
-                          type="button"
-                          title={t("remotes.setDefault")}
-                          onClick={() => props.onSetDefault(remote().name)}
+                      {/* Default / Set as default */}
+                      <Show
+                        when={isDefault()}
+                        fallback={
+                          <button
+                            type="button"
+                            title={t("remotes.setDefault")}
+                            onClick={() => props.onSetDefault(remote().name)}
+                            style={{
+                              ...btnStyle(),
+                              opacity: 0.5,
+                              "border-left": `1px solid ${theme().subtleBorder}`,
+                            }}
+                          >
+                            {t("remotes.setDefault")}
+                          </button>
+                        }
+                      >
+                        <div
+                          title={t("remotes.isDefault")}
                           style={{
                             ...btnStyle(),
-                            border: "none",
+                            cursor: "default",
+                            color: theme().accent,
                             "border-left": `1px solid ${theme().subtleBorder}`,
-                            opacity: 0.5,
                           }}
                         >
-                          {t("remotes.setDefault")}
-                        </button>
-                      }
-                    >
-                      <div
-                        title={t("remotes.isDefault")}
-                        style={{
-                          ...btnStyle(),
-                          border: "none",
-                          "border-left": `1px solid ${theme().subtleBorder}`,
-                          opacity: 0.7,
-                          cursor: "default",
-                          color: theme().accent,
-                        }}
-                      >
-                        {t("remotes.isDefault")}
-                      </div>
-                    </Show>
+                          {t("remotes.isDefault")}
+                        </div>
+                      </Show>
 
-                    {/* Reveal/hide button for share: URIs */}
-                    <Show when={share()}>
+                      {/* Reveal/hide — only column present when any remote is share */}
+                      <Show when={hasShare()}>
+                        <Show when={share()} fallback={<div />}>
+                          <button
+                            type="button"
+                            title={
+                              show()
+                                ? t("remotes.hideUri")
+                                : t("remotes.revealUri")
+                            }
+                            onClick={() => toggleReveal(remote().name)}
+                            style={btnStyle()}
+                          >
+                            {show()
+                              ? t("remotes.hideUri")
+                              : t("remotes.revealUri")}
+                          </button>
+                        </Show>
+                      </Show>
+
+                      {/* Reconnect */}
                       <button
                         type="button"
-                        title={
-                          show() ? t("remotes.hideUri") : t("remotes.revealUri")
-                        }
-                        onClick={() => toggleReveal(remote().name)}
-                        style={{
-                          ...btnStyle(),
-                          border: "none",
-                          "border-left": `1px solid ${theme().subtleBorder}`,
-                          opacity: 0.7,
-                        }}
+                        title={t("disconnected.reconnectNow")}
+                        onClick={() => props.onReconnect?.(remote().name)}
+                        style={btnStyle()}
                       >
-                        {show() ? t("remotes.hideUri") : t("remotes.revealUri")}
+                        {t("disconnected.reconnectNow")}
+                      </button>
+
+                      {/* Remove */}
+                      <button
+                        type="button"
+                        title={t("remotes.remove")}
+                        onClick={() => props.onRemove(remote().name)}
+                        style={btnStyle()}
+                      >
+                        {t("remotes.remove")}
                       </button>
                     </Show>
-
-                    {/* Remove button */}
-                    <button
-                      type="button"
-                      title={t("remotes.remove")}
-                      onClick={() => props.onRemove(remote().name)}
-                      style={{
-                        ...btnStyle(),
-                        border: "none",
-                        "border-left": `1px solid ${theme().subtleBorder}`,
-                        opacity: 0.7,
-                      }}
-                    >
-                      {t("remotes.remove")}
-                    </button>
                   </div>
                 );
               }}
@@ -371,73 +491,83 @@ export function RemotesOverlay(props: {
           </div>
         </Show>
 
-        {/* share: warning */}
-        <Show when={hasShare()}>
-          <div
-            style={{
-              "font-size": `${scale().xs}px`,
-              color: theme().dimFg,
-              padding: `${scale().tightGap}px ${scale().controlX}px`,
-              border: `1px solid ${theme().subtleBorder}`,
-              "background-color": theme().panelBg,
-            }}
-          >
-            {t("remotes.shareWarning")}
-          </div>
-        </Show>
+        <Show when={!props.readOnly && !gatewayDown()}>
+          {/* share: warning */}
+          <Show when={hasShare()}>
+            <div
+              style={{
+                "font-size": `${scale().xs}px`,
+                color: theme().dimFg,
+                padding: `${scale().tightGap}px ${scale().controlX}px`,
+                border: `1px solid ${theme().subtleBorder}`,
+                "background-color": theme().panelBg,
+              }}
+            >
+              {t("remotes.shareWarning")}
+            </div>
+          </Show>
 
-        {/* Add form */}
-        <form
-          onSubmit={handleAdd}
-          style={{
-            display: "flex",
-            gap: `${scale().tightGap}px`,
-            "align-items": "stretch",
-            "border-top": `1px solid ${theme().subtleBorder}`,
-            "padding-top": `${scale().gap}px`,
-          }}
-        >
-          <input
-            ref={nameRef}
-            type="text"
-            value={name()}
-            onInput={(e) => setName(e.currentTarget.value)}
-            placeholder={t("remotes.namePlaceholder")}
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck={false}
+          {/* Add form */}
+          <form
+            onSubmit={handleAdd}
             style={{
-              ...inputStyle(),
-              flex: "0 0 8em",
-              "font-weight": 600,
-            }}
-          />
-          <input
-            type="text"
-            value={uri()}
-            onInput={(e) => setUri(e.currentTarget.value)}
-            placeholder={t("remotes.uriPlaceholder")}
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck={false}
-            style={inputStyle()}
-          />
-          <button
-            type="submit"
-            disabled={!name().trim() || !uri().trim()}
-            style={{
-              ...btnStyle(),
-              opacity: name().trim() && uri().trim() ? 1 : 0.4,
-              "background-color": theme().accent,
-              color: "#fff",
-              border: `1px solid ${theme().accent}`,
+              display: "flex",
+              gap: `${scale().tightGap}px`,
+              "align-items": "stretch",
+              "border-top": `1px solid ${theme().subtleBorder}`,
+              "padding-top": `${scale().gap}px`,
             }}
           >
-            {t("remotes.add")}
-          </button>
-        </form>
+            <input
+              ref={nameRef}
+              name="blit-remote-name"
+              type="text"
+              value={name()}
+              onInput={(e) => setName(e.currentTarget.value)}
+              placeholder={t("remotes.namePlaceholder")}
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
+              style={{
+                ...inputStyle(),
+                flex: "0 0 8em",
+                "font-weight": 600,
+              }}
+            />
+            <input
+              name="blit-remote-uri"
+              type="text"
+              value={uri()}
+              onInput={(e) => setUri(e.currentTarget.value)}
+              placeholder={t("remotes.uriPlaceholder")}
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
+              style={inputStyle()}
+            />
+            <button
+              type="submit"
+              disabled={!name().trim() || !uri().trim()}
+              style={{
+                ...ui.btn,
+                "font-size": `${scale().sm}px`,
+                "border-radius": "0",
+                border: `1px solid ${theme().accent}`,
+                "background-color": theme().accent,
+                color: "#fff",
+                padding: `${scale().controlY}px ${scale().controlX + 2}px`,
+                "flex-shrink": 0,
+                cursor: "pointer",
+                "white-space": "nowrap",
+                opacity: name().trim() && uri().trim() ? 1 : 0.4,
+              }}
+            >
+              {t("remotes.add")}
+            </button>
+          </form>
+        </Show>
       </OverlayPanel>
     </OverlayBackdrop>
   );

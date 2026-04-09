@@ -21,6 +21,7 @@ import type {
   BlitTransport,
   BlitSession,
   BlitSurface,
+  BlitTerminalSurface,
   BlitWasmModule,
   SessionId,
   TerminalPalette,
@@ -34,11 +35,17 @@ import {
   PALETTE_KEY,
   FONT_KEY,
   FONT_SIZE_KEY,
+  AUDIO_BITRATE_KEY,
+  AUDIO_MUTED_KEY,
+  VIDEO_QUALITY_KEY,
   writeStorage,
   useConfigValue,
   preferredPalette,
   preferredFont,
   preferredFontSize,
+  preferredAudioBitrate,
+  preferredAudioMuted,
+  preferredVideoQuality,
   blitHost,
   basePath,
   useRemotes,
@@ -50,7 +57,15 @@ import {
   reorderRemotes,
 } from "./storage";
 import type { UIScale, Theme } from "./theme";
-import { themeFor, layout, ui, uiScale, z } from "./theme";
+import {
+  sessionName,
+  sessionPrefix,
+  themeFor,
+  layout,
+  ui,
+  uiScale,
+  z,
+} from "./theme";
 import { t } from "./i18n";
 import { StatusBar } from "./StatusBar";
 import { SwitcherOverlay } from "./SwitcherOverlay";
@@ -58,8 +73,10 @@ import { PaletteOverlay } from "./PaletteOverlay";
 import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
+import { MediaOverlay } from "./MediaOverlay";
 import { BSPContainer } from "./bsp/BSPContainer";
-import { ConnectingOverlay } from "./ConnectingOverlay";
+
+import { MobileToolbar } from "./MobileToolbar";
 import type { BSPAssignments, BSPLayout } from "./bsp/layout";
 import {
   loadActiveLayout,
@@ -72,14 +89,29 @@ import {
   parseSurfaceAssignment,
 } from "./bsp/layout";
 
-export type Overlay = "expose" | "palette" | "font" | "help" | "remotes" | null;
+export type Overlay =
+  | "expose"
+  | "palette"
+  | "font"
+  | "help"
+  | "remotes"
+  | "media"
+  | null;
+
+function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
+  const prev = import.meta.hot?.data?.workspace as BlitWorkspace | undefined;
+  if (prev) return prev;
+  const ws = new BlitWorkspace({ wasm });
+  if (import.meta.hot) import.meta.hot.data.workspace = ws;
+  return ws;
+}
 
 export function Workspace(props: {
   connections: ConnectionSpec[] | (() => ConnectionSpec[]);
   wasm: BlitWasmModule;
   onAuthError: () => void;
 }) {
-  const workspace = new BlitWorkspace({ wasm: props.wasm });
+  const workspace = getHmrWorkspace(props.wasm);
 
   // Normalise: accept either a static array or a reactive accessor.
   const getConnections =
@@ -112,8 +144,12 @@ export function Workspace(props: {
   });
 
   onCleanup(() => {
-    for (const conn of workspace.getSnapshot().connections) {
-      workspace.removeConnection(conn.id);
+    // On real teardown, remove all connections. During HMR, keep them alive —
+    // the reconciliation effect will re-adopt them on the next mount.
+    if (!import.meta.hot) {
+      for (const conn of workspace.getSnapshot().connections) {
+        workspace.removeConnection(conn.id);
+      }
     }
   });
 
@@ -180,11 +216,25 @@ function WorkspaceScreen(props: {
         const conn = workspace.getConnection(spec.id);
         if (!conn) continue;
         for (const s of conn.surfaceStore.getSurfaces().values()) {
-          // Filter out zero-size auxiliary surfaces (e.g. mpv's
-          // secondary window that never commits a buffer).
-          if (s.width > 0 && s.height > 0) all.push(s);
+          all.push(s);
         }
       }
+      // Avoid unnecessary signal updates (and <For> churn) when the
+      // surface set hasn't actually changed.
+      const prev = surfaces();
+      if (
+        prev.length === all.length &&
+        prev.every(
+          (s, i) =>
+            s.surfaceId === all[i].surfaceId &&
+            s.connectionId === all[i].connectionId &&
+            s.title === all[i].title &&
+            s.appId === all[i].appId &&
+            s.width === all[i].width &&
+            s.height === all[i].height,
+        )
+      )
+        return;
       setSurfaces(all);
     };
     for (const spec of props.connectionSpecs()) {
@@ -192,10 +242,11 @@ function WorkspaceScreen(props: {
       if (!conn) continue;
       cleanups.push(conn.surfaceStore.onChange(syncAll));
     }
-    // Also refresh surfaces on workspace state changes (connection
-    // status transitions) so the list stays in sync after reconnects
-    // even if the surfaceStore change event is suppressed during the
-    // reconnect window.
+    // Also refresh on workspace state changes (connection status
+    // transitions) so the surface list stays in sync after reconnects
+    // and initial connection setup.  The equality check in syncAll
+    // prevents <For> churn on unrelated snapshot changes (terminal
+    // frames, pacing, ping).
     cleanups.push(workspace.subscribe(syncAll));
     syncAll();
     onCleanup(() => cleanups.forEach((fn) => fn()));
@@ -223,9 +274,115 @@ function WorkspaceScreen(props: {
     string | null
   >(null);
   const [debugPanel, setDebugPanel] = createSignal(false);
+  const [audioMuted, setAudioMuted] = createSignal(preferredAudioMuted());
+  const [audioBitrate, setAudioBitrate] = createSignal(preferredAudioBitrate());
+  const [videoQuality, setVideoQuality] = createSignal(preferredVideoQuality());
   const [previewPanelOpen, setPreviewPanelOpen] = createSignal(true);
   const [previewPanelWidth, setPreviewPanelWidth] =
     createSignal(MIN_PANEL_WIDTH);
+
+  // --- Mobile touch detection & virtual keyboard tracking ---
+  const [isMobileTouch, setIsMobileTouch] = createSignal(false);
+  const [terminalSurface, setTerminalSurface] =
+    createSignal<BlitTerminalSurface | null>(null);
+
+  onMount(() => {
+    const isTouch = () =>
+      "ontouchstart" in window ||
+      navigator.maxTouchPoints > 0 ||
+      matchMedia("(pointer: coarse)").matches;
+    const check = () => isTouch();
+    setIsMobileTouch(check());
+    // Recheck when the coarse pointer media query changes (e.g.
+    // DevTools device-mode toggle).
+    const mq = matchMedia("(pointer: coarse)");
+    const handler = () => setIsMobileTouch(check());
+    mq.addEventListener?.("change", handler);
+    onCleanup(() => {
+      mq.removeEventListener?.("change", handler);
+    });
+  });
+
+  // Track visualViewport to detect keyboard open/close on mobile.
+  const [vpHeight, setVpHeight] = createSignal<number | null>(null);
+  const [vpOffset, setVpOffset] = createSignal(0);
+  onMount(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      setVpHeight(vv.height);
+      setVpOffset(vv.offsetTop);
+    };
+    update(); // initialise immediately
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    onCleanup(() => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    });
+  });
+
+  // Capture full viewport height at mount and on orientation change.
+  const [fullHeight, setFullHeight] = createSignal(0);
+  onMount(() => {
+    setFullHeight(window.innerHeight);
+    const onOrientationChange = () => {
+      setTimeout(() => setFullHeight(window.innerHeight), 150);
+    };
+    screen.orientation?.addEventListener("change", onOrientationChange);
+    onCleanup(() =>
+      screen.orientation?.removeEventListener("change", onOrientationChange),
+    );
+  });
+
+  // Keyboard open when visualViewport shrinks >150px from full height.
+  const keyboardOpen = createMemo(() => {
+    if (!isMobileTouch()) return false;
+    const h = vpHeight();
+    const full = fullHeight();
+    if (h === null || full === 0) return false;
+    return full - h > 150;
+  });
+
+  // Sticky virtual keyboard: track explicit user intent so the keyboard
+  // isn't dismissed when tapping elsewhere on the page.
+  const [keyboardWanted, setKeyboardWanted] = createSignal(false);
+
+  // Re-focus the terminal textarea when it blurs while the user wants
+  // the keyboard open, unless an overlay is active.
+  createEffect(() => {
+    if (!isMobileTouch() || !keyboardWanted()) return;
+    const handler = (e: FocusEvent) => {
+      if (!(e.target instanceof HTMLTextAreaElement)) return;
+      if (!(e.target as Element).closest?.("section")) return;
+      if (overlay()) return;
+      setTimeout(() => {
+        if (!keyboardWanted() || overlay()) return;
+        const el = document.querySelector<HTMLElement>(
+          "section textarea[tabindex]",
+        );
+        el?.focus();
+      }, 50);
+    };
+    document.addEventListener("focusout", handler, true);
+    onCleanup(() => document.removeEventListener("focusout", handler, true));
+  });
+
+  /** Toggle the virtual keyboard on mobile. */
+  function toggleMobileKeyboard() {
+    const el = document.querySelector<HTMLElement>(
+      "section textarea[tabindex]",
+    );
+    if (!el) return;
+    if (keyboardWanted()) {
+      setKeyboardWanted(false);
+      el.blur();
+    } else {
+      setKeyboardWanted(true);
+      el.focus();
+    }
+  }
+
   // Parse focus params from URL hash on init.
   // Surface: s=<connectionId>:<surfaceId>
   // Terminal: t=<sessionId>  (sessionId is already "<connectionId>:<counter>")
@@ -236,12 +393,17 @@ function WorkspaceScreen(props: {
   const hashTerminal = initHash.get("t");
 
   // s= and t= are mutually exclusive; s= takes priority.
-  const pendingSurfaceFromHash = (() => {
+  const pendingSurfaceFromHash: {
+    connectionId: string;
+    surfaceId: number;
+  } | null = (() => {
     if (!hashSurface) return null;
     const sep = hashSurface.indexOf(":");
     if (sep < 0) return null;
+    const connectionId = hashSurface.slice(0, sep);
     const surfaceId = Number(hashSurface.slice(sep + 1));
-    return Number.isFinite(surfaceId) ? surfaceId : null;
+    if (!connectionId || !Number.isFinite(surfaceId)) return null;
+    return { connectionId, surfaceId };
   })();
 
   const [focusedSurfaceId, setFocusedSurfaceId] = createSignal<number | null>(
@@ -253,12 +415,20 @@ function WorkspaceScreen(props: {
     createSignal<ConnectionId | null>(null);
 
   /** Set or clear the focused surface, always keeping the connectionId
-   *  in sync so the BSP view uses the correct connection. */
-  function focusSurfaceById(surfaceId: number | null) {
+   *  in sync so the BSP view uses the correct connection.
+   *  When `connectionId` is provided it is used directly, avoiding a
+   *  potentially ambiguous lookup by numeric surfaceId alone. */
+  function focusSurfaceById(
+    surfaceId: number | null,
+    connectionId?: ConnectionId | null,
+  ) {
     setFocusedSurfaceId(surfaceId);
     if (surfaceId != null) {
-      const s = surfaces().find((x) => x.surfaceId === surfaceId);
-      setFocusedSurfaceConnId(s?.connectionId ?? null);
+      const connId =
+        connectionId ??
+        surfaces().find((x) => x.surfaceId === surfaceId)?.connectionId ??
+        null;
+      setFocusedSurfaceConnId(connId);
     } else {
       setFocusedSurfaceConnId(null);
     }
@@ -270,9 +440,18 @@ function WorkspaceScreen(props: {
     createEffect(() => {
       if (surfaceRestored) return;
       const ss = surfaces();
-      if (ss.some((s) => s.surfaceId === pendingSurfaceFromHash)) {
+      if (
+        ss.some(
+          (s) =>
+            s.surfaceId === pendingSurfaceFromHash.surfaceId &&
+            s.connectionId === pendingSurfaceFromHash.connectionId,
+        )
+      ) {
         surfaceRestored = true;
-        focusSurfaceById(pendingSurfaceFromHash);
+        focusSurfaceById(
+          pendingSurfaceFromHash.surfaceId,
+          pendingSurfaceFromHash.connectionId as ConnectionId,
+        );
       }
     });
   }
@@ -302,6 +481,22 @@ function WorkspaceScreen(props: {
   );
   const [layoutAssignments, setLayoutAssignments] =
     createSignal<BSPAssignments | null>(null);
+  /** True once BSPContainer has finished resolving hash-based assignments. */
+  const [assignmentsResolved, setAssignmentsResolved] = createSignal(true);
+
+  // Re-parse layout from URL hash when the user edits it externally.
+  // The app writes the hash via history.replaceState() which does NOT
+  // trigger hashchange, so this only fires on genuine external edits.
+  createEffect(() => {
+    const onHashChange = () => {
+      const fromHash = loadActiveLayout();
+      if (fromHash && fromHash.dsl !== activeLayout()?.dsl) {
+        setActiveLayout(fromHash);
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+    onCleanup(() => window.removeEventListener("hashchange", onHashChange));
+  });
 
   // Clear focused surface if it was destroyed.  Use a short grace period
   // to avoid flickering during reconnect cycles where the surface list is
@@ -309,6 +504,7 @@ function WorkspaceScreen(props: {
   let clearFocusedTimer: ReturnType<typeof setTimeout> | null = null;
   createEffect(() => {
     const fid = focusedSurfaceId();
+    const fConnId = focusedSurfaceConnId();
     if (fid == null) {
       if (clearFocusedTimer) {
         clearTimeout(clearFocusedTimer);
@@ -316,13 +512,20 @@ function WorkspaceScreen(props: {
       }
       return;
     }
-    const exists = surfaces().some((s) => s.surfaceId === fid);
+    const exists = surfaces().some(
+      (s) =>
+        s.surfaceId === fid && (fConnId == null || s.connectionId === fConnId),
+    );
     if (!exists) {
       if (!clearFocusedTimer) {
         clearFocusedTimer = setTimeout(() => {
           clearFocusedTimer = null;
           // Re-check after the grace period.
-          const stillGone = !surfaces().some((s) => s.surfaceId === fid);
+          const stillGone = !surfaces().some(
+            (s) =>
+              s.surfaceId === fid &&
+              (fConnId == null || s.connectionId === fConnId),
+          );
           if (stillGone) focusSurfaceById(null);
         }, 2000);
       }
@@ -334,19 +537,31 @@ function WorkspaceScreen(props: {
 
   const offScreenSurfaces = createMemo(() => {
     const fid = focusedSurfaceId();
-    // Collect surface IDs assigned to BSP panes.
+    const fConnId = focusedSurfaceConnId();
+    // Collect surface keys assigned to BSP panes.
+    const al = activeLayout();
     const la = layoutAssignments();
-    const inPane = new Set<number>();
+    if (al) {
+      // While layoutAssignments hasn't been reported yet (null during
+      // initialization or layout switch), treat all surfaces as assigned
+      // to avoid showing them in both BSP panes and the side panel.
+      if (!la) return [];
+    }
+    const inPane = new Set<string>();
     if (la) {
       for (const v of Object.values(la.assignments)) {
         if (v && isSurfaceAssignment(v)) {
-          const id = parseInt(v.slice("surface:".length), 10);
-          if (Number.isFinite(id)) inPane.add(id);
+          const parsed = parseSurfaceAssignment(v);
+          if (parsed) inPane.add(`${parsed.connectionId}:${parsed.surfaceId}`);
         }
       }
     }
     return surfaces().filter(
-      (s) => s.surfaceId !== fid && !inPane.has(s.surfaceId),
+      (s) =>
+        !(
+          s.surfaceId === fid &&
+          (fConnId == null || s.connectionId === fConnId)
+        ) && !inPane.has(`${s.connectionId}:${s.surfaceId}`),
     );
   });
 
@@ -355,12 +570,14 @@ function WorkspaceScreen(props: {
     const la = layoutAssignments();
     const sess = sessions();
     if (al) {
+      // While layoutAssignments hasn't been reported yet (null during
+      // initialization or layout switch), treat all sessions as assigned
+      // to avoid flashing every terminal in the side panel.
+      if (!la) return [];
       const assigned = new Set<SessionId>(
-        la
-          ? Object.values(la.assignments).filter(
-              (id): id is SessionId => id != null,
-            )
-          : [],
+        Object.values(la.assignments).filter(
+          (id): id is SessionId => id != null && !isSurfaceAssignment(id),
+        ),
       );
       return sess.filter((s) => s.state !== "closed" && !assigned.has(s.id));
     }
@@ -386,6 +603,9 @@ function WorkspaceScreen(props: {
   const remotePaletteId = useConfigValue(PALETTE_KEY);
   const remoteFont = useConfigValue(FONT_KEY);
   const remoteFontSize = useConfigValue(FONT_SIZE_KEY);
+  const remoteAudioBitrate = useConfigValue(AUDIO_BITRATE_KEY);
+  const remoteAudioMuted = useConfigValue(AUDIO_MUTED_KEY);
+  const remoteVideoQuality = useConfigValue(VIDEO_QUALITY_KEY);
 
   createEffect(() => {
     const id = remotePaletteId();
@@ -404,6 +624,74 @@ function WorkspaceScreen(props: {
     if (!s) return;
     const n = parseInt(s, 10);
     if (n > 0) setFontSize(n);
+  });
+
+  createEffect(() => {
+    const s = remoteAudioBitrate();
+    if (!s) return;
+    const n = parseInt(s, 10);
+    if (n >= 0) setAudioBitrate(n);
+  });
+
+  createEffect(() => {
+    const s = remoteAudioMuted();
+    if (s === "0") setAudioMuted(false);
+    else if (s === "1") setAudioMuted(true);
+  });
+
+  createEffect(() => {
+    const s = remoteVideoQuality();
+    if (!s) return;
+    const n = parseInt(s, 10);
+    if (n >= 0 && n <= 4) setVideoQuality(n);
+  });
+
+  // Sync media preferences to all connections so new subscribes use them.
+  createEffect(() => {
+    const q = videoQuality();
+    const b = audioBitrate();
+    for (const snap of allConnections()) {
+      const conn = workspace.getConnection(snap.id);
+      if (conn) {
+        conn.defaultSurfaceQuality = q;
+        conn.defaultAudioBitrateKbps = b;
+      }
+    }
+  });
+
+  // Reactively sync audio subscriptions to all connections.
+  // Subscribes when unmuted and surfaces exist, unsubscribes when muted or
+  // surfaces disappear. Also applies mute state to the AudioPlayer so newly
+  // added connections pick up the current setting.
+  //
+  // AudioPlayer state changes (e.g. reset on reconnect / S2C_HELLO) are
+  // wired into the connection's emit chain (see BlitConnection constructor),
+  // so this effect re-runs whenever the subscription is invalidated and can
+  // re-subscribe automatically.
+  createEffect(() => {
+    const muted = audioMuted();
+    const bitrate = audioBitrate();
+    // Read surfaces() to re-run when surfaces appear/disappear.
+    surfaces();
+    for (const snap of allConnections()) {
+      if (!snap.supportsAudio) continue;
+      const conn = workspace.getConnection(snap.id);
+      if (!conn) continue;
+      conn.audioPlayer.setMuted(muted);
+      const surfs = conn.surfaceStore.getSurfaces();
+      if (surfs.size === 0) {
+        // No surfaces — unsubscribe if subscribed.
+        if (conn.audioPlayer.subscribed) {
+          conn.sendAudioUnsubscribe();
+        }
+        continue;
+      }
+      if (!muted && !conn.audioPlayer.subscribed) {
+        conn.sendAudioSubscribe(bitrate);
+      } else if (muted && conn.audioPlayer.subscribed) {
+        conn.sendAudioUnsubscribe();
+      }
+    }
   });
 
   const resolvedFontWithFallback = () => {
@@ -429,6 +717,7 @@ function WorkspaceScreen(props: {
   createEffect(() => {
     if (activeLayout()) return;
     setLayoutAssignments(null);
+    setAssignmentsResolved(true);
   });
 
   // Visibility management
@@ -454,11 +743,10 @@ function WorkspaceScreen(props: {
     if (conns.some((c) => c.error === "auth")) props.onAuthError();
   });
 
-  // Debounce connected status — worst status across all connections.
-  const rawStatus = () => {
+  // Worst status across all connections.
+  const connectionStatus = () => {
     const conns = allConnections();
     if (conns.length === 0) return "disconnected" as const;
-    // If any connection is in error/disconnected, show that.
     for (const s of [
       "error",
       "disconnected",
@@ -470,27 +758,34 @@ function WorkspaceScreen(props: {
     }
     return "connected" as const;
   };
-  const [stableStatus, setStableStatus] = createSignal(rawStatus());
+
+  // Auto-open the remotes overlay while connections are being established
+  // on initial page load, and auto-close once everything is connected.
+  // Once dismissed (by auto-close or user action), never auto-open again.
+  const [remotesAutoOpen, setRemotesAutoOpen] = createSignal<
+    "pending" | "open" | "done"
+  >("pending");
   createEffect(() => {
-    const rs = rawStatus();
-    if (rs !== "connected") {
-      setStableStatus(rs);
+    const status = connectionStatus();
+    const phase = remotesAutoOpen();
+    if (status === "connected") {
+      if (phase === "open") {
+        // All connected — auto-close if still showing.
+        setRemotesAutoOpen("done");
+        if (overlay() === "remotes") setOverlay(null);
+      } else if (phase === "pending") {
+        // Connected before we ever opened — skip entirely.
+        setRemotesAutoOpen("done");
+      }
       return;
     }
-    const timer = setTimeout(() => setStableStatus("connected"), 500);
-    onCleanup(() => clearTimeout(timer));
+    // Only auto-open when there are configured remotes — a single local
+    // connection is near-instant and doesn't need a status dialog.
+    if (phase === "pending" && overlay() === null && remotes().length > 0) {
+      setRemotesAutoOpen("open");
+      setOverlay("remotes");
+    }
   });
-
-  // Connecting overlay dismiss state: user can hide it manually.
-  // Only shown on initial page load — once dismissed (or connected), stays hidden.
-  const [connectingOverlayDismissed, setConnectingOverlayDismissed] =
-    createSignal(false);
-  createEffect(() => {
-    // Auto-dismiss once we reach connected for the first time.
-    if (stableStatus() === "connected") setConnectingOverlayDismissed(true);
-  });
-  const showConnectingOverlay = () =>
-    stableStatus() !== "connected" && !connectingOverlayDismissed();
 
   // Theme on document
   createEffect(() => {
@@ -513,6 +808,22 @@ function WorkspaceScreen(props: {
       const label = connectionLabels().get(fs.connectionId);
       if (label) parts.push(label);
       if (fs.title) parts.push(fs.title);
+    } else {
+      const surf =
+        focusedSurfaceId() != null
+          ? (surfaces().find(
+              (s) =>
+                s.surfaceId === focusedSurfaceId() &&
+                (focusedSurfaceConnId() == null ||
+                  s.connectionId === focusedSurfaceConnId()),
+            ) ?? null)
+          : bspFocusedSurface();
+      if (surf) {
+        const label = connectionLabels().get(surf.connectionId);
+        if (label) parts.push(label);
+        const name = surf.title || surf.appId;
+        if (name) parts.push(name);
+      }
     }
     if (host && host !== "localhost" && host !== "127.0.0.1") parts.push(host);
     parts.push("blit");
@@ -541,6 +852,11 @@ function WorkspaceScreen(props: {
   });
 
   function closeOverlay() {
+    // If the user manually dismisses the auto-opened remotes overlay,
+    // mark it done so it never re-opens or auto-closes a later overlay.
+    if (overlay() === "remotes" && remotesAutoOpen() === "open") {
+      setRemotesAutoOpen("done");
+    }
     paletteOverlayOrigin = null;
     fontOverlayOrigin = null;
     setOpenInNewTerminalMode(false);
@@ -607,12 +923,55 @@ function WorkspaceScreen(props: {
     closeOverlay();
   }
 
+  function changeAudioBitrate(kbps: number) {
+    setAudioBitrate(kbps);
+    writeStorage(AUDIO_BITRATE_KEY, String(kbps));
+    // Re-subscribe all active audio connections with the new bitrate.
+    for (const snap of allConnections()) {
+      if (!snap.supportsAudio) continue;
+      const conn = workspace.getConnection(snap.id);
+      if (!conn || !conn.audioPlayer.subscribed) continue;
+      conn.sendAudioSubscribe(kbps);
+    }
+  }
+
+  function toggleAudio() {
+    const newMuted = !audioMuted();
+    setAudioMuted(newMuted);
+    writeStorage(AUDIO_MUTED_KEY, newMuted ? "1" : "0");
+    // The reactive effect (syncAudioSubscriptions) will handle
+    // subscribing/unsubscribing and applying mute to all connections.
+  }
+
+  function resetAudio() {
+    for (const snap of allConnections()) {
+      if (!snap.supportsAudio) continue;
+      const conn = workspace.getConnection(snap.id);
+      if (!conn) continue;
+      conn.resetAudio();
+    }
+  }
+
+  function changeVideoQuality(quality: number) {
+    setVideoQuality(quality);
+    writeStorage(VIDEO_QUALITY_KEY, String(quality));
+    // Re-subscribe all active surface subscriptions with the new quality.
+    for (const snap of allConnections()) {
+      const conn = workspace.getConnection(snap.id);
+      if (!conn) continue;
+      for (const surface of conn.surfaceStore.getSurfaces().values()) {
+        conn.sendSurfaceResubscribe(surface.surfaceId, quality);
+      }
+    }
+  }
+
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
     | ((sessionId: SessionId, targetPaneId: string) => void)
     | null = null;
   let moveToPaneFn: ((value: string, targetPaneId: string) => void) | null =
     null;
+  let clearPaneAssignmentFn: ((paneId: string) => void) | null = null;
   let focusPaneFn: ((paneId: string) => void) | null = null;
   const [bspFocusedPaneId, setBspFocusedPaneId] = createSignal<string | null>(
     null,
@@ -620,6 +979,24 @@ function WorkspaceScreen(props: {
   const activePaneId = createMemo(() =>
     activeLayout() ? bspFocusedPaneId() : null,
   );
+
+  /** Resolve the surface occupying the BSP-focused pane (if any). */
+  const bspFocusedSurface = createMemo(() => {
+    const paneId = activePaneId();
+    if (!paneId) return null;
+    const la = layoutAssignments();
+    if (!la) return null;
+    const value = la.assignments[paneId] ?? null;
+    const parsed = parseSurfaceAssignment(value);
+    if (!parsed) return null;
+    return (
+      surfaces().find(
+        (s) =>
+          s.surfaceId === parsed.surfaceId &&
+          s.connectionId === parsed.connectionId,
+      ) ?? null
+    );
+  });
 
   function switchSession(sessionId: SessionId) {
     focusSurfaceById(null);
@@ -629,13 +1006,17 @@ function WorkspaceScreen(props: {
     closeOverlay();
   }
 
-  function focusSurface(surfaceId: number) {
+  function focusSurface(surfaceId: number, connectionId?: ConnectionId) {
     // When a BSP layout is active, place the surface into the focused pane.
     if (activeLayout() && bspFocusedPaneId()) {
-      moveToPaneFn?.(surfaceAssignment(surfaceId), bspFocusedPaneId()!);
+      const connId =
+        connectionId ??
+        surfaces().find((x) => x.surfaceId === surfaceId)?.connectionId ??
+        activeConnectionId();
+      moveToPaneFn?.(surfaceAssignment(connId, surfaceId), bspFocusedPaneId()!);
       focusSurfaceById(null);
     } else {
-      focusSurfaceById(surfaceId);
+      focusSurfaceById(surfaceId, connectionId);
     }
     closeOverlay();
   }
@@ -689,9 +1070,12 @@ function WorkspaceScreen(props: {
   ) {
     if (sessionId && !command) {
       workspace.focusSession(sessionId);
-      focusBySessionFn?.(sessionId);
-    } else {
+      focusPaneFn?.(paneId);
+    } else if (command || connectionId) {
       void createInPane(paneId, command, connectionId);
+    } else {
+      // Empty pane, no command — just move focus.
+      focusPaneFn?.(paneId);
     }
     closeOverlay();
   }
@@ -699,7 +1083,12 @@ function WorkspaceScreen(props: {
   function handleRestartOrClose() {
     const fs = focusedSession();
     if (!fs) {
-      void createAndFocus();
+      const paneId = bspFocusedPaneId();
+      if (paneId) {
+        void createInPane(paneId);
+      } else {
+        void createAndFocus();
+      }
       return;
     }
     if (fs.state !== "exited") return;
@@ -721,8 +1110,9 @@ function WorkspaceScreen(props: {
     focusedSessionId: () => wsState().focusedSessionId,
     supportsRestart: () => connection()?.supportsRestart ?? false,
     focusedSurfaceId,
-    closeSurface: (surfaceId: number) => {
-      workspace.closeSurface(activeConnectionId(), surfaceId);
+    focusedSurfaceConnId,
+    closeSurface: (connectionId: ConnectionId, surfaceId: number) => {
+      workspace.closeSurface(connectionId, surfaceId);
     },
     unfocusSurface: () => {
       focusSurfaceById(null);
@@ -740,6 +1130,11 @@ function WorkspaceScreen(props: {
       workspace.focusSession(sessionId);
       focusBySessionFn?.(sessionId);
     },
+    clearFocusedPaneAssignment: () => {
+      const paneId = bspFocusedPaneId();
+      if (paneId) clearPaneAssignmentFn?.(paneId);
+    },
+    resetAudio,
   });
 
   // Set font defaults on connection
@@ -751,44 +1146,77 @@ function WorkspaceScreen(props: {
     conn.setFontFamily(resolvedFontWithFallback());
   });
 
+  // Durable map from session ID to its hash-encodable representation
+  // ("t:connectionId:ptyId").  Survives connection removal so URL-hash
+  // entries for panes assigned to sessions on a removed remote aren't lost.
+  const durableSessionHashEntries = new Map<string, string>();
+
   // Sync layout + focus to URL hash.
   // Assignments are also durably saved to localStorage so they survive
   // even when the hash is lost (new tab, bookmark, etc.).
   createEffect(() => {
+    // Record every session we see so the hash can reference sessions whose
+    // connection has been removed.  This runs unconditionally (before the
+    // connected guard) so entries are populated before they're needed.
+    for (const s of sessions()) {
+      if (s.ptyId != null) {
+        durableSessionHashEntries.set(s.id, `t:${s.connectionId}:${s.ptyId}`);
+      }
+    }
     if (connection()?.status !== "connected") return;
     const parts: string[] = [];
     const al = activeLayout();
     const paneId = bspFocusedPaneId();
     const la = layoutAssignments();
+    const resolved = assignmentsResolved();
     if (al)
       parts.push(`l=${al.name !== al.dsl ? `${al.name}:${al.dsl}` : al.dsl}`);
     if (paneId) parts.push(`p=${paneId}`);
-    if (la) {
+    // Only write pane assignments to the hash when BSPContainer has
+    // finished resolving any hash-based entries.  Writing a partial `a=`
+    // while resolution is in progress would overwrite the original (complete)
+    // `a=` kept from the existing hash, losing entries for connections that
+    // haven't become ready yet.
+    if (la && resolved) {
       const a = Object.entries(la.assignments)
         .filter(([, sid]) => sid != null)
         .map(([pane, sid]) => {
+          const parsed = parseSurfaceAssignment(sid);
+          if (parsed) {
+            // e.g. "1.0:s:hound:42"
+            return `${pane}:s:${parsed.connectionId}:${parsed.surfaceId}`;
+          }
           const s = sessions().find((s) => s.id === sid);
-          return s ? `${pane}:${s.connectionId}:${s.ptyId}` : null;
+          if (s) {
+            // e.g. "0:t:hound:28"
+            return `${pane}:t:${s.connectionId}:${s.ptyId}`;
+          }
+          // Session removed (e.g. connection destroyed) — use cached info
+          // so the hash entry survives until the remote is re-added.
+          const cached = durableSessionHashEntries.get(sid as string);
+          return cached ? `${pane}:${cached}` : null;
         })
         .filter(Boolean)
         .join(",");
       if (a) parts.push(`a=${a}`);
     }
     const fSurface = focusedSurfaceId();
-    if (fSurface != null) parts.push(`s=${activeConnectionId()}:${fSurface}`);
+    if (fSurface != null) {
+      const sConnId = focusedSurfaceConnId() ?? activeConnectionId();
+      parts.push(`s=${sConnId}:${fSurface}`);
+    }
     const fTerminal = wsState().focusedSessionId;
     if (fTerminal && fSurface == null) parts.push(`t=${fTerminal}`);
     const existing = location.hash.slice(1);
     // Strip layout-managed keys (l, p, a) from the old hash only when we
-    // have fresh values to replace them.  If layoutAssignments is still null
-    // (BSPContainer hasn't resolved its pending hash assignments yet), keep
-    // the existing `a=` (and `p=`) so they aren't wiped before resolution
-    // completes.  Once la is non-null this effect will re-run and write the
-    // resolved values.
+    // have fresh values to replace them.  While BSPContainer is still
+    // resolving hash assignments (assignmentsResolved is false), keep
+    // the existing `a=` (and `p=`) so the original shareable hash
+    // survives until resolution completes.
     const written = new Set(parts.map((p) => p.slice(0, p.indexOf("="))));
     written.add("l");
     if (paneId) written.add("p");
-    if (la) written.add("a");
+    if (resolved) written.add("a");
     const kept = existing
       .split("&")
       .filter(
@@ -807,9 +1235,19 @@ function WorkspaceScreen(props: {
     }
   });
 
-  const { countFrame, timeline, net, metrics } = createMetrics(
+  const { countFrame, timeline, net, metrics } = createMetrics(() =>
     props.connectionSpecs().map((s) => s.transport),
   );
+
+  // Periodically bump a counter while the debug panel is open so that
+  // debugStats (which reads from non-reactive Maps) gets re-sampled.
+  const [debugTick, setDebugTick] = createSignal(0);
+  createEffect(() => {
+    if (!debugPanel()) return;
+    const id = setInterval(() => setDebugTick((n) => n + 1), 1000);
+    onCleanup(() => clearInterval(id));
+  });
+
   const theme = () => themeFor(palette());
   const chromeScale = () => uiScale(fontSize());
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
@@ -828,6 +1266,15 @@ function WorkspaceScreen(props: {
           "background-color": theme().bg,
           color: theme().fg,
           "font-family": resolvedFontWithFallback(),
+          // On mobile, pin to visualViewport so the keyboard doesn't hide content.
+          ...(isMobileTouch() && vpHeight()
+            ? {
+                position: "fixed",
+                "inset-inline": "0",
+                top: `${vpOffset()}px`,
+                height: `${vpHeight()}px`,
+              }
+            : {}),
         }}
       >
         <section
@@ -838,16 +1285,6 @@ function WorkspaceScreen(props: {
           }}
         >
           <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
-            <Show when={showConnectingOverlay()}>
-              <ConnectingOverlay
-                gatewayStatus={configWsStatus()}
-                connections={allConnections()}
-                connectionLabels={connectionLabels()}
-                palette={palette()}
-                fontSize={fontSize()}
-                onDismiss={() => setConnectingOverlayDismissed(true)}
-              />
-            </Show>
             <Show
               when={activeLayout()}
               fallback={
@@ -882,6 +1319,7 @@ function WorkspaceScreen(props: {
                             fontFamily={resolvedFontWithFallback()}
                             fontSize={fontSize()}
                             palette={palette()}
+                            surfaceRef={setTerminalSurface}
                           />
                           <Show when={focusedSession()?.state === "exited"}>
                             <div
@@ -969,10 +1407,13 @@ function WorkspaceScreen(props: {
                   fontSize={fontSize()}
                   focusedSessionId={wsState().focusedSessionId}
                   lruSessionIds={lru}
-                  liveSurfaceIds={surfaces().map((s) => s.surfaceId)}
+                  liveSurfaceKeys={surfaces().map(
+                    (s) => `${s.connectionId}:${s.surfaceId}`,
+                  )}
                   manageVisibility={overlay() !== "expose"}
                   extraVisibleSessions={offScreenSessions().map((s) => s.id)}
                   onAssignmentsChange={setLayoutAssignments}
+                  onAssignmentsResolved={setAssignmentsResolved}
                   onFocusSession={(id) => workspace.focusSession(id)}
                   onFocusBySession={(fn) => {
                     focusBySessionFn = fn;
@@ -985,6 +1426,9 @@ function WorkspaceScreen(props: {
                   }}
                   onMoveToPane={(fn) => {
                     moveToPaneFn = fn;
+                  }}
+                  onClearPaneAssignment={(fn) => {
+                    clearPaneAssignmentFn = fn;
                   }}
                   onFocusedPaneChange={setBspFocusedPaneId}
                   onCreateInPane={(paneId, command, connectionId) => {
@@ -1015,14 +1459,23 @@ function WorkspaceScreen(props: {
               offScreenSessions={offScreenSessions()}
               surfaces={offScreenSurfaces()}
               focusedSurfaceId={focusedSurfaceId()}
+              focusedSurfaceConnId={focusedSurfaceConnId()}
               connectionId={activeConnectionId()}
+              connectionLabels={connectionLabels()}
               theme={theme()}
               scale={chromeScale()}
               palette={palette()}
               fontFamily={resolvedFontWithFallback()}
               fontSize={fontSize()}
+              isMobileTouch={isMobileTouch()}
               onFocusSession={switchSession}
-              onFocusSurface={focusSurface}
+              onFocusSurface={(connectionId, surfaceId) =>
+                focusSurface(surfaceId, connectionId)
+              }
+              onCloseSession={(id) => void workspace.closeSession(id)}
+              onCloseSurface={(connectionId, surfaceId) =>
+                workspace.closeSurface(connectionId, surfaceId)
+              }
               width={previewPanelWidth()}
               onResize={setPreviewPanelWidth}
               onClose={togglePreviewPanel}
@@ -1081,6 +1534,7 @@ function WorkspaceScreen(props: {
               onChangeFont={() => toggleOverlay("font")}
               onChangePalette={() => toggleOverlay("palette")}
               onChangeRemotes={() => toggleOverlay("remotes")}
+              defaultRemote={defaultRemote()}
               remotes={remotes()}
               remoteStatuses={remoteStatuses()}
               surfaces={surfaces()}
@@ -1088,9 +1542,10 @@ function WorkspaceScreen(props: {
               connectionLabels={connectionLabels()}
               multiConnection={multiConnection()}
               focusedSurfaceId={focusedSurfaceId()}
+              focusedSurfaceConnId={focusedSurfaceConnId()}
               onFocusSurface={focusSurface}
-              onMoveSurfaceToPane={(sid, targetPaneId) => {
-                moveToPaneFn?.(surfaceAssignment(sid), targetPaneId);
+              onMoveSurfaceToPane={(sid, connId, targetPaneId) => {
+                moveToPaneFn?.(surfaceAssignment(connId, sid), targetPaneId);
                 focusSurfaceById(null);
                 closeOverlay();
               }}
@@ -1140,12 +1595,32 @@ function WorkspaceScreen(props: {
               remotes={remotes()}
               defaultRemote={defaultRemote()}
               statuses={remoteStatuses()}
+              gatewayStatus={configWsStatus()}
               palette={palette()}
               fontSize={fontSize()}
+              readOnly={remotesAutoOpen() === "open"}
               onAdd={(name, uri) => addRemote(name, uri)}
               onRemove={(name) => removeRemote(name)}
               onSetDefault={(name) => setDefaultRemote(name)}
               onReorder={(names) => reorderRemotes(names)}
+              onReconnect={(name) => workspace.reconnectConnection(name)}
+              onClose={closeOverlay}
+            />
+          )}
+        </Show>
+        <Show when={overlay() === "media"}>
+          {(_) => (
+            <MediaOverlay
+              palette={palette()}
+              fontSize={fontSize()}
+              audioBitrate={audioBitrate()}
+              videoQuality={videoQuality()}
+              audioMuted={audioMuted()}
+              audioAvailable={allConnections().some((c) => c.supportsAudio)}
+              onAudioBitrateChange={changeAudioBitrate}
+              onVideoQualityChange={changeVideoQuality}
+              onToggleAudio={toggleAudio}
+              onResetAudio={resetAudio}
               onClose={closeOverlay}
             />
           )}
@@ -1156,27 +1631,38 @@ function WorkspaceScreen(props: {
             padding: "0 1em",
             "background-color": theme().bg,
             color: theme().fg,
-            "border-top-color": theme().subtleBorder,
-            height: `${chromeScale().md + chromeScale().controlY * 2}px`,
-            "font-size": `${chromeScale().sm}px`,
+            "border-top-color": theme().border,
+            height: `${chromeScale().md + chromeScale().controlY * 3}px`,
+            "font-size": `${chromeScale().md}px`,
           }}
         >
           <StatusBar
             sessions={sessions()}
             surfaceCount={surfaces().length}
-            focusedSession={focusedSession()}
+            focusedSession={
+              focusedSurfaceId() != null || bspFocusedSurface() != null
+                ? null
+                : focusedSession()
+            }
+            focusedSurface={(() => {
+              const fid = focusedSurfaceId();
+              if (fid != null) {
+                const fConnId = focusedSurfaceConnId();
+                return (
+                  surfaces().find(
+                    (s) =>
+                      s.surfaceId === fid &&
+                      (fConnId == null || s.connectionId === fConnId),
+                  ) ?? null
+                );
+              }
+              return bspFocusedSurface();
+            })()}
             connectionLabels={connectionLabels()}
             connections={allConnections()}
             gatewayStatus={configWsStatus()}
-            status={stableStatus()}
-            onReconnect={() => {
-              for (const spec of props.connectionSpecs()) {
-                const c = wsState().connections.find((x) => x.id === spec.id);
-                if (c && c.status !== "connected") {
-                  workspace.reconnectConnection(spec.id);
-                }
-              }
-            }}
+            status={connectionStatus()}
+            onRemotes={() => toggleOverlay("remotes")}
             metrics={metrics()}
             palette={palette()}
             fontSize={fontSize()}
@@ -1186,17 +1672,36 @@ function WorkspaceScreen(props: {
             toggleDebug={toggleDebug}
             previewPanelOpen={previewPanelOpen()}
             onPreviewPanel={togglePreviewPanel}
-            debugStats={workspace.getConnectionDebugStats(
-              activeConnectionId(),
-              wsState().focusedSessionId,
-            )}
+            debugStats={
+              (debugTick(),
+              workspace.getConnectionDebugStats(
+                activeConnectionId(),
+                wsState().focusedSessionId,
+              ))
+            }
             timeline={timeline}
             net={net}
             onSwitcher={() => toggleOverlay("expose")}
             onPalette={() => toggleOverlay("palette")}
             onFont={() => toggleOverlay("font")}
+            audioMuted={audioMuted()}
+            audioAvailable={allConnections().some((c) => c.supportsAudio)}
+            hasSurfaces={surfaces().length > 0}
+            isMobileTouch={isMobileTouch()}
+            keyboardOpen={keyboardWanted()}
+            onToggleKeyboard={toggleMobileKeyboard}
+            onMedia={() => toggleOverlay("media")}
           />
         </footer>
+        <Show when={isMobileTouch() && keyboardWanted()}>
+          <MobileToolbar
+            workspace={workspace}
+            focusedSessionId={() => wsState().focusedSessionId}
+            surface={terminalSurface}
+            theme={theme()}
+            scale={chromeScale()}
+          />
+        </Show>
       </main>
     </BlitWorkspaceProvider>
   );
@@ -1262,14 +1767,19 @@ function PreviewPanel(props: {
   offScreenSessions: BlitSession[];
   surfaces: BlitSurface[];
   focusedSurfaceId: number | null;
+  focusedSurfaceConnId: ConnectionId | null;
   connectionId: string;
+  connectionLabels?: Map<string, string>;
   theme: Theme;
   scale: UIScale;
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+  isMobileTouch: boolean;
   onFocusSession: (id: SessionId) => void;
-  onFocusSurface: (surfaceId: number) => void;
+  onFocusSurface: (connectionId: ConnectionId, surfaceId: number) => void;
+  onCloseSession: (id: SessionId) => void;
+  onCloseSurface: (connectionId: ConnectionId, surfaceId: number) => void;
   width: number;
   onResize: (width: number) => void;
   onClose: () => void;
@@ -1367,12 +1877,15 @@ function PreviewPanel(props: {
             {(s) => (
               <SessionThumbnail
                 session={s}
+                connectionLabel={props.connectionLabels?.get(s.connectionId)}
                 theme={props.theme}
                 scale={props.scale}
                 palette={props.palette}
                 fontFamily={props.fontFamily}
                 fontSize={props.fontSize}
+                isMobileTouch={props.isMobileTouch}
                 onFocus={() => props.onFocusSession(s.id)}
+                onClose={() => props.onCloseSession(s.id)}
               />
             )}
           </For>
@@ -1381,10 +1894,20 @@ function PreviewPanel(props: {
               <SurfaceThumbnail
                 surface={s}
                 connectionId={s.connectionId}
+                connectionLabel={props.connectionLabels?.get(s.connectionId)}
                 theme={props.theme}
                 scale={props.scale}
-                focused={s.surfaceId === props.focusedSurfaceId}
-                onFocus={() => props.onFocusSurface(s.surfaceId)}
+                focused={
+                  s.surfaceId === props.focusedSurfaceId &&
+                  s.connectionId === props.focusedSurfaceConnId
+                }
+                isMobileTouch={props.isMobileTouch}
+                onFocus={() =>
+                  props.onFocusSurface(s.connectionId, s.surfaceId)
+                }
+                onClose={() =>
+                  props.onCloseSurface(s.connectionId, s.surfaceId)
+                }
               />
             )}
           </For>
@@ -1394,29 +1917,91 @@ function PreviewPanel(props: {
   );
 }
 
+/** Minimum horizontal swipe distance (px) to trigger dismiss. */
+const SWIPE_THRESHOLD = 60;
+/** Minimum ratio of horizontal to vertical movement for a swipe. */
+const SWIPE_RATIO = 1.5;
+
 function SessionThumbnail(props: {
   session: BlitSession;
+  connectionLabel?: string;
   theme: Theme;
   scale: UIScale;
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+  isMobileTouch: boolean;
   onFocus: () => void;
+  onClose: () => void;
 }) {
-  const label = () =>
-    props.session.title ||
-    props.session.tag ||
-    props.session.command ||
-    "Session";
+  const label = () => sessionName(props.session);
+
+  const [hover, setHover] = createSignal(false);
+  const [swipeX, setSwipeX] = createSignal(0);
+  const [swiping, setSwiping] = createSignal(false);
+  const [dismissed, setDismissed] = createSignal(false);
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let locked = false;
+
+  function onTouchStart(e: TouchEvent) {
+    const t = e.touches[0];
+    touchStartX = t.clientX;
+    touchStartY = t.clientY;
+    locked = false;
+    setSwiping(false);
+    setSwipeX(0);
+  }
+
+  function onTouchMove(e: TouchEvent) {
+    const t = e.touches[0];
+    const dx = t.clientX - touchStartX;
+    const dy = t.clientY - touchStartY;
+
+    if (!locked) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      locked = true;
+      if (Math.abs(dx) < Math.abs(dy) * SWIPE_RATIO) return;
+      setSwiping(true);
+    }
+    if (!swiping()) return;
+    e.preventDefault();
+    setSwipeX(dx);
+  }
+
+  function onTouchEnd() {
+    if (swiping() && Math.abs(swipeX()) >= SWIPE_THRESHOLD) {
+      setDismissed(true);
+      setSwipeX(swipeX() > 0 ? 400 : -400);
+      setTimeout(() => props.onClose(), 200);
+    } else {
+      setSwipeX(0);
+    }
+    setSwiping(false);
+  }
 
   return (
     <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
       style={{
         "border-bottom": `1px solid ${props.theme.subtleBorder}`,
-        display: "flex",
+        display: dismissed() ? "none" : "flex",
         "flex-direction": "column",
         "flex-shrink": 0,
         overflow: "hidden",
+        position: "relative",
+        transform: `translateX(${swipeX()}px)`,
+        opacity: swiping()
+          ? Math.max(0, 1 - Math.abs(swipeX()) / 200)
+          : dismissed()
+            ? 0
+            : 1,
+        transition: swiping() ? "none" : "transform 0.2s, opacity 0.2s",
+        "touch-action": "pan-y",
       }}
     >
       <button
@@ -1442,6 +2027,10 @@ function SessionThumbnail(props: {
             "white-space": "nowrap",
           }}
         >
+          <span style={{ opacity: 0.5 }}>
+            {sessionPrefix(props.session, props.connectionLabel)}
+          </span>
+          {" \u203A "}
           {label()}
         </span>
         <Show when={props.session.state === "exited"}>
@@ -1454,6 +2043,24 @@ function SessionThumbnail(props: {
           >
             exited
           </mark>
+        </Show>
+        <Show when={!props.isMobileTouch && hover()}>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onClose();
+            }}
+            title="Close terminal"
+            style={{
+              ...ui.btn,
+              "font-size": `${props.scale.sm}px`,
+              padding: `0 ${props.scale.tightGap}px`,
+              opacity: 0.6,
+              "flex-shrink": 0,
+            }}
+          >
+            {"\u00D7"}
+          </button>
         </Show>
       </button>
       <div
@@ -1480,19 +2087,80 @@ function SessionThumbnail(props: {
 function SurfaceThumbnail(props: {
   surface: BlitSurface;
   connectionId: string;
+  connectionLabel?: string;
   theme: Theme;
   scale: UIScale;
   focused: boolean;
+  isMobileTouch: boolean;
   onFocus: () => void;
+  onClose: () => void;
 }) {
+  const [hover, setHover] = createSignal(false);
+  const [swipeX, setSwipeX] = createSignal(0);
+  const [swiping, setSwiping] = createSignal(false);
+  const [dismissed, setDismissed] = createSignal(false);
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let locked = false;
+
+  function onTouchStart(e: TouchEvent) {
+    const t = e.touches[0];
+    touchStartX = t.clientX;
+    touchStartY = t.clientY;
+    locked = false;
+    setSwiping(false);
+    setSwipeX(0);
+  }
+
+  function onTouchMove(e: TouchEvent) {
+    const t = e.touches[0];
+    const dx = t.clientX - touchStartX;
+    const dy = t.clientY - touchStartY;
+
+    if (!locked) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      locked = true;
+      if (Math.abs(dx) < Math.abs(dy) * SWIPE_RATIO) return;
+      setSwiping(true);
+    }
+    if (!swiping()) return;
+    e.preventDefault();
+    setSwipeX(dx);
+  }
+
+  function onTouchEnd() {
+    if (swiping() && Math.abs(swipeX()) >= SWIPE_THRESHOLD) {
+      setDismissed(true);
+      setSwipeX(swipeX() > 0 ? 400 : -400);
+      setTimeout(() => props.onClose(), 200);
+    } else {
+      setSwipeX(0);
+    }
+    setSwiping(false);
+  }
+
   return (
     <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
       style={{
         "border-bottom": `1px solid ${props.theme.subtleBorder}`,
-        display: "flex",
+        display: dismissed() ? "none" : "flex",
         "flex-direction": "column",
         "flex-shrink": 0,
         overflow: "hidden",
+        position: "relative",
+        transform: `translateX(${swipeX()}px)`,
+        opacity: swiping()
+          ? Math.max(0, 1 - Math.abs(swipeX()) / 200)
+          : dismissed()
+            ? 0
+            : 1,
+        transition: swiping() ? "none" : "transform 0.2s, opacity 0.2s",
+        "touch-action": "pan-y",
       }}
     >
       <button
@@ -1521,6 +2189,10 @@ function SurfaceThumbnail(props: {
             "white-space": "nowrap",
           }}
         >
+          <Show when={props.connectionLabel}>
+            <span style={{ opacity: 0.5 }}>{props.connectionLabel}</span>
+            {" \u203A "}
+          </Show>
           {props.surface.title ||
             props.surface.appId ||
             `Surface ${props.surface.surfaceId}`}
@@ -1533,6 +2205,24 @@ function SurfaceThumbnail(props: {
         >
           {props.surface.width}x{props.surface.height}
         </span>
+        <Show when={!props.isMobileTouch && hover()}>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onClose();
+            }}
+            title="Close surface"
+            style={{
+              ...ui.btn,
+              "font-size": `${props.scale.sm}px`,
+              padding: `0 ${props.scale.tightGap}px`,
+              opacity: 0.6,
+              "flex-shrink": 0,
+            }}
+          >
+            {"\u00D7"}
+          </button>
+        </Show>
       </button>
       <div
         style={{

@@ -1,6 +1,6 @@
 [package]
 name = "blit-compositor"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2024"
 description = "blit headless Wayland compositor"
 license.workspace = true
@@ -8,13 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-smithay = { version = "0.7.0", default-features = false, features = [
-    "wayland_frontend",
-    "desktop",
-    "backend_drm",
-    "backend_egl",
-    "backend_gbm",
-    "renderer_gl",
-] }
-calloop = "0.14"
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+wayland-protocols-misc = { version = "0.3", features = ["server"] }
+calloop = { version = "0.14", features = ["signals"] }
 libc = "0.2"
+ash = { version = "0.38", default-features = false, features = ["loaded"] }

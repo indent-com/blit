@@ -24,16 +24,18 @@ use tokio_tungstenite::tungstenite::Message;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(4);
+/// Maximum time to wait for the share producer (forwarder) to appear on the
+/// signaling hub.  If the producer is offline this prevents the client from
+/// blocking indefinitely.
+const PEER_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct ServerMessage {
     #[serde(rename = "type")]
     msg_type: String,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
     role: Option<String>,
-    from: Option<String>,
     data: Option<serde_json::Value>,
     message: Option<String>,
 }
@@ -51,8 +53,9 @@ enum GatherResult {
 // ---------------------------------------------------------------------------
 
 enum DriveCmd {
-    /// Open a new "blit" DataChannel and hand back a DuplexStream.
+    /// Open a new DataChannel with the given label and hand back a DuplexStream.
     Open {
+        label: String,
         reply: oneshot::Sender<Result<(ChannelId, tokio::io::DuplexStream), String>>,
     },
     /// Close a channel. The ICE/DTLS session keeps running.
@@ -75,11 +78,21 @@ struct SessionInner {
 }
 
 impl Session {
-    /// Establish the ICE+DTLS+SCTP session and open the first DataChannel.
+    /// Establish the ICE+DTLS+SCTP session and open the first DataChannel
+    /// labeled `"blit"`.
     /// This is the expensive part; subsequent `open_channel()` calls are cheap.
     pub async fn establish(
         passphrase: &str,
         signal_url: &str,
+    ) -> Result<(Session, ChannelHandle, tokio::io::DuplexStream), BoxError> {
+        Self::establish_with_label(passphrase, signal_url, "blit").await
+    }
+
+    /// Like [`establish`] but with a caller-chosen DataChannel label.
+    pub async fn establish_with_label(
+        passphrase: &str,
+        signal_url: &str,
+        label: &str,
     ) -> Result<(Session, ChannelHandle, tokio::io::DuplexStream), BoxError> {
         crate::init_verbose();
         let (
@@ -93,7 +106,7 @@ impl Session {
             ws_write,
             box_keys,
             first_cid,
-        ) = setup_rtc(passphrase, signal_url).await?;
+        ) = setup_rtc(passphrase, signal_url, label).await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<DriveCmd>();
         let (ready_tx, ready_rx) =
@@ -123,10 +136,45 @@ impl Session {
     /// Open a new "blit" DataChannel on the existing session.
     /// No ICE or SDP negotiation — just an SCTP stream open.
     pub async fn open_channel(&self) -> Result<(ChannelHandle, tokio::io::DuplexStream), String> {
+        self.open_channel_with_label("blit").await
+    }
+
+    /// Open a lightweight keepalive DataChannel.
+    ///
+    /// The channel label is `"keepalive"`, which the forwarder (producer)
+    /// recognises and does **not** bridge to the blit-server, so no
+    /// server-side client state is created.  The channel's only purpose is
+    /// to keep the ICE/DTLS/SCTP session alive while the entry sits in a
+    /// connection pool.
+    pub async fn open_keepalive(&self) -> Result<ChannelHandle, String> {
+        let (handle, _stream) = self.open_channel_with_label("keepalive").await?;
+        // _stream dropped: the per-channel pump task exits, but the SCTP
+        // channel remains open in str0m, keeping the session alive.
+        Ok(handle)
+    }
+
+    /// Verify the ICE/DTLS/SCTP path is alive by doing a DCEP
+    /// round-trip.  Opens a lightweight channel (not bridged to
+    /// blit-server) and immediately closes it.  Returns `Ok(())` if
+    /// the path is healthy.
+    pub async fn probe(&self) -> Result<(), String> {
+        let (handle, _stream) = self.open_channel_with_label("probe").await?;
+        self.close_channel(handle);
+        Ok(())
+    }
+
+    /// Open a DataChannel with an arbitrary label.
+    async fn open_channel_with_label(
+        &self,
+        label: &str,
+    ) -> Result<(ChannelHandle, tokio::io::DuplexStream), String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .cmd_tx
-            .send(DriveCmd::Open { reply: reply_tx })
+            .send(DriveCmd::Open {
+                label: label.to_string(),
+                reply: reply_tx,
+            })
             .map_err(|_| "drive task has exited".to_string())?;
         let (cid, stream) = reply_rx
             .await
@@ -137,6 +185,15 @@ impl Session {
     /// Close a specific channel. The underlying ICE/DTLS session stays alive.
     pub fn close_channel(&self, handle: ChannelHandle) {
         let _ = self.inner.cmd_tx.send(DriveCmd::Close { id: handle.0 });
+    }
+
+    /// Returns `true` if the background drive task is still running.
+    ///
+    /// A session becomes non-alive when the drive task exits (ICE disconnect,
+    /// error, etc.).  This is a cheap check (no I/O) — it just tests whether
+    /// the command channel's receiver has been dropped.
+    pub fn is_alive(&self) -> bool {
+        !self.inner.cmd_tx.is_closed()
     }
 }
 
@@ -157,6 +214,256 @@ pub async fn connect(
 }
 
 // ---------------------------------------------------------------------------
+// MuxSession — multiplexed virtual streams over a single DataChannel
+// ---------------------------------------------------------------------------
+
+/// Mux control opcodes (sent on stream_id=0).
+const MUX_OPEN: u8 = 0x01;
+const MUX_CLOSE: u8 = 0x02;
+
+/// A multiplexed session that carries many virtual blit streams over a
+/// single SCTP DataChannel.  Each virtual stream gets its own
+/// [`tokio::io::DuplexStream`] that the proxy can hand to a downstream
+/// client.
+///
+/// Wire format of each frame written to the DataChannel's DuplexStream:
+/// ```text
+/// [total_len: u32 LE][stream_id: u16 LE][inner payload ...]
+/// ```
+/// where `total_len = 2 + inner_payload.len()`.
+///
+/// Stream 0 is the control channel:
+///   OPEN:  [3:u32 LE][0:u16 LE][0x01][stream_id: u16 LE]
+///   CLOSE: [3:u32 LE][0:u16 LE][0x02][stream_id: u16 LE]
+///
+/// Streams >= 1 carry raw blit frames:
+///   [2+blit_frame_len: u32 LE][stream_id: u16 LE][blit_frame ...]
+#[derive(Clone)]
+pub struct MuxSession {
+    inner: Arc<MuxInner>,
+}
+
+struct MuxInner {
+    /// Session handle — kept alive to prevent the drive task from exiting.
+    _session: Session,
+    /// Send side of the mux DataChannel's DuplexStream.
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Requests to register a new stream's sender.
+    reg_tx: mpsc::UnboundedSender<MuxReg>,
+    /// Next stream ID to assign (starts at 1; 0 is control).
+    next_id: std::sync::atomic::AtomicU16,
+    /// Set to `false` when the read demux task exits (DataChannel EOF/error).
+    mux_alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct MuxReg {
+    stream_id: u16,
+    /// Sender for data arriving from the remote for this stream.
+    data_tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl MuxSession {
+    /// Establish a WebRTC session and open a single `"mux"` DataChannel.
+    /// A background task demuxes incoming data to per-stream receivers.
+    pub async fn establish(passphrase: &str, signal_url: &str) -> Result<MuxSession, BoxError> {
+        crate::init_verbose();
+        let (session, _handle, stream) =
+            Session::establish_with_label(passphrase, signal_url, "mux").await?;
+
+        let (read_half, mut write_half) = tokio::io::split(stream);
+
+        // Channel for the mux write path: any task can send framed data.
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Channel for registering new streams with the read demux task.
+        let (reg_tx, mut reg_rx) = mpsc::unbounded_channel::<MuxReg>();
+
+        // Write pump: serialises all outgoing mux frames onto the DuplexStream.
+        tokio::spawn(async move {
+            while let Some(frame) = write_rx.recv().await {
+                if write_half.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mux_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mux_alive2 = mux_alive.clone();
+
+        // Read demux: reads mux frames from the DuplexStream and routes by stream_id.
+        tokio::spawn(async move {
+            let mut read_half = read_half;
+            let mut streams: std::collections::HashMap<u16, mpsc::UnboundedSender<Vec<u8>>> =
+                std::collections::HashMap::new();
+            let mut len_buf = [0u8; 4];
+
+            loop {
+                // Drain any pending registrations before blocking on read.
+                while let Ok(reg) = reg_rx.try_recv() {
+                    streams.insert(reg.stream_id, reg.data_tx);
+                }
+
+                // Use biased select so the read branch is always
+                // polled first.  This prevents the registration branch
+                // from cancelling a partially-completed read_exact,
+                // which would desync the framing.
+                tokio::select! {
+                    biased;
+                    // Read the next mux frame.
+                    read_result = read_half.read_exact(&mut len_buf) => {
+                        if read_result.is_err() { break; }
+                        let total_len = u32::from_le_bytes(len_buf) as usize;
+                        if !(2..=MAX_FRAME_SIZE).contains(&total_len) { break; }
+                        let mut payload = vec![0u8; total_len];
+                        if read_half.read_exact(&mut payload).await.is_err() { break; }
+                        let stream_id = u16::from_le_bytes([payload[0], payload[1]]);
+                        let inner = &payload[2..];
+
+                        if stream_id == 0 {
+                            // Control message — handle CLOSE from producer.
+                            if inner.len() >= 3 && inner[0] == MUX_CLOSE {
+                                let closed_id = u16::from_le_bytes([inner[1], inner[2]]);
+                                streams.remove(&closed_id);
+                            }
+                        } else if let Some(tx) = streams.get(&stream_id) {
+                            // Forward inner payload (raw blit frame bytes) to stream.
+                            let data: Vec<u8> = inner.to_vec();
+                            if tx.send(data).is_err() {
+                                streams.remove(&stream_id);
+                            }
+                        }
+                    }
+                    // Accept new stream registrations.
+                    reg = reg_rx.recv() => {
+                        match reg {
+                            Some(r) => { streams.insert(r.stream_id, r.data_tx); }
+                            None => break, // MuxSession dropped.
+                        }
+                    }
+                }
+            }
+            // DataChannel is dead — signal liveness check.
+            mux_alive2.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        Ok(MuxSession {
+            inner: Arc::new(MuxInner {
+                _session: session,
+                write_tx,
+                reg_tx,
+                next_id: std::sync::atomic::AtomicU16::new(1),
+                mux_alive,
+            }),
+        })
+    }
+
+    /// Open a new virtual stream.  This is a **local operation** — no
+    /// network round-trip.  Returns a DuplexStream whose reads produce
+    /// blit frames from the remote, and whose writes send blit frames
+    /// to the remote.
+    pub fn open_stream(&self) -> Result<(u16, tokio::io::DuplexStream), String> {
+        let id = self
+            .inner
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if id == 0 {
+            // Wrapped around — this would be the control stream.
+            return Err("stream ID space exhausted".into());
+        }
+
+        // Register a receiver for incoming data on this stream.
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        self.inner
+            .reg_tx
+            .send(MuxReg {
+                stream_id: id,
+                data_tx,
+            })
+            .map_err(|_| "mux session closed".to_string())?;
+
+        // Create a DuplexStream pair — the app half goes to the caller,
+        // the driver half is pumped by background tasks.
+        let (app_half, driver_half) = tokio::io::duplex(256 * 1024);
+        let (mut drv_read, mut drv_write) = tokio::io::split(driver_half);
+
+        // Send OPEN control message.
+        let mut open_frame = Vec::with_capacity(4 + 2 + 1 + 2);
+        open_frame.extend_from_slice(&5u32.to_le_bytes()); // total_len = 2 + 3
+        open_frame.extend_from_slice(&0u16.to_le_bytes()); // stream_id = 0 (control)
+        open_frame.push(MUX_OPEN);
+        open_frame.extend_from_slice(&id.to_le_bytes());
+        let _ = self.inner.write_tx.send(open_frame);
+
+        // Pump: remote → app (incoming blit frames).
+        // data_rx delivers raw blit frame bytes (already stripped of mux header).
+        // We write them as-is to the DuplexStream for the app to read with
+        // read_frame().
+        tokio::spawn(async move {
+            while let Some(data) = data_rx.recv().await {
+                if drv_write.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+            let _ = drv_write.shutdown().await;
+        });
+
+        // Pump: app → remote (outgoing blit frames).
+        // Read blit frames from the app, wrap in mux framing, send.
+        let write_tx = self.inner.write_tx.clone();
+        let stream_id = id;
+        tokio::spawn(async move {
+            let mut len_buf = [0u8; 4];
+            loop {
+                if drv_read.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len > MAX_FRAME_SIZE {
+                    break;
+                }
+                let mut payload = vec![0u8; len];
+                if len > 0 && drv_read.read_exact(&mut payload).await.is_err() {
+                    break;
+                }
+                // Build mux frame: [total_len:u32 LE][stream_id:u16 LE][blit frame]
+                let total = 2 + 4 + len;
+                let mut frame = Vec::with_capacity(4 + total);
+                frame.extend_from_slice(&(total as u32).to_le_bytes());
+                frame.extend_from_slice(&stream_id.to_le_bytes());
+                frame.extend_from_slice(&len_buf); // original blit length prefix
+                frame.extend_from_slice(&payload);
+                if write_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((id, app_half))
+    }
+
+    /// Close a virtual stream.  Sends a CLOSE control message to the
+    /// remote so it can tear down the corresponding blit-server
+    /// connection.
+    pub fn close_stream(&self, id: u16) {
+        let mut frame = Vec::with_capacity(4 + 2 + 1 + 2);
+        frame.extend_from_slice(&5u32.to_le_bytes()); // total_len = 2 + 3
+        frame.extend_from_slice(&0u16.to_le_bytes()); // stream_id = 0 (control)
+        frame.push(MUX_CLOSE);
+        frame.extend_from_slice(&id.to_le_bytes());
+        let _ = self.inner.write_tx.send(frame);
+    }
+
+    /// Returns `true` if both the drive task and the mux DataChannel
+    /// are still alive.
+    pub fn is_alive(&self) -> bool {
+        self.inner._session.is_alive()
+            && self
+                .inner
+                .mux_alive
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Common setup: ICE gathering + SDP exchange
 // ---------------------------------------------------------------------------
 
@@ -164,6 +471,7 @@ pub async fn connect(
 async fn setup_rtc(
     passphrase: &str,
     signal_url: &str,
+    channel_label: &str,
 ) -> Result<
     (
         Rtc,
@@ -230,31 +538,38 @@ async fn setup_rtc(
     };
 
     verbose!("waiting for forwarder to join signaling hub...");
-    let mut forwarder_session_id = loop {
-        let msg = ws_read
-            .next()
-            .await
-            .ok_or("signaling closed before peer joined")??;
-        if let Message::Text(t) = msg
-            && let Ok(m) = serde_json::from_str::<ServerMessage>(&t)
-        {
-            if m.msg_type == "peer_joined" {
-                // Only accept peer_joined from the producer side; ignore
-                // other consumers that may join the same channel (e.g. other
-                // gateway connections to the same share: remote).
-                if m.role.as_deref() == Some("consumer") {
-                    verbose!("ignoring peer_joined from another consumer");
-                    continue;
+    let mut forwarder_session_id = tokio::time::timeout(PEER_JOIN_TIMEOUT, async {
+        loop {
+            let msg = ws_read
+                .next()
+                .await
+                .ok_or("signaling closed before peer joined")?;
+            let msg = msg?;
+            if let Message::Text(t) = msg
+                && let Ok(m) = serde_json::from_str::<ServerMessage>(&t)
+            {
+                if m.msg_type == "peer_joined" {
+                    // Only accept peer_joined from the producer side; ignore
+                    // other consumers that may join the same channel (e.g. other
+                    // gateway connections to the same share: remote).
+                    if m.role.as_deref() == Some("consumer") {
+                        verbose!("ignoring peer_joined from another consumer");
+                        continue;
+                    }
+                    let id = m.session_id.unwrap_or_default();
+                    verbose!("forwarder joined (session {id})");
+                    return Ok::<_, BoxError>(id);
                 }
-                let id = m.session_id.unwrap_or_default();
-                verbose!("forwarder joined (session {id})");
-                break id;
-            }
-            if m.msg_type == "error" {
-                return Err(format!("signaling: {}", m.message.unwrap_or_default()).into());
+                if m.msg_type == "error" {
+                    return Err(format!("signaling: {}", m.message.unwrap_or_default()).into());
+                }
             }
         }
-    };
+    })
+    .await
+    .map_err(|_| -> BoxError {
+        "timed out waiting for share producer (is `blit share` running on the remote?)".into()
+    })??;
 
     let udp4 = UdpSocket::bind("0.0.0.0:0")?;
     udp4.set_nonblocking(true)?;
@@ -422,7 +737,7 @@ async fn setup_rtc(
 
     // First channel — triggers the SDP offer/answer.
     let mut changes = rtc.sdp_api();
-    let first_cid = changes.add_channel("blit".to_string());
+    let first_cid = changes.add_channel(channel_label.to_string());
     let (offer, pending) = changes.apply().unwrap();
 
     let offer_json = serde_json::to_value(&offer)?;
@@ -591,6 +906,8 @@ async fn drive(
     let mut pending_open: PendingOpenMap = std::collections::HashMap::new();
     pending_open.insert(first_cid, first_ready);
 
+    let mut pending_send: Option<(ChannelId, Vec<u8>)> = None;
+
     // Active channels: per-channel (abort handle, write-tx for DataChannel→app).
     struct ChannelState {
         abort: tokio::task::AbortHandle,
@@ -602,6 +919,15 @@ async fn drive(
 
     loop {
         let timeout = loop {
+            if let Some((cid, ref frame)) = pending_send {
+                if let Some(mut ch) = rtc.channel(cid) {
+                    if matches!(ch.write(true, frame), Ok(true)) {
+                        pending_send = None;
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
             match rtc.poll_output()? {
                 Output::Timeout(v) => break v,
                 Output::Transmit(t) => {
@@ -622,47 +948,49 @@ async fn drive(
                     match ev {
                         Event::ChannelOpen(cid, label) => {
                             verbose!("DataChannel opened: {label} (id {cid:?})");
-                            if label == "blit"
-                                && let Some(reply_tx) = pending_open.remove(&cid)
-                            {
-                                let (app_half, mut driver_half) =
-                                    tokio::io::duplex(256 * 1024 * 1024);
+                            if let Some(reply_tx) = pending_open.remove(&cid) {
+                                let (app_half, driver_half) = tokio::io::duplex(256 * 1024 * 1024);
                                 // write_tx: drive task → app half (DataChannel → app).
                                 let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
                                 // app_tx: reader task → drive task (app → DataChannel).
                                 let app_tx = app_data_tx.clone();
-                                let handle = tokio::spawn(async move {
+                                // Split the DuplexStream so each direction
+                                // gets its own task — no select cancellation.
+                                let (mut drv_r, mut drv_w) = tokio::io::split(driver_half);
+                                let read_handle = tokio::spawn(async move {
                                     let mut len_buf = [0u8; 4];
                                     loop {
-                                        tokio::select! {
-                                            // app → DataChannel
-                                            read_result = driver_half.read_exact(&mut len_buf) => {
-                                                if read_result.is_err() { break; }
-                                                let len = u32::from_le_bytes(len_buf) as usize;
-                                                if len > MAX_FRAME_SIZE { break; }
-                                                let mut payload = vec![0u8; len];
-                                                if len > 0 && driver_half.read_exact(&mut payload).await.is_err() {
-                                                    break;
-                                                }
-                                                let mut frame = Vec::with_capacity(4 + len);
-                                                frame.extend_from_slice(&(len as u32).to_le_bytes());
-                                                frame.extend_from_slice(&payload);
-                                                if app_tx.send((cid, frame)).is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            // DataChannel → app
-                                            incoming = write_rx.recv() => {
-                                                match incoming {
-                                                    Some(data) => {
-                                                        if driver_half.write_all(&data).await.is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    None => break,
-                                                }
-                                            }
+                                        if drv_r.read_exact(&mut len_buf).await.is_err() {
+                                            break;
                                         }
+                                        let len = u32::from_le_bytes(len_buf) as usize;
+                                        if len > MAX_FRAME_SIZE {
+                                            break;
+                                        }
+                                        let mut payload = vec![0u8; len];
+                                        if len > 0 && drv_r.read_exact(&mut payload).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                        let mut frame = Vec::with_capacity(4 + len);
+                                        frame.extend_from_slice(&(len as u32).to_le_bytes());
+                                        frame.extend_from_slice(&payload);
+                                        if app_tx.send((cid, frame)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                let write_handle = tokio::spawn(async move {
+                                    while let Some(data) = write_rx.recv().await {
+                                        if drv_w.write_all(&data).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                let handle = tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = read_handle => {}
+                                        _ = write_handle => {}
                                     }
                                 });
                                 channel_tasks.insert(
@@ -769,9 +1097,9 @@ async fn drive(
                 if session_alive { cmd_rx.recv().await } else { std::future::pending().await }
             } => {
                 match cmd {
-                    Some(DriveCmd::Open { reply }) => {
+                    Some(DriveCmd::Open { label, reply }) => {
                         let mut changes = rtc.sdp_api();
-                        let cid = changes.add_channel("blit".to_string());
+                        let cid = changes.add_channel(label);
                         // For non-first channels apply() returns None — no SDP needed.
                         let _ = changes.apply();
                         pending_open.insert(cid, reply);
@@ -795,13 +1123,19 @@ async fn drive(
                     }
                 }
             }
-            // app → DataChannel: per-channel pump tasks forward data here.
-            app_msg = app_data_rx.recv() => {
+            // app → DataChannel: forward to SCTP.  If the send
+            // buffer is full, park and retry next poll_output cycle.
+            app_msg = async {
+                if pending_send.is_some() {
+                    return std::future::pending().await;
+                }
+                app_data_rx.recv().await
+            } => {
                 if let Some((id, data)) = app_msg
                     && let Some(mut ch) = rtc.channel(id)
-                {
-                    let _ = ch.write(true, &data);
-                }
+                        && !matches!(ch.write(true, &data), Ok(true)) {
+                            pending_send = Some((id, data));
+                        }
             }
             sig = async {
                 if signaling_alive {

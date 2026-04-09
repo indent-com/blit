@@ -15,8 +15,8 @@
       webrtcProxy = true;
       hub = "hub.blit.sh"; # default hub for share: remotes
     };
-    forwarders.default = {
-      passFile = "/path/to/blit-forwarder-env";
+    shares.default = {
+      passFile = "/path/to/blit-share-env";
     };
   };
 }
@@ -52,9 +52,9 @@ gateways.default = {
       # Optional: proxy share: remotes via WebRTC (BLIT_GATEWAY_WEBRTC=1)
       webrtcProxy = true;
     };
-    forwarders.alice = {
+    shares.alice = {
       user = "alice";
-      passFile = "/run/secrets/blit-alice-forwarder-pass";
+      passFile = "/run/secrets/blit-alice-share-pass";
     };
   };
 }

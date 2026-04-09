@@ -23,7 +23,7 @@ export default function JoinForm() {
         class="bg-transparent border-none outline-none text-[var(--fg)] font-mono text-sm px-3 py-1.5 w-64 max-sm:w-48 placeholder:text-[var(--dim)] placeholder:opacity-60"
         classList={{ "[-webkit-text-security:disc]": !visible() }}
         type="text"
-        placeholder="session secret"
+        placeholder="share secret"
         value={secret()}
         onInput={(e) => setSecret(e.currentTarget.value)}
         spellcheck={false}

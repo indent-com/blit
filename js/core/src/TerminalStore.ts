@@ -13,6 +13,7 @@ import {
   createCanvas2dRenderer,
   type GlRenderer,
 } from "./gl-renderer";
+import { createWebGpuRenderer } from "./webgpu-renderer";
 
 export type BlitWasmModule = typeof import("@blit-sh/browser");
 
@@ -21,6 +22,7 @@ export type TerminalDirtyListener = (ptyId: number) => void;
 export interface TerminalStoreDelegate {
   send(data: Uint8Array): void;
   getStatus(): ConnectionStatus;
+  log?(msg: string): void;
 }
 
 export class TerminalStore {
@@ -50,6 +52,9 @@ export class TerminalStore {
   private frozenBuffers = new Map<number, Uint8Array[]>();
   private sharedRenderer: GlRenderer | null = null;
   private sharedCanvas: HTMLCanvasElement | null = null;
+  private webgpuProbe: Promise<void> | null = null;
+  private webgpuRenderer: GlRenderer | null = null;
+  private webgpuCanvas: HTMLCanvasElement | null = null;
   private displayFps = 0;
   private rafHandle = 0;
   private rafPrev = 0;
@@ -69,6 +74,7 @@ export class TerminalStore {
   ) {
     this.delegate = delegate;
     this.startRafProbe();
+    this.probeWebGpu();
 
     if (wasm instanceof Promise) {
       wasm
@@ -85,6 +91,35 @@ export class TerminalStore {
       this.mod = wasm;
       this.ready = true;
     }
+  }
+
+  /** Fire-and-forget WebGPU probe. If it succeeds, the next getSharedRenderer
+   *  call will pick it up. If it fails, we silently fall through to WebGL2. */
+  private probeWebGpu(): void {
+    if (typeof navigator === "undefined" || !navigator.gpu) return;
+    const canvas = document.createElement("canvas");
+    this.webgpuProbe = createWebGpuRenderer(canvas)
+      .then((r) => {
+        if (this.disposed) {
+          r?.dispose();
+          return;
+        }
+        if (r) {
+          this.webgpuCanvas = canvas;
+          this.webgpuRenderer = r;
+          // If the shared renderer was already initialised with a WebGL2 /
+          // Canvas2D fallback, replace it now so the next frame uses WebGPU.
+          if (this.sharedRenderer && this.sharedRenderer !== r) {
+            this.sharedRenderer.dispose();
+            this.sharedRenderer = r;
+            this.sharedCanvas = canvas;
+          }
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.webgpuProbe = null;
+      });
   }
 
   private nowMs(): number {
@@ -271,7 +306,8 @@ export class TerminalStore {
     this.fontSize = fontSize;
   }
 
-  /** Get a shared GL renderer for readOnly (preview) terminals. */
+  /** Get a shared renderer for readOnly (preview) terminals.
+   *  Prefers WebGPU (async probe), falls back to WebGL2, then Canvas 2D. */
   getSharedRenderer(): {
     renderer: GlRenderer;
     canvas: HTMLCanvasElement;
@@ -279,6 +315,13 @@ export class TerminalStore {
     if (this.sharedRenderer?.supported) {
       return { renderer: this.sharedRenderer, canvas: this.sharedCanvas! };
     }
+    // Use WebGPU renderer if the async probe has completed.
+    if (this.webgpuRenderer?.supported && this.webgpuCanvas) {
+      this.sharedRenderer = this.webgpuRenderer;
+      this.sharedCanvas = this.webgpuCanvas;
+      return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
+    }
+    // Synchronous fallback: WebGL2 → Canvas 2D.
     if (!this.sharedCanvas) {
       this.sharedCanvas = document.createElement("canvas");
     }
@@ -329,6 +372,7 @@ export class TerminalStore {
 
   getDebugStats(leadPtyId?: number | null): {
     displayFps: number;
+    rendererBackend: string;
     pendingApplied: number;
     ackAhead: number;
     applyMs: number;
@@ -346,6 +390,7 @@ export class TerminalStore {
     const lead = leadPtyId != null ? this.terminals.get(leadPtyId) : null;
     return {
       displayFps: this.displayFps,
+      rendererBackend: this.sharedRenderer?.backend ?? "none",
       pendingApplied: this.pendingAppliedFrames,
       ackAhead: this.ackAheadFrames,
       applyMs: this.applyMsX10 / 10,
@@ -417,6 +462,14 @@ export class TerminalStore {
   setDesiredSubscriptions(ptyIds: Set<number>): void {
     this.desired = new Set(ptyIds);
     this.syncSubscriptions();
+    // When all terminal subscriptions are cleared, reset the browser metrics
+    // so stale terminal-only counters (pendingAppliedFrames, ackAheadFrames)
+    // don't poison the server's shared flow-control window — which would
+    // block surface (compositor) frame delivery on that connection.
+    if (this.desired.size === 0 && this.subscribed.size === 0) {
+      this.resetClientMetrics();
+      this.flushClientMetrics();
+    }
   }
 
   /**
@@ -457,6 +510,11 @@ export class TerminalStore {
     if (t) {
       t.free();
       this.terminals.delete(ptyId);
+    }
+    const stale = this.staleTerminals.get(ptyId);
+    if (stale) {
+      stale.free();
+      this.staleTerminals.delete(ptyId);
     }
     this.subscribed.delete(ptyId);
   }
@@ -552,5 +610,12 @@ export class TerminalStore {
     this.sharedRenderer?.dispose();
     this.sharedRenderer = null;
     this.sharedCanvas = null;
+    // If the WebGPU renderer was created but never promoted to sharedRenderer,
+    // dispose it separately.
+    if (this.webgpuRenderer && this.webgpuRenderer !== this.sharedRenderer) {
+      this.webgpuRenderer.dispose();
+    }
+    this.webgpuRenderer = null;
+    this.webgpuCanvas = null;
   }
 }

@@ -29,6 +29,7 @@ import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 import {
   overlayChromeStyles,
   sessionName,
+  sessionPrefix,
   sidebarWidth,
   themeFor,
   ui,
@@ -37,6 +38,7 @@ import {
 import { LayoutPreview } from "./bsp/LayoutPreview";
 import {
   enumeratePanes,
+  isSurfaceAssignment,
   layoutFromDSL,
   type BSPAssignments,
   type BSPLayout,
@@ -72,6 +74,7 @@ type LayoutItem = {
 type SessionItem = {
   type: "session";
   key: string;
+  prefix: string;
   title: string;
   subtitle: string;
   sessionId: SessionId;
@@ -79,6 +82,7 @@ type SessionItem = {
   context?: string;
   source?: number;
   focused: boolean;
+  inLayout: boolean;
 };
 
 type ActionItem = {
@@ -563,8 +567,14 @@ export function SwitcherOverlay(props: {
   connectionLabels?: Map<string, string>;
   multiConnection?: boolean;
   focusedSurfaceId?: number | null;
-  onFocusSurface?: (surfaceId: number) => void;
-  onMoveSurfaceToPane?: (surfaceId: number, targetPaneId: string) => void;
+  focusedSurfaceConnId?: string | null;
+  onFocusSurface?: (surfaceId: number, connectionId?: string) => void;
+  onMoveSurfaceToPane?: (
+    surfaceId: number,
+    connectionId: string,
+    targetPaneId: string,
+  ) => void;
+  defaultRemote?: string | null;
 }) {
   const workspace = createBlitWorkspace();
   const notClosed = createMemo(() =>
@@ -586,6 +596,17 @@ export function SwitcherOverlay(props: {
     });
   });
 
+  // Session IDs currently assigned to a BSP pane (excludes surface assignments).
+  const assignedSessionIds = createMemo(() => {
+    const a = props.layoutAssignments?.assignments;
+    if (!a) return new Set<string>();
+    const ids = new Set<string>();
+    for (const v of Object.values(a)) {
+      if (v != null && !isSurfaceAssignment(v)) ids.add(v);
+    }
+    return ids;
+  });
+
   const dark = () => props.palette.dark;
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize ?? 13);
@@ -595,6 +616,9 @@ export function SwitcherOverlay(props: {
     BlitSearchResult[] | null
   >(null);
   const [selectedIdx, setSelectedIdx] = createSignal(0);
+  // Track whether the pointer actually moved so that scroll-triggered
+  // mouseenter events (from keyboard navigation) don't hijack selection.
+  let pointerMovedSinceKey = true;
   const [layoutMode, setLayoutMode] = createSignal(false);
   const [newTerminalMode, setNewTerminalMode] = createSignal(
     props.initialNewTerminalMode ?? false,
@@ -752,9 +776,14 @@ export function SwitcherOverlay(props: {
       const sessions = dp
         ? visibleSessions().filter((s) => s.connectionId === dp.connId)
         : visibleSessions();
+      const assigned = assignedSessionIds();
       return sessions.map<SessionItem>((session) => ({
         type: "session",
         key: `session:${session.id}`,
+        prefix: sessionPrefix(
+          session,
+          props.connectionLabels?.get(session.connectionId),
+        ),
         title: sessionName(session),
         subtitle:
           session.command ??
@@ -764,17 +793,23 @@ export function SwitcherOverlay(props: {
         sessionId: session.id,
         exited: session.state === "exited",
         focused: session.id === props.focusedSessionId,
+        inLayout: assigned.has(session.id),
       }));
     }
 
     // When a destination prefix is matched, show all sessions on that
     // connection without further text filtering (the `>` part is the command).
     if (dp) {
+      const assigned = assignedSessionIds();
       return visibleSessions()
         .filter((s) => s.connectionId === dp.connId)
         .map<SessionItem>((session) => ({
           type: "session",
           key: `session:${session.id}`,
+          prefix: sessionPrefix(
+            session,
+            props.connectionLabels?.get(session.connectionId),
+          ),
           title: sessionName(session),
           subtitle:
             session.command ??
@@ -784,23 +819,40 @@ export function SwitcherOverlay(props: {
           sessionId: session.id,
           exited: session.state === "exited",
           focused: session.id === props.focusedSessionId,
+          inLayout: assigned.has(session.id),
         }));
     }
 
     const needle = searchPart().toLowerCase();
+    const assigned = assignedSessionIds();
     const seen = new Set<SessionId>();
     const matches: SessionItem[] = [];
+
+    // When the search query matches a connection label (prefix or substring),
+    // include all sessions on that connection so that e.g. typing "rabbit"
+    // surfaces the terminals running on the rabbit remote.
+    const labelConnIds = new Set<string>();
+    if (props.connectionLabels) {
+      for (const [connId, label] of props.connectionLabels) {
+        if (label.toLowerCase().includes(needle)) labelConnIds.add(connId);
+      }
+    }
 
     for (const session of visibleSessions()) {
       if (
         session.tag.toLowerCase().includes(needle) ||
         (session.title ?? "").toLowerCase().includes(needle) ||
-        (session.command ?? "").toLowerCase().includes(needle)
+        (session.command ?? "").toLowerCase().includes(needle) ||
+        labelConnIds.has(session.connectionId)
       ) {
         seen.add(session.id);
         matches.push({
           type: "session",
           key: `session:${session.id}`,
+          prefix: sessionPrefix(
+            session,
+            props.connectionLabels?.get(session.connectionId),
+          ),
           title: sessionName(session),
           subtitle:
             session.command ??
@@ -810,6 +862,7 @@ export function SwitcherOverlay(props: {
           sessionId: session.id,
           exited: session.state === "exited",
           focused: session.id === props.focusedSessionId,
+          inLayout: assigned.has(session.id),
         });
       }
     }
@@ -822,6 +875,10 @@ export function SwitcherOverlay(props: {
       matches.push({
         type: "session",
         key: `session:${session.id}`,
+        prefix: sessionPrefix(
+          session,
+          props.connectionLabels?.get(session.connectionId),
+        ),
         title: sessionName(session),
         subtitle:
           session.command ??
@@ -833,6 +890,7 @@ export function SwitcherOverlay(props: {
         context: result.context,
         source: result.primarySource,
         focused: session.id === props.focusedSessionId,
+        inLayout: assigned.has(session.id),
       });
     }
 
@@ -843,22 +901,56 @@ export function SwitcherOverlay(props: {
     const surfs = props.surfaces ?? [];
     if (surfs.length === 0) return [] as SurfaceItem[];
 
+    const dp = destPrefix();
+    // When a destination prefix is matched, show surfaces on that connection.
+    if (dp) {
+      return surfs
+        .filter((s) => s.connectionId === dp.connId)
+        .map<SurfaceItem>((s) => ({
+          type: "surface",
+          key: `surface:${s.connectionId}:${s.surfaceId}`,
+          title: s.title || s.appId || `Surface ${s.surfaceId}`,
+          subtitle: `${s.width}\u00D7${s.height}`,
+          surfaceId: s.surfaceId,
+          connectionId: s.connectionId,
+          focused:
+            s.surfaceId === props.focusedSurfaceId &&
+            (props.focusedSurfaceConnId == null ||
+              s.connectionId === props.focusedSurfaceConnId),
+        }));
+    }
+
     const needle = searching() ? searchPart().toLowerCase() : "";
+
+    // When the search query matches a connection label, include surfaces on
+    // that connection (mirrors the session matching behaviour).
+    const labelConnIds = new Set<string>();
+    if (searching() && props.connectionLabels) {
+      for (const [connId, label] of props.connectionLabels) {
+        if (label.toLowerCase().includes(needle)) labelConnIds.add(connId);
+      }
+    }
 
     return surfs
       .filter((s) => {
         if (!searching()) return true;
         const name = s.title || s.appId || `Surface ${s.surfaceId}`;
-        return name.toLowerCase().includes(needle);
+        return (
+          name.toLowerCase().includes(needle) ||
+          labelConnIds.has(s.connectionId)
+        );
       })
       .map<SurfaceItem>((s) => ({
         type: "surface",
-        key: `surface:${s.surfaceId}`,
+        key: `surface:${s.connectionId}:${s.surfaceId}`,
         title: s.title || s.appId || `Surface ${s.surfaceId}`,
         subtitle: `${s.width}\u00D7${s.height}`,
         surfaceId: s.surfaceId,
         connectionId: s.connectionId,
-        focused: s.surfaceId === props.focusedSurfaceId,
+        focused:
+          s.surfaceId === props.focusedSurfaceId &&
+          (props.focusedSurfaceConnId == null ||
+            s.connectionId === props.focusedSurfaceConnId),
       }));
   });
 
@@ -1098,23 +1190,32 @@ export function SwitcherOverlay(props: {
       const dp = destPrefix();
       if (dp) {
         // Destination prefix matched — only show the resolved new-terminal action.
-        next.push({
+        // When there is an inline command (e.g. "rabbit>htop"), place the run
+        // action first so it is the default selection.
+        const dpActions = actions.filter((a) => a.connectionId === dp.connId);
+        const section = {
           title: t("switcher.sectionActions"),
-          items: actions.filter((a) => a.connectionId === dp.connId),
-        });
-      } else if (
-        !searching() ||
-        actions.some((action) =>
+          items: dpActions,
+        };
+        if (inlineCmd()) {
+          next.unshift(section);
+        } else {
+          next.push(section);
+        }
+      } else if (searching()) {
+        const matched = actions.filter((action) =>
           action.title.toLowerCase().includes(searchPart().toLowerCase()),
-        )
-      ) {
+        );
+        if (matched.length > 0) {
+          next.unshift({
+            title: t("switcher.sectionActions"),
+            items: matched,
+          });
+        }
+      } else {
         next.push({
           title: t("switcher.sectionActions"),
-          items: searching()
-            ? actions.filter((action) =>
-                action.title.toLowerCase().includes(searchPart().toLowerCase()),
-              )
-            : actions,
+          items: actions,
         });
       }
     }
@@ -1153,6 +1254,17 @@ export function SwitcherOverlay(props: {
     sections().flatMap((section) => section.items),
   );
 
+  // First flat-item index of each section, for PageUp/PageDown navigation.
+  const sectionStarts = createMemo(() => {
+    const starts: number[] = [];
+    let offset = 0;
+    for (const section of sections()) {
+      if (section.items.length > 0) starts.push(offset);
+      offset += section.items.length;
+    }
+    return starts;
+  });
+
   // Clamp selected index when flatItems changes.
   createEffect(() => {
     const len = flatItems().length;
@@ -1167,6 +1279,17 @@ export function SwitcherOverlay(props: {
     void query();
     setSelectedIdx(0);
     setKillPickerSessionId(null);
+  });
+
+  // When the "New terminal on…" picker opens, pre-select the default remote.
+  createEffect(() => {
+    if (!newTerminalMode()) return;
+    const dflt = props.defaultRemote;
+    if (!dflt) return;
+    const idx = flatItems().findIndex(
+      (i) => i.type === "remote" && (i as RemoteItem).remoteName === dflt,
+    );
+    if (idx >= 0) setSelectedIdx(idx);
   });
 
   // Scroll selected item into view and position preview panel.
@@ -1197,6 +1320,15 @@ export function SwitcherOverlay(props: {
       sel.type !== "remote"
     );
   };
+  // Narrow viewport: hide preview sidebar, shrink thumbnails.
+  const [narrow, setNarrow] = createSignal(window.innerWidth < 640);
+  onMount(() => {
+    const mq = matchMedia("(max-width: 639px)");
+    const handler = () => setNarrow(mq.matches);
+    mq.addEventListener?.("change", handler);
+    onCleanup(() => mq.removeEventListener?.("change", handler));
+  });
+
   const uiFont = () => props.fontFamily ?? "inherit";
   const compact = 0.75;
   const fsXs = () => Math.round(scale().xs * compact);
@@ -1220,7 +1352,10 @@ export function SwitcherOverlay(props: {
     "font-weight": 600,
     "letter-spacing": "0",
   });
-  const iconSize = () => Math.round(scale().icon * compact);
+  const iconSize = () =>
+    narrow()
+      ? Math.round(scale().icon * compact * 0.55)
+      : Math.round(scale().icon * compact);
 
   function renderItemSquare(item: SwitcherItem, selected: boolean) {
     return (
@@ -1349,9 +1484,13 @@ export function SwitcherOverlay(props: {
     }
     if (item.type === "surface") {
       if (props.focusedPaneId && props.onMoveSurfaceToPane) {
-        props.onMoveSurfaceToPane(item.surfaceId, props.focusedPaneId);
+        props.onMoveSurfaceToPane(
+          item.surfaceId,
+          item.connectionId,
+          props.focusedPaneId,
+        );
       } else {
-        props.onFocusSurface?.(item.surfaceId);
+        props.onFocusSurface?.(item.surfaceId, item.connectionId);
       }
       return;
     }
@@ -1418,6 +1557,7 @@ export function SwitcherOverlay(props: {
   function handleKeyDown(event: KeyboardEvent) {
     if (event.key === "ArrowDown") {
       event.preventDefault();
+      pointerMovedSinceKey = false;
       if (flatItems().length > 0) {
         setSelectedIdx((index) => (index + 1) % flatItems().length);
       }
@@ -1425,10 +1565,37 @@ export function SwitcherOverlay(props: {
     }
     if (event.key === "ArrowUp") {
       event.preventDefault();
+      pointerMovedSinceKey = false;
       if (flatItems().length > 0) {
         setSelectedIdx(
           (index) => (index - 1 + flatItems().length) % flatItems().length,
         );
+      }
+      return;
+    }
+    if (event.key === "PageDown") {
+      event.preventDefault();
+      pointerMovedSinceKey = false;
+      const starts = sectionStarts();
+      if (starts.length > 0) {
+        const cur = selectedIdx();
+        const next = starts.find((s) => s > cur);
+        setSelectedIdx(next ?? starts[starts.length - 1]);
+      }
+      return;
+    }
+    if (event.key === "PageUp") {
+      event.preventDefault();
+      pointerMovedSinceKey = false;
+      const starts = sectionStarts();
+      if (starts.length > 0) {
+        const cur = selectedIdx();
+        let prev = starts[0];
+        for (const s of starts) {
+          if (s >= cur) break;
+          prev = s;
+        }
+        setSelectedIdx(prev);
       }
       return;
     }
@@ -1475,7 +1642,12 @@ export function SwitcherOverlay(props: {
         return;
       }
     }
-    if (event.key === "Q" && event.shiftKey && event.ctrlKey) {
+    if (
+      (event.key === "Q" || event.code === "KeyQ") &&
+      event.shiftKey &&
+      event.ctrlKey &&
+      event.altKey
+    ) {
       const sel = selectedItem();
       if (sel?.type === "session") {
         event.preventDefault();
@@ -1503,7 +1675,8 @@ export function SwitcherOverlay(props: {
         ref={wrapperRef}
         style={{
           position: "relative",
-          "margin-right": newTerminalMode() ? undefined : sidebarWidth,
+          "margin-right":
+            narrow() || newTerminalMode() ? undefined : sidebarWidth,
         }}
       >
         <OverlayPanel
@@ -1535,6 +1708,7 @@ export function SwitcherOverlay(props: {
           >
             <input
               ref={searchRef}
+              name="blit-switcher-search"
               type="text"
               value={query()}
               onInput={(e) => setQuery(e.currentTarget.value)}
@@ -1582,6 +1756,9 @@ export function SwitcherOverlay(props: {
             }}
           >
             <div
+              onMouseMove={() => {
+                pointerMovedSinceKey = true;
+              }}
               style={{
                 "min-width": "0",
                 "min-height": "0",
@@ -1649,7 +1826,10 @@ export function SwitcherOverlay(props: {
                                 itemRefs[index()] = el;
                               }}
                               onClick={() => activateItem(item)}
-                              onMouseEnter={() => setSelectedIdx(index())}
+                              onMouseEnter={() => {
+                                if (pointerMovedSinceKey)
+                                  setSelectedIdx(index());
+                              }}
                               style={{
                                 display: "flex",
                                 "align-items": "stretch",
@@ -1697,6 +1877,22 @@ export function SwitcherOverlay(props: {
                                       "font-weight": 600,
                                     }}
                                   >
+                                    <Show
+                                      when={
+                                        item.type === "session" &&
+                                        (item as SessionItem).prefix
+                                      }
+                                    >
+                                      <span
+                                        style={{
+                                          opacity: 0.5,
+                                          "font-weight": 400,
+                                        }}
+                                      >
+                                        {(item as SessionItem).prefix}
+                                      </span>
+                                      {" \u203A "}
+                                    </Show>
                                     {item.title}
                                   </span>
                                   <Show
@@ -1709,6 +1905,16 @@ export function SwitcherOverlay(props: {
                                   >
                                     <mark style={ui.badge}>
                                       {t("switcher.badgeFocused")}
+                                    </mark>
+                                  </Show>
+                                  <Show
+                                    when={
+                                      item.type === "session" &&
+                                      (item as SessionItem).inLayout
+                                    }
+                                  >
+                                    <mark style={ui.badge}>
+                                      {t("switcher.badgeInLayout")}
                                     </mark>
                                   </Show>
                                   <Show
@@ -1985,8 +2191,8 @@ export function SwitcherOverlay(props: {
           </div>
         </OverlayPanel>
 
-        {/* Preview panel */}
-        <Show when={showPreview() && selectedItem()}>
+        {/* Preview panel — hidden on narrow/mobile screens */}
+        <Show when={!narrow() && showPreview() && selectedItem()}>
           {(sel) => (
             <div
               ref={previewRef}
@@ -2190,6 +2396,10 @@ export function SwitcherOverlay(props: {
                       "font-weight": 600,
                     }}
                   >
+                    <span style={{ opacity: 0.5, "font-weight": 400 }}>
+                      {(sel() as SessionItem).prefix}
+                    </span>
+                    {" \u203A "}
                     {sel().title}
                   </div>
                   <div

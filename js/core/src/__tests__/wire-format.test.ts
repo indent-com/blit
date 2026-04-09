@@ -139,6 +139,9 @@ describe("wire format parsing", () => {
     it("parses empty list", () => {
       transport.push(new Uint8Array([S2C_LIST, 0x00, 0x00]));
       expect(conn.getSnapshot().sessions.length).toBe(0);
+      // ready is only set by S2C_READY (0x09), not by S2C_LIST
+      expect(conn.getSnapshot().ready).toBe(false);
+      transport.pushReady();
       expect(conn.getSnapshot().ready).toBe(true);
     });
 

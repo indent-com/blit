@@ -18,6 +18,9 @@ export interface BlitDebug {
   error(msg: string, ...args: unknown[]): void;
 }
 
+/** Silent {@link BlitDebug} that discards everything. */
+export const noopDebug: BlitDebug = { log() {}, warn() {}, error() {} };
+
 /** Connection lifecycle states. */
 export type ConnectionStatus =
   | "connecting"
@@ -60,6 +63,8 @@ export interface BlitTransport {
   send(data: Uint8Array): void;
   /** Close the transport connection. */
   close(): void;
+  /** Tear down the current connection and reconnect from scratch. */
+  reconnect?(): void;
   /** Current connection status. */
   readonly status: ConnectionStatus;
   /** True when the server explicitly rejected authentication. */
@@ -104,6 +109,7 @@ export interface BlitConnectionSnapshot {
   supportsRestart: boolean;
   supportsCopyRange: boolean;
   supportsCompositor: boolean;
+  supportsAudio: boolean;
   retryCount: number;
   /** Non-null when the last connection attempt failed with an explicit error message. */
   error: string | null;
@@ -181,38 +187,52 @@ export const S2C_SEARCH_RESULTS = 0x05;
 export const S2C_CREATED_N = 0x06;
 export const S2C_HELLO = 0x07;
 export const S2C_EXITED = 0x08;
+export const S2C_READY = 0x09;
 export const S2C_TEXT = 0x0a;
+export const S2C_PING = 0x0b;
+export const S2C_QUIT = 0x0c;
+export const C2S_PING = 0x08;
+export const C2S_QUIT = 0x0f;
 
 export const C2S_SURFACE_INPUT = 0x20;
 export const C2S_SURFACE_POINTER = 0x21;
 export const C2S_SURFACE_POINTER_AXIS = 0x22;
 export const C2S_SURFACE_RESIZE = 0x23;
 export const C2S_SURFACE_FOCUS = 0x24;
-export const C2S_CLIPBOARD = 0x25;
+export const C2S_CLIPBOARD_SET = 0x25;
 export const C2S_SURFACE_SUBSCRIBE = 0x28;
 export const C2S_SURFACE_UNSUBSCRIBE = 0x29;
 export const C2S_SURFACE_ACK = 0x2a;
 export const C2S_SURFACE_CLOSE = 0x2b;
-export const C2S_SURFACE_REQUEST_KEYFRAME = 0x2c;
 export const C2S_CLIENT_FEATURES = 0x2d;
+/** Composed text input for a Wayland surface (UTF-8): [0x2F][surface_id:2][text:N] */
+export const C2S_SURFACE_TEXT = 0x2f;
 export const S2C_SURFACE_CREATED = 0x20;
 export const S2C_SURFACE_DESTROYED = 0x21;
 export const S2C_SURFACE_FRAME = 0x22;
 export const S2C_SURFACE_TITLE = 0x23;
 export const S2C_SURFACE_RESIZED = 0x24;
-export const S2C_CLIPBOARD_MSG = 0x25;
+export const S2C_CLIPBOARD_CONTENT = 0x25;
 export const S2C_SURFACE_APP_ID = 0x28;
+export const S2C_SURFACE_CURSOR = 0x29;
+/** Encoder backend info for a surface: [0x2A][surface_id:2][name:N] */
+export const S2C_SURFACE_ENCODER = 0x2a;
 export const SURFACE_FRAME_FLAG_KEYFRAME = 1 << 0;
 export const SURFACE_FRAME_CODEC_MASK = 0b110;
 export const SURFACE_FRAME_CODEC_H264 = 0 << 1;
 export const SURFACE_FRAME_CODEC_AV1 = 1 << 1;
 export const SURFACE_FRAME_CODEC_PNG = 2 << 1;
-export const SURFACE_FRAME_CODEC_H265 = 3 << 1;
 
-/** Bitmask for client-supported codecs in C2S_SURFACE_RESIZE. 0 = accept anything. */
+/** Bitmask for client-supported codecs in C2S_SURFACE_RESIZE / C2S_SURFACE_SUBSCRIBE. 0 = accept anything. */
 export const CODEC_SUPPORT_H264 = 1 << 0;
 export const CODEC_SUPPORT_AV1 = 1 << 1;
-export const CODEC_SUPPORT_H265 = 1 << 2;
+
+/** Quality values for C2S_SURFACE_SUBSCRIBE. 0 = server default. */
+export const SURFACE_QUALITY_DEFAULT = 0;
+export const SURFACE_QUALITY_LOW = 1;
+export const SURFACE_QUALITY_MEDIUM = 2;
+export const SURFACE_QUALITY_HIGH = 3;
+export const SURFACE_QUALITY_LOSSLESS = 4;
 
 export const PROTOCOL_VERSION = 1;
 export const FEATURE_CREATE_NONCE = 1 << 0;
@@ -220,10 +240,17 @@ export const FEATURE_RESTART = 1 << 1;
 export const FEATURE_RESIZE_BATCH = 1 << 2;
 export const FEATURE_COPY_RANGE = 1 << 3;
 export const FEATURE_COMPOSITOR = 1 << 4;
+export const FEATURE_AUDIO = 1 << 5;
+
+// -- Audio forwarding --
+export const C2S_AUDIO_SUBSCRIBE = 0x30;
+export const C2S_AUDIO_UNSUBSCRIBE = 0x31;
+export const S2C_AUDIO_FRAME = 0x30;
+export const AUDIO_FRAME_CODEC_MASK = 0b110;
+export const AUDIO_FRAME_CODEC_OPUS = 0 << 1;
 
 export type BlitSurface = {
   connectionId: ConnectionId;
-  sessionId: u16;
   surfaceId: u16;
   parentId: u16;
   title: string;

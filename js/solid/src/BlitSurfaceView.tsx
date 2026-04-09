@@ -6,11 +6,7 @@ import {
   Show,
   type JSX,
 } from "solid-js";
-import {
-  BlitSurfaceCanvas,
-  detectCodecSupport,
-  getCodecSupport,
-} from "@blit-sh/core";
+import { BlitSurfaceCanvas, detectCodecSupport } from "@blit-sh/core";
 import type { ConnectionId } from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "./BlitContext";
 
@@ -85,7 +81,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
       const h = Math.round(cssH * devicePixelRatio);
       if (w <= 0 || h <= 0) return;
       s.setDisplaySize(w, h);
-      s.requestResize(w, h, dprToScale120(), getCodecSupport());
+      s.requestResize(w, h, dprToScale120());
     };
 
     const ro = new ResizeObserver((entries) => {

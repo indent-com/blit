@@ -34,7 +34,7 @@
     </h3>
     <p class="text-[13px] leading-relaxed text-[var(--dim)]">
       Non-interactive subcommands for scripts and LLMs.
-      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit start</code>,
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit terminal start</code>,
       <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">show</code>,
       <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">send</code>,
       <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">wait --pattern</code>.
@@ -47,13 +47,14 @@
       Headless Wayland compositor <span class="text-[10px] font-normal uppercase tracking-wider text-[var(--accent)] opacity-70">Experimental</span>
     </h3>
     <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-      On Linux, every blit session includes an experimental headless
+      On Linux, every blit terminal includes an experimental headless
       Wayland compositor. Launch GUI apps —
-      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit start foot</code> —
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit terminal start foot</code> —
       then screenshot, click, and type into them via
-      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit capture</code> /
-      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit click</code>.
-      Streamed as H.264 / H.265 / AV1 video. No display, no GPU required.
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit surface capture</code> /
+      <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">blit surface click</code>.
+      Streamed as H.264 / AV1 video. Audio forwarded via PipeWire and
+      streamed as Opus. No display, no GPU required.
     </p>
   </div>
 </section>

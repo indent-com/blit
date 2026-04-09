@@ -17,9 +17,12 @@ use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{Notify, mpsc};
 
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 
@@ -67,7 +70,7 @@ pub fn default_local_ip() -> Option<std::net::IpAddr> {
     default_local_ips().into_iter().next()
 }
 const DEFAULT_MESSAGE_TEMPLATE: &str =
-    "Session available at https://blit.sh/s#{secret}\nRead-only: https://blit.sh/s#{ro_secret}";
+    "Terminals at https://blit.sh/s#{secret}\nRead-only: https://blit.sh/s#{ro_secret}";
 
 pub fn normalize_hub(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');
@@ -91,6 +94,12 @@ pub fn normalize_hub(raw: &str) -> String {
     format!("wss://{trimmed}")
 }
 
+/// Callback to ensure the blit-proxy daemon is running.
+/// Called when a proxy connection fails; should restart the proxy if needed
+/// and return the socket path on success.
+pub type ProxyEnsureFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+
 pub struct Config {
     pub sock_path: String,
     pub signal_url: String,
@@ -98,6 +107,14 @@ pub struct Config {
     pub message_override: Option<String>,
     pub quiet: bool,
     pub verbose: bool,
+    /// When set, per-peer IPC connections to blit-server are routed through
+    /// the blit-proxy daemon at this socket path instead of connecting
+    /// directly.  This lets the proxy pool local connections.
+    pub proxy_sock: Option<String>,
+    /// When set, called to restart the blit-proxy daemon when a proxy
+    /// connection fails.  Should ensure the proxy is running and return
+    /// the socket path on success.
+    pub proxy_ensure: Option<ProxyEnsureFn>,
 }
 
 // ── Key derivation ──────────────────────────────────────────────────────
@@ -387,9 +404,41 @@ pub async fn run(config: Config) {
         sig_send_rx,
     ));
 
+    let shutdown = Arc::new(Notify::new());
+
+    // Broadcast shutdown on SIGTERM / SIGINT so peers can send S2C_QUIT to
+    // connected browsers before the process exits.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = signal(SignalKind::terminate()).expect("signal handler");
+                let mut sigint = signal(SignalKind::interrupt()).expect("signal handler");
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            shutdown.notify_waiters();
+        });
+    }
+
     let mut peers: HashMap<String, PeerState> = HashMap::new();
 
-    while let Some(event) = sig_event_rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            ev = sig_event_rx.recv() => match ev {
+                Some(e) => e,
+                None => break,
+            },
+            _ = shutdown.notified() => break,
+        };
         match event {
             signaling::Event::Registered { session_id } => {
                 verbose!("registered with signaling server (session {session_id})");
@@ -422,10 +471,23 @@ pub async fn run(config: Config) {
                 let pk = keys.clone();
                 let est = established.clone();
                 let ice = ice_config.clone();
+                let sd = shutdown.clone();
+                let proxy = config.proxy_sock.clone();
+                let proxy_ensure = config.proxy_ensure.clone();
                 let handle = tokio::spawn(async move {
-                    if let Err(e) =
-                        peer::handle_peer(peer_id.clone(), sock, peer_sig_rx, out_tx, pk, est, ice)
-                            .await
+                    if let Err(e) = peer::handle_peer(
+                        peer_id.clone(),
+                        sock,
+                        peer_sig_rx,
+                        out_tx,
+                        pk,
+                        est,
+                        ice,
+                        sd,
+                        proxy,
+                        proxy_ensure,
+                    )
+                    .await
                     {
                         verbose!("peer {peer_id} error: {e}");
                     }
@@ -441,8 +503,29 @@ pub async fn run(config: Config) {
             }
             signaling::Event::PeerLeft { session_id } => {
                 verbose!("consumer left: {session_id}");
-                if let Some(state) = peers.remove(&session_id) {
-                    state.handle.abort();
+                if let Some(state) = peers.get(&session_id) {
+                    if state.established.load(Ordering::Relaxed) {
+                        // The signaling WebSocket dropped but the WebRTC
+                        // data path (ICE/DTLS/SCTP) is independent and may
+                        // still be alive.  Don't abort the peer handler —
+                        // it has its own liveness detection via
+                        // PEER_IDLE_TIMEOUT.  Just drop the signaling relay
+                        // so no more SDP messages can be forwarded.
+                        verbose!(
+                            "peer {session_id} is established, \
+                             keeping WebRTC session alive"
+                        );
+                        // Close the signal_tx so the peer handler's
+                        // signal_rx returns None (harmless — signaling is
+                        // only needed during ICE setup).
+                        drop(peers.remove(&session_id));
+                    } else {
+                        // Not yet established — the consumer disconnected
+                        // during ICE setup; tear down immediately.
+                        if let Some(state) = peers.remove(&session_id) {
+                            state.handle.abort();
+                        }
+                    }
                 }
             }
             signaling::Event::Signal { from, data } => {
@@ -456,5 +539,12 @@ pub async fn run(config: Config) {
                 verbose!("signaling error: {message}");
             }
         }
+    }
+
+    // On shutdown, notify all peers so they send S2C_QUIT, then give them a
+    // brief window to flush the SCTP frame before the process exits.
+    shutdown.notify_waiters();
+    if !peers.is_empty() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

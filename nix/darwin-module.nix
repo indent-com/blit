@@ -38,6 +38,16 @@ in
       description = "Scrollback buffer size in rows per PTY.";
     };
 
+    audio = {
+      enable = mkEnableOption "audio forwarding (Linux only — no-op on Darwin)";
+
+      bitrate = mkOption {
+        type = types.int;
+        default = 64000;
+        description = "Opus encoder bitrate in bits/sec. Only effective on Linux.";
+      };
+    };
+
     socketPath = mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -141,7 +151,7 @@ in
       description = "Named blit gateway instances.";
     };
 
-    forwarders = mkOption {
+    shares = mkOption {
       type = types.attrsOf (
         types.submodule {
           options = {
@@ -173,13 +183,13 @@ in
               type = types.package;
               default = self.packages.${pkgs.system}.blit;
               defaultText = "self.packages.\${system}.blit";
-              description = "The blit package to use for the forwarder.";
+              description = "The blit package to use for the share service.";
             };
           };
         }
       );
       default = { };
-      description = "Named blit-webrtc-forwarder instances sharing blit server sessions via WebRTC.";
+      description = "Named blit share instances exposing blit server sessions via WebRTC.";
     };
   };
 
@@ -261,18 +271,18 @@ in
       }) cfg.gateways
     )
     // builtins.listToAttrs (
-      lib.mapAttrsToList (name: fwd: {
-        name = "blit-webrtc-forwarder-${name}";
+      lib.mapAttrsToList (name: shr: {
+        name = "blit-share-${name}";
         value = {
           serviceConfig = {
-            Label = "com.blit.webrtc-forwarder.${name}";
+            Label = "com.blit.share.${name}";
             ProgramArguments = [
               "/bin/sh"
               "-lc"
               (
-                ". ${fwd.passFile} && exec ${fwd.package}/bin/blit share"
-                + lib.optionalString fwd.quiet " --quiet"
-                + lib.optionalString fwd.verbose " --verbose"
+                ". ${shr.passFile} && exec ${shr.package}/bin/blit share"
+                + lib.optionalString shr.quiet " --quiet"
+                + lib.optionalString shr.verbose " --verbose"
               )
             ];
             EnvironmentVariables =
@@ -280,19 +290,19 @@ in
               // lib.optionalAttrs (cfg.socketPath != null) {
                 BLIT_SOCK = cfg.socketPath;
               }
-              // lib.optionalAttrs (fwd.hub != null) {
-                BLIT_HUB = fwd.hub;
+              // lib.optionalAttrs (shr.hub != null) {
+                BLIT_HUB = shr.hub;
               }
-              // lib.optionalAttrs fwd.verboseWebrtc {
+              // lib.optionalAttrs shr.verboseWebrtc {
                 BLIT_WEBRTC_VERBOSE = "1";
               };
             RunAtLoad = true;
             KeepAlive = true;
-            StandardOutPath = "/tmp/blit-webrtc-forwarder-${name}.log";
-            StandardErrorPath = "/tmp/blit-webrtc-forwarder-${name}.log";
+            StandardOutPath = "/tmp/blit-share-${name}.log";
+            StandardErrorPath = "/tmp/blit-share-${name}.log";
           };
         };
-      }) cfg.forwarders
+      }) cfg.shares
     );
   };
 }

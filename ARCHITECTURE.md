@@ -64,14 +64,15 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `@blit-sh/solid`        | `js/solid/`                | npm           | Thin Solid wrapper: context provider, primitives, `BlitTerminal` component                                           |
 | `blit-server`           | `crates/server/`           | lib           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
 | `blit-gateway`          | `crates/gateway/`          | lib           | WebSocket/WebTransport proxy with passphrase auth. Multi-destination, live remotes.                                  |
+| `blit-ssh`              | `crates/ssh/`              | lib           | Embedded SSH client (russh): ssh-agent auth, `~/.ssh/config`, `direct-streamlocal` channels                          |
 | `blit-proxy`            | `crates/proxy/`            | lib           | Connection pool and transparent proxy. One process, multiple upstream targets, pre-warmed pools.                     |
 | `blit` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH/proxy/share transports, `remote` management, `server`/`share` subcommands     |
 | `blit-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib           | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                        |
 | `blit-fonts`            | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
 | `blit-webserver`        | `crates/webserver/`        | lib           | Shared axum helpers: HTML serving, font routes, config WebSocket, remotes file                                       |
-| `blit-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (smithay): surface multiplexing, input injection                            |
+| `blit-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (wayland-server): surface multiplexing, input injection                     |
 
-Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`blit-cli`, `blit-webrtc-forwarder`) use a small number of sibling files in the same directory.
+Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`blit-server`, `blit-compositor`, `blit-cli`, `blit-webrtc-forwarder`) use a small number of sibling files in the same directory.
 
 ### Dependency graph
 
@@ -87,6 +88,9 @@ graph TD
     compositor --> server
     server --> cli
     forwarder --> cli
+    ssh[blit-ssh] --> cli
+    ssh --> proxy[blit-proxy]
+    forwarder --> proxy
 
     browser --> core[@blit-sh/core]
     core --> react[@blit-sh/react]
@@ -98,7 +102,7 @@ graph TD
     webserver --> cli
 ```
 
-`blit-proxy` has no blit-specific dependencies — it depends only on tokio, tokio-tungstenite, and web-transport-quinn.
+`blit-proxy` depends on `blit-ssh` and `blit-webrtc-forwarder` for upstream SSH and WebRTC transport support.
 
 ---
 
@@ -145,7 +149,7 @@ graph LR
     G -->|"WS /mux"| B["browser"]
 ```
 
-The gateway reads `blit.remotes` and connects to each remote via the embedded SSH client. The browser opens a **single** WebSocket to `/mux` and multiplexes all destination traffic over it using 2-byte channel ID prefixes (see [docs/protocol.md § Multiplexed WebSocket](docs/protocol.md#multiplexed-websocket-mux)). Each channel maps to one upstream connection. Session IDs are namespaced (`rabbit:1`, `hound:1`). The legacy `/d/<name>` endpoint (one WS per destination) is still supported for backward compatibility.
+The gateway reads `blit.remotes` and connects to each remote via the embedded SSH client. The browser opens a **single** WebSocket to `/mux` and multiplexes all destination traffic over it using 2-byte channel ID prefixes (see [docs/protocol.md § Multiplexed WebSocket](docs/protocol.md#multiplexed-websocket-mux)). Each channel maps to one upstream connection. Terminal IDs are namespaced (`rabbit:1`, `hound:1`). The legacy `/d/<name>` endpoint (one WS per destination) is still supported for backward compatibility.
 
 ### 5. Proxy-accelerated gateway
 

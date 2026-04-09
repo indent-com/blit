@@ -7,7 +7,6 @@ use tokio::sync::broadcast;
 
 pub struct ConfigState {
     pub tx: broadcast::Sender<String>,
-    pub write_lock: tokio::sync::Mutex<()>,
 }
 
 impl Default for ConfigState {
@@ -20,10 +19,7 @@ impl ConfigState {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel::<String>(64);
         spawn_watcher(tx.clone());
-        Self {
-            tx,
-            write_lock: tokio::sync::Mutex::new(()),
-        }
+        Self { tx }
     }
 }
 
@@ -56,11 +52,46 @@ pub fn remotes_path() -> PathBuf {
     blit_config_dir().join("blit.remotes")
 }
 
+/// Acquire an exclusive cross-process lock for the config directory.
+/// Returns a `File` whose lifetime holds the lock (released on drop).
+/// On non-Unix platforms this is a no-op that returns `None`.
+fn lock_config_dir() -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = blit_config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let lock_path = dir.join("blit.lock");
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+        {
+            // Block until we get the lock.
+            use std::os::unix::io::AsRawFd;
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Some(f);
+            }
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 pub fn read_config() -> HashMap<String, String> {
     let path = config_path();
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return HashMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            eprintln!("blit: could not read {}: {e}", path.display());
+            return HashMap::new();
+        }
     };
     parse_config_str(&contents)
 }
@@ -71,13 +102,33 @@ pub fn read_remotes() -> Vec<(String, String)> {
     let path = remotes_path();
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let default = vec![("local".to_string(), "local".to_string())];
             write_remotes(&default);
             return default;
         }
+        Err(e) => {
+            eprintln!("blit: could not read {}: {e}", path.display());
+            return vec![];
+        }
     };
     parse_remotes_str(&contents)
+}
+
+/// Atomically read-modify-write `blit.conf` under an exclusive flock.
+pub fn modify_config(f: impl FnOnce(&mut HashMap<String, String>)) {
+    let _lock = lock_config_dir();
+    let mut map = read_config();
+    f(&mut map);
+    write_config(&map);
+}
+
+/// Atomically read-modify-write `blit.remotes` under an exclusive flock.
+pub fn modify_remotes(f: impl FnOnce(&mut Vec<(String, String)>)) {
+    let _lock = lock_config_dir();
+    let mut entries = read_remotes();
+    f(&mut entries);
+    write_remotes(&entries);
 }
 
 /// Parse `blit.remotes` content into ordered `(name, uri)` pairs.
@@ -141,8 +192,13 @@ fn write_secret_file(path: &PathBuf, contents: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // Write to a sibling temp file first, then rename for atomicity.
-        let tmp = path.with_extension("tmp");
+        // Write to a sibling temp file with a unique name (pid + counter)
+        // so concurrent writers don't clobber each other's temp files.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp = path.with_extension(format!("tmp.{pid}.{seq}"));
         let result = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -177,7 +233,7 @@ pub fn write_config(map: &HashMap<String, String>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, serialize_config_str(map));
+    write_secret_file(&path, &serialize_config_str(map));
 }
 
 /// Watches a single file in its parent directory and calls `on_change`
@@ -308,6 +364,15 @@ impl RemotesState {
         let _ = self.inner.tx.send(text);
     }
 
+    /// Atomically read-modify-write `blit.remotes` under an exclusive flock,
+    /// then update the in-memory cache and broadcast.
+    pub fn modify(&self, f: impl FnOnce(&mut Vec<(String, String)>)) {
+        let _lock = lock_config_dir();
+        let mut entries = parse_remotes_str(&self.get());
+        f(&mut entries);
+        self.set(&entries);
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.inner.tx.subscribe()
     }
@@ -376,6 +441,7 @@ pub async fn handle_config_ws(
     config: &ConfigState,
     remotes: Option<&RemotesState>,
     remotes_transform: Option<fn(&str) -> String>,
+    extra_init: &[String],
 ) {
     let authed = loop {
         match ws.recv().await {
@@ -425,6 +491,11 @@ pub async fn handle_config_ws(
             return;
         }
     }
+    for msg in extra_init {
+        if ws.send(Message::Text(msg.clone().into())).await.is_err() {
+            return;
+        }
+    }
     if ws.send(Message::Text("ready".into())).await.is_err() {
         return;
     }
@@ -442,17 +513,16 @@ pub async fn handle_config_ws(
                         let text = text.trim();
                         if let Some(rest) = text.strip_prefix("set ")
                             && let Some((k, v)) = rest.split_once(' ') {
-                                let _guard = config.write_lock.lock().await;
-                                let mut map = read_config();
                                 let k = k.trim().replace(['\n', '\r'], "");
                                 let v = v.trim().replace(['\n', '\r'], "");
                                 if k.is_empty() { continue; }
-                                if v.is_empty() {
-                                    map.remove(&k);
-                                } else {
-                                    map.insert(k, v);
-                                }
-                                write_config(&map);
+                                modify_config(|map| {
+                                    if v.is_empty() {
+                                        map.remove(&k);
+                                    } else {
+                                        map.insert(k, v);
+                                    }
+                                });
                         } else if let Some(rest) = text.strip_prefix("remotes-add ") {
                             // "remotes-add <name> <uri>" — name is first whitespace-delimited
                             // word, uri is the remainder after a single space.
@@ -464,13 +534,13 @@ pub async fn handle_config_ws(
                                     && !uri.is_empty()
                                     && let Some(r) = remotes
                                 {
-                                    let mut entries = parse_remotes_str(&r.get());
-                                    if let Some(pos) = entries.iter().position(|(n, _)| n == &name) {
-                                        entries[pos].1 = uri;
-                                    } else {
-                                        entries.push((name, uri));
-                                    }
-                                    r.set(&entries);
+                                    r.modify(|entries| {
+                                        if let Some(pos) = entries.iter().position(|(n, _)| n == &name) {
+                                            entries[pos].1 = uri;
+                                        } else {
+                                            entries.push((name, uri));
+                                        }
+                                    });
                                 }
                             }
                         } else if let Some(name) = text.strip_prefix("remotes-remove ") {
@@ -478,21 +548,20 @@ pub async fn handle_config_ws(
                             if !name.is_empty()
                                 && let Some(r) = remotes
                             {
-                                let mut entries = parse_remotes_str(&r.get());
-                                entries.retain(|(n, _)| n != &name);
-                                r.set(&entries);
+                                r.modify(|entries| {
+                                    entries.retain(|(n, _)| n != &name);
+                                });
                             }
                         } else if let Some(name) = text.strip_prefix("remotes-set-default ") {
                             // Write blit.target = <name> to blit.conf (or remove it for local/empty).
                             let name = name.trim().replace(['\n', '\r'], "");
-                            let _guard = config.write_lock.lock().await;
-                            let mut map = read_config();
-                            if name.is_empty() || name == "local" {
-                                map.remove("blit.target");
-                            } else {
-                                map.insert("blit.target".into(), name);
-                            }
-                            write_config(&map);
+                            modify_config(|map| {
+                                if name.is_empty() || name == "local" {
+                                    map.remove("blit.target");
+                                } else {
+                                    map.insert("blit.target".into(), name);
+                                }
+                            });
                         } else if let Some(rest) = text.strip_prefix("remotes-reorder ") {
                             // "remotes-reorder name1 name2 …" — reorder entries to match
                             // the supplied sequence; unlisted entries are appended at end.
@@ -503,30 +572,27 @@ pub async fn handle_config_ws(
                                     .filter(|s| !s.is_empty())
                                     .collect();
                                 if !desired.is_empty() {
-                                    let entries = parse_remotes_str(&r.get());
-                                    // Build a lookup from name → uri for existing entries.
-                                    let map: std::collections::HashMap<&str, &str> = entries
-                                        .iter()
-                                        .map(|(n, u)| (n.as_str(), u.as_str()))
-                                        .collect();
-                                    // Start with the desired order (only names that exist).
-                                    let mut reordered: Vec<(String, String)> = desired
-                                        .iter()
-                                        .filter_map(|n| {
-                                            map.get(n.as_str())
-                                                .map(|u| (n.clone(), u.to_string()))
-                                        })
-                                        .collect();
-                                    // Append any entries not mentioned, preserving their
-                                    // original relative order.
-                                    let desired_set: std::collections::HashSet<&str> =
-                                        desired.iter().map(|s| s.as_str()).collect();
-                                    for (n, u) in &entries {
-                                        if !desired_set.contains(n.as_str()) {
-                                            reordered.push((n.clone(), u.clone()));
+                                    r.modify(|entries| {
+                                        let map: std::collections::HashMap<&str, &str> = entries
+                                            .iter()
+                                            .map(|(n, u)| (n.as_str(), u.as_str()))
+                                            .collect();
+                                        let mut reordered: Vec<(String, String)> = desired
+                                            .iter()
+                                            .filter_map(|n| {
+                                                map.get(n.as_str())
+                                                    .map(|u| (n.clone(), u.to_string()))
+                                            })
+                                            .collect();
+                                        let desired_set: std::collections::HashSet<&str> =
+                                            desired.iter().map(|s| s.as_str()).collect();
+                                        for (n, u) in entries.iter() {
+                                            if !desired_set.contains(n.as_str()) {
+                                                reordered.push((n.clone(), u.clone()));
+                                            }
                                         }
-                                    }
-                                    r.set(&reordered);
+                                        *entries = reordered;
+                                    });
                                 }
                             }
                         }

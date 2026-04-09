@@ -25,6 +25,8 @@ export function createWebRtcDataChannelTransport(
   const maxDelay = opts?.maxReconnectDelay ?? 10000;
   const backoff = opts?.reconnectBackoff ?? 1.5;
 
+  const receiveTimeoutMs = 15_000;
+
   let _status: ConnectionStatus = "connecting";
   let _lastError: string | null = null;
   let channel: RTCDataChannel | null = null;
@@ -34,6 +36,7 @@ export function createWebRtcDataChannelTransport(
   let readBuf = new Uint8Array(0);
   let connectTimeout: ReturnType<typeof setTimeout> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let receiveTimer: ReturnType<typeof setTimeout> | null = null;
   let currentDelay = initialDelay;
   let started = false;
   let earlyMessages: ArrayBuffer[] = [];
@@ -60,6 +63,28 @@ export function createWebRtcDataChannelTransport(
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    }
+  }
+
+  function resetReceiveTimer() {
+    if (receiveTimer !== null) clearTimeout(receiveTimer);
+    if (disposed || _status !== "connected") {
+      receiveTimer = null;
+      return;
+    }
+    receiveTimer = setTimeout(() => {
+      receiveTimer = null;
+      if (disposed || _status !== "connected") return;
+      _lastError = "receive timeout";
+      setStatus("disconnected");
+      scheduleReconnect();
+    }, receiveTimeoutMs);
+  }
+
+  function clearReceiveTimer() {
+    if (receiveTimer !== null) {
+      clearTimeout(receiveTimer);
+      receiveTimer = null;
     }
   }
 
@@ -101,6 +126,7 @@ export function createWebRtcDataChannelTransport(
       currentDelay = initialDelay;
       _lastError = null;
       setStatus("connected");
+      resetReceiveTimer();
       const msg = new Uint8Array(3);
       msg[0] = C2S_DISPLAY_RATE;
       msg[1] = displayRateFps & 0xff;
@@ -110,6 +136,7 @@ export function createWebRtcDataChannelTransport(
 
     ch.onmessage = (e: MessageEvent) => {
       if (disposed || channel !== ch) return;
+      resetReceiveTimer();
       const incoming = new Uint8Array(e.data as ArrayBuffer);
       const combined = new Uint8Array(readBuf.length + incoming.length);
       combined.set(readBuf);
@@ -132,6 +159,7 @@ export function createWebRtcDataChannelTransport(
     ch.onerror = () => {
       if (disposed || channel !== ch) return;
       clearConnectTimeout();
+      clearReceiveTimer();
       _lastError = "Data channel error";
       setStatus("error");
       scheduleReconnect();
@@ -140,6 +168,7 @@ export function createWebRtcDataChannelTransport(
     ch.onclose = () => {
       if (disposed || channel !== ch) return;
       clearConnectTimeout();
+      clearReceiveTimer();
       setStatus("disconnected");
       scheduleReconnect();
     };
@@ -212,6 +241,7 @@ export function createWebRtcDataChannelTransport(
       disposed = true;
       clearConnectTimeout();
       clearReconnectTimer();
+      clearReceiveTimer();
       if (channel) {
         try {
           channel.close();
@@ -253,9 +283,12 @@ export function createWebRtcDataChannelTransport(
 
   function onConnectionStateChange() {
     if (disposed) return;
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+    const s = pc.connectionState;
+    if (s === "disconnected" || s === "failed" || s === "closed") {
       clearReconnectTimer();
+      clearReceiveTimer();
       setStatus("disconnected");
+      scheduleReconnect();
     }
   }
   pc.addEventListener("connectionstatechange", onConnectionStateChange);
