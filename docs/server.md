@@ -1,6 +1,6 @@
 # Server Internals
 
-`blit-server` is a single async Rust binary (tokio runtime). It owns PTYs, terminal state, and per-client frame scheduling. It has no CLI subcommands and no RPC API beyond the binary protocol described in [protocol.md](protocol.md). Configuration is entirely via environment variables.
+`blit server` is a single async Rust binary (tokio runtime). It owns PTYs, terminal state, and per-client frame scheduling. It has no CLI subcommands and no RPC API beyond the binary protocol described in [protocol.md](protocol.md). Configuration is entirely via environment variables.
 
 ## Configuration
 
@@ -108,7 +108,7 @@ After a conservative backoff, the server gradually probes with additive window g
 ```mermaid
 sequenceDiagram
     participant PTY
-    participant Server as blit-server
+    participant Server as blit server
     participant Client as gateway / browser
 
     PTY->>Server: raw bytes
@@ -145,7 +145,7 @@ All PTYs forked after the compositor starts inherit `WAYLAND_DISPLAY` pointing a
 
 ```mermaid
 sequenceDiagram
-    participant S as blit-server
+    participant S as blit server
     participant C as blit-compositor
     participant A as Wayland app
     participant Cl as client

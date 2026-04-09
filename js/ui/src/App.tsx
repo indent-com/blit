@@ -5,7 +5,7 @@ import {
   onCleanup,
   Show,
 } from "solid-js";
-import { WebSocketTransport, createShareTransport } from "@blit-sh/core";
+import { MuxTransport, createShareTransport } from "@blit-sh/core";
 import type { BlitTransport, BlitWasmModule } from "@blit-sh/core";
 import {
   useRemotes,
@@ -78,15 +78,13 @@ function isProxiable(uri: string): boolean {
   return new URLSearchParams(uri.slice(q + 1)).get("proxiable") === "true";
 }
 
-/** Build a WebSocket URL for a specific destination. */
-function wsUrlForDest(destId: string): string {
+/** Build the WebSocket URL for the multiplexed endpoint. */
+function muxWsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const base = location.pathname.endsWith("/")
     ? location.pathname
     : location.pathname + "/";
-  return (
-    proto + "//" + location.host + base + "d/" + encodeURIComponent(destId)
-  );
+  return proto + "//" + location.host + base + "mux";
 }
 
 export function App(props: { wasm: BlitWasmModule }) {
@@ -127,9 +125,16 @@ function ConnectedApp(props: { wasm: BlitWasmModule; passphrase: string }) {
   const remotes = useRemotes();
   const defaultRemote = useDefaultRemote();
 
-  // Transport cache: reuse existing transports for unchanged name->uri pairs
-  // so we don't tear down and reconnect on every remotes update.
-  const transportCache = new Map<
+  // Single multiplexed WebSocket for all gateway-proxied destinations.
+  const mux = new MuxTransport(muxWsUrl(), props.passphrase);
+  mux.connect();
+
+  onCleanup(() => mux.close());
+
+  // Channel cache: maps destination name → MuxChannel (or share transport).
+  // Channels are reused across reactive updates; only created/closed when the
+  // remote list changes.
+  const channelCache = new Map<
     string,
     { uri: string; transport: BlitTransport }
   >();
@@ -141,7 +146,7 @@ function ConnectedApp(props: { wasm: BlitWasmModule; passphrase: string }) {
     const seen = new Set<string>();
     for (const { name, uri } of live) {
       seen.add(name);
-      const cached = transportCache.get(name);
+      const cached = channelCache.get(name);
       if (cached && cached.uri === uri) {
         next.push({ id: name, label: name, transport: cached.transport });
       } else {
@@ -149,23 +154,22 @@ function ConnectedApp(props: { wasm: BlitWasmModule; passphrase: string }) {
         if (cached) cached.transport.close();
         let transport: BlitTransport;
         if (uri.toLowerCase().startsWith("share:") && !isProxiable(uri)) {
+          // Direct WebRTC share — not multiplexed.
           const { passphrase, hubUrl } = parseShareUri(uri);
           transport = createShareTransport(hubUrl, passphrase);
         } else {
-          transport = new WebSocketTransport(
-            wsUrlForDest(name),
-            props.passphrase,
-          );
+          // Gateway-proxied destination — use a mux channel.
+          transport = mux.createChannel(name);
         }
-        transportCache.set(name, { uri, transport });
+        channelCache.set(name, { uri, transport });
         next.push({ id: name, label: name, transport });
       }
     }
     // Evict stale cache entries, closing their transports.
-    for (const [key, entry] of transportCache) {
+    for (const [key, entry] of channelCache) {
       if (!seen.has(key)) {
         entry.transport.close();
-        transportCache.delete(key);
+        channelCache.delete(key);
       }
     }
     // Move the default remote to the front so it is used for new terminals.

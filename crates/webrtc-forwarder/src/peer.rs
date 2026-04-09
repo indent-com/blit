@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
-const GATHER_TIMEOUT: Duration = Duration::from_secs(4);
+const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Returns `true` for C2S message tags that mutate state (input, create, kill,
 /// etc.).  Read-only consumers have these messages silently dropped.
@@ -275,6 +275,27 @@ pub async fn handle_peer(
 
     let relay_addr = relay.as_ref().map(|r| r.relay_addr);
 
+    // Idle detection: if we receive nothing from the peer for this long,
+    // assume the connection is dead and tear down.  This catches cases where
+    // ICE never transitions to Disconnected (e.g. TURN relay stays alive
+    // after the browser tab is closed without clean teardown).
+    const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+    // Stop pushing data into the DataChannel when no incoming peer data has
+    // been observed for this long.  A healthy peer sends SCTP ACKs, ICE
+    // binding responses, etc. — silence means the peer is gone.  Without
+    // this gate the blit-server data pump keeps filling the SCTP send buffer,
+    // generating a continuous stream of retransmission Transmit outputs that
+    // spin the drive loop at full CPU.  After the cutoff, SCTP retransmits
+    // only what is already buffered with natural RTO backoff.
+    const SEND_IDLE_CUTOFF: Duration = Duration::from_secs(10);
+    let mut last_peer_activity = Instant::now();
+
+    // Reusable sleep future — avoids allocating/dropping a TimerEntry on every
+    // loop iteration, which was responsible for ~15% of steady-state CPU
+    // (timer wheel mutex contention + entry alloc/drop).
+    let sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(sleep);
+
     // Per-channel state: abort handle for the pump task + tx to send
     // DataChannel→blit-server data into the task.
     struct ChannelState {
@@ -288,6 +309,15 @@ pub async fn handle_peer(
     let (server_tx, mut server_rx) = mpsc::unbounded_channel::<(ChannelId, Vec<u8>)>();
 
     loop {
+        // Check idle timeout before doing any work.
+        if last_peer_activity.elapsed() > PEER_IDLE_TIMEOUT {
+            verbose!(
+                "peer idle for >{}s, tearing down",
+                PEER_IDLE_TIMEOUT.as_secs()
+            );
+            break;
+        }
+
         let timeout = loop {
             match rtc.poll_output()? {
                 Output::Timeout(v) => break v,
@@ -425,7 +455,8 @@ pub async fn handle_peer(
             }
         };
 
-        let sleep_dur = timeout.saturating_duration_since(Instant::now());
+        let deadline = tokio::time::Instant::from_std(timeout);
+        sleep.as_mut().reset(deadline);
 
         tokio::select! {
             result = tokio_udp4.recv_from(&mut buf4) => {
@@ -436,7 +467,8 @@ pub async fn handle_peer(
                     host_addr4,
                     &buf4[..n],
                 ) {
-                    rtc.handle_input(Input::Receive(Instant::now(), receive))?;
+                    last_peer_activity = Instant::now();
+                    rtc.handle_input(Input::Receive(last_peer_activity, receive))?;
                 }
             }
             result = async {
@@ -455,10 +487,11 @@ pub async fn handle_peer(
                         &buf6[..n],
                     )
                 {
-                    rtc.handle_input(Input::Receive(Instant::now(), receive))?;
+                    last_peer_activity = Instant::now();
+                    rtc.handle_input(Input::Receive(last_peer_activity, receive))?;
                 }
             }
-            _ = tokio::time::sleep(sleep_dur) => {
+            _ = &mut sleep => {
                 rtc.handle_input(Input::Timeout(Instant::now()))?;
             }
             turn_data = async {
@@ -476,11 +509,20 @@ pub async fn handle_peer(
                         ra,
                         &data,
                     ) {
-                    rtc.handle_input(Input::Receive(Instant::now(), receive))?;
+                    last_peer_activity = Instant::now();
+                    rtc.handle_input(Input::Receive(last_peer_activity, receive))?;
                 }
             }
             // blit-server → DataChannel: pump tasks forward data here.
-            msg = server_rx.recv() => {
+            // Gated on recent peer activity so we don't spin the loop
+            // writing into an SCTP association that can never deliver.
+            msg = async {
+                if last_peer_activity.elapsed() < SEND_IDLE_CUTOFF {
+                    server_rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
                 if let Some((cid, frame)) = msg
                     && let Some(mut ch) = rtc.channel(cid)
                 {
@@ -516,4 +558,10 @@ pub async fn handle_peer(
             }
         }
     }
+
+    // Clean up all channel pump tasks on exit.
+    for (_, state) in channels {
+        state.abort.abort();
+    }
+    Ok(())
 }

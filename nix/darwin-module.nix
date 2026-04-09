@@ -20,9 +20,9 @@ in
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.blit-server;
-      defaultText = "self.packages.\${system}.blit-server";
-      description = "The blit-server package to use.";
+      default = self.packages.${pkgs.system}.blit;
+      defaultText = "self.packages.\${system}.blit";
+      description = "The blit package to use.";
     };
 
     shell = mkOption {
@@ -41,7 +41,7 @@ in
     socketPath = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Unix socket path for blit-server. Defaults to $TMPDIR/blit.sock.";
+      description = "Unix socket path for blit server. Defaults to $TMPDIR/blit.sock.";
     };
 
     gateways = mkOption {
@@ -130,15 +130,15 @@ in
             };
             package = mkOption {
               type = types.package;
-              default = self.packages.${pkgs.system}.blit-gateway;
-              defaultText = "self.packages.\${system}.blit-gateway";
-              description = "The blit-gateway package to use.";
+              default = self.packages.${pkgs.system}.blit;
+              defaultText = "self.packages.\${system}.blit";
+              description = "The blit package to use for the gateway.";
             };
           };
         }
       );
       default = { };
-      description = "Named blit-gateway instances.";
+      description = "Named blit gateway instances.";
     };
 
     forwarders = mkOption {
@@ -171,15 +171,15 @@ in
             };
             package = mkOption {
               type = types.package;
-              default = self.packages.${pkgs.system}.blit-webrtc-forwarder;
-              defaultText = "self.packages.\${system}.blit-webrtc-forwarder";
-              description = "The blit-webrtc-forwarder package to use.";
+              default = self.packages.${pkgs.system}.blit;
+              defaultText = "self.packages.\${system}.blit";
+              description = "The blit package to use for the forwarder.";
             };
           };
         }
       );
       default = { };
-      description = "Named blit-webrtc-forwarder instances sharing blit-server sessions via WebRTC.";
+      description = "Named blit-webrtc-forwarder instances sharing blit server sessions via WebRTC.";
     };
   };
 
@@ -191,7 +191,7 @@ in
           ProgramArguments = [
             "/bin/sh"
             "-lc"
-            ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; exec ${cfg.package}/bin/blit-server''
+            ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; exec ${cfg.package}/bin/blit server''
           ];
           EnvironmentVariables = {
             BLIT_SCROLLBACK = toString cfg.scrollback;
@@ -223,7 +223,7 @@ in
               ProgramArguments = [
                 "/bin/sh"
                 "-lc"
-                ". ${gw.passFile} && exec ${gw.package}/bin/blit-gateway"
+                ". ${gw.passFile} && exec ${gw.package}/bin/blit gateway"
               ];
               EnvironmentVariables = {
                 BLIT_ADDR = "${gw.addr}:${toString gw.port}";
@@ -270,7 +270,7 @@ in
               "/bin/sh"
               "-lc"
               (
-                ". ${fwd.passFile} && exec ${fwd.package}/bin/blit-webrtc-forwarder"
+                ". ${fwd.passFile} && exec ${fwd.package}/bin/blit share"
                 + lib.optionalString fwd.quiet " --quiet"
                 + lib.optionalString fwd.verbose " --verbose"
               )

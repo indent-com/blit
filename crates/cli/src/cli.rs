@@ -246,6 +246,10 @@ pub enum Command {
 
     /// Run the blit terminal multiplexer server
     Server {
+        /// IPC socket/pipe path (or set BLIT_SOCK)
+        #[arg(long)]
+        socket: Option<String>,
+
         /// Shell flags (default: li, or set BLIT_SHELL_FLAGS)
         #[arg(long)]
         shell_flags: Option<String>,
@@ -258,6 +262,10 @@ pub enum Command {
         #[cfg(unix)]
         #[arg(long)]
         fd_channel: Option<i32>,
+
+        /// Enable verbose logging
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     #[command(
@@ -359,6 +367,16 @@ pub enum Command {
     ///   blit remote set-default rabbit
     #[command(subcommand)]
     Remote(RemoteCommand),
+
+    /// Run the WebSocket/WebTransport gateway
+    ///
+    /// All configuration is via environment variables:
+    ///   BLIT_PASSPHRASE   Browser passphrase (required)
+    ///   BLIT_ADDR         Listen address (default: 0.0.0.0:3264)
+    ///   BLIT_REMOTES      Path to remotes file
+    ///   BLIT_QUIC         Set to 1 for WebTransport
+    ///   BLIT_PROXY        Set to 0 to disable blit-proxy
+    Gateway,
 
     /// Generate man pages and shell completions
     ///

@@ -2,14 +2,8 @@
   pkgs,
   version,
   browserWasm,
-  blit-server,
-  blit-gateway,
-  blit-proxy,
-  blit-server-static,
-  blit-cli-static,
-  blit-gateway-static,
-  blit-proxy-static,
-  blit-webrtc-forwarder-static,
+  blit,
+  blit-static,
   webAppDist,
   websiteDist,
   rustToolchain,
@@ -163,10 +157,10 @@ let
       installPhase = "true";
     };
 
-  blit-server-deb = mkDeb {
-    pname = "blit-server";
-    binPkg = blit-server-static;
-    description = "blit terminal streaming server";
+  blit-deb = mkDeb {
+    pname = "blit";
+    binPkg = blit-static;
+    description = "blit terminal multiplexer";
     extraInstall =
       let
         systemdDir = ../systemd;
@@ -175,50 +169,12 @@ let
         mkdir -p pkg/lib/systemd/system
         cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
         cp "${systemdDir}/blit-server@.service" "pkg/lib/systemd/system/blit-server@.service"
+        cp "${systemdDir}/blit-webrtc-forwarder@.service" "pkg/lib/systemd/system/blit-webrtc-forwarder@.service"
         mkdir -p pkg/lib/systemd/user
         cp "${systemdDir}/blit-server.socket" "pkg/lib/systemd/user/blit-server.socket"
         cp "${systemdDir}/blit-server.service" "pkg/lib/systemd/user/blit-server.service"
-      '';
-  };
-
-  blit-cli-deb = mkDeb {
-    pname = "blit";
-    binPkg = blit-cli-static;
-    description = "blit terminal client";
-    extraInstall =
-      let
-        systemdDir = ../systemd;
-      in
-      ''
-        mkdir -p pkg/lib/systemd/user
         cp "${systemdDir}/blit.socket" "pkg/lib/systemd/user/blit.socket"
         cp "${systemdDir}/blit.service" "pkg/lib/systemd/user/blit.service"
-      '';
-  };
-
-  blit-gateway-deb = mkDeb {
-    pname = "blit-gateway";
-    binPkg = blit-gateway-static;
-    description = "blit WebSocket gateway";
-  };
-
-  blit-proxy-deb = mkDeb {
-    pname = "blit-proxy";
-    binPkg = blit-proxy-static;
-    description = "blit connection pool and transparent proxy";
-  };
-
-  blit-webrtc-forwarder-deb = mkDeb {
-    pname = "blit-webrtc-forwarder";
-    binPkg = blit-webrtc-forwarder-static;
-    description = "blit WebRTC forwarder";
-    extraInstall =
-      let
-        systemdDir = ../systemd;
-      in
-      ''
-        mkdir -p pkg/lib/systemd/system
-        cp "${systemdDir}/blit-webrtc-forwarder@.service" "pkg/lib/systemd/system/blit-webrtc-forwarder@.service"
       '';
   };
 
@@ -399,10 +355,17 @@ let
       pkgs.pkg-config
       pkgs.libxkbcommon
       pkgs.pixman
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
+        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
+      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
+        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
+      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -435,11 +398,7 @@ in
     deploy-website
     ;
   inherit
-    blit-server-deb
-    blit-cli-deb
-    blit-gateway-deb
-    blit-proxy-deb
-    blit-webrtc-forwarder-deb
+    blit-deb
     ;
   inherit fmt clippy coverage;
 
@@ -448,10 +407,7 @@ in
     text = ''
       outdir="''${1:-dist/debs}"
       mkdir -p "$outdir"
-      for pkg in ${blit-server-deb} ${blit-cli-deb} ${blit-gateway-deb} ${blit-proxy-deb} ${blit-webrtc-forwarder-deb}; do
-        cp "$pkg"/*.deb "$outdir"/
-      done
-      echo ""
+      cp ${blit-deb}/*.deb "$outdir"/
       ls -lh "$outdir"
     '';
   };
@@ -464,16 +420,10 @@ in
         arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
       in
       ''
-          outdir="''${1:-dist/tarballs}"
+        outdir="''${1:-dist/tarballs}"
         mkdir -p "$outdir"
-        for pkg in ${blit-server-static} ${blit-cli-static} ${blit-gateway-static} ${blit-proxy-static} ${blit-webrtc-forwarder-static}; do
-          for bin in "$pkg"/bin/*; do
-            name=$(basename "$bin")
-            tar -czf "$outdir/''${name}_${version}_${os}_${arch}.tar.gz" -C "$pkg/bin" "$name"
-          done
-        done
-          echo ""
-          ls -lh "$outdir"
+        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-static}/bin" blit
+        ls -lh "$outdir"
       '';
   };
 
@@ -489,9 +439,7 @@ in
 
       echo "=== Setting up binaries ==="
       mkdir -p target/debug
-      ln -sf "${blit-server}/bin/blit-server" target/debug/blit-server
-      ln -sf "${blit-gateway}/bin/blit-gateway" target/debug/blit-gateway
-      ln -sf "${blit-proxy}/bin/blit-proxy" target/debug/blit-proxy
+      ln -sf "${blit}/bin/blit" target/debug/blit
 
       echo "=== Installing e2e deps ==="
       (cd e2e && if ! pnpm install --frozen-lockfile 2>/dev/null; then pnpm install; fi)
@@ -590,10 +538,17 @@ in
       pkgs.pkg-config
       pkgs.libxkbcommon
       pkgs.pixman
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
+        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
+      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
+        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
+      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -612,7 +567,7 @@ in
       echo "=== JS workspace tests ==="
       (cd js && pnpm --filter @blit-sh/core run test && pnpm --filter @blit-sh/react run test && pnpm --filter @blit-sh/solid run test)
 
-      export BLIT_SERVER="${blit-server}/bin/blit-server"
+      export BLIT_SERVER="${blit}/bin/blit"
       echo ""
       echo "=== Python fd-channel test ==="
       python3 examples/fd-channel-python.py

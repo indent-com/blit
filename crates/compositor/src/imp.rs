@@ -39,7 +39,7 @@ use smithay::utils::{Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     self, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-    with_states, with_surface_tree_downward, TraversalAction,
+    with_states, with_surface_tree_downward, TraversalAction, get_parent,
 };
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
@@ -51,7 +51,9 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
-use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
+use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState, supports_syncobj_eventfd};
+use smithay::backend::drm::DrmDeviceFd;
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shm::{BufferData, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::socket::ListeningSocketSource;
@@ -103,6 +105,16 @@ pub enum PixelData {
         stride: u32,
         offset: u32,
     },
+}
+
+/// A single layer in a composited surface tree.
+#[derive(Clone)]
+pub struct PixelLayer {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: PixelData,
 }
 
 /// DRM fourcc constants used in PixelData::DmaBuf.
@@ -164,12 +176,121 @@ impl PixelData {
                 }
                 rgba
             }
-            PixelData::DmaBuf { .. } => {
-                // DmaBuf pixels live on the GPU — fall back to empty for
-                // screenshot callers (they should read via the compositor's
-                // read_surface_pixels path instead).
-                Vec::new()
+            PixelData::DmaBuf {
+                fd, fourcc, stride, ..
+            } => {
+                // Try CPU readback of DMA-BUF via sync + mmap.
+                use std::os::fd::AsRawFd;
+                let raw = fd.as_raw_fd();
+                let stride_usize = *stride as usize;
+                let map_size = stride_usize * h;
+                if map_size == 0 {
+                    return Vec::new();
+                }
+                // Sync to ensure GPU writes are visible to CPU.
+                let sync_start: u64 = 1 | 4; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+                unsafe { libc::ioctl(raw, 0x40086200u64 as _, &sync_start) };
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        map_size,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        raw,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Vec::new();
+                }
+                let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_size) };
+                let row_bytes = w * 4;
+                let mut pixels = Vec::with_capacity(w * h * 4);
+                for row in 0..h {
+                    let start = row * stride_usize;
+                    if start + row_bytes <= slice.len() {
+                        pixels.extend_from_slice(&slice[start..start + row_bytes]);
+                    }
+                }
+                // Force alpha=255 for XRGB/XBGR formats.
+                if matches!(*fourcc, drm_fourcc::XRGB8888 | drm_fourcc::XBGR8888) {
+                    for px in pixels.chunks_exact_mut(4) {
+                        px[3] = 255;
+                    }
+                }
+                let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+                unsafe {
+                    libc::ioctl(raw, 0x40086200u64 as _, &sync_end);
+                    libc::munmap(ptr, map_size);
+                }
+                pixels
             }
+        }
+    }
+
+    /// Return the pixel data as BGRA bytes (for compositing).
+    /// For DmaBuf, attempts mmap readback.  Returns empty on failure.
+    pub fn to_bgra_vec(&self, width: u32, height: u32) -> Vec<u8> {
+        match self {
+            PixelData::Bgra(v) => v.as_ref().to_vec(),
+            PixelData::Rgba(v) => {
+                // RGBA → BGRA swap
+                let mut bgra = v.as_ref().to_vec();
+                for px in bgra.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+                bgra
+            }
+            PixelData::DmaBuf {
+                fd, stride, fourcc, ..
+            } => {
+                // Try mmap readback for linear DMA-BUFs.
+                use std::os::fd::AsRawFd;
+                let raw = fd.as_raw_fd();
+                let s = *stride as usize;
+                let h = height as usize;
+                let w = width as usize;
+                let map_size = s * h;
+                if map_size == 0 {
+                    return Vec::new();
+                }
+                let sync_start: u64 = 1 | 4;
+                unsafe { libc::ioctl(raw, 0x40086200u64 as _, &sync_start) };
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        map_size,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        raw,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Vec::new();
+                }
+                let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_size) };
+                let row_bytes = w * 4;
+                let is_bgr = matches!(fourcc, 0x34325241 | 0x34325258);
+                let mut bgra = Vec::with_capacity(w * h * 4);
+                for row in 0..h {
+                    let src = &slice[row * s..row * s + row_bytes.min(slice.len() - row * s)];
+                    if is_bgr {
+                        bgra.extend_from_slice(src);
+                    } else {
+                        for px in src.chunks_exact(4) {
+                            bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                        }
+                    }
+                }
+                let sync_end: u64 = 2 | 4;
+                unsafe {
+                    libc::ioctl(raw, 0x40086200u64 as _, &sync_end);
+                    libc::munmap(ptr, map_size);
+                }
+                bgra
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -290,6 +411,8 @@ struct SurfaceInfo {
     last_height: u32,
     last_title: String,
     last_app_id: String,
+    /// Suppress repeated "commit with no readable buffer" warnings.
+    unreadable_warned: bool,
 }
 
 struct ClientData {
@@ -320,6 +443,7 @@ pub struct Compositor {
     dmabuf_state: DmabufState,
     #[allow(dead_code)]
     dmabuf_global: DmabufGlobal,
+    syncobj_state: Option<DrmSyncobjState>,
     primary_selection_state: PrimarySelectionState,
     activation_state: XdgActivationState,
     seat: Seat<Self>,
@@ -343,6 +467,17 @@ pub struct Compositor {
     /// dispatch.  Flushed after dispatch returns so that only the LAST
     /// commit per surface per iteration is sent to the server.
     pending_commits: HashMap<u16, (u32, u32, PixelData)>,
+
+    /// Per-wl_surface cache of the last successfully read pixel data.
+    /// Keyed by wl_surface protocol_id.  When a toplevel commits, its
+    /// subsurfaces may not have re-committed since the last read;
+    /// `BufferAssignment::NewBuffer` is only set on the subsurface's own
+    /// commit.  Without this cache, subsurface content silently disappears
+    /// from the composite whenever the parent commits independently.
+    surface_pixel_cache: HashMap<u64, (u32, u32, PixelData)>,
+
+    /// GPU renderer for compositing surfaces.  None if GPU unavailable.
+    gpu_renderer: Option<super::render::SurfaceRenderer>,
 }
 
 impl Compositor {
@@ -667,9 +802,7 @@ impl Compositor {
                 },
                 |_, _, &()| true,
             );
-            if fired > 0 && self.verbose {
-                eprintln!("[compositor] fire_frame_callbacks sid={surface_id}: {fired}");
-            }
+            let _ = fired;
         }
     }
 
@@ -722,12 +855,20 @@ fn read_shm_buffer(buffer: &wl_buffer::WlBuffer) -> Option<(u32, u32, PixelData)
         // XRGB8888: the alpha byte is undefined (clients typically leave it
         // as 0).  Force opaque so that captures and any alpha-aware path
         // treat pixels correctly.
-        if data.format == wl_shm::Format::Xrgb8888 {
+        if data.format == wl_shm::Format::Xrgb8888 || data.format == wl_shm::Format::Xbgr8888 {
             for px in bgra.chunks_exact_mut(4) {
                 px[3] = 255;
             }
         }
-        result = Some((width, height, PixelData::Bgra(Arc::new(bgra))));
+        // ABGR/XBGR are [R,G,B,A] in memory — store as PixelData::Rgba.
+        if matches!(
+            data.format,
+            wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888
+        ) {
+            result = Some((width, height, PixelData::Rgba(Arc::new(bgra))));
+        } else {
+            result = Some((width, height, PixelData::Bgra(Arc::new(bgra))));
+        }
     });
     result
 }
@@ -748,51 +889,106 @@ impl CompositorHandler for Compositor {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        let key = surface.id().protocol_id() as u64;
-        let surface_id = match self.surfaces.get(&key) {
-            Some(info) => info.surface_id,
-            None => return,
+        // Update RendererSurfaceState so Smithay's render element pipeline
+        // can produce elements from imported textures.
+        smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        // If this is a subsurface, walk up to the toplevel root.
+        let (root_surface, key, surface_id) = {
+            let key = surface.id().protocol_id() as u64;
+            if let Some(info) = self.surfaces.get(&key) {
+                (surface.clone(), key, info.surface_id)
+            } else {
+                // Not a toplevel — walk up to find the parent toplevel.
+                let mut current = surface.clone();
+                while let Some(parent) = get_parent(&current) {
+                    current = parent;
+                }
+                let parent_key = current.id().protocol_id() as u64;
+                match self.surfaces.get(&parent_key) {
+                    Some(info) => (current, parent_key, info.surface_id),
+                    None => return, // orphan subsurface
+                }
+            }
         };
 
-        let mut committed_buffer: Option<(u32, u32, PixelData)> = None;
+        let mut committed_pixels: Option<(u32, u32, PixelData)> = None;
         let mut new_title = String::new();
         let mut new_app_id = String::new();
 
-        // If we already have undelivered pixel data for this surface from
-        // an earlier commit in this dispatch cycle, skip the expensive
-        // DMA-BUF/SHM readback — the server only needs the latest frame.
         let have_pending = self.pending_commits.contains_key(&surface_id);
+        let warned_unreadable = self.surfaces.get(&key).is_none_or(|i| i.unreadable_warned);
 
-        with_states(surface, |states| {
-            let mut guard = states.cached_state.get::<SurfaceAttributes>();
-            let attrs = guard.current();
-            if let Some(compositor::BufferAssignment::NewBuffer(buffer)) = attrs.buffer.as_ref() {
-                if !have_pending {
-                    committed_buffer = read_shm_buffer(buffer);
-                    let shm_ok = committed_buffer.is_some();
+        if !have_pending {
+            // Use the xdg_toplevel geometry as the render region — this
+            // is the content rect EXCLUDING CSD shadows.  Clients like
+            // Chromium draw shadows as part of the surface buffer, but
+            // the geometry tells us exactly where the real window is.
+            let geometry = self.surfaces.get(&key).map(|i| i.window.geometry());
 
-                    if !shm_ok && let Ok(dmabuf) = get_dmabuf(buffer) {
-                        committed_buffer = read_dmabuf_pixels(dmabuf);
-                    }
-                    if committed_buffer.is_none() {
-                        eprintln!(
-                            "compositor: commit with no readable buffer (shm_ok={shm_ok}, has_dmabuf={})",
-                            get_dmabuf(buffer).is_ok()
-                        );
-                    }
-                }
-                // Release the buffer so the client can reuse it for the
-                // next frame.  Without this, clients like Firefox block
-                // waiting for the release event and never commit again.
-                buffer.release();
+            // Try GPU renderer (handles SHM + DMA-BUF + subsurfaces).
+            if let Some(renderer) = &mut self.gpu_renderer
+                && let Some((w, h, bgra)) =
+                    renderer.render_surface(&root_surface, geometry.as_ref())
+            {
+                committed_pixels = Some((w, h, PixelData::Bgra(Arc::new(bgra))));
             }
 
+            // GPU unavailable or failed — fall back to manual SHM readback
+            // for the root surface only (no subsurface compositing).
+            if committed_pixels.is_none() {
+                with_states(&root_surface, |states| {
+                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                    let attrs = guard.current();
+                    if let Some(compositor::BufferAssignment::NewBuffer(buffer)) =
+                        attrs.buffer.as_ref()
+                        && let Some((w, h, pd)) = read_shm_buffer(buffer)
+                    {
+                        committed_pixels = Some((w, h, pd));
+                    }
+                });
+            }
+
+            if committed_pixels.is_none() && !warned_unreadable {
+                eprintln!(
+                    "compositor: commit with no readable buffer — suppressing further warnings for this surface"
+                );
+            }
+        }
+
+        // Release all buffers in the tree so clients can reuse them.
+        with_surface_tree_downward(
+            &root_surface,
+            (),
+            |_, _, _| TraversalAction::DoChildren(()),
+            |_, states, _| {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                let attrs = guard.current();
+                if let Some(compositor::BufferAssignment::NewBuffer(buffer)) = attrs.buffer.as_ref()
+                {
+                    buffer.release();
+                }
+            },
+            |_, _, _| true,
+        );
+
+        // Read title/app_id from the toplevel.
+        with_states(&root_surface, |states| {
             if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
                 let lock = data.lock().unwrap();
                 new_title = lock.title.clone().unwrap_or_default();
                 new_app_id = lock.app_id.clone().unwrap_or_default();
             }
         });
+
+        // Mark surface as warned if we hit an unreadable buffer.
+        if committed_pixels.is_none()
+            && !have_pending
+            && !warned_unreadable
+            && let Some(info) = self.surfaces.get_mut(&key)
+        {
+            info.unreadable_warned = true;
+        }
 
         if let Some(info) = self.surfaces.get_mut(&key)
             && new_title != info.last_title
@@ -814,7 +1010,7 @@ impl CompositorHandler for Compositor {
             });
         }
 
-        if let Some((width, height, pixel_data)) = committed_buffer {
+        if let Some((width, height, pixels)) = committed_pixels {
             let info = self.surfaces.get_mut(&key).unwrap();
             if width != info.last_width || height != info.last_height {
                 info.last_width = width;
@@ -826,20 +1022,14 @@ impl CompositorHandler for Compositor {
                 });
             }
 
-            if !pixel_data.is_empty() {
-                // Buffer the commit — if this surface already has pending
-                // pixel data from an earlier commit in this dispatch cycle,
-                // the old data is dropped (we only keep the latest).
+            if !pixels.is_empty() {
                 self.pending_commits
-                    .insert(surface_id, (width, height, pixel_data));
+                    .insert(surface_id, (width, height, pixels));
             }
         }
 
-        // Do NOT fire frame callbacks here.  Frame callbacks are fired only
-        // via CompositorCommand::RequestFrame, which the server sends when a
-        // client is ready for the next frame.  Firing them unconditionally on
-        // every commit creates a hot loop: the Wayland client immediately
-        // paints again, commits, and pegs the CPU at 100%.
+        // Frame callbacks are fired in flush_pending_commits() — once per
+        // dispatch cycle — rather than on every commit to avoid hot loops.
     }
 }
 
@@ -877,6 +1067,7 @@ impl XdgShellHandler for Compositor {
             last_height: 0,
             last_title: String::new(),
             last_app_id: String::new(),
+            unreadable_warned: false,
         };
         self.surfaces.insert(key, info);
         self.surface_lookup.insert(surface_id, key);
@@ -901,6 +1092,7 @@ impl XdgShellHandler for Compositor {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
         let key = wl_surface.id().protocol_id() as u64;
+        self.surface_pixel_cache.remove(&key);
         if let Some(info) = self.surfaces.remove(&key) {
             self.surface_lookup.remove(&info.surface_id);
             self.space.unmap_elem(&info.window);
@@ -1000,34 +1192,37 @@ impl SelectionHandler for Compositor {
         let event_tx = self.event_tx.clone();
         let event_notify = self.event_notify.clone();
         let surface_id = self.focused_surface_id;
-        std::thread::spawn(move || {
-            use std::io::Read;
-            const MAX_CLIPBOARD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-            let _ = read_stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-            let mut data = Vec::new();
-            let mut buf = [0u8; 8192];
-            loop {
-                match read_stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        data.extend_from_slice(&buf[..n]);
-                        if data.len() > MAX_CLIPBOARD_SIZE {
-                            break;
+        std::thread::Builder::new()
+            .name("clipboard-read".into())
+            .spawn(move || {
+                use std::io::Read;
+                const MAX_CLIPBOARD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+                let _ = read_stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let mut data = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match read_stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if data.len() > MAX_CLIPBOARD_SIZE {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-            data.truncate(MAX_CLIPBOARD_SIZE);
-            if !data.is_empty() {
-                let _ = event_tx.send(CompositorEvent::ClipboardContent {
-                    surface_id,
-                    mime_type: mime,
-                    data,
-                });
-                (event_notify)();
-            }
-        });
+                data.truncate(MAX_CLIPBOARD_SIZE);
+                if !data.is_empty() {
+                    let _ = event_tx.send(CompositorEvent::ClipboardContent {
+                        surface_id,
+                        mime_type: mime,
+                        data,
+                    });
+                    (event_notify)();
+                }
+            })
+            .expect("failed to spawn clipboard-read thread");
     }
 
     fn send_selection(
@@ -1040,11 +1235,14 @@ impl SelectionHandler for Compositor {
     ) {
         // Write the compositor-owned clipboard data to the requesting client's fd.
         let data = user_data.clone();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let mut file = std::fs::File::from(fd);
-            let _ = file.write_all(&data);
-        });
+        std::thread::Builder::new()
+            .name("clipboard-write".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut file = std::fs::File::from(fd);
+                let _ = file.write_all(&data);
+            })
+            .expect("failed to spawn clipboard-write thread");
     }
 }
 
@@ -1092,6 +1290,12 @@ impl DmabufHandler for Compositor {
         notifier: ImportNotifier,
     ) {
         let _ = notifier.successful::<Compositor>();
+    }
+}
+
+impl DrmSyncobjHandler for Compositor {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.syncobj_state.as_mut()
     }
 }
 
@@ -1144,6 +1348,71 @@ fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let end = offset.checked_add(2)?;
     let raw = bytes.get(offset..end)?;
     Some(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+/// Direct mmap readback of a packed BGRA/RGBA DMA-BUF fd.
+/// Used for anonymous heap fds (Vulkan wsi) where Smithay's map_plane fails.
+/// Must be called BEFORE wl_buffer.release() to avoid a race with the client.
+#[allow(dead_code)]
+fn read_packed_dmabuf_fd(
+    raw_fd: std::os::fd::RawFd,
+    stride: usize,
+    width: usize,
+    height: usize,
+    format: Fourcc,
+) -> Option<PixelData> {
+    let file_size = unsafe { libc::lseek(raw_fd, 0, libc::SEEK_END) };
+    if file_size <= 0 {
+        return None;
+    }
+    let map_len = file_size as usize;
+
+    #[repr(C)]
+    struct DmaBufSync {
+        flags: u64,
+    }
+    const DMA_BUF_SYNC_READ: u64 = 1;
+    const DMA_BUF_SYNC_START: u64 = 0;
+    const DMA_BUF_SYNC_END: u64 = 4;
+    const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+
+    let sync_start = DmaBufSync {
+        flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+    };
+    unsafe {
+        libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_start);
+    }
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            raw_fd,
+            0,
+        )
+    };
+
+    let result = if ptr == libc::MAP_FAILED {
+        None
+    } else {
+        let plane_data = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
+        let r = read_packed_dmabuf(plane_data, stride, width, height, false, format);
+        unsafe {
+            libc::munmap(ptr, map_len);
+        }
+        r
+    };
+
+    let sync_end = DmaBufSync {
+        flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+    };
+    unsafe {
+        libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_end);
+    }
+
+    result
 }
 
 /// Read a packed 4-byte DMA-BUF into native pixel data.
@@ -1397,55 +1666,81 @@ fn read_dmabuf_pixels(dmabuf: &Dmabuf) -> Option<(u32, u32, PixelData)> {
 
     let format = dmabuf.format();
 
-    // --- Zero-copy path: pass the DMA-BUF fd through for GPU-side import ---
+    // --- Path selection ---
     //
-    // For single-plane packed formats (ARGB8888, XRGB8888, etc.) and NV12,
-    // we can dup the plane fd and let the encoder import it directly into
-    // VA-API / CUDA.  The encoder falls back to the CPU readback path if
-    // GPU import isn't available.
+    // For packed BGRA/RGBA formats (ARGB8888, XRGB8888, ABGR8888, XBGR8888)
+    // we take the zero-copy path: dup the DMA-BUF fd and pass it through as
+    // PixelData::DmaBuf.  The encoder imports it directly into a VASurface via
+    // VA-API VPP (BGRA→NV12 on the GPU) without any CPU mmap.  This is safe
+    // because the buffer release happens after we've already submitted the fd
+    // to the encoder's VPP pipeline — the kernel DMA-BUF object stays alive
+    // as long as the fd is open.
     //
-    // We skip the zero-copy path for:
-    //   - y_inverted buffers (would need GPU-side flip)
-    //   - P010 (needs 10→8 bit downscale)
-    //   - multi-object DMA-BUFs where the planes are separate fds
-    if !dmabuf.y_inverted() {
-        let can_zerocopy = matches!(
+    // For NV12/P010 (hardware video decoder output) we CPU-mmap immediately
+    // in the commit handler, before releasing the buffer, because these
+    // typically come from the VA-API decoder's own surfaces and are already
+    // CPU-accessible (system RAM).  The CPU path avoids a redundant GPU round-trip.
+    //
+    // Non-Linear modifiers are fine for the GPU zero-copy path (VA-API imports
+    // by DRM fd regardless of modifier).  For the CPU path we require Linear.
+
+    let y_inverted = dmabuf.y_inverted();
+
+    // For packed BGRA/RGBA DMA-BUFs, choose between two paths:
+    //
+    // 1. Zero-copy GPU path (PixelData::DmaBuf): dup the fd and let the
+    //    encoder import it into VA-API via PRIME_2.  Only safe for DRM
+    //    device-backed fds (from GBM/KMS).  The encoder detects anonymous fds
+    //    and rejects them.
+    //
+    // 2. Immediate CPU mmap (PixelData::Bgra): mmap NOW, before wl_buffer
+    //    release, so we capture the frame before mpv overwrites it.  Required
+    //    for anonymous /dmabuf heap fds (Vulkan wsi) where the content is
+    //    CPU-accessible but may be reused immediately after release.
+    //
+    // Zero-copy GPU path: dup the DMA-BUF fd and pass it through.
+    // The server imports it via VA-API VPP (BGRA→NV12 on the GPU)
+    // without any CPU mmap.  The dup'd fd keeps the kernel DMA-BUF
+    // object alive even after wl_buffer.release().
+    //
+    // Previously this path did an eager CPU mmap+copy as a fallback,
+    // but that consumed 87% of CPU at 60fps (1.9MB memcpy per frame).
+    if !y_inverted
+        && matches!(
             format.code,
-            Fourcc::Argb8888
-                | Fourcc::Xrgb8888
-                | Fourcc::Abgr8888
-                | Fourcc::Xbgr8888
-                | Fourcc::Nv12
-        );
-        if can_zerocopy
-            && let Some(borrowed_fd) = dmabuf.handles().next()
-            && let Ok(owned) = borrowed_fd.try_clone_to_owned()
-        {
-            let stride = dmabuf.strides().next().unwrap_or(width * 4);
-            let offset = dmabuf.offsets().next().unwrap_or(0);
-            let fourcc_u32 = fourcc_to_drm(format.code);
-            let modifier_u64: u64 = format.modifier.into();
-            return Some((
-                width,
-                height,
-                PixelData::DmaBuf {
-                    fd: Arc::new(owned),
-                    fourcc: fourcc_u32,
-                    modifier: modifier_u64,
-                    stride,
-                    offset,
-                },
-            ));
-        }
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
+        )
+        && let Some(borrowed_fd) = dmabuf.handles().next()
+        && let Ok(owned) = borrowed_fd.try_clone_to_owned()
+    {
+        let stride = dmabuf.strides().next().unwrap_or(width * 4);
+        let offset = dmabuf.offsets().next().unwrap_or(0);
+        return Some((
+            width,
+            height,
+            PixelData::DmaBuf {
+                fd: Arc::new(owned),
+                fourcc: fourcc_to_drm(format.code),
+                modifier: format.modifier.into(),
+                stride,
+                offset,
+            },
+        ));
     }
 
-    // --- CPU readback fallback ---
+    // CPU readback path for NV12/P010 (and y_inverted BGRA as fallback).
+    // Must happen before wl_buffer.release() since the client may reuse the
+    // buffer immediately after release.
+    let modifier_is_linear = matches!(format.modifier, Modifier::Linear);
+    if !modifier_is_linear {
+        return None;
+    }
 
     let width_usize = width as usize;
     let height_usize = height as usize;
-    let y_inverted = dmabuf.y_inverted();
     let pixel_data = match format.code {
         Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
+            // Fallback CPU path for y_inverted buffers.
             let stride = dmabuf.strides().next().unwrap_or(width * 4) as usize;
             with_dmabuf_plane_bytes(dmabuf, 0, |plane_data| {
                 read_packed_dmabuf(
@@ -1549,6 +1844,7 @@ delegate_data_device!(Compositor);
 delegate_primary_selection!(Compositor);
 delegate_output!(Compositor);
 delegate_dmabuf!(Compositor);
+smithay::delegate_drm_syncobj!(Compositor);
 delegate_fractional_scale!(Compositor);
 delegate_viewporter!(Compositor);
 delegate_xdg_activation!(Compositor);
@@ -1576,7 +1872,9 @@ impl CompositorHandle {
 pub fn spawn_compositor(
     verbose: bool,
     event_notify: Arc<dyn Fn() + Send + Sync>,
+    gpu_device: &str,
 ) -> CompositorHandle {
+    let gpu_device = gpu_device.to_string();
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
     let (socket_tx, socket_rx) = mpsc::sync_channel(1);
@@ -1604,30 +1902,34 @@ pub fn spawn_compositor(
         .unwrap_or_else(std::env::temp_dir);
 
     let runtime_dir_clone = runtime_dir.clone();
-    let thread = std::thread::spawn(move || {
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir_clone) };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_compositor(
-                event_tx,
-                command_rx,
-                socket_tx,
-                signal_tx,
-                event_notify,
-                shutdown_clone,
-                verbose,
-            );
-        }));
-        if let Err(e) = result {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            eprintln!("[compositor] PANIC: {msg}");
-        }
-    });
+    let thread = std::thread::Builder::new()
+        .name("compositor".into())
+        .spawn(move || {
+            unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir_clone) };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_compositor(
+                    event_tx,
+                    command_rx,
+                    socket_tx,
+                    signal_tx,
+                    event_notify,
+                    shutdown_clone,
+                    verbose,
+                    gpu_device,
+                );
+            }));
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[compositor] PANIC: {msg}");
+            }
+        })
+        .expect("failed to spawn compositor thread");
 
     let socket_name = socket_rx.recv().expect("compositor failed to start");
     let socket_name = runtime_dir
@@ -1648,6 +1950,7 @@ pub fn spawn_compositor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_compositor(
     event_tx: mpsc::Sender<CompositorEvent>,
     command_rx: mpsc::Receiver<CompositorCommand>,
@@ -1656,6 +1959,7 @@ fn run_compositor(
     event_notify: Arc<dyn Fn() + Send + Sync>,
     shutdown: Arc<AtomicBool>,
     verbose: bool,
+    gpu_device: String,
 ) {
     let mut event_loop: EventLoop<Compositor> =
         EventLoop::try_new().expect("failed to create event loop");
@@ -1678,57 +1982,69 @@ fn run_compositor(
     TextInputManagerState::new::<Compositor>(&dh);
 
     let mut dmabuf_state = DmabufState::new();
-    let dmabuf_formats = [
-        DmabufFormat {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Linear,
-        },
-        DmabufFormat {
-            code: Fourcc::Xrgb8888,
-            modifier: Modifier::Linear,
-        },
-        DmabufFormat {
-            code: Fourcc::Abgr8888,
-            modifier: Modifier::Linear,
-        },
-        DmabufFormat {
-            code: Fourcc::Xbgr8888,
-            modifier: Modifier::Linear,
-        },
-        DmabufFormat {
-            code: Fourcc::Nv12,
-            modifier: Modifier::Linear,
-        },
-        DmabufFormat {
-            code: Fourcc::P010,
-            modifier: Modifier::Linear,
-        },
-        DmabufFormat {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Invalid,
-        },
-        DmabufFormat {
-            code: Fourcc::Xrgb8888,
-            modifier: Modifier::Invalid,
-        },
-        DmabufFormat {
-            code: Fourcc::Abgr8888,
-            modifier: Modifier::Invalid,
-        },
-        DmabufFormat {
-            code: Fourcc::Xbgr8888,
-            modifier: Modifier::Invalid,
-        },
-        DmabufFormat {
-            code: Fourcc::Nv12,
-            modifier: Modifier::Invalid,
-        },
-        DmabufFormat {
-            code: Fourcc::P010,
-            modifier: Modifier::Invalid,
-        },
-    ];
-    let dmabuf_global = dmabuf_state.create_global::<Compositor>(&dh, dmabuf_formats);
+    // DMA-BUF format advertisement.
+    //
+    // Advertise packed BGRA/RGBA and YUV formats with both Linear and Invalid
+    // (implicit) modifiers.  Modifier::Invalid tells clients they may use any
+    // modifier (driver-chosen), which is how Vulkan/EGL allocates on AMD/radv.
+    // The VA-API VPP zero-copy path imports buffers by DRM fd regardless of
+    // modifier, so tiled GPU allocations work fine.
+    // NV12/P010 use the CPU readback path and must be Linear.
+    // Only advertise Linear modifier.  This forces clients to allocate
+    // CPU-mappable buffers, ensuring the mmap readback path and VA-API
+    // PRIME import both work.  Clients still render on the GPU — they
+    // just use a linear memory layout instead of GPU-tiled.
+    // Advertise packed BGRA/RGBA and YUV formats with both Linear and
+    // Invalid (implicit) modifiers.  Invalid tells clients they may use
+    // any modifier (driver-chosen tiling), which is how GPU compositors
+    // like Chromium allocate surfaces.  The VA-API VPP path imports
+    // buffers by DRM fd regardless of modifier.
+    let dmabuf_formats = {
+        use Fourcc::*;
+        let packed = [Argb8888, Xrgb8888, Abgr8888, Xbgr8888];
+        let yuv = [Fourcc::Nv12, Fourcc::P010];
+        let mut fmts = Vec::new();
+        for code in packed {
+            fmts.push(DmabufFormat {
+                code,
+                modifier: Modifier::Linear,
+            });
+            fmts.push(DmabufFormat {
+                code,
+                modifier: Modifier::Invalid,
+            });
+        }
+        for code in yuv {
+            fmts.push(DmabufFormat {
+                code,
+                modifier: Modifier::Linear,
+            });
+        }
+        fmts
+    };
+    // Build DMA-BUF feedback with the render node's dev_t so clients
+    // allocate GEM-backed DMA-BUFs on the right GPU (instead of anonymous
+    // /dmabuf: heap fds that EGL can't import).
+    let dmabuf_global = match std::fs::metadata(&gpu_device).ok().and_then(|m| {
+        use std::os::unix::fs::MetadataExt;
+        let dev = m.rdev();
+        let formats = dmabuf_formats.clone();
+        let feedback = DmabufFeedbackBuilder::new(dev, formats).build().ok()?;
+        Some(dmabuf_state.create_global_with_default_feedback::<Compositor>(&dh, &feedback))
+    }) {
+        Some(global) => {
+            if verbose {
+                eprintln!("[compositor] DMA-BUF feedback enabled ({gpu_device})");
+            }
+            global
+        }
+        None => {
+            if verbose {
+                eprintln!("[compositor] DMA-BUF feedback unavailable, using basic global");
+            }
+            dmabuf_state.create_global::<Compositor>(&dh, dmabuf_formats)
+        }
+    };
 
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "headless");
@@ -1804,6 +2120,30 @@ fn run_compositor(
         xdg_decoration_state,
         dmabuf_state,
         dmabuf_global,
+        syncobj_state: {
+            // Enable explicit sync (linux-drm-syncobj-v1) if the GPU supports it.
+            // This replaces implicit DMA-BUF fencing which hangs on AMD.
+
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&gpu_device)
+                .ok()
+                .and_then(|f| {
+                    use std::os::fd::OwnedFd;
+                    let owned: OwnedFd = f.into();
+                    let dev_fd = smithay::utils::DeviceFd::from(owned);
+                    let drm_fd = DrmDeviceFd::new(dev_fd);
+                    if supports_syncobj_eventfd(&drm_fd) {
+                        let state = DrmSyncobjState::new::<Compositor>(&dh, drm_fd);
+                        eprintln!("[compositor] explicit sync (drm-syncobj) enabled");
+                        Some(state)
+                    } else {
+                        eprintln!("[compositor] explicit sync not supported by GPU");
+                        None
+                    }
+                })
+        },
         primary_selection_state,
         activation_state,
         seat,
@@ -1818,6 +2158,8 @@ fn run_compositor(
         verbose,
         focused_surface_id: 0,
         pending_commits: HashMap::new(),
+        surface_pixel_cache: HashMap::new(),
+        gpu_renderer: super::render::SurfaceRenderer::try_new(&gpu_device),
     };
 
     // Send the loop signal back so the server can wake us.
@@ -1917,7 +2259,7 @@ mod tests {
 
         let rgba = read_nv12_dmabuf(&y_plane, 2, &uv_plane, 2, 2, 2, false).unwrap();
 
-        assert_eq!(rgba, vec![0, 0, 0, 255].repeat(4));
+        assert_eq!(rgba, [0, 0, 0, 255].repeat(4));
     }
 
     #[test]
@@ -1927,6 +2269,6 @@ mod tests {
 
         let rgba = read_p010_dmabuf(&y_plane, 4, &uv_plane, 4, 2, 2, false).unwrap();
 
-        assert_eq!(rgba, vec![255, 255, 255, 255].repeat(4));
+        assert_eq!(rgba, [255, 255, 255, 255].repeat(4));
     }
 }

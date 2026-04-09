@@ -167,10 +167,10 @@ describe("WebSocketTransport", () => {
     transport.connect();
     const ws = latestSocket();
     ws.simulateOpen();
-    ws.simulateMessage("error:cannot connect to blit-server");
+    ws.simulateMessage("error:cannot connect to blit server");
 
     expect(transport.authRejected).toBe(false);
-    expect(transport.lastError).toBe("cannot connect to blit-server");
+    expect(transport.lastError).toBe("cannot connect to blit server");
 
     // Server errors trigger reconnect (unlike auth rejection)
     const instancesBefore = MockWebSocket.instances.length;

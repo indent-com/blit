@@ -1,6 +1,6 @@
 [package]
 name = "blit-webrtc-forwarder"
-version = "0.21.0"
+version = "0.22.0"
 edition.workspace = true
 description = "Forward a blit-server session over WebRTC"
 license.workspace = true
@@ -10,10 +10,6 @@ homepage.workspace = true
 [lib]
 name = "blit_webrtc_forwarder"
 path = "src/lib.rs"
-
-[[bin]]
-name = "blit-webrtc-forwarder"
-path = "src/main.rs"
 
 [dependencies]
 blit-remote = { workspace = true }

@@ -21,13 +21,17 @@
       serverVaapiEnabled = pkgs.stdenv.isLinux;
       bindgenClangArgs = pkgs.lib.optionalString pkgs.stdenv.isLinux "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
 
-      # Runtime library search path for blit-server's dlopen GPU backends.
+      # Runtime library search path for blit server's dlopen GPU backends.
       #   pkgs.libva           → libva.so.2, libva-drm.so.2
+      #   pkgs.libglvnd        → libEGL.so.1, libGLESv2.so.2 (GLVND dispatch)
+      #   pkgs.libgbm           → libgbm.so.1
       #   addDriverRunpath     → /run/opengl-driver  (libcuda, libnvidia-encode,
-      #                          Mesa VA-API drivers, etc.)
+      #                          Mesa VA-API / EGL drivers, etc.)
       gpuRuntimeLibPath = pkgs.lib.optionalString serverVaapiEnabled (
         pkgs.lib.makeLibraryPath [
+          pkgs.libglvnd
           pkgs.libva
+          pkgs.libgbm
           pkgs.addDriverRunpath.driverLink
         ]
       );
@@ -80,16 +84,10 @@
           ''
         );
 
-      blit-server = mkBin { pname = "blit-server"; };
-      blit-cli = mkBin {
+      blit = mkBin {
         pname = "blit-cli";
         binName = "blit";
         withCompletions = true;
-      };
-      blit-gateway = mkBin { pname = "blit-gateway"; };
-      blit-proxy = mkBin { pname = "blit-proxy"; };
-      blit-webrtc-forwarder = mkBin {
-        pname = "blit-webrtc-forwarder";
       };
 
       # ------------------------------------------------------------------
@@ -174,14 +172,10 @@
           cp ${blit-workspace-static}/bin/${binName} $out/bin/
         '';
 
-      blit-server-static = mkStaticBin { pname = "blit-server"; };
-      blit-cli-static = mkStaticBin {
+      blit-static = mkStaticBin {
         pname = "blit-cli";
         binName = "blit";
       };
-      blit-gateway-static = mkStaticBin { pname = "blit-gateway"; };
-      blit-proxy-static = mkStaticBin { pname = "blit-proxy"; };
-      blit-webrtc-forwarder-static = mkStaticBin { pname = "blit-webrtc-forwarder"; };
 
       # ------------------------------------------------------------------
       # JS / Web assets
@@ -277,14 +271,8 @@
           pkgs
           version
           browserWasm
-          blit-server
-          blit-gateway
-          blit-proxy
-          blit-server-static
-          blit-cli-static
-          blit-gateway-static
-          blit-proxy-static
-          blit-webrtc-forwarder-static
+          blit
+          blit-static
           webAppDist
           websiteDist
           rustToolchain
@@ -326,7 +314,7 @@
             pkgs.foot
             pkgs.wev
             pkgs.zathura
-            blit-cli
+            blit
             fishConfig
             welcomeFile
             passwd
@@ -393,25 +381,14 @@
     in
     {
       packages = {
-        blit = blit-cli;
         inherit
-          blit-server
-          blit-cli
-          blit-gateway
-          blit-proxy
-          blit-webrtc-forwarder
-          ;
-        inherit
-          blit-server-static
-          blit-cli-static
-          blit-gateway-static
-          blit-proxy-static
-          blit-webrtc-forwarder-static
+          blit
+          blit-static
           ;
         demo-image = demoImage;
         push-demo = pushDemo;
         publish-demo = publishDemo;
-        default = blit-cli;
+        default = blit;
       }
       // tasks;
 
@@ -434,6 +411,7 @@
           pkgs.pnpm
           pkgs.process-compose
           pkgs.samply
+          pkgs.socat
           pkgs.wasm-bindgen-cli
           pkgs.wasm-pack
         ]
@@ -450,15 +428,19 @@
           export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
+            if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
+          }${
             if serverVaapiEnabled then
               ":${pkgs.ffmpeg-headless.dev}/lib/pkgconfig:${pkgs.libva.dev}/lib/pkgconfig"
             else
               ""
           }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
+            if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
+          }${
             if serverVaapiEnabled then ":${pkgs.ffmpeg-headless.lib}/lib:${pkgs.libva}/lib" else ""
           }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
-          # Runtime dlopen: blit-server loads VA-API / NVENC libraries at
+          # Runtime dlopen: blit server loads VA-API / NVENC libraries at
           # runtime via dlopen.  See gpuRuntimeLibPath definition above.
           ${pkgs.lib.optionalString (
             gpuRuntimeLibPath != ""

@@ -804,6 +804,20 @@ function LeafPane(props: {
   const surfaceId = () => parseSurfaceAssignment(props.sessionId);
   const isSurface = () => surfaceId() != null;
 
+  /** Resolve the connectionId that actually owns this surface.  The BSP
+   *  container passes the "active" connectionId, but in multi-connection
+   *  setups the surface may belong to a different connection. */
+  const surfaceConnectionId = createMemo(() => {
+    const sid = surfaceId();
+    if (sid == null) return props.connectionId;
+    const snap = workspaceState();
+    for (const c of snap.connections) {
+      const conn = workspace.getConnection(c.id);
+      if (conn?.surfaceStore.getSurface(sid)) return c.id;
+    }
+    return props.connectionId;
+  });
+
   const session = () =>
     isSurface()
       ? null
@@ -866,7 +880,7 @@ function LeafPane(props: {
       <Show when={isSurface()}>
         <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
           <BlitSurfaceView
-            connectionId={props.connectionId}
+            connectionId={surfaceConnectionId()}
             surfaceId={surfaceId()!}
             focus={props.isFocused}
             resizable

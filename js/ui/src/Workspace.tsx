@@ -180,7 +180,9 @@ function WorkspaceScreen(props: {
         const conn = workspace.getConnection(spec.id);
         if (!conn) continue;
         for (const s of conn.surfaceStore.getSurfaces().values()) {
-          all.push(s);
+          // Filter out zero-size auxiliary surfaces (e.g. mpv's
+          // secondary window that never commits a buffer).
+          if (s.width > 0 && s.height > 0) all.push(s);
         }
       }
       setSurfaces(all);
@@ -190,6 +192,11 @@ function WorkspaceScreen(props: {
       if (!conn) continue;
       cleanups.push(conn.surfaceStore.onChange(syncAll));
     }
+    // Also refresh surfaces on workspace state changes (connection
+    // status transitions) so the list stays in sync after reconnects
+    // even if the surfaceStore change event is suppressed during the
+    // reconnect window.
+    cleanups.push(workspace.subscribe(syncAll));
     syncAll();
     onCleanup(() => cleanups.forEach((fn) => fn()));
   });
@@ -212,10 +219,13 @@ function WorkspaceScreen(props: {
   const [fontSize, setFontSize] = createSignal(preferredFontSize());
   const [overlay, setOverlay] = createSignal<Overlay>(null);
   const [openInNewTerminalMode, setOpenInNewTerminalMode] = createSignal(false);
+  const [newTerminalTargetPaneId, setNewTerminalTargetPaneId] = createSignal<
+    string | null
+  >(null);
   const [debugPanel, setDebugPanel] = createSignal(false);
   const [previewPanelOpen, setPreviewPanelOpen] = createSignal(true);
   const [previewPanelWidth, setPreviewPanelWidth] =
-    createSignal(SURFACE_PANEL_WIDTH);
+    createSignal(MIN_PANEL_WIDTH);
   // Parse focus params from URL hash on init.
   // Surface: s=<connectionId>:<surfaceId>
   // Terminal: t=<sessionId>  (sessionId is already "<connectionId>:<counter>")
@@ -237,6 +247,22 @@ function WorkspaceScreen(props: {
   const [focusedSurfaceId, setFocusedSurfaceId] = createSignal<number | null>(
     null,
   );
+  // Track the connectionId for the focused surface so we don't re-derive
+  // it reactively (which causes thrashing when surface list changes).
+  const [focusedSurfaceConnId, setFocusedSurfaceConnId] =
+    createSignal<ConnectionId | null>(null);
+
+  /** Set or clear the focused surface, always keeping the connectionId
+   *  in sync so the BSP view uses the correct connection. */
+  function focusSurfaceById(surfaceId: number | null) {
+    setFocusedSurfaceId(surfaceId);
+    if (surfaceId != null) {
+      const s = surfaces().find((x) => x.surfaceId === surfaceId);
+      setFocusedSurfaceConnId(s?.connectionId ?? null);
+    } else {
+      setFocusedSurfaceConnId(null);
+    }
+  }
 
   // Restore surface focus from hash once the surface actually exists (one-shot).
   if (pendingSurfaceFromHash != null) {
@@ -246,7 +272,7 @@ function WorkspaceScreen(props: {
       const ss = surfaces();
       if (ss.some((s) => s.surfaceId === pendingSurfaceFromHash)) {
         surfaceRestored = true;
-        setFocusedSurfaceId(pendingSurfaceFromHash);
+        focusSurfaceById(pendingSurfaceFromHash);
       }
     });
   }
@@ -277,12 +303,33 @@ function WorkspaceScreen(props: {
   const [layoutAssignments, setLayoutAssignments] =
     createSignal<BSPAssignments | null>(null);
 
-  // Clear focused surface if it was destroyed.
+  // Clear focused surface if it was destroyed.  Use a short grace period
+  // to avoid flickering during reconnect cycles where the surface list is
+  // temporarily empty before being re-populated.
+  let clearFocusedTimer: ReturnType<typeof setTimeout> | null = null;
   createEffect(() => {
     const fid = focusedSurfaceId();
-    if (fid == null) return;
+    if (fid == null) {
+      if (clearFocusedTimer) {
+        clearTimeout(clearFocusedTimer);
+        clearFocusedTimer = null;
+      }
+      return;
+    }
     const exists = surfaces().some((s) => s.surfaceId === fid);
-    if (!exists) setFocusedSurfaceId(null);
+    if (!exists) {
+      if (!clearFocusedTimer) {
+        clearFocusedTimer = setTimeout(() => {
+          clearFocusedTimer = null;
+          // Re-check after the grace period.
+          const stillGone = !surfaces().some((s) => s.surfaceId === fid);
+          if (stillGone) focusSurfaceById(null);
+        }, 2000);
+      }
+    } else if (clearFocusedTimer) {
+      clearTimeout(clearFocusedTimer);
+      clearFocusedTimer = null;
+    }
   });
 
   const offScreenSurfaces = createMemo(() => {
@@ -497,6 +544,7 @@ function WorkspaceScreen(props: {
     paletteOverlayOrigin = null;
     fontOverlayOrigin = null;
     setOpenInNewTerminalMode(false);
+    setNewTerminalTargetPaneId(null);
     setOverlay(null);
     const el = previousFocus;
     previousFocus = null;
@@ -519,8 +567,9 @@ function WorkspaceScreen(props: {
     closeOverlay();
   }
 
-  function openNewTerminalPicker() {
+  function openNewTerminalPicker(paneId?: string) {
     if (!previousFocus) previousFocus = document.activeElement;
+    setNewTerminalTargetPaneId(paneId ?? null);
     setOpenInNewTerminalMode(true);
     setOverlay("expose");
   }
@@ -573,7 +622,7 @@ function WorkspaceScreen(props: {
   );
 
   function switchSession(sessionId: SessionId) {
-    setFocusedSurfaceId(null);
+    focusSurfaceById(null);
     workspace.focusSession(sessionId);
     focusBySessionFn?.(sessionId);
     previousFocus = null;
@@ -584,9 +633,9 @@ function WorkspaceScreen(props: {
     // When a BSP layout is active, place the surface into the focused pane.
     if (activeLayout() && bspFocusedPaneId()) {
       moveToPaneFn?.(surfaceAssignment(surfaceId), bspFocusedPaneId()!);
-      setFocusedSurfaceId(null);
+      focusSurfaceById(null);
     } else {
-      setFocusedSurfaceId(surfaceId);
+      focusSurfaceById(surfaceId);
     }
     closeOverlay();
   }
@@ -605,7 +654,7 @@ function WorkspaceScreen(props: {
         ...(command ? { command } : {}),
         ...(!command && fid && !connectionId ? { cwdFromSessionId: fid } : {}),
       });
-      setFocusedSurfaceId(null);
+      focusSurfaceById(null);
       workspace.focusSession(session.id);
       previousFocus = null;
       closeOverlay();
@@ -676,7 +725,7 @@ function WorkspaceScreen(props: {
       workspace.closeSurface(activeConnectionId(), surfaceId);
     },
     unfocusSurface: () => {
-      setFocusedSurfaceId(null);
+      focusSurfaceById(null);
     },
     toggleOverlay,
     cancelOverlay,
@@ -894,7 +943,9 @@ function WorkspaceScreen(props: {
                 >
                   {(sid) => (
                     <BlitSurfaceView
-                      connectionId={activeConnectionId()}
+                      connectionId={
+                        focusedSurfaceConnId() ?? activeConnectionId()
+                      }
                       surfaceId={sid()}
                       focus
                       resizable
@@ -936,7 +987,17 @@ function WorkspaceScreen(props: {
                     moveToPaneFn = fn;
                   }}
                   onFocusedPaneChange={setBspFocusedPaneId}
-                  onCreateInPane={createInPane}
+                  onCreateInPane={(paneId, command, connectionId) => {
+                    if (
+                      !command &&
+                      !connectionId &&
+                      allConnections().length > 1
+                    ) {
+                      openNewTerminalPicker(paneId);
+                    } else {
+                      void createInPane(paneId, command, connectionId);
+                    }
+                  }}
                   onSwitcher={() => toggleOverlay("expose")}
                   onHelp={() => toggleOverlay("help")}
                   onRender={countFrame}
@@ -981,7 +1042,14 @@ function WorkspaceScreen(props: {
               fontSize={fontSize()}
               onSelect={switchSession}
               onClose={closeOverlay}
-              onCreate={createAndFocus}
+              onCreate={(command, connectionId) => {
+                const paneId = newTerminalTargetPaneId();
+                if (paneId) {
+                  void createInPane(paneId, command, connectionId);
+                } else {
+                  void createAndFocus(command, connectionId);
+                }
+              }}
               initialNewTerminalMode={openInNewTerminalMode()}
               activeLayout={activeLayout()}
               layoutAssignments={layoutAssignments()}
@@ -1023,7 +1091,7 @@ function WorkspaceScreen(props: {
               onFocusSurface={focusSurface}
               onMoveSurfaceToPane={(sid, targetPaneId) => {
                 moveToPaneFn?.(surfaceAssignment(sid), targetPaneId);
-                setFocusedSurfaceId(null);
+                focusSurfaceById(null);
                 closeOverlay();
               }}
             />
@@ -1266,7 +1334,7 @@ function PreviewPanel(props: {
       <div
         style={{
           flex: 1,
-          "background-color": props.theme.solidPanelBg,
+          "background-color": props.theme.bg,
           display: "flex",
           "flex-direction": "column",
           overflow: "hidden",
@@ -1312,7 +1380,7 @@ function PreviewPanel(props: {
             {(s) => (
               <SurfaceThumbnail
                 surface={s}
-                connectionId={props.connectionId}
+                connectionId={s.connectionId}
                 theme={props.theme}
                 scale={props.scale}
                 focused={s.surfaceId === props.focusedSurfaceId}
@@ -1474,7 +1542,7 @@ function SurfaceThumbnail(props: {
         onClick={props.onFocus}
       >
         <BlitSurfaceView
-          connectionId={props.connectionId}
+          connectionId={props.surface.connectionId}
           surfaceId={props.surface.surfaceId}
           style={{
             display: "block",

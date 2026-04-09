@@ -7,23 +7,8 @@ const methods = [
     cmd: "curl -sf https://install.blit.sh | sh",
   },
   {
-    label: "Homebrew (macOS)",
-    cmd: "brew install indent-com/tap/blit",
-  },
-  {
-    label: "APT (Debian / Ubuntu)",
-    cmd: `curl -fsSL https://install.blit.sh/blit.gpg | sudo gpg --dearmor -o /usr/share/keyrings/blit.gpg
-echo "deb [signed-by=/usr/share/keyrings/blit.gpg arch=$(dpkg --print-architecture)] https://install.blit.sh/ stable main" \\
-  | sudo tee /etc/apt/sources.list.d/blit.list
-sudo apt update && sudo apt install blit`,
-  },
-  {
     label: "Windows (PowerShell)",
     cmd: "irm https://install.blit.sh/install.ps1 | iex",
-  },
-  {
-    label: "Nix",
-    cmd: "nix profile install github:indent-com/blit#blit",
   },
 ];
 ---

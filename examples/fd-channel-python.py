@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fd-channel example: spawn blit-server, pass a client fd via SCM_RIGHTS,
+"""fd-channel example: spawn blit server, pass a client fd via SCM_RIGHTS,
 and verify the protocol handshake (HELLO, LIST, READY, CREATE/CREATED)."""
 
 import os
@@ -9,7 +9,7 @@ import struct
 import subprocess
 import sys
 
-BLIT_SERVER = os.environ.get("BLIT_SERVER", "blit-server")
+BLIT_SERVER = os.environ.get("BLIT_SERVER", "blit")
 
 S2C_HELLO = 0x07
 S2C_LIST = 0x03
@@ -46,7 +46,7 @@ def main():
 
     env = {**os.environ, "BLIT_FD_CHANNEL": str(channel_theirs.fileno())}
     proc = subprocess.Popen(
-        [BLIT_SERVER],
+        [BLIT_SERVER, "server"],
         env=env,
         pass_fds=(channel_theirs.fileno(),),
     )

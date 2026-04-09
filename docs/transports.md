@@ -46,7 +46,7 @@ Any implementation of this interface can be passed to `BlitWorkspace`.
 
 ## Unix domain socket
 
-The primary transport. `blit-server` binds a `UnixListener`. All other transports ultimately proxy to this socket.
+The primary transport. `blit server` binds a `UnixListener`. All other transports ultimately proxy to this socket.
 
 **Socket path resolution** (in order):
 
@@ -65,27 +65,27 @@ When `LISTEN_FDS=1` is set, the server adopts fd 3 as its listening socket inste
 
 | Unit                                           | Scope                | Socket                              |
 | ---------------------------------------------- | -------------------- | ----------------------------------- |
-| `blit-server.socket` / `blit-server.service`   | user                 | `%t/blit.sock` (runs `blit-server`) |
+| `blit-server.socket` / `blit-server.service`   | user                 | `%t/blit.sock` (runs `blit server`) |
 | `blit.socket` / `blit.service`                 | user                 | `%t/blit.sock` (runs `blit server`) |
 | `blit-server@.socket` / `blit-server@.service` | system, per-user     | `/run/blit/%i.sock`                 |
 | `blit-webrtc-forwarder@.service`               | system, per-instance | reads `/etc/blit/forwarder-%i.env`  |
 
 ### fd-channel
 
-An external process can pass pre-connected client file descriptors to the server via `SCM_RIGHTS` ancillary messages. Configure with `--fd-channel FD` or `BLIT_FD_CHANNEL=<fd>`. The server calls `recvmsg()` and treats each received fd as an already-connected client stream. This is the integration point for embedding blit-server inside a custom service manager or sandbox.
+An external process can pass pre-connected client file descriptors to the server via `SCM_RIGHTS` ancillary messages. Configure with `--fd-channel FD` or `BLIT_FD_CHANNEL=<fd>`. The server calls `recvmsg()` and treats each received fd as an already-connected client stream. This is the integration point for embedding blit server inside a custom service manager or sandbox.
 
 ---
 
 ## WebSocket
 
-`blit-gateway` (and the CLI's embedded gateway) accept WebSocket connections from browsers.
+`blit gateway` (and the CLI's embedded gateway) accept WebSocket connections from browsers.
 
 ### Auth handshake
 
 ```mermaid
 sequenceDiagram
     participant B as browser
-    participant G as blit-gateway
+    participant G as blit gateway
 
     B->>G: passphrase (text frame)
     alt accepted
@@ -108,10 +108,10 @@ Both the standalone gateway and the CLI's embedded gateway support multiple name
 
 ```mermaid
 graph LR
-    B["browser"] -->|"WS /d/rabbit"| G["blit-gateway"]
+    B["browser"] -->|"WS /d/rabbit"| G["blit gateway"]
     B -->|"WS /d/hound"| G
-    G -->|Unix| SR["blit-server-rabbit"]
-    G -->|Unix| SH["blit-server-hound"]
+    G -->|Unix| SR["blit server (rabbit)"]
+    G -->|Unix| SH["blit server (hound)"]
 ```
 
 Session IDs are namespaced by connection (`"rabbit:1"`, `"hound:2"`) so they never collide across servers.
@@ -148,7 +148,7 @@ A single bidirectional QUIC stream carries the blit session, using the standard 
 ```mermaid
 sequenceDiagram
     participant B as browser
-    participant G as blit-gateway
+    participant G as blit gateway
 
     B->>G: [passphrase_len:2 LE][passphrase:N]
     alt accepted
@@ -165,7 +165,7 @@ sequenceDiagram
 For production deployments with a real CA certificate:
 
 ```bash
-BLIT_QUIC=1 BLIT_TLS_CERT=/path/to/cert.pem BLIT_TLS_KEY=/path/to/key.pem blit-gateway
+BLIT_QUIC=1 BLIT_TLS_CERT=/path/to/cert.pem BLIT_TLS_KEY=/path/to/key.pem blit gateway
 ```
 
 When explicit certs are provided, the browser does not need `serverCertificateHashes` and standard TLS verification applies.
@@ -174,11 +174,11 @@ When explicit certs are provided, the browser does not need `serverCertificateHa
 
 ## WebRTC DataChannel
 
-`blit-webrtc-forwarder` bridges a blit-server session to browsers over WebRTC using `str0m` (a sans-I/O WebRTC library). No gateway is involved — the browser connects directly to the forwarder via the signaling hub.
+`blit share` bridges a blit server session to browsers over WebRTC using `str0m` (a sans-I/O WebRTC library). No gateway is involved — the browser connects directly to the forwarder via the signaling hub.
 
 ```mermaid
 graph LR
-    S["blit-server"] -->|Unix| F["blit-webrtc-forwarder"]
+    S["blit server"] -->|Unix| F["blit share"]
     F <-->|WebSocket signaling| H["hub.blit.sh"]
     H <-->|WebSocket signaling| B["browser"]
     F <-->|WebRTC DataChannel| B
@@ -186,15 +186,15 @@ graph LR
 
 ### DataChannel framing
 
-An ordered, reliable DataChannel labeled `"blit"` carries 4-byte LE length-prefixed frames, identical to the Unix socket protocol. The forwarder connects to blit-server via Unix socket when the data channel opens.
+An ordered, reliable DataChannel labeled `"blit"` carries 4-byte LE length-prefixed frames, identical to the Unix socket protocol. The forwarder connects to blit server via Unix socket when the data channel opens.
 
 ### Signaling
 
 ```mermaid
 graph LR
-    F["blit-webrtc-forwarder"] -->|"WS /channel/&lt;pubHex&gt;/producer"| H["hub.blit.sh"]
+    F["blit share"] -->|"WS /channel/&lt;pubHex&gt;/producer"| H["hub.blit.sh"]
     B["browser"] -->|"WS /channel/&lt;pubHex&gt;/consumer"| H
-    G["blit-gateway\n(BLIT_GATEWAY_WEBRTC=1)"] -->|"WS /channel/&lt;pubHex&gt;/consumer"| H
+    G["blit gateway\n(BLIT_GATEWAY_WEBRTC=1)"] -->|"WS /channel/&lt;pubHex&gt;/consumer"| H
 ```
 
 Both **producer** and **consumers** connect to the same channel. `pubHex` is the Ed25519 verifying key derived from the passphrase via PBKDF2-SHA256 (100,000 rounds, salt `"https://blit.sh"`). The hub assigns each connection a unique sessionId (UUID), so multiple consumers can connect concurrently without colliding.
@@ -220,21 +220,21 @@ WebRTC peer connections are decoupled from the signaling WebSocket. An `establis
 ```bash
 blit share                         # auto-start server, run forwarder, print passphrase
 blit share --passphrase mysecret   # deterministic passphrase
-blit-webrtc-forwarder              # standalone binary (BLIT_PASSPHRASE, BLIT_HUB)
+blit share                         # subcommand (BLIT_PASSPHRASE, BLIT_HUB)
 ```
 
 ### Gateway-proxied WebRTC
 
-When `BLIT_GATEWAY_WEBRTC=1`, `blit-gateway` connects to `share:` entries in `blit.remotes` as a WebRTC consumer and re-exposes them over its normal WebSocket/WebTransport path:
+When `BLIT_GATEWAY_WEBRTC=1`, `blit gateway` connects to `share:` entries in `blit.remotes` as a WebRTC consumer and re-exposes them over its normal WebSocket/WebTransport path:
 
 ```mermaid
 graph LR
-    F["blit-webrtc-forwarder"] <-->|WebRTC DataChannel| G["blit-gateway\nBLIT_GATEWAY_WEBRTC=1"]
+    F["blit share"] <-->|WebRTC DataChannel| G["blit gateway\nBLIT_GATEWAY_WEBRTC=1"]
     G -->|"WS /d/name"| B["browser"]
 ```
 
 ```bash
-BLIT_GATEWAY_WEBRTC=1 BLIT_HUB=hub.blit.sh blit-gateway
+BLIT_GATEWAY_WEBRTC=1 BLIT_HUB=hub.blit.sh blit gateway
 ```
 
 `blit.remotes` entries:
@@ -250,12 +250,12 @@ The gateway appends `?proxiable=true` to `share:` URIs in the config WebSocket `
 
 ## SSH tunneling
 
-`blit-cli` and `blit-gateway` connect to remote `blit-server` instances over SSH
+`blit-cli` and `blit gateway` connect to remote `blit server` instances over SSH
 using an embedded SSH client (`russh` — pure Rust, no system `ssh` required).
 
 ```mermaid
 graph LR
-    C["blit / blit-gateway"] -->|"SSH (russh)\ndirect-streamlocal"| S["blit-server\n(remote)"]
+    C["blit / blit gateway"] -->|"SSH (russh)\ndirect-streamlocal"| S["blit server\n(remote)"]
 ```
 
 The embedded client authenticates via ssh-agent (primary) and key files (fallback),
@@ -270,23 +270,23 @@ is auto-started. Connection retries with back-off handle the startup window.
 
 ---
 
-## blit-proxy
+## blit proxy-daemon
 
 ### Why it exists
 
-Every browser WebSocket connection to blit-gateway requires the gateway to open a fresh connection to the upstream blit-server. When the server is remote — reached over TCP or WebSocket — that connection involves a round-trip or more: TCP handshake, gateway auth.
+Every browser WebSocket connection to `blit gateway` requires the gateway to open a fresh connection to the upstream `blit server`. When the server is remote — reached over TCP or WebSocket — that connection involves a round-trip or more: TCP handshake, gateway auth.
 
-`blit-proxy` eliminates that latency by maintaining a pool of pre-warmed, already-authenticated connections to each upstream. When a browser tab opens, the gateway gets a live connection from the pool instantly. The pool refills in the background so the next tab is equally fast.
+`blit proxy-daemon` eliminates that latency by maintaining a pool of pre-warmed, already-authenticated connections to each upstream. When a browser tab opens, the gateway gets a live connection from the pool instantly. The pool refills in the background so the next tab is equally fast.
 
 ### Why it auto-starts
 
-`blit-proxy` is a persistent daemon: one process per user session, shared across all CLI invocations. It auto-starts transparently on Unix and Windows when the CLI or `blit-gateway` (with `BLIT_PROXY=1`) needs it. No configuration required — it just works, and restarts automatically if it ever stops.
+`blit proxy-daemon` is a persistent daemon: one process per user session, shared across all CLI invocations. It auto-starts transparently on Unix and Windows when the CLI or `blit gateway` (with `BLIT_PROXY=1`) needs it. No configuration required — it just works, and restarts automatically if it ever stops.
 
 ```mermaid
 graph LR
-    C["gateway / CLI"] -->|Unix| P["blit-proxy"]
-    P -->|"pool[ssh:rabbit]\nssh bridge"| SR["blit-server-rabbit"]
-    P -->|"pool[wss://prod/]\nWebSocket"| GW["blit-gateway-prod"]
+    C["gateway / CLI"] -->|Unix| P["blit proxy-daemon"]
+    P -->|"pool[ssh:rabbit]\nssh bridge"| SR["blit server (rabbit)"]
+    P -->|"pool[wss://prod/]\nWebSocket"| GW["blit gateway (prod)"]
 ```
 
 ### Proxy handshake
@@ -296,7 +296,7 @@ After connecting to the proxy socket (`$XDG_RUNTIME_DIR/blit-proxy.sock` on Unix
 ```mermaid
 sequenceDiagram
     participant C as client
-    participant P as blit-proxy
+    participant P as blit proxy-daemon
     participant U as upstream
 
     C->>P: target &lt;uri&gt;\n
@@ -324,7 +324,7 @@ sequenceDiagram
 
 ### Auto-start
 
-The CLI auto-starts `blit-proxy` when needed:
+The CLI auto-starts `blit proxy-daemon` when needed:
 
 1. Check if the proxy socket/pipe exists and accepts connections.
 2. If not, re-exec the current `blit` binary as `blit proxy-daemon` in a detached background process:
@@ -355,7 +355,7 @@ When no explicit connection flags are given, the CLI resolves the remote in this
 1. `--on <uri-or-name>` CLI flag
 2. `BLIT_TARGET` environment variable
 3. `target = <uri-or-name>` key in `~/.config/blit/blit.conf`
-4. Local blit-server (auto-start)
+4. Local blit server (auto-start)
 
 Named targets (bare names with no `:`) are looked up in `~/.config/blit/blit.remotes`. A bare name in `blit.remotes` is not allowed (no recursive resolution).
 
@@ -374,12 +374,12 @@ blit --on staging list       # one-off override
 
 ## Transport selection summary
 
-| Scenario                  | Default transport        | Override                           |
-| ------------------------- | ------------------------ | ---------------------------------- |
-| Local session             | Unix socket (auto-start) | `--on socket:/path`                |
-| Remote via SSH            | blit-proxy → SSH         | `BLIT_NO_PROXY=1` → direct russh   |
-| Remote via TCP            | blit-proxy → TCP         | `BLIT_NO_PROXY=1` → direct TCP     |
-| Gateway → server (local)  | Unix socket direct       | `BLIT_PROXY=1` → via blit-proxy    |
-| Gateway → server (remote) | Embedded SSH (russh)     | Configure in `blit.remotes`        |
-| Shareable browser session | WebRTC DataChannel       | —                                  |
-| Browser → gateway         | WebSocket                | `BLIT_QUIC=1` enables WebTransport |
+| Scenario                  | Default transport               | Override                           |
+| ------------------------- | ------------------------------- | ---------------------------------- |
+| Local session             | Unix socket (auto-start)        | `--on socket:/path`                |
+| Remote via SSH            | blit proxy-daemon → SSH         | `BLIT_PROXY=0` → direct russh      |
+| Remote via TCP            | blit proxy-daemon → TCP         | `BLIT_PROXY=0` → direct TCP        |
+| Gateway → server (local)  | blit proxy-daemon → Unix socket | `BLIT_PROXY=0` → direct            |
+| Gateway → server (remote) | Embedded SSH (russh)            | Configure in `blit.remotes`        |
+| Shareable browser session | WebRTC DataChannel              | —                                  |
+| Browser → gateway         | WebSocket                       | `BLIT_QUIC=1` enables WebTransport |

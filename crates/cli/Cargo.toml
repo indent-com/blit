@@ -1,6 +1,6 @@
 [package]
 name = "blit-cli"
-version = "0.21.0"
+version = "0.22.0"
 edition.workspace = true
 description = "blit terminal client"
 license.workspace = true
@@ -23,6 +23,7 @@ clap_mangen = "0.2"
 clap_complete = "4"
 regex = "1"
 blit-server = { workspace = true }
+blit-gateway = { workspace = true }
 blit-proxy = { workspace = true }
 blit-webrtc-forwarder = { workspace = true }
 blit-ssh = { workspace = true }

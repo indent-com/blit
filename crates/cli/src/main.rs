@@ -34,12 +34,16 @@ async fn async_main() {
 
     match cli.command {
         Command::Server {
+            socket,
             shell_flags,
             scrollback,
             #[cfg(unix)]
             fd_channel,
+            verbose,
         } => {
-            let ipc_path = blit_server::default_ipc_path();
+            let ipc_path = socket
+                .or_else(|| std::env::var("BLIT_SOCK").ok())
+                .unwrap_or_else(blit_server::default_ipc_path);
 
             #[cfg(unix)]
             let shell_default = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -77,7 +81,11 @@ async fn async_main() {
                         .ok()
                         .and_then(|s| s.parse().ok())
                 }),
-                verbose: false,
+                verbose: verbose
+                    || std::env::var("BLIT_VERBOSE")
+                        .ok()
+                        .map(|v| v == "1")
+                        .unwrap_or(false),
                 max_connections: 0,
                 max_ptys: 0,
             };
@@ -276,6 +284,9 @@ async fn async_main() {
         Command::Open { port } => {
             let hub = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
             interactive::run_browser(port, &hub).await;
+        }
+        Command::Gateway => {
+            blit_gateway::run().await;
         }
         Command::Learn => {
             print!("{}", include_str!("learn.md"));

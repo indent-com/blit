@@ -1,0 +1,43 @@
+name: Build packages
+
+on:
+  workflow_call:
+    inputs:
+      upload:
+        type: boolean
+        default: false
+
+jobs:
+  build-packages:
+    strategy:
+      matrix:
+        include:
+          - runner: blacksmith-16vcpu-ubuntu-2404
+            label: linux-x86_64
+            arch: amd64
+            debs: true
+          - runner: blacksmith-16vcpu-ubuntu-2404-arm
+            label: linux-aarch64
+            arch: arm64
+            debs: true
+          - runner: blacksmith-12vcpu-macos-latest
+            label: macos-aarch64
+            debs: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/build-tarballs dist
+      - run: ./bin/build-debs debs
+        if: ${{ matrix.debs }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload }}
+        with:
+          name: tarballs-${{ matrix.label }}
+          path: dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload && matrix.debs }}
+        with:
+          name: debs-${{ matrix.arch }}
+          path: debs/*.deb

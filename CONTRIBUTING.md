@@ -23,7 +23,7 @@ When making changes, update the relevant docs in the same PR.
 | `ARCHITECTURE.md`         | System internals: data flow, crate responsibilities, transport layers, rendering pipeline                                                     | Crates are added/removed/renamed, data flow between components changes, or new transport/rendering mechanisms are introduced |
 | `CONTRIBUTING.md`         | Developer workflow: building, testing, code conventions, project structure                                                                    | Build steps, test commands, directory layout, or dev tooling changes                                                         |
 | `SERVICES.md`             | Hosted services, CI/CD, and running as a service (Homebrew, systemd)                                                                          | CI jobs are added/removed/changed, deployment targets change, new secrets are introduced, or the release process is modified |
-| `EMBEDDING.md`            | Embedding blit in other apps: React components (`@blit-sh/react`), embedding `blit-server` as a library                                       | Public embedding APIs, component props, or integration patterns change                                                       |
+| `EMBEDDING.md`            | Embedding blit in other apps: React components (`@blit-sh/react`), embedding `blit server` as a library                                       | Public embedding APIs, component props, or integration patterns change                                                       |
 | `SKILL.md`                | LLM agent skill definition: install instructions and pointer to `blit learn`. Deployed to `install.blit.sh/SKILL.md` by the release workflow. | Install methods change or the `learn` subcommand output changes                                                              |
 | `crates/cli/src/learn.md` | Full CLI reference printed by `blit learn`: usage patterns, subcommand details, transport options, escapes                                    | CLI subcommands, flags, output conventions, or transport options change                                                      |
 | `UNSAFE.md`               | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                                                      | Unsafe code is added, removed, or its safety invariants change                                                               |
@@ -75,7 +75,7 @@ Once you're in the dev shell, start the full stack with hot-reloading:
 ./bin/dev
 ```
 
-This launches the server, gateway, WASM watcher, and Vite dev servers via `process-compose`. See [Dev environment](#dev-environment) for details on what each process does.
+This launches the build, server, gateway, WASM watcher, and Vite dev servers via `process-compose`. See [Dev environment](#dev-environment) for details on what each process does.
 
 ## Building and testing
 
@@ -109,7 +109,7 @@ E2E (Playwright, requires built binaries):
 ./bin/e2e
 ```
 
-CI runs `./bin/lint`, `./bin/tests`, and `./bin/e2e`. These delegate to `nix run .#<task>`, etc.
+CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, `./bin/coverage`, and `./bin/dev-check`. These delegate to `nix run .#<task>`, etc.
 
 ## Packaging
 
@@ -129,8 +129,7 @@ Linkage is verified at `nix build` time — Linux binaries must be statically li
 Individual packages can also be built directly:
 
 ```bash
-nix build .#blit-server      # or blit-cli, blit-gateway
-nix build .#blit-server-deb  # or blit-cli-deb, blit-gateway-deb
+nix build .#blit
 ```
 
 There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and `clippy -D warnings` are the style enforcement. `./bin/fmt` runs both formatters in one pass.
@@ -139,13 +138,14 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and 
 
 `./bin/dev` starts the full stack with hot-reloading via `process-compose`:
 
-| Process        | What it does                                                      | Default port / socket |
-| -------------- | ----------------------------------------------------------------- | --------------------- |
-| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM | n/a                   |
-| `server`       | `cargo watch` running `blit-server --release`                     | `/tmp/blit-dev.sock`  |
-| `ui`           | Vite dev server for `js/ui/`                                      | `127.0.0.1:10000`     |
-| `gateway`      | `cargo watch` running `blit-gateway --release` (pass=`dev`)       | `127.0.0.1:10001`     |
-| `website`      | Astro dev server for `js/website/`                                | `127.0.0.1:10002`     |
+| Process        | What it does                                                               | Default port / socket |
+| -------------- | -------------------------------------------------------------------------- | --------------------- |
+| `build`        | One-shot `cargo build -p blit-cli --profile profiling`; restart to rebuild | n/a                   |
+| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM          | n/a                   |
+| `server`       | Runs `blit server`, auto-restarts when the binary changes                  | `/tmp/blit-dev.sock`  |
+| `gateway`      | Runs `blit gateway` (pass=`dev`), auto-restarts when binary changes        | `127.0.0.1:10001`     |
+| `ui`           | Vite dev server for `js/ui/`                                               | `127.0.0.1:10000`     |
+| `website`      | Astro dev server for `js/website/`                                         | `127.0.0.1:10002`     |
 
 ### Running multiple dev stacks
 
@@ -166,14 +166,14 @@ DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 | Variable             | Default (instance 0) | Description                   |
 | -------------------- | -------------------- | ----------------------------- |
 | `DEV_INSTANCE`       | `0`                  | Instance number (0, 1, 2, …)  |
-| `BLIT_DEV_SOCK`      | `/tmp/blit-dev.sock` | blit-server Unix socket       |
+| `BLIT_DEV_SOCK`      | `/tmp/blit-dev.sock` | blit server Unix socket       |
 | `BLIT_DEV_UI_PORT`   | `10000`              | Vite UI dev-server port       |
-| `BLIT_DEV_GW_PORT`   | `10001`              | blit-gateway port             |
+| `BLIT_DEV_GW_PORT`   | `10001`              | blit gateway port             |
 | `BLIT_DEV_SITE_PORT` | `10002`              | Astro website dev-server port |
 
 ## Project structure
 
-Most Rust crates are one or two source files. `blit-cli` is split into five and `blit-webrtc-forwarder` uses a multi-file module tree.
+Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is split into five and `blit-webrtc-forwarder` uses a multi-file module tree.
 
 | File                                   | Role                                                                                                                  |
 | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |

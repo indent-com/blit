@@ -75,7 +75,6 @@ type SessionItem = {
   title: string;
   subtitle: string;
   sessionId: SessionId;
-  connectionLabel?: string;
   exited: boolean;
   context?: string;
   source?: number;
@@ -746,9 +745,6 @@ export function SwitcherOverlay(props: {
       });
   });
 
-  const connLabel = (session: { connectionId: string }): string | undefined =>
-    props.connectionLabels?.get(session.connectionId) ?? undefined;
-
   const sessionMatches = createMemo(() => {
     const dp = destPrefix();
 
@@ -766,7 +762,6 @@ export function SwitcherOverlay(props: {
             ? t("switcher.exitedTerminal")
             : t("switcher.openTerminal")),
         sessionId: session.id,
-        connectionLabel: connLabel(session),
         exited: session.state === "exited",
         focused: session.id === props.focusedSessionId,
       }));
@@ -787,7 +782,6 @@ export function SwitcherOverlay(props: {
               ? t("switcher.exitedTerminal")
               : t("switcher.openTerminal")),
           sessionId: session.id,
-          connectionLabel: connLabel(session),
           exited: session.state === "exited",
           focused: session.id === props.focusedSessionId,
         }));
@@ -814,7 +808,6 @@ export function SwitcherOverlay(props: {
               ? t("switcher.exitedTerminal")
               : t("switcher.openTerminal")),
           sessionId: session.id,
-          connectionLabel: connLabel(session),
           exited: session.state === "exited",
           focused: session.id === props.focusedSessionId,
         });
@@ -836,7 +829,6 @@ export function SwitcherOverlay(props: {
             ? t("switcher.exitedTerminal")
             : t("switcher.openTerminal")),
         sessionId: session.id,
-        connectionLabel: connLabel(session),
         exited: session.state === "exited",
         context: result.context,
         source: result.primarySource,
@@ -851,7 +843,6 @@ export function SwitcherOverlay(props: {
     const surfs = props.surfaces ?? [];
     if (surfs.length === 0) return [] as SurfaceItem[];
 
-    const connId = props.connectionId ?? "";
     const needle = searching() ? searchPart().toLowerCase() : "";
 
     return surfs
@@ -866,7 +857,7 @@ export function SwitcherOverlay(props: {
         title: s.title || s.appId || `Surface ${s.surfaceId}`,
         subtitle: `${s.width}\u00D7${s.height}`,
         surfaceId: s.surfaceId,
-        connectionId: connId,
+        connectionId: s.connectionId,
         focused: s.surfaceId === props.focusedSurfaceId,
       }));
   });
@@ -947,33 +938,64 @@ export function SwitcherOverlay(props: {
     }
     if (!layoutMode() && sessionMatches().length > 0) {
       if (props.multiConnection && props.connectionLabels) {
-        // Group sessions by connection.
-        const groups = new Map<string, SessionItem[]>();
+        // Group sessions and surfaces together by connection.
+        const sessionGroups = new Map<string, SessionItem[]>();
         for (const item of sessionMatches()) {
           const session = props.sessions.find((s) => s.id === item.sessionId);
           const connId = session?.connectionId ?? "unknown";
-          if (!groups.has(connId)) groups.set(connId, []);
-          groups.get(connId)!.push(item);
+          if (!sessionGroups.has(connId)) sessionGroups.set(connId, []);
+          sessionGroups.get(connId)!.push(item);
         }
-        for (const [connId, items] of groups) {
+        const surfaceGroups = new Map<string, SurfaceItem[]>();
+        for (const item of surfaceMatches()) {
+          const connId = item.connectionId || "unknown";
+          if (!surfaceGroups.has(connId)) surfaceGroups.set(connId, []);
+          surfaceGroups.get(connId)!.push(item);
+        }
+        // Merge: iterate all connection IDs that have sessions or surfaces.
+        const allConnIds = new Set([
+          ...sessionGroups.keys(),
+          ...surfaceGroups.keys(),
+        ]);
+        for (const connId of allConnIds) {
           const label = props.connectionLabels.get(connId) ?? connId;
-          next.push({
-            title: label,
-            items,
-          });
+          const items: SwitcherItem[] = [
+            ...(sessionGroups.get(connId) ?? []),
+            ...(surfaceGroups.get(connId) ?? []),
+          ];
+          next.push({ title: label, items });
         }
       } else {
         next.push({
           title: t("switcher.sectionTerminals"),
           items: sessionMatches(),
         });
+        if (surfaceMatches().length > 0) {
+          next.push({
+            title: t("switcher.sectionSurfaces"),
+            items: surfaceMatches(),
+          });
+        }
       }
-    }
-    if (!layoutMode() && surfaceMatches().length > 0) {
-      next.push({
-        title: t("switcher.sectionSurfaces"),
-        items: surfaceMatches(),
-      });
+    } else if (!layoutMode() && surfaceMatches().length > 0) {
+      if (props.multiConnection && props.connectionLabels) {
+        // No sessions — still group surfaces by connection.
+        const surfaceGroups = new Map<string, SurfaceItem[]>();
+        for (const item of surfaceMatches()) {
+          const connId = item.connectionId || "unknown";
+          if (!surfaceGroups.has(connId)) surfaceGroups.set(connId, []);
+          surfaceGroups.get(connId)!.push(item);
+        }
+        for (const [connId, items] of surfaceGroups) {
+          const label = props.connectionLabels.get(connId) ?? connId;
+          next.push({ title: label, items });
+        }
+      } else {
+        next.push({
+          title: t("switcher.sectionSurfaces"),
+          items: surfaceMatches(),
+        });
+      }
     }
 
     if (customLayouts.length > 0) {
@@ -1000,7 +1022,10 @@ export function SwitcherOverlay(props: {
         type: "action",
         key: `action:new-terminal:${dp.connId}`,
         title: cmd
-          ? tp("switcher.runCommand", { command: cmd })
+          ? tp("switcher.runCommandOnTarget", {
+              command: cmd,
+              target: dp.label,
+            })
           : t("switcher.newTerminal"),
         subtitle: cmd
           ? t("switcher.createRunning")
@@ -1069,21 +1094,29 @@ export function SwitcherOverlay(props: {
       subtitle: t("switcher.clearLocalStorageDesc"),
       action: "clear-local-storage",
     });
-    if (
-      !layoutMode() &&
-      (!searching() ||
+    if (!layoutMode()) {
+      const dp = destPrefix();
+      if (dp) {
+        // Destination prefix matched — only show the resolved new-terminal action.
+        next.push({
+          title: t("switcher.sectionActions"),
+          items: actions.filter((a) => a.connectionId === dp.connId),
+        });
+      } else if (
+        !searching() ||
         actions.some((action) =>
           action.title.toLowerCase().includes(searchPart().toLowerCase()),
-        ))
-    ) {
-      next.push({
-        title: t("switcher.sectionActions"),
-        items: searching()
-          ? actions.filter((action) =>
-              action.title.toLowerCase().includes(searchPart().toLowerCase()),
-            )
-          : actions,
-      });
+        )
+      ) {
+        next.push({
+          title: t("switcher.sectionActions"),
+          items: searching()
+            ? actions.filter((action) =>
+                action.title.toLowerCase().includes(searchPart().toLowerCase()),
+              )
+            : actions,
+        });
+      }
     }
 
     // Remotes section — show configured remotes with connection status.
@@ -1298,15 +1331,11 @@ export function SwitcherOverlay(props: {
     if (item.type === "remote") {
       // Open a new terminal on this remote's connection.
       // If a pane is focused (BSP layout), place the terminal in that pane.
+      const cmd = commandText() || inlineCmd() || undefined;
       if (props.focusedPaneId && props.onSelectPane) {
-        props.onSelectPane(
-          props.focusedPaneId,
-          null,
-          undefined,
-          item.remoteName,
-        );
+        props.onSelectPane(props.focusedPaneId, null, cmd, item.remoteName);
       } else {
-        props.onCreate(undefined, item.remoteName);
+        props.onCreate(cmd, item.remoteName);
       }
       return;
     }
@@ -1362,10 +1391,12 @@ export function SwitcherOverlay(props: {
       location.reload();
       return;
     }
-    // new-terminal: if remotes are configured and we're not already in the
+    // new-terminal: if remotes are configured, no connection is already
+    // resolved (e.g. via "rabbit>htop" prefix), and we're not already in the
     // sub-menu, show the "New terminal on…" picker instead of creating immediately.
     if (
       item.action === "new-terminal" &&
+      !item.connectionId &&
       !newTerminalMode() &&
       props.remotes &&
       props.remotes.length > 0
@@ -1427,26 +1458,34 @@ export function SwitcherOverlay(props: {
     }
     if (
       (event.key === "w" || event.key === "W") &&
-      (event.ctrlKey || event.metaKey) &&
-      selectedItem()?.type === "session"
-    ) {
-      event.preventDefault();
-      void workspace.closeSession((selectedItem() as SessionItem).sessionId);
-      return;
-    }
-    if (
-      event.key === "Q" &&
-      event.shiftKey &&
       (event.ctrlKey || event.metaKey)
     ) {
       const sel = selectedItem();
       if (sel?.type === "session") {
         event.preventDefault();
         void workspace.closeSession((sel as SessionItem).sessionId);
+        return;
+      }
+      if (sel?.type === "surface") {
+        event.preventDefault();
+        workspace.closeSurface(
+          (sel as SurfaceItem).connectionId,
+          (sel as SurfaceItem).surfaceId,
+        );
+        return;
+      }
+    }
+    if (event.key === "Q" && event.shiftKey && event.ctrlKey) {
+      const sel = selectedItem();
+      if (sel?.type === "session") {
+        event.preventDefault();
+        void workspace.closeSession((sel as SessionItem).sessionId);
       } else if (sel?.type === "surface") {
         event.preventDefault();
-        props.onClose();
-        // Surface close is handled by the global shortcut after overlay closes.
+        workspace.closeSurface(
+          (sel as SurfaceItem).connectionId,
+          (sel as SurfaceItem).surfaceId,
+        );
       }
     }
   }
@@ -1462,7 +1501,10 @@ export function SwitcherOverlay(props: {
     >
       <div
         ref={wrapperRef}
-        style={{ position: "relative", "margin-right": sidebarWidth }}
+        style={{
+          position: "relative",
+          "margin-right": newTerminalMode() ? undefined : sidebarWidth,
+        }}
       >
         <OverlayPanel
           palette={props.palette}
@@ -1646,23 +1688,6 @@ export function SwitcherOverlay(props: {
                                     "flex-wrap": "wrap",
                                   }}
                                 >
-                                  <Show
-                                    when={
-                                      item.type === "session" &&
-                                      (item as SessionItem).connectionLabel
-                                    }
-                                  >
-                                    <span
-                                      style={{
-                                        opacity: 0.5,
-                                        "font-size": `${fsMd()}px`,
-                                        "white-space": "nowrap",
-                                      }}
-                                    >
-                                      {(item as SessionItem).connectionLabel}
-                                      {" \u203A "}
-                                    </span>
-                                  </Show>
                                   <span
                                     style={{
                                       overflow: "hidden",

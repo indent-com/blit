@@ -1,6 +1,6 @@
 # Embedding
 
-There are two distinct dimensions: embedding the frontend into your app, and embedding `blit-server` into your own service.
+There are two distinct dimensions: embedding the frontend into your app, and embedding `blit server` into your own service.
 
 ## Your app, our components: `@blit-sh/react` / `@blit-sh/solid`
 
@@ -237,7 +237,7 @@ interface BlitTransport {
 
 ## Your service, our server: `fd-channel` mode
 
-`fd-channel` lets an external process own `blit-server`'s lifecycle and control which clients connect via `SCM_RIGHTS` fd passing. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol details and the working examples:
+`fd-channel` lets an external process own `blit server`'s lifecycle and control which clients connect via `SCM_RIGHTS` fd passing. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol details and the working examples:
 
 - [Python](examples/fd-channel-python.py)
 - [Bun](examples/fd-channel-bun.ts)

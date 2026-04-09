@@ -209,6 +209,14 @@ export class BlitSurfaceCanvas {
   // subscriptions
   private unsubFrame: (() => void) | null = null;
   private unsubChange: (() => void) | null = null;
+  /** Cached store reference so we can keep the frame listener alive
+   *  even when the connection is temporarily unavailable. */
+  private _store: import("./SurfaceStore").SurfaceStore | null = null;
+
+  /** The SurfaceStore generation at the time we last sent a subscribe.
+   *  Used to detect reconnects (generation bumps on disconnect) so we
+   *  re-subscribe even when the surfaceId/sessionId haven't changed. */
+  private _subscribedGeneration = -1;
 
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
@@ -277,10 +285,7 @@ export class BlitSurfaceCanvas {
     this.releaseAllButtons();
     this.serverUnsubscribe();
     this.detachEvents();
-    this.unsubFrame?.();
-    this.unsubChange?.();
-    this.unsubFrame = null;
-    this.unsubChange = null;
+    this.unsubscribeAll();
     if (this.canvas && this.container) {
       this.container.removeChild(this.canvas);
     }
@@ -312,11 +317,28 @@ export class BlitSurfaceCanvas {
     scale120: number = 0,
     codecSupport: number = 0,
   ): void {
-    const conn = this.getConn();
-    if (!conn || !this.surface) return;
     const w = Math.round(width);
     const h = Math.round(height);
     if (w <= 0 || h <= 0) return;
+    // Stash the pending resize so it can be sent when the surface info
+    // arrives (the ResizeObserver may fire before the surface is known).
+    this._pendingResize = { w, h, scale120, codecSupport };
+    this.flushPendingResize();
+  }
+
+  private _pendingResize: {
+    w: number;
+    h: number;
+    scale120: number;
+    codecSupport: number;
+  } | null = null;
+
+  private flushPendingResize(): void {
+    if (!this._pendingResize) return;
+    const conn = this.getConn();
+    if (!conn || !this.surface) return;
+    const { w, h, scale120, codecSupport } = this._pendingResize;
+    this._pendingResize = null;
     conn.sendSurfaceResize(
       this.surface.sessionId,
       this._surfaceId,
@@ -375,8 +397,9 @@ export class BlitSurfaceCanvas {
 
   private subscribe(): void {
     const conn = this.getConn();
-    if (!conn) return;
-    const store = conn.surfaceStore;
+    const store = conn?.surfaceStore ?? this._store;
+    if (!store) return;
+    this._store = store;
 
     this.surface = store.getSurface(this._surfaceId);
 
@@ -384,32 +407,63 @@ export class BlitSurfaceCanvas {
     // browser can actually decode the video.  Subscribing when WebCodecs
     // is unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
-    if (this.surface && store.canDecodeVideo) {
+    if (conn && this.surface && store.canDecodeVideo) {
       conn.sendSurfaceSubscribe(this.surface.sessionId, this._surfaceId);
+      this._subscribedGeneration = store.generation;
     }
 
-    // Paint the latest frame immediately so newly-mounted views aren't blank.
+    // Flush any pending resize and paint the latest frame immediately
+    // so newly-mounted views aren't blank.
+    this.flushPendingResize();
     this.blitFromStore(store);
 
     this.unsubChange = store.onChange(() => {
       const prev = this.surface;
       this.surface = store.getSurface(this._surfaceId);
-      // Late-subscribe: the surface info may arrive after we attach.
-      if (!prev && this.surface && store.canDecodeVideo) {
-        conn.sendSurfaceSubscribe(this.surface.sessionId, this._surfaceId);
-        // Update canvas size to match actual surface dimensions,
-        // unless the display size is pinned by a ResizeObserver.
-        if (this.canvas && !this._displaySize) {
-          this.canvas.width = this.surface.width;
-          this.canvas.height = this.surface.height;
+      // Subscribe (or re-subscribe) when:
+      //  1. Surface info just arrived (late-subscribe: prev was undefined)
+      //  2. Session ID changed (surface recreated on the server)
+      //  3. Store generation changed (reconnect — the server dropped all
+      //     subscriptions but the surface reappeared with the same IDs)
+      if (this.surface && store.canDecodeVideo) {
+        const generationChanged =
+          this._subscribedGeneration !== store.generation;
+        const sessionChanged =
+          !prev || prev.sessionId !== this.surface.sessionId;
+        if (sessionChanged || generationChanged) {
+          const c = this.getConn();
+          if (c) {
+            c.sendSurfaceSubscribe(this.surface.sessionId, this._surfaceId);
+            this._subscribedGeneration = store.generation;
+          }
+          // Update canvas size to match actual surface dimensions,
+          // unless the display size is pinned by a ResizeObserver.
+          if (this.canvas && !this._displaySize) {
+            this.canvas.width = this.surface.width;
+            this.canvas.height = this.surface.height;
+          }
         }
       }
+      // Flush any pending resize now that we have the surface info.
+      this.flushPendingResize();
+      // Repaint on any surface change (e.g. resize, new frame decoded
+      // while listener was briefly detached).
+      this.blitFromStore(store);
     });
 
+    // Frame listener — must always be registered so decoded frames are
+    // painted to the visible canvas regardless of connection state.
     this.unsubFrame = store.onFrame((sid) => {
       if (sid !== this._surfaceId) return;
       this.blitFromStore(store);
     });
+  }
+
+  private unsubscribeAll(): void {
+    this.unsubFrame?.();
+    this.unsubChange?.();
+    this.unsubFrame = null;
+    this.unsubChange = null;
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */
@@ -422,8 +476,26 @@ export class BlitSurfaceCanvas {
 
     if (this._displaySize) {
       // Resizable mode: canvas resolution is pinned to the container's
-      // physical pixel size.  Draw the source frame scaled to fill.
-      ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+      // physical pixel size.  Draw the source frame scaled to fit,
+      // preserving aspect ratio (letterbox/pillarbox).
+      const srcAR = src.width / src.height;
+      const dstAR = canvas.width / canvas.height;
+      let dw: number, dh: number, dx: number, dy: number;
+      if (srcAR > dstAR) {
+        // Source is wider — pillarbox (bars top/bottom)
+        dw = canvas.width;
+        dh = canvas.width / srcAR;
+        dx = 0;
+        dy = (canvas.height - dh) / 2;
+      } else {
+        // Source is taller — letterbox (bars left/right)
+        dh = canvas.height;
+        dw = canvas.height * srcAR;
+        dx = (canvas.width - dw) / 2;
+        dy = 0;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(src, dx, dy, dw, dh);
     } else {
       // Frame-tracking mode: canvas resolution follows the source frame.
       if (canvas.width !== src.width || canvas.height !== src.height) {
@@ -436,10 +508,7 @@ export class BlitSurfaceCanvas {
 
   private resubscribe(): void {
     this.serverUnsubscribe();
-    this.unsubFrame?.();
-    this.unsubChange?.();
-    this.unsubFrame = null;
-    this.unsubChange = null;
+    this.unsubscribeAll();
     if (!this.disposed) this.subscribe();
   }
 

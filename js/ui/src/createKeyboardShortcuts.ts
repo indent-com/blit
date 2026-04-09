@@ -38,7 +38,7 @@ export interface KeyboardShortcutHandlers {
   togglePreviewPanel: () => void;
   createAndFocus: () => Promise<void>;
   createInPane: (paneId: string) => Promise<void>;
-  openNewTerminalPicker: () => void;
+  openNewTerminalPicker: (paneId?: string) => void;
   handleRestartOrClose: () => void;
   connectionCount: () => number;
   /** Focus a session by ID, updating BSP pane focus if a layout is active */
@@ -80,7 +80,13 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           // Let the overlay handle it.
           return;
         }
-        if (h.connectionCount() <= 1) {
+        if (h.activeLayout() && h.bspFocusedPaneId()) {
+          if (h.connectionCount() <= 1) {
+            void h.createInPane(h.bspFocusedPaneId()!);
+          } else {
+            h.openNewTerminalPicker(h.bspFocusedPaneId()!);
+          }
+        } else if (h.connectionCount() <= 1) {
           void h.createAndFocus();
         } else {
           h.openNewTerminalPicker();
@@ -114,7 +120,7 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           return;
         }
       }
-      if (mod && e.shiftKey && e.key === "Q") {
+      if (e.ctrlKey && e.shiftKey && e.key === "Q") {
         if (h.overlay()) return;
         e.preventDefault();
         const sid = h.focusedSurfaceId();
@@ -147,8 +153,8 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           .sessions()
           .filter((s) => s.state !== "closed")
           .map((s) => s.id);
+        if (all.length === 0) return;
         const currentId = h.focusedSessionId();
-        if (all.length < 2 || !currentId) return;
         const la = h.layoutAssignments();
         const fpId = h.bspFocusedPaneId();
         if (la && fpId) {
@@ -160,20 +166,37 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
               .map(([, sid]) => sid as string),
           );
           const candidates = all.filter((id) => !assignedElsewhere.has(id));
-          if (candidates.length < 2) return;
-          const index = candidates.indexOf(currentId);
-          const nextId =
-            e.code === "BracketRight"
-              ? candidates[(index + 1) % candidates.length]
-              : candidates[(index - 1 + candidates.length) % candidates.length];
+          if (candidates.length === 0) return;
+          const index = currentId ? candidates.indexOf(currentId) : -1;
+          if (index >= 0 && candidates.length < 2) return;
+          let nextId: string;
+          if (index < 0) {
+            nextId =
+              e.code === "BracketRight"
+                ? candidates[0]
+                : candidates[candidates.length - 1];
+          } else {
+            nextId =
+              e.code === "BracketRight"
+                ? candidates[(index + 1) % candidates.length]
+                : candidates[
+                    (index - 1 + candidates.length) % candidates.length
+                  ];
+          }
           h.focusBySession(nextId);
         } else {
           // No layout: simple global cycle.
-          const index = all.indexOf(currentId);
-          const nextId =
-            e.code === "BracketRight"
-              ? all[(index + 1) % all.length]
-              : all[(index - 1 + all.length) % all.length];
+          const index = currentId ? all.indexOf(currentId) : -1;
+          if (index >= 0 && all.length < 2) return;
+          let nextId: string;
+          if (index < 0) {
+            nextId = e.code === "BracketRight" ? all[0] : all[all.length - 1];
+          } else {
+            nextId =
+              e.code === "BracketRight"
+                ? all[(index + 1) % all.length]
+                : all[(index - 1 + all.length) % all.length];
+          }
           h.focusBySession(nextId);
         }
         return;

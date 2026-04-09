@@ -1,8 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use blit_compositor::PixelData;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use blit_remote::SURFACE_FRAME_CODEC_H265;
+
 use blit_remote::{
     CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264, CODEC_SUPPORT_H265, SURFACE_FRAME_CODEC_AV1,
     SURFACE_FRAME_CODEC_H264,
@@ -192,9 +193,9 @@ enum SurfaceEncoderKind {
     NvencH264(Box<crate::nvenc_encode::NvencDirectEncoder>),
     NvencH265(Box<crate::nvenc_encode::NvencDirectEncoder>),
     NvencAV1(Box<crate::nvenc_encode::NvencDirectEncoder>),
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     H264Vaapi(Box<crate::vaapi_encode::VaapiDirectEncoder>),
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     H265Vaapi(Box<crate::vaapi_encode::VaapiHevcEncoder>),
     AV1Software(Box<SoftwareAV1Encoder>),
 }
@@ -298,7 +299,7 @@ impl SurfaceEncoder {
                     crate::nvenc_encode::NvencDirectEncoder::try_new("av1", width, height)?,
                 )),
             }),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderPreference::H264Vaapi => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
                 Ok(Self {
@@ -315,7 +316,7 @@ impl SurfaceEncoder {
                     )),
                 })
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderPreference::H265Vaapi => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
                 Ok(Self {
@@ -332,7 +333,7 @@ impl SurfaceEncoder {
                     )),
                 })
             }
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             SurfaceEncoderPreference::H264Vaapi | SurfaceEncoderPreference::H265Vaapi => {
                 Err("VA-API is only available on Unix".into())
             }
@@ -375,9 +376,9 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::NvencH264(_) => "nvenc-h264",
             SurfaceEncoderKind::NvencH265(_) => "nvenc-h265",
             SurfaceEncoderKind::NvencAV1(_) => "nvenc-av1",
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(_) => "h264-vaapi",
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H265Vaapi(_) => "h265-vaapi",
             SurfaceEncoderKind::AV1Software(_) => "av1-software",
         }
@@ -386,9 +387,9 @@ impl SurfaceEncoder {
     pub fn codec_flag(&self) -> u8 {
         match &self.kind {
             SurfaceEncoderKind::H264Software(_) => SURFACE_FRAME_CODEC_H264,
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(_) => SURFACE_FRAME_CODEC_H264,
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H265Vaapi(_) => SURFACE_FRAME_CODEC_H265,
             SurfaceEncoderKind::NvencH264(enc)
             | SurfaceEncoderKind::NvencH265(enc)
@@ -403,9 +404,9 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::NvencH264(enc)
             | SurfaceEncoderKind::NvencH265(enc)
             | SurfaceEncoderKind::NvencAV1(enc) => enc.request_keyframe(),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.request_keyframe(),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H265Vaapi(enc) => enc.request_keyframe(),
             SurfaceEncoderKind::AV1Software(enc) => enc.request_keyframe(),
         }
@@ -469,7 +470,7 @@ impl SurfaceEncoder {
                 }
                 enc.encode_bgra(&bgra)
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => {
                 let mut bgra = rgba.into_owned();
                 for px in bgra.chunks_exact_mut(4) {
@@ -478,7 +479,7 @@ impl SurfaceEncoder {
                 let (sw, sh) = (self.source_width as usize, self.source_height as usize);
                 enc.encode_bgra_padded(&bgra, sw, sh)
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H265Vaapi(enc) => {
                 let mut bgra = rgba.into_owned();
                 for px in bgra.chunks_exact_mut(4) {
@@ -488,28 +489,6 @@ impl SurfaceEncoder {
                 enc.encode_bgra_padded(&bgra, sw, sh)
             }
             SurfaceEncoderKind::AV1Software(encoder) => encoder.encode(&rgba),
-        }
-    }
-
-    /// Encode a single keyframe.  For AV1 (rav1e with rdo_lookahead=1) the
-    /// first encode primes the pipeline and the second flushes the keyframe.
-    /// H.264 encoders produce output on the first call.
-    #[cfg(test)]
-    fn encode_keyframe(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        self.request_keyframe();
-        let first = self.encode(rgba);
-        if first.is_some() {
-            return first;
-        }
-        // Pipeline wasn't ready — flush to force output.
-        self.flush_keyframe(rgba)
-    }
-
-    /// Feed a frame, flush the encoder, and drain packets.
-    fn flush_keyframe(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        match &mut self.kind {
-            SurfaceEncoderKind::AV1Software(enc) => enc.flush_encode(rgba),
-            _ => self.encode(rgba),
         }
     }
 
@@ -524,7 +503,7 @@ impl SurfaceEncoder {
             } => self.encode_nv12(data, *y_stride, *uv_stride),
             PixelData::Bgra(bgra) => self.encode_bgra(bgra),
             PixelData::Rgba(rgba) => self.encode(rgba),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             PixelData::DmaBuf {
                 fd,
                 fourcc,
@@ -532,66 +511,70 @@ impl SurfaceEncoder {
                 stride,
                 offset,
             } => self.encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset),
-            #[cfg(not(unix))]
-            PixelData::DmaBuf { .. } => None,
-        }
-    }
-
-    /// Encode a keyframe from native pixel data.
-    pub fn encode_keyframe_pixels(&mut self, pixels: &PixelData) -> Option<(Vec<u8>, bool)> {
-        self.request_keyframe();
-        let first = self.encode_pixels(pixels);
-        if first.is_some() {
-            return first;
-        }
-        // Pipeline wasn't ready — flush to force output.
-        match pixels {
-            PixelData::Rgba(rgba) => self.flush_keyframe(rgba),
-            PixelData::Bgra(bgra) => self.flush_keyframe_bgra(bgra),
-            PixelData::Nv12 {
-                data,
-                y_stride,
-                uv_stride,
-            } => self.flush_keyframe_nv12(data, *y_stride, *uv_stride),
-            #[cfg(unix)]
-            PixelData::DmaBuf {
-                fd,
-                fourcc,
-                modifier,
-                stride,
-                offset,
-            } => {
-                // DmaBuf path always produces output on first call (no pipeline priming).
-                self.encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset)
-            }
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             PixelData::DmaBuf { .. } => None,
         }
     }
 
     /// Encode from a DMA-BUF fd — tries zero-copy GPU import first,
     /// falls back to CPU mmap readback if no GPU path is available.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn encode_dmabuf(
         &mut self,
         fd: &std::os::fd::OwnedFd,
         fourcc: u32,
-        _modifier: u64,
+        modifier: u64,
         stride: u32,
         offset: u32,
     ) -> Option<(Vec<u8>, bool)> {
-        // TODO: Try VA-API VPP zero-copy or CUDA-EGL zero-copy here.
-        // When implemented, a successful GPU encode returns early.
+        use std::os::fd::AsRawFd;
+
+        // The encoder's source dimensions match the DMA-BUF dimensions
+        // (both come from last_pixels).
+        let src_w = self.source_width;
+        let src_h = self.source_height;
+
+        // --- Zero-copy GPU path (VA-API VPP) ---
+        // Import the DMA-BUF directly into a VASurface via PRIME_2, convert
+        // BGRA→NV12 on the GPU via VPP, then encode.  No CPU mmap needed.
+        match &mut self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => {
+                if let Some(result) = enc.encode_dmabuf_fd(
+                    fd.as_raw_fd(),
+                    fourcc,
+                    modifier,
+                    stride,
+                    offset,
+                    src_w,
+                    src_h,
+                ) {
+                    return Some(result);
+                }
+            }
+            SurfaceEncoderKind::H265Vaapi(enc) => {
+                if let Some(result) = enc.encode_dmabuf_fd(
+                    fd.as_raw_fd(),
+                    fourcc,
+                    modifier,
+                    stride,
+                    offset,
+                    src_w,
+                    src_h,
+                ) {
+                    return Some(result);
+                }
+            }
+            _ => {}
+        }
 
         // --- CPU readback fallback ---
-        // The DMA-BUF fd is still valid (dup'd from the Wayland buffer).
-        // mmap it and read the pixels just like the compositor would.
+        // Only reached if zero-copy failed (VPP unavailable, or non-VA-API encoder).
         self.encode_dmabuf_cpu_fallback(fd, fourcc, stride, offset)
     }
 
     /// CPU-side fallback for DMA-BUF encoding: mmap the fd, read pixels,
     /// and encode through the normal BGRA/NV12 path.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn encode_dmabuf_cpu_fallback(
         &mut self,
         fd: &std::os::fd::OwnedFd,
@@ -690,6 +673,37 @@ impl SurfaceEncoder {
                 }
                 self.encode(&packed)
             }
+        } else if fourcc == blit_compositor::drm_fourcc::NV12 {
+            // NV12: Y plane at offset 0 with `stride` pitch, UV plane
+            // immediately following at y_size offset with the same pitch.
+            // For linear single-fd NV12 DMA-BUFs both planes are contiguous.
+            let uv_stride = stride; // UV stride matches Y stride for linear NV12
+            let y_size = stride * h;
+            let uv_h = h.div_ceil(2);
+            let uv_size = uv_stride * uv_h;
+            if map_len >= y_size + uv_size {
+                // Pack Y rows then UV rows tightly (strip stride padding).
+                let out_stride = w;
+                let mut data = vec![0u8; out_stride * h + out_stride * uv_h];
+                for row in 0..h {
+                    let src = row * stride;
+                    let dst = row * out_stride;
+                    if src + w <= plane_data.len() {
+                        data[dst..dst + w].copy_from_slice(&plane_data[src..src + w]);
+                    }
+                }
+                let uv_dst_base = out_stride * h;
+                for row in 0..uv_h {
+                    let src = y_size + row * uv_stride;
+                    let dst = uv_dst_base + row * out_stride;
+                    if src + w <= plane_data.len() {
+                        data[dst..dst + w].copy_from_slice(&plane_data[src..src + w]);
+                    }
+                }
+                self.encode_nv12(&data, out_stride, out_stride)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -724,9 +738,9 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::NvencH264(enc)
             | SurfaceEncoderKind::NvencH265(enc)
             | SurfaceEncoderKind::NvencAV1(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H265Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
             SurfaceEncoderKind::AV1Software(encoder) => {
                 let yuv = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
@@ -742,9 +756,9 @@ impl SurfaceEncoder {
             *is_key = match &self.kind {
                 SurfaceEncoderKind::NvencH264(_) => h264_stream_contains_idr(data),
                 SurfaceEncoderKind::NvencH265(_) => h265_stream_contains_idr(data),
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 SurfaceEncoderKind::H264Vaapi(_) => h264_stream_contains_idr(data),
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 SurfaceEncoderKind::H265Vaapi(_) => h265_stream_contains_idr(data),
                 _ => false,
             };
@@ -794,7 +808,7 @@ impl SurfaceEncoder {
                 let rgba = pd.to_rgba(self.source_width, self.source_height);
                 self.encode(&rgba)
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => {
                 let uv_offset = y_stride * src_h;
                 let y_data = &data[..uv_offset];
@@ -807,7 +821,7 @@ impl SurfaceEncoder {
                 }
                 r
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H265Vaapi(enc) => {
                 let uv_offset = y_stride * src_h;
                 let y_data = &data[..uv_offset];
@@ -823,29 +837,6 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::AV1Software(encoder) => {
                 encoder.encode_nv12(data, y_stride, uv_stride, src_w, src_h)
             }
-        }
-    }
-
-    fn flush_keyframe_bgra(&mut self, bgra: &[u8]) -> Option<(Vec<u8>, bool)> {
-        match &mut self.kind {
-            SurfaceEncoderKind::AV1Software(enc) => enc.flush_encode_bgra(bgra),
-            _ => self.encode_bgra(bgra),
-        }
-    }
-
-    fn flush_keyframe_nv12(
-        &mut self,
-        data: &[u8],
-        y_stride: usize,
-        uv_stride: usize,
-    ) -> Option<(Vec<u8>, bool)> {
-        match &mut self.kind {
-            SurfaceEncoderKind::AV1Software(enc) => {
-                let w = self.width as usize;
-                let h = self.height as usize;
-                enc.flush_encode_nv12(data, y_stride, uv_stride, w, h)
-            }
-            _ => self.encode_nv12(data, y_stride, uv_stride),
         }
     }
 }
@@ -1032,11 +1023,6 @@ fn compute_uv_planes_padded(
     }
 }
 
-/// BGRA -> I420 (Y + U + V planar).  No intermediate RGBA step.
-fn bgra_to_yuv420(bgra: &[u8], width: usize, height: usize) -> Vec<u8> {
-    bgra_to_yuv420_padded(bgra, width, height, width, height)
-}
-
 /// BGRA -> I420 with edge-pixel padding to encoder dimensions.
 /// `src_w × src_h` is the actual pixel count in `bgra`.
 /// `enc_w × enc_h` is the encoder output dimensions (>= src).
@@ -1071,89 +1057,6 @@ fn rgba_to_yuv420(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     compute_y_plane(rgba, width, height, y_plane, 0, 1, 2);
     compute_uv_planes(rgba, width, height, u_plane, v_plane, 0, 1, 2);
     yuv
-}
-
-/// Simple BGRA -> RGBA bulk swizzle for fallback paths.
-#[cfg(test)]
-fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = vec![0u8; bgra.len()];
-    for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
-    }
-    rgba
-}
-
-/// Write Y plane from packed 4-byte pixels into an NV12 Y plane buffer.
-#[cfg(test)]
-#[inline(always)]
-fn write_nv12_y_plane_packed(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    y_plane: &mut [u8],
-    y_stride: usize,
-    r_off: usize,
-    g_off: usize,
-    b_off: usize,
-) -> Option<()> {
-    if y_plane.len() < y_stride.checked_mul(height)? {
-        return None;
-    }
-    for row in 0..height {
-        let dst_start = row * y_stride;
-        let src_row = row * width * 4;
-        for col in 0..width {
-            let i = src_row + col * 4;
-            let r = src[i + r_off] as i32;
-            let g = src[i + g_off] as i32;
-            let b = src[i + b_off] as i32;
-            y_plane[dst_start + col] = rgb_to_y(r, g, b);
-        }
-    }
-    Some(())
-}
-
-/// Write UV plane from packed 4-byte pixels into an NV12 UV plane buffer.
-#[cfg(test)]
-#[inline(always)]
-fn write_nv12_uv_plane_packed(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    uv_plane: &mut [u8],
-    uv_stride: usize,
-    r_off: usize,
-    g_off: usize,
-    b_off: usize,
-) -> Option<()> {
-    if uv_plane.len() < uv_stride.checked_mul(height / 2)? {
-        return None;
-    }
-    let chroma_w = (width / 2) * 2;
-    let chroma_h = (height / 2) * 2;
-    for row in (0..chroma_h).step_by(2) {
-        let dst_start = (row / 2) * uv_stride;
-        for col in (0..chroma_w).step_by(2) {
-            let mut u_sum = 0i32;
-            let mut v_sum = 0i32;
-            for dy in 0..2usize {
-                for dx in 0..2usize {
-                    let i = ((row + dy) * width + col + dx) * 4;
-                    let r = src[i + r_off] as i32;
-                    let g = src[i + g_off] as i32;
-                    let b = src[i + b_off] as i32;
-                    u_sum += rgb_to_u(r, g, b) as i32;
-                    v_sum += rgb_to_v(r, g, b) as i32;
-                }
-            }
-            uv_plane[dst_start + col] = (u_sum / 4) as u8;
-            uv_plane[dst_start + col + 1] = (v_sum / 4) as u8;
-        }
-    }
-    Some(())
 }
 
 /// NV12 -> I420: Y plane memcpy + UV deinterleave.
@@ -1194,43 +1097,6 @@ fn nv12_to_yuv420(
     }
 
     yuv
-}
-
-#[cfg(test)]
-fn write_nv12_y_plane(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    y_plane: &mut [u8],
-    y_stride: usize,
-) -> Option<()> {
-    write_nv12_y_plane_packed(rgba, width, height, y_plane, y_stride, 0, 1, 2)
-}
-
-#[cfg(test)]
-fn write_nv12_uv_plane(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    uv_plane: &mut [u8],
-    uv_stride: usize,
-) -> Option<()> {
-    write_nv12_uv_plane_packed(rgba, width, height, uv_plane, uv_stride, 0, 1, 2)
-}
-
-#[cfg(test)]
-fn rgba_to_nv12(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    y_plane: &mut [u8],
-    y_stride: usize,
-    uv_plane: &mut [u8],
-    uv_stride: usize,
-) -> Option<()> {
-    write_nv12_y_plane(rgba, width, height, y_plane, y_stride)?;
-    write_nv12_uv_plane(rgba, width, height, uv_plane, uv_stride)?;
-    Some(())
 }
 
 /// Scan an Annex B H.264 bitstream for an IDR NAL unit (type 5).
@@ -1369,12 +1235,6 @@ impl SoftwareAV1Encoder {
         self.encode_yuv_planes(&yuv)
     }
 
-    #[allow(dead_code)]
-    fn encode_bgra(&mut self, bgra: &[u8]) -> Option<(Vec<u8>, bool)> {
-        let yuv = bgra_to_yuv420(bgra, self.width, self.height);
-        self.encode_yuv_planes(&yuv)
-    }
-
     fn encode_nv12(
         &mut self,
         data: &[u8],
@@ -1430,72 +1290,6 @@ impl SoftwareAV1Encoder {
             }
             Err(rav1e::EncoderStatus::Encoded) | Err(rav1e::EncoderStatus::NeedMoreData) => None,
             Err(_) => None,
-        }
-    }
-
-    /// Feed a frame, flush, and drain until a packet is produced.
-    fn flush_encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        let yuv = rgba_to_yuv420(rgba, self.width, self.height);
-        self.flush_yuv_planes(&yuv)
-    }
-
-    fn flush_encode_bgra(&mut self, bgra: &[u8]) -> Option<(Vec<u8>, bool)> {
-        let yuv = bgra_to_yuv420(bgra, self.width, self.height);
-        self.flush_yuv_planes(&yuv)
-    }
-
-    fn flush_encode_nv12(
-        &mut self,
-        data: &[u8],
-        y_stride: usize,
-        uv_stride: usize,
-        width: usize,
-        height: usize,
-    ) -> Option<(Vec<u8>, bool)> {
-        let yuv = nv12_to_yuv420(data, y_stride, uv_stride, width, height);
-        self.flush_yuv_planes(&yuv)
-    }
-
-    fn flush_yuv_planes(&mut self, yuv: &[u8]) -> Option<(Vec<u8>, bool)> {
-        use rav1e::prelude::*;
-
-        let width = self.width;
-        let height = self.height;
-        let y_size = width * height;
-        let uv_w = width.div_ceil(2);
-        let uv_h = height.div_ceil(2);
-        let uv_size = uv_w * uv_h;
-
-        let y_plane = &yuv[..y_size];
-        let u_plane = &yuv[y_size..y_size + uv_size];
-        let v_plane = &yuv[y_size + uv_size..];
-
-        let mut frame = self.ctx.new_frame();
-        frame.planes[0].copy_from_raw_u8(y_plane, width, 1);
-        frame.planes[1].copy_from_raw_u8(u_plane, uv_w, 1);
-        frame.planes[2].copy_from_raw_u8(v_plane, uv_w, 1);
-
-        let params = FrameParameters {
-            frame_type_override: FrameTypeOverride::Key,
-            ..Default::default()
-        };
-        if self.ctx.send_frame((frame, params)).is_err() {
-            return None;
-        }
-        self.ctx.flush();
-
-        loop {
-            match self.ctx.receive_packet() {
-                Ok(packet) => {
-                    let is_key = packet.frame_type == FrameType::KEY;
-                    return Some((packet.data, is_key));
-                }
-                Err(rav1e::EncoderStatus::NeedMoreData) | Err(rav1e::EncoderStatus::Encoded) => {
-                    continue;
-                }
-                Err(rav1e::EncoderStatus::LimitReached) => return None,
-                Err(_) => return None,
-            }
         }
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts blit-server and blit-gateway for e2e tests.
+# Starts blit server and blit gateway for e2e tests.
 # The gateway proxies to the server over a Unix socket.
 # Exits when either process exits.
 set -euo pipefail
@@ -18,8 +18,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Start blit-server
-"${REPO_ROOT}/target/debug/blit-server" &
+# Start blit server
+"${REPO_ROOT}/target/debug/blit" server &
 SERVER_PID=$!
 
 # Wait for socket to appear
@@ -31,19 +31,19 @@ for i in $(seq 1 30); do
 done
 
 if [ ! -S "$BLIT_SOCK" ]; then
-    echo "ERROR: blit-server socket did not appear at $BLIT_SOCK" >&2
+    echo "ERROR: blit server socket did not appear at $BLIT_SOCK" >&2
     exit 1
 fi
 
-echo "blit-server started (pid=$SERVER_PID, socket=$BLIT_SOCK)"
+echo "blit server started (pid=$SERVER_PID, socket=$BLIT_SOCK)"
 
-# Start blit-gateway
+# Start blit gateway
 export BLIT_PASSPHRASE="${BLIT_PASSPHRASE:-test-secret}"
 export BLIT_ADDR="${BLIT_ADDR:-127.0.0.1:3274}"
-"${REPO_ROOT}/target/debug/blit-gateway" &
+"${REPO_ROOT}/target/debug/blit" gateway &
 GATEWAY_PID=$!
 
-echo "blit-gateway started (pid=$GATEWAY_PID, addr=$BLIT_ADDR)"
+echo "blit gateway started (pid=$GATEWAY_PID, addr=$BLIT_ADDR)"
 echo "READY"
 
 # Wait for either to exit

@@ -19,6 +19,7 @@ export type { CellMetrics } from "./measure";
 export { WebSocketTransport } from "./transports/websocket";
 export { WebTransportTransport } from "./transports/webtransport";
 export { createShareTransport } from "./transports/webrtc-share";
+export { MuxTransport, MuxChannel } from "./transports/mux";
 
 export { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
 export type {

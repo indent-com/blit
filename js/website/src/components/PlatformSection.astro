@@ -1,8 +1,8 @@
 ---
 const platforms = [
-  { os: "Linux", arch: "x86_64, arm64", wayland: true, notes: "Full features" },
-  { os: "macOS", arch: "arm64", wayland: true, notes: "Full features" },
-  { os: "Windows", arch: "x86_64", wayland: false, notes: "PTY multiplexing only" },
+  { os: "Linux", arch: "x86_64, arm64", wayland: true },
+  { os: "macOS", arch: "arm64", wayland: false },
+  { os: "Windows", arch: "x86_64", wayland: false },
 ];
 ---
 
@@ -19,21 +19,19 @@ const platforms = [
         <tr class="border-b border-[var(--border)]">
           <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Platform</th>
           <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Arch</th>
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Wayland compositor</th>
-          <th class="text-left py-2 font-bold text-[var(--bright)]">Notes</th>
+          <th class="text-left py-2 font-bold text-[var(--bright)]">Wayland compositor <span class="text-[10px] font-normal uppercase tracking-wider text-[var(--accent)] opacity-70">Experimental</span></th>
         </tr>
       </thead>
       <tbody>
-        {platforms.map(({ os, arch, wayland, notes }) => (
+        {platforms.map(({ os, arch, wayland }) => (
           <tr class="border-b border-[var(--border)] last:border-0">
             <td class="py-2.5 pr-6 text-[var(--fg)] font-medium">{os}</td>
             <td class="py-2.5 pr-6 text-[var(--dim)] font-mono text-xs">{arch}</td>
-            <td class="py-2.5 pr-6">
+            <td class="py-2.5">
               {wayland
                 ? <span class="text-[var(--green)]">Yes</span>
                 : <span class="text-[var(--dim)] opacity-60">No</span>}
             </td>
-            <td class="py-2.5 text-[var(--dim)]">{notes}</td>
           </tr>
         ))}
       </tbody>

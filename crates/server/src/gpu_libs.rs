@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 // dlopen helpers
 // ---------------------------------------------------------------------------
 
-struct DynLib {
+pub(crate) struct DynLib {
     handle: *mut c_void,
 }
 
@@ -26,10 +26,22 @@ unsafe impl Sync for DynLib {}
 
 impl DynLib {
     #[cfg(unix)]
-    fn open(names: &[&str]) -> Option<Self> {
+    pub(crate) fn open(names: &[&str]) -> Option<Self> {
+        Self::open_flags(names, libc::RTLD_NOW | libc::RTLD_LOCAL)
+    }
+
+    /// Open with RTLD_GLOBAL — needed for GLVND so EGL and GL dispatch
+    /// tables are shared across libEGL.so and libGLESv2.so.
+    #[cfg(unix)]
+    pub(crate) fn open_global(names: &[&str]) -> Option<Self> {
+        Self::open_flags(names, libc::RTLD_NOW | libc::RTLD_GLOBAL)
+    }
+
+    #[cfg(unix)]
+    fn open_flags(names: &[&str], flags: libc::c_int) -> Option<Self> {
         for name in names {
             let cname = std::ffi::CString::new(*name).ok()?;
-            let handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+            let handle = unsafe { libc::dlopen(cname.as_ptr(), flags) };
             if !handle.is_null() {
                 eprintln!("[gpu-libs] loaded {name}");
                 return Some(Self { handle });
@@ -39,12 +51,12 @@ impl DynLib {
     }
 
     #[cfg(not(unix))]
-    fn open(_names: &[&str]) -> Option<Self> {
+    pub(crate) fn open(_names: &[&str]) -> Option<Self> {
         None
     }
 
     #[cfg(unix)]
-    unsafe fn sym<T>(&self, name: &str) -> Option<T> {
+    pub(crate) unsafe fn sym<T>(&self, name: &str) -> Option<T> {
         let cname = std::ffi::CString::new(name).ok()?;
         let ptr = unsafe { libc::dlsym(self.handle, cname.as_ptr()) };
         if ptr.is_null() {

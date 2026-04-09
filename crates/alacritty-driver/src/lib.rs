@@ -1203,7 +1203,7 @@ mod integration_tests {
         );
 
         let heart_col = 15usize;
-        let f1 = frame.cells()[(1 * cols as usize + heart_col) * CELL_SIZE + 1];
+        let f1 = frame.cells()[((cols as usize) + heart_col) * CELL_SIZE + 1];
         assert!(
             f1 & (1 << 1) != 0,
             "heart cell at col {heart_col} should have WIDE_CHAR flag, f1={f1:#010b}"

@@ -15,7 +15,7 @@ Detailed references:
 
 ```mermaid
 graph TB
-    subgraph server["blit-server"]
+    subgraph server["blit server"]
         PTY["PTY / shell"]
         COMP["blit-compositor\n(Wayland, experimental)"]
         PARSE["alacritty_terminal\n→ FrameState → diff + LZ4"]
@@ -28,9 +28,9 @@ graph TB
     end
 
     subgraph connlayer["connection layer"]
-        GW["blit-gateway"]
+        GW["blit gateway"]
         CLI["blit (embedded gateway)"]
-        PROXY["blit-proxy\n(connection pool)"]
+        PROXY["blit proxy-daemon\n(connection pool)"]
     end
 
     SOCK -->|Unix socket| GW
@@ -62,11 +62,11 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `@blit-sh/core`         | `js/core/`                 | npm           | Framework-agnostic core: transports, workspace, connections, terminal surface, WebGL renderer                        |
 | `@blit-sh/react`        | `js/react/`                | npm           | Thin React wrapper: context provider, hooks, `BlitTerminal` component                                                |
 | `@blit-sh/solid`        | `js/solid/`                | npm           | Thin Solid wrapper: context provider, primitives, `BlitTerminal` component                                           |
-| `blit-server`           | `crates/server/`           | bin           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
-| `blit-gateway`          | `crates/gateway/`          | bin           | WebSocket/WebTransport proxy with passphrase auth. Multi-destination, live remotes.                                  |
-| `blit-proxy`            | `crates/proxy/`            | bin           | Connection pool and transparent proxy. One process, multiple upstream targets, pre-warmed pools.                     |
+| `blit-server`           | `crates/server/`           | lib           | PTY host and frame scheduler. Listens on Unix socket.                                                                |
+| `blit-gateway`          | `crates/gateway/`          | lib           | WebSocket/WebTransport proxy with passphrase auth. Multi-destination, live remotes.                                  |
+| `blit-proxy`            | `crates/proxy/`            | lib           | Connection pool and transparent proxy. One process, multiple upstream targets, pre-warmed pools.                     |
 | `blit` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH/proxy/share transports, `remote` management, `server`/`share` subcommands     |
-| `blit-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib + bin     | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                        |
+| `blit-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib           | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                        |
 | `blit-fonts`            | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
 | `blit-webserver`        | `crates/webserver/`        | lib           | Shared axum helpers: HTML serving, font routes, config WebSocket, remotes file                                       |
 | `blit-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (smithay): surface multiplexing, input injection                            |
@@ -110,27 +110,27 @@ See [docs/transports.md](docs/transports.md) for the full transport reference. T
 
 ```mermaid
 graph LR
-    S["blit-server"] -->|Unix| C["blit\n(embedded gateway)"]
+    S["blit server"] -->|Unix| C["blit\n(embedded gateway)"]
     C -->|WebSocket| B["browser"]
 ```
 
-`blit open` auto-starts `blit-server` if needed, embeds a temporary gateway, and opens the browser. Everything runs in one user session.
+`blit open` auto-starts `blit server` if needed, embeds a temporary gateway, and opens the browser. Everything runs in one user session.
 
 ### 2. Remote via SSH (`blit remote add host ssh:host && blit open`)
 
 ```mermaid
 graph LR
-    S["blit-server\n(remote)"] -->|Unix| C["blit\n(embedded gateway\n+ embedded SSH)"]
+    S["blit server\n(remote)"] -->|Unix| C["blit\n(embedded gateway\n+ embedded SSH)"]
     C -->|WebSocket| B["browser"]
 ```
 
 SSH remotes configured in `blit.remotes` are connected via an embedded SSH client (russh). The embedded client authenticates via ssh-agent and key files, resolves `~/.ssh/config`, and opens `direct-streamlocal` channels to the remote blit socket. Multiple channels share a single TCP+SSH connection per host.
 
-### 3. Persistent gateway (`blit-gateway`)
+### 3. Persistent gateway (`blit gateway`)
 
 ```mermaid
 graph LR
-    S["blit-server"] -->|Unix| G["blit-gateway"]
+    S["blit server"] -->|Unix| G["blit gateway"]
     G -->|WebSocket / WebTransport| B["browser"]
 ```
 
@@ -140,34 +140,29 @@ For a permanent deployment. The gateway handles browser auth (passphrase), serve
 
 ```mermaid
 graph LR
-    SA["blit-server-rabbit"] -->|SSH| G["blit-gateway"]
-    SB["blit-server-hound"] -->|SSH| G
-    G -->|"WS /d/rabbit"| B["browser"]
-    G -->|"WS /d/hound"| B
+    SA["blit server (rabbit)"] -->|SSH| G["blit gateway"]
+    SB["blit server (hound)"] -->|SSH| G
+    G -->|"WS /mux"| B["browser"]
 ```
 
-The gateway reads `blit.remotes` and connects to each remote via the embedded SSH client. The browser receives all destinations over the `/config` WebSocket and opens one connection per destination. Session IDs are namespaced (`rabbit:1`, `hound:1`).
+The gateway reads `blit.remotes` and connects to each remote via the embedded SSH client. The browser opens a **single** WebSocket to `/mux` and multiplexes all destination traffic over it using 2-byte channel ID prefixes (see [docs/protocol.md § Multiplexed WebSocket](docs/protocol.md#multiplexed-websocket-mux)). Each channel maps to one upstream connection. Session IDs are namespaced (`rabbit:1`, `hound:1`). The legacy `/d/<name>` endpoint (one WS per destination) is still supported for backward compatibility.
 
-### 5. Proxy-accelerated gateway (`BLIT_PROXY=1`)
+### 5. Proxy-accelerated gateway
 
 ```mermaid
 graph LR
-    S["blit-server"] -->|Unix| P["blit-proxy\n(pools N idle connections)"]
-    P -->|Unix| G["blit-gateway"]
+    S["blit server"] -->|Unix| P["blit proxy-daemon\n(pools N idle connections)"]
+    P -->|Unix| G["blit gateway"]
     G -->|WebSocket| B["browser"]
 ```
 
-```bash
-BLIT_PROXY=1 blit-gateway
-```
-
-Each browser WebSocket is handed a pre-warmed upstream connection from the pool instead of opening a fresh one. Useful when the upstream is remote (TCP, WS, WT) and connection setup latency is perceptible.
+Enabled by default on Unix (disable with `BLIT_PROXY=0`). Each browser WebSocket is handed a pre-warmed upstream connection from the pool instead of opening a fresh one. Useful when the upstream is remote (TCP, WS, WT) and connection setup latency is perceptible.
 
 ### 6. WebRTC share (`blit share`)
 
 ```mermaid
 graph LR
-    S["blit-server"] -->|Unix| F["blit-webrtc-forwarder"]
+    S["blit server"] -->|Unix| F["blit share"]
     F <-->|signaling| H["hub.blit.sh"]
     H <-->|signaling| B["browser"]
     F <-->|WebRTC DataChannel| B
@@ -179,8 +174,8 @@ No gateway required. The forwarder advertises a passphrase-derived public key on
 
 ```mermaid
 graph LR
-    S["blit-server"] -->|Unix| F["blit-webrtc-forwarder"]
-    F <-->|WebRTC DataChannel| G["blit-gateway\n(BLIT_GATEWAY_WEBRTC=1)"]
+    S["blit server"] -->|Unix| F["blit share"]
+    F <-->|WebRTC DataChannel| G["blit gateway\n(BLIT_GATEWAY_WEBRTC=1)"]
     G -->|"WS /d/hound"| B["browser"]
 ```
 
@@ -202,7 +197,7 @@ Special key: `target = <uri-or-name>` — sets the default connection target for
 
 `name = uri` pairs, one per line. Contains passphrases for `share:` destinations and SSH host references, so permissions are restricted.
 
-Managed with `blit remote add/remove/list/set-default`. Watched at runtime by `blit-gateway` and the CLI's embedded gateway — changes are pushed live to all open `/config` WebSocket clients as `remotes:<text>` messages.
+Managed with `blit remote add/remove/list/set-default`. Watched at runtime by `blit gateway` and the CLI's embedded gateway — changes are pushed live to all open `/config` WebSocket clients as `remotes:<text>` messages.
 
 ---
 
@@ -240,15 +235,15 @@ The `remotes:` message carries the raw file text. The browser parses it as `name
 
 ---
 
-## blit-proxy protocol
+## blit proxy-daemon protocol
 
-`blit-proxy` listens on a Unix socket (`$XDG_RUNTIME_DIR/blit-proxy.sock`, or `/tmp/blit-proxy.sock` as fallback) on Unix and a named pipe (`\\.\pipe\blit-proxy`) on Windows. Clients declare their upstream target before the blit protocol begins:
+`blit proxy-daemon` listens on a Unix socket (`$XDG_RUNTIME_DIR/blit-proxy.sock`, or `/tmp/blit-proxy.sock` as fallback) on Unix and a named pipe (`\\.\pipe\blit-proxy`) on Windows. Clients declare their upstream target before the blit protocol begins:
 
 ```mermaid
 sequenceDiagram
     participant C as client (gateway / CLI)
-    participant P as blit-proxy
-    participant U as upstream blit-server
+    participant P as blit proxy-daemon
+    participant U as upstream blit server
 
     C->>P: target &lt;uri&gt;\n
     P->>U: connect (pooled or fresh)
@@ -278,19 +273,19 @@ Passphrase and cert hash are embedded as query parameters in the URI so the pool
 
 ## URI scheme reference
 
-All blit components share a common URI vocabulary for addressing blit-servers:
+All blit components share a common URI vocabulary for addressing blit server instances:
 
 | URI                          | Where accepted                  | Meaning                                                         |
 | ---------------------------- | ------------------------------- | --------------------------------------------------------------- |
-| `local`                      | CLI, `blit.remotes`             | Local blit-server (auto-start)                                  |
+| `local`                      | CLI, `blit.remotes`             | Local blit server (auto-start)                                  |
 | `socket:/path`               | CLI, `blit.remotes`, BLIT_DEST. | Unix socket / named pipe                                        |
 | `ssh:[user@]host[:/socket]`  | CLI, `blit.remotes`             | Embedded SSH (russh) + auto-install                             |
 | `tcp:host:port`              | CLI, `blit.remotes`, BLIT_DEST. | Raw TCP                                                         |
-| `ws[s]://host/?passphrase=…` | blit-proxy upstream             | WebSocket (plain or TLS)                                        |
-| `wt://host/?passphrase=…`    | blit-proxy upstream             | WebTransport / QUIC                                             |
+| `ws[s]://host/?passphrase=…` | blit proxy-daemon upstream      | WebSocket (plain or TLS)                                        |
+| `wt://host/?passphrase=…`    | blit proxy-daemon upstream      | WebTransport / QUIC                                             |
 | `share:passphrase`           | CLI, `blit.remotes`             | WebRTC via hub; gateway proxies it when `BLIT_GATEWAY_WEBRTC=1` |
 | `share:passphrase?hub=URL`   | `blit.remotes`                  | WebRTC via custom hub URL                                       |
-| `proxy:uri`                  | CLI (`--on`)                    | Explicitly route through blit-proxy                             |
+| `proxy:uri`                  | CLI (`--on`)                    | Explicitly route through blit proxy-daemon                      |
 | `name`                       | CLI (`--on`), blit.conf         | Named remote from blit.remotes                                  |
 
-The CLI uses `BLIT_NO_PROXY=1` to bypass proxy routing and connect directly for `ssh:`, `tcp:`, `ws:`, `wss:`, and `wt:` URIs.
+Set `BLIT_PROXY=0` to bypass proxy routing and connect directly for `ssh:`, `tcp:`, `ws:`, `wss:`, and `wt:` URIs.

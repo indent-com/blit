@@ -399,7 +399,7 @@ pub async fn connect_via_proxy(upstream_uri: &str) -> Result<Transport, String> 
 ///   proxy:<upstream-uri>       — explicitly route via blit-proxy
 ///   <name>                     — bare name: looked up in `blit.remotes`
 ///
-/// When `BLIT_NO_PROXY` is unset, ssh/tcp/ws/wss/wt URIs are automatically
+/// When `BLIT_PROXY` is not `0`, ssh/tcp/ws/wss/wt URIs are automatically
 /// routed via blit-proxy (equivalent to the `proxy:` prefix).
 pub async fn connect_uri(uri: &str, hub: &str) -> Result<Transport, String> {
     Box::pin(connect_uri_inner(
@@ -415,7 +415,7 @@ async fn connect_uri_inner(
     hub: &str,
     mut visited: std::collections::HashSet<String>,
 ) -> Result<Transport, String> {
-    // Explicit proxy: prefix — always via proxy regardless of BLIT_NO_PROXY.
+    // Explicit proxy: prefix — always via proxy regardless of BLIT_PROXY.
     if let Some(upstream) = uri.strip_prefix("proxy:") {
         return connect_via_proxy(upstream).await;
     }
@@ -450,7 +450,7 @@ async fn connect_uri_inner(
         // (only blit-proxy speaks those transports).
         return Err(format!(
             "{uri}: ws/wss/wt direct connection requires blit-proxy \
-             (set BLIT_NO_PROXY=1 is not supported for these transports)"
+             (set BLIT_PROXY=0 is not supported for these transports)"
         ));
     }
     if let Some(rest) = uri.strip_prefix("socket:") {
@@ -492,11 +492,9 @@ async fn connect_uri_inner(
 }
 
 /// Returns true when the proxy should be used automatically.
-/// Disabled by setting `BLIT_NO_PROXY=1`.
+/// Disabled by setting `BLIT_PROXY=0`.
 pub fn proxy_enabled() -> bool {
-    !std::env::var("BLIT_NO_PROXY")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var("BLIT_PROXY").ok().as_deref() != Some("0")
 }
 
 /// Return the configured default target URI, if any.

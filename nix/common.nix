@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.21.0";
+  version = "0.22.0";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
@@ -64,7 +64,9 @@ let
     ]
     ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
       pkgs.ffmpeg-headless
+      pkgs.libglvnd # EGL / GLESv2 dispatch
       pkgs.libva
+      pkgs.libgbm # libgbm for GBM device / buffer allocation
     ];
     nativeCheckInputs = [ ];
   }
@@ -90,6 +92,16 @@ let
   # Static (musl on Linux) Crane setup for release tarballs.
   craneLibStatic = (inputs.crane.mkLib pkgs.pkgsStatic).overrideToolchain rustToolchain;
 
+  # Mesa's meson.build uses shared_library() for libgbm, which the musl
+  # static toolchain cannot link.  Override to use library() so meson
+  # respects --default-library=static and produces libgbm.a.
+  staticLibgbm = pkgs.pkgsStatic.libgbm.overrideAttrs (old: {
+    postPatch = (old.postPatch or "") + ''
+      substituteInPlace src/gbm/meson.build \
+        --replace-fail "shared_library(" "library("
+    '';
+  });
+
   commonArgsStatic = {
     inherit src version;
     strictDeps = true;
@@ -97,6 +109,9 @@ let
     buildInputs = [
       pkgs.pkgsStatic.libxkbcommon
       pkgs.pkgsStatic.pixman
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      staticLibgbm
     ];
     RUSTFLAGS = "-C relocation-model=static";
   }

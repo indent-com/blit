@@ -330,7 +330,10 @@ pub fn spawn_pty(
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_output = SendHandle(handle.output);
     let notify = state.delivery_notify.clone();
-    let reader_handle = std::thread::spawn(move || pty_reader(reader_output, byte_tx, notify));
+    let reader_handle = std::thread::Builder::new()
+        .name(format!("pty-reader-{id}"))
+        .spawn(move || pty_reader(reader_output, byte_tx, notify))
+        .expect("failed to spawn pty-reader thread");
     let lflag_cache = pty_lflag(&handle);
 
     Some(crate::Pty {
@@ -472,6 +475,9 @@ pub fn respawn_child(
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_output = SendHandle(handle.output);
     let notify = state.delivery_notify.clone();
-    let reader_handle = std::thread::spawn(move || pty_reader(reader_output, byte_tx, notify));
+    let reader_handle = std::thread::Builder::new()
+        .name(format!("pty-reader-{pty_id}"))
+        .spawn(move || pty_reader(reader_output, byte_tx, notify))
+        .expect("failed to spawn pty-reader thread");
     Some((handle, reader_handle, byte_rx))
 }

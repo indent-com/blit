@@ -22,7 +22,7 @@ export function HelpOverlay(props: {
         [`${mod}+K`, t("help.menu")],
         [`${mod}+Enter`, t("help.newTerminal")],
         [`${mod}+Shift+Enter`, t("help.newTerminalHere")],
-        [`${mod}+Shift+Q`, t("help.closeTerminal")],
+        [`Ctrl+Shift+Q`, t("help.closeTerminal")],
         ["Alt+Shift+[ / ]", t("help.prevNextTerminal")],
         ["Ctrl+[ / ]", t("help.prevNextPane")],
         ["Ctrl+Shift+V", t("help.paste")],

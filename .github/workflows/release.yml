@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify-tag:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Verify tag signature via GitHub API
         env:
@@ -28,98 +28,21 @@ jobs:
             exit 1
           fi
 
-  build-debs:
+  build-packages:
     needs: [verify-tag]
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - run: ./bin/build-debs debs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: debs-${{ matrix.arch }}
-          path: debs/*.deb
-
-  build-tarballs:
-    needs: [verify-tag]
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            label: linux-x86_64
-          - runner: ubuntu-24.04-arm
-            label: linux-aarch64
-          - runner: macos-latest
-            label: macos-aarch64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - run: ./bin/build-tarballs dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tarballs-${{ matrix.label }}
-          path: dist/*.tar.gz
+    uses: ./.github/workflows/_build-packages.yml
+    with:
+      upload: true
 
   build-windows:
     needs: [verify-tag]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: pnpm
-          cache-dependency-path: js/pnpm-lock.yaml
-      - name: Build UI
-        shell: bash
-        run: |
-          cargo install wasm-pack
-          cd crates/browser
-          wasm-pack build --target web --release --out-dir pkg
-          cd ../..
-          cd js
-          pnpm install --frozen-lockfile
-          pnpm --filter @blit-sh/core run build
-          pnpm --filter @blit-sh/solid run build
-          pnpm --filter @blit-sh/ui run build
-      - name: Build release binaries
-        run: cargo build --release -p blit-cli -p blit-server -p blit-gateway -p blit-webrtc-forwarder
-      - name: Package zips
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          for bin in blit blit-server blit-gateway blit-webrtc-forwarder; do
-            cp "target/release/${bin}.exe" "${bin}.exe"
-            7z a "dist/${bin}_${version}_windows_x86_64.zip" "${bin}.exe"
-            rm "${bin}.exe"
-          done
-          ls -lh dist/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86_64
-          path: dist/*.zip
+    uses: ./.github/workflows/_build-windows.yml
+    with:
+      upload: true
 
   release:
-    needs: [build-debs, build-tarballs, build-windows]
-    runs-on: ubuntu-latest
+    needs: [build-packages, build-windows]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -155,7 +78,7 @@ jobs:
 
   publish-crates:
     needs: [release]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
@@ -164,7 +87,7 @@ jobs:
 
   publish-npm:
     needs: [release]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
@@ -173,7 +96,7 @@ jobs:
 
   update-homebrew:
     needs: [release]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Update Homebrew tap
         uses: peter-evans/repository-dispatch@v3
@@ -184,8 +107,8 @@ jobs:
           client-payload: '{"version": "${{ github.ref_name }}"}'
 
   apt-repo:
-    needs: [build-debs, build-tarballs, build-windows]
-    runs-on: ubuntu-latest
+    needs: [build-packages, build-windows]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
@@ -262,6 +185,6 @@ jobs:
 
   deploy-pages:
     needs: [apt-repo]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/deploy-pages@v4
