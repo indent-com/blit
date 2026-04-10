@@ -1,5 +1,5 @@
 import { Redis } from "ioredis";
-import { handleDemoRequest } from "./demo";
+import { corsHeaders, handleDemoRequest } from "./demo";
 
 const PORT = parseInt(process.env.PORT || "8001", 10);
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
@@ -11,7 +11,8 @@ const server = Bun.serve({
 
   async fetch(req) {
     const url = new URL(req.url);
-    const cors = { "Access-Control-Allow-Origin": "*" };
+    const origin = req.headers.get("origin");
+    const cors = corsHeaders(origin);
 
     if (req.method === "OPTIONS") {
       return new Response(null, {
@@ -39,22 +40,24 @@ const server = Bun.serve({
         req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
         server.requestIP(req)?.address ||
         "unknown";
-      return handleDemoRequest(redis, body as { nonce?: string }, clientIp);
+      return handleDemoRequest(
+        redis,
+        body as { nonce?: string },
+        clientIp,
+        origin,
+      );
     }
 
     if (url.pathname === "/health") {
       try {
         await redis.ping();
-        return new Response("ok", { status: 200, headers: cors });
+        return new Response("ok", { status: 200 });
       } catch {
-        return new Response("redis unreachable", {
-          status: 503,
-          headers: cors,
-        });
+        return new Response("redis unreachable", { status: 503 });
       }
     }
 
-    return new Response("Not Found", { status: 404, headers: cors });
+    return new Response("Not Found", { status: 404 });
   },
 });
 

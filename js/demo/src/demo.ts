@@ -1,7 +1,7 @@
 import type { Redis } from "ioredis";
 import { ModalClient } from "modal";
 
-const SANDBOX_TIMEOUT_MS = 60 * 1000;
+const SANDBOX_TIMEOUT_MS = 5 * 60 * 1000;
 const REDIS_TTL_SECONDS = 30 * 60;
 const MAX_SANDBOXES_PER_IP = 5;
 const RATE_LIMIT_WINDOW_SECONDS = 60;
@@ -15,6 +15,27 @@ const DEMO_APP_NAME = "blit-demo";
 
 const DEMO_IMAGE = "grab/blit-demo:latest";
 const INDENT_SPIN_GIF_URL = "https://assets.indent.com/indent_spin.gif";
+
+function isAllowedOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    if (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+      return true;
+    if (url.hostname === "indent.com" || url.hostname.endsWith(".indent.com"))
+      return true;
+    if (url.hostname.endsWith(".vercel.app")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function corsHeaders(origin: string | null): Record<string, string> {
+  if (origin && isAllowedOrigin(origin)) {
+    return { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
+  }
+  return {};
+}
 
 type SandboxInfo = {
   sandbox_id: string;
@@ -47,7 +68,11 @@ async function acquireRateLimit(
 }
 
 async function releaseRateLimit(redis: Redis, clientIp: string): Promise<void> {
-  await redis.decr(rateLimitKey(clientIp));
+  const key = rateLimitKey(clientIp);
+  const exists = await redis.exists(key);
+  if (exists) {
+    await redis.decr(key);
+  }
 }
 
 async function storeSandbox(redis: Redis, info: SandboxInfo): Promise<void> {
@@ -85,8 +110,9 @@ export async function handleDemoRequest(
   redis: Redis,
   body: { nonce?: string },
   clientIp: string,
+  origin: string | null,
 ): Promise<Response> {
-  const cors = { "Access-Control-Allow-Origin": "*" };
+  const cors = corsHeaders(origin);
 
   if (
     !body.nonce ||
