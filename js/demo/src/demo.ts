@@ -168,13 +168,20 @@ export async function handleDemoRequest(
       });
       const image = modal.images
         .fromRegistry(DEMO_IMAGE)
-        .dockerfileCommands([
-          `RUN curl -L -o /usr/local/share/indent_spin.gif '${INDENT_SPIN_GIF_URL}'`,
-          "RUN printf '#!/bin/sh\\nexec chafa --animate=on --duration=inf /usr/local/share/indent_spin.gif\\n' > /usr/local/bin/indent-spin && chmod +x /usr/local/bin/indent-spin",
-        ]);
+        .dockerfileCommands(["ENTRYPOINT []"]);
+
+      const startupScript = [
+        "set -e",
+        `curl -sfL -o /home/blit/indent_spin.gif '${INDENT_SPIN_GIF_URL}'`,
+        'blit share --passphrase "$BLIT_NONCE" &',
+        "sleep 2",
+        "blit start htop",
+        "blit start sh",
+        "wait",
+      ].join("\n");
 
       const sb = await modal.sandboxes.create(app, image, {
-        command: ["blit", "share", "--passphrase", nonce],
+        command: ["/bin/sh", "-c", startupScript],
         timeoutMs: SANDBOX_TIMEOUT_MS,
         workdir: "/home/blit",
         env: { BLIT_NONCE: nonce },
