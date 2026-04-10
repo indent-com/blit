@@ -1,0 +1,17 @@
+{
+  "name": "blit-demo",
+  "version": "0.1.0",
+  "description": "Ephemeral demo sandbox provisioning via Modal",
+  "license": "MIT",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "ioredis": "^5.6.1",
+    "modal": "^0.7.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.13"
+  }
+}
