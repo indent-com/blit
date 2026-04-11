@@ -1411,13 +1411,102 @@ fn spawn_compositor_child(
     pid
 }
 
+/// Map xterm-256 color index to (r, g, b) in 16-bit per channel.
+fn xterm256_color(idx: u8) -> (u16, u16, u16) {
+    // Standard 16 colors (0-15)
+    const BASE16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let (r8, g8, b8) = if idx < 16 {
+        BASE16[idx as usize]
+    } else if idx < 232 {
+        // 6x6x6 color cube (indices 16-231)
+        let n = idx - 16;
+        let ri = n / 36;
+        let gi = (n % 36) / 6;
+        let bi = n % 6;
+        let to_val = |v: u8| if v == 0 { 0u8 } else { 55 + 40 * v };
+        (to_val(ri), to_val(gi), to_val(bi))
+    } else {
+        // Grayscale ramp (indices 232-255)
+        let v = 8 + 10 * (idx - 232);
+        (v, v, v)
+    };
+    // Scale 8-bit to 16-bit (0xFF -> 0xFFFF)
+    let scale = |v: u8| (v as u16) << 8 | v as u16;
+    (scale(r8), scale(g8), scale(b8))
+}
+
 fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> Vec<String> {
     const DA1_RESPONSE: &[u8] = b"\x1b[?64;1;2;6;9;15;18;21;22c";
 
     let mut results = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if data[i] != 0x1b || i + 2 >= data.len() || data[i + 1] != b'[' {
+        if data[i] != 0x1b || i + 1 >= data.len() {
+            i += 1;
+            continue;
+        }
+
+        // Handle OSC sequences: \x1b] ... (ST or BEL)
+        if data[i + 1] == b']' {
+            let osc_start = i + 2;
+            // Find the terminator: BEL (\x07) or ST (\x1b\\)
+            let mut end = osc_start;
+            while end < data.len() {
+                if data[end] == 0x07 {
+                    break;
+                }
+                if data[end] == 0x1b && end + 1 < data.len() && data[end + 1] == b'\\' {
+                    break;
+                }
+                end += 1;
+            }
+            if end < data.len() {
+                let payload = &data[osc_start..end];
+                // OSC 11 ; ? — query background color
+                if payload == b"11;?" {
+                    // Respond with dark background (rgb:0000/0000/0000)
+                    results.push("\x1b]11;rgb:0000/0000/0000\x1b\\".into());
+                }
+                // OSC 10 ; ? — query foreground color
+                else if payload == b"10;?" {
+                    results.push("\x1b]10;rgb:ffff/ffff/ffff\x1b\\".into());
+                }
+                // OSC 4 ; N ; ? — query palette color N
+                else if payload.starts_with(b"4;") && payload.ends_with(b";?") {
+                    let idx_bytes = &payload[2..payload.len() - 2];
+                    if let Ok(idx_str) = std::str::from_utf8(idx_bytes)
+                        && let Ok(idx) = idx_str.parse::<u8>()
+                    {
+                        let (r, g, b) = xterm256_color(idx);
+                        results.push(format!("\x1b]4;{idx};rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\"));
+                    }
+                }
+                i = end + if data[end] == 0x07 { 1 } else { 2 };
+                continue;
+            }
+            i = end;
+            continue;
+        }
+
+        // Handle CSI sequences: \x1b[ ...
+        if i + 2 >= data.len() || data[i + 1] != b'[' {
             i += 1;
             continue;
         }
@@ -5414,6 +5503,53 @@ mod tests {
     fn parse_tq_interleaved_with_text() {
         let results = parse_terminal_queries(b"abc\x1b[cdef\x1b[6n", (24, 80), (1, 2));
         assert_eq!(results.len(), 2);
+    }
+
+    // ── parse_terminal_queries: OSC ──
+
+    #[test]
+    fn parse_tq_osc11_background_color_bel() {
+        let results = parse_terminal_queries(b"\x1b]11;?\x07", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b]11;rgb:0000/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn parse_tq_osc11_background_color_st() {
+        let results = parse_terminal_queries(b"\x1b]11;?\x1b\\", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b]11;rgb:0000/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn parse_tq_osc10_foreground_color() {
+        let results = parse_terminal_queries(b"\x1b]10;?\x07", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+    }
+
+    #[test]
+    fn parse_tq_osc4_palette_color_0() {
+        let results = parse_terminal_queries(b"\x1b]4;0;?\x07", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b]4;0;rgb:0000/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn parse_tq_osc4_palette_color_1() {
+        let results = parse_terminal_queries(b"\x1b]4;1;?\x07", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b]4;1;rgb:8080/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn parse_tq_osc_mixed_with_csi() {
+        let results =
+            parse_terminal_queries(b"\x1b]11;?\x07\x1b[c\x1b]4;0;?\x07", (24, 80), (0, 0));
+        assert_eq!(results.len(), 3);
+        assert!(results[0].starts_with("\x1b]11;"));
+        assert!(results[1].starts_with("\x1b[?64;"));
+        assert!(results[2].starts_with("\x1b]4;0;"));
     }
 
     // ── build_search_results_msg ──
