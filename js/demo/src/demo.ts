@@ -13,8 +13,9 @@ const REDIS_LOCK_PREFIX = "blit_demo:lock";
 
 const DEMO_APP_NAME = "blit-demo";
 
-const DEMO_IMAGE = "grab/blit-demo:latest";
-const INDENT_SPIN_GIF_URL = "https://assets.indent.com/indent_spin.gif";
+// Pre-built Modal image containing blit, opencode, htop, mpv, git, and the parrot gif.
+// Rebuild with: uv run python js/demo/scripts/build-image.py
+const DEMO_IMAGE_ID = "im-zgUHkbfuv2J4kR1LcnCg7W";
 
 function isAllowedOrigin(origin: string): boolean {
   try {
@@ -166,25 +167,28 @@ export async function handleDemoRequest(
       const app = await modal.apps.fromName(DEMO_APP_NAME, {
         createIfMissing: true,
       });
-      const image = modal.images
-        .fromRegistry(DEMO_IMAGE)
-        .dockerfileCommands(["ENTRYPOINT []"]);
+      const image = await modal.images.fromId(DEMO_IMAGE_ID);
 
       const startupScript = [
-        "set -e",
-        `curl -sfL -o /home/blit/indent_spin.gif '${INDENT_SPIN_GIF_URL}'`,
         'blit share --passphrase "$BLIT_NONCE" &',
         "sleep 2",
-        "blit start htop",
-        "blit start sh",
+        "blit start -t bash --cols 280 --rows 60 -- bash",
+        "blit start -t opencode --cols 280 --rows 60 -- opencode /home/blit/project || true",
+        "blit start -t parrot --cols 280 --rows 60 -- mpv --vo=tct --no-osd-bar --osd-level=0 --no-terminal --loop=inf /home/blit/parrot.gif",
         "wait",
       ].join("\n");
 
       const sb = await modal.sandboxes.create(app, image, {
-        command: ["/bin/sh", "-c", startupScript],
+        command: ["/bin/bash", "-c", startupScript],
         timeoutMs: SANDBOX_TIMEOUT_MS,
+        cpu: 0.5,
+        memoryMiB: 1024,
         workdir: "/home/blit",
-        env: { BLIT_NONCE: nonce },
+        env: {
+          BLIT_NONCE: nonce,
+          SHELL: "/bin/bash",
+          COLORFGBG: "15;0",
+        },
       });
 
       await sb.setTags({ client_ip: clientIp });
