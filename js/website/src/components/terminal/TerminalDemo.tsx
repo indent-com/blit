@@ -291,6 +291,11 @@ function ToolbarMenu(props: {
 // ---------------------------------------------------------------------------
 
 function DisconnectedOverlay(props: { passphrase: string; readOnly: boolean }) {
+  // Notify parent frame (e.g. blog embed) so it can show its own overlay
+  if (window.parent !== window) {
+    window.parent.postMessage({ type: "blit:disconnected" }, "*");
+  }
+
   const [copied, setCopied] = createSignal(false);
   let timeout: ReturnType<typeof setTimeout> | undefined;
 

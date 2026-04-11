@@ -240,9 +240,10 @@ export default function TabBar(props: {
           {(dt) => (
             <Tab
               sessionId={dt.sessionId}
-              getTitle={() =>
-                props.sessions.find((s) => s.id === dt.sessionId)?.title
-              }
+              getTitle={() => {
+                const s = props.sessions.find((s) => s.id === dt.sessionId);
+                return s?.title || s?.tag || null;
+              }}
               index={dt.liveIndex}
               isFocused={!dt.exiting && dt.sessionId === props.focusedSessionId}
               exiting={dt.exiting}
