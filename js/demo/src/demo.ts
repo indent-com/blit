@@ -15,7 +15,7 @@ const DEMO_APP_NAME = "blit-demo";
 
 // Pre-built Modal image containing blit, opencode, htop, mpv, git, and the parrot gif.
 // Rebuild with: uv run python js/demo/scripts/build-image.py
-const DEMO_IMAGE_ID = "im-zgUHkbfuv2J4kR1LcnCg7W";
+const DEMO_IMAGE_ID = "im-VydV0eeimTFG2pXKhnQWB1";
 
 function isAllowedOrigin(origin: string): boolean {
   try {
@@ -172,9 +172,8 @@ export async function handleDemoRequest(
       const startupScript = [
         'blit share --passphrase "$BLIT_NONCE" &',
         "sleep 2",
-        "blit start -t bash --cols 280 --rows 60 -- bash",
-        "blit start -t opencode --cols 280 --rows 60 -- opencode /home/blit/project || true",
-        "blit start -t parrot --cols 280 --rows 60 -- mpv --vo=tct --no-osd-bar --osd-level=0 --no-terminal --loop=inf /home/blit/parrot.gif",
+        "blit terminal start -t bash --cols 280 --rows 60 -- bash",
+        "blit terminal start -t parrot --cols 280 --rows 60 -- mpv --vo=tct --no-osd-bar --osd-level=0 --no-terminal --loop=inf /home/blit/parrot.gif",
         "wait",
       ].join("\n");
 
