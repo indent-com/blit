@@ -31,7 +31,7 @@ mod ipc;
 mod nvenc_encode;
 mod pty;
 mod surface_encoder;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod vaapi_encode;
 
 pub use ipc::{IpcListener, default_ipc_path};

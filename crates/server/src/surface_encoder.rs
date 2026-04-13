@@ -460,21 +460,14 @@ impl SurfaceEncoder {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    pub fn export_vpp_surfaces(&self) -> Vec<()> {
-        Vec::new()
-    }
-
     /// Get VA display pointer (as usize).
+    #[cfg(target_os = "linux")]
     pub fn va_display_usize(&self) -> usize {
-        #[cfg(target_os = "linux")]
         match &self.kind {
             SurfaceEncoderKind::H264Vaapi(enc) => enc.va_display_usize(),
             SurfaceEncoderKind::AV1Vaapi(enc) => enc.va_display_usize(),
             _ => 0,
         }
-        #[cfg(not(target_os = "linux"))]
-        0
     }
 
     pub fn encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {

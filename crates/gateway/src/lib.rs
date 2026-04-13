@@ -246,23 +246,7 @@ fn uri_to_connector(
         });
     }
     if uri == "local" {
-        let path = {
-            #[cfg(unix)]
-            {
-                std::env::var("BLIT_SOCK")
-                    .or_else(|_| std::env::var("TMPDIR").map(|d| format!("{d}/blit.sock")))
-                    .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|d| format!("{d}/blit.sock")))
-                    .or_else(|_| std::env::var("USER").map(|u| format!("/tmp/blit-{u}.sock")))
-                    .unwrap_or_else(|_| "/tmp/blit.sock".into())
-            }
-            #[cfg(windows)]
-            {
-                std::env::var("BLIT_SOCK").unwrap_or_else(|_| {
-                    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
-                    format!(r"\\.\pipe\blit-{user}")
-                })
-            }
-        };
+        let path = blit_webserver::config::default_local_socket();
         return Some(GatewayConnector::Ipc(path));
     }
     None

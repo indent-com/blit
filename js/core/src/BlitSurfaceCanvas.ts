@@ -230,6 +230,9 @@ export class BlitSurfaceCanvas {
   private textInput: HTMLTextAreaElement | null = null;
   /** True while an IME composition session is active (focus is on textarea). */
   private _isComposing = false;
+  /** Non-zero when a Meta→Ctrl translation is in flight (stores the Meta
+   *  evdev keycode that was swapped so the release can be translated back). */
+  private _metaToCtrl = 0;
 
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
@@ -818,6 +821,54 @@ export class BlitSurfaceCanvas {
       this.syncCapsLock(e, conn);
     }
 
+    // Paste: read the browser clipboard and offer it to the Wayland
+    // compositor *before* forwarding the key, so the data offer is in
+    // place when the app processes the paste shortcut.
+    if (
+      pressed &&
+      (e.key === "v" || e.key === "V") &&
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey
+    ) {
+      const keycode = domKeyToEvdev(e.code);
+      if (keycode !== 0) this.pressedKeys.add(keycode);
+
+      // On macOS, Cmd+V arrives with metaKey set.  Wayland apps expect
+      // Ctrl+V, so swap the already-pressed Meta → Ctrl before forwarding
+      // the key.  The reverse swap happens on Meta key-up (see below).
+      if (e.metaKey && !e.ctrlKey) {
+        const metaCode = this.pressedKeys.has(125)
+          ? 125
+          : this.pressedKeys.has(126)
+            ? 126
+            : 0;
+        if (metaCode !== 0) {
+          this.pressedKeys.delete(metaCode);
+          conn.sendSurfaceInput(this._surfaceId, metaCode, false);
+          this.pressedKeys.add(29); // ControlLeft
+          conn.sendSurfaceInput(this._surfaceId, 29, true);
+          this._metaToCtrl = metaCode;
+        }
+      }
+
+      const surfaceId = this._surfaceId;
+      navigator.clipboard.readText().then(
+        (text) => {
+          if (text) {
+            const enc = new TextEncoder();
+            conn.sendClipboard("text/plain;charset=utf-8", enc.encode(text));
+          }
+          if (keycode !== 0) conn.sendSurfaceInput(surfaceId, keycode, true);
+        },
+        () => {
+          // Clipboard read failed (no permission, empty, etc.) —
+          // forward the key anyway so the shortcut still reaches the app.
+          if (keycode !== 0) conn.sendSurfaceInput(surfaceId, keycode, true);
+        },
+      );
+      return;
+    }
+
     // Printable character (no Ctrl/Alt/Meta): send the browser-resolved
     // character via the text path.  This handles keyboard layout
     // differences (e.g. Shift+2 → @ on US, " on UK) without depending
@@ -837,6 +888,14 @@ export class BlitSurfaceCanvas {
     // send raw evdev keycode.
     const keycode = domKeyToEvdev(e.code);
     if (keycode !== 0) {
+      // Finish Meta→Ctrl translation: when the physical Meta key is
+      // released after a translated Cmd+V paste, release Ctrl instead.
+      if (!pressed && keycode === this._metaToCtrl) {
+        this.pressedKeys.delete(29); // ControlLeft
+        conn.sendSurfaceInput(this._surfaceId, 29, false);
+        this._metaToCtrl = 0;
+        return;
+      }
       if (pressed) {
         this.pressedKeys.add(keycode);
       } else {
@@ -884,6 +943,7 @@ export class BlitSurfaceCanvas {
       conn.sendSurfaceInput(this._surfaceId, kc, false);
     }
     this.pressedKeys.clear();
+    this._metaToCtrl = 0;
   }
 
   private handleBlur(): void {
@@ -945,5 +1005,20 @@ export class BlitSurfaceCanvas {
     const conn = this.getConn();
     if (!conn || !this.surface) return;
     conn.sendSurfaceFocus(this._surfaceId);
+
+    // Best-effort: pre-load the browser clipboard so it is already
+    // available as a wl_data_offer if the Wayland client pastes via a
+    // mechanism other than Ctrl/Cmd+V (e.g. right-click context menu).
+    // This may fail without a user gesture in some browsers — that is
+    // fine; the Ctrl/Cmd+V path handles clipboard reading reliably.
+    navigator.clipboard.readText().then(
+      (text) => {
+        if (text) {
+          const enc = new TextEncoder();
+          conn.sendClipboard("text/plain;charset=utf-8", enc.encode(text));
+        }
+      },
+      () => {},
+    );
   }
 }

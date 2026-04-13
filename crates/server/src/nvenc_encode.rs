@@ -651,7 +651,7 @@ impl NvencDirectEncoder {
     ///
     /// Returns `None` if the CUDA driver doesn't support external memory
     /// import (pre-10.0) or if the import fails for this particular fd.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn encode_dmabuf_fd(
         &mut self,
