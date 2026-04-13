@@ -169,7 +169,7 @@ let
         mkdir -p pkg/lib/systemd/system
         cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
         cp "${systemdDir}/blit-server@.service" "pkg/lib/systemd/system/blit-server@.service"
-        cp "${systemdDir}/blit-webrtc-forwarder@.service" "pkg/lib/systemd/system/blit-webrtc-forwarder@.service"
+        cp "${systemdDir}/blit-share@.service" "pkg/lib/systemd/system/blit-share@.service"
         mkdir -p pkg/lib/systemd/user
         cp "${systemdDir}/blit-server.socket" "pkg/lib/systemd/user/blit-server.socket"
         cp "${systemdDir}/blit-server.service" "pkg/lib/systemd/user/blit-server.service"
@@ -259,8 +259,8 @@ let
       # Layer 2: depend only on leaf crates
       publish blit-webserver
       publish blit-alacritty
-      publish blit-webrtc-forwarder
-      wait_for_layer blit-webserver blit-alacritty blit-webrtc-forwarder
+      publish blit-share
+      wait_for_layer blit-webserver blit-alacritty blit-share
 
       # Layer 3: depend on layer 1+2
       publish blit-server
@@ -336,8 +336,24 @@ let
 
   clippy = pkgs.writeShellApplication {
     name = "blit-clippy";
-    runtimeInputs = [ rustToolchain ];
+    runtimeInputs = [
+      rustToolchain
+      pkgs.pkg-config
+      pkgs.libopus
+      pkgs.libxkbcommon
+      pkgs.pixman
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.libgbm
+    ];
     text = ''
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
+        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
+      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
+        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
+      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
@@ -353,6 +369,7 @@ let
       pkgs.cargo-llvm-cov
       pkgs.python3
       pkgs.pkg-config
+      pkgs.libopus
       pkgs.libxkbcommon
       pkgs.pixman
     ]
@@ -360,10 +377,10 @@ let
       pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
         if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
       }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
+      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
         if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
       }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
@@ -454,6 +471,7 @@ in
     runtimeInputs = [
       rustToolchain
       pkgs.pkg-config
+      pkgs.libopus
       pkgs.libxkbcommon
       pkgs.pixman
     ];
@@ -536,6 +554,7 @@ in
       pkgs.python3
       pkgs.bun
       pkgs.pkg-config
+      pkgs.libopus
       pkgs.libxkbcommon
       pkgs.pixman
     ]
@@ -543,10 +562,10 @@ in
       pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
         if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
       }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
+      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
         if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
       }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 

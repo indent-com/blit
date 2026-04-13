@@ -2,11 +2,14 @@ use std::collections::HashMap;
 
 use blit_remote::{
     C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
-    CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, EXIT_STATUS_UNKNOWN, S2C_EXITED, S2C_HELLO, S2C_LIST,
-    S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
-    S2C_UPDATE, SURFACE_FRAME_CODEC_H265, SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME,
-    ServerMsg, TerminalState, msg_ack, msg_close, msg_create2, msg_input, msg_kill, msg_read,
-    msg_resize, msg_restart, msg_subscribe, msg_surface_resize, msg_surface_subscribe,
+    CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264,
+    EXIT_STATUS_UNKNOWN, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO,
+    S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
+    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
+    SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
+    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
+    msg_input, msg_kill, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
+    msg_surface_close, msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext,
     parse_server_msg,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,7 +40,7 @@ impl AgentConn {
 
         loop {
             let data =
-                tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut reader))
+                tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut reader))
                     .await
                     .map_err(|_| "timeout waiting for server".to_string())?
                     .ok_or_else(|| "server closed connection".to_string())?;
@@ -48,7 +51,8 @@ impl AgentConn {
 
             match data[0] {
                 S2C_READY => break,
-                S2C_HELLO => {}
+                S2C_QUIT => return Err("server is shutting down".to_string()),
+                S2C_HELLO | S2C_PING => {}
                 S2C_LIST => {
                     if let Some(ServerMsg::List { entries }) = parse_server_msg(&data) {
                         ptys = entries
@@ -161,7 +165,9 @@ pub async fn cmd_list(transport: Transport) -> Result<(), String> {
             pty.id, pty.tag, title, pty.command, status
         );
     }
-    conn.finish().await;
+    // Read-only command — nothing was written so there is nothing to drain.
+    // Just drop the connection; the proxy (if any) handles cleanup.
+    drop(conn);
     Ok(())
 }
 
@@ -306,6 +312,13 @@ pub async fn cmd_send(transport: Transport, id: u16, text: String) -> Result<(),
 
     let bytes = parse_escapes(&text);
     conn.send(&msg_input(id, &bytes)).await?;
+    conn.finish().await;
+    Ok(())
+}
+
+pub async fn cmd_quit(transport: Transport) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_quit()).await?;
     conn.finish().await;
     Ok(())
 }
@@ -523,7 +536,12 @@ pub fn parse_escapes(s: &str) -> Vec<u8> {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'n' => {
-                    out.push(b'\n');
+                    // Emit CR (0x0D) instead of LF (0x0A). Real terminals
+                    // send CR for Enter; bare LF only works when the PTY
+                    // line discipline has ICRNL/ICANON active.  Programs in
+                    // raw mode (readline, vim, …) expect CR.  Use \x0a for
+                    // a literal LF if you ever need one.
+                    out.push(b'\r');
                     i += 2;
                 }
                 b'r' => {
@@ -575,6 +593,71 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+pub async fn cmd_close_surface(transport: Transport, id: u16) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_surface_close(id)).await?;
+    conn.finish().await;
+    Ok(())
+}
+
+pub async fn cmd_clipboard_get(transport: Transport, mime: &str) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_c2s_clipboard_get(mime)).await?;
+    loop {
+        let data = conn.recv().await?;
+        if data.is_empty() {
+            continue;
+        }
+        if data[0] == S2C_CLIPBOARD_CONTENT {
+            if let Some(ServerMsg::ClipboardContent { data, .. }) = parse_server_msg(&data) {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(data);
+                let _ = std::io::stdout().flush();
+            }
+            return Ok(());
+        }
+    }
+}
+
+pub async fn cmd_clipboard_list(transport: Transport) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_c2s_clipboard_list()).await?;
+    loop {
+        let data = conn.recv().await?;
+        if data.is_empty() {
+            continue;
+        }
+        if data[0] == S2C_CLIPBOARD_LIST {
+            if let Some(ServerMsg::ClipboardList { mime_types }) = parse_server_msg(&data) {
+                for mime in &mime_types {
+                    println!("{mime}");
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
+pub async fn cmd_clipboard_set(
+    transport: Transport,
+    mime: &str,
+    text: Option<String>,
+) -> Result<(), String> {
+    let data = match text {
+        Some(t) => t.into_bytes(),
+        None => {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| format!("failed to read stdin: {e}"))?;
+            buf
+        }
+    };
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_c2s_clipboard_set(mime, &data)).await?;
+    conn.finish().await;
+    Ok(())
+}
+
 pub async fn cmd_surfaces(transport: Transport) -> Result<(), String> {
     let mut conn = AgentConn::connect(transport).await?;
 
@@ -602,6 +685,7 @@ pub async fn cmd_surfaces(transport: Transport) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_capture(
     transport: Transport,
     id: u16,
@@ -610,6 +694,7 @@ pub async fn cmd_capture(
     quality: u8,
     width: Option<u16>,
     height: Option<u16>,
+    scale: u16,
 ) -> Result<(), String> {
     // Resolve format: explicit flag > extension > png.
     let ext = output
@@ -637,16 +722,16 @@ pub async fn cmd_capture(
     if width.is_some() || height.is_some() {
         let w = width.unwrap_or(640);
         let h = height.unwrap_or(480);
-        conn.send(&msg_surface_resize(0, id, w, h, 0, 0)).await?;
+        conn.send(&msg_surface_resize(id, w, h, 0)).await?;
         // Give the Wayland client a moment to repaint at the new size.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     let mut msg = vec![C2S_SURFACE_CAPTURE];
-    msg.extend_from_slice(&0u16.to_le_bytes());
     msg.extend_from_slice(&id.to_le_bytes());
     msg.push(format_byte);
     msg.push(quality);
+    msg.extend_from_slice(&scale.to_le_bytes());
     conn.send(&msg).await?;
 
     loop {
@@ -676,7 +761,7 @@ pub async fn cmd_capture(
 
 /// Record raw encoded surface video or terminal output to a file.
 ///
-/// Surfaces: writes concatenated Annex B NAL units (H.264/H.265) or OBU (AV1)
+/// Surfaces: writes concatenated Annex B NAL units (H.264) or OBU (AV1)
 /// that can be played directly with `ffplay` / inspected with `ffprobe`.
 ///
 /// Terminals: writes a simple binary format:
@@ -687,17 +772,72 @@ pub async fn cmd_record(
     id: u16,
     output: Option<String>,
     max_frames: u32,
+    max_duration: f64,
     is_surface: bool,
+    codecs: Vec<String>,
 ) -> Result<(), String> {
     use std::io::Write;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     let mut conn = AgentConn::connect(transport).await?;
+    let start = Instant::now();
+    let deadline = if max_duration > 0.0 {
+        Some(start + Duration::from_secs_f64(max_duration))
+    } else {
+        None
+    };
+
+    // Stop on Ctrl+C gracefully.
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled2 = cancelled.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        cancelled2.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let should_stop = |frame_count: u32| -> bool {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        if max_frames > 0 && frame_count >= max_frames {
+            return true;
+        }
+        if let Some(d) = deadline
+            && Instant::now() >= d
+        {
+            return true;
+        }
+        false
+    };
+
+    let limit_str = match (max_frames > 0, max_duration > 0.0) {
+        (true, true) => format!("{max_frames} frames / {max_duration}s"),
+        (true, false) => format!("{max_frames} frames"),
+        (false, true) => format!("{max_duration}s"),
+        (false, false) => "until Ctrl+C".to_string(),
+    };
 
     if is_surface {
         // --- Surface recording ---
-        // Subscribe to the surface's video stream.
-        conn.send(&msg_surface_subscribe(0, id)).await?;
+        let codec_support = if codecs.is_empty() {
+            0 // accept anything
+        } else {
+            let mut mask = 0u8;
+            for c in &codecs {
+                match c.to_lowercase().as_str() {
+                    "h264" => mask |= CODEC_SUPPORT_H264,
+                    "av1" => mask |= CODEC_SUPPORT_AV1,
+                    other => return Err(format!("unknown codec: {other} (expected h264, av1)")),
+                }
+            }
+            mask
+        };
+        if codec_support != 0 {
+            conn.send(&msg_surface_subscribe_ext(id, codec_support, 0))
+                .await?;
+        } else {
+            conn.send(&msg_surface_subscribe(id)).await?;
+        }
 
         let mut file: Option<std::fs::File> = None;
         let mut frame_count: u32 = 0;
@@ -708,21 +848,20 @@ pub async fn cmd_record(
             if data.is_empty() {
                 continue;
             }
-            if data[0] == S2C_SURFACE_FRAME && data.len() >= 14 {
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let flags = data[9];
-                let width = u16::from_le_bytes([data[10], data[11]]);
-                let height = u16::from_le_bytes([data[12], data[13]]);
+            if data[0] == S2C_SURFACE_FRAME && data.len() >= 12 {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let flags = data[7];
+                let width = u16::from_le_bytes([data[8], data[9]]);
+                let height = u16::from_le_bytes([data[10], data[11]]);
                 let is_key = flags & SURFACE_FRAME_FLAG_KEYFRAME != 0;
                 let codec_bits = flags & SURFACE_FRAME_CODEC_MASK;
-                let codec_name = if codec_bits == SURFACE_FRAME_CODEC_H265 {
-                    "h265"
+                let codec_name = if codec_bits == SURFACE_FRAME_CODEC_AV1 {
+                    "obu"
                 } else {
                     "h264"
                 };
-                let payload = &data[14..];
+                let payload = &data[12..];
 
-                // Open file lazily so we know the codec for the extension.
                 if file.is_none() {
                     let path = output
                         .clone()
@@ -731,7 +870,7 @@ pub async fn cmd_record(
                         std::fs::File::create(&path).map_err(|e| format!("create {path}: {e}"))?,
                     );
                     eprintln!(
-                        "recording surface {id} ({codec_name}, {width}x{height}) → {}",
+                        "recording surface {id} ({codec_name}, {width}x{height}) → {} ({limit_str})",
                         output.as_deref().unwrap_or(&path)
                     );
                 }
@@ -742,22 +881,22 @@ pub async fn cmd_record(
                 }
 
                 frame_count += 1;
+                let elapsed = start.elapsed().as_secs_f64();
                 eprint!(
-                    "\r  frame {frame_count}/{max_frames} key={is_key} {width}x{height} {} bytes  ",
-                    payload.len()
+                    "\r  frame {frame_count} key={is_key} {width}x{height} {elapsed:.1}s {total_bytes} bytes  ",
                 );
 
-                // Send ack so the server keeps sending frames.
                 let mut ack = vec![C2S_SURFACE_ACK];
                 ack.extend_from_slice(&surface_id.to_le_bytes());
                 conn.send(&ack).await?;
 
-                if frame_count >= max_frames {
+                if should_stop(frame_count) {
                     break;
                 }
             }
         }
-        eprintln!("\n  done: {frame_count} frames, {total_bytes} bytes");
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("\n  done: {frame_count} frames, {total_bytes} bytes, {elapsed:.1}s");
     } else {
         // --- Terminal recording ---
         if !conn.has_pty(id) {
@@ -766,15 +905,12 @@ pub async fn cmd_record(
 
         let path = output.unwrap_or_else(|| format!("pty-{id}.blitrec"));
         let mut file = std::fs::File::create(&path).map_err(|e| format!("create {path}: {e}"))?;
-
-        // Magic header.
         file.write_all(b"BLITREC\n")
             .map_err(|e| format!("write: {e}"))?;
 
-        eprintln!("recording pty {id} → {path}");
+        eprintln!("recording pty {id} → {path} ({limit_str})");
 
         conn.send(&msg_subscribe(id)).await?;
-        let start = Instant::now();
         let mut frame_count: u32 = 0;
 
         loop {
@@ -795,15 +931,17 @@ pub async fn cmd_record(
                     conn.send(&msg_ack()).await?;
 
                     frame_count += 1;
-                    eprint!("\r  frame {frame_count}/{max_frames}  ");
+                    let elapsed = start.elapsed().as_secs_f64();
+                    eprint!("\r  frame {frame_count} {elapsed:.1}s  ");
 
-                    if frame_count >= max_frames {
+                    if should_stop(frame_count) {
                         break;
                     }
                 }
             }
         }
-        eprintln!("\n  done: {frame_count} frames");
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("\n  done: {frame_count} frames, {elapsed:.1}s");
     }
 
     Ok(())
@@ -830,7 +968,6 @@ pub async fn cmd_click(
 
     for ptype in [0u8, 1u8] {
         let mut msg = vec![C2S_SURFACE_POINTER];
-        msg.extend_from_slice(&0u16.to_le_bytes());
         msg.extend_from_slice(&id.to_le_bytes());
         msg.push(ptype);
         msg.push(btn);
@@ -1191,8 +1328,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_escapes_newline() {
-        assert_eq!(parse_escapes("a\\nb"), b"a\nb");
+    fn parse_escapes_newline_emits_cr() {
+        // \n emits CR (0x0D), not LF — matches what real terminals send for Enter
+        assert_eq!(parse_escapes("a\\nb"), b"a\rb");
     }
 
     #[test]
@@ -1222,7 +1360,13 @@ mod tests {
 
     #[test]
     fn parse_escapes_mixed() {
-        assert_eq!(parse_escapes("echo hello\\n"), b"echo hello\n");
+        assert_eq!(parse_escapes("echo hello\\n"), b"echo hello\r");
+    }
+
+    #[test]
+    fn parse_escapes_literal_lf_via_hex() {
+        // \x0a is the escape hatch for a real LF byte
+        assert_eq!(parse_escapes("a\\x0ab"), b"a\nb");
     }
 
     // ── Mock server infrastructure ───────────────────────────────────────
@@ -1653,7 +1797,7 @@ mod tests {
 
             let data = mock.recv().await.unwrap();
             assert_eq!(data[0], blit_remote::C2S_INPUT);
-            assert_eq!(&data[3..], b"line1\nline2\ttab");
+            assert_eq!(&data[3..], b"line1\rline2\ttab");
         });
 
         let transport = Transport::Unix(client);

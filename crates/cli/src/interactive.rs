@@ -11,6 +11,9 @@ use tokio::task::JoinHandle;
 
 use crate::transport::{self, Transport, make_frame, read_frame, write_frame};
 
+/// Blit protocol: server is shutting down (single byte, no payload).
+const S2C_QUIT: u8 = 0x0C;
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -50,18 +53,10 @@ fn uri_to_browser_connector(
     hub: &str,
     ssh_pool: &blit_ssh::SshPool,
 ) -> Option<BrowserConnector> {
-    if let Some(rest) = uri.strip_prefix("ssh:") {
-        let (user, host, socket) = blit_ssh::parse_ssh_uri(rest);
-        return Some(BrowserConnector::Ssh {
-            pool: ssh_pool.clone(),
-            user,
-            host,
-            socket,
-        });
-    }
     #[cfg(unix)]
     if crate::transport::proxy_enabled() {
-        if uri.starts_with("tcp:")
+        if uri.starts_with("ssh:")
+            || uri.starts_with("tcp:")
             || uri.starts_with("ws://")
             || uri.starts_with("wss://")
             || uri.starts_with("wt://")
@@ -72,6 +67,15 @@ fn uri_to_browser_connector(
             let proxy_uri = crate::transport::share_proxy_uri(passphrase, hub);
             return Some(BrowserConnector::Proxied(proxy_uri));
         }
+    }
+    if let Some(rest) = uri.strip_prefix("ssh:") {
+        let (user, host, socket) = blit_ssh::parse_ssh_uri(rest);
+        return Some(BrowserConnector::Ssh {
+            pool: ssh_pool.clone(),
+            user,
+            host,
+            socket,
+        });
     }
     if let Some(path) = uri.strip_prefix("socket:") {
         return Some(BrowserConnector::Ipc(path.to_string()));
@@ -142,6 +146,9 @@ struct BrowserState {
     hub: String,
     /// Shared SSH connection pool.
     ssh_pool: blit_ssh::SshPool,
+    /// Broadcast notification triggered on SIGINT so active WebSocket
+    /// handlers can send `S2C_QUIT` before the process exits.
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 pub async fn run_browser(port: Option<u16>, hub: &str) {
@@ -168,23 +175,20 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
         std::process::exit(1);
     }
 
-    // Build initial destinations from blit.remotes + local.
+    // Build initial destinations from blit.remotes.  When the file does
+    // not exist, `read_remotes()` (called by `RemotesState::new`) auto-
+    // provisions it with `local = local`, so there is always at least one
+    // entry.  The "local" URI is resolved to an IPC connector by
+    // `uri_to_browser_connector`.
     let mut destinations = std::collections::HashMap::new();
-    destinations.insert(
-        "local".to_string(),
-        DestinationInfo {
-            connector: BrowserConnector::Ipc(local_path),
-        },
-    );
     let initial_remotes = blit_webserver::config::parse_remotes_str(&remotes.get());
     for (name, uri) in &initial_remotes {
-        if name == "local" {
-            continue; // Already added above
-        }
         if let Some(connector) = uri_to_browser_connector(uri, hub, &ssh_pool) {
             destinations.insert(name.clone(), DestinationInfo { connector });
         }
     }
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
 
     let state = Arc::new(BrowserState {
         token: token.clone(),
@@ -193,6 +197,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
         remotes,
         hub: hub.to_string(),
         ssh_pool,
+        shutdown: shutdown.clone(),
     });
 
     // Reconcile destinations whenever blit.remotes changes (from the
@@ -211,8 +216,8 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                 };
                 let entries = blit_webserver::config::parse_remotes_str(&text);
                 let mut map = recon_state.destinations.write().unwrap();
-                // Remove destinations no longer in the list (except "local").
-                map.retain(|name, _| name == "local" || entries.iter().any(|(n, _)| n == name));
+                // Remove destinations no longer in the list.
+                map.retain(|name, _| entries.iter().any(|(n, _)| n == name));
                 // Add new entries.
                 for (name, uri) in &entries {
                     if !map.contains_key(name)
@@ -244,6 +249,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                                     &state.config,
                                     Some(&state.remotes),
                                     None,
+                                    &[],
                                 )
                                 .await;
                             })
@@ -270,9 +276,13 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
 
     open_browser(&url);
 
-    tokio::select! {
-        r = axum::serve(listener, app) => { if let Err(e) = r { eprintln!("blit: serve error: {e}"); } }
-        _ = tokio::signal::ctrl_c() => {}
+    let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        // Notify all active handlers so they can send S2C_QUIT.
+        shutdown.notify_waiters();
+    });
+    if let Err(e) = graceful.await {
+        eprintln!("blit: serve error: {e}");
     }
 }
 
@@ -402,12 +412,23 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>, dest_nam
     let (mut transport_reader, mut transport_writer) = transport.split();
     let (mut ws_tx, mut ws_rx) = ws.split();
 
+    let shutdown = state.shutdown.clone();
     let mut transport_to_ws = tokio::spawn(async move {
         let mut frames = 0u64;
-        while let Some(data) = read_frame(&mut transport_reader).await {
-            frames += 1;
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                frame = read_frame(&mut transport_reader) => {
+                    match frame {
+                        Some(data) => {
+                            frames += 1;
+                            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break, // upstream EOF
+                    }
+                }
+                _ = shutdown.notified() => break,
             }
         }
         if frames == 0 {
@@ -416,6 +437,8 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>, dest_nam
                     "error:blit-server not reachable (is it running on the remote host?)".into(),
                 ))
                 .await;
+        } else {
+            let _ = ws_tx.send(Message::Binary(vec![S2C_QUIT].into())).await;
         }
     });
 
@@ -525,6 +548,7 @@ async fn browser_handle_mux_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     let (merge_tx, mut merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
+    let shutdown = state.shutdown.clone();
 
     loop {
         tokio::select! {
@@ -593,6 +617,19 @@ async fn browser_handle_mux_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
                     }
                     None => break,
                 }
+            }
+
+            // Server is shutting down — send S2C_QUIT on every open channel.
+            _ = shutdown.notified() => {
+                for &ch_id in channels.keys() {
+                    let mut quit_frame = Vec::with_capacity(3);
+                    quit_frame.extend_from_slice(&ch_id.to_le_bytes());
+                    quit_frame.push(S2C_QUIT);
+                    if ws_tx.send(Message::Binary(quit_frame.into())).await.is_err() {
+                        break;
+                    }
+                }
+                break;
             }
         }
     }

@@ -145,18 +145,6 @@ pub fn proxy_socket_path() -> String {
     }
 }
 
-/// Returns true for URI schemes that benefit from proxy pooling.
-/// `local` and `socket:` are excluded — they are already local.
-#[allow(dead_code)]
-pub fn uri_should_use_proxy(uri: &str) -> bool {
-    uri.starts_with("ssh:")
-        || uri.starts_with("tcp:")
-        || uri.starts_with("ws://")
-        || uri.starts_with("wss://")
-        || uri.starts_with("wt://")
-        || uri.starts_with("share:")
-}
-
 /// Build a `share:` proxy URI, embedding the hub when it's non-default.
 ///
 /// The proxy URI format is `share:PASSPHRASE` or
@@ -327,11 +315,46 @@ pub async fn stop_proxy() {
 /// Connect to an upstream via blit-proxy, auto-starting the proxy if needed.
 /// Performs the `target <uri>\n` / `ok\n` handshake then returns the stream.
 pub async fn connect_via_proxy(upstream_uri: &str) -> Result<Transport, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Maximum time to wait for the proxy to respond with `ok\n` after
+    /// sending the `target` handshake.  This covers the full upstream
+    /// connection time (e.g. WebRTC session setup for share: remotes).
+    const PROXY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     let sock = ensure_proxy().await?;
 
     let msg = format!("target {upstream_uri}\n");
+
+    /// Read the proxy handshake response line byte-by-byte.
+    ///
+    /// Using a BufReader here would be incorrect: its read-ahead could
+    /// consume server data that arrives right after `ok\n`, and that
+    /// data would be silently lost when the BufReader is unwrapped via
+    /// `into_inner()`.  Reading one byte at a time avoids the problem
+    /// (the response is tiny — just `ok\n` or `error …\n`).
+    async fn read_handshake_line<S: AsyncReadExt + Unpin>(
+        stream: &mut S,
+    ) -> Result<String, String> {
+        let mut buf = Vec::with_capacity(64);
+        let mut byte = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .map_err(|e| format!("blit-proxy: handshake read: {e}"))?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
+            if buf.len() > 4096 {
+                return Err("blit-proxy: handshake response too long".into());
+            }
+        }
+        Ok(String::from_utf8_lossy(&buf)
+            .trim_end_matches('\r')
+            .to_string())
+    }
 
     #[cfg(unix)]
     {
@@ -342,15 +365,11 @@ pub async fn connect_via_proxy(upstream_uri: &str) -> Result<Transport, String> 
             .write_all(msg.as_bytes())
             .await
             .map_err(|e| format!("blit-proxy: handshake write: {e}"))?;
-        let mut reader = BufReader::new(stream);
-        let mut resp = String::new();
-        reader
-            .read_line(&mut resp)
+        let resp = tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, read_handshake_line(&mut stream))
             .await
-            .map_err(|e| format!("blit-proxy: handshake read: {e}"))?;
-        let resp = resp.trim_end_matches('\n').trim_end_matches('\r');
+            .map_err(|_| format!("blit-proxy: timed out connecting to {upstream_uri}"))??;
         if resp == "ok" {
-            return Ok(Transport::Unix(reader.into_inner()));
+            return Ok(Transport::Unix(stream));
         } else if let Some(m) = resp.strip_prefix("error ") {
             return Err(format!("blit-proxy: {m}"));
         } else {
@@ -368,15 +387,11 @@ pub async fn connect_via_proxy(upstream_uri: &str) -> Result<Transport, String> 
             .write_all(msg.as_bytes())
             .await
             .map_err(|e| format!("blit-proxy: handshake write: {e}"))?;
-        let mut reader = BufReader::new(stream);
-        let mut resp = String::new();
-        reader
-            .read_line(&mut resp)
+        let resp = tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, read_handshake_line(&mut stream))
             .await
-            .map_err(|e| format!("blit-proxy: handshake read: {e}"))?;
-        let resp = resp.trim_end_matches('\n').trim_end_matches('\r');
+            .map_err(|_| format!("blit-proxy: timed out connecting to {upstream_uri}"))??;
         if resp == "ok" {
-            return Ok(Transport::NamedPipe(reader.into_inner()));
+            return Ok(Transport::NamedPipe(stream));
         } else if let Some(m) = resp.strip_prefix("error ") {
             return Err(format!("blit-proxy: {m}"));
         } else {
@@ -553,6 +568,8 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
         verbose: false,
         max_connections: 0,
         max_ptys: 0,
+        ping_interval: std::time::Duration::from_secs(10),
+        skip_compositor: true,
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {
@@ -587,6 +604,8 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
         verbose: false,
         max_connections: 0,
         max_ptys: 0,
+        ping_interval: std::time::Duration::from_secs(10),
+        skip_compositor: true,
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {

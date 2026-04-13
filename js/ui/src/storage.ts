@@ -34,6 +34,19 @@ export function useRemotes(): () => Remote[] {
   return remotes;
 }
 
+// ---------------------------------------------------------------------------
+// WebTransport cert hash — pushed by the gateway via the config WS as
+// `wt=<sha256hex>` when QUIC is enabled.
+// ---------------------------------------------------------------------------
+
+const [wtCertHash, setWtCertHash] = createSignal<string | undefined>(undefined);
+
+/** Reactive accessor — returns the WebTransport cert hash (hex), or
+ *  undefined when the gateway does not offer WebTransport. */
+export function useWtCertHash(): () => string | undefined {
+  return wtCertHash;
+}
+
 /** Send a remotes-add command over the config WebSocket. */
 export function addRemote(name: string, uri: string): void {
   if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
@@ -82,6 +95,9 @@ export const FONT_KEY = "blit.fontFamily";
 export const FONT_SIZE_KEY = "blit.fontSize";
 export const FONT_SMOOTHING_KEY = "blit.fontSmoothing";
 export const TARGET_KEY = "blit.target";
+export const AUDIO_BITRATE_KEY = "blit.audioBitrate";
+export const AUDIO_MUTED_KEY = "blit.audioMuted";
+export const VIDEO_QUALITY_KEY = "blit.videoQuality";
 
 const PERSISTED_KEYS = new Set([
   PALETTE_KEY,
@@ -90,6 +106,9 @@ const PERSISTED_KEYS = new Set([
   FONT_SMOOTHING_KEY,
   "blit.layouts",
   TARGET_KEY,
+  AUDIO_BITRATE_KEY,
+  AUDIO_MUTED_KEY,
+  VIDEO_QUALITY_KEY,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -138,6 +157,17 @@ function getPassphraseFromHash(): string | null {
   return decoded;
 }
 
+/** Close the config WebSocket and stop reconnection attempts. */
+export function disconnectConfigWs(): void {
+  if (configWs) {
+    const ws = configWs;
+    configWs = null;
+    configReady = false;
+    ws.onclose = null;
+    ws.close();
+  }
+}
+
 export function connectConfigWs(): void {
   if (configWs || configUnavailable) return;
   const pass = getPassphraseFromHash();
@@ -153,6 +183,23 @@ export function connectConfigWs(): void {
 
   ws.onmessage = (ev) => {
     const msg = String(ev.data);
+    if (msg === "auth") {
+      // Auth rejected — stop reconnecting and navigate back to login.
+      configWs = null;
+      configReady = false;
+      ws.onclose = null;
+      ws.close();
+      // Clear passphrase from URL hash, preserving layout params.
+      const raw = location.hash.slice(1);
+      const keep = raw.split("&").filter((s) => /^[lpast]=/.test(s));
+      history.replaceState(
+        null,
+        "",
+        location.pathname + (keep.length ? `#${keep.join("&")}` : ""),
+      );
+      window.dispatchEvent(new Event("hashchange"));
+      return;
+    }
     if (msg === "ok") {
       configEverAuthed = true;
       return;
@@ -170,6 +217,10 @@ export function connectConfigWs(): void {
     }
     if (msg.startsWith("remotes:")) {
       setRemotesSignal(parseRemotesText(msg.slice("remotes:".length)));
+      return;
+    }
+    if (msg.startsWith("wt=")) {
+      setWtCertHash(msg.slice(3));
       return;
     }
     const eq = msg.indexOf("=");
@@ -300,4 +351,32 @@ export function preferredFont(): string {
   const s = readStorage(FONT_KEY);
   if (s?.trim()) return s.trim();
   return DEFAULT_FONT;
+}
+
+/** Preferred audio muted state. Defaults to true (browser autoplay policy). */
+export function preferredAudioMuted(): boolean {
+  const s = readStorage(AUDIO_MUTED_KEY);
+  if (s === "0") return false;
+  // Default to muted — browsers require a user gesture before audio can play.
+  return true;
+}
+
+/** Preferred audio bitrate in kbps. 0 = server default. */
+export function preferredAudioBitrate(): number {
+  const s = readStorage(AUDIO_BITRATE_KEY);
+  if (s) {
+    const n = parseInt(s, 10);
+    if (n >= 0) return n;
+  }
+  return 0;
+}
+
+/** Preferred video quality. 0 = server default. */
+export function preferredVideoQuality(): number {
+  const s = readStorage(VIDEO_QUALITY_KEY);
+  if (s) {
+    const n = parseInt(s, 10);
+    if (n >= 0 && n <= 4) return n;
+  }
+  return 0;
 }

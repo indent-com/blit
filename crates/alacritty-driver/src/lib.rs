@@ -362,7 +362,6 @@ pub struct SearchResult {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct SearchCandidate {
     score: u32,
     source: SearchSource,

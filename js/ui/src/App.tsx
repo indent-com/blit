@@ -10,7 +10,10 @@ import type { BlitTransport, BlitWasmModule } from "@blit-sh/core";
 import {
   useRemotes,
   useDefaultRemote,
+  useWtCertHash,
+  configWsStatus,
   connectConfigWs,
+  disconnectConfigWs,
   configWsUrl,
 } from "./storage";
 import { themeFor } from "./theme";
@@ -87,6 +90,15 @@ function muxWsUrl(): string {
   return proto + "//" + location.host + base + "mux";
 }
 
+/** Build the WebTransport URL for the multiplexed endpoint.
+ *  WebTransport always uses https:// (QUIC requires TLS). */
+function muxWtUrl(): string {
+  const base = location.pathname.endsWith("/")
+    ? location.pathname
+    : location.pathname + "/";
+  return "https://" + location.host + base + "mux";
+}
+
 export function App(props: { wasm: BlitWasmModule }) {
   const [passphrase, setPassphrase] = createSignal(readPassphrase());
 
@@ -114,34 +126,126 @@ export function App(props: { wasm: BlitWasmModule }) {
     connectConfigWs();
   }
 
+  function handleAuthError() {
+    // Remove passphrase from hash, preserving layout params.
+    const rawHash = location.hash.slice(1);
+    const keep = rawHash.split("&").filter((s) => /^[lpast]=/.test(s));
+    const newHash = keep.join("&");
+    history.replaceState(
+      null,
+      "",
+      location.pathname + (newHash ? `#${newHash}` : ""),
+    );
+    disconnectConfigWs();
+    setPassphrase(null);
+  }
+
   return (
     <Show when={passphrase()} fallback={<AuthApp onAuth={handleAuth} />}>
-      {(pass) => <ConnectedApp wasm={props.wasm} passphrase={pass()} />}
+      {(pass) => (
+        <ConnectedApp
+          wasm={props.wasm}
+          passphrase={pass()}
+          onAuthError={handleAuthError}
+        />
+      )}
     </Show>
   );
 }
 
-function ConnectedApp(props: { wasm: BlitWasmModule; passphrase: string }) {
+// ---------------------------------------------------------------------------
+// HMR-preserved state: keep the mux transport and channel cache alive across
+// hot-module reloads so remote connections are not torn down.
+// ---------------------------------------------------------------------------
+
+type HmrData = {
+  mux: MuxTransport;
+  channelCache: Map<string, { uri: string; transport: BlitTransport }>;
+  passphrase: string;
+};
+
+function getHmrData(): HmrData | null {
+  return (import.meta.hot?.data?.connectedApp as HmrData) ?? null;
+}
+
+function setHmrData(data: HmrData): void {
+  if (import.meta.hot) {
+    import.meta.hot.data.connectedApp = data;
+  }
+}
+
+const muxDebug = {
+  log: (m: string, ...a: unknown[]) => console.log(`[mux] ${m}`, ...a),
+  warn: (m: string, ...a: unknown[]) => console.warn(`[mux] ${m}`, ...a),
+  error: (m: string, ...a: unknown[]) => console.error(`[mux] ${m}`, ...a),
+};
+
+function ConnectedApp(props: {
+  wasm: BlitWasmModule;
+  passphrase: string;
+  onAuthError: () => void;
+}) {
   const remotes = useRemotes();
   const defaultRemote = useDefaultRemote();
+  const certHash = useWtCertHash();
 
-  // Single multiplexed WebSocket for all gateway-proxied destinations.
-  const mux = new MuxTransport(muxWsUrl(), props.passphrase);
-  mux.connect();
+  // Reuse the mux and channel cache from a previous HMR cycle if the
+  // passphrase hasn't changed; otherwise start fresh.
+  const prev = getHmrData();
+  if (prev && prev.passphrase !== props.passphrase) {
+    prev.mux.close();
+    for (const entry of prev.channelCache.values()) {
+      entry.transport.close();
+    }
+  }
 
-  onCleanup(() => mux.close());
+  const channelCache: Map<string, { uri: string; transport: BlitTransport }> =
+    prev && prev.passphrase === props.passphrase
+      ? prev.channelCache
+      : new Map();
 
-  // Channel cache: maps destination name → MuxChannel (or share transport).
-  // Channels are reused across reactive updates; only created/closed when the
-  // remote list changes.
-  const channelCache = new Map<
-    string,
-    { uri: string; transport: BlitTransport }
-  >();
+  // The MuxTransport is created only once the config WS has resolved, so
+  // the WT-vs-WS decision is final at construction time.  Before that,
+  // mux() returns null and no connection is attempted.
+  const [mux, setMux] = createSignal<MuxTransport | null>(
+    prev && prev.passphrase === props.passphrase ? prev.mux : null,
+  );
+
+  createEffect(() => {
+    const status = configWsStatus();
+    const hash = certHash();
+    if (status === "connecting") return;
+    if (mux()) return; // already created (or reused from HMR)
+    const m = new MuxTransport(muxWsUrl(), props.passphrase, {
+      wtUrl: hash ? muxWtUrl() : undefined,
+      wtCertHash: hash,
+      debug: muxDebug,
+    });
+    m.connect();
+    setMux(m);
+  });
+
+  createEffect(() => {
+    const m = mux();
+    if (m) setHmrData({ mux: m, channelCache, passphrase: props.passphrase });
+  });
+
+  // On real unmount (passphrase change / auth error) close all transports.
+  // During HMR the data persists and the next mount will re-adopt them.
+  onCleanup(() => {
+    if (!import.meta.hot) {
+      mux()?.close();
+      for (const entry of channelCache.values()) {
+        entry.transport.close();
+      }
+    }
+  });
 
   const connections = createMemo<ConnectionSpec[]>(() => {
+    const m = mux();
     const live = remotes();
     const dflt = defaultRemote();
+    if (!m) return [];
     const next: ConnectionSpec[] = [];
     const seen = new Set<string>();
     for (const { name, uri } of live) {
@@ -159,7 +263,7 @@ function ConnectedApp(props: { wasm: BlitWasmModule; passphrase: string }) {
           transport = createShareTransport(hubUrl, passphrase);
         } else {
           // Gateway-proxied destination — use a mux channel.
-          transport = mux.createChannel(name);
+          transport = m.createChannel(name);
         }
         channelCache.set(name, { uri, transport });
         next.push({ id: name, label: name, transport });
@@ -184,10 +288,7 @@ function ConnectedApp(props: { wasm: BlitWasmModule; passphrase: string }) {
     <Workspace
       connections={connections}
       wasm={props.wasm}
-      onAuthError={() => {
-        history.replaceState(null, "", location.pathname);
-        window.location.reload();
-      }}
+      onAuthError={props.onAuthError}
     />
   );
 }
@@ -257,6 +358,7 @@ function AuthScreen(props: {
       >
         <input
           ref={inputRef}
+          name="blit-passphrase"
           type="password"
           placeholder={i18n("auth.placeholder")}
           autofocus

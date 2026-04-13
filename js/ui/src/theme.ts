@@ -1,10 +1,39 @@
 import type { JSX } from "solid-js";
-import type { BlitSession, TerminalPalette } from "@blit-sh/core";
+import type { BlitSession, BlitSurface, TerminalPalette } from "@blit-sh/core";
 
+/** Display name for a session (title/command, no ptyId — use sessionPrefix() for that). */
 export function sessionName(s: BlitSession): string {
-  const label = s.title ?? s.command;
-  if (label && s.tag && label !== s.tag) return `${s.tag}: ${label}`;
-  return label ?? s.tag ?? "Terminal";
+  const hasTitle = s.title != null && s.title.length > 0;
+  const hasCommand = s.command != null && s.command.length > 0;
+  if (hasTitle && hasCommand && s.title !== s.command) {
+    return `${s.title} \u00B7 ${s.command}`;
+  }
+  if (hasTitle) return s.title!;
+  if (hasCommand) return s.command!;
+  return `${s.ptyId}`;
+}
+
+/** Gray prefix shown before sessionName(): "remote:ptyId" or just "ptyId". */
+export function sessionPrefix(
+  s: BlitSession,
+  connectionLabel?: string | null,
+): string {
+  return connectionLabel ? `${connectionLabel}:${s.ptyId}` : `${s.ptyId}`;
+}
+
+/** Display name for a surface (title/appId, no surfaceId prefix). */
+export function surfaceName(s: BlitSurface): string {
+  return s.title || s.appId || `Surface ${s.surfaceId}`;
+}
+
+/** Gray prefix shown before surfaceName(): "remote:Sid" or just "Sid". */
+export function surfacePrefix(
+  s: BlitSurface,
+  connectionLabel?: string | null,
+): string {
+  return connectionLabel
+    ? `${connectionLabel}:S${s.surfaceId}`
+    : `S${s.surfaceId}`;
 }
 
 export interface Theme {

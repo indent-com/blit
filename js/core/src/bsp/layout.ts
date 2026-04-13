@@ -37,9 +37,13 @@ function preset(name: string, dsl: string): BSPLayout {
 
 const SURFACE_PREFIX = "surface:";
 
-/** Create a BSP assignment value representing a compositor surface. */
-export function surfaceAssignment(surfaceId: number): string {
-  return `${SURFACE_PREFIX}${surfaceId}`;
+/** Create a BSP assignment value representing a compositor surface.
+ *  Format: "surface:<connectionId>:<surfaceId>" */
+export function surfaceAssignment(
+  connectionId: string,
+  surfaceId: number,
+): string {
+  return `${SURFACE_PREFIX}${connectionId}:${surfaceId}`;
 }
 
 /** Check whether a BSP assignment value represents a surface. */
@@ -48,10 +52,16 @@ export function isSurfaceAssignment(value: string | null): boolean {
 }
 
 /** Extract the numeric surface ID from a surface assignment string, or null. */
-export function parseSurfaceAssignment(value: string | null): number | null {
+export function parseSurfaceAssignment(
+  value: string | null,
+): { connectionId: string; surfaceId: number } | null {
   if (value == null || !value.startsWith(SURFACE_PREFIX)) return null;
-  const n = parseInt(value.slice(SURFACE_PREFIX.length), 10);
-  return Number.isFinite(n) ? n : null;
+  const rest = value.slice(SURFACE_PREFIX.length);
+  const colon = rest.lastIndexOf(":");
+  if (colon <= 0) return null;
+  const connectionId = rest.slice(0, colon);
+  const n = parseInt(rest.slice(colon + 1), 10);
+  return Number.isFinite(n) ? { connectionId, surfaceId: n } : null;
 }
 
 export function enumeratePanes(
@@ -121,32 +131,84 @@ export function reconcileAssignments({
   previous,
   liveSessionIds,
   knownSessionIds,
-  liveSurfaceIds,
+  liveSurfaceKeys,
+  readyConnectionIds,
+  sessionReplacements,
+  sessionConnectionIds,
 }: {
   panes: readonly BSPPane[];
   previous: BSPAssignments;
   liveSessionIds: readonly string[];
   knownSessionIds: readonly string[];
-  /** When provided, surface assignments for destroyed surfaces are cleared. */
-  liveSurfaceIds?: readonly number[];
+  /** When provided, surface assignments for destroyed surfaces are cleared.
+   *  Each key is "connectionId:surfaceId". */
+  liveSurfaceKeys?: readonly string[];
+  /** Connections that are both present AND ready.  Surface assignments
+   *  whose connection is absent OR not yet ready (reconnecting) are
+   *  preserved — the surface may reappear once the connection finishes
+   *  its handshake or is re-added. */
+  readyConnectionIds?: ReadonlySet<string>;
+  /** Maps old (closed) session IDs to replacement live session IDs.
+   *  Used to re-map pane assignments after a reconnect where PTYs get
+   *  new session IDs but represent the same underlying terminal. */
+  sessionReplacements?: ReadonlyMap<string, string>;
+  /** Maps session IDs to their owning connection ID.  Used together with
+   *  `readyConnectionIds` to preserve terminal assignments whose
+   *  connection is absent or still reconnecting — mirroring the surface
+   *  assignment protection so terminals survive reconnect cycles too. */
+  sessionConnectionIds?: ReadonlyMap<string, string>;
 }): BSPAssignments {
   const live = new Set(liveSessionIds);
   const known = new Set(knownSessionIds);
-  const liveSurfaces = liveSurfaceIds ? new Set(liveSurfaceIds) : null;
+  const liveSurfaces = liveSurfaceKeys ? new Set(liveSurfaceKeys) : null;
   const assignments: Record<string, string | null> = {};
 
   for (const pane of panes) {
     const value = previous.assignments[pane.id];
     if (isSurfaceAssignment(value)) {
-      // Remove surface assignments when the surface no longer exists.
       if (liveSurfaces) {
-        const sid = parseSurfaceAssignment(value);
-        assignments[pane.id] =
-          sid != null && liveSurfaces.has(sid) ? value : null;
+        const parsed = parseSurfaceAssignment(value);
+        const key =
+          parsed != null ? `${parsed.connectionId}:${parsed.surfaceId}` : null;
+        if (key != null && liveSurfaces.has(key)) {
+          // Surface is live — keep.
+          assignments[pane.id] = value;
+        } else if (
+          parsed &&
+          readyConnectionIds &&
+          !readyConnectionIds.has(parsed.connectionId)
+        ) {
+          // Surface's connection is absent or still reconnecting —
+          // preserve the assignment so it survives until the connection
+          // is fully ready (or re-added).
+          assignments[pane.id] = value;
+        } else {
+          // Surface is gone and its connection is present+ready — clear.
+          assignments[pane.id] = null;
+        }
       } else {
         assignments[pane.id] = value;
       }
       continue;
+    }
+    if (value != null && !live.has(value)) {
+      // The assigned session is gone. Try to replace it with a live
+      // session for the same underlying PTY (reconnect gave it a new ID).
+      const replacement = sessionReplacements?.get(value);
+      if (replacement && live.has(replacement)) {
+        assignments[pane.id] = replacement;
+        continue;
+      }
+      // Session's connection is absent or still reconnecting — preserve
+      // the assignment so it survives until the connection is fully
+      // ready (or re-added), mirroring the surface protection above.
+      if (readyConnectionIds && sessionConnectionIds) {
+        const connId = sessionConnectionIds.get(value);
+        if (connId != null && !readyConnectionIds.has(connId)) {
+          assignments[pane.id] = value;
+          continue;
+        }
+      }
     }
     const keep = value != null && (live.has(value) || !known.has(value));
     assignments[pane.id] = keep ? value : null;

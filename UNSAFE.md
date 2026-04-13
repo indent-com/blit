@@ -25,7 +25,7 @@ child: close(master) -> setsid() -> ioctl(TIOCSCTTY) -> dup2(slave, 0/1/2)
 
 `setsid` must come before `TIOCSCTTY` (can't set a controlling terminal without being a session leader). `dup2` must come before closing the slave fd (otherwise stdio points at nothing). The `close(slave)` is conditional on `slave > 2` — if slave happens to be fd 0/1/2, the `dup2` calls already aliased it. `close(master)` happens first in the child because the child must not hold the master fd — if it did, reads from master in the parent would never see EOF when the child exits.
 
-`close_fds_except(3)` closes all inherited parent fds (IPC listener, other PTY masters, epoll fd, compositor fds) to prevent the child from accessing other sessions. `signal(SIGPIPE, SIG_DFL)` resets SIGPIPE handling since the Rust runtime sets it to SIG_IGN, which breaks piped commands.
+`close_fds_except(3)` closes all inherited parent fds (IPC listener, other PTY masters, epoll fd, compositor fds) to prevent the child from accessing other terminals. `signal(SIGPIPE, SIG_DFL)` resets SIGPIPE handling since the Rust runtime sets it to SIG_IGN, which breaks piped commands.
 
 The child's environment is built before `fork()` via `build_child_env()` and passed to `execve()` — this avoids calling `std::env::set_var`/`remove_var` after fork in a multi-threaded process (not async-signal-safe per POSIX). PATH resolution is also done before fork via `resolve_in_path()`.
 
@@ -33,7 +33,7 @@ On the parent side, `close(slave)` is equally important — the parent must not 
 
 ## Compositor child spawn
 
-`spawn_compositor_child` in [`crates/server/src/lib.rs`](crates/server/src/lib.rs) is a simpler fork/exec path used to launch Wayland GUI commands (e.g. `foot`). The child calls `chdir()`, mutates the environment (`set_var`/`remove_var` for `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `DISPLAY`), then `execvp`. Unlike the PTY spawn path, it does not call `setsid`, `TIOCSCTTY`, or `close_fds_except` — the child inherits the parent's fd table. This is acceptable because compositor children don't need a controlling terminal and don't interact with PTY sessions.
+`spawn_compositor_child` in [`crates/server/src/lib.rs`](crates/server/src/lib.rs) is a simpler fork/exec path used to launch Wayland GUI commands (e.g. `foot`). The child calls `chdir()`, mutates the environment (`set_var`/`remove_var` for `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `DISPLAY`), then `execvp`. Unlike the PTY spawn path, it does not call `setsid`, `TIOCSCTTY`, or `close_fds_except` — the child inherits the parent's fd table. This is acceptable because compositor children don't need a controlling terminal and don't interact with PTYs.
 
 ## Windows ConPTY in `server`
 
@@ -67,13 +67,11 @@ Two macOS-only calls that aren't in the `libc` crate:
 
 `crates/browser/src/lib.rs` declares an `unsafe extern "C"` block for JavaScript helper functions injected via `#[wasm_bindgen(inline_js)]`. The functions (`blitFillTextCodePoint`, `blitFillTextStretched`, `blitFillText`, `blitMeasureMaxOverhang`) are called from safe Rust through wasm-bindgen's generated bindings. The `unsafe` marker is required by edition 2024 for all `extern` blocks.
 
-## Dmabuf pixel reads in `compositor`
+## Dmabuf and SHM pixel reads in `compositor`
 
-`read_dmabuf_pixels` in [`crates/compositor/src/imp.rs`](crates/compositor/src/imp.rs) calls `dmabuf.map_plane()` to get a raw pointer and length, then uses `std::slice::from_raw_parts(ptr, len)` to create byte slices from the mapped memory regions.
+`read_dmabuf_buffer` in [`crates/compositor/src/imp.rs`](crates/compositor/src/imp.rs) uses `libc::readlink` on `/proc/self/fd/{fd}` to resolve the DMA-BUF fd path for diagnostics, and returns the fd/fourcc/modifier metadata as `PixelData::DmaBuf` for zero-copy import by the GPU renderer or CPU fallback.
 
-The invariants: `map_plane` must return a valid mapping whose `ptr()` is non-null and `length()` accurately describes the mapped region. Each mapping is bracketed by `sync_plane(START|READ)` / `sync_plane(END|READ)` to ensure cache coherence with the GPU. The slices must not outlive the `DmabufMapping` objects — currently they don't because both stay local to the helper closure that reads each plane.
-
-The SHM path in `commit()` uses the same pattern (`std::slice::from_raw_parts`) via `with_buffer_contents`, which smithay invokes with a pointer to the shared memory pool. The safety contract is the same: the slice is only used within the callback closure.
+The SHM path in `commit()` uses `std::slice::from_raw_parts` to read from the client's shared memory pool. The safety contract: the slice is only used within the commit handler and does not outlive the buffer mapping.
 
 `spawn_compositor` calls `std::env::set_var("XDG_RUNTIME_DIR", …)` inside an `unsafe` block when the variable is unset (e.g. macOS). This is called once at the start of the compositor thread before any Wayland socket is created. The invariant: no other thread reads `XDG_RUNTIME_DIR` concurrently at that point; the variable is only consumed by `ListeningSocketSource::new_auto` immediately after.
 
@@ -93,19 +91,21 @@ The CUDA context (`cuCtxCreate_v2`) is created per encoder instance and must rem
 
 ## VA-API direct encoder in `server`
 
-`crates/server/src/vaapi_encode.rs` implements H.264 and H.265 (HEVC) encoding via VA-API's C interface loaded through `gpu_libs.rs`. Both encoders (`VaapiDirectEncoder` for H.264, `VaapiHevcEncoder` for H.265) follow the same pattern: all VA-API parameter buffer structs (SPS, PPS, slice) are accessed as raw byte arrays at verified offsets rather than `#[repr(C)]` struct translation, since the VA-API headers contain complex bitfields.
+`crates/server/src/vaapi_encode.rs` implements H.264 encoding via VA-API's C interface loaded through `gpu_libs.rs`. `VaapiDirectEncoder` accesses all VA-API parameter buffer structs (SPS, PPS, slice) as raw byte arrays at verified offsets rather than `#[repr(C)]` struct translation, since the VA-API headers contain complex bitfields.
 
 Surface pixel upload uses `vaDeriveImage` + `vaMapBuffer` to get a raw pointer into driver-owned memory. Writes into this mapping use the image-reported `pitches` (not packed width). The mapping must be unmapped (`vaUnmapBuffer`) and the derived image destroyed (`vaDestroyImage`) before the surface is submitted for encoding. Violating this ordering corrupts the driver's internal state.
 
-Encoded bitstream readback walks a linked list of `VACodedBufferSegment` structs via raw pointer arithmetic at hardcoded offsets (`CBS_SIZE_OFF`, `CBS_BUF_OFF`, `CBS_NEXT_OFF`), reading each segment's data pointer and size to copy out the NAL units.
+Encoded bitstream readback walks a linked list of `VACodedBufferSegment` structs via raw pointer arithmetic at hardcoded offsets (`CBS_BUF_OFF`, `CBS_NEXT_OFF`), reading each segment's data pointer and size to copy out the NAL units.
 
 ## DMA-BUF CPU fallback in `server`
 
 `crates/server/src/surface_encoder.rs` reads DMA-BUF pixel data via `mmap` + `DMA_BUF_IOCTL_SYNC` when no zero-copy GPU import path is available. The `mmap` size is determined by `lseek(SEEK_END)` on the fd. The sync start/end brackets ensure cache coherence with the GPU. The mapped slice must not outlive the `munmap` call.
 
-## DMA-BUF zero-copy color conversion in `server`
+## GPU compositing in `compositor`
 
-`crates/server/src/dmabuf_zerocopy.rs` implements VA-API Video Processing Pipeline (VPP) for zero-copy DMA-BUF color space conversion (BGRA to NV12). It loads a separate set of VA-API VPP function pointers (declared as local `unsafe extern "C" fn` types) and calls them through the same `gpu_libs.rs` mechanism. The `VaapiVppContext` struct holds the VA display, config, context, and surfaces — all must be destroyed in the correct order in `Drop`. The `convert_dmabuf` method imports a client DMA-BUF as a BGRA `VASurface` and runs VPP conversion to an NV12 output surface. `unsafe impl Send` is required because the VA-API handles are raw pointers.
+`crates/compositor/src/vulkan_render.rs` loads Vulkan at runtime via the `ash` crate's `loaded` feature (dlopen `libvulkan.so`). `VulkanRenderer` manages a Vulkan instance, device, queue, command pool, descriptor pool, and pipeline for compositing Wayland client surfaces. DMA-BUF textures are imported via `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier`. SHM buffers are uploaded via staging memory. Output images are read back through `HOST_VISIBLE` staging buffers. `unsafe impl Send for VulkanRenderer` is required because Vulkan handles are raw pointers accessed only from the compositor thread.
+
+The invariants: Vulkan objects must be destroyed in the correct order — images and image views before the device, descriptor sets before the pool, command buffers before the command pool, and the device before the instance (`Drop` impl handles ordering); imported DMA-BUF memory must not be accessed after the client destroys the underlying buffer; and staging buffer mappings must remain valid for the duration of the memory copy.
 
 ## Audit checklist
 
@@ -115,8 +115,8 @@ Encoded bitstream readback walks a linked list of `VACodedBufferSegment` structs
 - **WASM boundary** — `crates/browser/` targets `wasm32-unknown-unknown` and must never import `libc` or `std::os::unix`.
 - **NVENC struct sizes** — every NVENC struct must be sized to match `nv-codec-headers` 12.1 exactly. The driver validates sizes via version tags — an oversized or undersized struct silently fails with error 15.
 - **NVENC function list slots** — the function pointer index in `NvEncFunctionList` must match the SDK header's field order. A wrong slot calls a different function with incompatible arguments → undefined behavior.
-- **VA-API byte offsets** — the SPS/PPS/slice parameter buffer offsets are hand-verified against `va_enc_h264.h` and `va_enc_hevc.h`. If VA-API bumps struct versions, these must be re-verified.
+- **VA-API byte offsets** — the SPS/PPS/slice parameter buffer offsets are hand-verified against `va_enc_h264.h`. If VA-API bumps struct versions, these must be re-verified.
 - **dlopen lifetime** — the `DynLib` handle in each `*Fns` struct must not be dropped while function pointers are still callable. The `OnceLock<Option<*Fns>>` pattern ensures this for `'static`.
 - **Windows handle leaks** — every `CreatePipe`/`CreatePseudoConsole`/`CreateProcessW` path must close all handles on failure. `CloseHandle(pi.hThread)` must be called after `CreateProcessW` since the thread handle is unused.
-- **VPP destroy order** — `dmabuf_zerocopy.rs` must destroy surfaces before context, and context before config, matching the VA-API object hierarchy.
-- **VA-API encoder VPP lifetime** — `VaapiDirectEncoder` and `VaapiHevcEncoder` in `vaapi_encode.rs` each own an `Option<VppContext>` that shares the parent encoder's VA display handle. The VPP context must be dropped (`self.vpp.take()`) **before** `vaTerminate(self.display)` in the encoder's `Drop` impl — otherwise `VppContext::drop` calls `vaDestroyContext` on a terminated display, causing a SIGSEGV. Rust's default field drop order does not guarantee this.
+- **Vulkan renderer resource ordering** — `VulkanRenderer::Drop` must destroy images, image views, descriptor sets, pipelines, and command buffers before destroying the device, and the device before the instance.
+- **DMA-BUF import lifetime** — imported Vulkan memory from DMA-BUF fds must not outlive the client buffer; per-frame textures are destroyed at the start of each render pass to prevent stale references.

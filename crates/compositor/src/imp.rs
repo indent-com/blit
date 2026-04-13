@@ -1,113 +1,142 @@
+//! Headless Wayland compositor using `wayland-server` directly.
+//!
+//! Handles
+//! wl_compositor, wl_subcompositor, xdg_shell, wl_shm, wl_seat,
+//! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
+//! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
+
+use crate::positioner::PositionerGeometry;
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
 
-use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufMappingMode};
-use smithay::backend::allocator::{Buffer, Fourcc, Modifier, Format as DmabufFormat};
-use smithay::backend::input::{Axis, ButtonState, KeyState};
-use smithay::delegate_compositor;
-use smithay::delegate_cursor_shape;
-use smithay::delegate_data_device;
-use smithay::delegate_dmabuf;
-use smithay::delegate_fractional_scale;
-use smithay::delegate_output;
-use smithay::delegate_text_input_manager;
-use smithay::delegate_primary_selection;
-use smithay::delegate_seat;
-use smithay::delegate_shm;
-use smithay::delegate_viewporter;
-use smithay::delegate_xdg_activation;
-use smithay::delegate_xdg_decoration;
-use smithay::delegate_xdg_shell;
-use smithay::delegate_xdg_toplevel_icon;
-use smithay::desktop::{Space, Window};
-use smithay::input::keyboard::FilterResult;
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
-use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, PostAction};
-use smithay::reexports::wayland_server::protocol::wl_buffer;
-use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
-use smithay::reexports::wayland_server::protocol::wl_shm;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
-use smithay::utils::{Serial, Transform, SERIAL_COUNTER};
-use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{
-    self, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-    with_states, with_surface_tree_downward, TraversalAction, get_parent,
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, LoopSignal, PostAction};
+use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::{
+    self, WpCursorShapeDeviceV1,
 };
-use smithay::wayland::output::OutputHandler;
-use smithay::wayland::selection::data_device::{
-    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-    set_data_device_focus, set_data_device_selection, request_data_device_client_selection,
+use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::{
+    self, WpCursorShapeManagerV1,
 };
-use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
-use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-    XdgToplevelSurfaceData,
+use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::{
+    self, WpFractionalScaleManagerV1,
 };
-use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
-use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState, supports_syncobj_eventfd};
-use smithay::backend::drm::DrmDeviceFd;
-use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
-use smithay::wayland::shm::{BufferData, ShmHandler, ShmState, with_buffer_contents};
-use smithay::wayland::socket::ListeningSocketSource;
-use smithay::wayland::cursor_shape::CursorShapeManagerState;
-use smithay::wayland::tablet_manager::TabletSeatHandler;
-use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
-use smithay::wayland::selection::primary_selection::{PrimarySelectionHandler, PrimarySelectionState, set_primary_focus};
-use smithay::wayland::text_input::TextInputManagerState;
-use smithay::wayland::viewporter::ViewporterState;
-use smithay::wayland::xdg_activation::{
-    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::presentation_time::server::wp_presentation::{
+    self, WpPresentation,
 };
-use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler;
-use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::{
+    Kind as WpPresentationFeedbackKind, WpPresentationFeedback,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_buffer_params_v1::{
+    self, ZwpLinuxBufferParamsV1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::{
+    self, ZwpLinuxDmabufV1,
+};
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_confined_pointer_v1::ZwpConfinedPointerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_locked_pointer_v1::ZwpLockedPointerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::{
+    self, ZwpPointerConstraintsV1,
+};
+use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::{
+    self, ZwpPrimarySelectionDeviceManagerV1,
+};
+use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::{
+    self, ZwpPrimarySelectionDeviceV1,
+};
+use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_offer_v1::{
+    self, ZwpPrimarySelectionOfferV1,
+};
+use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::{
+    self, ZwpPrimarySelectionSourceV1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::{
+    self, ZwpRelativePointerManagerV1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_v1::ZwpRelativePointerV1;
+use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::{
+    self, ZwpTextInputManagerV3,
+};
+use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
+    self, ZwpTextInputV3,
+};
+use wayland_protocols::wp::viewporter::server::wp_viewport::WpViewport;
+use wayland_protocols::wp::viewporter::server::wp_viewporter::{self, WpViewporter};
+use wayland_protocols::xdg::activation::v1::server::xdg_activation_token_v1::{
+    self, XdgActivationTokenV1,
+};
+use wayland_protocols::xdg::activation::v1::server::xdg_activation_v1::{
+    self, XdgActivationV1,
+};
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::{
+    self, ZxdgDecorationManagerV1,
+};
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::{
+    self, ZxdgToplevelDecorationV1,
+};
+use wayland_protocols::xdg::shell::server::xdg_popup::{self, XdgPopup};
+use wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner;
+use wayland_protocols::xdg::shell::server::xdg_surface::{self, XdgSurface};
+use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, XdgToplevel};
+use wayland_protocols::xdg::shell::server::xdg_wm_base::{self, XdgWmBase};
+use wayland_server::protocol::wl_buffer::WlBuffer;
+use wayland_server::protocol::wl_callback::WlCallback;
+use wayland_server::protocol::wl_compositor::WlCompositor;
+use wayland_server::protocol::wl_data_device::{self, WlDataDevice};
+use wayland_server::protocol::wl_data_device_manager::{self, WlDataDeviceManager};
+use wayland_server::protocol::wl_data_offer::{self, WlDataOffer};
+use wayland_server::protocol::wl_data_source::{self, WlDataSource};
+use wayland_server::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_server::protocol::wl_output::{self, WlOutput};
+use wayland_server::protocol::wl_pointer::{self, WlPointer};
+use wayland_server::protocol::wl_region::WlRegion;
+use wayland_server::protocol::wl_seat::{self, WlSeat};
+use wayland_server::protocol::wl_shm::{self, WlShm};
+use wayland_server::protocol::wl_shm_pool::WlShmPool;
+use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
+use wayland_server::protocol::wl_subsurface::WlSubsurface;
+use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::backend::ObjectId;
+use wayland_server::{
+    Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
+};
+
+// ---------------------------------------------------------------------------
+// Public types (re-exported from lib.rs)
+// ---------------------------------------------------------------------------
 
 /// Pixel data in its native format, avoiding unnecessary colorspace conversions.
-///
-/// The inner buffers are wrapped in `Arc` so that cloning `PixelData` is O(1)
-/// (refcount bump) rather than a multi-megabyte memcpy.
 #[derive(Clone)]
 pub enum PixelData {
-    /// BGRA packed pixels (from Wayland SHM buffers).
-    /// Layout: [B, G, R, A] per pixel, row-major, no padding.
     Bgra(Arc<Vec<u8>>),
-    /// RGBA packed pixels (legacy path / capture conversions).
-    /// Layout: [R, G, B, A] per pixel, row-major, no padding.
     Rgba(Arc<Vec<u8>>),
-    /// NV12 planar: Y plane followed by interleaved UV plane.
-    /// `y_stride` and `uv_stride` may differ from width (DMA-BUF padding).
-    /// Stored contiguously: `data[..y_stride*height]` is Y,
-    /// `data[y_stride*height..]` is UV.
     Nv12 {
         data: Arc<Vec<u8>>,
         y_stride: usize,
         uv_stride: usize,
     },
-    /// DMA-BUF file descriptor for zero-copy GPU encoding.
-    ///
-    /// The fd is dup'd from the Wayland buffer — the original wl_buffer has
-    /// been released, but this fd keeps the DMA-BUF kernel object alive.
-    /// The encoder imports this directly into GPU memory (VA-API VPP or
-    /// CUDA-EGL) without any CPU-side pixel copies.
     DmaBuf {
-        fd: Arc<std::os::fd::OwnedFd>,
-        /// DRM fourcc (e.g. DRM_FORMAT_ARGB8888)
+        fd: Arc<OwnedFd>,
         fourcc: u32,
-        /// DRM format modifier (e.g. DRM_FORMAT_MOD_LINEAR)
         modifier: u64,
         stride: u32,
         offset: u32,
     },
+    /// VA-API surface ready for VPP/encode — zero-copy path.
+    /// The surface was allocated by VA-API, exported as DMA-BUF for EGL
+    /// rendering, and is identified by its VASurfaceID.  The `va_display`
+    /// is an opaque pointer to the shared VADisplay.
+    VaSurface {
+        surface_id: u32,
+        va_display: usize, // *mut c_void as usize for Send+Sync
+        /// Keep the DMA-BUF fd alive so the EGL image remains valid.
+        _fd: Arc<OwnedFd>,
+    },
 }
 
-/// A single layer in a composited surface tree.
 #[derive(Clone)]
 pub struct PixelLayer {
     pub x: i32,
@@ -117,23 +146,30 @@ pub struct PixelLayer {
     pub pixels: PixelData,
 }
 
-/// DRM fourcc constants used in PixelData::DmaBuf.
+/// A DMA-BUF fd exported from a VA-API surface for use as a GPU
+/// renderer output target.  The compositor renders into the EGL FBO
+/// backed by this fd; the encoder references the VA-API surface by ID.
+pub struct ExternalOutputBuffer {
+    pub fd: Arc<OwnedFd>,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub stride: u32,
+    pub offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub va_surface_id: u32,
+    pub va_display: usize,
+}
+
 pub mod drm_fourcc {
-    /// DRM_FORMAT_ARGB8888 — [B,G,R,A] in memory on little-endian.
     pub const ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
-    /// DRM_FORMAT_XRGB8888 — [B,G,R,X] in memory on little-endian.
     pub const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
-    /// DRM_FORMAT_ABGR8888 — [R,G,B,A] in memory on little-endian.
     pub const ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
-    /// DRM_FORMAT_XBGR8888 — [R,G,B,X] in memory on little-endian.
     pub const XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
-    /// DRM_FORMAT_NV12
     pub const NV12: u32 = u32::from_le_bytes(*b"NV12");
 }
 
 impl PixelData {
-    /// Convert to RGBA for consumers that require it (screenshots, etc.).
-    /// Panics for DmaBuf variant — callers must handle that case separately.
     pub fn to_rgba(&self, width: u32, height: u32) -> Vec<u8> {
         let w = width as usize;
         let h = height as usize;
@@ -177,19 +213,44 @@ impl PixelData {
                 rgba
             }
             PixelData::DmaBuf {
-                fd, fourcc, stride, ..
+                fd,
+                fourcc,
+                stride,
+                offset,
+                ..
             } => {
-                // Try CPU readback of DMA-BUF via sync + mmap.
-                use std::os::fd::AsRawFd;
                 let raw = fd.as_raw_fd();
                 let stride_usize = *stride as usize;
-                let map_size = stride_usize * h;
+                let plane_offset = *offset as usize;
+                let map_size = plane_offset + stride_usize * h;
                 if map_size == 0 {
                     return Vec::new();
                 }
-                // Sync to ensure GPU writes are visible to CPU.
-                let sync_start: u64 = 1 | 4; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
-                unsafe { libc::ioctl(raw, 0x40086200u64 as _, &sync_start) };
+                // Best-effort DMA-BUF sync: try a non-blocking poll to see
+                // if the implicit GPU fence is signaled.  If it is, bracket
+                // the read with SYNC_START/SYNC_END for cache coherency.
+                // If poll fails (fd doesn't support it, e.g. Vulkan WSI) or
+                // the fence isn't ready yet, skip the sync and read anyway —
+                // a slightly stale frame is far better than a black surface.
+                const DMA_BUF_SYNC_READ: u64 = 1;
+                const DMA_BUF_SYNC_START: u64 = 0;
+                const DMA_BUF_SYNC_END: u64 = 4;
+                const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+                let did_sync = {
+                    let mut pfd = libc::pollfd {
+                        fd: raw,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    if ready > 0 {
+                        let s: u64 = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                        unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &s) };
+                        true
+                    } else {
+                        false
+                    }
+                };
                 let ptr = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
@@ -201,40 +262,46 @@ impl PixelData {
                     )
                 };
                 if ptr == libc::MAP_FAILED {
+                    if did_sync {
+                        let s: u64 = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                        unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &s) };
+                    }
                     return Vec::new();
                 }
                 let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_size) };
                 let row_bytes = w * 4;
                 let mut pixels = Vec::with_capacity(w * h * 4);
                 for row in 0..h {
-                    let start = row * stride_usize;
+                    let start = plane_offset + row * stride_usize;
                     if start + row_bytes <= slice.len() {
                         pixels.extend_from_slice(&slice[start..start + row_bytes]);
                     }
                 }
-                // Force alpha=255 for XRGB/XBGR formats.
-                if matches!(*fourcc, drm_fourcc::XRGB8888 | drm_fourcc::XBGR8888) {
-                    for px in pixels.chunks_exact_mut(4) {
+                let is_bgr_mem = matches!(*fourcc, drm_fourcc::ARGB8888 | drm_fourcc::XRGB8888);
+                let force_alpha = matches!(*fourcc, drm_fourcc::XRGB8888 | drm_fourcc::XBGR8888);
+                for px in pixels.chunks_exact_mut(4) {
+                    if is_bgr_mem {
+                        px.swap(0, 2);
+                    }
+                    if force_alpha {
                         px[3] = 255;
                     }
                 }
-                let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
-                unsafe {
-                    libc::ioctl(raw, 0x40086200u64 as _, &sync_end);
-                    libc::munmap(ptr, map_size);
+                unsafe { libc::munmap(ptr, map_size) };
+                if did_sync {
+                    let s: u64 = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                    unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &s) };
                 }
                 pixels
             }
+            PixelData::VaSurface { .. } => Vec::new(),
         }
     }
 
-    /// Return the pixel data as BGRA bytes (for compositing).
-    /// For DmaBuf, attempts mmap readback.  Returns empty on failure.
     pub fn to_bgra_vec(&self, width: u32, height: u32) -> Vec<u8> {
         match self {
             PixelData::Bgra(v) => v.as_ref().to_vec(),
             PixelData::Rgba(v) => {
-                // RGBA → BGRA swap
                 let mut bgra = v.as_ref().to_vec();
                 for px in bgra.chunks_exact_mut(4) {
                     px.swap(0, 2);
@@ -242,20 +309,27 @@ impl PixelData {
                 bgra
             }
             PixelData::DmaBuf {
-                fd, stride, fourcc, ..
+                fd,
+                stride,
+                fourcc,
+                offset,
+                ..
             } => {
-                // Try mmap readback for linear DMA-BUFs.
-                use std::os::fd::AsRawFd;
                 let raw = fd.as_raw_fd();
                 let s = *stride as usize;
                 let h = height as usize;
                 let w = width as usize;
-                let map_size = s * h;
+                let off = *offset as usize;
+                let map_size = off + s * h;
                 if map_size == 0 {
                     return Vec::new();
                 }
-                let sync_start: u64 = 1 | 4;
-                unsafe { libc::ioctl(raw, 0x40086200u64 as _, &sync_start) };
+                const DMA_BUF_SYNC_READ: u64 = 1;
+                const DMA_BUF_SYNC_START: u64 = 0;
+                const DMA_BUF_SYNC_END: u64 = 4;
+                const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+                let sync_start: u64 = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &sync_start) };
                 let ptr = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
@@ -274,7 +348,8 @@ impl PixelData {
                 let is_bgr = matches!(fourcc, 0x34325241 | 0x34325258);
                 let mut bgra = Vec::with_capacity(w * h * 4);
                 for row in 0..h {
-                    let src = &slice[row * s..row * s + row_bytes.min(slice.len() - row * s)];
+                    let row_start = off + row * s;
+                    let src = &slice[row_start..row_start + row_bytes.min(slice.len() - row_start)];
                     if is_bgr {
                         bgra.extend_from_slice(src);
                     } else {
@@ -283,10 +358,10 @@ impl PixelData {
                         }
                     }
                 }
-                let sync_end: u64 = 2 | 4;
+                let sync_end: u64 = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
                 unsafe {
-                    libc::ioctl(raw, 0x40086200u64 as _, &sync_end);
                     libc::munmap(ptr, map_size);
+                    libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &sync_end);
                 }
                 bgra
             }
@@ -298,14 +373,30 @@ impl PixelData {
         match self {
             PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
             PixelData::Nv12 { data, .. } => data.is_empty(),
-            PixelData::DmaBuf { .. } => false,
+            PixelData::DmaBuf { .. } | PixelData::VaSurface { .. } => false,
         }
     }
 
-    /// Returns true if this is a DMA-BUF reference (GPU-resident).
     pub fn is_dmabuf(&self) -> bool {
         matches!(self, PixelData::DmaBuf { .. })
     }
+
+    pub fn is_va_surface(&self) -> bool {
+        matches!(self, PixelData::VaSurface { .. })
+    }
+}
+
+#[derive(Clone)]
+pub enum CursorImage {
+    Named(String),
+    Custom {
+        hotspot_x: u16,
+        hotspot_y: u16,
+        width: u16,
+        height: u16,
+        rgba: Vec<u8>,
+    },
+    Hidden,
 }
 
 pub enum CompositorEvent {
@@ -340,9 +431,12 @@ pub enum CompositorEvent {
         height: u16,
     },
     ClipboardContent {
-        surface_id: u16,
         mime_type: String,
         data: Vec<u8>,
+    },
+    SurfaceCursor {
+        surface_id: u16,
+        cursor: CursorImage,
     },
 }
 
@@ -371,7 +465,6 @@ pub enum CompositorCommand {
         surface_id: u16,
         width: u16,
         height: u16,
-        /// DPR in 1/120th units (Wayland convention): 120 = 1×, 240 = 2×.  0 = unchanged.
         scale_120: u16,
     },
     SurfaceFocus {
@@ -381,128 +474,652 @@ pub enum CompositorCommand {
         surface_id: u16,
     },
     ClipboardOffer {
-        surface_id: u16,
         mime_type: String,
         data: Vec<u8>,
     },
     Capture {
         surface_id: u16,
+        scale_120: u16,
         reply: mpsc::SyncSender<Option<(u32, u32, Vec<u8>)>>,
     },
-    /// Fire pending wl_surface.frame callbacks for a surface so the
-    /// client will paint and commit its next frame.  Send this when
-    /// the server is ready to consume a new frame (streaming or capture).
     RequestFrame {
         surface_id: u16,
     },
-    /// Release the given keys (evdev keycodes) in the compositor's XKB
-    /// state.  Sent by the server when a transport client disconnects so
-    /// that stuck modifiers / runaway key-repeat don't persist.
     ReleaseKeys {
         keycodes: Vec<u32>,
+    },
+    /// List available clipboard MIME types.
+    ClipboardListMimes {
+        reply: mpsc::SyncSender<Vec<String>>,
+    },
+    /// Read clipboard content for a specific MIME type.
+    ClipboardGet {
+        mime_type: String,
+        reply: mpsc::SyncSender<Option<Vec<u8>>>,
+    },
+    /// Set externally-allocated DMA-BUF fds as GPU renderer output targets.
+    SetExternalOutputBuffers {
+        buffers: Vec<ExternalOutputBuffer>,
+    },
+    /// Synthesize text input as key press/release sequences.
+    TextInput {
+        text: String,
     },
     Shutdown,
 }
 
-struct SurfaceInfo {
-    surface_id: u16,
-    window: Window,
-    last_width: u32,
-    last_height: u32,
-    last_title: String,
-    last_app_id: String,
-    /// Suppress repeated "commit with no readable buffer" warnings.
-    unreadable_warned: bool,
+// ---------------------------------------------------------------------------
+// Internal state
+// ---------------------------------------------------------------------------
+
+/// Per-wl_surface state.  `pub(crate)` so render.rs can access fields.
+pub(crate) struct Surface {
+    pub surface_id: u16,
+    pub wl_surface: WlSurface,
+
+    // pending state
+    pending_buffer: Option<WlBuffer>,
+    pending_buffer_scale: i32,
+    pending_damage: bool,
+    pending_frame_callbacks: Vec<WlCallback>,
+    pending_presentation_feedbacks: Vec<WpPresentationFeedback>,
+    pending_opaque: bool,
+
+    // committed state
+    pub buffer_scale: i32,
+    pub is_opaque: bool,
+
+    // subsurface
+    pub parent_surface_id: Option<ObjectId>,
+    pending_subsurface_position: Option<(i32, i32)>,
+    pub subsurface_position: (i32, i32),
+    pub children: Vec<ObjectId>,
+
+    // xdg
+    xdg_surface: Option<XdgSurface>,
+    xdg_toplevel: Option<XdgToplevel>,
+    xdg_popup: Option<XdgPopup>,
+    pub xdg_geometry: Option<(i32, i32, i32, i32)>,
+
+    title: String,
+    app_id: String,
+
+    // viewport
+    pending_viewport_destination: Option<(i32, i32)>,
+    /// Committed viewport destination (logical size declared by client via
+    /// `wp_viewport.set_destination`).  Used by fractional-scale-aware clients
+    /// (e.g. Chromium) that render at physical resolution with `buffer_scale=1`
+    /// and rely on the viewport to declare the logical surface size.
+    pub viewport_destination: Option<(i32, i32)>,
+
+    is_cursor: bool,
+    cursor_hotspot: (i32, i32),
 }
 
-struct ClientData {
-    compositor_state: CompositorClientState,
+struct ShmPool {
+    resource: WlShmPool,
+    fd: OwnedFd,
+    size: usize,
+    mmap_ptr: *mut u8,
 }
 
-impl smithay::reexports::wayland_server::backend::ClientData for ClientData {
-    fn initialized(&self, _client_id: smithay::reexports::wayland_server::backend::ClientId) {}
-    fn disconnected(
+impl ShmPool {
+    fn new(resource: WlShmPool, fd: OwnedFd, size: i32) -> Self {
+        let sz = size.max(0) as usize;
+        let ptr = if sz > 0 {
+            unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    sz,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    0,
+                )
+            }
+        } else {
+            libc::MAP_FAILED
+        };
+        ShmPool {
+            resource,
+            fd,
+            size: sz,
+            mmap_ptr: if ptr == libc::MAP_FAILED {
+                std::ptr::null_mut()
+            } else {
+                ptr as *mut u8
+            },
+        }
+    }
+
+    fn resize(&mut self, new_size: i32) {
+        let new_sz = new_size.max(0) as usize;
+        if new_sz <= self.size {
+            return;
+        }
+        if !self.mmap_ptr.is_null() {
+            unsafe {
+                libc::munmap(self.mmap_ptr as *mut _, self.size);
+            }
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                new_sz,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                self.fd.as_raw_fd(),
+                0,
+            )
+        };
+        self.mmap_ptr = if ptr == libc::MAP_FAILED {
+            std::ptr::null_mut()
+        } else {
+            ptr as *mut u8
+        };
+        self.size = new_sz;
+    }
+
+    fn read_buffer(
         &self,
-        _client_id: smithay::reexports::wayland_server::backend::ClientId,
-        _reason: smithay::reexports::wayland_server::backend::DisconnectReason,
-    ) {
+        offset: i32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        format: wl_shm::Format,
+    ) -> Option<(u32, u32, PixelData)> {
+        if self.mmap_ptr.is_null() {
+            return None;
+        }
+        let w = width as u32;
+        let h = height as u32;
+        let s = stride as usize;
+        let off = offset as usize;
+        let row_bytes = w as usize * 4;
+        let needed = off + s * (h as usize).saturating_sub(1) + row_bytes;
+        if needed > self.size {
+            return None;
+        }
+        let mut bgra = if s == row_bytes && off == 0 {
+            let total = row_bytes * h as usize;
+            unsafe { std::slice::from_raw_parts(self.mmap_ptr, total) }.to_vec()
+        } else {
+            let mut packed = Vec::with_capacity(row_bytes * h as usize);
+            for row in 0..h as usize {
+                let src = unsafe {
+                    std::slice::from_raw_parts(self.mmap_ptr.add(off + row * s), row_bytes)
+                };
+                packed.extend_from_slice(src);
+            }
+            packed
+        };
+        if matches!(format, wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888) {
+            for px in bgra.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+        if matches!(format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888) {
+            Some((w, h, PixelData::Rgba(Arc::new(bgra))))
+        } else {
+            Some((w, h, PixelData::Bgra(Arc::new(bgra))))
+        }
     }
 }
 
-pub struct Compositor {
+impl Drop for ShmPool {
+    fn drop(&mut self) {
+        if !self.mmap_ptr.is_null() {
+            unsafe {
+                libc::munmap(self.mmap_ptr as *mut _, self.size);
+            }
+        }
+    }
+}
+
+unsafe impl Send for ShmPool {}
+
+struct ShmBufferData {
+    pool_id: ObjectId,
+    offset: i32,
+    width: i32,
+    height: i32,
+    stride: i32,
+    format: wl_shm::Format,
+}
+
+struct DmaBufBufferData {
+    width: i32,
+    height: i32,
+    fourcc: u32,
+    modifier: u64,
+    planes: Vec<DmaBufPlane>,
+}
+
+struct DmaBufPlane {
+    fd: OwnedFd,
+    offset: u32,
+    stride: u32,
+}
+
+struct DmaBufParamsPending {
+    resource: ZwpLinuxBufferParamsV1,
+    planes: Vec<DmaBufPlane>,
+    modifier: u64,
+}
+
+struct ClientState;
+struct XdgSurfaceData {
+    wl_surface_id: ObjectId,
+}
+struct XdgToplevelData {
+    wl_surface_id: ObjectId,
+}
+struct XdgPopupData {
+    wl_surface_id: ObjectId,
+}
+struct SubsurfaceData {
+    wl_surface_id: ObjectId,
+    parent_surface_id: ObjectId,
+}
+
+// -- Clipboard / data device data types --
+
+struct DataSourceData {
+    mime_types: std::sync::Mutex<Vec<String>>,
+}
+
+struct DataOfferData {
+    /// If `true`, the offer represents external (browser/CLI) clipboard data
+    /// stored in `Compositor::external_clipboard`.  Otherwise it is backed by
+    /// a Wayland `wl_data_source`.
+    external: bool,
+}
+
+/// Stored state for the external (browser/CLI) clipboard selection.
+struct ExternalClipboard {
+    mime_type: String,
+    data: Vec<u8>,
+}
+
+struct PrimarySourceData {
+    mime_types: std::sync::Mutex<Vec<String>>,
+}
+struct PrimaryOfferData {
+    external: bool,
+}
+
+// -- Activation token data --
+struct ActivationTokenData {
+    serial: u32,
+}
+
+struct PositionerState {
+    resource: XdgPositioner,
+    geometry: PositionerGeometry,
+}
+
+// ---------------------------------------------------------------------------
+// US-QWERTY character → evdev keycode mapping
+// ---------------------------------------------------------------------------
+
+/// Map an ASCII character to its evdev keycode under a US-QWERTY layout.
+/// Returns `(keycode, needs_shift)`, or `None` for characters not on the
+/// layout (non-ASCII, control chars other than \t/\n).
+fn char_to_keycode(ch: char) -> Option<(u32, bool)> {
+    const KEY_1: u32 = 2;
+    const KEY_2: u32 = 3;
+    const KEY_3: u32 = 4;
+    const KEY_4: u32 = 5;
+    const KEY_5: u32 = 6;
+    const KEY_6: u32 = 7;
+    const KEY_7: u32 = 8;
+    const KEY_8: u32 = 9;
+    const KEY_9: u32 = 10;
+    const KEY_0: u32 = 11;
+    const KEY_MINUS: u32 = 12;
+    const KEY_EQUAL: u32 = 13;
+    const KEY_TAB: u32 = 15;
+    const KEY_Q: u32 = 16;
+    const KEY_W: u32 = 17;
+    const KEY_E: u32 = 18;
+    const KEY_R: u32 = 19;
+    const KEY_T: u32 = 20;
+    const KEY_Y: u32 = 21;
+    const KEY_U: u32 = 22;
+    const KEY_I: u32 = 23;
+    const KEY_O: u32 = 24;
+    const KEY_P: u32 = 25;
+    const KEY_LEFTBRACE: u32 = 26;
+    const KEY_RIGHTBRACE: u32 = 27;
+    const KEY_ENTER: u32 = 28;
+    const KEY_A: u32 = 30;
+    const KEY_S: u32 = 31;
+    const KEY_D: u32 = 32;
+    const KEY_F: u32 = 33;
+    const KEY_G: u32 = 34;
+    const KEY_H: u32 = 35;
+    const KEY_J: u32 = 36;
+    const KEY_K: u32 = 37;
+    const KEY_L: u32 = 38;
+    const KEY_SEMICOLON: u32 = 39;
+    const KEY_APOSTROPHE: u32 = 40;
+    const KEY_GRAVE: u32 = 41;
+    const KEY_BACKSLASH: u32 = 43;
+    const KEY_Z: u32 = 44;
+    const KEY_X: u32 = 45;
+    const KEY_C: u32 = 46;
+    const KEY_V: u32 = 47;
+    const KEY_B: u32 = 48;
+    const KEY_N: u32 = 49;
+    const KEY_M: u32 = 50;
+    const KEY_COMMA: u32 = 51;
+    const KEY_DOT: u32 = 52;
+    const KEY_SLASH: u32 = 53;
+    const KEY_SPACE: u32 = 57;
+
+    fn letter_kc(ch: char) -> u32 {
+        match ch {
+            'a' => KEY_A,
+            'b' => KEY_B,
+            'c' => KEY_C,
+            'd' => KEY_D,
+            'e' => KEY_E,
+            'f' => KEY_F,
+            'g' => KEY_G,
+            'h' => KEY_H,
+            'i' => KEY_I,
+            'j' => KEY_J,
+            'k' => KEY_K,
+            'l' => KEY_L,
+            'm' => KEY_M,
+            'n' => KEY_N,
+            'o' => KEY_O,
+            'p' => KEY_P,
+            'q' => KEY_Q,
+            'r' => KEY_R,
+            's' => KEY_S,
+            't' => KEY_T,
+            'u' => KEY_U,
+            'v' => KEY_V,
+            'w' => KEY_W,
+            'x' => KEY_X,
+            'y' => KEY_Y,
+            'z' => KEY_Z,
+            _ => KEY_SPACE,
+        }
+    }
+
+    let (kc, shift) = match ch {
+        'a'..='z' => (letter_kc(ch), false),
+        'A'..='Z' => (letter_kc(ch.to_ascii_lowercase()), true),
+        '0' => (KEY_0, false),
+        '1'..='9' => (KEY_1 + (ch as u32 - '1' as u32), false),
+        ' ' => (KEY_SPACE, false),
+        '-' => (KEY_MINUS, false),
+        '=' => (KEY_EQUAL, false),
+        '[' => (KEY_LEFTBRACE, false),
+        ']' => (KEY_RIGHTBRACE, false),
+        ';' => (KEY_SEMICOLON, false),
+        '\'' => (KEY_APOSTROPHE, false),
+        ',' => (KEY_COMMA, false),
+        '.' => (KEY_DOT, false),
+        '/' => (KEY_SLASH, false),
+        '\\' => (KEY_BACKSLASH, false),
+        '`' => (KEY_GRAVE, false),
+        '\t' => (KEY_TAB, false),
+        '\n' => (KEY_ENTER, false),
+        '!' => (KEY_1, true),
+        '@' => (KEY_2, true),
+        '#' => (KEY_3, true),
+        '$' => (KEY_4, true),
+        '%' => (KEY_5, true),
+        '^' => (KEY_6, true),
+        '&' => (KEY_7, true),
+        '*' => (KEY_8, true),
+        '(' => (KEY_9, true),
+        ')' => (KEY_0, true),
+        '_' => (KEY_MINUS, true),
+        '+' => (KEY_EQUAL, true),
+        '{' => (KEY_LEFTBRACE, true),
+        '}' => (KEY_RIGHTBRACE, true),
+        ':' => (KEY_SEMICOLON, true),
+        '"' => (KEY_APOSTROPHE, true),
+        '<' => (KEY_COMMA, true),
+        '>' => (KEY_DOT, true),
+        '?' => (KEY_SLASH, true),
+        '|' => (KEY_BACKSLASH, true),
+        '~' => (KEY_GRAVE, true),
+        _ => return None,
+    };
+    Some((kc, shift))
+}
+
+// ---------------------------------------------------------------------------
+// XKB modifier state tracking
+// ---------------------------------------------------------------------------
+
+/// Bitmask values matching the `modifier_map` in us-qwerty.xkb.
+const MOD_SHIFT: u32 = 1 << 0;
+const MOD_LOCK: u32 = 1 << 1;
+const MOD_CONTROL: u32 = 1 << 2;
+const MOD_MOD1: u32 = 1 << 3; // Alt
+const MOD_MOD4: u32 = 1 << 6; // Super / Meta
+
+/// Return the XKB modifier bit for an evdev keycode, or 0 if the key is
+/// not a modifier.
+fn keycode_to_mod(keycode: u32) -> u32 {
+    match keycode {
+        42 | 54 => MOD_SHIFT,   // ShiftLeft, ShiftRight
+        58 => MOD_LOCK,         // CapsLock (toggled, handled separately)
+        29 | 97 => MOD_CONTROL, // ControlLeft, ControlRight
+        56 | 100 => MOD_MOD1,   // AltLeft, AltRight
+        125 | 126 => MOD_MOD4,  // MetaLeft, MetaRight
+        _ => 0,
+    }
+}
+
+/// Per-object state for a `zwp_text_input_v3` resource.
+struct TextInputState {
+    resource: ZwpTextInputV3,
+    /// Whether the client has sent `enable` (text input is active).
+    enabled: bool,
+}
+
+/// Main compositor state.
+struct Compositor {
     display_handle: DisplayHandle,
-    compositor_state: CompositorState,
-    xdg_shell_state: XdgShellState,
-    shm_state: ShmState,
-    seat_state: SeatState<Self>,
-    data_device_state: DataDeviceState,
-    #[allow(dead_code)]
-    viewporter_state: ViewporterState,
-    #[allow(dead_code)]
-    xdg_decoration_state: XdgDecorationState,
-    dmabuf_state: DmabufState,
-    #[allow(dead_code)]
-    dmabuf_global: DmabufGlobal,
-    syncobj_state: Option<DrmSyncobjState>,
-    primary_selection_state: PrimarySelectionState,
-    activation_state: XdgActivationState,
-    seat: Seat<Self>,
-    output: Output,
-    space: Space<Window>,
-
-    surfaces: HashMap<u64, SurfaceInfo>,
-    surface_lookup: HashMap<u16, u64>,
+    surfaces: HashMap<ObjectId, Surface>,
+    toplevel_surface_ids: HashMap<u16, ObjectId>,
     next_surface_id: u16,
-
+    shm_pools: HashMap<ObjectId, ShmPool>,
+    pixel_cache: HashMap<ObjectId, (u32, u32, i32, bool, PixelData)>,
+    dmabuf_params: HashMap<ObjectId, DmaBufParamsPending>,
+    vulkan_renderer: Option<super::vulkan_render::VulkanRenderer>,
+    output_width: i32,
+    output_height: i32,
+    /// Output scale in 1/120th units (wp_fractional_scale_v1 convention).
+    /// 120 = 1×, 180 = 1.5×, 240 = 2×.  Derived from the browser's
+    /// devicePixelRatio sent via C2S_SURFACE_RESIZE.
+    output_scale_120: u16,
+    outputs: Vec<WlOutput>,
+    keyboards: Vec<WlKeyboard>,
+    pointers: Vec<WlPointer>,
+    keyboard_keymap_data: Vec<u8>,
+    /// Currently depressed (held down) XKB modifier mask.
+    mods_depressed: u32,
+    /// CapsLock locked modifier mask (toggled on/off by CapsLock key).
+    mods_locked: u32,
+    serial: u32,
     event_tx: mpsc::Sender<CompositorEvent>,
     event_notify: Arc<dyn Fn() + Send + Sync>,
     loop_signal: LoopSignal,
-
-    verbose: bool,
-
-    /// The surface_id of the currently keyboard-focused surface (0 = none).
+    /// (phys_w, phys_h, log_w, log_h, pixels)
+    pending_commits: HashMap<u16, (u32, u32, u32, u32, PixelData)>,
     focused_surface_id: u16,
+    /// The wl_surface ObjectId the pointer is currently over (None = none).
+    pointer_entered_id: Option<ObjectId>,
+    /// Set after output scale change; triggers keyboard leave/re-enter
+    /// on the next surface commit so clients have time to process the
+    /// reconfigure before receiving new input events.
+    pending_kb_reenter: bool,
+    verbose: bool,
+    shutdown: Arc<AtomicBool>,
+    /// Track last reported size per toplevel surface_id to detect changes.
+    /// Per-toplevel: (composited_w, composited_h, logical_w, logical_h).
+    /// Used for pointer coordinate mapping (browser→Wayland).
+    last_reported_size: HashMap<u16, (u32, u32, u32, u32)>,
+    /// Per-toplevel configured size.  Each surface can live in a
+    /// differently-sized BSP pane, so we need to track sizes individually
+    /// rather than relying on the single `output_width`/`output_height`.
+    surface_sizes: HashMap<u16, (i32, i32)>,
+    /// Pending positioner geometry, keyed by XdgPositioner protocol id.
+    positioners: HashMap<ObjectId, PositionerState>,
+    /// Active wp_fractional_scale_v1 objects.  When `output_scale_120`
+    /// changes we send `preferred_scale` to every entry.
+    fractional_scales: Vec<WpFractionalScaleV1>,
 
-    /// Buffered pixel data from commits within the current event-loop
-    /// dispatch.  Flushed after dispatch returns so that only the LAST
-    /// commit per surface per iteration is sent to the server.
-    pending_commits: HashMap<u16, (u32, u32, PixelData)>,
+    // -- Clipboard --
+    /// Active wl_data_device objects (one per seat binding).
+    data_devices: Vec<WlDataDevice>,
+    /// The wl_data_source that currently owns the clipboard selection (if any).
+    /// Cleared when the source is destroyed or replaced.
+    selection_source: Option<WlDataSource>,
+    /// External clipboard data offered from the browser or CLI.
+    external_clipboard: Option<ExternalClipboard>,
 
-    /// Per-wl_surface cache of the last successfully read pixel data.
-    /// Keyed by wl_surface protocol_id.  When a toplevel commits, its
-    /// subsurfaces may not have re-committed since the last read;
-    /// `BufferAssignment::NewBuffer` is only set on the subsurface's own
-    /// commit.  Without this cache, subsurface content silently disappears
-    /// from the composite whenever the parent commits independently.
-    surface_pixel_cache: HashMap<u64, (u32, u32, PixelData)>,
+    // -- Primary selection --
+    primary_devices: Vec<ZwpPrimarySelectionDeviceV1>,
+    primary_source: Option<ZwpPrimarySelectionSourceV1>,
+    external_primary: Option<ExternalClipboard>,
 
-    /// GPU renderer for compositing surfaces.  None if GPU unavailable.
-    gpu_renderer: Option<super::render::SurfaceRenderer>,
+    // -- Relative pointer --
+    relative_pointers: Vec<ZwpRelativePointerV1>,
+
+    // -- Text input --
+    /// Active zwp_text_input_v3 objects.  When the compositor receives
+    /// composed text from the browser it delivers it via `commit_string`
+    /// + `done` to the text_input object belonging to the focused surface.
+    text_inputs: Vec<TextInputState>,
+    /// Serial counter for `zwp_text_input_v3.done` events.  Incremented on
+    /// every `done` event sent by the compositor.
+    #[expect(dead_code)]
+    text_input_serial: u32,
+
+    // -- Activation --
+    next_activation_token: u32,
 }
 
 impl Compositor {
-    /// Send buffered SurfaceCommit events to the server.  Called after
-    /// event_loop.dispatch() returns so that multiple commits within a
-    /// single dispatch cycle are coalesced into one event per surface.
-    fn flush_pending_commits(&mut self) {
-        for (surface_id, (width, height, pixels)) in self.pending_commits.drain() {
-            let _ = self.event_tx.send(CompositorEvent::SurfaceCommit {
-                surface_id,
-                width,
-                height,
-                pixels,
-            });
+    fn next_serial(&mut self) -> u32 {
+        self.serial = self.serial.wrapping_add(1);
+        self.serial
+    }
+
+    /// Update internal modifier state from a key event and send
+    /// `wl_keyboard.modifiers` to all keyboards belonging to the focused
+    /// surface's client.  Many Wayland clients (GTK, Chromium) rely on this
+    /// event rather than tracking modifiers from raw key events.
+    fn update_and_send_modifiers(&mut self, keycode: u32, pressed: bool) {
+        let m = keycode_to_mod(keycode);
+        if m == 0 {
+            return;
         }
-        (self.event_notify)();
+        if keycode == 58 {
+            // CapsLock toggles mods_locked on press.
+            if pressed {
+                self.mods_locked ^= MOD_LOCK;
+            }
+        } else if pressed {
+            self.mods_depressed |= m;
+        } else {
+            self.mods_depressed &= !m;
+        }
+        let serial = self.next_serial();
+        let focused_wl = self
+            .toplevel_surface_ids
+            .get(&self.focused_surface_id)
+            .and_then(|root_id| self.surfaces.get(root_id))
+            .map(|s| s.wl_surface.clone());
+        for kb in &self.keyboards {
+            if let Some(ref wl) = focused_wl
+                && same_client(kb, wl)
+            {
+                kb.modifiers(serial, self.mods_depressed, 0, self.mods_locked, 0);
+            }
+        }
+    }
+
+    /// Switch keyboard (and text_input) focus from the current surface to
+    /// `new_surface_id`.  Sends `wl_keyboard.leave` to the old surface's
+    /// client and `wl_keyboard.enter` to the new surface's client, which is
+    /// required by the Wayland protocol when focus changes between clients.
+    fn set_keyboard_focus(&mut self, new_surface_id: u16) {
+        let old_id = self.focused_surface_id;
+        if old_id == new_surface_id {
+            // Focus unchanged — still send enter so the client gets the
+            // event (e.g. first toplevel), but skip leave.
+            self.focused_surface_id = new_surface_id;
+            if let Some(root_id) = self.toplevel_surface_ids.get(&new_surface_id)
+                && let Some(wl_surface) = self.surfaces.get(root_id).map(|s| s.wl_surface.clone())
+            {
+                let serial = self.next_serial();
+                for kb in &self.keyboards {
+                    if same_client(kb, &wl_surface) {
+                        kb.enter(serial, &wl_surface, vec![]);
+                    }
+                }
+                for ti in &self.text_inputs {
+                    if same_client(&ti.resource, &wl_surface) {
+                        ti.resource.enter(&wl_surface);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Leave the old surface.
+        if old_id != 0
+            && let Some(old_root) = self.toplevel_surface_ids.get(&old_id)
+            && let Some(old_wl) = self.surfaces.get(old_root).map(|s| s.wl_surface.clone())
+        {
+            let serial = self.next_serial();
+            for kb in &self.keyboards {
+                if same_client(kb, &old_wl) {
+                    kb.leave(serial, &old_wl);
+                }
+            }
+            for ti in &self.text_inputs {
+                if same_client(&ti.resource, &old_wl) {
+                    ti.resource.leave(&old_wl);
+                }
+            }
+        }
+
+        self.focused_surface_id = new_surface_id;
+
+        // Enter the new surface.
+        if let Some(root_id) = self.toplevel_surface_ids.get(&new_surface_id)
+            && let Some(wl_surface) = self.surfaces.get(root_id).map(|s| s.wl_surface.clone())
+        {
+            let serial = self.next_serial();
+            for kb in &self.keyboards {
+                if same_client(kb, &wl_surface) {
+                    kb.enter(serial, &wl_surface, vec![]);
+                }
+            }
+            for ti in &self.text_inputs {
+                if same_client(&ti.resource, &wl_surface) {
+                    ti.resource.enter(&wl_surface);
+                }
+            }
+        }
     }
 
     fn allocate_surface_id(&mut self) -> u16 {
-        // Skip IDs already in use to prevent collisions after u16 wraparound
-        // (possible in long-running sessions with >65535 surface creates).
         let mut id = self.next_surface_id;
         let start = id;
         loop {
-            if !self.surface_lookup.contains_key(&id) {
+            if !self.toplevel_surface_ids.contains_key(&id) {
                 break;
             }
             id = id.wrapping_add(1);
@@ -510,7 +1127,6 @@ impl Compositor {
                 id = 1;
             }
             if id == start {
-                // Exhausted all IDs — extremely unlikely (65535 concurrent surfaces).
                 break;
             }
         }
@@ -521,1336 +1137,3382 @@ impl Compositor {
         id
     }
 
-    fn handle_command(&mut self, cmd: CompositorCommand) {
-        match cmd {
-            CompositorCommand::KeyInput {
-                surface_id,
-                keycode,
-                pressed,
-            } => {
-                if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-                    && let Some(info) = self.surfaces.get(&obj_id)
-                    && let Some(toplevel) = info.window.toplevel()
-                    && let Some(keyboard) = self.seat.get_keyboard()
-                {
-                    if self.verbose {
-                        eprintln!(
-                            "[compositor] key: sid={surface_id} evdev={keycode} pressed={pressed}"
-                        );
-                    }
-                    let serial = SERIAL_COUNTER.next_serial();
-                    let time = elapsed_ms();
-                    let state = if pressed {
-                        KeyState::Pressed
-                    } else {
-                        KeyState::Released
-                    };
-                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
-                    // smithay expects XKB keycodes (evdev + 8).  The browser
-                    // sends raw evdev scancodes, so we add the offset here,
-                    // matching what smithay's libinput and winit backends do.
-                    keyboard.input::<(), _>(
-                        self,
-                        (keycode + 8).into(),
-                        state,
-                        serial,
-                        time,
-                        |_, _, _| FilterResult::Forward,
-                    );
-                }
-            }
-            CompositorCommand::PointerMotion { surface_id, x, y } => {
-                if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-                    && let Some(info) = self.surfaces.get(&obj_id)
-                    && let Some(toplevel) = info.window.toplevel()
-                    && let Some(pointer) = self.seat.get_pointer()
-                {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    let time = elapsed_ms();
-                    let wl_surface = toplevel.wl_surface().clone();
-                    // smithay's ClickGrab redirects all motion events to the
-                    // surface that received the original button-press, ignoring
-                    // the focus we pass here.  In blit every surface has its
-                    // own canvas, so a stale grab (e.g. mouseup lost when the
-                    // user switched surfaces) would permanently block input to
-                    // every other surface.  Clear the grab when the target
-                    // surface differs from the grabbed one.
-                    if pointer.is_grabbed() {
-                        let stale = pointer
-                            .grab_start_data()
-                            .and_then(|d| d.focus.as_ref().map(|(s, _)| s.id() != wl_surface.id()))
-                            .unwrap_or(false);
-                        if stale {
-                            pointer.unset_grab(self, serial, time);
-                        }
-                    }
-                    pointer.motion(
-                        self,
-                        Some((wl_surface, (0.0, 0.0).into())),
-                        &MotionEvent {
-                            location: (x, y).into(),
-                            serial,
-                            time,
-                        },
-                    );
-                    pointer.frame(self);
-                }
-            }
-            CompositorCommand::PointerButton {
-                surface_id,
-                button,
-                pressed,
-            } => {
-                if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-                    && self.surfaces.contains_key(&obj_id)
-                    && let Some(pointer) = self.seat.get_pointer()
-                {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    let state = if pressed {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    };
-                    pointer.button(
-                        self,
-                        &ButtonEvent {
-                            button,
-                            state,
-                            serial,
-                            time: elapsed_ms(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
-            }
-            CompositorCommand::PointerAxis {
-                surface_id: _,
-                axis,
-                value,
-            } => {
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
-                let ax = if axis == 0 {
-                    Axis::Vertical
-                } else {
-                    Axis::Horizontal
-                };
-                pointer.axis(self, AxisFrame::new(elapsed_ms()).value(ax, value));
-                pointer.frame(self);
-            }
-            CompositorCommand::SurfaceResize {
-                surface_id: _,
-                width,
-                height,
-                scale_120,
-            } => {
-                // Update output scale if the client reported a DPR.
-                // scale_120 is already in Wayland fractional_scale units (1/120th).
-                let scale_frac = if scale_120 >= 120 {
-                    scale_120 as f64
-                } else {
-                    120.0
-                };
-                let cur = self.output.current_scale().fractional_scale();
-                if (cur - scale_frac).abs() > 0.01 {
-                    // Integer scale for wl_output: round to nearest.
-                    let int_scale = ((scale_frac / 120.0) + 0.5) as i32;
-                    self.output.change_current_state(
-                        None,
-                        None,
-                        Some(smithay::output::Scale::Custom {
-                            advertised_integer: int_scale.max(1),
-                            fractional: scale_frac,
-                        }),
-                        None,
-                    );
-                }
-
-                // width/height are in physical pixels.  Convert to logical
-                // pixels for the toplevel configure (Wayland uses logical).
-                let scale_f = scale_frac / 120.0;
-                let logical_w = ((width as f64) / scale_f).round() as i32;
-                let logical_h = ((height as f64) / scale_f).round() as i32;
-
-                // Update the output mode to match the physical size.
-                let mode = smithay::output::Mode {
-                    size: (width as i32, height as i32).into(),
-                    refresh: 60_000,
-                };
-                self.output
-                    .change_current_state(Some(mode), None, None, None);
-                self.output.set_preferred(mode);
-
-                // Configure all toplevel surfaces to fill the output.
-                for info in self.surfaces.values() {
-                    if let Some(toplevel) = info.window.toplevel() {
-                        toplevel.with_pending_state(|state| {
-                            state.size = Some((logical_w.max(1), logical_h.max(1)).into());
-                        });
-                        toplevel.send_pending_configure();
-                    }
-                }
-                // Refresh so surfaces receive the updated output scale via
-                // wl_surface.enter and wp_fractional_scale_v1.preferred_scale.
-                self.space.refresh();
-            }
-            CompositorCommand::SurfaceFocus { surface_id } => {
-                if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-                    && let Some(info) = self.surfaces.get(&obj_id)
-                    && let Some(toplevel) = info.window.toplevel()
-                    && let Some(keyboard) = self.seat.get_keyboard()
-                {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
-                }
-            }
-            CompositorCommand::SurfaceClose { surface_id } => {
-                if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-                    && let Some(info) = self.surfaces.get(&obj_id)
-                    && let Some(toplevel) = info.window.toplevel()
-                {
-                    toplevel.send_close();
-                }
-            }
-            CompositorCommand::ClipboardOffer {
-                surface_id: _,
-                mime_type,
-                data,
-            } => {
-                // Inject the browser/remote clipboard as a compositor-owned
-                // selection so that focused Wayland clients can paste it.
-                let mime_types = if mime_type == "text/plain" {
-                    vec![
-                        "text/plain".to_string(),
-                        "text/plain;charset=utf-8".to_string(),
-                        "UTF8_STRING".to_string(),
-                        "TEXT".to_string(),
-                        "STRING".to_string(),
-                    ]
-                } else {
-                    vec![mime_type]
-                };
-                set_data_device_selection(
-                    &self.display_handle,
-                    &self.seat,
-                    mime_types,
-                    Arc::new(data),
-                );
-            }
-            CompositorCommand::Capture { surface_id, reply } => {
-                let result = if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-                    && let Some(info) = self.surfaces.get(&obj_id)
-                    && let Some(toplevel) = info.window.toplevel()
-                {
-                    let wl_surface = toplevel.wl_surface().clone();
-                    self.read_surface_pixels(&wl_surface)
-                } else {
-                    None
-                };
-                let _ = reply.send(result);
-            }
-            CompositorCommand::RequestFrame { surface_id } => {
-                self.fire_frame_callbacks(surface_id);
-            }
-            CompositorCommand::ReleaseKeys { keycodes } => {
-                if let Some(keyboard) = self.seat.get_keyboard() {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    let time = elapsed_ms();
-                    for keycode in keycodes {
-                        keyboard.input::<(), _>(
-                            self,
-                            (keycode + 8).into(),
-                            KeyState::Released,
-                            serial,
-                            time,
-                            |_, _, _| FilterResult::Forward,
-                        );
-                    }
-                }
-            }
-            CompositorCommand::Shutdown => {
-                self.loop_signal.stop();
-            }
-        }
-    }
-
-    /// Fire pending `wl_surface.frame` callbacks for a specific surface.
-    fn fire_frame_callbacks(&self, surface_id: u16) {
-        if let Some(&obj_id) = self.surface_lookup.get(&surface_id)
-            && let Some(info) = self.surfaces.get(&obj_id)
-            && let Some(toplevel) = info.window.toplevel()
-        {
-            let surface = toplevel.wl_surface().clone();
-            let time = elapsed_ms();
-            let mut fired = 0u32;
-            with_surface_tree_downward(
-                &surface,
-                (),
-                |_, _, &()| TraversalAction::DoChildren(()),
-                |_, states, &()| {
-                    for callback in states
-                        .cached_state
-                        .get::<SurfaceAttributes>()
-                        .current()
-                        .frame_callbacks
-                        .drain(..)
-                    {
-                        callback.done(time);
-                        fired += 1;
-                    }
-                },
-                |_, _, &()| true,
-            );
-            let _ = fired;
-        }
-    }
-
-    fn read_surface_pixels(&mut self, surface: &WlSurface) -> Option<(u32, u32, Vec<u8>)> {
-        let mut result: Option<(u32, u32, PixelData)> = None;
-        with_states(surface, |states| {
-            let mut guard = states.cached_state.get::<SurfaceAttributes>();
-            let attrs = guard.current();
-            if let Some(compositor::BufferAssignment::NewBuffer(buffer)) = attrs.buffer.as_ref() {
-                result = read_shm_buffer(buffer);
-                if result.is_none()
-                    && let Ok(dmabuf) = get_dmabuf(buffer)
-                {
-                    result = read_dmabuf_pixels(dmabuf);
-                }
-            }
-        });
-        // Convert to RGBA for the capture path (used only by dead-code Capture command).
-        result.map(|(w, h, pd)| (w, h, pd.to_rgba(w, h)))
-    }
-}
-
-/// Read an SHM buffer into `PixelData::Bgra`, forcing alpha=255 for
-/// XRGB8888 format (where the alpha byte is undefined and typically 0).
-fn read_shm_buffer(buffer: &wl_buffer::WlBuffer) -> Option<(u32, u32, PixelData)> {
-    let mut result = None;
-    let _ = with_buffer_contents(buffer, |ptr, len, data: BufferData| {
-        let width = data.width as u32;
-        let height = data.height as u32;
-        let stride = data.stride as usize;
-        let offset = data.offset as usize;
-        let pixel_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let row_bytes = width as usize * 4;
-        let mut bgra = if stride == row_bytes
-            && offset == 0
-            && pixel_data.len() >= row_bytes * height as usize
-        {
-            pixel_data[..row_bytes * height as usize].to_vec()
-        } else {
-            let mut packed = Vec::with_capacity(row_bytes * height as usize);
-            for row in 0..height as usize {
-                let row_start = offset + row * stride;
-                let row_end = row_start + row_bytes;
-                if row_end <= pixel_data.len() {
-                    packed.extend_from_slice(&pixel_data[row_start..row_end]);
-                }
-            }
-            packed
-        };
-        // XRGB8888: the alpha byte is undefined (clients typically leave it
-        // as 0).  Force opaque so that captures and any alpha-aware path
-        // treat pixels correctly.
-        if data.format == wl_shm::Format::Xrgb8888 || data.format == wl_shm::Format::Xbgr8888 {
-            for px in bgra.chunks_exact_mut(4) {
-                px[3] = 255;
-            }
-        }
-        // ABGR/XBGR are [R,G,B,A] in memory — store as PixelData::Rgba.
-        if matches!(
-            data.format,
-            wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888
-        ) {
-            result = Some((width, height, PixelData::Rgba(Arc::new(bgra))));
-        } else {
-            result = Some((width, height, PixelData::Bgra(Arc::new(bgra))));
-        }
-    });
-    result
-}
-
-fn elapsed_ms() -> u32 {
-    use std::sync::OnceLock;
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u32
-}
-
-impl CompositorHandler for Compositor {
-    fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
-    }
-
-    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientData>().unwrap().compositor_state
-    }
-
-    fn commit(&mut self, surface: &WlSurface) {
-        // Update RendererSurfaceState so Smithay's render element pipeline
-        // can produce elements from imported textures.
-        smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
-
-        // If this is a subsurface, walk up to the toplevel root.
-        let (root_surface, key, surface_id) = {
-            let key = surface.id().protocol_id() as u64;
-            if let Some(info) = self.surfaces.get(&key) {
-                (surface.clone(), key, info.surface_id)
-            } else {
-                // Not a toplevel — walk up to find the parent toplevel.
-                let mut current = surface.clone();
-                while let Some(parent) = get_parent(&current) {
-                    current = parent;
-                }
-                let parent_key = current.id().protocol_id() as u64;
-                match self.surfaces.get(&parent_key) {
-                    Some(info) => (current, parent_key, info.surface_id),
-                    None => return, // orphan subsurface
-                }
-            }
-        };
-
-        let mut committed_pixels: Option<(u32, u32, PixelData)> = None;
-        let mut new_title = String::new();
-        let mut new_app_id = String::new();
-
-        let have_pending = self.pending_commits.contains_key(&surface_id);
-        let warned_unreadable = self.surfaces.get(&key).is_none_or(|i| i.unreadable_warned);
-
-        if !have_pending {
-            // Use the xdg_toplevel geometry as the render region — this
-            // is the content rect EXCLUDING CSD shadows.  Clients like
-            // Chromium draw shadows as part of the surface buffer, but
-            // the geometry tells us exactly where the real window is.
-            let geometry = self.surfaces.get(&key).map(|i| i.window.geometry());
-
-            // Try GPU renderer (handles SHM + DMA-BUF + subsurfaces).
-            if let Some(renderer) = &mut self.gpu_renderer
-                && let Some((w, h, bgra)) =
-                    renderer.render_surface(&root_surface, geometry.as_ref())
-            {
-                committed_pixels = Some((w, h, PixelData::Bgra(Arc::new(bgra))));
-            }
-
-            // GPU unavailable or failed — fall back to manual SHM readback
-            // for the root surface only (no subsurface compositing).
-            if committed_pixels.is_none() {
-                with_states(&root_surface, |states| {
-                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                    let attrs = guard.current();
-                    if let Some(compositor::BufferAssignment::NewBuffer(buffer)) =
-                        attrs.buffer.as_ref()
-                        && let Some((w, h, pd)) = read_shm_buffer(buffer)
-                    {
-                        committed_pixels = Some((w, h, pd));
-                    }
-                });
-            }
-
-            if committed_pixels.is_none() && !warned_unreadable {
-                eprintln!(
-                    "compositor: commit with no readable buffer — suppressing further warnings for this surface"
-                );
-            }
-        }
-
-        // Release all buffers in the tree so clients can reuse them.
-        with_surface_tree_downward(
-            &root_surface,
-            (),
-            |_, _, _| TraversalAction::DoChildren(()),
-            |_, states, _| {
-                let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                let attrs = guard.current();
-                if let Some(compositor::BufferAssignment::NewBuffer(buffer)) = attrs.buffer.as_ref()
-                {
-                    buffer.release();
-                }
-            },
-            |_, _, _| true,
-        );
-
-        // Read title/app_id from the toplevel.
-        with_states(&root_surface, |states| {
-            if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
-                let lock = data.lock().unwrap();
-                new_title = lock.title.clone().unwrap_or_default();
-                new_app_id = lock.app_id.clone().unwrap_or_default();
-            }
-        });
-
-        // Mark surface as warned if we hit an unreadable buffer.
-        if committed_pixels.is_none()
-            && !have_pending
-            && !warned_unreadable
-            && let Some(info) = self.surfaces.get_mut(&key)
-        {
-            info.unreadable_warned = true;
-        }
-
-        if let Some(info) = self.surfaces.get_mut(&key)
-            && new_title != info.last_title
-        {
-            info.last_title = new_title.clone();
-            let _ = self.event_tx.send(CompositorEvent::SurfaceTitle {
-                surface_id,
-                title: new_title,
-            });
-        }
-
-        if let Some(info) = self.surfaces.get_mut(&key)
-            && new_app_id != info.last_app_id
-        {
-            info.last_app_id = new_app_id.clone();
-            let _ = self.event_tx.send(CompositorEvent::SurfaceAppId {
-                surface_id,
-                app_id: new_app_id,
-            });
-        }
-
-        if let Some((width, height, pixels)) = committed_pixels {
-            let info = self.surfaces.get_mut(&key).unwrap();
-            if width != info.last_width || height != info.last_height {
-                info.last_width = width;
-                info.last_height = height;
+    fn flush_pending_commits(&mut self) {
+        for (surface_id, (width, height, log_w, log_h, pixels)) in self.pending_commits.drain() {
+            // Check for size change.
+            let prev = self.last_reported_size.get(&surface_id).copied();
+            if prev.is_none() || prev.map(|(pw, ph, _, _)| (pw, ph)) != Some((width, height)) {
+                self.last_reported_size
+                    .insert(surface_id, (width, height, log_w, log_h));
                 let _ = self.event_tx.send(CompositorEvent::SurfaceResized {
                     surface_id,
                     width: width as u16,
                     height: height as u16,
                 });
             }
-
-            if !pixels.is_empty() {
-                self.pending_commits
-                    .insert(surface_id, (width, height, pixels));
-            }
-        }
-
-        // Frame callbacks are fired in flush_pending_commits() — once per
-        // dispatch cycle — rather than on every commit to avoid hot loops.
-    }
-}
-
-impl BufferHandler for Compositor {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
-}
-
-impl ShmHandler for Compositor {
-    fn shm_state(&self) -> &ShmState {
-        &self.shm_state
-    }
-}
-
-impl XdgShellHandler for Compositor {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg_shell_state
-    }
-
-    fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        if self.verbose {
-            eprintln!("[compositor] new_toplevel");
-        }
-        let window = Window::new_wayland_window(surface.clone());
-        let wl_surface = surface.wl_surface().clone();
-        let key = wl_surface.id().protocol_id() as u64;
-        let surface_id = self.allocate_surface_id();
-
-        self.space.map_element(window.clone(), (0, 0), false);
-        self.space.refresh();
-
-        let info = SurfaceInfo {
-            surface_id,
-            window,
-            last_width: 0,
-            last_height: 0,
-            last_title: String::new(),
-            last_app_id: String::new(),
-            unreadable_warned: false,
-        };
-        self.surfaces.insert(key, info);
-        self.surface_lookup.insert(surface_id, key);
-
-        surface.with_pending_state(|state| {
-            state.states.set(
-                smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated,
-            );
-        });
-        surface.send_configure();
-
-        let _ = self.event_tx.send(CompositorEvent::SurfaceCreated {
-            surface_id,
-            title: String::new(),
-            app_id: String::new(),
-            parent_id: 0,
-            width: 0,
-            height: 0,
-        });
-    }
-
-    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let wl_surface = surface.wl_surface();
-        let key = wl_surface.id().protocol_id() as u64;
-        self.surface_pixel_cache.remove(&key);
-        if let Some(info) = self.surfaces.remove(&key) {
-            self.surface_lookup.remove(&info.surface_id);
-            self.space.unmap_elem(&info.window);
-            let _ = self.event_tx.send(CompositorEvent::SurfaceDestroyed {
-                surface_id: info.surface_id,
+            let _ = self.event_tx.send(CompositorEvent::SurfaceCommit {
+                surface_id,
+                width,
+                height,
+                pixels,
             });
         }
+        (self.event_notify)();
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
-
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
-
-    fn reposition_request(
-        &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
-    ) {
-    }
-}
-
-impl OutputHandler for Compositor {}
-
-impl SeatHandler for Compositor {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
-
-    fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seat_state
+    fn read_shm_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
+        let data = buffer.data::<ShmBufferData>()?;
+        let pool = self.shm_pools.get(&data.pool_id)?;
+        pool.read_buffer(
+            data.offset,
+            data.width,
+            data.height,
+            data.stride,
+            data.format,
+        )
     }
 
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn read_dmabuf_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
+        let data = buffer.data::<DmaBufBufferData>()?;
+        let width = data.width as u32;
+        let height = data.height as u32;
+        if width == 0 || height == 0 || data.planes.is_empty() {
+            return None;
+        }
+        let plane = &data.planes[0];
+        if matches!(
+            data.fourcc,
+            drm_fourcc::ARGB8888
+                | drm_fourcc::XRGB8888
+                | drm_fourcc::ABGR8888
+                | drm_fourcc::XBGR8888
+        ) {
+            // Check if this is a DRM GEM fd (importable by VA-API) or an
+            // anonymous /dmabuf heap fd (Vulkan WSI, needs CPU mmap).
+            use std::os::fd::AsRawFd;
+            let raw_fd = plane.fd.as_raw_fd();
+            let _is_drm = {
+                let mut link_buf = [0u8; 256];
+                let path = format!("/proc/self/fd/{raw_fd}\0");
+                let n = unsafe {
+                    libc::readlink(
+                        path.as_ptr() as *const _,
+                        link_buf.as_mut_ptr() as *mut _,
+                        255,
+                    )
+                };
+                n > 0 && link_buf[..n as usize].starts_with(b"/dev/dri/")
+            };
+
+            // Always dup the fd — the encoder handles both DRM GEM and
+            // anonymous /dmabuf fds.  For /dmabuf fds, the encoder falls
+            // back to CPU mmap internally.
+            let owned = plane.fd.try_clone().ok()?;
+            return Some((
+                width,
+                height,
+                PixelData::DmaBuf {
+                    fd: Arc::new(owned),
+                    fourcc: data.fourcc,
+                    modifier: data.modifier,
+                    stride: plane.stride,
+                    offset: plane.offset,
+                },
+            ));
+        }
+        None
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        if let Some(surface) = focused {
-            let key = surface.id().protocol_id() as u64;
-            if let Some(info) = self.surfaces.get(&key) {
-                self.focused_surface_id = info.surface_id;
+    fn read_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
+        self.read_shm_buffer(buffer)
+            .or_else(|| self.read_dmabuf_buffer(buffer))
+    }
+
+    fn handle_surface_commit(&mut self, surface_id: &ObjectId) {
+        let (root_id, toplevel_sid) = self.find_toplevel_root(surface_id);
+
+        // Always consume the pending buffer so the client gets a release
+        // event.  Skipping this (e.g. when the surface has no toplevel
+        // role yet) leaks a buffer from the client's pool on every attach,
+        // eventually starving it and causing a hang.
+        let had_buffer = self
+            .surfaces
+            .get(surface_id)
+            .is_some_and(|s| s.pending_buffer.is_some());
+        self.apply_pending_state(surface_id);
+
+        let toplevel_sid = match toplevel_sid {
+            Some(sid) => sid,
+            None => {
+                // No toplevel yet — fire any pending frame callbacks so
+                // the client doesn't stall.
+                self.fire_surface_frame_callbacks(surface_id);
+                let _ = self.display_handle.flush_clients();
+                return;
             }
-        }
-        let client = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
-        set_data_device_focus(&self.display_handle, seat, client.clone());
-        set_primary_focus(&self.display_handle, seat, client);
-    }
-}
-
-impl SelectionHandler for Compositor {
-    type SelectionUserData = Arc<Vec<u8>>;
-
-    fn new_selection(
-        &mut self,
-        ty: SelectionTarget,
-        source: Option<SelectionSource>,
-        seat: Seat<Self>,
-    ) {
-        if ty != SelectionTarget::Clipboard {
-            return;
-        }
-        let Some(source) = source else { return };
-        let mime_types = source.mime_types();
-
-        // Pick the best text mime type the source offers.
-        let preferred = [
-            "text/plain;charset=utf-8",
-            "text/plain",
-            "UTF8_STRING",
-            "TEXT",
-            "STRING",
-        ];
-        let Some(mime) = preferred
-            .iter()
-            .map(|m| m.to_string())
-            .find(|m| mime_types.contains(m))
-        else {
-            return;
         };
 
-        // Create a socketpair: the write end goes to the Wayland client,
-        // we read clipboard data from the read end on a helper thread.
-        let (mut read_stream, write_stream) = match std::os::unix::net::UnixStream::pair() {
-            Ok(pair) => pair,
-            Err(_) => return,
+        // Composite at the output scale so HiDPI clients are rendered
+        // at full resolution.  Use the browser's requested size as the
+        // target so the frame fits the canvas without letterboxing.
+        let s120 = self.output_scale_120;
+        let target_phys = self.surface_sizes.get(&toplevel_sid).map(|&(lw, lh)| {
+            let pw = super::render::to_physical(lw as u32, s120 as u32);
+            let ph = super::render::to_physical(lh as u32, s120 as u32);
+            (pw, ph)
+        });
+        let composited = if let Some(ref mut vk) = self.vulkan_renderer {
+            vk.render_tree_sized(
+                &root_id,
+                &self.surfaces,
+                &self.pixel_cache,
+                s120,
+                target_phys,
+            )
+        } else {
+            None
         };
-        let write_fd: OwnedFd = write_stream.into();
+        let gpu_ok = composited.is_some();
+        let composited = composited.or_else(|| {
+            super::render::cpu_composite_from_cache(
+                &root_id,
+                &self.surfaces,
+                &self.pixel_cache,
+                s120,
+            )
+        });
 
-        if request_data_device_client_selection::<Self>(&seat, mime.clone(), write_fd).is_err() {
-            return;
-        }
-
-        let event_tx = self.event_tx.clone();
-        let event_notify = self.event_notify.clone();
-        let surface_id = self.focused_surface_id;
-        std::thread::Builder::new()
-            .name("clipboard-read".into())
-            .spawn(move || {
-                use std::io::Read;
-                const MAX_CLIPBOARD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-                let _ = read_stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                let mut data = Vec::new();
-                let mut buf = [0u8; 8192];
-                loop {
-                    match read_stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            data.extend_from_slice(&buf[..n]);
-                            if data.len() > MAX_CLIPBOARD_SIZE {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+        if let Some((w, h, ref pixels)) = composited
+            && !pixels.is_empty()
+        {
+            let kind = match pixels {
+                PixelData::Bgra(_) => "bgra",
+                PixelData::Rgba(_) => "rgba",
+                PixelData::Nv12 { .. } => "nv12",
+                PixelData::VaSurface { .. } => "va-surface",
+                PixelData::DmaBuf { fd, .. } => {
+                    use std::os::fd::AsRawFd;
+                    let raw = fd.as_raw_fd();
+                    let mut lb = [0u8; 128];
+                    let p = format!("/proc/self/fd/{raw}\0");
+                    let n = unsafe {
+                        libc::readlink(p.as_ptr() as *const _, lb.as_mut_ptr() as *mut _, 127)
+                    };
+                    if n > 0 && lb[..n as usize].starts_with(b"/dev/dri/") {
+                        "dmabuf-drm"
+                    } else {
+                        "dmabuf-anon"
                     }
                 }
-                data.truncate(MAX_CLIPBOARD_SIZE);
-                if !data.is_empty() {
-                    let _ = event_tx.send(CompositorEvent::ClipboardContent {
-                        surface_id,
-                        mime_type: mime,
-                        data,
-                    });
-                    (event_notify)();
+            };
+            if self.verbose {
+                static LC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let lc = LC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if lc < 3 || lc.is_multiple_of(1000) {
+                    eprintln!("[pending #{lc}] {w}x{h} gpu={gpu_ok} kind={kind}");
                 }
-            })
-            .expect("failed to spawn clipboard-read thread");
-    }
+            }
+            // Determine the logical size for pointer coordinate mapping.
+            // The composited frame's physical dimensions (w, h) must pair
+            // with a logical size that preserves the true DPR ratio so the
+            // PointerMotion handler can convert browser pixel coords back
+            // to Wayland logical coords correctly.  The simplest correct
+            // approach is to derive logical size directly from the physical
+            // size and the output scale — this works regardless of whether
+            // the frame came from the Vulkan renderer (which targets the
+            // browser's requested size) or the CPU renderer (which targets
+            // the xdg_geometry content area).  The PointerMotion handler
+            // separately adds the xdg_geometry offset to translate from
+            // composited-frame space into surface-tree space, so the
+            // logical size here should represent the full composited frame,
+            // not just the xdg_geometry window extents.
+            let s120_u32 = (s120 as u32).max(120);
+            let log_w = (w * 120).div_ceil(s120_u32);
+            let log_h = (h * 120).div_ceil(s120_u32);
+            self.pending_commits
+                .insert(toplevel_sid, (w, h, log_w, log_h, composited.unwrap().2));
+        }
 
-    fn send_selection(
-        &mut self,
-        _ty: SelectionTarget,
-        _mime_type: String,
-        fd: OwnedFd,
-        _seat: Seat<Self>,
-        user_data: &Self::SelectionUserData,
-    ) {
-        // Write the compositor-owned clipboard data to the requesting client's fd.
-        let data = user_data.clone();
-        std::thread::Builder::new()
-            .name("clipboard-write".into())
-            .spawn(move || {
-                use std::io::Write;
-                let mut file = std::fs::File::from(fd);
-                let _ = file.write_all(&data);
-            })
-            .expect("failed to spawn clipboard-write thread");
-    }
-}
+        // Always fire frame callbacks after processing a commit, so
+        // clients can continue their render loop.  Without this, clients
+        // stall when the server doesn't send RequestFrame (e.g. during
+        // resize or when no subscribers are connected).
+        self.fire_frame_callbacks_for_toplevel(toplevel_sid);
 
-impl DataDeviceHandler for Compositor {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
-    }
-}
+        // After an output scale change, re-send keyboard leave/enter on
+        // the first commit so clients (especially Firefox) resume input
+        // processing.  Deferred to here so the client has processed the
+        // reconfigure before we re-enter.
+        if self.pending_kb_reenter {
+            self.pending_kb_reenter = false;
+            let root_ids: Vec<ObjectId> = self.toplevel_surface_ids.values().cloned().collect();
+            for root_id in root_ids {
+                let wl = self.surfaces.get(&root_id).map(|s| s.wl_surface.clone());
+                if let Some(wl) = wl {
+                    let serial = self.next_serial();
+                    for kb in &self.keyboards {
+                        if same_client(kb, &wl) {
+                            kb.leave(serial, &wl);
+                        }
+                    }
+                    let serial = self.next_serial();
+                    for kb in &self.keyboards {
+                        if same_client(kb, &wl) {
+                            kb.enter(serial, &wl, vec![]);
+                        }
+                    }
+                }
+            }
+            let _ = self.display_handle.flush_clients();
+        }
 
-impl ClientDndGrabHandler for Compositor {}
-impl ServerDndGrabHandler for Compositor {}
-
-impl XdgDecorationHandler for Compositor {
-    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
-    }
-
-    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
-    }
-
-    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
-    }
-}
-
-impl DmabufHandler for Compositor {
-    fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.dmabuf_state
-    }
-
-    fn dmabuf_imported(
-        &mut self,
-        _global: &DmabufGlobal,
-        _dmabuf: Dmabuf,
-        notifier: ImportNotifier,
-    ) {
-        let _ = notifier.successful::<Compositor>();
-    }
-}
-
-impl DrmSyncobjHandler for Compositor {
-    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
-        self.syncobj_state.as_mut()
-    }
-}
-
-fn with_dmabuf_plane_bytes<T>(
-    dmabuf: &Dmabuf,
-    plane_idx: usize,
-    f: impl FnOnce(&[u8]) -> Option<T>,
-) -> Option<T> {
-    let _ = dmabuf.sync_plane(
-        plane_idx,
-        smithay::backend::allocator::dmabuf::DmabufSyncFlags::START
-            | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
-    );
-    struct PlaneSyncGuard<'a> {
-        dmabuf: &'a Dmabuf,
-        plane_idx: usize,
-    }
-
-    impl Drop for PlaneSyncGuard<'_> {
-        fn drop(&mut self) {
-            let _ = self.dmabuf.sync_plane(
-                self.plane_idx,
-                smithay::backend::allocator::dmabuf::DmabufSyncFlags::END
-                    | smithay::backend::allocator::dmabuf::DmabufSyncFlags::READ,
-            );
+        if self.verbose {
+            let cache_entries = self.pixel_cache.len();
+            let has_pending = self.pending_commits.contains_key(&toplevel_sid);
+            static COMMIT_COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = COMMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n.is_multiple_of(1000) {
+                eprintln!(
+                    "[commit #{n}] sid={surface_id:?} root={root_id:?} cache={cache_entries} pending={has_pending} buf={had_buffer}",
+                );
+            }
         }
     }
 
-    let _sync_guard = PlaneSyncGuard { dmabuf, plane_idx };
-    let mapping = dmabuf.map_plane(plane_idx, DmabufMappingMode::READ).ok()?;
-    let ptr = mapping.ptr() as *const u8;
-    let len = mapping.length();
-    let plane_data = unsafe { std::slice::from_raw_parts(ptr, len) };
-    f(plane_data)
+    /// Compute the absolute position of a surface within its toplevel by
+    /// walking up the parent chain and summing `subsurface_position` offsets.
+    /// The toplevel root itself has position (0, 0).
+    fn surface_absolute_position(&self, surface_id: &ObjectId) -> (i32, i32) {
+        let mut x = 0i32;
+        let mut y = 0i32;
+        let mut current = surface_id.clone();
+        while let Some(surf) = self.surfaces.get(&current) {
+            x += surf.subsurface_position.0;
+            y += surf.subsurface_position.1;
+            match surf.parent_surface_id {
+                Some(ref parent) => current = parent.clone(),
+                None => break,
+            }
+        }
+        (x, y)
+    }
+
+    fn find_toplevel_root(&self, surface_id: &ObjectId) -> (ObjectId, Option<u16>) {
+        let mut current = surface_id.clone();
+        loop {
+            match self.surfaces.get(&current) {
+                Some(surf) => {
+                    if let Some(ref parent) = surf.parent_surface_id {
+                        current = parent.clone();
+                    } else {
+                        return (
+                            current,
+                            if surf.surface_id > 0 {
+                                Some(surf.surface_id)
+                            } else {
+                                None
+                            },
+                        );
+                    }
+                }
+                None => return (current, None),
+            }
+        }
+    }
+
+    fn collect_surface_tree(&self, root_id: &ObjectId) -> Vec<ObjectId> {
+        let mut result = Vec::new();
+        self.collect_tree_recursive(root_id, &mut result);
+        result
+    }
+
+    fn collect_tree_recursive(&self, surface_id: &ObjectId, result: &mut Vec<ObjectId>) {
+        result.push(surface_id.clone());
+        if let Some(surf) = self.surfaces.get(surface_id) {
+            for child_id in &surf.children {
+                self.collect_tree_recursive(child_id, result);
+            }
+        }
+    }
+
+    /// Walk the surface tree rooted at `root_id` and return the topmost
+    /// surface whose pixel bounds contain (`x`, `y`).  Returns
+    /// `(wl_surface, local_x, local_y)` with coordinates relative to the
+    /// hit surface.  Falls back to the root surface when nothing else matches.
+    fn hit_test_surface_at(
+        &self,
+        root_id: &ObjectId,
+        x: f64,
+        y: f64,
+    ) -> Option<(WlSurface, f64, f64)> {
+        self.hit_test_recursive(root_id, x, y, 0, 0).or_else(|| {
+            // Fallback: return the root surface with the original coords.
+            self.surfaces
+                .get(root_id)
+                .map(|s| (s.wl_surface.clone(), x, y))
+        })
+    }
+
+    fn hit_test_recursive(
+        &self,
+        surface_id: &ObjectId,
+        x: f64,
+        y: f64,
+        offset_x: i32,
+        offset_y: i32,
+    ) -> Option<(WlSurface, f64, f64)> {
+        let surf = self.surfaces.get(surface_id)?;
+        let sx = offset_x + surf.subsurface_position.0;
+        let sy = offset_y + surf.subsurface_position.1;
+
+        // Children are ordered back-to-front; iterate in reverse for topmost.
+        for child_id in surf.children.iter().rev() {
+            if let Some(hit) = self.hit_test_recursive(child_id, x, y, sx, sy) {
+                return Some(hit);
+            }
+        }
+
+        // Check this surface's bounds (logical coordinates).
+        if let Some(&(w, h, scale, _, _)) = self.pixel_cache.get(surface_id) {
+            let s = scale.max(1) as f64;
+            // Prefer viewport destination for logical size (fractional-scale
+            // clients set buffer_scale=1 and declare logical size via viewport).
+            let (lw, lh) = surf
+                .viewport_destination
+                .filter(|&(dw, dh)| dw > 0 && dh > 0)
+                .map(|(dw, dh)| (dw as f64, dh as f64))
+                .unwrap_or((w as f64 / s, h as f64 / s));
+            let lx = x - sx as f64;
+            let ly = y - sy as f64;
+            if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
+                return Some((surf.wl_surface.clone(), lx, ly));
+            }
+        }
+        None
+    }
+
+    /// Apply double-buffered pending state and consume the pending buffer.
+    ///
+    /// DMA-BUF content is eagerly snapshot into CPU memory so the
+    /// pixel_cache holds a stable copy.  Without this, sibling surfaces
+    /// whose buffers were released in previous frames would be read from
+    /// DMA-BUF fds that the client is actively rewriting — producing
+    /// black rectangles wherever the client's GPU has already cleared
+    /// the old content.
+    fn apply_pending_state(&mut self, surface_id: &ObjectId) {
+        let (buffer, scale, is_opaque) = {
+            let Some(surf) = self.surfaces.get_mut(surface_id) else {
+                return;
+            };
+            let buffer = surf.pending_buffer.take();
+            let scale = surf.pending_buffer_scale;
+            surf.buffer_scale = scale;
+            surf.viewport_destination = surf.pending_viewport_destination;
+            surf.is_opaque = surf.pending_opaque;
+            surf.pending_damage = false;
+            if let Some(pos) = surf.pending_subsurface_position.take() {
+                surf.subsurface_position = pos;
+            }
+            (buffer, scale, surf.is_opaque)
+        };
+        let Some(buf) = buffer else { return };
+        if let Some((w, h, pixels)) = self.read_buffer(&buf) {
+            // For DMA-BUFs, eagerly read pixel data into a CPU-side
+            // snapshot.  The pixel_cache may hold entries from surfaces
+            // that committed many frames ago — those DMA-BUF fds
+            // reference buffers the client has since reused and is
+            // actively overwriting.  Snapshotting here means every
+            // cache entry is a frozen copy from commit time, immune
+            // to client-side GPU clears.
+            let pixels = if pixels.is_dmabuf() {
+                let rgba = pixels.to_rgba(w, h);
+                if !rgba.is_empty() {
+                    PixelData::Rgba(std::sync::Arc::new(rgba))
+                } else {
+                    // Fence not ready — keep the DMA-BUF reference as
+                    // a best-effort fallback; the Vulkan renderer may
+                    // still be able to import it directly.
+                    pixels
+                }
+            } else {
+                pixels
+            };
+            self.pixel_cache
+                .insert(surface_id.clone(), (w, h, scale, is_opaque, pixels));
+        }
+        buf.release();
+    }
+
+    fn fire_surface_frame_callbacks(&mut self, surface_id: &ObjectId) {
+        let (callbacks, feedbacks) = {
+            let Some(surf) = self.surfaces.get_mut(surface_id) else {
+                return;
+            };
+            (
+                std::mem::take(&mut surf.pending_frame_callbacks),
+                std::mem::take(&mut surf.pending_presentation_feedbacks),
+            )
+        };
+        let time = elapsed_ms();
+        for cb in callbacks {
+            cb.done(time);
+        }
+        if !feedbacks.is_empty() {
+            let (sec, nsec) = monotonic_timespec();
+            // Send sync_output for each feedback, then presented().
+            // refresh=0 means unknown (headless, no real display).
+            for fb in feedbacks {
+                for output in &self.outputs {
+                    if same_client(&fb, output) {
+                        fb.sync_output(output);
+                    }
+                }
+                fb.presented(
+                    (sec >> 32) as u32,
+                    sec as u32,
+                    nsec as u32,
+                    0, // refresh: unknown (headless)
+                    0, // seq_hi
+                    0, // seq_lo
+                    WpPresentationFeedbackKind::empty(),
+                );
+            }
+        }
+    }
+
+    /// Remove surfaces whose underlying `WlSurface` is no longer alive.
+    /// This handles the case where a Wayland client process exits or crashes
+    /// without explicitly destroying its surfaces — `dispatch_clients()`
+    /// marks the resources as dead, and we clean up here.
+    fn cleanup_dead_surfaces(&mut self) {
+        // Purge stale protocol objects from disconnected clients.
+        self.fractional_scales.retain(|fs| fs.is_alive());
+        self.outputs.retain(|o| o.is_alive());
+        self.keyboards.retain(|k| k.is_alive());
+        self.pointers.retain(|p| p.is_alive());
+        self.data_devices.retain(|d| d.is_alive());
+        self.primary_devices.retain(|d| d.is_alive());
+        self.relative_pointers.retain(|p| p.is_alive());
+        self.text_inputs.retain(|ti| ti.resource.is_alive());
+        self.shm_pools.retain(|_, p| p.resource.is_alive());
+        self.dmabuf_params.retain(|_, p| p.resource.is_alive());
+        self.positioners.retain(|_, p| p.resource.is_alive());
+
+        let dead: Vec<ObjectId> = self
+            .surfaces
+            .iter()
+            .filter(|(_, surf)| !surf.wl_surface.is_alive())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for proto_id in &dead {
+            self.pixel_cache.remove(proto_id);
+            if let Some(surf) = self.surfaces.remove(proto_id) {
+                // Discard any pending presentation feedbacks — the surface
+                // died before the frame was ever presented.
+                for fb in surf.pending_presentation_feedbacks {
+                    fb.discarded();
+                }
+                if let Some(ref parent_id) = surf.parent_surface_id
+                    && let Some(parent) = self.surfaces.get_mut(parent_id)
+                {
+                    parent.children.retain(|c| c != proto_id);
+                }
+                if surf.surface_id > 0 {
+                    self.toplevel_surface_ids.remove(&surf.surface_id);
+                    self.last_reported_size.remove(&surf.surface_id);
+                    self.surface_sizes.remove(&surf.surface_id);
+                    let _ = self.event_tx.send(CompositorEvent::SurfaceDestroyed {
+                        surface_id: surf.surface_id,
+                    });
+                    (self.event_notify)();
+                }
+            }
+        }
+    }
+
+    fn fire_frame_callbacks_for_toplevel(&mut self, toplevel_sid: u16) {
+        let Some(root_id) = self.toplevel_surface_ids.get(&toplevel_sid).cloned() else {
+            return;
+        };
+        let tree = self.collect_surface_tree(&root_id);
+        for sid in &tree {
+            self.fire_surface_frame_callbacks(sid);
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+
+    fn handle_cursor_commit(&mut self, surface_id: &ObjectId) {
+        self.apply_pending_state(surface_id);
+        let hotspot = self
+            .surfaces
+            .get(surface_id)
+            .map(|s| s.cursor_hotspot)
+            .unwrap_or((0, 0));
+        if let Some((w, h, _scale, _opaque, pixels)) = self.pixel_cache.get(surface_id) {
+            let rgba = pixels.to_rgba(*w, *h);
+            if !rgba.is_empty() {
+                let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
+                    surface_id: self.focused_surface_id,
+                    cursor: CursorImage::Custom {
+                        hotspot_x: hotspot.0 as u16,
+                        hotspot_y: hotspot.1 as u16,
+                        width: *w as u16,
+                        height: *h as u16,
+                        rgba,
+                    },
+                });
+            }
+        }
+        self.fire_surface_frame_callbacks(surface_id);
+        let _ = self.display_handle.flush_clients();
+    }
+
+    fn handle_command(&mut self, cmd: CompositorCommand) {
+        match cmd {
+            CompositorCommand::KeyInput {
+                surface_id: _,
+                keycode,
+                pressed,
+            } => {
+                let serial = self.next_serial();
+                let time = elapsed_ms();
+                let state = if pressed {
+                    wl_keyboard::KeyState::Pressed
+                } else {
+                    wl_keyboard::KeyState::Released
+                };
+                let focused_wl = self
+                    .toplevel_surface_ids
+                    .get(&self.focused_surface_id)
+                    .and_then(|root_id| self.surfaces.get(root_id))
+                    .map(|s| s.wl_surface.clone());
+                for kb in &self.keyboards {
+                    if let Some(ref wl) = focused_wl
+                        && same_client(kb, wl)
+                    {
+                        kb.key(serial, time, keycode, state);
+                    }
+                }
+                // Send wl_keyboard.modifiers if this key changed modifier
+                // state.  Many Wayland clients (GTK, Chromium, Qt) rely on
+                // this event rather than computing modifiers from raw key
+                // events.
+                self.update_and_send_modifiers(keycode, pressed);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::TextInput { text } => {
+                let focused_wl = self
+                    .toplevel_surface_ids
+                    .get(&self.focused_surface_id)
+                    .and_then(|root_id| self.surfaces.get(root_id))
+                    .map(|s| s.wl_surface.clone());
+                let Some(focused_wl) = focused_wl else { return };
+
+                // Synthesise evdev key sequences for ASCII
+                // characters that exist on the US-QWERTY layout.
+                const KEY_LEFTSHIFT: u32 = 42;
+                for ch in text.chars() {
+                    if let Some((kc, need_shift)) = char_to_keycode(ch) {
+                        let time = elapsed_ms();
+                        if need_shift {
+                            let serial = self.next_serial();
+                            for kb in &self.keyboards {
+                                if same_client(kb, &focused_wl) {
+                                    kb.key(
+                                        serial,
+                                        time,
+                                        KEY_LEFTSHIFT,
+                                        wl_keyboard::KeyState::Pressed,
+                                    );
+                                }
+                            }
+                            self.update_and_send_modifiers(KEY_LEFTSHIFT, true);
+                        }
+                        let serial = self.next_serial();
+                        for kb in &self.keyboards {
+                            if same_client(kb, &focused_wl) {
+                                kb.key(serial, time, kc, wl_keyboard::KeyState::Pressed);
+                            }
+                        }
+                        let serial = self.next_serial();
+                        for kb in &self.keyboards {
+                            if same_client(kb, &focused_wl) {
+                                kb.key(serial, time, kc, wl_keyboard::KeyState::Released);
+                            }
+                        }
+                        if need_shift {
+                            let serial = self.next_serial();
+                            for kb in &self.keyboards {
+                                if same_client(kb, &focused_wl) {
+                                    kb.key(
+                                        serial,
+                                        time,
+                                        KEY_LEFTSHIFT,
+                                        wl_keyboard::KeyState::Released,
+                                    );
+                                }
+                            }
+                            self.update_and_send_modifiers(KEY_LEFTSHIFT, false);
+                        }
+                    }
+                    // Non-ASCII characters without a text_input_v3 path
+                    // are silently dropped.
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::PointerMotion { surface_id, x, y } => {
+                let time = elapsed_ms();
+                // The browser sends coordinates in the composited frame's
+                // physical pixel space.  Convert to logical (surface-local)
+                // coordinates using the actual composited-to-logical ratio
+                // for this surface.
+                let (mut x, mut y) =
+                    if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
+                        let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
+                        let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
+                        (x * sx, y * sy)
+                    } else {
+                        (x, y)
+                    };
+                // The composited frame is cropped to xdg_geometry (if set),
+                // so the browser's (0,0) corresponds to (geo_x, geo_y) in the
+                // surface tree.  Offset accordingly.
+                if let Some((gx, gy, _, _)) = self
+                    .toplevel_surface_ids
+                    .get(&surface_id)
+                    .and_then(|rid| self.surfaces.get(rid))
+                    .and_then(|s| s.xdg_geometry)
+                {
+                    x += gx as f64;
+                    y += gy as f64;
+                }
+                // Hit-test the surface tree to find the actual target
+                // (may be a subsurface or popup rather than the root).
+                let target_wl = self
+                    .toplevel_surface_ids
+                    .get(&surface_id)
+                    .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
+                    .map(|(wl_surface, lx, ly)| (wl_surface.id(), wl_surface, lx, ly));
+
+                static PTR_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let pn = PTR_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if pn < 5 || pn.is_multiple_of(500) {
+                    let root = self.toplevel_surface_ids.get(&surface_id).cloned();
+                    let lrs = self.last_reported_size.get(&surface_id).copied();
+                    eprintln!(
+                        "[pointer #{pn}] sid={surface_id} logical=({x:.1},{y:.1}) lrs={lrs:?} root={root:?} hit={:?}",
+                        target_wl.as_ref().map(|(pid, _, lx, ly)| format!(
+                            "proto={pid:?} local=({lx:.1},{ly:.1})"
+                        ))
+                    );
+                }
+                if let Some((proto_id, wl_surface, lx, ly)) = target_wl {
+                    if self.pointer_entered_id.as_ref() != Some(&proto_id) {
+                        let serial = self.next_serial();
+                        let matching_ptrs = self
+                            .pointers
+                            .iter()
+                            .filter(|p| same_client(*p, &wl_surface))
+                            .count();
+                        eprintln!(
+                            "[pointer-enter] proto={proto_id:?} matching_ptrs={matching_ptrs} total_ptrs={}",
+                            self.pointers.len()
+                        );
+                        // Leave old surface.
+                        if self.pointer_entered_id.is_some() {
+                            let old_wl = self
+                                .surfaces
+                                .values()
+                                .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                                .map(|s| s.wl_surface.clone());
+                            if let Some(old_wl) = old_wl {
+                                for ptr in &self.pointers {
+                                    if same_client(ptr, &old_wl) {
+                                        ptr.leave(serial, &old_wl);
+                                    }
+                                }
+                            }
+                        }
+                        for ptr in &self.pointers {
+                            if same_client(ptr, &wl_surface) {
+                                ptr.enter(serial, &wl_surface, lx, ly);
+                            }
+                        }
+                        self.pointer_entered_id = Some(proto_id);
+                    }
+                    for ptr in &self.pointers {
+                        if same_client(ptr, &wl_surface) {
+                            ptr.motion(time, lx, ly);
+                            ptr.frame();
+                        }
+                    }
+                }
+                // When no surface is hit, don't send motion events —
+                // there is no valid surface-local coordinate to report.
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::PointerButton {
+                surface_id: _,
+                button,
+                pressed,
+            } => {
+                let serial = self.next_serial();
+                let time = elapsed_ms();
+                let state = if pressed {
+                    wl_pointer::ButtonState::Pressed
+                } else {
+                    wl_pointer::ButtonState::Released
+                };
+                let focused_wl = self
+                    .surfaces
+                    .values()
+                    .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                    .map(|s| s.wl_surface.clone());
+                for ptr in &self.pointers {
+                    if let Some(ref wl) = focused_wl
+                        && same_client(ptr, wl)
+                    {
+                        ptr.button(serial, time, button, state);
+                        ptr.frame();
+                    }
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::PointerAxis {
+                surface_id: _,
+                axis,
+                value,
+            } => {
+                let time = elapsed_ms();
+                let wl_axis = if axis == 0 {
+                    wl_pointer::Axis::VerticalScroll
+                } else {
+                    wl_pointer::Axis::HorizontalScroll
+                };
+                let focused_wl = self
+                    .surfaces
+                    .values()
+                    .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                    .map(|s| s.wl_surface.clone());
+                for ptr in &self.pointers {
+                    if let Some(ref wl) = focused_wl
+                        && same_client(ptr, wl)
+                    {
+                        ptr.axis(time, wl_axis, value);
+                        ptr.frame();
+                    }
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::SurfaceResize {
+                surface_id,
+                width,
+                height,
+                scale_120,
+            } => {
+                // The browser sends physical pixels (cssW × DPR).  Convert
+                // to logical (CSS) pixels for use in Wayland configures.
+                let s_in = (scale_120 as i32).max(120);
+                let w = (width as i32) * 120 / s_in;
+                let h = (height as i32) * 120 / s_in;
+                self.surface_sizes.insert(surface_id, (w, h));
+
+                // Track whether output properties changed so we can batch
+                // all events before a single output.done().
+                let mut output_changed = false;
+
+                // Update output scale (in 1/120th units) from the browser DPR.
+                if scale_120 > 0 && scale_120 != self.output_scale_120 {
+                    self.output_scale_120 = scale_120;
+                    output_changed = true;
+                }
+
+                let s120 = self.output_scale_120 as i32;
+
+                // Recompute output dimensions from scratch (start from 0,0)
+                // so the output can shrink when surfaces get smaller or are
+                // destroyed.  The previous fold started from (output_width,
+                // output_height) which meant dimensions could only grow.
+                let (max_w, max_h) = self
+                    .surface_sizes
+                    .values()
+                    .fold((0i32, 0i32), |(mw, mh), &(sw, sh)| (mw.max(sw), mh.max(sh)));
+                // Clamp to a sensible minimum so the output is never 0×0.
+                let max_w = max_w.max(1);
+                let max_h = max_h.max(1);
+                if max_w != self.output_width || max_h != self.output_height {
+                    self.output_width = max_w;
+                    self.output_height = max_h;
+                    output_changed = true;
+                }
+
+                // When any output property changed, re-send the full
+                // sequence so clients see it as a display configuration
+                // change: geometry → mode → scale → fractional_scale → done.
+                if output_changed {
+                    let int_scale = ((s120) + 119) / 120;
+                    for output in &self.outputs {
+                        output.geometry(
+                            0,
+                            0,
+                            0,
+                            0,
+                            wl_output::Subpixel::None,
+                            "blit".to_string(),
+                            "virtual".to_string(),
+                            wl_output::Transform::Normal,
+                        );
+                        // mode() takes physical pixels: logical × scale.
+                        let mode_w = self.output_width * s120 / 120;
+                        let mode_h = self.output_height * s120 / 120;
+                        output.mode(
+                            wl_output::Mode::Current | wl_output::Mode::Preferred,
+                            mode_w,
+                            mode_h,
+                            60_000,
+                        );
+                        if output.version() >= 2 {
+                            output.scale(int_scale);
+                        }
+                    }
+                    for fs in &self.fractional_scales {
+                        fs.preferred_scale(s120 as u32);
+                    }
+                }
+
+                // Single output.done() after all property changes, so the
+                // client sees scale + mode atomically before the configure.
+                if output_changed {
+                    for output in &self.outputs {
+                        if output.version() >= 2 {
+                            output.done();
+                        }
+                    }
+                }
+
+                let states = xdg_toplevel_states(&[
+                    xdg_toplevel::State::Activated,
+                    xdg_toplevel::State::Maximized,
+                ]);
+
+                if output_changed {
+                    // When output scale or dimensions changed, every
+                    // toplevel needs a new configure so it re-renders at
+                    // the correct density / size.
+                    for (&sid, root_id) in &self.toplevel_surface_ids {
+                        let (lw, lh) = self.surface_sizes.get(&sid).copied().unwrap_or((w, h));
+                        if let Some(surf) = self.surfaces.get(root_id) {
+                            if let Some(ref tl) = surf.xdg_toplevel {
+                                tl.configure(lw, lh, states.clone());
+                            }
+                            if let Some(ref xs) = surf.xdg_surface {
+                                let serial = self.serial.wrapping_add(1);
+                                self.serial = serial;
+                                xs.configure(serial);
+                            }
+                        }
+                    }
+                    // Fire frame callbacks so all clients repaint at new
+                    // scale.
+                    let all_sids: Vec<u16> = self.toplevel_surface_ids.keys().copied().collect();
+                    for sid in all_sids {
+                        self.fire_frame_callbacks_for_toplevel(sid);
+                    }
+
+                    // Reset pointer/keyboard state — scale change
+                    // invalidates coordinate mappings.
+                    self.pointer_entered_id = None;
+                    self.pending_kb_reenter = true;
+                } else {
+                    // Only the target surface changed size — configure just
+                    // that one.  This avoids disturbing other surfaces'
+                    // frame callback / render cycle, which would race with
+                    // the server's RequestFrame mechanism and stall them.
+                    if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id)
+                        && let Some(surf) = self.surfaces.get(root_id)
+                    {
+                        if let Some(ref tl) = surf.xdg_toplevel {
+                            tl.configure(w, h, states);
+                        }
+                        if let Some(ref xs) = surf.xdg_surface {
+                            let serial = self.serial.wrapping_add(1);
+                            self.serial = serial;
+                            xs.configure(serial);
+                        }
+                    }
+                    self.fire_frame_callbacks_for_toplevel(surface_id);
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::SurfaceFocus { surface_id } => {
+                self.set_keyboard_focus(surface_id);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::SurfaceClose { surface_id } => {
+                if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id)
+                    && let Some(surf) = self.surfaces.get(root_id)
+                    && let Some(ref tl) = surf.xdg_toplevel
+                {
+                    tl.close();
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::ClipboardOffer { mime_type, data } => {
+                self.external_clipboard = Some(ExternalClipboard { mime_type, data });
+                // Invalidate the Wayland-side selection — external takes over.
+                self.selection_source = None;
+                self.offer_external_clipboard();
+            }
+            CompositorCommand::Capture {
+                surface_id,
+                scale_120,
+                reply,
+            } => {
+                // Use the capture-specific scale if provided, otherwise
+                // fall back to the current output scale.
+                let cap_s120 = if scale_120 > 0 {
+                    scale_120
+                } else {
+                    self.output_scale_120
+                };
+                let result = if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id) {
+                    super::render::cpu_composite_from_cache(
+                        root_id,
+                        &self.surfaces,
+                        &self.pixel_cache,
+                        cap_s120,
+                    )
+                    .map(|(w, h, pixels)| {
+                        let rgba = pixels.to_rgba(w, h);
+                        (w, h, rgba)
+                    })
+                } else {
+                    None
+                };
+                let _ = reply.send(result);
+            }
+            CompositorCommand::RequestFrame { surface_id } => {
+                self.fire_frame_callbacks_for_toplevel(surface_id);
+            }
+            CompositorCommand::ReleaseKeys { keycodes } => {
+                let time = elapsed_ms();
+                let focused_wl = self
+                    .toplevel_surface_ids
+                    .get(&self.focused_surface_id)
+                    .and_then(|root_id| self.surfaces.get(root_id))
+                    .map(|s| s.wl_surface.clone());
+                for keycode in &keycodes {
+                    let serial = self.next_serial();
+                    for kb in &self.keyboards {
+                        if let Some(ref wl) = focused_wl
+                            && same_client(kb, wl)
+                        {
+                            kb.key(serial, time, *keycode, wl_keyboard::KeyState::Released);
+                        }
+                    }
+                }
+                // Update modifier state for any released modifier keys.
+                for keycode in &keycodes {
+                    self.update_and_send_modifiers(*keycode, false);
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::ClipboardListMimes { reply } => {
+                let mimes = self.collect_clipboard_mime_types();
+                let _ = reply.send(mimes);
+            }
+            CompositorCommand::ClipboardGet { mime_type, reply } => {
+                let data = self.get_clipboard_content(&mime_type);
+                let _ = reply.send(data);
+            }
+            CompositorCommand::SetExternalOutputBuffers { buffers } => {
+                if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.set_external_output_buffers(buffers);
+                }
+            }
+            CompositorCommand::Shutdown => {
+                self.shutdown.store(true, Ordering::Relaxed);
+                self.loop_signal.stop();
+            }
+        }
+    }
+}
+
+impl Compositor {
+    /// Collect all MIME types available on the current clipboard.
+    fn collect_clipboard_mime_types(&self) -> Vec<String> {
+        // If a Wayland app owns the selection, use its MIME types.
+        if let Some(ref src) = self.selection_source {
+            let data = src.data::<DataSourceData>().unwrap();
+            return data.mime_types.lock().unwrap().clone();
+        }
+        // Otherwise use the external (browser/CLI) clipboard.
+        if let Some(ref cb) = self.external_clipboard
+            && !cb.mime_type.is_empty()
+        {
+            let mut mimes = vec![cb.mime_type.clone()];
+            // Add standard text aliases.
+            if cb.mime_type.starts_with("text/plain") {
+                if cb.mime_type != "text/plain" {
+                    mimes.push("text/plain".to_string());
+                }
+                if cb.mime_type != "text/plain;charset=utf-8" {
+                    mimes.push("text/plain;charset=utf-8".to_string());
+                }
+                mimes.push("UTF8_STRING".to_string());
+            }
+            return mimes;
+        }
+        Vec::new()
+    }
+
+    /// Get clipboard content for a specific MIME type.
+    fn get_clipboard_content(&mut self, mime_type: &str) -> Option<Vec<u8>> {
+        // If external clipboard matches, return its data directly.
+        if let Some(ref cb) = self.external_clipboard
+            && self.selection_source.is_none()
+        {
+            // External clipboard is active.
+            let matches = cb.mime_type == mime_type
+                || (cb.mime_type.starts_with("text/plain")
+                    && (mime_type == "text/plain"
+                        || mime_type == "text/plain;charset=utf-8"
+                        || mime_type == "UTF8_STRING"));
+            if matches {
+                return Some(cb.data.clone());
+            }
+            return None;
+        }
+        // If a Wayland app owns the selection, read from it via pipe.
+        if let Some(src) = self.selection_source.clone() {
+            return self.read_data_source_sync(&src, mime_type);
+        }
+        None
+    }
+
+    /// Synchronously read data from a Wayland data source via pipe.
+    fn read_data_source_sync(&mut self, source: &WlDataSource, mime_type: &str) -> Option<Vec<u8>> {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        source.send(mime_type.to_string(), write_fd.as_fd());
+        let _ = self.display_handle.flush_clients();
+        drop(write_fd); // close write end so read gets EOF
+        // Non-blocking read with a modest limit.
+        unsafe {
+            libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    read_fd.as_raw_fd(),
+                    tmp.as_mut_ptr() as *mut libc::c_void,
+                    tmp.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n as usize]);
+            if buf.len() > 1024 * 1024 {
+                break; // 1 MiB cap
+            }
+        }
+        if buf.is_empty() { None } else { Some(buf) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Read `CLOCK_MONOTONIC` and return `(tv_sec, tv_nsec)`.
+fn monotonic_timespec() -> (i64, i64) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with CLOCK_MONOTONIC is always valid.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec, ts.tv_nsec)
+}
+
+fn elapsed_ms() -> u32 {
+    // Use CLOCK_MONOTONIC directly so the timestamp matches what Wayland
+    // clients (especially Chromium/Brave) expect for frame-latency
+    // calculations.  The previous implementation measured from an arbitrary
+    // epoch which caused Chromium to report negative frame latency.
+    let (sec, nsec) = monotonic_timespec();
+    (sec as u32)
+        .wrapping_mul(1000)
+        .wrapping_add(nsec as u32 / 1_000_000)
+}
+
+/// Returns true when two Wayland resources belong to the same still-connected client.
+fn same_client<R1: Resource, R2: Resource>(a: &R1, b: &R2) -> bool {
+    match (a.client(), b.client()) {
+        (Some(ca), Some(cb)) => ca.id() == cb.id(),
+        _ => false,
+    }
 }
 
 fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     let y = (y as i32 - 16).max(0);
     let u = u as i32 - 128;
     let v = v as i32 - 128;
-
     let r = ((298 * y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
     let g = ((298 * y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
     let b = ((298 * y + 516 * u + 128) >> 8).clamp(0, 255) as u8;
-
     [r, g, b]
 }
 
-fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    let raw = bytes.get(offset..end)?;
-    Some(u16::from_le_bytes([raw[0], raw[1]]))
+/// Encode xdg_toplevel states as the raw byte array expected by the protocol.
+fn xdg_toplevel_states(states: &[xdg_toplevel::State]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(states.len() * 4);
+    for state in states {
+        bytes.extend_from_slice(&(*state as u32).to_ne_bytes());
+    }
+    bytes
 }
 
-/// Direct mmap readback of a packed BGRA/RGBA DMA-BUF fd.
-/// Used for anonymous heap fds (Vulkan wsi) where Smithay's map_plane fails.
-/// Must be called BEFORE wl_buffer.release() to avoid a race with the client.
-#[allow(dead_code)]
-fn read_packed_dmabuf_fd(
-    raw_fd: std::os::fd::RawFd,
-    stride: usize,
-    width: usize,
-    height: usize,
-    format: Fourcc,
-) -> Option<PixelData> {
-    let file_size = unsafe { libc::lseek(raw_fd, 0, libc::SEEK_END) };
-    if file_size <= 0 {
+fn create_keymap_fd(keymap_data: &[u8]) -> Option<OwnedFd> {
+    use std::io::Write;
+    let name = c"blit-keymap";
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if raw_fd < 0 {
         return None;
     }
-    let map_len = file_size as usize;
-
-    #[repr(C)]
-    struct DmaBufSync {
-        flags: u64,
-    }
-    const DMA_BUF_SYNC_READ: u64 = 1;
-    const DMA_BUF_SYNC_START: u64 = 0;
-    const DMA_BUF_SYNC_END: u64 = 4;
-    const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
-
-    let sync_start = DmaBufSync {
-        flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
-    };
-    unsafe {
-        libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_start);
-    }
-
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            raw_fd,
-            0,
-        )
-    };
-
-    let result = if ptr == libc::MAP_FAILED {
-        None
-    } else {
-        let plane_data = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
-        let r = read_packed_dmabuf(plane_data, stride, width, height, false, format);
-        unsafe {
-            libc::munmap(ptr, map_len);
-        }
-        r
-    };
-
-    let sync_end = DmaBufSync {
-        flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
-    };
-    unsafe {
-        libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_end);
-    }
-
-    result
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut file = std::fs::File::from(fd);
+    file.write_all(keymap_data).ok()?;
+    Some(file.into())
 }
 
-/// Read a packed 4-byte DMA-BUF into native pixel data.
-///
-/// ARGB8888 / XRGB8888 are BGRA in memory on little-endian — pass straight
-/// through as `PixelData::Bgra` with zero per-pixel work.  ABGR8888 /
-/// XBGR8888 are RGBA in memory — likewise zero swizzle.
-fn read_packed_dmabuf(
-    plane_data: &[u8],
-    stride: usize,
-    width: usize,
-    height: usize,
-    y_inverted: bool,
-    format: Fourcc,
-) -> Option<PixelData> {
-    let row_bytes = width * 4;
-    let total = row_bytes * height;
+// ---------------------------------------------------------------------------
+// Protocol dispatch implementations
+// ---------------------------------------------------------------------------
 
-    // Determine whether the raw bytes are BGRA or RGBA in memory, and
-    // whether the alpha channel is real or must be forced to 0xFF.
-    let (is_bgra, force_opaque) = match format {
-        Fourcc::Argb8888 => (true, false),  // BGRA in memory, real alpha
-        Fourcc::Xrgb8888 => (true, true),   // BGRX — alpha undefined
-        Fourcc::Abgr8888 => (false, false), // RGBA in memory, real alpha
-        Fourcc::Xbgr8888 => (false, true),  // RGBX — alpha undefined
-        _ => return None,
-    };
+// -- wl_compositor --
 
-    // Fast path: contiguous, not y-inverted, no padding.
-    if !y_inverted && stride == row_bytes && plane_data.len() >= total {
-        let mut buf = plane_data[..total].to_vec();
-        if force_opaque {
-            // Stamp alpha = 255 on every 4th byte.
-            for px in buf.chunks_exact_mut(4) {
-                px[3] = 255;
+impl GlobalDispatch<WlCompositor, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<WlCompositor>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WlCompositor, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &WlCompositor,
+        request: <WlCompositor as Resource>::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_compositor::Request;
+        match request {
+            Request::CreateSurface { id } => {
+                let surface = data_init.init(id, ());
+                let proto_id = surface.id();
+                state.surfaces.insert(
+                    proto_id,
+                    Surface {
+                        surface_id: 0,
+                        wl_surface: surface,
+                        pending_buffer: None,
+                        pending_buffer_scale: 1,
+                        pending_damage: false,
+                        pending_frame_callbacks: Vec::new(),
+                        pending_presentation_feedbacks: Vec::new(),
+                        pending_opaque: false,
+                        buffer_scale: 1,
+                        is_opaque: false,
+                        parent_surface_id: None,
+                        pending_subsurface_position: None,
+                        subsurface_position: (0, 0),
+                        children: Vec::new(),
+                        xdg_surface: None,
+                        xdg_toplevel: None,
+                        xdg_popup: None,
+                        xdg_geometry: None,
+                        title: String::new(),
+                        app_id: String::new(),
+                        pending_viewport_destination: None,
+                        viewport_destination: None,
+                        is_cursor: false,
+                        cursor_hotspot: (0, 0),
+                    },
+                );
             }
-        }
-        return Some(if is_bgra {
-            PixelData::Bgra(Arc::new(buf))
-        } else {
-            PixelData::Rgba(Arc::new(buf))
-        });
-    }
-
-    // Slow path: stride padding or y-inversion — pack rows.
-    let mut buf = Vec::with_capacity(total);
-    for row in 0..height {
-        let src_row = if y_inverted { height - 1 - row } else { row };
-        let row_start = src_row * stride;
-        let row_end = row_start + row_bytes;
-        if row_end > plane_data.len() {
-            return None;
-        }
-        buf.extend_from_slice(&plane_data[row_start..row_end]);
-    }
-    if force_opaque {
-        for px in buf.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
-    }
-    Some(if is_bgra {
-        PixelData::Bgra(Arc::new(buf))
-    } else {
-        PixelData::Rgba(Arc::new(buf))
-    })
-}
-
-#[cfg(test)]
-fn read_nv12_dmabuf(
-    y_plane: &[u8],
-    y_stride: usize,
-    uv_plane: &[u8],
-    uv_stride: usize,
-    width: usize,
-    height: usize,
-    y_inverted: bool,
-) -> Option<Vec<u8>> {
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return None;
-    }
-
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    for row in 0..height {
-        let src_row = if y_inverted { height - 1 - row } else { row };
-        let y_row_start = src_row * y_stride;
-        let uv_row_start = (src_row / 2) * uv_stride;
-        for col in 0..width {
-            let y = y_plane[y_row_start + col];
-            let uv_idx = uv_row_start + (col / 2) * 2;
-            let u = uv_plane[uv_idx];
-            let v = uv_plane[uv_idx + 1];
-            let [r, g, b] = yuv420_to_rgb(y, u, v);
-            rgba.extend_from_slice(&[r, g, b, 255]);
-        }
-    }
-    Some(rgba)
-}
-
-#[cfg(test)]
-fn read_p010_dmabuf(
-    y_plane: &[u8],
-    y_stride: usize,
-    uv_plane: &[u8],
-    uv_stride: usize,
-    width: usize,
-    height: usize,
-    y_inverted: bool,
-) -> Option<Vec<u8>> {
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return None;
-    }
-
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    for row in 0..height {
-        let src_row = if y_inverted { height - 1 - row } else { row };
-        let y_row_start = src_row * y_stride;
-        let y_row_end = y_row_start + width * 2;
-        if y_row_end > y_plane.len() {
-            return None;
-        }
-
-        let uv_row_start = (src_row / 2) * uv_stride;
-        let uv_row_end = uv_row_start + width * 2;
-        if uv_row_end > uv_plane.len() {
-            return None;
-        }
-
-        for col in 0..width {
-            let y = (read_le_u16(y_plane, y_row_start + col * 2)? >> 8) as u8;
-            let uv_idx = uv_row_start + (col / 2) * 4;
-            let u = (read_le_u16(uv_plane, uv_idx)? >> 8) as u8;
-            let v = (read_le_u16(uv_plane, uv_idx + 2)? >> 8) as u8;
-            let [r, g, b] = yuv420_to_rgb(y, u, v);
-            rgba.extend_from_slice(&[r, g, b, 255]);
-        }
-    }
-
-    Some(rgba)
-}
-
-/// Copy NV12 planes into a contiguous buffer without colorspace conversion.
-/// Returns (data, y_stride, uv_stride) where data = Y rows ++ UV rows.
-fn read_nv12_dmabuf_passthrough(
-    y_plane: &[u8],
-    y_stride: usize,
-    uv_plane: &[u8],
-    uv_stride: usize,
-    width: usize,
-    height: usize,
-    y_inverted: bool,
-) -> Option<(Vec<u8>, usize, usize)> {
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return None;
-    }
-
-    let uv_height = height / 2;
-    // Use width as the output stride (pack rows tightly).
-    let out_y_stride = width;
-    // UV plane has interleaved U,V pairs: width bytes per row.
-    let out_uv_stride = width;
-    let mut data = vec![0u8; out_y_stride * height + out_uv_stride * uv_height];
-
-    // Copy Y plane
-    for row in 0..height {
-        let src_row = if y_inverted { height - 1 - row } else { row };
-        let src_start = src_row * y_stride;
-        let src_end = src_start + width;
-        if src_end > y_plane.len() {
-            return None;
-        }
-        let dst_start = row * out_y_stride;
-        data[dst_start..dst_start + width].copy_from_slice(&y_plane[src_start..src_end]);
-    }
-
-    // Copy UV plane
-    let uv_dst_offset = out_y_stride * height;
-    for row in 0..uv_height {
-        let src_row = if y_inverted { uv_height - 1 - row } else { row };
-        let src_start = src_row * uv_stride;
-        let src_end = src_start + width; // width bytes of interleaved UV
-        if src_end > uv_plane.len() {
-            return None;
-        }
-        let dst_start = uv_dst_offset + row * out_uv_stride;
-        data[dst_start..dst_start + width].copy_from_slice(&uv_plane[src_start..src_end]);
-    }
-
-    Some((data, out_y_stride, out_uv_stride))
-}
-
-/// Convert P010 (10-bit) DMA-BUF to 8-bit NV12 without going through RGBA.
-/// Returns (data, y_stride, uv_stride).
-fn read_p010_to_nv12(
-    y_plane: &[u8],
-    y_stride: usize,
-    uv_plane: &[u8],
-    uv_stride: usize,
-    width: usize,
-    height: usize,
-    y_inverted: bool,
-) -> Option<(Vec<u8>, usize, usize)> {
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return None;
-    }
-
-    let uv_height = height / 2;
-    let out_y_stride = width;
-    let out_uv_stride = width;
-    let mut data = vec![0u8; out_y_stride * height + out_uv_stride * uv_height];
-
-    // Convert Y plane: P010 stores 16-bit LE values, take high 8 bits
-    for row in 0..height {
-        let src_row = if y_inverted { height - 1 - row } else { row };
-        let dst_start = row * out_y_stride;
-        for col in 0..width {
-            let src_offset = src_row * y_stride + col * 2;
-            let val = read_le_u16(y_plane, src_offset)?;
-            data[dst_start + col] = (val >> 8) as u8;
-        }
-    }
-
-    // Convert UV plane: P010 stores 16-bit LE U,V pairs
-    let uv_dst_offset = out_y_stride * height;
-    for row in 0..uv_height {
-        let src_row = if y_inverted { uv_height - 1 - row } else { row };
-        let dst_start = uv_dst_offset + row * out_uv_stride;
-        for col in 0..width / 2 {
-            let src_offset = src_row * uv_stride + col * 4;
-            let u = (read_le_u16(uv_plane, src_offset)? >> 8) as u8;
-            let v = (read_le_u16(uv_plane, src_offset + 2)? >> 8) as u8;
-            data[dst_start + col * 2] = u;
-            data[dst_start + col * 2 + 1] = v;
-        }
-    }
-
-    Some((data, out_y_stride, out_uv_stride))
-}
-
-/// Convert Smithay Fourcc (DrmFourcc enum) to raw DRM fourcc u32.
-fn fourcc_to_drm(code: Fourcc) -> u32 {
-    code as u32
-}
-
-fn read_dmabuf_pixels(dmabuf: &Dmabuf) -> Option<(u32, u32, PixelData)> {
-    let size = dmabuf.size();
-    let width = size.w as u32;
-    let height = size.h as u32;
-    if width == 0 || height == 0 {
-        return None;
-    }
-
-    let format = dmabuf.format();
-
-    // --- Path selection ---
-    //
-    // For packed BGRA/RGBA formats (ARGB8888, XRGB8888, ABGR8888, XBGR8888)
-    // we take the zero-copy path: dup the DMA-BUF fd and pass it through as
-    // PixelData::DmaBuf.  The encoder imports it directly into a VASurface via
-    // VA-API VPP (BGRA→NV12 on the GPU) without any CPU mmap.  This is safe
-    // because the buffer release happens after we've already submitted the fd
-    // to the encoder's VPP pipeline — the kernel DMA-BUF object stays alive
-    // as long as the fd is open.
-    //
-    // For NV12/P010 (hardware video decoder output) we CPU-mmap immediately
-    // in the commit handler, before releasing the buffer, because these
-    // typically come from the VA-API decoder's own surfaces and are already
-    // CPU-accessible (system RAM).  The CPU path avoids a redundant GPU round-trip.
-    //
-    // Non-Linear modifiers are fine for the GPU zero-copy path (VA-API imports
-    // by DRM fd regardless of modifier).  For the CPU path we require Linear.
-
-    let y_inverted = dmabuf.y_inverted();
-
-    // For packed BGRA/RGBA DMA-BUFs, choose between two paths:
-    //
-    // 1. Zero-copy GPU path (PixelData::DmaBuf): dup the fd and let the
-    //    encoder import it into VA-API via PRIME_2.  Only safe for DRM
-    //    device-backed fds (from GBM/KMS).  The encoder detects anonymous fds
-    //    and rejects them.
-    //
-    // 2. Immediate CPU mmap (PixelData::Bgra): mmap NOW, before wl_buffer
-    //    release, so we capture the frame before mpv overwrites it.  Required
-    //    for anonymous /dmabuf heap fds (Vulkan wsi) where the content is
-    //    CPU-accessible but may be reused immediately after release.
-    //
-    // Zero-copy GPU path: dup the DMA-BUF fd and pass it through.
-    // The server imports it via VA-API VPP (BGRA→NV12 on the GPU)
-    // without any CPU mmap.  The dup'd fd keeps the kernel DMA-BUF
-    // object alive even after wl_buffer.release().
-    //
-    // Previously this path did an eager CPU mmap+copy as a fallback,
-    // but that consumed 87% of CPU at 60fps (1.9MB memcpy per frame).
-    if !y_inverted
-        && matches!(
-            format.code,
-            Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
-        )
-        && let Some(borrowed_fd) = dmabuf.handles().next()
-        && let Ok(owned) = borrowed_fd.try_clone_to_owned()
-    {
-        let stride = dmabuf.strides().next().unwrap_or(width * 4);
-        let offset = dmabuf.offsets().next().unwrap_or(0);
-        return Some((
-            width,
-            height,
-            PixelData::DmaBuf {
-                fd: Arc::new(owned),
-                fourcc: fourcc_to_drm(format.code),
-                modifier: format.modifier.into(),
-                stride,
-                offset,
-            },
-        ));
-    }
-
-    // CPU readback path for NV12/P010 (and y_inverted BGRA as fallback).
-    // Must happen before wl_buffer.release() since the client may reuse the
-    // buffer immediately after release.
-    let modifier_is_linear = matches!(format.modifier, Modifier::Linear);
-    if !modifier_is_linear {
-        return None;
-    }
-
-    let width_usize = width as usize;
-    let height_usize = height as usize;
-    let pixel_data = match format.code {
-        Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
-            // Fallback CPU path for y_inverted buffers.
-            let stride = dmabuf.strides().next().unwrap_or(width * 4) as usize;
-            with_dmabuf_plane_bytes(dmabuf, 0, |plane_data| {
-                read_packed_dmabuf(
-                    plane_data,
-                    stride,
-                    width_usize,
-                    height_usize,
-                    y_inverted,
-                    format.code,
-                )
-            })?
-        }
-        Fourcc::Nv12 => {
-            // Pass NV12 straight through — no YUV->RGBA conversion.
-            let mut strides = dmabuf.strides();
-            let y_stride = strides.next().unwrap_or(width) as usize;
-            let uv_stride = strides.next().unwrap_or(width) as usize;
-            let nv12 = with_dmabuf_plane_bytes(dmabuf, 0, |y_plane_data| {
-                with_dmabuf_plane_bytes(dmabuf, 1, |uv_plane_data| {
-                    read_nv12_dmabuf_passthrough(
-                        y_plane_data,
-                        y_stride,
-                        uv_plane_data,
-                        uv_stride,
-                        width_usize,
-                        height_usize,
-                        y_inverted,
-                    )
-                })
-            })?;
-            PixelData::Nv12 {
-                data: Arc::new(nv12.0),
-                y_stride: nv12.1,
-                uv_stride: nv12.2,
+            Request::CreateRegion { id } => {
+                data_init.init(id, ());
             }
+            _ => {}
         }
-        Fourcc::P010 => {
-            // P010 requires conversion to 8-bit NV12 since our encoders don't
-            // accept 10-bit input.  Convert to NV12 directly (not RGBA).
-            let mut strides = dmabuf.strides();
-            let y_stride = strides.next().unwrap_or(width * 2) as usize;
-            let uv_stride = strides.next().unwrap_or(width * 2) as usize;
-            let nv12 = with_dmabuf_plane_bytes(dmabuf, 0, |y_plane| {
-                with_dmabuf_plane_bytes(dmabuf, 1, |uv_plane| {
-                    read_p010_to_nv12(
-                        y_plane,
-                        y_stride,
-                        uv_plane,
-                        uv_stride,
-                        width_usize,
-                        height_usize,
-                        y_inverted,
-                    )
-                })
-            })?;
-            PixelData::Nv12 {
-                data: Arc::new(nv12.0),
-                y_stride: nv12.1,
-                uv_stride: nv12.2,
+    }
+}
+
+// -- wl_surface --
+
+impl Dispatch<WlSurface, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &WlSurface,
+        request: <WlSurface as Resource>::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_surface::Request;
+        let sid = resource.id();
+        match request {
+            Request::Attach { buffer, x: _, y: _ } => {
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_buffer = buffer;
+                }
             }
+            Request::Damage { .. } | Request::DamageBuffer { .. } => {
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_damage = true;
+                }
+            }
+            Request::Frame { callback } => {
+                let cb = data_init.init(callback, ());
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_frame_callbacks.push(cb);
+                }
+            }
+            Request::SetBufferScale { scale } => {
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_buffer_scale = scale;
+                }
+            }
+            Request::SetOpaqueRegion { region: _ } => {
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_opaque = true;
+                }
+            }
+            Request::SetInputRegion { .. } => {}
+            Request::Commit => {
+                let is_cursor = state.surfaces.get(&sid).is_some_and(|s| s.is_cursor);
+                if is_cursor {
+                    state.handle_cursor_commit(&sid);
+                } else {
+                    state.handle_surface_commit(&sid);
+                }
+            }
+            Request::SetBufferTransform { .. } => {}
+            Request::Offset { .. } => {}
+            Request::Destroy => {
+                state.pixel_cache.remove(&sid);
+                if let Some(parent_id) = state
+                    .surfaces
+                    .get(&sid)
+                    .and_then(|s| s.parent_surface_id.clone())
+                    && let Some(parent) = state.surfaces.get_mut(&parent_id)
+                {
+                    parent.children.retain(|c| *c != sid);
+                }
+                if let Some(surf) = state.surfaces.remove(&sid) {
+                    for fb in surf.pending_presentation_feedbacks {
+                        fb.discarded();
+                    }
+                    if surf.surface_id > 0 {
+                        state.toplevel_surface_ids.remove(&surf.surface_id);
+                        state.last_reported_size.remove(&surf.surface_id);
+                        state.surface_sizes.remove(&surf.surface_id);
+                        let _ = state.event_tx.send(CompositorEvent::SurfaceDestroyed {
+                            surface_id: surf.surface_id,
+                        });
+                        (state.event_notify)();
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => return None,
-    };
-
-    Some((width, height, pixel_data))
-}
-
-impl PrimarySelectionHandler for Compositor {
-    fn primary_selection_state(&self) -> &PrimarySelectionState {
-        &self.primary_selection_state
     }
 }
 
-impl XdgActivationHandler for Compositor {
-    fn activation_state(&mut self) -> &mut XdgActivationState {
-        &mut self.activation_state
-    }
-
-    fn request_activation(
-        &mut self,
-        _token: XdgActivationToken,
-        _token_data: XdgActivationTokenData,
-        _surface: WlSurface,
+// -- wl_callback --
+impl Dispatch<WlCallback, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlCallback,
+        _: <WlCallback as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
     ) {
     }
 }
 
-impl FractionalScaleHandler for Compositor {
-    fn new_fractional_scale(&mut self, _surface: WlSurface) {}
+// -- wp_presentation --
+impl GlobalDispatch<WpPresentation, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WpPresentation>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let pres = data_init.init(resource, ());
+        // Tell the client we use CLOCK_MONOTONIC for presentation timestamps.
+        pres.clock_id(libc::CLOCK_MONOTONIC as u32);
+    }
 }
 
-impl XdgToplevelIconHandler for Compositor {}
-impl TabletSeatHandler for Compositor {}
+impl Dispatch<WpPresentation, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpPresentation,
+        request: <WpPresentation as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wp_presentation::Request;
+        match request {
+            Request::Feedback { surface, callback } => {
+                let fb = data_init.init(callback, ());
+                let sid = surface.id();
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_presentation_feedbacks.push(fb);
+                }
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
 
-delegate_compositor!(Compositor);
-delegate_cursor_shape!(Compositor);
-delegate_shm!(Compositor);
-delegate_xdg_shell!(Compositor);
-delegate_seat!(Compositor);
-delegate_data_device!(Compositor);
-delegate_primary_selection!(Compositor);
-delegate_output!(Compositor);
-delegate_dmabuf!(Compositor);
-smithay::delegate_drm_syncobj!(Compositor);
-delegate_fractional_scale!(Compositor);
-delegate_viewporter!(Compositor);
-delegate_xdg_activation!(Compositor);
-delegate_xdg_decoration!(Compositor);
-delegate_xdg_toplevel_icon!(Compositor);
-delegate_text_input_manager!(Compositor);
+// -- wp_presentation_feedback (no client requests) --
+impl Dispatch<WpPresentationFeedback, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WpPresentationFeedback,
+        _: <WpPresentationFeedback as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+// -- wl_region --
+impl Dispatch<WlRegion, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlRegion,
+        _: <WlRegion as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+// -- wl_subcompositor --
+impl GlobalDispatch<WlSubcompositor, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WlSubcompositor>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WlSubcompositor, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlSubcompositor,
+        request: <WlSubcompositor as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_subcompositor::Request;
+        match request {
+            Request::GetSubsurface {
+                id,
+                surface,
+                parent,
+            } => {
+                let child_id = surface.id();
+                let parent_id = parent.id();
+                data_init.init(
+                    id,
+                    SubsurfaceData {
+                        wl_surface_id: child_id.clone(),
+                        parent_surface_id: parent_id.clone(),
+                    },
+                );
+                if let Some(surf) = state.surfaces.get_mut(&child_id) {
+                    surf.parent_surface_id = Some(parent_id.clone());
+                }
+                if let Some(parent_surf) = state.surfaces.get_mut(&parent_id)
+                    && !parent_surf.children.contains(&child_id)
+                {
+                    parent_surf.children.push(child_id);
+                }
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- wl_subsurface --
+impl Dispatch<WlSubsurface, SubsurfaceData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlSubsurface,
+        request: <WlSubsurface as Resource>::Request,
+        data: &SubsurfaceData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_subsurface::Request;
+        match request {
+            Request::SetPosition { x, y } => {
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.pending_subsurface_position = Some((x, y));
+                }
+            }
+            Request::PlaceAbove { sibling } => {
+                let sibling_id = sibling.id();
+                if let Some(parent) = state.surfaces.get_mut(&data.parent_surface_id) {
+                    let child_id = &data.wl_surface_id;
+                    parent.children.retain(|c| c != child_id);
+                    let pos = parent
+                        .children
+                        .iter()
+                        .position(|c| *c == sibling_id)
+                        .map(|p| p + 1)
+                        .unwrap_or(parent.children.len());
+                    parent.children.insert(pos, child_id.clone());
+                }
+            }
+            Request::PlaceBelow { sibling } => {
+                let sibling_id = sibling.id();
+                if let Some(parent) = state.surfaces.get_mut(&data.parent_surface_id) {
+                    let child_id = &data.wl_surface_id;
+                    parent.children.retain(|c| c != child_id);
+                    let pos = parent
+                        .children
+                        .iter()
+                        .position(|c| *c == sibling_id)
+                        .unwrap_or(0);
+                    parent.children.insert(pos, child_id.clone());
+                }
+            }
+            Request::SetSync | Request::SetDesync => {}
+            Request::Destroy => {
+                let child_id = &data.wl_surface_id;
+                if let Some(parent) = state.surfaces.get_mut(&data.parent_surface_id) {
+                    parent.children.retain(|c| c != child_id);
+                }
+                if let Some(surf) = state.surfaces.get_mut(child_id) {
+                    surf.parent_surface_id = None;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- xdg_wm_base --
+impl GlobalDispatch<XdgWmBase, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<XdgWmBase>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<XdgWmBase, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &XdgWmBase,
+        request: <XdgWmBase as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_wm_base::Request;
+        match request {
+            Request::GetXdgSurface { id, surface } => {
+                let wl_surface_id = surface.id();
+                let xdg_surface = data_init.init(
+                    id,
+                    XdgSurfaceData {
+                        wl_surface_id: wl_surface_id.clone(),
+                    },
+                );
+                if let Some(surf) = state.surfaces.get_mut(&wl_surface_id) {
+                    surf.xdg_surface = Some(xdg_surface);
+                }
+            }
+            Request::CreatePositioner { id } => {
+                let positioner = data_init.init(id, ());
+                let pos_id = positioner.id();
+                state.positioners.insert(
+                    pos_id,
+                    PositionerState {
+                        resource: positioner,
+                        geometry: PositionerGeometry {
+                            size: (0, 0),
+                            anchor_rect: (0, 0, 0, 0),
+                            anchor: 0,
+                            gravity: 0,
+                            constraint_adjustment: 0,
+                            offset: (0, 0),
+                        },
+                    },
+                );
+            }
+            Request::Pong { .. } => {}
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- xdg_surface --
+impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &XdgSurface,
+        request: <XdgSurface as Resource>::Request,
+        data: &XdgSurfaceData,
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_surface::Request;
+        match request {
+            Request::GetToplevel { id } => {
+                let toplevel = data_init.init(
+                    id,
+                    XdgToplevelData {
+                        wl_surface_id: data.wl_surface_id.clone(),
+                    },
+                );
+                let surface_id = state.allocate_surface_id();
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.xdg_toplevel = Some(toplevel.clone());
+                    surf.surface_id = surface_id;
+                }
+                state
+                    .toplevel_surface_ids
+                    .insert(surface_id, data.wl_surface_id.clone());
+
+                // Use a per-surface size if one was already configured
+                // (e.g. the browser sent C2S_SURFACE_RESIZE before the
+                // toplevel was created), otherwise fall back to the global
+                // output dimensions.  surface_sizes stores logical pixels.
+                let (cw, ch) = state
+                    .surface_sizes
+                    .get(&surface_id)
+                    .copied()
+                    .unwrap_or((state.output_width, state.output_height));
+                let states = xdg_toplevel_states(&[
+                    xdg_toplevel::State::Activated,
+                    xdg_toplevel::State::Maximized,
+                ]);
+                toplevel.configure(cw, ch, states);
+                let serial = state.next_serial();
+                resource.configure(serial);
+
+                // Keyboard focus — sends leave to the previously focused
+                // surface's client before entering the new one.
+                state.set_keyboard_focus(surface_id);
+                // Tell the client which output its surface is on so it can
+                // determine scale and start rendering.
+                if let Some(surf) = state.surfaces.get(&data.wl_surface_id) {
+                    for output in &state.outputs {
+                        if same_client(output, &surf.wl_surface) {
+                            surf.wl_surface.enter(output);
+                        }
+                    }
+                }
+                let _ = state.display_handle.flush_clients();
+
+                let _ = state.event_tx.send(CompositorEvent::SurfaceCreated {
+                    surface_id,
+                    title: String::new(),
+                    app_id: String::new(),
+                    parent_id: 0,
+                    width: 0,
+                    height: 0,
+                });
+                (state.event_notify)();
+                if state.verbose {
+                    eprintln!("[compositor] new_toplevel sid={surface_id}");
+                }
+            }
+            Request::GetPopup {
+                id,
+                parent,
+                positioner,
+            } => {
+                let popup = data_init.init(
+                    id,
+                    XdgPopupData {
+                        wl_surface_id: data.wl_surface_id.clone(),
+                    },
+                );
+
+                // Parent relationship: make the popup a child of the parent
+                // surface so it is composited into the same toplevel frame.
+                let parent_wl_id: Option<ObjectId> = parent
+                    .as_ref()
+                    .and_then(|p| p.data::<XdgSurfaceData>())
+                    .map(|d| d.wl_surface_id.clone());
+
+                // The xdg-shell protocol specifies popup positions relative
+                // to the parent's *window geometry*, not its surface origin.
+                // Fetch the parent's geometry offset so we can convert
+                // between window-geometry space and surface-tree space.
+                let parent_geom_offset = parent_wl_id
+                    .as_ref()
+                    .and_then(|pid| state.surfaces.get(pid))
+                    .and_then(|s| s.xdg_geometry)
+                    .map(|(gx, gy, _, _)| (gx, gy))
+                    .unwrap_or((0, 0));
+
+                // Compute the parent's absolute position within the toplevel
+                // and the logical output bounds for constraint adjustment.
+                // Add the geometry offset so parent_abs represents the
+                // window-geometry origin in surface-tree coordinates.
+                let parent_abs = parent_wl_id
+                    .as_ref()
+                    .map(|pid| {
+                        let abs = state.surface_absolute_position(pid);
+                        (abs.0 + parent_geom_offset.0, abs.1 + parent_geom_offset.1)
+                    })
+                    .unwrap_or((0, 0));
+                // Use the client's actual surface size for popup bounds,
+                // not the configured size (client may not have resized yet).
+                let (_, toplevel_root) = parent_wl_id
+                    .as_ref()
+                    .map(|pid| state.find_toplevel_root(pid))
+                    .unwrap_or_else(|| {
+                        // Dummy root — no parent.
+                        (data.wl_surface_id.clone(), None)
+                    });
+                let bounds = toplevel_root
+                    .and_then(|_| {
+                        let root_wl_id = parent_wl_id.as_ref().map(|pid| {
+                            let (rid, _) = state.find_toplevel_root(pid);
+                            rid
+                        })?;
+                        let surf = state.surfaces.get(&root_wl_id)?;
+                        if let Some((gx, gy, gw, gh)) = surf.xdg_geometry
+                            && gw > 0
+                            && gh > 0
+                        {
+                            return Some((gx, gy, gw, gh));
+                        }
+
+                        // Fall back to the client's actual logical surface
+                        // size when window geometry is unavailable.
+                        let (w, h, scale, _, _) = state.pixel_cache.get(&root_wl_id)?;
+                        let s = (*scale).max(1);
+                        let (lw, lh) = surf
+                            .viewport_destination
+                            .filter(|&(dw, dh)| dw > 0 && dh > 0)
+                            .unwrap_or((*w as i32 / s, *h as i32 / s));
+                        Some((0, 0, lw, lh))
+                    })
+                    .unwrap_or((0, 0, state.output_width, state.output_height));
+
+                eprintln!(
+                    "[popup] parent_abs={parent_abs:?} bounds={bounds:?} parent_wl={parent_wl_id:?} geom_off={parent_geom_offset:?}"
+                );
+                // Compute geometry from positioner with constraint adjustment.
+                let pos_id = positioner.id();
+                let (px, py, pw, ph) = state
+                    .positioners
+                    .get(&pos_id)
+                    .map(|p| p.geometry.compute_position(parent_abs, bounds))
+                    .unwrap_or((0, 0, 200, 200));
+                eprintln!("[popup] result=({px},{py},{pw},{ph})");
+
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.xdg_popup = Some(popup.clone());
+                    surf.parent_surface_id = parent_wl_id.clone();
+                    // Convert from window-geometry-relative to surface-
+                    // relative coords so the popup composites correctly.
+                    // The rendering crops to xdg_geometry, so the popup
+                    // must be offset by the parent's geometry origin.
+                    surf.subsurface_position =
+                        (parent_geom_offset.0 + px, parent_geom_offset.1 + py);
+                }
+                if let Some(ref parent_id) = parent_wl_id
+                    && let Some(parent_surf) = state.surfaces.get_mut(parent_id)
+                    && !parent_surf.children.contains(&data.wl_surface_id)
+                {
+                    parent_surf.children.push(data.wl_surface_id.clone());
+                }
+
+                popup.configure(px, py, pw, ph);
+                let serial = state.next_serial();
+                resource.configure(serial);
+                let _ = state.display_handle.flush_clients();
+            }
+            Request::SetWindowGeometry {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    // For popup surfaces, adjust subsurface_position to
+                    // account for the popup's own geometry offset.  The
+                    // xdg-shell protocol positions the popup's *geometry*
+                    // (not its surface origin) relative to the parent's
+                    // geometry.  Without this adjustment, CSD shadows or
+                    // borders around the popup cause the visible content
+                    // to shift by (gx, gy).
+                    if surf.xdg_popup.is_some() {
+                        let (old_gx, old_gy) = surf
+                            .xdg_geometry
+                            .map(|(gx, gy, _, _)| (gx, gy))
+                            .unwrap_or((0, 0));
+                        surf.subsurface_position.0 += old_gx - x;
+                        surf.subsurface_position.1 += old_gy - y;
+                    }
+                    surf.xdg_geometry = Some((x, y, width, height));
+                }
+            }
+            Request::AckConfigure { .. } => {}
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- xdg_toplevel --
+impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &XdgToplevel,
+        request: <XdgToplevel as Resource>::Request,
+        data: &XdgToplevelData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_toplevel::Request;
+        match request {
+            Request::SetTitle { title } => {
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id)
+                    && surf.title != title
+                {
+                    surf.title = title.clone();
+                    if surf.surface_id > 0 {
+                        let _ = state.event_tx.send(CompositorEvent::SurfaceTitle {
+                            surface_id: surf.surface_id,
+                            title,
+                        });
+                        (state.event_notify)();
+                    }
+                }
+            }
+            Request::SetAppId { app_id } => {
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id)
+                    && surf.app_id != app_id
+                {
+                    surf.app_id = app_id.clone();
+                    if surf.surface_id > 0 {
+                        let _ = state.event_tx.send(CompositorEvent::SurfaceAppId {
+                            surface_id: surf.surface_id,
+                            app_id,
+                        });
+                        (state.event_notify)();
+                    }
+                }
+            }
+            Request::Destroy => {
+                let wl_surface_id = &data.wl_surface_id;
+                state.pixel_cache.remove(wl_surface_id);
+                if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
+                    let sid = surf.surface_id;
+                    surf.xdg_toplevel = None;
+                    if sid > 0 {
+                        state.toplevel_surface_ids.remove(&sid);
+                        state.last_reported_size.remove(&sid);
+                        state.surface_sizes.remove(&sid);
+                        let _ = state
+                            .event_tx
+                            .send(CompositorEvent::SurfaceDestroyed { surface_id: sid });
+                        (state.event_notify)();
+                        surf.surface_id = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- xdg_popup --
+impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &XdgPopup,
+        request: <XdgPopup as Resource>::Request,
+        data: &XdgPopupData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_popup::Request;
+        if let Request::Destroy = request {
+            // Remove from parent's children list.
+            if let Some(parent_id) = state
+                .surfaces
+                .get(&data.wl_surface_id)
+                .and_then(|s| s.parent_surface_id.clone())
+                && let Some(parent) = state.surfaces.get_mut(&parent_id)
+            {
+                parent.children.retain(|c| *c != data.wl_surface_id);
+            }
+            if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                surf.xdg_popup = None;
+                surf.parent_surface_id = None;
+            }
+        }
+    }
+}
+
+// -- xdg_positioner --
+use wayland_protocols::xdg::shell::server::xdg_positioner;
+impl Dispatch<XdgPositioner, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &XdgPositioner,
+        request: <XdgPositioner as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_positioner::Request;
+        let pos_id = resource.id();
+        let Some(pos) = state.positioners.get_mut(&pos_id) else {
+            return;
+        };
+        match request {
+            Request::SetSize { width, height } => {
+                pos.geometry.size = (width, height);
+            }
+            Request::SetAnchorRect {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                pos.geometry.anchor_rect = (x, y, width, height);
+            }
+            Request::SetAnchor {
+                anchor: wayland_server::WEnum::Value(v),
+            } => {
+                pos.geometry.anchor = v as u32;
+            }
+            Request::SetGravity {
+                gravity: wayland_server::WEnum::Value(v),
+            } => {
+                pos.geometry.gravity = v as u32;
+            }
+            Request::SetOffset { x, y } => {
+                pos.geometry.offset = (x, y);
+            }
+            Request::SetConstraintAdjustment {
+                constraint_adjustment,
+            } => {
+                pos.geometry.constraint_adjustment = constraint_adjustment.into();
+            }
+            Request::Destroy => {
+                state.positioners.remove(&pos_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- xdg_decoration --
+impl GlobalDispatch<ZxdgDecorationManagerV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<ZxdgDecorationManagerV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZxdgDecorationManagerV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZxdgDecorationManagerV1,
+        request: <ZxdgDecorationManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zxdg_decoration_manager_v1::Request;
+        match request {
+            Request::GetToplevelDecoration { id, toplevel: _ } => {
+                let decoration = data_init.init(id, ());
+                // Always request server-side (i.e. no) decorations.
+                decoration.configure(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgToplevelDecorationV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        resource: &ZxdgToplevelDecorationV1,
+        request: <ZxdgToplevelDecorationV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use zxdg_toplevel_decoration_v1::Request;
+        match request {
+            Request::SetMode { .. } | Request::UnsetMode => {
+                resource.configure(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- wl_shm --
+impl GlobalDispatch<WlShm, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WlShm>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let shm = data_init.init(resource, ());
+        shm.format(wl_shm::Format::Argb8888);
+        shm.format(wl_shm::Format::Xrgb8888);
+        shm.format(wl_shm::Format::Abgr8888);
+        shm.format(wl_shm::Format::Xbgr8888);
+    }
+}
+
+impl Dispatch<WlShm, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlShm,
+        request: <WlShm as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_shm::Request;
+        if let Request::CreatePool { id, fd, size } = request {
+            let pool = data_init.init(id, ());
+            let pool_id = pool.id();
+            state
+                .shm_pools
+                .insert(pool_id, ShmPool::new(pool, fd, size));
+        }
+    }
+}
+
+// -- wl_shm_pool --
+impl Dispatch<WlShmPool, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &WlShmPool,
+        request: <WlShmPool as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_shm_pool::Request;
+        let pool_id = resource.id();
+        match request {
+            Request::CreateBuffer {
+                id,
+                offset,
+                width,
+                height,
+                stride,
+                format,
+            } => {
+                // format comes as WEnum<Format>, extract the known value.
+                let fmt = match format {
+                    wayland_server::WEnum::Value(f) => f,
+                    _ => wl_shm::Format::Argb8888, // fallback
+                };
+                data_init.init(
+                    id,
+                    ShmBufferData {
+                        pool_id: pool_id.clone(),
+                        offset,
+                        width,
+                        height,
+                        stride,
+                        format: fmt,
+                    },
+                );
+            }
+            Request::Resize { size } => {
+                if let Some(pool) = state.shm_pools.get_mut(&pool_id) {
+                    pool.resize(size);
+                }
+            }
+            Request::Destroy => {
+                state.shm_pools.remove(&pool_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- wl_buffer (SHM) --
+impl Dispatch<WlBuffer, ShmBufferData> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlBuffer,
+        _: <WlBuffer as Resource>::Request,
+        _: &ShmBufferData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+// -- wl_buffer (DMA-BUF) --
+impl Dispatch<WlBuffer, DmaBufBufferData> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlBuffer,
+        _: <WlBuffer as Resource>::Request,
+        _: &DmaBufBufferData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+// -- wl_output --
+impl GlobalDispatch<WlOutput, ()> for Compositor {
+    fn bind(
+        state: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WlOutput>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let output = data_init.init(resource, ());
+        output.geometry(
+            0,
+            0,
+            0,
+            0,
+            wl_output::Subpixel::Unknown,
+            "Virtual".to_string(),
+            "Headless".to_string(),
+            wl_output::Transform::Normal,
+        );
+        let s120 = state.output_scale_120 as i32;
+        let mode_w = state.output_width * s120 / 120;
+        let mode_h = state.output_height * s120 / 120;
+        output.mode(
+            wl_output::Mode::Current | wl_output::Mode::Preferred,
+            mode_w,
+            mode_h,
+            60_000,
+        );
+        if output.version() >= 2 {
+            output.scale(((state.output_scale_120 as i32) + 119) / 120);
+        }
+        if output.version() >= 2 {
+            output.done();
+        }
+        state.outputs.push(output);
+    }
+}
+
+impl Dispatch<WlOutput, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &WlOutput,
+        request: <WlOutput as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_output::Request;
+        if let Request::Release = request {
+            state.outputs.retain(|o| o.id() != resource.id());
+        }
+    }
+}
+
+// -- wl_seat --
+impl GlobalDispatch<WlSeat, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WlSeat>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let seat = data_init.init(resource, ());
+        seat.capabilities(wl_seat::Capability::Keyboard | wl_seat::Capability::Pointer);
+        if seat.version() >= 2 {
+            seat.name("headless".to_string());
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlSeat,
+        request: <WlSeat as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_server::protocol::wl_seat::Request;
+        match request {
+            Request::GetKeyboard { id } => {
+                let kb = data_init.init(id, ());
+                if let Some(fd) = create_keymap_fd(&state.keyboard_keymap_data) {
+                    kb.keymap(
+                        wl_keyboard::KeymapFormat::XkbV1,
+                        fd.as_fd(),
+                        state.keyboard_keymap_data.len() as u32,
+                    );
+                }
+                if kb.version() >= 4 {
+                    kb.repeat_info(25, 200);
+                }
+                state.keyboards.push(kb);
+            }
+            Request::GetPointer { id } => {
+                let ptr = data_init.init(id, ());
+                state.pointers.push(ptr);
+            }
+            Request::GetTouch { id } => {
+                data_init.init(id, ());
+            }
+            Request::Release => {}
+            _ => {}
+        }
+    }
+}
+
+// -- wl_keyboard --
+impl Dispatch<WlKeyboard, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &WlKeyboard,
+        request: <WlKeyboard as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        if let wl_keyboard::Request::Release = request {
+            state.keyboards.retain(|k| k.id() != resource.id());
+        }
+    }
+}
+
+// -- wl_pointer --
+impl Dispatch<WlPointer, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &WlPointer,
+        request: <WlPointer as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wl_pointer::Request;
+        match request {
+            Request::SetCursor {
+                serial: _,
+                surface,
+                hotspot_x,
+                hotspot_y,
+            } => {
+                if let Some(surface) = surface {
+                    let sid = surface.id();
+                    if let Some(surf) = state.surfaces.get_mut(&sid) {
+                        surf.is_cursor = true;
+                        surf.cursor_hotspot = (hotspot_x, hotspot_y);
+                    }
+                } else {
+                    let _ = state.event_tx.send(CompositorEvent::SurfaceCursor {
+                        surface_id: state.focused_surface_id,
+                        cursor: CursorImage::Hidden,
+                    });
+                }
+            }
+            Request::Release => {
+                state.pointers.retain(|p| p.id() != resource.id());
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- wl_touch (stub) --
+impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wayland_server::protocol::wl_touch::WlTouch,
+        _: <wayland_server::protocol::wl_touch::WlTouch as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+// -- zwp_linux_dmabuf_v1 --
+impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<ZwpLinuxDmabufV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let dmabuf = data_init.init(resource, ());
+        if dmabuf.version() >= 3 {
+            // MOD_LINEAR = 0, MOD_INVALID = 0x00ffffffffffffff
+            let formats: &[(u32, u32, u32)] = &[
+                (drm_fourcc::ARGB8888, 0, 0),
+                (drm_fourcc::XRGB8888, 0, 0),
+                (drm_fourcc::ABGR8888, 0, 0),
+                (drm_fourcc::XBGR8888, 0, 0),
+                (drm_fourcc::ARGB8888, 0x00ffffff, 0xffffffff),
+                (drm_fourcc::XRGB8888, 0x00ffffff, 0xffffffff),
+                (drm_fourcc::ABGR8888, 0x00ffffff, 0xffffffff),
+                (drm_fourcc::XBGR8888, 0x00ffffff, 0xffffffff),
+            ];
+            for &(fmt, mod_hi, mod_lo) in formats {
+                dmabuf.modifier(fmt, mod_hi, mod_lo);
+            }
+        } else {
+            dmabuf.format(drm_fourcc::ARGB8888);
+            dmabuf.format(drm_fourcc::XRGB8888);
+            dmabuf.format(drm_fourcc::ABGR8888);
+            dmabuf.format(drm_fourcc::XBGR8888);
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZwpLinuxDmabufV1,
+        request: <ZwpLinuxDmabufV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_linux_dmabuf_v1::Request;
+        match request {
+            Request::CreateParams { params_id } => {
+                data_init.init(params_id, ());
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- zwp_linux_buffer_params_v1 --
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &ZwpLinuxBufferParamsV1,
+        request: <ZwpLinuxBufferParamsV1 as Resource>::Request,
+        _: &(),
+        dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_linux_buffer_params_v1::Request;
+        let params_id = resource.id();
+        match request {
+            Request::Add {
+                fd,
+                plane_idx: _,
+                offset,
+                stride,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
+                let entry = state
+                    .dmabuf_params
+                    .entry(params_id.clone())
+                    .or_insert_with(|| DmaBufParamsPending {
+                        resource: resource.clone(),
+                        planes: Vec::new(),
+                        modifier,
+                    });
+                entry.modifier = modifier;
+                entry.planes.push(DmaBufPlane { fd, offset, stride });
+            }
+            Request::Create {
+                width,
+                height,
+                format,
+                flags: _,
+            } => {
+                let pending = state.dmabuf_params.remove(&params_id);
+                let (planes, modifier) = match pending {
+                    Some(p) => (p.planes, p.modifier),
+                    None => {
+                        resource.failed();
+                        return;
+                    }
+                };
+                match client.create_resource::<WlBuffer, DmaBufBufferData, Compositor>(
+                    dh,
+                    1,
+                    DmaBufBufferData {
+                        width,
+                        height,
+                        fourcc: format,
+                        modifier,
+                        planes,
+                    },
+                ) {
+                    Ok(buffer) => resource.created(&buffer),
+                    Err(_) => resource.failed(),
+                }
+            }
+            Request::CreateImmed {
+                buffer_id,
+                width,
+                height,
+                format,
+                flags: _,
+            } => {
+                let (planes, modifier) = state
+                    .dmabuf_params
+                    .remove(&params_id)
+                    .map(|p| (p.planes, p.modifier))
+                    .unwrap_or_default();
+                data_init.init(
+                    buffer_id,
+                    DmaBufBufferData {
+                        width,
+                        height,
+                        fourcc: format,
+                        modifier,
+                        planes,
+                    },
+                );
+            }
+            Request::Destroy => {
+                state.dmabuf_params.remove(&params_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- wp_fractional_scale_manager_v1 --
+impl GlobalDispatch<WpFractionalScaleManagerV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WpFractionalScaleManagerV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpFractionalScaleManagerV1,
+        request: <WpFractionalScaleManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wp_fractional_scale_manager_v1::Request;
+        match request {
+            Request::GetFractionalScale { id, surface: _ } => {
+                let fs = data_init.init(id, ());
+                // Send the current preferred scale immediately.
+                fs.preferred_scale(state.output_scale_120 as u32);
+                state.fractional_scales.push(fs);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- wp_fractional_scale_v1 --
+impl Dispatch<WpFractionalScaleV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &WpFractionalScaleV1,
+        _: <WpFractionalScaleV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // Only request is Destroy.
+        state
+            .fractional_scales
+            .retain(|fs| fs.id() != resource.id());
+    }
+}
+
+// -- wp_viewporter --
+impl GlobalDispatch<WpViewporter, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WpViewporter>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WpViewporter,
+        request: <WpViewporter as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wp_viewporter::Request;
+        match request {
+            Request::GetViewport { id, surface } => {
+                // Associate the viewport with the surface's ObjectId so
+                // SetDestination can update the right Surface.
+                let obj_id = surface.id();
+                data_init.init(id, obj_id);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- wp_viewport --
+impl Dispatch<WpViewport, ObjectId> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpViewport,
+        request: <WpViewport as Resource>::Request,
+        surface_obj_id: &ObjectId,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wayland_protocols::wp::viewporter::server::wp_viewport::Request;
+        match request {
+            Request::SetDestination { width, height } => {
+                if let Some(surf) = state.surfaces.get_mut(surface_obj_id) {
+                    // width/height of -1 means unset (revert to buffer size).
+                    if width > 0 && height > 0 {
+                        surf.pending_viewport_destination = Some((width, height));
+                    } else {
+                        surf.pending_viewport_destination = None;
+                    }
+                }
+            }
+            Request::SetSource { .. } => {
+                // Source crop — not needed for headless compositor.
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// =========================================================================
+// NEW PROTOCOLS
+// =========================================================================
+
+// -- wl_data_device_manager (clipboard) --
+
+impl GlobalDispatch<WlDataDeviceManager, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WlDataDeviceManager>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WlDataDeviceManager, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlDataDeviceManager,
+        request: <WlDataDeviceManager as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wl_data_device_manager::Request;
+        match request {
+            Request::CreateDataSource { id } => {
+                data_init.init(
+                    id,
+                    DataSourceData {
+                        mime_types: std::sync::Mutex::new(Vec::new()),
+                    },
+                );
+            }
+            Request::GetDataDevice { id, seat: _ } => {
+                let dd = data_init.init(id, ());
+                state.data_devices.push(dd);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlDataSource, DataSourceData> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlDataSource,
+        request: <WlDataSource as Resource>::Request,
+        data: &DataSourceData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wl_data_source::Request;
+        match request {
+            Request::Offer { mime_type } => {
+                data.mime_types.lock().unwrap().push(mime_type);
+            }
+            Request::Destroy => {}
+            _ => {} // SetActions — DnD, ignored
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        resource: &WlDataSource,
+        _: &DataSourceData,
+    ) {
+        if state
+            .selection_source
+            .as_ref()
+            .is_some_and(|s| s.id() == resource.id())
+        {
+            state.selection_source = None;
+        }
+    }
+}
+
+impl Dispatch<WlDataDevice, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlDataDevice,
+        request: <WlDataDevice as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wl_data_device::Request;
+        match request {
+            Request::SetSelection { source, serial: _ } => {
+                state.selection_source = source.clone();
+                // Try to read text content and emit an event.
+                if let Some(ref src) = source {
+                    let data = src.data::<DataSourceData>().unwrap();
+                    let mimes = data.mime_types.lock().unwrap();
+                    let text_mime = mimes
+                        .iter()
+                        .find(|m| {
+                            m.as_str() == "text/plain;charset=utf-8"
+                                || m.as_str() == "text/plain"
+                                || m.as_str() == "UTF8_STRING"
+                        })
+                        .cloned();
+                    drop(mimes);
+                    if let Some(mime) = text_mime {
+                        state.read_data_source_and_emit(src, &mime);
+                    }
+                }
+            }
+            Request::Release => {}
+            _ => {} // StartDrag — ignored
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        resource: &WlDataDevice,
+        _: &(),
+    ) {
+        state.data_devices.retain(|d| d.id() != resource.id());
+    }
+}
+
+impl Dispatch<WlDataOffer, DataOfferData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WlDataOffer,
+        request: <WlDataOffer as Resource>::Request,
+        data: &DataOfferData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wl_data_offer::Request;
+        match request {
+            Request::Receive { mime_type, fd } => {
+                if data.external {
+                    // Write external clipboard data to the fd.
+                    if let Some(ref cb) = state.external_clipboard
+                        && (cb.mime_type == mime_type
+                            || mime_type == "text/plain"
+                            || mime_type == "text/plain;charset=utf-8"
+                            || mime_type == "UTF8_STRING")
+                    {
+                        use std::io::Write;
+                        let mut f = std::fs::File::from(fd);
+                        let _ = f.write_all(&cb.data);
+                    }
+                } else if let Some(ref src) = state.selection_source {
+                    // Forward to the Wayland data source.
+                    src.send(mime_type, fd.as_fd());
+                }
+            }
+            Request::Destroy => {}
+            _ => {} // Accept, Finish, SetActions — DnD
+        }
+    }
+}
+
+impl Compositor {
+    /// Create a pipe, ask the data source to write into it, read the result,
+    /// and emit a `ClipboardContent` event.
+    fn read_data_source_and_emit(&mut self, source: &WlDataSource, mime_type: &str) {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return;
+        }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        source.send(mime_type.to_string(), write_fd.as_fd());
+        let _ = self.display_handle.flush_clients();
+        // Non-blocking read with a modest limit.
+        unsafe {
+            libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        // Give the client a moment to write.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    read_fd.as_raw_fd(),
+                    tmp.as_mut_ptr() as *mut libc::c_void,
+                    tmp.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n as usize]);
+            if buf.len() > 1024 * 1024 {
+                break; // 1 MiB cap
+            }
+        }
+        if !buf.is_empty() {
+            let _ = self.event_tx.send(CompositorEvent::ClipboardContent {
+                mime_type: mime_type.to_string(),
+                data: buf,
+            });
+            (self.event_notify)();
+        }
+    }
+
+    /// Push external clipboard to all connected wl_data_device objects.
+    fn offer_external_clipboard(&mut self) {
+        let Some(ref cb) = self.external_clipboard else {
+            return;
+        };
+        let mime = cb.mime_type.clone();
+        for dd in &self.data_devices {
+            if let Some(client) = dd.client() {
+                let offer = client
+                    .create_resource::<WlDataOffer, DataOfferData, Compositor>(
+                        &self.display_handle,
+                        dd.version(),
+                        DataOfferData { external: true },
+                    )
+                    .unwrap();
+                dd.data_offer(&offer);
+                offer.offer(mime.clone());
+                // Offer standard text aliases.
+                if mime.starts_with("text/plain") {
+                    if mime != "text/plain" {
+                        offer.offer("text/plain".to_string());
+                    }
+                    if mime != "text/plain;charset=utf-8" {
+                        offer.offer("text/plain;charset=utf-8".to_string());
+                    }
+                    offer.offer("UTF8_STRING".to_string());
+                }
+                dd.selection(Some(&offer));
+            }
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+}
+
+// -- zwp_primary_selection --
+
+impl GlobalDispatch<ZwpPrimarySelectionDeviceManagerV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<ZwpPrimarySelectionDeviceManagerV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZwpPrimarySelectionDeviceManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpPrimarySelectionDeviceManagerV1,
+        request: <ZwpPrimarySelectionDeviceManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_primary_selection_device_manager_v1::Request;
+        match request {
+            Request::CreateSource { id } => {
+                data_init.init(
+                    id,
+                    PrimarySourceData {
+                        mime_types: std::sync::Mutex::new(Vec::new()),
+                    },
+                );
+            }
+            Request::GetDevice { id, seat: _ } => {
+                let pd = data_init.init(id, ());
+                state.primary_devices.push(pd);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpPrimarySelectionSourceV1, PrimarySourceData> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZwpPrimarySelectionSourceV1,
+        request: <ZwpPrimarySelectionSourceV1 as Resource>::Request,
+        data: &PrimarySourceData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_primary_selection_source_v1::Request;
+        match request {
+            Request::Offer { mime_type } => {
+                data.mime_types.lock().unwrap().push(mime_type);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        resource: &ZwpPrimarySelectionSourceV1,
+        _: &PrimarySourceData,
+    ) {
+        if state
+            .primary_source
+            .as_ref()
+            .is_some_and(|s| s.id() == resource.id())
+        {
+            state.primary_source = None;
+        }
+    }
+}
+
+impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpPrimarySelectionDeviceV1,
+        request: <ZwpPrimarySelectionDeviceV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_primary_selection_device_v1::Request;
+        match request {
+            Request::SetSelection { source, serial: _ } => {
+                state.primary_source = source;
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        resource: &ZwpPrimarySelectionDeviceV1,
+        _: &(),
+    ) {
+        state.primary_devices.retain(|d| d.id() != resource.id());
+    }
+}
+
+impl Dispatch<ZwpPrimarySelectionOfferV1, PrimaryOfferData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpPrimarySelectionOfferV1,
+        request: <ZwpPrimarySelectionOfferV1 as Resource>::Request,
+        data: &PrimaryOfferData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_primary_selection_offer_v1::Request;
+        match request {
+            Request::Receive { mime_type, fd } => {
+                if data.external {
+                    if let Some(ref cb) = state.external_primary {
+                        use std::io::Write;
+                        let mut f = std::fs::File::from(fd);
+                        let _ = f.write_all(&cb.data);
+                        let _ = mime_type; // accepted regardless
+                    }
+                } else if let Some(ref src) = state.primary_source {
+                    src.send(mime_type, fd.as_fd());
+                }
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- zwp_pointer_constraints_v1 --
+
+impl GlobalDispatch<ZwpPointerConstraintsV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<ZwpPointerConstraintsV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZwpPointerConstraintsV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZwpPointerConstraintsV1,
+        request: <ZwpPointerConstraintsV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_pointer_constraints_v1::Request;
+        match request {
+            Request::LockPointer {
+                id,
+                surface: _,
+                pointer: _,
+                region: _,
+                lifetime: _,
+            } => {
+                let lp = data_init.init(id, ());
+                // Immediately grant the lock (headless — no physical pointer to contest).
+                lp.locked();
+            }
+            Request::ConfinePointer {
+                id,
+                surface: _,
+                pointer: _,
+                region: _,
+                lifetime: _,
+            } => {
+                let cp = data_init.init(id, ());
+                cp.confined();
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpLockedPointerV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZwpLockedPointerV1,
+        _: <ZwpLockedPointerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // SetCursorPositionHint, SetRegion, Destroy — no-ops for headless.
+    }
+}
+
+impl Dispatch<ZwpConfinedPointerV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZwpConfinedPointerV1,
+        _: <ZwpConfinedPointerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // SetRegion, Destroy — no-ops for headless.
+    }
+}
+
+// -- zwp_relative_pointer_manager_v1 --
+
+impl GlobalDispatch<ZwpRelativePointerManagerV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<ZwpRelativePointerManagerV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZwpRelativePointerManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpRelativePointerManagerV1,
+        request: <ZwpRelativePointerManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_relative_pointer_manager_v1::Request;
+        match request {
+            Request::GetRelativePointer { id, pointer: _ } => {
+                let rp = data_init.init(id, ());
+                state.relative_pointers.push(rp);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpRelativePointerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &ZwpRelativePointerV1,
+        _: <ZwpRelativePointerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // Only request is Destroy.
+        state
+            .relative_pointers
+            .retain(|rp| rp.id() != resource.id());
+    }
+}
+
+// -- zwp_text_input_v3 --
+
+impl GlobalDispatch<ZwpTextInputManagerV3, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<ZwpTextInputManagerV3>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZwpTextInputManagerV3, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpTextInputManagerV3,
+        request: <ZwpTextInputManagerV3 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_text_input_manager_v3::Request;
+        match request {
+            Request::GetTextInput { id, seat: _ } => {
+                let ti = data_init.init(id, ());
+                state.text_inputs.push(TextInputState {
+                    resource: ti,
+                    enabled: false,
+                });
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpTextInputV3, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &ZwpTextInputV3,
+        request: <ZwpTextInputV3 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_text_input_v3::Request;
+        match request {
+            Request::Enable => {
+                if let Some(ti) = state
+                    .text_inputs
+                    .iter_mut()
+                    .find(|t| t.resource.id() == resource.id())
+                {
+                    ti.enabled = true;
+                }
+            }
+            Request::Disable => {
+                if let Some(ti) = state
+                    .text_inputs
+                    .iter_mut()
+                    .find(|t| t.resource.id() == resource.id())
+                {
+                    ti.enabled = false;
+                }
+            }
+            Request::Commit => {
+                // Client acknowledges our last done; nothing to do.
+            }
+            Request::Destroy => {
+                state
+                    .text_inputs
+                    .retain(|t| t.resource.id() != resource.id());
+            }
+            // SetSurroundingText, SetTextChangeCause, SetContentType,
+            // SetCursorRectangle — informational; ignored for now.
+            _ => {}
+        }
+    }
+}
+
+// -- xdg_activation_v1 --
+
+impl GlobalDispatch<XdgActivationV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<XdgActivationV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<XdgActivationV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &XdgActivationV1,
+        request: <XdgActivationV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_activation_v1::Request;
+        match request {
+            Request::GetActivationToken { id } => {
+                let serial = state.next_activation_token;
+                state.next_activation_token = serial.wrapping_add(1);
+                data_init.init(id, ActivationTokenData { serial });
+            }
+            Request::Activate {
+                token: _,
+                surface: _,
+            } => {
+                // In a headless compositor, activation requests are always
+                // granted (focus is managed externally by the browser/CLI).
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<XdgActivationTokenV1, ActivationTokenData> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        resource: &XdgActivationTokenV1,
+        request: <XdgActivationTokenV1 as Resource>::Request,
+        data: &ActivationTokenData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_activation_token_v1::Request;
+        match request {
+            Request::Commit => {
+                // Issue a token immediately — the headless compositor doesn't
+                // need to validate app_id / surface / serial.
+                resource.done(format!("blit-token-{}", data.serial));
+            }
+            Request::SetSerial { .. } | Request::SetAppId { .. } | Request::SetSurface { .. } => {}
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- wp_cursor_shape_manager_v1 --
+
+impl GlobalDispatch<WpCursorShapeManagerV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<WpCursorShapeManagerV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WpCursorShapeManagerV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WpCursorShapeManagerV1,
+        request: <WpCursorShapeManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wp_cursor_shape_manager_v1::Request;
+        match request {
+            Request::GetPointer {
+                cursor_shape_device,
+                pointer: _,
+            } => {
+                data_init.init(cursor_shape_device, ());
+            }
+            Request::GetTabletToolV2 {
+                cursor_shape_device,
+                tablet_tool: _,
+            } => {
+                data_init.init(cursor_shape_device, ());
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WpCursorShapeDeviceV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpCursorShapeDeviceV1,
+        request: <WpCursorShapeDeviceV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wp_cursor_shape_device_v1::Request;
+        match request {
+            Request::SetShape { serial: _, shape } => {
+                use wayland_server::WEnum;
+                use wp_cursor_shape_device_v1::Shape;
+                let name = match shape {
+                    WEnum::Value(Shape::Default) => "default",
+                    WEnum::Value(Shape::ContextMenu) => "context-menu",
+                    WEnum::Value(Shape::Help) => "help",
+                    WEnum::Value(Shape::Pointer) => "pointer",
+                    WEnum::Value(Shape::Progress) => "progress",
+                    WEnum::Value(Shape::Wait) => "wait",
+                    WEnum::Value(Shape::Cell) => "cell",
+                    WEnum::Value(Shape::Crosshair) => "crosshair",
+                    WEnum::Value(Shape::Text) => "text",
+                    WEnum::Value(Shape::VerticalText) => "vertical-text",
+                    WEnum::Value(Shape::Alias) => "alias",
+                    WEnum::Value(Shape::Copy) => "copy",
+                    WEnum::Value(Shape::Move) => "move",
+                    WEnum::Value(Shape::NoDrop) => "no-drop",
+                    WEnum::Value(Shape::NotAllowed) => "not-allowed",
+                    WEnum::Value(Shape::Grab) => "grab",
+                    WEnum::Value(Shape::Grabbing) => "grabbing",
+                    WEnum::Value(Shape::EResize) => "e-resize",
+                    WEnum::Value(Shape::NResize) => "n-resize",
+                    WEnum::Value(Shape::NeResize) => "ne-resize",
+                    WEnum::Value(Shape::NwResize) => "nw-resize",
+                    WEnum::Value(Shape::SResize) => "s-resize",
+                    WEnum::Value(Shape::SeResize) => "se-resize",
+                    WEnum::Value(Shape::SwResize) => "sw-resize",
+                    WEnum::Value(Shape::WResize) => "w-resize",
+                    WEnum::Value(Shape::EwResize) => "ew-resize",
+                    WEnum::Value(Shape::NsResize) => "ns-resize",
+                    WEnum::Value(Shape::NeswResize) => "nesw-resize",
+                    WEnum::Value(Shape::NwseResize) => "nwse-resize",
+                    WEnum::Value(Shape::ColResize) => "col-resize",
+                    WEnum::Value(Shape::RowResize) => "row-resize",
+                    WEnum::Value(Shape::AllScroll) => "all-scroll",
+                    WEnum::Value(Shape::ZoomIn) => "zoom-in",
+                    WEnum::Value(Shape::ZoomOut) => "zoom-out",
+                    _ => "default",
+                };
+                let _ = state.event_tx.send(CompositorEvent::SurfaceCursor {
+                    surface_id: state.focused_surface_id,
+                    cursor: CursorImage::Named(name.to_string()),
+                });
+                (state.event_notify)();
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// -- Client data --
+impl wayland_server::backend::ClientData for ClientState {
+    fn initialized(&self, _: wayland_server::backend::ClientId) {}
+    fn disconnected(
+        &self,
+        _: wayland_server::backend::ClientId,
+        _: wayland_server::backend::DisconnectReason,
+    ) {
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 pub struct CompositorHandle {
     pub event_rx: mpsc::Receiver<CompositorEvent>,
@@ -1862,8 +4524,6 @@ pub struct CompositorHandle {
 }
 
 impl CompositorHandle {
-    /// Wake the compositor event loop immediately so it processes
-    /// pending commands without waiting for the idle timeout.
     pub fn wake(&self) {
         self.loop_signal.wakeup();
     }
@@ -1874,7 +4534,7 @@ pub fn spawn_compositor(
     event_notify: Arc<dyn Fn() + Send + Sync>,
     gpu_device: &str,
 ) -> CompositorHandle {
-    let gpu_device = gpu_device.to_string();
+    let _gpu_device = gpu_device.to_string();
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
     let (socket_tx, socket_rx) = mpsc::sync_channel(1);
@@ -1885,12 +4545,6 @@ pub fn spawn_compositor(
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .filter(|p| {
-            // Verify the directory is actually writable by the current user
-            // before using it. A stale or inaccessible XDG_RUNTIME_DIR (e.g.
-            // in containers, after su/sudo, or in CI) causes PermissionDenied
-            // when smithay tries to bind the Wayland socket. A probe write is
-            // more reliable than inspecting mode bits, which don't account for
-            // the effective uid.
             let probe = p.join(".blit-probe");
             if std::fs::write(&probe, b"").is_ok() {
                 let _ = std::fs::remove_file(&probe);
@@ -1915,7 +4569,7 @@ pub fn spawn_compositor(
                     event_notify,
                     shutdown_clone,
                     verbose,
-                    gpu_device,
+                    _gpu_device,
                 );
             }));
             if let Err(e) = result {
@@ -1963,219 +4617,114 @@ fn run_compositor(
 ) {
     let mut event_loop: EventLoop<Compositor> =
         EventLoop::try_new().expect("failed to create event loop");
+    let loop_signal = event_loop.get_signal();
+
     let display: Display<Compositor> = Display::new().expect("failed to create display");
     let dh = display.handle();
 
-    let compositor_state = CompositorState::new::<Compositor>(&dh);
-    let xdg_shell_state = XdgShellState::new::<Compositor>(&dh);
-    let shm_state = ShmState::new::<Compositor>(&dh, vec![]);
-    let data_device_state = DataDeviceState::new::<Compositor>(&dh);
-    let viewporter_state = ViewporterState::new::<Compositor>(&dh);
-    let xdg_decoration_state = XdgDecorationState::new::<Compositor>(&dh);
-    let primary_selection_state = PrimarySelectionState::new::<Compositor>(&dh);
-    let activation_state = XdgActivationState::new::<Compositor>(&dh);
-    FractionalScaleManagerState::new::<Compositor>(&dh);
-    CursorShapeManagerState::new::<Compositor>(&dh);
-    // Disabled: smithay 0.7 has a bug in ShmBufferUserData::remove_destruction_hook
-    // (uses != instead of ==) that causes a protocol error when clients destroy icon
-    // buffers, killing Chromium-based browsers.
-    TextInputManagerState::new::<Compositor>(&dh);
+    // Create globals.
+    dh.create_global::<Compositor, WlCompositor, ()>(6, ());
+    dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
+    dh.create_global::<Compositor, XdgWmBase, ()>(6, ());
+    dh.create_global::<Compositor, WlShm, ()>(1, ());
+    dh.create_global::<Compositor, WlOutput, ()>(4, ());
+    dh.create_global::<Compositor, WlSeat, ()>(9, ());
+    dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    dh.create_global::<Compositor, WpViewporter, ()>(1, ());
+    dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
+    dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
+    dh.create_global::<Compositor, WlDataDeviceManager, ()>(3, ());
+    dh.create_global::<Compositor, ZwpPointerConstraintsV1, ()>(1, ());
+    dh.create_global::<Compositor, ZwpRelativePointerManagerV1, ()>(1, ());
+    dh.create_global::<Compositor, XdgActivationV1, ()>(1, ());
+    dh.create_global::<Compositor, WpCursorShapeManagerV1, ()>(1, ());
+    dh.create_global::<Compositor, ZwpPrimarySelectionDeviceManagerV1, ()>(1, ());
+    dh.create_global::<Compositor, WpPresentation, ()>(1, ());
+    dh.create_global::<Compositor, ZwpTextInputManagerV3, ()>(1, ());
 
-    let mut dmabuf_state = DmabufState::new();
-    // DMA-BUF format advertisement.
-    //
-    // Advertise packed BGRA/RGBA and YUV formats with both Linear and Invalid
-    // (implicit) modifiers.  Modifier::Invalid tells clients they may use any
-    // modifier (driver-chosen), which is how Vulkan/EGL allocates on AMD/radv.
-    // The VA-API VPP zero-copy path imports buffers by DRM fd regardless of
-    // modifier, so tiled GPU allocations work fine.
-    // NV12/P010 use the CPU readback path and must be Linear.
-    // Only advertise Linear modifier.  This forces clients to allocate
-    // CPU-mappable buffers, ensuring the mmap readback path and VA-API
-    // PRIME import both work.  Clients still render on the GPU — they
-    // just use a linear memory layout instead of GPU-tiled.
-    // Advertise packed BGRA/RGBA and YUV formats with both Linear and
-    // Invalid (implicit) modifiers.  Invalid tells clients they may use
-    // any modifier (driver-chosen tiling), which is how GPU compositors
-    // like Chromium allocate surfaces.  The VA-API VPP path imports
-    // buffers by DRM fd regardless of modifier.
-    let dmabuf_formats = {
-        use Fourcc::*;
-        let packed = [Argb8888, Xrgb8888, Abgr8888, Xbgr8888];
-        let yuv = [Fourcc::Nv12, Fourcc::P010];
-        let mut fmts = Vec::new();
-        for code in packed {
-            fmts.push(DmabufFormat {
-                code,
-                modifier: Modifier::Linear,
-            });
-            fmts.push(DmabufFormat {
-                code,
-                modifier: Modifier::Invalid,
-            });
-        }
-        for code in yuv {
-            fmts.push(DmabufFormat {
-                code,
-                modifier: Modifier::Linear,
-            });
-        }
-        fmts
-    };
-    // Build DMA-BUF feedback with the render node's dev_t so clients
-    // allocate GEM-backed DMA-BUFs on the right GPU (instead of anonymous
-    // /dmabuf: heap fds that EGL can't import).
-    let dmabuf_global = match std::fs::metadata(&gpu_device).ok().and_then(|m| {
-        use std::os::unix::fs::MetadataExt;
-        let dev = m.rdev();
-        let formats = dmabuf_formats.clone();
-        let feedback = DmabufFeedbackBuilder::new(dev, formats).build().ok()?;
-        Some(dmabuf_state.create_global_with_default_feedback::<Compositor>(&dh, &feedback))
-    }) {
-        Some(global) => {
-            if verbose {
-                eprintln!("[compositor] DMA-BUF feedback enabled ({gpu_device})");
-            }
-            global
-        }
-        None => {
-            if verbose {
-                eprintln!("[compositor] DMA-BUF feedback unavailable, using basic global");
-            }
-            dmabuf_state.create_global::<Compositor>(&dh, dmabuf_formats)
-        }
-    };
+    // XKB keymap.
+    let keymap_string = include_str!("../data/us-qwerty.xkb");
+    let mut keymap_data = keymap_string.as_bytes().to_vec();
+    keymap_data.push(0); // null-terminate
 
-    let mut seat_state = SeatState::new();
-    let mut seat = seat_state.new_wl_seat(&dh, "headless");
-    let keymap = include_str!("../data/us-qwerty.xkb").to_string();
-    seat.add_keyboard_from_keymap_string(keymap, 200, 25)
-        .expect("failed to add keyboard from embedded keymap");
-    seat.add_pointer();
-
-    let output = Output::new(
-        "headless-0".to_string(),
-        PhysicalProperties {
-            size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
-            make: "Virtual".into(),
-            model: "Headless".into(),
-        },
-    );
-    let mode = Mode {
-        size: (1920, 1080).into(),
-        refresh: 60_000,
-    };
-    output.create_global::<Compositor>(&dh);
-    output.change_current_state(
-        Some(mode),
-        Some(Transform::Normal),
-        Some(smithay::output::Scale::Integer(1)),
-        Some((0, 0).into()),
-    );
-    output.set_preferred(mode);
-
-    let mut space = Space::default();
-    space.map_output(&output, (0, 0));
-
-    let listening_socket = ListeningSocketSource::new_auto().unwrap_or_else(|e| {
-        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "(unset)".into());
-        panic!(
-            "failed to create wayland socket in XDG_RUNTIME_DIR={dir}: {e}\n\
-             hint: ensure the directory exists and is writable by the current user"
-        );
-    });
+    // Listening socket.
+    let listening_socket = wayland_server::ListeningSocket::bind_auto("wayland", 0..33)
+        .unwrap_or_else(|e| {
+            let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "(unset)".into());
+            panic!("failed to create wayland socket in XDG_RUNTIME_DIR={dir}: {e}\nhint: ensure the directory exists and is writable by the current user");
+        });
     let socket_name = listening_socket
         .socket_name()
+        .unwrap()
         .to_string_lossy()
         .into_owned();
     socket_tx.send(socket_name).unwrap();
-
-    let handle = event_loop.handle();
-
-    handle
-        .insert_source(listening_socket, |client_stream, _, state| {
-            if let Err(e) = state.display_handle.insert_client(
-                client_stream,
-                Arc::new(ClientData {
-                    compositor_state: CompositorClientState::default(),
-                }),
-            ) && verbose
-            {
-                eprintln!("[compositor] insert_client error: {e}");
-            }
-        })
-        .expect("failed to insert listening socket");
-
-    let loop_signal = event_loop.get_signal();
+    let _ = signal_tx.send(loop_signal.clone());
 
     let mut compositor = Compositor {
-        display_handle: dh.clone(),
-        compositor_state,
-        xdg_shell_state,
-        shm_state,
-        seat_state,
-        data_device_state,
-        viewporter_state,
-        xdg_decoration_state,
-        dmabuf_state,
-        dmabuf_global,
-        syncobj_state: {
-            // Enable explicit sync (linux-drm-syncobj-v1) if the GPU supports it.
-            // This replaces implicit DMA-BUF fencing which hangs on AMD.
-
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&gpu_device)
-                .ok()
-                .and_then(|f| {
-                    use std::os::fd::OwnedFd;
-                    let owned: OwnedFd = f.into();
-                    let dev_fd = smithay::utils::DeviceFd::from(owned);
-                    let drm_fd = DrmDeviceFd::new(dev_fd);
-                    if supports_syncobj_eventfd(&drm_fd) {
-                        let state = DrmSyncobjState::new::<Compositor>(&dh, drm_fd);
-                        eprintln!("[compositor] explicit sync (drm-syncobj) enabled");
-                        Some(state)
-                    } else {
-                        eprintln!("[compositor] explicit sync not supported by GPU");
-                        None
-                    }
-                })
-        },
-        primary_selection_state,
-        activation_state,
-        seat,
-        output,
-        space,
+        display_handle: dh,
         surfaces: HashMap::new(),
-        surface_lookup: HashMap::new(),
+        toplevel_surface_ids: HashMap::new(),
         next_surface_id: 1,
+        shm_pools: HashMap::new(),
+        pixel_cache: HashMap::new(),
+        dmabuf_params: HashMap::new(),
+        vulkan_renderer: {
+            eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
+            let r = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
+            eprintln!("[compositor] Vulkan renderer: {}", r.is_some());
+            r
+        },
+        output_width: 1920,
+        output_height: 1080,
+        output_scale_120: 120,
+        outputs: Vec::new(),
+        keyboards: Vec::new(),
+        pointers: Vec::new(),
+        keyboard_keymap_data: keymap_data,
+        mods_depressed: 0,
+        mods_locked: 0,
+        serial: 0,
         event_tx,
         event_notify,
         loop_signal: loop_signal.clone(),
-        verbose,
-        focused_surface_id: 0,
         pending_commits: HashMap::new(),
-        surface_pixel_cache: HashMap::new(),
-        gpu_renderer: super::render::SurfaceRenderer::try_new(&gpu_device),
+        focused_surface_id: 0,
+        pointer_entered_id: None,
+        pending_kb_reenter: false,
+        verbose,
+        shutdown: shutdown.clone(),
+        last_reported_size: HashMap::new(),
+        surface_sizes: HashMap::new(),
+        positioners: HashMap::new(),
+        fractional_scales: Vec::new(),
+        data_devices: Vec::new(),
+        selection_source: None,
+        external_clipboard: None,
+        primary_devices: Vec::new(),
+        primary_source: None,
+        external_primary: None,
+        relative_pointers: Vec::new(),
+        text_inputs: Vec::new(),
+        text_input_serial: 0,
+        next_activation_token: 1,
     };
 
-    // Send the loop signal back so the server can wake us.
-    let _ = signal_tx.send(loop_signal.clone());
+    let handle = event_loop.handle();
 
+    // Insert display fd source.
     let display_source = Generic::new(display, Interest::READ, calloop::Mode::Level);
     handle
         .insert_source(display_source, |_, display, state| {
             let d = unsafe { display.get_mut() };
             if let Err(e) = d.dispatch_clients(state)
-                && verbose
+                && state.verbose
             {
                 eprintln!("[compositor] dispatch_clients error: {e}");
             }
+            state.cleanup_dead_surfaces();
             if let Err(e) = d.flush_clients()
-                && verbose
+                && state.verbose
             {
                 eprintln!("[compositor] flush_clients error: {e}");
             }
@@ -2183,10 +4732,29 @@ fn run_compositor(
         })
         .expect("failed to insert display source");
 
+    // Insert listening socket.
+    let socket_source = Generic::new(listening_socket, Interest::READ, calloop::Mode::Level);
+    handle
+        .insert_source(socket_source, |_, socket, state| {
+            let ls = unsafe { socket.get_mut() };
+            if let Some(client_stream) = ls.accept().ok().flatten()
+                && let Err(e) = state
+                    .display_handle
+                    .insert_client(client_stream, Arc::new(ClientState))
+                && state.verbose
+            {
+                eprintln!("[compositor] insert_client error: {e}");
+            }
+            Ok(PostAction::Continue)
+        })
+        .expect("failed to insert listening socket");
+
     if verbose {
         eprintln!("[compositor] entering event loop");
     }
+
     while !shutdown.load(Ordering::Relaxed) {
+        // Process commands.
         while let Ok(cmd) = command_rx.try_recv() {
             match cmd {
                 CompositorCommand::Shutdown => {
@@ -2197,9 +4765,6 @@ fn run_compositor(
             }
         }
 
-        // No rate limit — the loop wakes instantly on Wayland client
-        // traffic (fd readable) or server commands (loop_signal.wakeup()).
-        // The 1s ceiling is only a liveness fallback for shutdown polling.
         if let Err(e) =
             event_loop.dispatch(Some(std::time::Duration::from_secs(1)), &mut compositor)
             && verbose
@@ -2207,7 +4772,6 @@ fn run_compositor(
             eprintln!("[compositor] event loop error: {e}");
         }
 
-        // Flush coalesced commits — only the latest per surface is sent.
         if !compositor.pending_commits.is_empty() {
             compositor.flush_pending_commits();
         }
@@ -2218,57 +4782,8 @@ fn run_compositor(
             eprintln!("[compositor] flush error: {e}");
         }
     }
+
     if verbose {
         eprintln!("[compositor] event loop exited");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Fourcc, read_nv12_dmabuf, read_p010_dmabuf, read_packed_dmabuf};
-
-    /// Test-only wrapper that returns RGBA like the old `read_packed_rgba_dmabuf`.
-    fn read_packed_rgba_dmabuf(
-        plane_data: &[u8],
-        stride: usize,
-        width: usize,
-        height: usize,
-        y_inverted: bool,
-        format: Fourcc,
-    ) -> Option<Vec<u8>> {
-        let pd = read_packed_dmabuf(plane_data, stride, width, height, y_inverted, format)?;
-        Some(pd.to_rgba(width as u32, height as u32))
-    }
-
-    #[test]
-    fn xrgb_dmabuf_forces_opaque_alpha() {
-        let pixels = [
-            0x10, 0x20, 0x30, 0x00, //
-            0x40, 0x50, 0x60, 0x7f,
-        ];
-
-        let rgba = read_packed_rgba_dmabuf(&pixels, 8, 2, 1, false, Fourcc::Xrgb8888).unwrap();
-
-        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0xff, 0x60, 0x50, 0x40, 0xff]);
-    }
-
-    #[test]
-    fn nv12_black_decodes_to_opaque_black() {
-        let y_plane = [16, 16, 16, 16];
-        let uv_plane = [128, 128];
-
-        let rgba = read_nv12_dmabuf(&y_plane, 2, &uv_plane, 2, 2, 2, false).unwrap();
-
-        assert_eq!(rgba, [0, 0, 0, 255].repeat(4));
-    }
-
-    #[test]
-    fn p010_white_decodes_to_opaque_white() {
-        let y_plane = [0x00, 0xeb, 0x00, 0xeb, 0x00, 0xeb, 0x00, 0xeb];
-        let uv_plane = [0x00, 0x80, 0x00, 0x80];
-
-        let rgba = read_p010_dmabuf(&y_plane, 4, &uv_plane, 4, 2, 2, false).unwrap();
-
-        assert_eq!(rgba, [255, 255, 255, 255].repeat(4));
     }
 }

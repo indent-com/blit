@@ -14,7 +14,7 @@ processes:
     command: cargo build -p blit-cli --profile profiling
 
   browser-wasm:
-    command: cargo watch -w crates/browser/src -w crates/remote/src -s "./bin/build-browser"
+    command: cargo watch -w crates/browser/src -w crates/remote/src -s "cd crates/browser && wasm-pack build --target web --release --out-dir pkg"
     availability:
       restart: always
     readiness_probe:
@@ -22,6 +22,12 @@ processes:
         command: test -f crates/browser/pkg/blit_browser.js
       period_seconds: 2
       failure_threshold: 300
+
+  js-deps:
+    command: cd js && pnpm install --frozen-lockfile
+    depends_on:
+      browser-wasm:
+        condition: process_healthy
 
   server:
     command: ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
@@ -65,7 +71,7 @@ processes:
   share:
     command: >-
       if [ -z "${BLIT_DEV_SHARE:-}" ]; then exit 0; fi;
-      exec ./target/profiling/blit share
+      exec ./target/profiling/blit share --quiet
     environment:
       - BLIT_SOCK=${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
       - BLIT_PROXY=0
@@ -78,19 +84,19 @@ processes:
       restart: on_failure
 
   ui:
-    command: cd js && pnpm install --frozen-lockfile && cd ui && pnpm exec vite --host --port ${BLIT_DEV_UI_PORT:-10000}
+    command: cd js/ui && pnpm exec vite --host --port ${BLIT_DEV_UI_PORT:-10000}
     environment:
       - BLIT_DEV_GW_PORT=${BLIT_DEV_GW_PORT:-10001}
     depends_on:
-      browser-wasm:
-        condition: process_healthy
+      js-deps:
+        condition: process_completed_successfully
     availability:
       restart: always
 
   website:
-    command: cd js && pnpm install --frozen-lockfile && cd website && pnpm exec astro dev --host --port ${BLIT_DEV_SITE_PORT:-3267}
+    command: cd js/website && pnpm exec astro dev --host --port ${BLIT_DEV_SITE_PORT:-3267}
     depends_on:
-      browser-wasm:
-        condition: process_healthy
+      js-deps:
+        condition: process_completed_successfully
     availability:
       restart: always

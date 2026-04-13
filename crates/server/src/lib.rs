@@ -1,28 +1,31 @@
 use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
 use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use blit_remote::{
-    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD, C2S_CLOSE, C2S_COPY_RANGE,
+    C2S_ACK, C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS,
+    C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST, C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE,
     C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT,
-    C2S_KILL, C2S_MOUSE, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
-    C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
-    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_REQUEST_KEYFRAME,
-    C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE,
-    CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY,
-    FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
-    FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N,
-    S2C_LIST, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT,
-    S2C_TITLE, SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg, msg_hello, msg_s2c_clipboard,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_frame,
-    msg_surface_resized, msg_surface_title,
+    C2S_KILL, C2S_MOUSE, C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL,
+    C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE,
+    C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
+    C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
+    C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG,
+    CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_AUDIO, FEATURE_COMPOSITOR,
+    FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
+    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
+    SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg, msg_hello, msg_s2c_clipboard_content,
+    msg_s2c_clipboard_list, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
+    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 #[cfg(unix)]
-mod dmabuf_zerocopy;
+mod audio;
 mod gpu_libs;
 mod ipc;
 mod nvenc_encode;
@@ -54,6 +57,12 @@ pub struct Config {
     pub max_connections: usize,
     /// Maximum number of PTYs across all clients (0 = unlimited).
     pub max_ptys: usize,
+    /// Application-level ping interval.  The server sends S2C_PING to every
+    /// client at this cadence so that transports without native keepalive
+    /// (WebRTC data channels) can detect dead connections.  0 = disabled.
+    pub ping_interval: Duration,
+    /// Skip compositor initialization (e.g. for share-only mode).
+    pub skip_compositor: bool,
 }
 
 trait PtyDriver: Send {
@@ -175,15 +184,23 @@ impl PtyDriver for AlacrittyDriver {
     }
 }
 
-// Keep small to limit bufferbloat on slow connections.  The soft queue limit
-// (OUTBOX_SOFT_QUEUE_LIMIT_FRAMES) prevents the tick from queuing more than
-// ~2 frames, so this just needs to be bigger than that with some headroom.
+// Keep small to limit bufferbloat on slow connections. The soft queue budget
+// is enforced by both message count and queued bytes so a couple of tiny
+// terminal diffs do not block a large surface frame.
 const OUTBOX_CAPACITY: usize = 8;
-const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 2;
+const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 4;
+const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 128 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+
+/// Number of surface frames to send at wire speed after a keyframe request
+/// (subscribe, resubscribe, or error recovery).  During this burst window
+/// only outbox backpressure gates delivery — the time-based pacing interval
+/// is skipped.  This lets bandwidth estimates ramp up quickly on high-latency
+/// links instead of starving the pipeline with conservative initial rates.
+const SURFACE_BURST_FRAMES: u8 = 4;
 
 /// A chunk of data from the PTY reader, sent through a lock-free channel
 /// so the reader never contends with the delivery tick for the Session mutex.
@@ -224,6 +241,32 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(payload);
     writer.write_all(&buf).await.is_ok()
+}
+
+/// Write a length-prefixed frame, draining any pending audio frames
+/// before the bulk write.  Audio frames are complete length-prefixed
+/// messages on the same stream, so they MUST be written between bulk
+/// frames — never interleaved within one.
+///
+/// Previous code inserted audio frames between write-syscall chunks of
+/// a single bulk frame.  This corrupted the stream: the reader does
+/// `read_exact(len, 4)` then `read_exact(payload, len)` and expects a
+/// contiguous `4+len` bytes.  Inserting audio bytes inside that span
+/// corrupts the payload and desynchronises every subsequent frame.
+async fn write_frame_interleaved(
+    writer: &mut (impl AsyncWrite + Unpin),
+    payload: &[u8],
+    audio_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> bool {
+    // Drain pending audio *before* the bulk frame so audio is never
+    // starved for more than one bulk-frame write time.  Audio frames
+    // are tiny (~160 B) so this is near-instant.
+    while let Ok(audio_msg) = audio_rx.try_recv() {
+        if !write_frame(writer, &audio_msg).await {
+            return false;
+        }
+    }
+    write_frame(writer, payload).await
 }
 
 struct Pty {
@@ -267,17 +310,8 @@ struct CachedSurfaceInfo {
     parent_id: u16,
     width: u16,
     height: u16,
-    /// Last applied DPR in 1/120th units (Wayland convention).  Tracked so
-    /// that a scale-only change (same pixel dimensions, different DPR) is
-    /// not silently dropped by the resize dedup check.
-    scale_120: u16,
     title: String,
     app_id: String,
-}
-
-struct BufferedSurfaceFrame {
-    _msg: Vec<u8>,
-    _is_keyframe: bool,
 }
 
 /// Last committed pixel buffer for a surface, kept so we can re-encode a
@@ -292,7 +326,6 @@ struct LastPixels {
 }
 
 struct SharedCompositor {
-    session_id: u16,
     handle: CompositorHandle,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
     last_pixels: HashMap<u16, LastPixels>,
@@ -307,6 +340,24 @@ struct SharedCompositor {
     /// those without subscribers).  Throttled to prevent hot-looping when
     /// apps commit at high rates without any client consuming frames.
     last_blanket_frame_request: Instant,
+    /// Last dimensions sent to the compositor via `CompositorCommand::SurfaceResize`.
+    /// Used to dedup resize commands — the composited output size
+    /// (`info.width`/`info.height`) may differ from the requested size
+    /// when the Wayland client sets `xdg_geometry` (e.g. excluding a
+    /// title bar), so we compare against the actually-requested values.
+    last_configured_size: HashMap<u16, (u16, u16, u16)>,
+    /// Audio capture pipeline (PipeWire → pw-cat → Opus encode).
+    /// `None` when PipeWire is not available or `BLIT_AUDIO=0`.
+    #[cfg(unix)]
+    audio_pipeline: Option<audio::AudioPipeline>,
+    /// Compositor instance ID passed to `AudioPipeline::spawn()` so restarts
+    /// reuse the same audio runtime directory.
+    #[cfg(unix)]
+    audio_session_id: u16,
+    /// When the last audio pipeline restart was attempted.  Used to enforce a
+    /// cooldown so we don't spin on persistent failures.
+    #[cfg(unix)]
+    last_audio_restart: Option<Instant>,
 }
 
 fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -361,24 +412,17 @@ fn encode_capture(pixels: &[u8], width: u32, height: u32, format: u8, quality: u
     }
 }
 
-#[allow(dead_code)] // used in tests
-async fn request_surface_capture(
-    command_tx: std::sync::mpsc::Sender<CompositorCommand>,
-    surface_id: u16,
-) -> Option<(u32, u32, Vec<u8>)> {
-    request_surface_capture_with_timeout(command_tx, surface_id, Duration::from_secs(1)).await
-}
-
-#[allow(dead_code)] // used in tests
 async fn request_surface_capture_with_timeout(
     command_tx: std::sync::mpsc::Sender<CompositorCommand>,
     surface_id: u16,
+    scale_120: u16,
     timeout: Duration,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     command_tx
         .send(CompositorCommand::Capture {
             surface_id,
+            scale_120,
             reply: tx,
         })
         .ok()?;
@@ -393,11 +437,28 @@ async fn request_surface_capture_with_timeout(
         .flatten()
 }
 
+/// Capacity for the dedicated audio outbox channel.  Audio frames are tiny
+/// (~160 B / 20 ms ≈ 8 KB/s) so a small channel is fine — but it must be
+/// deep enough to absorb a short write stall without dropping frames.
+const AUDIO_OUTBOX_CAPACITY: usize = 10; // 200 ms of audio
+
 struct ClientState {
     tx: mpsc::Sender<Vec<u8>>,
+    outbox_queued_frames: Arc<AtomicUsize>,
+    outbox_queued_bytes: Arc<AtomicUsize>,
+    /// Dedicated channel for audio frames.  The writer task selects on this
+    /// with higher priority than the main outbox so audio is never starved
+    /// by large video/terminal messages.
+    audio_tx: mpsc::Sender<Vec<u8>>,
     lead: Option<u16>,
     subscriptions: HashSet<u16>,
     surface_subscriptions: HashSet<u16>,
+    /// Whether this client is subscribed to audio frames.
+    audio_subscribed: bool,
+    /// Per-client audio bitrate preference in kbps from C2S_AUDIO_SUBSCRIBE.
+    /// 0 means use the server/env default.
+    #[cfg(unix)]
+    audio_bitrate_kbps: u16,
     view_sizes: HashMap<u16, (u16, u16)>,
     scroll_offsets: HashMap<u16, usize>,
     scroll_caches: HashMap<u16, FrameState>,
@@ -425,6 +486,11 @@ struct ClientState {
     avg_paced_frame_bytes: f32,
     /// EWMA of acknowledged preview/unpaced frame payload size in bytes.
     avg_preview_frame_bytes: f32,
+    /// EWMA of surface (video) frame payload size in bytes.  Tracked
+    /// separately from terminal frame sizes so surface pacing uses
+    /// `goodput_bps / avg_surface_frame_bytes` without polluting
+    /// terminal congestion control estimates.
+    avg_surface_frame_bytes: f32,
     /// Payload bytes currently in flight (sent, not yet ACKed).
     inflight_bytes: usize,
     /// Oldest in-flight frame first; ACKs arrive in order.
@@ -447,15 +513,23 @@ struct ClientState {
     goodput_window_start: Instant,
     surface_next_send_at: Instant,
     surface_needs_keyframe: bool,
+    /// Number of surface frames delivered since the last keyframe request
+    /// (subscribe, resubscribe, or error recovery).  Used for burst-start:
+    /// the first few frames bypass time-based pacing so they flow at wire
+    /// speed, letting bandwidth estimates ramp up quickly on high-latency
+    /// links instead of starving the pipeline with conservative initial rates.
+    surface_burst_remaining: u8,
     /// Per-client video encoders, one per subscribed surface.
     surface_encoders: HashMap<u16, SurfaceEncoder>,
+    /// Surface frames in flight — separate from terminal inflight so surface
+    /// ACKs feed shared RTT / goodput without corrupting terminal frame-size
+    /// averages or probe_frames.
+    surface_inflight_frames: VecDeque<InFlightFrame>,
     /// Surfaces whose encoder is currently in a spawn_blocking encode task.
     /// Prevents spawning parallel encode jobs for the same (client, surface)
     /// pair — which would create throwaway encoders and risk concurrent
     /// access to the underlying C codec library.
     surface_encodes_in_flight: HashSet<u16>,
-    /// Per-client last encoded frame per surface, ready for delivery.
-    surface_last_frames: HashMap<u16, BufferedSurfaceFrame>,
     /// Per-surface pixel generation that was last encoded for this client.
     /// Used to skip re-encoding when pixel data hasn't changed.
     surface_last_encoded_gen: HashMap<u16, u64>,
@@ -463,11 +537,16 @@ struct ClientState {
     /// Mirrors `view_sizes` for PTYs: the server mediates across all clients
     /// and picks min(width), min(height), max(scale).
     /// `scale_120` is the DPR in 1/120th units (Wayland convention): 240 = 2×.
-    /// `codec_support` is a bitmask of CODEC_SUPPORT_* (0 = accept anything).
-    surface_view_sizes: HashMap<u16, (u16, u16, u16, u8)>,
+    surface_view_sizes: HashMap<u16, (u16, u16, u16)>,
     /// Intersection of codec support across all surfaces for this client.
     /// Used to pick an encoder the client can decode.  0 = accept anything.
     surface_codec_support: u8,
+    /// Per-surface codec support override from C2S_SURFACE_SUBSCRIBE.
+    /// When non-zero, overrides `surface_codec_support` for encoder creation.
+    surface_codec_overrides: HashMap<u16, u8>,
+    /// Per-surface quality override from C2S_SURFACE_SUBSCRIBE.
+    /// `None` means use the server-global default.
+    surface_quality_overrides: HashMap<u16, SurfaceQuality>,
     /// Evdev keycodes currently held down by this client on compositor
     /// surfaces.  On disconnect we send synthetic key-up events for each
     /// so modifiers don't stay stuck and keys don't auto-repeat forever.
@@ -652,10 +731,11 @@ fn send_interval(client: &ClientState) -> Duration {
 
 fn preview_fps(client: &ClientState) -> f32 {
     let mut fps = client.display_fps.max(1.0);
-    if client.lead.is_some() {
-        // Always budget preview bandwidth: available minus lead's share.
+    if client.lead.is_some() && throughput_limited(client) {
+        // Only budget preview bandwidth when the link is actually saturated.
         // Without this, large preview frames (e.g. 12 KB) at 30 fps consume
         // 360 KB/s, starving the lead even when lead frames are tiny.
+        // On fast links (localhost, LAN), previews run at display_fps.
         let avail = bandwidth_floor_bps(client);
         let lead_bps = client.avg_paced_frame_bytes.max(256.0) * browser_pacing_fps(client);
         let preview_budget = (avail - lead_bps).max(avail * 0.25).max(0.0);
@@ -667,6 +747,27 @@ fn preview_fps(client: &ClientState) -> f32 {
 
 fn preview_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / preview_fps(client) as f64)
+}
+
+/// Surface frame rate: display rate capped by what the pipe can carry.
+///
+/// `goodput_bps` is fed by terminal ACKs, surface ACKs, and audio send
+/// accounting — so it reflects total pipe utilisation.  Dividing by
+/// `avg_surface_frame_bytes` gives the sustainable surface fps.
+///
+/// Additional backpressure layers below this:
+/// - `surface_encodes_in_flight` limits to 1 encode per (client, surface)
+/// - `outbox_backpressured` triggers on either queued bytes or queued messages
+/// - TCP / SSH flow control on the wire
+fn surface_pacing_fps(client: &ClientState) -> f32 {
+    let frame_bytes = client.avg_surface_frame_bytes.max(256.0);
+    let bw = client.goodput_bps.max(client.delivery_bps);
+    let sustainable = bw / frame_bytes;
+    sustainable.min(client.display_fps).max(1.0)
+}
+
+fn surface_send_interval(client: &ClientState) -> Duration {
+    Duration::from_secs_f64(1.0 / surface_pacing_fps(client).max(1.0) as f64)
 }
 
 fn advance_deadline(deadline: &mut Instant, now: Instant, interval: Duration) {
@@ -779,11 +880,71 @@ fn client_has_due_preview(sess: &Session, client: &ClientState, now: Instant) ->
 }
 
 fn outbox_queued_frames(client: &ClientState) -> usize {
-    OUTBOX_CAPACITY.saturating_sub(client.tx.capacity())
+    client.outbox_queued_frames.load(Ordering::Relaxed)
+}
+
+fn outbox_queued_bytes(client: &ClientState) -> usize {
+    client.outbox_queued_bytes.load(Ordering::Relaxed)
 }
 
 fn outbox_backpressured(client: &ClientState) -> bool {
     outbox_queued_frames(client) >= OUTBOX_SOFT_QUEUE_LIMIT_FRAMES
+        || outbox_queued_bytes(client) >= OUTBOX_SOFT_QUEUE_LIMIT_BYTES
+}
+
+fn mark_outbox_drained(
+    queued_frames: &Arc<AtomicUsize>,
+    queued_bytes: &Arc<AtomicUsize>,
+    bytes: usize,
+) {
+    let _ = queued_frames.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+    let _ = queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(bytes))
+    });
+}
+
+fn try_send_outbox_tracked(
+    tx: &mpsc::Sender<Vec<u8>>,
+    queued_frames: &Arc<AtomicUsize>,
+    queued_bytes: &Arc<AtomicUsize>,
+    msg: Vec<u8>,
+) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+    let bytes = msg.len();
+    match tx.try_send(msg) {
+        Ok(()) => {
+            queued_frames.fetch_add(1, Ordering::Relaxed);
+            queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn try_send_outbox(
+    client: &ClientState,
+    msg: Vec<u8>,
+) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+    try_send_outbox_tracked(
+        &client.tx,
+        &client.outbox_queued_frames,
+        &client.outbox_queued_bytes,
+        msg,
+    )
+}
+
+async fn send_outbox_tracked(
+    tx: &mpsc::Sender<Vec<u8>>,
+    queued_frames: &Arc<AtomicUsize>,
+    queued_bytes: &Arc<AtomicUsize>,
+    msg: Vec<u8>,
+) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+    let bytes = msg.len();
+    tx.send(msg).await?;
+    queued_frames.fetch_add(1, Ordering::Relaxed);
+    queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+    Ok(())
 }
 
 fn can_send_preview(client: &ClientState, pid: u16, now: Instant) -> bool {
@@ -805,6 +966,19 @@ fn window_open(client: &ClientState) -> bool {
         && !outbox_backpressured(client)
         && client.inflight_frames.len() < target_frame_window(client)
         && client.inflight_bytes < target_byte_window(client)
+}
+
+/// Surface send window: only outbox backpressure.
+///
+/// Surface pacing is decoupled from terminal congestion control.  Surfaces
+/// have their own time-based pacing (`surface_send_interval`) derived from
+/// `display_fps` and `goodput_bps / avg_surface_frame_bytes`.  The shared
+/// inflight window (`target_frame_window`, `target_byte_window`) is sized
+/// for tiny terminal diffs and must not gate large video frames — doing so
+/// causes the two streams to drag each other down, especially on SSH links
+/// where the conservative bandwidth estimates are already fragile.
+fn surface_window_open(client: &ClientState) -> bool {
+    !outbox_backpressured(client)
 }
 
 fn lead_window_open(client: &ClientState, reserve_preview_slot: bool) -> bool {
@@ -993,6 +1167,44 @@ fn record_ack(client: &mut ClientState) {
     }
 }
 
+/// Process a surface ACK.  Feeds delivery_bps and goodput estimates (same
+/// pipe) from the surface inflight queue.  Does NOT update rtt_ms / min_rtt_ms
+/// — surface frames are large and their wall-clock delivery time is dominated
+/// by serialization and wire transfer, not network latency.  Feeding those
+/// samples into the shared RTT inflates it by orders of magnitude and
+/// destabilises terminal pacing and congestion control.
+fn record_surface_ack(client: &mut ClientState) {
+    if let Some(frame) = client.surface_inflight_frames.pop_front() {
+        client.acked_bytes_since_log = client.acked_bytes_since_log.saturating_add(frame.bytes);
+
+        let sample_ms = frame.sent_at.elapsed().as_secs_f32() * 1_000.0;
+
+        // Shared delivery rate (bandwidth, not latency — safe to update).
+        let sample_bps = frame.bytes as f32 / sample_ms.max(1.0e-3) * 1_000.0;
+        client.delivery_bps = ewma_with_direction(client.delivery_bps, sample_bps, 0.5, 0.125);
+
+        // Shared goodput window — accumulate bytes, flush periodically.
+        // Surface traffic at display_fps is sustained, so always use the
+        // window-limited EWMA parameters (rise 0.5, fall 0.125).  No
+        // jitter tracking — jitter is a terminal congestion-control signal
+        // and large keyframe/P-frame variance would poison it.
+        client.goodput_window_bytes = client.goodput_window_bytes.saturating_add(frame.bytes);
+        let now = Instant::now();
+        let goodput_elapsed = now
+            .duration_since(client.goodput_window_start)
+            .as_secs_f32();
+        if goodput_elapsed >= 0.02 {
+            let sample_goodput = client.goodput_window_bytes as f32 / goodput_elapsed.max(1.0e-3);
+            client.goodput_bps =
+                ewma_with_direction(client.goodput_bps, sample_goodput, 0.5, 0.125);
+            client.last_goodput_sample_bps =
+                (client.last_goodput_sample_bps * 0.99).max(sample_goodput);
+            client.goodput_window_bytes = 0;
+            client.goodput_window_start = now;
+        }
+    }
+}
+
 fn reset_inflight(client: &mut ClientState) {
     client.inflight_bytes = 0;
     client.inflight_frames.clear();
@@ -1068,6 +1280,7 @@ struct Session {
     surface_encodes: u32,
     surface_encode_bytes: u64,
     surface_frames_sent: u32,
+    last_ping: Instant,
     clients: HashMap<u64, ClientState>,
 }
 
@@ -1098,6 +1311,7 @@ impl Session {
             surface_commits: 0,
             surface_encodes: 0,
             surface_encode_bytes: 0,
+            last_ping: Instant::now(),
             surface_frames_sent: 0,
         }
     }
@@ -1111,19 +1325,92 @@ impl Session {
         if self.compositor.is_none() {
             let session_id = self.next_compositor_id;
             self.next_compositor_id = self.next_compositor_id.wrapping_add(1);
+            // Create the epoch before spawning anything so audio and video
+            // share the same time origin for A/V sync.
+            let created_at = Instant::now();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
+            #[cfg(unix)]
+            let audio_pipeline = {
+                let audio_disabled = std::env::var("BLIT_AUDIO")
+                    .map(|v| v == "0")
+                    .unwrap_or(false);
+                if !audio_disabled && audio::pipewire_available() {
+                    let runtime_dir = std::path::Path::new(&handle.socket_name)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("/tmp"));
+                    let bitrate = std::env::var("BLIT_AUDIO_BITRATE")
+                        .ok()
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(0);
+                    // Wrap in block_in_place so the thread::sleep calls
+                    // inside spawn() don't stall the tokio runtime.
+                    tokio::task::block_in_place(|| {
+                        match audio::AudioPipeline::spawn(
+                            runtime_dir,
+                            session_id,
+                            bitrate,
+                            verbose,
+                            created_at,
+                        ) {
+                            Ok(pipeline) => {
+                                if verbose {
+                                    eprintln!(
+                                        "[audio] pipeline started, PULSE_SERVER={}",
+                                        pipeline.pulse_server_path(),
+                                    );
+                                }
+                                Some(pipeline)
+                            }
+                            Err(e) => {
+                                eprintln!("[audio] failed to start pipeline: {e}");
+                                None
+                            }
+                        }
+                    })
+                } else {
+                    if verbose && !audio_disabled {
+                        eprintln!("[audio] PipeWire not available, audio disabled");
+                    }
+                    None
+                }
+            };
+
             self.compositor = Some(SharedCompositor {
-                session_id,
                 handle,
                 surfaces: HashMap::new(),
                 last_pixels: HashMap::new(),
                 pending_frame_requests: HashSet::new(),
-                created_at: Instant::now(),
+                created_at,
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
+                last_configured_size: HashMap::new(),
+                #[cfg(unix)]
+                audio_pipeline,
+                #[cfg(unix)]
+                audio_session_id: session_id,
+                #[cfg(unix)]
+                last_audio_restart: None,
             });
         }
         &self.compositor.as_ref().unwrap().handle.socket_name
+    }
+
+    /// Returns the `PULSE_SERVER` path if the audio pipeline is active.
+    #[cfg(unix)]
+    fn pulse_server_path(&self) -> Option<String> {
+        self.compositor
+            .as_ref()
+            .and_then(|cs| cs.audio_pipeline.as_ref())
+            .map(|ap| ap.pulse_server_path())
+    }
+
+    /// Returns the `PIPEWIRE_REMOTE` path if the audio pipeline is active.
+    #[cfg(unix)]
+    fn pipewire_remote_path(&self) -> Option<String> {
+        self.compositor
+            .as_ref()
+            .and_then(|cs| cs.audio_pipeline.as_ref())
+            .map(|ap| ap.pipewire_remote_path())
     }
 
     fn allocate_pty_id(&mut self, max_ptys: usize) -> Option<u16> {
@@ -1146,7 +1433,7 @@ impl Session {
 
     fn send_to_all(&self, msg: &[u8]) {
         for c in self.clients.values() {
-            let _ = c.tx.try_send(msg.to_vec());
+            let _ = try_send_outbox(c, msg.to_vec());
         }
     }
 
@@ -1226,7 +1513,7 @@ impl Session {
         let mut min_h: Option<u16> = None;
         let mut max_scale: u16 = 0;
         for c in self.clients.values() {
-            if let Some(&(w, h, s, _codec)) = c.surface_view_sizes.get(&surface_id) {
+            if let Some(&(w, h, s)) = c.surface_view_sizes.get(&surface_id) {
                 min_w = Some(min_w.map_or(w, |m: u16| m.min(w)));
                 min_h = Some(min_h.map_or(h, |m: u16| m.min(h)));
                 max_scale = max_scale.max(s);
@@ -1251,17 +1538,22 @@ impl Session {
             Some(cs) => cs,
             None => return false,
         };
-        if let Some(info) = cs.surfaces.get(&surface_id)
-            && info.width == width
-            && info.height == height
-            && info.scale_120 == scale_120
+        // Dedup against the last *requested* dimensions, not the composited
+        // output dimensions (`info.width`/`info.height`).  The composited
+        // output may be smaller when the Wayland client sets xdg_geometry
+        // (e.g. Chromium excludes the title bar), so comparing against it
+        // would cause every resize to look like a change, flooding the
+        // compositor with redundant configures and re-creating the encoder
+        // (keyframe) on every tick during a drag-resize.
+        if let Some(&(lw, lh, ls)) = cs.last_configured_size.get(&surface_id)
+            && lw == width
+            && lh == height
+            && ls == scale_120
         {
             return false;
         }
-        // Update the cached scale so subsequent identical resizes are deduped.
-        if let Some(info) = cs.surfaces.get_mut(&surface_id) {
-            info.scale_120 = scale_120;
-        }
+        cs.last_configured_size
+            .insert(surface_id, (width, height, scale_120));
         let _ = cs.handle.command_tx.send(CompositorCommand::SurfaceResize {
             surface_id,
             width,
@@ -1345,6 +1637,8 @@ struct AppStateInner {
     session: Mutex<Session>,
     pty_fds: PtyFds,
     delivery_notify: Arc<Notify>,
+    /// Signalled when a client sends C2S_QUIT to initiate server shutdown.
+    shutdown_notify: Arc<Notify>,
     /// Tracks the number of currently connected clients for enforcing
     /// `config.max_connections`.
     active_connections: std::sync::atomic::AtomicUsize,
@@ -1387,6 +1681,8 @@ fn spawn_compositor_child(
             }
             std::env::set_var("WAYLAND_DISPLAY", wayland_socket);
             std::env::remove_var("DISPLAY");
+            std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+            std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
         }
         if let Some(args) = argv {
             let prog = CString::new(args[0]).unwrap();
@@ -1451,7 +1747,6 @@ fn xterm256_color(idx: u8) -> (u16, u16, u16) {
     let scale = |v: u8| (v as u16) << 8 | v as u16;
     (scale(r8), scale(g8), scale(b8))
 }
-
 fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> Vec<String> {
     const DA1_RESPONSE: &[u8] = b"\x1b[?64;1;2;6;9;15;18;21;22c";
 
@@ -1565,13 +1860,6 @@ async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
         let msg = blit_remote::msg_exited(pty_id, pty.exit_status);
         sess.send_to_all(&msg);
     }
-    let all_exited = sess.ptys.values().all(|p| p.exited);
-    if all_exited && let Some(cs) = sess.compositor.take() {
-        cs.handle
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = cs.handle.command_tx.send(CompositorCommand::Shutdown);
-    }
 }
 
 fn take_snapshot(pty: &mut Pty) -> FrameState {
@@ -1640,7 +1928,7 @@ fn try_send_update(
         return SendOutcome::NoChange;
     };
     let bytes = msg.len();
-    if client.tx.try_send(msg).is_ok() {
+    if try_send_outbox(client, msg).is_ok() {
         client.last_sent.insert(pid, current);
         record_send(client, bytes, now, paced);
         client.frames_sent = client.frames_sent.wrapping_add(1);
@@ -1662,8 +1950,22 @@ pub async fn run(config: Config) {
         session: Mutex::new(Session::new()),
         pty_fds: Arc::new(std::sync::RwLock::new(HashMap::new())),
         delivery_notify: Arc::new(Notify::new()),
+        shutdown_notify: Arc::new(Notify::new()),
         active_connections: std::sync::atomic::AtomicUsize::new(0),
     });
+
+    // Start the compositor eagerly so it is ready before any client
+    // connects or any terminal is created.
+    if !state.config.skip_compositor {
+        let notify = state.delivery_notify.clone();
+        let event_notify = Arc::new(move || notify.notify_one()) as Arc<dyn Fn() + Send + Sync>;
+        let mut sess = state.session.lock().await;
+        sess.ensure_compositor(
+            state.config.verbose,
+            event_notify,
+            &state.config.vaapi_device,
+        );
+    }
 
     let delivery_state = state.clone();
     tokio::spawn(async move {
@@ -1706,14 +2008,44 @@ pub async fn run(config: Config) {
     #[cfg(not(unix))]
     let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose);
 
-    loop {
-        let stream = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("accept error: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+    // Broadcast S2C_QUIT on SIGTERM / SIGINT so clients can reconnect promptly
+    // instead of waiting for a transport-level timeout.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = signal(SignalKind::terminate()).expect("signal handler");
+                let mut sigint = signal(SignalKind::interrupt()).expect("signal handler");
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
+                }
             }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            let sess = state.session.lock().await;
+            sess.send_to_all(&[S2C_QUIT]);
+            drop(sess);
+            state.shutdown_notify.notify_waiters();
+        });
+    }
+
+    let shutdown = state.shutdown_notify.clone();
+    loop {
+        let stream = tokio::select! {
+            result = listener.accept() => match result {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("accept error: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = shutdown.notified() => break,
         };
         let max = state.config.max_connections;
         if max > 0 {
@@ -1737,6 +2069,8 @@ pub async fn run(config: Config) {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
+    // Brief grace period for S2C_QUIT to reach clients before the process exits.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 async fn tick(state: &AppState) -> TickOutcome {
@@ -1744,6 +2078,17 @@ async fn tick(state: &AppState) -> TickOutcome {
     sess.tick_fires += 1;
     let mut next_deadline: Option<Instant> = None;
     let now = Instant::now();
+
+    // Application-level keepalive.
+    let ping_interval = state.config.ping_interval;
+    if !ping_interval.is_zero() && now.duration_since(sess.last_ping) >= ping_interval {
+        sess.send_to_all(&[S2C_PING]);
+        sess.last_ping = now;
+    }
+    if !ping_interval.is_zero() {
+        let next_ping = sess.last_ping + ping_interval;
+        next_deadline = Some(next_deadline.map_or(next_ping, |d: Instant| d.min(next_ping)));
+    }
 
     let max_fps = sess
         .clients
@@ -1955,7 +2300,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             break;
                         };
                         let bytes = msg.len();
-                        if c.tx.try_send(msg).is_ok() {
+                        if try_send_outbox(c, msg).is_ok() {
                             c.scroll_caches.insert(scroll_pid, new_frame);
                             record_send(c, bytes, now, is_lead);
                             c.frames_sent += 1;
@@ -2137,13 +2482,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     height,
                 } => {
                     broadcast.push(msg_surface_created(
-                        cs.session_id,
-                        surface_id,
-                        parent_id,
-                        width,
-                        height,
-                        &title,
-                        &app_id,
+                        surface_id, parent_id, width, height, &title, &app_id,
                     ));
                     cs.surfaces.insert(
                         surface_id,
@@ -2152,7 +2491,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                             parent_id,
                             width,
                             height,
-                            scale_120: 0,
                             title,
                             app_id,
                         },
@@ -2163,8 +2501,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.surfaces.remove(&surface_id);
                     cs.last_pixels.remove(&surface_id);
+                    cs.last_configured_size.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
-                    broadcast.push(msg_surface_destroyed(cs.session_id, surface_id));
+                    broadcast.push(msg_surface_destroyed(surface_id));
                 }
                 CompositorEvent::SurfaceCommit {
                     surface_id,
@@ -2193,13 +2532,13 @@ async fn tick(state: &AppState) -> TickOutcome {
                     if let Some(info) = cs.surfaces.get_mut(&surface_id) {
                         info.title = title.clone();
                     }
-                    broadcast.push(msg_surface_title(cs.session_id, surface_id, &title));
+                    broadcast.push(msg_surface_title(surface_id, &title));
                 }
                 CompositorEvent::SurfaceAppId { surface_id, app_id } => {
                     if let Some(info) = cs.surfaces.get_mut(&surface_id) {
                         info.app_id = app_id.clone();
                     }
-                    broadcast.push(msg_surface_app_id(cs.session_id, surface_id, &app_id));
+                    broadcast.push(msg_surface_app_id(surface_id, &app_id));
                 }
                 CompositorEvent::SurfaceResized {
                     surface_id,
@@ -2211,25 +2550,65 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.height = height;
                     }
                     cs.last_pixels.remove(&surface_id);
+                    // Clear pending_frame_requests so the tick loop sends a
+                    // fresh RequestFrame after the resize.  Without this, a
+                    // stale entry from a previous frame-request cycle can
+                    // prevent the compositor from firing frame callbacks,
+                    // stalling the encode pipeline (same pattern as the
+                    // subscribe handler).
+                    cs.pending_frame_requests.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
-                    broadcast.push(msg_surface_resized(
-                        cs.session_id,
-                        surface_id,
-                        width,
-                        height,
-                    ));
+                    broadcast.push(msg_surface_resized(surface_id, width, height));
                 }
                 CompositorEvent::ClipboardContent {
-                    surface_id,
-                    mime_type,
-                    data,
+                    mime_type, data, ..
                 } => {
-                    broadcast.push(msg_s2c_clipboard(
-                        cs.session_id,
-                        surface_id,
-                        &mime_type,
-                        &data,
-                    ));
+                    broadcast.push(msg_s2c_clipboard_content(&mime_type, &data));
+                }
+                CompositorEvent::SurfaceCursor { surface_id, cursor } => {
+                    // Format: [0x29][surface_id:2][type:1][payload...]
+                    // type 0 = named: [name_len:1][name:N]
+                    // type 1 = hidden (no payload)
+                    // type 2 = custom: [hotx:2][hoty:2][w:2][h:2][png:N]
+                    let mut msg = Vec::new();
+                    msg.push(blit_remote::S2C_SURFACE_CURSOR);
+                    msg.extend_from_slice(&surface_id.to_le_bytes());
+                    match &cursor {
+                        blit_compositor::CursorImage::Named(name) => {
+                            msg.push(0); // type = named
+                            msg.push(name.len() as u8);
+                            msg.extend_from_slice(name.as_bytes());
+                        }
+                        blit_compositor::CursorImage::Hidden => {
+                            msg.push(1); // type = hidden
+                        }
+                        blit_compositor::CursorImage::Custom {
+                            hotspot_x,
+                            hotspot_y,
+                            width,
+                            height,
+                            rgba,
+                        } => {
+                            // Encode as PNG to keep message small.
+                            let mut png_buf = Vec::new();
+                            {
+                                let mut encoder =
+                                    png::Encoder::new(&mut png_buf, *width as u32, *height as u32);
+                                encoder.set_color(png::ColorType::Rgba);
+                                encoder.set_depth(png::BitDepth::Eight);
+                                if let Ok(mut writer) = encoder.write_header() {
+                                    let _ = writer.write_image_data(rgba);
+                                }
+                            }
+                            msg.push(2); // type = custom
+                            msg.extend_from_slice(&hotspot_x.to_le_bytes());
+                            msg.extend_from_slice(&hotspot_y.to_le_bytes());
+                            msg.extend_from_slice(&width.to_le_bytes());
+                            msg.extend_from_slice(&height.to_le_bytes());
+                            msg.extend_from_slice(&png_buf);
+                        }
+                    }
+                    broadcast.push(msg);
                 }
             }
         }
@@ -2244,7 +2623,6 @@ async fn tick(state: &AppState) -> TickOutcome {
     for sid in invalidate_client_encoders {
         for c in sess.clients.values_mut() {
             c.surface_encoders.remove(&sid);
-            c.surface_last_frames.remove(&sid);
             c.surface_last_encoded_gen.remove(&sid);
         }
     }
@@ -2306,10 +2684,15 @@ async fn tick(state: &AppState) -> TickOutcome {
 
     if !pixel_snapshot.is_empty() {
         for (&cid, client) in sess.clients.iter_mut() {
-            if !window_open(client) {
+            if !surface_window_open(client) {
                 continue;
             }
-            if client.surface_next_send_at > now {
+            // During burst-start (first few frames after subscribe/keyframe
+            // request), skip the time-based pacing gate — let outbox
+            // backpressure (checked above) be the only flow control.
+            // This lets frames flow at wire speed, establishing bandwidth
+            // estimates quickly on high-latency links.
+            if client.surface_burst_remaining == 0 && client.surface_next_send_at > now {
                 let deadline = client.surface_next_send_at;
                 next_deadline = Some(match next_deadline {
                     Some(existing) => existing.min(deadline),
@@ -2325,9 +2708,17 @@ async fn tick(state: &AppState) -> TickOutcome {
                 subs: client.surface_subscriptions.clone(),
                 needs_keyframe: client.surface_needs_keyframe,
             });
-            let interval = send_interval(client);
-            advance_deadline(&mut client.surface_next_send_at, now, interval);
+            // Don't advance the deadline here — wait until we know an
+            // encode job was actually collected (see below).  Advancing
+            // eagerly wastes time slots when the encode is skipped due
+            // to in-flight limits or unchanged pixel data.
         }
+
+        // Track which clients actually had encode jobs collected so we
+        // can advance their deadlines after the job-collection pass.
+        let mut clients_with_encodes: HashSet<u64> = HashSet::new();
+        #[cfg(target_os = "linux")]
+        let mut pending_external_bufs: Option<Vec<blit_compositor::ExternalOutputBuffer>> = None;
 
         for work in &client_work {
             for &(sid, px_w, px_h, px_gen) in &pixel_snapshot {
@@ -2370,18 +2761,51 @@ async fn tick(state: &AppState) -> TickOutcome {
                     .is_none_or(|e| e.source_dimensions() != (px_w, px_h));
                 if needs_new_encoder {
                     client.surface_encoders.remove(&sid);
-                    client.surface_last_frames.remove(&sid);
+                    let codec_support = client
+                        .surface_codec_overrides
+                        .get(&sid)
+                        .copied()
+                        .unwrap_or(client.surface_codec_support);
+                    let quality = client
+                        .surface_quality_overrides
+                        .get(&sid)
+                        .copied()
+                        .unwrap_or(state.config.surface_quality);
                     match SurfaceEncoder::new(
                         &state.config.surface_encoders,
                         px_w,
                         px_h,
                         &state.config.vaapi_device,
-                        state.config.surface_quality,
+                        quality,
                         state.config.verbose,
-                        client.surface_codec_support,
+                        codec_support,
                     ) {
                         Ok(encoder) => {
+                            #[cfg(target_os = "linux")]
+                            {
+                                let exported = encoder.export_vpp_surfaces();
+                                if !exported.is_empty() {
+                                    let va_display = encoder.va_display_usize();
+                                    let bufs = exported
+                                        .into_iter()
+                                        .map(|e| blit_compositor::ExternalOutputBuffer {
+                                            fd: std::sync::Arc::new(e.fd),
+                                            fourcc: e.fourcc,
+                                            modifier: e.modifier,
+                                            stride: e.stride,
+                                            offset: e.offset,
+                                            width: e.width,
+                                            height: e.height,
+                                            va_surface_id: e.surface_id,
+                                            va_display,
+                                        })
+                                        .collect();
+                                    pending_external_bufs = Some(bufs);
+                                }
+                            }
+                            let enc_msg = msg_surface_encoder(sid, encoder.encoder_name());
                             client.surface_encoders.insert(sid, encoder);
+                            let _ = try_send_outbox(client, enc_msg);
                         }
                         Err(err) => {
                             if state.config.verbose {
@@ -2400,6 +2824,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // A fresh encoder always needs a keyframe, regardless of
                 // the client's global flag.
                 let needs_kf = work.needs_keyframe || needs_new_encoder;
+                clients_with_encodes.insert(work.cid);
                 encode_jobs.push(EncodeJob {
                     cid: work.cid,
                     sid,
@@ -2412,6 +2837,30 @@ async fn tick(state: &AppState) -> TickOutcome {
                 });
             }
         }
+
+        // Send VA-API exported surfaces to compositor if a new encoder was created.
+        #[cfg(target_os = "linux")]
+        if let Some(bufs) = pending_external_bufs
+            && let Some(cs) = sess.compositor.as_ref()
+        {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::SetExternalOutputBuffers { buffers: bufs },
+            );
+            cs.handle.wake();
+        }
+
+        // Advance the pacing deadline only for clients that actually had
+        // at least one encode job collected.  Clients skipped due to
+        // in-flight limits or unchanged pixels keep their current
+        // deadline so the next tick retries without burning a time slot.
+        for work in &client_work {
+            if let Some(client) = sess.clients.get_mut(&work.cid)
+                && clients_with_encodes.contains(&work.cid)
+            {
+                let interval = surface_send_interval(client);
+                advance_deadline(&mut client.surface_next_send_at, now, interval);
+            }
+        }
     }
 
     if !encode_jobs.is_empty() {
@@ -2419,24 +2868,19 @@ async fn tick(state: &AppState) -> TickOutcome {
         // so the tick loop is never blocked by slow encoders.
         let state2 = state.clone();
         tokio::spawn(async move {
+            // Track (cid, sid) for each job so we can clean up
+            // surface_encodes_in_flight if a task panics or times out.
+            let job_ids: Vec<(u64, u16)> = encode_jobs.iter().map(|j| (j.cid, j.sid)).collect();
+
             let handles: Vec<_> = encode_jobs
                 .into_iter()
                 .map(|mut job| {
                     tokio::task::spawn_blocking(move || {
-                        let t0 = Instant::now();
                         if job.needs_keyframe {
                             job.encoder.request_keyframe();
                         }
                         let nal_data = job.encoder.encode_pixels(&job.pixels);
                         let codec_flag = job.encoder.codec_flag();
-                        let encode_ms = t0.elapsed().as_millis();
-
-                        if encode_ms > 50 {
-                            eprintln!(
-                                "[surface-encoder] cid={} sid={} {}x{} encode took {encode_ms}ms",
-                                job.cid, job.sid, job.px_w, job.px_h
-                            );
-                        }
                         EncodeResult {
                             cid: job.cid,
                             sid: job.sid,
@@ -2451,10 +2895,35 @@ async fn tick(state: &AppState) -> TickOutcome {
                 })
                 .collect();
 
+            // Timeout: if a hardware encoder hangs (e.g. vaSyncSurface on
+            // AMD), don't block delivery of other surfaces' results forever.
+            const ENCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
             let mut results = Vec::with_capacity(handles.len());
-            for h in handles {
-                if let Ok(r) = h.await {
-                    results.push(r);
+            let mut failed: Vec<(u64, u16)> = Vec::new();
+            for (i, h) in handles.into_iter().enumerate() {
+                match tokio::time::timeout(ENCODE_TIMEOUT, h).await {
+                    Ok(Ok(r)) => results.push(r),
+                    Ok(Err(_join_err)) => {
+                        // spawn_blocking panicked — encoder is lost.
+                        eprintln!(
+                            "[surface-encoder] encode task panicked: cid={} sid={}",
+                            job_ids[i].0, job_ids[i].1
+                        );
+                        failed.push(job_ids[i]);
+                    }
+                    Err(_timeout) => {
+                        // Encoder hung (e.g. GPU hang in vaSyncSurface).
+                        // The blocking thread is leaked but we must not
+                        // let it stall all other surfaces forever.
+                        eprintln!(
+                            "[surface-encoder] encode timed out ({}s): cid={} sid={}",
+                            ENCODE_TIMEOUT.as_secs(),
+                            job_ids[i].0,
+                            job_ids[i].1
+                        );
+                        failed.push(job_ids[i]);
+                    }
                 }
             }
 
@@ -2464,6 +2933,21 @@ async fn tick(state: &AppState) -> TickOutcome {
             let mut local_encodes = 0u32;
             let mut local_encode_bytes = 0u64;
             let mut local_frames_sent = 0u32;
+
+            // Clean up in-flight tracking for panicked/timed-out encodes.
+            // Without this, the surface is permanently blocked from future
+            // encode jobs and frame delivery stops for that surface.
+            for (cid, sid) in failed {
+                if let Some(client) = sess.clients.get_mut(&cid) {
+                    client.surface_encodes_in_flight.remove(&sid);
+                    // The encoder was moved into the spawn_blocking closure
+                    // and is now lost.  A fresh encoder will be created on
+                    // the next tick when surface_encoders doesn't contain
+                    // this sid.  Force a keyframe so the new encoder starts
+                    // with a clean reference chain.
+                    client.surface_needs_keyframe = true;
+                }
+            }
 
             for result in results {
                 // Return the encoder to the client, but only if its
@@ -2497,11 +2981,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                 local_encodes += 1;
                 local_encode_bytes += nal_data.len() as u64;
 
-                let (session_id, created_at) = sess
+                let created_at = sess
                     .compositor
                     .as_ref()
-                    .map(|cs| (cs.session_id, cs.created_at))
-                    .unwrap_or((0, now));
+                    .map(|cs| cs.created_at)
+                    .unwrap_or(now);
 
                 let flags = result.codec_flag
                     | if is_keyframe {
@@ -2511,7 +2995,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     };
                 let timestamp = created_at.elapsed().as_millis() as u32;
                 let msg = msg_surface_frame(
-                    session_id,
                     result.sid,
                     timestamp,
                     flags,
@@ -2525,21 +3008,13 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 };
 
-                client.surface_last_frames.insert(
-                    result.sid,
-                    BufferedSurfaceFrame {
-                        _msg: msg.clone(),
-                        _is_keyframe: is_keyframe,
-                    },
-                );
-
                 // Don't check window_open here — we already checked before
                 // starting the encode job.  Dropping an encoded P-frame
                 // breaks the decoder's reference chain and causes glitches.
                 // With surface_encodes_in_flight limiting to 1 concurrent
                 // encode per surface, at most 1 frame arrives after the
                 // window closes, which is acceptable.
-                match client.tx.try_send(msg) {
+                match try_send_outbox(client, msg) {
                     Err(_e) => {
                         // Outbox full (rare — window_open checked at encode
                         // time but outbox filled during async encode).
@@ -2547,12 +3022,59 @@ async fn tick(state: &AppState) -> TickOutcome {
                         client.surface_needs_keyframe = true;
                     }
                     Ok(()) => {
-                        record_send(client, bytes, now, true);
+                        // Track surface frames in their own inflight queue
+                        // so surface ACKs feed shared goodput / RTT without
+                        // polluting terminal frame-size averages or probing.
+                        client.surface_inflight_frames.push_back(InFlightFrame {
+                            sent_at: now,
+                            bytes,
+                            paced: true,
+                        });
+                        // Prefer updating avg_surface_frame_bytes from delta
+                        // (non-keyframe) frames — keyframes are 5-10× larger
+                        // than P-frames and would inflate the average, dragging
+                        // surface_pacing_fps below the sustainable rate.
+                        //
+                        // However, we must still update from keyframes with a
+                        // very slow alpha: all-intra encoders (e.g. AV1 VAAPI
+                        // before P-frame support) only produce keyframes, so
+                        // skipping them entirely leaves the average stuck at
+                        // the 8 KB initial value, causing the pacer to wildly
+                        // overshoot the send rate and saturate the transport.
+                        if !is_keyframe {
+                            client.avg_surface_frame_bytes = ewma_with_direction(
+                                client.avg_surface_frame_bytes,
+                                bytes as f32,
+                                0.5,
+                                0.125,
+                            );
+                        } else if client.avg_surface_frame_bytes <= 16_384.0 {
+                            // First keyframe while the estimate is still at or
+                            // near the initial 8 KB seed.  No P-frame data has
+                            // been seen yet, so the seed is pure fiction.  Use a
+                            // realistic P-frame estimate: keyframes are typically
+                            // 3-8× larger than P-frames, so divide by 4.  This
+                            // prevents surface_pacing_fps from being wildly
+                            // optimistic (8 KB → 32 fps at 256 KB/s) when the
+                            // actual frames are 50-200 KB keyframes.
+                            client.avg_surface_frame_bytes = (bytes as f32 / 4.0).max(4_096.0);
+                        } else {
+                            // Slow convergence so one keyframe doesn't wreck
+                            // the estimate for dozens of subsequent P-frames.
+                            client.avg_surface_frame_bytes = ewma_with_direction(
+                                client.avg_surface_frame_bytes,
+                                bytes as f32,
+                                0.05,
+                                0.05,
+                            );
+                        }
                         client.frames_sent = client.frames_sent.wrapping_add(1);
                         local_frames_sent += 1;
                         if client.surface_needs_keyframe && is_keyframe {
                             client.surface_needs_keyframe = false;
                         }
+                        client.surface_burst_remaining =
+                            client.surface_burst_remaining.saturating_sub(1);
                     }
                 }
             }
@@ -2597,7 +3119,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             blanket_requested = true;
         }
         for client in sess.clients.values() {
-            if !window_open(client) {
+            if !surface_window_open(client) {
                 continue;
             }
             let surface_ready = client.surface_next_send_at <= now;
@@ -2640,6 +3162,100 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
+    // -- Audio frame delivery -----------------------------------------------
+    #[cfg(unix)]
+    if let Some(ref mut cs) = sess.compositor
+        && let Some(ref mut ap) = cs.audio_pipeline
+        && ap.is_alive()
+    {
+        let new_frames = ap.poll_frames();
+        if !new_frames.is_empty() {
+            for client in sess.clients.values_mut() {
+                if client.audio_subscribed {
+                    for frame in &new_frames {
+                        let msg = audio::msg_audio_frame(frame);
+                        let bytes = msg.len();
+                        // Send via the dedicated audio channel so audio is
+                        // never blocked behind large video/terminal messages
+                        // in the shared outbox.  The writer task interleaves
+                        // audio between write syscalls of bulk messages.
+                        if client.audio_tx.try_send(msg).is_ok() {
+                            // Count audio bytes into the goodput window so
+                            // the shared bandwidth estimate reflects total
+                            // pipe utilisation (terminals + video + audio).
+                            client.goodput_window_bytes += bytes;
+                        }
+                    }
+                }
+            }
+        }
+        // Schedule the next tick soon so audio frames don't accumulate.
+        // 20 ms matches the Opus frame interval.
+        let next_audio = now + Duration::from_millis(20);
+        next_deadline = Some(next_deadline.map_or(next_audio, |d: Instant| d.min(next_audio)));
+    }
+
+    // -- Audio pipeline auto-restart ----------------------------------------
+    // If the pipeline died (pw-cat exited, encoder crashed, PipeWire gone),
+    // drop it, wait for a cooldown, and respawn.  This avoids permanent
+    // audio loss that previously required a full client reconnect.
+    //
+    // Bitrate is pre-computed here to avoid borrowing sess.clients inside
+    // the sess.compositor mutable borrow (they're the same MutexGuard).
+    #[cfg(unix)]
+    let audio_restart_bitrate: i32 = sess
+        .clients
+        .values()
+        .filter(|c| c.audio_subscribed)
+        .map(|c| c.audio_bitrate_kbps)
+        .max()
+        .map(|kbps| kbps as i32 * 1000)
+        .unwrap_or(0);
+    #[cfg(unix)]
+    if let Some(ref mut cs) = sess.compositor {
+        let pipeline_dead = cs.audio_pipeline.as_mut().is_some_and(|ap| !ap.is_alive());
+        if pipeline_dead {
+            const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
+            let can_restart = cs
+                .last_audio_restart
+                .is_none_or(|t| now.duration_since(t) >= RESTART_COOLDOWN);
+            if can_restart {
+                cs.last_audio_restart = Some(now);
+                // Drop the dead pipeline — triggers shutdown() which kills
+                // orphaned child processes and cleans up the runtime dir.
+                cs.audio_pipeline = None;
+                let runtime_dir = std::path::Path::new(&cs.handle.socket_name)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/tmp"));
+                let session_id = cs.audio_session_id;
+                let epoch = cs.created_at;
+                let verbose = state.config.verbose;
+                eprintln!("[audio] pipeline died, restarting...");
+                let pipeline = tokio::task::block_in_place(|| {
+                    audio::AudioPipeline::spawn(
+                        runtime_dir,
+                        session_id,
+                        audio_restart_bitrate,
+                        verbose,
+                        epoch,
+                    )
+                });
+                match pipeline {
+                    Ok(p) => {
+                        eprintln!(
+                            "[audio] pipeline restarted, PULSE_SERVER={}",
+                            p.pulse_server_path(),
+                        );
+                        cs.audio_pipeline = Some(p);
+                    }
+                    Err(e) => {
+                        eprintln!("[audio] failed to restart pipeline: {e}");
+                    }
+                }
+            }
+        }
+    }
+
     TickOutcome { next_deadline }
 }
 
@@ -2655,10 +3271,59 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOX_CAPACITY);
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_OUTBOX_CAPACITY);
+    let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
+    let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
+    let sender_outbox_queued_frames = outbox_frame_counter.clone();
+    let sender_outbox_queued_bytes = outbox_byte_counter.clone();
     let sender = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if !write_frame(&mut writer, &msg).await {
-                break;
+        loop {
+            // Drain all pending audio before waiting for the next message.
+            // Audio frames are tiny (~160 B) so this is near-instant.
+            while let Ok(audio_msg) = audio_rx.try_recv() {
+                if !write_frame(&mut writer, &audio_msg).await {
+                    return;
+                }
+            }
+
+            // Wait for the next message from either channel.  Prefer audio
+            // so that audio frames queued while we were writing are sent
+            // before the next bulk message.
+            let msg = tokio::select! {
+                biased;
+                msg = audio_rx.recv() => {
+                    // Pure audio message — write it directly (tiny).
+                    match msg {
+                        Some(m) => {
+                            if !write_frame(&mut writer, &m).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                msg = out_rx.recv() => msg,
+            };
+
+            // Non-audio message: may be large (video keyframe, terminal
+            // snapshot).  Use interleaved write so audio frames that arrive
+            // while the kernel TCP buffer drains are written between write
+            // syscalls rather than piling up and being dropped.
+            match msg {
+                Some(m) => {
+                    let bytes = m.len();
+                    let wrote = write_frame_interleaved(&mut writer, &m, &mut audio_rx).await;
+                    mark_outbox_drained(
+                        &sender_outbox_queued_frames,
+                        &sender_outbox_queued_bytes,
+                        bytes,
+                    );
+                    if !wrote {
+                        break;
+                    }
+                }
+                None => break,
             }
         }
     });
@@ -2672,9 +3337,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             client_id,
             ClientState {
                 tx: out_tx,
+                outbox_queued_frames: outbox_frame_counter,
+                outbox_queued_bytes: outbox_byte_counter,
+                audio_tx,
                 lead: None,
                 subscriptions: HashSet::new(),
                 surface_subscriptions: HashSet::new(),
+                audio_subscribed: false,
+                #[cfg(unix)]
+                audio_bitrate_kbps: 0,
                 view_sizes: HashMap::new(),
                 scroll_offsets: HashMap::new(),
                 scroll_caches: HashMap::new(),
@@ -2695,6 +3366,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 avg_frame_bytes: 1_024.0,
                 avg_paced_frame_bytes: 1_024.0,
                 avg_preview_frame_bytes: 1_024.0,
+                avg_surface_frame_bytes: 8_192.0,
                 inflight_bytes: 0,
                 inflight_frames: VecDeque::new(),
                 next_send_at: Instant::now(),
@@ -2711,28 +3383,69 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 goodput_window_start: Instant::now(),
                 surface_next_send_at: Instant::now(),
                 surface_needs_keyframe: true,
+                surface_burst_remaining: SURFACE_BURST_FRAMES,
+                surface_inflight_frames: VecDeque::new(),
                 surface_encoders: HashMap::new(),
                 surface_encodes_in_flight: HashSet::new(),
-                surface_last_frames: HashMap::new(),
                 surface_last_encoded_gen: HashMap::new(),
                 surface_view_sizes: HashMap::new(),
                 surface_codec_support: 0,
+                surface_codec_overrides: HashMap::new(),
+                surface_quality_overrides: HashMap::new(),
                 pressed_surface_keys: HashSet::new(),
             },
         );
         // Wake the tick loop so the new client gets its first frame.
         state.delivery_notify.notify_one();
         if let Some(c) = sess.clients.get(&client_id) {
-            let _ = c.tx.try_send(msg_hello(
-                1,
-                FEATURE_CREATE_NONCE
-                    | FEATURE_RESTART
-                    | FEATURE_RESIZE_BATCH
-                    | FEATURE_COPY_RANGE
-                    | FEATURE_COMPOSITOR,
-            ));
+            let mut features = FEATURE_CREATE_NONCE
+                | FEATURE_RESTART
+                | FEATURE_RESIZE_BATCH
+                | FEATURE_COPY_RANGE
+                | FEATURE_COMPOSITOR;
+            #[cfg(unix)]
+            {
+                let audio_disabled = std::env::var("BLIT_AUDIO")
+                    .map(|v| v == "0")
+                    .unwrap_or(false);
+                if !audio_disabled && audio::pipewire_available() {
+                    features |= FEATURE_AUDIO;
+                }
+            }
+            let _ = try_send_outbox(c, msg_hello(1, features));
         }
         let mut initial_msgs = Vec::with_capacity(2 + sess.ptys.len() * 2);
+        // Send surface-created messages BEFORE the PTY list so that
+        // the client's surface store is populated before `ready` is
+        // set — otherwise the BSP reconciliation runs with an empty
+        // surface list and wipes restored surface assignments.
+        if let Some(cs) = sess.compositor.as_ref() {
+            for info in cs.surfaces.values() {
+                // Use the latest known pixel dimensions if the stored
+                // width/height is still 0 (surface created before first commit).
+                let (w, h) = if info.width == 0 && info.height == 0 {
+                    cs.last_pixels
+                        .get(&info.surface_id)
+                        .map(|lp| (lp.width as u16, lp.height as u16))
+                        .unwrap_or((0, 0))
+                } else {
+                    (info.width, info.height)
+                };
+                initial_msgs.push(msg_surface_created(
+                    info.surface_id,
+                    info.parent_id,
+                    w,
+                    h,
+                    &info.title,
+                    &info.app_id,
+                ));
+                // Also send a resize message so the client gets the
+                // correct dimensions even if surface_created carried 0x0.
+                if w > 0 && h > 0 {
+                    initial_msgs.push(msg_surface_resized(info.surface_id, w, h));
+                }
+            }
+        }
         initial_msgs.push(sess.pty_list_msg());
         for (&id, pty) in &sess.ptys {
             let title = pty.driver.title();
@@ -2748,25 +3461,21 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 initial_msgs.push(blit_remote::msg_exited(id, pty.exit_status));
             }
         }
-        if let Some(cs) = sess.compositor.as_ref() {
-            for info in cs.surfaces.values() {
-                initial_msgs.push(msg_surface_created(
-                    cs.session_id,
-                    info.surface_id,
-                    info.parent_id,
-                    info.width,
-                    info.height,
-                    &info.title,
-                    &info.app_id,
-                ));
-            }
-        }
         initial_msgs.push(vec![S2C_READY]);
-        let tx = sess.clients.get(&client_id).map(|c| c.tx.clone());
+        let tx = sess.clients.get(&client_id).map(|c| {
+            (
+                c.tx.clone(),
+                c.outbox_queued_frames.clone(),
+                c.outbox_queued_bytes.clone(),
+            )
+        });
         drop(sess);
-        if let Some(tx) = tx {
+        if let Some((tx, queued_frames, queued_bytes)) = tx {
             for msg in initial_msgs {
-                if tx.send(msg).await.is_err() {
+                if send_outbox_tracked(&tx, &queued_frames, &queued_bytes, msg)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -2810,16 +3519,19 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 browser_backlog_frames,
                 browser_ack_ahead_frames,
                 browser_apply_ms,
+                surface_fps,
+                avg_surface_frame_bytes,
             ) = {
                 let Some(c) = sess.clients.get_mut(&client_id) else {
                     continue;
                 };
                 c.acks_recv += 1;
                 record_ack(c);
-                let do_log = c.last_log.elapsed().as_secs_f32() >= 1.0;
+                let do_log = c.last_log.elapsed().as_secs_f32() >= 10.0;
                 let log_elapsed = c.last_log.elapsed().as_secs_f32().max(1.0e-3);
                 let paced_fps = pacing_fps(c);
                 let display_need_bps = display_need_bps(c);
+                let surface_fps = surface_pacing_fps(c);
                 let out = (
                     do_log,
                     c.frames_sent,
@@ -2846,6 +3558,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     c.browser_backlog_frames,
                     c.browser_ack_ahead_frames,
                     c.browser_apply_ms,
+                    surface_fps,
+                    c.avg_surface_frame_bytes,
                 );
                 if do_log {
                     c.frames_sent = 0;
@@ -2868,7 +3582,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 });
                 let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
                 eprintln!(
-                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={}",
+                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={}",
                     sess.tick_fires,
                     sess.tick_snaps,
                     sess.surface_commits,
@@ -2886,6 +3600,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 sess.surface_frames_sent = 0;
             }
             nudge_delivery(&state);
+            continue;
+        }
+
+        if data[0] == C2S_PING {
+            // Application-level keepalive — no-op.  Its arrival is enough
+            // to keep the connection alive (any received data resets
+            // transport-level timeouts).
             continue;
         }
 
@@ -2991,47 +3712,83 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .then_with(|| a.pty_id.cmp(&b.pty_id))
             });
             if let Some(client) = sess.clients.get_mut(&client_id) {
-                let _ = client
-                    .tx
-                    .try_send(build_search_results_msg(request_id, &ranked));
+                let _ = try_send_outbox(client, build_search_results_msg(request_id, &ranked));
             }
             continue;
         }
 
-        if data[0] == C2S_SURFACE_CAPTURE && data.len() >= 5 {
-            let surface_id = u16::from_le_bytes([data[3], data[4]]);
+        if data[0] == C2S_SURFACE_CAPTURE && data.len() >= 3 {
+            let surface_id = u16::from_le_bytes([data[1], data[2]]);
             // Extended message includes format and quality bytes.
-            let format = data.get(5).copied().unwrap_or(CAPTURE_FORMAT_PNG);
-            let quality = data.get(6).copied().unwrap_or(0);
+            let format = data.get(3).copied().unwrap_or(CAPTURE_FORMAT_PNG);
+            let quality = data.get(4).copied().unwrap_or(0);
+            let scale_120 = if data.len() >= 7 {
+                u16::from_le_bytes([data[5], data[6]])
+            } else {
+                0
+            };
 
             let mut reply_msg = vec![S2C_SURFACE_CAPTURE];
             reply_msg.extend_from_slice(&surface_id.to_le_bytes());
 
             eprintln!("[capture] acquiring lock for surface {surface_id}");
-            let snapshot = {
+            let (snapshot, command_tx) = {
                 let sess = state.session.lock().await;
                 eprintln!("[capture] lock acquired");
-                sess.compositor
+                let snap = sess
+                    .compositor
                     .as_ref()
                     .and_then(|cs| cs.last_pixels.get(&surface_id))
-                    .map(|lp| (lp.width, lp.height, lp.pixels.clone()))
+                    .map(|lp| (lp.width, lp.height, lp.pixels.clone()));
+                let cmd_tx = sess
+                    .compositor
+                    .as_ref()
+                    .map(|cs| cs.handle.command_tx.clone());
+                (snap, cmd_tx)
             };
 
-            // Convert to RGBA for capture.  The compositor already composed
-            // the surface tree via GlesRenderer — we just need the format
-            // conversion.
-            eprintln!("[capture] converting to RGBA");
-            let captured = snapshot.map(|(w, h, pixels)| {
-                eprintln!("[capture] to_rgba {w}x{h}");
-                let rgba = pixels.to_rgba(w, h);
-                eprintln!("[capture] to_rgba done: {} bytes", rgba.len());
-                (w, h, rgba)
-            });
+            // Compositor direct capture (CPU compositing from the per-surface
+            // pixel cache).  This is the primary path — it produces correct
+            // lossless results for clients that use CPU-mappable DMA-BUFs
+            // (Chromium/Brave) or SHM buffers.
+            let mut captured: Option<(u32, u32, Vec<u8>)> = None;
+            if let Some(ctx) = command_tx {
+                captured = request_surface_capture_with_timeout(
+                    ctx,
+                    surface_id,
+                    scale_120,
+                    Duration::from_secs(5),
+                )
+                .await;
+            }
+
+            // Fallback: last_pixels from the video pipeline.  Used when
+            // the compositor capture returns nothing (no cached buffers).
+            if captured.is_none() {
+                captured = snapshot.and_then(|(w, h, pixels)| {
+                    if pixels.is_dmabuf() {
+                        return None;
+                    }
+                    let rgba = pixels.to_rgba(w, h);
+                    if rgba.is_empty() {
+                        None
+                    } else {
+                        Some((w, h, rgba))
+                    }
+                });
+            }
+
             eprintln!("[capture] acquiring client_tx lock");
             let client_tx = {
                 let sess = state.session.lock().await;
                 eprintln!("[capture] client_tx lock acquired");
-                sess.clients.get(&client_id).map(|c| c.tx.clone())
+                sess.clients.get(&client_id).map(|c| {
+                    (
+                        c.tx.clone(),
+                        c.outbox_queued_frames.clone(),
+                        c.outbox_queued_bytes.clone(),
+                    )
+                })
             };
 
             if let Some((w, h, rgba_pixels)) = captured {
@@ -3044,9 +3801,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 reply_msg.extend_from_slice(&0u32.to_le_bytes());
             }
 
-            if let Some(client_tx) = client_tx {
+            if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
                 eprintln!("[capture] sending reply: {} bytes", reply_msg.len());
-                match client_tx.try_send(reply_msg) {
+                match try_send_outbox_tracked(&client_tx, &queued_frames, &queued_bytes, reply_msg)
+                {
                     Ok(()) => eprintln!("[capture] sent OK"),
                     Err(e) => eprintln!("[capture] try_send failed: {e}"),
                 }
@@ -3054,6 +3812,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 eprintln!("[capture] no client_tx");
             }
             continue;
+        }
+
+        if data[0] == C2S_QUIT {
+            let sess = state.session.lock().await;
+            sess.send_to_all(&[S2C_QUIT]);
+            drop(sess);
+            state.shutdown_notify.notify_waiters();
+            break;
         }
 
         let mut sess = state.session.lock().await;
@@ -3150,6 +3916,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
+                #[cfg(unix)]
+                let pulse_server = sess.pulse_server_path();
+                #[cfg(not(unix))]
+                let pulse_server: Option<String> = None;
+                #[cfg(unix)]
+                let pipewire_remote = sess.pipewire_remote_path();
+                #[cfg(not(unix))]
+                let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
@@ -3163,6 +3937,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    pulse_server.as_deref(),
+                    pipewire_remote.as_deref(),
                 ) {
                     let mut msg = Vec::with_capacity(3 + pty.tag.len());
                     msg.push(S2C_CREATED);
@@ -3232,6 +4008,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
+                #[cfg(unix)]
+                let pulse_server = sess.pulse_server_path();
+                #[cfg(not(unix))]
+                let pulse_server: Option<String> = None;
+                #[cfg(unix)]
+                let pipewire_remote = sess.pipewire_remote_path();
+                #[cfg(not(unix))]
+                let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
@@ -3245,6 +4029,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    pulse_server.as_deref(),
+                    pipewire_remote.as_deref(),
                 ) {
                     let tag_bytes = pty.tag.as_bytes();
                     let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
@@ -3262,11 +4048,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         c.view_sizes.insert(id, (rows, cols));
                         subscribe_client_to(c, id);
                         reset_inflight(c);
-                        let _ = c.tx.try_send(nonce_msg);
+                        let _ = try_send_outbox(c, nonce_msg);
                     }
                     for (&cid, c) in sess.clients.iter() {
                         if cid != client_id {
-                            let _ = c.tx.try_send(broadcast_msg.clone());
+                            let _ = try_send_outbox(c, broadcast_msg.clone());
                         }
                     }
                     need_nudge = true;
@@ -3309,6 +4095,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
+                #[cfg(unix)]
+                let pulse_server = sess.pulse_server_path();
+                #[cfg(not(unix))]
+                let pulse_server: Option<String> = None;
+                #[cfg(unix)]
+                let pipewire_remote = sess.pipewire_remote_path();
+                #[cfg(not(unix))]
+                let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
@@ -3322,6 +4116,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    pulse_server.as_deref(),
+                    pipewire_remote.as_deref(),
                 ) {
                     let mut msg = Vec::with_capacity(3 + pty.tag.len());
                     msg.push(S2C_CREATED);
@@ -3383,6 +4179,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
+                #[cfg(unix)]
+                let pulse_server = sess.pulse_server_path();
+                #[cfg(not(unix))]
+                let pulse_server: Option<String> = None;
+                #[cfg(unix)]
+                let pipewire_remote = sess.pipewire_remote_path();
+                #[cfg(not(unix))]
+                let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
@@ -3396,6 +4200,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    pulse_server.as_deref(),
+                    pipewire_remote.as_deref(),
                 ) {
                     let tag_bytes = pty.tag.as_bytes();
                     let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
@@ -3413,21 +4219,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         c.view_sizes.insert(id, (rows, cols));
                         subscribe_client_to(c, id);
                         reset_inflight(c);
-                        let _ = c.tx.try_send(nonce_msg);
+                        let _ = try_send_outbox(c, nonce_msg);
                     }
                     for (&cid, c) in sess.clients.iter() {
                         if cid != client_id {
-                            let _ = c.tx.try_send(broadcast_msg.clone());
+                            let _ = try_send_outbox(c, broadcast_msg.clone());
                         }
                     }
                     need_nudge = true;
                 }
             }
-            C2S_SURFACE_INPUT if data.len() >= 10 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let keycode = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
-                let pressed = data[9] != 0;
+            C2S_SURFACE_INPUT if data.len() >= 8 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let keycode = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+                let pressed = data[7] != 0;
                 if let Some(client) = sess.clients.get_mut(&client_id) {
                     if pressed {
                         client.pressed_surface_keys.insert(keycode);
@@ -3435,11 +4240,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         client.pressed_surface_keys.remove(&keycode);
                     }
                 }
-                if let Some(cs) = sess
-                    .compositor
-                    .as_mut()
-                    .filter(|cs| session_id == 0 || cs.session_id == session_id)
-                {
+                if let Some(cs) = sess.compositor.as_mut() {
                     let _ = cs.handle.command_tx.send(CompositorCommand::KeyInput {
                         surface_id,
                         keycode,
@@ -3449,18 +4250,25 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     state.delivery_notify.notify_one();
                 }
             }
-            C2S_SURFACE_POINTER if data.len() >= 11 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let ptype = data[5];
-                let button = data[6];
-                let x = u16::from_le_bytes([data[7], data[8]]) as f64;
-                let y = u16::from_le_bytes([data[9], data[10]]) as f64;
-                if let Some(cs) = sess
-                    .compositor
-                    .as_mut()
-                    .filter(|cs| session_id == 0 || cs.session_id == session_id)
+            C2S_SURFACE_TEXT if data.len() >= 3 => {
+                let _surface_id = u16::from_le_bytes([data[1], data[2]]);
+                if let Ok(text) = std::str::from_utf8(&data[3..])
+                    && let Some(cs) = sess.compositor.as_mut()
                 {
+                    let _ = cs.handle.command_tx.send(CompositorCommand::TextInput {
+                        text: text.to_string(),
+                    });
+                    cs.handle.wake();
+                    state.delivery_notify.notify_one();
+                }
+            }
+            C2S_SURFACE_POINTER if data.len() >= 9 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let ptype = data[3];
+                let button = data[4];
+                let x = u16::from_le_bytes([data[5], data[6]]) as f64;
+                let y = u16::from_le_bytes([data[7], data[8]]) as f64;
+                if let Some(cs) = sess.compositor.as_mut() {
                     match ptype {
                         0 | 1 => {
                             let _ = cs.handle.command_tx.send(CompositorCommand::PointerMotion {
@@ -3491,17 +4299,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 state.delivery_notify.notify_one();
             }
-            C2S_SURFACE_POINTER_AXIS if data.len() >= 10 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let axis = data[5];
-                let value_x100 = i32::from_le_bytes([data[6], data[7], data[8], data[9]]);
+            C2S_SURFACE_POINTER_AXIS if data.len() >= 8 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let axis = data[3];
+                let value_x100 = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 let value = value_x100 as f64 / 100.0;
-                if let Some(cs) = sess
-                    .compositor
-                    .as_mut()
-                    .filter(|cs| session_id == 0 || cs.session_id == session_id)
-                {
+                if let Some(cs) = sess.compositor.as_mut() {
                     let _ = cs.handle.command_tx.send(CompositorCommand::PointerAxis {
                         surface_id,
                         axis,
@@ -3512,54 +4315,44 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 state.delivery_notify.notify_one();
             }
             C2S_SURFACE_RESIZE if data.len() >= 9 => {
-                let _session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let width = u16::from_le_bytes([data[5], data[6]]);
-                let height = u16::from_le_bytes([data[7], data[8]]);
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let width = u16::from_le_bytes([data[3], data[4]]);
+                let height = u16::from_le_bytes([data[5], data[6]]);
                 // Scale in 1/120th units (Wayland convention): 240 = 2×.
-                let scale_120 = if data.len() >= 11 {
-                    u16::from_le_bytes([data[9], data[10]])
-                } else {
-                    0
-                };
-                // Codec support bitmask (CODEC_SUPPORT_*). 0 = accept anything.
-                let codec_support = if data.len() >= 12 { data[11] } else { 0 };
+                let scale_120 = u16::from_le_bytes([data[7], data[8]]);
+                if state.config.verbose {
+                    eprintln!(
+                        "C2S_SURFACE_RESIZE: cid={client_id} sid={surface_id} {width}x{height} scale={scale_120}"
+                    );
+                }
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     if is_unset_view_size(width, height) {
                         c.surface_view_sizes.remove(&surface_id);
                     } else if width > 0 && height > 0 {
                         c.surface_view_sizes
-                            .insert(surface_id, (width, height, scale_120, codec_support));
+                            .insert(surface_id, (width, height, scale_120));
                     }
-                    c.surface_codec_support = codec_support;
                 }
                 sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
                 );
             }
-            C2S_SURFACE_FOCUS if data.len() >= 5 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                if let Some(cs) = sess
-                    .compositor
-                    .as_ref()
-                    .filter(|cs| session_id == 0 || cs.session_id == session_id)
-                {
+            C2S_SURFACE_FOCUS if data.len() >= 3 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                if state.config.verbose {
+                    eprintln!("C2S_SURFACE_FOCUS: cid={client_id} sid={surface_id}");
+                }
+                if let Some(cs) = sess.compositor.as_ref() {
                     let _ = cs
                         .handle
                         .command_tx
                         .send(CompositorCommand::SurfaceFocus { surface_id });
                 }
             }
-            C2S_SURFACE_CLOSE if data.len() >= 5 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                if let Some(cs) = sess
-                    .compositor
-                    .as_ref()
-                    .filter(|cs| session_id == 0 || cs.session_id == session_id)
-                {
+            C2S_SURFACE_CLOSE if data.len() >= 3 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                if let Some(cs) = sess.compositor.as_ref() {
                     let _ = cs
                         .handle
                         .command_tx
@@ -3567,17 +4360,48 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     cs.handle.wake();
                 }
             }
-            C2S_SURFACE_SUBSCRIBE if data.len() >= 5 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+            C2S_SURFACE_SUBSCRIBE if data.len() >= 3 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                // Extended fields (backward-compatible: absent = 0 = defaults).
+                let codec_support = if data.len() >= 4 { data[3] } else { 0 };
+                let quality_wire = if data.len() >= 5 { data[4] } else { 0 };
                 if state.config.verbose {
                     eprintln!(
-                        "C2S_SURFACE_SUBSCRIBE: cid={client_id} session={session_id} surface={surface_id}"
+                        "C2S_SURFACE_SUBSCRIBE: cid={client_id} surface={surface_id} codec={codec_support:#04x} quality={quality_wire}"
                     );
                 }
                 if let Some(c) = sess.clients.get_mut(&client_id) {
-                    c.surface_subscriptions.insert(surface_id);
+                    let was_subscribed = !c.surface_subscriptions.insert(surface_id);
                     c.surface_needs_keyframe = true;
+                    // Reset burst window so the first frames after (re)subscribe
+                    // bypass time-based pacing and flow at wire speed.
+                    c.surface_burst_remaining = SURFACE_BURST_FRAMES;
+
+                    // Track per-surface codec/quality overrides.
+                    let old_codec = c
+                        .surface_codec_overrides
+                        .get(&surface_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let old_quality = c.surface_quality_overrides.get(&surface_id).copied();
+                    let new_quality = SurfaceQuality::from_wire(quality_wire);
+
+                    if codec_support != 0 {
+                        c.surface_codec_overrides.insert(surface_id, codec_support);
+                    } else {
+                        c.surface_codec_overrides.remove(&surface_id);
+                    }
+                    if let Some(q) = new_quality {
+                        c.surface_quality_overrides.insert(surface_id, q);
+                    } else {
+                        c.surface_quality_overrides.remove(&surface_id);
+                    }
+
+                    // Force encoder recreation if preferences changed on resubscribe.
+                    if was_subscribed && (codec_support != old_codec || new_quality != old_quality)
+                    {
+                        c.surface_encoders.remove(&surface_id);
+                    }
                 }
                 // Clear pending_frame_requests so the tick loop sends a fresh
                 // RequestFrame.  Without this, a stale entry from a previous
@@ -3588,31 +4412,98 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 state.delivery_notify.notify_one();
             }
-            C2S_SURFACE_UNSUBSCRIBE if data.len() >= 5 => {
-                let _session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
+            C2S_SURFACE_UNSUBSCRIBE if data.len() >= 3 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.surface_subscriptions.remove(&surface_id);
                     c.surface_view_sizes.remove(&surface_id);
+                    c.surface_codec_overrides.remove(&surface_id);
+                    c.surface_quality_overrides.remove(&surface_id);
                 }
                 sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
                 );
             }
-            C2S_SURFACE_REQUEST_KEYFRAME if data.len() >= 3 => {
-                let _surface_id = u16::from_le_bytes([data[1], data[2]]);
+            #[cfg(unix)]
+            C2S_AUDIO_SUBSCRIBE if data.len() >= 3 => {
+                let bitrate_kbps = u16::from_le_bytes([data[1], data[2]]);
                 if let Some(c) = sess.clients.get_mut(&client_id) {
-                    c.surface_needs_keyframe = true;
+                    c.audio_subscribed = true;
+                    c.audio_bitrate_kbps = bitrate_kbps;
+                    if state.config.verbose {
+                        eprintln!(
+                            "C2S_AUDIO_SUBSCRIBE: cid={client_id} bitrate_kbps={bitrate_kbps}"
+                        );
+                    }
+                    // Send ring buffer catch-up frames via the audio channel.
+                    if let Some(cs) = sess.compositor.as_mut()
+                        && let Some(ref ap) = cs.audio_pipeline
+                    {
+                        let msgs: Vec<_> = ap.ring_frames().map(audio::msg_audio_frame).collect();
+                        if let Some(c) = sess.clients.get(&client_id) {
+                            for msg in msgs {
+                                let _ = c.audio_tx.try_send(msg);
+                            }
+                        }
+                    }
+                }
+                // Recompute the effective audio bitrate across all
+                // subscribed clients (use the max requested bitrate).
+                if let Some(cs) = sess.compositor.as_ref()
+                    && let Some(ref ap) = cs.audio_pipeline
+                {
+                    let max_kbps = sess
+                        .clients
+                        .values()
+                        .filter(|c| c.audio_subscribed)
+                        .map(|c| c.audio_bitrate_kbps)
+                        .max()
+                        .unwrap_or(0);
+                    let bitrate = if max_kbps > 0 {
+                        max_kbps as i32 * 1000
+                    } else {
+                        audio::DEFAULT_BITRATE
+                    };
+                    ap.set_bitrate(bitrate);
                 }
                 state.delivery_notify.notify_one();
             }
+            #[cfg(unix)]
+            C2S_AUDIO_UNSUBSCRIBE if !data.is_empty() => {
+                if let Some(c) = sess.clients.get_mut(&client_id) {
+                    c.audio_subscribed = false;
+                    c.audio_bitrate_kbps = 0;
+                    if state.config.verbose {
+                        eprintln!("C2S_AUDIO_UNSUBSCRIBE: cid={client_id}");
+                    }
+                }
+                // Recompute effective bitrate after unsubscribe.
+                if let Some(cs) = sess.compositor.as_ref()
+                    && let Some(ref ap) = cs.audio_pipeline
+                {
+                    let max_kbps = sess
+                        .clients
+                        .values()
+                        .filter(|c| c.audio_subscribed)
+                        .map(|c| c.audio_bitrate_kbps)
+                        .max()
+                        .unwrap_or(0);
+                    let bitrate = if max_kbps > 0 {
+                        max_kbps as i32 * 1000
+                    } else {
+                        audio::DEFAULT_BITRATE
+                    };
+                    ap.set_bitrate(bitrate);
+                }
+            }
             C2S_SURFACE_ACK if data.len() >= 3 => {
-                // Surface ACKs share the same inflight window as terminal ACKs
-                // so RTT / goodput / window sizing applies uniformly.
+                // Surface ACKs feed shared RTT / delivery_bps / goodput_bps
+                // from a separate inflight queue so they don't corrupt
+                // terminal frame-size averages or probe_frames.
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.acks_recv += 1;
-                    record_ack(c);
+                    record_surface_ack(c);
                 }
                 state.delivery_notify.notify_one();
             }
@@ -3624,33 +4515,26 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     c.surface_codec_support = codec_support;
                 }
             }
-            C2S_CLIPBOARD if data.len() >= 9 => {
-                let session_id = u16::from_le_bytes([data[1], data[2]]);
-                let surface_id = u16::from_le_bytes([data[3], data[4]]);
-                let mime_len = u16::from_le_bytes([data[5], data[6]]) as usize;
-                if data.len() >= 7 + mime_len + 4 {
-                    let mime = std::str::from_utf8(&data[7..7 + mime_len])
+            C2S_CLIPBOARD_SET if data.len() >= 5 => {
+                let mime_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+                if data.len() >= 3 + mime_len + 4 {
+                    let mime = std::str::from_utf8(&data[3..3 + mime_len])
                         .unwrap_or("text/plain")
                         .to_string();
                     let data_len = u32::from_le_bytes([
-                        data[7 + mime_len],
-                        data[8 + mime_len],
-                        data[9 + mime_len],
-                        data[10 + mime_len],
+                        data[3 + mime_len],
+                        data[4 + mime_len],
+                        data[5 + mime_len],
+                        data[6 + mime_len],
                     ]) as usize;
-                    let payload_start = 11 + mime_len;
+                    let payload_start = 7 + mime_len;
                     if data.len() >= payload_start + data_len {
                         let payload = data[payload_start..payload_start + data_len].to_vec();
-                        if let Some(cs) = sess
-                            .compositor
-                            .as_ref()
-                            .filter(|cs| cs.session_id == session_id)
-                        {
+                        if let Some(cs) = sess.compositor.as_ref() {
                             let _ = cs
                                 .handle
                                 .command_tx
                                 .send(CompositorCommand::ClipboardOffer {
-                                    surface_id,
                                     mime_type: mime,
                                     data: payload,
                                 });
@@ -3658,10 +4542,88 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
             }
-            C2S_SURFACE_LIST if data.len() >= 3 => {
+            C2S_CLIPBOARD_LIST if !data.is_empty() => {
+                if let Some(cs) = sess.compositor.as_ref() {
+                    let command_tx = cs.handle.command_tx.clone();
+                    let client_tx = sess.clients.get(&client_id).map(|c| {
+                        (
+                            c.tx.clone(),
+                            c.outbox_queued_frames.clone(),
+                            c.outbox_queued_bytes.clone(),
+                        )
+                    });
+                    if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
+                        tokio::task::spawn_blocking(move || {
+                            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                            if command_tx
+                                .send(CompositorCommand::ClipboardListMimes { reply: tx })
+                                .is_ok()
+                                && let Ok(mimes) = rx.recv_timeout(Duration::from_secs(2))
+                            {
+                                let _ = try_send_outbox_tracked(
+                                    &client_tx,
+                                    &queued_frames,
+                                    &queued_bytes,
+                                    msg_s2c_clipboard_list(&mimes),
+                                );
+                            }
+                        });
+                    }
+                } else {
+                    // No compositor — respond with empty list.
+                    if let Some(c) = sess.clients.get(&client_id) {
+                        let _ = try_send_outbox(c, msg_s2c_clipboard_list(&[]));
+                    }
+                }
+            }
+            C2S_CLIPBOARD_GET if data.len() >= 3 => {
+                let mime_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+                if data.len() >= 3 + mime_len {
+                    let mime = std::str::from_utf8(&data[3..3 + mime_len])
+                        .unwrap_or("text/plain")
+                        .to_string();
+                    if let Some(cs) = sess.compositor.as_ref() {
+                        let command_tx = cs.handle.command_tx.clone();
+                        let client_tx = sess.clients.get(&client_id).map(|c| {
+                            (
+                                c.tx.clone(),
+                                c.outbox_queued_frames.clone(),
+                                c.outbox_queued_bytes.clone(),
+                            )
+                        });
+                        if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
+                            tokio::task::spawn_blocking(move || {
+                                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                                if command_tx
+                                    .send(CompositorCommand::ClipboardGet {
+                                        mime_type: mime.clone(),
+                                        reply: tx,
+                                    })
+                                    .is_ok()
+                                    && let Ok(content) = rx.recv_timeout(Duration::from_secs(2))
+                                {
+                                    let data = content.unwrap_or_default();
+                                    let _ = try_send_outbox_tracked(
+                                        &client_tx,
+                                        &queued_frames,
+                                        &queued_bytes,
+                                        msg_s2c_clipboard_content(&mime, &data),
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        // No compositor — respond with empty clipboard.
+                        if let Some(c) = sess.clients.get(&client_id) {
+                            let _ = try_send_outbox(c, msg_s2c_clipboard_content(&mime, &[]));
+                        }
+                    }
+                }
+            }
+            C2S_SURFACE_LIST if !data.is_empty() => {
                 let msg = sess.surface_list_msg();
                 if let Some(c) = sess.clients.get(&client_id) {
-                    let _ = c.tx.try_send(msg);
+                    let _ = try_send_outbox(c, msg);
                 }
             }
             C2S_FOCUS if data.len() >= 3 => {
@@ -3722,6 +4684,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .compositor
                         .as_ref()
                         .map(|cs| cs.handle.socket_name.clone());
+                    #[cfg(unix)]
+                    let pulse_server = sess.pulse_server_path();
+                    #[cfg(not(unix))]
+                    let pulse_server: Option<String> = None;
+                    #[cfg(unix)]
+                    let pipewire_remote = sess.pipewire_remote_path();
+                    #[cfg(not(unix))]
+                    let pipewire_remote: Option<String> = None;
                     if let Some((new_handle, reader, byte_rx)) = pty::respawn_child(
                         &state.config.shell,
                         &state.config.shell_flags,
@@ -3731,6 +4701,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         command.as_deref(),
                         state.clone(),
                         wayland_display.as_deref(),
+                        pulse_server.as_deref(),
+                        pipewire_remote.as_deref(),
                     ) {
                         let Some(pty) = sess.ptys.get_mut(&pid) else {
                             break;
@@ -3836,7 +4808,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     msg.extend_from_slice(&(start as u32).to_le_bytes());
                     msg.extend_from_slice(text.as_bytes());
                     if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = client.tx.try_send(msg);
+                        let _ = try_send_outbox(client, msg);
                     }
                 }
             }
@@ -3862,7 +4834,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     msg.extend_from_slice(&start_tail.to_le_bytes());
                     msg.extend_from_slice(text.as_bytes());
                     if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = client.tx.try_send(msg);
+                        let _ = try_send_outbox(client, msg);
                     }
                 }
             }
@@ -3889,14 +4861,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let mut msg = vec![S2C_CLOSED];
                     msg.extend_from_slice(&pid.to_le_bytes());
                     sess.send_to_all(&msg);
-                    // Shut down the compositor when all PTYs are gone.
-                    let all_done = sess.ptys.is_empty() || sess.ptys.values().all(|p| p.exited);
-                    if all_done && let Some(cs) = sess.compositor.take() {
-                        cs.handle
-                            .shutdown
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = cs.handle.command_tx.send(CompositorCommand::Shutdown);
-                    }
                 }
             }
             _ => {}
@@ -3954,11 +4918,18 @@ mod tests {
 
     fn test_client_with_capacity(capacity: usize) -> (ClientState, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(capacity);
+        let (audio_tx, _audio_rx) = mpsc::channel(AUDIO_OUTBOX_CAPACITY);
         let client = ClientState {
             tx,
+            outbox_queued_frames: Arc::new(AtomicUsize::new(0)),
+            outbox_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            audio_tx,
             lead: None,
             subscriptions: HashSet::new(),
             surface_subscriptions: HashSet::new(),
+            audio_subscribed: false,
+            #[cfg(unix)]
+            audio_bitrate_kbps: 0,
             view_sizes: HashMap::new(),
             scroll_offsets: HashMap::new(),
             scroll_caches: HashMap::new(),
@@ -3975,6 +4946,7 @@ mod tests {
             avg_frame_bytes: 1_024.0,
             avg_paced_frame_bytes: 1_024.0,
             avg_preview_frame_bytes: 1_024.0,
+            avg_surface_frame_bytes: 8_192.0,
             inflight_bytes: 0,
             inflight_frames: VecDeque::new(),
             next_send_at: Instant::now(),
@@ -3991,12 +4963,15 @@ mod tests {
             goodput_window_start: Instant::now(),
             surface_next_send_at: Instant::now(),
             surface_needs_keyframe: true,
+            surface_burst_remaining: SURFACE_BURST_FRAMES,
+            surface_inflight_frames: VecDeque::new(),
             surface_encoders: HashMap::new(),
             surface_encodes_in_flight: HashSet::new(),
-            surface_last_frames: HashMap::new(),
             surface_last_encoded_gen: HashMap::new(),
             surface_view_sizes: HashMap::new(),
             surface_codec_support: 0,
+            surface_codec_overrides: HashMap::new(),
+            surface_quality_overrides: HashMap::new(),
             pressed_surface_keys: HashSet::new(),
         };
         (client, rx)
@@ -4059,8 +5034,8 @@ mod tests {
         let mut session = Session::new();
         let mut c1 = test_client();
         let mut c2 = test_client();
-        c1.surface_view_sizes.insert(1, (1920, 1080, 240, 0)); // 2×
-        c2.surface_view_sizes.insert(1, (1280, 720, 120, 0)); // 1×
+        c1.surface_view_sizes.insert(1, (1920, 1080, 240)); // 2×
+        c2.surface_view_sizes.insert(1, (1280, 720, 120)); // 1×
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
@@ -4079,7 +5054,7 @@ mod tests {
     fn mediated_surface_size_single_client() {
         let mut session = Session::new();
         let mut c1 = test_client();
-        c1.surface_view_sizes.insert(3, (800, 600, 120, 0));
+        c1.surface_view_sizes.insert(3, (800, 600, 120));
         session.clients.insert(1, c1);
         assert_eq!(
             session.mediated_size_for_surface(3, None),
@@ -4091,8 +5066,8 @@ mod tests {
     fn mediated_surface_size_ignores_other_surfaces() {
         let mut session = Session::new();
         let mut c1 = test_client();
-        c1.surface_view_sizes.insert(1, (1920, 1080, 240, 0));
-        c1.surface_view_sizes.insert(2, (640, 480, 120, 0));
+        c1.surface_view_sizes.insert(1, (1920, 1080, 240));
+        c1.surface_view_sizes.insert(2, (640, 480, 120));
         session.clients.insert(1, c1);
         assert_eq!(
             session.mediated_size_for_surface(1, None),
@@ -4109,7 +5084,7 @@ mod tests {
     fn mediated_surface_size_clamped_to_encoder_max() {
         let mut session = Session::new();
         let mut c1 = test_client();
-        c1.surface_view_sizes.insert(1, (5000, 3000, 240, 0));
+        c1.surface_view_sizes.insert(1, (5000, 3000, 240));
         session.clients.insert(1, c1);
         assert_eq!(
             session.mediated_size_for_surface(1, None),
@@ -4172,7 +5147,11 @@ mod tests {
         std::thread::Builder::new()
             .name("test-capture-reply".into())
             .spawn(move || {
-                let CompositorCommand::Capture { surface_id, reply } = command_rx.recv().unwrap()
+                let CompositorCommand::Capture {
+                    surface_id,
+                    scale_120: _,
+                    reply,
+                } = command_rx.recv().unwrap()
                 else {
                     panic!("expected capture command");
                 };
@@ -4182,7 +5161,7 @@ mod tests {
             .unwrap();
 
         let result =
-            request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;
+            request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
 
         assert_eq!(result, Some((2, 3, vec![1, 2, 3, 4])));
     }
@@ -4198,7 +5177,7 @@ mod tests {
             .unwrap();
 
         let result =
-            request_surface_capture_with_timeout(command_tx, 7, Duration::from_millis(50)).await;
+            request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
 
         assert_eq!(result, None);
     }
@@ -4383,8 +5362,24 @@ mod tests {
         let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
         // Fill the channel to trigger backpressure
         for _ in 0..OUTBOX_SOFT_QUEUE_LIMIT_FRAMES {
-            let _ = client.tx.try_send(vec![0u8]);
+            let _ = try_send_outbox(&client, vec![0u8]);
         }
+        assert!(outbox_backpressured(&client));
+    }
+
+    #[test]
+    fn outbox_not_backpressured_by_small_frames_under_byte_budget() {
+        let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
+        for _ in 0..(OUTBOX_SOFT_QUEUE_LIMIT_FRAMES - 1) {
+            let _ = try_send_outbox(&client, vec![0u8; 512]);
+        }
+        assert!(!outbox_backpressured(&client));
+    }
+
+    #[test]
+    fn outbox_backpressured_by_large_queued_bytes() {
+        let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
+        let _ = try_send_outbox(&client, vec![0u8; OUTBOX_SOFT_QUEUE_LIMIT_BYTES]);
         assert!(outbox_backpressured(&client));
     }
 
@@ -5663,7 +6658,7 @@ mod tests {
         let (mut client, _rx) = test_client_with_capacity(1);
         let frame = sample_frame("x");
         let now = Instant::now();
-        let _ = client.tx.try_send(vec![0]);
+        let _ = try_send_outbox(&client, vec![0]);
         let outcome = try_send_update(
             &mut client,
             1,

@@ -200,6 +200,7 @@ export function PaletteOverlay(props: {
           </div>
           <input
             ref={inputRef!}
+            name="blit-palette-search"
             type="text"
             value={query()}
             onInput={(e) => setQuery(e.currentTarget.value)}

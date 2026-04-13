@@ -4,7 +4,6 @@ import {
   SURFACE_FRAME_CODEC_MASK,
   SURFACE_FRAME_CODEC_H264,
   SURFACE_FRAME_CODEC_AV1,
-  SURFACE_FRAME_CODEC_H265,
 } from "./types";
 
 /**
@@ -18,7 +17,25 @@ export type SurfaceEventCallback = (
   surfaces: ReadonlyMap<number, BlitSurface>,
 ) => void;
 
-type SurfaceCodec = "h264" | "av1" | "h265";
+/** Timestamped record of an incoming surface video frame. */
+export interface SurfaceFrameSample {
+  /** `performance.now()` when the frame arrived. */
+  t: number;
+  /** Encoded frame payload size in bytes. */
+  bytes: number;
+  /** Whether this was a keyframe. */
+  key: boolean;
+}
+
+type SurfaceCodec = "h264" | "av1";
+
+/**
+ * Maximum decode queue depth before we defer the surface ACK.  When the
+ * WebCodecs decoder's internal queue is at or above this threshold the ACK
+ * is held back, which stalls the server's pacing window and prevents it
+ * from flooding the client faster than it can decode.
+ */
+const MAX_DECODE_QUEUE_FOR_ACK = 2;
 
 interface DecoderEntry {
   decoder: VideoDecoder;
@@ -27,6 +44,8 @@ interface DecoderEntry {
   /** Last HVCC/AVCC description bytes, used to avoid reconfiguring on every
    *  keyframe when the parameter sets haven't changed. */
   lastDescription: string | null;
+  /** Surface IDs awaiting ACK, held back because the decode queue was deep. */
+  pendingAcks: number;
 }
 
 interface CanvasEntry {
@@ -37,31 +56,70 @@ interface CanvasEntry {
 function codecFromFlags(flags: number): SurfaceCodec {
   const bits = flags & SURFACE_FRAME_CODEC_MASK;
   if (bits === SURFACE_FRAME_CODEC_AV1) return "av1";
-  if (bits === SURFACE_FRAME_CODEC_H265) return "h265";
   return "h264";
 }
 
+/**
+ * Compute AV1 level index from coded dimensions, mirroring the server's
+ * `compute_level()` in vaapi_encode.rs.  Returns the two-digit level
+ * string used in the av01 codec string (e.g. "05" for level 3.1).
+ */
+function av1LevelString(width: number, height: number): string {
+  // Assume 60 fps — matches the server's compute_level(w, h, 60).
+  const sps = width * height * 60;
+  const specs: [string, number, number, number][] = [
+    ["00", 2048, 1152, 5529600],
+    ["01", 2816, 1152, 10454400],
+    ["04", 4352, 2448, 24969600],
+    ["05", 5504, 3096, 39938400],
+    ["08", 6144, 3456, 77856768],
+    ["09", 6144, 3456, 155713536],
+    ["12", 8192, 4352, 273715200],
+    ["13", 8192, 4352, 547430400],
+    ["16", 16384, 8704, 1176502272],
+  ];
+  for (const [level, maxW, maxH, maxRate] of specs) {
+    if (width <= maxW && height <= maxH && sps <= maxRate) return level;
+  }
+  return "16";
+}
+
 /** WebCodecs codec string for the given surface codec. */
-function codecString(codec: SurfaceCodec): string {
-  if (codec === "av1") return "av01.0.01M.08"; // Main profile, level 2.1, 8-bit
-  // hev1 / avc3: parameter sets in-band (description optional but provided
-  // on keyframes for platform decoders that need it up front).
-  if (codec === "h265") return "hev1.1.6.L93.B0"; // Main profile, level 3.1
-  // Constrained Baseline, level 5.2.  Using avc1 (description out-of-band)
-  // rather than avc3 (in-band) because many WebCodecs implementations
-  // require an explicit AVCDecoderConfigurationRecord description.
-  return "avc1.420034";
+function codecString(
+  codec: SurfaceCodec,
+  width?: number,
+  height?: number,
+  sps?: Uint8Array,
+): string {
+  if (codec === "av1") {
+    const level = width && height ? av1LevelString(width, height) : "13";
+    return `av01.0.${level}M.08`;
+  }
+  // Derive the avc1 codec string from the SPS so it matches the actual
+  // profile/level NVENC (or any encoder) produces.  The old hardcoded
+  // "avc1.420034" claimed Baseline profile, but NVENC's P1 preset emits
+  // High profile (CABAC).  A decoder selected for Baseline can't handle
+  // CABAC, producing black macroblocks.
+  if (sps && sps.length >= 4) {
+    const profile = sps[1];
+    const compat = sps[2];
+    const level = sps[3];
+    const hex = (b: number) => b.toString(16).padStart(2, "0");
+    return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
+  }
+  // Fallback: High profile level 5.2 — safe for any modern decoder.
+  return "avc1.640034";
 }
 
 // ---------------------------------------------------------------------------
 // Annex B → length-prefixed NAL conversion
 //
 // The server sends Annex B bitstreams (start-code delimited NAL units).
-// WebCodecs defaults to length-prefixed containers (AVCC for H.264,
-// HVCC for H.265).  The `avc.format` / `hevc.format` annexb hints are
-// not universally supported (macOS VideoToolbox rejects with -12909,
-// Windows Media Foundation doesn't support the option at all), so we
-// convert Annex B → 4-byte-length-prefixed on every frame.
+// WebCodecs defaults to length-prefixed containers (AVCC for H.264).
+// The `avc.format` annexb hint is not universally supported (macOS
+// VideoToolbox rejects with -12909, Windows Media Foundation doesn't
+// support the option at all), so we convert Annex B →
+// 4-byte-length-prefixed on every frame.
 // ---------------------------------------------------------------------------
 
 /** Split Annex B byte stream into individual NAL units (without start codes). */
@@ -123,107 +181,6 @@ function toLengthPrefixed(nals: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** HEVC NAL unit type from the first byte of the NAL. */
-function hevcNalType(nal: Uint8Array): number {
-  return (nal[0] >>> 1) & 0x3f;
-}
-
-/** Remove Annex B emulation prevention bytes (0x00 0x00 0x03 → 0x00 0x00). */
-function removeEPB(nal: Uint8Array): Uint8Array {
-  const out: number[] = [];
-  let i = 0;
-  while (i < nal.length) {
-    if (
-      i + 2 < nal.length &&
-      nal[i] === 0 &&
-      nal[i + 1] === 0 &&
-      nal[i + 2] === 3
-    ) {
-      out.push(0, 0);
-      i += 3;
-    } else {
-      out.push(nal[i]);
-      i++;
-    }
-  }
-  return new Uint8Array(out);
-}
-
-/**
- * Build an HEVCDecoderConfigurationRecord (ISO 14496-15 §8.3.3.1)
- * from raw VPS, SPS, and PPS NAL units (without start codes).
- */
-function buildHvccDescription(
-  vps: Uint8Array,
-  sps: Uint8Array,
-  pps: Uint8Array,
-): ArrayBuffer {
-  // Parse profile/tier/level from VPS RBSP (must strip emulation prevention
-  // bytes first — the raw NAL contains 0x00 0x00 0x03 sequences that shift
-  // byte offsets).
-  const rbsp = removeEPB(vps);
-  const profileSpace = (rbsp[6] >>> 6) & 0x3;
-  const tierFlag = (rbsp[6] >>> 5) & 0x1;
-  const profileIdc = rbsp[6] & 0x1f;
-  const compatFlags =
-    (rbsp[7] << 24) | (rbsp[8] << 16) | (rbsp[9] << 8) | rbsp[10];
-  const constraintBytes = rbsp.subarray(11, 17); // 6 bytes
-  const levelIdc = rbsp[17];
-
-  // Fixed fields for our use case
-  const lengthSizeMinusOne = 3; // 4-byte NAL lengths
-
-  const arrays = [
-    { type: 32, nals: [vps] }, // VPS
-    { type: 33, nals: [sps] }, // SPS
-    { type: 34, nals: [pps] }, // PPS
-  ];
-
-  // Calculate total size
-  let size = 23; // fixed header
-  for (const a of arrays) {
-    size += 3; // array header: completeness+type(1) + numNalus(2)
-    for (const n of a.nals) size += 2 + n.length; // nalUnitLength(2) + data
-  }
-
-  const buf = new ArrayBuffer(size);
-  const v = new DataView(buf);
-  const u = new Uint8Array(buf);
-  let o = 0;
-
-  v.setUint8(o++, 1); // configurationVersion
-  v.setUint8(o++, (profileSpace << 6) | (tierFlag << 5) | profileIdc);
-  v.setUint32(o, compatFlags);
-  o += 4;
-  u.set(constraintBytes, o);
-  o += 6;
-  v.setUint8(o++, levelIdc);
-  v.setUint16(o, 0xf000);
-  o += 2; // min_spatial_segmentation_idc (reserved 4 bits + 12 bits = 0)
-  v.setUint8(o++, 0xfc); // parallelismType (reserved 6 bits + 2 bits = 0)
-  v.setUint8(o++, 0xfc | 1); // chromaFormat = 1 (4:2:0)
-  v.setUint8(o++, 0xf8); // bitDepthLumaMinus8 = 0 (reserved 5 bits + 3 bits)
-  v.setUint8(o++, 0xf8); // bitDepthChromaMinus8 = 0
-  v.setUint16(o, 0);
-  o += 2; // avgFrameRate = 0
-  v.setUint8(o++, (lengthSizeMinusOne & 0x3) | 0x0c); // constantFrameRate=0, numTemporalLayers=1, temporalIdNested=1, lengthSizeMinusOne=3
-  v.setUint8(o++, arrays.length); // numOfArrays
-
-  for (const a of arrays) {
-    v.setUint8(o++, 0x80 | (a.type & 0x3f)); // array_completeness=1 + NAL type
-    v.setUint16(o, a.nals.length);
-    o += 2;
-    for (const n of a.nals) {
-      v.setUint16(o, n.length);
-      o += 2;
-      u.set(n, o);
-      o += n.length;
-    }
-  }
-
-  return buf;
-}
-
 /** H.264 NAL unit type (5 low bits of the first byte). */
 function h264NalType(nal: Uint8Array): number {
   return nal[0] & 0x1f;
@@ -269,9 +226,59 @@ export class SurfaceStore {
   private decoders = new Map<number, DecoderEntry>();
   private canvases = new Map<number, CanvasEntry>();
   private frameListeners = new Set<SurfaceFrameCallback>();
+  private cursorShapes = new Map<number, string>();
+  private encoderNames = new Map<number, string>();
+  private cursorListeners = new Set<
+    (surfaceId: number, shape: string) => void
+  >();
   private eventListeners = new Set<SurfaceEventCallback>();
   private _diag = { received: 0, decoded: 0, output: 0, dropped: 0, errors: 0 };
   private _diagTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Per-surface diagnostics exposed to the debug panel.
+  private _surfaceFrameSamples = new Map<number, SurfaceFrameSample[]>();
+  /** Timestamps of decoded output frames (for computing output fps). */
+  private _surfaceOutputSamples = new Map<number, number[]>();
+  /** Cumulative per-surface drop/error counters. */
+  private _surfaceDrops = new Map<number, number>();
+  private _surfaceErrors = new Map<number, number>();
+
+  private static readonly FRAME_SAMPLE_MAX = 500;
+  private static readonly OUTPUT_SAMPLE_MAX = 500;
+
+  /**
+   * Callback to send a surface ACK to the server.  Injected by the
+   * connection layer so the store can defer ACKs when the decode queue
+   * is deep (backpressure).
+   */
+  private _ackSender: ((surfaceId: number) => void) | null = null;
+
+  /**
+   * Callback to request a keyframe from the server (re-subscribe).
+   * Called when the decoder enters an error state and needs a clean
+   * reference point to recover.
+   */
+  private _keyframeSender: ((surfaceId: number) => void) | null = null;
+
+  /** Install the ACK sender callback (called once by BlitConnection). */
+  setAckSender(fn: (surfaceId: number) => void): void {
+    this._ackSender = fn;
+  }
+
+  /** Install the keyframe-request callback (called once by BlitConnection). */
+  setKeyframeSender(fn: (surfaceId: number) => void): void {
+    this._keyframeSender = fn;
+  }
+
+  private sendAck(surfaceId: number): void {
+    this._ackSender?.(surfaceId);
+  }
+
+  /** Send an ACK unconditionally — used by the connection layer's catch
+   *  path when handleSurfaceFrame throws before it can ACK itself. */
+  sendAckFallback(surfaceId: number): void {
+    this._ackSender?.(surfaceId);
+  }
 
   /**
    * Monotonically increasing counter bumped on every disconnect.  Consumers
@@ -335,26 +342,53 @@ export class SurfaceStore {
     return this.surfaces;
   }
 
-  /** Debug info about active surface decoders. */
+  /** Debug info about all known surfaces (encoder, codec, size, decode stats). */
   getDebugStats(): {
     surfaceId: number;
     codec: string;
+    encoder: string;
     width: number;
     height: number;
+    /** Ring buffer of recent incoming frame samples (for timeline graph). */
+    frameSamples: SurfaceFrameSample[];
+    /** Ring buffer of decoded-output timestamps (for fps computation). */
+    outputSamples: readonly number[];
+    /** Cumulative dropped frame count. */
+    dropped: number;
+    /** Cumulative decode error count. */
+    errors: number;
+    /** Current WebCodecs decode queue depth. */
+    queueDepth: number;
+    /** ACKs deferred due to decode backpressure. */
+    pendingAcks: number;
   }[] {
-    const result: {
-      surfaceId: number;
-      codec: string;
-      width: number;
-      height: number;
-    }[] = [];
-    for (const [id, entry] of this.decoders) {
-      const surface = this.surfaces.get(id);
+    const result: ReturnType<SurfaceStore["getDebugStats"]> = [];
+    for (const [id, surface] of this.surfaces) {
+      // Skip subsurfaces — they are composited into their parent and
+      // don't have their own encoder or codec.
+      if (surface.parentId !== 0) continue;
+      const entry = this.decoders.get(id);
+      let queueDepth = 0;
+      try {
+        queueDepth =
+          entry && entry.decoder.state === "configured"
+            ? entry.decoder.decodeQueueSize
+            : 0;
+      } catch {
+        // decoder may be closed
+      }
       result.push({
         surfaceId: id,
-        codec: entry.codec,
-        width: surface?.width ?? 0,
-        height: surface?.height ?? 0,
+        codec: entry?.codec ?? "",
+        encoder: this.encoderNames.get(id) ?? "",
+        width: surface.width,
+        height: surface.height,
+        frameSamples: this._surfaceFrameSamples.get(id) ?? [],
+        outputSamples: this._surfaceOutputSamples.get(id) ?? [],
+        dropped: this._surfaceDrops.get(id) ?? 0,
+        errors: this._surfaceErrors.get(id) ?? 0,
+        queueDepth,
+        pendingAcks: entry?.pendingAcks ?? 0,
       });
     }
     return result;
@@ -379,7 +413,6 @@ export class SurfaceStore {
   }
 
   handleSurfaceCreated(
-    sessionId: number,
     surfaceId: number,
     parentId: number,
     width: number,
@@ -389,7 +422,6 @@ export class SurfaceStore {
   ): void {
     this.surfaces.set(surfaceId, {
       connectionId: this.connectionId,
-      sessionId,
       surfaceId,
       parentId,
       title,
@@ -398,23 +430,19 @@ export class SurfaceStore {
       height,
     });
     this.ensureCanvas(surfaceId, width, height);
-    // Track that this surface was re-announced after reconnect so
-    // reconcileAfterList() knows to keep it.
-    this._reconnectSeen?.add(surfaceId);
     // Don't init decoder yet — we'll init on the first frame when we know
     // the codec from the flags byte.
-
-    // Suppress change notifications during the reconnect window so the UI
-    // doesn't see a mix of stale + re-announced surfaces.  A single
-    // emitChange() fires from reconcileAfterList() once S2C_LIST arrives.
-    if (!this._reconnectSeen) {
-      this.emitChange();
-    }
+    this.emitChange();
   }
 
   handleSurfaceDestroyed(surfaceId: number): void {
     this.surfaces.delete(surfaceId);
     this.canvases.delete(surfaceId);
+    this.encoderNames.delete(surfaceId);
+    this._surfaceFrameSamples.delete(surfaceId);
+    this._surfaceOutputSamples.delete(surfaceId);
+    this._surfaceDrops.delete(surfaceId);
+    this._surfaceErrors.delete(surfaceId);
     const entry = this.decoders.get(surfaceId);
     if (entry) {
       entry.decoder.close();
@@ -432,50 +460,79 @@ export class SurfaceStore {
     data: Uint8Array,
   ): void {
     this._diag.received++;
+    const isKey = (flags & SURFACE_FRAME_FLAG_KEYFRAME) !== 0;
+
+    // Per-surface frame timeline sample.
+    let samples = this._surfaceFrameSamples.get(surfaceId);
+    if (!samples) {
+      samples = [];
+      this._surfaceFrameSamples.set(surfaceId, samples);
+    }
+    samples.push({ t: performance.now(), bytes: data.length, key: isKey });
+    if (samples.length > SurfaceStore.FRAME_SAMPLE_MAX)
+      samples.splice(0, samples.length - SurfaceStore.FRAME_SAMPLE_MAX);
+
     const codec = codecFromFlags(flags);
 
     // Ensure we have a decoder for this surface with the right codec.
     let entry = this.decoders.get(surfaceId);
     if (!entry || entry.codec !== codec) {
-      // Close old decoder if codec changed.
-      if (entry) entry.decoder.close();
+      // Flush deferred ACKs before discarding the old decoder —
+      // losing them permanently stalls the server's pacing window.
+      if (entry) {
+        for (let i = 0; i < entry.pendingAcks; i++) {
+          this.sendAck(surfaceId);
+        }
+        entry.decoder.close();
+      }
       this.decoders.delete(surfaceId);
-      this.initDecoder(surfaceId, codec);
+      this.initDecoder(surfaceId, codec, width, height);
       entry = this.decoders.get(surfaceId);
     }
-    if (!entry) return;
+    if (!entry) {
+      // No decoder — ACK immediately so the server doesn't stall.
+      this.sendAck(surfaceId);
+      return;
+    }
 
-    const isKey = (flags & SURFACE_FRAME_FLAG_KEYFRAME) !== 0;
     if (entry.pendingKeyframe && !isKey) {
       this._diag.dropped++;
+      this._surfaceDrops.set(
+        surfaceId,
+        (this._surfaceDrops.get(surfaceId) ?? 0) + 1,
+      );
+      // Dropped frame — ACK immediately.
+      this.sendAck(surfaceId);
       return;
     }
     entry.pendingKeyframe = false;
 
     const surface = this.surfaces.get(surfaceId);
     if (surface && (surface.width !== width || surface.height !== height)) {
-      // Update dimensions silently — no emitChange().  Dimension updates
-      // from every frame cause Solid re-renders → BlitSurfaceCanvas
-      // unmount/remount → subscribe/unsubscribe spam.  The canvas gets
-      // the correct size from the decoded frame directly.
+      const wasEmpty = surface.width === 0 || surface.height === 0;
       this.surfaces.set(surfaceId, { ...surface, width, height });
+      // Emit a change when the surface gets its first real dimensions
+      // (the compositor sends SurfaceCreated with 0×0 before the first
+      // buffer commit).  Subsequent per-frame dimension tweaks are silent
+      // to avoid Solid re-render → unmount/remount → sub/unsub churn.
+      if (wasEmpty && width > 0 && height > 0) {
+        this.emitChange();
+      }
     }
 
     this.ensureCanvas(surfaceId, width, height);
 
     try {
-      // Convert Annex B → length-prefixed NALs.  WebCodecs always expects
-      // length-prefixed containers (AVCC for H.264, HVCC for H.265) — the
-      // annexb format hint is not universally supported.
-      const nals = splitNALs(data);
-      const frameData = toLengthPrefixed(nals);
+      let frameData: Uint8Array;
 
-      // On keyframes, extract parameter sets and (re)configure the decoder
-      // with a description.  WebCodecs requires this even for avc3/hev1 on
-      // many platforms.
-      if (isKey) {
-        let description: ArrayBuffer | undefined;
-        if (codec === "h264") {
+      if (codec === "av1") {
+        // AV1: raw OBU "low-overhead bitstream format" per WebCodecs spec.
+        // No description, no NAL splitting, no length-prefix — pass through.
+        frameData = data;
+      } else {
+        // H.264: Annex B → AVCC length-prefixed + description
+        const nals = splitNALs(data);
+        if (isKey) {
           let sps: Uint8Array | undefined;
           let pps: Uint8Array | undefined;
           for (const nal of nals) {
@@ -483,21 +540,28 @@ export class SurfaceStore {
             if (t === 7) sps = nal;
             else if (t === 8) pps = nal;
           }
-          if (sps && pps) description = buildAvccDescription(sps, pps);
-        } else if (codec === "h265") {
-          description = this.buildHevcDescription(nals);
-        }
-        if (description) {
-          const descKey = Array.from(new Uint8Array(description)).join(",");
-          if (descKey !== entry.lastDescription) {
-            entry.lastDescription = descKey;
-            entry.decoder.configure({
-              codec: codecString(codec),
-              optimizeForLatency: true,
-              description,
-            });
+          if (sps && pps) {
+            const description = buildAvccDescription(sps, pps);
+            const descKey = Array.from(new Uint8Array(description)).join(",");
+            if (descKey !== entry.lastDescription) {
+              entry.lastDescription = descKey;
+              entry.decoder.configure({
+                codec: codecString(codec, width, height, sps),
+                optimizeForLatency: true,
+                description,
+              });
+            }
           }
         }
+        frameData = toLengthPrefixed(nals);
+      }
+
+      // Guard: don't decode if the decoder was never configured
+      // (e.g., old server without VPS/SPS/PPS or HVCC prefix).
+      if (entry.decoder.state !== "configured") {
+        this._diag.dropped++;
+        this.sendAck(surfaceId);
+        return;
       }
 
       const chunk = new EncodedVideoChunk({
@@ -507,6 +571,16 @@ export class SurfaceStore {
       });
       entry.decoder.decode(chunk);
       this._diag.decoded++;
+
+      // Backpressure: only ACK immediately if the decode queue is shallow.
+      // When the queue is deep the ACK is deferred until the decoder's
+      // output callback drains it below the threshold — this stalls the
+      // server's pacing window and prevents flooding.
+      if (entry.decoder.decodeQueueSize < MAX_DECODE_QUEUE_FOR_ACK) {
+        this.sendAck(surfaceId);
+      } else {
+        entry.pendingAcks++;
+      }
     } catch (e) {
       console.warn(
         "[blit] surface decode error:",
@@ -519,6 +593,16 @@ export class SurfaceStore {
       );
       if (entry) entry.pendingKeyframe = true;
       this._diag.errors++;
+      this._surfaceErrors.set(
+        surfaceId,
+        (this._surfaceErrors.get(surfaceId) ?? 0) + 1,
+      );
+      // Error — ACK immediately so the server doesn't permanently stall.
+      this.sendAck(surfaceId);
+      // Ask the server for a keyframe so the decoder can recover.
+      // Without this, the client drops every P-frame (pendingKeyframe
+      // gate) and the server never knows to send a keyframe.
+      this._keyframeSender?.(surfaceId);
     }
   }
 
@@ -526,15 +610,42 @@ export class SurfaceStore {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       this.surfaces.set(surfaceId, { ...surface, title });
-      if (!this._reconnectSeen) this.emitChange();
+      this.emitChange();
     }
+  }
+
+  handleSurfaceCursor(surfaceId: number, shape: string): void {
+    this.cursorShapes.set(surfaceId, shape);
+    // Notify cursor listeners without triggering a full change cycle.
+    for (const listener of this.cursorListeners) {
+      try {
+        listener(surfaceId, shape);
+      } catch {}
+    }
+  }
+
+  /** Get the current CSS cursor for a surface. */
+  getCursor(surfaceId: number): string {
+    return this.cursorShapes.get(surfaceId) ?? "default";
+  }
+
+  /** Register a callback for cursor shape changes. Returns unsubscribe fn. */
+  onCursor(listener: (surfaceId: number, shape: string) => void): () => void {
+    this.cursorListeners.add(listener);
+    return () => {
+      this.cursorListeners.delete(listener);
+    };
+  }
+
+  handleSurfaceEncoder(surfaceId: number, encoderName: string): void {
+    this.encoderNames.set(surfaceId, encoderName);
   }
 
   handleSurfaceAppId(surfaceId: number, appId: string): void {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       this.surfaces.set(surfaceId, { ...surface, appId });
-      if (!this._reconnectSeen) this.emitChange();
+      this.emitChange();
     }
   }
 
@@ -552,72 +663,52 @@ export class SurfaceStore {
         Math.abs(surface.height - height) > 1;
       this.surfaces.set(surfaceId, { ...surface, width, height });
       this.ensureCanvas(surfaceId, width, height);
-      if (significant && !this._reconnectSeen) this.emitChange();
+      if (significant) this.emitChange();
     }
   }
-
-  /** Build HEVCDecoderConfigurationRecord from NALs in a keyframe. */
-  private buildHevcDescription(nals: Uint8Array[]): ArrayBuffer | undefined {
-    let vps: Uint8Array | undefined;
-    let sps: Uint8Array | undefined;
-    let pps: Uint8Array | undefined;
-    for (const nal of nals) {
-      const t = hevcNalType(nal);
-      if (t === 32) vps = nal;
-      else if (t === 33) sps = nal;
-      else if (t === 34) pps = nal;
-    }
-    if (vps && sps && pps) return buildHvccDescription(vps, sps, pps);
-    return undefined;
-  }
-
-  /** Surface IDs announced since the last disconnect.  Non-null only
-   *  between a disconnect and the first reconcile (S2C_LIST arrival). */
-  private _reconnectSeen: Set<number> | null = null;
 
   /**
-   * Soft reset for disconnect/reconnect cycles: close decoders but keep
-   * surfaces so the UI doesn't flicker.  Fresh surface info from the
-   * server will replace stale entries on reconnect.  The generation counter
-   * is bumped so that {@link BlitSurfaceCanvas} instances detect the
-   * reconnect and re-subscribe for video frames.
+   * Full teardown on transport disconnect.  Clears all surfaces, canvases,
+   * and decoders so the UI reflects the disconnected state immediately.
+   * The server's initial message sequence after reconnect
+   * ({@link reset} via S2C_HELLO, then S2C_SURFACE_CREATED) will rebuild
+   * the surface list.  The generation counter is bumped so
+   * {@link BlitSurfaceCanvas} instances detect the reconnect and
+   * re-subscribe for video frames.
    */
   handleDisconnect(): void {
     for (const entry of this.decoders.values()) {
       entry.decoder.close();
     }
     this.decoders.clear();
+    this.canvases.clear();
+    this.surfaces.clear();
+    this._surfaceFrameSamples.clear();
+    this._surfaceOutputSamples.clear();
+    this._surfaceDrops.clear();
+    this._surfaceErrors.clear();
     this._generation++;
-    // Start tracking which surfaces the server re-announces after reconnect.
-    if (this.surfaces.size > 0) {
-      this._reconnectSeen = new Set();
-    }
+    this.emitChange();
   }
 
   /**
-   * Called after the initial session list arrives (S2C_LIST) to prune
-   * surfaces that existed before disconnect but were not re-announced.
+   * Full surface reset — called when S2C_HELLO signals a (possibly new)
+   * server instance.  Clears all surfaces, canvases, and decoders.  The
+   * server's initial message sequence will rebuild the surface list via
+   * individual S2C_SURFACE_CREATED messages.
    */
-  reconcileAfterList(): void {
-    const seen = this._reconnectSeen;
-    if (!seen) return;
-    this._reconnectSeen = null;
-
-    for (const surfaceId of [...this.surfaces.keys()]) {
-      if (!seen.has(surfaceId)) {
-        this.surfaces.delete(surfaceId);
-        this.canvases.delete(surfaceId);
-        const entry = this.decoders.get(surfaceId);
-        if (entry) {
-          entry.decoder.close();
-          this.decoders.delete(surfaceId);
-        }
-      }
+  reset(): void {
+    for (const entry of this.decoders.values()) {
+      entry.decoder.close();
     }
-    // Always emit — even when nothing was pruned — because
-    // handleSurfaceCreated/Title/AppId/Resized suppress notifications
-    // while _reconnectSeen is active, so the UI needs a single
-    // catch-up notification once the reconciliation window closes.
+    this.decoders.clear();
+    this.canvases.clear();
+    this.surfaces.clear();
+    this._surfaceFrameSamples.clear();
+    this._surfaceOutputSamples.clear();
+    this._surfaceDrops.clear();
+    this._surfaceErrors.clear();
+    this._generation++;
     this.emitChange();
   }
 
@@ -629,10 +720,7 @@ export class SurfaceStore {
       clearInterval(this._diagTimer);
       this._diagTimer = null;
     }
-    this.handleDisconnect();
-    this.canvases.clear();
-    this.surfaces.clear();
-    this.emitChange();
+    this.reset();
   }
 
   // -----------------------------------------------------------------------
@@ -664,7 +752,12 @@ export class SurfaceStore {
 
   private webCodecsUnavailableWarned = false;
 
-  private initDecoder(surfaceId: number, codec: SurfaceCodec): void {
+  private initDecoder(
+    surfaceId: number,
+    codec: SurfaceCodec,
+    width?: number,
+    height?: number,
+  ): void {
     if (!this.canDecodeVideo) {
       if (!this.webCodecsUnavailableWarned) {
         this.webCodecsUnavailableWarned = true;
@@ -681,6 +774,17 @@ export class SurfaceStore {
     const decoder = new VideoDecoder({
       output: (frame) => {
         this._diag.output++;
+
+        // Per-surface output sample for debug panel rate computation.
+        let outputs = this._surfaceOutputSamples.get(surfaceId);
+        if (!outputs) {
+          outputs = [];
+          this._surfaceOutputSamples.set(surfaceId, outputs);
+        }
+        outputs.push(performance.now());
+        if (outputs.length > SurfaceStore.OUTPUT_SAMPLE_MAX)
+          outputs.splice(0, outputs.length - SurfaceStore.OUTPUT_SAMPLE_MAX);
+
         try {
           // Draw to the shared backing canvas.
           const ce = this.canvases.get(surfaceId);
@@ -698,6 +802,18 @@ export class SurfaceStore {
           frame.close();
         }
 
+        // Flush deferred ACKs now that the decode queue has drained.
+        const entry = this.decoders.get(surfaceId);
+        if (entry && entry.pendingAcks > 0) {
+          // Send one ACK per deferred frame.  The server's pacing window
+          // opens one slot per ACK, so this naturally meters delivery.
+          const toSend = entry.pendingAcks;
+          entry.pendingAcks = 0;
+          for (let i = 0; i < toSend; i++) {
+            this.sendAck(surfaceId);
+          }
+        }
+
         // Notify frame listeners so they blit from getCanvas().
         for (const listener of this.frameListeners) {
           try {
@@ -708,9 +824,23 @@ export class SurfaceStore {
         }
       },
       error: (e: DOMException) => {
-        console.warn("[blit] surface decoder error:", surfaceId, e.message);
+        console.warn(
+          "[blit] surface decoder error:",
+          surfaceId,
+          e.name,
+          e.message,
+          e.code,
+          "state:",
+          this.decoders.get(surfaceId)?.decoder?.state,
+        );
         const entry = this.decoders.get(surfaceId);
         if (entry) {
+          // Flush any deferred ACKs before destroying the entry —
+          // losing them permanently shrinks the server's pacing window,
+          // eventually stalling frame delivery for this surface.
+          for (let i = 0; i < entry.pendingAcks; i++) {
+            this.sendAck(surfaceId);
+          }
           try {
             entry.decoder.close();
           } catch {
@@ -720,28 +850,39 @@ export class SurfaceStore {
           // re-initialization via initDecoder().
           this.decoders.delete(surfaceId);
         }
+        // Ask the server for a keyframe so the new decoder gets a
+        // clean reference point instead of only P-frames.
+        this._keyframeSender?.(surfaceId);
       },
     });
-    try {
-      decoder.configure({
-        codec: codecString(codec),
-        optimizeForLatency: true,
-      });
-    } catch (e) {
-      console.warn(
-        "[blit] surface decoder configure failed:",
-        surfaceId,
-        codec,
-        e,
-      );
-      decoder.close();
-      return;
+    // Defer configure() until the first keyframe provides the codec
+    // description (AVCC for H.264).  Configuring without a description
+    // then reconfiguring with one causes VideoToolbox on macOS to drop
+    // the first decoded frame.
+    // AV1 has no description — configure it eagerly.
+    if (codec === "av1") {
+      try {
+        decoder.configure({
+          codec: codecString(codec, width, height),
+          optimizeForLatency: true,
+        });
+      } catch (e) {
+        console.warn(
+          "[blit] surface decoder configure failed:",
+          surfaceId,
+          codec,
+          e,
+        );
+        decoder.close();
+        return;
+      }
     }
     this.decoders.set(surfaceId, {
       decoder,
       codec,
       pendingKeyframe: true,
       lastDescription: null,
+      pendingAcks: 0,
     });
   }
 

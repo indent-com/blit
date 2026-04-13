@@ -118,7 +118,7 @@ Every `nix run` target has a corresponding script in `bin/`:
 ```bash
 ./bin/build-debs             # .deb packages -> dist/debs/
 ./bin/build-tarballs         # static tarballs -> dist/tarballs/
-./bin/publish-npm-packages   # npm publish @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid, @blit-sh/solid
+./bin/publish-npm-packages   # npm publish @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid
 ./bin/publish-crates         # cargo publish
 ```
 
@@ -161,7 +161,7 @@ Every port and socket path is derived from `DEV_INSTANCE` (default `0`). Each in
 DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 ```
 
-`bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child PTY sessions, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
+`bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child terminals, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
 
 | Variable             | Default (instance 0) | Description                   |
 | -------------------- | -------------------- | ----------------------------- |
@@ -173,26 +173,33 @@ DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 
 ## Project structure
 
-Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is split into five and `blit-webrtc-forwarder` uses a multi-file module tree.
+Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is split into six and `blit-webrtc-forwarder` uses a multi-file module tree.
 
-| File                                   | Role                                                                                                                  |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `crates/server/src/lib.rs`             | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration                  |
-| `crates/server/src/surface_encoder.rs` | Surface video encoding: AV1 (rav1e), H.264/H.265 (openh264, VA-API, NVENC)                                            |
-| `crates/remote/src/lib.rs`             | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
-| `crates/compositor/src/imp.rs`         | Experimental headless Wayland compositor (smithay): surface tracking, input forwarding, protocol delegates            |
-| `crates/webrtc-forwarder/src/`         | WebRTC forwarder (7 files: signaling, ICE, TURN, peer management)                                                     |
-| `crates/cli/src/agent.rs`              | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `surfaces`, `capture`, `click`, `key`, `type` |
-| `crates/cli/src/main.rs`               | Clap structs, dispatch, embedded server/gateway                                                                       |
-| `crates/cli/src/interactive.rs`        | Browser mode                                                                                                          |
-| `crates/cli/src/transport.rs`          | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                           |
-| `crates/cli/src/learn.md`              | CLI reference text printed by `blit learn`                                                                            |
-| `crates/browser/src/lib.rs`            | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                    |
-| `crates/alacritty-driver/src/lib.rs`   | Terminal parsing wrapper around `alacritty_terminal`                                                                  |
-| `crates/gateway/src/main.rs`           | WebSocket/WebTransport proxy, multi-destination routing                                                               |
-| `crates/fonts/src/lib.rs`              | Font discovery and TTF/OTF parsing                                                                                    |
-| `crates/webserver/src/lib.rs`          | Shared axum HTTP helpers                                                                                              |
-| `crates/webserver/src/config.rs`       | Server configuration types                                                                                            |
+| File                                     | Role                                                                                                                  |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `crates/server/src/lib.rs`               | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration                  |
+| `crates/server/src/surface_encoder.rs`   | Surface video encoding: AV1 (rav1e), H.264 (openh264, VA-API, NVENC)                                                  |
+| `crates/server/src/vaapi_encode.rs`      | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                              |
+| `crates/server/src/nvenc_encode.rs`      | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                          |
+| `crates/server/src/gpu_libs.rs`          | Dlopen loaders for libva, NVENC shared across encoders                                                                |
+| `crates/server/src/audio.rs`             | Audio capture pipeline: PipeWire spawn, pw-cat PCM pipe, Opus encoding                                                |
+| `crates/remote/src/lib.rs`               | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
+| `crates/compositor/src/imp.rs`           | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates     |
+| `crates/compositor/src/render.rs`        | Surface compositing: CPU fallback and layer collection for the GPU renderer                                           |
+| `crates/compositor/src/vulkan_render.rs` | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                           |
+| `crates/webrtc-forwarder/src/`           | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                     |
+| `crates/cli/src/agent.rs`                | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `surfaces`, `capture`, `click`, `key`, `type` |
+| `crates/cli/src/main.rs`                 | Dispatch, embedded server/gateway                                                                                     |
+| `crates/cli/src/cli.rs`                  | Clap struct definitions                                                                                               |
+| `crates/cli/src/interactive.rs`          | Browser mode                                                                                                          |
+| `crates/cli/src/transport.rs`            | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                           |
+| `crates/cli/src/learn.md`                | CLI reference text printed by `blit learn`                                                                            |
+| `crates/browser/src/lib.rs`              | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                    |
+| `crates/alacritty-driver/src/lib.rs`     | Terminal parsing wrapper around `alacritty_terminal`                                                                  |
+| `crates/gateway/src/lib.rs`              | WebSocket/WebTransport proxy, multi-destination routing                                                               |
+| `crates/fonts/src/lib.rs`                | Font discovery and TTF/OTF parsing                                                                                    |
+| `crates/webserver/src/lib.rs`            | Shared axum HTTP helpers                                                                                              |
+| `crates/webserver/src/config.rs`         | Server configuration types                                                                                            |
 
 ### Non-Rust code
 
@@ -202,7 +209,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | `js/react/`                  | `@blit-sh/react` npm package — thin React bindings wrapping `BlitTerminalSurface` from core. Tests in `js/react/src/__tests__/` |
 | `js/solid/`                  | `@blit-sh/solid` npm package — thin Solid bindings wrapping `BlitTerminalSurface` from core                                     |
 | `js/ui/`                     | Vite + Solid SPA — browser UI with BSP tiled layouts, overlays, status bar                                                      |
-| `js/website/`                | Marketing/docs website (Vite + SSR with prerendering)                                                                           |
+| `js/website/`                | Marketing/docs website (Astro + Solid)                                                                                          |
 | `js/hub/`                    | Signaling relay server (Bun, deployed to Fly.io). See [js/hub/README.md](js/hub/README.md)                                      |
 | `e2e/`                       | Playwright tests against the full stack (6 spec files)                                                                          |
 | `examples/`                  | fd-channel examples in Python and Bun                                                                                           |
@@ -219,7 +226,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 
 1. Constants and `ServerMsg`/parse case in `remote/src/lib.rs`
 2. A `msg_*()` builder function in `remote/src/lib.rs`
-3. Server handler in `server/src/main.rs`
+3. Server handler in `server/src/lib.rs`
 4. Client-side handling in `cli/src/agent.rs` (agent subcommands) and/or `cli/src/interactive.rs` (TUI)
 5. Update the protocol tables in [ARCHITECTURE.md](ARCHITECTURE.md)
 
@@ -249,13 +256,13 @@ CI on the verified tag builds debs/tarballs, publishes to crates.io and npm, upd
 
 ## Wayland compositor (experimental)
 
-The experimental headless Wayland compositor (`crates/compositor/`) is `#[cfg(unix)]` only — it compiles to a stub on Windows. It uses [smithay](https://github.com/Smithay/smithay) and runs as a thread per session.
+The experimental headless Wayland compositor (`crates/compositor/`) is `#[cfg(target_os = "linux")]` only — it compiles to a stub on macOS and Windows. It uses `wayland-server` directly and runs as a single shared thread across all terminals.
 
 ### How it works
 
-1. When the first PTY in a session is created, `ensure_compositor()` spawns a compositor thread with a calloop event loop.
+1. When the first PTY is created, `ensure_compositor()` spawns a compositor thread with a calloop event loop.
 2. The compositor creates a Wayland listening socket (`/tmp/wayland-N`) and sets `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` in the PTY child environment.
-3. GUI apps launched inside the session connect to this socket and create `xdg_toplevel` windows.
+3. GUI apps launched inside any terminal connect to this socket and create `xdg_toplevel` windows.
 4. On each `wl_surface.commit`, the compositor reads the buffer pixels (via SHM or dmabuf) and sends a `CompositorEvent::SurfaceCommit` to the server.
 5. The server encodes the pixels as H.264 or AV1 and stores the encoded frame in `last_frames`. The tick loop sends frames to connected browser clients using the same pacing/congestion-control system as terminal updates.
 6. Browser clients decode frames via WebCodecs and render to a `<canvas>`.
@@ -273,13 +280,13 @@ Wayland app → compositor thread → CompositorEvent::SurfaceCommit
 
 `crates/server/src/surface_encoder.rs` wraps seven backends behind a common `SurfaceEncoder` interface:
 
-- **NVENC AV1 / H.265 / H.264** — NVIDIA GPU hardware encoding via FFmpeg
-- **H.265 VA-API** — Intel/AMD GPU hardware encoding via FFmpeg/libva
-- **H.264 VA-API** — Intel/AMD GPU hardware encoding via FFmpeg/libva
+- **NVENC AV1 / H.264** — NVIDIA GPU hardware encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)
+- **AV1 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
+- **H.264 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
 - **AV1 (rav1e)** — software, handles odd dimensions
 - **H.264 software (openh264)** — software fallback, max 3840x2160
 
-`BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `nvenc-h265,h265-vaapi,nvenc-av1,av1,nvenc-h264,h264-vaapi,h264-software`. `BLIT_SURFACE_QUALITY` (low/medium/high/lossless) controls rav1e speed/quantizer presets. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
+`BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software`. `BLIT_SURFACE_QUALITY` (low/medium/high/lossless) controls rav1e speed/quantizer presets. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
 
 ### Testing surfaces without a browser
 
@@ -295,4 +302,4 @@ blit -s /tmp/blit-dev.sock type 1 'hello'    # type text
 
 ### Wire protocol surface messages
 
-Surface messages use opcodes `0x20`–`0x28` (S2C) and `0x20`–`0x29` (C2S). See the constants in `crates/remote/src/lib.rs`. A new client receives `S2C_SURFACE_CREATED` for each existing surface during the initial state sync, followed by keyframes via the normal pacing loop.
+Surface, clipboard, and audio messages use opcodes `0x20`+ (see the constants in `crates/remote/src/lib.rs`). A new client receives `S2C_SURFACE_CREATED` for each existing surface during the initial state sync, followed by keyframes via the normal pacing loop.

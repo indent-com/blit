@@ -5,7 +5,7 @@ mod interactive;
 mod transport;
 
 use clap::Parser;
-use cli::{Cli, Command, RecordTarget, RemoteCommand};
+use cli::{Cli, ClipboardCommand, Command, RemoteCommand, SurfaceCommand, TerminalCommand};
 
 fn main() {
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
@@ -33,6 +33,195 @@ async fn async_main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Terminal { command } => {
+            let cmd = command.unwrap_or(TerminalCommand::List);
+            // All terminal commands except Quit need a server connection.
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match cmd {
+                TerminalCommand::List => agent::cmd_list(transport).await,
+                TerminalCommand::Start {
+                    command,
+                    tag,
+                    rows,
+                    cols,
+                    wait,
+                    timeout,
+                } => {
+                    let start_result = agent::cmd_start(transport, tag, command, rows, cols).await;
+                    if wait {
+                        let pty_id = match start_result {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        let transport2 = match transport::connect(&conn.on, &conn.hub).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        match agent::cmd_wait(transport2, pty_id, timeout.unwrap(), None).await {
+                            Ok(code) => std::process::exit(code),
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    start_result.map(|_| ())
+                }
+                TerminalCommand::Show {
+                    id,
+                    ansi,
+                    rows,
+                    cols,
+                } => agent::cmd_show(transport, id, ansi, rows, cols).await,
+                TerminalCommand::History {
+                    id,
+                    from_start,
+                    from_end,
+                    limit,
+                    ansi,
+                    rows,
+                    cols,
+                } => {
+                    let size = agent::capture_size(rows, cols);
+                    agent::cmd_history(transport, id, from_start, from_end, limit, ansi, size).await
+                }
+                TerminalCommand::Send { id, text } => {
+                    let text = if text == "-" {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf).unwrap_or(0);
+                        buf
+                    } else {
+                        text
+                    };
+                    agent::cmd_send(transport, id, text).await
+                }
+                TerminalCommand::Wait {
+                    id,
+                    timeout,
+                    pattern,
+                } => match agent::cmd_wait(transport, id, timeout, pattern).await {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        eprintln!("blit: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                TerminalCommand::Restart { id } => agent::cmd_restart(transport, id).await,
+                TerminalCommand::Kill { id, signal } => {
+                    agent::cmd_kill(transport, id, &signal).await
+                }
+                TerminalCommand::Close { id } => agent::cmd_close(transport, id).await,
+                TerminalCommand::Record {
+                    id,
+                    output,
+                    frames,
+                    duration,
+                } => {
+                    agent::cmd_record(transport, id, output, frames, duration, false, vec![]).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Surface { command } => {
+            let cmd = command.unwrap_or(SurfaceCommand::List);
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match cmd {
+                SurfaceCommand::List => agent::cmd_surfaces(transport).await,
+                SurfaceCommand::Close { id } => agent::cmd_close_surface(transport, id).await,
+                SurfaceCommand::Capture {
+                    id,
+                    output,
+                    format,
+                    quality,
+                    width,
+                    height,
+                    scale,
+                } => {
+                    agent::cmd_capture(transport, id, output, format, quality, width, height, scale)
+                        .await
+                }
+                SurfaceCommand::Click { id, x, y, button } => {
+                    agent::cmd_click(transport, id, x, y, &button).await
+                }
+                SurfaceCommand::Key { id, key } => agent::cmd_key(transport, id, &key).await,
+                SurfaceCommand::Type { id, text } => agent::cmd_type(transport, id, &text).await,
+                SurfaceCommand::Record {
+                    id,
+                    output,
+                    frames,
+                    duration,
+                    codec,
+                } => agent::cmd_record(transport, id, output, frames, duration, true, codec).await,
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Clipboard { command } => {
+            let cmd = command.unwrap_or(ClipboardCommand::List);
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match cmd {
+                ClipboardCommand::List => agent::cmd_clipboard_list(transport).await,
+                ClipboardCommand::Get { mime } => agent::cmd_clipboard_get(transport, &mime).await,
+                ClipboardCommand::Set { mime, text } => {
+                    agent::cmd_clipboard_set(transport, &mime, text).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Remote { command } => {
+            let cmd = command.unwrap_or(RemoteCommand::List { reveal: false });
+            cmd_remote(cmd);
+        }
+        Command::Quit => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = agent::cmd_quit(transport).await {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Server {
             socket,
             shell_flags,
@@ -88,29 +277,10 @@ async fn async_main() {
                         .unwrap_or(false),
                 max_connections: 0,
                 max_ptys: 0,
+                ping_interval: std::time::Duration::from_secs(10),
+                skip_compositor: false,
             };
             blit_server::run(config).await;
-        }
-        Command::Install { host } => match host {
-            Some(host) => {
-                if let Err(e) = cmd_install(&host).await {
-                    eprintln!("blit: {e}");
-                    std::process::exit(1);
-                }
-            }
-            None => {
-                println!("# Linux / macOS");
-                println!("curl -sf https://install.blit.sh | sh");
-                println!();
-                println!("# Windows (PowerShell)");
-                println!("irm https://install.blit.sh/install.ps1 | iex");
-            }
-        },
-        Command::Upgrade => {
-            if let Err(e) = cmd_upgrade().await {
-                eprintln!("blit: {e}");
-                std::process::exit(1);
-            }
         }
         Command::Share {
             passphrase,
@@ -135,6 +305,31 @@ async fn async_main() {
                 std::process::exit(1);
             }
 
+            // Route per-peer IPC connections through blit-proxy when enabled.
+            let proxy_sock = if transport::proxy_enabled() {
+                match transport::ensure_proxy().await {
+                    Ok(sock) => Some(sock),
+                    Err(e) => {
+                        eprintln!("blit share: proxy auto-start failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Provide a callback to restart the proxy if it dies mid-session.
+            let proxy_ensure: Option<blit_webrtc_forwarder::ProxyEnsureFn> = if proxy_sock.is_some()
+            {
+                let exe = std::env::current_exe().unwrap_or_default();
+                Some(std::sync::Arc::new(move || {
+                    let exe = exe.clone();
+                    Box::pin(async move { blit_proxy::ensure_proxy(&exe, true).await })
+                }))
+            } else {
+                None
+            };
+
             blit_webrtc_forwarder::run(blit_webrtc_forwarder::Config {
                 sock_path,
                 signal_url,
@@ -142,141 +337,28 @@ async fn async_main() {
                 message_override: None,
                 quiet,
                 verbose,
+                proxy_sock,
+                proxy_ensure,
             })
             .await;
         }
-        Command::Remote(remote_cmd) => {
-            cmd_remote(remote_cmd);
-        }
-        cmd @ (Command::List
-        | Command::Start { .. }
-        | Command::Show { .. }
-        | Command::History { .. }
-        | Command::Send { .. }
-        | Command::Restart { .. }
-        | Command::Kill { .. }
-        | Command::Close { .. }
-        | Command::Wait { .. }
-        | Command::Surfaces
-        | Command::Capture { .. }
-        | Command::Record { .. }
-        | Command::Click { .. }
-        | Command::Key { .. }
-        | Command::Type { .. }) => {
-            let conn = &cli.connect;
-            let transport = match transport::connect(&conn.on, &conn.hub).await {
-                Ok(t) => t,
-                Err(e) => {
+        Command::Install { host } => match host {
+            Some(host) => {
+                if let Err(e) = cmd_install(&host).await {
                     eprintln!("blit: {e}");
                     std::process::exit(1);
                 }
-            };
-            let result = match cmd {
-                Command::List => agent::cmd_list(transport).await,
-                Command::Start {
-                    command,
-                    tag,
-                    rows,
-                    cols,
-                    wait,
-                    timeout,
-                } => {
-                    let start_result = agent::cmd_start(transport, tag, command, rows, cols).await;
-                    if wait {
-                        let pty_id = match start_result {
-                            Ok(id) => id,
-                            Err(e) => {
-                                eprintln!("blit: {e}");
-                                std::process::exit(1);
-                            }
-                        };
-                        let transport2 = match transport::connect(&conn.on, &conn.hub).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                eprintln!("blit: {e}");
-                                std::process::exit(1);
-                            }
-                        };
-                        match agent::cmd_wait(transport2, pty_id, timeout.unwrap(), None).await {
-                            Ok(code) => std::process::exit(code),
-                            Err(e) => {
-                                eprintln!("blit: {e}");
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    start_result.map(|_| ())
-                }
-                Command::Show {
-                    id,
-                    ansi,
-                    rows,
-                    cols,
-                } => agent::cmd_show(transport, id, ansi, rows, cols).await,
-                Command::History {
-                    id,
-                    from_start,
-                    from_end,
-                    limit,
-                    ansi,
-                    rows,
-                    cols,
-                } => {
-                    let size = agent::capture_size(rows, cols);
-                    agent::cmd_history(transport, id, from_start, from_end, limit, ansi, size).await
-                }
-                Command::Send { id, text } => {
-                    let text = if text == "-" {
-                        use std::io::Read;
-                        let mut buf = String::new();
-                        std::io::stdin().read_to_string(&mut buf).unwrap_or(0);
-                        buf
-                    } else {
-                        text
-                    };
-                    agent::cmd_send(transport, id, text).await
-                }
-                Command::Restart { id } => agent::cmd_restart(transport, id).await,
-                Command::Kill { id, signal } => agent::cmd_kill(transport, id, &signal).await,
-                Command::Close { id } => agent::cmd_close(transport, id).await,
-                Command::Wait {
-                    id,
-                    timeout,
-                    pattern,
-                } => match agent::cmd_wait(transport, id, timeout, pattern).await {
-                    Ok(code) => std::process::exit(code),
-                    Err(e) => {
-                        eprintln!("blit: {e}");
-                        std::process::exit(1);
-                    }
-                },
-                Command::Surfaces => agent::cmd_surfaces(transport).await,
-                Command::Capture {
-                    id,
-                    output,
-                    format,
-                    quality,
-                    width,
-                    height,
-                } => {
-                    agent::cmd_capture(transport, id, output, format, quality, width, height).await
-                }
-                Command::Click { id, x, y, button } => {
-                    agent::cmd_click(transport, id, x, y, &button).await
-                }
-                Command::Key { id, key } => agent::cmd_key(transport, id, &key).await,
-                Command::Type { id, text } => agent::cmd_type(transport, id, &text).await,
-                Command::Record(target) => match target {
-                    RecordTarget::Surface { id, output, frames } => {
-                        agent::cmd_record(transport, id, output, frames, true).await
-                    }
-                    RecordTarget::Pty { id, output, frames } => {
-                        agent::cmd_record(transport, id, output, frames, false).await
-                    }
-                },
-                _ => unreachable!(),
-            };
-            if let Err(e) = result {
+            }
+            None => {
+                println!("# Linux / macOS");
+                println!("curl -sf https://install.blit.sh | sh");
+                println!();
+                println!("# Windows (PowerShell)");
+                println!("irm https://install.blit.sh/install.ps1 | iex");
+            }
+        },
+        Command::Upgrade => {
+            if let Err(e) = cmd_upgrade().await {
                 eprintln!("blit: {e}");
                 std::process::exit(1);
             }
@@ -295,10 +377,6 @@ async fn async_main() {
             generate::run(&output);
         }
         Command::ProxyDaemon => {
-            // Normally handled synchronously in main() before the async runtime
-            // starts. Reaching here means clap parsed the subcommand but the
-            // early-exit in main() missed it (e.g. due to argument reordering).
-            // Run the daemon now rather than panicking.
             blit_proxy::run(false);
         }
     }
@@ -354,37 +432,41 @@ fn cmd_remote(cmd: RemoteCommand) {
                     input.trim().to_string()
                 }
             };
-            let mut entries = blit_webserver::config::read_remotes();
-            // Update in place if name exists, preserving order; append if new.
-            if let Some(pos) = entries.iter().position(|(n, _)| n == &name) {
-                entries[pos].1 = uri.clone();
-            } else {
-                entries.push((name.clone(), uri.clone()));
-            }
-            blit_webserver::config::write_remotes(&entries);
+            blit_webserver::config::modify_remotes(|entries| {
+                if let Some(pos) = entries.iter().position(|(n, _)| n == &name) {
+                    entries[pos].1 = uri.clone();
+                } else {
+                    entries.push((name.clone(), uri.clone()));
+                }
+            });
             eprintln!("blit: remote '{name}' set to '{uri}'");
         }
         RemoteCommand::Remove { name } => {
-            let mut entries = blit_webserver::config::read_remotes();
-            let before = entries.len();
-            entries.retain(|(n, _)| n != &name);
-            if entries.len() == before {
+            let mut found = false;
+            blit_webserver::config::modify_remotes(|entries| {
+                let before = entries.len();
+                entries.retain(|(n, _)| n != &name);
+                found = entries.len() < before;
+            });
+            if !found {
                 eprintln!("blit: no remote named '{name}'");
                 std::process::exit(1);
             }
-            blit_webserver::config::write_remotes(&entries);
             eprintln!("blit: remote '{name}' removed");
         }
         RemoteCommand::SetDefault { target } => {
-            let mut config = blit_webserver::config::read_config();
+            blit_webserver::config::modify_config(|config| {
+                if target.is_empty() || target == "local" {
+                    config.remove("blit.target");
+                } else {
+                    config.insert("blit.target".into(), target.clone());
+                }
+            });
             if target.is_empty() || target == "local" {
-                config.remove("blit.target");
                 eprintln!("blit: default target cleared (using local)");
             } else {
-                config.insert("blit.target".into(), target.clone());
                 eprintln!("blit: default target set to '{target}'");
             }
-            blit_webserver::config::write_config(&config);
         }
     }
 }

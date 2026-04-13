@@ -16,9 +16,9 @@ brew services start blit gateway
 ```bash
 sudo systemctl enable --now blit-server@alice.socket
 
-# Share via WebRTC: create /etc/blit/forwarder-alice.env with
+# Share via WebRTC: create /etc/blit/share-alice.env with
 # BLIT_SOCK=/run/blit/alice.sock and BLIT_PASSPHRASE=<secret>, then:
-sudo systemctl enable --now blit-webrtc-forwarder@alice.service
+sudo systemctl enable --now blit-share@alice.service
 ```
 
 ### Multi-remote gateway (blit gateway)
@@ -52,8 +52,8 @@ BLIT_GATEWAY_WEBRTC=1 BLIT_PASSPHRASE=secret blit gateway
 
 The gateway connects as a WebRTC consumer (using the passphrase-derived channel
 identity; the hub assigns each connection a unique sessionId so multiple
-consumers can connect to the same forwarder concurrently) and re-exposes each
-session at `WS /d/<name>`. The browser never touches WebRTC
+consumers can connect to the same producer concurrently) and re-exposes each
+destination at `WS /d/<name>`. The browser never touches WebRTC
 or the hub. Without `BLIT_GATEWAY_WEBRTC=1`, `share:` entries are ignored by
 the gateway and the browser connects to the hub directly.
 
@@ -176,16 +176,16 @@ For protocol details, deployment instructions, and configuration, see [`js/hub/R
 
 `blit.sh` is the public website, deployed to **Vercel**. It serves two purposes:
 
-1. **Landing page** (`/`) — marketing page with install instructions, feature overview, and a join form to connect to a shared session.
-2. **Terminal viewer** (`/#<secret>`) — browser-based terminal that connects to a `blit share` session via WebRTC through `hub.blit.sh`.
+1. **Landing page** (`/`) — marketing page with install instructions, feature overview, and a join form to connect to a shared terminal.
+2. **Terminal viewer** (`/#<secret>`) — browser-based terminal that connects to a shared terminal via WebRTC through `hub.blit.sh`.
 
-The site is a Vite + React SPA built from [`js/website/`](js/website/). It consumes `@blit-sh/core` and `@blit-sh/react` via source aliases and inlines the browser WASM module at build time.
+The site is an Astro + Solid app built from [`js/website/`](js/website/). It consumes `@blit-sh/core` and `@blit-sh/solid` via workspace aliases and inlines the browser WASM module at build time.
 
 ### Build and deploy
 
-The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](nix/packages.nix)) which compiles the WASM crate, installs pnpm deps via `fetchPnpmDeps`, and runs `vite build`. The `deploy-website` task in [`nix/tasks.nix`](nix/tasks.nix) assembles a Vercel prebuilt output directory and deploys via `pnpm dlx vercel deploy --prebuilt`.
+The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](nix/packages.nix)) which compiles the WASM crate, installs pnpm deps via `fetchPnpmDeps`, and runs `astro build`. The `deploy-website` task in [`nix/tasks.nix`](nix/tasks.nix) assembles a Vercel prebuilt output directory and deploys via `pnpm dlx vercel deploy --prebuilt`.
 
-- **Production deploy** — pushes to `main` that touch `js/website/**`, `js/core/**`, `js/react/**`, or `crates/browser/**` trigger `./bin/deploy-website --prod`.
+- **Production deploy** — pushes to `main` that touch `js/website/**`, `js/core/**`, `js/solid/**`, or `crates/browser/**` trigger `./bin/deploy-website --prod`.
 - **Preview deploy** — PRs with the same path changes get a preview deploy with the URL posted as a PR comment.
 
 ### Local usage
@@ -199,7 +199,7 @@ The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](
 
 All release binaries are built with Nix, which makes the entire toolchain reproducible and keeps the build definitions small.
 
-On Linux, binaries are statically linked against **musl libc** via `pkgs.pkgsStatic`. Nix's `pkgsStatic` overlay cross-compiles the entire dependency closure against musl, producing fully self-contained executables with zero runtime dependencies — no glibc version issues, no `LD_LIBRARY_PATH`, works on any Linux kernel from the past decade. The `mkStaticBin` helper in [`nix/packages.nix`](nix/packages.nix) wraps this and includes a `postFixup` assertion that the output is genuinely statically linked (via `file`), failing the build if it isn't.
+On Linux, binaries are statically linked against **musl libc** via `pkgs.pkgsStatic`. Nix's `pkgsStatic` overlay cross-compiles the entire dependency closure against musl, producing fully self-contained executables with zero runtime dependencies — no glibc version issues, no `LD_LIBRARY_PATH`, works on any Linux kernel from the past decade. The `blit-static` derivation in [`nix/packages.nix`](nix/packages.nix) builds this and includes a `postFixup` assertion that the output is genuinely statically linked (via `file`), failing the build if it isn't.
 
 On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed.
 

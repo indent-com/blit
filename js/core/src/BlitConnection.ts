@@ -9,29 +9,37 @@ import type {
   TerminalPalette,
 } from "./types";
 import {
+  FEATURE_AUDIO,
   FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CREATE_NONCE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
+  S2C_AUDIO_FRAME,
   PROTOCOL_VERSION,
-  S2C_CLIPBOARD_MSG,
+  S2C_CLIPBOARD_CONTENT,
   S2C_CLOSED,
   S2C_CREATED,
   S2C_CREATED_N,
   S2C_EXITED,
   S2C_HELLO,
   S2C_LIST,
+  S2C_READY,
   S2C_SEARCH_RESULTS,
   S2C_SURFACE_APP_ID,
+  S2C_SURFACE_CURSOR,
   S2C_SURFACE_CREATED,
   S2C_SURFACE_DESTROYED,
+  S2C_SURFACE_ENCODER,
   S2C_SURFACE_FRAME,
   S2C_SURFACE_RESIZED,
   S2C_SURFACE_TITLE,
+  S2C_PING,
+  S2C_QUIT,
   S2C_TEXT,
   S2C_TITLE,
   S2C_UPDATE,
+  C2S_PING,
 } from "./types";
 import {
   buildCloseMessage,
@@ -49,6 +57,7 @@ import {
   buildScrollMessage,
   buildSearchMessage,
   buildSurfaceInputMessage,
+  buildSurfaceTextMessage,
   buildSurfacePointerMessage,
   buildSurfaceAxisMessage,
   buildSurfaceResizeMessage,
@@ -59,7 +68,10 @@ import {
   buildSurfaceAckMessage,
   buildClipboardMessage,
   buildClientFeaturesMessage,
+  buildAudioSubscribeMessage,
+  buildAudioUnsubscribeMessage,
 } from "./protocol";
+import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
@@ -78,6 +90,7 @@ export interface CreateBlitConnectionOptions {
   transport: BlitTransport;
   wasm: BlitWasmModule | Promise<BlitWasmModule>;
   autoConnect?: boolean;
+  logger?: import("./BlitWorkspace").BlitLogger;
 }
 
 export interface CreateSessionOptions {
@@ -97,6 +110,7 @@ type ResizeSessionOptions = {
 type PendingCreate = {
   resolve: (session: BlitSession) => void;
   reject: (error: Error) => void;
+  command?: string;
 };
 
 type PendingSearch = {
@@ -128,6 +142,7 @@ export class BlitConnection {
   readonly transport: BlitTransport;
   private readonly store: TerminalStore;
   readonly surfaceStore = new SurfaceStore();
+  readonly audioPlayer = new AudioPlayer();
 
   private readonly listeners = new Set<() => void>();
   private readonly sessionsById = new Map<SessionId, InternalSession>();
@@ -155,20 +170,52 @@ export class BlitConnection {
   private retryCount = 0;
   private lastError: string | null = null;
 
+  /** Default video quality for new surface subscriptions (0 = server default). */
+  defaultSurfaceQuality = 0;
+  /** Default audio bitrate in kbps for audio subscriptions (0 = server default). */
+  defaultAudioBitrateKbps = 0;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly pingIntervalMs = 10_000;
+
   private snapshot: BlitConnectionSnapshot;
   private sessions: InternalSession[] = [];
   private _publicSessions: BlitSession[] = [];
   private _publicSessionsDirty = false;
+  private _logger: import("./BlitWorkspace").BlitLogger;
 
   constructor({
     id,
     transport,
     wasm,
     autoConnect = true,
+    logger,
   }: CreateBlitConnectionOptions) {
     this.id = id;
     this.transport = transport;
+    // Inline fallback to avoid circular import of consoleLogger at module load.
+    this._logger = logger ?? {
+      info: (m, ...a) => console.log(`[blit] ${m}`, ...a),
+      warn: (m, ...a) => console.warn(`[blit] ${m}`, ...a),
+    };
     this.surfaceStore.setConnectionId(id);
+    this.surfaceStore.setAckSender((surfaceId) => {
+      if (this.transport.status === "connected") {
+        this.transport.send(buildSurfaceAckMessage(surfaceId));
+      }
+    });
+    this.surfaceStore.setKeyframeSender((surfaceId) => {
+      // Re-subscribing triggers surface_needs_keyframe on the server,
+      // which forces the next encoded frame to be a keyframe.
+      if (this.transport.status === "connected") {
+        this.transport.send(
+          buildSurfaceSubscribeMessage(
+            surfaceId,
+            0,
+            this.defaultSurfaceQuality,
+          ),
+        );
+      }
+    });
     this.store = new TerminalStore(
       {
         send: (data) => {
@@ -177,16 +224,21 @@ export class BlitConnection {
           }
         },
         getStatus: () => this.transport.status,
+        log: (msg) => this._logger.info(`${this.id}: ${msg}`),
       },
       wasm,
     );
     this.snapshot = {
       id,
-      status: transport.status,
+      // When the transport is already connected, the blit handshake hasn't
+      // completed yet — report "authenticating" until S2C_READY arrives.
+      status:
+        transport.status === "connected" ? "authenticating" : transport.status,
       ready: false,
       supportsRestart: false,
       supportsCopyRange: false,
       supportsCompositor: false,
+      supportsAudio: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -200,6 +252,13 @@ export class BlitConnection {
     this.transport.addEventListener("message", this.handleMessage);
     this.transport.addEventListener("statuschange", this.handleStatusChange);
     this.store.handleStatusChange(this.transport.status);
+
+    // Propagate AudioPlayer state changes (e.g. reset on reconnect) into the
+    // connection's listener chain so the reactive graph re-evaluates audio
+    // subscription intent.  Without this, audioPlayer.reset() sets _subscribed
+    // to false but nothing in the SolidJS reactive graph notices, so the
+    // Workspace audio effect never re-runs to re-subscribe.
+    this.audioPlayer.onChange(() => this.emit());
 
     if (autoConnect) {
       this.connect();
@@ -233,7 +292,11 @@ export class BlitConnection {
   }
 
   reconnect(): void {
-    this.connect();
+    if (this.transport.reconnect) {
+      this.transport.reconnect();
+    } else {
+      this.connect();
+    }
   }
 
   close(): void {
@@ -243,6 +306,10 @@ export class BlitConnection {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
     this.transport.removeEventListener("message", this.handleMessage);
     this.transport.removeEventListener("statuschange", this.handleStatusChange);
     this.rejectPendingCreates(
@@ -251,8 +318,12 @@ export class BlitConnection {
     this.rejectPendingSearches(connectionError("Connection disposed"));
     this.rejectPendingReads(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
+    for (const t of this._pendingUnsubs.values()) clearTimeout(t);
+    this._pendingUnsubs.clear();
+    this.surfaceSubRefCounts.clear();
     this.store.destroy();
     this.surfaceStore.destroy();
+    this.audioPlayer.destroy();
   }
 
   setVisibleSessionIds(sessionIds: Iterable<SessionId>): void {
@@ -304,7 +375,11 @@ export class BlitConnection {
         if (src) srcPtyId = src.ptyId;
       }
 
-      this.pendingCreates.set(nonce, { resolve, reject });
+      this.pendingCreates.set(nonce, {
+        resolve,
+        reject,
+        command: options.command,
+      });
       this.transport.send(
         buildCreate2Message(nonce, options.rows, options.cols, {
           tag: options.tag,
@@ -359,17 +434,18 @@ export class BlitConnection {
   async closeSession(sessionId: SessionId): Promise<void> {
     const session = this.sessionsById.get(sessionId);
     if (!session || session.state === "closed") return;
-    if (this.transport.status !== "connected") return;
 
-    return new Promise<void>((resolve) => {
-      const resolvers = this.pendingCloses.get(sessionId);
-      if (resolvers) {
-        resolvers.push(resolve);
-      } else {
-        this.pendingCloses.set(sessionId, [resolve]);
-      }
-      this.transport.send(buildCloseMessage(session.ptyId));
-    });
+    // Mark the session closed immediately so the UI updates without
+    // waiting for the server round-trip.  This prevents a visual glitch
+    // in BSP layouts where the session briefly appears in the off-screen
+    // sidebar (triggering the preview panel and shifting splits) between
+    // being unassigned from a pane and the server confirming the close.
+    // The retain-count mechanism in TerminalStore ensures the terminal
+    // data isn't freed while a BlitTerminalSurface still references it.
+    this.markSessionClosed(sessionId);
+
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildCloseMessage(session.ptyId));
   }
 
   restartSession(sessionId: SessionId): void {
@@ -584,6 +660,7 @@ export class BlitConnection {
     views.delete(viewId);
     if (views.size === 0) {
       this.viewSizes.delete(sessionId);
+      this.clearSessionSize(sessionId);
     } else {
       this.sendMinSize(sessionId);
     }
@@ -683,20 +760,17 @@ export class BlitConnection {
     this.store.setPalette(p);
   }
 
-  sendSurfaceInput(
-    sessionId: number,
-    surfaceId: number,
-    keycode: number,
-    pressed: boolean,
-  ): void {
+  sendSurfaceInput(surfaceId: number, keycode: number, pressed: boolean): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(
-      buildSurfaceInputMessage(sessionId, surfaceId, keycode, pressed),
-    );
+    this.transport.send(buildSurfaceInputMessage(surfaceId, keycode, pressed));
+  }
+
+  sendSurfaceText(surfaceId: number, text: string): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceTextMessage(surfaceId, text));
   }
 
   sendSurfacePointer(
-    sessionId: number,
     surfaceId: number,
     type: number,
     button: number,
@@ -705,88 +779,167 @@ export class BlitConnection {
   ): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(
-      buildSurfacePointerMessage(sessionId, surfaceId, type, button, x, y),
+      buildSurfacePointerMessage(surfaceId, type, button, x, y),
     );
   }
 
-  sendSurfaceAxis(
-    sessionId: number,
-    surfaceId: number,
-    axis: number,
-    valueX100: number,
-  ): void {
+  sendSurfaceAxis(surfaceId: number, axis: number, valueX100: number): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(
-      buildSurfaceAxisMessage(sessionId, surfaceId, axis, valueX100),
-    );
+    this.transport.send(buildSurfaceAxisMessage(surfaceId, axis, valueX100));
   }
 
   sendSurfaceResize(
-    sessionId: number,
     surfaceId: number,
     width: number,
     height: number,
     scale120: number = 0,
-    codecSupport: number = 0,
   ): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(
-      buildSurfaceResizeMessage(
-        sessionId,
-        surfaceId,
-        width,
-        height,
-        scale120,
-        codecSupport,
-      ),
+      buildSurfaceResizeMessage(surfaceId, width, height, scale120),
     );
   }
 
-  sendSurfaceFocus(sessionId: number, surfaceId: number): void {
+  sendSurfaceFocus(surfaceId: number): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(buildSurfaceFocusMessage(sessionId, surfaceId));
+    this.transport.send(buildSurfaceFocusMessage(surfaceId));
   }
 
-  sendSurfaceClose(sessionId: number, surfaceId: number): void {
+  sendSurfaceClose(surfaceId: number): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(buildSurfaceCloseMessage(sessionId, surfaceId));
+    this.transport.send(buildSurfaceCloseMessage(surfaceId));
   }
 
   private surfaceSubRefCounts = new Map<number, number>();
+  private _pendingUnsubs = new Map<number, ReturnType<typeof setTimeout>>();
 
-  sendSurfaceSubscribe(sessionId: number, surfaceId: number): void {
+  /**
+   * True once {@link detectCodecSupport} has resolved and
+   * {@link sendClientFeatures} has informed the server which video codecs
+   * this client can decode.
+   *
+   * Surface subscribes are sent immediately (with codec_support=0 =
+   * "accept anything") so the server can start encoding the first frame
+   * without waiting for the async codec probe.  Once the probe resolves
+   * we send C2S_CLIENT_FEATURES and re-subscribe any active surfaces so
+   * the server can switch to the optimal encoder.  This eliminates a
+   * round-trip from the time-to-first-frame on remote connections.
+   */
+  private _codecFeaturesSent = false;
+
+  sendSurfaceSubscribe(surfaceId: number): void {
     const prev = this.surfaceSubRefCounts.get(surfaceId) ?? 0;
     this.surfaceSubRefCounts.set(surfaceId, prev + 1);
+    // Cancel any pending debounced unsub — the surface is still wanted.
+    const pendingUnsub = this._pendingUnsubs.get(surfaceId);
+    if (pendingUnsub) {
+      clearTimeout(pendingUnsub);
+      this._pendingUnsubs.delete(surfaceId);
+      // The server still has the subscription — no need to re-send.
+      return;
+    }
     if (prev === 0 && this.transport.status === "connected") {
-      this.transport.send(buildSurfaceSubscribeMessage(sessionId, surfaceId));
+      this._logger.info(`surface sub ${this.id}:${surfaceId}`);
+      this.transport.send(
+        buildSurfaceSubscribeMessage(surfaceId, 0, this.defaultSurfaceQuality),
+      );
     }
   }
 
-  sendSurfaceUnsubscribe(sessionId: number, surfaceId: number): void {
+  /**
+   * Re-subscribe active surfaces after the codec probe resolves so the
+   * server can switch to the optimal encoder for this client's
+   * capabilities.  Surfaces that were subscribed with codec_support=0
+   * ("accept anything") before the probe completed get updated.
+   */
+  private resubscribeWithCodecSupport(): void {
+    if (this.transport.status !== "connected") return;
+    for (const [surfaceId, count] of this.surfaceSubRefCounts) {
+      if (count > 0) {
+        const surface = this.surfaceStore.getSurface(surfaceId);
+        if (surface) {
+          // Re-subscribe triggers the server to recreate the encoder
+          // with the now-known codec support bitmask.
+          this.transport.send(
+            buildSurfaceSubscribeMessage(
+              surfaceId,
+              0,
+              this.defaultSurfaceQuality,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  sendSurfaceUnsubscribe(surfaceId: number): void {
     const prev = this.surfaceSubRefCounts.get(surfaceId) ?? 0;
     const next = Math.max(0, prev - 1);
     if (next === 0) {
       this.surfaceSubRefCounts.delete(surfaceId);
-      if (this.transport.status === "connected") {
-        this.transport.send(
-          buildSurfaceUnsubscribeMessage(sessionId, surfaceId),
-        );
-      }
+      // Defer the unsub so view transitions (destroy old → create new)
+      // can cancel it.  SolidJS does this synchronously; React batches
+      // useEffect cleanup and mount across separate macrotasks, so we
+      // need a short grace period rather than just setTimeout(0).
+      const existing = this._pendingUnsubs.get(surfaceId);
+      if (existing) clearTimeout(existing);
+      this._pendingUnsubs.set(
+        surfaceId,
+        setTimeout(() => {
+          this._pendingUnsubs.delete(surfaceId);
+          if (this.transport.status === "connected") {
+            this._logger.info(`surface unsub ${this.id}:${surfaceId}`);
+            this.transport.send(buildSurfaceUnsubscribeMessage(surfaceId));
+          }
+        }, 50),
+      );
     } else {
       this.surfaceSubRefCounts.set(surfaceId, next);
     }
   }
 
-  sendClipboard(
-    sessionId: number,
-    surfaceId: number,
-    mimeType: string,
-    data: Uint8Array,
-  ): void {
+  /**
+   * Re-send a surface subscribe with a quality override.
+   * Does not affect ref-counts -- only sends the wire message for already-
+   * subscribed surfaces.  The server treats a second SURFACE_SUBSCRIBE as
+   * a quality/codec update (same as AUDIO_SUBSCRIBE).
+   */
+  sendSurfaceResubscribe(surfaceId: number, quality: number): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(
-      buildClipboardMessage(sessionId, surfaceId, mimeType, data),
-    );
+    if ((this.surfaceSubRefCounts.get(surfaceId) ?? 0) <= 0) return;
+    this.transport.send(buildSurfaceSubscribeMessage(surfaceId, 0, quality));
+  }
+
+  /**
+   * Subscribe to audio frames, optionally specifying bitrate.
+   * Can be called repeatedly to adjust bitrate without unsubscribing first.
+   * `bitrateKbps`: 0 = server default, otherwise desired Opus bitrate in kbps.
+   */
+  sendAudioSubscribe(bitrateKbps: number = 0): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildAudioSubscribeMessage(bitrateKbps));
+    this.audioPlayer.setSubscribed(true);
+  }
+
+  sendAudioUnsubscribe(): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildAudioUnsubscribeMessage());
+    this.audioPlayer.setSubscribed(false);
+  }
+
+  /**
+   * Reset the audio pipeline to recover from stalled or broken audio.
+   * The server subscription stays active — audio rebuilds automatically
+   * on the next incoming frame without a re-subscribe round-trip.
+   */
+  resetAudio(): void {
+    this._logger.info(`${this.id}: audio pipeline reset`);
+    this.audioPlayer.resetPipeline();
+  }
+
+  sendClipboard(mimeType: string, data: Uint8Array): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildClipboardMessage(mimeType, data));
   }
 
   /**
@@ -818,6 +971,41 @@ export class BlitConnection {
 
     const type = bytes[0];
     switch (type) {
+      case S2C_PING:
+        // Application-level keepalive — no action needed.
+        return;
+      case S2C_QUIT:
+        // Server is shutting down.  Immediately dismiss all sessions and
+        // surfaces so the UI doesn't show stale windows while reconnecting.
+        // This mirrors the S2C_HELLO reset path but happens *before* the
+        // transport drops, so the UI clears instantly.
+        this.surfaceStore.reset();
+        this.audioPlayer.reset();
+        this.surfaceSubRefCounts.clear();
+        for (const t of this._pendingUnsubs.values()) clearTimeout(t);
+        this._pendingUnsubs.clear();
+        for (const session of this.sessions) {
+          if (session.state !== "closed") {
+            this.markSessionClosed(session.id, false);
+          }
+        }
+        this.snapshot = {
+          ...this.snapshot,
+          ready: false,
+          sessions: this.publicSessions,
+          focusedSessionId: null,
+        };
+        this.emit();
+        // Immediately reconnect so the UI recovers as fast as possible
+        // when the server restarts.  Do NOT call transport.close() — that
+        // permanently disposes the transport.  transport.reconnect() tears
+        // down the current connection and starts a fresh attempt right
+        // away, bypassing the backoff delay that transport-level disconnect
+        // detection would otherwise impose.
+        if (this.transport.reconnect) {
+          this.transport.reconnect();
+        }
+        return;
       case S2C_UPDATE: {
         if (bytes.length < 3) return;
         const ptyId = bytes[1] | (bytes[2] << 8);
@@ -829,15 +1017,19 @@ export class BlitConnection {
         if (bytes.length < 3) return;
         const ptyId = bytes[1] | (bytes[2] << 8);
         const tag = textDecoder.decode(bytes.subarray(3));
-        const session = this.upsertLiveSession(ptyId, tag, "active");
+        let command: string | null = null;
         if (
           (this.features & FEATURE_CREATE_NONCE) === 0 &&
           this.pendingCreates.size > 0
         ) {
           const [firstNonce, pending] = this.pendingCreates.entries().next()
             .value as [number, PendingCreate];
+          command = pending.command?.trim() || null;
           this.pendingCreates.delete(firstNonce);
+          const session = this.upsertLiveSession(ptyId, tag, "active", command);
           pending.resolve(toPublicSession(session));
+        } else {
+          this.upsertLiveSession(ptyId, tag, "active");
         }
 
         return;
@@ -847,8 +1039,9 @@ export class BlitConnection {
         const nonce = bytes[1] | (bytes[2] << 8);
         const ptyId = bytes[3] | (bytes[4] << 8);
         const tag = textDecoder.decode(bytes.subarray(5));
-        const session = this.upsertLiveSession(ptyId, tag, "active");
         const pending = this.pendingCreates.get(nonce);
+        const command = pending?.command?.trim() || null;
+        const session = this.upsertLiveSession(ptyId, tag, "active", command);
         if (pending) {
           this.pendingCreates.delete(nonce);
           pending.resolve(toPublicSession(session));
@@ -878,6 +1071,38 @@ export class BlitConnection {
         this.handleListMessage(bytes);
         return;
       }
+      case S2C_READY: {
+        // S2C_READY is the last message in the server's initial
+        // handshake sequence (after S2C_SURFACE_CREATED and S2C_LIST).
+        // Setting `ready` here instead of in S2C_LIST ensures the
+        // surface store is already populated when the BSP reconciliation
+        // runs, preventing surface assignments from being wiped.
+        //
+        // Also promote the snapshot status to "connected" — until now it
+        // was held at "authenticating" (see handleStatusChange) because
+        // the transport being open doesn't mean the remote blit server
+        // is reachable and functional.
+        if (!this.snapshot.ready || this.snapshot.status !== "connected") {
+          this.snapshot = {
+            ...this.snapshot,
+            ready: true,
+            status:
+              this.transport.status === "connected"
+                ? "connected"
+                : this.snapshot.status,
+          };
+          this.emit();
+        }
+        // Prune closed sessions that have been superseded by a live
+        // session for the same PTY.  This MUST happen after the emit()
+        // above so the synchronous reactive flush (which runs BSP
+        // reconciliation) still sees the closed sessions and can build
+        // the old→new session-ID replacement map.  Deferring to a
+        // microtask ensures the prune fires after the current reactive
+        // cycle completes.
+        queueMicrotask(() => this.pruneSupersededSessions());
+        return;
+      }
       case S2C_TITLE: {
         if (bytes.length < 3) return;
         const ptyId = bytes[1] | (bytes[2] << 8);
@@ -902,28 +1127,52 @@ export class BlitConnection {
           return;
         }
         this.features = features;
+        // S2C_HELLO is the first message on every new server connection.
+        // Reset all surfaces and close stale sessions — the server's
+        // initial message sequence (S2C_SURFACE_CREATED, S2C_LIST,
+        // S2C_READY) will rebuild both.  S2C_READY marks the end of
+        // the initial burst and sets `ready: true`.  This also handles
+        // transparent gateway reconnects where the transport never went
+        // through "disconnected".
+        this.surfaceStore.reset();
+        this.audioPlayer.reset();
+        this.surfaceSubRefCounts.clear();
+        for (const t of this._pendingUnsubs.values()) clearTimeout(t);
+        this._pendingUnsubs.clear();
+        for (const session of this.sessions) {
+          if (session.state !== "closed") {
+            this.markSessionClosed(session.id, false);
+          }
+        }
         this.snapshot = {
           ...this.snapshot,
+          // S2C_HELLO means a new handshake is starting — the connection
+          // is not yet fully operational until S2C_READY arrives.
+          status:
+            this.snapshot.status === "connected"
+              ? "authenticating"
+              : this.snapshot.status,
+          ready: false,
           supportsRestart: (features & FEATURE_RESTART) !== 0,
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
+          supportsAudio: (features & FEATURE_AUDIO) !== 0,
         };
         this.emit();
         return;
       }
       case S2C_SURFACE_CREATED: {
         try {
-          if (bytes.length < 13) return;
+          if (bytes.length < 11) return;
           const view = new DataView(data);
-          const sessionId = view.getUint16(1, true);
-          const surfaceId = view.getUint16(3, true);
-          const parentId = view.getUint16(5, true);
-          const width = view.getUint16(7, true);
-          const height = view.getUint16(9, true);
-          const titleLen = view.getUint16(11, true);
-          const title = textDecoder.decode(bytes.subarray(13, 13 + titleLen));
+          const surfaceId = view.getUint16(1, true);
+          const parentId = view.getUint16(3, true);
+          const width = view.getUint16(5, true);
+          const height = view.getUint16(7, true);
+          const titleLen = view.getUint16(9, true);
+          const title = textDecoder.decode(bytes.subarray(11, 11 + titleLen));
           let appId = "";
-          const appIdOffset = 13 + titleLen;
+          const appIdOffset = 11 + titleLen;
           if (bytes.length >= appIdOffset + 2) {
             const appIdLen = view.getUint16(appIdOffset, true);
             appId = textDecoder.decode(
@@ -931,7 +1180,6 @@ export class BlitConnection {
             );
           }
           this.surfaceStore.handleSurfaceCreated(
-            sessionId,
             surfaceId,
             parentId,
             width,
@@ -946,71 +1194,131 @@ export class BlitConnection {
       }
       case S2C_SURFACE_DESTROYED: {
         try {
-          if (bytes.length < 5) return;
-          const surfaceId = bytes[3] | (bytes[4] << 8);
+          if (bytes.length < 3) return;
+          const surfaceId = bytes[1] | (bytes[2] << 8);
           this.surfaceStore.handleSurfaceDestroyed(surfaceId);
         } catch {}
         return;
       }
       case S2C_SURFACE_FRAME: {
+        if (bytes.length < 12) return;
+        const view = new DataView(data);
+        const surfaceId = view.getUint16(1, true);
+        const timestamp = view.getUint32(3, true);
+        const flags = bytes[7];
+        const width = view.getUint16(8, true);
+        const height = view.getUint16(10, true);
         try {
-          if (bytes.length < 14) return;
-          const view = new DataView(data);
-          const surfaceId = view.getUint16(3, true);
-          const timestamp = view.getUint32(5, true);
-          const flags = bytes[9];
-          const width = view.getUint16(10, true);
-          const height = view.getUint16(12, true);
+          // The store sends ACKs itself, deferring them when the decode
+          // queue is deep to apply backpressure on the server.
           this.surfaceStore.handleSurfaceFrame(
             surfaceId,
             timestamp,
             flags,
             width,
             height,
-            bytes.subarray(14),
+            bytes.subarray(12),
           );
-          this.transport.send(buildSurfaceAckMessage(surfaceId));
-        } catch {}
+        } catch {
+          // Swallowed decode errors must still ACK so the server's pacing
+          // window doesn't permanently stall.
+          this.surfaceStore.sendAckFallback(surfaceId);
+        }
+        // Feed the video frame's server timestamp to the audio player
+        // for A/V sync.  Video is never delayed — the audio player uses
+        // this to steer its playback rate.
+        this.audioPlayer.notifyVideoTimestamp(timestamp);
         return;
       }
       case S2C_SURFACE_TITLE: {
         try {
-          if (bytes.length < 5) return;
-          const surfaceId = bytes[3] | (bytes[4] << 8);
-          const title = textDecoder.decode(bytes.subarray(5));
+          if (bytes.length < 3) return;
+          const surfaceId = bytes[1] | (bytes[2] << 8);
+          const title = textDecoder.decode(bytes.subarray(3));
           this.surfaceStore.handleSurfaceTitle(surfaceId, title);
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_CURSOR: {
+        try {
+          if (bytes.length < 4) return;
+          const surfaceId = bytes[1] | (bytes[2] << 8);
+          const cursorType = bytes[3];
+          if (cursorType === 0) {
+            // Named CSS cursor
+            const nameLen = bytes[4];
+            if (bytes.length < 5 + nameLen) return;
+            const shape = textDecoder.decode(bytes.subarray(5, 5 + nameLen));
+            this.surfaceStore.handleSurfaceCursor(surfaceId, shape);
+          } else if (cursorType === 1) {
+            // Hidden
+            this.surfaceStore.handleSurfaceCursor(surfaceId, "none");
+          } else if (cursorType === 2) {
+            // Custom image: hotx(2) + hoty(2) + w(2) + h(2) + png
+            if (bytes.length < 12) return;
+            const view = new DataView(data);
+            const hotX = view.getUint16(4, true);
+            const hotY = view.getUint16(6, true);
+            const pngData = bytes.subarray(12);
+            const blob = new Blob([pngData], { type: "image/png" });
+            const url = URL.createObjectURL(blob);
+            this.surfaceStore.handleSurfaceCursor(
+              surfaceId,
+              `url(${url}) ${hotX} ${hotY}, auto`,
+            );
+          }
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_ENCODER: {
+        try {
+          if (bytes.length < 3) return;
+          const surfaceId = bytes[1] | (bytes[2] << 8);
+          const encoderName = textDecoder.decode(bytes.subarray(3));
+          this.surfaceStore.handleSurfaceEncoder(surfaceId, encoderName);
         } catch {}
         return;
       }
       case S2C_SURFACE_APP_ID: {
         try {
-          if (bytes.length < 5) return;
-          const surfaceId = bytes[3] | (bytes[4] << 8);
-          const appId = textDecoder.decode(bytes.subarray(5));
+          if (bytes.length < 3) return;
+          const surfaceId = bytes[1] | (bytes[2] << 8);
+          const appId = textDecoder.decode(bytes.subarray(3));
           this.surfaceStore.handleSurfaceAppId(surfaceId, appId);
         } catch {}
         return;
       }
       case S2C_SURFACE_RESIZED: {
         try {
-          if (bytes.length < 9) return;
+          if (bytes.length < 7) return;
           const view = new DataView(data);
-          const surfaceId = view.getUint16(3, true);
-          const width = view.getUint16(5, true);
-          const height = view.getUint16(7, true);
+          const surfaceId = view.getUint16(1, true);
+          const width = view.getUint16(3, true);
+          const height = view.getUint16(5, true);
           this.surfaceStore.handleSurfaceResized(surfaceId, width, height);
         } catch {}
         return;
       }
-      case S2C_CLIPBOARD_MSG: {
+      case S2C_AUDIO_FRAME: {
         try {
-          if (bytes.length < 11) return;
+          if (bytes.length < 6) return;
           const view = new DataView(data);
-          const mimeLen = view.getUint16(5, true);
-          if (bytes.length < 7 + mimeLen + 4) return;
-          const mimeType = textDecoder.decode(bytes.subarray(7, 7 + mimeLen));
-          const dataLen = view.getUint32(7 + mimeLen, true);
-          const dataStart = 11 + mimeLen;
+          const timestamp = view.getUint32(1, true);
+          const flags = bytes[5];
+          const audioData = bytes.subarray(6);
+          this.audioPlayer.handleAudioFrame(timestamp, flags, audioData);
+        } catch {}
+        return;
+      }
+      case S2C_CLIPBOARD_CONTENT: {
+        try {
+          if (bytes.length < 7) return;
+          const view = new DataView(data);
+          const mimeLen = view.getUint16(1, true);
+          if (bytes.length < 3 + mimeLen + 4) return;
+          const mimeType = textDecoder.decode(bytes.subarray(3, 3 + mimeLen));
+          const dataLen = view.getUint32(3 + mimeLen, true);
+          const dataStart = 7 + mimeLen;
           if (bytes.length < dataStart + dataLen) return;
           if (mimeType.startsWith("text/") || mimeType === "UTF8_STRING") {
             const text = textDecoder.decode(
@@ -1051,10 +1359,24 @@ export class BlitConnection {
       this.hasConnected = true;
       this.retryCount = 0;
       this.lastError = null;
-      // Eagerly detect supported codecs and inform the server so it picks
-      // a compatible encoder before any surface subscribe arrives.
+      this._codecFeaturesSent = false;
+      // Start application-level keepalive.
+      if (this.pingTimer === null && this.pingIntervalMs > 0) {
+        this.pingTimer = setInterval(() => {
+          if (this.transport.status === "connected") {
+            this.transport.send(new Uint8Array([C2S_PING]));
+          }
+        }, this.pingIntervalMs);
+      }
+      // Detect supported codecs and inform the server.  Surface subscribes
+      // are sent immediately (with codec_support=0) so the first frame
+      // arrives without waiting for this async probe.  Once the probe
+      // resolves, we send C2S_CLIENT_FEATURES and re-subscribe active
+      // surfaces so the server can switch to the optimal encoder.
       detectCodecSupport().then((mask) => {
         this.sendClientFeatures(mask);
+        this._codecFeaturesSent = true;
+        this.resubscribeWithCodecSupport();
       });
     } else if (
       (status === "error" ||
@@ -1073,9 +1395,18 @@ export class BlitConnection {
       this.lastError = lastError;
     }
 
+    // When the transport connects, the blit protocol handshake (S2C_HELLO →
+    // S2C_LIST → S2C_READY) hasn't completed yet.  Report "authenticating"
+    // so the UI doesn't show a connection as online until S2C_READY confirms
+    // the remote is actually reachable and functional.
+    const snapshotStatus =
+      status === "connected" && !this.snapshot.ready
+        ? ("authenticating" as ConnectionStatus)
+        : status;
+
     this.snapshot = {
       ...this.snapshot,
-      status,
+      status: snapshotStatus,
       retryCount: this.retryCount,
       error: this.lastError,
     };
@@ -1085,6 +1416,10 @@ export class BlitConnection {
       status === "closed" ||
       status === "error"
     ) {
+      if (this.pingTimer !== null) {
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
+      }
       this.rejectPendingCreates(
         connectionError(`Transport ${status} before PTY creation completed`),
       );
@@ -1092,11 +1427,29 @@ export class BlitConnection {
       this.rejectPendingReads(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
       this.surfaceStore.handleDisconnect();
+      this.audioPlayer.reset();
       // All surface subscriptions are implicitly dropped when the transport
       // dies.  Clear the ref-counts so that re-subscribes after reconnect
       // are sent correctly (the check `if (prev === 0 ...)` would otherwise
       // skip re-sending since the old count is still > 0).
       this.surfaceSubRefCounts.clear();
+      for (const t of this._pendingUnsubs.values()) clearTimeout(t);
+      this._pendingUnsubs.clear();
+      // Dismiss all sessions so the UI doesn't show stale terminals from a
+      // server that crashed without sending S2C_QUIT.  On reconnect the
+      // server's S2C_HELLO + S2C_LIST sequence rebuilds the session list
+      // from scratch.
+      for (const session of this.sessions) {
+        if (session.state !== "closed") {
+          this.markSessionClosed(session.id, false);
+        }
+      }
+      this.snapshot = {
+        ...this.snapshot,
+        ready: false,
+        sessions: this.publicSessions,
+        focusedSessionId: null,
+      };
     }
 
     this.emit();
@@ -1155,24 +1508,36 @@ export class BlitConnection {
     }
 
     const previousFocus = this.snapshot.focusedSessionId;
-    const nextFocus =
-      previousFocus && this.sessionsById.get(previousFocus)?.state !== "closed"
-        ? previousFocus
-        : this.firstLiveSessionId();
+    const previousSession = previousFocus
+      ? (this.sessionsById.get(previousFocus) ?? null)
+      : null;
+    let nextFocus: SessionId | null = null;
+    if (previousSession && previousSession.state !== "closed") {
+      nextFocus = previousFocus;
+    } else if (previousSession && previousSession.state === "closed") {
+      // The focused session was closed during reconnect — find the live
+      // replacement for the same PTY so focus survives transparently.
+      const replacementId = this.currentSessionIdByPtyId.get(
+        previousSession.ptyId,
+      );
+      const replacement = replacementId
+        ? (this.sessionsById.get(replacementId) ?? null)
+        : null;
+      nextFocus =
+        replacement && replacement.state !== "closed"
+          ? replacement.id
+          : this.firstLiveSessionId();
+    } else {
+      nextFocus = this.firstLiveSessionId();
+    }
 
     this.snapshot = {
       ...this.snapshot,
-      ready: true,
       focusedSessionId: nextFocus,
     };
     this.store.setLead(
       nextFocus ? (this.sessionsById.get(nextFocus)?.ptyId ?? null) : null,
     );
-
-    // Prune surfaces that existed before a disconnect but were not
-    // re-announced by the server.  S2C_SURFACE_CREATED messages arrive
-    // before S2C_LIST, so any surface not seen by now is gone.
-    this.surfaceStore.reconcileAfterList();
 
     this.emit();
 
@@ -1186,6 +1551,59 @@ export class BlitConnection {
         this.transport.send(buildFocusMessage(session.ptyId));
       }
     }
+
+    // Pruning of superseded sessions is normally deferred until S2C_READY
+    // (see the S2C_READY handler) because BSP reconciliation is gated on
+    // `ready === true`.  If we pruned here, the closed sessions would be
+    // removed before the UI built the old→new session-ID replacement map,
+    // wiping pane assignments instead of remapping them.
+    //
+    // However, if `ready` is already true (e.g. a mid-session re-list,
+    // currently not sent by the server but guarding defensively), the
+    // emit() above already triggered reconciliation synchronously, so it
+    // is safe to prune now.
+    if (this.snapshot.ready) {
+      queueMicrotask(() => this.pruneSupersededSessions());
+    }
+  }
+
+  /**
+   * Remove closed sessions from `sessionsById`, `sessions`, and `viewSizes`
+   * when a live session already exists for the same ptyId.  This prevents
+   * stale closed sessions from accumulating across reconnect cycles.
+   */
+  private pruneSupersededSessions(): void {
+    // Collect ptyIds that currently have a live session.
+    const livePtyIds = new Set<number>();
+    for (const session of this.sessions) {
+      if (session.state !== "closed") {
+        livePtyIds.add(session.ptyId);
+      }
+    }
+
+    const toPrune: SessionId[] = [];
+    for (const session of this.sessions) {
+      if (session.state === "closed" && livePtyIds.has(session.ptyId)) {
+        toPrune.push(session.id);
+      }
+    }
+
+    if (toPrune.length === 0) return;
+
+    for (const id of toPrune) {
+      this.sessionsById.delete(id);
+      this.viewSizes.delete(id);
+    }
+    const pruneSet = new Set(toPrune);
+    this.sessions = this.sessions.filter(
+      (session) => !pruneSet.has(session.id),
+    );
+    this.invalidatePublicSessions();
+    this.snapshot = {
+      ...this.snapshot,
+      sessions: this.publicSessions,
+    };
+    this.emit();
   }
 
   private handleSearchResults(bytes: Uint8Array): void {

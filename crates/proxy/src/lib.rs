@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
@@ -147,75 +147,69 @@ struct UpstreamConn {
 }
 
 // ---------------------------------------------------------------------------
-// Share session pool — pools WebRTC Sessions, opens/closes channels per req
+// Share session cache — one multiplexed WebRTC session per remote
 // ---------------------------------------------------------------------------
 
+/// Maintains a single multiplexed WebRTC session per remote.  The heavy
+/// ICE+DTLS+SCTP setup is done once; subsequent `acquire` calls open a
+/// virtual stream on the existing mux DataChannel — a purely local
+/// operation with zero network round-trips.
 struct SharePool {
-    idle: Mutex<VecDeque<blit_webrtc_forwarder::client::Session>>,
+    mux: Mutex<Option<blit_webrtc_forwarder::client::MuxSession>>,
     passphrase: String,
     hub: String,
-    pool_size: usize,
     active: AtomicUsize,
     last_activity: AtomicI64,
 }
 
 impl SharePool {
-    fn new(passphrase: String, hub: String, pool_size: usize) -> Arc<Self> {
+    fn new(passphrase: String, hub: String) -> Arc<Self> {
         Arc::new(Self {
-            idle: Mutex::new(VecDeque::new()),
+            mux: Mutex::new(None),
             passphrase,
             hub,
-            pool_size,
             active: AtomicUsize::new(0),
             last_activity: AtomicI64::new(now_secs()),
         })
     }
 
-    async fn acquire(
-        &self,
-    ) -> Result<
-        (
-            blit_webrtc_forwarder::client::Session,
-            blit_webrtc_forwarder::client::ChannelHandle,
-            UpstreamConn,
-        ),
-        String,
-    > {
-        loop {
-            let session = {
-                let mut idle = self.idle.lock().await;
-                idle.pop_front()
-            };
-            match session {
-                Some(s) => match s.open_channel().await {
-                    Ok((handle, stream)) => {
-                        let (r, w) = tokio::io::split(stream);
-                        return Ok((
-                            s,
-                            handle,
-                            UpstreamConn {
-                                reader: Box::new(r),
-                                writer: Box::new(w),
-                            },
-                        ));
-                    }
-                    Err(e) => {
-                        log!("blit-proxy: share: idle session stale ({e}), discarding");
-                        continue;
-                    }
-                },
-                None => break,
+    /// Open a virtual stream on the mux session, establishing the
+    /// underlying WebRTC session if needed.
+    ///
+    /// When the session already exists this is a **local operation** —
+    /// no network round-trip, typically <1 ms.
+    async fn acquire(&self) -> Result<(u16, UpstreamConn), String> {
+        // Fast path: open a stream on the existing mux session.
+        {
+            let mux = self.mux.lock().await;
+            if let Some(ref m) = *mux
+                && m.is_alive()
+            {
+                let (id, stream) = m.open_stream()?;
+                let (r, w) = tokio::io::split(stream);
+                return Ok((
+                    id,
+                    UpstreamConn {
+                        reader: Box::new(r),
+                        writer: Box::new(w),
+                    },
+                ));
             }
         }
-        // No idle session — establish a new one.
-        let (session, handle, stream) =
-            blit_webrtc_forwarder::client::Session::establish(&self.passphrase, &self.hub)
+
+        // Slow path: establish a new mux session.
+        let hub_url = blit_webrtc_forwarder::normalize_hub(&self.hub);
+        let new_mux =
+            blit_webrtc_forwarder::client::MuxSession::establish(&self.passphrase, &hub_url)
                 .await
                 .map_err(|e| format!("{e}"))?;
+
+        let (id, stream) = new_mux.open_stream()?;
+        *self.mux.lock().await = Some(new_mux);
+
         let (r, w) = tokio::io::split(stream);
         Ok((
-            session,
-            handle,
+            id,
             UpstreamConn {
                 reader: Box::new(r),
                 writer: Box::new(w),
@@ -223,10 +217,12 @@ impl SharePool {
         ))
     }
 
-    async fn release(&self, session: blit_webrtc_forwarder::client::Session) {
-        let mut idle = self.idle.lock().await;
-        if idle.len() < self.pool_size {
-            idle.push_back(session);
+    /// Close a virtual stream.  The mux session stays alive.
+    fn recycle(&self, stream_id: u16) {
+        if let Ok(mux) = self.mux.try_lock()
+            && let Some(ref m) = *mux
+        {
+            m.close_stream(stream_id);
         }
     }
 
@@ -241,51 +237,20 @@ impl SharePool {
             self.last_activity.store(now_secs(), Ordering::Relaxed);
         }
     }
-
-    async fn refill_loop(self: Arc<Self>) {
-        loop {
-            let need = {
-                let idle = self.idle.lock().await;
-                self.pool_size.saturating_sub(idle.len())
-            };
-            for _ in 0..need {
-                match blit_webrtc_forwarder::client::Session::establish(&self.passphrase, &self.hub)
-                    .await
-                {
-                    Ok((session, handle, _stream)) => {
-                        // Close the initial channel; keep only the warm session.
-                        session.close_channel(handle);
-                        let mut idle = self.idle.lock().await;
-                        if idle.len() < self.pool_size {
-                            idle.push_back(session);
-                        }
-                    }
-                    Err(e) => {
-                        log!("blit-proxy: share: pre-warm failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
 }
 
 struct ShareRegistry {
     pools: RwLock<HashMap<String, Arc<SharePool>>>,
-    pool_size: usize,
 }
 
 impl ShareRegistry {
-    fn new(pool_size: usize) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         Arc::new(Self {
             pools: RwLock::new(HashMap::new()),
-            pool_size,
         })
     }
 
-    async fn get_or_create(self: &Arc<Self>, uri: &str) -> Arc<SharePool> {
+    async fn get_or_create(&self, uri: &str) -> Arc<SharePool> {
         {
             let pools = self.pools.read().await;
             if let Some(p) = pools.get(uri) {
@@ -297,15 +262,8 @@ impl ShareRegistry {
             return p.clone();
         }
         let (passphrase, hub) = parse_share_uri(uri.strip_prefix("share:").unwrap_or(uri));
-        let pool = SharePool::new(passphrase, hub, self.pool_size);
+        let pool = SharePool::new(passphrase, hub);
         pools.insert(uri.to_string(), pool.clone());
-        drop(pools);
-
-        let pool_seed = pool.clone();
-        tokio::spawn(async move {
-            pool_seed.refill_loop().await;
-        });
-
         pool
     }
 
@@ -335,6 +293,8 @@ struct Pool {
     last_activity: AtomicI64,
     pool_size: usize,
     upstream_uri: String,
+    /// Wakes the refill loop immediately when a connection is consumed.
+    refill_notify: Notify,
 }
 
 impl Pool {
@@ -345,6 +305,7 @@ impl Pool {
             last_activity: AtomicI64::new(now_secs()),
             pool_size,
             upstream_uri,
+            refill_notify: Notify::new(),
         })
     }
 
@@ -352,6 +313,7 @@ impl Pool {
         {
             let mut idle = self.idle.lock().await;
             if let Some(conn) = idle.pop_front() {
+                self.refill_notify.notify_one();
                 return Ok(conn);
             }
         }
@@ -375,28 +337,49 @@ impl Pool {
     }
 
     /// Background task: keep idle slots full.
+    ///
+    /// Wakes immediately when notified (a connection was consumed) or
+    /// falls back to polling every 200 ms.  Launches refill connections
+    /// concurrently so a burst of consumes is replenished quickly.
     async fn refill_loop(self: Arc<Self>) {
         loop {
             let need = {
                 let idle = self.idle.lock().await;
                 self.pool_size.saturating_sub(idle.len())
             };
-            for _ in 0..need {
-                match self.connect_one().await {
-                    Ok(conn) => {
-                        self.idle.lock().await.push_back(conn);
-                    }
-                    Err(e) => {
-                        log!(
-                            "blit-proxy: [{uri}] upstream connect failed: {e}",
-                            uri = self.upstream_uri
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        break;
+            if need > 0 {
+                let mut tasks = Vec::with_capacity(need);
+                for _ in 0..need {
+                    let pool = self.clone();
+                    tasks.push(tokio::spawn(async move { pool.connect_one().await }));
+                }
+                let mut any_failed = false;
+                for task in tasks {
+                    match task.await {
+                        Ok(Ok(conn)) => {
+                            self.idle.lock().await.push_back(conn);
+                        }
+                        Ok(Err(e)) => {
+                            log!(
+                                "blit-proxy: [{uri}] upstream connect failed: {e}",
+                                uri = self.upstream_uri
+                            );
+                            any_failed = true;
+                        }
+                        Err(_) => {
+                            any_failed = true;
+                        }
                     }
                 }
+                if any_failed {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Wait for a notify (connection consumed) or poll interval.
+            tokio::select! {
+                _ = self.refill_notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
         }
     }
 }
@@ -440,27 +423,45 @@ impl Registry {
         if let Some(p) = pools.get(uri) {
             return p.clone();
         }
-        let pool = Pool::new(uri.to_string(), self.pool_size);
+
+        // SSH connections multiplex channels over a single cached TCP+SSH
+        // session, so opening a channel on demand is cheap (~1 RTT).
+        // Pre-warming would waste server-side resources (each idle
+        // connection allocates a full ClientState).
+        let effective_pool_size = if uri.starts_with("ssh:") {
+            0
+        } else {
+            self.pool_size
+        };
+
+        let pool = Pool::new(uri.to_string(), effective_pool_size);
         pools.insert(uri.to_string(), pool.clone());
         drop(pools);
 
-        // Seed eagerly in a background task.
-        let pool_seed = pool.clone();
-        tokio::spawn(async move {
-            for _ in 0..pool_seed.pool_size {
-                match pool_seed.connect_one().await {
-                    Ok(conn) => pool_seed.idle.lock().await.push_back(conn),
-                    Err(e) => {
-                        log!(
-                            "blit-proxy: [{uri}] initial connect: {e}",
-                            uri = pool_seed.upstream_uri
-                        );
-                        break;
+        // Seed eagerly in a background task (skipped when pool_size is 0).
+        if effective_pool_size > 0 {
+            let pool_seed = pool.clone();
+            tokio::spawn(async move {
+                let mut tasks = Vec::with_capacity(pool_seed.pool_size);
+                for _ in 0..pool_seed.pool_size {
+                    let p = pool_seed.clone();
+                    tasks.push(tokio::spawn(async move { p.connect_one().await }));
+                }
+                for task in tasks {
+                    match task.await {
+                        Ok(Ok(conn)) => pool_seed.idle.lock().await.push_back(conn),
+                        Ok(Err(e)) => {
+                            log!(
+                                "blit-proxy: [{uri}] initial connect: {e}",
+                                uri = pool_seed.upstream_uri
+                            );
+                        }
+                        Err(_) => {}
                     }
                 }
-            }
-            pool_seed.refill_loop().await;
-        });
+                pool_seed.refill_loop().await;
+            });
+        }
 
         pool
     }
@@ -1032,10 +1033,10 @@ async fn handle_downstream<S>(
     };
 
     if uri.starts_with("share:") {
-        // Route through session-reuse pool.
+        // Route through mux session pool.
         let pool = share_registry.get_or_create(&uri).await;
 
-        let (session, channel_handle, upstream) = match pool.acquire().await {
+        let (stream_id, upstream) = match pool.acquire().await {
             Ok(t) => t,
             Err(e) => {
                 log!("blit-proxy: [{uri}] share upstream unavailable: {e}");
@@ -1046,7 +1047,7 @@ async fn handle_downstream<S>(
         };
 
         if downstream.write_all(b"ok\n").await.is_err() {
-            session.close_channel(channel_handle);
+            pool.recycle(stream_id);
             return;
         }
 
@@ -1060,11 +1061,17 @@ async fn handle_downstream<S>(
         let mut u2d =
             tokio::spawn(async move { tokio::io::copy(&mut us_read, &mut ds_write).await });
 
-        tokio::select! { _ = &mut d2u => { u2d.abort(); }, _ = &mut u2d => { d2u.abort(); } }
+        // Wait for the aborted task to complete so its half of the
+        // downstream socket is dropped before we return.  Without this
+        // the CLI's `finish()` may spin for up to 2 s waiting for EOF
+        // that only arrives once the runtime asynchronously drops the
+        // aborted task's future (and the `ds_write` it owns).
+        tokio::select! {
+            _ = &mut d2u => { u2d.abort(); let _ = u2d.await; },
+            _ = &mut u2d => { d2u.abort(); let _ = d2u.await; },
+        }
 
-        // Close the DataChannel but keep the WebRTC session alive for reuse.
-        session.close_channel(channel_handle);
-        pool.release(session).await;
+        pool.recycle(stream_id);
         pool.client_disconnected();
         return;
     }
@@ -1093,7 +1100,12 @@ async fn handle_downstream<S>(
     let mut d2u = tokio::spawn(async move { tokio::io::copy(&mut ds_read, &mut us_write).await });
     let mut u2d = tokio::spawn(async move { tokio::io::copy(&mut us_read, &mut ds_write).await });
 
-    tokio::select! { _ = &mut d2u => { u2d.abort(); }, _ = &mut u2d => { d2u.abort(); } }
+    // Await the aborted task so its socket half is dropped promptly (see
+    // comment in the share: arm above).
+    tokio::select! {
+        _ = &mut d2u => { u2d.abort(); let _ = u2d.await; },
+        _ = &mut u2d => { d2u.abort(); let _ = d2u.await; },
+    }
 
     pool.client_disconnected();
 }
@@ -1133,7 +1145,7 @@ pub fn run(verbose: bool) {
                 .ok(); // may already be installed by the CLI's runtime
 
             let registry = Registry::new(pool_size);
-            let share_registry = ShareRegistry::new(pool_size);
+            let share_registry = ShareRegistry::new();
 
             // Idle-timeout watcher.
             if let Some(idle) = idle_secs {

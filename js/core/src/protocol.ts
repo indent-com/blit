@@ -1,7 +1,7 @@
 import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
-  C2S_CLIPBOARD,
+  C2S_CLIPBOARD_SET,
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_KILL,
@@ -26,6 +26,9 @@ import {
   C2S_SURFACE_ACK,
   C2S_SURFACE_CLOSE,
   C2S_CLIENT_FEATURES,
+  C2S_SURFACE_TEXT,
+  C2S_AUDIO_SUBSCRIBE,
+  C2S_AUDIO_UNSUBSCRIBE,
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
 } from "./types";
@@ -286,20 +289,30 @@ export function buildCopyRangeMessage(
 }
 
 export function buildSurfaceInputMessage(
-  sessionId: number,
   surfaceId: number,
   keycode: number,
   pressed: boolean,
 ): Uint8Array {
-  const msg = new Uint8Array(10);
+  const msg = new Uint8Array(8);
   msg[0] = C2S_SURFACE_INPUT;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
   const v = new DataView(msg.buffer);
-  v.setUint32(5, keycode, true);
-  msg[9] = pressed ? 1 : 0;
+  v.setUint32(3, keycode, true);
+  msg[7] = pressed ? 1 : 0;
+  return msg;
+}
+
+export function buildSurfaceTextMessage(
+  surfaceId: number,
+  text: string,
+): Uint8Array {
+  const encoded = textEncoder.encode(text);
+  const msg = new Uint8Array(3 + encoded.length);
+  msg[0] = C2S_SURFACE_TEXT;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg.set(encoded, 3);
   return msg;
 }
 
@@ -308,43 +321,37 @@ export const SURFACE_POINTER_UP = 1;
 export const SURFACE_POINTER_MOVE = 2;
 
 export function buildSurfacePointerMessage(
-  sessionId: number,
   surfaceId: number,
   type: number,
   button: number,
   x: number,
   y: number,
 ): Uint8Array {
-  const msg = new Uint8Array(11);
+  const msg = new Uint8Array(9);
   msg[0] = C2S_SURFACE_POINTER;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
-  msg[5] = type;
-  msg[6] = button;
-  msg[7] = x & 0xff;
-  msg[8] = (x >> 8) & 0xff;
-  msg[9] = y & 0xff;
-  msg[10] = (y >> 8) & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = type;
+  msg[4] = button;
+  msg[5] = x & 0xff;
+  msg[6] = (x >> 8) & 0xff;
+  msg[7] = y & 0xff;
+  msg[8] = (y >> 8) & 0xff;
   return msg;
 }
 
 export function buildSurfaceAxisMessage(
-  sessionId: number,
   surfaceId: number,
   axis: number,
   valueX100: number,
 ): Uint8Array {
-  const msg = new Uint8Array(10);
+  const msg = new Uint8Array(8);
   msg[0] = C2S_SURFACE_POINTER_AXIS;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
-  msg[5] = axis;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = axis;
   const v = new DataView(msg.buffer);
-  v.setInt32(6, valueX100, true);
+  v.setInt32(4, valueX100, true);
   return msg;
 }
 
@@ -355,78 +362,69 @@ export function buildSurfaceAxisMessage(
  * @param codecSupport Bitmask of CODEC_SUPPORT_* flags. 0 = accept anything.
  */
 export function buildSurfaceResizeMessage(
-  sessionId: number,
   surfaceId: number,
   width: number,
   height: number,
   scale120: number = 0,
-  codecSupport: number = 0,
 ): Uint8Array {
-  const msg = new Uint8Array(12);
+  const msg = new Uint8Array(9);
   msg[0] = C2S_SURFACE_RESIZE;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
-  msg[5] = width & 0xff;
-  msg[6] = (width >> 8) & 0xff;
-  msg[7] = height & 0xff;
-  msg[8] = (height >> 8) & 0xff;
-  msg[9] = scale120 & 0xff;
-  msg[10] = (scale120 >> 8) & 0xff;
-  msg[11] = codecSupport & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = width & 0xff;
+  msg[4] = (width >> 8) & 0xff;
+  msg[5] = height & 0xff;
+  msg[6] = (height >> 8) & 0xff;
+  msg[7] = scale120 & 0xff;
+  msg[8] = (scale120 >> 8) & 0xff;
   return msg;
 }
 
-export function buildSurfaceFocusMessage(
-  sessionId: number,
-  surfaceId: number,
-): Uint8Array {
-  const msg = new Uint8Array(5);
+export function buildSurfaceFocusMessage(surfaceId: number): Uint8Array {
+  const msg = new Uint8Array(3);
   msg[0] = C2S_SURFACE_FOCUS;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
   return msg;
 }
 
-export function buildSurfaceCloseMessage(
-  sessionId: number,
-  surfaceId: number,
-): Uint8Array {
-  const msg = new Uint8Array(5);
+export function buildSurfaceCloseMessage(surfaceId: number): Uint8Array {
+  const msg = new Uint8Array(3);
   msg[0] = C2S_SURFACE_CLOSE;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
   return msg;
 }
 
+/**
+ * Build a surface subscribe message with optional codec/quality overrides.
+ *
+ * @param codecSupport - CODEC_SUPPORT_* bitmask (0 = use connection default from sendClientFeatures)
+ * @param quality - SURFACE_QUALITY_* constant (0 = use server default)
+ */
 export function buildSurfaceSubscribeMessage(
-  sessionId: number,
   surfaceId: number,
+  codecSupport?: number,
+  quality?: number,
 ): Uint8Array {
-  const msg = new Uint8Array(5);
+  const hasExtended =
+    (codecSupport && codecSupport !== 0) || (quality && quality !== 0);
+  const msg = new Uint8Array(hasExtended ? 5 : 3);
   msg[0] = C2S_SURFACE_SUBSCRIBE;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  if (hasExtended) {
+    msg[3] = (codecSupport ?? 0) & 0xff;
+    msg[4] = (quality ?? 0) & 0xff;
+  }
   return msg;
 }
 
-export function buildSurfaceUnsubscribeMessage(
-  sessionId: number,
-  surfaceId: number,
-): Uint8Array {
-  const msg = new Uint8Array(5);
+export function buildSurfaceUnsubscribeMessage(surfaceId: number): Uint8Array {
+  const msg = new Uint8Array(3);
   msg[0] = C2S_SURFACE_UNSUBSCRIBE;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
   return msg;
 }
 
@@ -439,24 +437,18 @@ export function buildSurfaceAckMessage(surfaceId: number): Uint8Array {
 }
 
 export function buildClipboardMessage(
-  sessionId: number,
-  surfaceId: number,
   mimeType: string,
   data: Uint8Array,
 ): Uint8Array {
   const mimeBytes = textEncoder.encode(mimeType);
-  const msg = new Uint8Array(11 + mimeBytes.length + data.length);
-  msg[0] = C2S_CLIPBOARD;
-  msg[1] = sessionId & 0xff;
-  msg[2] = (sessionId >> 8) & 0xff;
-  msg[3] = surfaceId & 0xff;
-  msg[4] = (surfaceId >> 8) & 0xff;
-  msg[5] = mimeBytes.length & 0xff;
-  msg[6] = (mimeBytes.length >> 8) & 0xff;
-  msg.set(mimeBytes, 7);
+  const msg = new Uint8Array(7 + mimeBytes.length + data.length);
+  msg[0] = C2S_CLIPBOARD_SET;
+  msg[1] = mimeBytes.length & 0xff;
+  msg[2] = (mimeBytes.length >> 8) & 0xff;
+  msg.set(mimeBytes, 3);
   const v = new DataView(msg.buffer);
-  v.setUint32(7 + mimeBytes.length, data.length, true);
-  msg.set(data, 11 + mimeBytes.length);
+  v.setUint32(3 + mimeBytes.length, data.length, true);
+  msg.set(data, 7 + mimeBytes.length);
   return msg;
 }
 
@@ -465,4 +457,24 @@ export function buildClientFeaturesMessage(codecSupport: number): Uint8Array {
   msg[0] = C2S_CLIENT_FEATURES;
   msg[1] = codecSupport & 0xff;
   return msg;
+}
+
+/**
+ * Build a C2S_AUDIO_SUBSCRIBE message.
+ * `bitrateKbps`: 0 = server default, otherwise the desired Opus bitrate
+ * in kbps (e.g. 64 for 64 kbps).  Sent as a little-endian u16.
+ * Can be sent repeatedly to adjust bitrate without unsubscribing first.
+ */
+export function buildAudioSubscribeMessage(
+  bitrateKbps: number = 0,
+): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_AUDIO_SUBSCRIBE;
+  msg[1] = bitrateKbps & 0xff;
+  msg[2] = (bitrateKbps >> 8) & 0xff;
+  return msg;
+}
+
+export function buildAudioUnsubscribeMessage(): Uint8Array {
+  return new Uint8Array([C2S_AUDIO_UNSUBSCRIBE]);
 }

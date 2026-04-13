@@ -27,6 +27,7 @@ import {
   loadFocusedPaneFromHash,
   reconcileAssignments,
   saveActiveLayout,
+  surfaceAssignment,
   isSurfaceAssignment,
   parseSurfaceAssignment,
 } from "./layout";
@@ -74,12 +75,15 @@ export function BSPContainer(props: {
 
   focusedSessionId: SessionId | null;
   lruSessionIds: readonly SessionId[];
-  /** Live surface IDs for auto-placement and cleanup of dead surface assignments. */
-  liveSurfaceIds?: readonly number[];
+  /** Live surface keys ("connectionId:surfaceId") for cleanup of dead surface assignments. */
+  liveSurfaceKeys?: readonly string[];
   /** Additional session IDs to keep visible (e.g. side panel thumbnails). */
   extraVisibleSessions?: readonly SessionId[];
   manageVisibility?: boolean;
   onAssignmentsChange?: (assignments: BSPAssignments) => void;
+  /** Called when hash-based assignment resolution completes (or immediately
+   *  if there was nothing to resolve). */
+  onAssignmentsResolved?: (resolved: boolean) => void;
   onFocusSession: (id: SessionId | null) => void;
   onCreateInPane?: (
     paneId: string,
@@ -95,6 +99,7 @@ export function BSPContainer(props: {
     fn: (sessionId: SessionId, targetPaneId: string) => void,
   ) => void;
   onMoveToPane?: (fn: (value: string, targetPaneId: string) => void) => void;
+  onClearPaneAssignment?: (fn: (paneId: string) => void) => void;
   onFocusedPaneChange?: (paneId: string | null) => void;
   onRender?: (renderMs?: number) => void;
 }) {
@@ -174,39 +179,56 @@ export function BSPContainer(props: {
     setLayoutState(assignSessionsToPanes(nextPanes, orderedSessionIds));
   });
 
-  const knownSessionIds = createMemo(() =>
-    sessions()
-      .filter((s) => s.connectionId === props.connectionId)
-      .map((s) => s.id),
-  );
+  const knownSessionIds = createMemo(() => sessions().map((s) => s.id));
 
-  // Resolve pending hash assignments (connectionId:ptyId) to session IDs
-  // progressively as sessions arrive. Each run resolves whatever it can and
-  // removes those entries from pendingHash. Once all referenced connections
-  // are connected, any remaining unmatched entries are given up on and
-  // pendingHash is cleared so normal reconciliation takes over.
+  // Resolve pending hash assignments to live session IDs / surface assignment
+  // strings.  Hash values use "t:connectionId:ptyId" for terminals and
+  // "s:connectionId:surfaceId" for compositor surfaces.
+  //
+  // Terminals are resolved progressively as sessions arrive from the server.
+  // Surface entries are resolved immediately (they don't depend on a session
+  // list).  Once all referenced connections are ready, any remaining
+  // unmatched terminal entries are given up on and pendingHash is cleared so
+  // normal reconciliation takes over.
   createEffect(() => {
     if (!pendingHash) return;
     const live = liveSessions();
     const snap = workspaceState();
-    // Collect the connection IDs still referenced by pending entries.
+    // Collect connection IDs referenced by pending *terminal* entries.
     const referencedConnIds = new Set<string>();
     for (const ref of Object.values(pendingHash)) {
-      const lastColon = ref.lastIndexOf(":");
-      if (lastColon > 0) referencedConnIds.add(ref.slice(0, lastColon));
+      if (!ref.startsWith("t:")) continue;
+      const body = ref.slice(2); // "connectionId:ptyId"
+      const lastColon = body.lastIndexOf(":");
+      if (lastColon > 0) referencedConnIds.add(body.slice(0, lastColon));
     }
 
-    // Resolve whatever sessions are available right now.
-    const resolved: Record<string, SessionId> = {};
+    const resolved: Record<string, string> = {};
     for (const [paneId, ref] of Object.entries(pendingHash)) {
-      const lastColon = ref.lastIndexOf(":");
-      if (lastColon <= 0) continue;
-      const connId = ref.slice(0, lastColon);
-      const ptyId = parseInt(ref.slice(lastColon + 1), 10);
-      const session = live.find(
-        (s) => s.connectionId === connId && s.ptyId === ptyId,
-      );
-      if (session) resolved[paneId] = session.id;
+      if (ref.startsWith("s:")) {
+        // Surface: "s:connectionId:surfaceId" → surfaceAssignment(connId, id)
+        const body = ref.slice(2);
+        const lastColon = body.lastIndexOf(":");
+        if (lastColon <= 0) continue;
+        const connId = body.slice(0, lastColon);
+        const surfId = parseInt(body.slice(lastColon + 1), 10);
+        if (Number.isFinite(surfId)) {
+          resolved[paneId] = surfaceAssignment(connId, surfId);
+        }
+        continue;
+      }
+      if (ref.startsWith("t:")) {
+        // Terminal: "t:connectionId:ptyId" → session ID
+        const body = ref.slice(2);
+        const lastColon = body.lastIndexOf(":");
+        if (lastColon <= 0) continue;
+        const connId = body.slice(0, lastColon);
+        const ptyId = parseInt(body.slice(lastColon + 1), 10);
+        const session = live.find(
+          (s) => s.connectionId === connId && s.ptyId === ptyId,
+        );
+        if (session) resolved[paneId] = session.id;
+      }
     }
 
     if (Object.keys(resolved).length > 0) {
@@ -227,71 +249,152 @@ export function BSPContainer(props: {
     }
 
     // Check whether all referenced connections have received their initial
-    // session list (ready=true). Only then can we be sure that unmatched
-    // ptyIds are genuinely gone — give up and let normal reconciliation fill
-    // the empty panes.
-    const allReady = [...referencedConnIds].every((connId) => {
+    // session list (ready=true).  Only then can we be sure that unmatched
+    // ptyIds are genuinely gone — give up on those specific entries and let
+    // normal reconciliation fill the empty panes.
+    //
+    // Missing connections (not yet added to the workspace) are treated as
+    // *not* ready — their sessions may still arrive once the connection is
+    // established.  Only connections that are present AND ready count.
+    const readyConnIds = new Set<string>();
+    for (const connId of referencedConnIds) {
       const c = snap.connections.find((c) => c.id === connId);
-      return c?.ready === true;
-    });
-    if (allReady) {
-      pendingHash = null;
-      setResolvingHash(false);
+      if (c?.ready === true) readyConnIds.add(connId);
     }
+    if (readyConnIds.size > 0) {
+      // Drop pending terminal entries whose connection is ready — those
+      // PTYs are genuinely gone.  Keep entries for connections that are
+      // missing or still connecting.
+      for (const [paneId, ref] of Object.entries(pendingHash)) {
+        if (!ref.startsWith("t:")) continue;
+        const body = ref.slice(2);
+        const lastColon = body.lastIndexOf(":");
+        if (lastColon <= 0) continue;
+        const connId = body.slice(0, lastColon);
+        if (readyConnIds.has(connId)) {
+          delete pendingHash[paneId];
+        }
+      }
+      if (Object.keys(pendingHash).length === 0) {
+        pendingHash = null;
+        setResolvingHash(false);
+      }
+    }
+  });
+
+  // Durable mapping from session ID → "connectionId:ptyId".  Survives
+  // connection removal so that when a remote is re-added we can remap stale
+  // pane assignments to newly created sessions for the same PTY.
+  const durableSessionKeys = new Map<string, string>();
+
+  // Build a map from closed session IDs to their replacement live session
+  // IDs.  After a reconnect the server re-issues the same PTYs under new
+  // session IDs; this map lets reconciliation re-attach panes to the
+  // reappearing terminals instead of dumping them into the sidebar.
+  //
+  // Also uses durableSessionKeys to remap sessions that were fully removed
+  // (connection destroyed) but whose underlying PTY now has a live session.
+  const sessionReplacements = createMemo(() => {
+    const allSessions = sessions();
+    // Record every session we've ever seen so we can remap after a
+    // remove-then-readd of a connection.
+    for (const s of allSessions) {
+      if (s.ptyId != null) {
+        durableSessionKeys.set(s.id, `${s.connectionId}:${s.ptyId}`);
+      }
+    }
+    const liveByKey = new Map<string, string>();
+    for (const s of allSessions) {
+      if (s.state !== "closed") {
+        liveByKey.set(`${s.connectionId}:${s.ptyId}`, s.id);
+      }
+    }
+    const map = new Map<string, string>();
+    for (const s of allSessions) {
+      if (s.state === "closed") {
+        const replacement = liveByKey.get(`${s.connectionId}:${s.ptyId}`);
+        if (replacement && replacement !== s.id) {
+          map.set(s.id, replacement);
+        }
+      }
+    }
+    // Remap sessions that were completely removed (connection destroyed)
+    // but whose underlying PTY now has a live session again.
+    const currentIds = new Set(allSessions.map((s) => s.id));
+    for (const [oldId, key] of durableSessionKeys) {
+      if (!currentIds.has(oldId) && !map.has(oldId)) {
+        const replacement = liveByKey.get(key);
+        if (replacement) {
+          map.set(oldId, replacement);
+        }
+      }
+    }
+    return map;
+  });
+
+  // Durable mapping from session ID → connectionId.  Uses the same
+  // durableSessionKeys map so connections that were removed still have
+  // their sessionId→connectionId mapping available for reconciliation.
+  const sessionConnectionIds = createMemo(() => {
+    const allSessions = sessions();
+    const map = new Map<string, string>();
+    for (const s of allSessions) {
+      map.set(s.id, s.connectionId);
+    }
+    // Include entries for sessions whose connection has been removed so
+    // reconciliation can still determine which connection they belonged to.
+    for (const [sessionId, key] of durableSessionKeys) {
+      if (!map.has(sessionId)) {
+        const colonIdx = key.indexOf(":");
+        if (colonIdx > 0) map.set(sessionId, key.slice(0, colonIdx));
+      }
+    }
+    return map;
   });
 
   createEffect(() => {
     if (!connected()) return;
+    // Skip reconciliation until S2C_READY has been processed (ready=true).
+    // Between S2C_HELLO (marks all sessions closed) and S2C_READY (end of
+    // initial handshake), liveSessionIds and liveSurfaceKeys are
+    // momentarily empty — reconciling in that window wipes all pane
+    // assignments.
+    if (!connection()?.ready) return;
     // Skip reconciliation while we still have pending hash assignments to resolve.
     if (resolvingHash()) return;
     const p = panes();
     const live = liveSessionIds();
     const known = knownSessionIds();
-    const surfaceIds = props.liveSurfaceIds;
+    const surfaceKeys = props.liveSurfaceKeys;
+    const replacements = sessionReplacements();
+    const sessionConns = sessionConnectionIds();
+    // Only include connections that are both present AND ready.  A
+    // connection that is present but not ready (reconnecting) has its
+    // surface list momentarily empty — treating it as "ready" would
+    // cause reconciliation to nuke surface assignments that will
+    // reappear once the handshake finishes.
+    const readyConns = new Set(
+      workspaceState()
+        .connections.filter((c) => c.ready)
+        .map((c) => c.id),
+    );
     setLayoutState((previous) => {
       const next = reconcileAssignments({
         panes: p,
         previous,
         liveSessionIds: live,
         knownSessionIds: known,
-        liveSurfaceIds: surfaceIds,
+        liveSurfaceKeys: surfaceKeys,
+        readyConnectionIds: readyConns,
+        sessionReplacements: replacements,
+        sessionConnectionIds: sessionConns,
       });
       return sameAssignments(previous, next) ? previous : next;
     });
   });
 
-  // Auto-assign new surfaces to empty panes.
-  createEffect(() => {
-    const surfaceIds = props.liveSurfaceIds;
-    if (!surfaceIds || surfaceIds.length === 0) return;
-    if (!connected()) return;
-
-    const state = layoutState();
-    const assignedSurfaces = new Set<number>();
-    for (const v of Object.values(state.assignments)) {
-      if (v && isSurfaceAssignment(v)) {
-        const id = parseSurfaceAssignment(v);
-        if (id != null) assignedSurfaces.add(id);
-      }
-    }
-
-    const unassigned = surfaceIds.filter((id) => !assignedSurfaces.has(id));
-    if (unassigned.length === 0) return;
-
-    const emptyPanes = paneIds().filter(
-      (pid) => state.assignments[pid] == null,
-    );
-    if (emptyPanes.length === 0) return;
-
-    const count = Math.min(unassigned.length, emptyPanes.length);
-    setLayoutState((prev) => {
-      const next = { ...prev.assignments };
-      for (let i = 0; i < count; i++) {
-        next[emptyPanes[i]] = `surface:${unassigned[i]}`;
-      }
-      return { assignments: next };
-    });
-  });
+  // Surfaces are only assigned to panes by explicit user action (switcher,
+  // drag-and-drop, etc.) — never automatically.
 
   const assignedInPaneOrder = createMemo(() =>
     paneIds()
@@ -384,6 +487,20 @@ export function BSPContainer(props: {
     props.onMoveToPane?.(moveToPane);
   });
 
+  function clearPaneAssignment(paneId: string) {
+    setLayoutState((prev) => {
+      if (prev.assignments[paneId] == null) return prev;
+      return {
+        ...prev,
+        assignments: { ...prev.assignments, [paneId]: null },
+      };
+    });
+  }
+
+  createEffect(() => {
+    props.onClearPaneAssignment?.(clearPaneAssignment);
+  });
+
   function focusPane(paneId: string) {
     setFocusedPaneId(paneId);
   }
@@ -429,11 +546,16 @@ export function BSPContainer(props: {
 
   createEffect(() => {
     const state = layoutState();
-    // Don't report unresolved (all-null) assignments while the hash is
-    // still pending — Workspace would write them to the URL, stripping
-    // the previous `a=` that we need for resolution.
-    if (resolvingHash()) return;
+    // Always report assignments so that Workspace can derive the focused
+    // surface (for the status bar) and filter offScreenSurfaces even
+    // while hash resolution is in progress.  The URL-hash writer in
+    // Workspace guards against overwriting unresolved entries separately
+    // via onAssignmentsResolved.
     props.onAssignmentsChange?.(state);
+  });
+
+  createEffect(() => {
+    props.onAssignmentsResolved?.(!resolvingHash());
   });
 
   createEffect(() => {
@@ -482,6 +604,7 @@ export function BSPContainer(props: {
   createEffect(() => {
     const fsId = props.focusedSessionId;
     const live = liveSessions();
+    const fpId = focusedPaneId();
     const handler = (event: KeyboardEvent) => {
       if (!fsId) return;
       const session = live.find((item) => item.id === fsId);
@@ -491,6 +614,16 @@ export function BSPContainer(props: {
         workspace.restartSession(fsId);
       } else if (event.key === "Escape") {
         event.preventDefault();
+        // Immediately clear the pane assignment so the exited terminal
+        // disappears without waiting for the server round-trip.
+        if (fpId) {
+          setLayoutState((prev) => {
+            if (prev.assignments[fpId] !== fsId) return prev;
+            return {
+              assignments: { ...prev.assignments, [fpId]: null },
+            };
+          });
+        }
         void workspace.closeSession(fsId);
       }
     };
@@ -801,22 +934,22 @@ function LeafPane(props: {
   const sessions = createBlitSessions(workspace);
   const workspaceState = createBlitWorkspaceState(workspace);
 
-  const surfaceId = () => parseSurfaceAssignment(props.sessionId);
-  const isSurface = () => surfaceId() != null;
+  const surfaceParsed = () => parseSurfaceAssignment(props.sessionId);
+  const isSurface = () => surfaceParsed() != null;
+  const surfaceId = () => surfaceParsed()?.surfaceId ?? null;
+  const surfaceConnectionId = () =>
+    surfaceParsed()?.connectionId ?? props.connectionId;
 
-  /** Resolve the connectionId that actually owns this surface.  The BSP
-   *  container passes the "active" connectionId, but in multi-connection
-   *  setups the surface may belong to a different connection. */
-  const surfaceConnectionId = createMemo(() => {
-    const sid = surfaceId();
-    if (sid == null) return props.connectionId;
+  /** True when the surface's owning connection is present in the workspace.
+   *  When the remote is removed the connection disappears — we hide the
+   *  surface view (the assignment is still preserved so it can reattach
+   *  once the remote is re-added). */
+  const surfaceConnPresent = () => {
+    const parsed = surfaceParsed();
+    if (!parsed) return false;
     const snap = workspaceState();
-    for (const c of snap.connections) {
-      const conn = workspace.getConnection(c.id);
-      if (conn?.surfaceStore.getSurface(sid)) return c.id;
-    }
-    return props.connectionId;
-  });
+    return snap.connections.some((c) => c.id === parsed.connectionId);
+  };
 
   const session = () =>
     isSurface()
@@ -878,46 +1011,52 @@ function LeafPane(props: {
       onFocusIn={() => props.onFocusPane()}
     >
       <Show when={isSurface()}>
-        <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
-          <BlitSurfaceView
-            connectionId={surfaceConnectionId()}
-            surfaceId={surfaceId()!}
-            focus={props.isFocused}
-            resizable
-            style={{ width: "100%", height: "100%" }}
-          />
-        </div>
+        <Show
+          when={surfaceConnPresent()}
+          fallback={
+            <EmptyPane
+              paneId={props.paneId}
+              label={props.leaf.tag || null}
+              isFocused={props.isFocused}
+              theme={theme()}
+              palette={props.palette}
+              fontSize={props.fontSize}
+              connectionId={props.connectionId}
+              connectionLabels={props.connectionLabels}
+              onCreateInPane={props.onCreateInPane}
+              onSwitcher={props.onSwitcher}
+              onHelp={props.onHelp}
+            />
+          }
+        >
+          <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
+            <BlitSurfaceView
+              connectionId={surfaceConnectionId()}
+              surfaceId={surfaceId()!}
+              focus={props.isFocused}
+              resizable
+              style={{ width: "100%", height: "100%" }}
+            />
+          </div>
+        </Show>
       </Show>
       <Show when={!isSurface()}>
         <Show
           when={props.sessionId && session()}
           fallback={
-            <Show
-              when={connection()?.status === "connected"}
-              fallback={
-                <div
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    "background-color": `rgb(${props.palette.bg[0]},${props.palette.bg[1]},${props.palette.bg[2]})`,
-                  }}
-                />
-              }
-            >
-              <EmptyPane
-                paneId={props.paneId}
-                label={props.leaf.tag || null}
-                isFocused={props.isFocused}
-                theme={theme()}
-                palette={props.palette}
-                fontSize={props.fontSize}
-                connectionId={props.connectionId}
-                connectionLabels={props.connectionLabels}
-                onCreateInPane={props.onCreateInPane}
-                onSwitcher={props.onSwitcher}
-                onHelp={props.onHelp}
-              />
-            </Show>
+            <EmptyPane
+              paneId={props.paneId}
+              label={props.leaf.tag || null}
+              isFocused={props.isFocused}
+              theme={theme()}
+              palette={props.palette}
+              fontSize={props.fontSize}
+              connectionId={props.connectionId}
+              connectionLabels={props.connectionLabels}
+              onCreateInPane={props.onCreateInPane}
+              onSwitcher={props.onSwitcher}
+              onHelp={props.onHelp}
+            />
           }
         >
           <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
@@ -1000,9 +1139,11 @@ function EmptyPane(props: {
 }) {
   const [cmd, setCmd] = createSignal("");
   const [acIdx, setAcIdx] = createSignal(-1);
+  const [hovered, setHovered] = createSignal(false);
   let inputRef!: HTMLInputElement;
   const scale = () => uiScale(props.fontSize);
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
+  const active = () => props.isFocused || hovered();
 
   /**
    * Autocomplete suggestions: connection labels that start with whatever the
@@ -1073,6 +1214,8 @@ function EmptyPane(props: {
   return (
     <div
       onClick={() => inputRef?.focus()}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
         width: "100%",
         height: "100%",
@@ -1083,109 +1226,114 @@ function EmptyPane(props: {
         "align-items": "center",
         "justify-content": "center",
         gap: `${scale().gap}px`,
-        opacity: 0.6,
       }}
     >
-      <div
-        style={{
-          "font-size": `${scale().sm}px`,
-          display: "flex",
-          "flex-direction": "column",
-          "align-items": "center",
-          gap: `${scale().tightGap}px`,
-        }}
-      >
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCreateInPane?.(props.paneId);
-          }}
-          style={{ ...ui.btn, "font-size": `${scale().md}px` }}
-        >
-          {t("workspace.newTerminal")} <kbd style={ui.kbd}>{mod}+Enter</kbd>
-        </button>
-        <Show when={props.onSwitcher}>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              props.onSwitcher!();
-            }}
-            style={{ ...ui.btn, "font-size": `${scale().md}px` }}
-          >
-            {t("workspace.menu")} <kbd style={ui.kbd}>{mod}+K</kbd>
-          </button>
-        </Show>
-        <Show when={props.onHelp}>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              props.onHelp!();
-            }}
-            style={{ ...ui.btn, "font-size": `${scale().md}px` }}
-          >
-            {t("workspace.help")} <kbd style={ui.kbd}>Ctrl+?</kbd>
-          </button>
-        </Show>
-      </div>
-      <div
-        style={{
-          position: "absolute",
-          bottom: "8px",
-          left: "50%",
-          transform: "translateX(-50%)",
-          "font-size": `${scale().sm}px`,
-          display: "flex",
-          "flex-direction": "column",
-          "min-width": "min(50vw, 220px)",
-        }}
-      >
-        {/* Autocomplete list — rendered above the input */}
-        <Show when={acSuggestions().length > 0}>
-          <div
-            style={{
-              background: props.theme.solidPanelBg,
-              border: `1px solid ${props.theme.border}`,
-              "border-bottom": "none",
-              display: "flex",
-              "flex-direction": "column",
-            }}
-          >
-            <For each={acSuggestions()}>
-              {(item, i) => (
-                <button
-                  style={{
-                    ...ui.btn,
-                    padding: `${scale().controlY}px ${scale().controlX}px`,
-                    "text-align": "left",
-                    "font-size": `${scale().sm}px`,
-                    background:
-                      i() === acIdx()
-                        ? props.theme.subtleBorder
-                        : "transparent",
-                    color: props.theme.fg,
-                    cursor: "pointer",
-                  }}
-                  onMouseEnter={() => setAcIdx(i())}
-                  onMouseLeave={() => setAcIdx(-1)}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    commitSuggestion(item.label);
-                  }}
-                >
-                  {item.label}
-                </button>
-              )}
-            </For>
-          </div>
-        </Show>
+      <Show when={active()}>
         <div
           style={{
-            background: props.theme.solidPanelBg,
-            border: `1px solid ${props.theme.border}`,
+            flex: 1,
+            display: "flex",
+            "flex-direction": "column",
+            "align-items": "center",
+            "justify-content": "center",
+            gap: `${scale().tightGap}px`,
+            "font-size": `${scale().sm}px`,
           }}
         >
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              // When multiple connections exist, omit connectionId so the
+              // Workspace callback opens the remote picker instead of
+              // creating a terminal on the current connection directly.
+              const multiConn =
+                props.connectionLabels && props.connectionLabels.size > 1;
+              props.onCreateInPane?.(
+                props.paneId,
+                undefined,
+                multiConn ? undefined : props.connectionId,
+              );
+            }}
+            style={{ ...ui.btn, "font-size": `${scale().md}px` }}
+          >
+            {t("workspace.newTerminal")} <kbd style={ui.kbd}>{mod}+Enter</kbd>
+          </button>
+          <Show when={props.onSwitcher}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onSwitcher!();
+              }}
+              style={{ ...ui.btn, "font-size": `${scale().md}px` }}
+            >
+              {t("workspace.menu")} <kbd style={ui.kbd}>{mod}+K</kbd>
+            </button>
+          </Show>
+          <Show when={props.onHelp}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onHelp!();
+              }}
+              style={{ ...ui.btn, "font-size": `${scale().md}px` }}
+            >
+              {t("workspace.help")} <kbd style={ui.kbd}>Ctrl+?</kbd>
+            </button>
+          </Show>
+        </div>
+        <div
+          style={{
+            "flex-shrink": 0,
+            "align-self": "center",
+            "margin-bottom": "0.5em",
+            "font-size": `${scale().sm}px`,
+            display: "flex",
+            "flex-direction": "column",
+            "min-width": "min(50vw, 220px)",
+            background: props.theme.solidInputBg,
+            border: `1px solid ${props.theme.subtleBorder}`,
+            overflow: "hidden",
+          }}
+        >
+          {/* Autocomplete list — rendered above the input */}
+          <Show when={acSuggestions().length > 0}>
+            <div
+              style={{
+                display: "flex",
+                "flex-direction": "column",
+                "border-bottom": `1px solid ${props.theme.subtleBorder}`,
+              }}
+            >
+              <For each={acSuggestions()}>
+                {(item, i) => (
+                  <button
+                    style={{
+                      ...ui.btn,
+                      padding: `${scale().controlY}px ${scale().controlX}px`,
+                      "text-align": "left",
+                      "font-size": `${scale().sm}px`,
+                      background:
+                        i() === acIdx() ? props.theme.hoverBg : "transparent",
+                      color: props.theme.fg,
+                      cursor: "pointer",
+                      opacity: 1,
+                    }}
+                    onMouseEnter={() => setAcIdx(i())}
+                    onMouseLeave={() => setAcIdx(-1)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      commitSuggestion(item.label);
+                    }}
+                  >
+                    {item.label}
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
           <input
             ref={inputRef}
+            name={`blit-pane-cmd-${props.paneId}`}
             type="text"
             value={cmd()}
             onInput={(e) => setCmd(e.currentTarget.value)}
@@ -1226,7 +1374,7 @@ function EmptyPane(props: {
                 const command = dp
                   ? inlineCmd() || undefined
                   : cmd().trim() || undefined;
-                const connId = dp?.connId;
+                const connId = dp?.connId ?? props.connectionId;
                 props.onCreateInPane?.(props.paneId, command, connId);
               }
             }}
@@ -1245,7 +1393,7 @@ function EmptyPane(props: {
             }}
           />
         </div>
-      </div>
+      </Show>
     </div>
   );
 }

@@ -1,12 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use blit_compositor::PixelData;
-#[cfg(target_os = "linux")]
-use blit_remote::SURFACE_FRAME_CODEC_H265;
-
 use blit_remote::{
-    CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264, CODEC_SUPPORT_H265, SURFACE_FRAME_CODEC_AV1,
-    SURFACE_FRAME_CODEC_H264,
+    CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_H264,
 };
 use openh264::encoder::Encoder as OpenH264Encoder;
 use openh264::formats::YUVBuffer;
@@ -15,11 +11,10 @@ use openh264::formats::YUVBuffer;
 pub enum SurfaceEncoderPreference {
     H264Software,
     H264Vaapi,
-    H265Vaapi,
+    AV1Vaapi,
     NvencH264,
-    NvencH265,
     NvencAV1,
-    AV1,
+    AV1Software,
 }
 
 // Type alias for backwards compatibility in tests.
@@ -34,11 +29,10 @@ impl SurfaceEncoderPreference {
         match value.trim() {
             "h264-software" | "software" => Some(Self::H264Software),
             "h264-vaapi" | "vaapi" => Some(Self::H264Vaapi),
-            "h265-vaapi" | "hevc-vaapi" => Some(Self::H265Vaapi),
-            "nvenc-h264" | "h264-nvenc" => Some(Self::NvencH264),
-            "nvenc-h265" | "h265-nvenc" | "nvenc-hevc" | "hevc-nvenc" => Some(Self::NvencH265),
-            "nvenc-av1" | "av1-nvenc" => Some(Self::NvencAV1),
-            "av1" => Some(Self::AV1),
+            "av1-vaapi" => Some(Self::AV1Vaapi),
+            "h264-nvenc" => Some(Self::NvencH264),
+            "av1-nvenc" => Some(Self::NvencAV1),
+            "av1-software" => Some(Self::AV1Software),
             _ => None,
         }
     }
@@ -56,9 +50,9 @@ impl SurfaceEncoderPreference {
         Ok(result)
     }
 
-    /// Sensible default: hardware before software, H.265 > H.264 > AV1.
+    /// Sensible default: hardware before software, NVENC preferred.
     ///
-    /// Override at runtime with `BLIT_SURFACE_ENCODERS=nvenc-h265,h264-software`
+    /// Override at runtime with `BLIT_SURFACE_ENCODERS=h264-nvenc,h264-software`
     /// (comma-separated list).
     pub fn defaults() -> Vec<Self> {
         if let Some(list) = std::env::var("BLIT_SURFACE_ENCODERS")
@@ -68,13 +62,12 @@ impl SurfaceEncoderPreference {
             return list;
         }
         vec![
-            Self::NvencH265,
-            Self::H265Vaapi,
             Self::NvencAV1,
             Self::NvencH264,
+            Self::AV1Vaapi,
             Self::H264Vaapi,
             Self::H264Software,
-            Self::AV1,
+            Self::AV1Software,
         ]
     }
 
@@ -88,8 +81,9 @@ impl SurfaceEncoderPreference {
             Self::H264Software | Self::H264Vaapi | Self::NvencH264 => {
                 codec_support & CODEC_SUPPORT_H264 != 0
             }
-            Self::H265Vaapi | Self::NvencH265 => codec_support & CODEC_SUPPORT_H265 != 0,
-            Self::AV1 | Self::NvencAV1 => codec_support & CODEC_SUPPORT_AV1 != 0,
+            Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 => {
+                codec_support & CODEC_SUPPORT_AV1 != 0
+            }
         }
     }
 
@@ -100,7 +94,7 @@ impl SurfaceEncoderPreference {
             Self::H264Software | Self::H264Vaapi | Self::NvencH264 => {
                 Some((H264_MAX_WIDTH, H264_MAX_HEIGHT))
             }
-            Self::H265Vaapi | Self::NvencH265 | Self::NvencAV1 | Self::AV1 => None,
+            Self::AV1Vaapi | Self::NvencAV1 | Self::AV1Software => None,
         }
     }
 
@@ -147,6 +141,18 @@ impl SurfaceQuality {
         }
     }
 
+    /// Decode from the wire `quality` byte in C2S_SURFACE_SUBSCRIBE.
+    /// Returns `None` for 0 (server default) or unknown values.
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Low),
+            2 => Some(Self::Medium),
+            3 => Some(Self::High),
+            4 => Some(Self::Lossless),
+            _ => None,
+        }
+    }
+
     /// rav1e speed preset (0 = slowest/best, 10 = fastest/worst).
     fn av1_speed(self) -> u8 {
         match self {
@@ -176,6 +182,34 @@ impl SurfaceQuality {
             Self::Lossless => 0,
         }
     }
+
+    /// H.264 QP for constant-quality mode (0 = best, 51 = worst).
+    /// Used by NVENC H.264 and VA-API H.264.
+    pub fn h264_qp(self) -> u8 {
+        match self {
+            Self::Low => 35,
+            Self::Medium => 28,
+            Self::High => 20,
+            Self::Lossless => 10,
+        }
+    }
+
+    /// NVENC AV1 QP for constant-quality mode (0 = best, 255 = worst).
+    /// Same scale as `av1_quantizer` / VA-API `base_qindex`.
+    pub fn nvenc_av1_qp(self) -> u32 {
+        self.av1_quantizer() as u32
+    }
+
+    /// openh264 target bitrate in bits/sec.  Resolution-independent
+    /// approximation — openh264 adapts internally.
+    fn openh264_bitrate(self) -> u32 {
+        match self {
+            Self::Low => 500_000,
+            Self::Medium => 2_000_000,
+            Self::High => 8_000_000,
+            Self::Lossless => 20_000_000,
+        }
+    }
 }
 
 pub struct SurfaceEncoder {
@@ -191,12 +225,11 @@ pub struct SurfaceEncoder {
 enum SurfaceEncoderKind {
     H264Software(Box<SoftwareH264Encoder>),
     NvencH264(Box<crate::nvenc_encode::NvencDirectEncoder>),
-    NvencH265(Box<crate::nvenc_encode::NvencDirectEncoder>),
     NvencAV1(Box<crate::nvenc_encode::NvencDirectEncoder>),
     #[cfg(target_os = "linux")]
     H264Vaapi(Box<crate::vaapi_encode::VaapiDirectEncoder>),
     #[cfg(target_os = "linux")]
-    H265Vaapi(Box<crate::vaapi_encode::VaapiHevcEncoder>),
+    AV1Vaapi(Box<crate::vaapi_encode::VaapiAv1Encoder>),
     AV1Software(Box<SoftwareAV1Encoder>),
 }
 
@@ -229,6 +262,7 @@ impl SurfaceEncoder {
                 source_height,
                 vaapi_device,
                 quality,
+                verbose,
             ) {
                 Ok(enc) => {
                     if verbose {
@@ -261,6 +295,7 @@ impl SurfaceEncoder {
         source_height: u32,
         vaapi_device: &str,
         quality: SurfaceQuality,
+        verbose: bool,
     ) -> Result<Self, String> {
         let _ = vaapi_device;
         validate_surface_dimensions(width, height, pref)?;
@@ -268,37 +303,37 @@ impl SurfaceEncoder {
         match pref {
             SurfaceEncoderPreference::NvencH264 => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
+                let qp = quality.h264_qp() as u32;
                 Ok(Self {
                     width,
                     height,
                     source_width,
                     source_height,
                     kind: SurfaceEncoderKind::NvencH264(Box::new(
-                        crate::nvenc_encode::NvencDirectEncoder::try_new("h264", width, height)?,
+                        crate::nvenc_encode::NvencDirectEncoder::try_new(
+                            "h264", width, height, qp, verbose,
+                        )?,
                     )),
                 })
             }
-            SurfaceEncoderPreference::NvencH265 => {
+            SurfaceEncoderPreference::NvencAV1 => {
+                // AV1 superblocks are 64x64; NVENC requires even dimensions
+                // at minimum.  Round up to a multiple of 2 (matching H.264)
+                // so chroma planes stay aligned.
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
+                let qp = quality.nvenc_av1_qp();
                 Ok(Self {
                     width,
                     height,
                     source_width,
                     source_height,
-                    kind: SurfaceEncoderKind::NvencH265(Box::new(
-                        crate::nvenc_encode::NvencDirectEncoder::try_new("h265", width, height)?,
+                    kind: SurfaceEncoderKind::NvencAV1(Box::new(
+                        crate::nvenc_encode::NvencDirectEncoder::try_new(
+                            "av1", width, height, qp, verbose,
+                        )?,
                     )),
                 })
             }
-            SurfaceEncoderPreference::NvencAV1 => Ok(Self {
-                width,
-                height,
-                source_width,
-                source_height,
-                kind: SurfaceEncoderKind::NvencAV1(Box::new(
-                    crate::nvenc_encode::NvencDirectEncoder::try_new("av1", width, height)?,
-                )),
-            }),
             #[cfg(target_os = "linux")]
             SurfaceEncoderPreference::H264Vaapi => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
@@ -312,32 +347,38 @@ impl SurfaceEncoder {
                             width,
                             height,
                             vaapi_device,
-                        )?,
-                    )),
-                })
-            }
-            #[cfg(target_os = "linux")]
-            SurfaceEncoderPreference::H265Vaapi => {
-                let (width, height) = ((width + 1) & !1, (height + 1) & !1);
-                Ok(Self {
-                    width,
-                    height,
-                    source_width,
-                    source_height,
-                    kind: SurfaceEncoderKind::H265Vaapi(Box::new(
-                        crate::vaapi_encode::VaapiHevcEncoder::try_new(
-                            width,
-                            height,
-                            vaapi_device,
+                            quality.h264_qp(),
+                            verbose,
                         )?,
                     )),
                 })
             }
             #[cfg(not(target_os = "linux"))]
-            SurfaceEncoderPreference::H264Vaapi | SurfaceEncoderPreference::H265Vaapi => {
-                Err("VA-API is only available on Unix".into())
+            SurfaceEncoderPreference::H264Vaapi => Err("VA-API is only available on Unix".into()),
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderPreference::AV1Vaapi => {
+                let (width, height) = (width.div_ceil(64) * 64, height.div_ceil(64) * 64);
+                Ok(Self {
+                    width,
+                    height,
+                    source_width,
+                    source_height,
+                    kind: SurfaceEncoderKind::AV1Vaapi(Box::new(
+                        crate::vaapi_encode::VaapiAv1Encoder::try_new(
+                            width,
+                            height,
+                            source_width,
+                            source_height,
+                            vaapi_device,
+                            quality.av1_quantizer() as u8,
+                            verbose,
+                        )?,
+                    )),
+                })
             }
-            SurfaceEncoderPreference::AV1 => Ok(Self {
+            #[cfg(not(target_os = "linux"))]
+            SurfaceEncoderPreference::AV1Vaapi => Err("VA-API is only available on Linux".into()),
+            SurfaceEncoderPreference::AV1Software => Ok(Self {
                 width,
                 height,
                 source_width,
@@ -353,15 +394,12 @@ impl SurfaceEncoder {
                     height,
                     source_width,
                     source_height,
-                    kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new()?)),
+                    kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new(
+                        quality,
+                    )?)),
                 })
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn dimensions(&self) -> (u32, u32) {
-        (self.width, self.height)
     }
 
     /// The original surface dimensions before any encoder padding.
@@ -369,17 +407,17 @@ impl SurfaceEncoder {
         (self.source_width, self.source_height)
     }
 
-    #[allow(dead_code)]
-    pub fn kind_name(&self) -> &'static str {
+    /// Human-readable name of the active encoder backend, sent to clients
+    /// for display in debug panels.
+    pub fn encoder_name(&self) -> &'static str {
         match &self.kind {
             SurfaceEncoderKind::H264Software(_) => "h264-software",
-            SurfaceEncoderKind::NvencH264(_) => "nvenc-h264",
-            SurfaceEncoderKind::NvencH265(_) => "nvenc-h265",
-            SurfaceEncoderKind::NvencAV1(_) => "nvenc-av1",
+            SurfaceEncoderKind::NvencH264(_) => "h264-nvenc",
+            SurfaceEncoderKind::NvencAV1(_) => "av1-nvenc",
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(_) => "h264-vaapi",
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H265Vaapi(_) => "h265-vaapi",
+            SurfaceEncoderKind::AV1Vaapi(_) => "av1-vaapi",
             SurfaceEncoderKind::AV1Software(_) => "av1-software",
         }
     }
@@ -389,11 +427,11 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::H264Software(_) => SURFACE_FRAME_CODEC_H264,
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(_) => SURFACE_FRAME_CODEC_H264,
+            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
+                enc.codec_flag()
+            }
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H265Vaapi(_) => SURFACE_FRAME_CODEC_H265,
-            SurfaceEncoderKind::NvencH264(enc)
-            | SurfaceEncoderKind::NvencH265(enc)
-            | SurfaceEncoderKind::NvencAV1(enc) => enc.codec_flag(),
+            SurfaceEncoderKind::AV1Vaapi(_) => SURFACE_FRAME_CODEC_AV1,
             SurfaceEncoderKind::AV1Software(_) => SURFACE_FRAME_CODEC_AV1,
         }
     }
@@ -401,18 +439,59 @@ impl SurfaceEncoder {
     pub fn request_keyframe(&mut self) {
         match &mut self.kind {
             SurfaceEncoderKind::H264Software(enc) => enc.request_keyframe(),
-            SurfaceEncoderKind::NvencH264(enc)
-            | SurfaceEncoderKind::NvencH265(enc)
-            | SurfaceEncoderKind::NvencAV1(enc) => enc.request_keyframe(),
+            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
+                enc.request_keyframe()
+            }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.request_keyframe(),
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H265Vaapi(enc) => enc.request_keyframe(),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.request_keyframe(),
             SurfaceEncoderKind::AV1Software(enc) => enc.request_keyframe(),
         }
     }
 
+    /// Export VPP's pre-allocated BGRA surfaces (if available).
+    #[cfg(target_os = "linux")]
+    pub fn export_vpp_surfaces(&self) -> Vec<crate::vaapi_encode::ExportedVaSurface> {
+        match &self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => enc.export_vpp_surfaces(),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.export_vpp_surfaces(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn export_vpp_surfaces(&self) -> Vec<()> {
+        Vec::new()
+    }
+
+    /// Get VA display pointer (as usize).
+    pub fn va_display_usize(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        match &self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => enc.va_display_usize(),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.va_display_usize(),
+            _ => 0,
+        }
+        #[cfg(not(target_os = "linux"))]
+        0
+    }
+
     pub fn encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
+        // NVENC handles RGBA→encoder-size padding internally in pinned
+        // GPU memory, so pass the original un-padded buffer with source
+        // dimensions.  The generic padding below produces enc_w stride
+        // which would cause a diagonal-skew artefact when
+        // encode_rgba_padded re-interprets it at src_w stride.
+        if let SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) =
+            &mut self.kind
+        {
+            let (sw, sh) = (self.source_width as usize, self.source_height as usize);
+            let mut result = enc.encode_rgba_padded(rgba, sw, sh);
+            self.fixup_keyframe(&mut result);
+            return result;
+        }
+
         let enc_len = expected_rgba_len(self.width, self.height);
         let enc_len = match enc_len {
             Some(v) => v,
@@ -461,15 +540,8 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::H264Software(encoder) => {
                 encoder.encode(&rgba, self.width, self.height)
             }
-            SurfaceEncoderKind::NvencH264(enc)
-            | SurfaceEncoderKind::NvencH265(enc)
-            | SurfaceEncoderKind::NvencAV1(enc) => {
-                let mut bgra = rgba.into_owned();
-                for px in bgra.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
-                enc.encode_bgra(&bgra)
-            }
+            // NVENC early-returned above.
+            SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) => unreachable!(),
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => {
                 let mut bgra = rgba.into_owned();
@@ -480,7 +552,7 @@ impl SurfaceEncoder {
                 enc.encode_bgra_padded(&bgra, sw, sh)
             }
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H265Vaapi(enc) => {
+            SurfaceEncoderKind::AV1Vaapi(enc) => {
                 let mut bgra = rgba.into_owned();
                 for px in bgra.chunks_exact_mut(4) {
                     px.swap(0, 2);
@@ -513,7 +585,23 @@ impl SurfaceEncoder {
             } => self.encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset),
             #[cfg(not(target_os = "linux"))]
             PixelData::DmaBuf { .. } => None,
+            #[cfg(target_os = "linux")]
+            PixelData::VaSurface { surface_id, .. } => self.encode_va_surface(*surface_id),
+            #[cfg(not(target_os = "linux"))]
+            PixelData::VaSurface { .. } => None,
         }
+    }
+
+    /// Encode from a pre-allocated VA-API surface (true zero-copy path).
+    #[cfg(target_os = "linux")]
+    fn encode_va_surface(&mut self, surface_id: u32) -> Option<(Vec<u8>, bool)> {
+        let mut result = match &mut self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_va_surface(surface_id),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_va_surface(surface_id),
+            _ => None,
+        };
+        self.fixup_keyframe(&mut result);
+        result
     }
 
     /// Encode from a DMA-BUF fd — tries zero-copy GPU import first,
@@ -534,12 +622,28 @@ impl SurfaceEncoder {
         let src_w = self.source_width;
         let src_h = self.source_height;
 
-        // --- Zero-copy GPU path (VA-API VPP) ---
-        // Import the DMA-BUF directly into a VASurface via PRIME_2, convert
-        // BGRA→NV12 on the GPU via VPP, then encode.  No CPU mmap needed.
-        match &mut self.kind {
-            SurfaceEncoderKind::H264Vaapi(enc) => {
-                if let Some(result) = enc.encode_dmabuf_fd(
+        // --- Zero-copy GPU path (VA-API VPP / NVENC CUDA import) ---
+        let mut gpu_result = match &mut self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_dmabuf_fd(
+                fd.as_raw_fd(),
+                fourcc,
+                modifier,
+                stride,
+                offset,
+                src_w,
+                src_h,
+            ),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_dmabuf_fd(
+                fd.as_raw_fd(),
+                fourcc,
+                modifier,
+                stride,
+                offset,
+                src_w,
+                src_h,
+            ),
+            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => enc
+                .encode_dmabuf_fd(
                     fd.as_raw_fd(),
                     fourcc,
                     modifier,
@@ -547,28 +651,18 @@ impl SurfaceEncoder {
                     offset,
                     src_w,
                     src_h,
-                ) {
-                    return Some(result);
-                }
-            }
-            SurfaceEncoderKind::H265Vaapi(enc) => {
-                if let Some(result) = enc.encode_dmabuf_fd(
-                    fd.as_raw_fd(),
-                    fourcc,
-                    modifier,
-                    stride,
-                    offset,
-                    src_w,
-                    src_h,
-                ) {
-                    return Some(result);
-                }
-            }
-            _ => {}
+                ),
+            _ => None,
+        };
+        if gpu_result.is_some() {
+            self.fixup_keyframe(&mut gpu_result);
+            return gpu_result;
         }
 
         // --- CPU readback fallback ---
         // Only reached if zero-copy failed (VPP unavailable, or non-VA-API encoder).
+        // The GBM BO is created with GBM_BO_USE_LINEAR so mmap reads
+        // pixels in the correct linear layout.
         self.encode_dmabuf_cpu_fallback(fd, fourcc, stride, offset)
     }
 
@@ -609,11 +703,26 @@ impl SurfaceEncoder {
         // and aarch64 (ioctl takes c_int).
         const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
 
-        let sync_start = DmaBufSync {
-            flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
-        };
-        unsafe {
-            libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_start);
+        // Use poll() to check if the DMA-BUF fence is ready before
+        // attempting sync.  Anonymous /dmabuf: fds from Vulkan WSI may
+        // have implicit GPU fences that block indefinitely on SYNC_START.
+        {
+            let mut pfd = libc::pollfd {
+                fd: raw_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ready <= 0 {
+                // Not ready — skip sync, accept possible tearing.
+            } else {
+                let sync_start = DmaBufSync {
+                    flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+                };
+                unsafe {
+                    libc::ioctl(raw_fd, DMA_BUF_IOCTL_SYNC as _, &sync_start);
+                }
+            }
         }
 
         // mmap the DMA-BUF for reading.
@@ -638,41 +747,46 @@ impl SurfaceEncoder {
         }
         let plane_data = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
 
+        // Detect OpenGL FBO-backed DMA-BUFs (anonymous, not /dev/dri/).
+        // These have bottom-up row order and must be flipped.
+        let is_gl_fbo = {
+            let mut link = [0u8; 128];
+            let path = format!("/proc/self/fd/{raw_fd}\0");
+            let n = unsafe {
+                libc::readlink(path.as_ptr() as *const _, link.as_mut_ptr() as *mut _, 127)
+            };
+            !(n > 0 && link[..n as usize].starts_with(b"/dev/dri/"))
+        };
+
         let result = if fourcc == blit_compositor::drm_fourcc::ARGB8888
             || fourcc == blit_compositor::drm_fourcc::XRGB8888
         {
-            // BGRA in memory — encode directly from the mmap'd buffer.
-            if stride == w * 4 && map_len >= w * h * 4 {
-                self.encode_bgra(&plane_data[..w * h * 4])
-            } else {
-                // Pack rows (strip stride padding).
-                let mut packed = Vec::with_capacity(w * h * 4);
-                for row in 0..h {
-                    let start = row * stride;
-                    let end = start + w * 4;
-                    if end <= plane_data.len() {
-                        packed.extend_from_slice(&plane_data[start..end]);
-                    }
+            // BGRA in memory.
+            let mut packed = Vec::with_capacity(w * h * 4);
+            for i in 0..h {
+                // Flip row order for GL FBO buffers.
+                let row = if is_gl_fbo { h - 1 - i } else { i };
+                let start = row * stride;
+                let end = start + w * 4;
+                if end <= plane_data.len() {
+                    packed.extend_from_slice(&plane_data[start..end]);
                 }
-                self.encode_bgra(&packed)
             }
+            self.encode_bgra(&packed)
         } else if fourcc == blit_compositor::drm_fourcc::ABGR8888
             || fourcc == blit_compositor::drm_fourcc::XBGR8888
         {
             // RGBA in memory.
-            if stride == w * 4 && map_len >= w * h * 4 {
-                self.encode(&plane_data[..w * h * 4])
-            } else {
-                let mut packed = Vec::with_capacity(w * h * 4);
-                for row in 0..h {
-                    let start = row * stride;
-                    let end = start + w * 4;
-                    if end <= plane_data.len() {
-                        packed.extend_from_slice(&plane_data[start..end]);
-                    }
+            let mut packed = Vec::with_capacity(w * h * 4);
+            for i in 0..h {
+                let row = if is_gl_fbo { h - 1 - i } else { i };
+                let start = row * stride;
+                let end = start + w * 4;
+                if end <= plane_data.len() {
+                    packed.extend_from_slice(&plane_data[start..end]);
                 }
-                self.encode(&packed)
             }
+            self.encode(&packed)
         } else if fourcc == blit_compositor::drm_fourcc::NV12 {
             // NV12: Y plane at offset 0 with `stride` pitch, UV plane
             // immediately following at y_size offset with the same pitch.
@@ -712,6 +826,7 @@ impl SurfaceEncoder {
         unsafe {
             libc::munmap(ptr, map_len);
         }
+        // Only sync end if we did sync start (non-blocking check).
         let sync_end = DmaBufSync {
             flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
         };
@@ -720,6 +835,26 @@ impl SurfaceEncoder {
         }
 
         result
+    }
+
+    /// Hardware encoders (NVENC, VA-API) may report the wrong picture type
+    /// due to struct layout mismatches.  Re-detect from the bitstream as a
+    /// cheap safety net.  This is applied to every encode path so that RGBA,
+    /// BGRA, NV12, and DMA-BUF frames all get the same keyframe fixup.
+    fn fixup_keyframe(&self, result: &mut Option<(Vec<u8>, bool)>) {
+        if let Some((data, is_key)) = result.as_mut()
+            && !*is_key
+        {
+            *is_key = match &self.kind {
+                SurfaceEncoderKind::NvencH264(_) => h264_stream_contains_idr(data),
+                SurfaceEncoderKind::NvencAV1(_) => av1_stream_contains_keyframe(data),
+                #[cfg(target_os = "linux")]
+                SurfaceEncoderKind::H264Vaapi(_) => h264_stream_contains_idr(data),
+                #[cfg(target_os = "linux")]
+                SurfaceEncoderKind::AV1Vaapi(_) => av1_stream_contains_keyframe(data),
+                _ => false,
+            };
+        }
     }
 
     /// Encode from BGRA pixels — converts directly to YUV, skipping RGBA.
@@ -735,34 +870,19 @@ impl SurfaceEncoder {
                 let yuv_buf = YUVBuffer::from_vec(yuv, enc_w, enc_h);
                 encoder.encode_yuv(&yuv_buf, self.width, self.height)
             }
-            SurfaceEncoderKind::NvencH264(enc)
-            | SurfaceEncoderKind::NvencH265(enc)
-            | SurfaceEncoderKind::NvencAV1(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
+            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
+                enc.encode_bgra_padded(bgra, src_w, src_h)
+            }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H265Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
             SurfaceEncoderKind::AV1Software(encoder) => {
                 let yuv = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
                 encoder.encode_yuv_planes(&yuv)
             }
         };
-        // Hardware encoders (NVENC, VA-API) may report the wrong picture
-        // type due to struct layout mismatches.  Re-detect from the
-        // bitstream to be safe — this is a cheap scan.
-        if let Some((ref data, ref mut is_key)) = result
-            && !*is_key
-        {
-            *is_key = match &self.kind {
-                SurfaceEncoderKind::NvencH264(_) => h264_stream_contains_idr(data),
-                SurfaceEncoderKind::NvencH265(_) => h265_stream_contains_idr(data),
-                #[cfg(target_os = "linux")]
-                SurfaceEncoderKind::H264Vaapi(_) => h264_stream_contains_idr(data),
-                #[cfg(target_os = "linux")]
-                SurfaceEncoderKind::H265Vaapi(_) => h265_stream_contains_idr(data),
-                _ => false,
-            };
-        }
+        self.fixup_keyframe(&mut result);
         result
     }
 
@@ -778,7 +898,7 @@ impl SurfaceEncoder {
         let src_w = self.source_width as usize;
         let src_h = self.source_height as usize;
 
-        match &mut self.kind {
+        let mut result = match &mut self.kind {
             SurfaceEncoderKind::H264Software(encoder) => {
                 let enc_w = self.width as usize;
                 let enc_h = self.height as usize;
@@ -793,51 +913,33 @@ impl SurfaceEncoder {
                         uv_stride,
                     };
                     let rgba = pd.to_rgba(self.source_width, self.source_height);
-                    self.encode(&rgba)
+                    return self.encode(&rgba);
                 }
             }
-            SurfaceEncoderKind::NvencH264(_)
-            | SurfaceEncoderKind::NvencH265(_)
-            | SurfaceEncoderKind::NvencAV1(_) => {
-                // NVENC accepts BGRA; convert NV12→RGBA→BGRA (uncommon path).
-                let pd = PixelData::Nv12 {
-                    data: std::sync::Arc::new(data.to_vec()),
-                    y_stride,
-                    uv_stride,
-                };
-                let rgba = pd.to_rgba(self.source_width, self.source_height);
-                self.encode(&rgba)
+            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
+                // NVENC accepts NV12 natively — upload directly, no conversion.
+                enc.encode_nv12(data, y_stride, uv_stride, src_h)
             }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => {
                 let uv_offset = y_stride * src_h;
                 let y_data = &data[..uv_offset];
                 let uv_data = &data[uv_offset..];
-                let mut r = enc.encode_nv12(y_data, uv_data, y_stride, uv_stride);
-                if let Some((ref d, ref mut k)) = r
-                    && !*k
-                {
-                    *k = h264_stream_contains_idr(d);
-                }
-                r
+                enc.encode_nv12(y_data, uv_data, y_stride, uv_stride)
             }
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H265Vaapi(enc) => {
+            SurfaceEncoderKind::AV1Vaapi(enc) => {
                 let uv_offset = y_stride * src_h;
                 let y_data = &data[..uv_offset];
                 let uv_data = &data[uv_offset..];
-                let mut r = enc.encode_nv12(y_data, uv_data, y_stride, uv_stride);
-                if let Some((ref d, ref mut k)) = r
-                    && !*k
-                {
-                    *k = h265_stream_contains_idr(d);
-                }
-                r
+                enc.encode_nv12(y_data, uv_data, y_stride, uv_stride)
             }
             SurfaceEncoderKind::AV1Software(encoder) => {
                 encoder.encode_nv12(data, y_stride, uv_stride, src_w, src_h)
             }
-        }
+        };
+        self.fixup_keyframe(&mut result);
+        result
     }
 }
 
@@ -928,18 +1030,20 @@ fn compute_uv_planes(
     g_off: usize,
     b_off: usize,
 ) {
-    let chroma_w = width / 2;
-    let chroma_h = height / 2;
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
     for cy in 0..chroma_h {
         for cx in 0..chroma_w {
             let row = cy * 2;
             let col = cx * 2;
-            // Average 2x2 block
+            // Average 2x2 block, clamping to source bounds for odd dims.
             let mut u_sum = 0i32;
             let mut v_sum = 0i32;
             for dy in 0..2u32 {
                 for dx in 0..2u32 {
-                    let i = ((row + dy as usize) * width + col + dx as usize) * 4;
+                    let sr = (row + dy as usize).min(height - 1);
+                    let sc = (col + dx as usize).min(width - 1);
+                    let i = (sr * width + sc) * 4;
                     let r = src[i + r_off] as i32;
                     let g = src[i + g_off] as i32;
                     let b = src[i + b_off] as i32;
@@ -981,8 +1085,8 @@ fn compute_y_plane_padded(
     }
 }
 
-/// Padded chroma planes: produces `enc_w/2 × enc_h/2` chroma samples with
-/// edge-pixel duplication for pixels beyond `src_w × src_h`.
+/// Padded chroma planes: produces `ceil(enc_w/2) × ceil(enc_h/2)` chroma
+/// samples with edge-pixel duplication for pixels beyond `src_w × src_h`.
 #[inline(always)]
 fn compute_uv_planes_padded(
     src: &[u8],
@@ -996,8 +1100,8 @@ fn compute_uv_planes_padded(
     g_off: usize,
     b_off: usize,
 ) {
-    let chroma_w = enc_w / 2;
-    let chroma_h = enc_h / 2;
+    let chroma_w = enc_w.div_ceil(2);
+    let chroma_h = enc_h.div_ceil(2);
     for cy in 0..chroma_h {
         for cx in 0..chroma_w {
             let row = cy * 2;
@@ -1034,8 +1138,12 @@ fn bgra_to_yuv420_padded(
     enc_h: usize,
 ) -> Vec<u8> {
     let y_size = enc_w * enc_h;
-    let uv_w = enc_w / 2;
-    let uv_size = uv_w * (enc_h / 2);
+    // Use div_ceil to match encode_yuv_planes (rav1e) which expects
+    // ceil(w/2) × ceil(h/2) chroma planes.  Truncating division produces
+    // a short buffer when enc_w or enc_h is odd (AV1Software doesn't pad),
+    // causing a panic in encode_yuv_planes's slice indexing.
+    let uv_w = enc_w.div_ceil(2);
+    let uv_size = uv_w * enc_h.div_ceil(2);
     let mut yuv = vec![0u8; y_size + uv_size * 2];
     let (y_plane, uv) = yuv.split_at_mut(y_size);
     let (u_plane, v_plane) = uv.split_at_mut(uv_size);
@@ -1048,8 +1156,8 @@ fn bgra_to_yuv420_padded(
 /// RGBA -> I420 (Y + U + V planar).
 fn rgba_to_yuv420(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let y_size = width * height;
-    let uv_w = width / 2;
-    let uv_size = uv_w * (height / 2);
+    let uv_w = width.div_ceil(2);
+    let uv_size = uv_w * height.div_ceil(2);
     let mut yuv = vec![0u8; y_size + uv_size * 2];
     let (y_plane, uv) = yuv.split_at_mut(y_size);
     let (u_plane, v_plane) = uv.split_at_mut(uv_size);
@@ -1070,8 +1178,8 @@ fn nv12_to_yuv420(
     height: usize,
 ) -> Vec<u8> {
     let y_size = width * height;
-    let uv_w = width / 2;
-    let uv_h = height / 2;
+    let uv_w = width.div_ceil(2);
+    let uv_h = height.div_ceil(2);
     let uv_size = uv_w * uv_h;
     let mut yuv = vec![0u8; y_size + uv_size * 2];
     let (y_out, uv_out) = yuv.split_at_mut(y_size);
@@ -1086,13 +1194,17 @@ fn nv12_to_yuv420(
         y_out[dst..dst + width].copy_from_slice(&data[src..src + width]);
     }
 
-    // Deinterleave UV -> separate U, V
+    // Deinterleave UV -> separate U, V.
+    // uv_w may be one more than the source has (odd width), so clamp
+    // to the number of pairs actually present in each source row.
+    let src_uv_pairs = width / 2;
     for row in 0..uv_h {
-        let src_start = uv_offset + row * uv_stride;
+        let src_start = uv_offset + row.min(height / 2 - 1) * uv_stride;
         let dst_start = row * uv_w;
         for col in 0..uv_w {
-            u_out[dst_start + col] = data[src_start + col * 2];
-            v_out[dst_start + col] = data[src_start + col * 2 + 1];
+            let sc = col.min(src_uv_pairs.saturating_sub(1));
+            u_out[dst_start + col] = data[src_start + sc * 2];
+            v_out[dst_start + col] = data[src_start + sc * 2 + 1];
         }
     }
 
@@ -1102,14 +1214,6 @@ fn nv12_to_yuv420(
 /// Scan an Annex B H.264 bitstream for an IDR NAL unit (type 5).
 fn h264_stream_contains_idr(data: &[u8]) -> bool {
     annex_b_contains_nal(data, |byte| (byte & 0x1f) == 5)
-}
-
-/// Scan an Annex B H.265 bitstream for an IDR NAL unit (types 19–20).
-fn h265_stream_contains_idr(data: &[u8]) -> bool {
-    annex_b_contains_nal(data, |byte| {
-        let nal_type = (byte >> 1) & 0x3f;
-        nal_type == 19 || nal_type == 20 // IDR_W_RADL, IDR_N_LP
-    })
 }
 
 /// Walk Annex B start codes and return true if any NAL's first byte satisfies `pred`.
@@ -1138,14 +1242,78 @@ fn annex_b_contains_nal(data: &[u8], pred: impl Fn(u8) -> bool) -> bool {
     false
 }
 
+/// Check whether an AV1 OBU bitstream contains a sequence header, which
+/// NVENC emits only for key frames.  This mirrors `h264_stream_contains_idr`
+/// as a cheap bitstream-level safety net.
+///
+/// NVENC typically prepends a temporal delimiter OBU (type 2) before the
+/// sequence header, so we must walk the OBU chain rather than only checking
+/// the first byte.
+fn av1_stream_contains_keyframe(data: &[u8]) -> bool {
+    // OBU header byte: forbidden(1) | obu_type(4) | extension(1) | has_size(1) | reserved(1)
+    // OBU types: 1 = SEQUENCE_HEADER, 2 = TEMPORAL_DELIMITER, 3 = FRAME_HEADER,
+    //            6 = FRAME (header + tile data).
+    let mut pos = 0;
+    while pos < data.len() {
+        let header = data[pos];
+        let obu_type = (header >> 3) & 0xF;
+        let has_extension = (header >> 2) & 1;
+        let has_size = (header >> 1) & 1;
+        pos += 1;
+
+        // Skip optional extension byte.
+        if has_extension != 0 {
+            if pos >= data.len() {
+                break;
+            }
+            pos += 1;
+        }
+
+        // OBU_SEQUENCE_HEADER → this is a key frame.
+        if obu_type == 1 {
+            return true;
+        }
+
+        // If has_size is set, read the LEB128-encoded payload size and
+        // skip past the OBU payload to inspect the next OBU.
+        if has_size != 0 {
+            let mut size: u64 = 0;
+            let mut shift = 0u32;
+            while pos < data.len() {
+                let byte = data[pos];
+                pos += 1;
+                size |= ((byte & 0x7F) as u64) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if shift >= 56 {
+                    return false; // malformed LEB128
+                }
+            }
+            pos = pos.saturating_add(size as usize);
+        } else {
+            // No size field — the rest of the buffer is this OBU's payload;
+            // we can't skip past it to find subsequent OBUs.
+            break;
+        }
+    }
+    false
+}
+
 struct SoftwareH264Encoder {
     encoder: OpenH264Encoder,
 }
 
 impl SoftwareH264Encoder {
-    fn new() -> Result<Self, String> {
-        let encoder = OpenH264Encoder::new()
-            .map_err(|err| format!("failed to create OpenH264 encoder: {err:?}"))?;
+    fn new(quality: SurfaceQuality) -> Result<Self, String> {
+        use openh264::encoder::{EncoderConfig, RateControlMode};
+        let config = EncoderConfig::new()
+            .set_bitrate_bps(quality.openh264_bitrate())
+            .rate_control_mode(RateControlMode::Bitrate);
+        let encoder =
+            OpenH264Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+                .map_err(|err| format!("failed to create OpenH264 encoder: {err:?}"))?;
         Ok(Self { encoder })
     }
 
@@ -1291,5 +1459,78 @@ impl SoftwareAV1Encoder {
             Err(rav1e::EncoderStatus::Encoded) | Err(rav1e::EncoderStatus::NeedMoreData) => None,
             Err(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal AV1 OBU with the given type, has_size=1.
+    fn make_obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        // header: forbidden=0, obu_type(4), extension=0, has_size=1, reserved=0
+        let header = (obu_type & 0xF) << 3 | 0b10; // has_size=1
+        let mut obu = vec![header];
+        // LEB128-encode the payload length.
+        let mut size = payload.len();
+        loop {
+            let mut byte = (size & 0x7F) as u8;
+            size >>= 7;
+            if size > 0 {
+                byte |= 0x80;
+            }
+            obu.push(byte);
+            if size == 0 {
+                break;
+            }
+        }
+        obu.extend_from_slice(payload);
+        obu
+    }
+
+    #[test]
+    fn av1_keyframe_with_sequence_header_only() {
+        // Sequence header OBU (type 1) as the only OBU — keyframe.
+        let data = make_obu(1, &[0xAA; 10]);
+        assert!(av1_stream_contains_keyframe(&data));
+    }
+
+    #[test]
+    fn av1_keyframe_with_temporal_delimiter_prefix() {
+        // Temporal delimiter (type 2) + sequence header (type 1) — keyframe.
+        // This is the typical NVENC output for a keyframe.
+        let mut data = make_obu(2, &[]); // temporal delimiter, empty payload
+        data.extend(make_obu(1, &[0xBB; 8])); // sequence header
+        data.extend(make_obu(6, &[0xCC; 20])); // frame OBU
+        assert!(av1_stream_contains_keyframe(&data));
+    }
+
+    #[test]
+    fn av1_non_keyframe_with_temporal_delimiter() {
+        // Temporal delimiter (type 2) + frame (type 6) — not a keyframe.
+        let mut data = make_obu(2, &[]);
+        data.extend(make_obu(6, &[0xDD; 15]));
+        assert!(!av1_stream_contains_keyframe(&data));
+    }
+
+    #[test]
+    fn av1_non_keyframe_frame_header_only() {
+        // Frame header (type 3) — not a keyframe.
+        let data = make_obu(3, &[0xEE; 5]);
+        assert!(!av1_stream_contains_keyframe(&data));
+    }
+
+    #[test]
+    fn av1_empty_stream() {
+        assert!(!av1_stream_contains_keyframe(&[]));
+    }
+
+    #[test]
+    fn av1_keyframe_large_leb128_size() {
+        // Temporal delimiter with a larger payload needing multi-byte LEB128,
+        // followed by a sequence header.
+        let mut data = make_obu(2, &[0x00; 200]);
+        data.extend(make_obu(1, &[0xFF; 4]));
+        assert!(av1_stream_contains_keyframe(&data));
     }
 }

@@ -60,14 +60,25 @@ in
       description = "Scrollback buffer size in rows per PTY.";
     };
 
+    audio = {
+      enable = mkEnableOption "audio forwarding (PipeWire capture + Opus)";
+
+      bitrate = mkOption {
+        type = types.int;
+        default = 64000;
+        description = "Opus encoder bitrate in bits/sec.";
+      };
+    };
+
     gpuLibraries = mkOption {
       type = types.listOf types.package;
       default = lib.optionals pkgs.stdenv.isLinux [
         pkgs.libglvnd
         pkgs.libva
         pkgs.libgbm
+        pkgs.vulkan-loader
       ];
-      defaultText = "[ pkgs.libglvnd pkgs.libva pkgs.libgbm ] (Linux only)";
+      defaultText = "[ pkgs.libglvnd pkgs.libva pkgs.libgbm pkgs.vulkan-loader ] (Linux only)";
       description = ''
         Libraries to make available to blit server via LD_LIBRARY_PATH
         for hardware-accelerated video encoding and GPU compositing.
@@ -186,13 +197,13 @@ in
       description = "Named blit gateway instances connecting to blit server sockets.";
     };
 
-    forwarders = mkOption {
+    shares = mkOption {
       type = types.attrsOf (
         types.submodule {
           options = {
             user = mkOption {
               type = types.str;
-              description = "                User whose blit server socket to forward.";
+              description = "User whose blit server socket to share.";
             };
             passFile = mkOption {
               type = types.path;
@@ -222,13 +233,13 @@ in
               type = types.package;
               default = self.packages.${pkgs.system}.blit;
               defaultText = "self.packages.\${system}.blit";
-              description = "The blit package to use for the forwarder.";
+              description = "The blit package to use for the share service.";
             };
           };
         }
       );
       default = { };
-      description = "Named blit-webrtc-forwarder instances sharing blit server sessions via WebRTC.";
+      description = "Named blit share instances exposing blit server sessions via WebRTC.";
     };
   };
 
@@ -250,7 +261,19 @@ in
                 ++ [
                   "BLIT_SCROLLBACK=${toString cfg.scrollback}"
                 ]
-                ++ lib.optional (gpuLibSearchPath != "") "LD_LIBRARY_PATH=${gpuLibSearchPath}";
+                ++ lib.optional (gpuLibSearchPath != "") "LD_LIBRARY_PATH=${gpuLibSearchPath}"
+                ++ lib.optionals cfg.audio.enable [
+                  "BLIT_AUDIO=1"
+                  "BLIT_AUDIO_BITRATE=${toString cfg.audio.bitrate}"
+                  "PATH=${
+                    lib.makeBinPath [
+                      pkgs.pipewire
+                      pkgs.wireplumber
+                      pkgs.dbus
+                    ]
+                  }"
+                ]
+                ++ lib.optional (!cfg.audio.enable) "BLIT_AUDIO=0";
             };
           };
         }) cfg.users
@@ -293,33 +316,33 @@ in
         }) cfg.gateways
       )
       // builtins.listToAttrs (
-        lib.mapAttrsToList (name: fwd: {
-          name = "blit-webrtc-forwarder-${name}";
+        lib.mapAttrsToList (name: shr: {
+          name = "blit-share-${name}";
           value = {
-            description = "blit WebRTC forwarder ${name} for ${fwd.user}";
+            description = "blit share ${name} for ${shr.user}";
             after = [
-              "blit-server@${fwd.user}.socket"
+              "blit-server@${shr.user}.socket"
               "network.target"
             ];
-            requires = [ "blit-server@${fwd.user}.socket" ];
+            requires = [ "blit-server@${shr.user}.socket" ];
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
               Type = "simple";
-              User = fwd.user;
+              User = shr.user;
               ExecStart =
-                "${fwd.package}/bin/blit share"
-                + lib.optionalString fwd.quiet " --quiet"
-                + lib.optionalString fwd.verbose " --verbose";
+                "${shr.package}/bin/blit share"
+                + lib.optionalString shr.quiet " --quiet"
+                + lib.optionalString shr.verbose " --verbose";
               Environment = [
-                "BLIT_SOCK=/run/blit/${fwd.user}.sock"
+                "BLIT_SOCK=/run/blit/${shr.user}.sock"
               ]
-              ++ lib.optional (fwd.hub != null) "BLIT_HUB=${fwd.hub}"
-              ++ lib.optional fwd.verboseWebrtc "BLIT_WEBRTC_VERBOSE=1";
-              EnvironmentFile = fwd.passFile;
+              ++ lib.optional (shr.hub != null) "BLIT_HUB=${shr.hub}"
+              ++ lib.optional shr.verboseWebrtc "BLIT_WEBRTC_VERBOSE=1";
+              EnvironmentFile = shr.passFile;
               Restart = "on-failure";
             };
           };
-        }) cfg.forwarders
+        }) cfg.shares
       );
 
     systemd.sockets = builtins.listToAttrs (

@@ -53,7 +53,9 @@ describe("BlitConnection", () => {
   // --- Status tracking ---
 
   it("starts with transport status", () => {
-    expect(conn.getSnapshot().status).toBe("connected");
+    // MockTransport starts as "connected" but since the blit handshake
+    // (S2C_READY) hasn't completed, the snapshot reports "authenticating".
+    expect(conn.getSnapshot().status).toBe("authenticating");
   });
 
   it("tracks status changes", () => {
@@ -63,17 +65,17 @@ describe("BlitConnection", () => {
 
   it("tracks retryCount on failed connection attempts", () => {
     expect(conn.getSnapshot().retryCount).toBe(0);
-    // Simulate: connected → disconnected (not from connecting, no increment)
+    // Simulate: authenticating → disconnected (handshake never completed)
     transport.setStatus("disconnected");
-    expect(conn.getSnapshot().retryCount).toBe(0);
+    expect(conn.getSnapshot().retryCount).toBe(1);
     // Retry: connecting → error (failed attempt)
     transport.setStatus("connecting");
     transport.setStatus("error");
-    expect(conn.getSnapshot().retryCount).toBe(1);
+    expect(conn.getSnapshot().retryCount).toBe(2);
     // Another retry: connecting → disconnected (failed attempt)
     transport.setStatus("connecting");
     transport.setStatus("disconnected");
-    expect(conn.getSnapshot().retryCount).toBe(2);
+    expect(conn.getSnapshot().retryCount).toBe(3);
     // Successful reconnect resets
     transport.setStatus("connecting");
     transport.setStatus("connected");
@@ -123,9 +125,15 @@ describe("BlitConnection", () => {
 
   // --- LIST reconciliation ---
 
-  it("becomes ready after LIST", () => {
+  it("becomes ready after READY", () => {
     transport.pushList([{ ptyId: 1, tag: "a" }]);
+    expect(conn.getSnapshot().ready).toBe(false);
+    // Before S2C_READY, status is "authenticating" (blit handshake incomplete).
+    expect(conn.getSnapshot().status).toBe("authenticating");
+    transport.pushReady();
     expect(conn.getSnapshot().ready).toBe(true);
+    // S2C_READY promotes status to "connected".
+    expect(conn.getSnapshot().status).toBe("connected");
     expect(conn.getSnapshot().sessions.length).toBe(1);
   });
 
@@ -225,11 +233,28 @@ describe("BlitConnection", () => {
     expect(session.tag).toBe("test");
   });
 
+  it("createSession via S2C_CREATED_N populates command immediately", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    const promise = conn.createSession({ rows: 24, cols: 80, command: "htop" });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    const nonce = msg[1] | (msg[2] << 8);
+    transport.pushCreatedN(nonce, 7, "");
+    const session = await promise;
+    expect(session.command).toBe("htop");
+  });
+
   it("createSession falls back to FIFO via S2C_CREATED", async () => {
     const promise = conn.createSession({ rows: 24, cols: 80, tag: "test" });
     transport.pushCreated(42, "test");
     const session = await promise;
     expect(session.tag).toBe("test");
+  });
+
+  it("createSession via S2C_CREATED FIFO populates command immediately", async () => {
+    const promise = conn.createSession({ rows: 24, cols: 80, command: "vim" });
+    transport.pushCreated(5, "");
+    const session = await promise;
+    expect(session.command).toBe("vim");
   });
 
   it("createSession rejects on disconnect", async () => {
@@ -367,6 +392,33 @@ describe("BlitConnection", () => {
     expect(msg[1] | (msg[2] << 8)).toBe(9);
   });
 
+  // --- S2C_QUIT ---
+
+  it("triggers immediate reconnect on S2C_QUIT", () => {
+    expect(transport.reconnectCount).toBe(0);
+    transport.pushQuit();
+    expect(transport.reconnectCount).toBe(1);
+  });
+
+  it("clears sessions and sets ready=false on S2C_QUIT", () => {
+    transport.pushCreated(1, "shell");
+    transport.pushCreated(2, "vim");
+    expect(conn.getSnapshot().sessions).toHaveLength(2);
+    expect(conn.getSnapshot().sessions.every((s) => s.state !== "closed")).toBe(
+      true,
+    );
+
+    transport.pushQuit();
+
+    const snap = conn.getSnapshot();
+    expect(snap.ready).toBe(false);
+    expect(snap.focusedSessionId).toBeNull();
+    // All sessions should be marked closed.
+    for (const s of snap.sessions) {
+      expect(s.state).toBe("closed");
+    }
+  });
+
   // --- S2C_HELLO ---
 
   it("closes transport on hello with version > PROTOCOL_VERSION", () => {
@@ -376,7 +428,9 @@ describe("BlitConnection", () => {
 
   it("accepts hello with version 1", () => {
     transport.pushHello(1, FEATURE_CREATE_NONCE);
-    expect(conn.getSnapshot().status).toBe("connected");
+    // After S2C_HELLO but before S2C_READY, the connection is in the
+    // handshake phase — status should be "authenticating", not "connected".
+    expect(conn.getSnapshot().status).toBe("authenticating");
   });
 
   it("supportsRestart reflects FEATURE_RESTART", () => {
@@ -558,12 +612,14 @@ describe("BlitConnection — advanced scenarios", () => {
     expect(conn.getSnapshot().sessions[50].tag).toBe("tag-50");
   });
 
-  it("sessions persist across transport disconnect", () => {
+  it("sessions are closed on transport disconnect", () => {
     const { conn, transport } = createConnection();
     transport.pushList([{ ptyId: 1, tag: "a" }]);
     transport.setStatus("disconnected");
+    // Sessions should be dismissed so the UI doesn't show stale terminals
+    // from a server that crashed without sending S2C_QUIT.
     expect(conn.getSnapshot().sessions.length).toBe(1);
-    expect(conn.getSnapshot().sessions[0].state).toBe("active");
+    expect(conn.getSnapshot().sessions[0].state).toBe("closed");
   });
 
   it("sessions reconcile on reconnect LIST", () => {
@@ -580,10 +636,16 @@ describe("BlitConnection — advanced scenarios", () => {
       { ptyId: 3, tag: "c" },
     ]);
     const s = conn.getSnapshot().sessions;
-    expect(s.find((x) => x.tag === "a")?.state).toBe("closed");
-    expect(s.find((x) => x.tag === "b")?.state).toBe("active");
-    expect(s.find((x) => x.tag === "c")?.state).toBe("active");
-    expect(s.find((x) => x.tag === "a")?.title).toBe("vim");
+    const live = s.filter((x) => x.state !== "closed");
+    const closed = s.filter((x) => x.state === "closed");
+    // "b" and "c" are live from the server's LIST.
+    expect(live.length).toBe(2);
+    expect(live.find((x) => x.tag === "b")?.state).toBe("active");
+    expect(live.find((x) => x.tag === "c")?.state).toBe("active");
+    // "a" was closed on disconnect and not in the reconnect LIST.
+    expect(closed.some((x) => x.tag === "a")).toBe(true);
+    // Title from before disconnect is preserved (session reuse by ptyId).
+    expect(closed.find((x) => x.tag === "a")?.title).toBe("vim");
   });
 
   it("handles emoji tags and titles", () => {
@@ -604,6 +666,7 @@ describe("BlitConnection — advanced scenarios", () => {
   it("ready stays true after multiple LISTs", () => {
     const { conn, transport } = createConnection();
     transport.pushList([]);
+    transport.pushReady();
     expect(conn.getSnapshot().ready).toBe(true);
     transport.pushList([{ ptyId: 1 }]);
     expect(conn.getSnapshot().ready).toBe(true);
@@ -651,5 +714,46 @@ describe("BlitConnection — advanced scenarios", () => {
     const snap = conn.getSnapshot();
     const focused = snap.sessions.find((s) => s.id === snap.focusedSessionId);
     expect(focused?.tag).toBe("b");
+  });
+
+  // --- View size tracking ---
+
+  it("removeView sends clearSessionSize when last view is removed", () => {
+    const { conn, transport } = createConnection();
+    transport.pushHello(1, FEATURE_RESIZE_BATCH);
+    transport.pushCreated(1, "");
+    const session = conn.getSnapshot().sessions[0];
+    const viewId = conn.allocViewId();
+    conn.setViewSize(session.id, viewId, 24, 80);
+    const before = transport.sent.length;
+    conn.removeView(session.id, viewId);
+    const sent = transport.sent.slice(before);
+    const resizes = sent.filter((m) => m[0] === C2S_RESIZE);
+    expect(resizes).toHaveLength(1);
+    const msg = resizes[0]!;
+    expect(msg[1] | (msg[2] << 8)).toBe(1);
+    // rows=0, cols=0 signals size constraint removal
+    expect(msg[3] | (msg[4] << 8)).toBe(0);
+    expect(msg[5] | (msg[6] << 8)).toBe(0);
+  });
+
+  it("removeView recalculates minimum when other views remain", () => {
+    const { conn, transport } = createConnection();
+    transport.pushHello(1, FEATURE_RESIZE_BATCH);
+    transport.pushCreated(1, "");
+    const session = conn.getSnapshot().sessions[0];
+    const v1 = conn.allocViewId();
+    const v2 = conn.allocViewId();
+    conn.setViewSize(session.id, v1, 24, 80);
+    conn.setViewSize(session.id, v2, 40, 120);
+    const before = transport.sent.length;
+    conn.removeView(session.id, v1);
+    const sent = transport.sent.slice(before);
+    const resizes = sent.filter((m) => m[0] === C2S_RESIZE);
+    expect(resizes).toHaveLength(1);
+    const msg = resizes[0]!;
+    // Should send the remaining view's size (40x120), not a clear
+    expect(msg[3] | (msg[4] << 8)).toBe(40);
+    expect(msg[5] | (msg[6] << 8)).toBe(120);
   });
 });

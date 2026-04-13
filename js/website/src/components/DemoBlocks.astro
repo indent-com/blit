@@ -1,17 +1,30 @@
 ---
 const remotes = `<span class="text-[var(--green)] select-none">$</span> blit share
-Session: https://blit.sh/s#rf6e…
+Terminals at https://blit.sh/s#rf6e…
 Read-only: https://blit.sh/s#EMPs…
 
 <span class="text-[var(--green)] select-none">$</span> blit remote add dev ssh:dev
-<span class="text-[var(--green)] select-none">$</span> blit --on dev list`;
+<span class="text-[var(--green)] select-none">$</span> blit --on dev terminal list`;
 
-const agentApi = `<span class="text-[var(--green)] select-none">$</span> blit start -t build make -j8
+const agentApi = `<span class="text-[var(--green)] select-none">$</span> blit terminal start -t build make -j8
 1
-<span class="text-[var(--green)] select-none">$</span> blit wait 1 --pattern 'BUILD OK'
-<span class="text-[var(--green)] select-none">$</span> blit show 1
+<span class="text-[var(--green)] select-none">$</span> blit terminal wait 1 --pattern 'BUILD OK'
+<span class="text-[var(--green)] select-none">$</span> blit terminal show 1
 [100%] Built target app
 BUILD OK`;
+
+const compositor = `<span class="text-[var(--green)] select-none">$</span> blit terminal start foot
+1
+<span class="text-[var(--green)] select-none">$</span> blit surface list
+<span class="text-[var(--green)] select-none">$</span> blit surface capture 1 screenshot.png
+<span class="text-[var(--green)] select-none">$</span> blit surface click 1 100 50`;
+
+const clipboard = `<span class="text-[var(--green)] select-none">$</span> blit clipboard list
+text/plain;charset=utf-8
+text/plain
+<span class="text-[var(--green)] select-none">$</span> blit clipboard get
+hello world
+<span class="text-[var(--green)] select-none">$</span> blit clipboard set "new value"`;
 
 const blocks = [
   {
@@ -23,6 +36,16 @@ const blocks = [
     title: "Terminals as an API",
     desc: "Non-interactive subcommands for scripts and LLMs. Parsed terminal grid, LZ4-compressed binary diffs — not pixels.",
     code: agentApi,
+  },
+  {
+    title: "GUI apps & audio",
+    desc: "Headless Wayland compositor streams GUI apps as H.264 / AV1 video. Audio forwarded via PipeWire and streamed as Opus. Linux only.",
+    code: compositor,
+  },
+  {
+    title: "Clipboard",
+    desc: "Read and write the compositor clipboard. List MIME types, get/set with any MIME — text, images, or custom formats.",
+    code: clipboard,
   },
 ];
 ---

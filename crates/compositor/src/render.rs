@@ -1,251 +1,267 @@
-//! GPU surface renderer using Smithay's GlesRenderer.
+//! Surface compositing — CPU fallback and layer collection for GPU rendering.
 //!
-//! Renders a Wayland surface tree (including subsurfaces) to an offscreen
-//! buffer and reads back the composed BGRA pixels.  Handles SHM and DMA-BUF
-//! import, cross-process fencing, format conversion — all via Smithay.
+//! `cpu_composite_from_cache` performs software compositing of a surface tree.
+//! `collect_gpu_layers` gathers layer metadata for the external GPU renderer.
 
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::egl::{EGLContext, EGLDisplay};
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::element::surface::{
-    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
-};
-use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
-use smithay::backend::renderer::utils::import_surface_tree;
-use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, TextureMapping,
-};
-use smithay::utils::{Physical, Point, Rectangle, Scale, Size, Transform};
+use std::collections::HashMap;
+use std::sync::Arc;
 
-/// GPU-accelerated surface renderer.
-pub struct SurfaceRenderer {
-    renderer: GlesRenderer,
+use wayland_server::backend::ObjectId;
+
+use super::imp::{PixelData, Surface};
+
+// ===================================================================
+// CPU composite (unchanged public API)
+// ===================================================================
+
+struct Layer {
+    x: i32,
+    y: i32,
+    logical_w: u32,
+    logical_h: u32,
+    pixel_w: u32,
+    scale: i32,
+    is_opaque: bool,
+    rgba: Vec<u8>,
 }
 
-impl SurfaceRenderer {
-    /// Try to create a renderer from a DRM render node path.
-    /// Returns None if the GPU or EGL isn't available.
-    pub fn try_new(drm_device: &str) -> Option<Self> {
-        let drm_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(drm_device)
-            .map_err(|e| eprintln!("[renderer] failed to open {drm_device}: {e}"))
-            .ok()?;
+/// Scale a logical dimension to physical pixels using scale_120
+/// (ceil so we never lose a pixel).
+#[inline]
+pub(crate) fn to_physical(logical: u32, scale_120: u32) -> u32 {
+    (logical * scale_120).div_ceil(120)
+}
 
-        let gbm = smithay::reexports::gbm::Device::new(drm_file)
-            .map_err(|e| eprintln!("[renderer] GBM device failed: {e}"))
-            .ok()?;
+/// CPU-composite a surface tree from the per-surface pixel cache.
+///
+/// `output_scale_120` is in 1/120th units (120 = 1×, 240 = 2×).
+/// The composited image is output at full physical resolution so the
+/// encoder / browser receives the native pixel density.
+///
+/// Returns `(width, height, PixelData)` or None if no renderable content.
+pub(crate) fn cpu_composite_from_cache(
+    root_surface_id: &ObjectId,
+    surfaces: &HashMap<ObjectId, Surface>,
+    cache: &HashMap<ObjectId, (u32, u32, i32, bool, PixelData)>,
+    output_scale_120: u16,
+) -> Option<(u32, u32, PixelData)> {
+    let s120 = (output_scale_120 as u32).max(120);
 
-        let egl_display = unsafe { EGLDisplay::new(gbm) }
-            .map_err(|e| eprintln!("[renderer] EGL display failed: {e}"))
-            .ok()?;
+    let mut layers: Vec<Layer> = Vec::new();
+    collect_layers(root_surface_id, surfaces, cache, 0, 0, &mut layers);
 
-        let egl_context = EGLContext::new(&egl_display)
-            .map_err(|e| eprintln!("[renderer] EGL context failed: {e}"))
-            .ok()?;
-
-        let renderer = unsafe { GlesRenderer::new(egl_context) }
-            .map_err(|e| eprintln!("[renderer] GlesRenderer failed: {e}"))
-            .ok()?;
-
-        eprintln!("[renderer] initialized on {drm_device}");
-
-        Some(Self { renderer })
+    if layers.is_empty() {
+        return None;
     }
 
-    /// Render a surface tree to BGRA pixels.
-    ///
-    /// Render a surface tree to BGRA pixels, cropped to `geometry` if
-    /// provided (excludes CSD shadows/decorations).
-    pub fn render_surface(
-        &mut self,
-        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-        geometry: Option<&Rectangle<i32, smithay::utils::Logical>>,
-    ) -> Option<(u32, u32, Vec<u8>)> {
-        use std::time::Instant;
-        let t0 = Instant::now();
-
-        // Import SHM buffers only.  DMA-BUF import via EGL hangs on AMD
-        // due to implicit fence sync issues with cross-process buffers.
-        // import_surface_tree would import both SHM and DMA-BUF — instead
-        // we import each surface individually, skipping DMA-BUF.
-        // Check if any DMA-BUF surface lacks explicit sync — those would
-        // hang on EGL import due to implicit fence waits.  If all DMA-BUFs
-        // have explicit sync (or the surface is SHM-only), proceed with
-        // GPU rendering.  Otherwise bail to CPU fallback.
-        {
-            use smithay::wayland::compositor::{
-                BufferAssignment, SurfaceAttributes, TraversalAction, with_surface_tree_downward,
-            };
-            use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
-            let mut has_unsafe_dmabuf = false;
-            with_surface_tree_downward(
-                surface,
-                (),
-                |_, _, _| TraversalAction::DoChildren(()),
-                |_wl, states, _| {
-                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                    let attrs = guard.current();
-                    let is_dmabuf = matches!(
-                        attrs.buffer.as_ref(),
-                        Some(BufferAssignment::NewBuffer(buf))
-                            if smithay::wayland::dmabuf::get_dmabuf(buf).is_ok()
-                    );
-                    if is_dmabuf {
-                        let mut sync_guard = states.cached_state.get::<DrmSyncobjCachedState>();
-                        let sync = sync_guard.current();
-                        if sync.acquire_point.is_none() {
-                            has_unsafe_dmabuf = true;
-                        }
-                    }
-                },
-                |_, _, _| true,
-            );
-            if has_unsafe_dmabuf {
-                // Fall back to CPU — this surface has DMA-BUF without
-                // explicit sync, which would hang on EGL import.
-                return None;
+    // Determine xdg_geometry crop from root surface (logical coords).
+    let (crop_x, crop_y, log_w, log_h) = surfaces
+        .get(root_surface_id)
+        .and_then(|s| s.xdg_geometry)
+        .filter(|&(_, _, w, h)| w > 0 && h > 0)
+        .map(|(x, y, w, h)| (x, y, w as u32, h as u32))
+        .unwrap_or_else(|| {
+            let (mut mw, mut mh) = (0i32, 0i32);
+            for l in &layers {
+                mw = mw.max(l.x + l.logical_w as i32);
+                mh = mh.max(l.y + l.logical_h as i32);
             }
-        }
+            (0, 0, mw.max(0) as u32, mh.max(0) as u32)
+        });
 
-        // All buffers are either SHM or DMA-BUF with explicit sync — safe
-        // to import via EGL.
-        let _ = import_surface_tree(&mut self.renderer, surface);
-        let t1 = Instant::now();
+    if log_w == 0 || log_h == 0 {
+        return None;
+    }
 
-        // Compute crop offset from geometry (excludes CSD shadows).
-        let (crop_x, crop_y) = geometry
-            .filter(|g| g.size.w > 0 && g.size.h > 0)
-            .map(|g| (g.loc.x, g.loc.y))
-            .unwrap_or((0, 0));
+    // Physical output dimensions.
+    let phys_w = to_physical(log_w, s120) as usize;
+    let phys_h = to_physical(log_h, s120) as usize;
 
-        // Get render elements, offset by -geometry.loc so the content
-        // area maps to (0,0) and shadows are clipped.
-        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-            render_elements_from_surface_tree(
-                &mut self.renderer,
-                surface,
-                Point::from((-crop_x, -crop_y)),
-                Scale::from(1.0),
-                1.0,
-                Kind::Unspecified,
-            );
-        let t2 = Instant::now();
+    let stride = phys_w * 4;
+    let mut out = vec![0u8; stride * phys_h];
 
-        eprintln!(
-            "[renderer] {} elements, crop=({crop_x},{crop_y})",
-            elements.len()
-        );
-        if elements.is_empty() {
-            return None;
-        }
-
-        // Output size: geometry size if available, otherwise derive from elements.
-        let (w, h) = geometry
-            .filter(|g| g.size.w > 0 && g.size.h > 0)
-            .map(|g| (g.size.w, g.size.h))
-            .unwrap_or_else(|| {
-                use smithay::backend::renderer::element::Element;
-                let mut max_w = 0i32;
-                let mut max_h = 0i32;
-                for elem in &elements {
-                    let g = elem.geometry(Scale::from(1.0));
-                    max_w = max_w.max(g.loc.x + g.size.w);
-                    max_h = max_h.max(g.loc.y + g.size.h);
-                }
-                (max_w, max_h)
-            });
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-
-        // Create offscreen renderbuffer.
-        let size = Size::from((w, h));
-        let mut rb: GlesRenderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(
-            &mut self.renderer,
-            Fourcc::Abgr8888,
-            size,
-        )
-        .ok()?;
-        let t3 = Instant::now();
-
-        let output_size: Size<i32, Physical> = (w, h).into();
-        let damage = [Rectangle::from_size(output_size)];
-
-        // Render to offscreen buffer.
-        {
-            let mut target = self.renderer.bind(&mut rb).ok()?;
-            let mut frame = self
-                .renderer
-                .render(&mut target, output_size, Transform::Normal)
-                .ok()?;
-
-            frame.clear(Color32F::TRANSPARENT, &damage).ok()?;
-
-            for elem in &elements {
-                use smithay::backend::renderer::element::{Element, RenderElement};
-                let src = elem.src();
-                let geo = elem.geometry(Scale::from(1.0));
-                let _ = elem.draw(&mut frame, src, geo, &damage, &[]);
-            }
-
-            let _sync = frame.finish().ok()?;
-        }
-        let t4 = Instant::now();
-
-        // Read back pixels.
-        let target2 = self.renderer.bind(&mut rb).ok()?;
-        let t5 = Instant::now();
-        eprintln!(
-            "[renderer] {w}x{h} {}elem import={:?} elements={:?} create={:?} render={:?} bind2={:?}",
-            elements.len(),
-            t1 - t0,
-            t2 - t1,
-            t3 - t2,
-            t4 - t3,
-            t5 - t4,
-        );
-        let region = Rectangle::from_size(size);
-        let mapping = self
-            .renderer
-            .copy_framebuffer(&target2, region, Fourcc::Abgr8888)
-            .ok()?;
-        let t6 = Instant::now();
-        let pixels = self.renderer.map_texture(&mapping).ok()?;
-        let t7 = Instant::now();
-        eprintln!("[renderer] copy={:?} map={:?}", t6 - t5, t7 - t6);
-
-        // Pixels may be y-flipped.
-        let row_bytes = w as usize * 4;
-        let total = row_bytes * h as usize;
-        let mut bgra = Vec::with_capacity(total);
-        if !mapping.flipped() {
-            for y in (0..h as usize).rev() {
-                let start = y * row_bytes;
-                bgra.extend_from_slice(&pixels[start..start + row_bytes]);
-            }
+    for layer in &layers {
+        // Layer position in logical coords.
+        let (lx, ly) = if layer.logical_w == log_w && layer.logical_h == log_h {
+            (layer.x, layer.y)
         } else {
-            bgra.extend_from_slice(&pixels[..total]);
-        }
+            (layer.x - crop_x, layer.y - crop_y)
+        };
+        let buf_s = layer.scale.max(1) as usize;
+        let pw = layer.pixel_w as usize;
 
-        // ABGR8888 readback = RGBA in memory.  Convert to BGRA for encoder.
-        for px in bgra.chunks_exact_mut(4) {
-            px.swap(0, 2); // R ↔ B
+        // Physical extent of this layer in the output.
+        let layer_phys_w = to_physical(layer.logical_w, s120) as usize;
+        let layer_phys_h = to_physical(layer.logical_h, s120) as usize;
+
+        for prow in 0..layer_phys_h {
+            let dy = (ly as i64) * (s120 as i64) / 120 + prow as i64;
+            if dy < 0 || dy >= phys_h as i64 {
+                continue;
+            }
+            for pcol in 0..layer_phys_w {
+                let dx = (lx as i64) * (s120 as i64) / 120 + pcol as i64;
+                if dx < 0 || dx >= phys_w as i64 {
+                    continue;
+                }
+
+                // Map output physical pixel to source buffer pixel.
+                let src_row = prow * buf_s * 120 / (s120 as usize);
+                let src_col = pcol * buf_s * 120 / (s120 as usize);
+                let src_off = (src_row * pw + src_col) * 4;
+                let dst_off = dy as usize * stride + dx as usize * 4;
+                if src_off + 3 >= layer.rgba.len() || dst_off + 3 >= out.len() {
+                    continue;
+                }
+
+                let (sr, sg, sb) = (
+                    layer.rgba[src_off],
+                    layer.rgba[src_off + 1],
+                    layer.rgba[src_off + 2],
+                );
+                let sa = if layer.is_opaque {
+                    255u32
+                } else {
+                    layer.rgba[src_off + 3] as u32
+                };
+
+                if sa == 0 {
+                    continue;
+                }
+                if sa == 255 {
+                    out[dst_off] = sr;
+                    out[dst_off + 1] = sg;
+                    out[dst_off + 2] = sb;
+                    out[dst_off + 3] = 255;
+                } else {
+                    let inv = 255 - sa;
+                    out[dst_off] = ((sr as u32 * sa + out[dst_off] as u32 * inv) / 255) as u8;
+                    out[dst_off + 1] =
+                        ((sg as u32 * sa + out[dst_off + 1] as u32 * inv) / 255) as u8;
+                    out[dst_off + 2] =
+                        ((sb as u32 * sa + out[dst_off + 2] as u32 * inv) / 255) as u8;
+                    out[dst_off + 3] = 255;
+                }
+            }
         }
-        Some((w as u32, h as u32, bgra))
     }
 
-    /// Get the renderer's supported DMA-BUF formats (for DmabufFeedback).
-    #[allow(dead_code)]
-    pub fn dmabuf_formats(&self) -> smithay::backend::allocator::format::FormatSet {
-        use smithay::backend::renderer::ImportDma;
-        self.renderer.dmabuf_formats()
+    // Output is RGBA from to_rgba().
+    Some((phys_w as u32, phys_h as u32, PixelData::Rgba(Arc::new(out))))
+}
+
+fn collect_layers(
+    surface_id: &ObjectId,
+    surfaces: &HashMap<ObjectId, Surface>,
+    cache: &HashMap<ObjectId, (u32, u32, i32, bool, PixelData)>,
+    parent_x: i32,
+    parent_y: i32,
+    layers: &mut Vec<Layer>,
+) {
+    let Some(surf) = surfaces.get(surface_id) else {
+        return;
+    };
+    let (x, y) = (
+        parent_x + surf.subsurface_position.0,
+        parent_y + surf.subsurface_position.1,
+    );
+
+    if let Some((w, h, scale, is_opaque, pixels)) = cache.get(surface_id) {
+        let rgba = pixels.to_rgba(*w, *h);
+        if !rgba.is_empty() {
+            let s = (*scale).max(1) as u32;
+            // Prefer viewport destination (logical size declared by the client
+            // via wp_viewport.set_destination) over buffer_scale division.
+            // Fractional-scale-aware clients (e.g. Chromium) render at physical
+            // resolution with buffer_scale=1 and use the viewport to declare
+            // logical size.  Traditional clients (e.g. Firefox) set
+            // buffer_scale=2 and don't use the viewport.
+            let (lw, lh) = surf
+                .viewport_destination
+                .filter(|&(dw, dh)| dw > 0 && dh > 0)
+                .map(|(dw, dh)| (dw as u32, dh as u32))
+                .unwrap_or((*w / s, *h / s));
+            layers.push(Layer {
+                x,
+                y,
+                logical_w: lw,
+                logical_h: lh,
+                pixel_w: *w,
+                scale: *scale,
+                is_opaque: *is_opaque,
+                rgba,
+            });
+        }
     }
 
-    /// Get the EGL display (for DmabufFeedback device).
-    #[allow(dead_code)]
-    pub fn egl_display(&self) -> &EGLDisplay {
-        self.renderer.egl_context().display()
+    for child_id in &surf.children {
+        collect_layers(child_id, surfaces, cache, x, y, layers);
+    }
+}
+
+// ===================================================================
+// Layer collection for GPU rendering
+// ===================================================================
+
+/// A single compositing layer for the GPU renderer.
+pub(crate) struct GpuLayer<'a> {
+    pub x: i32,
+    pub y: i32,
+    pub logical_w: u32,
+    pub logical_h: u32,
+    pub pixel_w: u32,
+    pub pixel_h: u32,
+    pub pixels: &'a PixelData,
+}
+
+/// Collect layers for GPU compositing.  Each layer carries a reference to
+/// the original `PixelData` so we can distinguish DMA-BUF vs SHM.
+pub(crate) fn collect_gpu_layers<'a>(
+    surface_id: &ObjectId,
+    surfaces: &HashMap<ObjectId, Surface>,
+    cache: &'a HashMap<ObjectId, (u32, u32, i32, bool, PixelData)>,
+    parent_x: i32,
+    parent_y: i32,
+    layers: &mut Vec<GpuLayer<'a>>,
+) {
+    let Some(surf) = surfaces.get(surface_id) else {
+        return;
+    };
+    let (x, y) = (
+        parent_x + surf.subsurface_position.0,
+        parent_y + surf.subsurface_position.1,
+    );
+
+    if let Some((w, h, scale, _is_opaque, pixels)) = cache.get(surface_id)
+        && !pixels.is_empty()
+    {
+        let s = (*scale).max(1) as u32;
+        // Prefer viewport destination (see collect_layers for rationale).
+        let (lw, lh) = surf
+            .viewport_destination
+            .filter(|&(dw, dh)| dw > 0 && dh > 0)
+            .map(|(dw, dh)| (dw as u32, dh as u32))
+            .unwrap_or((*w / s, *h / s));
+        static DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 || n.is_multiple_of(1000) {
+            eprintln!(
+                "[gpu-layer #{n}] sid={surface_id:?} pos=({x},{y}) pixel={}x{} scale={} viewport={:?} logical={}x{}",
+                w, h, scale, surf.viewport_destination, lw, lh,
+            );
+        }
+        layers.push(GpuLayer {
+            x,
+            y,
+            logical_w: lw,
+            logical_h: lh,
+            pixel_w: *w,
+            pixel_h: *h,
+            pixels,
+        });
+    }
+
+    for child_id in &surf.children {
+        collect_gpu_layers(child_id, surfaces, cache, x, y, layers);
     }
 }

@@ -1,8 +1,8 @@
 [package]
 name = "blit-webrtc-forwarder"
-version = "0.22.1"
+version = "0.23.0"
 edition.workspace = true
-description = "Forward a blit-server session over WebRTC"
+description = "Forward a blit-server terminal over WebRTC"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

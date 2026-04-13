@@ -1,13 +1,13 @@
 # Frontend
 
-The browser-side of blit consists of a Rust WASM module (`blit-browser`) that applies frame diffs and produces GPU-ready vertex data, a WebGL renderer, and a TypeScript layer (`@blit-sh/core`) that handles transports, workspace state, and input.
+The browser-side of blit consists of a Rust WASM module (`blit-browser`) that applies frame diffs and produces GPU-ready vertex data, a GPU renderer (WebGPU with WebGL2 fallback), and a TypeScript layer (`@blit-sh/core`) that handles transports, workspace state, and input.
 
 ## Render pipeline overview
 
 ```mermaid
 graph LR
     WS["WebSocket /\nWebTransport /\nWebRTC"] -->|compressed frame| WASM["blit-browser\n(WASM)"]
-    WASM -->|vertex buffers\n(zero-copy)| GL["WebGL renderer"]
+    WASM -->|vertex buffers\n(zero-copy)| GL["GPU renderer\n(WebGPU / WebGL2)"]
     GL -->|bg rects + glyphs| OC["offscreen canvas"]
     OC -->|drawImage| DC["display canvas"]
     DC -->|2D overlays| OUT["screen"]
@@ -38,7 +38,34 @@ When a new glyph is needed:
 
 The atlas canvas is uploaded to a WebGL texture once per frame (skipped if unchanged). The GL shader tints white glyphs with the per-vertex foreground color; color glyphs (emoji) pass through untinted.
 
-## WebGL renderer
+## GPU renderer
+
+The browser renderer has three backends, tried in order:
+
+1. **WebGPU** — preferred when available (Chrome 113+, Edge 113+, Firefox Nightly). Async initialisation via `navigator.gpu.requestAdapter()`.
+2. **WebGL2** — synchronous fallback, used while the WebGPU probe is in-flight or if WebGPU is unavailable.
+3. **Canvas 2D** — software fallback when neither GPU API is available (e.g. headless environments).
+
+All three implement the same `GlRenderer` interface and consume the same vertex buffers produced by the WASM module. `TerminalStore` kicks off the WebGPU probe eagerly in its constructor and transparently promotes the renderer once the probe resolves; frames rendered before that use the WebGL2 fallback.
+
+### WebGPU renderer
+
+Two WGSL render pipelines:
+
+**RECT pipeline** — colored rectangles for cell backgrounds and the cursor.
+
+- Vertex layout: `pos` (float32x2), `color` (float32x4) — 24-byte stride.
+- Single draw call per frame (no batching needed; vertex buffer grows on demand).
+
+**GLYPH pipeline** — textured atlas quads with per-vertex coloring.
+
+- Vertex layout: `pos` (float32x2), `uv` (float32x2), `color` (float32x4) — 32-byte stride.
+- Fragment shader uses the same gray-detection tinting as WebGL2 (grayscale → tinted, color → passthrough).
+- Atlas uploaded via `copyExternalImageToTexture` with premultiplied alpha.
+
+Both pipelines use premultiplied-alpha blending (`src: one, dst: one-minus-src-alpha`).
+
+### WebGL2 renderer
 
 Two shader programs handle all drawing:
 
@@ -54,7 +81,7 @@ Two shader programs handle all drawing:
 
 Both programs batch up to 65,532 vertices per draw call.
 
-### Render loop (`BlitTerminal`)
+### Render loop (`BlitTerminalSurface`)
 
 Demand-driven via `requestAnimationFrame`:
 
@@ -62,7 +89,7 @@ Demand-driven via `requestAnimationFrame`:
 graph TD
     RAF["requestAnimationFrame"] --> PREP["WASM prepare_render_ops()"]
     PREP --> VIEW["Float32Array views over WASM memory\n(zero-copy)"]
-    VIEW --> DRAW["WebGL: bg rects + glyph quads + cursor\n→ offscreen canvas"]
+    VIEW --> DRAW["GPU: bg rects + glyph quads + cursor\n→ offscreen canvas"]
     DRAW --> COMP["ctx.drawImage to display canvas"]
     COMP --> OVL["Canvas 2D overlays:\nselection · URL underlines · emoji · echo · scrollbar"]
 ```
@@ -99,17 +126,17 @@ graph TD
     WS --> C2["BlitConnection\n(hound)"]
     C1 --> T1["WebSocketTransport\n/d/rabbit"]
     C2 --> T2["WebSocketTransport\n/d/hound"]
-    C1 --> P1["PTY sessions\nrabbit:1, rabbit:2"]
-    C2 --> P2["PTY sessions\nhound:1"]
+    C1 --> P1["Terminals\nrabbit:1, rabbit:2"]
+    C2 --> P2["Terminals\nhound:1"]
 ```
 
-`BlitWorkspace` manages one or more `BlitConnection` instances, each with its own transport and PTY namespace. Session IDs are prefixed by connection name (`"rabbit:1"`) to avoid collisions when multiple servers are open simultaneously.
+`BlitWorkspace` manages one or more `BlitConnection` instances, each with its own transport and PTY namespace. Terminal IDs are prefixed by connection name (`"rabbit:1"`) to avoid collisions when multiple servers are open simultaneously.
 
 ## Surface video decoding
 
 GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headless-wayland-compositor)) are decoded in the browser via the **WebCodecs `VideoDecoder` API**:
 
-- Codec is detected per-frame from the `flags` byte in `S2C_SURFACE_FRAME`: H.264 (0), H.265 (1), AV1 (2).
+- Codec is detected per-frame from the `flags` byte in `S2C_SURFACE_FRAME`: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2).
 - `optimizeForLatency: true` is set on the decoder to minimize decode delay.
 - Decoded `VideoFrame`s are rendered to a canvas by `BlitSurfaceView` (React/Solid component).
 - Mouse and keyboard events from the surface canvas are forwarded as `C2S_SURFACE_INPUT` / `C2S_SURFACE_POINTER` messages.

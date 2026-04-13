@@ -153,6 +153,7 @@ export function FontOverlay(props: {
         >
           <input
             ref={inputRef!}
+            name="blit-font-search"
             type="text"
             value={query()}
             onInput={(e) => {
@@ -223,6 +224,7 @@ export function FontOverlay(props: {
               {t("font.sizeLabel")}
             </label>
             <input
+              name="blit-font-size-range"
               type="range"
               min={8}
               max={32}
@@ -231,6 +233,7 @@ export function FontOverlay(props: {
               style={{ flex: 1 }}
             />
             <input
+              name="blit-font-size"
               type="number"
               min={6}
               max={72}

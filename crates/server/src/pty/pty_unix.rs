@@ -8,12 +8,19 @@ use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 /// This avoids calling std::env::set_var/remove_var after fork() in a
 /// multi-threaded process (which is UB per POSIX — those functions are
 /// not async-signal-safe).
-fn build_child_env(wayland_display: Option<&str>) -> Vec<CString> {
+fn build_child_env(
+    wayland_display: Option<&str>,
+    pulse_server: Option<&str>,
+    pipewire_remote: Option<&str>,
+) -> Vec<CString> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
             k != "COLUMNS"
                 && k != "LINES"
                 && k != "DISPLAY"
+                && k != "PIPEWIRE_REMOTE"
+                && k != "DBUS_SESSION_BUS_ADDRESS"
+                && k != "DBUS_SYSTEM_BUS_ADDRESS"
                 && !(k.starts_with("BLIT_") && k != "BLIT_HUB")
         })
         .collect();
@@ -39,8 +46,33 @@ fn build_child_env(wayland_display: Option<&str>) -> Vec<CString> {
                 set(&mut env, "XDG_RUNTIME_DIR", &dir.to_string_lossy());
             }
         }
-        set(&mut env, "WAYLAND_DISPLAY", wd);
+        // WAYLAND_DISPLAY must be just the socket filename (e.g. "wayland-2"),
+        // not a full path.  Clients resolve it under XDG_RUNTIME_DIR.
+        let wd_name = wd_path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_else(|| wd.into());
+        set(&mut env, "WAYLAND_DISPLAY", &wd_name);
         // DISPLAY was already filtered out above.
+    }
+    if let Some(ps) = pulse_server {
+        set(&mut env, "PULSE_SERVER", ps);
+    } else {
+        // No audio pipeline — point PULSE_SERVER at a path that will make
+        // libpulse fail immediately.  Without this, libpulse falls back to
+        // autospawn (`pulseaudio --start`) which hangs in headless /
+        // container environments.  Setting PULSE_SERVER explicitly also
+        // prevents inheriting a host PulseAudio server that would bypass
+        // blit's audio pipeline.
+        set(&mut env, "PULSE_SERVER", "/dev/null");
+    }
+    // Set PIPEWIRE_REMOTE so native PipeWire clients (mpv, Firefox, etc.)
+    // can connect to our private PipeWire instance.  WirePlumber is running
+    // as the session manager and handles linking streams to blit-sink.
+    // The path is absolute so it works regardless of the child's
+    // XDG_RUNTIME_DIR (which points at the Wayland socket directory).
+    if let Some(pr) = pipewire_remote {
+        set(&mut env, "PIPEWIRE_REMOTE", pr);
     }
     env.into_iter()
         .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
@@ -289,6 +321,8 @@ pub fn spawn_pty(
     scrollback: usize,
     state: AppState,
     wayland_display: Option<&str>,
+    pulse_server: Option<&str>,
+    pipewire_remote: Option<&str>,
 ) -> Option<crate::Pty> {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
@@ -315,7 +349,7 @@ pub fn spawn_pty(
 
     // Build the child's environment before fork() to avoid calling
     // set_var/remove_var after fork in a multi-threaded process (UB per POSIX).
-    let child_env = build_child_env(wayland_display);
+    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote);
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -467,6 +501,8 @@ pub fn respawn_child(
     command: Option<&str>,
     state: AppState,
     wayland_display: Option<&str>,
+    pulse_server: Option<&str>,
+    pipewire_remote: Option<&str>,
 ) -> Option<(
     PtyHandle,
     std::thread::JoinHandle<()>,
@@ -495,7 +531,7 @@ pub fn respawn_child(
     }
 
     // Build the child's environment before fork() (same rationale as spawn_pty).
-    let child_env = build_child_env(wayland_display);
+    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote);
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())

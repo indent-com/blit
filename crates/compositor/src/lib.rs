@@ -1,7 +1,11 @@
+mod positioner;
+
 #[cfg(target_os = "linux")]
 mod imp;
 #[cfg(target_os = "linux")]
 mod render;
+#[cfg(target_os = "linux")]
+mod vulkan_render;
 #[cfg(target_os = "linux")]
 pub use imp::*;
 
@@ -39,6 +43,11 @@ mod stub {
             stride: u32,
             offset: u32,
         },
+        VaSurface {
+            surface_id: u32,
+            va_display: usize,
+            _fd: Arc<OwnedFd>,
+        },
     }
 
     #[derive(Clone)]
@@ -61,7 +70,7 @@ mod stub {
                     }
                     rgba
                 }
-                PixelData::Nv12 { .. } | PixelData::DmaBuf { .. } => Vec::new(),
+                _ => Vec::new(),
             }
         }
 
@@ -69,13 +78,30 @@ mod stub {
             match self {
                 PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
                 PixelData::Nv12 { data, .. } => data.is_empty(),
-                PixelData::DmaBuf { .. } => false,
+                PixelData::DmaBuf { .. } | PixelData::VaSurface { .. } => false,
             }
         }
 
         pub fn is_dmabuf(&self) -> bool {
             matches!(self, PixelData::DmaBuf { .. })
         }
+
+        pub fn is_va_surface(&self) -> bool {
+            matches!(self, PixelData::VaSurface { .. })
+        }
+    }
+
+    #[derive(Clone)]
+    pub enum CursorImage {
+        Named(String),
+        Custom {
+            hotspot_x: u16,
+            hotspot_y: u16,
+            width: u16,
+            height: u16,
+            rgba: Vec<u8>,
+        },
+        Hidden,
     }
 
     pub enum CompositorEvent {
@@ -114,6 +140,10 @@ mod stub {
             mime_type: String,
             data: Vec<u8>,
         },
+        SurfaceCursor {
+            surface_id: u16,
+            cursor: CursorImage,
+        },
     }
 
     pub enum CompositorCommand {
@@ -150,15 +180,32 @@ mod stub {
             surface_id: u16,
         },
         ClipboardOffer {
-            surface_id: u16,
             mime_type: String,
             data: Vec<u8>,
+        },
+        /// List available clipboard MIME types.
+        ClipboardListMimes {
+            reply: mpsc::SyncSender<Vec<String>>,
+        },
+        /// Read clipboard content for a specific MIME type.
+        ClipboardGet {
+            mime_type: String,
+            reply: mpsc::SyncSender<Option<Vec<u8>>>,
+        },
+        /// Composed text from the browser (e.g. IME or shifted characters
+        /// that don't match the compositor's US-QWERTY keymap).  The compositor
+        /// synthesises evdev key sequences for ASCII chars and uses
+        /// zwp_text_input_v3 commit_string for non-ASCII.
+        TextInput {
+            text: String,
         },
         ReleaseKeys {
             keycodes: Vec<u32>,
         },
         Capture {
             surface_id: u16,
+            /// Render scale in 120ths. 0 = current output scale.
+            scale_120: u16,
             reply: mpsc::SyncSender<Option<(u32, u32, Vec<u8>)>>,
         },
         /// Fire pending wl_surface.frame callbacks for a surface so the
@@ -167,7 +214,22 @@ mod stub {
         RequestFrame {
             surface_id: u16,
         },
+        SetExternalOutputBuffers {
+            buffers: Vec<ExternalOutputBuffer>,
+        },
         Shutdown,
+    }
+
+    pub struct ExternalOutputBuffer {
+        pub fd: Arc<OwnedFd>,
+        pub fourcc: u32,
+        pub modifier: u64,
+        pub stride: u32,
+        pub offset: u32,
+        pub width: u32,
+        pub height: u32,
+        pub va_surface_id: u32,
+        pub va_display: usize,
     }
 
     pub struct CompositorHandle {

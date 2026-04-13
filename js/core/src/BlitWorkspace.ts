@@ -23,9 +23,30 @@ export interface AddBlitConnectionOptions
   wasm?: BlitWasmModule | Promise<BlitWasmModule>;
 }
 
+/** Logger interface for workspace lifecycle events. */
+export interface BlitLogger {
+  /** Called for informational events (subscribe, unsubscribe, connect, etc.). */
+  info(msg: string, ...args: unknown[]): void;
+  /** Called for warnings (decode errors, transport issues, etc.). */
+  warn(msg: string, ...args: unknown[]): void;
+}
+
+/** Default logger that writes to the console. */
+export const consoleLogger: BlitLogger = {
+  info: (msg, ...args) => console.log(`[blit] ${msg}`, ...args),
+  warn: (msg, ...args) => console.warn(`[blit] ${msg}`, ...args),
+};
+
+/** Silent logger that discards everything. */
+export const nullLogger: BlitLogger = {
+  info: () => {},
+  warn: () => {},
+};
+
 export interface CreateBlitWorkspaceOptions {
   wasm: BlitWasmModule | Promise<BlitWasmModule>;
   connections?: AddBlitConnectionOptions[];
+  logger?: BlitLogger;
 }
 
 export interface CreateWorkspaceSessionOptions {
@@ -52,6 +73,7 @@ export class BlitWorkspace {
   private readonly connectionListeners = new Map<ConnectionId, () => void>();
   private readonly connections = new Map<ConnectionId, BlitConnection>();
   private readonly defaultWasm: BlitWasmModule | Promise<BlitWasmModule>;
+  readonly logger: BlitLogger;
 
   private snapshot: BlitWorkspaceSnapshot = {
     connections: [],
@@ -60,8 +82,9 @@ export class BlitWorkspace {
     ready: false,
   };
 
-  constructor({ wasm, connections = [] }: CreateBlitWorkspaceOptions) {
+  constructor({ wasm, connections = [], logger }: CreateBlitWorkspaceOptions) {
     this.defaultWasm = wasm;
+    this.logger = logger ?? consoleLogger;
     for (const connection of connections) {
       this.addConnection(connection);
     }
@@ -86,6 +109,7 @@ export class BlitWorkspace {
       ...options,
       transport,
       wasm: options.wasm ?? this.defaultWasm,
+      logger: this.logger,
     });
     this.connections.set(options.id, connection);
     this.connectionListeners.set(
@@ -165,9 +189,7 @@ export class BlitWorkspace {
 
   closeSurface(connectionId: ConnectionId, surfaceId: number): void {
     const connection = this.requireConnection(connectionId);
-    const surface = connection.surfaceStore.getSurfaces().get(surfaceId);
-    const sessionId = surface?.sessionId ?? 0;
-    connection.sendSurfaceClose(sessionId, surfaceId);
+    connection.sendSurfaceClose(surfaceId);
   }
 
   restartSession(sessionId: SessionId): void {
@@ -334,7 +356,15 @@ export class BlitWorkspace {
     connectionId: ConnectionId,
     sessionId: SessionId | null,
   ): ReturnType<BlitConnection["getDebugStats"]> | null {
-    return this.connections.get(connectionId)?.getDebugStats(sessionId) ?? null;
+    const stats = this.connections.get(connectionId)?.getDebugStats(sessionId);
+    if (!stats) return null;
+    // Aggregate surfaces from *all* connections so the debug panel shows
+    // every surface regardless of which connection owns it.
+    const allSurfaces: typeof stats.surfaces = [];
+    for (const conn of this.connections.values()) {
+      allSurfaces.push(...conn.surfaceStore.getDebugStats());
+    }
+    return { ...stats, surfaces: allSurfaces };
   }
 
   private emit(): void {
@@ -395,6 +425,17 @@ export class BlitWorkspace {
       );
       if (focused && focused.state !== "closed") {
         return focused.id;
+      }
+      // The old session ID is gone or closed — try to find a live session
+      // for the same underlying PTY so focus survives reconnects.
+      if (focused && focused.state === "closed") {
+        const replacement = sessions.find(
+          (s) =>
+            s.state !== "closed" &&
+            s.connectionId === focused.connectionId &&
+            s.ptyId === focused.ptyId,
+        );
+        if (replacement) return replacement.id;
       }
     }
 

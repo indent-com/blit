@@ -76,6 +76,23 @@ export class WebSocketTransport implements BlitTransport {
     this.setStatus("closed");
   }
 
+  reconnect(): void {
+    if (this.disposed) return;
+    this.clearReconnectTimer();
+    this.clearConnectTimer();
+    if (this.ws) {
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.onmessage = null;
+      this.ws.onopen = null;
+      this.ws.close();
+      this.ws = null;
+    }
+    this.currentDelay = this.initialDelay;
+    this.setStatus("disconnected");
+    this.connect();
+  }
+
   addEventListener(
     type: "message",
     listener: (data: ArrayBuffer) => void,

@@ -62,6 +62,8 @@ function effectiveDpr(): number {
 // BlitTerminalSurface
 // ---------------------------------------------------------------------------
 
+let surfaceCounter = 0;
+
 /**
  * Framework-agnostic terminal surface. Manages DOM elements, WebGL rendering,
  * keyboard/mouse input, selection, scrollbar, DPR tracking, and resize
@@ -141,6 +143,8 @@ export class BlitTerminalSurface {
   private disposed = false;
   private _ctrlModifier = false;
   private _ctrlModifierListeners = new Set<(active: boolean) => void>();
+  private _altModifier = false;
+  private _altModifierListeners = new Set<(active: boolean) => void>();
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
@@ -228,6 +232,28 @@ export class BlitTerminalSurface {
     return () => this._ctrlModifierListeners.delete(listener);
   }
 
+  /**
+   * Set the Alt modifier state for the next typed character.
+   * When active, the next character typed via the soft keyboard will be
+   * prefixed with ESC (0x1b), producing an Alt+char sequence.
+   * The modifier auto-resets after one character is consumed.
+   */
+  setAltModifier(active: boolean): void {
+    if (this._altModifier === active) return;
+    this._altModifier = active;
+    for (const l of this._altModifierListeners) l(active);
+  }
+
+  get altModifier(): boolean {
+    return this._altModifier;
+  }
+
+  /** Subscribe to Alt modifier state changes. Returns unsubscribe function. */
+  onAltModifierChange(listener: (active: boolean) => void): () => void {
+    this._altModifierListeners.add(listener);
+    return () => this._altModifierListeners.delete(listener);
+  }
+
   /** Attach to a container element. Creates the canvas + textarea inside it. */
   attach(container: HTMLDivElement): void {
     if (this.container === container) return;
@@ -264,6 +290,12 @@ export class BlitTerminalSurface {
       this.inputEl.setAttribute("autocorrect", "off");
       this.inputEl.setAttribute("spellcheck", "false");
       this.inputEl.setAttribute("tabindex", "0");
+      // Give each textarea a name so browsers don't flag it as an
+      // anonymous form field (Chrome DevTools "Issues" warning).
+      this.inputEl.setAttribute(
+        "name",
+        `blit-input-${this._sessionId ?? `anon-${++surfaceCounter}`}`,
+      );
       Object.assign(this.inputEl.style, {
         position: "absolute",
         opacity: "0",
@@ -1054,6 +1086,21 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Alt modifier from mobile toolbar: prefix next printable key with ESC
+      if (
+        this._altModifier &&
+        e.key.length === 1 &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        const charCode = e.key.charCodeAt(0);
+        this.sendInput(this._sessionId!, new Uint8Array([0x1b, charCode]));
+        this.setAltModifier(false);
+        return;
+      }
+
       if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
         const t2 = this.terminal;
         const maxScroll = t2 ? t2.scrollback_lines() : 0;
@@ -1149,6 +1196,20 @@ export class BlitTerminalSurface {
         input.value = "";
         return;
       }
+      // Alt modifier: prefix next typed character with ESC
+      if (
+        this._altModifier &&
+        input.value &&
+        this._sessionId !== null &&
+        this.status === "connected"
+      ) {
+        const char = input.value[0];
+        const charCode = char.charCodeAt(0);
+        this.sendInput(this._sessionId, new Uint8Array([0x1b, charCode]));
+        this.setAltModifier(false);
+        input.value = "";
+        return;
+      }
       if (inputEvent.inputType === "deleteContentBackward" && !input.value) {
         if (this._sessionId !== null && this.status === "connected") {
           this.sendInput(this._sessionId, new Uint8Array([0x7f]));
@@ -1158,10 +1219,22 @@ export class BlitTerminalSurface {
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        this.sendInput(
-          this._sessionId,
-          encoder.encode(input.value.replace(/\n/g, "\r")),
-        );
+        const payload = encoder.encode(input.value.replace(/\n/g, "\r"));
+        const isPaste = inputEvent.inputType === "insertFromPaste";
+        const t = this.terminal;
+        if (isPaste && t && t.bracketed_paste()) {
+          const open = encoder.encode("\x1b[200~");
+          const close = encoder.encode("\x1b[201~");
+          const wrapped = new Uint8Array(
+            open.length + payload.length + close.length,
+          );
+          wrapped.set(open, 0);
+          wrapped.set(payload, open.length);
+          wrapped.set(close, open.length + payload.length);
+          this.sendInput(this._sessionId, wrapped);
+        } else {
+          this.sendInput(this._sessionId, payload);
+        }
       }
       input.value = "";
     };
@@ -1728,6 +1801,92 @@ export class BlitTerminalSurface {
       }
     };
 
+    // --- Touch-based scrolling (mobile) ---
+    // On mobile, vertical swipes don't reliably produce wheel events.
+    // Track single-finger vertical movement and translate into scroll
+    // events (mouse-mode wheel buttons or scrollback navigation).
+    let touchId: number | null = null;
+    let touchStartY = 0;
+    let touchAccum = 0;
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) return;
+      const touch = e.touches[0]!;
+      touchId = touch.identifier;
+      touchStartY = touch.clientY;
+      touchAccum = 0;
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (touchId === null) return;
+      let touch: Touch | undefined;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i]!.identifier === touchId) {
+          touch = e.changedTouches[i]!;
+          break;
+        }
+      }
+      if (!touch) return;
+      const dy = touchStartY - touch.clientY;
+      touchStartY = touch.clientY;
+      touchAccum += dy;
+
+      const t = this.terminal;
+      const lineH = this.cell.h || 20;
+
+      // Emit one scroll event per cell-height of accumulated movement.
+      while (Math.abs(touchAccum) >= lineH) {
+        const dir = touchAccum > 0 ? 1 : -1; // 1 = scroll up, -1 = scroll down
+        touchAccum -= dir * lineH;
+
+        if (t && t.mouse_mode() > 0) {
+          // Mouse mode — send wheel button events (64=up, 65=down)
+          const button = dir > 0 ? 64 : 65;
+          const pos = mouseToCell(
+            new MouseEvent("wheel", {
+              clientX: touch.clientX,
+              clientY: touch.clientY,
+            }),
+          );
+          this._workspace?.sendMouse(
+            this._sessionId!,
+            MOUSE_DOWN,
+            button,
+            pos.col,
+            pos.row,
+          );
+        } else if (this._sessionId !== null && this.status === "connected") {
+          // Normal mode — scrollback
+          const maxScroll = t ? t.scrollback_lines() : 0;
+          if (maxScroll > 0 || this.scrollOffset > 0) {
+            this.scrollOffset = Math.max(
+              0,
+              Math.min(maxScroll, this.scrollOffset + dir),
+            );
+            this.sendScroll(this._sessionId!, this.scrollOffset);
+            if (this.scrollOffset > 0) this.flashScrollbar();
+            this.scheduleRender();
+          }
+        }
+        e.preventDefault();
+      }
+    };
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i]!.identifier === touchId) {
+          touchId = null;
+          touchAccum = 0;
+          break;
+        }
+      }
+    };
+
+    canvas.addEventListener("touchstart", handleTouchStart, { passive: true });
+    canvas.addEventListener("touchmove", handleTouchMove, { passive: false });
+    canvas.addEventListener("touchend", handleTouchEnd, { passive: true });
+    canvas.addEventListener("touchcancel", handleTouchEnd, { passive: true });
+
     canvas.addEventListener("mousedown", handleMouseDown);
     window.addEventListener("mousemove", handleMouseMove);
     canvas.addEventListener("mousemove", handleHoverMove);
@@ -1738,6 +1897,10 @@ export class BlitTerminalSurface {
     canvas.addEventListener("click", handleClick);
 
     this.mouseCleanup = () => {
+      canvas.removeEventListener("touchstart", handleTouchStart);
+      canvas.removeEventListener("touchmove", handleTouchMove);
+      canvas.removeEventListener("touchend", handleTouchEnd);
+      canvas.removeEventListener("touchcancel", handleTouchEnd);
       canvas.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mousemove", handleMouseMove);
       canvas.removeEventListener("mousemove", handleHoverMove);

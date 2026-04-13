@@ -15,29 +15,29 @@ const DOCKER_CMD = "docker run --rm grab/blit-demo";
     Terminals for the Web and machines.
   </h1>
   <p class="mt-4 text-[14px] leading-relaxed text-[var(--dim)]">
-    Low-latency terminal streaming to any browser. Share a session with one
+    Low-latency terminal streaming to any browser. Share a terminal with one
     command. Drive it from AI agents. Tunnel into remote SSH hosts or
     connect through NAT-friendly sharing. One binary, zero config.
   </p>
   <p class="mt-2 text-xs text-[var(--dim)] opacity-60">
-    MIT-licensed · Wide chars, emoji &amp; Unicode
+    MIT-licensed · Wide chars, emoji &amp; Unicode · WebGPU, WebGL, canvas2d
   </p>
 
   <div class="mt-8 bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3 flex flex-col gap-1.5">
     <div class="flex items-center gap-2">
-      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-16">Try it</span>
+      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-24">Try it</span>
       <span class="text-[var(--green)] select-none shrink-0">$</span>
       <span class="flex-1 min-w-0 text-[13px]">{DOCKER_CMD}</span>
       <CopyButton text={DOCKER_CMD} client:load />
     </div>
     <div class="flex items-center gap-2 pt-1.5 border-t border-[var(--border)]">
-      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-16">Install</span>
+      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-24">Linux/Mac</span>
       <span class="text-[var(--green)] select-none shrink-0">$</span>
       <span class="flex-1 min-w-0 text-[13px]">{INSTALL_CMD}</span>
       <CopyButton text={INSTALL_CMD} client:load />
     </div>
     <div class="flex items-center gap-2 pt-1.5 border-t border-[var(--border)]">
-      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-16"></span>
+      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-24">Windows</span>
       <span class="text-[var(--green)] select-none shrink-0">&gt;</span>
       <span class="flex-1 min-w-0 text-[13px]">{INSTALL_PS}</span>
       <CopyButton text={INSTALL_PS} client:load />
@@ -46,7 +46,7 @@ const DOCKER_CMD = "docker run --rm grab/blit-demo";
 
   <div class="mt-5">
     <div class="text-[12px] text-[var(--dim)] mb-2">
-      or join an existing session
+      or join an existing terminal
     </div>
     <JoinForm client:load />
   </div>

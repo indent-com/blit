@@ -9,6 +9,8 @@ import {
   S2C_CLOSED,
   S2C_HELLO,
   S2C_LIST,
+  S2C_QUIT,
+  S2C_READY,
   S2C_TITLE,
   S2C_UPDATE,
 } from "../types";
@@ -20,6 +22,7 @@ export class MockTransport implements BlitTransport {
   sent: Uint8Array[] = [];
   authRejected = false;
   lastError: string | null = null;
+  reconnectCount = 0;
 
   constructor(initialStatus: ConnectionStatus = "connected") {
     this._status = initialStatus;
@@ -30,6 +33,12 @@ export class MockTransport implements BlitTransport {
   }
 
   connect() {}
+
+  reconnect() {
+    this.reconnectCount++;
+    this.setStatus("disconnected");
+    this.setStatus("connecting");
+  }
 
   send(data: Uint8Array) {
     this.sent.push(new Uint8Array(data));
@@ -142,6 +151,14 @@ export class MockTransport implements BlitTransport {
     msg[5] = (features >> 16) & 0xff;
     msg[6] = (features >> 24) & 0xff;
     this.push(msg);
+  }
+
+  pushQuit() {
+    this.push(new Uint8Array([S2C_QUIT]));
+  }
+
+  pushReady() {
+    this.push(new Uint8Array([S2C_READY]));
   }
 
   pushUpdate(ptyId: number, payload: Uint8Array = new Uint8Array(0)) {

@@ -101,16 +101,16 @@ By default it returns Google's public STUN servers. If `CF_TURN_TOKEN_ID` and
 ## Message template
 
 `GET /message` returns a message template that clients can display when a
-terminal session is shared:
+terminal is shared:
 
 ```jsonc
 {
-  "template": "Session available at https://blit.sh/s#{secret}\nor blit open --passphrase {secret}",
+  "template": "Terminals at https://blit.sh/s#{secret}\nor blit open --passphrase {secret}",
 }
 ```
 
 The `{secret}` placeholder is intended to be replaced client-side with the
-actual session secret. Override the default via the `MESSAGE_TEMPLATE` env var.
+actual share secret. Override the default via the `MESSAGE_TEMPLATE` env var.
 
 ## Architecture
 
