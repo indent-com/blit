@@ -575,7 +575,21 @@ impl SurfaceEncoder {
                 modifier,
                 stride,
                 offset,
-            } => self.encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset),
+                ..
+            } => self
+                .encode_dmabuf(fd, *fourcc, *modifier, *stride, *offset)
+                .or_else(|| {
+                    // DMA-BUF import failed (e.g. VAAPI can't import Vulkan
+                    // stride).  Fall back to CPU mmap + BGRA encode.
+                    let w = self.width;
+                    let h = self.height;
+                    let rgba = pixels.to_rgba(w, h);
+                    if !rgba.is_empty() {
+                        self.encode(&rgba)
+                    } else {
+                        None
+                    }
+                }),
             #[cfg(not(target_os = "linux"))]
             PixelData::DmaBuf { .. } => None,
             #[cfg(target_os = "linux")]

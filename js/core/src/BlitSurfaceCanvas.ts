@@ -494,11 +494,17 @@ export class BlitSurfaceCanvas {
 
     this.surface = store.getSurface(this._surfaceId);
 
-    // Tell the server we want frames for this surface, but only if the
-    // browser can actually decode the video.  Subscribing when WebCodecs
-    // is unavailable (non-secure context) drives the server encoder for
+    // Tell the server we want frames for this surface.  Subscribe eagerly
+    // even when the surface metadata hasn't arrived yet (this.surface may
+    // be undefined) — the server already knows the surface and can start
+    // encoding as soon as it sees our subscribe.  Waiting for
+    // S2C_SURFACE_CREATED to be processed before subscribing adds a
+    // needless round-trip to time-to-first-frame.
+    //
+    // Only gate on canDecodeVideo: subscribing when WebCodecs is
+    // unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
-    if (conn && this.surface && store.canDecodeVideo) {
+    if (conn && store.canDecodeVideo) {
       conn.sendSurfaceSubscribe(this._surfaceId);
       this._subscribedGeneration = store.generation;
     }
@@ -511,26 +517,24 @@ export class BlitSurfaceCanvas {
     this.unsubChange = store.onChange(() => {
       const prev = this.surface;
       this.surface = store.getSurface(this._surfaceId);
-      // Subscribe (or re-subscribe) when:
-      //  1. Surface info just arrived (late-subscribe: prev was undefined)
-      //  2. Store generation changed (reconnect — the server dropped all
-      //     subscriptions but the surface reappeared with the same IDs)
+      // Re-subscribe when the store generation changed (reconnect — the
+      // server dropped all subscriptions but the surface reappeared with
+      // the same IDs).  We no longer need to handle the "surface info
+      // just arrived" case here because subscribe() above sends the
+      // subscribe eagerly before the surface metadata is available.
       if (this.surface && store.canDecodeVideo) {
-        const generationChanged =
-          this._subscribedGeneration !== store.generation;
-        const surfaceNew = !prev;
-        if (surfaceNew || generationChanged) {
+        if (this._subscribedGeneration !== store.generation) {
           const c = this.getConn();
           if (c) {
             c.sendSurfaceSubscribe(this._surfaceId);
             this._subscribedGeneration = store.generation;
           }
-          // Update canvas size to match actual surface dimensions,
-          // unless the display size is pinned by a ResizeObserver.
-          if (this.canvas && !this._displaySize) {
-            this.canvas.width = this.surface.width;
-            this.canvas.height = this.surface.height;
-          }
+        }
+        // Update canvas size when surface info first arrives,
+        // unless the display size is pinned by a ResizeObserver.
+        if (!prev && this.canvas && !this._displaySize) {
+          this.canvas.width = this.surface.width;
+          this.canvas.height = this.surface.height;
         }
       }
       // Flush any pending resize now that we have the surface info.

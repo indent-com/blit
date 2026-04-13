@@ -44,9 +44,7 @@ function badge(s: Status) {
     Known limitations
   </h2>
   <p class="text-[13px] text-[var(--dim)] mb-4">
-    The Wayland compositor is highly experimental. It encodes surfaces with hardware video
-    encoders when available. Surface types (SHM, DMA-BUF with linear and tiled modifiers)
-    are supported.
+  The Wayland compositor is experimental. Built on Vulkan, it leverages NVENC or VAAPI where available, avoids memory copies and GPU↔CPU crossings whenever found possible.
   </p>
   <p class="text-[13px] text-[var(--dim)] mb-4">
     The audio pipeline often crashes client-side and needs to be restarted.

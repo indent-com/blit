@@ -13,7 +13,7 @@
 #![allow(non_upper_case_globals, clippy::too_many_arguments)]
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use ash::vk;
@@ -36,9 +36,6 @@ pub(crate) struct VulkanRenderer {
     queue_family: u32,
     command_pool: vk::CommandPool,
 
-    // Extensions
-    ext_mem_fd: ash::khr::external_memory_fd::Device,
-
     // Render pipeline
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
@@ -56,6 +53,30 @@ pub(crate) struct VulkanRenderer {
 
     // In-flight GPU submission that timed out — tracked for later cleanup.
     pending_submit: Option<PendingSubmit>,
+
+    /// Supported DRM format modifiers queried from the Vulkan device.
+    pub(crate) supported_dmabuf_modifiers: Vec<(u32, u64)>,
+
+    /// Encoder-allocated output buffers imported as Vulkan render targets.
+    /// When non-empty, `render_tree_sized` renders into these instead of
+    /// self-allocated output images, and returns `PixelData::VaSurface`
+    /// for true zero-copy encoding.
+    external_outputs: Vec<ExternalOutput>,
+    external_output_idx: usize,
+}
+
+/// Encoder-allocated DMA-BUF imported as a Vulkan framebuffer.
+struct ExternalOutput {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    width: u32,
+    height: u32,
+    va_surface_id: u32,
+    va_display: usize,
+    /// Keep the DMA-BUF fd alive.
+    _fd: Arc<OwnedFd>,
 }
 
 struct TempTexture {
@@ -65,17 +86,21 @@ struct TempTexture {
     descriptor_set: vk::DescriptorSet,
 }
 
-/// In-flight GPU submission that timed out.  Resources are kept alive
-/// until the fence signals so the GPU doesn't access freed memory.
+/// In-flight GPU submission.  Resources are kept alive until the fence
+/// signals so the GPU doesn't access freed memory.
 struct PendingSubmit {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
     textures: Vec<TempTexture>,
+    output_idx: usize,
+    phys_w: u32,
+    phys_h: u32,
+    /// True when the render targeted an encoder-allocated external buffer.
+    external: bool,
 }
 
 unsafe impl Send for VulkanRenderer {}
 
-#[expect(dead_code)]
 struct OutputImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -83,13 +108,11 @@ struct OutputImage {
     framebuffer: vk::Framebuffer,
     width: u32,
     height: u32,
-    /// DMA-BUF fd for export to VA-API.
-    dmabuf_fd: Option<OwnedFd>,
+
     /// Staging buffer for CPU readback.
     staging_buf: vk::Buffer,
     staging_mem: vk::DeviceMemory,
     staging_ptr: *mut u8,
-    staging_size: usize,
 }
 
 // Inline SPIR-V for vertex and fragment shaders.
@@ -197,9 +220,6 @@ impl VulkanRenderer {
             }
         };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
-
-        let ext_mem_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
-
         // Command pool.
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
@@ -352,6 +372,75 @@ impl VulkanRenderer {
 
         eprintln!("[vulkan-render] initialized on {drm_device}");
 
+        // Query supported DRM format modifiers for each format we accept.
+        // Clients (Chromium, mpv, …) will pick from these when allocating
+        // DMA-BUFs, ensuring the GPU can import them with the correct
+        // tiling layout.
+        let supported_dmabuf_modifiers = {
+            use super::imp::drm_fourcc;
+            let format_pairs: &[(u32, vk::Format)] = &[
+                (drm_fourcc::ARGB8888, vk::Format::B8G8R8A8_UNORM),
+                (drm_fourcc::XRGB8888, vk::Format::B8G8R8A8_UNORM),
+                (drm_fourcc::ABGR8888, vk::Format::R8G8B8A8_UNORM),
+                (drm_fourcc::XBGR8888, vk::Format::R8G8B8A8_UNORM),
+            ];
+            let mut mods = Vec::new();
+            for &(drm_fmt, vk_fmt) in format_pairs {
+                // First pass: get count.
+                let mut mod_list = vk::DrmFormatModifierPropertiesListEXT::default();
+                let mut fp2 = vk::FormatProperties2::default().push_next(&mut mod_list);
+                unsafe {
+                    instance.get_physical_device_format_properties2(
+                        physical_device,
+                        vk_fmt,
+                        &mut fp2,
+                    );
+                }
+                let count = mod_list.drm_format_modifier_count as usize;
+                if count == 0 {
+                    // No modifier support — fall back to LINEAR.
+                    mods.push((drm_fmt, 0u64));
+                    continue;
+                }
+                // Second pass: read properties.
+                let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+                mod_list.drm_format_modifier_count = count as u32;
+                mod_list.p_drm_format_modifier_properties = props.as_mut_ptr();
+                let mut fp2 = vk::FormatProperties2::default().push_next(&mut mod_list);
+                unsafe {
+                    instance.get_physical_device_format_properties2(
+                        physical_device,
+                        vk_fmt,
+                        &mut fp2,
+                    );
+                }
+                let mut has_linear = false;
+                for p in &props {
+                    // Only advertise single-plane modifiers that support
+                    // sampling (we need to texture from the imported image).
+                    if p.drm_format_modifier_plane_count == 1
+                        && p.drm_format_modifier_tiling_features
+                            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                    {
+                        mods.push((drm_fmt, p.drm_format_modifier));
+                        if p.drm_format_modifier == 0 {
+                            has_linear = true;
+                        }
+                    }
+                }
+                // Always include LINEAR so clients that can't use
+                // vendor-specific tiled modifiers have a fallback.
+                if !has_linear {
+                    mods.push((drm_fmt, 0u64));
+                }
+            }
+            eprintln!(
+                "[vulkan-render] {} supported DMA-BUF format/modifier pairs",
+                mods.len(),
+            );
+            mods
+        };
+
         Some(Self {
             _entry: entry,
             instance,
@@ -360,7 +449,6 @@ impl VulkanRenderer {
             queue,
             queue_family,
             command_pool,
-            ext_mem_fd,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -371,6 +459,9 @@ impl VulkanRenderer {
             output_idx: 0,
             frame_textures: Vec::new(),
             pending_submit: None,
+            supported_dmabuf_modifiers,
+            external_outputs: Vec::new(),
+            external_output_idx: 0,
         })
     }
 
@@ -420,9 +511,170 @@ impl VulkanRenderer {
     // External output buffers (VA-API zero-copy)
     // ---------------------------------------------------------------
 
-    pub(crate) fn set_external_output_buffers(&mut self, _buffers: Vec<ExternalOutputBuffer>) {
-        // VA-API external buffer path is not used with Vulkan renderer.
-        // We export our own DMA-BUFs instead.
+    pub(crate) fn set_external_output_buffers(&mut self, buffers: Vec<ExternalOutputBuffer>) {
+        if buffers.is_empty() {
+            self.destroy_external_outputs();
+            return;
+        }
+        // Import each encoder-allocated DMA-BUF as a Vulkan render target.
+        // The encoder owns the buffer; we borrow it for compositing.
+        // After rendering, we return PixelData::VaSurface and the encoder
+        // encodes directly — zero copies, zero bus crossings.
+        self.destroy_external_outputs();
+        let format = vk::Format::B8G8R8A8_UNORM;
+        for buf in &buffers {
+            let Some(ext_out) = self.import_external_output(buf, format) else {
+                eprintln!(
+                    "[vulkan-render] failed to import external output {}x{}",
+                    buf.width, buf.height,
+                );
+                continue;
+            };
+            self.external_outputs.push(ext_out);
+        }
+        self.external_output_idx = 0;
+        if !self.external_outputs.is_empty() {
+            eprintln!(
+                "[vulkan-render] {} external output buffers imported ({}x{})",
+                self.external_outputs.len(),
+                buffers[0].width,
+                buffers[0].height,
+            );
+        }
+    }
+
+    fn destroy_external_outputs(&mut self) {
+        for ext in self.external_outputs.drain(..) {
+            unsafe {
+                self.device.destroy_framebuffer(ext.framebuffer, None);
+                self.device.destroy_image_view(ext.view, None);
+                self.device.destroy_image(ext.image, None);
+                self.device.free_memory(ext.memory, None);
+            }
+        }
+        self.external_output_idx = 0;
+    }
+
+    fn import_external_output(
+        &self,
+        buf: &ExternalOutputBuffer,
+        format: vk::Format,
+    ) -> Option<ExternalOutput> {
+        use std::os::fd::AsRawFd;
+        let fd = buf.fd.as_raw_fd();
+        let w = buf.width;
+        let h = buf.height;
+
+        // Import via DRM format modifier (handles tiled AMD surfaces).
+        let buf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+        let plane_size = if buf_size > 0 {
+            buf_size as u64 - buf.offset as u64
+        } else {
+            buf.stride as u64 * h as u64
+        };
+        let plane_layout = vk::SubresourceLayout {
+            offset: buf.offset as u64,
+            size: plane_size,
+            row_pitch: buf.stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+        let mut drm_mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(buf.modifier)
+            .plane_layouts(std::slice::from_ref(&plane_layout));
+        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let format_list_entry = [format];
+        let mut format_list =
+            vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entry);
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext_info)
+            .push_next(&mut drm_mod_info)
+            .push_next(&mut format_list);
+
+        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
+        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
+
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            unsafe { self.device.destroy_image(image, None) };
+            return None;
+        }
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dup_fd);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(
+                self.find_memory_type(mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())?,
+            )
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated);
+
+        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                    libc::close(dup_fd);
+                }
+                return None;
+            }
+        };
+        unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
+
+        let fb_info = vk::FramebufferCreateInfo::default()
+            .render_pass(self.render_pass)
+            .attachments(std::slice::from_ref(&view))
+            .width(w)
+            .height(h)
+            .layers(1);
+        let framebuffer = unsafe { self.device.create_framebuffer(&fb_info, None).ok()? };
+
+        Some(ExternalOutput {
+            image,
+            memory,
+            view,
+            framebuffer,
+            width: w,
+            height: h,
+            va_surface_id: buf.va_surface_id,
+            va_display: buf.va_display,
+            _fd: buf.fd.clone(),
+        })
     }
 
     // ---------------------------------------------------------------
@@ -439,8 +691,8 @@ impl VulkanRenderer {
         }
         // Destroy old.
         self.destroy_output_images();
-        // Create triple-buffered output.
-        for _ in 0..3 {
+        // Double-buffered: one being rendered to, one being read back.
+        for _ in 0..2 {
             if let Some(img) = self.create_output_image(w, h) {
                 self.output_images.push(img);
             }
@@ -451,10 +703,9 @@ impl VulkanRenderer {
     fn create_output_image(&self, w: u32, h: u32) -> Option<OutputImage> {
         let format = vk::Format::B8G8R8A8_UNORM;
 
-        // Create image with external memory export capability.
-        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
+        // TILING_OPTIMAL + DEVICE_LOCAL: GPU renders at full speed in
+        // VRAM.  Staging buffer (HOST_VISIBLE) handles CPU readback via
+        // cmd_copy_image_to_buffer.
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -466,50 +717,34 @@ impl VulkanRenderer {
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
+            .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC
                     | vk::ImageUsageFlags::TRANSFER_DST,
             )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .push_next(&mut ext_info);
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let image = unsafe { self.device.create_image(&image_info, None).ok()? };
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
-        // Allocate with export capability.
-        let mut export_info = vk::ExportMemoryAllocateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
         let mem_type = self
             .find_memory_type(
                 mem_reqs.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
             .or_else(|| {
                 self.find_memory_type(
                     mem_reqs.memory_type_bits,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
             })?;
-
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type)
-            .push_next(&mut export_info);
-
+            .memory_type_index(mem_type);
         let memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
         unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
 
-        // Export as DMA-BUF fd.
-        let fd_info = vk::MemoryGetFdInfoKHR::default()
-            .memory(memory)
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let fd = unsafe { self.ext_mem_fd.get_memory_fd(&fd_info).ok()? };
-        let dmabuf_fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
-
-        // Image view.
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -523,7 +758,6 @@ impl VulkanRenderer {
             });
         let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
 
-        // Framebuffer.
         let fb_info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(std::slice::from_ref(&view))
@@ -566,11 +800,9 @@ impl VulkanRenderer {
             framebuffer,
             width: w,
             height: h,
-            dmabuf_fd,
             staging_buf,
             staging_mem,
             staging_ptr,
-            staging_size,
         })
     }
 
@@ -607,110 +839,139 @@ impl VulkanRenderer {
         // Re-import every frame to get the latest content.
 
         const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
-        const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
         let vk_format = drm_fourcc_to_vk_format(fourcc)?;
 
-        // Choose the import tiling mode based on the DMA-BUF modifier.
-        // LINEAR (0) or INVALID uses the old VK_IMAGE_TILING_LINEAR path.
-        // Any other modifier uses VK_EXT_image_drm_format_modifier so the
-        // driver can handle vendor-specific tiled layouts (e.g. NVIDIA).
-        let use_drm_modifier =
-            modifier != DRM_FORMAT_MOD_LINEAR && modifier != DRM_FORMAT_MOD_INVALID;
+        // Try DRM modifier path for non-linear tiled buffers (zero
+        // GPU-CPU crossings).  LINEAR (0) skips this — the DRM modifier
+        // ext produces black on AMD and y-flip on NVIDIA for LINEAR.
+        if modifier != DRM_FORMAT_MOD_INVALID
+            && modifier != 0
+            && let Some(result) = self.try_import_dmabuf_drm_modifier(
+                fd, vk_format, modifier, stride, offset, width, height,
+            )
+        {
+            return Some(result);
+        }
+        // DRM modifier path failed or modifier is INVALID — try LINEAR.
+        if let Some(result) = self.try_import_dmabuf_linear(fd, vk_format, stride, width, height) {
+            return Some(result);
+        }
+        // LINEAR stride mismatch — mmap fallback (safe for linear data).
+        self.import_linear_dmabuf_mmap(fd, fourcc, stride, width, height)
+    }
 
-        let image = if use_drm_modifier {
-            // DRM format modifier path — VK_EXT_image_drm_format_modifier.
-            // Provides the exact modifier + plane layout so the driver
-            // can import tiled VRAM buffers directly.
-            let buf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-            let plane_size = if buf_size > 0 {
-                buf_size as u64 - offset as u64
-            } else {
-                stride as u64 * height as u64
-            };
-            let plane_layout = vk::SubresourceLayout {
-                offset: offset as u64,
-                size: plane_size,
-                row_pitch: stride as u64,
-                array_pitch: 0,
-                depth_pitch: 0,
-            };
-            let mut drm_mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                .drm_format_modifier(modifier)
-                .plane_layouts(std::slice::from_ref(&plane_layout));
-            let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
-            let format_list_entry = [vk_format];
-            let mut format_list =
-                vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entry);
-
-            let image_info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk_format)
-                .extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(vk::ImageUsageFlags::SAMPLED)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .push_next(&mut ext_info)
-                .push_next(&mut drm_mod_info)
-                .push_next(&mut format_list);
-
-            unsafe { self.device.create_image(&image_info, None).ok() }
+    /// Import a DMA-BUF via VK_EXT_image_drm_format_modifier with an
+    /// explicit plane layout.  Zero GPU-CPU crossings.
+    fn try_import_dmabuf_drm_modifier(
+        &mut self,
+        fd: RawFd,
+        vk_format: vk::Format,
+        modifier: u64,
+        stride: u32,
+        offset: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<(vk::DescriptorSet, vk::Image)> {
+        let buf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+        let plane_size = if buf_size > 0 {
+            buf_size as u64 - offset as u64
         } else {
-            // LINEAR path.
-            let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
-            let image_info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk_format)
-                .extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::LINEAR)
-                .usage(vk::ImageUsageFlags::SAMPLED)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .push_next(&mut ext_info);
-
-            let img = unsafe { self.device.create_image(&image_info, None).ok()? };
-
-            // Check whether the driver's LINEAR row pitch matches the
-            // DMA-BUF stride.  When they differ (e.g. different alignment
-            // between the client allocator and the compositor's Vulkan
-            // driver), binding the foreign memory and sampling would
-            // produce diagonal-shear artefacts.  Fall back to mmap +
-            // row-by-row upload in that case.
-            let subresource = vk::ImageSubresource {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                array_layer: 0,
-            };
-            let layout = unsafe { self.device.get_image_subresource_layout(img, subresource) };
-            if layout.row_pitch != stride as u64 {
-                unsafe { self.device.destroy_image(img, None) };
-                return self.import_dmabuf_mmap_fallback(fd, fourcc, stride, width, height);
-            }
-            Some(img)
+            stride as u64 * height as u64
         };
+        let plane_layout = vk::SubresourceLayout {
+            offset: offset as u64,
+            size: plane_size,
+            row_pitch: stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+        let mut drm_mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(std::slice::from_ref(&plane_layout));
+        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let format_list_entry = [vk_format];
+        let mut format_list =
+            vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entry);
 
-        let image = image?;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext_info)
+            .push_next(&mut drm_mod_info)
+            .push_next(&mut format_list);
+
+        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
+        self.finish_dmabuf_import(fd, image, vk_format, true)
+    }
+
+    /// Import a DMA-BUF via VK_IMAGE_TILING_LINEAR.  Returns None on
+    /// stride mismatch (caller should fall back to mmap).
+    fn try_import_dmabuf_linear(
+        &mut self,
+        fd: RawFd,
+        vk_format: vk::Format,
+        stride: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<(vk::DescriptorSet, vk::Image)> {
+        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext_info);
+
+        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
+        let subresource = vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            array_layer: 0,
+        };
+        let layout = unsafe { self.device.get_image_subresource_layout(image, subresource) };
+        if layout.row_pitch != stride as u64 {
+            unsafe { self.device.destroy_image(image, None) };
+            return None;
+        }
+        self.finish_dmabuf_import(fd, image, vk_format, false)
+    }
+
+    /// Shared tail for DMA-BUF import: allocate+import memory, create
+    /// image view and descriptor set.
+    fn finish_dmabuf_import(
+        &mut self,
+        fd: RawFd,
+        image: vk::Image,
+        vk_format: vk::Format,
+        use_dedicated: bool,
+    ) -> Option<(vk::DescriptorSet, vk::Image)> {
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
-        // Import the fd.
         let dup_fd = unsafe { libc::dup(fd) };
         if dup_fd < 0 {
             unsafe { self.device.destroy_image(image, None) };
@@ -720,9 +981,6 @@ impl VulkanRenderer {
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
             .fd(dup_fd);
-
-        // For DRM modifier imports use a dedicated allocation — required
-        // by most drivers for tiled layouts.
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
 
         let mut alloc_info = vk::MemoryAllocateInfo::default()
@@ -731,7 +989,7 @@ impl VulkanRenderer {
                 self.find_memory_type(mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())?,
             )
             .push_next(&mut import_info);
-        if use_drm_modifier {
+        if use_dedicated {
             alloc_info = alloc_info.push_next(&mut dedicated);
         }
 
@@ -797,9 +1055,10 @@ impl VulkanRenderer {
         Some((descriptor_set, image))
     }
 
-    /// Fallback: mmap the DMA-BUF, strip stride padding, convert
-    /// BGRA→RGBA if needed, and upload via the SHM texture path.
-    fn import_dmabuf_mmap_fallback(
+    /// mmap a LINEAR DMA-BUF, strip stride padding, convert BGRA→RGBA
+    /// if needed, and upload via the SHM texture path.  Only valid for
+    /// LINEAR (modifier=0) buffers — tiled VRAM must NOT be mmap'd.
+    fn import_linear_dmabuf_mmap(
         &mut self,
         fd: RawFd,
         fourcc: u32,
@@ -813,40 +1072,6 @@ impl VulkanRenderer {
         }
         unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
 
-        // DMA-BUF sync: try to wait for the client's GPU writes before
-        // mmap-reading.  Anonymous /dmabuf fds (Vulkan WSI) may carry
-        // implicit fences that block indefinitely on SYNC_START — they
-        // can depend on the compositor releasing a previous buffer, which
-        // we're deferring until after compositing.  Use a non-blocking
-        // poll() to detect whether the fence is ready; skip the sync if
-        // not (accept possible tearing rather than deadlocking).
-        #[repr(C)]
-        struct DmaBufSync {
-            flags: u64,
-        }
-        const DMA_BUF_SYNC_READ: u64 = 1;
-        const DMA_BUF_SYNC_START: u64 = 0;
-        const DMA_BUF_SYNC_END: u64 = 4;
-        const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
-
-        let did_sync = {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 0) }; // non-blocking
-            if ready > 0 {
-                let sync_start = DmaBufSync {
-                    flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
-                };
-                unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &sync_start) };
-                true
-            } else {
-                false // fence not ready — skip sync, accept possible tearing
-            }
-        };
-
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -858,12 +1083,6 @@ impl VulkanRenderer {
             )
         };
         if ptr == libc::MAP_FAILED {
-            if did_sync {
-                let sync_end = DmaBufSync {
-                    flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
-                };
-                unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &sync_end) };
-            }
             return None;
         }
         let plane_data = unsafe { std::slice::from_raw_parts(ptr as *const u8, buf_size as usize) };
@@ -879,15 +1098,8 @@ impl VulkanRenderer {
             }
         }
         unsafe { libc::munmap(ptr, buf_size as usize) };
-        if did_sync {
-            let sync_end = DmaBufSync {
-                flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
-            };
-            unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &sync_end) };
-        }
 
-        // Convert BGRA↔RGBA if the DMA-BUF fourcc is ARGB/XRGB
-        // (BGRA in memory) but upload_rgba_texture expects RGBA.
+        // DRM ARGB/XRGB is BGRA in memory; upload_rgba_texture expects RGBA.
         if fourcc == super::imp::drm_fourcc::ARGB8888 || fourcc == super::imp::drm_fourcc::XRGB8888
         {
             for px in packed.chunks_exact_mut(4) {
@@ -1010,6 +1222,102 @@ impl VulkanRenderer {
     }
 
     // ---------------------------------------------------------------
+    // Async submit retirement
+    // ---------------------------------------------------------------
+
+    /// Returns true when there is in-flight GPU work that hasn't been
+    /// retired yet.  The event loop uses this to shorten its poll
+    /// timeout so it can call `try_retire_pending` promptly.
+    pub fn has_pending(&self) -> bool {
+        self.pending_submit.is_some()
+    }
+
+    /// Non-blocking check: if the previous GPU submission has completed,
+    /// read back its result and return it.  Called from the compositor's
+    /// main event loop so completed frames are flushed to the server
+    /// without waiting for the next Wayland surface commit.
+    pub fn try_retire_pending(&mut self) -> Option<(u32, u32, PixelData)> {
+        let pending = self.pending_submit.take()?;
+        let raw = unsafe {
+            (self.device.fp_v1_0().wait_for_fences)(
+                self.device.handle(),
+                1,
+                [pending.fence].as_ptr(),
+                vk::TRUE,
+                0, // non-blocking
+            )
+        };
+        if raw != vk::Result::SUCCESS {
+            self.pending_submit = Some(pending);
+            return None;
+        }
+        let result = self.retire_pending(pending);
+        // Free per-frame temporary textures now that the GPU is done.
+        self.free_frame_textures();
+        result
+    }
+
+    /// Produce the result from a completed GPU submission.
+    fn retire_pending(&mut self, pending: PendingSubmit) -> Option<(u32, u32, PixelData)> {
+        // External output → encoder owns the buffer → zero-copy VaSurface.
+        if pending.external {
+            let ext = self.external_outputs.get(pending.output_idx)?;
+            return Some((
+                pending.phys_w,
+                pending.phys_h,
+                PixelData::VaSurface {
+                    surface_id: ext.va_surface_id,
+                    va_display: ext.va_display,
+                    _fd: ext._fd.clone(),
+                },
+            ));
+        }
+
+        // Self-allocated output → staging readback.
+        let result = if pending.output_idx < self.output_images.len() {
+            let img = &self.output_images[pending.output_idx];
+            let size = (pending.phys_w * pending.phys_h * 4) as usize;
+            let bgra = unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
+            Some((
+                pending.phys_w,
+                pending.phys_h,
+                PixelData::Bgra(Arc::new(bgra)),
+            ))
+        } else {
+            None
+        };
+        unsafe {
+            self.device.destroy_fence(pending.fence, None);
+            self.device
+                .free_command_buffers(self.command_pool, &[pending.cb]);
+        }
+        for t in pending.textures {
+            unsafe {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[t.descriptor_set])
+                    .ok();
+                self.device.destroy_image_view(t.view, None);
+                self.device.destroy_image(t.image, None);
+                self.device.free_memory(t.memory, None);
+            }
+        }
+        result
+    }
+
+    fn free_frame_textures(&mut self) {
+        for t in self.frame_textures.drain(..) {
+            unsafe {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[t.descriptor_set])
+                    .ok();
+                self.device.destroy_image_view(t.view, None);
+                self.device.destroy_image(t.image, None);
+                self.device.free_memory(t.memory, None);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Main render
     // ---------------------------------------------------------------
 
@@ -1021,53 +1329,21 @@ impl VulkanRenderer {
         output_scale_120: u16,
         target_phys: Option<(u32, u32)>,
     ) -> Option<(u32, u32, PixelData)> {
-        // Retire any previous submission that timed out.  If the GPU is
-        // still working on it, skip Vulkan compositing entirely so the
-        // compositor thread never blocks.
-        if let Some(pending) = self.pending_submit.take() {
-            let raw = unsafe {
-                (self.device.fp_v1_0().wait_for_fences)(
-                    self.device.handle(),
-                    1,
-                    [pending.fence].as_ptr(),
-                    vk::TRUE,
-                    0, // non-blocking check
-                )
-            };
-            if raw == vk::Result::SUCCESS {
-                unsafe {
-                    self.device.destroy_fence(pending.fence, None);
-                    self.device
-                        .free_command_buffers(self.command_pool, &[pending.cb]);
-                }
-                for t in pending.textures {
-                    unsafe {
-                        self.device
-                            .free_descriptor_sets(self.descriptor_pool, &[t.descriptor_set])
-                            .ok();
-                        self.device.destroy_image_view(t.view, None);
-                        self.device.destroy_image(t.image, None);
-                        self.device.free_memory(t.memory, None);
-                    }
-                }
-            } else {
-                // GPU still busy — fall back to CPU compositing.
-                self.pending_submit = Some(pending);
+        // Retire the previous submission if done (non-blocking).
+        // The result we return is from the PREVIOUS frame; the current
+        // frame is submitted asynchronously and retired on the next call
+        // or by the event loop via try_retire_pending().
+        let prev_result = if self.pending_submit.is_some() {
+            let r = self.try_retire_pending();
+            if self.pending_submit.is_some() {
+                // GPU still busy — skip this compositing pass.
                 return None;
             }
-        }
-
-        // Free per-frame temporary textures from the previous frame.
-        for t in self.frame_textures.drain(..) {
-            unsafe {
-                self.device
-                    .free_descriptor_sets(self.descriptor_pool, &[t.descriptor_set])
-                    .ok();
-                self.device.destroy_image_view(t.view, None);
-                self.device.destroy_image(t.image, None);
-                self.device.free_memory(t.memory, None);
-            }
-        }
+            r
+        } else {
+            self.free_frame_textures();
+            None
+        };
 
         let s120 = (output_scale_120 as u32).max(120);
 
@@ -1117,17 +1393,26 @@ impl VulkanRenderer {
             );
         }
 
-        self.ensure_output_images(phys_w, phys_h);
-        if self.output_images.is_empty() {
-            return None;
-        }
+        // Prefer encoder-allocated external outputs (zero-copy to
+        // encoder).  Fall back to self-allocated output images with
+        // staging readback.
+        let use_external = !self.external_outputs.is_empty()
+            && self.external_outputs[0].width == phys_w
+            && self.external_outputs[0].height == phys_h;
 
-        let out_idx = self.output_idx;
-        // Copy what we need from the output image to avoid borrowing self.
-        let out_framebuffer = self.output_images[out_idx].framebuffer;
-        let out_image = self.output_images[out_idx].image;
-        let out_staging_buf = self.output_images[out_idx].staging_buf;
-        let out_staging_ptr = self.output_images[out_idx].staging_ptr;
+        let (out_framebuffer, out_image, out_staging_buf, out_idx, external) = if use_external {
+            let idx = self.external_output_idx % self.external_outputs.len();
+            let ext = &self.external_outputs[idx];
+            (ext.framebuffer, ext.image, vk::Buffer::null(), idx, true)
+        } else {
+            self.ensure_output_images(phys_w, phys_h);
+            if self.output_images.is_empty() {
+                return None;
+            }
+            let idx = self.output_idx;
+            let img = &self.output_images[idx];
+            (img.framebuffer, img.image, img.staging_buf, idx, false)
+        };
 
         // Allocate command buffer.
         let cb_alloc = vk::CommandBufferAllocateInfo::default()
@@ -1192,12 +1477,23 @@ impl VulkanRenderer {
         }
         let mut draws: Vec<DrawCmd> = Vec::new();
 
+        let mut is_first_layer = true;
         for l in &all_layers {
-            let (adj_x, adj_y) = if l.logical_w == log_w && l.logical_h == log_h {
+            // Every layer must be offset by the xdg_geometry crop origin
+            // so the geometry area starts at (0,0) in the composited
+            // output.  The first layer (root surface) is a special case
+            // only when its logical size exactly matches the output —
+            // meaning the surface *is* the geometry (crop_x/y are zero
+            // or the surface already accounts for them).  Child layers
+            // (popups, subsurfaces) must ALWAYS be cropped even if they
+            // happen to share the output dimensions; otherwise they
+            // render at the wrong position.
+            let (adj_x, adj_y) = if is_first_layer && l.logical_w == log_w && l.logical_h == log_h {
                 (l.x, l.y)
             } else {
                 (l.x - crop_x, l.y - crop_y)
             };
+            is_first_layer = false;
             let px = (adj_x as i64 * s120 as i64 / 120) as i32;
             let py = (adj_y as i64 * s120 as i64 / 120) as i32;
             let pw = to_physical(l.logical_w, s120);
@@ -1223,18 +1519,16 @@ impl VulkanRenderer {
                     ) {
                         Some((d, i)) => (d, i, vk::ImageLayout::UNDEFINED),
                         None => {
-                            // Vulkan DMA-BUF import failed (e.g. tiled
-                            // VRAM buffer on NVIDIA).  Fall back to CPU
-                            // readback so the layer is still composited
-                            // instead of silently dropped (black frame).
-                            let rgba = l.pixels.to_rgba(l.pixel_w, l.pixel_h);
-                            if rgba.is_empty() {
-                                continue;
-                            }
-                            match self.upload_rgba_texture(&rgba, l.pixel_w, l.pixel_h) {
-                                Some((d, i)) => (d, i, vk::ImageLayout::PREINITIALIZED),
-                                None => continue,
-                            }
+                            // DMA-BUF import failed — skip this layer.
+                            // CPU mmap is not an option: GPU buffers use
+                            // vendor-specific tiled layouts that produce
+                            // garbage when read linearly and may block on
+                            // VRAM page faults.
+                            eprintln!(
+                                "[vulkan-render] DMA-BUF import failed for {}x{} fourcc=0x{:08x} modifier=0x{:016x}",
+                                l.pixel_w, l.pixel_h, fourcc, modifier,
+                            );
+                            continue;
                         }
                     }
                 }
@@ -1252,9 +1546,19 @@ impl VulkanRenderer {
 
             // Vulkan clip space: x=[-1,1] left→right, y=[-1,1] top→bottom.
             let clip_x = (px as f32 / phys_w as f32) * 2.0 - 1.0;
-            let clip_y = (py as f32 / phys_h as f32) * 2.0 - 1.0;
+            let mut clip_y = (py as f32 / phys_h as f32) * 2.0 - 1.0;
             let clip_w = (pw as f32 / phys_w as f32) * 2.0;
-            let clip_h = (ph as f32 / phys_h as f32) * 2.0;
+            let mut clip_h = (ph as f32 / phys_h as f32) * 2.0;
+
+            // For y_invert (OpenGL-origin) DMA-BUFs, flip the quad
+            // vertically.  The vertex shader maps pos.y ∈ [0,1] to
+            // v_tc.y ∈ [0,1]; negating clip_h and offsetting clip_y
+            // by the old clip_h effectively samples v_tc.y from 1→0
+            // instead of 0→1, flipping the image.
+            if l.y_invert {
+                clip_y += clip_h;
+                clip_h = -clip_h;
+            }
 
             draws.push(DrawCmd {
                 descriptor_set: ds,
@@ -1333,37 +1637,38 @@ impl VulkanRenderer {
             self.device.cmd_end_render_pass(cb);
         }
 
-        // Copy to staging buffer for CPU readback.
-        let region = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            image_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-            image_extent: vk::Extent3D {
-                width: phys_w,
-                height: phys_h,
-                depth: 1,
-            },
-        };
-        unsafe {
-            self.device.cmd_copy_image_to_buffer(
-                cb,
-                out_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                out_staging_buf,
-                &[region],
-            );
+        // Copy to staging buffer for CPU readback (only for self-allocated
+        // output images — external outputs are encoded directly).
+        if !external {
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width: phys_w,
+                    height: phys_h,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                self.device.cmd_copy_image_to_buffer(
+                    cb,
+                    out_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    out_staging_buf,
+                    &[region],
+                );
+            }
         }
 
-        // Submit and wait with a bounded timeout.  On AMD VAAPI the GPU
-        // can stall when clients contend for hardware decoders; an
-        // unbounded wait would freeze the entire compositor thread.
+        // Submit asynchronously.
         unsafe {
             self.device.end_command_buffer(cb).ok()?;
         }
@@ -1375,39 +1680,25 @@ impl VulkanRenderer {
                 .queue_submit(self.queue, &[submit], fence)
                 .ok()?;
         }
-        let wait_result = unsafe {
-            (self.device.fp_v1_0().wait_for_fences)(
-                self.device.handle(),
-                1,
-                [fence].as_ptr(),
-                vk::TRUE,
-                500_000_000, // 500 ms
-            )
-        };
-        if wait_result != vk::Result::SUCCESS {
-            eprintln!(
-                "[vulkan-render] vkWaitForFences timed out ({wait_result:?}), \
-                 deferring to CPU compositing"
-            );
-            self.pending_submit = Some(PendingSubmit {
-                fence,
-                cb,
-                textures: std::mem::take(&mut self.frame_textures),
-            });
-            return None;
-        }
-        unsafe {
-            self.device.destroy_fence(fence, None);
-            self.device.free_command_buffers(self.command_pool, &[cb]);
+
+        self.pending_submit = Some(PendingSubmit {
+            fence,
+            cb,
+            textures: std::mem::take(&mut self.frame_textures),
+            output_idx: out_idx,
+            phys_w,
+            phys_h,
+            external,
+        });
+        if external {
+            self.external_output_idx = (self.external_output_idx + 1) % self.external_outputs.len();
+        } else {
+            self.output_idx = (self.output_idx + 1) % self.output_images.len();
         }
 
-        // Read back from staging buffer.
-        let size = (phys_w * phys_h * 4) as usize;
-        let bgra = unsafe { std::slice::from_raw_parts(out_staging_ptr, size) }.to_vec();
-
-        self.output_idx = (self.output_idx + 1) % self.output_images.len();
-
-        Some((phys_w, phys_h, PixelData::Bgra(Arc::new(bgra))))
+        // Return the PREVIOUS frame's readback (or None on the first
+        // frame).  The current frame will be read back next time.
+        prev_result
     }
 }
 
@@ -1431,6 +1722,13 @@ impl Drop for VulkanRenderer {
                 }
             }
             self.destroy_output_images();
+            // Destroy external outputs.
+            for ext in self.external_outputs.drain(..) {
+                self.device.destroy_framebuffer(ext.framebuffer, None);
+                self.device.destroy_image_view(ext.view, None);
+                self.device.destroy_image(ext.image, None);
+                self.device.free_memory(ext.memory, None);
+            }
             // Destroy per-frame temp textures.
             for t in self.frame_textures.drain(..) {
                 self.device.destroy_image_view(t.view, None);

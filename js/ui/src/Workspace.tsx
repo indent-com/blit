@@ -207,8 +207,24 @@ function WorkspaceScreen(props: {
 
   const [surfaces, setSurfaces] = createSignal<BlitSurface[]>([]);
 
+  // Track the set of available connection IDs so the surface aggregation
+  // effect re-runs when connections are added or removed.  The joined-string
+  // comparison ensures the memo value only changes when the actual set of
+  // IDs changes, not on every workspace snapshot update (which is frequent
+  // due to terminal output, pings, etc.).
+  const availableConnIds = createMemo(() =>
+    wsState()
+      .connections.map((c) => c.id)
+      .sort()
+      .join(","),
+  );
+
   // Aggregate surfaces from all connections.
   createEffect(() => {
+    // Re-run when connection specs change OR when the set of live
+    // connections changes (a connection that was absent when we first ran
+    // may now be available, and we need its surfaceStore.onChange listener).
+    const _connIds = availableConnIds();
     const cleanups: (() => void)[] = [];
     const syncAll = () => {
       const all: BlitSurface[] = [];
