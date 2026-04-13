@@ -1,6 +1,6 @@
 [package]
 name = "blit-proxy"
-version = "0.23.0"
+version = "0.24.0"
 edition.workspace = true
 description = "blit connection pool and protocol-transparent proxy"
 license.workspace = true
