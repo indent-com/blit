@@ -111,7 +111,15 @@ export function BSPContainer(props: {
     const snap = workspaceState();
     return snap.connections.find((c) => c.id === props.connectionId) ?? null;
   });
-  const connected = () => connection()?.status === "connected";
+  // Include "authenticating" so reconciliation can run during the S2C_HELLO →
+  // S2C_READY handshake window.  The per-connection `readyConnectionIds`
+  // filter inside reconcileAssignments preserves assignments for connections
+  // that haven't completed the handshake, so this is safe and lets surfaces
+  // propagate to the UI (e.g. PreviewPanel) before S2C_READY arrives.
+  const connected = () => {
+    const status = connection()?.status;
+    return status === "connected" || status === "authenticating";
+  };
 
   const liveSessions = createMemo(() =>
     sessions().filter((session) => session.state !== "closed"),
@@ -354,12 +362,6 @@ export function BSPContainer(props: {
 
   createEffect(() => {
     if (!connected()) return;
-    // Skip reconciliation until S2C_READY has been processed (ready=true).
-    // Between S2C_HELLO (marks all sessions closed) and S2C_READY (end of
-    // initial handshake), liveSessionIds and liveSurfaceKeys are
-    // momentarily empty — reconciling in that window wipes all pane
-    // assignments.
-    if (!connection()?.ready) return;
     // Skip reconciliation while we still have pending hash assignments to resolve.
     if (resolvingHash()) return;
     const p = panes();

@@ -124,6 +124,10 @@ pub enum PixelData {
         modifier: u64,
         stride: u32,
         offset: u32,
+        /// When true the image origin is bottom-left (OpenGL convention).
+        /// The Vulkan renderer flips the V texture coordinate to display
+        /// the image right-side-up.
+        y_invert: bool,
     },
     /// VA-API surface ready for VPP/encode — zero-copy path.
     /// The surface was allocated by VA-API, exported as DMA-BUF for EGL
@@ -372,6 +376,7 @@ impl PixelData {
     pub fn is_empty(&self) -> bool {
         match self {
             PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
+
             PixelData::Nv12 { data, .. } => data.is_empty(),
             PixelData::DmaBuf { .. } | PixelData::VaSurface { .. } => false,
         }
@@ -693,6 +698,7 @@ struct DmaBufBufferData {
     fourcc: u32,
     modifier: u64,
     planes: Vec<DmaBufPlane>,
+    y_invert: bool,
 }
 
 struct DmaBufPlane {
@@ -962,6 +968,10 @@ struct Compositor {
     /// on the next surface commit so clients have time to process the
     /// reconfigure before receiving new input events.
     pending_kb_reenter: bool,
+    /// Toplevel surface_id of the last Vulkan render submission.
+    /// Used to route async GPU completion results to the right
+    /// pending_commits entry.
+    last_render_toplevel: Option<u16>,
     verbose: bool,
     shutdown: Arc<AtomicBool>,
     /// Track last reported size per toplevel surface_id to detect changes.
@@ -1007,6 +1017,20 @@ struct Compositor {
 
     // -- Activation --
     next_activation_token: u32,
+
+    // -- Popup grab --
+    /// Stack of grabbed xdg_popup surfaces (outermost first).  When the
+    /// pointer clicks outside the topmost grabbed popup we send
+    /// `xdg_popup.popup_done` to dismiss the popup chain.
+    popup_grab_stack: Vec<ObjectId>,
+
+    // -- DMA-BUF buffer hold --
+    /// Buffers whose DMA-BUF content could not be eagerly snapshotted to
+    /// CPU memory (e.g. tiled VRAM that cannot be mmap-read linearly, or
+    /// fence not ready).  We hold the `WlBuffer` alive so the client
+    /// cannot reuse it while the pixel_cache still references the fd.
+    /// Released when the surface commits a new buffer or is destroyed.
+    held_buffers: HashMap<ObjectId, WlBuffer>,
 }
 
 impl Compositor {
@@ -1217,6 +1241,7 @@ impl Compositor {
                     modifier: data.modifier,
                     stride: plane.stride,
                     offset: plane.offset,
+                    y_invert: data.y_invert,
                 },
             ));
         }
@@ -1244,8 +1269,13 @@ impl Compositor {
         let toplevel_sid = match toplevel_sid {
             Some(sid) => sid,
             None => {
-                // No toplevel yet — fire any pending frame callbacks so
-                // the client doesn't stall.
+                // No toplevel yet — release any held DMA-BUF buffer since
+                // no compositing will run to consume it.
+                if let Some(held) = self.held_buffers.remove(surface_id) {
+                    held.release();
+                }
+                // Fire any pending frame callbacks so the client doesn't
+                // stall.
                 self.fire_surface_frame_callbacks(surface_id);
                 let _ = self.display_handle.flush_clients();
                 return;
@@ -1262,6 +1292,7 @@ impl Compositor {
             (pw, ph)
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
+            self.last_render_toplevel = Some(toplevel_sid);
             vk.render_tree_sized(
                 &root_id,
                 &self.surfaces,
@@ -1272,15 +1303,6 @@ impl Compositor {
         } else {
             None
         };
-        let gpu_ok = composited.is_some();
-        let composited = composited.or_else(|| {
-            super::render::cpu_composite_from_cache(
-                &root_id,
-                &self.surfaces,
-                &self.pixel_cache,
-                s120,
-            )
-        });
 
         if let Some((w, h, ref pixels)) = composited
             && !pixels.is_empty()
@@ -1309,7 +1331,7 @@ impl Compositor {
                 static LC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let lc = LC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if lc < 3 || lc.is_multiple_of(1000) {
-                    eprintln!("[pending #{lc}] {w}x{h} gpu={gpu_ok} kind={kind}");
+                    eprintln!("[pending #{lc}] {w}x{h} kind={kind}");
                 }
             }
             // Determine the logical size for pointer coordinate mapping.
@@ -1331,6 +1353,16 @@ impl Compositor {
             let log_h = (h * 120).div_ceil(s120_u32);
             self.pending_commits
                 .insert(toplevel_sid, (w, h, log_w, log_h, composited.unwrap().2));
+        }
+
+        // Compositing is done — the output is a self-contained BGRA
+        // buffer that does not reference any client DMA-BUF fds.
+        // Release the held buffer so the client can reuse it for the
+        // next frame.  (The pixel_cache still holds the DMA-BUF fd as
+        // a fallback for subsequent compositing passes before the next
+        // commit; the fd remains valid via its Arc<OwnedFd>.)
+        if let Some(held) = self.held_buffers.remove(surface_id) {
+            held.release();
         }
 
         // Always fire frame callbacks after processing a commit, so
@@ -1494,12 +1526,15 @@ impl Compositor {
 
     /// Apply double-buffered pending state and consume the pending buffer.
     ///
-    /// DMA-BUF content is eagerly snapshot into CPU memory so the
-    /// pixel_cache holds a stable copy.  Without this, sibling surfaces
-    /// whose buffers were released in previous frames would be read from
-    /// DMA-BUF fds that the client is actively rewriting — producing
-    /// black rectangles wherever the client's GPU has already cleared
-    /// the old content.
+    /// SHM buffers are snapshot and released immediately.  DMA-BUF
+    /// buffers are kept as fd references in the pixel_cache and the
+    /// wl_buffer is held in `held_buffers` so the client cannot reuse
+    /// the underlying GPU memory while compositing reads from it.
+    /// The held buffer is released after compositing completes in
+    /// `handle_surface_commit`, or immediately if there is no toplevel
+    /// to composite.  The Vulkan renderer imports DMA-BUFs on the GPU
+    /// and handles vendor-specific tiled layouts (NVIDIA, AMD) natively
+    /// — CPU mmap of such buffers would produce garbage or block.
     fn apply_pending_state(&mut self, surface_id: &ObjectId) {
         let (buffer, scale, is_opaque) = {
             let Some(surf) = self.surfaces.get_mut(surface_id) else {
@@ -1517,31 +1552,40 @@ impl Compositor {
             (buffer, scale, surf.is_opaque)
         };
         let Some(buf) = buffer else { return };
-        if let Some((w, h, pixels)) = self.read_buffer(&buf) {
-            // For DMA-BUFs, eagerly read pixel data into a CPU-side
-            // snapshot.  The pixel_cache may hold entries from surfaces
-            // that committed many frames ago — those DMA-BUF fds
-            // reference buffers the client has since reused and is
-            // actively overwriting.  Snapshotting here means every
-            // cache entry is a frozen copy from commit time, immune
-            // to client-side GPU clears.
-            let pixels = if pixels.is_dmabuf() {
-                let rgba = pixels.to_rgba(w, h);
-                if !rgba.is_empty() {
-                    PixelData::Rgba(std::sync::Arc::new(rgba))
-                } else {
-                    // Fence not ready — keep the DMA-BUF reference as
-                    // a best-effort fallback; the Vulkan renderer may
-                    // still be able to import it directly.
-                    pixels
-                }
-            } else {
-                pixels
-            };
-            self.pixel_cache
-                .insert(surface_id.clone(), (w, h, scale, is_opaque, pixels));
+
+        // Release any previously held buffer for this surface — the new
+        // commit supersedes it.
+        if let Some(old) = self.held_buffers.remove(surface_id) {
+            old.release();
         }
-        buf.release();
+
+        if let Some((w, h, pixels)) = self.read_buffer(&buf) {
+            if pixels.is_dmabuf() {
+                // Never attempt a CPU-side mmap snapshot of DMA-BUFs.
+                // GPU-allocated buffers may use vendor-specific tiled
+                // layouts (NVIDIA, AMD) that produce garbage when read
+                // linearly, or may block the compositor thread if the
+                // backing memory is in VRAM.
+                //
+                // Instead, keep the DMA-BUF fd reference and hold the
+                // wl_buffer alive so the client cannot reuse it while the
+                // pixel_cache still points at it.  The Vulkan renderer
+                // imports DMA-BUFs on the GPU during compositing and
+                // handles tiled layouts natively.  The CPU composite
+                // fallback calls to_rgba() at draw time if needed.
+                self.pixel_cache
+                    .insert(surface_id.clone(), (w, h, scale, is_opaque, pixels));
+                self.held_buffers.insert(surface_id.clone(), buf);
+            } else {
+                // SHM buffers are already in CPU-accessible linear memory.
+                // Snapshot and release immediately.
+                self.pixel_cache
+                    .insert(surface_id.clone(), (w, h, scale, is_opaque, pixels));
+                buf.release();
+            }
+        } else {
+            buf.release();
+        }
     }
 
     fn fire_surface_frame_callbacks(&mut self, surface_id: &ObjectId) {
@@ -1608,6 +1652,9 @@ impl Compositor {
 
         for proto_id in &dead {
             self.pixel_cache.remove(proto_id);
+            if let Some(held) = self.held_buffers.remove(proto_id) {
+                held.release();
+            }
             if let Some(surf) = self.surfaces.remove(proto_id) {
                 // Discard any pending presentation feedbacks — the surface
                 // died before the frame was ever presented.
@@ -1831,6 +1878,7 @@ impl Compositor {
                                 for ptr in &self.pointers {
                                     if same_client(ptr, &old_wl) {
                                         ptr.leave(serial, &old_wl);
+                                        ptr.frame();
                                     }
                                 }
                             }
@@ -1865,6 +1913,30 @@ impl Compositor {
                 } else {
                     wl_pointer::ButtonState::Released
                 };
+
+                // If a popup is grabbed and the pointer clicked outside
+                // the popup chain, dismiss the topmost grabbed popup.
+                if pressed && !self.popup_grab_stack.is_empty() {
+                    let click_on_grabbed = self.pointer_entered_id.as_ref().is_some_and(|eid| {
+                        self.popup_grab_stack.iter().any(|gid| {
+                            self.surfaces
+                                .get(gid)
+                                .is_some_and(|s| s.wl_surface.id() == *eid)
+                        })
+                    });
+                    if !click_on_grabbed {
+                        // Dismiss from the topmost popup down.
+                        while let Some(grab_wl_id) = self.popup_grab_stack.pop() {
+                            if let Some(surf) = self.surfaces.get(&grab_wl_id)
+                                && let Some(ref popup) = surf.xdg_popup
+                            {
+                                popup.popup_done();
+                            }
+                        }
+                        let _ = self.display_handle.flush_clients();
+                    }
+                }
+
                 let focused_wl = self
                     .surfaces
                     .values()
@@ -2078,16 +2150,21 @@ impl Compositor {
                     self.output_scale_120
                 };
                 let result = if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id) {
-                    super::render::cpu_composite_from_cache(
-                        root_id,
-                        &self.surfaces,
-                        &self.pixel_cache,
-                        cap_s120,
-                    )
-                    .map(|(w, h, pixels)| {
-                        let rgba = pixels.to_rgba(w, h);
-                        (w, h, rgba)
-                    })
+                    if let Some(ref mut vk) = self.vulkan_renderer {
+                        vk.render_tree_sized(
+                            root_id,
+                            &self.surfaces,
+                            &self.pixel_cache,
+                            cap_s120,
+                            None,
+                        )
+                        .map(|(w, h, pixels)| {
+                            let rgba = pixels.to_rgba(w, h);
+                            (w, h, rgba)
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -2422,6 +2499,9 @@ impl Dispatch<WlSurface, ()> for Compositor {
             Request::Offset { .. } => {}
             Request::Destroy => {
                 state.pixel_cache.remove(&sid);
+                if let Some(held) = state.held_buffers.remove(&sid) {
+                    held.release();
+                }
                 if let Some(parent_id) = state
                     .surfaces
                     .get(&sid)
@@ -2970,6 +3050,9 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
             Request::Destroy => {
                 let wl_surface_id = &data.wl_surface_id;
                 state.pixel_cache.remove(wl_surface_id);
+                if let Some(held) = state.held_buffers.remove(wl_surface_id) {
+                    held.release();
+                }
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;
                     surf.xdg_toplevel = None;
@@ -3002,20 +3085,99 @@ impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
         _: &mut DataInit<'_, Self>,
     ) {
         use xdg_popup::Request;
-        if let Request::Destroy = request {
-            // Remove from parent's children list.
-            if let Some(parent_id) = state
-                .surfaces
-                .get(&data.wl_surface_id)
-                .and_then(|s| s.parent_surface_id.clone())
-                && let Some(parent) = state.surfaces.get_mut(&parent_id)
-            {
-                parent.children.retain(|c| *c != data.wl_surface_id);
+        match request {
+            Request::Grab { seat: _, serial: _ } => {
+                // Add this popup to the grab stack so we can send
+                // popup_done when the user clicks outside.
+                state
+                    .popup_grab_stack
+                    .retain(|id| *id != data.wl_surface_id);
+                state.popup_grab_stack.push(data.wl_surface_id.clone());
             }
-            if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
-                surf.xdg_popup = None;
-                surf.parent_surface_id = None;
+            Request::Reposition {
+                positioner,
+                token: _,
+            } => {
+                // Recompute the popup position using the new positioner.
+                let pos_id = positioner.id();
+                if let Some(surf) = state.surfaces.get(&data.wl_surface_id)
+                    && let Some(parent_id) = surf.parent_surface_id.clone()
+                {
+                    let parent_geom_offset = state
+                        .surfaces
+                        .get(&parent_id)
+                        .and_then(|s| s.xdg_geometry)
+                        .map(|(gx, gy, _, _)| (gx, gy))
+                        .unwrap_or((0, 0));
+                    let parent_abs = {
+                        let abs = state.surface_absolute_position(&parent_id);
+                        (abs.0 + parent_geom_offset.0, abs.1 + parent_geom_offset.1)
+                    };
+                    let (root_id, toplevel_root) = state.find_toplevel_root(&parent_id);
+                    let bounds = toplevel_root
+                        .and_then(|_| {
+                            let surf = state.surfaces.get(&root_id)?;
+                            if let Some((gx, gy, gw, gh)) = surf.xdg_geometry
+                                && gw > 0
+                                && gh > 0
+                            {
+                                return Some((gx, gy, gw, gh));
+                            }
+                            let (w, h, scale, _, _) = state.pixel_cache.get(&root_id)?;
+                            let s = (*scale).max(1);
+                            let (lw, lh) = surf
+                                .viewport_destination
+                                .filter(|&(dw, dh)| dw > 0 && dh > 0)
+                                .unwrap_or((*w as i32 / s, *h as i32 / s));
+                            Some((0, 0, lw, lh))
+                        })
+                        .unwrap_or((0, 0, state.output_width, state.output_height));
+                    let (px, py, pw, ph) = state
+                        .positioners
+                        .get(&pos_id)
+                        .map(|p| p.geometry.compute_position(parent_abs, bounds))
+                        .unwrap_or((0, 0, 200, 200));
+                    if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                        // Undo the previous geometry adjustment before
+                        // applying the new position.
+                        let old_gx = surf.xdg_geometry.map(|(gx, _, _, _)| gx).unwrap_or(0);
+                        let old_gy = surf.xdg_geometry.map(|(_, gy, _, _)| gy).unwrap_or(0);
+                        surf.subsurface_position = (
+                            parent_geom_offset.0 + px - old_gx,
+                            parent_geom_offset.1 + py - old_gy,
+                        );
+                        if let Some(ref popup) = surf.xdg_popup {
+                            popup.configure(px, py, pw, ph);
+                            popup.repositioned(0);
+                        }
+                        if let Some(ref xs) = surf.xdg_surface {
+                            let serial = state.serial.wrapping_add(1);
+                            state.serial = serial;
+                            xs.configure(serial);
+                        }
+                    }
+                }
             }
+            Request::Destroy => {
+                // Remove from grab stack.
+                state
+                    .popup_grab_stack
+                    .retain(|id| *id != data.wl_surface_id);
+                // Remove from parent's children list.
+                if let Some(parent_id) = state
+                    .surfaces
+                    .get(&data.wl_surface_id)
+                    .and_then(|s| s.parent_surface_id.clone())
+                    && let Some(parent) = state.surfaces.get_mut(&parent_id)
+                {
+                    parent.children.retain(|c| *c != data.wl_surface_id);
+                }
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.xdg_popup = None;
+                    surf.parent_surface_id = None;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -3440,7 +3602,7 @@ impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for Compositor {
 // -- zwp_linux_dmabuf_v1 --
 impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
     fn bind(
-        _: &mut Self,
+        state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: New<ZwpLinuxDmabufV1>,
@@ -3449,19 +3611,28 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
     ) {
         let dmabuf = data_init.init(resource, ());
         if dmabuf.version() >= 3 {
-            // MOD_LINEAR = 0, MOD_INVALID = 0x00ffffffffffffff
-            let formats: &[(u32, u32, u32)] = &[
-                (drm_fourcc::ARGB8888, 0, 0),
-                (drm_fourcc::XRGB8888, 0, 0),
-                (drm_fourcc::ABGR8888, 0, 0),
-                (drm_fourcc::XBGR8888, 0, 0),
-                (drm_fourcc::ARGB8888, 0x00ffffff, 0xffffffff),
-                (drm_fourcc::XRGB8888, 0x00ffffff, 0xffffffff),
-                (drm_fourcc::ABGR8888, 0x00ffffff, 0xffffffff),
-                (drm_fourcc::XBGR8888, 0x00ffffff, 0xffffffff),
-            ];
-            for &(fmt, mod_hi, mod_lo) in formats {
-                dmabuf.modifier(fmt, mod_hi, mod_lo);
+            // Advertise DRM format modifiers that the Vulkan device can
+            // actually import.  This ensures clients (Chromium, mpv, …)
+            // allocate DMA-BUFs with a tiling layout the compositor can
+            // handle natively on the GPU, avoiding broken CPU mmap
+            // fallbacks for vendor-specific tiled VRAM.
+            if let Some(ref vk) = state.vulkan_renderer {
+                for &(drm_fmt, modifier) in &vk.supported_dmabuf_modifiers {
+                    let mod_hi = (modifier >> 32) as u32;
+                    let mod_lo = (modifier & 0xFFFFFFFF) as u32;
+                    dmabuf.modifier(drm_fmt, mod_hi, mod_lo);
+                }
+            } else {
+                // No Vulkan — only LINEAR is safe.
+                let formats = [
+                    drm_fourcc::ARGB8888,
+                    drm_fourcc::XRGB8888,
+                    drm_fourcc::ABGR8888,
+                    drm_fourcc::XBGR8888,
+                ];
+                for fmt in formats {
+                    dmabuf.modifier(fmt, 0, 0);
+                }
             }
         } else {
             dmabuf.format(drm_fourcc::ARGB8888);
@@ -3531,7 +3702,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Compositor {
                 width,
                 height,
                 format,
-                flags: _,
+                flags,
             } => {
                 let pending = state.dmabuf_params.remove(&params_id);
                 let (planes, modifier) = match pending {
@@ -3541,6 +3712,10 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Compositor {
                         return;
                     }
                 };
+                let y_invert = flags
+                    .into_result()
+                    .ok()
+                    .is_some_and(|f| f.contains(zwp_linux_buffer_params_v1::Flags::YInvert));
                 match client.create_resource::<WlBuffer, DmaBufBufferData, Compositor>(
                     dh,
                     1,
@@ -3550,6 +3725,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Compositor {
                         fourcc: format,
                         modifier,
                         planes,
+                        y_invert,
                     },
                 ) {
                     Ok(buffer) => resource.created(&buffer),
@@ -3561,13 +3737,17 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Compositor {
                 width,
                 height,
                 format,
-                flags: _,
+                flags,
             } => {
                 let (planes, modifier) = state
                     .dmabuf_params
                     .remove(&params_id)
                     .map(|p| (p.planes, p.modifier))
                     .unwrap_or_default();
+                let y_invert = flags
+                    .into_result()
+                    .ok()
+                    .is_some_and(|f| f.contains(zwp_linux_buffer_params_v1::Flags::YInvert));
                 data_init.init(
                     buffer_id,
                     DmaBufBufferData {
@@ -3576,6 +3756,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Compositor {
                         fourcc: format,
                         modifier,
                         planes,
+                        y_invert,
                     },
                 );
             }
@@ -4692,6 +4873,7 @@ fn run_compositor(
         focused_surface_id: 0,
         pointer_entered_id: None,
         pending_kb_reenter: false,
+        last_render_toplevel: None,
         verbose,
         shutdown: shutdown.clone(),
         last_reported_size: HashMap::new(),
@@ -4708,6 +4890,8 @@ fn run_compositor(
         text_inputs: Vec::new(),
         text_input_serial: 0,
         next_activation_token: 1,
+        popup_grab_stack: Vec::new(),
+        held_buffers: HashMap::new(),
     };
 
     let handle = event_loop.handle();
@@ -4765,11 +4949,37 @@ fn run_compositor(
             }
         }
 
-        if let Err(e) =
-            event_loop.dispatch(Some(std::time::Duration::from_secs(1)), &mut compositor)
+        // Shorten the dispatch timeout when the Vulkan renderer has
+        // in-flight GPU work so we poll for completion promptly.
+        let poll_timeout = if compositor
+            .vulkan_renderer
+            .as_ref()
+            .is_some_and(|vk| vk.has_pending())
+        {
+            std::time::Duration::from_millis(1)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+
+        if let Err(e) = event_loop.dispatch(Some(poll_timeout), &mut compositor)
             && verbose
         {
             eprintln!("[compositor] event loop error: {e}");
+        }
+
+        // Check for completed Vulkan GPU work.  This runs independently
+        // of surface commits so completed frames are flushed to the
+        // server without waiting for the next Wayland event.
+        if let Some(ref mut vk) = compositor.vulkan_renderer
+            && let Some((w, h, pixels)) = vk.try_retire_pending()
+            && let Some(sid) = compositor.last_render_toplevel
+        {
+            let s120_u32 = (compositor.output_scale_120 as u32).max(120);
+            let log_w = (w * 120).div_ceil(s120_u32);
+            let log_h = (h * 120).div_ceil(s120_u32);
+            compositor
+                .pending_commits
+                .insert(sid, (w, h, log_w, log_h, pixels));
         }
 
         if !compositor.pending_commits.is_empty() {

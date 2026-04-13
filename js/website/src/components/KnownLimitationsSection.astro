@@ -1,5 +1,5 @@
 ---
-type Status = "ok" | "issue" | "untested";
+type Status = "ok" | "untested";
 
 const encoders = ["NVENC", "VA-API AMD", "VA-API Intel", "Software"] as const;
 
@@ -16,7 +16,7 @@ const apps: { name: string; status: Record<string, Status> }[] = [
   {
     name: "mpv / GPU video players",
     status: {
-      NVENC:          "issue",
+      NVENC:          "ok",
       "VA-API AMD":   "ok",
       "VA-API Intel": "untested",
       Software:       "untested",
@@ -35,7 +35,6 @@ const apps: { name: string; status: Record<string, Status> }[] = [
 
 function badge(s: Status) {
   if (s === "ok") return { text: "Working", cls: "text-[var(--green)]" };
-  if (s === "issue") return { text: "Hangs", cls: "text-[var(--red)]" };
   return { text: "Untested", cls: "text-[var(--dim)]" };
 }
 ---
@@ -45,9 +44,7 @@ function badge(s: Status) {
     Known limitations
   </h2>
   <p class="text-[13px] text-[var(--dim)] mb-4">
-    The Wayland compositor is highly experimental. It encodes surfaces with hardware video
-    encoders when available. Surface types (SHM, DMA-BUF with linear and tiled modifiers)
-    are supported.
+  The Wayland compositor is experimental. Built on Vulkan, it leverages NVENC or VAAPI where available, avoids memory copies and GPU↔CPU crossings whenever found possible.
   </p>
   <p class="text-[13px] text-[var(--dim)] mb-4">
     The audio pipeline often crashes client-side and needs to be restarted.

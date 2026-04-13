@@ -31,7 +31,7 @@ mod ipc;
 mod nvenc_encode;
 mod pty;
 mod surface_encoder;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod vaapi_encode;
 
 pub use ipc::{IpcListener, default_ipc_path};
@@ -329,10 +329,11 @@ struct SharedCompositor {
     handle: CompositorHandle,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
     last_pixels: HashMap<u16, LastPixels>,
-    /// Surfaces for which a RequestFrame has been sent but no SurfaceCommit
-    /// has been received yet.  Prevents hot-looping when the app hasn't
-    /// painted in response to the previous frame callback.
-    pending_frame_requests: HashSet<u16>,
+    /// Per-surface timestamp of the last RequestFrame sent.  Used to
+    /// throttle requests to at most one per 1 ms so frame callbacks
+    /// carry distinct `elapsed_ms` timestamps — video players (mpv)
+    /// use these to pace their presentation clock.  Supports up to 1 kHz.
+    last_frame_request: HashMap<u16, Instant>,
     created_at: Instant,
     /// Monotonically increasing counter for pixel generations.
     pixel_generation: u64,
@@ -1379,7 +1380,7 @@ impl Session {
                 handle,
                 surfaces: HashMap::new(),
                 last_pixels: HashMap::new(),
-                pending_frame_requests: HashSet::new(),
+                last_frame_request: HashMap::new(),
                 created_at,
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
@@ -2073,6 +2074,12 @@ pub async fn run(config: Config) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
+/// Minimum interval between blanket RequestFrame rounds.  Keeps video
+/// players (mpv) and browsers ticking even when no client is consuming
+/// frames.  Also used as the maximum tick-loop sleep so the loop never
+/// blocks longer than this.  33 ms ≈ 30 Hz.
+const BLANKET_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
 async fn tick(state: &AppState) -> TickOutcome {
     let mut sess = state.session.lock().await;
     sess.tick_fires += 1;
@@ -2512,7 +2519,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     pixels,
                 } => {
                     surface_commit_count += 1;
-                    cs.pending_frame_requests.remove(&surface_id);
                     if let Some(info) = cs.surfaces.get_mut(&surface_id) {
                         info.width = width as u16;
                         info.height = height as u16;
@@ -2550,13 +2556,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.height = height;
                     }
                     cs.last_pixels.remove(&surface_id);
-                    // Clear pending_frame_requests so the tick loop sends a
-                    // fresh RequestFrame after the resize.  Without this, a
-                    // stale entry from a previous frame-request cycle can
-                    // prevent the compositor from firing frame callbacks,
-                    // stalling the encode pipeline (same pattern as the
-                    // subscribe handler).
-                    cs.pending_frame_requests.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
                     broadcast.push(msg_surface_resized(surface_id, width, height));
                 }
@@ -3106,10 +3105,9 @@ async fn tick(state: &AppState) -> TickOutcome {
         let mut wanted: HashSet<u16> = HashSet::new();
         let mut blanket_requested = false;
         // Request frames for all known surfaces so Wayland apps can make
-        // rendering progress (browsers need frame callbacks to load pages).
-        // Throttled to 5 Hz to prevent a hot loop when apps commit at high
-        // rates without any client consuming frames.
-        const BLANKET_FRAME_INTERVAL: Duration = Duration::from_millis(200);
+        // rendering progress.  Video players (mpv) need frequent callbacks
+        // to advance their presentation clock; browsers need them for
+        // page loads and animations.
         if let Some(cs) = sess.compositor.as_ref()
             && now.duration_since(cs.last_blanket_frame_request) >= BLANKET_FRAME_INTERVAL
         {
@@ -3138,14 +3136,26 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
         }
 
-        // Only send RequestFrame for surfaces that don't already have a
-        // pending request.  This prevents hot-looping when the app hasn't
-        // committed in response to the previous frame callback.
         if let Some(cs) = sess.compositor.as_mut() {
+            if blanket_requested {
+                cs.last_blanket_frame_request = now;
+            }
+
+            // Gate: at most one RequestFrame per surface per millisecond.
+            // This ensures each wl_callback.done carries a distinct
+            // elapsed_ms timestamp (video players like mpv use these to
+            // pace their presentation clock).  Supports up to 1 kHz.
+            // The gate auto-expires: if the app doesn't commit, the next
+            // tick ≥1 ms later will send a fresh request.
+            const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(1);
             let mut sent_any = false;
             for sid in &wanted {
-                if !cs.pending_frame_requests.contains(sid) {
-                    cs.pending_frame_requests.insert(*sid);
+                let dominated = cs
+                    .last_frame_request
+                    .get(sid)
+                    .is_some_and(|&t| now.duration_since(t) < MIN_REQUEST_INTERVAL);
+                if !dominated {
+                    cs.last_frame_request.insert(*sid, now);
                     let _ = cs
                         .handle
                         .command_tx
@@ -3155,9 +3165,6 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
             if sent_any {
                 cs.handle.wake();
-            }
-            if blanket_requested {
-                cs.last_blanket_frame_request = now;
             }
         }
     }
@@ -3254,6 +3261,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
         }
+    }
+
+    // Guarantee the tick loop wakes up at least every BLANKET_FRAME_INTERVAL
+    // even when no other time-based work is pending.  Without this, the
+    // loop blocks forever on delivery_notify when there are no events,
+    // and the blanket RequestFrame (which keeps video players like mpv
+    // ticking) never fires.
+    {
+        let blanket_deadline = now + BLANKET_FRAME_INTERVAL;
+        next_deadline = Some(next_deadline.map_or(blanket_deadline, |d| d.min(blanket_deadline)));
     }
 
     TickOutcome { next_deadline }
@@ -3572,7 +3589,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             if do_log && config.verbose {
                 let surf_info = sess.compositor.as_ref().map(|cs| {
                     let surfaces = cs.surfaces.len();
-                    let pending = cs.pending_frame_requests.len();
+                    let pending = 0usize;
                     let subs: usize = sess
                         .clients
                         .values()
@@ -4402,13 +4419,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     {
                         c.surface_encoders.remove(&surface_id);
                     }
-                }
-                // Clear pending_frame_requests so the tick loop sends a fresh
-                // RequestFrame.  Without this, a stale entry from a previous
-                // subscribe/unsubscribe cycle prevents the compositor from
-                // firing frame callbacks, deadlocking the encode pipeline.
-                if let Some(cs) = sess.compositor.as_mut() {
-                    cs.pending_frame_requests.remove(&surface_id);
                 }
                 state.delivery_notify.notify_one();
             }

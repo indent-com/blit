@@ -651,7 +651,7 @@ impl NvencDirectEncoder {
     ///
     /// Returns `None` if the CUDA driver doesn't support external memory
     /// import (pre-10.0) or if the import fails for this particular fd.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn encode_dmabuf_fd(
         &mut self,
@@ -819,9 +819,12 @@ impl NvencDirectEncoder {
         w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
 
         if self.force_idr {
-            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR);
+            // Include OUTPUT_SPSPPS (0x4) so that AV1 keyframes contain
+            // the sequence header OBU and H.264 IDRs include SPS/PPS.
+            // Without this, decoders joining mid-stream cannot decode
+            // forced keyframes produced via the DMA-BUF path.
+            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR | 0x4);
             w32(&mut pic_buf, 72, NV_ENC_PIC_TYPE_IDR);
-            self.force_idr = false;
         }
 
         self.frame_idx += 1;
@@ -831,6 +834,9 @@ impl NvencDirectEncoder {
         };
 
         let result = if nv_status == NV_ENC_SUCCESS {
+            // Encode succeeded — safe to clear the IDR request.
+            self.force_idr = false;
+
             // Lock and read bitstream.
             let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
             w32(&mut lock_buf, 0, NV_ENC_LOCK_BITSTREAM_VER);
@@ -863,6 +869,7 @@ impl NvencDirectEncoder {
             if nv_status != NV_ENC_ERR_NEED_MORE_INPUT {
                 eprintln!("[nvenc-dmabuf] nvEncEncodePicture failed: {nv_status}");
             }
+            // force_idr stays true — next call retries.
             None
         };
 

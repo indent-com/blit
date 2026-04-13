@@ -230,6 +230,9 @@ export class BlitSurfaceCanvas {
   private textInput: HTMLTextAreaElement | null = null;
   /** True while an IME composition session is active (focus is on textarea). */
   private _isComposing = false;
+  /** Non-zero when a Meta→Ctrl translation is in flight (stores the Meta
+   *  evdev keycode that was swapped so the release can be translated back). */
+  private _metaToCtrl = 0;
 
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
@@ -491,11 +494,17 @@ export class BlitSurfaceCanvas {
 
     this.surface = store.getSurface(this._surfaceId);
 
-    // Tell the server we want frames for this surface, but only if the
-    // browser can actually decode the video.  Subscribing when WebCodecs
-    // is unavailable (non-secure context) drives the server encoder for
+    // Tell the server we want frames for this surface.  Subscribe eagerly
+    // even when the surface metadata hasn't arrived yet (this.surface may
+    // be undefined) — the server already knows the surface and can start
+    // encoding as soon as it sees our subscribe.  Waiting for
+    // S2C_SURFACE_CREATED to be processed before subscribing adds a
+    // needless round-trip to time-to-first-frame.
+    //
+    // Only gate on canDecodeVideo: subscribing when WebCodecs is
+    // unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
-    if (conn && this.surface && store.canDecodeVideo) {
+    if (conn && store.canDecodeVideo) {
       conn.sendSurfaceSubscribe(this._surfaceId);
       this._subscribedGeneration = store.generation;
     }
@@ -508,26 +517,24 @@ export class BlitSurfaceCanvas {
     this.unsubChange = store.onChange(() => {
       const prev = this.surface;
       this.surface = store.getSurface(this._surfaceId);
-      // Subscribe (or re-subscribe) when:
-      //  1. Surface info just arrived (late-subscribe: prev was undefined)
-      //  2. Store generation changed (reconnect — the server dropped all
-      //     subscriptions but the surface reappeared with the same IDs)
+      // Re-subscribe when the store generation changed (reconnect — the
+      // server dropped all subscriptions but the surface reappeared with
+      // the same IDs).  We no longer need to handle the "surface info
+      // just arrived" case here because subscribe() above sends the
+      // subscribe eagerly before the surface metadata is available.
       if (this.surface && store.canDecodeVideo) {
-        const generationChanged =
-          this._subscribedGeneration !== store.generation;
-        const surfaceNew = !prev;
-        if (surfaceNew || generationChanged) {
+        if (this._subscribedGeneration !== store.generation) {
           const c = this.getConn();
           if (c) {
             c.sendSurfaceSubscribe(this._surfaceId);
             this._subscribedGeneration = store.generation;
           }
-          // Update canvas size to match actual surface dimensions,
-          // unless the display size is pinned by a ResizeObserver.
-          if (this.canvas && !this._displaySize) {
-            this.canvas.width = this.surface.width;
-            this.canvas.height = this.surface.height;
-          }
+        }
+        // Update canvas size when surface info first arrives,
+        // unless the display size is pinned by a ResizeObserver.
+        if (!prev && this.canvas && !this._displaySize) {
+          this.canvas.width = this.surface.width;
+          this.canvas.height = this.surface.height;
         }
       }
       // Flush any pending resize now that we have the surface info.
@@ -818,6 +825,54 @@ export class BlitSurfaceCanvas {
       this.syncCapsLock(e, conn);
     }
 
+    // Paste: read the browser clipboard and offer it to the Wayland
+    // compositor *before* forwarding the key, so the data offer is in
+    // place when the app processes the paste shortcut.
+    if (
+      pressed &&
+      (e.key === "v" || e.key === "V") &&
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey
+    ) {
+      const keycode = domKeyToEvdev(e.code);
+      if (keycode !== 0) this.pressedKeys.add(keycode);
+
+      // On macOS, Cmd+V arrives with metaKey set.  Wayland apps expect
+      // Ctrl+V, so swap the already-pressed Meta → Ctrl before forwarding
+      // the key.  The reverse swap happens on Meta key-up (see below).
+      if (e.metaKey && !e.ctrlKey) {
+        const metaCode = this.pressedKeys.has(125)
+          ? 125
+          : this.pressedKeys.has(126)
+            ? 126
+            : 0;
+        if (metaCode !== 0) {
+          this.pressedKeys.delete(metaCode);
+          conn.sendSurfaceInput(this._surfaceId, metaCode, false);
+          this.pressedKeys.add(29); // ControlLeft
+          conn.sendSurfaceInput(this._surfaceId, 29, true);
+          this._metaToCtrl = metaCode;
+        }
+      }
+
+      const surfaceId = this._surfaceId;
+      navigator.clipboard.readText().then(
+        (text) => {
+          if (text) {
+            const enc = new TextEncoder();
+            conn.sendClipboard("text/plain;charset=utf-8", enc.encode(text));
+          }
+          if (keycode !== 0) conn.sendSurfaceInput(surfaceId, keycode, true);
+        },
+        () => {
+          // Clipboard read failed (no permission, empty, etc.) —
+          // forward the key anyway so the shortcut still reaches the app.
+          if (keycode !== 0) conn.sendSurfaceInput(surfaceId, keycode, true);
+        },
+      );
+      return;
+    }
+
     // Printable character (no Ctrl/Alt/Meta): send the browser-resolved
     // character via the text path.  This handles keyboard layout
     // differences (e.g. Shift+2 → @ on US, " on UK) without depending
@@ -837,6 +892,14 @@ export class BlitSurfaceCanvas {
     // send raw evdev keycode.
     const keycode = domKeyToEvdev(e.code);
     if (keycode !== 0) {
+      // Finish Meta→Ctrl translation: when the physical Meta key is
+      // released after a translated Cmd+V paste, release Ctrl instead.
+      if (!pressed && keycode === this._metaToCtrl) {
+        this.pressedKeys.delete(29); // ControlLeft
+        conn.sendSurfaceInput(this._surfaceId, 29, false);
+        this._metaToCtrl = 0;
+        return;
+      }
       if (pressed) {
         this.pressedKeys.add(keycode);
       } else {
@@ -884,6 +947,7 @@ export class BlitSurfaceCanvas {
       conn.sendSurfaceInput(this._surfaceId, kc, false);
     }
     this.pressedKeys.clear();
+    this._metaToCtrl = 0;
   }
 
   private handleBlur(): void {
@@ -945,5 +1009,20 @@ export class BlitSurfaceCanvas {
     const conn = this.getConn();
     if (!conn || !this.surface) return;
     conn.sendSurfaceFocus(this._surfaceId);
+
+    // Best-effort: pre-load the browser clipboard so it is already
+    // available as a wl_data_offer if the Wayland client pastes via a
+    // mechanism other than Ctrl/Cmd+V (e.g. right-click context menu).
+    // This may fail without a user gesture in some browsers — that is
+    // fine; the Ctrl/Cmd+V path handles clipboard reading reliably.
+    navigator.clipboard.readText().then(
+      (text) => {
+        if (text) {
+          const enc = new TextEncoder();
+          conn.sendClipboard("text/plain;charset=utf-8", enc.encode(text));
+        }
+      },
+      () => {},
+    );
   }
 }

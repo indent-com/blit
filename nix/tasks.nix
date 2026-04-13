@@ -259,8 +259,8 @@ let
       # Layer 2: depend only on leaf crates
       publish blit-webserver
       publish blit-alacritty
-      publish blit-share
-      wait_for_layer blit-webserver blit-alacritty blit-share
+      publish blit-webrtc-forwarder
+      wait_for_layer blit-webserver blit-alacritty blit-webrtc-forwarder
 
       # Layer 3: depend on layer 1+2
       publish blit-server

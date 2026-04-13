@@ -41,41 +41,7 @@ impl Transport {
     }
 }
 
-#[cfg(unix)]
-pub fn default_local_socket() -> String {
-    if let Ok(p) = std::env::var("BLIT_SOCK") {
-        return p;
-    }
-    if let Ok(dir) = std::env::var("TMPDIR") {
-        let p = format!("{dir}/blit.sock");
-        if std::path::Path::new(&p).exists() {
-            return p;
-        }
-    }
-    if let Ok(user) = std::env::var("USER") {
-        let p = format!("/tmp/blit-{user}.sock");
-        if std::path::Path::new(&p).exists() {
-            return p;
-        }
-        let sys = format!("/run/blit/{user}.sock");
-        if std::path::Path::new(&sys).exists() {
-            return sys;
-        }
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return format!("{dir}/blit.sock");
-    }
-    "/tmp/blit.sock".into()
-}
-
-#[cfg(windows)]
-pub fn default_local_socket() -> String {
-    if let Ok(p) = std::env::var("BLIT_SOCK") {
-        return p;
-    }
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
-    format!(r"\\.\pipe\blit-{user}")
-}
+pub use blit_webserver::config::default_local_socket;
 
 pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut hdr = [0u8; 4];

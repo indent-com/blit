@@ -52,6 +52,48 @@ pub fn remotes_path() -> PathBuf {
     blit_config_dir().join("blit.remotes")
 }
 
+/// Resolve the local blit server IPC socket path.
+///
+/// Checks `BLIT_SOCK` first (explicit override), then probes well-known
+/// paths with existence checks so we find a running server regardless of
+/// which fallback it used at startup.
+#[cfg(unix)]
+pub fn default_local_socket() -> String {
+    if let Ok(p) = std::env::var("BLIT_SOCK") {
+        return p;
+    }
+    if let Ok(dir) = std::env::var("TMPDIR") {
+        let p = format!("{dir}/blit.sock");
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    if let Ok(user) = std::env::var("USER") {
+        let p = format!("/tmp/blit-{user}.sock");
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+        let sys = format!("/run/blit/{user}.sock");
+        if std::path::Path::new(&sys).exists() {
+            return sys;
+        }
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return format!("{dir}/blit.sock");
+    }
+    "/tmp/blit.sock".into()
+}
+
+/// Resolve the local blit server IPC pipe path (Windows).
+#[cfg(windows)]
+pub fn default_local_socket() -> String {
+    if let Ok(p) = std::env::var("BLIT_SOCK") {
+        return p;
+    }
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+    format!(r"\\.\pipe\blit-{user}")
+}
+
 /// Acquire an exclusive cross-process lock for the config directory.
 /// Returns a `File` whose lifetime holds the lock (released on drop).
 /// On non-Unix platforms this is a no-op that returns `None`.
