@@ -185,7 +185,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | `crates/server/src/audio.rs`             | Audio capture pipeline: PipeWire spawn, pw-cat PCM pipe, Opus encoding                                                |
 | `crates/remote/src/lib.rs`               | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
 | `crates/compositor/src/imp.rs`           | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates     |
-| `crates/compositor/src/render.rs`        | Surface compositing: CPU fallback and layer collection for the GPU renderer                                           |
+| `crates/compositor/src/render.rs`        | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer                   |
 | `crates/compositor/src/vulkan_render.rs` | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                           |
 | `crates/webrtc-forwarder/src/`           | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                     |
 | `crates/cli/src/agent.rs`                | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `surfaces`, `capture`, `click`, `key`, `type` |
@@ -263,8 +263,8 @@ The experimental headless Wayland compositor (`crates/compositor/`) is `#[cfg(ta
 1. When the first PTY is created, `ensure_compositor()` spawns a compositor thread with a calloop event loop.
 2. The compositor creates a Wayland listening socket (`/tmp/wayland-N`) and sets `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` in the PTY child environment.
 3. GUI apps launched inside any terminal connect to this socket and create `xdg_toplevel` windows.
-4. On each `wl_surface.commit`, the compositor reads the buffer pixels (via SHM or dmabuf) and sends a `CompositorEvent::SurfaceCommit` to the server.
-5. The server encodes the pixels as H.264 or AV1 and stores the encoded frame in `last_frames`. The tick loop sends frames to connected browser clients using the same pacing/congestion-control system as terminal updates.
+4. On each `wl_surface.commit`, the compositor uploads the buffer as a persistent GPU texture (SHM is uploaded, DMA-BUF is imported via Vulkan), composites the surface tree, and sends a `CompositorEvent::SurfaceCommit` with the composited `PixelData` to the server.
+5. The server encodes the pixel data as H.264 or AV1 (zero-copy from a VA surface when available, or from BGRA staging) and stores the encoded frame in `last_frames`. The tick loop sends frames to connected browser clients using the same pacing/congestion-control system as terminal updates.
 6. Browser clients decode frames via WebCodecs and render to a `<canvas>`.
 
 ### Key data flow

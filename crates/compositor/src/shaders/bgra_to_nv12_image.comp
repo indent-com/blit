@@ -1,0 +1,55 @@
+#version 450
+
+// Convert BGRA → NV12 via image storage (tiled NV12 surfaces).
+// Y plane written as R8 image, UV plane as RG8 image.
+// Vulkan handles tiling internally — works with any DRM modifier.
+// Source pixels are edge-extended into encoder padding area.
+// Dispatch with (ceil(enc_width/16), ceil(enc_height/16), 1).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D bgra_in;
+layout(set = 0, binding = 1, r8)    writeonly uniform image2D y_out;
+layout(set = 0, binding = 2, rg8)   writeonly uniform image2D uv_out;
+
+layout(push_constant) uniform Params {
+    uint src_width;   // BGRA source dimensions
+    uint src_height;
+    uint enc_width;   // NV12 output dimensions (>= src, encoder-aligned)
+    uint enc_height;
+};
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    if (pos.x >= enc_width || pos.y >= enc_height) return;
+
+    // Clamp to source dimensions for edge-extension into padding.
+    ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
+    vec4 bgra = imageLoad(bgra_in, src);
+    float r = bgra.z;  // BGRA: z=R
+    float g = bgra.y;  // BGRA: y=G
+    float b = bgra.x;  // BGRA: x=B
+
+    // BT.601 full-range RGB→Y
+    float y_val = 0.299 * r + 0.587 * g + 0.114 * b;
+    imageStore(y_out, ivec2(pos), vec4(y_val, 0, 0, 0));
+
+    // Write UV at half resolution (every 2x2 block).
+    if ((pos.x & 1u) == 0u && (pos.y & 1u) == 0u) {
+        vec4 s00 = bgra;
+        ivec2 s10_pos = ivec2(min(pos.x + 1u, src_width - 1u), src.y);
+        ivec2 s01_pos = ivec2(src.x, min(pos.y + 1u, src_height - 1u));
+        ivec2 s11_pos = ivec2(s10_pos.x, s01_pos.y);
+        vec4 s10 = imageLoad(bgra_in, s10_pos);
+        vec4 s01 = imageLoad(bgra_in, s01_pos);
+        vec4 s11 = imageLoad(bgra_in, s11_pos);
+
+        float ar = (s00.z + s10.z + s01.z + s11.z) * 0.25;
+        float ag = (s00.y + s10.y + s01.y + s11.y) * 0.25;
+        float ab = (s00.x + s10.x + s01.x + s11.x) * 0.25;
+        float u_val = -0.169 * ar - 0.331 * ag + 0.500 * ab + 0.5;
+        float v_val =  0.500 * ar - 0.419 * ag - 0.081 * ab + 0.5;
+
+        imageStore(uv_out, ivec2(pos >> 1u), vec4(u_val, v_val, 0, 0));
+    }
+}

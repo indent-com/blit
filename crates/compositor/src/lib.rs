@@ -5,6 +5,8 @@ mod positioner;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
+mod vulkan_encode;
+#[cfg(target_os = "linux")]
 mod vulkan_render;
 #[cfg(target_os = "linux")]
 pub use imp::*;
@@ -48,15 +50,11 @@ mod stub {
             va_display: usize,
             _fd: Arc<OwnedFd>,
         },
-    }
-
-    #[derive(Clone)]
-    pub struct PixelLayer {
-        pub x: i32,
-        pub y: i32,
-        pub width: u32,
-        pub height: u32,
-        pub pixels: PixelData,
+        Encoded {
+            data: Arc<Vec<u8>>,
+            is_keyframe: bool,
+            codec_flag: u8,
+        },
     }
 
     impl PixelData {
@@ -79,6 +77,7 @@ mod stub {
                 PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
                 PixelData::Nv12 { data, .. } => data.is_empty(),
                 PixelData::DmaBuf { .. } | PixelData::VaSurface { .. } => false,
+                PixelData::Encoded { data, .. } => data.is_empty(),
             }
         }
 
@@ -220,6 +219,12 @@ mod stub {
         Shutdown,
     }
 
+    #[derive(Clone, Copy, Default)]
+    pub struct ExternalOutputPlane {
+        pub offset: u32,
+        pub pitch: u32,
+    }
+
     pub struct ExternalOutputBuffer {
         pub fd: Arc<OwnedFd>,
         pub fourcc: u32,
@@ -230,6 +235,7 @@ mod stub {
         pub height: u32,
         pub va_surface_id: u32,
         pub va_display: usize,
+        pub planes: Vec<ExternalOutputPlane>,
     }
 
     pub struct CompositorHandle {
@@ -238,6 +244,10 @@ mod stub {
         pub socket_name: String,
         pub thread: std::thread::JoinHandle<()>,
         pub shutdown: Arc<AtomicBool>,
+        /// Whether the compositor's Vulkan renderer supports Vulkan Video encode.
+        pub vulkan_video_encode: bool,
+        /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
+        pub vulkan_video_encode_av1: bool,
     }
 
     impl CompositorHandle {
@@ -261,6 +271,8 @@ mod stub {
             socket_name: String::new(),
             thread: std::thread::spawn(|| {}),
             shutdown,
+            vulkan_video_encode: false,
+            vulkan_video_encode_av1: false,
         }
     }
 }

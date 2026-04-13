@@ -73,16 +73,15 @@ in
     gpuLibraries = mkOption {
       type = types.listOf types.package;
       default = lib.optionals pkgs.stdenv.isLinux [
-        pkgs.libglvnd
         pkgs.libva
         pkgs.libgbm
         pkgs.vulkan-loader
       ];
-      defaultText = "[ pkgs.libglvnd pkgs.libva pkgs.libgbm pkgs.vulkan-loader ] (Linux only)";
+      defaultText = "[ pkgs.libva pkgs.libgbm pkgs.vulkan-loader ] (Linux only)";
       description = ''
         Libraries to make available to blit server via LD_LIBRARY_PATH
         for hardware-accelerated video encoding and GPU compositing.
-        blit server loads VA-API, EGL, GLESv2, and GBM via dlopen at
+        blit server loads VA-API, Vulkan, and GBM via dlopen at
         runtime; on NixOS these shared objects are not in the default
         search path.
 

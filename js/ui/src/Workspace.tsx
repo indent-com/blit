@@ -38,6 +38,7 @@ import {
   AUDIO_BITRATE_KEY,
   AUDIO_MUTED_KEY,
   VIDEO_QUALITY_KEY,
+  SURFACE_STREAMING_KEY,
   writeStorage,
   useConfigValue,
   preferredPalette,
@@ -46,6 +47,7 @@ import {
   preferredAudioBitrate,
   preferredAudioMuted,
   preferredVideoQuality,
+  preferredSurfaceStreaming,
   blitHost,
   basePath,
   useRemotes,
@@ -82,6 +84,7 @@ import {
   loadActiveLayout,
   saveActiveLayout,
   saveToHistory,
+  removeFromHistory,
   loadRecentLayouts,
   PRESETS,
   surfaceAssignment,
@@ -220,13 +223,21 @@ function WorkspaceScreen(props: {
   );
 
   // Aggregate surfaces from all connections.
+  // When surface streaming is disabled the list is emptied, which cascades
+  // through every derived view (focused surface, BSP panes, preview panel,
+  // status bar count, switcher) so windows disappear immediately.
   createEffect(() => {
     // Re-run when connection specs change OR when the set of live
     // connections changes (a connection that was absent when we first ran
     // may now be available, and we need its surfaceStore.onChange listener).
     const _connIds = availableConnIds();
+    const streaming = surfaceStreaming();
     const cleanups: (() => void)[] = [];
     const syncAll = () => {
+      if (!streaming) {
+        if (surfaces().length !== 0) setSurfaces([]);
+        return;
+      }
       const all: BlitSurface[] = [];
       for (const spec of props.connectionSpecs()) {
         const conn = workspace.getConnection(spec.id);
@@ -293,6 +304,9 @@ function WorkspaceScreen(props: {
   const [audioMuted, setAudioMuted] = createSignal(preferredAudioMuted());
   const [audioBitrate, setAudioBitrate] = createSignal(preferredAudioBitrate());
   const [videoQuality, setVideoQuality] = createSignal(preferredVideoQuality());
+  const [surfaceStreaming, setSurfaceStreaming] = createSignal(
+    preferredSurfaceStreaming(),
+  );
   const [previewPanelOpen, setPreviewPanelOpen] = createSignal(true);
   const [previewPanelWidth, setPreviewPanelWidth] =
     createSignal(MIN_PANEL_WIDTH);
@@ -495,6 +509,7 @@ function WorkspaceScreen(props: {
   const [activeLayout, setActiveLayout] = createSignal<BSPLayout | null>(
     loadActiveLayout(),
   );
+  const [recentLayouts, setRecentLayouts] = createSignal(loadRecentLayouts());
   const [layoutAssignments, setLayoutAssignments] =
     createSignal<BSPAssignments | null>(null);
   /** True once BSPContainer has finished resolving hash-based assignments. */
@@ -622,6 +637,7 @@ function WorkspaceScreen(props: {
   const remoteAudioBitrate = useConfigValue(AUDIO_BITRATE_KEY);
   const remoteAudioMuted = useConfigValue(AUDIO_MUTED_KEY);
   const remoteVideoQuality = useConfigValue(VIDEO_QUALITY_KEY);
+  const remoteSurfaceStreaming = useConfigValue(SURFACE_STREAMING_KEY);
 
   createEffect(() => {
     const id = remotePaletteId();
@@ -662,15 +678,23 @@ function WorkspaceScreen(props: {
     if (n >= 0 && n <= 4) setVideoQuality(n);
   });
 
+  createEffect(() => {
+    const s = remoteSurfaceStreaming();
+    if (s === "0") setSurfaceStreaming(false);
+    else if (s === "1") setSurfaceStreaming(true);
+  });
+
   // Sync media preferences to all connections so new subscribes use them.
   createEffect(() => {
     const q = videoQuality();
     const b = audioBitrate();
+    const streaming = surfaceStreaming();
     for (const snap of allConnections()) {
       const conn = workspace.getConnection(snap.id);
       if (conn) {
         conn.defaultSurfaceQuality = q;
         conn.defaultAudioBitrateKbps = b;
+        conn.surfaceStreamingEnabled = streaming;
       }
     }
   });
@@ -914,7 +938,10 @@ function WorkspaceScreen(props: {
     }
     restoreOverlayPreview(current);
     if (!current) previousFocus = document.activeElement;
-    if (target === "palette") {
+    if (target === "remotes" && remotesAutoOpen() === "open") {
+      // User explicitly opened remotes — stop auto-close from dismissing it.
+      setRemotesAutoOpen("done");
+    } else if (target === "palette") {
       paletteOverlayOrigin = palette();
     } else if (target === "font") {
       fontOverlayOrigin = { family: font(), size: fontSize() };
@@ -975,9 +1002,20 @@ function WorkspaceScreen(props: {
     for (const snap of allConnections()) {
       const conn = workspace.getConnection(snap.id);
       if (!conn) continue;
+      conn.defaultSurfaceQuality = quality;
       for (const surface of conn.surfaceStore.getSurfaces().values()) {
         conn.sendSurfaceResubscribe(surface.surfaceId, quality);
       }
+    }
+  }
+
+  function changeSurfaceStreaming(enabled: boolean) {
+    setSurfaceStreaming(enabled);
+    writeStorage(SURFACE_STREAMING_KEY, enabled ? "1" : "0");
+    for (const snap of allConnections()) {
+      const conn = workspace.getConnection(snap.id);
+      if (!conn) continue;
+      conn.setSurfaceStreamingEnabled(enabled);
     }
   }
 
@@ -1537,7 +1575,12 @@ function WorkspaceScreen(props: {
                 setActiveLayout(l);
                 saveActiveLayout(l);
                 saveToHistory(l);
+                setRecentLayouts(loadRecentLayouts());
                 closeOverlay();
+              }}
+              onRemoveLayout={(dsl) => {
+                removeFromHistory(dsl);
+                setRecentLayouts(loadRecentLayouts());
               }}
               onClearLayout={() => {
                 setLayoutAssignments(null);
@@ -1545,7 +1588,7 @@ function WorkspaceScreen(props: {
                 saveActiveLayout(null);
                 closeOverlay();
               }}
-              recentLayouts={loadRecentLayouts()}
+              recentLayouts={recentLayouts()}
               presetLayouts={PRESETS}
               onChangeFont={() => toggleOverlay("font")}
               onChangePalette={() => toggleOverlay("palette")}
@@ -1614,7 +1657,7 @@ function WorkspaceScreen(props: {
               gatewayStatus={configWsStatus()}
               palette={palette()}
               fontSize={fontSize()}
-              readOnly={remotesAutoOpen() === "open"}
+              readOnly={false}
               onAdd={(name, uri) => addRemote(name, uri)}
               onRemove={(name) => removeRemote(name)}
               onSetDefault={(name) => setDefaultRemote(name)}
@@ -1633,8 +1676,10 @@ function WorkspaceScreen(props: {
               videoQuality={videoQuality()}
               audioMuted={audioMuted()}
               audioAvailable={allConnections().some((c) => c.supportsAudio)}
+              surfaceStreaming={surfaceStreaming()}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoQualityChange={changeVideoQuality}
+              onSurfaceStreamingChange={changeSurfaceStreaming}
               onToggleAudio={toggleAudio}
               onResetAudio={resetAudio}
               onClose={closeOverlay}
@@ -1757,7 +1802,7 @@ function EmptyState(props: {
           style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
         >
           {t("workspace.newTerminal")} <kbd style={ui.kbd}>Enter</kbd>{" "}
-          <kbd style={ui.kbd}>{props.mod}+Shift+Enter</kbd>
+          <kbd style={ui.kbd}>{props.mod}+Enter</kbd>
         </button>
         <button
           onClick={props.onSwitcher}

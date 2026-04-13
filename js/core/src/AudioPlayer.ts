@@ -348,10 +348,16 @@ export class AudioPlayer {
   /** Snapshot of framesDecoded at the last health check. */
   private lastHealthFramesDecoded = 0;
   /**
-   * Count of consecutive health checks where the decoder received frames
-   * but produced no output.  Two consecutive checks (10 s) triggers a reset.
+   * Whether a health check saw the decoder receive frames but produce no
+   * output.  A single silent check (2 s) triggers a reset.
    */
-  private decoderSilentChecks = 0;
+  private decoderSilentLastCheck = false;
+  /** Timestamp (ms) of the last decoded audio frame output. */
+  private lastDecodedAt = 0;
+  /** Timestamp (ms) when the AudioContext entered "suspended" state. */
+  private suspendedSince = 0;
+  /** Registered visibilitychange handler, for cleanup. */
+  private visibilityHandler: (() => void) | null = null;
 
   get muted(): boolean {
     return this._muted;
@@ -471,8 +477,25 @@ export class AudioPlayer {
   handleAudioFrame(timestamp: number, _flags: number, data: Uint8Array): void {
     if (this._destroyed || this._muted) return;
 
-    this.lastFrameAt = Date.now();
+    const now = Date.now();
+    this.lastFrameAt = now;
     this.startHealthCheck();
+
+    // Inline decoder stall check: if we've been feeding the decoder for
+    // > 2 s but it hasn't produced any output, the decode pipeline is
+    // dead.  Catches failures within one frame interval (~20 ms) rather
+    // than waiting for the next health-check tick.
+    if (
+      this.lastDecodedAt > 0 &&
+      this.decodesRequested > 0 &&
+      now - this.lastDecodedAt > 2_000
+    ) {
+      if (now - this.lastAutoResetAt > 10_000) {
+        this.lastAutoResetAt = now;
+        this.resetPipeline();
+      }
+      return;
+    }
 
     // Recover from a dead or missing AudioContext.  The browser can close
     // the context at any time (audio device change, resource pressure, GPU
@@ -485,8 +508,8 @@ export class AudioPlayer {
       this.initAudioContext();
     } else if (this.ctx.state === "suspended") {
       // Eagerly try to resume on every incoming frame rather than waiting
-      // for the 5-second health-check poll.  On active tabs (user typing
-      // or clicking) this succeeds immediately.
+      // for the health-check poll.  On active tabs (user typing or
+      // clicking) this succeeds immediately.
       this.ctx.resume().catch(() => {});
     }
 
@@ -510,7 +533,14 @@ export class AudioPlayer {
       );
       this.decodesRequested++;
     } catch {
-      // Decoder error -- will be recreated on next frame.
+      // Decoder threw — close and null it immediately so the next
+      // handleAudioFrame creates a fresh one instead of repeatedly
+      // calling decode() on a broken decoder until the async error
+      // callback fires.
+      try {
+        this.decoder.close();
+      } catch {}
+      this.decoder = null;
     }
   }
 
@@ -580,7 +610,8 @@ export class AudioPlayer {
     this.framesDecoded = 0;
     this.lastHealthDecodesRequested = 0;
     this.lastHealthFramesDecoded = 0;
-    this.decoderSilentChecks = 0;
+    this.decoderSilentLastCheck = false;
+    this.lastDecodedAt = 0;
   }
 
   /**
@@ -692,7 +723,32 @@ export class AudioPlayer {
   private startHealthCheck(): void {
     if (this.healthTimer || this._destroyed || this._muted || !this._subscribed)
       return;
-    this.healthTimer = setInterval(() => this.checkHealth(), 5000);
+    this.healthTimer = setInterval(() => this.checkHealth(), 2000);
+
+    // When the tab returns from background, audio is often in a broken
+    // state (context suspended, worklet stalled, decode chain dead).
+    // Preemptively reset the pipeline so the user never has to do it
+    // manually.  The reset is cheap — everything rebuilds on the next
+    // incoming frame with only ~100-200 ms of imperceptible silence.
+    // Quick tab switches (< 3 s) just get an immediate health check.
+    if (!this.visibilityHandler && typeof document !== "undefined") {
+      let hiddenAt = 0;
+      this.visibilityHandler = () => {
+        if (document.visibilityState === "hidden") {
+          hiddenAt = Date.now();
+        } else if (document.visibilityState === "visible") {
+          if (this._destroyed || this._muted || !this._subscribed) return;
+          const wasHiddenMs = hiddenAt > 0 ? Date.now() - hiddenAt : 0;
+          hiddenAt = 0;
+          if (wasHiddenMs > 3_000) {
+            this.resetPipeline();
+          } else {
+            this.checkHealth();
+          }
+        }
+      };
+      document.addEventListener("visibilitychange", this.visibilityHandler);
+    }
   }
 
   private stopHealthCheck(): void {
@@ -700,23 +756,30 @@ export class AudioPlayer {
       clearInterval(this.healthTimer);
       this.healthTimer = null;
     }
+    if (this.visibilityHandler) {
+      document.removeEventListener("visibilitychange", this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
   }
 
   /**
-   * Periodic health check: detects stalled or silently broken audio and
-   * recovers by rebuilding the pipeline.
+   * Periodic health check (every 2 s): detects stalled or silently broken
+   * audio and recovers by rebuilding the pipeline.
    *
-   * Checks for three failure modes:
+   * Checks for four failure modes:
    * 1. **Worklet stall** — frames arrive from the server but the worklet
-   *    hasn't reported a consumed-sample position in over 5 seconds.  The
+   *    hasn't reported a consumed-sample position in over 2 seconds.  The
    *    decode → worklet chain has silently broken.
    * 2. **Decoder stall** — frames are being sent to the decoder but no
-   *    decoded output arrives for two consecutive checks (10 s).  The
+   *    decoded output arrives for two consecutive checks (4 s).  The
    *    WebCodecs AudioDecoder has silently stopped producing output
-   *    without transitioning to the "closed" state.
+   *    without transitioning to the "closed" state.  (Most decoder
+   *    stalls are caught earlier by the inline check in handleAudioFrame.)
    * 3. **AudioContext death** — context is "closed" (resource pressure,
    *    device removal, GPU process crash).  The statechange listener
    *    handles this immediately, but this is a safety net.
+   * 4. **Persistent suspension** — context is "suspended" and resume()
+   *    fails for > 2 s.  Tear down and rebuild from scratch.
    *
    * Also resumes a suspended AudioContext (can happen after device
    * changes or resource pressure without transitioning to "closed").
@@ -738,9 +801,23 @@ export class AudioPlayer {
 
     const now = Date.now();
 
+    // Check if the auto-reset rate limit allows a reset right now.
+    const canAutoReset = now - this.lastAutoResetAt > 10_000;
+
     // Resume a suspended AudioContext (device change, resource pressure).
+    // If it stays suspended despite repeated resume() attempts, tear it
+    // down and rebuild — the context may be permanently stuck.
     if (this.ctx && this.ctx.state === "suspended") {
+      if (this.suspendedSince === 0) this.suspendedSince = now;
       this.ctx.resume().catch(() => {});
+      if (now - this.suspendedSince > 2_000 && canAutoReset) {
+        this.suspendedSince = 0;
+        this.lastAutoResetAt = now;
+        this.resetPipeline();
+        return;
+      }
+    } else {
+      this.suspendedSince = 0;
     }
 
     // Safety net: catch a closed AudioContext even if the statechange
@@ -750,15 +827,18 @@ export class AudioPlayer {
       // Will rebuild on next handleAudioFrame().
     }
 
-    // Check if the auto-reset rate limit allows a reset right now.
-    const canAutoReset = now - this.lastAutoResetAt > 10_000;
-
-    // 1. Worklet stall: frames arriving but worklet silent for > 5 s.
+    // 1. Worklet stall: frames arriving but worklet silent for > 2 s.
+    //    Also catches the case where the worklet was created and fed
+    //    decoded audio but never produced a position report (e.g.
+    //    processorerror before the first report, or stuck buffering).
+    const workletSilent =
+      this.lastWorkletReportAt > 0
+        ? now - this.lastWorkletReportAt > 2_000
+        : this.worklet != null && this.framesDecoded > 0;
     if (
       this.lastFrameAt > 0 &&
-      now - this.lastFrameAt < 5000 &&
-      this.lastWorkletReportAt > 0 &&
-      now - this.lastWorkletReportAt > 5_000
+      now - this.lastFrameAt < 3000 &&
+      workletSilent
     ) {
       if (canAutoReset) {
         this.lastAutoResetAt = now;
@@ -768,24 +848,21 @@ export class AudioPlayer {
     }
 
     // 2. Decoder stall: decoder received frames but produced no output.
-    //    Compare snapshots from the last health check.  If the decoder
-    //    got new input but didn't produce any decoded frames, increment
-    //    the silent counter.  Two consecutive silent checks = reset.
+    //    Compare snapshots from the last health check.  A single silent
+    //    interval (2 s) triggers a reset — Opus frames decode nearly
+    //    instantly, so any gap this long is a real failure.
     const decodesGrew = this.decodesRequested > this.lastHealthDecodesRequested;
     const decodesProduced = this.framesDecoded > this.lastHealthFramesDecoded;
+    const wasSilent = this.decoderSilentLastCheck;
     this.lastHealthDecodesRequested = this.decodesRequested;
     this.lastHealthFramesDecoded = this.framesDecoded;
+    this.decoderSilentLastCheck = decodesGrew && !decodesProduced;
 
-    if (decodesGrew && !decodesProduced) {
-      this.decoderSilentChecks++;
-      if (this.decoderSilentChecks >= 2 && canAutoReset) {
-        this.decoderSilentChecks = 0;
-        this.lastAutoResetAt = now;
-        this.resetPipeline();
-        return;
-      }
-    } else {
-      this.decoderSilentChecks = 0;
+    if (wasSilent && decodesGrew && !decodesProduced && canAutoReset) {
+      this.decoderSilentLastCheck = false;
+      this.lastAutoResetAt = now;
+      this.resetPipeline();
+      return;
     }
   }
 
@@ -811,6 +888,7 @@ export class AudioPlayer {
       this.ctx = null;
     }
     this.gain = null;
+    this.suspendedSince = 0;
     this.resetSync();
   }
 
@@ -878,6 +956,13 @@ export class AudioPlayer {
       });
       this.worklet.connect(this.gain);
 
+      // Detect worklet processor crashes.  When process() throws, the
+      // worklet fires processorerror and stops processing audio
+      // permanently.  Reset the pipeline immediately.
+      this.worklet.addEventListener("processorerror", () => {
+        if (!this._destroyed) this.resetPipeline();
+      });
+
       // Listen for position reports from the worklet.
       this.worklet.port.onmessage = (e: MessageEvent) => {
         if (e.data && e.data.type === "pos") {
@@ -930,6 +1015,7 @@ export class AudioPlayer {
 
   private onDecodedFrame(frame: AudioData): void {
     this.framesDecoded++;
+    this.lastDecodedAt = Date.now();
     // Extract f32-planar samples: [L...L, R...R].
     const n = frame.numberOfFrames;
     const pcm = new Float32Array(n * 2);

@@ -136,8 +136,8 @@ All PTYs forked after the compositor starts inherit `WAYLAND_DISPLAY` pointing a
 ### Surface lifecycle
 
 1. The app creates an `xdg_toplevel` surface; the compositor assigns it a `surface_id`.
-2. The compositor sends `SurfaceCommit` events with RGBA pixel buffers via tokio channels.
-3. The server converts RGBA to YUV420 or NV12 and encodes via the configured encoder chain.
+2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value. With Vulkan Video this is a pre-encoded bitstream (`PixelData::Encoded`); otherwise it is NV12 DMA-BUF data or BGRA pixels for server-side encoding.
+3. The server either forwards the pre-encoded bitstream directly (Vulkan Video) or encodes the pixel data via the configured encoder chain (VA-API / NVENC / software).
 4. `S2C_SURFACE_CREATED` is broadcast to subscribed clients, followed by `S2C_SURFACE_FRAME` as the app renders.
 5. Input events from clients (`C2S_SURFACE_INPUT`, `C2S_SURFACE_POINTER`, `C2S_SURFACE_POINTER_AXIS`) are translated to Wayland keyboard/pointer events via the compositor.
 6. When the app closes the surface, `S2C_SURFACE_DESTROYED` is broadcast.
@@ -155,8 +155,14 @@ sequenceDiagram
     C->>A: wl_surface.frame callback
     A->>C: wl_surface.commit (buffer)
     C->>C: GPU composite (Vulkan)
-    C->>S: SurfaceCommit (PixelData)
-    S->>S: VPP BGRA→NV12 + encode
+    C->>C: compute BGRA→NV12
+    alt Vulkan Video
+        C->>C: GPU encode (H.264/AV1)
+        C->>S: SurfaceCommit (Encoded bitstream)
+    else VA-API / NVENC / Software
+        C->>S: SurfaceCommit (NV12 DMA-BUF)
+        S->>S: encode
+    end
     S->>Cl: S2C_SURFACE_FRAME
 ```
 
@@ -164,15 +170,22 @@ sequenceDiagram
 
 ### GPU rendering and encoding
 
-The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `ash` (dlopen `libvulkan.so`). Client surfaces (SHM or DMA-BUF) are composited into a Vulkan output image, read back via a staging buffer, and fed to the video encoder.
+The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `ash` (dlopen `libvulkan.so`). Client surface buffers (SHM or DMA-BUF) are uploaded as persistent GPU textures at `wl_surface.commit` time and reused across frames until the surface commits a new buffer.
 
 #### Output pipeline
 
-The Vulkan renderer allocates its own output images with device-local memory and HOST_VISIBLE staging buffers for CPU readback. Each frame, all client surface layers are composited into the output image, then the result is copied to a staging buffer and mapped for CPU access. The BGRA pixel data is handed to the encoder. No GBM involvement.
+The render pipeline has three tiers, chosen at runtime based on hardware capabilities:
 
-- **VA-API**: The encoder imports the BGRA pixel data into a VA surface via VPP color-space conversion (BGRA to NV12). The old EGL zero-copy path (VA-API-allocated DMA-BUFs imported as EGL FBOs) no longer exists.
-- **NVENC**: CUDA imports the BGRA pixel data for encoding.
-- **Software**: The CPU encoder reads the staging buffer directly.
+**Tier 1 — Vulkan Video (fully on-GPU, preferred):**
+When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_encode_av1` are available, the compositor does the entire pipeline in Vulkan: render BGRA → compute shader BGRA→NV12 → Vulkan Video hardware encode → bitstream readback. Returns `PixelData::Encoded` — the server sends the bitstream directly to clients with zero encoding work. No VA-API, no DMA-BUF export/import, no cross-API sync. Supported on AMD (radv, RDNA2+) and Intel (anv).
+
+**Tier 2 — Vulkan compute + VA-API encode (zero-copy NV12):**
+VA-API allocates NV12 surfaces and exports them as DMA-BUFs. The compositor imports these into Vulkan as multi-plane `G8_B8R8_2PLANE_420_UNORM` images (handles tiled surfaces on AMD via `VK_EXT_image_drm_format_modifier`). A compute shader converts BGRA→NV12 via `imageStore` on per-plane views. The VA-API encoder reads the surface directly — zero CPU involvement. Returns `PixelData::Nv12DmaBuf` with an `Arc<OwnedFd>` shared between compositor and encoder for fd-based surface lookup.
+
+**Tier 3 — CPU fallback:**
+When neither Vulkan Video nor VA-API external outputs are available, the renderer falls back to self-allocated output images with HOST_VISIBLE staging buffers. The composited BGRA frame is copied to a staging buffer and returned as `PixelData::Bgra` for CPU-side encoding.
+
+External outputs and NV12 compute buffers are **per-surface** (`HashMap<u32, Vec<...>>` keyed by surface ID) so multiple surfaces (e.g., Brave + mpv) encode independently without interference.
 
 ### Encoder selection
 
@@ -182,33 +195,27 @@ Controlled by `BLIT_SURFACE_ENCODERS` (comma-separated priority list). The serve
 av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, h264-software, av1-software
 ```
 
-| Encoder         | Backend        | Notes                            |
-| --------------- | -------------- | -------------------------------- |
-| `av1-nvenc`     | NVENC (GPU)    | AV1 via CUDA                     |
-| `h264-nvenc`    | NVENC (GPU)    | H.264 via CUDA                   |
-| `av1-vaapi`     | VA-API (GPU)   | AV1 via libva                    |
-| `h264-vaapi`    | VA-API (GPU)   | H.264 via libva                  |
-| `h264-software` | openh264 (CPU) | Software H.264, always available |
-| `av1-software`  | rav1e (CPU)    | Software AV1                     |
+Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the default list yet as they haven't been tested. Enable via `BLIT_SURFACE_ENCODERS=av1-vulkan,...`.
 
-`BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `lossless`.
+| Encoder         | Backend            | Notes                              |
+| --------------- | ------------------ | ---------------------------------- |
+| `av1-vulkan`    | Vulkan Video (GPU) | AV1 via VK_KHR_video_encode_av1    |
+| `h264-vulkan`   | Vulkan Video (GPU) | H.264 via VK_KHR_video_encode_h264 |
+| `av1-nvenc`     | NVENC (GPU)        | AV1 via CUDA                       |
+| `h264-nvenc`    | NVENC (GPU)        | H.264 via CUDA                     |
+| `av1-vaapi`     | VA-API (GPU)       | AV1 via libva                      |
+| `h264-vaapi`    | VA-API (GPU)       | H.264 via libva                    |
+| `h264-software` | openh264 (CPU)     | Software H.264, always available   |
+| `av1-software`  | rav1e (CPU)        | Software AV1                       |
 
-### VA-API VPP (Video Processing Pipeline)
-
-The VPP context (`VppContext`) handles BGRA-to-NV12 color-space conversion on the GPU. It is created alongside each VA-API encoder and shares the same `VADisplay`.
-
-- **NV12 output pool**: 4 round-robin surfaces for the encoder's reference frame and reconstruction buffers.
-- **BGRA input pool**: 3 pre-allocated surfaces for VPP color-space conversion (BGRA pixel data from the Vulkan compositor is imported per-frame).
-- **PRIME import cache**: imported VASurfaces are cached by fd inode so the expensive `vaCreateSurfaces` call happens only once per unique buffer.
-
-Fourcc mapping (AMD quirk): AMD's VA-API only accepts `VA_FOURCC_BGRA`/`VA_FOURCC_BGRX` for RGB surface operations. DRM `ABGR8888`/`XBGR8888` (which map to `VA_FOURCC_RGBA`/`VA_FOURCC_RGBX`) are remapped to their BGR counterparts for the PRIME descriptor.
+`BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `ultra`.
 
 ### Compositor capabilities
 
 - **Protocols**: `wl_compositor` v6, `xdg-shell` v6, `wp_viewporter`, `wp_fractional_scale_manager` v1, `xdg-decoration`, `zwp_linux_dmabuf` v3, `wp_presentation`, `zwp_pointer_constraints` v1, `zwp_relative_pointer_manager` v1, `xdg-activation` v1, `wp_cursor_shape_manager` v1.
 - **Buffer types**: SHM (shared memory) and DMA-BUF (GPU). DMA-BUF accepted via `zwp_linux_dmabuf_v1`; client buffers imported via Vulkan external memory extensions (`VK_EXT_external_memory_dma_buf`) and composited as Vulkan textures.
 - **Pixel formats**: ARGB8888, XRGB8888, ABGR8888, XBGR8888 with linear modifier or `DRM_FORMAT_MOD_INVALID` (treated as linear).
-- **Screenshots**: `blit surface capture <surface_id>` uses CPU compositing from the pixel cache. Output format: PNG or AVIF, inferred from file extension.
+- **Screenshots**: `blit surface capture <surface_id>` uses the Vulkan renderer to composite the surface tree and reads back RGBA pixels. Output format: PNG or AVIF, inferred from file extension.
 
 Chrome/Electron work with `--ozone-platform=wayland`. mpv works with `--vo=gpu-next` (Vulkan WSI submits DMA-BUFs via `zwp_linux_dmabuf`).
 

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod audio;
 mod gpu_libs;
 mod ipc;
@@ -184,10 +184,9 @@ impl PtyDriver for AlacrittyDriver {
     }
 }
 
-// Keep small to limit bufferbloat on slow connections. The soft queue budget
-// is enforced by both message count and queued bytes so a couple of tiny
-// terminal diffs do not block a large surface frame.
-const OUTBOX_CAPACITY: usize = 8;
+// Soft backpressure thresholds.  The outbox channel is unbounded so messages
+// are never dropped, but production is throttled (via `window_open` /
+// `surface_window_open`) once either counter exceeds these limits.
 const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 4;
 const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 128 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
@@ -256,7 +255,7 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
 async fn write_frame_interleaved(
     writer: &mut (impl AsyncWrite + Unpin),
     payload: &[u8],
-    audio_rx: &mut mpsc::Receiver<Vec<u8>>,
+    audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> bool {
     // Drain pending audio *before* the bulk frame so audio is never
     // starved for more than one bulk-frame write time.  Audio frames
@@ -349,15 +348,15 @@ struct SharedCompositor {
     last_configured_size: HashMap<u16, (u16, u16, u16)>,
     /// Audio capture pipeline (PipeWire → pw-cat → Opus encode).
     /// `None` when PipeWire is not available or `BLIT_AUDIO=0`.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     audio_pipeline: Option<audio::AudioPipeline>,
     /// Compositor instance ID passed to `AudioPipeline::spawn()` so restarts
     /// reuse the same audio runtime directory.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     audio_session_id: u16,
     /// When the last audio pipeline restart was attempted.  Used to enforce a
     /// cooldown so we don't spin on persistent failures.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     last_audio_restart: Option<Instant>,
 }
 
@@ -438,19 +437,14 @@ async fn request_surface_capture_with_timeout(
         .flatten()
 }
 
-/// Capacity for the dedicated audio outbox channel.  Audio frames are tiny
-/// (~160 B / 20 ms ≈ 8 KB/s) so a small channel is fine — but it must be
-/// deep enough to absorb a short write stall without dropping frames.
-const AUDIO_OUTBOX_CAPACITY: usize = 10; // 200 ms of audio
-
 struct ClientState {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
     outbox_queued_frames: Arc<AtomicUsize>,
     outbox_queued_bytes: Arc<AtomicUsize>,
     /// Dedicated channel for audio frames.  The writer task selects on this
     /// with higher priority than the main outbox so audio is never starved
     /// by large video/terminal messages.
-    audio_tx: mpsc::Sender<Vec<u8>>,
+    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     lead: Option<u16>,
     subscriptions: HashSet<u16>,
     surface_subscriptions: HashSet<u16>,
@@ -458,7 +452,7 @@ struct ClientState {
     audio_subscribed: bool,
     /// Per-client audio bitrate preference in kbps from C2S_AUDIO_SUBSCRIBE.
     /// 0 means use the server/env default.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     audio_bitrate_kbps: u16,
     view_sizes: HashMap<u16, (u16, u16)>,
     scroll_offsets: HashMap<u16, usize>,
@@ -522,6 +516,10 @@ struct ClientState {
     surface_burst_remaining: u8,
     /// Per-client video encoders, one per subscribed surface.
     surface_encoders: HashMap<u16, SurfaceEncoder>,
+    /// Surfaces that use Vulkan Video encoding in the compositor rather than
+    /// a local SurfaceEncoder.  Maps surface_id → (encoder_name, codec_flag).
+    /// These surfaces rely on the compositor producing `PixelData::Encoded`.
+    vulkan_video_surfaces: HashMap<u16, (&'static str, u8)>,
     /// Surface frames in flight — separate from terminal inflight so surface
     /// ACKs feed shared RTT / goodput without corrupting terminal frame-size
     /// averages or probe_frames.
@@ -531,6 +529,10 @@ struct ClientState {
     /// pair — which would create throwaway encoders and risk concurrent
     /// access to the underlying C codec library.
     surface_encodes_in_flight: HashSet<u16>,
+    /// Surfaces whose in-flight encoder was invalidated by a quality or codec
+    /// change (resubscribe) while the encode was running.  The completion
+    /// handler must not reinsert the stale encoder for these surfaces.
+    surface_encoder_invalidated: HashSet<u16>,
     /// Per-surface pixel generation that was last encoded for this client.
     /// Used to skip re-encoding when pixel data hasn't changed.
     surface_last_encoded_gen: HashMap<u16, u64>,
@@ -906,46 +908,26 @@ fn mark_outbox_drained(
     });
 }
 
-fn try_send_outbox_tracked(
-    tx: &mpsc::Sender<Vec<u8>>,
-    queued_frames: &Arc<AtomicUsize>,
-    queued_bytes: &Arc<AtomicUsize>,
-    msg: Vec<u8>,
-) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
-    let bytes = msg.len();
-    match tx.try_send(msg) {
-        Ok(()) => {
-            queued_frames.fetch_add(1, Ordering::Relaxed);
-            queued_bytes.fetch_add(bytes, Ordering::Relaxed);
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn try_send_outbox(
-    client: &ClientState,
-    msg: Vec<u8>,
-) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
-    try_send_outbox_tracked(
-        &client.tx,
-        &client.outbox_queued_frames,
-        &client.outbox_queued_bytes,
-        msg,
-    )
-}
-
-async fn send_outbox_tracked(
-    tx: &mpsc::Sender<Vec<u8>>,
+fn send_outbox_tracked(
+    tx: &mpsc::UnboundedSender<Vec<u8>>,
     queued_frames: &Arc<AtomicUsize>,
     queued_bytes: &Arc<AtomicUsize>,
     msg: Vec<u8>,
 ) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
     let bytes = msg.len();
-    tx.send(msg).await?;
+    tx.send(msg)?;
     queued_frames.fetch_add(1, Ordering::Relaxed);
     queued_bytes.fetch_add(bytes, Ordering::Relaxed);
     Ok(())
+}
+
+fn send_outbox(client: &ClientState, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+    send_outbox_tracked(
+        &client.tx,
+        &client.outbox_queued_frames,
+        &client.outbox_queued_bytes,
+        msg,
+    )
 }
 
 fn can_send_preview(client: &ClientState, pid: u16, now: Instant) -> bool {
@@ -1330,7 +1312,7 @@ impl Session {
             // share the same time origin for A/V sync.
             let created_at = Instant::now();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             let audio_pipeline = {
                 let audio_disabled = std::env::var("BLIT_AUDIO")
                     .map(|v| v == "0")
@@ -1385,11 +1367,11 @@ impl Session {
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
                 last_configured_size: HashMap::new(),
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 audio_pipeline,
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 audio_session_id: session_id,
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 last_audio_restart: None,
             });
         }
@@ -1397,7 +1379,7 @@ impl Session {
     }
 
     /// Returns the `PULSE_SERVER` path if the audio pipeline is active.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn pulse_server_path(&self) -> Option<String> {
         self.compositor
             .as_ref()
@@ -1406,7 +1388,7 @@ impl Session {
     }
 
     /// Returns the `PIPEWIRE_REMOTE` path if the audio pipeline is active.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn pipewire_remote_path(&self) -> Option<String> {
         self.compositor
             .as_ref()
@@ -1434,7 +1416,7 @@ impl Session {
 
     fn send_to_all(&self, msg: &[u8]) {
         for c in self.clients.values() {
-            let _ = try_send_outbox(c, msg.to_vec());
+            let _ = send_outbox(c, msg.to_vec());
         }
     }
 
@@ -1929,17 +1911,15 @@ fn try_send_update(
         return SendOutcome::NoChange;
     };
     let bytes = msg.len();
-    if try_send_outbox(client, msg).is_ok() {
+    if send_outbox(client, msg).is_ok() {
         client.last_sent.insert(pid, current);
         record_send(client, bytes, now, paced);
         client.frames_sent = client.frames_sent.wrapping_add(1);
         SendOutcome::Sent
     } else {
-        // Outbox full — the sender can't keep up.  Advance last_sent to
-        // the current frame so the NEXT diff is small (only changes since
-        // now), effectively dropping this intermediate state.  Without
-        // this, backpressure causes the tick to re-dirty the PTY, building
-        // ever-larger diffs that make the backlog worse.
+        // Receiver dropped — client disconnected.  Advance last_sent so
+        // the next diff (if any) is small rather than accumulating stale
+        // changes.
         client.last_sent.insert(pid, current);
         SendOutcome::Backpressured
     }
@@ -2307,7 +2287,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             break;
                         };
                         let bytes = msg.len();
-                        if try_send_outbox(c, msg).is_ok() {
+                        if send_outbox(c, msg).is_ok() {
                             c.scroll_caches.insert(scroll_pid, new_frame);
                             record_send(c, bytes, now, is_lead);
                             c.frames_sent += 1;
@@ -2556,7 +2536,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.height = height;
                     }
                     cs.last_pixels.remove(&surface_id);
-                    invalidate_client_encoders.push(surface_id);
+                    // Don't eagerly invalidate client encoders here.  The
+                    // encode path already checks for dimension mismatches
+                    // (source_dimensions != pixel size) and recreates the
+                    // encoder on demand.  Eagerly destroying encoders on
+                    // every intermediate size during a drag-resize causes
+                    // expensive encoder teardown+creation cycles for sizes
+                    // that may never actually be encoded (because a newer
+                    // SurfaceCommit arrives before the next encode tick).
                     broadcast.push(msg_surface_resized(surface_id, width, height));
                 }
                 CompositorEvent::ClipboardContent {
@@ -2622,6 +2609,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     for sid in invalidate_client_encoders {
         for c in sess.clients.values_mut() {
             c.surface_encoders.remove(&sid);
+            c.vulkan_video_surfaces.remove(&sid);
             c.surface_last_encoded_gen.remove(&sid);
         }
     }
@@ -2671,6 +2659,10 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 
     let mut encode_jobs: Vec<EncodeJob> = Vec::new();
+    // Surfaces that had encode jobs dispatched this tick.  Used below to
+    // eagerly pre-request the next frame so the compositor renders in
+    // parallel with the in-flight encode (pipeline overlap).
+    let mut encode_dispatched_surfaces: HashSet<u16> = HashSet::new();
 
     // Collect (cid, subs, needs_kf) for clients that are due, then build
     // encode jobs in a second pass to avoid overlapping borrows.
@@ -2717,7 +2709,32 @@ async fn tick(state: &AppState) -> TickOutcome {
         // can advance their deadlines after the job-collection pass.
         let mut clients_with_encodes: HashSet<u64> = HashSet::new();
         #[cfg(target_os = "linux")]
-        let mut pending_external_bufs: Option<Vec<blit_compositor::ExternalOutputBuffer>> = None;
+        let mut pending_external_bufs: Vec<(
+            u32,
+            Vec<blit_compositor::ExternalOutputBuffer>,
+        )> = Vec::new();
+
+        // Pre-extract compositor Vulkan Video capabilities so we don't
+        // need to borrow sess.compositor inside the client-mutation loop.
+        let vk_encode_available = sess
+            .compositor
+            .as_ref()
+            .is_some_and(|cs| cs.handle.vulkan_video_encode);
+        let vk_encode_av1_available = sess
+            .compositor
+            .as_ref()
+            .is_some_and(|cs| cs.handle.vulkan_video_encode_av1);
+
+        // Vulkan Video encoder setup commands to send after the client loop.
+        struct VulkanEncoderSetup {
+            surface_id: u32,
+            codec: u8,
+            qp: u8,
+            width: u32,
+            height: u32,
+        }
+        let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
+        let mut pending_vulkan_keyframe_requests: Vec<u32> = Vec::new();
 
         for work in &client_work {
             for &(sid, px_w, px_h, px_gen) in &pixel_snapshot {
@@ -2736,14 +2753,61 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                let pixels = {
+                let (pixels, created_at) = {
                     let cs = sess.compositor.as_ref().unwrap();
-                    match cs.last_pixels.get(&sid) {
+                    let ca = cs.created_at;
+                    let px = match cs.last_pixels.get(&sid) {
                         Some(lp) if lp.width == px_w && lp.height == px_h => lp.pixels.clone(),
                         _ => continue,
-                    }
+                    };
+                    (px, ca)
                 };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
+
+                // Fast path: if the compositor already produced an encoded
+                // bitstream (Vulkan Video), skip the SurfaceEncoder entirely
+                // and send the pre-encoded data directly to the client.
+                if let blit_compositor::PixelData::Encoded {
+                    ref data,
+                    is_keyframe,
+                    codec_flag,
+                } = pixels
+                {
+                    let flags = codec_flag
+                        | if is_keyframe {
+                            SURFACE_FRAME_FLAG_KEYFRAME
+                        } else {
+                            0
+                        };
+                    let timestamp = created_at.elapsed().as_millis() as u32;
+                    let msg =
+                        msg_surface_frame(sid, timestamp, flags, px_w as u16, px_h as u16, data);
+                    let bytes = msg.len();
+                    match send_outbox(client, msg) {
+                        Err(_e) => {
+                            client.surface_needs_keyframe = true;
+                        }
+                        Ok(()) => {
+                            client.surface_inflight_frames.push_back(InFlightFrame {
+                                sent_at: now,
+                                bytes,
+                                paced: true,
+                            });
+                            if !is_keyframe {
+                                client.avg_surface_frame_bytes = ewma_with_direction(
+                                    client.avg_surface_frame_bytes,
+                                    bytes as f32,
+                                    0.5,
+                                    0.125,
+                                );
+                            }
+                        }
+                    }
+                    clients_with_encodes.insert(work.cid);
+                    encode_dispatched_surfaces.insert(sid);
+                    client.surface_last_encoded_gen.insert(sid, px_gen);
+                    continue;
+                }
 
                 // Skip if an encode job is already in flight for this
                 // (client, surface) pair.  Spawning a second job would
@@ -2754,12 +2818,24 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                let needs_new_encoder = client
-                    .surface_encoders
-                    .get(&sid)
-                    .is_none_or(|e| e.source_dimensions() != (px_w, px_h));
+                // Check if a Vulkan Video encoder should be used for this
+                // surface.  Vulkan Video encoders live in the compositor;
+                // the server only sends commands to create / keyframe /
+                // destroy them and the fast path above handles the
+                // resulting PixelData::Encoded.
+                let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
+                let needs_new_encoder = if has_vulkan_enc {
+                    // Vulkan Video encoder exists — no local SurfaceEncoder.
+                    false
+                } else {
+                    client
+                        .surface_encoders
+                        .get(&sid)
+                        .is_none_or(|e| e.source_dimensions() != (px_w, px_h))
+                };
+
+                // --- Try Vulkan Video first ---
                 if needs_new_encoder {
-                    client.surface_encoders.remove(&sid);
                     let codec_support = client
                         .surface_codec_overrides
                         .get(&sid)
@@ -2770,6 +2846,64 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .get(&sid)
                         .copied()
                         .unwrap_or(state.config.surface_quality);
+
+                    for &pref in &state.config.surface_encoders {
+                        if !pref.is_vulkan_video() {
+                            continue;
+                        }
+                        if !pref.supported_by_client(codec_support) {
+                            continue;
+                        }
+                        // Check compositor capability (pre-extracted above).
+                        let available = match pref {
+                            SurfaceEncoderPreference::VulkanVideoH264 => vk_encode_available,
+                            SurfaceEncoderPreference::VulkanVideoAV1 => vk_encode_av1_available,
+                            _ => false,
+                        };
+                        if !available {
+                            continue;
+                        }
+                        let qp = match pref {
+                            SurfaceEncoderPreference::VulkanVideoAV1 => quality.av1_qp_for_vulkan(),
+                            _ => quality.h264_qp(),
+                        };
+                        let enc_name = match pref {
+                            SurfaceEncoderPreference::VulkanVideoH264 => "h264-vulkan",
+                            SurfaceEncoderPreference::VulkanVideoAV1 => "av1-vulkan",
+                            _ => "vulkan",
+                        };
+                        // Queue commands to send after the client loop.
+                        pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
+                            surface_id: sid as u32,
+                            codec: pref.vulkan_codec(),
+                            qp,
+                            width: px_w,
+                            height: px_h,
+                        });
+                        pending_vulkan_keyframe_requests.push(sid as u32);
+                        // Remove any local encoder for this surface.
+                        client.surface_encoders.remove(&sid);
+                        client
+                            .vulkan_video_surfaces
+                            .insert(sid, (enc_name, pref.codec_flag()));
+                        let enc_msg = msg_surface_encoder(sid, enc_name);
+                        let _ = send_outbox(client, enc_msg);
+                        if state.config.verbose {
+                            eprintln!(
+                                "[surface-encoder] cid={} sid={sid} {px_w}x{px_h}: using {enc_name}",
+                                work.cid,
+                            );
+                        }
+                        break;
+                    }
+
+                    // Even with Vulkan Video, we need a SurfaceEncoder to
+                    // allocate GBM BGRA buffers + VA-API NV12 surfaces for the
+                    // compositor's external output pipeline.  The encoder won't
+                    // be used for encoding — PixelData::Encoded bypasses it.
+
+                    // Fall through to local SurfaceEncoder creation.
+                    client.surface_encoders.remove(&sid);
                     match SurfaceEncoder::new(
                         &state.config.surface_encoders,
                         px_w,
@@ -2779,32 +2913,63 @@ async fn tick(state: &AppState) -> TickOutcome {
                         state.config.verbose,
                         codec_support,
                     ) {
-                        Ok(encoder) => {
+                        Ok(mut encoder) => {
                             #[cfg(target_os = "linux")]
                             {
-                                let exported = encoder.export_vpp_surfaces();
-                                if !exported.is_empty() {
-                                    let va_display = encoder.va_display_usize();
-                                    let bufs = exported
-                                        .into_iter()
-                                        .map(|e| blit_compositor::ExternalOutputBuffer {
-                                            fd: std::sync::Arc::new(e.fd),
-                                            fourcc: e.fourcc,
-                                            modifier: e.modifier,
-                                            stride: e.stride,
-                                            offset: e.offset,
-                                            width: e.width,
-                                            height: e.height,
-                                            va_surface_id: e.surface_id,
-                                            va_display,
+                                // Export GBM LINEAR BGRA buffers + VA-API NV12
+                                // surfaces to compositor for zero-copy rendering.
+                                // Vulkan compute converts BGRA→NV12; the encoder
+                                // reads the VA surface directly.
+                                {
+                                    // Allocate GBM NV12 buffers (same count as BGRA).
+                                    let drm_fd = encoder.drm_fd_raw();
+                                    let count = encoder.gbm_buffers().len();
+                                    if count > 0 {
+                                        encoder.allocate_nv12_buffers(drm_fd, count);
+                                    }
+                                }
+                                let gbm_bufs = encoder.gbm_buffers();
+                                if !gbm_bufs.is_empty() {
+                                    let nv12_bufs = encoder.gbm_nv12_buffers();
+                                    let (enc_w, enc_h) = encoder.encoder_dimensions();
+                                    let bufs = gbm_bufs
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, b)| {
+                                            let nv12 = nv12_bufs.get(i);
+                                            blit_compositor::ExternalOutputBuffer {
+                                                fd: std::sync::Arc::new(
+                                                    b.fd.try_clone().expect("dup gbm fd"),
+                                                ),
+                                                fourcc: 0x34325241,
+                                                modifier: 0,
+                                                stride: b.stride,
+                                                offset: 0,
+                                                width: b.width,
+                                                height: b.height,
+                                                va_surface_id: 0,
+                                                va_display: 0,
+                                                planes: vec![
+                                                    blit_compositor::ExternalOutputPlane {
+                                                        offset: 0,
+                                                        pitch: b.stride,
+                                                    },
+                                                ],
+                                                nv12_fd: nv12.map(|n| n.fd.clone()),
+                                                nv12_stride: nv12.map_or(0, |n| n.stride),
+                                                nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
+                                                nv12_modifier: nv12.map_or(0, |n| n.modifier),
+                                                nv12_width: enc_w,
+                                                nv12_height: enc_h,
+                                            }
                                         })
                                         .collect();
-                                    pending_external_bufs = Some(bufs);
+                                    pending_external_bufs.push((sid as u32, bufs));
                                 }
                             }
                             let enc_msg = msg_surface_encoder(sid, encoder.encoder_name());
                             client.surface_encoders.insert(sid, encoder);
-                            let _ = try_send_outbox(client, enc_msg);
+                            let _ = send_outbox(client, enc_msg);
                         }
                         Err(err) => {
                             if state.config.verbose {
@@ -2818,12 +2983,24 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
 
+                // If using Vulkan Video, handle keyframe via compositor command
+                // and skip local encode — the fast path above handles delivery.
+                if client.vulkan_video_surfaces.contains_key(&sid) {
+                    if work.needs_keyframe {
+                        pending_vulkan_keyframe_requests.push(sid as u32);
+                    }
+                    // The encoded frame comes via PixelData::Encoded on
+                    // the next compositor commit, handled by the fast path.
+                    continue;
+                }
+
                 let encoder = client.surface_encoders.remove(&sid).unwrap();
                 client.surface_encodes_in_flight.insert(sid);
                 // A fresh encoder always needs a keyframe, regardless of
                 // the client's global flag.
                 let needs_kf = work.needs_keyframe || needs_new_encoder;
                 clients_with_encodes.insert(work.cid);
+                encode_dispatched_surfaces.insert(sid);
                 encode_jobs.push(EncodeJob {
                     cid: work.cid,
                     sid,
@@ -2837,14 +3014,48 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
         }
 
-        // Send VA-API exported surfaces to compositor if a new encoder was created.
-        #[cfg(target_os = "linux")]
-        if let Some(bufs) = pending_external_bufs
+        // Send Vulkan Video encoder setup commands to compositor.
+        if (!pending_vulkan_encoder_setups.is_empty()
+            || !pending_vulkan_keyframe_requests.is_empty())
             && let Some(cs) = sess.compositor.as_ref()
         {
-            let _ = cs.handle.command_tx.send(
-                blit_compositor::CompositorCommand::SetExternalOutputBuffers { buffers: bufs },
-            );
+            for setup in pending_vulkan_encoder_setups {
+                eprintln!(
+                    "[vulkan-video] sending SetVulkanEncoder sid={} codec={} {}x{} qp={}",
+                    setup.surface_id, setup.codec, setup.width, setup.height, setup.qp,
+                );
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::SetVulkanEncoder {
+                        surface_id: setup.surface_id,
+                        codec: setup.codec,
+                        qp: setup.qp,
+                        width: setup.width,
+                        height: setup.height,
+                    },
+                );
+            }
+            for surface_id in pending_vulkan_keyframe_requests {
+                let _ = cs
+                    .handle
+                    .command_tx
+                    .send(blit_compositor::CompositorCommand::RequestVulkanKeyframe { surface_id });
+            }
+            cs.handle.wake();
+        }
+
+        // Send VA-API exported surfaces to compositor for each new encoder.
+        #[cfg(target_os = "linux")]
+        if !pending_external_bufs.is_empty()
+            && let Some(cs) = sess.compositor.as_ref()
+        {
+            for (surface_id, bufs) in pending_external_bufs {
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::SetExternalOutputBuffers {
+                        surface_id,
+                        buffers: bufs,
+                    },
+                );
+            }
             cs.handle.wake();
         }
 
@@ -2963,7 +3174,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     .is_some_and(|lp| result.encoder.source_dimensions() == (lp.width, lp.height));
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     client.surface_encodes_in_flight.remove(&result.sid);
-                    if dims_match {
+                    let invalidated = client.surface_encoder_invalidated.remove(&result.sid);
+                    if dims_match && !invalidated {
                         client.surface_encoders.insert(result.sid, result.encoder);
                     }
                     // Record the generation we just encoded so we don't
@@ -3013,11 +3225,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // With surface_encodes_in_flight limiting to 1 concurrent
                 // encode per surface, at most 1 frame arrives after the
                 // window closes, which is acceptable.
-                match try_send_outbox(client, msg) {
+                match send_outbox(client, msg) {
                     Err(_e) => {
-                        // Outbox full (rare — window_open checked at encode
-                        // time but outbox filled during async encode).
-                        // Request keyframe to avoid broken reference chain.
+                        // Receiver dropped (client disconnected during encode).
+                        // Request keyframe so the next encoder starts clean.
                         client.surface_needs_keyframe = true;
                     }
                     Ok(()) => {
@@ -3091,11 +3302,11 @@ async fn tick(state: &AppState) -> TickOutcome {
     // fires the surface's pending wl_surface.frame callback so the
     // Wayland client will paint and commit its next frame.
     //
-    // No timers — the pipeline is fully demand-driven:
-    //   server sends RequestFrame + wake() → compositor fires callback →
-    //   app paints & commits → compositor sends SurfaceCommit +
-    //   event_notify → delivery_notify wakes tick loop → encode & deliver.
-    // See ARCHITECTURE.md § "Compositor sessions".
+    // Demand-driven with pipeline overlap:
+    //   When an encode job is dispatched, we eagerly pre-request the next
+    //   frame so the Wayland client paints in parallel with the encode.
+    //   Fresh pixels are ready when the encode completes, turning the
+    //   serial   encode + round_trip   into   max(encode, round_trip).
     {
         // Only request frames for surfaces where at least one client is
         // ready to consume the result.  Without this check, apps that are
@@ -3103,6 +3314,13 @@ async fn tick(state: &AppState) -> TickOutcome {
         // RequestFrame → commit → SurfaceCommit wakes tick → no client
         // ready → RequestFrame again → 100% CPU.
         let mut wanted: HashSet<u16> = HashSet::new();
+
+        // Pre-request: surfaces with an encode just dispatched.  The
+        // compositor will render the next frame while the encode runs,
+        // so pixels are ready when the next pacing window opens.
+        for &sid in &encode_dispatched_surfaces {
+            wanted.insert(sid);
+        }
         let mut blanket_requested = false;
         // Request frames for all known surfaces so Wayland apps can make
         // rendering progress.  Video players (mpv) need frequent callbacks
@@ -3170,7 +3388,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 
     // -- Audio frame delivery -----------------------------------------------
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Some(ref mut cs) = sess.compositor
         && let Some(ref mut ap) = cs.audio_pipeline
         && ap.is_alive()
@@ -3186,7 +3404,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // never blocked behind large video/terminal messages
                         // in the shared outbox.  The writer task interleaves
                         // audio between write syscalls of bulk messages.
-                        if client.audio_tx.try_send(msg).is_ok() {
+                        if client.audio_tx.send(msg).is_ok() {
                             // Count audio bytes into the goodput window so
                             // the shared bandwidth estimate reflects total
                             // pipe utilisation (terminals + video + audio).
@@ -3209,7 +3427,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     //
     // Bitrate is pre-computed here to avoid borrowing sess.clients inside
     // the sess.compositor mutable borrow (they're the same MutexGuard).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let audio_restart_bitrate: i32 = sess
         .clients
         .values()
@@ -3218,7 +3436,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .max()
         .map(|kbps| kbps as i32 * 1000)
         .unwrap_or(0);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Some(ref mut cs) = sess.compositor {
         let pipeline_dead = cs.audio_pipeline.as_mut().is_some_and(|ap| !ap.is_alive());
         if pipeline_dead {
@@ -3287,8 +3505,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOX_CAPACITY);
-    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_OUTBOX_CAPACITY);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
     let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
     let sender_outbox_queued_frames = outbox_frame_counter.clone();
@@ -3361,7 +3579,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 subscriptions: HashSet::new(),
                 surface_subscriptions: HashSet::new(),
                 audio_subscribed: false,
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 audio_bitrate_kbps: 0,
                 view_sizes: HashMap::new(),
                 scroll_offsets: HashMap::new(),
@@ -3403,7 +3621,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 surface_burst_remaining: SURFACE_BURST_FRAMES,
                 surface_inflight_frames: VecDeque::new(),
                 surface_encoders: HashMap::new(),
+                vulkan_video_surfaces: HashMap::new(),
                 surface_encodes_in_flight: HashSet::new(),
+                surface_encoder_invalidated: HashSet::new(),
                 surface_last_encoded_gen: HashMap::new(),
                 surface_view_sizes: HashMap::new(),
                 surface_codec_support: 0,
@@ -3420,7 +3640,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
                 | FEATURE_COMPOSITOR;
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
                 let audio_disabled = std::env::var("BLIT_AUDIO")
                     .map(|v| v == "0")
@@ -3429,7 +3649,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     features |= FEATURE_AUDIO;
                 }
             }
-            let _ = try_send_outbox(c, msg_hello(1, features));
+            let _ = send_outbox(c, msg_hello(1, features));
         }
         let mut initial_msgs = Vec::with_capacity(2 + sess.ptys.len() * 2);
         // Send surface-created messages BEFORE the PTY list so that
@@ -3489,10 +3709,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         drop(sess);
         if let Some((tx, queued_frames, queued_bytes)) = tx {
             for msg in initial_msgs {
-                if send_outbox_tracked(&tx, &queued_frames, &queued_bytes, msg)
-                    .await
-                    .is_err()
-                {
+                if send_outbox_tracked(&tx, &queued_frames, &queued_bytes, msg).is_err() {
                     break;
                 }
             }
@@ -3634,6 +3851,22 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.display_fps = fps;
                 }
+                // Advertise the highest refresh rate across all clients
+                // to the compositor so Wayland apps render at full speed.
+                let max_fps = sess
+                    .clients
+                    .values()
+                    .map(|c| c.display_fps)
+                    .fold(0.0f32, f32::max);
+                let mhz = (max_fps * 1000.0).round() as u32;
+                if mhz > 0
+                    && let Some(cs) = &sess.compositor
+                {
+                    let _ = cs
+                        .handle
+                        .command_tx
+                        .send(blit_compositor::CompositorCommand::SetRefreshRate { mhz });
+                }
             }
             nudge_delivery(&state);
             continue;
@@ -3729,7 +3962,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .then_with(|| a.pty_id.cmp(&b.pty_id))
             });
             if let Some(client) = sess.clients.get_mut(&client_id) {
-                let _ = try_send_outbox(client, build_search_results_msg(request_id, &ranked));
+                let _ = send_outbox(client, build_search_results_msg(request_id, &ranked));
             }
             continue;
         }
@@ -3820,10 +4053,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
             if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
                 eprintln!("[capture] sending reply: {} bytes", reply_msg.len());
-                match try_send_outbox_tracked(&client_tx, &queued_frames, &queued_bytes, reply_msg)
-                {
+                match send_outbox_tracked(&client_tx, &queued_frames, &queued_bytes, reply_msg) {
                     Ok(()) => eprintln!("[capture] sent OK"),
-                    Err(e) => eprintln!("[capture] try_send failed: {e}"),
+                    Err(e) => eprintln!("[capture] send failed: {e}"),
                 }
             } else {
                 eprintln!("[capture] no client_tx");
@@ -3933,13 +4165,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pulse_server = sess.pulse_server_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pulse_server: Option<String> = None;
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pipewire_remote = sess.pipewire_remote_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -4025,13 +4257,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pulse_server = sess.pulse_server_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pulse_server: Option<String> = None;
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pipewire_remote = sess.pipewire_remote_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -4065,11 +4297,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         c.view_sizes.insert(id, (rows, cols));
                         subscribe_client_to(c, id);
                         reset_inflight(c);
-                        let _ = try_send_outbox(c, nonce_msg);
+                        let _ = send_outbox(c, nonce_msg);
                     }
                     for (&cid, c) in sess.clients.iter() {
                         if cid != client_id {
-                            let _ = try_send_outbox(c, broadcast_msg.clone());
+                            let _ = send_outbox(c, broadcast_msg.clone());
                         }
                     }
                     need_nudge = true;
@@ -4112,13 +4344,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pulse_server = sess.pulse_server_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pulse_server: Option<String> = None;
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pipewire_remote = sess.pipewire_remote_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -4196,13 +4428,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &config.vaapi_device,
                     )
                     .to_string();
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pulse_server = sess.pulse_server_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pulse_server: Option<String> = None;
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let pipewire_remote = sess.pipewire_remote_path();
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
                 if let Some(pty) = pty::spawn_pty(
                     &config.shell,
@@ -4236,11 +4468,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         c.view_sizes.insert(id, (rows, cols));
                         subscribe_client_to(c, id);
                         reset_inflight(c);
-                        let _ = try_send_outbox(c, nonce_msg);
+                        let _ = send_outbox(c, nonce_msg);
                     }
                     for (&cid, c) in sess.clients.iter() {
                         if cid != client_id {
-                            let _ = try_send_outbox(c, broadcast_msg.clone());
+                            let _ = send_outbox(c, broadcast_msg.clone());
                         }
                     }
                     need_nudge = true;
@@ -4387,6 +4619,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         "C2S_SURFACE_SUBSCRIBE: cid={client_id} surface={surface_id} codec={codec_support:#04x} quality={quality_wire}"
                     );
                 }
+                let mut destroy_vulkan_enc_sid = None;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     let was_subscribed = !c.surface_subscriptions.insert(surface_id);
                     c.surface_needs_keyframe = true;
@@ -4418,24 +4651,65 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     if was_subscribed && (codec_support != old_codec || new_quality != old_quality)
                     {
                         c.surface_encoders.remove(&surface_id);
+                        // Also destroy Vulkan Video encoder so it gets
+                        // recreated with updated codec/quality settings.
+                        if c.vulkan_video_surfaces.remove(&surface_id).is_some() {
+                            destroy_vulkan_enc_sid = Some(surface_id);
+                        }
+                        // If the encoder is currently in a spawn_blocking
+                        // encode task, the remove above is a no-op.  Mark
+                        // the surface so the completion handler knows not
+                        // to reinsert the stale encoder.
+                        if c.surface_encodes_in_flight.contains(&surface_id) {
+                            c.surface_encoder_invalidated.insert(surface_id);
+                        }
                     }
+                }
+                // Send Vulkan encoder destroy outside the client borrow.
+                if let Some(sid) = destroy_vulkan_enc_sid
+                    && let Some(cs) = sess.compositor.as_ref()
+                {
+                    let _ = cs.handle.command_tx.send(
+                        blit_compositor::CompositorCommand::DestroyVulkanEncoder {
+                            surface_id: sid as u32,
+                        },
+                    );
+                    cs.handle.wake();
                 }
                 state.delivery_notify.notify_one();
             }
             C2S_SURFACE_UNSUBSCRIBE if data.len() >= 3 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let mut removed_vulkan = false;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.surface_subscriptions.remove(&surface_id);
                     c.surface_view_sizes.remove(&surface_id);
                     c.surface_codec_overrides.remove(&surface_id);
                     c.surface_quality_overrides.remove(&surface_id);
+                    c.surface_encoder_invalidated.remove(&surface_id);
+                    removed_vulkan = c.vulkan_video_surfaces.remove(&surface_id).is_some();
+                }
+                // Destroy Vulkan Video encoder if no remaining client needs it.
+                if removed_vulkan {
+                    let still_needed = sess
+                        .clients
+                        .values()
+                        .any(|other| other.vulkan_video_surfaces.contains_key(&surface_id));
+                    if !still_needed && let Some(cs) = sess.compositor.as_ref() {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::DestroyVulkanEncoder {
+                                surface_id: surface_id as u32,
+                            },
+                        );
+                        cs.handle.wake();
+                    }
                 }
                 sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
                 );
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             C2S_AUDIO_SUBSCRIBE if data.len() >= 3 => {
                 let bitrate_kbps = u16::from_le_bytes([data[1], data[2]]);
                 if let Some(c) = sess.clients.get_mut(&client_id) {
@@ -4453,7 +4727,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         let msgs: Vec<_> = ap.ring_frames().map(audio::msg_audio_frame).collect();
                         if let Some(c) = sess.clients.get(&client_id) {
                             for msg in msgs {
-                                let _ = c.audio_tx.try_send(msg);
+                                let _ = c.audio_tx.send(msg);
                             }
                         }
                     }
@@ -4479,7 +4753,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 state.delivery_notify.notify_one();
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             C2S_AUDIO_UNSUBSCRIBE if !data.is_empty() => {
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.audio_subscribed = false;
@@ -4570,7 +4844,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 .is_ok()
                                 && let Ok(mimes) = rx.recv_timeout(Duration::from_secs(2))
                             {
-                                let _ = try_send_outbox_tracked(
+                                let _ = send_outbox_tracked(
                                     &client_tx,
                                     &queued_frames,
                                     &queued_bytes,
@@ -4582,7 +4856,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     // No compositor — respond with empty list.
                     if let Some(c) = sess.clients.get(&client_id) {
-                        let _ = try_send_outbox(c, msg_s2c_clipboard_list(&[]));
+                        let _ = send_outbox(c, msg_s2c_clipboard_list(&[]));
                     }
                 }
             }
@@ -4613,7 +4887,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     && let Ok(content) = rx.recv_timeout(Duration::from_secs(2))
                                 {
                                     let data = content.unwrap_or_default();
-                                    let _ = try_send_outbox_tracked(
+                                    let _ = send_outbox_tracked(
                                         &client_tx,
                                         &queued_frames,
                                         &queued_bytes,
@@ -4625,7 +4899,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     } else {
                         // No compositor — respond with empty clipboard.
                         if let Some(c) = sess.clients.get(&client_id) {
-                            let _ = try_send_outbox(c, msg_s2c_clipboard_content(&mime, &[]));
+                            let _ = send_outbox(c, msg_s2c_clipboard_content(&mime, &[]));
                         }
                     }
                 }
@@ -4633,7 +4907,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             C2S_SURFACE_LIST if !data.is_empty() => {
                 let msg = sess.surface_list_msg();
                 if let Some(c) = sess.clients.get(&client_id) {
-                    let _ = try_send_outbox(c, msg);
+                    let _ = send_outbox(c, msg);
                 }
             }
             C2S_FOCUS if data.len() >= 3 => {
@@ -4694,13 +4968,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .compositor
                         .as_ref()
                         .map(|cs| cs.handle.socket_name.clone());
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     let pulse_server = sess.pulse_server_path();
-                    #[cfg(not(unix))]
+                    #[cfg(not(target_os = "linux"))]
                     let pulse_server: Option<String> = None;
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     let pipewire_remote = sess.pipewire_remote_path();
-                    #[cfg(not(unix))]
+                    #[cfg(not(target_os = "linux"))]
                     let pipewire_remote: Option<String> = None;
                     if let Some((new_handle, reader, byte_rx)) = pty::respawn_child(
                         &state.config.shell,
@@ -4818,7 +5092,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     msg.extend_from_slice(&(start as u32).to_le_bytes());
                     msg.extend_from_slice(text.as_bytes());
                     if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = try_send_outbox(client, msg);
+                        let _ = send_outbox(client, msg);
                     }
                 }
             }
@@ -4844,7 +5118,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     msg.extend_from_slice(&start_tail.to_le_bytes());
                     msg.extend_from_slice(text.as_bytes());
                     if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = try_send_outbox(client, msg);
+                        let _ = send_outbox(client, msg);
                     }
                 }
             }
@@ -4911,6 +5185,28 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 .send(CompositorCommand::ReleaseKeys { keycodes });
             cs.handle.wake();
         }
+        // Destroy Vulkan Video encoders for surfaces that no remaining
+        // client needs.
+        if let Some(ref client) = client
+            && !client.vulkan_video_surfaces.is_empty()
+            && let Some(cs) = sess.compositor.as_ref()
+        {
+            for &sid in client.vulkan_video_surfaces.keys() {
+                let still_needed = sess
+                    .clients
+                    .values()
+                    .any(|c| c.vulkan_video_surfaces.contains_key(&sid));
+                if !still_needed {
+                    let _ = cs
+                        .handle
+                        .command_tx
+                        .send(CompositorCommand::DestroyVulkanEncoder {
+                            surface_id: sid as u32,
+                        });
+                }
+            }
+            cs.handle.wake();
+        }
         drop(sess);
         if need_nudge {
             nudge_delivery(&state);
@@ -4926,9 +5222,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 mod tests {
     use super::*;
 
-    fn test_client_with_capacity(capacity: usize) -> (ClientState, mpsc::Receiver<Vec<u8>>) {
-        let (tx, rx) = mpsc::channel(capacity);
-        let (audio_tx, _audio_rx) = mpsc::channel(AUDIO_OUTBOX_CAPACITY);
+    fn test_client_with_capacity(
+        _capacity: usize,
+    ) -> (ClientState, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
         let client = ClientState {
             tx,
             outbox_queued_frames: Arc::new(AtomicUsize::new(0)),
@@ -4938,7 +5236,7 @@ mod tests {
             subscriptions: HashSet::new(),
             surface_subscriptions: HashSet::new(),
             audio_subscribed: false,
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             audio_bitrate_kbps: 0,
             view_sizes: HashMap::new(),
             scroll_offsets: HashMap::new(),
@@ -4976,7 +5274,9 @@ mod tests {
             surface_burst_remaining: SURFACE_BURST_FRAMES,
             surface_inflight_frames: VecDeque::new(),
             surface_encoders: HashMap::new(),
+            vulkan_video_surfaces: HashMap::new(),
             surface_encodes_in_flight: HashSet::new(),
+            surface_encoder_invalidated: HashSet::new(),
             surface_last_encoded_gen: HashMap::new(),
             surface_view_sizes: HashMap::new(),
             surface_codec_support: 0,
@@ -4988,7 +5288,7 @@ mod tests {
     }
 
     fn test_client() -> ClientState {
-        let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
+        let (client, _rx) = test_client_with_capacity(0);
         client
     }
 
@@ -5369,27 +5669,27 @@ mod tests {
 
     #[test]
     fn outbox_backpressured_when_queue_full() {
-        let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
+        let (client, _rx) = test_client_with_capacity(0);
         // Fill the channel to trigger backpressure
         for _ in 0..OUTBOX_SOFT_QUEUE_LIMIT_FRAMES {
-            let _ = try_send_outbox(&client, vec![0u8]);
+            let _ = send_outbox(&client, vec![0u8]);
         }
         assert!(outbox_backpressured(&client));
     }
 
     #[test]
     fn outbox_not_backpressured_by_small_frames_under_byte_budget() {
-        let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
+        let (client, _rx) = test_client_with_capacity(0);
         for _ in 0..(OUTBOX_SOFT_QUEUE_LIMIT_FRAMES - 1) {
-            let _ = try_send_outbox(&client, vec![0u8; 512]);
+            let _ = send_outbox(&client, vec![0u8; 512]);
         }
         assert!(!outbox_backpressured(&client));
     }
 
     #[test]
     fn outbox_backpressured_by_large_queued_bytes() {
-        let (client, _rx) = test_client_with_capacity(OUTBOX_CAPACITY);
-        let _ = try_send_outbox(&client, vec![0u8; OUTBOX_SOFT_QUEUE_LIMIT_BYTES]);
+        let (client, _rx) = test_client_with_capacity(0);
+        let _ = send_outbox(&client, vec![0u8; OUTBOX_SOFT_QUEUE_LIMIT_BYTES]);
         assert!(outbox_backpressured(&client));
     }
 
@@ -6664,11 +6964,12 @@ mod tests {
     }
 
     #[test]
-    fn try_send_backpressured() {
-        let (mut client, _rx) = test_client_with_capacity(1);
+    fn try_send_backpressured_on_disconnect() {
+        let (mut client, rx) = test_client_with_capacity(0);
         let frame = sample_frame("x");
         let now = Instant::now();
-        let _ = try_send_outbox(&client, vec![0]);
+        // Drop the receiver to simulate a disconnected client.
+        drop(rx);
         let outcome = try_send_update(
             &mut client,
             1,
@@ -6680,7 +6981,7 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Backpressured));
         assert!(
             client.last_sent.contains_key(&1),
-            "last_sent should advance even on backpressure"
+            "last_sent should advance even on disconnect"
         );
     }
 }

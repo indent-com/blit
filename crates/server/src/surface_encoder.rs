@@ -9,6 +9,8 @@ use openh264::formats::YUVBuffer;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SurfaceEncoderPreference {
+    VulkanVideoH264,
+    VulkanVideoAV1,
     H264Software,
     H264Vaapi,
     AV1Vaapi,
@@ -27,6 +29,8 @@ const H264_MAX_HEIGHT: u16 = 2160;
 impl SurfaceEncoderPreference {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
+            "h264-vulkan" => Some(Self::VulkanVideoH264),
+            "av1-vulkan" => Some(Self::VulkanVideoAV1),
             "h264-software" | "software" => Some(Self::H264Software),
             "h264-vaapi" | "vaapi" => Some(Self::H264Vaapi),
             "av1-vaapi" => Some(Self::AV1Vaapi),
@@ -62,6 +66,10 @@ impl SurfaceEncoderPreference {
             return list;
         }
         vec![
+            // Vulkan Video encoders are not yet stable — enable via
+            // BLIT_SURFACE_ENCODERS=av1-vulkan,h264-vulkan,...
+            // Self::VulkanVideoAV1,
+            // Self::VulkanVideoH264,
             Self::NvencAV1,
             Self::NvencH264,
             Self::AV1Vaapi,
@@ -78,10 +86,10 @@ impl SurfaceEncoderPreference {
             return true;
         }
         match self {
-            Self::H264Software | Self::H264Vaapi | Self::NvencH264 => {
+            Self::H264Software | Self::H264Vaapi | Self::NvencH264 | Self::VulkanVideoH264 => {
                 codec_support & CODEC_SUPPORT_H264 != 0
             }
-            Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 => {
+            Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 | Self::VulkanVideoAV1 => {
                 codec_support & CODEC_SUPPORT_AV1 != 0
             }
         }
@@ -91,10 +99,10 @@ impl SurfaceEncoderPreference {
     /// Returns `None` if there is no practical limit.
     pub fn max_dimensions(self) -> Option<(u16, u16)> {
         match self {
-            Self::H264Software | Self::H264Vaapi | Self::NvencH264 => {
+            Self::H264Software | Self::H264Vaapi | Self::NvencH264 | Self::VulkanVideoH264 => {
                 Some((H264_MAX_WIDTH, H264_MAX_HEIGHT))
             }
-            Self::AV1Vaapi | Self::NvencAV1 | Self::AV1Software => None,
+            Self::AV1Vaapi | Self::NvencAV1 | Self::AV1Software | Self::VulkanVideoAV1 => None,
         }
     }
 
@@ -111,23 +119,54 @@ impl SurfaceEncoderPreference {
         }
         result
     }
+
+    /// Whether this encoder runs in the compositor via Vulkan Video.
+    pub fn is_vulkan_video(self) -> bool {
+        matches!(self, Self::VulkanVideoH264 | Self::VulkanVideoAV1)
+    }
+
+    /// Vulkan Video codec byte: 0x01 = H.264, 0x02 = AV1.
+    pub fn vulkan_codec(self) -> u8 {
+        match self {
+            Self::VulkanVideoAV1 => 0x02,
+            _ => 0x01,
+        }
+    }
+
+    /// Codec flag matching `SURFACE_FRAME_CODEC_*` constants.
+    pub fn codec_flag(self) -> u8 {
+        match self {
+            Self::H264Software | Self::H264Vaapi | Self::NvencH264 | Self::VulkanVideoH264 => {
+                SURFACE_FRAME_CODEC_H264
+            }
+            Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 | Self::VulkanVideoAV1 => {
+                SURFACE_FRAME_CODEC_AV1
+            }
+        }
+    }
 }
 
-/// Video quality preset.  Higher quality uses more CPU.
+/// Video quality preset.  Higher quality uses more CPU / bandwidth.
 ///
 /// - **Low**: speed 10, quantizer 180 — minimal CPU, visibly lossy
 /// - **Medium** (default): speed 10, quantizer 120 — good balance
 /// - **High**: speed 8, quantizer 80 — sharp, noticeable CPU use
-/// - **Lossless-ish**: speed 6, quantizer 40 — near-lossless, heavy CPU
+/// - **Ultra**: speed 6, quantizer 1 — near-lossless, heavy CPU
+/// - **Custom**: caller-specified AV1 quantizer (10–255)
 ///
-/// Set via `BLIT_SURFACE_QUALITY=low|medium|high|lossless`.
+/// Set via `BLIT_SURFACE_QUALITY=low|medium|high|ultra`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SurfaceQuality {
     Low,
     #[default]
     Medium,
     High,
-    Lossless,
+    Ultra,
+    /// Caller-specified AV1 quantizer (10–255).  H.264 QP, encoder speed,
+    /// and software-encoder bitrate are derived proportionally.
+    Custom {
+        quantizer: u8,
+    },
 }
 
 impl SurfaceQuality {
@@ -136,19 +175,24 @@ impl SurfaceQuality {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "lossless" => Some(Self::Lossless),
+            "ultra" | "lossless" => Some(Self::Ultra),
             _ => None,
         }
     }
 
     /// Decode from the wire `quality` byte in C2S_SURFACE_SUBSCRIBE.
-    /// Returns `None` for 0 (server default) or unknown values.
+    ///
+    /// - 0 → `None` (server default)
+    /// - 1–4 → named presets
+    /// - 10–255 → `Custom { quantizer: value }`
+    /// - 5–9 → reserved, treated as server default
     pub fn from_wire(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Low),
             2 => Some(Self::Medium),
             3 => Some(Self::High),
-            4 => Some(Self::Lossless),
+            4 => Some(Self::Ultra),
+            v @ 10..=255 => Some(Self::Custom { quantizer: v }),
             _ => None,
         }
     }
@@ -159,27 +203,39 @@ impl SurfaceQuality {
             Self::Low => 10,
             Self::Medium => 10,
             Self::High => 8,
-            Self::Lossless => 6,
+            Self::Ultra => 6,
+            Self::Custom { quantizer } => {
+                if quantizer <= 40 {
+                    6
+                } else if quantizer <= 80 {
+                    8
+                } else {
+                    10
+                }
+            }
         }
     }
 
-    /// rav1e quantizer (0 = lossless, 255 = worst).
+    /// AV1 quantizer (0 = lossless, 255 = worst).
+    /// Also used as VA-API `base_qindex` and NVENC AV1 QP.
     fn av1_quantizer(self) -> usize {
         match self {
             Self::Low => 180,
             Self::Medium => 120,
             Self::High => 80,
-            Self::Lossless => 40,
+            Self::Ultra => 1,
+            Self::Custom { quantizer } => quantizer as usize,
         }
     }
 
-    /// rav1e min_quantizer.
+    /// rav1e min_quantizer — floor the encoder is allowed to improve to.
     fn av1_min_quantizer(self) -> u8 {
         match self {
             Self::Low => 120,
             Self::Medium => 80,
             Self::High => 40,
-            Self::Lossless => 0,
+            Self::Ultra => 0,
+            Self::Custom { quantizer } => quantizer.saturating_sub(40),
         }
     }
 
@@ -190,7 +246,8 @@ impl SurfaceQuality {
             Self::Low => 35,
             Self::Medium => 28,
             Self::High => 20,
-            Self::Lossless => 10,
+            Self::Ultra => 10,
+            Self::Custom { quantizer } => ((quantizer as u32) * 51 / 255).min(51) as u8,
         }
     }
 
@@ -200,6 +257,12 @@ impl SurfaceQuality {
         self.av1_quantizer() as u32
     }
 
+    /// AV1 QP for Vulkan Video encode (0 = best, 255 = worst).
+    /// Same base_qindex scale as VA-API / NVENC.
+    pub fn av1_qp_for_vulkan(self) -> u8 {
+        self.av1_quantizer().min(255) as u8
+    }
+
     /// openh264 target bitrate in bits/sec.  Resolution-independent
     /// approximation — openh264 adapts internally.
     fn openh264_bitrate(self) -> u32 {
@@ -207,7 +270,12 @@ impl SurfaceQuality {
             Self::Low => 500_000,
             Self::Medium => 2_000_000,
             Self::High => 8_000_000,
-            Self::Lossless => 20_000_000,
+            Self::Ultra => 20_000_000,
+            Self::Custom { quantizer } => {
+                // Linear interpolation: quantizer 0 → 20 Mbps, 255 → 500 kbps.
+                let q = quantizer as u32;
+                20_000_000 - q * (20_000_000 - 500_000) / 255
+            }
         }
     }
 }
@@ -251,6 +319,10 @@ impl SurfaceEncoder {
         let mut last_err = String::from("no encoders configured");
 
         for &pref in preferences {
+            // Vulkan Video encoders live in the compositor, not in SurfaceEncoder.
+            if pref.is_vulkan_video() {
+                continue;
+            }
             if !pref.supported_by_client(codec_support) {
                 continue;
             }
@@ -301,6 +373,10 @@ impl SurfaceEncoder {
         validate_surface_dimensions(width, height, pref)?;
 
         match pref {
+            SurfaceEncoderPreference::VulkanVideoH264
+            | SurfaceEncoderPreference::VulkanVideoAV1 => {
+                Err("Vulkan Video encoders are managed by the compositor".into())
+            }
             SurfaceEncoderPreference::NvencH264 => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
                 let qp = quality.h264_qp() as u32;
@@ -407,6 +483,12 @@ impl SurfaceEncoder {
         (self.source_width, self.source_height)
     }
 
+    /// The encoder's padded dimensions (may be larger than source due to
+    /// alignment requirements, e.g. AV1 64-pixel superblock alignment).
+    pub fn encoder_dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// Human-readable name of the active encoder backend, sent to clients
     /// for display in debug panels.
     pub fn encoder_name(&self) -> &'static str {
@@ -450,18 +532,55 @@ impl SurfaceEncoder {
         }
     }
 
-    /// Export VPP's pre-allocated BGRA surfaces (if available).
+    /// Get GBM-allocated LINEAR BGRA buffers for zero-copy compositor→encoder.
     #[cfg(target_os = "linux")]
-    pub fn export_vpp_surfaces(&self) -> Vec<crate::vaapi_encode::ExportedVaSurface> {
+    pub fn gbm_buffers(&self) -> &[crate::vaapi_encode::GbmExportedBuffer] {
         match &self.kind {
-            SurfaceEncoderKind::H264Vaapi(enc) => enc.export_vpp_surfaces(),
-            SurfaceEncoderKind::AV1Vaapi(enc) => enc.export_vpp_surfaces(),
-            _ => Vec::new(),
+            SurfaceEncoderKind::H264Vaapi(enc) => enc.gbm_buffers(),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.gbm_buffers(),
+            _ => &[],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn gbm_nv12_buffers(&self) -> &[crate::vaapi_encode::GbmNv12Buffer] {
+        match &self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => enc.gbm_nv12_buffers(),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc.gbm_nv12_buffers(),
+            _ => &[],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn allocate_nv12_buffers(&mut self, drm_fd: std::os::fd::RawFd, count: usize) {
+        match &mut self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => {
+                if let Some(vpp) = &mut enc.vpp {
+                    vpp.allocate_nv12_buffers(drm_fd, count);
+                }
+            }
+            SurfaceEncoderKind::AV1Vaapi(enc) => {
+                if let Some(vpp) = &mut enc.vpp {
+                    vpp.allocate_nv12_buffers(drm_fd, count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn drm_fd_raw(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match &self.kind {
+            SurfaceEncoderKind::H264Vaapi(enc) => enc._drm_fd.as_raw_fd(),
+            SurfaceEncoderKind::AV1Vaapi(enc) => enc._drm_fd.as_raw_fd(),
+            _ => -1,
         }
     }
 
     /// Get VA display pointer (as usize).
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub fn va_display_usize(&self) -> usize {
         match &self.kind {
             SurfaceEncoderKind::H264Vaapi(enc) => enc.va_display_usize(),
@@ -593,18 +712,95 @@ impl SurfaceEncoder {
             #[cfg(not(target_os = "linux"))]
             PixelData::DmaBuf { .. } => None,
             #[cfg(target_os = "linux")]
-            PixelData::VaSurface { surface_id, .. } => self.encode_va_surface(*surface_id),
+            PixelData::Nv12DmaBuf {
+                fd,
+                stride,
+                uv_offset,
+                width,
+                height,
+                sync_fd,
+            } => {
+                // If the compositor exported a sync_fd (tiled NV12 on radv),
+                // wait for the GPU to finish the BGRA→NV12 compute before
+                // reading.  This runs in spawn_blocking so blocking is fine.
+                if let Some(sfd) = sync_fd {
+                    use std::os::fd::AsRawFd;
+                    let mut pfd = libc::pollfd {
+                        fd: sfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 5000) };
+                }
+                self.encode_nv12_dmabuf(fd, *stride, *uv_offset, *width, *height)
+            }
+            .or_else(|| {
+                // VA surface lookup failed — mmap the DMA-BUF and
+                // fall back to encode_nv12 (upload path).
+                use std::os::fd::AsRawFd;
+                let h = *height as usize;
+                let s = *stride as usize;
+                let uv_off = *uv_offset as usize;
+                let raw = fd.as_raw_fd();
+                let map_size = uv_off + s * h.div_ceil(2);
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        map_size,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        raw,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED || ptr.is_null() {
+                    return None;
+                }
+                let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_size) };
+                let result = self.encode_nv12(data, s, s);
+                unsafe { libc::munmap(ptr, map_size) };
+                result
+            }),
             #[cfg(not(target_os = "linux"))]
+            PixelData::Nv12DmaBuf { .. } => None,
             PixelData::VaSurface { .. } => None,
+            // Vulkan Video pre-encoded — should be handled before reaching
+            // SurfaceEncoder.  If it gets here, we can't re-encode.
+            PixelData::Encoded { .. } => None,
         }
     }
 
-    /// Encode from a pre-allocated VA-API surface (true zero-copy path).
+    /// Encode from a VA-API-allocated NV12 surface (zero-copy).
+    /// The compute shader wrote NV12 into the exported DMA-BUF; we look up
+    /// the owning VA surface by inode and encode directly — no PRIME import.
     #[cfg(target_os = "linux")]
-    fn encode_va_surface(&mut self, surface_id: u32) -> Option<(Vec<u8>, bool)> {
+    fn encode_nv12_dmabuf(
+        &mut self,
+        fd: &std::sync::Arc<std::os::fd::OwnedFd>,
+        _stride: u32,
+        _uv_offset: u32,
+        _width: u32,
+        _height: u32,
+    ) -> Option<(Vec<u8>, bool)> {
+        use std::os::fd::AsRawFd;
+        let raw_fd = fd.as_raw_fd();
+        let find_surface = |nv12s: &[crate::vaapi_encode::GbmNv12Buffer]| -> Option<u32> {
+            let buf = nv12s.iter().find(|n| n.fd.as_raw_fd() == raw_fd)?;
+            // va_surface==0 means GBM fallback — no direct encode, use mmap.
+            if buf.va_surface == 0 {
+                return None;
+            }
+            Some(buf.va_surface)
+        };
         let mut result = match &mut self.kind {
-            SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_va_surface(surface_id),
-            SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_va_surface(surface_id),
+            SurfaceEncoderKind::AV1Vaapi(enc) => {
+                let surf = find_surface(enc.gbm_nv12_buffers())?;
+                enc.encode_surface(surf)
+            }
+            SurfaceEncoderKind::H264Vaapi(enc) => {
+                let surf = find_surface(enc.gbm_nv12_buffers())?;
+                enc.encode_surface(surf)
+            }
             _ => None,
         };
         self.fixup_keyframe(&mut result);
@@ -629,26 +825,10 @@ impl SurfaceEncoder {
         let src_w = self.source_width;
         let src_h = self.source_height;
 
-        // --- Zero-copy GPU path (VA-API VPP / NVENC CUDA import) ---
+        // --- Zero-copy GPU path (NVENC CUDA import) ---
+        // VA-API encode uses the Nv12DmaBuf path instead (compute shader
+        // writes NV12 into VA-API-exported surfaces, no PRIME import).
         let mut gpu_result = match &mut self.kind {
-            SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_dmabuf_fd(
-                fd.as_raw_fd(),
-                fourcc,
-                modifier,
-                stride,
-                offset,
-                src_w,
-                src_h,
-            ),
-            SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_dmabuf_fd(
-                fd.as_raw_fd(),
-                fourcc,
-                modifier,
-                stride,
-                offset,
-                src_w,
-                src_h,
-            ),
             SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => enc
                 .encode_dmabuf_fd(
                     fd.as_raw_fd(),

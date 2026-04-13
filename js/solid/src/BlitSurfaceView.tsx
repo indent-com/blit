@@ -68,7 +68,9 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
   // Observe container size and request a server-side resize when resizable.
   // The canvas resolution is set immediately via setDisplaySize so there is
   // no CSS-scaling gap while waiting for the Wayland app to resize.
-  // The server resize request is debounced to avoid flooding.
+  // The server resize request is debounced to avoid flooding the compositor
+  // with redundant configure cycles and encoder recreations during a
+  // drag-resize.
   createEffect(() => {
     const s = mounted();
     if (!props.resizable || !s) return;
@@ -76,12 +78,28 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     const dprToScale120 = () => Math.round(devicePixelRatio * 120);
     detectCodecSupport();
 
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    let hasSentInitial = false;
+    const RESIZE_DEBOUNCE_MS = 80;
+
     const applySize = (cssW: number, cssH: number) => {
       const w = Math.round(cssW * devicePixelRatio);
       const h = Math.round(cssH * devicePixelRatio);
       if (w <= 0 || h <= 0) return;
       s.setDisplaySize(w, h);
-      s.requestResize(w, h, dprToScale120());
+      if (!hasSentInitial) {
+        // First resize: send immediately so the Wayland client
+        // gets its configure without the debounce delay.
+        hasSentInitial = true;
+        s.requestResize(w, h, dprToScale120());
+      } else {
+        // Subsequent resizes (drag-resize): debounce to avoid
+        // flooding configure -> repaint -> encode -> keyframe.
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          s.requestResize(w, h, dprToScale120());
+        }, RESIZE_DEBOUNCE_MS);
+      }
     };
 
     const ro = new ResizeObserver((entries) => {
@@ -100,6 +118,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     }
 
     onCleanup(() => {
+      clearTimeout(resizeTimer);
       ro.disconnect();
       s.setDisplaySize(null);
     });

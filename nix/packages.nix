@@ -23,13 +23,12 @@
 
       # Runtime library search path for blit server's dlopen GPU backends.
       #   pkgs.libva           → libva.so.2, libva-drm.so.2
-      #   pkgs.libglvnd        → libEGL.so.1, libGLESv2.so.2 (GLVND dispatch)
-      #   pkgs.libgbm           → libgbm.so.1
+      #   pkgs.libgbm          → libgbm.so.1
+      #   pkgs.vulkan-loader   → libvulkan.so.1 (Vulkan dispatch)
       #   addDriverRunpath     → /run/opengl-driver  (libcuda, libnvidia-encode,
-      #                          Mesa VA-API / EGL drivers, etc.)
+      #                          Mesa VA-API / Vulkan drivers, etc.)
       gpuRuntimeLibPath = pkgs.lib.optionalString serverVaapiEnabled (
         pkgs.lib.makeLibraryPath [
-          pkgs.libglvnd
           pkgs.libva
           pkgs.libgbm
           pkgs.vulkan-loader
@@ -303,10 +302,10 @@
         text = ''
           arch="''${1:?usage: push-demo <amd64|arm64> [version]}"
           version="''${2:-}"
-          skopeo --policy ${skopeoPolicy} login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
-          skopeo --policy ${skopeoPolicy} copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:latest-$arch"
+          creds="$DOCKERHUB_USERNAME:$DOCKERHUB_TOKEN"
+          skopeo --policy ${skopeoPolicy} copy --dest-creds "$creds" "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:latest-$arch"
           if [[ "$version" != "" ]]; then
-            skopeo --policy ${skopeoPolicy} copy "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:$version-$arch"
+            skopeo --policy ${skopeoPolicy} copy --dest-creds "$creds" "docker-archive:${demoImage}" "docker://docker.io/grab/blit-demo:$version-$arch"
           fi
         '';
       };

@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.24.0";
+  version = "0.24.1";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
@@ -65,7 +65,6 @@ let
     ]
     ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
       pkgs.ffmpeg-headless
-      pkgs.libglvnd # EGL / GLESv2 dispatch
       pkgs.libva
       pkgs.libgbm # libgbm for GBM device / buffer allocation
       pkgs.vulkan-loader # libvulkan.so.1 for Vulkan compositor renderer
