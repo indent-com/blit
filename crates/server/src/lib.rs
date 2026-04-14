@@ -1822,6 +1822,19 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
         let params = &data[param_start..i];
         i += 1;
         if has_q {
+            // DECRQM: CSI ? {mode} $ p → respond DECRPM "not recognized"
+            // The parser consumed `$` as final_byte; check for trailing `p`.
+            if final_byte == b'$' && i < data.len() && data[i] == b'p' {
+                i += 1;
+                if let Ok(mode_str) = std::str::from_utf8(params) {
+                    // Respond: CSI ? {mode} ; 0 $ y  (0 = not recognized)
+                    results.push(format!("\x1b[?{mode_str};0$y"));
+                }
+            }
+            // Kitty keyboard query: CSI ? u → respond with no enhancements
+            else if final_byte == b'u' && params.is_empty() {
+                results.push("\x1b[?0u".into());
+            }
             continue;
         }
         let resp: Option<String> = match final_byte {
@@ -6484,6 +6497,61 @@ mod tests {
     fn parse_tq_question_mark_sequences_skipped() {
         let results = parse_terminal_queries(b"\x1b[?1h", (24, 80), (0, 0));
         assert!(results.is_empty());
+    }
+
+    // ── parse_terminal_queries: DECRQM ──
+
+    #[test]
+    fn parse_tq_decrqm_mode_2026() {
+        // Synchronized output: CSI ? 2026 $ p
+        let results = parse_terminal_queries(b"\x1b[?2026$p", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[?2026;0$y");
+    }
+
+    #[test]
+    fn parse_tq_decrqm_mode_2027() {
+        // Unicode core: CSI ? 2027 $ p
+        let results = parse_terminal_queries(b"\x1b[?2027$p", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[?2027;0$y");
+    }
+
+    #[test]
+    fn parse_tq_decrqm_multiple() {
+        // Bubbletea sends both queries back-to-back on startup
+        let results = parse_terminal_queries(b"\x1b[?2026$p\x1b[?2027$p", (24, 80), (0, 0));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], "\x1b[?2026;0$y");
+        assert_eq!(results[1], "\x1b[?2027;0$y");
+    }
+
+    #[test]
+    fn parse_tq_decrqm_without_trailing_p_skipped() {
+        // CSI ? 2026 $ (missing p) — should not generate a response
+        let results = parse_terminal_queries(b"\x1b[?2026$", (24, 80), (0, 0));
+        assert!(results.is_empty());
+    }
+
+    // ── parse_terminal_queries: Kitty keyboard ──
+
+    #[test]
+    fn parse_tq_kitty_keyboard_query() {
+        // CSI ? u — query kitty keyboard protocol flags
+        let results = parse_terminal_queries(b"\x1b[?u", (24, 80), (0, 0));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "\x1b[?0u");
+    }
+
+    #[test]
+    fn parse_tq_decrqm_mixed_with_other_queries() {
+        // DECRQM + DA1 + Kitty keyboard
+        let data = b"\x1b[?2026$p\x1b[c\x1b[?u";
+        let results = parse_terminal_queries(data, (24, 80), (0, 0));
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], "\x1b[?2026;0$y");
+        assert!(results[1].starts_with("\x1b[?64;"));
+        assert_eq!(results[2], "\x1b[?0u");
     }
 
     #[test]
