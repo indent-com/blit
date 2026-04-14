@@ -1306,7 +1306,7 @@ impl Session {
         gpu_device: &str,
     ) -> &str {
         if self.compositor.is_none() {
-            let session_id = self.next_compositor_id;
+            let _session_id = self.next_compositor_id;
             self.next_compositor_id = self.next_compositor_id.wrapping_add(1);
             // Create the epoch before spawning anything so audio and video
             // share the same time origin for A/V sync.

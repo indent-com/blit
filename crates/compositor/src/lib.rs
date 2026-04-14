@@ -45,6 +45,14 @@ mod stub {
             stride: u32,
             offset: u32,
         },
+        Nv12DmaBuf {
+            fd: Arc<OwnedFd>,
+            stride: u32,
+            uv_offset: u32,
+            width: u32,
+            height: u32,
+            sync_fd: Option<Arc<OwnedFd>>,
+        },
         VaSurface {
             surface_id: u32,
             va_display: usize,
@@ -76,7 +84,9 @@ mod stub {
             match self {
                 PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
                 PixelData::Nv12 { data, .. } => data.is_empty(),
-                PixelData::DmaBuf { .. } | PixelData::VaSurface { .. } => false,
+                PixelData::DmaBuf { .. }
+                | PixelData::VaSurface { .. }
+                | PixelData::Nv12DmaBuf { .. } => false,
                 PixelData::Encoded { data, .. } => data.is_empty(),
             }
         }
@@ -214,7 +224,28 @@ mod stub {
             surface_id: u16,
         },
         SetExternalOutputBuffers {
+            surface_id: u32,
             buffers: Vec<ExternalOutputBuffer>,
+        },
+        /// Update the advertised output refresh rate (millihertz).
+        SetRefreshRate {
+            mhz: u32,
+        },
+        /// Set up a Vulkan Video encoder for a surface.
+        SetVulkanEncoder {
+            surface_id: u32,
+            codec: u8,
+            qp: u8,
+            width: u32,
+            height: u32,
+        },
+        /// Request a keyframe from the Vulkan Video encoder for a surface.
+        RequestVulkanKeyframe {
+            surface_id: u32,
+        },
+        /// Destroy the Vulkan Video encoder for a surface.
+        DestroyVulkanEncoder {
+            surface_id: u32,
         },
         Shutdown,
     }
