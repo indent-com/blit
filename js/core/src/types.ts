@@ -227,12 +227,13 @@ export const SURFACE_FRAME_CODEC_PNG = 2 << 1;
 export const CODEC_SUPPORT_H264 = 1 << 0;
 export const CODEC_SUPPORT_AV1 = 1 << 1;
 
-/** Quality values for C2S_SURFACE_SUBSCRIBE. 0 = server default. */
+/** Quality values for C2S_SURFACE_SUBSCRIBE. 0 = server default.
+ *  10–255 = custom AV1 quantizer (wire value IS the quantizer). */
 export const SURFACE_QUALITY_DEFAULT = 0;
 export const SURFACE_QUALITY_LOW = 1;
 export const SURFACE_QUALITY_MEDIUM = 2;
 export const SURFACE_QUALITY_HIGH = 3;
-export const SURFACE_QUALITY_LOSSLESS = 4;
+export const SURFACE_QUALITY_ULTRA = 4;
 
 export const PROTOCOL_VERSION = 1;
 export const FEATURE_CREATE_NONCE = 1 << 0;

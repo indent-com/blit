@@ -118,7 +118,8 @@ pub const CAPTURE_FORMAT_AVIF: u8 = 1;
 ///        for this surface.  0 = use connection-level default (from C2S_CLIENT_FEATURES).
 ///
 /// quality: desired compression quality for this surface.
-///   0 = server default, 1 = low, 2 = medium, 3 = high, 4 = lossless.
+///   0 = server default, 1 = low, 2 = medium, 3 = high, 4 = ultra.
+///   10–255 = custom AV1 quantizer (wire value IS the quantizer).
 ///   See `SURFACE_QUALITY_*` constants.
 ///
 /// Re-subscribing to an already-subscribed surface updates the codec/quality
@@ -131,7 +132,7 @@ pub const SURFACE_QUALITY_DEFAULT: u8 = 0;
 pub const SURFACE_QUALITY_LOW: u8 = 1;
 pub const SURFACE_QUALITY_MEDIUM: u8 = 2;
 pub const SURFACE_QUALITY_HIGH: u8 = 3;
-pub const SURFACE_QUALITY_LOSSLESS: u8 = 4;
+pub const SURFACE_QUALITY_ULTRA: u8 = 4;
 /// Unsubscribe from surface frame updates: [0x29][surface_id:2]
 pub const C2S_SURFACE_UNSUBSCRIBE: u8 = 0x29;
 /// Acknowledge receipt of a surface video frame: [0x2A]

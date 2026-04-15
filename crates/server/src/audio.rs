@@ -9,6 +9,7 @@ use blit_remote::{AUDIO_FRAME_CODEC_OPUS, S2C_AUDIO_FRAME};
 use opus::{Application, Channels, Encoder as OpusEncoder};
 use std::collections::VecDeque;
 use std::io::BufRead;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -16,6 +17,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+
+/// Returns a closure suitable for `Command::pre_exec` that sets
+/// `PR_SET_PDEATHSIG(SIGTERM)` so the child is killed when the parent (blit
+/// server) dies — even via SIGKILL where Rust destructors can't run.
+///
+fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> {
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, …)` is async-signal-safe and runs in
+    // the child between fork and exec.
+    || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 
 /// 48 kHz, stereo, 20 ms = 960 samples per channel = 1920 interleaved samples.
 const FRAME_SAMPLES: usize = 960;
@@ -205,18 +221,21 @@ impl AudioPipeline {
         //    PipeWire modules (rt, portal, jackdbus-detect, fallback-sink)
         //    need a session bus.  Without one the daemon fails to initialise
         //    in headless environments that have no $DISPLAY.
-        let mut dbus_child = Command::new("dbus-daemon")
-            .args(["--session", "--print-address=1", "--nofork"])
-            .env("XDG_RUNTIME_DIR", &audio_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(if verbose {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-            .map_err(|e| format!("failed to start dbus-daemon: {e}"))?;
+        let mut dbus_child = unsafe {
+            Command::new("dbus-daemon")
+                .args(["--session", "--print-address=1", "--nofork"])
+                .env("XDG_RUNTIME_DIR", &audio_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(if verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+                .map_err(|e| format!("failed to start dbus-daemon: {e}"))?
+        };
 
         let dbus_stdout = dbus_child
             .stdout
@@ -237,19 +256,21 @@ impl AudioPipeline {
         //    XDG_CONFIG_HOME=$audio_dir makes PipeWire load
         //    $audio_dir/pipewire/pipewire.conf, which takes priority over
         //    system and nix-store configs on all PipeWire versions.
-        let mut pipewire_child = match Command::new("pipewire")
-            .env("XDG_CONFIG_HOME", &audio_dir)
-            .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
-            .env("XDG_RUNTIME_DIR", &audio_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(if verbose {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-        {
+        let mut pipewire_child = match unsafe {
+            Command::new("pipewire")
+                .env("XDG_CONFIG_HOME", &audio_dir)
+                .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
+                .env("XDG_RUNTIME_DIR", &audio_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(if verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+        } {
             Ok(c) => c,
             Err(e) => {
                 let _ = dbus_child.kill();
@@ -284,19 +305,22 @@ impl AudioPipeline {
             let wp_conf_dir = audio_dir.join("wireplumber").join("wireplumber.conf.d");
             let _ = std::fs::create_dir_all(&wp_conf_dir);
             let _ = std::fs::write(wp_conf_dir.join("99-blit.conf"), WIREPLUMBER_CONF_TEMPLATE);
-            let child = Command::new("wireplumber")
-                .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
-                .env("XDG_CONFIG_HOME", &audio_dir)
-                .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
-                .env("XDG_RUNTIME_DIR", &audio_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(if verbose {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .spawn();
+            let child = unsafe {
+                Command::new("wireplumber")
+                    .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
+                    .env("XDG_CONFIG_HOME", &audio_dir)
+                    .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
+                    .env("XDG_RUNTIME_DIR", &audio_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(if verbose {
+                        Stdio::inherit()
+                    } else {
+                        Stdio::null()
+                    })
+                    .pre_exec(pdeathsig_hook())
+                    .spawn()
+            };
             match child {
                 Ok(c) => {
                     // Give WirePlumber a moment to register its policy module
@@ -317,19 +341,21 @@ impl AudioPipeline {
         };
 
         // 2. Start pipewire-pulse.
-        let mut pipewire_pulse_child = match Command::new("pipewire-pulse")
-            .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
-            .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
-            .env("XDG_RUNTIME_DIR", &audio_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(if verbose {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-        {
+        let mut pipewire_pulse_child = match unsafe {
+            Command::new("pipewire-pulse")
+                .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
+                .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
+                .env("XDG_RUNTIME_DIR", &audio_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(if verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+        } {
             Ok(c) => c,
             Err(e) => {
                 if let Some(ref mut wp) = wireplumber_child {
@@ -431,31 +457,33 @@ impl AudioPipeline {
         }
 
         // 4. Start pw-cat to capture the monitor source.
-        let pw_cat_child = match Command::new("pw-cat")
-            .args([
-                "--record",
-                "--rate",
-                "48000",
-                "--format",
-                "f32",
-                "--channels",
-                "2",
-                "--target",
-                target,
-                "-", // write to stdout
-            ])
-            .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
-            .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
-            .env("XDG_RUNTIME_DIR", &audio_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(if verbose {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-        {
+        let pw_cat_child = match unsafe {
+            Command::new("pw-cat")
+                .args([
+                    "--record",
+                    "--rate",
+                    "48000",
+                    "--format",
+                    "f32",
+                    "--channels",
+                    "2",
+                    "--target",
+                    target,
+                    "-", // write to stdout
+                ])
+                .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
+                .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
+                .env("XDG_RUNTIME_DIR", &audio_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(if verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+        } {
             Ok(c) => c,
             Err(e) => {
                 let _ = pipewire_pulse_child.kill();

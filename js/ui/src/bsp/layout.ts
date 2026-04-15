@@ -123,6 +123,20 @@ export function saveToHistory(layout: BSPLayout | string): void {
   pushRecentLayout(layout);
 }
 
+/** Remove a layout from the recent history by its DSL string. */
+export function removeFromHistory(dsl: string): void {
+  try {
+    const raw = readStorage(LAYOUT_HISTORY_KEY);
+    if (!raw) return;
+    const existing: StoredRecentLayout[] = JSON.parse(raw);
+    const next = existing.filter((entry) => {
+      const d = typeof entry === "string" ? entry : entry.dsl;
+      return d !== dsl;
+    });
+    writeStorage(LAYOUT_HISTORY_KEY, JSON.stringify(next));
+  } catch {}
+}
+
 export function loadRecentLayouts(): BSPLayout[] {
   try {
     const raw = readStorage(LAYOUT_HISTORY_KEY);

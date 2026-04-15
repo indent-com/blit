@@ -98,6 +98,7 @@ export const TARGET_KEY = "blit.target";
 export const AUDIO_BITRATE_KEY = "blit.audioBitrate";
 export const AUDIO_MUTED_KEY = "blit.audioMuted";
 export const VIDEO_QUALITY_KEY = "blit.videoQuality";
+export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
 
 const PERSISTED_KEYS = new Set([
   PALETTE_KEY,
@@ -109,6 +110,7 @@ const PERSISTED_KEYS = new Set([
   AUDIO_BITRATE_KEY,
   AUDIO_MUTED_KEY,
   VIDEO_QUALITY_KEY,
+  SURFACE_STREAMING_KEY,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -371,12 +373,20 @@ export function preferredAudioBitrate(): number {
   return 0;
 }
 
-/** Preferred video quality. 0 = server default. */
+/** Preferred video quality.  0 = server default, 1–4 = presets,
+ *  10–255 = custom AV1 quantizer. */
 export function preferredVideoQuality(): number {
   const s = readStorage(VIDEO_QUALITY_KEY);
   if (s) {
     const n = parseInt(s, 10);
-    if (n >= 0 && n <= 4) return n;
+    if (n >= 0 && n <= 255) return n;
   }
   return 0;
+}
+
+/** Preferred surface streaming state.  Defaults to enabled. */
+export function preferredSurfaceStreaming(): boolean {
+  const s = readStorage(SURFACE_STREAMING_KEY);
+  if (s === "0") return false;
+  return true;
 }

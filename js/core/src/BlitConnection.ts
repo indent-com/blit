@@ -174,6 +174,9 @@ export class BlitConnection {
   defaultSurfaceQuality = 0;
   /** Default audio bitrate in kbps for audio subscriptions (0 = server default). */
   defaultAudioBitrateKbps = 0;
+  /** When false, surface subscribe messages are suppressed (ref-counts
+   *  still tracked so re-enabling restores subscriptions). */
+  surfaceStreamingEnabled = true;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pingIntervalMs = 10_000;
 
@@ -206,7 +209,10 @@ export class BlitConnection {
     this.surfaceStore.setKeyframeSender((surfaceId) => {
       // Re-subscribing triggers surface_needs_keyframe on the server,
       // which forces the next encoded frame to be a keyframe.
-      if (this.transport.status === "connected") {
+      if (
+        this.transport.status === "connected" &&
+        this.surfaceStreamingEnabled
+      ) {
         this.transport.send(
           buildSurfaceSubscribeMessage(
             surfaceId,
@@ -838,7 +844,11 @@ export class BlitConnection {
       // The server still has the subscription — no need to re-send.
       return;
     }
-    if (prev === 0 && this.transport.status === "connected") {
+    if (
+      prev === 0 &&
+      this.transport.status === "connected" &&
+      this.surfaceStreamingEnabled
+    ) {
       this._logger.info(`surface sub ${this.id}:${surfaceId}`);
       this.transport.send(
         buildSurfaceSubscribeMessage(surfaceId, 0, this.defaultSurfaceQuality),
@@ -854,6 +864,7 @@ export class BlitConnection {
    */
   private resubscribeWithCodecSupport(): void {
     if (this.transport.status !== "connected") return;
+    if (!this.surfaceStreamingEnabled) return;
     for (const [surfaceId, count] of this.surfaceSubRefCounts) {
       if (count > 0) {
         const surface = this.surfaceStore.getSurface(surfaceId);
@@ -906,8 +917,39 @@ export class BlitConnection {
    */
   sendSurfaceResubscribe(surfaceId: number, quality: number): void {
     if (this.transport.status !== "connected") return;
+    if (!this.surfaceStreamingEnabled) return;
     if ((this.surfaceSubRefCounts.get(surfaceId) ?? 0) <= 0) return;
     this.transport.send(buildSurfaceSubscribeMessage(surfaceId, 0, quality));
+  }
+
+  /**
+   * Enable or disable surface video streaming.  When disabled, tracked
+   * ref-counts are preserved but no subscribe messages are sent.
+   * Re-enabling sends subscribe for every surface with refcount > 0.
+   */
+  setSurfaceStreamingEnabled(enabled: boolean): void {
+    if (this.surfaceStreamingEnabled === enabled) return;
+    this.surfaceStreamingEnabled = enabled;
+    if (this.transport.status !== "connected") return;
+    if (enabled) {
+      for (const [surfaceId, count] of this.surfaceSubRefCounts) {
+        if (count > 0) {
+          this.transport.send(
+            buildSurfaceSubscribeMessage(
+              surfaceId,
+              0,
+              this.defaultSurfaceQuality,
+            ),
+          );
+        }
+      }
+    } else {
+      for (const [surfaceId, count] of this.surfaceSubRefCounts) {
+        if (count > 0) {
+          this.transport.send(buildSurfaceUnsubscribeMessage(surfaceId));
+        }
+      }
+    }
   }
 
   /**

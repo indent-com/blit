@@ -20,10 +20,65 @@ pub fn default_ipc_path() -> String {
 
 pub struct IpcListener {
     inner: UnixListener,
+    /// Held for the process lifetime so the flock is released on exit.
+    _lock: Option<std::fs::File>,
 }
 
 impl IpcListener {
     pub fn bind(path: &str, verbose: bool) -> Self {
+        // Acquire an exclusive flock on a companion lockfile so that a
+        // previous server instance is terminated before we bind.  The OS
+        // releases the lock automatically when the holder exits — even on
+        // SIGKILL — so there are no stale-lock issues.
+        let lock_path = format!("{path}.lock");
+        #[allow(clippy::suspicious_open_options)]
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap_or_else(|e| {
+                eprintln!("blit-server: cannot open {lock_path}: {e}");
+                std::process::exit(1);
+            });
+
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        let mut locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
+
+        if !locked {
+            // Lock held by another server — read its PID and terminate it.
+            let mut pid_str = String::new();
+            if std::io::Read::read_to_string(&mut (&lock_file), &mut pid_str).is_ok()
+                && let Ok(old_pid) = pid_str.trim().parse::<i32>()
+            {
+                eprintln!("blit-server: terminating previous server (pid {old_pid})");
+                unsafe { libc::kill(old_pid, libc::SIGTERM) };
+            }
+            // Wait up to 3 s for the old server to release the lock.
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    locked = true;
+                    break;
+                }
+            }
+            if !locked {
+                eprintln!(
+                    "blit-server: cannot acquire lock {lock_path} — is another server running?"
+                );
+                std::process::exit(1);
+            }
+        }
+
+        // Record our PID so the next server instance can terminate us.
+        {
+            use std::io::{Seek, Write};
+            let _ = lock_file.set_len(0);
+            let _ = (&lock_file).seek(std::io::SeekFrom::Start(0));
+            let _ = write!(&lock_file, "{}", std::process::id());
+        }
+
         let _ = std::fs::remove_file(path);
         // Set a restrictive umask before bind so the socket is created with
         // 0700 permissions atomically, closing the race window between bind
@@ -41,7 +96,10 @@ impl IpcListener {
         if verbose {
             eprintln!("listening on {path}");
         }
-        Self { inner: listener }
+        Self {
+            inner: listener,
+            _lock: Some(lock_file),
+        }
     }
 
     pub fn from_systemd_fd(verbose: bool) -> Option<Self> {
@@ -70,6 +128,7 @@ impl IpcListener {
         }
         Some(Self {
             inner: UnixListener::from_std(std_listener).unwrap(),
+            _lock: None,
         })
     }
 

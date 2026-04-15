@@ -5,6 +5,8 @@ mod positioner;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
+mod vulkan_encode;
+#[cfg(target_os = "linux")]
 mod vulkan_render;
 #[cfg(target_os = "linux")]
 pub use imp::*;
@@ -43,20 +45,24 @@ mod stub {
             stride: u32,
             offset: u32,
         },
+        Nv12DmaBuf {
+            fd: Arc<OwnedFd>,
+            stride: u32,
+            uv_offset: u32,
+            width: u32,
+            height: u32,
+            sync_fd: Option<Arc<OwnedFd>>,
+        },
         VaSurface {
             surface_id: u32,
             va_display: usize,
             _fd: Arc<OwnedFd>,
         },
-    }
-
-    #[derive(Clone)]
-    pub struct PixelLayer {
-        pub x: i32,
-        pub y: i32,
-        pub width: u32,
-        pub height: u32,
-        pub pixels: PixelData,
+        Encoded {
+            data: Arc<Vec<u8>>,
+            is_keyframe: bool,
+            codec_flag: u8,
+        },
     }
 
     impl PixelData {
@@ -78,7 +84,10 @@ mod stub {
             match self {
                 PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
                 PixelData::Nv12 { data, .. } => data.is_empty(),
-                PixelData::DmaBuf { .. } | PixelData::VaSurface { .. } => false,
+                PixelData::DmaBuf { .. }
+                | PixelData::VaSurface { .. }
+                | PixelData::Nv12DmaBuf { .. } => false,
+                PixelData::Encoded { data, .. } => data.is_empty(),
             }
         }
 
@@ -215,9 +224,36 @@ mod stub {
             surface_id: u16,
         },
         SetExternalOutputBuffers {
+            surface_id: u32,
             buffers: Vec<ExternalOutputBuffer>,
         },
+        /// Update the advertised output refresh rate (millihertz).
+        SetRefreshRate {
+            mhz: u32,
+        },
+        /// Set up a Vulkan Video encoder for a surface.
+        SetVulkanEncoder {
+            surface_id: u32,
+            codec: u8,
+            qp: u8,
+            width: u32,
+            height: u32,
+        },
+        /// Request a keyframe from the Vulkan Video encoder for a surface.
+        RequestVulkanKeyframe {
+            surface_id: u32,
+        },
+        /// Destroy the Vulkan Video encoder for a surface.
+        DestroyVulkanEncoder {
+            surface_id: u32,
+        },
         Shutdown,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub struct ExternalOutputPlane {
+        pub offset: u32,
+        pub pitch: u32,
     }
 
     pub struct ExternalOutputBuffer {
@@ -230,6 +266,7 @@ mod stub {
         pub height: u32,
         pub va_surface_id: u32,
         pub va_display: usize,
+        pub planes: Vec<ExternalOutputPlane>,
     }
 
     pub struct CompositorHandle {
@@ -238,6 +275,10 @@ mod stub {
         pub socket_name: String,
         pub thread: std::thread::JoinHandle<()>,
         pub shutdown: Arc<AtomicBool>,
+        /// Whether the compositor's Vulkan renderer supports Vulkan Video encode.
+        pub vulkan_video_encode: bool,
+        /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
+        pub vulkan_video_encode_av1: bool,
     }
 
     impl CompositorHandle {
@@ -261,6 +302,8 @@ mod stub {
             socket_name: String::new(),
             thread: std::thread::spawn(|| {}),
             shutdown,
+            vulkan_video_encode: false,
+            vulkan_video_encode_av1: false,
         }
     }
 }

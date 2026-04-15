@@ -33,19 +33,8 @@ const VA_ENTRYPOINT_VIDEO_PROC: i32 = 10;
 
 // RT formats
 const VA_RT_FORMAT_YUV420: u32 = 0x00000001;
-const VA_RT_FORMAT_RGB32: u32 = 0x00000100;
-
-// VASurfaceAttrib type enum (VASurfaceAttribType in va.h):
-//   None=0, PixelFormat=1, MinWidth=2, MaxWidth=3, MinHeight=4, MaxHeight=5,
-//   MemoryType=6, ExternalBufferDescriptor=7
-const VA_SURFACE_ATTRIB_MEM_TYPE: u32 = 6;
-const VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS: u32 = 7;
-const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x00000002;
-const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME: u32 = 0x20000000;
-const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x40000000;
-
-// VAProcPipelineParameterBuffer type
-const VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE: i32 = 41;
+#[allow(dead_code)]
+const VA_RT_FORMAT_YUV420_10: u32 = 0x00000100;
 
 // Buffer types
 const VAEncCodedBufferType: i32 = 21;
@@ -136,69 +125,23 @@ const VAIMG_PITCHES_OFF: usize = 68;
 const VAIMG_OFFSETS_OFF: usize = 80;
 const VAIMG_ID_OFF: usize = 0;
 
+/// Cached result of `vaDeriveImage` on the encoder's input surface.
+/// The surface is fixed for the encoder's lifetime, so the derived image
+/// metadata (pitches, offsets, buffer ID) never changes.  Caching avoids
+/// two VA-API driver round-trips per frame (vaDeriveImage + vaDestroyImage).
+struct CachedDerivedImage {
+    image_id: u32,
+    buf_id: u32,
+    y_pitch: usize,
+    uv_pitch: usize,
+    y_offset: usize,
+    uv_offset: usize,
+}
+
 // VA-API fourcc values differ from DRM fourcc values.
 // DRM uses little-endian channel order in the name; VA-API uses memory order.
 // DRM AR24 (ARGB8888) = [B,G,R,A] in memory = VA_FOURCC_BGRA.
-// DRM AB24 (ABGR8888) = [R,G,B,A] in memory = VA_FOURCC_RGBA.
-const VA_FOURCC_BGRA: u32 = u32::from_le_bytes(*b"BGRA"); // DRM ARGB8888
-const VA_FOURCC_BGRX: u32 = u32::from_le_bytes(*b"BGRX"); // DRM XRGB8888
-const VA_FOURCC_RGBA: u32 = u32::from_le_bytes(*b"RGBA"); // DRM ABGR8888
-const VA_FOURCC_RGBX: u32 = u32::from_le_bytes(*b"RGBX"); // DRM XBGR8888
-
-/// Translate a DRM fourcc to VA-API fourcc for packed surface import.
-fn drm_fourcc_to_va(drm: u32) -> Option<u32> {
-    use blit_compositor::drm_fourcc::*;
-    match drm {
-        ARGB8888 => Some(VA_FOURCC_BGRA),
-        XRGB8888 => Some(VA_FOURCC_BGRX),
-        ABGR8888 => Some(VA_FOURCC_RGBA),
-        XBGR8888 => Some(VA_FOURCC_RGBX),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VA-API VPP structs (for DMA-BUF import and BGRA→NV12 conversion on GPU)
-// ---------------------------------------------------------------------------
-
-#[repr(C)]
-struct VASurfaceAttrib {
-    type_: u32,
-    flags: u32,
-    value: VAGenericValue,
-}
-
-#[repr(C)]
-struct VAGenericValue {
-    type_: u32, // VAGenericValueType (0=int, 1=float, 2=ptr, 3=func)
-    value: VAGenericValueInner,
-}
-
-#[repr(C)]
-union VAGenericValueInner {
-    i: i32,
-    f: f32,
-    p: *mut c_void,
-}
-
-/// Legacy PRIME import descriptor (DRM_PRIME).
-#[repr(C)]
-struct VASurfaceAttribExternalBuffers {
-    pixel_format: u32,
-    width: u32,
-    height: u32,
-    data_size: u32,
-    num_planes: u32,
-    pitches: [u32; 4],
-    offsets: [u32; 4],
-    buffers: *mut libc::uintptr_t,
-    num_buffers: u32,
-    flags: u32,
-    private_data: *mut c_void,
-}
-
-/// Modern PRIME_2 import descriptor (VADRMPRIMESurfaceDescriptor).
-/// Includes modifier, used with VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2.
+/// VADRMPRIMESurfaceDescriptor — used for NV12 surface export.
 #[repr(C)]
 struct VADRMPRIMESurfaceDescriptor {
     fourcc: u32,
@@ -228,91 +171,40 @@ struct DRMLayer {
     pitch: [u32; 4],
 }
 
-/// VARectangle — used for surface_region / output_region in VPP.
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct VARectangle {
-    x: i16,
-    y: i16,
-    width: u16,
-    height: u16,
-}
-
-/// VAProcPipelineParameterBuffer — enough fields for a simple BGRA→NV12 blit.
-/// We zero-init the full struct so padding and unused fields are safe.
-#[repr(C)]
-struct VAProcPipelineParameterBuffer {
-    surface: u32, // input VASurfaceID
-    surface_region: *const c_void,
-    surface_color_standard: u32,
-    output_region: *const c_void,
-    output_background_color: u32,
-    output_color_standard: u32,
-    pipeline_flags: u32,
-    filter_flags: u32,
-    filters: *mut u32,
-    num_filters: u32,
-    forward_references: *mut u32,
-    num_forward_references: u32,
-    backward_references: *mut u32,
-    num_backward_references: u32,
-    rotation_state: u32,
-    blend_state: *const c_void,
-    mirror_state: u32,
-    additional_outputs: *mut u32,
-    num_additional_outputs: u32,
-    input_color_properties: u64,
-    output_color_properties: u64,
-    processing_mode: u32,
-    output_hdr_metadata: *const c_void,
-}
-
-fn fd_inode(fd: std::os::fd::RawFd) -> u64 {
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) == 0 {
-            st.st_ino
-        } else {
-            0
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// VPP context — BGRA DMA-BUF → NV12 VASurface on the GPU
+// VPP context — allocates NV12 surfaces for Vulkan compute, GBM BGRA buffers
 // ---------------------------------------------------------------------------
 
-/// Key for caching PRIME-imported VASurfaces so we don't re-import
-/// the same GBM BO every frame.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct PrimeImportKey {
-    ino: u64,
-    width: u32,
-    height: u32,
-    fourcc: u32,
-    stride: u32,
-}
+/// Number of NV12 output surfaces in the VPP round-robin pool.  Must be
+/// large enough so that a surface handed to the encoder is not overwritten
+/// by a later VPP conversion before the encode finishes.  6 gives ample
+/// headroom for pipelined VPP→encode with the vaSyncSurface elided.
+const NUM_NV12_SURFACES: usize = 6;
 
-struct CachedPrimeSurface {
-    surface: VASurfaceID,
-    key: PrimeImportKey,
-}
+/// Number of BGRA input surfaces exported to the compositor for the
+/// zero-copy path.  The compositor renders into these via Vulkan while
+/// VPP reads a previously rendered surface.  5 allows two frames of
+/// pipeline depth (1 encoding + 1 rendered + 1 rendering + 2 free).
+const NUM_BGRA_SURFACES: usize = 5;
 
-/// VA-API Video Processing Pipeline context.
-/// Shares the VADisplay with the encoder; convert_dmabuf() takes a BGRA
-/// DMA-BUF fd and returns an NV12 VASurface ready to be encoded.
-/// Info about a VA-API-allocated BGRA surface exported as DMA-BUF.
-/// The compositor can import the fd into EGL for FBO rendering;
-/// the encoder uses the surface_id directly for VPP.
-pub struct ExportedVaSurface {
-    pub surface_id: u32,
+/// GBM-allocated LINEAR buffer for zero-copy compositor→encoder sharing.
+pub(crate) struct GbmExportedBuffer {
     pub fd: std::os::fd::OwnedFd,
-    pub fourcc: u32,
-    pub modifier: u64,
     pub stride: u32,
-    pub offset: u32,
     pub width: u32,
     pub height: u32,
+}
+
+/// NV12 buffer for the Vulkan compute shader → VA-API encoder zero-copy path.
+/// VA-API allocates the surface, exports a DMA-BUF fd for Vulkan to write into.
+pub(crate) struct GbmNv12Buffer {
+    pub fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    pub stride: u32,
+    pub uv_offset: u32,
+    /// DRM format modifier (0 = linear, nonzero = tiled).
+    pub modifier: u64,
+    /// VA surface — encoder reads directly, no PRIME import needed.
+    pub va_surface: VASurfaceID,
 }
 
 pub(crate) struct VppContext {
@@ -320,27 +212,41 @@ pub(crate) struct VppContext {
     display: VADisplay,
     config: u32,
     context: u32,
-    /// Pool of NV12 output surfaces (round-robin).
-    nv12_surfaces: [u32; 4],
-    next_surf: usize,
-    width: u32,
-    height: u32,
-    /// Small cache of PRIME-imported BGRA surfaces (keyed by fd inode).
-    /// Avoids expensive vaCreateSurfaces+vaDestroySurfaces per frame.
-    import_cache: Vec<CachedPrimeSurface>,
-    /// Pre-allocated BGRA input surfaces for zero-copy compositor→encoder.
-    bgra_surfaces: Vec<VASurfaceID>,
+    /// Pool of NV12 output surfaces for VPP.
+    nv12_surfaces: [u32; NUM_NV12_SURFACES],
+    /// Encoder-padded NV12 output dimensions.
+    enc_width: u32,
+    enc_height: u32,
+    #[allow(dead_code)]
+    bgra_width: u32,
+    #[allow(dead_code)]
+    bgra_height: u32,
+    /// GBM-allocated LINEAR BGRA buffers for zero-copy path.
+    pub(crate) gbm_buffers: Vec<GbmExportedBuffer>,
+    /// GBM-allocated NV12 buffers — compute shader writes, encoder reads.
+    pub(crate) gbm_nv12_buffers: Vec<GbmNv12Buffer>,
+    #[allow(dead_code)]
     verbose: bool,
 }
 
 impl VppContext {
     /// Try to create a VPP context on an existing VADisplay.
     /// Returns None if VAEntrypointVideoProc is unavailable.
+    ///
+    /// `width`/`height` are the NV12 output dimensions (encoder-aligned).
+    /// `bgra_width`/`bgra_height` are the BGRA input surface dimensions
+    /// (source resolution).  The compositor matches against these when
+    /// deciding whether to use the zero-copy external output path, so they
+    /// must equal the compositor's physical output size.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn try_new(
         va: &'static crate::gpu_libs::VaFns,
         display: VADisplay,
         width: u32,
         height: u32,
+        bgra_width: u32,
+        bgra_height: u32,
+        drm_fd: std::os::fd::RawFd,
         verbose: bool,
     ) -> Option<Self> {
         // Check VideoProc entrypoint is available on VAProfileNone.
@@ -374,7 +280,7 @@ impl VppContext {
         }
 
         // Allocate pool of NV12 output surfaces.
-        let mut nv12_surfaces = [0u32; 4];
+        let mut nv12_surfaces = [0u32; NUM_NV12_SURFACES];
         let st = unsafe {
             (va.vaCreateSurfaces)(
                 display,
@@ -382,7 +288,7 @@ impl VppContext {
                 width,
                 height,
                 nv12_surfaces.as_mut_ptr(),
-                4,
+                NUM_NV12_SURFACES as u32,
                 ptr::null_mut(),
                 0,
             )
@@ -404,44 +310,77 @@ impl VppContext {
                 height as i32,
                 0,
                 nv12_surfaces.as_mut_ptr(),
-                4,
+                NUM_NV12_SURFACES as i32,
                 &mut context,
             )
         };
         if st != crate::gpu_libs::VA_STATUS_SUCCESS {
             unsafe {
-                (va.vaDestroySurfaces)(display, nv12_surfaces.as_mut_ptr(), 4);
+                (va.vaDestroySurfaces)(
+                    display,
+                    nv12_surfaces.as_mut_ptr(),
+                    NUM_NV12_SURFACES as i32,
+                );
                 (va.vaDestroyConfig)(display, config);
             }
             return None;
         }
 
-        // Allocate BGRA input surfaces for the zero-copy path.
-        // The compositor renders into these via EGL (after exporting as DMA-BUF);
-        // the encoder uses the surface_id directly for VPP BGRA→NV12.
-        const NUM_BGRA: usize = 3; // triple-buffered
-        let mut bgra_surfaces = vec![0u32; NUM_BGRA];
-        let st = unsafe {
-            (va.vaCreateSurfaces)(
-                display,
-                VA_RT_FORMAT_RGB32,
-                width,
-                height,
-                bgra_surfaces.as_mut_ptr(),
-                NUM_BGRA as u32,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
-            eprintln!("[vaapi-vpp] failed to allocate BGRA surfaces (st={st})");
-            bgra_surfaces.clear();
+        // Allocate LINEAR BGRA buffers via GBM.  The compositor imports
+        // these into Vulkan and renders directly into them.  The encoder
+        // Allocate LINEAR BGRA buffers via GBM for zero-copy sharing.
+        // The compositor renders into these via Vulkan; the compute shader
+        // converts BGRA→NV12 into VA-API-owned surfaces.
+        let mut gbm_buffers = Vec::new();
+        if let Ok(gbm) = crate::gpu_libs::gbm() {
+            let gbm_fd = unsafe { libc::dup(drm_fd) };
+            if gbm_fd >= 0 {
+                let dev = unsafe { (gbm.gbm_create_device)(gbm_fd) };
+                if !dev.is_null() {
+                    for i in 0..NUM_BGRA_SURFACES {
+                        let bo = unsafe {
+                            (gbm.gbm_bo_create)(
+                                dev,
+                                bgra_width,
+                                bgra_height,
+                                crate::gpu_libs::GBM_FORMAT_ARGB8888,
+                                crate::gpu_libs::GBM_BO_USE_RENDERING
+                                    | crate::gpu_libs::GBM_BO_USE_LINEAR,
+                            )
+                        };
+                        if bo.is_null() {
+                            if verbose {
+                                eprintln!("[vaapi-vpp] gbm_bo_create failed for buffer {i}");
+                            }
+                            break;
+                        }
+                        let fd = unsafe { (gbm.gbm_bo_get_fd)(bo) };
+                        let stride = unsafe { (gbm.gbm_bo_get_stride)(bo) };
+                        if fd < 0 {
+                            break;
+                        }
+                        if verbose && i == 0 {
+                            eprintln!(
+                                "[vaapi-vpp] GBM buffer: {bgra_width}x{bgra_height} stride={stride} LINEAR",
+                            );
+                        }
+                        gbm_buffers.push(GbmExportedBuffer {
+                            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+                            stride,
+                            width: bgra_width,
+                            height: bgra_height,
+                        });
+                        // GBM BO intentionally leaked — must outlive the fd.
+                    }
+                    // GBM device intentionally leaked — must outlive BOs.
+                }
+            }
         }
 
         if verbose {
             eprintln!(
-                "[vaapi-vpp] initialized {width}x{height} BGRA→NV12 VPP ({} BGRA surfaces)",
-                bgra_surfaces.len()
+                "[vaapi-vpp] initialized {bgra_width}x{bgra_height} → {width}x{height} VPP ({} GBM buffers)",
+                gbm_buffers.len()
             );
         }
         Some(Self {
@@ -450,574 +389,179 @@ impl VppContext {
             config,
             context,
             nv12_surfaces,
-            next_surf: 0,
-            width,
-            height,
-            import_cache: Vec::new(),
-            bgra_surfaces,
+            enc_width: width,
+            enc_height: height,
+            bgra_width,
+            bgra_height,
+            gbm_buffers,
+            gbm_nv12_buffers: Vec::new(),
             verbose,
         })
     }
 
-    /// Export pre-allocated BGRA surfaces as DMA-BUF fds.
-    /// The compositor imports these into EGL for FBO rendering.
-    pub(crate) fn export_surfaces(&self) -> Vec<ExportedVaSurface> {
-        let va = self.va;
-        let mut result = Vec::new();
-        for &surf_id in &self.bgra_surfaces {
-            // Export as PRIME_2 DMA-BUF.
-            #[repr(C)]
-            struct ExportDesc {
-                fourcc: u32,
-                width: u32,
-                height: u32,
-                num_objects: u32,
-                objects: [ExportObj; 4],
-                num_layers: u32,
-                layers: [ExportLayer; 4],
-            }
-            #[repr(C)]
-            #[derive(Default)]
-            struct ExportObj {
-                fd: i32,
-                size: u32,
-                drm_format_modifier: u64,
-            }
-            #[repr(C)]
-            #[derive(Default)]
-            struct ExportLayer {
-                drm_format: u32,
-                num_planes: u32,
-                object_index: [u32; 4],
-                offset: [u32; 4],
-                pitch: [u32; 4],
-            }
-            let mut desc = ExportDesc {
-                fourcc: 0,
-                width: 0,
-                height: 0,
-                num_objects: 0,
-                objects: Default::default(),
-                num_layers: 0,
-                layers: Default::default(),
-            };
-            // VA_EXPORT_SURFACE_READ_WRITE = 0x07
-            // VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 = 0x40000000
-            let st = unsafe {
-                (va.vaExportSurfaceHandle)(
-                    self.display,
-                    surf_id,
-                    0x40000000,
-                    0x07,
-                    &mut desc as *mut _ as *mut c_void,
-                )
-            };
-            if st != crate::gpu_libs::VA_STATUS_SUCCESS {
-                eprintln!("[vaapi-vpp] export surface {surf_id} failed (st={st})");
-                continue;
-            }
-            if desc.num_objects == 0 || desc.num_layers == 0 {
-                continue;
-            }
-            let fd = desc.objects[0].fd;
-            if fd < 0 {
-                continue;
-            }
-            let owned_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            // Force ARGB8888 fourcc for the export.  The surfaces were
-            // created with VA_RT_FORMAT_RGB32 (= BGRA in memory), but on
-            // AMD (radeonsi) the export descriptor reports the internal
-            // tiled format (R16 per-layer, P010 top-level) which is
-            // useless for EGL import.  We know the logical format.
-            let fourcc: u32 = 0x34325241; // DRM_FORMAT_ARGB8888 = "AR24"
-            result.push(ExportedVaSurface {
-                surface_id: surf_id,
-                fd: owned_fd,
-                fourcc,
-                modifier: desc.objects[0].drm_format_modifier,
-                stride: desc.layers[0].pitch[0],
-                offset: desc.layers[0].offset[0],
-                width: desc.width,
-                height: desc.height,
-            });
-        }
-        if self.verbose {
-            for (i, r) in result.iter().enumerate() {
-                let fc = r.fourcc.to_le_bytes();
-                eprintln!(
-                    "[vaapi-vpp] exported surface {i}: {}x{} fourcc={}{}{}{} (0x{:08x}) modifier=0x{:016x} stride={}",
-                    r.width,
-                    r.height,
-                    fc[0] as char,
-                    fc[1] as char,
-                    fc[2] as char,
-                    fc[3] as char,
-                    r.fourcc,
-                    r.modifier,
-                    r.stride,
-                );
-            }
+    /// Allocate NV12 surfaces in VA-API (driver picks optimal layout),
+    /// export as DMA-BUFs for the Vulkan compute shader to write into.
+    /// The encoder reads the VA surface directly — no PRIME import needed.
+    /// If the driver uses a tiled layout (modifier ≠ 0), the compute shader
+    /// VA-API allocates NV12 surfaces (linear or tiled), exports as DMA-BUFs.
+    /// The compositor imports them into Vulkan — as buffers (linear) or
+    /// images (tiled, using VK_EXT_image_drm_format_modifier).
+    pub(crate) fn allocate_nv12_buffers(&mut self, _drm_fd: std::os::fd::RawFd, count: usize) {
+        // Allocate at encoder-padded dimensions so the full surface is valid.
+        let w = self.enc_width;
+        let h = self.enc_height;
+        if !self.try_vaapi_nv12_export(w, h, count) {
             eprintln!(
-                "[vaapi-vpp] exported {} of {} BGRA surfaces as DMA-BUF",
-                result.len(),
-                self.bgra_surfaces.len()
+                "[vaapi-vpp] NV12 export unavailable {w}x{h} — \
+                 falling back to CPU BGRA→NV12",
             );
         }
-        result
     }
 
-    /// Get the raw VADisplay pointer (as usize for Send safety).
-    pub(crate) fn va_display_usize(&self) -> usize {
-        self.display as usize
-    }
-
-    /// Convert a pre-allocated BGRA surface (by VASurfaceID) to NV12.
-    /// Zero-copy path — no import needed, the surface is already on this VADisplay.
-    pub(crate) unsafe fn convert_surface(&mut self, bgra_surf: VASurfaceID) -> Option<u32> {
-        let va = self.va;
-        let nv12_surf = self.nv12_surfaces[self.next_surf];
-        self.next_surf = (self.next_surf + 1) % self.nv12_surfaces.len();
-
-        let params = VAProcPipelineParameterBuffer {
-            surface: bgra_surf,
-            surface_region: ptr::null(),
-            surface_color_standard: 0,
-            output_region: ptr::null(),
-            output_background_color: 0,
-            output_color_standard: 0,
-            pipeline_flags: 0,
-            filter_flags: 0,
-            filters: ptr::null_mut(),
-            num_filters: 0,
-            forward_references: ptr::null_mut(),
-            num_forward_references: 0,
-            backward_references: ptr::null_mut(),
-            num_backward_references: 0,
-            rotation_state: 0,
-            blend_state: ptr::null(),
-            mirror_state: 0,
-            additional_outputs: ptr::null_mut(),
-            num_additional_outputs: 0,
-            input_color_properties: 0,
-            output_color_properties: 0,
-            processing_mode: 0,
-            output_hdr_metadata: ptr::null(),
-        };
-        let mut buf_id = 0u32;
-        let st = unsafe {
-            (va.vaCreateBuffer)(
-                self.display,
-                self.context,
-                VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE,
-                std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
-                1,
-                &params as *const _ as *mut c_void,
-                &mut buf_id,
-            )
-        };
-        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
-            return None;
-        }
-
-        let ok = unsafe {
-            (va.vaBeginPicture)(self.display, self.context, nv12_surf)
-                == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaRenderPicture)(self.display, self.context, &mut buf_id, 1)
-                    == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaEndPicture)(self.display, self.context)
-                    == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaSyncSurface)(self.display, nv12_surf) == crate::gpu_libs::VA_STATUS_SUCCESS
-        };
-
-        unsafe {
-            (va.vaDestroyBuffer)(self.display, buf_id);
-        }
-
-        if ok { Some(nv12_surf) } else { None }
-    }
-
-    /// Like [`convert_surface`] but flips the image vertically during the
-    /// VPP pass.  Used for surfaces rendered by EGL into FBOs, where
-    /// OpenGL's bottom-up row order must be corrected to top-down for the
-    /// video encoder.
-    #[expect(dead_code)]
-    pub(crate) unsafe fn convert_surface_flipped(&mut self, bgra_surf: VASurfaceID) -> Option<u32> {
-        let va = self.va;
-        let nv12_surf = self.nv12_surfaces[self.next_surf];
-        self.next_surf = (self.next_surf + 1) % self.nv12_surfaces.len();
-
-        let params = VAProcPipelineParameterBuffer {
-            surface: bgra_surf,
-            surface_region: ptr::null(),
-            surface_color_standard: 0,
-            output_region: ptr::null(),
-            output_background_color: 0,
-            output_color_standard: 0,
-            pipeline_flags: 0,
-            filter_flags: 0,
-            filters: ptr::null_mut(),
-            num_filters: 0,
-            forward_references: ptr::null_mut(),
-            num_forward_references: 0,
-            backward_references: ptr::null_mut(),
-            num_backward_references: 0,
-            rotation_state: 0,
-            blend_state: ptr::null(),
-            mirror_state: 2, // VA_MIRROR_VERTICAL
-            additional_outputs: ptr::null_mut(),
-            num_additional_outputs: 0,
-            input_color_properties: 0,
-            output_color_properties: 0,
-            processing_mode: 0,
-            output_hdr_metadata: ptr::null(),
-        };
-        let mut buf_id = 0u32;
-        let st = unsafe {
-            (va.vaCreateBuffer)(
-                self.display,
-                self.context,
-                VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE,
-                std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
-                1,
-                &params as *const _ as *mut c_void,
-                &mut buf_id,
-            )
-        };
-        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
-            return None;
-        }
-
-        let ok = unsafe {
-            (va.vaBeginPicture)(self.display, self.context, nv12_surf)
-                == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaRenderPicture)(self.display, self.context, &mut buf_id, 1)
-                    == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaEndPicture)(self.display, self.context)
-                    == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaSyncSurface)(self.display, nv12_surf) == crate::gpu_libs::VA_STATUS_SUCCESS
-        };
-
-        unsafe {
-            (va.vaDestroyBuffer)(self.display, buf_id);
-        }
-
-        if ok { Some(nv12_surf) } else { None }
-    }
-
-    /// Import a BGRA/XRGB DMA-BUF, run VPP BGRA→NV12, return the NV12 surface.
-    /// The returned VASurfaceID is from the internal pool; it must be consumed
-    /// (encoded) before the next call.
-    ///
-    /// PRIME-imported BGRA surfaces are cached by fd inode so that the same
-    /// GBM BO (triple-buffered in the compositor) is imported only once.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn convert_dmabuf(
-        &mut self,
-        fd: std::os::fd::RawFd,
-        fourcc: u32,
-        modifier: u64,
-        stride: u32,
-        offset: u32,
-        src_width: u32,
-        src_height: u32,
-    ) -> Option<u32> {
-        let va = self.va;
-        let import_w = if src_width > 0 { src_width } else { self.width };
-        let import_h = if src_height > 0 {
-            src_height
-        } else {
-            self.height
-        };
-
-        // Normalize DRM_FORMAT_MOD_INVALID → LINEAR.
-        let modifier = if modifier == 0x00ff_ffff_ffff_ffff {
-            0
-        } else {
-            modifier
-        };
-
-        let key = PrimeImportKey {
-            ino: fd_inode(fd),
-            width: import_w,
-            height: import_h,
-            fourcc,
-            stride,
-        };
-
-        // Look up cached PRIME import.
-        let bgra_surf = if let Some(cached) = self.import_cache.iter().find(|c| c.key == key) {
-            cached.surface
-        } else {
-            // Cache miss — do the expensive PRIME import.
-            let surf = unsafe {
-                self.prime_import(fd, fourcc, modifier, stride, offset, import_w, import_h)?
-            };
-            // Evict oldest if cache is full (keep up to 8 entries to cover
-            // triple-buffered compositor + Vulkan WSI quad-buffering).
-            const MAX_CACHE: usize = 8;
-            if self.import_cache.len() >= MAX_CACHE {
-                let old = self.import_cache.remove(0);
-                unsafe {
-                    let mut s = old.surface;
-                    (va.vaDestroySurfaces)(self.display, &mut s, 1);
-                }
+    /// Destroy VA surfaces that were allocated for compute but not yet
+    /// pushed into `gbm_nv12_buffers` (cleanup on early error).
+    fn destroy_nv12_compute_surfaces(&self, surfaces: &mut [u32]) {
+        // Only destroy surfaces not already tracked in gbm_nv12_buffers.
+        let tracked: std::collections::HashSet<u32> =
+            self.gbm_nv12_buffers.iter().map(|b| b.va_surface).collect();
+        let to_destroy: Vec<u32> = surfaces
+            .iter()
+            .copied()
+            .filter(|s| *s != 0 && !tracked.contains(s))
+            .collect();
+        if !to_destroy.is_empty() {
+            let mut buf = to_destroy;
+            unsafe {
+                (self.va.vaDestroySurfaces)(self.display, buf.as_mut_ptr(), buf.len() as i32);
             }
-            self.import_cache
-                .push(CachedPrimeSurface { surface: surf, key });
-            surf
-        };
-
-        let nv12_surf = self.nv12_surfaces[self.next_surf];
-        self.next_surf = (self.next_surf + 1) % self.nv12_surfaces.len();
-
-        // When the NV12 output surface is larger than the source (e.g. AV1
-        // 64-pixel alignment padding), use output_region to place the source
-        // content at the top-left and leave the padding area as black.
-        // Without this the VPP would stretch the source to fill the padded
-        // surface, producing a slight vertical distortion.
-        let out_rect = VARectangle {
-            x: 0,
-            y: 0,
-            width: import_w as u16,
-            height: import_h as u16,
-        };
-        let needs_region = import_w < self.width || import_h < self.height;
-
-        // Run VPP: bgra_surf → nv12_surf.
-        let params = VAProcPipelineParameterBuffer {
-            surface: bgra_surf,
-            surface_region: ptr::null(),
-            surface_color_standard: 0,
-            output_region: if needs_region {
-                &out_rect as *const _ as *const c_void
-            } else {
-                ptr::null()
-            },
-            output_background_color: 0,
-            output_color_standard: 0,
-            pipeline_flags: 0,
-            filter_flags: 0,
-            filters: ptr::null_mut(),
-            num_filters: 0,
-            forward_references: ptr::null_mut(),
-            num_forward_references: 0,
-            backward_references: ptr::null_mut(),
-            num_backward_references: 0,
-            rotation_state: 0,
-            blend_state: ptr::null(),
-            mirror_state: 0,
-            additional_outputs: ptr::null_mut(),
-            num_additional_outputs: 0,
-            input_color_properties: 0,
-            output_color_properties: 0,
-            processing_mode: 0,
-            output_hdr_metadata: ptr::null(),
-        };
-        let mut buf_id = 0u32;
-        let st = unsafe {
-            (va.vaCreateBuffer)(
-                self.display,
-                self.context,
-                VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE,
-                std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
-                1,
-                &params as *const _ as *mut c_void,
-                &mut buf_id,
-            )
-        };
-        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
-            return None;
         }
-
-        let ok = unsafe {
-            (va.vaBeginPicture)(self.display, self.context, nv12_surf)
-                == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaRenderPicture)(self.display, self.context, &mut buf_id, 1)
-                    == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaEndPicture)(self.display, self.context)
-                    == crate::gpu_libs::VA_STATUS_SUCCESS
-                && (va.vaSyncSurface)(self.display, nv12_surf) == crate::gpu_libs::VA_STATUS_SUCCESS
-        };
-
-        unsafe {
-            (va.vaDestroyBuffer)(self.display, buf_id);
-        }
-
-        if ok { Some(nv12_surf) } else { None }
     }
 
-    /// Do the actual PRIME import (expensive — called only on cache miss).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn prime_import(
-        &self,
-        fd: std::os::fd::RawFd,
-        fourcc: u32,
-        modifier: u64,
-        stride: u32,
-        offset: u32,
-        import_w: u32,
-        import_h: u32,
-    ) -> Option<VASurfaceID> {
+    /// Try VA-API allocate → export. Returns true on success.
+    fn try_vaapi_nv12_export(&mut self, w: u32, h: u32, count: usize) -> bool {
         let va = self.va;
-
-        let va_fourcc = drm_fourcc_to_va(fourcc)?;
-        let (surface_fourcc, layer_drm_fourcc) = match va_fourcc {
-            VA_FOURCC_RGBA => (VA_FOURCC_BGRA, blit_compositor::drm_fourcc::ARGB8888),
-            VA_FOURCC_RGBX => (VA_FOURCC_BGRX, blit_compositor::drm_fourcc::XRGB8888),
-            _ => (va_fourcc, fourcc),
-        };
-
-        let actual_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-        let buf_size = if actual_size > 0 {
-            actual_size as u32
-        } else {
-            stride * import_h
-        };
-
-        let mut desc = VADRMPRIMESurfaceDescriptor {
-            fourcc: surface_fourcc,
-            width: import_w,
-            height: import_h,
-            num_objects: 1,
-            objects: [
-                DRMObject {
-                    fd,
-                    size: buf_size,
-                    drm_format_modifier: modifier,
-                },
-                DRMObject::default(),
-                DRMObject::default(),
-                DRMObject::default(),
-            ],
-            num_layers: 1,
-            layers: [
-                DRMLayer {
-                    drm_format: layer_drm_fourcc,
-                    num_planes: 1,
-                    object_index: [0, 0, 0, 0],
-                    offset: [offset, 0, 0, 0],
-                    pitch: [stride, 0, 0, 0],
-                },
-                DRMLayer::default(),
-                DRMLayer::default(),
-                DRMLayer::default(),
-            ],
-        };
-        let attribs = [
-            VASurfaceAttrib {
-                type_: VA_SURFACE_ATTRIB_MEM_TYPE,
-                flags: VA_SURFACE_ATTRIB_SETTABLE,
-                value: VAGenericValue {
-                    type_: 0,
-                    value: VAGenericValueInner {
-                        i: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
-                    },
-                },
-            },
-            VASurfaceAttrib {
-                type_: VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS,
-                flags: VA_SURFACE_ATTRIB_SETTABLE,
-                value: VAGenericValue {
-                    type_: 2,
-                    value: VAGenericValueInner {
-                        p: &mut desc as *mut _ as *mut c_void,
-                    },
-                },
-            },
-        ];
-        let mut bgra_surf: VASurfaceID = 0;
+        let mut surfaces = vec![0u32; count];
         let st = unsafe {
             (va.vaCreateSurfaces)(
                 self.display,
-                VA_RT_FORMAT_RGB32,
-                import_w,
-                import_h,
-                &mut bgra_surf,
-                1,
-                attribs.as_ptr() as *mut c_void,
-                2,
+                VA_RT_FORMAT_YUV420,
+                w,
+                h,
+                surfaces.as_mut_ptr(),
+                count as u32,
+                ptr::null_mut(),
+                0,
             )
         };
-        if st != crate::gpu_libs::VA_STATUS_SUCCESS {
-            eprintln!(
-                "[vpp] PRIME_2 failed (st={st}) fd={fd} {import_w}x{import_h} drm=0x{fourcc:08x} va=0x{surface_fourcc:08x} layer=0x{layer_drm_fourcc:08x} modifier=0x{modifier:016x} stride={stride} buf_size={buf_size}",
-            );
-            // Fallback: PRIME_1 (legacy).
-            let mut ext_buf = VASurfaceAttribExternalBuffers {
-                pixel_format: surface_fourcc,
-                width: import_w,
-                height: import_h,
-                data_size: buf_size,
-                num_planes: 1,
-                pitches: [stride, 0, 0, 0],
-                offsets: [offset, 0, 0, 0],
-                buffers: &mut (fd as libc::uintptr_t) as *mut _,
-                num_buffers: 1,
-                flags: 0,
-                private_data: ptr::null_mut(),
-            };
-            let attribs_p1 = [
-                VASurfaceAttrib {
-                    type_: VA_SURFACE_ATTRIB_MEM_TYPE,
-                    flags: VA_SURFACE_ATTRIB_SETTABLE,
-                    value: VAGenericValue {
-                        type_: 0,
-                        value: VAGenericValueInner {
-                            i: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32,
-                        },
-                    },
-                },
-                VASurfaceAttrib {
-                    type_: VA_SURFACE_ATTRIB_EXTERNAL_BUFFERS,
-                    flags: VA_SURFACE_ATTRIB_SETTABLE,
-                    value: VAGenericValue {
-                        type_: 2,
-                        value: VAGenericValueInner {
-                            p: &mut ext_buf as *mut _ as *mut c_void,
-                        },
-                    },
-                },
-            ];
-            let st2 = unsafe {
-                (va.vaCreateSurfaces)(
+        if st != VA_STATUS_SUCCESS {
+            eprintln!("[vaapi-vpp] NV12 vaCreateSurfaces failed: st={st} {w}x{h}");
+            return false;
+        }
+
+        for (i, &surf) in surfaces.iter().enumerate() {
+            let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+            let st = unsafe {
+                (va.vaExportSurfaceHandle)(
                     self.display,
-                    VA_RT_FORMAT_RGB32,
-                    import_w,
-                    import_h,
-                    &mut bgra_surf,
-                    1,
-                    attribs_p1.as_ptr() as *mut c_void,
-                    2,
+                    surf,
+                    0x40000000, // VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2
+                    0x07,       // VA_EXPORT_SURFACE_READ_WRITE
+                    &mut desc as *mut _ as *mut c_void,
                 )
             };
-            if st2 != crate::gpu_libs::VA_STATUS_SUCCESS {
-                eprintln!("[vpp] PRIME_1 also failed (st={st2}) fd={fd} {import_w}x{import_h}");
-                return None;
+            if st != VA_STATUS_SUCCESS || desc.num_layers == 0 {
+                eprintln!(
+                    "[vaapi-vpp] NV12 export failed: st={st} layers={}",
+                    desc.num_layers,
+                );
+                if desc.objects[0].fd >= 0 && st == VA_STATUS_SUCCESS {
+                    unsafe { libc::close(desc.objects[0].fd) };
+                }
+                self.destroy_nv12_compute_surfaces(&mut surfaces);
+                return false;
             }
+
+            let fd = desc.objects[0].fd;
+            let modifier = desc.objects[0].drm_format_modifier;
+
+            // NV12 export layout varies by driver:
+            //   Intel (iHD): 1 layer, 2 planes — offset[0]=Y, offset[1]=UV
+            //   AMD (radeonsi): 2 layers, 1 plane each — layer 0=Y, layer 1=UV
+            let (stride, uv_offset) = if desc.num_layers >= 2 {
+                // AMD: 2 layers × 1 plane
+                (desc.layers[0].pitch[0], desc.layers[1].offset[0])
+            } else if desc.layers[0].num_planes >= 2 {
+                // Intel: 1 layer × 2 planes
+                (desc.layers[0].pitch[0], desc.layers[0].offset[1])
+            } else {
+                eprintln!(
+                    "[vaapi-vpp] NV12 export: unexpected layout layers={} planes={}",
+                    desc.num_layers, desc.layers[0].num_planes,
+                );
+                unsafe { libc::close(fd) };
+                self.destroy_nv12_compute_surfaces(&mut surfaces);
+                return false;
+            };
+
+            if self.verbose && i == 0 {
+                eprintln!(
+                    "[vaapi-vpp] NV12 export: {w}x{h} stride={stride} \
+                     uv_offset={uv_offset} modifier=0x{modifier:016x} va_surface={surf}",
+                );
+            }
+            self.gbm_nv12_buffers.push(GbmNv12Buffer {
+                fd: std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+                stride,
+                uv_offset,
+                modifier,
+                va_surface: surf,
+            });
         }
-        Some(bgra_surf)
+        eprintln!(
+            "[vaapi-vpp] exported {} NV12 surfaces for compute {w}x{h}",
+            self.gbm_nv12_buffers.len(),
+        );
+        true
+    }
+
+    /// Get the raw VADisplay pointer (as usize for Send safety).
+    #[allow(dead_code)]
+    pub(crate) fn va_display_usize(&self) -> usize {
+        self.display as usize
     }
 }
+
+// Dead code below removed: export_surfaces, upload_and_convert_bgra,
+// convert_surface, convert_surface_flipped, convert_dmabuf, prime_import.
+// The compute NV12 path (allocate_nv12_buffers + Vulkan compute shader)
+// replaces the VPP BGRA→NV12 PRIME import pipeline entirely.
 
 impl Drop for VppContext {
     fn drop(&mut self) {
         unsafe {
             let va = self.va;
-            // Destroy cached PRIME-imported surfaces.
-            for cached in self.import_cache.drain(..) {
-                let mut s = cached.surface;
-                (va.vaDestroySurfaces)(self.display, &mut s, 1);
-            }
-            // Destroy pre-allocated BGRA surfaces.
-            if !self.bgra_surfaces.is_empty() {
+            // Destroy compute NV12 surfaces (VA-API-allocated, exported to Vulkan).
+            let mut compute_surfs: Vec<u32> = self
+                .gbm_nv12_buffers
+                .drain(..)
+                .map(|b| {
+                    drop(b.fd);
+                    b.va_surface
+                })
+                .collect();
+            if !compute_surfs.is_empty() {
                 (va.vaDestroySurfaces)(
                     self.display,
-                    self.bgra_surfaces.as_mut_ptr(),
-                    self.bgra_surfaces.len() as i32,
+                    compute_surfs.as_mut_ptr(),
+                    compute_surfs.len() as i32,
                 );
             }
             (va.vaDestroyContext)(self.display, self.context);
-            (va.vaDestroySurfaces)(self.display, self.nv12_surfaces.as_mut_ptr(), 4);
+            (va.vaDestroySurfaces)(
+                self.display,
+                self.nv12_surfaces.as_mut_ptr(),
+                NUM_NV12_SURFACES as i32,
+            );
             (va.vaDestroyConfig)(self.display, self.config);
         }
     }
@@ -1273,10 +817,12 @@ pub struct VaapiDirectEncoder {
     cur_ref_idx: usize,
     qp: u8,
     _verbose: bool,
-    _drm_fd: OwnedFd,
+    pub(crate) _drm_fd: OwnedFd,
     /// Optional VA-API VPP context for zero-copy DMA-BUF import.
     /// Present when VAEntrypointVideoProc is supported by the driver.
-    vpp: Option<VppContext>,
+    pub(crate) vpp: Option<VppContext>,
+    /// Cached vaDeriveImage for the input surface.
+    cached_input_image: Option<CachedDerivedImage>,
 }
 
 unsafe impl Send for VaapiDirectEncoder {}
@@ -1450,8 +996,20 @@ impl VaapiDirectEncoder {
             cur_ref_idx: 0,
             qp,
             _verbose: verbose,
+            vpp: unsafe {
+                VppContext::try_new(
+                    va,
+                    display,
+                    width,
+                    height,
+                    width,
+                    height,
+                    drm_fd.as_raw_fd(),
+                    verbose,
+                )
+            },
             _drm_fd: drm_fd,
-            vpp: unsafe { VppContext::try_new(va, display, width, height, verbose) },
+            cached_input_image: None,
         })
     }
 
@@ -1459,51 +1017,50 @@ impl VaapiDirectEncoder {
         self.force_idr = true;
     }
 
-    /// Encode directly from a DMA-BUF fd (zero-copy GPU path).
-    ///
-    /// Imports the DMA-BUF as a BGRA VASurface, uses the VPP to convert
-    /// to NV12 on the GPU, then encodes the NV12 surface.
-    #[allow(clippy::too_many_arguments)]
-    pub fn encode_dmabuf_fd(
-        &mut self,
-        fd: std::os::fd::RawFd,
-        fourcc: u32,
-        modifier: u64,
-        stride: u32,
-        offset: u32,
-        src_width: u32,
-        src_height: u32,
-    ) -> Option<(Vec<u8>, bool)> {
-        let vpp = self.vpp.as_mut()?;
-        let nv12_surf = unsafe {
-            vpp.convert_dmabuf(fd, fourcc, modifier, stride, offset, src_width, src_height)?
-        };
-        self.encode_surface(nv12_surf)
-    }
-
-    /// Encode from a pre-allocated VASurface (true zero-copy path).
-    /// The surface was allocated by VPP and rendered into by the compositor
-    /// via a shared DMA-BUF/EGL FBO.
-    pub fn encode_va_surface(&mut self, surface_id: VASurfaceID) -> Option<(Vec<u8>, bool)> {
-        let vpp = self.vpp.as_mut()?;
-        let nv12_surf = unsafe { vpp.convert_surface(surface_id)? };
-        self.encode_surface(nv12_surf)
-    }
-
-    /// Export VPP's pre-allocated BGRA surfaces as DMA-BUFs.
-    pub fn export_vpp_surfaces(&self) -> Vec<ExportedVaSurface> {
+    pub fn gbm_buffers(&self) -> &[GbmExportedBuffer] {
         match &self.vpp {
-            Some(vpp) => vpp.export_surfaces(),
-            None => Vec::new(),
+            Some(vpp) => &vpp.gbm_buffers,
+            None => &[],
+        }
+    }
+
+    pub fn gbm_nv12_buffers(&self) -> &[GbmNv12Buffer] {
+        match &self.vpp {
+            Some(vpp) => &vpp.gbm_nv12_buffers,
+            None => &[],
         }
     }
 
     /// Get the VADisplay as usize.
+    #[allow(dead_code)]
     pub fn va_display_usize(&self) -> usize {
         match &self.vpp {
             Some(vpp) => vpp.va_display_usize(),
             None => 0,
         }
+    }
+
+    /// Get or create a cached derived image for the input surface.
+    fn derive_input_image(&mut self) -> Option<&CachedDerivedImage> {
+        if self.cached_input_image.is_none() {
+            let surface = self.surfaces[NUM_REF_SURFACES];
+            let mut image = [0u8; VA_IMAGE_SIZE];
+            let st = unsafe {
+                (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
+            };
+            if st != VA_STATUS_SUCCESS {
+                return None;
+            }
+            self.cached_input_image = Some(CachedDerivedImage {
+                image_id: r32(&image, VAIMG_ID_OFF),
+                buf_id: r32(&image, VAIMG_BUF_OFF),
+                y_pitch: r32(&image, VAIMG_PITCHES_OFF) as usize,
+                uv_pitch: r32(&image, VAIMG_PITCHES_OFF + 4) as usize,
+                y_offset: r32(&image, VAIMG_OFFSETS_OFF) as usize,
+                uv_offset: r32(&image, VAIMG_OFFSETS_OFF + 4) as usize,
+            });
+        }
+        self.cached_input_image.as_ref()
     }
 
     /// Encode an NV12 frame (Y + UV interleaved planes).
@@ -1514,10 +1071,8 @@ impl VaapiDirectEncoder {
         y_stride: usize,
         uv_stride: usize,
     ) -> Option<(Vec<u8>, bool)> {
-        let input_surface = self.surfaces[NUM_REF_SURFACES]; // last surface is input
-
-        // Upload NV12 data to the input surface
-        self.upload_nv12(input_surface, y_data, uv_data, y_stride, uv_stride)?;
+        self.upload_nv12(y_data, uv_data, y_stride, uv_stride)?;
+        let input_surface = self.surfaces[NUM_REF_SURFACES];
         self.encode_surface(input_surface)
     }
 
@@ -1528,42 +1083,28 @@ impl VaapiDirectEncoder {
         src_w: usize,
         src_h: usize,
     ) -> Option<(Vec<u8>, bool)> {
+        self.upload_bgra(bgra, src_w, src_h)?;
         let input_surface = self.surfaces[NUM_REF_SURFACES];
-
-        // Convert BGRA→NV12 and upload to surface
-        self.upload_bgra(input_surface, bgra, src_w, src_h)?;
         self.encode_surface(input_surface)
     }
 
     fn upload_nv12(
-        &self,
-        surface: VASurfaceID,
+        &mut self,
         y_data: &[u8],
         uv_data: &[u8],
         src_y_stride: usize,
         src_uv_stride: usize,
     ) -> Option<()> {
-        let mut image = [0u8; VA_IMAGE_SIZE];
-        let st = unsafe {
-            (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
-        };
-        if st != VA_STATUS_SUCCESS {
-            return None;
-        }
-
-        let image_id = r32(&image, VAIMG_ID_OFF);
-        let buf_id = r32(&image, VAIMG_BUF_OFF);
-        let y_pitch = r32(&image, VAIMG_PITCHES_OFF) as usize;
-        let uv_pitch = r32(&image, VAIMG_PITCHES_OFF + 4) as usize;
-        let y_offset = r32(&image, VAIMG_OFFSETS_OFF) as usize;
-        let uv_offset = r32(&image, VAIMG_OFFSETS_OFF + 4) as usize;
+        let img = self.derive_input_image()?;
+        let buf_id = img.buf_id;
+        let y_pitch = img.y_pitch;
+        let uv_pitch = img.uv_pitch;
+        let y_offset = img.y_offset;
+        let uv_offset = img.uv_offset;
 
         let mut map_ptr: *mut c_void = ptr::null_mut();
         let st = unsafe { (self.va.vaMapBuffer)(self.display, buf_id, &mut map_ptr) };
         if st != VA_STATUS_SUCCESS {
-            unsafe {
-                (self.va.vaDestroyImage)(self.display, image_id);
-            }
             return None;
         }
 
@@ -1595,43 +1136,22 @@ impl VaapiDirectEncoder {
                     copy_len,
                 );
             }
-        }
-
-        unsafe {
             (self.va.vaUnmapBuffer)(self.display, buf_id);
-            (self.va.vaDestroyImage)(self.display, image_id);
         }
         Some(())
     }
 
-    fn upload_bgra(
-        &self,
-        surface: VASurfaceID,
-        bgra: &[u8],
-        src_w: usize,
-        src_h: usize,
-    ) -> Option<()> {
-        let mut image = [0u8; VA_IMAGE_SIZE];
-        let st = unsafe {
-            (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
-        };
-        if st != VA_STATUS_SUCCESS {
-            return None;
-        }
-
-        let image_id = r32(&image, VAIMG_ID_OFF);
-        let buf_id = r32(&image, VAIMG_BUF_OFF);
-        let y_pitch = r32(&image, VAIMG_PITCHES_OFF) as usize;
-        let uv_pitch = r32(&image, VAIMG_PITCHES_OFF + 4) as usize;
-        let y_offset = r32(&image, VAIMG_OFFSETS_OFF) as usize;
-        let uv_offset = r32(&image, VAIMG_OFFSETS_OFF + 4) as usize;
+    fn upload_bgra(&mut self, bgra: &[u8], src_w: usize, src_h: usize) -> Option<()> {
+        let img = self.derive_input_image()?;
+        let buf_id = img.buf_id;
+        let y_pitch = img.y_pitch;
+        let uv_pitch = img.uv_pitch;
+        let y_offset = img.y_offset;
+        let uv_offset = img.uv_offset;
 
         let mut map_ptr: *mut c_void = ptr::null_mut();
         let st = unsafe { (self.va.vaMapBuffer)(self.display, buf_id, &mut map_ptr) };
         if st != VA_STATUS_SUCCESS {
-            unsafe {
-                (self.va.vaDestroyImage)(self.display, image_id);
-            }
             return None;
         }
 
@@ -1681,16 +1201,12 @@ impl VaapiDirectEncoder {
                     *dst_row.add(cx * 2 + 1) = (v_sum / 4).clamp(0, 255) as u8;
                 }
             }
-        }
-
-        unsafe {
             (self.va.vaUnmapBuffer)(self.display, buf_id);
-            (self.va.vaDestroyImage)(self.display, image_id);
         }
         Some(())
     }
 
-    fn encode_surface(&mut self, input_surface: VASurfaceID) -> Option<(Vec<u8>, bool)> {
+    pub(crate) fn encode_surface(&mut self, input_surface: VASurfaceID) -> Option<(Vec<u8>, bool)> {
         let is_idr = self.force_idr || self.frame_num == 0;
         if is_idr {
             self.frame_num = 0;
@@ -1863,10 +1379,12 @@ impl VaapiDirectEncoder {
             52 // Level 5.2: 4096×2304
         };
         w8(&mut sps, 1, level_idc);
-        // intra_period (offset 4, u32)
-        w32(&mut sps, 4, 120);
-        // intra_idr_period (offset 8, u32)
-        w32(&mut sps, 8, 120);
+        // intra_period (offset 4, u32) — set to max so the driver never
+        // auto-inserts keyframes; blit uses explicit force_idr instead.
+        // 0 means "all intra" in VA-API, so use a large value.
+        w32(&mut sps, 4, 0x7FFF_FFFF);
+        // intra_idr_period (offset 8, u32) — same as intra_period.
+        w32(&mut sps, 8, 0x7FFF_FFFF);
         // ip_period (offset 12, u32)
         w32(&mut sps, 12, 1);
         // bits_per_second (offset 16, u32)
@@ -2098,6 +1616,11 @@ impl Drop for VaapiDirectEncoder {
         // Drop VPP context first — it shares our VA display handle and must
         // be destroyed before vaTerminate() invalidates the display.
         self.vpp.take();
+        if let Some(img) = self.cached_input_image.take() {
+            unsafe {
+                (self.va.vaDestroyImage)(self.display, img.image_id);
+            }
+        }
         unsafe {
             (self.va.vaDestroyBuffer)(self.display, self.coded_buf);
             (self.va.vaDestroyContext)(self.display, self.context);
@@ -2374,8 +1897,12 @@ pub struct VaapiAv1Encoder {
     cur_ref_idx: usize,
     base_qindex: u8,
     _verbose: bool,
-    _drm_fd: OwnedFd,
-    vpp: Option<VppContext>,
+    pub(crate) _drm_fd: OwnedFd,
+    pub(crate) vpp: Option<VppContext>,
+    /// Cached vaDeriveImage for the input surface (surfaces[2]).
+    /// Avoids per-frame vaDeriveImage/vaDestroyImage driver calls on the
+    /// fallback (non-zero-copy) encode path.
+    cached_input_image: Option<CachedDerivedImage>,
 }
 
 unsafe impl Send for VaapiAv1Encoder {}
@@ -2522,12 +2049,23 @@ impl VaapiAv1Encoder {
                 "[vaapi-direct] initialized AV1 Profile0 encoder for {width}x{height} (ep={entrypoint})"
             );
         }
-        // VPP at encoder (padded) dimensions — the NV12 surfaces must match
-        // the encoder context's resolution (64-pixel aligned for AV1).
-        // Using source dimensions here would produce undersized NV12 surfaces
-        // causing bottom-of-frame corruption and potential encoder hangs on
-        // AMD VAAPI drivers.
-        let vpp = unsafe { VppContext::try_new(va, display, width, height, verbose) };
+        // NV12 surfaces must match the encoder context's resolution (64-pixel
+        // aligned for AV1).  BGRA surfaces are created at the *source*
+        // resolution so the compositor's external-output dimension check
+        // passes and the zero-copy path is used — eliminating the staging
+        // readback memcpy and CPU BGRA→NV12 conversion entirely.
+        let vpp = unsafe {
+            VppContext::try_new(
+                va,
+                display,
+                width,
+                height,
+                source_width,
+                source_height,
+                drm_fd.as_raw_fd(),
+                verbose,
+            )
+        };
 
         Ok(Self {
             va,
@@ -2548,6 +2086,7 @@ impl VaapiAv1Encoder {
             _verbose: verbose,
             _drm_fd: drm_fd,
             vpp,
+            cached_input_image: None,
         })
     }
 
@@ -2555,39 +2094,44 @@ impl VaapiAv1Encoder {
         self.force_idr = true;
     }
 
-    /// Encode directly from a DMA-BUF fd (zero-copy GPU path).
-    #[allow(clippy::too_many_arguments)]
-    pub fn encode_dmabuf_fd(
-        &mut self,
-        fd: std::os::fd::RawFd,
-        fourcc: u32,
-        modifier: u64,
-        stride: u32,
-        offset: u32,
-        src_width: u32,
-        src_height: u32,
-    ) -> Option<(Vec<u8>, bool)> {
-        let vpp = self.vpp.as_mut()?;
-        let nv12_surf = unsafe {
-            vpp.convert_dmabuf(fd, fourcc, modifier, stride, offset, src_width, src_height)?
-        };
-        self.encode_surface(nv12_surf)
+    /// Get or create a cached derived image for the input surface.
+    fn derive_input_image(&mut self) -> Option<&CachedDerivedImage> {
+        if self.cached_input_image.is_none() {
+            let surface = self.surfaces[2];
+            let mut image = [0u8; VA_IMAGE_SIZE];
+            let st = unsafe {
+                (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
+            };
+            if st != VA_STATUS_SUCCESS {
+                return None;
+            }
+            self.cached_input_image = Some(CachedDerivedImage {
+                image_id: r32(&image, VAIMG_ID_OFF),
+                buf_id: r32(&image, VAIMG_BUF_OFF),
+                y_pitch: r32(&image, VAIMG_PITCHES_OFF) as usize,
+                uv_pitch: r32(&image, VAIMG_PITCHES_OFF + 4) as usize,
+                y_offset: r32(&image, VAIMG_OFFSETS_OFF) as usize,
+                uv_offset: r32(&image, VAIMG_OFFSETS_OFF + 4) as usize,
+            });
+        }
+        self.cached_input_image.as_ref()
     }
 
-    /// Encode from a pre-allocated VASurface (true zero-copy path).
-    pub fn encode_va_surface(&mut self, surface_id: VASurfaceID) -> Option<(Vec<u8>, bool)> {
-        let vpp = self.vpp.as_mut()?;
-        let nv12_surf = unsafe { vpp.convert_surface(surface_id)? };
-        self.encode_surface(nv12_surf)
-    }
-
-    pub fn export_vpp_surfaces(&self) -> Vec<ExportedVaSurface> {
+    pub fn gbm_buffers(&self) -> &[GbmExportedBuffer] {
         match &self.vpp {
-            Some(vpp) => vpp.export_surfaces(),
-            None => Vec::new(),
+            Some(vpp) => &vpp.gbm_buffers,
+            None => &[],
         }
     }
 
+    pub fn gbm_nv12_buffers(&self) -> &[GbmNv12Buffer] {
+        match &self.vpp {
+            Some(vpp) => &vpp.gbm_nv12_buffers,
+            None => &[],
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn va_display_usize(&self) -> usize {
         match &self.vpp {
             Some(vpp) => vpp.va_display_usize(),
@@ -2602,8 +2146,8 @@ impl VaapiAv1Encoder {
         y_stride: usize,
         uv_stride: usize,
     ) -> Option<(Vec<u8>, bool)> {
-        let input_surface = self.surfaces[2]; // index 0,1 = recon, 2 = input
-        self.upload_nv12(input_surface, y_data, uv_data, y_stride, uv_stride)?;
+        self.upload_nv12(y_data, uv_data, y_stride, uv_stride)?;
+        let input_surface = self.surfaces[2];
         self.encode_surface(input_surface)
     }
 
@@ -2613,38 +2157,27 @@ impl VaapiAv1Encoder {
         src_w: usize,
         src_h: usize,
     ) -> Option<(Vec<u8>, bool)> {
-        let input_surface = self.surfaces[2]; // index 0,1 = recon, 2 = input
-        self.upload_bgra(input_surface, bgra, src_w, src_h)?;
+        self.upload_bgra(bgra, src_w, src_h)?;
+        let input_surface = self.surfaces[2];
         self.encode_surface(input_surface)
     }
 
     fn upload_nv12(
-        &self,
-        surface: VASurfaceID,
+        &mut self,
         y_data: &[u8],
         uv_data: &[u8],
         src_y_stride: usize,
         src_uv_stride: usize,
     ) -> Option<()> {
-        let mut image = [0u8; VA_IMAGE_SIZE];
-        let st = unsafe {
-            (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
-        };
-        if st != VA_STATUS_SUCCESS {
-            return None;
-        }
-        let image_id = r32(&image, VAIMG_ID_OFF);
-        let buf_id = r32(&image, VAIMG_BUF_OFF);
-        let y_pitch = r32(&image, VAIMG_PITCHES_OFF) as usize;
-        let uv_pitch = r32(&image, VAIMG_PITCHES_OFF + 4) as usize;
-        let y_offset = r32(&image, VAIMG_OFFSETS_OFF) as usize;
-        let uv_offset = r32(&image, VAIMG_OFFSETS_OFF + 4) as usize;
+        let img = self.derive_input_image()?;
+        let buf_id = img.buf_id;
+        let y_pitch = img.y_pitch;
+        let uv_pitch = img.uv_pitch;
+        let y_offset = img.y_offset;
+        let uv_offset = img.uv_offset;
         let mut map_ptr: *mut c_void = ptr::null_mut();
         let st = unsafe { (self.va.vaMapBuffer)(self.display, buf_id, &mut map_ptr) };
         if st != VA_STATUS_SUCCESS {
-            unsafe {
-                (self.va.vaDestroyImage)(self.display, image_id);
-            }
             return None;
         }
         let w = self.width as usize;
@@ -2674,37 +2207,20 @@ impl VaapiAv1Encoder {
                 );
             }
             (self.va.vaUnmapBuffer)(self.display, buf_id);
-            (self.va.vaDestroyImage)(self.display, image_id);
         }
         Some(())
     }
 
-    fn upload_bgra(
-        &self,
-        surface: VASurfaceID,
-        bgra: &[u8],
-        src_w: usize,
-        src_h: usize,
-    ) -> Option<()> {
-        let mut image = [0u8; VA_IMAGE_SIZE];
-        let st = unsafe {
-            (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
-        };
-        if st != VA_STATUS_SUCCESS {
-            return None;
-        }
-        let image_id = r32(&image, VAIMG_ID_OFF);
-        let buf_id = r32(&image, VAIMG_BUF_OFF);
-        let y_pitch = r32(&image, VAIMG_PITCHES_OFF) as usize;
-        let uv_pitch = r32(&image, VAIMG_PITCHES_OFF + 4) as usize;
-        let y_offset = r32(&image, VAIMG_OFFSETS_OFF) as usize;
-        let uv_offset = r32(&image, VAIMG_OFFSETS_OFF + 4) as usize;
+    fn upload_bgra(&mut self, bgra: &[u8], src_w: usize, src_h: usize) -> Option<()> {
+        let img = self.derive_input_image()?;
+        let buf_id = img.buf_id;
+        let y_pitch = img.y_pitch;
+        let uv_pitch = img.uv_pitch;
+        let y_offset = img.y_offset;
+        let uv_offset = img.uv_offset;
         let mut map_ptr: *mut c_void = ptr::null_mut();
         let st = unsafe { (self.va.vaMapBuffer)(self.display, buf_id, &mut map_ptr) };
         if st != VA_STATUS_SUCCESS {
-            unsafe {
-                (self.va.vaDestroyImage)(self.display, image_id);
-            }
             return None;
         }
         let enc_w = self.width as usize;
@@ -2750,12 +2266,11 @@ impl VaapiAv1Encoder {
                 }
             }
             (self.va.vaUnmapBuffer)(self.display, buf_id);
-            (self.va.vaDestroyImage)(self.display, image_id);
         }
         Some(())
     }
 
-    fn encode_surface(&mut self, input_surface: VASurfaceID) -> Option<(Vec<u8>, bool)> {
+    pub(crate) fn encode_surface(&mut self, input_surface: VASurfaceID) -> Option<(Vec<u8>, bool)> {
         let is_key = self.force_idr || self.frame_num == 0;
         if is_key {
             self.frame_num = 0;
@@ -2922,12 +2437,19 @@ impl VaapiAv1Encoder {
         seq.seq_level_idx = self.level_idx;
         seq.seq_tier = 0;
         seq.hierarchical_flag = 0;
-        seq.intra_period = 120;
+        // Max value so the driver never auto-inserts keyframes; blit
+        // uses explicit force_idr instead.  0 means "all intra" in
+        // VA-API, so use a large value.
+        seq.intra_period = 0x7FFF_FFFF;
         seq.ip_period = 1;
         seq.bits_per_second = 0;
         seq.order_hint_bits_minus_1 = 7;
-        // seq_fields: enable_order_hint(bit 8)=1, enable_cdef(bit 12)=1,
-        //             subsampling_x(bit 17)=1, subsampling_y(bit 18)=1
+        // seq_fields bitfield (from va_enc_av1.h):
+        //   bit  8: enable_order_hint = 1
+        //   bit 12: enable_cdef = 1
+        //   bit 14-15: bit_depth_minus8 = 2 (for 10-bit)
+        //   bit 17: subsampling_x = 1
+        //   bit 18: subsampling_y = 1
         seq.seq_fields = (1 << 8) | (1 << 12) | (1 << 17) | (1 << 18);
         seq
     }
@@ -2992,7 +2514,7 @@ impl VaapiAv1Encoder {
         ret.write_bool(false); // superres
         ret.write_bool(true); // cdef
         ret.write_bool(false); // restoration
-        ret.write_bool(false); // high bitdepth
+        ret.write_bool(false); // high bitdepth (8-bit)
         ret.write_bool(false); // monochrome
         ret.write_bool(false); // no color description
         ret.write_bool(false); // no color range
@@ -3032,9 +2554,16 @@ impl VaapiAv1Encoder {
         pic.seg_id_block_size = 0;
         pic.num_tile_groups_minus1 = 0;
         pic.temporal_id = 0;
-        pic.filter_level = [15, 15];
-        pic.filter_level_u = 8;
-        pic.filter_level_v = 8;
+        // Scale loop filter with QP.  At low base_qindex the encoder
+        // produces few blocking artefacts, so aggressive deblocking just
+        // blurs sharp edges (especially text).  Calibrated so QP 80 gives
+        // the same [15, 15, 8, 8] as before, while QP 1 (Ultra) gives ~0.
+        let qp = self.base_qindex as u32;
+        let lf_y = ((qp * 15) / 80).min(63) as u8;
+        let lf_uv = ((qp * 8) / 80).min(63) as u8;
+        pic.filter_level = [lf_y, lf_y];
+        pic.filter_level_u = lf_uv;
+        pic.filter_level_v = lf_uv;
         pic.loop_filter_flags = 0;
         pic.superres_scale_denominator = 0;
         pic.interpolation_filter = 0;
@@ -3224,6 +2753,11 @@ impl Drop for VaapiAv1Encoder {
     fn drop(&mut self) {
         // Drop VPP first — it shares our VA display handle.
         self.vpp.take();
+        if let Some(img) = self.cached_input_image.take() {
+            unsafe {
+                (self.va.vaDestroyImage)(self.display, img.image_id);
+            }
+        }
         unsafe {
             (self.va.vaDestroyBuffer)(self.display, self.coded_buf);
             (self.va.vaDestroyContext)(self.display, self.context);

@@ -542,6 +542,7 @@ export function SwitcherOverlay(props: {
   activeLayout?: BSPLayout | null;
   layoutAssignments?: BSPAssignments | null;
   onApplyLayout?: (layout: BSPLayout) => void;
+  onRemoveLayout?: (dsl: string) => void;
   onClearLayout?: () => void;
   onSelectPane?: (
     paneId: string,
@@ -2145,6 +2146,40 @@ export function SwitcherOverlay(props: {
                                   {t("switcher.close")}
                                 </button>
                               </Show>
+
+                              {/* Remove button for recent layouts */}
+                              <Show
+                                when={
+                                  item.type === "layout" &&
+                                  item.key.startsWith("layout:recent:")
+                                }
+                              >
+                                <button
+                                  type="button"
+                                  aria-label={t("switcher.removeLayout")}
+                                  title={t("switcher.removeLayout")}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    props.onRemoveLayout?.(
+                                      (item as LayoutItem).layout.dsl,
+                                    );
+                                  }}
+                                  style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: "inherit",
+                                    cursor: "pointer",
+                                    opacity: 0.45,
+                                    "font-size": `${fsSm()}px`,
+                                    padding: `${scale().controlY}px ${scale().controlX}px`,
+                                    "font-family": "inherit",
+                                    "line-height": "1",
+                                    "align-self": "center",
+                                  }}
+                                >
+                                  {"\u00d7"}
+                                </button>
+                              </Show>
                             </div>
                           );
                         }}
@@ -2296,13 +2331,49 @@ export function SwitcherOverlay(props: {
                     <mark style={ui.badge}>{t("switcher.badgeDefault")}</mark>
                   </Show>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => activateItem(sel())}
-                  style={ctaStyle()}
+                <div
+                  style={{
+                    display: "flex",
+                    gap: `${scale().tightGap}px`,
+                    "align-items": "center",
+                  }}
                 >
-                  {t("switcher.applyLayout")}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => activateItem(sel())}
+                    style={{ ...ctaStyle(), flex: 1 }}
+                  >
+                    {t("switcher.applyLayout")}
+                  </button>
+                  <Show
+                    when={layoutChoices().recent.some(
+                      (layout) =>
+                        layout.dsl === (sel() as LayoutItem).layout.dsl,
+                    )}
+                  >
+                    <button
+                      type="button"
+                      aria-label={t("switcher.removeLayout")}
+                      title={t("switcher.removeLayout")}
+                      onClick={() =>
+                        props.onRemoveLayout?.((sel() as LayoutItem).layout.dsl)
+                      }
+                      style={{
+                        background: "none",
+                        border: "none",
+                        color: "inherit",
+                        cursor: "pointer",
+                        opacity: 0.45,
+                        "font-size": `${fsMd()}px`,
+                        padding: `${scale().controlY}px`,
+                        "font-family": "inherit",
+                        "line-height": "1",
+                      }}
+                    >
+                      {"\u00d7"}
+                    </button>
+                  </Show>
+                </div>
               </Show>
 
               <Show when={sel().type === "pane"}>

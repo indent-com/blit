@@ -347,6 +347,67 @@ impl VaDrmFns {
 }
 
 // ---------------------------------------------------------------------------
+// GBM (Generic Buffer Manager) — allocates DRM-native DMA-BUFs that both
+// VA-API and Vulkan can import.
+// ---------------------------------------------------------------------------
+
+pub type GbmDevice = *mut c_void;
+pub type GbmBo = *mut c_void;
+
+pub struct GbmFns {
+    pub gbm_create_device: unsafe extern "C" fn(fd: c_int) -> GbmDevice,
+    pub gbm_device_destroy: unsafe extern "C" fn(gbm: GbmDevice),
+    pub gbm_bo_create: unsafe extern "C" fn(
+        gbm: GbmDevice,
+        width: u32,
+        height: u32,
+        format: u32,
+        flags: u32,
+    ) -> GbmBo,
+    pub gbm_bo_destroy: unsafe extern "C" fn(bo: GbmBo),
+    pub gbm_bo_get_fd: unsafe extern "C" fn(bo: GbmBo) -> c_int,
+    pub gbm_bo_get_stride: unsafe extern "C" fn(bo: GbmBo) -> u32,
+    pub gbm_bo_get_modifier: unsafe extern "C" fn(bo: GbmBo) -> u64,
+    pub gbm_bo_get_handle: unsafe extern "C" fn(bo: GbmBo) -> GbmBoHandle,
+    _lib: DynLib,
+}
+
+/// `union gbm_bo_handle` — only the u32 GEM handle field is used.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union GbmBoHandle {
+    pub u32_: u32,
+    pub u64_: u64,
+}
+
+unsafe impl Send for GbmFns {}
+unsafe impl Sync for GbmFns {}
+
+// GBM_FORMAT_ARGB8888 = __gbm_fourcc_code('A','R','2','4')
+pub const GBM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+pub const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+pub const GBM_BO_USE_LINEAR: u32 = 1 << 4;
+
+impl GbmFns {
+    pub fn load() -> Result<Self, String> {
+        let lib = DynLib::open(&["libgbm.so.1", "libgbm.so"])?;
+        unsafe {
+            Ok(Self {
+                gbm_create_device: lib.sym("gbm_create_device")?,
+                gbm_device_destroy: lib.sym("gbm_device_destroy")?,
+                gbm_bo_create: lib.sym("gbm_bo_create")?,
+                gbm_bo_destroy: lib.sym("gbm_bo_destroy")?,
+                gbm_bo_get_fd: lib.sym("gbm_bo_get_fd")?,
+                gbm_bo_get_stride: lib.sym("gbm_bo_get_stride")?,
+                gbm_bo_get_modifier: lib.sym("gbm_bo_get_modifier")?,
+                gbm_bo_get_handle: lib.sym("gbm_bo_get_handle")?,
+                _lib: lib,
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Singleton accessors
 // ---------------------------------------------------------------------------
 
@@ -354,6 +415,7 @@ static CUDA: OnceLock<Result<CudaFns, String>> = OnceLock::new();
 static NVENC: OnceLock<Result<NvEncFns, String>> = OnceLock::new();
 static VA: OnceLock<Result<VaFns, String>> = OnceLock::new();
 static VA_DRM: OnceLock<Result<VaDrmFns, String>> = OnceLock::new();
+static GBM: OnceLock<Result<GbmFns, String>> = OnceLock::new();
 
 pub fn cuda() -> Result<&'static CudaFns, &'static str> {
     CUDA.get_or_init(CudaFns::load)
@@ -375,6 +437,12 @@ pub fn va() -> Result<&'static VaFns, &'static str> {
 pub fn va_drm() -> Result<&'static VaDrmFns, &'static str> {
     VA_DRM
         .get_or_init(VaDrmFns::load)
+        .as_ref()
+        .map_err(|e| e.as_str())
+}
+
+pub fn gbm() -> Result<&'static GbmFns, &'static str> {
+    GBM.get_or_init(GbmFns::load)
         .as_ref()
         .map_err(|e| e.as_str())
 }
