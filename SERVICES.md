@@ -195,17 +195,25 @@ The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](
 ./bin/deploy-website --prod   # production deploy
 ```
 
-## Static binaries via Nix + musl
+## Release binaries via Nix + musl
 
 All release binaries are built with Nix, which makes the entire toolchain reproducible and keeps the build definitions small.
 
-On Linux, binaries are statically linked against **musl libc** via `pkgs.pkgsStatic`. Nix's `pkgsStatic` overlay cross-compiles the entire dependency closure against musl, producing fully self-contained executables with zero runtime dependencies — no glibc version issues, no `LD_LIBRARY_PATH`, works on any Linux kernel from the past decade. The `blit-static` derivation in [`nix/packages.nix`](nix/packages.nix) builds this and includes a `postFixup` assertion that the output is genuinely statically linked (via `file`), failing the build if it isn't.
+On Linux, the main binary is **dynamically linked against musl libc** so that `dlopen` works for GPU acceleration (VA-API, NVENC, Vulkan). All other dependencies (libopus, pixman, libxkbcommon, libgbm) are statically linked via `pkgs.pkgsStatic`. A tiny **static launcher binary** (`crates/launcher/`) resolves the bundled musl dynamic linker relative to its own location and `exec()`s the real binary through it — this is necessary because the ELF interpreter path must be absolute and is not known at build time. The release tarball layout is:
 
-On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed.
+```
+blit                              <- static launcher
+lib/blit/blit                     <- dynamically-linked musl binary
+lib/blit/ld-musl-<arch>.so.1     <- musl dynamic linker (bundled)
+```
+
+The `blit-dynamic` derivation in [`nix/packages.nix`](nix/packages.nix) builds the main binary and verifies its only dynamic dependency is `ld-musl-*.so.1`. The `blit-launcher` derivation builds the static launcher and verifies it is genuinely statically linked. A `blit-static` derivation assembles both with the musl loader.
+
+On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed. No launcher is needed on macOS.
 
 The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) in [`nix/common.nix`](nix/common.nix). The same toolchain also includes `wasm32-unknown-unknown` for the browser WASM build.
 
-This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages are single-file, zero-dependency executables — download, `chmod +x`, run.
+The tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages have zero external dependencies — download, extract, run.
 
 On Windows, Nix isn't available, so the `_build-windows.yml` reusable workflow uses `cargo build --release` directly on a Windows runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
 

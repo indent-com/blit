@@ -82,13 +82,19 @@
       };
 
       # ------------------------------------------------------------------
-      # Static binaries (musl on Linux, for release tarballs)
+      # Release binaries (musl on Linux, for release tarballs)
+      #
+      # On Linux the main binary is dynamically linked against musl libc
+      # (so dlopen works for GPU acceleration) while all other deps are
+      # statically linked.  A tiny static launcher binary exec()s the
+      # real binary through the bundled musl dynamic linker.
       # ------------------------------------------------------------------
 
-      blit-static = craneLibStatic.buildPackage (
+      # Main blit binary — dynamically linked against musl libc.
+      blit-dynamic = craneLibStatic.buildPackage (
         commonArgsStatic
         // {
-          pname = "blit-static";
+          pname = "blit-dynamic";
           cargoArtifacts = cargoArtifactsStatic;
           cargoExtraArgs = "-p blit-cli";
           doCheck = false;
@@ -97,11 +103,20 @@
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           postFixup = ''
             for bin in $out/bin/*; do
-              if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
-                echo "FATAL: $bin is not statically linked:"
+              # Verify the binary is dynamically linked and its only
+              # dynamic dependency is the musl loader.
+              if file "$bin" | grep -q "statically linked"; then
+                echo "FATAL: $bin is statically linked (expected dynamic musl):"
                 file "$bin"
                 exit 1
               fi
+              deps=$(ldd "$bin" 2>/dev/null | grep -oP '/\S+' || true)
+              for dep in $deps; do
+                case "$(basename "$dep")" in
+                  ld-musl-*) ;;
+                  *) echo "FATAL: unexpected dynamic dep: $dep"; exit 1 ;;
+                esac
+              done
             done
           '';
         }
@@ -126,6 +141,50 @@
           '';
         }
       );
+
+      # Static launcher — exec()s the dynamic binary through the bundled
+      # musl dynamic linker.  Must be truly statically linked.
+      blit-launcher = craneLibStatic.buildPackage (
+        commonArgsStatic
+        // {
+          pname = "blit-launcher";
+          cargoArtifacts = cargoArtifactsStatic;
+          cargoExtraArgs = "-p blit-launcher";
+          # Force +crt-static back on — the launcher must be fully static.
+          RUSTFLAGS = "-C target-feature=+crt-static";
+          doCheck = false;
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          postFixup = ''
+            for bin in $out/bin/*; do
+              if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
+                echo "FATAL: launcher $bin is not statically linked:"
+                file "$bin"
+                exit 1
+              fi
+            done
+          '';
+        }
+      );
+
+      # Assembled release package (Linux): launcher + dynamic binary + musl.
+      # On macOS the dynamic binary is used directly (no launcher needed).
+      blit-static =
+        let
+          muslLib = pkgs.pkgsStatic.stdenv.cc.libc;
+          arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
+        in
+        if pkgs.stdenv.isLinux then
+          pkgs.runCommand "blit-release-${version}" { } ''
+            mkdir -p $out/bin/lib/blit
+            cp ${blit-launcher}/bin/blit $out/bin/blit
+            cp ${blit-dynamic}/bin/blit $out/bin/lib/blit/blit
+            cp ${muslLib}/lib/ld-musl-${arch}.so.1 $out/bin/lib/blit/
+            chmod +x $out/bin/blit $out/bin/lib/blit/blit $out/bin/lib/blit/ld-musl-${arch}.so.1
+          ''
+        else
+          blit-dynamic;
+
 
       # ------------------------------------------------------------------
       # JS / Web assets

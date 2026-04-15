@@ -322,7 +322,7 @@ async fn async_main() {
             // Provide a callback to restart the proxy if it dies mid-session.
             let proxy_ensure: Option<blit_webrtc_forwarder::ProxyEnsureFn> = if proxy_sock.is_some()
             {
-                let exe = std::env::current_exe().unwrap_or_default();
+                let exe = blit_proxy::blit_exe();
                 Some(std::sync::Arc::new(move || {
                     let exe = exe.clone();
                     Box::pin(async move { blit_proxy::ensure_proxy(&exe, true).await })
@@ -534,7 +534,7 @@ async fn cmd_install(host: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
-    let exe_path = std::env::current_exe()?;
+    let exe_path = blit_proxy::blit_exe();
     let install_dir = exe_path
         .parent()
         .ok_or("cannot determine binary directory")?;

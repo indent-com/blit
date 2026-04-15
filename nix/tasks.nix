@@ -166,6 +166,10 @@ let
         systemdDir = ../systemd;
       in
       ''
+        # Install the launcher's lib/ directory (dynamic binary + musl loader)
+        if [ -d "${blit-static}/bin/lib" ]; then
+          cp -r "${blit-static}/bin/lib" pkg/usr/lib
+        fi
         mkdir -p pkg/lib/systemd/system
         cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
         cp "${systemdDir}/blit-server@.service" "pkg/lib/systemd/system/blit-server@.service"
@@ -439,7 +443,9 @@ in
       ''
         outdir="''${1:-dist/tarballs}"
         mkdir -p "$outdir"
-        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-static}/bin" blit
+        # Linux tarballs include the launcher + lib/blit/ (dynamic binary + musl).
+        # macOS tarballs are a single binary.
+        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-static}/bin" .
         ls -lh "$outdir"
       '';
   };

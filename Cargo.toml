@@ -13,6 +13,7 @@ members = [
     "crates/compositor",
     "crates/proxy",
     "crates/ssh",
+    "crates/launcher",
 ]
 
 [workspace.package]

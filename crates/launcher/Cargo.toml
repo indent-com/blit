@@ -1,0 +1,12 @@
+[package]
+name = "blit-launcher"
+version = "0.24.1"
+edition.workspace = true
+description = "Tiny static launcher that exec()s the dynamically-linked blit binary through the bundled musl dynamic linker"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "blit"
+path = "src/main.rs"

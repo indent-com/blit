@@ -117,14 +117,14 @@ Every `nix run` target has a corresponding script in `bin/`:
 
 ```bash
 ./bin/build-debs             # .deb packages -> dist/debs/
-./bin/build-tarballs         # static tarballs -> dist/tarballs/
+./bin/build-tarballs         # release tarballs -> dist/tarballs/
 ./bin/publish-npm-packages   # npm publish @blit-sh/browser, @blit-sh/core, @blit-sh/react, @blit-sh/solid
 ./bin/publish-crates         # cargo publish
 ```
 
 `build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
 The version and platform are derived from `flake.nix` and the build host.
-Linkage is verified at `nix build` time — Linux binaries must be statically linked and macOS binaries must not reference nix-store dylibs.
+Linkage is verified at `nix build` time — on Linux the main binary must be dynamically linked against musl libc only (for dlopen/GPU support), the launcher must be statically linked, and macOS binaries must not reference nix-store dylibs.
 
 Individual packages can also be built directly:
 
@@ -181,7 +181,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | `crates/server/src/surface_encoder.rs`   | Surface video encoding: AV1 (rav1e), H.264 (openh264, VA-API, NVENC)                                                  |
 | `crates/server/src/vaapi_encode.rs`      | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                              |
 | `crates/server/src/nvenc_encode.rs`      | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                          |
-| `crates/server/src/gpu_libs.rs`          | Dlopen loaders for libva, NVENC shared across encoders                                                                |
+| `crates/server/src/gpu_libs.rs`          | Runtime dlopen loaders for libva, NVENC, GBM shared across encoders                                                   |
 | `crates/server/src/audio.rs`             | Audio capture pipeline: PipeWire spawn, pw-cat PCM pipe, Opus encoding                                                |
 | `crates/remote/src/lib.rs`               | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
 | `crates/compositor/src/imp.rs`           | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates     |
@@ -232,7 +232,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 
 **Tests live next to the code.** `server/src/lib.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. Core tests are in `core/src/__tests__/`, React tests in `react/src/__tests__/`.
 
-**Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. Linux binaries are statically linked via musl; Nix verifies this at build time.
+**Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. On Linux, release tarballs ship a static launcher binary that exec()s the main binary (dynamically linked against musl libc for dlopen/GPU support) through a bundled musl dynamic linker. Nix verifies linkage at build time.
 
 ## Versioning and releases
 

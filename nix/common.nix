@@ -147,7 +147,9 @@ let
     ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
       staticLibgbm
     ];
-    RUSTFLAGS = "-C relocation-model=static";
+    # Link musl libc dynamically so dlopen works (GPU acceleration).
+    # All other deps (libopus, pixman, etc.) remain statically linked.
+    RUSTFLAGS = "-C target-feature=-crt-static";
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
     CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;

@@ -59,6 +59,13 @@ main() {
   $elevate mkdir -p "$INSTALL_DIR"
   $elevate mv "$tmp/blit" "$INSTALL_DIR/blit"
   $elevate chmod +x "$INSTALL_DIR/blit"
+  # On Linux the tarball includes lib/blit/ with the dynamic binary and
+  # the bundled musl dynamic linker.  Install them alongside the launcher.
+  if [ -d "$tmp/lib/blit" ]; then
+    $elevate mkdir -p "$INSTALL_DIR/lib/blit"
+    $elevate cp "$tmp/lib/blit/"* "$INSTALL_DIR/lib/blit/"
+    $elevate chmod +x "$INSTALL_DIR/lib/blit/"*
+  fi
   echo "installed blit ${version} to $INSTALL_DIR/blit"
 
   # Generate man pages and shell completions alongside the binary

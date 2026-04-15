@@ -353,7 +353,7 @@ async fn proxy_connect(
         Ok(s) => s,
         Err(first_err) => {
             // Proxy socket is unreachable — attempt to restart the daemon.
-            let exe = std::env::current_exe().unwrap_or_default();
+            let exe = blit_proxy::blit_exe();
             match blit_proxy::ensure_proxy(&exe, true).await {
                 Ok(sock) => {
                     eprintln!("blit gateway: proxy restarted → {sock}");
@@ -479,7 +479,7 @@ pub async fn run() {
     let proxy_sock: Option<String> = if std::env::var("BLIT_PROXY").ok().as_deref() == Some("0") {
         None
     } else {
-        let exe = std::env::current_exe().unwrap_or_default();
+        let exe = blit_proxy::blit_exe();
         match blit_proxy::ensure_proxy(&exe, true).await {
             Ok(sock) => {
                 eprintln!("blit gateway: proxy enabled → {sock}");
