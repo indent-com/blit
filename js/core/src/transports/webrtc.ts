@@ -149,6 +149,10 @@ export function createWebRtcDataChannelTransport(
           (readBuf[1] << 8) |
           (readBuf[2] << 16) |
           (readBuf[3] << 24);
+        if (len < 0 || len > 16 * 1024 * 1024) {
+          channel?.close();
+          return;
+        }
         if (readBuf.length < 4 + len) break;
         const payload = readBuf.slice(4, 4 + len);
         readBuf = readBuf.slice(4 + len);

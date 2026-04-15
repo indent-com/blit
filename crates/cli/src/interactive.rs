@@ -15,12 +15,9 @@ use crate::transport::{self, Transport, make_frame, read_frame, write_frame};
 const S2C_QUIT: u8 = 0x0C;
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().min(b.len()) {
+        diff |= a[i] ^ b[i];
     }
     std::hint::black_box(diff) == 0
 }
@@ -114,7 +111,7 @@ impl BrowserConnector {
             Self::WebRtc { passphrase, hub } => {
                 let stream = blit_webrtc_forwarder::client::connect(passphrase, hub)
                     .await
-                    .map_err(|e| format!("share:{passphrase}: {e}"))?;
+                    .map_err(|e| format!("share: {e}"))?;
                 Ok(Transport::Duplex(stream))
             }
             Self::Ssh {

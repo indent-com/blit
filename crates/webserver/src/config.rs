@@ -427,12 +427,9 @@ impl Default for RemotesState {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().min(b.len()) {
+        diff |= a[i] ^ b[i];
     }
     std::hint::black_box(diff) == 0
 }

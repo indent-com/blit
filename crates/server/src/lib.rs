@@ -367,7 +367,7 @@ struct SharedCompositor {
 fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut buf = Vec::new();
     {
-        let expected = (width * height * 4) as usize;
+        let expected = (width as usize) * (height as usize) * 4;
         let actual = pixels.len();
         if actual != expected {
             // Size mismatch — return a 1×1 red pixel PNG rather than panicking.
