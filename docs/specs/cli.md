@@ -70,7 +70,7 @@
 ### Non-Goals
 
 - Reimplementing the blit **server** or **gateway** in TypeScript. The CLI is a client only; `blit server` and `blit gateway` continue to run the Rust binary. The TypeScript CLI shells out to the Rust server binary when auto-starting.
-- Replacing the browser-side `@blit-sh/core` package. The CLI *depends on* it.
+- Replacing the browser-side `@blit-sh/core` package. The CLI _depends on_ it.
 - Supporting `blit open`'s embedded HTTP server for the browser SPA. This command will launch the Rust binary's `open` subcommand as a subprocess (or be deferred to a later phase).
 
 ---
@@ -195,10 +195,10 @@ blit [--on <uri>] [--hub <url>] <command>
 
 ## 5. Global Options
 
-| Flag | Env Override | Default | Description |
-|------|-------------|---------|-------------|
-| `--on <uri>` | `BLIT_TARGET` / `blit.conf` key `blit.target` | `local` | Remote to connect to. Accepts any [URI scheme](#81-uri-schemes) or a named remote from `blit.remotes`. |
-| `--hub <url>` | `BLIT_HUB` | `hub.blit.sh` | WebRTC signaling hub URL. |
+| Flag          | Env Override                                  | Default       | Description                                                                                            |
+| ------------- | --------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------ |
+| `--on <uri>`  | `BLIT_TARGET` / `blit.conf` key `blit.target` | `local`       | Remote to connect to. Accepts any [URI scheme](#81-uri-schemes) or a named remote from `blit.remotes`. |
+| `--hub <url>` | `BLIT_HUB`                                    | `hub.blit.sh` | WebRTC signaling hub URL.                                                                              |
 
 **Resolution order for target:** `--on` flag → `BLIT_TARGET` env → `blit.target` in `blit.conf` → `local`.
 
@@ -222,14 +222,14 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `terminal start`
 
-| Arg/Flag | Type | Default | Notes |
-|----------|------|---------|-------|
-| `command` | `string[]` | (empty = default shell) | Positional, variadic. Elements joined with `\0` separator in CREATE2. |
-| `--tag`, `-t` | `string` | `""` | Terminal label. |
-| `--rows` | `u16` | `24` | Initial rows. |
-| `--cols` | `u16` | `80` | Initial columns. |
-| `--wait` | `bool` | `false` | Block until process exits. Requires `--timeout`. |
-| `--timeout` | `u64` | — | Max seconds to wait (only with `--wait`). |
+| Arg/Flag      | Type       | Default                 | Notes                                                                 |
+| ------------- | ---------- | ----------------------- | --------------------------------------------------------------------- |
+| `command`     | `string[]` | (empty = default shell) | Positional, variadic. Elements joined with `\0` separator in CREATE2. |
+| `--tag`, `-t` | `string`   | `""`                    | Terminal label.                                                       |
+| `--rows`      | `u16`      | `24`                    | Initial rows.                                                         |
+| `--cols`      | `u16`      | `80`                    | Initial columns.                                                      |
+| `--wait`      | `bool`     | `false`                 | Block until process exits. Requires `--timeout`.                      |
+| `--timeout`   | `u64`      | —                       | Max seconds to wait (only with `--wait`).                             |
 
 - Sends `C2S_CREATE2` with nonce `1`.
 - Waits for `S2C_CREATED_N` with matching nonce.
@@ -238,12 +238,12 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `terminal show`
 
-| Arg/Flag | Type | Default | Notes |
-|----------|------|---------|-------|
-| `id` | `u16` | — | Required positional. |
+| Arg/Flag | Type   | Default | Notes                           |
+| -------- | ------ | ------- | ------------------------------- |
+| `id`     | `u16`  | —       | Required positional.            |
 | `--ansi` | `bool` | `false` | Preserve ANSI escape sequences. |
-| `--rows` | `u16` | — | Resize before reading. |
-| `--cols` | `u16` | — | Resize before reading. |
+| `--rows` | `u16`  | —       | Resize before reading.          |
+| `--cols` | `u16`  | —       | Resize before reading.          |
 
 - Validates PTY exists in initial LIST.
 - Optionally sends `C2S_RESIZE`.
@@ -253,25 +253,25 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `terminal history`
 
-| Arg/Flag | Type | Default | Notes |
-|----------|------|---------|-------|
-| `id` | `u16` | — | Required positional. |
-| `--from-start` | `u32` | — | Lines to skip from the top. Conflicts with `--from-end`. |
-| `--from-end` | `u32` | — | Lines to skip from the bottom. Conflicts with `--from-start`. |
-| `--limit` | `u32` | — | Max lines to return. |
-| `--ansi` | `bool` | `false` | Preserve ANSI escapes. |
-| `--rows` | `u16` | — | Resize before reading. |
-| `--cols` | `u16` | — | Resize before reading. |
+| Arg/Flag       | Type   | Default | Notes                                                         |
+| -------------- | ------ | ------- | ------------------------------------------------------------- |
+| `id`           | `u16`  | —       | Required positional.                                          |
+| `--from-start` | `u32`  | —       | Lines to skip from the top. Conflicts with `--from-end`.      |
+| `--from-end`   | `u32`  | —       | Lines to skip from the bottom. Conflicts with `--from-start`. |
+| `--limit`      | `u32`  | —       | Max lines to return.                                          |
+| `--ansi`       | `bool` | `false` | Preserve ANSI escapes.                                        |
+| `--rows`       | `u16`  | —       | Resize before reading.                                        |
+| `--cols`       | `u16`  | —       | Resize before reading.                                        |
 
 - Sends `C2S_READ` with flags composed from `READ_ANSI` (bit 0) and `READ_TAIL` (bit 1, when `--from-end` is used).
 - `offset` = `from_start` or `from_end` value, `limit` = `--limit` or `0`.
 
 #### `terminal send`
 
-| Arg/Flag | Type | Notes |
-|----------|------|-------|
-| `id` | `u16` | Required. |
-| `text` | `string` | Required. Use `-` to read from stdin. |
+| Arg/Flag | Type     | Notes                                 |
+| -------- | -------- | ------------------------------------- |
+| `id`     | `u16`    | Required.                             |
+| `text`   | `string` | Required. Use `-` to read from stdin. |
 
 - Parses C-style escapes in `text`:
   - `\n` → `0x0D` (CR, not LF — matches real terminal Enter)
@@ -286,19 +286,21 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `terminal wait`
 
-| Arg/Flag | Type | Notes |
-|----------|------|-------|
-| `id` | `u16` | Required. |
-| `--timeout` | `u64` | Required. Seconds. |
+| Arg/Flag    | Type     | Notes                                             |
+| ----------- | -------- | ------------------------------------------------- |
+| `id`        | `u16`    | Required.                                         |
+| `--timeout` | `u64`    | Required. Seconds.                                |
 | `--pattern` | `string` | Optional regex to match against new output lines. |
 
 **Without `--pattern`:**
+
 - Waits for `S2C_EXITED` with matching `pty_id`.
 - Returns the exit status as the process exit code.
 - If already exited at connect time (in initial EXITED burst), returns immediately.
 - Exit code 124 on timeout.
 
 **With `--pattern`:**
+
 - Sends `C2S_SUBSCRIBE` to the PTY.
 - Feeds incoming `S2C_UPDATE` frames through `TerminalState`.
 - After each update, extracts viewport text and tests each line against the regex.
@@ -313,9 +315,9 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `terminal kill`
 
-| Arg/Flag | Type | Default | Notes |
-|----------|------|---------|-------|
-| `id` | `u16` | — | Required. |
+| Arg/Flag | Type     | Default  | Notes                                                          |
+| -------- | -------- | -------- | -------------------------------------------------------------- |
+| `id`     | `u16`    | —        | Required.                                                      |
 | `signal` | `string` | `"TERM"` | Signal name (e.g. `TERM`, `KILL`, `INT`) or number (e.g. `9`). |
 
 - Resolves signal name to number using POSIX signal map.
@@ -329,12 +331,12 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `terminal record`
 
-| Arg/Flag | Type | Default | Notes |
-|----------|------|---------|-------|
-| `id` | `u16` | — | Required. |
-| `--output`, `-o` | `string` | `pty-<id>.blitrec` | Output file path. |
-| `--frames`, `-f` | `u32` | `0` (unlimited) | Max frames to record. |
-| `--duration`, `-d` | `f64` | `0.0` (unlimited) | Max seconds to record. |
+| Arg/Flag           | Type     | Default            | Notes                  |
+| ------------------ | -------- | ------------------ | ---------------------- |
+| `id`               | `u16`    | —                  | Required.              |
+| `--output`, `-o`   | `string` | `pty-<id>.blitrec` | Output file path.      |
+| `--frames`, `-f`   | `u32`    | `0` (unlimited)    | Max frames to record.  |
+| `--duration`, `-d` | `f64`    | `0.0` (unlimited)  | Max seconds to record. |
 
 - Subscribes to the PTY.
 - Writes BLITREC format (see [Recording Formats](#13-recording-formats)).
@@ -360,15 +362,15 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `surface capture`
 
-| Arg/Flag | Type | Default | Notes |
-|----------|------|---------|-------|
-| `id` | `u16` | — | Required. |
-| `--output`, `-o` | `string` | `surface-<id>.png` | Output path. Format inferred from extension. |
-| `--format`, `-f` | `string` | (inferred or `png`) | `png` or `avif`. |
-| `--quality`, `-q` | `u8` | `0` (lossless) | 0 = lossless, 1-100 = lossy (AVIF only). |
-| `--width` | `u16` | — | Resize surface width before capture. |
-| `--height` | `u16` | — | Resize surface height before capture. |
-| `--scale` | `u16` | `0` (current) | Scale in 120ths (120=1x, 240=2x). |
+| Arg/Flag          | Type     | Default             | Notes                                        |
+| ----------------- | -------- | ------------------- | -------------------------------------------- |
+| `id`              | `u16`    | —                   | Required.                                    |
+| `--output`, `-o`  | `string` | `surface-<id>.png`  | Output path. Format inferred from extension. |
+| `--format`, `-f`  | `string` | (inferred or `png`) | `png` or `avif`.                             |
+| `--quality`, `-q` | `u8`     | `0` (lossless)      | 0 = lossless, 1-100 = lossy (AVIF only).     |
+| `--width`         | `u16`    | —                   | Resize surface width before capture.         |
+| `--height`        | `u16`    | —                   | Resize surface height before capture.        |
+| `--scale`         | `u16`    | `0` (current)       | Scale in 120ths (120=1x, 240=2x).            |
 
 - If `--width` or `--height` given, sends `C2S_SURFACE_RESIZE`.
 - Sends `C2S_SURFACE_CAPTURE` with format byte (`0`=PNG, `1`=AVIF) and quality.
@@ -377,11 +379,11 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `surface click`
 
-| Arg/Flag | Type | Default |
-|----------|------|---------|
-| `id` | `u16` | — |
-| `x` | `u16` | — |
-| `y` | `u16` | — |
+| Arg/Flag   | Type     | Default  |
+| ---------- | -------- | -------- |
+| `id`       | `u16`    | —        |
+| `x`        | `u16`    | —        |
+| `y`        | `u16`    | —        |
 | `--button` | `string` | `"left"` |
 
 - Maps button string to protocol value: `left`=1, `right`=3, `middle`=2.
@@ -389,33 +391,33 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `surface key`
 
-| Arg/Flag | Type |
-|----------|------|
-| `id` | `u16` |
-| `key` | `string` |
+| Arg/Flag | Type     |
+| -------- | -------- |
+| `id`     | `u16`    |
+| `key`    | `string` |
 
 - Parses key string into Linux keycode(s). Supports modifiers (`ctrl+a`, `shift+Tab`, `ctrl+shift+c`).
 - Sends `C2S_SURFACE_INPUT` with `pressed=1` then `pressed=0` for each key. Modifier keys are pressed first, released last.
 
 #### `surface type`
 
-| Arg/Flag | Type |
-|----------|------|
-| `id` | `u16` |
-| `text` | `string` |
+| Arg/Flag | Type     |
+| -------- | -------- |
+| `id`     | `u16`    |
+| `text`   | `string` |
 
 - Sends `C2S_SURFACE_TEXT` for plain text segments.
 - Parses `{Return}`, `{Escape}`, `{ctrl+a}` etc. as key presses (via `surface key` logic).
 
 #### `surface record`
 
-| Arg/Flag | Type | Default |
-|----------|------|---------|
-| `id` | `u16` | — |
-| `--output`, `-o` | `string` | `surface-<id>.<codec>` |
-| `--frames`, `-f` | `u32` | `0` |
-| `--duration`, `-d` | `f64` | `0.0` |
-| `--codec`, `-c` | `string[]` | all | Comma-separated: `h264`, `av1`. |
+| Arg/Flag           | Type       | Default                |
+| ------------------ | ---------- | ---------------------- | ------------------------------- |
+| `id`               | `u16`      | —                      |
+| `--output`, `-o`   | `string`   | `surface-<id>.<codec>` |
+| `--frames`, `-f`   | `u32`      | `0`                    |
+| `--duration`, `-d` | `f64`      | `0.0`                  |
+| `--codec`, `-c`    | `string[]` | all                    | Comma-separated: `h264`, `av1`. |
 
 - Maps codec strings to bitmask: `h264`=0x01, `av1`=0x02.
 - Sends `C2S_SURFACE_SUBSCRIBE` (with codec/quality extension bytes).
@@ -435,8 +437,8 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `clipboard get`
 
-| Arg/Flag | Type | Default |
-|----------|------|---------|
+| Arg/Flag | Type     | Default      |
+| -------- | -------- | ------------ |
 | `--mime` | `string` | `text/plain` |
 
 - Sends `C2S_CLIPBOARD_GET` with MIME type.
@@ -445,10 +447,10 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `clipboard set`
 
-| Arg/Flag | Type | Default |
-|----------|------|---------|
-| `--mime` | `string` | `text/plain;charset=utf-8` |
-| `text` | `string?` | — |
+| Arg/Flag | Type      | Default                    |
+| -------- | --------- | -------------------------- |
+| `--mime` | `string`  | `text/plain;charset=utf-8` |
+| `text`   | `string?` | —                          |
 
 - If `text` is omitted, reads from stdin.
 - Sends `C2S_CLIPBOARD_SET` with MIME type and data.
@@ -459,8 +461,8 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `remote list`
 
-| Arg/Flag | Type | Default |
-|----------|------|---------|
+| Arg/Flag   | Type   | Default |
+| ---------- | ------ | ------- |
 | `--reveal` | `bool` | `false` |
 
 - Reads `blit.remotes` file.
@@ -469,10 +471,10 @@ blit [--on <uri>] [--hub <url>] <command>
 
 #### `remote add`
 
-| Arg/Flag | Type | Notes |
-|----------|------|-------|
-| `name` | `string` | Required. |
-| `uri` | `string?` | If omitted, prompts interactively on stderr. |
+| Arg/Flag | Type      | Notes                                        |
+| -------- | --------- | -------------------------------------------- |
+| `name`   | `string`  | Required.                                    |
+| `uri`    | `string?` | If omitted, prompts interactively on stderr. |
 
 - Validates URI scheme (ssh:, tcp:, socket:, share:, local, or bare name).
 - Writes entry to `blit.remotes` atomically (temp file + rename).
@@ -496,6 +498,7 @@ blit [--on <uri>] [--hub <url>] <command>
 - **Phase 2 (future):** Native TypeScript HTTP server serving the embedded SPA.
 
 Behavior:
+
 - Auto-starts the blit server if not running.
 - Starts an embedded HTTP gateway on `--port` (or random port).
 - Opens the default browser via `xdg-open` / `open` / `cmd start`.
@@ -505,11 +508,11 @@ Behavior:
 
 ### 6.6 share
 
-| Arg/Flag | Type | Default |
-|----------|------|---------|
+| Arg/Flag       | Type     | Default                          |
+| -------------- | -------- | -------------------------------- |
 | `--passphrase` | `string` | Random 26-char (base32 alphabet) |
-| `--quiet` | `bool` | `false` |
-| `--verbose` | `bool` | `false` |
+| `--quiet`      | `bool`   | `false`                          |
+| `--verbose`    | `bool`   | `false`                          |
 
 - Generates random passphrase if not provided.
 - Derives Ed25519 key pair from passphrase via PBKDF2-SHA256 (100k rounds, salt `"https://blit.sh"`).
@@ -525,13 +528,13 @@ Behavior:
 
 **Delegates to the Rust binary.** The TypeScript CLI spawns `blit-server` (the Rust binary) with the provided flags. This is because the server hosts PTYs and the Wayland compositor, which require native code.
 
-| Flag | Env | Default |
-|------|-----|---------|
-| `--socket` | `BLIT_SOCK` | Platform default |
-| `--shell-flags` | `BLIT_SHELL_FLAGS` | `li` (Unix), empty (Windows) |
-| `--scrollback` | `BLIT_SCROLLBACK` | `10000` |
-| `--fd-channel` | `BLIT_FD_CHANNEL` | — (Unix only) |
-| `-v`, `--verbose` | `BLIT_VERBOSE` | `false` |
+| Flag              | Env                | Default                      |
+| ----------------- | ------------------ | ---------------------------- |
+| `--socket`        | `BLIT_SOCK`        | Platform default             |
+| `--shell-flags`   | `BLIT_SHELL_FLAGS` | `li` (Unix), empty (Windows) |
+| `--scrollback`    | `BLIT_SCROLLBACK`  | `10000`                      |
+| `--fd-channel`    | `BLIT_FD_CHANNEL`  | — (Unix only)                |
+| `-v`, `--verbose` | `BLIT_VERBOSE`     | `false`                      |
 
 ---
 
@@ -551,11 +554,12 @@ Behavior:
 
 ### 6.10 install
 
-| Arg | Type | Notes |
-|-----|------|-------|
+| Arg    | Type      | Notes                                            |
+| ------ | --------- | ------------------------------------------------ |
 | `host` | `string?` | SSH target. If omitted, prints install commands. |
 
 **Without host:** prints platform-specific install one-liners to stdout:
+
 ```
 # Linux / macOS
 curl -sf https://install.blit.sh | sh
@@ -584,8 +588,8 @@ irm https://install.blit.sh/install.ps1 | iex
 
 ### 6.13 generate
 
-| Arg | Type |
-|-----|------|
+| Arg      | Type     |
+| -------- | -------- |
 | `output` | `string` |
 
 - Writes man pages and shell completions (fish, bash, zsh) to the output directory.
@@ -599,6 +603,7 @@ The blit wire protocol is a custom binary format. There is no protobuf, JSON, or
 ### 7.1 Framing
 
 **Non-WebSocket transports** (Unix socket, named pipe, TCP):
+
 ```
 [len:4 LE][payload:len]
 ```
@@ -613,54 +618,56 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 ### 7.3 Client-to-Server Opcodes
 
-| Opcode | Name | Layout |
-|--------|------|--------|
-| `0x00` | `INPUT` | `[pty_id:2][data:N]` |
-| `0x01` | `RESIZE` | `[pty_id:2][rows:2][cols:2]…` (batch: repeating triplets) |
-| `0x02` | `SCROLL` | `[pty_id:2][offset:4]` |
-| `0x03` | `ACK` | (no payload) |
-| `0x04` | `DISPLAY_RATE` | `[fps:2]` |
-| `0x05` | `CLIENT_METRICS` | `[backlog:2][ack_ahead:2][apply_ms_x10:2]` |
-| `0x06` | `MOUSE` | `[pty_id:2][type:1][button:1][col:2][row:2]` |
-| `0x07` | `RESTART` | `[pty_id:2]` |
-| `0x08` | `PING` | (empty) |
-| `0x0F` | `QUIT` | (empty) |
-| `0x10` | `CREATE` | `[rows:2][cols:2][tag_len:2][tag:N]` |
-| `0x11` | `FOCUS` | `[pty_id:2]` |
-| `0x12` | `CLOSE` | `[pty_id:2]` |
-| `0x13` | `SUBSCRIBE` | `[pty_id:2]` |
-| `0x14` | `UNSUBSCRIBE` | `[pty_id:2]` |
-| `0x15` | `SEARCH` | `[request_id:2][query:N]` |
-| `0x16` | `CREATE_AT` | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]` |
-| `0x17` | `CREATE_N` | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]` |
-| `0x18` | `CREATE2` | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]` |
-| `0x19` | `READ` | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]` |
-| `0x1A` | `KILL` | `[pty_id:2][signal:4]` |
-| `0x1B` | `COPY_RANGE` | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]` |
-| `0x20` | `SURFACE_INPUT` | `[surface_id:2][keycode:4][pressed:1]` |
-| `0x21` | `SURFACE_POINTER` | `[surface_id:2][type:1][button:1][x:2][y:2]` |
-| `0x22` | `SURFACE_POINTER_AXIS` | `[surface_id:2][axis:1][value:4]` |
-| `0x23` | `SURFACE_RESIZE` | `[surface_id:2][width:2][height:2][scale_120:2]` |
-| `0x24` | `SURFACE_FOCUS` | `[surface_id:2]` |
-| `0x25` | `CLIPBOARD_SET` | `[mime_len:2][mime:N][data_len:4][data:M]` |
-| `0x26` | `SURFACE_LIST` | (empty) |
-| `0x27` | `SURFACE_CAPTURE` | `[surface_id:2][format:1][quality:1]` |
-| `0x28` | `SURFACE_SUBSCRIBE` | `[surface_id:2][codec:1][quality:1]` (trailing bytes optional) |
-| `0x29` | `SURFACE_UNSUBSCRIBE` | `[surface_id:2]` |
-| `0x2A` | `SURFACE_ACK` | `[surface_id:2]` |
-| `0x2B` | `SURFACE_CLOSE` | `[surface_id:2]` |
-| `0x2C` | `CLIPBOARD_LIST` | (no payload) |
-| `0x2D` | `CLIENT_FEATURES` | `[codec_support:1]` |
-| `0x2E` | `CLIPBOARD_GET` | `[mime_len:2][mime:N]` |
-| `0x2F` | `SURFACE_TEXT` | `[surface_id:2][text:N]` |
-| `0x30` | `AUDIO_SUBSCRIBE` | `[bitrate_kbps:2]` |
-| `0x31` | `AUDIO_UNSUBSCRIBE` | (no payload) |
+| Opcode | Name                   | Layout                                                                           |
+| ------ | ---------------------- | -------------------------------------------------------------------------------- |
+| `0x00` | `INPUT`                | `[pty_id:2][data:N]`                                                             |
+| `0x01` | `RESIZE`               | `[pty_id:2][rows:2][cols:2]…` (batch: repeating triplets)                        |
+| `0x02` | `SCROLL`               | `[pty_id:2][offset:4]`                                                           |
+| `0x03` | `ACK`                  | (no payload)                                                                     |
+| `0x04` | `DISPLAY_RATE`         | `[fps:2]`                                                                        |
+| `0x05` | `CLIENT_METRICS`       | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                                       |
+| `0x06` | `MOUSE`                | `[pty_id:2][type:1][button:1][col:2][row:2]`                                     |
+| `0x07` | `RESTART`              | `[pty_id:2]`                                                                     |
+| `0x08` | `PING`                 | (empty)                                                                          |
+| `0x0F` | `QUIT`                 | (empty)                                                                          |
+| `0x10` | `CREATE`               | `[rows:2][cols:2][tag_len:2][tag:N]`                                             |
+| `0x11` | `FOCUS`                | `[pty_id:2]`                                                                     |
+| `0x12` | `CLOSE`                | `[pty_id:2]`                                                                     |
+| `0x13` | `SUBSCRIBE`            | `[pty_id:2]`                                                                     |
+| `0x14` | `UNSUBSCRIBE`          | `[pty_id:2]`                                                                     |
+| `0x15` | `SEARCH`               | `[request_id:2][query:N]`                                                        |
+| `0x16` | `CREATE_AT`            | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                               |
+| `0x17` | `CREATE_N`             | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                                    |
+| `0x18` | `CREATE2`              | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]`             |
+| `0x19` | `READ`                 | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                                |
+| `0x1A` | `KILL`                 | `[pty_id:2][signal:4]`                                                           |
+| `0x1B` | `COPY_RANGE`           | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]` |
+| `0x20` | `SURFACE_INPUT`        | `[surface_id:2][keycode:4][pressed:1]`                                           |
+| `0x21` | `SURFACE_POINTER`      | `[surface_id:2][type:1][button:1][x:2][y:2]`                                     |
+| `0x22` | `SURFACE_POINTER_AXIS` | `[surface_id:2][axis:1][value:4]`                                                |
+| `0x23` | `SURFACE_RESIZE`       | `[surface_id:2][width:2][height:2][scale_120:2]`                                 |
+| `0x24` | `SURFACE_FOCUS`        | `[surface_id:2]`                                                                 |
+| `0x25` | `CLIPBOARD_SET`        | `[mime_len:2][mime:N][data_len:4][data:M]`                                       |
+| `0x26` | `SURFACE_LIST`         | (empty)                                                                          |
+| `0x27` | `SURFACE_CAPTURE`      | `[surface_id:2][format:1][quality:1]`                                            |
+| `0x28` | `SURFACE_SUBSCRIBE`    | `[surface_id:2][codec:1][quality:1]` (trailing bytes optional)                   |
+| `0x29` | `SURFACE_UNSUBSCRIBE`  | `[surface_id:2]`                                                                 |
+| `0x2A` | `SURFACE_ACK`          | `[surface_id:2]`                                                                 |
+| `0x2B` | `SURFACE_CLOSE`        | `[surface_id:2]`                                                                 |
+| `0x2C` | `CLIPBOARD_LIST`       | (no payload)                                                                     |
+| `0x2D` | `CLIENT_FEATURES`      | `[codec_support:1]`                                                              |
+| `0x2E` | `CLIPBOARD_GET`        | `[mime_len:2][mime:N]`                                                           |
+| `0x2F` | `SURFACE_TEXT`         | `[surface_id:2][text:N]`                                                         |
+| `0x30` | `AUDIO_SUBSCRIBE`      | `[bitrate_kbps:2]`                                                               |
+| `0x31` | `AUDIO_UNSUBSCRIBE`    | (no payload)                                                                     |
 
 **CREATE2 feature bits:**
+
 - Bit 0 (`HAS_SRC_PTY`): followed by `[src_pty_id:2]`.
 - Bit 1 (`HAS_COMMAND`): remaining bytes after tag are the UTF-8 command string.
 
 **READ flags:**
+
 - Bit 0 (`READ_ANSI`): include ANSI escape sequences.
 - Bit 1 (`READ_TAIL`): count offset from the end.
 
@@ -668,34 +675,34 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 ### 7.4 Server-to-Client Opcodes
 
-| Opcode | Name | Layout |
-|--------|------|--------|
-| `0x00` | `UPDATE` | `[pty_id:2][lz4-compressed-frame]` |
-| `0x01` | `CREATED` | `[pty_id:2][tag:N]` |
-| `0x02` | `CLOSED` | `[pty_id:2]` |
-| `0x03` | `LIST` | `[count:2][entries…]` — entry: `[pty_id:2][cols:2][rows:2][tag_len:2][tag:N]` |
-| `0x04` | `TITLE` | `[pty_id:2][title:N]` |
-| `0x05` | `SEARCH_RESULTS` | `[request_id:2][results…]` |
-| `0x06` | `CREATED_N` | `[nonce:2][pty_id:2][tag:N]` |
-| `0x07` | `HELLO` | `[version:2][features:4]` |
-| `0x08` | `EXITED` | `[pty_id:2][exit_status:4]` |
-| `0x09` | `READY` | (no payload) |
-| `0x0A` | `TEXT` | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]` |
-| `0x0B` | `PING` | (empty) |
-| `0x0C` | `QUIT` | (empty) |
-| `0x20` | `SURFACE_CREATED` | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]` |
-| `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]` |
-| `0x22` | `SURFACE_FRAME` | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]` |
-| `0x23` | `SURFACE_TITLE` | `[surface_id:2][title:N]` |
-| `0x24` | `SURFACE_RESIZED` | `[surface_id:2][w:2][h:2]` |
-| `0x25` | `CLIPBOARD_CONTENT` | `[mime_len:2][mime:N][data_len:4][data:M]` |
-| `0x26` | `SURFACE_LIST` | `[count:2]` repeated `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]` |
-| `0x27` | `SURFACE_CAPTURE` | `[surface_id:2][width:4][height:4][image_data:N]` |
-| `0x28` | `SURFACE_APP_ID` | `[surface_id:2][app_id:N]` |
-| `0x29` | `SURFACE_CURSOR` | `[surface_id:2][shape_len:1][shape:N]` |
-| `0x2A` | `SURFACE_ENCODER` | `[surface_id:2][encoder:N]` |
-| `0x2C` | `CLIPBOARD_LIST` | `[count:2]` repeated `[mime_len:2][mime:N]` |
-| `0x30` | `AUDIO_FRAME` | `[timestamp:4][flags:1][data:N]` |
+| Opcode | Name                | Layout                                                                                                     |
+| ------ | ------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `0x00` | `UPDATE`            | `[pty_id:2][lz4-compressed-frame]`                                                                         |
+| `0x01` | `CREATED`           | `[pty_id:2][tag:N]`                                                                                        |
+| `0x02` | `CLOSED`            | `[pty_id:2]`                                                                                               |
+| `0x03` | `LIST`              | `[count:2][entries…]` — entry: `[pty_id:2][cols:2][rows:2][tag_len:2][tag:N]`                              |
+| `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                      |
+| `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                 |
+| `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                               |
+| `0x07` | `HELLO`             | `[version:2][features:4]`                                                                                  |
+| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                |
+| `0x09` | `READY`             | (no payload)                                                                                               |
+| `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                     |
+| `0x0B` | `PING`              | (empty)                                                                                                    |
+| `0x0C` | `QUIT`              | (empty)                                                                                                    |
+| `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                      |
+| `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                           |
+| `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                   |
+| `0x23` | `SURFACE_TITLE`     | `[surface_id:2][title:N]`                                                                                  |
+| `0x24` | `SURFACE_RESIZED`   | `[surface_id:2][w:2][h:2]`                                                                                 |
+| `0x25` | `CLIPBOARD_CONTENT` | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                 |
+| `0x26` | `SURFACE_LIST`      | `[count:2]` repeated `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]` |
+| `0x27` | `SURFACE_CAPTURE`   | `[surface_id:2][width:4][height:4][image_data:N]`                                                          |
+| `0x28` | `SURFACE_APP_ID`    | `[surface_id:2][app_id:N]`                                                                                 |
+| `0x29` | `SURFACE_CURSOR`    | `[surface_id:2][shape_len:1][shape:N]`                                                                     |
+| `0x2A` | `SURFACE_ENCODER`   | `[surface_id:2][encoder:N]`                                                                                |
+| `0x2C` | `CLIPBOARD_LIST`    | `[count:2]` repeated `[mime_len:2][mime:N]`                                                                |
+| `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                           |
 
 **EXITED exit_status:** `WEXITSTATUS` for normal exits; negative signal number for signal deaths (e.g. `-9` = SIGKILL); `i32.MIN` (`-2147483648`) when unknown.
 
@@ -707,14 +714,14 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 `S2C_HELLO` carries a 4-byte `features` bitmask:
 
-| Bit | Name | Meaning |
-|-----|------|---------|
-| 0 | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
-| 1 | `RESTART` | Server supports `C2S_RESTART` |
-| 2 | `RESIZE_BATCH` | Server accepts batched resize triplets |
-| 3 | `COPY_RANGE` | Server supports range-based text copy |
-| 4 | `COMPOSITOR` | Server has headless Wayland compositor |
-| 5 | `AUDIO` | Server supports audio forwarding |
+| Bit | Name           | Meaning                                                        |
+| --- | -------------- | -------------------------------------------------------------- |
+| 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
+| 1   | `RESTART`      | Server supports `C2S_RESTART`                                  |
+| 2   | `RESIZE_BATCH` | Server accepts batched resize triplets                         |
+| 3   | `COPY_RANGE`   | Server supports range-based text copy                          |
+| 4   | `COMPOSITOR`   | Server has headless Wayland compositor                         |
+| 5   | `AUDIO`        | Server supports audio forwarding                               |
 
 ### 7.6 Connection Lifecycle
 
@@ -751,26 +758,29 @@ sequenceDiagram
 `S2C_UPDATE` payload (after opcode + pty_id) is LZ4-compressed. Decompressed layout:
 
 **Header (12 bytes):**
+
 ```
 [rows:2][cols:2][cursor_row:2][cursor_col:2][mode:2][title_field:2]
 ```
 
 `title_field` upper 4 bits are flags:
 
-| Bit | Flag |
-|-----|------|
-| 15 | `TITLE_PRESENT` |
-| 14 | `OPS_PRESENT` |
-| 13 | `STRINGS_PRESENT` |
-| 12 | `LINE_FLAGS_PRESENT` |
+| Bit  | Flag                    |
+| ---- | ----------------------- |
+| 15   | `TITLE_PRESENT`         |
+| 14   | `OPS_PRESENT`           |
+| 13   | `STRINGS_PRESENT`       |
+| 12   | `LINE_FLAGS_PRESENT`    |
 | 0–11 | Title UTF-8 byte length |
 
 **Cell operations** (when `OPS_PRESENT`):
+
 - `OP_COPY_RECT (0x01)` — copy rectangle (encodes scrolling).
 - `OP_FILL_RECT (0x02)` — fill rectangle with single cell.
 - `OP_PATCH_CELLS (0x03)` — bitmask-indexed cell updates.
 
 **Cell format (12 bytes):**
+
 ```
 Byte 0 (flags0): fg_type[2] | bg_type[2] | bold | dim | italic | underline
 Byte 1 (flags1): inverse | wide | wide_continuation | content_len[3] | reserved
@@ -790,6 +800,7 @@ The `/mux` endpoint carries traffic for all gateway destinations over a single c
 **Auth:** browser sends passphrase as text frame; server responds `"mux"` (not `"ok"`).
 
 **Framing (after auth):**
+
 ```
 [channel_id:2 LE][payload:N]          channel_id < 0xFFFF → data
 [0xFFFF][control_opcode:1][...]       channel_id = 0xFFFF → control
@@ -797,13 +808,13 @@ The `/mux` endpoint carries traffic for all gateway destinations over a single c
 
 **Control messages:**
 
-| Direction | Opcode | Name | Layout |
-|-----------|--------|------|--------|
-| C→S | `0x01` | OPEN | `[channel_id:2][name_len:2][name:N]` |
-| C→S | `0x02` | CLOSE | `[channel_id:2]` |
-| S→C | `0x81` | OPENED | `[channel_id:2]` |
-| S→C | `0x82` | CLOSED | `[channel_id:2]` |
-| S→C | `0x83` | ERROR | `[channel_id:2][msg_len:2][msg:N]` |
+| Direction | Opcode | Name   | Layout                               |
+| --------- | ------ | ------ | ------------------------------------ |
+| C→S       | `0x01` | OPEN   | `[channel_id:2][name_len:2][name:N]` |
+| C→S       | `0x02` | CLOSE  | `[channel_id:2]`                     |
+| S→C       | `0x81` | OPENED | `[channel_id:2]`                     |
+| S→C       | `0x82` | CLOSED | `[channel_id:2]`                     |
+| S→C       | `0x83` | ERROR  | `[channel_id:2][msg_len:2][msg:N]`   |
 
 ---
 
@@ -811,29 +822,30 @@ The `/mux` endpoint carries traffic for all gateway destinations over a single c
 
 ### 8.1 URI Schemes
 
-| Scheme | Example | Description |
-|--------|---------|-------------|
-| `local` | `local` | Local blit server via Unix socket / named pipe. Auto-starts if not running. |
-| `ssh:` | `ssh:user@host` | SSH tunnel to remote blit server. Supports `~/.ssh/config`. |
-| `tcp:` | `tcp:host:3264` | Raw TCP connection. |
-| `socket:` | `socket:/tmp/blit.sock` | Explicit IPC socket / named pipe. |
-| `share:` | `share:mypassphrase` | WebRTC peer-to-peer via signaling hub. |
-| `ws://` / `wss://` | `wss://gw.example.com` | WebSocket (proxy-only). |
-| `wt://` | `wt://gw.example.com` | WebTransport (proxy-only). |
-| `proxy:` | `proxy:ssh:host` | Explicitly route via blit-proxy. |
-| `<name>` | `prod` | Named remote from `blit.remotes` (resolved recursively with cycle detection). |
+| Scheme             | Example                 | Description                                                                   |
+| ------------------ | ----------------------- | ----------------------------------------------------------------------------- |
+| `local`            | `local`                 | Local blit server via Unix socket / named pipe. Auto-starts if not running.   |
+| `ssh:`             | `ssh:user@host`         | SSH tunnel to remote blit server. Supports `~/.ssh/config`.                   |
+| `tcp:`             | `tcp:host:3264`         | Raw TCP connection.                                                           |
+| `socket:`          | `socket:/tmp/blit.sock` | Explicit IPC socket / named pipe.                                             |
+| `share:`           | `share:mypassphrase`    | WebRTC peer-to-peer via signaling hub.                                        |
+| `ws://` / `wss://` | `wss://gw.example.com`  | WebSocket (proxy-only).                                                       |
+| `wt://`            | `wt://gw.example.com`   | WebTransport (proxy-only).                                                    |
+| `proxy:`           | `proxy:ssh:host`        | Explicitly route via blit-proxy.                                              |
+| `<name>`           | `prod`                  | Named remote from `blit.remotes` (resolved recursively with cycle detection). |
 
 ### 8.2 Transport Interface
 
 ```typescript
 interface IpcTransport {
-  read(): Promise<Uint8Array | null>;   // Read one length-prefixed frame
+  read(): Promise<Uint8Array | null>; // Read one length-prefixed frame
   write(payload: Uint8Array): Promise<void>;
   close(): Promise<void>;
 }
 ```
 
 Implementations:
+
 - **UnixSocketTransport** — `net.Socket` connection to Unix domain socket.
 - **NamedPipeTransport** — `net.Socket` connection to `\\.\pipe\blit-*` (Windows).
 - **TcpTransport** — `net.Socket` with TCP_NODELAY.
@@ -844,7 +856,10 @@ All implementations use 4-byte LE length-prefix framing.
 ### 8.3 Connection Resolution
 
 ```typescript
-async function connect(on: string | undefined, hub: string): Promise<IpcTransport>
+async function connect(
+  on: string | undefined,
+  hub: string,
+): Promise<IpcTransport>;
 ```
 
 1. Determine effective target: `--on` → `BLIT_TARGET` → `blit.conf[blit.target]` → `"local"`.
@@ -878,11 +893,11 @@ When connecting to `local` and no server is running:
 
 ### 9.1 File Locations
 
-| File | Default Path | Env Override |
-|------|-------------|--------------|
-| Config | `~/.config/blit/blit.conf` | `BLIT_CONFIG` |
+| File    | Default Path                  | Env Override   |
+| ------- | ----------------------------- | -------------- |
+| Config  | `~/.config/blit/blit.conf`    | `BLIT_CONFIG`  |
 | Remotes | `~/.config/blit/blit.remotes` | `BLIT_REMOTES` |
-| Lock | `~/.config/blit/blit.lock` | — |
+| Lock    | `~/.config/blit/blit.lock`    | —              |
 
 On Windows: `%APPDATA%\blit\`.
 XDG: `$XDG_CONFIG_HOME/blit/`.
@@ -914,37 +929,37 @@ Auto-provisioned with `local = local` on first read if missing.
 
 ## 10. Environment Variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `BLIT_SOCK` | Platform-dependent | Unix socket / named pipe path |
-| `BLIT_TARGET` | — | Default remote (overrides blit.conf) |
-| `BLIT_REMOTES` | `~/.config/blit/blit.remotes` | Remotes file path |
-| `BLIT_CONFIG` | `~/.config/blit/blit.conf` | Config file path |
-| `BLIT_HUB` | `hub.blit.sh` | WebRTC signaling hub URL |
-| `BLIT_PASSPHRASE` | — | Share/gateway passphrase |
-| `BLIT_SCROLLBACK` | `10000` | Scrollback rows per PTY |
-| `BLIT_SHELL_FLAGS` | `li` (Unix) / empty (Windows) | Shell flags |
-| `BLIT_PROXY` | enabled | Set to `0` to disable proxy |
-| `BLIT_PROXY_SOCK` | `$XDG_RUNTIME_DIR/blit-proxy.sock` | Proxy socket path |
-| `BLIT_PROXY_IDLE` | — | Proxy idle timeout (seconds) |
-| `BLIT_PROXY_POOL` | `4` | Pre-warmed connections per pool |
-| `BLIT_SURFACE_ENCODERS` | hw-before-sw | Encoder priority |
-| `BLIT_SURFACE_QUALITY` | `medium` | Video quality |
-| `BLIT_VAAPI_DEVICE` | `/dev/dri/renderD128` | VA-API render node |
-| `BLIT_CUDA_DEVICE` | `0` | CUDA device for NVENC |
-| `BLIT_ADDR` | `0.0.0.0:3264` | Gateway listen address |
-| `BLIT_QUIC` | — | Set to `1` for WebTransport |
-| `BLIT_TLS_CERT` | — | TLS cert path (WebTransport) |
-| `BLIT_TLS_KEY` | — | TLS key path (WebTransport) |
-| `BLIT_GATEWAY_WEBRTC` | — | Set to `1` to proxy WebRTC remotes |
-| `BLIT_STORE_CONFIG` | — | Set to `1` to sync browser settings |
-| `BLIT_INSTALL_DIR` | `/usr/local/bin` (Unix) / `%LOCALAPPDATA%\blit\bin` (Win) | Install location |
-| `BLIT_FD_CHANNEL` | — | fd-passing channel fd (Unix) |
-| `BLIT_VERBOSE` | `0` | Verbose logging |
-| `BLIT_FONT_DIRS` | — | Extra font dirs (colon-separated) |
-| `BLIT_CORS` | — | CORS origin for font routes |
-| `SHELL` / `COMSPEC` | `/bin/sh` / `cmd.exe` | Default shell |
-| `SSH_AUTH_SOCK` | — | SSH agent socket |
+| Variable                | Default                                                   | Purpose                              |
+| ----------------------- | --------------------------------------------------------- | ------------------------------------ |
+| `BLIT_SOCK`             | Platform-dependent                                        | Unix socket / named pipe path        |
+| `BLIT_TARGET`           | —                                                         | Default remote (overrides blit.conf) |
+| `BLIT_REMOTES`          | `~/.config/blit/blit.remotes`                             | Remotes file path                    |
+| `BLIT_CONFIG`           | `~/.config/blit/blit.conf`                                | Config file path                     |
+| `BLIT_HUB`              | `hub.blit.sh`                                             | WebRTC signaling hub URL             |
+| `BLIT_PASSPHRASE`       | —                                                         | Share/gateway passphrase             |
+| `BLIT_SCROLLBACK`       | `10000`                                                   | Scrollback rows per PTY              |
+| `BLIT_SHELL_FLAGS`      | `li` (Unix) / empty (Windows)                             | Shell flags                          |
+| `BLIT_PROXY`            | enabled                                                   | Set to `0` to disable proxy          |
+| `BLIT_PROXY_SOCK`       | `$XDG_RUNTIME_DIR/blit-proxy.sock`                        | Proxy socket path                    |
+| `BLIT_PROXY_IDLE`       | —                                                         | Proxy idle timeout (seconds)         |
+| `BLIT_PROXY_POOL`       | `4`                                                       | Pre-warmed connections per pool      |
+| `BLIT_SURFACE_ENCODERS` | hw-before-sw                                              | Encoder priority                     |
+| `BLIT_SURFACE_QUALITY`  | `medium`                                                  | Video quality                        |
+| `BLIT_VAAPI_DEVICE`     | `/dev/dri/renderD128`                                     | VA-API render node                   |
+| `BLIT_CUDA_DEVICE`      | `0`                                                       | CUDA device for NVENC                |
+| `BLIT_ADDR`             | `0.0.0.0:3264`                                            | Gateway listen address               |
+| `BLIT_QUIC`             | —                                                         | Set to `1` for WebTransport          |
+| `BLIT_TLS_CERT`         | —                                                         | TLS cert path (WebTransport)         |
+| `BLIT_TLS_KEY`          | —                                                         | TLS key path (WebTransport)          |
+| `BLIT_GATEWAY_WEBRTC`   | —                                                         | Set to `1` to proxy WebRTC remotes   |
+| `BLIT_STORE_CONFIG`     | —                                                         | Set to `1` to sync browser settings  |
+| `BLIT_INSTALL_DIR`      | `/usr/local/bin` (Unix) / `%LOCALAPPDATA%\blit\bin` (Win) | Install location                     |
+| `BLIT_FD_CHANNEL`       | —                                                         | fd-passing channel fd (Unix)         |
+| `BLIT_VERBOSE`          | `0`                                                       | Verbose logging                      |
+| `BLIT_FONT_DIRS`        | —                                                         | Extra font dirs (colon-separated)    |
+| `BLIT_CORS`             | —                                                         | CORS origin for font routes          |
+| `SHELL` / `COMSPEC`     | `/bin/sh` / `cmd.exe`                                     | Default shell                        |
+| `SSH_AUTH_SOCK`         | —                                                         | SSH agent socket                     |
 
 ---
 
@@ -952,17 +967,18 @@ Auto-provisioned with `local = local` on first read if missing.
 
 All structured output uses **tab-separated values (TSV)** with a header row. This is deliberate — it's trivially parsed by `cut`, `awk`, and LLM agents.
 
-| Command | Format |
-|---------|--------|
-| `terminal list` | `ID\tTAG\tTITLE\tCOMMAND\tSTATUS` |
-| `surface list` | `ID\tTITLE\tSIZE\tAPP_ID` |
-| `clipboard list` | One MIME type per line |
-| `terminal start` | Just the PTY ID (integer) |
-| `terminal show/history` | Raw text (with ANSI if `--ansi`) |
-| `terminal wait` | Matched line (with `--pattern`) or nothing |
-| `remote list` | `name\turi` (tab-separated) |
+| Command                 | Format                                     |
+| ----------------------- | ------------------------------------------ |
+| `terminal list`         | `ID\tTAG\tTITLE\tCOMMAND\tSTATUS`          |
+| `surface list`          | `ID\tTITLE\tSIZE\tAPP_ID`                  |
+| `clipboard list`        | One MIME type per line                     |
+| `terminal start`        | Just the PTY ID (integer)                  |
+| `terminal show/history` | Raw text (with ANSI if `--ansi`)           |
+| `terminal wait`         | Matched line (with `--pattern`) or nothing |
+| `remote list`           | `name\turi` (tab-separated)                |
 
 Status messages go to **stderr** with a `blit: ` prefix:
+
 ```
 blit: server started on /tmp/blit-1000.sock
 blit: cannot connect to ssh:broken: connection refused
@@ -999,6 +1015,7 @@ Default filename: `pty-<id>.blitrec`.
 ### Surface recording
 
 Raw video stream:
+
 - **H.264:** Annex B NAL units (playable with `ffplay`).
 - **AV1:** OBU stream (playable with `ffplay`).
 
@@ -1040,7 +1057,8 @@ Passphrase is a random 32-char alphanumeric token, passed via URL fragment (`#to
 ```typescript
 // Re-exported from @blit-sh/core
 export {
-  C2S, S2C,                           // Opcode namespaces
+  C2S,
+  S2C, // Opcode namespaces
   FEATURE_CREATE_NONCE,
   FEATURE_RESTART,
   FEATURE_RESIZE_BATCH,
@@ -1049,10 +1067,14 @@ export {
   FEATURE_AUDIO,
   CODEC_SUPPORT_H264,
   CODEC_SUPPORT_AV1,
-  READ_ANSI, READ_TAIL,
-  CAPTURE_FORMAT_PNG, CAPTURE_FORMAT_AVIF,
-  SURFACE_QUALITY_DEFAULT, SURFACE_QUALITY_LOW,
-  SURFACE_QUALITY_MEDIUM, SURFACE_QUALITY_HIGH,
+  READ_ANSI,
+  READ_TAIL,
+  CAPTURE_FORMAT_PNG,
+  CAPTURE_FORMAT_AVIF,
+  SURFACE_QUALITY_DEFAULT,
+  SURFACE_QUALITY_LOW,
+  SURFACE_QUALITY_MEDIUM,
+  SURFACE_QUALITY_HIGH,
   SURFACE_QUALITY_ULTRA,
 } from "@blit-sh/core/types";
 ```
@@ -1062,16 +1084,16 @@ export {
 ```typescript
 /** Parsed PTY info from S2C_LIST */
 interface PtyInfo {
-  id: number;       // u16
+  id: number; // u16
   tag: string;
   command: string;
-  cols: number;     // u16
-  rows: number;     // u16
+  cols: number; // u16
+  rows: number; // u16
 }
 
 /** Parsed surface info from S2C_SURFACE_LIST */
 interface SurfaceInfo {
-  id: number;       // u16
+  id: number; // u16
   parentId: number;
   width: number;
   height: number;
@@ -1083,9 +1105,9 @@ interface SurfaceInfo {
 interface AgentConnection {
   ptys: PtyInfo[];
   titles: Map<number, string>;
-  exited: Map<number, number>;       // pty_id → exit_status (i32)
-  features: number;                   // u32 bitmask from S2C_HELLO
-  version: number;                    // u16 from S2C_HELLO
+  exited: Map<number, number>; // pty_id → exit_status (i32)
+  features: number; // u32 bitmask from S2C_HELLO
+  version: number; // u16 from S2C_HELLO
 
   send(msg: Uint8Array): Promise<void>;
   recv(timeoutMs?: number): Promise<Uint8Array>;
@@ -1153,13 +1175,34 @@ type ServerMessage =
   | { type: "exited"; ptyId: number; exitStatus: number }
   | { type: "title"; ptyId: number; title: string }
   | { type: "ready" }
-  | { type: "text"; nonce: number; ptyId: number; totalLines: number; offset: number; text: string }
+  | {
+      type: "text";
+      nonce: number;
+      ptyId: number;
+      totalLines: number;
+      offset: number;
+      text: string;
+    }
   | { type: "quit" }
   | { type: "ping" }
   | { type: "update"; ptyId: number; payload: Uint8Array }
   | { type: "surfaceList"; entries: SurfaceInfo[] }
-  | { type: "surfaceCapture"; surfaceId: number; width: number; height: number; data: Uint8Array }
-  | { type: "surfaceFrame"; surfaceId: number; timestamp: number; flags: number; width: number; height: number; data: Uint8Array }
+  | {
+      type: "surfaceCapture";
+      surfaceId: number;
+      width: number;
+      height: number;
+      data: Uint8Array;
+    }
+  | {
+      type: "surfaceFrame";
+      surfaceId: number;
+      timestamp: number;
+      flags: number;
+      width: number;
+      height: number;
+      data: Uint8Array;
+    }
   | { type: "clipboardContent"; mimeType: string; data: Uint8Array }
   | { type: "clipboardList"; mimeTypes: string[] }
   | { type: "unknown"; opcode: number; raw: Uint8Array };
@@ -1173,25 +1216,25 @@ function parseServerMessage(data: Uint8Array): ServerMessage;
 
 ### Runtime Dependencies
 
-| Package | Purpose | Notes |
-|---------|---------|-------|
-| `@blit-sh/core` | Protocol codec, types, message builders | Already exists |
-| `commander` or `yargs` | CLI argument parsing | Commander preferred for smaller bundle |
-| `lz4js` or `lz4-wasm` | LZ4 decompression for `S2C_UPDATE` | Only needed for `terminal wait --pattern` |
-| `tweetnacl` | Ed25519/X25519 crypto for WebRTC signaling | Already a dep of `@blit-sh/core` |
+| Package                | Purpose                                    | Notes                                     |
+| ---------------------- | ------------------------------------------ | ----------------------------------------- |
+| `@blit-sh/core`        | Protocol codec, types, message builders    | Already exists                            |
+| `commander` or `yargs` | CLI argument parsing                       | Commander preferred for smaller bundle    |
+| `lz4js` or `lz4-wasm`  | LZ4 decompression for `S2C_UPDATE`         | Only needed for `terminal wait --pattern` |
+| `tweetnacl`            | Ed25519/X25519 crypto for WebRTC signaling | Already a dep of `@blit-sh/core`          |
 
 ### Build Dependencies
 
-| Package | Purpose |
-|---------|---------|
-| `typescript` | Type checking |
-| `esbuild` or `bun build` | Bundling to single file |
-| `vitest` | Testing |
-| `@types/node` | Node.js type definitions |
+| Package                  | Purpose                  |
+| ------------------------ | ------------------------ |
+| `typescript`             | Type checking            |
+| `esbuild` or `bun build` | Bundling to single file  |
+| `vitest`                 | Testing                  |
+| `@types/node`            | Node.js type definitions |
 
 ### Avoided
 
-- No `node-pty` (CLI is a *client*, not a server).
+- No `node-pty` (CLI is a _client_, not a server).
 - No `ssh2` (SSH is handled by blit-proxy or the Rust binary).
 - No heavy frameworks.
 
@@ -1211,17 +1254,18 @@ The CLI is compiled to a single self-contained binary using one of:
 
 ### Build Matrix
 
-| Platform | Target | Binary Name |
-|----------|--------|-------------|
-| Linux x86_64 | `bun-linux-x64` | `blit` |
-| Linux aarch64 | `bun-linux-arm64` | `blit` |
-| macOS x86_64 | `bun-darwin-x64` | `blit` |
-| macOS aarch64 | `bun-darwin-arm64` | `blit` |
-| Windows x86_64 | `bun-windows-x64` | `blit.exe` |
+| Platform       | Target             | Binary Name |
+| -------------- | ------------------ | ----------- |
+| Linux x86_64   | `bun-linux-x64`    | `blit`      |
+| Linux aarch64  | `bun-linux-arm64`  | `blit`      |
+| macOS x86_64   | `bun-darwin-x64`   | `blit`      |
+| macOS aarch64  | `bun-darwin-arm64` | `blit`      |
+| Windows x86_64 | `bun-windows-x64`  | `blit.exe`  |
 
 ### Distribution
 
 Same channels as the Rust CLI:
+
 - GitHub Releases (tarballs + zips + debs)
 - `curl -sf https://install.blit.sh | sh`
 - Homebrew tap
@@ -1267,6 +1311,7 @@ The TypeScript CLI must speak the **exact same wire protocol** as the Rust CLI. 
 ### Output Compatibility
 
 Stdout output must be **byte-identical** for all commands. This includes:
+
 - TSV delimiters (tabs, not spaces).
 - Header row casing and column order.
 - Exit status formatting (`exited(0)`, `signal(9)`, `exited(unknown)`).
@@ -1281,11 +1326,11 @@ Stdout output must be **byte-identical** for all commands. This includes:
 
 ### Phased Rollout
 
-| Phase | Scope |
-|-------|-------|
-| 1 | `terminal` subcommands + `quit` + `remote` — the core agent interface |
-| 2 | `clipboard` + `surface` subcommands |
-| 3 | `share` (WebRTC producer) |
-| 4 | `open` (embedded HTTP server for browser SPA) |
-| 5 | `install`, `upgrade`, `generate` |
-| 6 | Deprecate and remove Rust CLI binary |
+| Phase | Scope                                                                 |
+| ----- | --------------------------------------------------------------------- |
+| 1     | `terminal` subcommands + `quit` + `remote` — the core agent interface |
+| 2     | `clipboard` + `surface` subcommands                                   |
+| 3     | `share` (WebRTC producer)                                             |
+| 4     | `open` (embedded HTTP server for browser SPA)                         |
+| 5     | `install`, `upgrade`, `generate`                                      |
+| 6     | Deprecate and remove Rust CLI binary                                  |
