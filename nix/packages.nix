@@ -151,20 +151,23 @@
           launcherSrc = pkgs.lib.cleanSourceWith {
             src = ../crates/launcher;
             filter = path: type:
-              (craneLibStatic.filterCargoSources path type);
+              (craneLib.filterCargoSources path type);
           };
+          muslCC = pkgs.pkgsStatic.stdenv.cc;
+          muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+          # "X86_64_UNKNOWN_LINUX_MUSL" or "AARCH64_UNKNOWN_LINUX_MUSL"
+          envTarget = builtins.replaceStrings [ "-" ] [ "_" ] (pkgs.lib.toUpper muslTarget);
         in
-        craneLibStatic.buildPackage (
+        craneLib.buildPackage (
           {
             pname = "blit-launcher";
             src = launcherSrc;
             inherit version;
             strictDeps = true;
-            # Force +crt-static back on — the launcher must be fully static.
+            # Force +crt-static — the launcher must be fully static.
             RUSTFLAGS = "-C target-feature=+crt-static";
             doCheck = false;
-            # No workspace deps — standalone crate with only libc.
-            cargoVendorDir = craneLibStatic.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
+            cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
             postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
               for bin in $out/bin/*; do
                 if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
@@ -176,12 +179,11 @@
             '';
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # Cross-compile for musl target so build scripts (libc build.rs)
-            # run natively on the glibc host instead of being compiled for musl.
-            CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-            # Provide musl libc.a so the cross-linker can resolve libc symbols.
-            buildInputs = [ pkgs.pkgsStatic.stdenv.cc.libc ];
-            postUnpack = "export NIX_CFLAGS_LINK=''";
+            # Cross-compile for musl: build scripts link against glibc (host)
+            # while the final binary targets musl via the explicit linker.
+            CARGO_BUILD_TARGET = muslTarget;
+            "CARGO_TARGET_${envTarget}_LINKER" = "${muslCC}/bin/${muslCC.targetPrefix}cc";
+            nativeBuildInputs = [ muslCC ];
           }
         );
 
