@@ -10,7 +10,7 @@ Update DEMO_IMAGE_ID in js/demo/src/demo.ts with the printed image ID.
 import modal
 
 PARROT_GIF_URL = "https://raw.githubusercontent.com/indent-com/assets/indent-2026-04-10-hires-spin/parrot_1k.gif"
-BLIT_DEB_URL = "https://github.com/indent-com/blit/releases/download/v0.22.0/blit_0.22.0_amd64.deb"
+BLIT_DEB_URL = "https://github.com/indent-com/blit/releases/download/v0.24.0/blit_0.24.0_amd64.deb"
 
 image = (
     modal.Image.from_registry("ubuntu:24.04")
