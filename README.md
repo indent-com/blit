@@ -1,6 +1,6 @@
 # blit
 
-Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. One binary, nothing to configure.
+Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. Nothing to configure, zero external dependencies.
 
 We publish a [computer agent skill](https://install.blit.sh/SKILL.md).
 
