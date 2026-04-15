@@ -154,25 +154,33 @@
               (craneLibStatic.filterCargoSources path type);
           };
         in
-        craneLibStatic.buildPackage {
-          pname = "blit-launcher";
-          src = launcherSrc;
-          inherit version;
-          # Force +crt-static back on — the launcher must be fully static.
-          RUSTFLAGS = "-C target-feature=+crt-static";
-          doCheck = false;
-          # No workspace deps — standalone crate with only libc.
-          cargoVendorDir = craneLibStatic.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
-          postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-            for bin in $out/bin/*; do
-              if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
-                echo "FATAL: launcher $bin is not statically linked:"
-                file "$bin"
-                exit 1
-              fi
-            done
-          '';
-        };
+        craneLibStatic.buildPackage (
+          {
+            pname = "blit-launcher";
+            src = launcherSrc;
+            inherit version;
+            # Force +crt-static back on — the launcher must be fully static.
+            RUSTFLAGS = "-C target-feature=+crt-static";
+            doCheck = false;
+            # No workspace deps — standalone crate with only libc.
+            cargoVendorDir = craneLibStatic.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              for bin in $out/bin/*; do
+                if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
+                  echo "FATAL: launcher $bin is not statically linked:"
+                  file "$bin"
+                  exit 1
+                fi
+              done
+            '';
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Cross-compile for musl target so build scripts (libc build.rs)
+            # run natively on the glibc host instead of being compiled for musl.
+            CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+            postUnpack = "export NIX_CFLAGS_LINK=''";
+          }
+        );
 
       # Assembled release package (Linux): launcher + dynamic binary + musl.
       # On macOS the dynamic binary is used directly (no launcher needed).
