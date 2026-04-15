@@ -1379,10 +1379,12 @@ impl VaapiDirectEncoder {
             52 // Level 5.2: 4096×2304
         };
         w8(&mut sps, 1, level_idc);
-        // intra_period (offset 4, u32)
-        w32(&mut sps, 4, 120);
-        // intra_idr_period (offset 8, u32)
-        w32(&mut sps, 8, 120);
+        // intra_period (offset 4, u32) — set to max so the driver never
+        // auto-inserts keyframes; blit uses explicit force_idr instead.
+        // 0 means "all intra" in VA-API, so use a large value.
+        w32(&mut sps, 4, 0x7FFF_FFFF);
+        // intra_idr_period (offset 8, u32) — same as intra_period.
+        w32(&mut sps, 8, 0x7FFF_FFFF);
         // ip_period (offset 12, u32)
         w32(&mut sps, 12, 1);
         // bits_per_second (offset 16, u32)
@@ -2435,7 +2437,10 @@ impl VaapiAv1Encoder {
         seq.seq_level_idx = self.level_idx;
         seq.seq_tier = 0;
         seq.hierarchical_flag = 0;
-        seq.intra_period = 120;
+        // Max value so the driver never auto-inserts keyframes; blit
+        // uses explicit force_idr instead.  0 means "all intra" in
+        // VA-API, so use a large value.
+        seq.intra_period = 0x7FFF_FFFF;
         seq.ip_period = 1;
         seq.bits_per_second = 0;
         seq.order_hint_bits_minus_1 = 7;

@@ -269,123 +269,9 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // 4. Query and bind session memory
         // ---------------------------------------------------------------
-        let mut mem_req_count = 0u32;
-        let res = unsafe {
-            (video_fns.get_video_session_memory_requirements)(
-                device.handle(),
-                video_session,
-                &mut mem_req_count,
-                ptr::null_mut(),
-            )
-        };
-        if res != vk::Result::SUCCESS {
-            eprintln!(
-                "[vulkan-encode] vkGetVideoSessionMemoryRequirementsKHR(count) failed: {res:?}",
-            );
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
-            return None;
-        }
-
-        let mut mem_reqs: Vec<vk::VideoSessionMemoryRequirementsKHR<'_>> =
-            vec![vk::VideoSessionMemoryRequirementsKHR::default(); mem_req_count as usize];
-        let res = unsafe {
-            (video_fns.get_video_session_memory_requirements)(
-                device.handle(),
-                video_session,
-                &mut mem_req_count,
-                mem_reqs.as_mut_ptr(),
-            )
-        };
-        if res != vk::Result::SUCCESS {
-            eprintln!(
-                "[vulkan-encode] vkGetVideoSessionMemoryRequirementsKHR(data) failed: {res:?}",
-            );
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
-            return None;
-        }
-
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-        let mut session_memory = Vec::new();
-        let mut bind_infos = Vec::new();
-        for req in &mem_reqs[..mem_req_count as usize] {
-            let mr = &req.memory_requirements;
-            let mem_type_idx = find_memory_type(
-                &mem_props,
-                mr.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .or_else(|| {
-                find_memory_type(
-                    &mem_props,
-                    mr.memory_type_bits,
-                    vk::MemoryPropertyFlags::empty(),
-                )
-            });
-            let Some(mem_type_idx) = mem_type_idx else {
-                eprintln!("[vulkan-encode] no suitable memory type for session memory");
-                for &m in &session_memory {
-                    unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-                }
-                return None;
-            };
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(mr.size)
-                .memory_type_index(mem_type_idx);
-            let memory = match unsafe { device.allocate_memory(&alloc, None) } {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[vulkan-encode] session memory alloc failed: {e:?}");
-                    for &m in &session_memory {
-                        unsafe { device.free_memory(m, None) };
-                    }
-                    unsafe {
-                        (video_fns.destroy_video_session)(
-                            device.handle(),
-                            video_session,
-                            ptr::null(),
-                        );
-                    }
-                    return None;
-                }
-            };
-            session_memory.push(memory);
-            bind_infos.push(
-                vk::BindVideoSessionMemoryInfoKHR::default()
-                    .memory_bind_index(req.memory_bind_index)
-                    .memory(memory)
-                    .memory_offset(0)
-                    .memory_size(mr.size),
-            );
-        }
-
-        if !bind_infos.is_empty() {
-            let res = unsafe {
-                (video_fns.bind_video_session_memory)(
-                    device.handle(),
-                    video_session,
-                    bind_infos.len() as u32,
-                    bind_infos.as_ptr(),
-                )
-            };
-            if res != vk::Result::SUCCESS {
-                eprintln!("[vulkan-encode] vkBindVideoSessionMemoryKHR failed: {res:?}");
-                for &m in &session_memory {
-                    unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-                }
-                return None;
-            }
-        }
+        let session_memory = unsafe {
+            bind_session_memory(device, video_fns, video_session, physical_device, instance)
+        }?;
 
         // ---------------------------------------------------------------
         // 5. Session parameters (SPS / PPS)
@@ -477,160 +363,42 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // 6. DPB images (2x)
         // ---------------------------------------------------------------
-        let mut dpb_slots_vec = Vec::new();
-        for i in 0..2 {
-            let dpb = unsafe {
-                create_dpb_image(
-                    device,
-                    instance,
-                    physical_device,
-                    width,
-                    height,
-                    video_queue_family,
-                    &profile,
-                )
-            };
-            let Some(dpb) = dpb else {
-                eprintln!("[vulkan-encode] DPB image {i} creation failed");
-                for slot in &dpb_slots_vec {
-                    unsafe { destroy_dpb_slot(device, slot) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session_parameters)(
-                        device.handle(),
-                        session_params,
-                        ptr::null(),
-                    );
-                }
-                for &m in &session_memory {
-                    unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-                }
-                return None;
-            };
-            dpb_slots_vec.push(dpb);
-        }
-        let dpb_slots = [dpb_slots_vec.remove(0), dpb_slots_vec.remove(0)];
+        let dpb_slots = unsafe {
+            allocate_dpb_slots(
+                device,
+                instance,
+                physical_device,
+                video_fns,
+                width,
+                height,
+                video_queue_family,
+                &profile,
+                &session_memory,
+                session_params,
+                video_session,
+            )
+        }?;
 
         // ---------------------------------------------------------------
         // 7. Bitstream buffer (host-visible, host-coherent)
         // ---------------------------------------------------------------
-        let buf_info = vk::BufferCreateInfo::default()
-            .size(BITSTREAM_CAPACITY)
-            .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let bitstream_buffer = match unsafe { device.create_buffer(&buf_info, None) } {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[vulkan-encode] bitstream buffer create failed: {e:?}");
-                unsafe {
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
-        let buf_reqs = unsafe { device.get_buffer_memory_requirements(bitstream_buffer) };
-        let buf_mem_type = find_memory_type(
-            &mem_props,
-            buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
-        let Some(buf_mem_type) = buf_mem_type else {
-            eprintln!("[vulkan-encode] no host-visible memory for bitstream buffer");
-            unsafe {
-                device.destroy_buffer(bitstream_buffer, None);
-                cleanup_session(
-                    device,
-                    video_fns,
-                    &dpb_slots,
-                    &session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
-            return None;
-        };
-        let buf_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(buf_reqs.size)
-            .memory_type_index(buf_mem_type);
-        let bitstream_memory = match unsafe { device.allocate_memory(&buf_alloc, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[vulkan-encode] bitstream memory alloc failed: {e:?}");
-                unsafe { device.destroy_buffer(bitstream_buffer, None) };
-                unsafe {
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
-        if unsafe { device.bind_buffer_memory(bitstream_buffer, bitstream_memory, 0) }.is_err() {
-            eprintln!("[vulkan-encode] bind bitstream buffer memory failed");
-            unsafe {
-                device.free_memory(bitstream_memory, None);
-                device.destroy_buffer(bitstream_buffer, None);
-                cleanup_session(
-                    device,
-                    video_fns,
-                    &dpb_slots,
-                    &session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
-            return None;
-        }
-        let bitstream_ptr = match unsafe {
-            device.map_memory(
-                bitstream_memory,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
+        let (bitstream_buffer, bitstream_memory, bitstream_ptr) = unsafe {
+            allocate_bitstream_buffer(
+                device,
+                instance,
+                physical_device,
+                video_fns,
+                BITSTREAM_CAPACITY,
+                &dpb_slots,
+                &session_memory,
+                session_params,
+                video_session,
             )
-        } {
-            Ok(p) => p as *mut u8,
-            Err(e) => {
-                eprintln!("[vulkan-encode] map bitstream memory failed: {e:?}");
-                unsafe {
-                    device.free_memory(bitstream_memory, None);
-                    device.destroy_buffer(bitstream_buffer, None);
-                }
-                unsafe {
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
+        }?;
 
         // ---------------------------------------------------------------
         // 8. Query pool (encode feedback)
         // ---------------------------------------------------------------
-        let mut encode_feedback_info = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN);
-        // Build a fresh h264 profile to chain into the query pool profile.
         let mut h264_profile_for_qp = vk::VideoEncodeH264ProfileInfoKHR::default()
             .std_profile_idc(StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH);
         let mut video_profile_for_query = vk::VideoProfileInfoKHR::default()
@@ -639,33 +407,19 @@ impl VulkanVideoEncoder {
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .push_next(&mut h264_profile_for_qp);
-        let qp_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1)
-            .push_next(&mut encode_feedback_info)
-            .push_next(&mut video_profile_for_query);
-        let query_pool = match unsafe { device.create_query_pool(&qp_info, None) } {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("[vulkan-encode] query pool create failed: {e:?}");
-                unsafe {
-                    device.unmap_memory(bitstream_memory);
-                    device.free_memory(bitstream_memory, None);
-                    device.destroy_buffer(bitstream_buffer, None);
-                }
-                unsafe {
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
+        let query_pool = unsafe {
+            create_encode_query_pool(
+                device,
+                video_fns,
+                &mut video_profile_for_query,
+                bitstream_buffer,
+                bitstream_memory,
+                &dpb_slots,
+                &session_memory,
+                session_params,
+                video_session,
+            )
+        }?;
 
         eprintln!(
             "[vulkan-encode] initialized H.264 encoder {width}x{height} qp={qp} level={level_idc}",
@@ -1225,121 +979,11 @@ impl VulkanVideoEncoder {
         }
 
         // ---------------------------------------------------------------
-        // 4. Query and bind session memory (identical to H.264 path)
+        // 4. Query and bind session memory
         // ---------------------------------------------------------------
-        let mut mem_req_count = 0u32;
-        let res = unsafe {
-            (video_fns.get_video_session_memory_requirements)(
-                device.handle(),
-                video_session,
-                &mut mem_req_count,
-                ptr::null_mut(),
-            )
-        };
-        if res != vk::Result::SUCCESS {
-            eprintln!("[vulkan-encode] AV1 session memory requirements query failed: {res:?}");
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
-            return None;
-        }
-
-        let mut mem_reqs: Vec<vk::VideoSessionMemoryRequirementsKHR<'_>> =
-            vec![vk::VideoSessionMemoryRequirementsKHR::default(); mem_req_count as usize];
-        let res = unsafe {
-            (video_fns.get_video_session_memory_requirements)(
-                device.handle(),
-                video_session,
-                &mut mem_req_count,
-                mem_reqs.as_mut_ptr(),
-            )
-        };
-        if res != vk::Result::SUCCESS {
-            eprintln!("[vulkan-encode] AV1 session memory requirements data failed: {res:?}");
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
-            return None;
-        }
-
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-        let mut session_memory = Vec::new();
-        let mut bind_infos = Vec::new();
-        for req in &mem_reqs[..mem_req_count as usize] {
-            let mr = &req.memory_requirements;
-            let mem_type_idx = find_memory_type(
-                &mem_props,
-                mr.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .or_else(|| {
-                find_memory_type(
-                    &mem_props,
-                    mr.memory_type_bits,
-                    vk::MemoryPropertyFlags::empty(),
-                )
-            });
-            let Some(mem_type_idx) = mem_type_idx else {
-                eprintln!("[vulkan-encode] AV1 no suitable memory type for session memory");
-                for &m in &session_memory {
-                    unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-                }
-                return None;
-            };
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(mr.size)
-                .memory_type_index(mem_type_idx);
-            let memory = match unsafe { device.allocate_memory(&alloc, None) } {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[vulkan-encode] AV1 session memory alloc failed: {e:?}");
-                    for &m in &session_memory {
-                        unsafe { device.free_memory(m, None) };
-                    }
-                    unsafe {
-                        (video_fns.destroy_video_session)(
-                            device.handle(),
-                            video_session,
-                            ptr::null(),
-                        );
-                    }
-                    return None;
-                }
-            };
-            session_memory.push(memory);
-            bind_infos.push(
-                vk::BindVideoSessionMemoryInfoKHR::default()
-                    .memory_bind_index(req.memory_bind_index)
-                    .memory(memory)
-                    .memory_offset(0)
-                    .memory_size(mr.size),
-            );
-        }
-
-        if !bind_infos.is_empty() {
-            let res = unsafe {
-                (video_fns.bind_video_session_memory)(
-                    device.handle(),
-                    video_session,
-                    bind_infos.len() as u32,
-                    bind_infos.as_ptr(),
-                )
-            };
-            if res != vk::Result::SUCCESS {
-                eprintln!("[vulkan-encode] AV1 vkBindVideoSessionMemoryKHR failed: {res:?}");
-                for &m in &session_memory {
-                    unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-                }
-                return None;
-            }
-        }
+        let session_memory = unsafe {
+            bind_session_memory(device, video_fns, video_session, physical_device, instance)
+        }?;
 
         // ---------------------------------------------------------------
         // 5. Session parameters (AV1 sequence header)
@@ -1422,159 +1066,44 @@ impl VulkanVideoEncoder {
         }
 
         // ---------------------------------------------------------------
-        // 6. DPB images (2x — identical to H.264 path)
+        // 6. DPB images (2x)
         // ---------------------------------------------------------------
-        let mut dpb_slots_vec = Vec::new();
-        for i in 0..2 {
-            let dpb = unsafe {
-                create_dpb_image(
-                    device,
-                    instance,
-                    physical_device,
-                    coded_w,
-                    coded_h,
-                    video_queue_family,
-                    &profile,
-                )
-            };
-            let Some(dpb) = dpb else {
-                eprintln!("[vulkan-encode] AV1 DPB image {i} creation failed");
-                for slot in &dpb_slots_vec {
-                    unsafe { destroy_dpb_slot(device, slot) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session_parameters)(
-                        device.handle(),
-                        session_params,
-                        ptr::null(),
-                    );
-                }
-                for &m in &session_memory {
-                    unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-                }
-                return None;
-            };
-            dpb_slots_vec.push(dpb);
-        }
-        let dpb_slots = [dpb_slots_vec.remove(0), dpb_slots_vec.remove(0)];
+        let dpb_slots = unsafe {
+            allocate_dpb_slots(
+                device,
+                instance,
+                physical_device,
+                video_fns,
+                coded_w,
+                coded_h,
+                video_queue_family,
+                &profile,
+                &session_memory,
+                session_params,
+                video_session,
+            )
+        }?;
 
         // ---------------------------------------------------------------
-        // 7. Bitstream buffer (identical to H.264 path)
+        // 7. Bitstream buffer
         // ---------------------------------------------------------------
-        let buf_info = vk::BufferCreateInfo::default()
-            .size(BITSTREAM_CAPACITY)
-            .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let bitstream_buffer = match unsafe { device.create_buffer(&buf_info, None) } {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[vulkan-encode] AV1 bitstream buffer create failed: {e:?}");
-                unsafe {
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
-        let buf_reqs = unsafe { device.get_buffer_memory_requirements(bitstream_buffer) };
-        let buf_mem_type = find_memory_type(
-            &mem_props,
-            buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
-        let Some(buf_mem_type) = buf_mem_type else {
-            eprintln!("[vulkan-encode] AV1 no host-visible memory for bitstream buffer");
-            unsafe {
-                device.destroy_buffer(bitstream_buffer, None);
-                cleanup_session(
-                    device,
-                    video_fns,
-                    &dpb_slots,
-                    &session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
-            return None;
-        };
-        let buf_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(buf_reqs.size)
-            .memory_type_index(buf_mem_type);
-        let bitstream_memory = match unsafe { device.allocate_memory(&buf_alloc, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[vulkan-encode] AV1 bitstream memory alloc failed: {e:?}");
-                unsafe { device.destroy_buffer(bitstream_buffer, None) };
-                unsafe {
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
-        if unsafe { device.bind_buffer_memory(bitstream_buffer, bitstream_memory, 0) }.is_err() {
-            eprintln!("[vulkan-encode] AV1 bind bitstream buffer memory failed");
-            unsafe {
-                device.free_memory(bitstream_memory, None);
-                device.destroy_buffer(bitstream_buffer, None);
-                cleanup_session(
-                    device,
-                    video_fns,
-                    &dpb_slots,
-                    &session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
-            return None;
-        }
-        let bitstream_ptr = match unsafe {
-            device.map_memory(
-                bitstream_memory,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
+        let (bitstream_buffer, bitstream_memory, bitstream_ptr) = unsafe {
+            allocate_bitstream_buffer(
+                device,
+                instance,
+                physical_device,
+                video_fns,
+                BITSTREAM_CAPACITY,
+                &dpb_slots,
+                &session_memory,
+                session_params,
+                video_session,
             )
-        } {
-            Ok(p) => p as *mut u8,
-            Err(e) => {
-                eprintln!("[vulkan-encode] AV1 map bitstream memory failed: {e:?}");
-                unsafe {
-                    device.free_memory(bitstream_memory, None);
-                    device.destroy_buffer(bitstream_buffer, None);
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
+        }?;
 
         // ---------------------------------------------------------------
         // 8. Query pool (encode feedback)
         // ---------------------------------------------------------------
-        let mut encode_feedback_info = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN);
         let mut av1_profile_for_qp = VideoEncodeAV1ProfileInfoKHR {
             s_type: vk::StructureType::from_raw(
                 VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
@@ -1589,7 +1118,7 @@ impl VulkanVideoEncoder {
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-        // Chain av1 profile.
+        // Chain av1 profile via raw pNext.
         {
             let base = &mut video_profile_for_query as *mut _ as *mut vk::BaseOutStructure<'_>;
             unsafe {
@@ -1600,31 +1129,19 @@ impl VulkanVideoEncoder {
                 (*cur).p_next = &mut av1_profile_for_qp as *mut _ as *mut vk::BaseOutStructure<'_>;
             }
         }
-        let qp_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1)
-            .push_next(&mut encode_feedback_info)
-            .push_next(&mut video_profile_for_query);
-        let query_pool = match unsafe { device.create_query_pool(&qp_info, None) } {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("[vulkan-encode] AV1 query pool create failed: {e:?}");
-                unsafe {
-                    device.unmap_memory(bitstream_memory);
-                    device.free_memory(bitstream_memory, None);
-                    device.destroy_buffer(bitstream_buffer, None);
-                    cleanup_session(
-                        device,
-                        video_fns,
-                        &dpb_slots,
-                        &session_memory,
-                        session_params,
-                        video_session,
-                    );
-                }
-                return None;
-            }
-        };
+        let query_pool = unsafe {
+            create_encode_query_pool(
+                device,
+                video_fns,
+                &mut video_profile_for_query,
+                bitstream_buffer,
+                bitstream_memory,
+                &dpb_slots,
+                &session_memory,
+                session_params,
+                video_session,
+            )
+        }?;
 
         eprintln!(
             "[vulkan-encode] initialized AV1 encoder {coded_w}x{coded_h} (source {width}x{height}) qp={qp} level={level}",
@@ -2204,6 +1721,361 @@ unsafe fn cleanup_session(
         }
         (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
     }
+}
+
+/// Query and bind memory for a video session.
+///
+/// Calls `vkGetVideoSessionMemoryRequirementsKHR`, allocates device-local
+/// memory for each requirement, and binds it via `vkBindVideoSessionMemoryKHR`.
+/// On failure, cleans up any partially-allocated memory and destroys the
+/// video session.
+unsafe fn bind_session_memory(
+    device: &ash::Device,
+    video_fns: &VideoFns,
+    session: vk::VideoSessionKHR,
+    physical_device: vk::PhysicalDevice,
+    instance: &ash::Instance,
+) -> Option<Vec<vk::DeviceMemory>> {
+    let mut mem_req_count = 0u32;
+    let res = unsafe {
+        (video_fns.get_video_session_memory_requirements)(
+            device.handle(),
+            session,
+            &mut mem_req_count,
+            ptr::null_mut(),
+        )
+    };
+    if res != vk::Result::SUCCESS {
+        eprintln!("[vulkan-encode] vkGetVideoSessionMemoryRequirementsKHR(count) failed: {res:?}",);
+        unsafe {
+            (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
+        }
+        return None;
+    }
+
+    let mut mem_reqs: Vec<vk::VideoSessionMemoryRequirementsKHR<'_>> =
+        vec![vk::VideoSessionMemoryRequirementsKHR::default(); mem_req_count as usize];
+    let res = unsafe {
+        (video_fns.get_video_session_memory_requirements)(
+            device.handle(),
+            session,
+            &mut mem_req_count,
+            mem_reqs.as_mut_ptr(),
+        )
+    };
+    if res != vk::Result::SUCCESS {
+        eprintln!("[vulkan-encode] vkGetVideoSessionMemoryRequirementsKHR(data) failed: {res:?}",);
+        unsafe {
+            (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
+        }
+        return None;
+    }
+
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+    let mut session_memory = Vec::new();
+    let mut bind_infos = Vec::new();
+    for req in &mem_reqs[..mem_req_count as usize] {
+        let mr = &req.memory_requirements;
+        let mem_type_idx = find_memory_type(
+            &mem_props,
+            mr.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            find_memory_type(
+                &mem_props,
+                mr.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            )
+        });
+        let Some(mem_type_idx) = mem_type_idx else {
+            eprintln!("[vulkan-encode] no suitable memory type for session memory");
+            for &m in &session_memory {
+                unsafe { device.free_memory(m, None) };
+            }
+            unsafe {
+                (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
+            }
+            return None;
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(mr.size)
+            .memory_type_index(mem_type_idx);
+        let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[vulkan-encode] session memory alloc failed: {e:?}");
+                for &m in &session_memory {
+                    unsafe { device.free_memory(m, None) };
+                }
+                unsafe {
+                    (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
+                }
+                return None;
+            }
+        };
+        session_memory.push(memory);
+        bind_infos.push(
+            vk::BindVideoSessionMemoryInfoKHR::default()
+                .memory_bind_index(req.memory_bind_index)
+                .memory(memory)
+                .memory_offset(0)
+                .memory_size(mr.size),
+        );
+    }
+
+    if !bind_infos.is_empty() {
+        let res = unsafe {
+            (video_fns.bind_video_session_memory)(
+                device.handle(),
+                session,
+                bind_infos.len() as u32,
+                bind_infos.as_ptr(),
+            )
+        };
+        if res != vk::Result::SUCCESS {
+            eprintln!("[vulkan-encode] vkBindVideoSessionMemoryKHR failed: {res:?}");
+            for &m in &session_memory {
+                unsafe { device.free_memory(m, None) };
+            }
+            unsafe {
+                (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
+            }
+            return None;
+        }
+    }
+
+    Some(session_memory)
+}
+
+/// Allocate two DPB (Decoded Picture Buffer) slots for video encode.
+///
+/// Each slot gets a `G8_B8R8_2PLANE_420_UNORM` image with `VIDEO_ENCODE_DPB`
+/// usage plus an image view.  On failure, cleans up partially-created slots
+/// and the full session (params + memory + session).
+unsafe fn allocate_dpb_slots(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    video_fns: &VideoFns,
+    width: u32,
+    height: u32,
+    video_queue_family: u32,
+    profile: &vk::VideoProfileInfoKHR<'_>,
+    session_memory: &[vk::DeviceMemory],
+    session_params: vk::VideoSessionParametersKHR,
+    video_session: vk::VideoSessionKHR,
+) -> Option<[DpbSlot; 2]> {
+    let mut dpb_slots_vec = Vec::new();
+    for i in 0..2 {
+        let dpb = unsafe {
+            create_dpb_image(
+                device,
+                instance,
+                physical_device,
+                width,
+                height,
+                video_queue_family,
+                profile,
+            )
+        };
+        let Some(dpb) = dpb else {
+            eprintln!("[vulkan-encode] DPB image {i} creation failed");
+            for slot in &dpb_slots_vec {
+                unsafe { destroy_dpb_slot(device, slot) };
+            }
+            unsafe {
+                (video_fns.destroy_video_session_parameters)(
+                    device.handle(),
+                    session_params,
+                    ptr::null(),
+                );
+            }
+            for &m in session_memory {
+                unsafe { device.free_memory(m, None) };
+            }
+            unsafe {
+                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
+            }
+            return None;
+        };
+        dpb_slots_vec.push(dpb);
+    }
+    Some([dpb_slots_vec.remove(0), dpb_slots_vec.remove(0)])
+}
+
+/// Allocate a host-visible, host-coherent mapped buffer for encoded bitstream
+/// output.
+///
+/// Returns `(buffer, memory, mapped_ptr)`.  On failure, cleans up and returns
+/// `None`.
+unsafe fn allocate_bitstream_buffer(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    video_fns: &VideoFns,
+    capacity: u64,
+    dpb_slots: &[DpbSlot; 2],
+    session_memory: &[vk::DeviceMemory],
+    session_params: vk::VideoSessionParametersKHR,
+    video_session: vk::VideoSessionKHR,
+) -> Option<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+    let buf_info = vk::BufferCreateInfo::default()
+        .size(capacity)
+        .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let bitstream_buffer = match unsafe { device.create_buffer(&buf_info, None) } {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[vulkan-encode] bitstream buffer create failed: {e:?}");
+            unsafe {
+                cleanup_session(
+                    device,
+                    video_fns,
+                    dpb_slots,
+                    session_memory,
+                    session_params,
+                    video_session,
+                );
+            }
+            return None;
+        }
+    };
+    let buf_reqs = unsafe { device.get_buffer_memory_requirements(bitstream_buffer) };
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let buf_mem_type = find_memory_type(
+        &mem_props,
+        buf_reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    );
+    let Some(buf_mem_type) = buf_mem_type else {
+        eprintln!("[vulkan-encode] no host-visible memory for bitstream buffer");
+        unsafe {
+            device.destroy_buffer(bitstream_buffer, None);
+            cleanup_session(
+                device,
+                video_fns,
+                dpb_slots,
+                session_memory,
+                session_params,
+                video_session,
+            );
+        }
+        return None;
+    };
+    let buf_alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(buf_reqs.size)
+        .memory_type_index(buf_mem_type);
+    let bitstream_memory = match unsafe { device.allocate_memory(&buf_alloc, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[vulkan-encode] bitstream memory alloc failed: {e:?}");
+            unsafe { device.destroy_buffer(bitstream_buffer, None) };
+            unsafe {
+                cleanup_session(
+                    device,
+                    video_fns,
+                    dpb_slots,
+                    session_memory,
+                    session_params,
+                    video_session,
+                );
+            }
+            return None;
+        }
+    };
+    if unsafe { device.bind_buffer_memory(bitstream_buffer, bitstream_memory, 0) }.is_err() {
+        eprintln!("[vulkan-encode] bind bitstream buffer memory failed");
+        unsafe {
+            device.free_memory(bitstream_memory, None);
+            device.destroy_buffer(bitstream_buffer, None);
+            cleanup_session(
+                device,
+                video_fns,
+                dpb_slots,
+                session_memory,
+                session_params,
+                video_session,
+            );
+        }
+        return None;
+    }
+    let bitstream_ptr = match unsafe {
+        device.map_memory(
+            bitstream_memory,
+            0,
+            vk::WHOLE_SIZE,
+            vk::MemoryMapFlags::empty(),
+        )
+    } {
+        Ok(p) => p as *mut u8,
+        Err(e) => {
+            eprintln!("[vulkan-encode] map bitstream memory failed: {e:?}");
+            unsafe {
+                device.free_memory(bitstream_memory, None);
+                device.destroy_buffer(bitstream_buffer, None);
+            }
+            unsafe {
+                cleanup_session(
+                    device,
+                    video_fns,
+                    dpb_slots,
+                    session_memory,
+                    session_params,
+                    video_session,
+                );
+            }
+            return None;
+        }
+    };
+
+    Some((bitstream_buffer, bitstream_memory, bitstream_ptr))
+}
+
+/// Create a query pool for video encode feedback.
+///
+/// `profile_for_query` must already have codec-specific profile info
+/// chained via pNext before being passed here.
+unsafe fn create_encode_query_pool(
+    device: &ash::Device,
+    video_fns: &VideoFns,
+    profile_for_query: &mut vk::VideoProfileInfoKHR<'_>,
+    bitstream_buffer: vk::Buffer,
+    bitstream_memory: vk::DeviceMemory,
+    dpb_slots: &[DpbSlot; 2],
+    session_memory: &[vk::DeviceMemory],
+    session_params: vk::VideoSessionParametersKHR,
+    video_session: vk::VideoSessionKHR,
+) -> Option<vk::QueryPool> {
+    let mut encode_feedback_info = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
+        .encode_feedback_flags(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN);
+    let qp_info = vk::QueryPoolCreateInfo::default()
+        .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+        .query_count(1)
+        .push_next(&mut encode_feedback_info)
+        .push_next(profile_for_query);
+    let query_pool = match unsafe { device.create_query_pool(&qp_info, None) } {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[vulkan-encode] query pool create failed: {e:?}");
+            unsafe {
+                device.unmap_memory(bitstream_memory);
+                device.free_memory(bitstream_memory, None);
+                device.destroy_buffer(bitstream_buffer, None);
+                cleanup_session(
+                    device,
+                    video_fns,
+                    dpb_slots,
+                    session_memory,
+                    session_params,
+                    video_session,
+                );
+            }
+            return None;
+        }
+    };
+    Some(query_pool)
 }
 
 /// Create a DPB (Decoded Picture Buffer) image + view.

@@ -94,13 +94,11 @@ pub(crate) struct VulkanRenderer {
     /// Encoder-allocated output buffers imported as Vulkan render targets,
     /// keyed by surface_id.  Each surface has its own pool so different
     /// surfaces never share buffers.
-    external_outputs: HashMap<u32, Vec<ExternalOutput>>,
-    external_output_idx: HashMap<u32, usize>,
+    external_outputs: HashMap<u32, (Vec<ExternalOutput>, usize)>,
 
     /// NV12 output buffers for zero-copy BGRA→NV12 compute conversion,
-    /// keyed by surface_id.
-    nv12_outputs: HashMap<u32, Vec<Nv12Output>>,
-    nv12_output_idx: HashMap<u32, usize>,
+    /// keyed by surface_id.  The `usize` is the round-robin index.
+    nv12_outputs: HashMap<u32, (Vec<Nv12Output>, usize)>,
 
     /// Persistent texture cache keyed by Wayland surface ObjectId.
     /// Textures are created at surface commit time and reused across
@@ -821,9 +819,7 @@ impl VulkanRenderer {
             external_fence_fd_fn,
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
-            external_output_idx: HashMap::new(),
             nv12_outputs: HashMap::new(),
-            nv12_output_idx: HashMap::new(),
             surface_textures: HashMap::new(),
             pending_destroy_textures: Vec::new(),
         })
@@ -1024,7 +1020,6 @@ impl VulkanRenderer {
             };
             imported.push(ext_out);
         }
-        self.external_output_idx.insert(surface_id, 0);
         if !imported.is_empty() {
             eprintln!(
                 "[vulkan-render] {} external output buffers imported for surface {surface_id} ({}x{})",
@@ -1065,11 +1060,11 @@ impl VulkanRenderer {
                 self.create_nv12_outputs(surface_id, buffers[0].width, buffers[0].height);
             }
         }
-        self.external_outputs.insert(surface_id, imported);
+        self.external_outputs.insert(surface_id, (imported, 0));
     }
 
     fn destroy_external_outputs_for(&mut self, surface_id: u32) {
-        if let Some(exts) = self.external_outputs.remove(&surface_id) {
+        if let Some((exts, _)) = self.external_outputs.remove(&surface_id) {
             for ext in exts {
                 unsafe {
                     self.device.destroy_framebuffer(ext.framebuffer, None);
@@ -1079,12 +1074,11 @@ impl VulkanRenderer {
                 }
             }
         }
-        self.external_output_idx.remove(&surface_id);
         self.destroy_nv12_outputs_for(surface_id);
     }
 
     fn destroy_all_external_outputs(&mut self) {
-        for (_, exts) in self.external_outputs.drain() {
+        for (_, (exts, _)) in self.external_outputs.drain() {
             for ext in exts {
                 unsafe {
                     self.device.destroy_framebuffer(ext.framebuffer, None);
@@ -1094,7 +1088,6 @@ impl VulkanRenderer {
                 }
             }
         }
-        self.external_output_idx.clear();
         self.destroy_all_nv12_outputs();
     }
 
@@ -1424,18 +1417,16 @@ impl VulkanRenderer {
     }
 
     fn destroy_nv12_outputs_for(&mut self, surface_id: u32) {
-        if let Some(nv12s) = self.nv12_outputs.remove(&surface_id) {
+        if let Some((nv12s, _)) = self.nv12_outputs.remove(&surface_id) {
             self.destroy_nv12_vec(nv12s);
         }
-        self.nv12_output_idx.remove(&surface_id);
     }
 
     fn destroy_all_nv12_outputs(&mut self) {
-        let all: Vec<Vec<Nv12Output>> = self.nv12_outputs.drain().map(|(_, v)| v).collect();
+        let all: Vec<Vec<Nv12Output>> = self.nv12_outputs.drain().map(|(_, (v, _))| v).collect();
         for nv12s in all {
             self.destroy_nv12_vec(nv12s);
         }
-        self.nv12_output_idx.clear();
     }
 
     /// Allocate NV12 output planes for the BGRA→NV12 compute path.
@@ -1546,10 +1537,19 @@ impl VulkanRenderer {
                 eprintln!("[vulkan-render] failed to create NV12 buffer {w}x{h}");
                 return;
             };
-            self.nv12_outputs.entry(surface_id).or_default().push(nv12);
+            self.nv12_outputs
+                .entry(surface_id)
+                .or_insert_with(|| (Vec::new(), 0))
+                .0
+                .push(nv12);
         }
-        self.nv12_output_idx.insert(surface_id, 0);
-        let count = self.nv12_outputs.get(&surface_id).map_or(0, |v| v.len());
+        if let Some(entry) = self.nv12_outputs.get_mut(&surface_id) {
+            entry.1 = 0;
+        }
+        let count = self
+            .nv12_outputs
+            .get(&surface_id)
+            .map_or(0, |(v, _)| v.len());
         eprintln!(
             "[vulkan-render] created {count} NV12 buffers {w}x{h} stride={stride} uv_offset={uv_offset}",
         );
@@ -1579,7 +1579,13 @@ impl VulkanRenderer {
             };
 
             match nv12 {
-                Some(n) => self.nv12_outputs.entry(surface_id).or_default().push(n),
+                Some(n) => {
+                    self.nv12_outputs
+                        .entry(surface_id)
+                        .or_insert_with(|| (Vec::new(), 0))
+                        .0
+                        .push(n);
+                }
                 None => {
                     eprintln!(
                         "[vulkan-render] failed to import NV12 fd {w}x{h} modifier=0x{modifier:016x}",
@@ -1587,8 +1593,8 @@ impl VulkanRenderer {
                 }
             }
         }
-        let nv12_vec = self.nv12_outputs.get(&surface_id);
-        if let Some(nv12s) = nv12_vec.filter(|v| !v.is_empty()) {
+        let nv12_entry = self.nv12_outputs.get(&surface_id);
+        if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty()) {
             let kind_str = match &nv12s[0].kind {
                 Nv12OutputKind::Buffer { .. } => "buffer",
                 Nv12OutputKind::Image { .. } => "image",
@@ -1598,7 +1604,9 @@ impl VulkanRenderer {
                 nv12s.len(),
             );
         }
-        self.nv12_output_idx.insert(surface_id, 0);
+        if let Some(entry) = self.nv12_outputs.get_mut(&surface_id) {
+            entry.1 = 0;
+        }
     }
 
     /// Import a linear NV12 DMA-BUF as a VkBuffer.
@@ -2955,7 +2963,7 @@ impl VulkanRenderer {
         // Build the result payload — external or staging readback.
         let result = if pending.external {
             let sid = pending.surface_id;
-            let ext_vec = self.external_outputs.get(&sid)?;
+            let (ext_vec, _) = self.external_outputs.get(&sid)?;
             let ext = ext_vec.get(pending.output_idx)?;
             if ext.va_surface_id != 0 {
                 // Legacy VA-API surface path.
@@ -2968,9 +2976,10 @@ impl VulkanRenderer {
                         _fd: ext._fd.clone(),
                     },
                 ))
-            } else if let Some(nv12_vec) = self.nv12_outputs.get(&sid).filter(|v| !v.is_empty()) {
+            } else if let Some(&(ref nv12_vec, nv12_cur_idx)) =
+                self.nv12_outputs.get(&sid).filter(|(v, _)| !v.is_empty())
+            {
                 // NV12 zero-copy: compute shader already wrote Y+UV planes.
-                let nv12_cur_idx = self.nv12_output_idx.get(&sid).copied().unwrap_or(0);
                 let nv12_idx = (nv12_cur_idx + nv12_vec.len() - 1) % nv12_vec.len();
                 let nv12 = &nv12_vec[nv12_idx];
                 let (stride, uv_offset) = match &nv12.kind {
@@ -3202,11 +3211,10 @@ impl VulkanRenderer {
         let use_external = self
             .external_outputs
             .get(&sid)
-            .is_some_and(|v| !v.is_empty() && v[0].width == phys_w && v[0].height == phys_h);
+            .is_some_and(|(v, _)| !v.is_empty() && v[0].width == phys_w && v[0].height == phys_h);
 
         let (out_framebuffer, out_image, out_staging_buf, out_idx, external) = if use_external {
-            let ext_vec = &self.external_outputs[&sid];
-            let ext_idx = self.external_output_idx.get(&sid).copied().unwrap_or(0);
+            let (ext_vec, ext_idx) = &self.external_outputs[&sid];
             let idx = ext_idx % ext_vec.len();
             let ext = &ext_vec[idx];
             (ext.framebuffer, ext.image, vk::Buffer::null(), idx, true)
@@ -3400,9 +3408,13 @@ impl VulkanRenderer {
         }
 
         // Dispatch BGRA→NV12 compute for external outputs with NV12 planes.
-        if external && self.nv12_outputs.get(&sid).is_some_and(|v| !v.is_empty()) {
-            let nv12_vec = &self.nv12_outputs[&sid];
-            let nv12_cur_idx = self.nv12_output_idx.get(&sid).copied().unwrap_or(0);
+        if external
+            && self
+                .nv12_outputs
+                .get(&sid)
+                .is_some_and(|(v, _)| !v.is_empty())
+        {
+            let &(ref nv12_vec, nv12_cur_idx) = &self.nv12_outputs[&sid];
             let nv12_idx = nv12_cur_idx % nv12_vec.len();
             match &nv12_vec[nv12_idx].kind {
                 Nv12OutputKind::Buffer { .. } => {
@@ -3456,12 +3468,8 @@ impl VulkanRenderer {
         // to the encoder instead of blocking the compositor thread.
         let needs_sync_fd_export = external
             && self.external_fence_fd_fn.is_some()
-            && self.nv12_outputs.get(&sid).is_some_and(|v| {
-                !v.is_empty()
-                    && matches!(
-                        v[self.nv12_output_idx.get(&sid).copied().unwrap_or(0) % v.len()].kind,
-                        Nv12OutputKind::Image { .. }
-                    )
+            && self.nv12_outputs.get(&sid).is_some_and(|(v, idx)| {
+                !v.is_empty() && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
             });
         let fence = if needs_sync_fd_export {
             let mut export_info = vk::ExportFenceCreateInfo::default()
@@ -3497,11 +3505,11 @@ impl VulkanRenderer {
             // the encoder's VPP will wait for it via implicit DMA-BUF
             // fencing.  This eliminates the 1-frame pipeline delay and
             // the 1 ms poll-to-retire latency for the zero-copy path.
-            let ext_vec = &self.external_outputs[&sid];
+            let (ext_vec, _) = &self.external_outputs[&sid];
             let ext = &ext_vec[out_idx];
-            let nv12_vec = self.nv12_outputs.get(&sid);
-            let nv12_cur_idx = self.nv12_output_idx.get(&sid).copied().unwrap_or(0);
-            let nv12_len = nv12_vec.map_or(0, |v| v.len()).max(1);
+            let nv12_entry = self.nv12_outputs.get(&sid);
+            let nv12_cur_idx = nv12_entry.map_or(0, |(_, idx)| *idx);
+            let nv12_len = nv12_entry.map_or(0, |(v, _)| v.len()).max(1);
             let nv12_idx = nv12_cur_idx % nv12_len;
             let pixel_data = if ext.va_surface_id != 0 {
                 PixelData::VaSurface {
@@ -3509,7 +3517,7 @@ impl VulkanRenderer {
                     va_display: ext.va_display,
                     _fd: ext._fd.clone(),
                 }
-            } else if let Some(nv12s) = nv12_vec.filter(|v| !v.is_empty()) {
+            } else if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty()) {
                 let nv12 = &nv12s[nv12_idx];
                 let (stride, uv_offset) = match &nv12.kind {
                     Nv12OutputKind::Buffer {
@@ -3535,7 +3543,9 @@ impl VulkanRenderer {
                     y_invert: true,
                 }
             };
-            *self.nv12_output_idx.entry(sid).or_insert(0) = (nv12_cur_idx + 1) % nv12_len;
+            if let Some(entry) = self.nv12_outputs.get_mut(&sid) {
+                entry.1 = (nv12_cur_idx + 1) % nv12_len;
+            }
 
             // For tiled NV12 images: radv doesn't do implicit DMA-BUF sync,
             // so we export the Vulkan fence as a sync_fd and pass it to the
@@ -3575,7 +3585,7 @@ impl VulkanRenderer {
             } else {
                 // Tiled NV12 but no sync_fd export support — block here as
                 // a last resort (same as the old code path).
-                let needs_explicit_sync = self.nv12_outputs.get(&sid).is_some_and(|v| {
+                let needs_explicit_sync = self.nv12_outputs.get(&sid).is_some_and(|(v, _)| {
                     !v.is_empty() && matches!(v[nv12_idx].kind, Nv12OutputKind::Image { .. })
                 });
                 if needs_explicit_sync {
@@ -3591,7 +3601,7 @@ impl VulkanRenderer {
             // surface and the NV12 output is a tiled image with an
             // encode-compatible view, encode the frame directly on the GPU.
             let pixel_data = if self.vulkan_encoders.contains_key(&sid) {
-                let nv12_image_and_view = self.nv12_outputs.get(&sid).and_then(|v| {
+                let nv12_image_and_view = self.nv12_outputs.get(&sid).and_then(|(v, _)| {
                     if v.is_empty() {
                         return None;
                     }
@@ -3633,10 +3643,10 @@ impl VulkanRenderer {
 
             let result = Some((toplevel_sid, phys_w, phys_h, pixel_data));
             self.deferred_submits.push(submit_info);
-            let ext_len = ext_vec.len();
-            let ext_cur = self.external_output_idx.get(&sid).copied().unwrap_or(0);
-            self.external_output_idx
-                .insert(sid, (ext_cur + 1) % ext_len);
+            if let Some((ext_vec, ext_idx)) = self.external_outputs.get_mut(&sid) {
+                let ext_len = ext_vec.len();
+                *ext_idx = (*ext_idx + 1) % ext_len;
+            }
             result
         } else {
             self.pending_submit = Some(submit_info);

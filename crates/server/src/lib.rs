@@ -201,6 +201,10 @@ const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 /// links instead of starving the pipeline with conservative initial rates.
 const SURFACE_BURST_FRAMES: u8 = 4;
 
+/// Minimum surface frames in flight per client.  Even on a zero-RTT
+/// local link we need a small buffer (decoding + wire + TCP send).
+const SURFACE_INFLIGHT_FLOOR: usize = 3;
+
 /// A chunk of data from the PTY reader, sent through a lock-free channel
 /// so the reader never contends with the delivery tick for the Session mutex.
 enum PtyInput {
@@ -951,7 +955,7 @@ fn window_open(client: &ClientState) -> bool {
         && client.inflight_bytes < target_byte_window(client)
 }
 
-/// Surface send window: only outbox backpressure.
+/// Surface send window: outbox backpressure + RTT-scaled inflight limit.
 ///
 /// Surface pacing is decoupled from terminal congestion control.  Surfaces
 /// have their own time-based pacing (`surface_send_interval`) derived from
@@ -960,8 +964,22 @@ fn window_open(client: &ClientState) -> bool {
 /// for tiny terminal diffs and must not gate large video frames — doing so
 /// causes the two streams to drag each other down, especially on SSH links
 /// where the conservative bandwidth estimates are already fragile.
+///
+/// The inflight limit bounds queuing when the bandwidth estimator overshoots
+/// on jittery links (e.g. wifi).  It scales with RTT and display rate so
+/// high-latency links can still sustain high fps, floored at
+/// `SURFACE_INFLIGHT_FLOOR` for local/LAN paths.
 fn surface_window_open(client: &ClientState) -> bool {
     !outbox_backpressured(client)
+        && (client.surface_burst_remaining > 0
+            || client.surface_inflight_frames.len() < surface_inflight_limit(client))
+}
+
+fn surface_inflight_limit(client: &ClientState) -> usize {
+    let rtt_s = client.rtt_ms.max(client.min_rtt_ms) / 1_000.0;
+    let frames_per_rtt = (client.display_fps * rtt_s).ceil() as usize;
+    // +1 for the frame currently being decoded/applied on the client side.
+    (frames_per_rtt + 1).max(SURFACE_INFLIGHT_FLOOR)
 }
 
 fn lead_window_open(client: &ClientState, reserve_preview_slot: bool) -> bool {
@@ -1306,7 +1324,7 @@ impl Session {
         gpu_device: &str,
     ) -> &str {
         if self.compositor.is_none() {
-            let _session_id = self.next_compositor_id;
+            let session_id = self.next_compositor_id;
             self.next_compositor_id = self.next_compositor_id.wrapping_add(1);
             // Create the epoch before spawning anything so audio and video
             // share the same time origin for A/V sync.
@@ -2644,8 +2662,18 @@ async fn tick(state: &AppState) -> TickOutcome {
         px_h: u32,
         pixels: blit_compositor::PixelData,
         needs_keyframe: bool,
-        encoder: SurfaceEncoder,
+        encoder: Option<SurfaceEncoder>,
+        /// When set, the encoder must be created inside spawn_blocking
+        /// (avoids blocking the tick loop with VA-API init).
+        create_params: Option<EncoderCreateParams>,
         generation: u64,
+    }
+    struct EncoderCreateParams {
+        preferences: Vec<SurfaceEncoderPreference>,
+        vaapi_device: String,
+        quality: SurfaceQuality,
+        verbose: bool,
+        codec_support: u8,
     }
     struct EncodeResult {
         cid: u64,
@@ -2653,9 +2681,14 @@ async fn tick(state: &AppState) -> TickOutcome {
         px_w: u32,
         px_h: u32,
         generation: u64,
-        encoder: SurfaceEncoder,
+        encoder: Option<SurfaceEncoder>,
         nal_data: Option<(Vec<u8>, bool)>, // (data, is_keyframe)
         codec_flag: u8,
+        /// Encoder name for S2C_SURFACE_ENCODER (set when encoder was just created).
+        encoder_name: Option<&'static str>,
+        /// GBM buffers to export to compositor (set when encoder was just created).
+        #[cfg(target_os = "linux")]
+        external_bufs: Option<(u32, Vec<blit_compositor::ExternalOutputBuffer>)>,
     }
 
     let mut encode_jobs: Vec<EncodeJob> = Vec::new();
@@ -2709,10 +2742,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         // can advance their deadlines after the job-collection pass.
         let mut clients_with_encodes: HashSet<u64> = HashSet::new();
         #[cfg(target_os = "linux")]
-        let mut pending_external_bufs: Vec<(
-            u32,
-            Vec<blit_compositor::ExternalOutputBuffer>,
-        )> = Vec::new();
+        let pending_external_bufs: Vec<(u32, Vec<blit_compositor::ExternalOutputBuffer>)> =
+            Vec::new();
 
         // Pre-extract compositor Vulkan Video capabilities so we don't
         // need to borrow sess.compositor inside the client-mutation loop.
@@ -2902,85 +2933,34 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // compositor's external output pipeline.  The encoder won't
                     // be used for encoding — PixelData::Encoded bypasses it.
 
-                    // Fall through to local SurfaceEncoder creation.
+                    // Defer encoder creation to spawn_blocking so the
+                    // tick loop isn't blocked by slow VA-API init.  The
+                    // EncodeJob carries creation parameters; the blocking
+                    // task creates the encoder, exports GBM buffers, and
+                    // performs the first encode in one shot.
                     client.surface_encoders.remove(&sid);
-                    match SurfaceEncoder::new(
-                        &state.config.surface_encoders,
+                    client.surface_encodes_in_flight.insert(sid);
+                    let needs_kf = true; // new encoder always needs keyframe
+                    clients_with_encodes.insert(work.cid);
+                    encode_dispatched_surfaces.insert(sid);
+                    encode_jobs.push(EncodeJob {
+                        cid: work.cid,
+                        sid,
                         px_w,
                         px_h,
-                        &state.config.vaapi_device,
-                        quality,
-                        state.config.verbose,
-                        codec_support,
-                    ) {
-                        Ok(mut encoder) => {
-                            #[cfg(target_os = "linux")]
-                            {
-                                // Export GBM LINEAR BGRA buffers + VA-API NV12
-                                // surfaces to compositor for zero-copy rendering.
-                                // Vulkan compute converts BGRA→NV12; the encoder
-                                // reads the VA surface directly.
-                                {
-                                    // Allocate GBM NV12 buffers (same count as BGRA).
-                                    let drm_fd = encoder.drm_fd_raw();
-                                    let count = encoder.gbm_buffers().len();
-                                    if count > 0 {
-                                        encoder.allocate_nv12_buffers(drm_fd, count);
-                                    }
-                                }
-                                let gbm_bufs = encoder.gbm_buffers();
-                                if !gbm_bufs.is_empty() {
-                                    let nv12_bufs = encoder.gbm_nv12_buffers();
-                                    let (enc_w, enc_h) = encoder.encoder_dimensions();
-                                    let bufs = gbm_bufs
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, b)| {
-                                            let nv12 = nv12_bufs.get(i);
-                                            blit_compositor::ExternalOutputBuffer {
-                                                fd: std::sync::Arc::new(
-                                                    b.fd.try_clone().expect("dup gbm fd"),
-                                                ),
-                                                fourcc: 0x34325241,
-                                                modifier: 0,
-                                                stride: b.stride,
-                                                offset: 0,
-                                                width: b.width,
-                                                height: b.height,
-                                                va_surface_id: 0,
-                                                va_display: 0,
-                                                planes: vec![
-                                                    blit_compositor::ExternalOutputPlane {
-                                                        offset: 0,
-                                                        pitch: b.stride,
-                                                    },
-                                                ],
-                                                nv12_fd: nv12.map(|n| n.fd.clone()),
-                                                nv12_stride: nv12.map_or(0, |n| n.stride),
-                                                nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
-                                                nv12_modifier: nv12.map_or(0, |n| n.modifier),
-                                                nv12_width: enc_w,
-                                                nv12_height: enc_h,
-                                            }
-                                        })
-                                        .collect();
-                                    pending_external_bufs.push((sid as u32, bufs));
-                                }
-                            }
-                            let enc_msg = msg_surface_encoder(sid, encoder.encoder_name());
-                            client.surface_encoders.insert(sid, encoder);
-                            let _ = send_outbox(client, enc_msg);
-                        }
-                        Err(err) => {
-                            if state.config.verbose {
-                                eprintln!(
-                                    "[surface-encoder] cid={} sid={sid} {px_w}x{px_h}: {err}",
-                                    work.cid
-                                );
-                            }
-                            continue;
-                        }
-                    }
+                        pixels,
+                        needs_keyframe: needs_kf,
+                        encoder: None,
+                        create_params: Some(EncoderCreateParams {
+                            preferences: state.config.surface_encoders.clone(),
+                            vaapi_device: state.config.vaapi_device.clone(),
+                            quality,
+                            verbose: state.config.verbose,
+                            codec_support,
+                        }),
+                        generation: px_gen,
+                    });
+                    continue;
                 }
 
                 // If using Vulkan Video, handle keyframe via compositor command
@@ -3008,7 +2988,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     px_h,
                     pixels,
                     needs_keyframe: needs_kf,
-                    encoder,
+                    encoder: Some(encoder),
+                    create_params: None,
                     generation: px_gen,
                 });
             }
@@ -3086,20 +3067,140 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .into_iter()
                 .map(|mut job| {
                     tokio::task::spawn_blocking(move || {
+                        // Create encoder on the blocking thread if it was
+                        // deferred (avoids blocking the tick loop with
+                        // VA-API device open / context creation).
+                        let mut encoder = if let Some(enc) = job.encoder.take() {
+                            enc
+                        } else if let Some(ref params) = job.create_params {
+                            match SurfaceEncoder::new(
+                                &params.preferences,
+                                job.px_w,
+                                job.px_h,
+                                &params.vaapi_device,
+                                params.quality,
+                                params.verbose,
+                                params.codec_support,
+                            ) {
+                                Ok(enc) => enc,
+                                Err(err) => {
+                                    if params.verbose {
+                                        eprintln!(
+                                            "[surface-encoder] cid={} sid={} {}x{}: {err}",
+                                            job.cid, job.sid, job.px_w, job.px_h,
+                                        );
+                                    }
+                                    return EncodeResult {
+                                        cid: job.cid,
+                                        sid: job.sid,
+                                        px_w: job.px_w,
+                                        px_h: job.px_h,
+                                        generation: job.generation,
+                                        encoder: None,
+                                        nal_data: None,
+                                        codec_flag: 0,
+                                        encoder_name: None,
+                                        #[cfg(target_os = "linux")]
+                                        external_bufs: None,
+                                    };
+                                }
+                            }
+                        } else {
+                            // Neither encoder nor create_params — shouldn't happen.
+                            return EncodeResult {
+                                cid: job.cid,
+                                sid: job.sid,
+                                px_w: job.px_w,
+                                px_h: job.px_h,
+                                generation: job.generation,
+                                encoder: None,
+                                nal_data: None,
+                                codec_flag: 0,
+                                encoder_name: None,
+                                #[cfg(target_os = "linux")]
+                                external_bufs: None,
+                            };
+                        };
+
+                        // If the encoder was just created, collect its name
+                        // and GBM buffers for the completion handler.
+                        let newly_created = job.create_params.is_some();
+                        let encoder_name = if newly_created {
+                            Some(encoder.encoder_name())
+                        } else {
+                            None
+                        };
+
+                        #[cfg(target_os = "linux")]
+                        let external_bufs = if newly_created {
+                            // Allocate NV12 GBM buffers for the compositor's
+                            // BGRA→NV12 compute shader pipeline.
+                            {
+                                let drm_fd = encoder.drm_fd_raw();
+                                let count = encoder.gbm_buffers().len();
+                                if count > 0 {
+                                    encoder.allocate_nv12_buffers(drm_fd, count);
+                                }
+                            }
+                            let gbm_bufs = encoder.gbm_buffers();
+                            if !gbm_bufs.is_empty() {
+                                let nv12_bufs = encoder.gbm_nv12_buffers();
+                                let (enc_w, enc_h) = encoder.encoder_dimensions();
+                                let bufs = gbm_bufs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, b)| {
+                                        let nv12 = nv12_bufs.get(i);
+                                        blit_compositor::ExternalOutputBuffer {
+                                            fd: std::sync::Arc::new(
+                                                b.fd.try_clone().expect("dup gbm fd"),
+                                            ),
+                                            fourcc: 0x34325241,
+                                            modifier: 0,
+                                            stride: b.stride,
+                                            offset: 0,
+                                            width: b.width,
+                                            height: b.height,
+                                            va_surface_id: 0,
+                                            va_display: 0,
+                                            planes: vec![blit_compositor::ExternalOutputPlane {
+                                                offset: 0,
+                                                pitch: b.stride,
+                                            }],
+                                            nv12_fd: nv12.map(|n| n.fd.clone()),
+                                            nv12_stride: nv12.map_or(0, |n| n.stride),
+                                            nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
+                                            nv12_modifier: nv12.map_or(0, |n| n.modifier),
+                                            nv12_width: enc_w,
+                                            nv12_height: enc_h,
+                                        }
+                                    })
+                                    .collect();
+                                Some((job.sid as u32, bufs))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         if job.needs_keyframe {
-                            job.encoder.request_keyframe();
+                            encoder.request_keyframe();
                         }
-                        let nal_data = job.encoder.encode_pixels(&job.pixels);
-                        let codec_flag = job.encoder.codec_flag();
+                        let nal_data = encoder.encode_pixels(&job.pixels);
+                        let codec_flag = encoder.codec_flag();
                         EncodeResult {
                             cid: job.cid,
                             sid: job.sid,
                             px_w: job.px_w,
                             px_h: job.px_h,
                             generation: job.generation,
-                            encoder: job.encoder,
+                            encoder: Some(encoder),
                             nal_data,
                             codec_flag,
+                            encoder_name,
+                            #[cfg(target_os = "linux")]
+                            external_bufs,
                         }
                     })
                 })
@@ -3167,16 +3268,38 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // would force the next tick to discard and recreate it,
                 // wasting work and risking feeding a C encoder (openh264)
                 // frames at the wrong resolution.
-                let dims_match = sess
-                    .compositor
-                    .as_ref()
-                    .and_then(|cs| cs.last_pixels.get(&result.sid))
-                    .is_some_and(|lp| result.encoder.source_dimensions() == (lp.width, lp.height));
+                // Send GBM buffers to compositor if the encoder was just
+                // created (deferred from the tick loop).
+                #[cfg(target_os = "linux")]
+                if let Some((surface_id, bufs)) = result.external_bufs
+                    && let Some(cs) = sess.compositor.as_ref()
+                {
+                    let _ = cs.handle.command_tx.send(
+                        blit_compositor::CompositorCommand::SetExternalOutputBuffers {
+                            surface_id,
+                            buffers: bufs,
+                        },
+                    );
+                    cs.handle.wake();
+                }
+                let dims_match = result.encoder.as_ref().is_some_and(|enc| {
+                    sess.compositor
+                        .as_ref()
+                        .and_then(|cs| cs.last_pixels.get(&result.sid))
+                        .is_some_and(|lp| enc.source_dimensions() == (lp.width, lp.height))
+                });
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     client.surface_encodes_in_flight.remove(&result.sid);
                     let invalidated = client.surface_encoder_invalidated.remove(&result.sid);
-                    if dims_match && !invalidated {
-                        client.surface_encoders.insert(result.sid, result.encoder);
+                    if let Some(encoder) = result.encoder
+                        && dims_match
+                        && !invalidated
+                    {
+                        if let Some(name) = result.encoder_name {
+                            let enc_msg = msg_surface_encoder(result.sid, name);
+                            let _ = send_outbox(client, enc_msg);
+                        }
+                        client.surface_encoders.insert(result.sid, encoder);
                     }
                     // Record the generation we just encoded so we don't
                     // re-encode identical pixel data on subsequent ticks.
@@ -3335,13 +3458,18 @@ async fn tick(state: &AppState) -> TickOutcome {
             blanket_requested = true;
         }
         for client in sess.clients.values() {
-            if !surface_window_open(client) {
+            // Don't gate frame requests on surface_window_open — the
+            // compositor should keep producing pixels even when the
+            // inflight window is closed.  Otherwise, recovery after a
+            // wifi stall has to wait for the full render pipeline to
+            // flush (request → paint → commit → encode) before the
+            // first frame can be sent, causing a visible hang.
+            if client.surface_subscriptions.is_empty() {
                 continue;
             }
-            let surface_ready = client.surface_next_send_at <= now;
+            let surface_ready =
+                client.surface_next_send_at <= now || client.surface_burst_remaining > 0;
             if !surface_ready {
-                // Record the client's surface deadline so the outer loop
-                // sleeps until this client is ready.
                 let deadline = client.surface_next_send_at;
                 next_deadline = Some(match next_deadline {
                     Some(existing) => existing.min(deadline),
