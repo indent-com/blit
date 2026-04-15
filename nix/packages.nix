@@ -189,7 +189,7 @@
             # Cross-compile for musl: build scripts compile/link against glibc
             # (host), while the final binary targets musl.
             CARGO_BUILD_TARGET = muslTarget;
-            RUSTFLAGS = "-C target-feature=+crt-static";
+            RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=-L${muslCC.libc}/lib";
             MUSL_LIBC_DIR = "${muslCC.libc}/lib";
             nativeBuildInputs = [ muslCC muslCCWrapped ];
             preBuild = ''
