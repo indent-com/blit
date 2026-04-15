@@ -149,21 +149,19 @@
       blit-launcher =
         let
           muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-          muslCC = pkgs.pkgsStatic.stdenv.cc;
-          envVarTarget = builtins.replaceStrings [ "-" ] [ "_" ] (pkgs.lib.toUpper muslTarget);
+          launcherRustPlatform = pkgs.pkgsStatic.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
         in
-        rustPlatform.buildRustPackage ({
+        launcherRustPlatform.buildRustPackage {
           pname = "blit-launcher";
           inherit version;
           src = ../crates/launcher;
           cargoLock.lockFile = ../crates/launcher/Cargo.lock;
+          CARGO_BUILD_TARGET = muslTarget;
           RUSTFLAGS = "-C target-feature=+crt-static";
           doCheck = false;
-        }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          CARGO_BUILD_TARGET = muslTarget;
-          "CARGO_TARGET_${envVarTarget}_LINKER" = "${muslCC}/bin/${muslCC.targetPrefix}cc";
-          nativeBuildInputs = [ muslCC ];
           postFixup = ''
             for bin in $out/bin/*; do
               if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
@@ -173,7 +171,7 @@
               fi
             done
           '';
-        });
+        };
 
       # Assembled release package (Linux): launcher + dynamic binary + musl.
       # On macOS the dynamic binary is used directly (no launcher needed).
