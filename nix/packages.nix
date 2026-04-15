@@ -146,25 +146,34 @@
       # musl dynamic linker.  Must be truly statically linked.
       # Excluded from the workspace (no_std + #[panic_handler] conflicts),
       # so built standalone with its own Cargo.lock.
-      blit-launcher = rustPlatform.buildRustPackage {
-        pname = "blit-launcher";
-        inherit version;
-        src = ../crates/launcher;
-        cargoLock.lockFile = ../crates/launcher/Cargo.lock;
-        CARGO_BUILD_TARGET = pkgs.lib.optionalString pkgs.stdenv.isLinux
-          pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-        RUSTFLAGS = "-C target-feature=+crt-static";
-        doCheck = false;
-        postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-          for bin in $out/bin/*; do
-            if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
-              echo "FATAL: launcher $bin is not statically linked:"
-              file "$bin"
-              exit 1
-            fi
-          done
-        '';
-      };
+      blit-launcher =
+        let
+          muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+          muslCC = pkgs.pkgsStatic.stdenv.cc;
+          envVarTarget = builtins.replaceStrings [ "-" ] [ "_" ] (pkgs.lib.toUpper muslTarget);
+        in
+        rustPlatform.buildRustPackage ({
+          pname = "blit-launcher";
+          inherit version;
+          src = ../crates/launcher;
+          cargoLock.lockFile = ../crates/launcher/Cargo.lock;
+          RUSTFLAGS = "-C target-feature=+crt-static";
+          doCheck = false;
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          CARGO_BUILD_TARGET = muslTarget;
+          "CARGO_TARGET_${envVarTarget}_LINKER" = "${muslCC}/bin/${muslCC.targetPrefix}cc";
+          nativeBuildInputs = [ muslCC ];
+          postFixup = ''
+            for bin in $out/bin/*; do
+              if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
+                echo "FATAL: launcher $bin is not statically linked:"
+                file "$bin"
+                exit 1
+              fi
+            done
+          '';
+        });
 
       # Assembled release package (Linux): launcher + dynamic binary + musl.
       # On macOS the dynamic binary is used directly (no launcher needed).
