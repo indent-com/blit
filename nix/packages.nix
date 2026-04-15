@@ -155,8 +155,6 @@
           };
           muslCC = pkgs.pkgsStatic.stdenv.cc;
           muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-          # "X86_64_UNKNOWN_LINUX_MUSL" or "AARCH64_UNKNOWN_LINUX_MUSL"
-          envTarget = builtins.replaceStrings [ "-" ] [ "_" ] (pkgs.lib.toUpper muslTarget);
         in
         craneLib.buildPackage (
           {
@@ -177,15 +175,19 @@
             '';
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # Cross-compile for musl: build scripts link against glibc (host)
-            # while the final binary targets musl via the explicit linker.
+            # Cross-compile for musl: build scripts compile/link against glibc
+            # (host), while the final binary targets musl.  Inject a
+            # .cargo/config.toml so Cargo uses the musl CC and finds libc.a.
             CARGO_BUILD_TARGET = muslTarget;
-            "CARGO_TARGET_${envTarget}_LINKER" = "${muslCC}/bin/${muslCC.targetPrefix}cc";
-            # Target-specific RUSTFLAGS: +crt-static for full static linking,
-            # plus explicit -L so the musl linker can find libc.a.
-            # Using target-specific env var so build scripts (glibc) aren't affected.
-            "CARGO_TARGET_${envTarget}_RUSTFLAGS" = "-C target-feature=+crt-static -C link-arg=-L${muslCC.libc}/lib";
             nativeBuildInputs = [ muslCC ];
+            preBuild = ''
+              mkdir -p .cargo
+              cat > .cargo/config.toml << EOF
+              [target.${muslTarget}]
+              linker = "${muslCC}/bin/${muslCC.targetPrefix}cc"
+              rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-L${muslCC.libc}/lib"]
+              EOF
+            '';
           }
         );
 
