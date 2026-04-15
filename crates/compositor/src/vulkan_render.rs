@@ -339,7 +339,7 @@ impl VulkanRenderer {
             && ext_names_all.contains(&ash::khr::external_fence::NAME);
 
         // Device extensions for DMA-BUF import/export.
-        let mut device_extensions: Vec<*const i8> = vec![
+        let mut device_extensions: Vec<*const std::ffi::c_char> = vec![
             ash::khr::external_memory_fd::NAME.as_ptr(),
             ash::khr::external_memory::NAME.as_ptr(),
             ash::ext::external_memory_dma_buf::NAME.as_ptr(),
