@@ -151,19 +151,11 @@
           launcherSrc = pkgs.lib.cleanSourceWith {
             src = ../crates/launcher;
             filter = path: type:
-              (craneLib.filterCargoSources path type);
+              (craneLib.filterCargoSources path type)
+              || builtins.baseNameOf path == "build.rs";
           };
           muslCC = pkgs.pkgsStatic.stdenv.cc;
           muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-          # Wrapper that invokes the musl CC with the sysroot library path
-          # explicitly provided.  The bare CC wrapper loses its sysroot
-          # when called from a glibc-based Nix stdenv.
-          muslLinker = pkgs.writeShellScript "musl-linker" ''
-            exec ${muslCC}/bin/${muslCC.targetPrefix}cc \
-              -L${muslCC.libc}/lib \
-              --sysroot=${muslCC.libc} \
-              "$@"
-          '';
         in
         craneLib.buildPackage (
           {
@@ -185,19 +177,18 @@
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             # Cross-compile for musl: build scripts compile/link against glibc
-            # (host), while the final binary targets musl via the wrapper linker.
+            # (host), while the final binary targets musl.
+            # The launcher's build.rs reads MUSL_LIBC_DIR to emit
+            # cargo:rustc-link-search so the linker can find libc.a.
             CARGO_BUILD_TARGET = muslTarget;
+            RUSTFLAGS = "-C target-feature=+crt-static";
+            MUSL_LIBC_DIR = "${muslCC.libc}/lib";
             nativeBuildInputs = [ muslCC ];
             preBuild = ''
-              # Unset RUSTFLAGS so Cargo honors target-specific rustflags from
-              # .cargo/config.toml (global RUSTFLAGS takes precedence over config).
-              unset RUSTFLAGS
-              unset CARGO_ENCODED_RUSTFLAGS
               mkdir -p .cargo
               cat > .cargo/config.toml << EOF
 [target.${muslTarget}]
-linker = "${muslLinker}"
-rustflags = ["-C", "target-feature=+crt-static"]
+linker = "${muslCC}/bin/${muslCC.targetPrefix}cc"
 EOF
             '';
           }
