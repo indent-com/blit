@@ -7,11 +7,11 @@
 //! the bundled musl dynamic linker relative to its own location and
 //! `exec()`s the real binary through it.
 //!
-//! Layout expected relative to this binary:
+//! Expected install layout (PREFIX = e.g. /usr/local):
 //!
-//!     blit                          <- this launcher (static, no_std)
-//!     lib/blit/blit                 <- real binary (dynamic musl)
-//!     lib/blit/ld-musl-<arch>.so.1  <- musl dynamic linker
+//!     PREFIX/bin/blit                          <- this launcher (static, no_std)
+//!     PREFIX/lib/blit/blit                     <- real binary (dynamic musl)
+//!     PREFIX/lib/blit/ld-musl-<arch>.so.1      <- musl dynamic linker
 
 #![no_std]
 #![no_main]
@@ -33,6 +33,7 @@ const LOADER_SUFFIX: &[u8] = b"/lib/blit/ld-musl-x86_64.so.1\0";
 const LOADER_SUFFIX: &[u8] = b"/lib/blit/ld-musl-aarch64.so.1\0";
 
 const BLIT_SUFFIX: &[u8] = b"/lib/blit/blit\0";
+const BIN_COMPONENT: &[u8] = b"/bin";
 const WRAPPER_PREFIX: &[u8] = b"BLIT_WRAPPER_DIR=";
 const PROC_SELF_EXE: &[u8] = b"/proc/self/exe\0";
 
@@ -54,40 +55,53 @@ pub unsafe extern "C" fn main(
     }
     let exe_len = exe_len as usize;
 
-    // Find parent directory (strip trailing component).
-    let mut dir_len = exe_len;
-    while dir_len > 0 && exe_buf[dir_len - 1] != b'/' {
-        dir_len -= 1;
+    // Find parent directory of the binary (the bin/ dir).
+    let mut bin_dir_len = exe_len;
+    while bin_dir_len > 0 && exe_buf[bin_dir_len - 1] != b'/' {
+        bin_dir_len -= 1;
     }
-    if dir_len > 0 {
-        dir_len -= 1; // strip the '/' itself
+    if bin_dir_len > 0 {
+        bin_dir_len -= 1; // strip the '/' itself
     }
 
-    // Build loader path: <dir> + LOADER_SUFFIX.
+    // Derive PREFIX by stripping the trailing /bin component.
+    // If the parent dir doesn't end in /bin, fall back to it directly
+    // (handles non-standard layouts where everything is in one dir).
+    let mut prefix_len = bin_dir_len;
+    if bin_dir_len >= BIN_COMPONENT.len() {
+        let tail_start = bin_dir_len - BIN_COMPONENT.len();
+        if slice_eq(&exe_buf[tail_start..bin_dir_len], &BIN_COMPONENT[..]) {
+            // Ends with /bin — strip it, but keep at least root.
+            prefix_len = if tail_start > 0 { tail_start } else { 1 };
+        }
+    }
+
+    // Build loader path: <prefix> + LOADER_SUFFIX.
     let mut loader = [0u8; PATH_MAX];
-    if dir_len + LOADER_SUFFIX.len() >= PATH_MAX {
+    if prefix_len + LOADER_SUFFIX.len() >= PATH_MAX {
         fatal(b"blit: path too long\n");
     }
-    copy_bytes(&exe_buf, dir_len, &mut loader, 0);
-    copy_bytes(LOADER_SUFFIX, LOADER_SUFFIX.len(), &mut loader, dir_len);
+    copy_bytes(&exe_buf, prefix_len, &mut loader, 0);
+    copy_bytes(LOADER_SUFFIX, LOADER_SUFFIX.len(), &mut loader, prefix_len);
 
-    // Build real binary path: <dir> + BLIT_SUFFIX.
+    // Build real binary path: <prefix> + BLIT_SUFFIX.
     let mut real_bin = [0u8; PATH_MAX];
-    if dir_len + BLIT_SUFFIX.len() >= PATH_MAX {
+    if prefix_len + BLIT_SUFFIX.len() >= PATH_MAX {
         fatal(b"blit: path too long\n");
     }
-    copy_bytes(&exe_buf, dir_len, &mut real_bin, 0);
-    copy_bytes(BLIT_SUFFIX, BLIT_SUFFIX.len(), &mut real_bin, dir_len);
+    copy_bytes(&exe_buf, prefix_len, &mut real_bin, 0);
+    copy_bytes(BLIT_SUFFIX, BLIT_SUFFIX.len(), &mut real_bin, prefix_len);
 
-    // Build BLIT_WRAPPER_DIR=<dir> (null-terminated).
+    // Build BLIT_WRAPPER_DIR=<prefix>/bin (null-terminated).
+    // Points at the bin/ directory so blit_exe() returns the launcher path.
     let mut wrapper_env = [0u8; PATH_MAX];
-    let pfx = WRAPPER_PREFIX.len();
-    if pfx + dir_len + 1 >= PATH_MAX {
+    let env_pfx = WRAPPER_PREFIX.len();
+    if env_pfx + bin_dir_len + 1 >= PATH_MAX {
         fatal(b"blit: path too long\n");
     }
-    copy_bytes(WRAPPER_PREFIX, pfx, &mut wrapper_env, 0);
-    copy_bytes(&exe_buf, dir_len, &mut wrapper_env, pfx);
-    wrapper_env[pfx + dir_len] = 0;
+    copy_bytes(WRAPPER_PREFIX, env_pfx, &mut wrapper_env, 0);
+    copy_bytes(&exe_buf, bin_dir_len, &mut wrapper_env, env_pfx);
+    wrapper_env[env_pfx + bin_dir_len] = 0;
 
     // Build new argv: [loader, real_bin, original_argv[1..], NULL].
     let mut new_argv: [*const libc::c_char; MAX_ARGS] = [core::ptr::null(); MAX_ARGS];
@@ -150,6 +164,20 @@ fn copy_bytes(src: &[u8], len: usize, dst: &mut [u8], offset: usize) {
         dst[offset + i] = src[i];
         i += 1;
     }
+}
+
+fn slice_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 unsafe fn starts_with_cstr(cstr: *const libc::c_char, prefix: &[u8]) -> bool {

@@ -106,7 +106,7 @@ install.blit.sh/
 2. Fetches `/latest` from `install.blit.sh` to get the current version.
 3. Skips if the installed version already matches.
 4. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
-5. Extracts and installs to `$BLIT_INSTALL_DIR` (default `/usr/local/bin`), escalating with `sudo`/`doas` if needed.
+5. Extracts the tarball (`bin/` + `lib/` on Linux, `bin/` only on macOS) into `$BLIT_PREFIX` (default `/usr/local`), escalating with `sudo`/`doas` if needed.
 
 ### Windows installer
 
@@ -119,7 +119,7 @@ install.blit.sh/
 
 ### `blit upgrade`
 
-`blit upgrade` is the in-place self-update command. On Unix it fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_INSTALL_DIR` set to the directory of the currently running binary. On Windows it fetches `install.ps1` and runs it via PowerShell. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
+`blit upgrade` is the in-place self-update command. On Unix it fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_PREFIX` set to the install prefix of the currently running binary. On Windows it fetches `install.ps1` and runs it via PowerShell. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
 
 ### How the site is built
 
@@ -202,18 +202,18 @@ All release binaries are built with Nix, which makes the entire toolchain reprod
 On Linux, the main binary is **dynamically linked against musl libc** so that `dlopen` works for GPU acceleration (VA-API, NVENC, Vulkan). All other dependencies (libopus, pixman, libxkbcommon, libgbm) are statically linked via `pkgs.pkgsStatic`. A tiny **static launcher binary** (`crates/launcher/`) resolves the bundled musl dynamic linker relative to its own location and `exec()`s the real binary through it — this is necessary because the ELF interpreter path must be absolute and is not known at build time. The release tarball layout is:
 
 ```
-blit                              <- static launcher
+bin/blit                          <- static launcher
 lib/blit/blit                     <- dynamically-linked musl binary
 lib/blit/ld-musl-<arch>.so.1     <- musl dynamic linker (bundled)
 ```
 
-The `blit-dynamic` derivation in [`nix/packages.nix`](nix/packages.nix) builds the main binary and verifies its only dynamic dependency is `ld-musl-*.so.1`. The `blit-launcher` derivation builds the static launcher and verifies it is genuinely statically linked. A `blit-static` derivation assembles both with the musl loader.
+The `blit-dynamic` derivation in [`nix/packages.nix`](nix/packages.nix) builds the main binary and verifies its only dynamic dependency is `ld-musl-*.so.1`. The `blit-launcher` derivation builds the static launcher and verifies it is genuinely statically linked. A `blit-release` derivation assembles both with the musl loader into a PREFIX layout (`bin/` + `lib/`).
 
 On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed. No launcher is needed on macOS.
 
 The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) in [`nix/common.nix`](nix/common.nix). The same toolchain also includes `wasm32-unknown-unknown` for the browser WASM build.
 
-The tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages have zero external dependencies — download, extract, run.
+The tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages have no required dependencies — download, extract, run.
 
 On Windows, Nix isn't available, so the `_build-windows.yml` reusable workflow uses `cargo build --release` directly on a Windows runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
 

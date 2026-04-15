@@ -1,6 +1,6 @@
 # blit
 
-Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. Nothing to configure, zero external dependencies.
+Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. Nothing to configure, no required dependencies.
 
 We publish a [computer agent skill](https://install.blit.sh/SKILL.md).
 
@@ -90,7 +90,7 @@ curl -sf https://install.blit.sh | sh
 irm https://install.blit.sh/install.ps1 | iex
 ```
 
-This downloads `blit.exe` to `%LOCALAPPDATA%\blit\bin` and adds it to your user `PATH`. Set `BLIT_INSTALL_DIR` to override the install location.
+This downloads `blit.exe` to `%LOCALAPPDATA%\blit\bin` and adds it to your user `PATH`. Set `BLIT_INSTALL_DIR` to override the install location on Windows.
 
 ## How it works
 
@@ -116,6 +116,7 @@ For wire protocol details, frame encoding, and transport internals, see [ARCHITE
 | `BLIT_SCROLLBACK`       | `10000`                                                                                                                | Scrollback rows per PTY                                                                                                                                                                                                                   |
 | `BLIT_HUB`              | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing. On `blit gateway`, sets the default hub for `share:` remotes when `BLIT_GATEWAY_WEBRTC=1`.                                                                                                          |
 | `BLIT_GATEWAY_WEBRTC`   | unset                                                                                                                  | Set to `1` on `blit gateway` to proxy `share:` remotes via WebRTC. The gateway connects as a WebRTC consumer and bridges terminals to browsers over WebSocket/WebTransport. Without this, `share:` entries in `blit.remotes` are ignored. |
+| `BLIT_PREFIX`           | `/usr/local` or `~/.local` (Unix)                                                                                      | Override install prefix (`bin/`, `lib/`, `share/` go under this)                                                                                                                                                                          |
 | `BLIT_INSTALL_DIR`      | `%LOCALAPPDATA%\blit\bin` (Windows)                                                                                    | Override install location (Windows PowerShell installer)                                                                                                                                                                                  |
 | `BLIT_SURFACE_ENCODERS` | see below                                                                                                              | Comma-separated encoder priority list (see below)                                                                                                                                                                                         |
 | `BLIT_SURFACE_QUALITY`  | `medium`                                                                                                               | Video quality preset: `low`, `medium`, `high`, `lossless`                                                                                                                                                                                 |

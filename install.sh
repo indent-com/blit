@@ -4,14 +4,14 @@
 set -eu
 
 REPO="https://install.blit.sh"
-pick_install_dir() {
+pick_prefix() {
   case ":$PATH:" in
-    *":$HOME/.local/bin:"*) echo "$HOME/.local/bin" ;;
-    *":$HOME/bin:"*) echo "$HOME/bin" ;;
-    *) echo "/usr/local/bin" ;;
+    *":$HOME/.local/bin:"*) echo "$HOME/.local" ;;
+    *":$HOME/bin:"*) echo "$HOME" ;;
+    *) echo "/usr/local" ;;
   esac
 }
-INSTALL_DIR="${BLIT_INSTALL_DIR:-$(pick_install_dir)}"
+PREFIX="${BLIT_PREFIX:-${BLIT_INSTALL_DIR:-$(pick_prefix)}}"
 
 main() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -32,8 +32,8 @@ main() {
   version=$(fetch "$REPO/latest") || err "failed to fetch latest version"
   version=$(echo "$version" | tr -d '[:space:]')
 
-  if [ -x "$INSTALL_DIR/blit" ]; then
-    current=$("$INSTALL_DIR/blit" --version 2>/dev/null | awk '{print $2}') || true
+  if [ -x "$PREFIX/bin/blit" ]; then
+    current=$("$PREFIX/bin/blit" --version 2>/dev/null | awk '{print $2}') || true
     if [ "$current" = "$version" ]; then
       echo "blit ${version} already installed."
       exit 0
@@ -52,26 +52,24 @@ main() {
   tar -xzf "$tmp/$tarball" -C "$tmp"
 
   elevate=""
-  if ! [ -w "$INSTALL_DIR" ] && [ "$(id -u)" != "0" ]; then
+  if ! [ -w "$PREFIX/bin" ] 2>/dev/null && [ "$(id -u)" != "0" ]; then
     elevate=$(pick_elevate)
-    echo "installing to $INSTALL_DIR (requires $elevate)..."
+    echo "installing to $PREFIX (requires $elevate)..."
   fi
-  $elevate mkdir -p "$INSTALL_DIR"
-  $elevate mv "$tmp/blit" "$INSTALL_DIR/blit"
-  $elevate chmod +x "$INSTALL_DIR/blit"
-  # On Linux the tarball includes lib/blit/ with the dynamic binary and
-  # the bundled musl dynamic linker.  Install them alongside the launcher.
+  # Tarball contains bin/ and (on Linux) lib/ — copy into PREFIX.
+  $elevate mkdir -p "$PREFIX/bin"
+  $elevate cp "$tmp/bin/blit" "$PREFIX/bin/blit"
+  $elevate chmod +x "$PREFIX/bin/blit"
   if [ -d "$tmp/lib/blit" ]; then
-    $elevate mkdir -p "$INSTALL_DIR/lib/blit"
-    $elevate cp "$tmp/lib/blit/"* "$INSTALL_DIR/lib/blit/"
-    $elevate chmod +x "$INSTALL_DIR/lib/blit/"*
+    $elevate mkdir -p "$PREFIX/lib/blit"
+    $elevate cp "$tmp/lib/blit/"* "$PREFIX/lib/blit/"
+    $elevate chmod +x "$PREFIX/lib/blit/"*
   fi
-  echo "installed blit ${version} to $INSTALL_DIR/blit"
+  echo "installed blit ${version} to $PREFIX/bin/blit"
 
   # Generate man pages and shell completions alongside the binary
-  share_dir="$(dirname "$INSTALL_DIR")/share"
-  if $elevate "$INSTALL_DIR/blit" generate "$share_dir" 2>/dev/null; then
-    echo "generated man pages and completions in $share_dir"
+  if $elevate "$PREFIX/bin/blit" generate "$PREFIX/share" 2>/dev/null; then
+    echo "generated man pages and completions in $PREFIX/share"
   fi
 }
 
@@ -81,7 +79,7 @@ pick_elevate() {
   elif command -v doas >/dev/null 2>&1; then
     echo "doas"
   else
-    err "cannot write to $INSTALL_DIR and neither sudo nor doas is available"
+    err "cannot write to $PREFIX and neither sudo nor doas is available"
   fi
 }
 

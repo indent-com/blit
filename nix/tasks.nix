@@ -3,7 +3,7 @@
   version,
   browserWasm,
   blit,
-  blit-static,
+  blit-release,
   webAppDist,
   websiteDist,
   rustToolchain,
@@ -159,16 +159,16 @@ let
 
   blit-deb = mkDeb {
     pname = "blit";
-    binPkg = blit-static;
+    binPkg = blit-release;
     description = "blit terminal multiplexer";
     extraInstall =
       let
         systemdDir = ../systemd;
       in
       ''
-        # Install the launcher's lib/ directory (dynamic binary + musl loader)
-        if [ -d "${blit-static}/bin/lib" ]; then
-          cp -r "${blit-static}/bin/lib" pkg/usr/lib
+        # Install the dynamic binary + musl loader alongside the launcher.
+        if [ -d "${blit-release}/lib" ]; then
+          cp -r "${blit-release}/lib" pkg/usr/lib
         fi
         mkdir -p pkg/lib/systemd/system
         cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
@@ -443,9 +443,10 @@ in
       ''
         outdir="''${1:-dist/tarballs}"
         mkdir -p "$outdir"
-        # Linux tarballs include the launcher + lib/blit/ (dynamic binary + musl).
-        # macOS tarballs are a single binary.
-        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-static}/bin" .
+        # Linux tarballs contain bin/ + lib/ (PREFIX layout).
+        # macOS tarballs contain bin/ only (single binary, no launcher).
+        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin lib 2>/dev/null || \
+        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
         ls -lh "$outdir"
       '';
   };

@@ -169,18 +169,18 @@
 
       # Assembled release package (Linux): launcher + dynamic binary + musl.
       # On macOS the dynamic binary is used directly (no launcher needed).
-      blit-static =
+      blit-release =
         let
           muslLib = pkgs.pkgsStatic.stdenv.cc.libc;
           arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
         in
         if pkgs.stdenv.isLinux then
           pkgs.runCommand "blit-release-${version}" { } ''
-            mkdir -p $out/bin/lib/blit
+            mkdir -p $out/bin $out/lib/blit
             cp ${blit-launcher}/bin/blit $out/bin/blit
-            cp ${blit-dynamic}/bin/blit $out/bin/lib/blit/blit
-            cp ${muslLib}/lib/ld-musl-${arch}.so.1 $out/bin/lib/blit/
-            chmod +x $out/bin/blit $out/bin/lib/blit/blit $out/bin/lib/blit/ld-musl-${arch}.so.1
+            cp ${blit-dynamic}/bin/blit $out/lib/blit/blit
+            cp ${muslLib}/lib/ld-musl-${arch}.so.1 $out/lib/blit/
+            chmod +x $out/bin/blit $out/lib/blit/blit $out/lib/blit/ld-musl-${arch}.so.1
           ''
         else
           blit-dynamic;
@@ -281,7 +281,7 @@
           version
           browserWasm
           blit
-          blit-static
+          blit-release
           webAppDist
           websiteDist
           rustToolchain
@@ -392,7 +392,7 @@
       packages = {
         inherit
           blit
-          blit-static
+          blit-release
           ;
         demo-image = demoImage;
         push-demo = pushDemo;
