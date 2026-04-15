@@ -156,6 +156,14 @@
           };
           muslCC = pkgs.pkgsStatic.stdenv.cc;
           muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+          # The musl CC wrapper's libc-ldflags is empty — it relies on
+          # NIX_LDFLAGS (set by the musl stdenv) to find libc.a.  When
+          # invoked from a glibc stdenv, NIX_LDFLAGS has glibc paths.
+          # This wrapper injects the musl libc library path.
+          muslCCWrapped = pkgs.writeShellScriptBin "${muslCC.targetPrefix}cc" ''
+            NIX_LDFLAGS="-L${muslCC.libc}/lib ''${NIX_LDFLAGS-}" \
+              exec ${muslCC}/bin/${muslCC.targetPrefix}cc "$@"
+          '';
         in
         craneLib.buildPackage (
           {
@@ -178,17 +186,14 @@
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             # Cross-compile for musl: build scripts compile/link against glibc
             # (host), while the final binary targets musl.
-            # The launcher's build.rs reads MUSL_LIBC_DIR to emit
-            # cargo:rustc-link-search so the linker can find libc.a.
             CARGO_BUILD_TARGET = muslTarget;
             RUSTFLAGS = "-C target-feature=+crt-static";
-            MUSL_LIBC_DIR = "${muslCC.libc}/lib";
-            nativeBuildInputs = [ muslCC ];
+            nativeBuildInputs = [ muslCC muslCCWrapped ];
             preBuild = ''
               mkdir -p .cargo
               cat > .cargo/config.toml << EOF
 [target.${muslTarget}]
-linker = "${muslCC}/bin/${muslCC.targetPrefix}cc"
+linker = "${muslCCWrapped}/bin/${muslCC.targetPrefix}cc"
 EOF
             '';
           }
