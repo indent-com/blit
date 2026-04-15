@@ -154,6 +154,8 @@
               (craneLibStatic.filterCargoSources path type)
               || builtins.baseNameOf path == "build.rs";
           };
+          muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+          muslLibcLib = pkgs.pkgsStatic.stdenv.cc.libc;
         in
         craneLibStatic.buildPackage (
           {
@@ -163,7 +165,6 @@
             strictDeps = true;
             doCheck = false;
             cargoVendorDir = craneLibStatic.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
-            RUSTFLAGS = "-C target-feature=+crt-static";
             postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
               for bin in $out/bin/*; do
                 if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
@@ -175,15 +176,28 @@
             '';
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # Mirror the workspace's commonArgsStatic pattern:
-            # craneLibStatic provides the musl CC; CARGO_BUILD_TARGET ensures
-            # build scripts compile for glibc (host) while the final binary
-            # targets musl; buildInputs with the musl libc makes the stdenv
-            # setup hooks populate NIX_LDFLAGS_<target> so the linker can
-            # find libc.a.
-            CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-            buildInputs = [ pkgs.pkgsStatic.stdenv.cc.libc ];
-            postUnpack = "export NIX_CFLAGS_LINK=''";
+            # craneLibStatic provides the musl CC.  CARGO_BUILD_TARGET makes
+            # build scripts compile for glibc (the build machine) while the
+            # final binary targets musl.
+            #
+            # We must NOT add musl libc to buildInputs — its setup hooks
+            # leak into the build-script environment and break glibc linking.
+            # Instead, unset RUSTFLAGS (so Cargo reads config-level flags)
+            # and inject target-specific rustflags via cargo config that
+            # pass +crt-static and -L<musl-libc>/lib only for the musl target.
+            CARGO_BUILD_TARGET = muslTarget;
+            postUnpack = ''
+              export NIX_CFLAGS_LINK=""
+              unset RUSTFLAGS
+              unset CARGO_ENCODED_RUSTFLAGS
+            '';
+            preBuild = ''
+              cat >> $CARGO_HOME/config.toml <<EOF
+
+[target.${muslTarget}]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-L${muslLibcLib}/lib"]
+EOF
+            '';
           }
         );
 
