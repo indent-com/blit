@@ -17,15 +17,14 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use core::ptr;
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     unsafe { libc::_exit(127) }
 }
 
-const PATH_MAX: usize = 4096;
-const MAX_ARGS: usize = 4096;
-const MAX_ENV: usize = 8192;
+const MAX_PATH: usize = libc::PATH_MAX as usize;
 
 #[cfg(target_arch = "x86_64")]
 const LOADER_SUFFIX: &[u8] = b"/lib/blit/ld-musl-x86_64.so.1\0";
@@ -37,6 +36,30 @@ const BIN_COMPONENT: &[u8] = b"/bin";
 const WRAPPER_PREFIX: &[u8] = b"BLIT_WRAPPER_DIR=";
 const PROC_SELF_EXE: &[u8] = b"/proc/self/exe\0";
 
+unsafe fn alloc_ptrs(count: usize) -> *mut *const libc::c_char {
+    let p = unsafe { libc::malloc(count * core::mem::size_of::<*const libc::c_char>()) };
+    if p.is_null() {
+        fatal(b"blit: out of memory\n");
+    }
+    let p = p.cast::<*const libc::c_char>();
+    unsafe {
+        libc::memset(p.cast(), 0, count * core::mem::size_of::<*const libc::c_char>());
+    }
+    p
+}
+
+unsafe fn count_null_terminated(p: *const *const libc::c_char) -> usize {
+    let mut n: usize = 0;
+    if !p.is_null() {
+        unsafe {
+            while !(*p.add(n)).is_null() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(
     argc: libc::c_int,
@@ -45,11 +68,11 @@ pub unsafe extern "C" fn main(
 ) -> libc::c_int {
     unsafe {
         // Resolve our own path via /proc/self/exe.
-        let mut exe_buf = [0u8; PATH_MAX];
+        let mut exe_buf = [0u8; MAX_PATH];
         let exe_len = libc::readlink(
             PROC_SELF_EXE.as_ptr().cast(),
             exe_buf.as_mut_ptr().cast(),
-            PATH_MAX - 1,
+            MAX_PATH - 1,
         );
         if exe_len <= 0 {
             fatal(b"blit: cannot read /proc/self/exe\n");
@@ -78,16 +101,16 @@ pub unsafe extern "C" fn main(
         }
 
         // Build loader path: <prefix> + LOADER_SUFFIX.
-        let mut loader = [0u8; PATH_MAX];
-        if prefix_len + LOADER_SUFFIX.len() >= PATH_MAX {
+        let mut loader = [0u8; MAX_PATH];
+        if prefix_len + LOADER_SUFFIX.len() >= MAX_PATH {
             fatal(b"blit: path too long\n");
         }
         copy_bytes(&exe_buf, prefix_len, &mut loader, 0);
         copy_bytes(LOADER_SUFFIX, LOADER_SUFFIX.len(), &mut loader, prefix_len);
 
         // Build real binary path: <prefix> + BLIT_SUFFIX.
-        let mut real_bin = [0u8; PATH_MAX];
-        if prefix_len + BLIT_SUFFIX.len() >= PATH_MAX {
+        let mut real_bin = [0u8; MAX_PATH];
+        if prefix_len + BLIT_SUFFIX.len() >= MAX_PATH {
             fatal(b"blit: path too long\n");
         }
         copy_bytes(&exe_buf, prefix_len, &mut real_bin, 0);
@@ -95,9 +118,9 @@ pub unsafe extern "C" fn main(
 
         // Build BLIT_WRAPPER_DIR=<prefix>/bin (null-terminated).
         // Points at the bin/ directory so blit_exe() returns the launcher path.
-        let mut wrapper_env = [0u8; PATH_MAX];
+        let mut wrapper_env = [0u8; MAX_PATH];
         let env_pfx = WRAPPER_PREFIX.len();
-        if env_pfx + bin_dir_len + 1 >= PATH_MAX {
+        if env_pfx + bin_dir_len + 1 >= MAX_PATH {
             fatal(b"blit: path too long\n");
         }
         copy_bytes(WRAPPER_PREFIX, env_pfx, &mut wrapper_env, 0);
@@ -105,50 +128,43 @@ pub unsafe extern "C" fn main(
         wrapper_env[env_pfx + bin_dir_len] = 0;
 
         // Build new argv: [loader, real_bin, original_argv[1..], NULL].
-        let mut new_argv: [*const libc::c_char; MAX_ARGS] = [core::ptr::null(); MAX_ARGS];
-        new_argv[0] = loader.as_ptr().cast();
-        new_argv[1] = real_bin.as_ptr().cast();
+        // argc + 2: one extra slot for loader (replacing argv[0]) plus the
+        // real binary inserted before the original args, plus NULL terminator.
+        let new_argc = argc as usize + 2;
+        let new_argv = alloc_ptrs(new_argc);
+        *new_argv.add(0) = loader.as_ptr().cast();
+        *new_argv.add(1) = real_bin.as_ptr().cast();
         let mut i: usize = 1;
-        while i < argc as usize && i + 1 < MAX_ARGS - 1 {
-            new_argv[i + 1] = *argv.add(i);
+        while i < argc as usize {
+            *new_argv.add(i + 1) = *argv.add(i);
             i += 1;
         }
+        *new_argv.add(argc as usize + 1) = ptr::null();
 
         // Build new envp: existing env + BLIT_WRAPPER_DIR, NULL-terminated.
-        let mut new_envp: [*const libc::c_char; MAX_ENV] = [core::ptr::null(); MAX_ENV];
-        let mut n: usize = 0;
-        if !envp.is_null() {
-            while !(*envp.add(n)).is_null() && n < MAX_ENV - 2 {
-                let entry = *envp.add(n);
-                // Skip any existing BLIT_WRAPPER_DIR entry.
-                if !starts_with_cstr(entry, WRAPPER_PREFIX) {
-                    new_envp[n] = entry;
-                } else {
-                    // Shift: we'll append the new one at the end.
-                    new_envp[n] = entry; // keep it for now, overwrite below
-                }
-                n += 1;
-            }
-        }
-        // Replace or append BLIT_WRAPPER_DIR.
-        // Scan backwards to find any existing one and replace in-place.
-        let mut found = false;
+        let envc = count_null_terminated(envp);
+        let new_envp = alloc_ptrs(envc + 2); // +1 for BLIT_WRAPPER_DIR, +1 for NULL
+        let mut dst: usize = 0;
+        let mut replaced = false;
         let mut j: usize = 0;
-        while j < n {
-            if starts_with_cstr(new_envp[j], WRAPPER_PREFIX) {
-                new_envp[j] = wrapper_env.as_ptr().cast();
-                found = true;
-                break;
+        while j < envc {
+            let entry = *envp.add(j);
+            if starts_with_cstr(entry, WRAPPER_PREFIX) {
+                *new_envp.add(dst) = wrapper_env.as_ptr().cast();
+                replaced = true;
+            } else {
+                *new_envp.add(dst) = entry;
             }
+            dst += 1;
             j += 1;
         }
-        if !found && n < MAX_ENV - 1 {
-            new_envp[n] = wrapper_env.as_ptr().cast();
-            n += 1;
+        if !replaced {
+            *new_envp.add(dst) = wrapper_env.as_ptr().cast();
+            dst += 1;
         }
-        new_envp[n] = core::ptr::null();
+        *new_envp.add(dst) = ptr::null();
 
-        libc::execve(loader.as_ptr().cast(), new_argv.as_ptr(), new_envp.as_ptr());
+        libc::execve(loader.as_ptr().cast(), new_argv, new_envp);
 
         // execve only returns on failure.
         fatal(b"blit: exec failed\n");
