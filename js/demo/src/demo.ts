@@ -58,12 +58,12 @@ async function acquireRateLimit(
   clientIp: string,
 ): Promise<boolean> {
   const key = rateLimitKey(clientIp);
-  const count = await redis.eval(
+  const count = (await redis.eval(
     "local c = redis.call('INCR', KEYS[1]); if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; return c",
     1,
     key,
     RATE_LIMIT_WINDOW_SECONDS,
-  ) as number;
+  )) as number;
   if (count > MAX_SANDBOXES_PER_IP) {
     await redis.decr(key);
     return false;
