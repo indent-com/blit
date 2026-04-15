@@ -164,8 +164,6 @@
             src = launcherSrc;
             inherit version;
             strictDeps = true;
-            # Force +crt-static — the launcher must be fully static.
-            RUSTFLAGS = "-C target-feature=+crt-static";
             doCheck = false;
             cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
             postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
@@ -183,6 +181,10 @@
             # while the final binary targets musl via the explicit linker.
             CARGO_BUILD_TARGET = muslTarget;
             "CARGO_TARGET_${envTarget}_LINKER" = "${muslCC}/bin/${muslCC.targetPrefix}cc";
+            # Target-specific RUSTFLAGS: +crt-static for full static linking,
+            # plus explicit -L so the musl linker can find libc.a.
+            # Using target-specific env var so build scripts (glibc) aren't affected.
+            "CARGO_TARGET_${envTarget}_RUSTFLAGS" = "-C target-feature=+crt-static -C link-arg=-L${muslCC.libc}/lib";
             nativeBuildInputs = [ muslCC ];
           }
         );
