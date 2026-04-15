@@ -30,17 +30,37 @@ processes:
         condition: process_healthy
 
   server:
-    command: ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
+    # Remove the stale socket *before* starting the server.  The old
+    # server's UnixListener::drop does not unlink the socket file, so
+    # without this the readiness probe (`test -S`) gives a false
+    # positive while the new server is still spawning its compositor
+    # and audio pipeline — causing dependents (gateway, share) to
+    # connect to a dead socket and enter a restart loop.
+    command: rm -f ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} && exec ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
     depends_on:
       build:
         condition: process_completed_successfully
     availability:
-      restart: always
+      # on_failure (not "always") so a graceful SIGTERM exit (code 0)
+      # does not trigger an automatic restart.  With "always", the
+      # flock-based server replacement (ipc_unix.rs) can create a
+      # restart loop: the old server exits 0, process-compose
+      # auto-starts another, which kills the replacement, etc.
+      restart: on_failure
+      backoff_seconds: 2
+      max_restarts: 5
     readiness_probe:
       exec:
         command: test -S ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
       period_seconds: 2
       failure_threshold: 300
+    shutdown:
+      # SIGTERM gives the server time to broadcast S2C_QUIT to clients
+      # and run AudioPipeline::drop (which kills dbus/pipewire/pw-cat
+      # children in order).  15 s is generous — normal shutdown takes
+      # < 1 s, but a slow audio teardown can take a few seconds.
+      signal: 15
+      timeout_seconds: 15
 
   gateway:
     command: ./target/profiling/blit gateway
