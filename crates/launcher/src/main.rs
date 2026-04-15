@@ -13,13 +13,11 @@
 //!     PREFIX/lib/blit/blit                     <- real binary (dynamic musl)
 //!     PREFIX/lib/blit/ld-musl-<arch>.so.1      <- musl dynamic linker
 
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
+#![no_std]
+#![no_main]
 
-#[cfg(not(test))]
 use core::panic::PanicInfo;
 
-#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     unsafe { libc::_exit(127) }
@@ -39,7 +37,7 @@ const BIN_COMPONENT: &[u8] = b"/bin";
 const WRAPPER_PREFIX: &[u8] = b"BLIT_WRAPPER_DIR=";
 const PROC_SELF_EXE: &[u8] = b"/proc/self/exe\0";
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(
     argc: libc::c_int,
     argv: *const *const libc::c_char,

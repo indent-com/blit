@@ -13,6 +13,8 @@ members = [
     "crates/compositor",
     "crates/proxy",
     "crates/ssh",
+]
+exclude = [
     "crates/launcher",
 ]
 
