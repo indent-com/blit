@@ -159,6 +159,7 @@
             pname = "blit-launcher";
             src = launcherSrc;
             inherit version;
+            strictDeps = true;
             # Force +crt-static back on — the launcher must be fully static.
             RUSTFLAGS = "-C target-feature=+crt-static";
             doCheck = false;
@@ -178,6 +179,8 @@
             # Cross-compile for musl target so build scripts (libc build.rs)
             # run natively on the glibc host instead of being compiled for musl.
             CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+            # Provide musl libc.a so the cross-linker can resolve libc symbols.
+            buildInputs = [ pkgs.pkgsStatic.stdenv.cc.libc ];
             postUnpack = "export NIX_CFLAGS_LINK=''";
           }
         );
