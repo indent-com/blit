@@ -2029,7 +2029,7 @@ pub async fn run(config: Config) {
             let sess = state.session.lock().await;
             sess.send_to_all(&[S2C_QUIT]);
             drop(sess);
-            state.shutdown_notify.notify_waiters();
+            state.shutdown_notify.notify_one();
         });
     }
 
@@ -4195,7 +4195,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let sess = state.session.lock().await;
             sess.send_to_all(&[S2C_QUIT]);
             drop(sess);
-            state.shutdown_notify.notify_waiters();
+            state.shutdown_notify.notify_one();
             break;
         }
 
