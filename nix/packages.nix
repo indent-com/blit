@@ -148,21 +148,22 @@
       # so built standalone with its own Cargo.lock.
       blit-launcher =
         let
-          muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-          launcherRustPlatform = pkgs.pkgsStatic.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
+          launcherSrc = pkgs.lib.cleanSourceWith {
+            src = ../crates/launcher;
+            filter = path: type:
+              (craneLibStatic.filterCargoSources path type);
           };
         in
-        launcherRustPlatform.buildRustPackage {
+        craneLibStatic.buildPackage {
           pname = "blit-launcher";
+          src = launcherSrc;
           inherit version;
-          src = ../crates/launcher;
-          cargoLock.lockFile = ../crates/launcher/Cargo.lock;
-          CARGO_BUILD_TARGET = muslTarget;
+          # Force +crt-static back on — the launcher must be fully static.
           RUSTFLAGS = "-C target-feature=+crt-static";
           doCheck = false;
-          postFixup = ''
+          # No workspace deps — standalone crate with only libc.
+          cargoVendorDir = craneLibStatic.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
+          postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             for bin in $out/bin/*; do
               if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
                 echo "FATAL: launcher $bin is not statically linked:"
