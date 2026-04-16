@@ -43,15 +43,13 @@
   - [9.5 Streaming Execution](#95-streaming-execution)
   - [9.6 Background Process Tracking](#96-background-process-tracking)
 - [10. Terminal Management](#10-terminal-management)
-  - [10.1 PTY Sessions (Legacy)](#101-pty-sessions-legacy)
-  - [10.2 Blit Terminal Server](#102-blit-terminal-server)
-  - [10.3 Terminal Controller (TLV Protocol)](#103-terminal-controller-tlv-protocol)
+  - [10.1 Blit Terminal Server](#101-blit-terminal-server)
+  - [10.2 Terminal Controller (TLV Protocol)](#102-terminal-controller-tlv-protocol)
 - [11. REST API Endpoints](#11-rest-api-endpoints)
 - [12. GraphQL Operations](#12-graphql-operations)
 - [13. WebRTC Port Forwarding](#13-webrtc-port-forwarding)
   - [13.1 Signaling Protocol](#131-signaling-protocol)
   - [13.2 Data Channel Bridge](#132-data-channel-bridge)
-  - [13.3 SSH Helper](#133-ssh-helper)
 - [14. UI and Output](#14-ui-and-output)
 - [15. Environment Variables](#15-environment-variables)
 - [16. TypeScript Interfaces](#16-typescript-interfaces)
@@ -75,7 +73,7 @@
 
 - Reimplementing server-side components (the RPC server, message broker, WebSocket handler stay in Python).
 - Changing the wire protocol — the TypeScript CLI must be a drop-in replacement that the server cannot distinguish from the Python CLI.
-- Replacing the `indent-ssh-helper` binary in this phase (can be a follow-up).
+- **SSH helper is explicitly out of scope.** The `indent-ssh-helper` binary (SSH-over-WebRTC) will not be ported. If SSH access to sandboxes is needed in the future, it should be redesigned as a feature of blit rather than a standalone binary.
 
 ---
 
@@ -89,7 +87,6 @@ graph TD
         REC["RemoteExecutionClient"]
         TOOLS["Tool executors"]
         HEART["Heartbeat emitter"]
-        TERM["Terminal session manager"]
         BLIT["Blit terminal client"]
         TCTL["Terminal controller (TLV)"]
         WEBRTC["WebRTC port forwarder"]
@@ -108,7 +105,6 @@ graph TD
     REC -->|WebSocket JSON| WS
     REC --> TOOLS
     REC --> HEART
-    REC --> TERM
     REC --> BLIT
     REC --> TCTL
     CLI --> WEBRTC
@@ -118,7 +114,7 @@ graph TD
     WS --> REDIS
 ```
 
-The `RemoteExecutionClient` is the heart of the CLI. It maintains a persistent WebSocket connection to the server, multiplexing four async channels: incoming requests, outgoing results, heartbeats, and terminal output.
+The `RemoteExecutionClient` is the heart of the CLI. It maintains a persistent WebSocket connection to the server, multiplexing async channels: incoming requests, outgoing results, and heartbeats. Terminal management is fully delegated to blit via Unix socket.
 
 ---
 
@@ -159,8 +155,7 @@ indent-cli-ts/
 │   │   ├── streaming.ts            # Streaming code execution
 │   │   └── background-tracker.ts   # Background process tracking
 │   ├── terminal/
-│   │   ├── session.ts              # PTY session manager (node-pty)
-│   │   ├── blit-client.ts          # Blit terminal server client
+│   │   ├── blit-client.ts          # Blit terminal server client (all PTY via blit)
 │   │   └── controller.ts           # TLV terminal controller server
 │   ├── graphql/
 │   │   ├── client.ts               # GraphQL client
@@ -695,12 +690,11 @@ interface CliRpcRequest {
     | HttpRequest // { url, method, headers, timeout }
     | GenerateUploadUrlRequest // { s3_key, content_type }
     | DownloadFromUrlRequest // { url, file_path, timeout }
-    | StartTerminalRequest
+    | StartBlitTerminalRequest
     | TerminalInputRequest
     | TerminalResizeRequest
     | StopTerminalRequest
     | ListTerminalsRequest
-    | StartBlitTerminalRequest
     | StreamingCodeExecutionRequest;
   idempotency_key: string | null;
 }
@@ -724,12 +718,11 @@ interface CliRpcResponse {
     | HttpResponse
     | GenerateUploadUrlResponse // { upload_url, s3_uri }
     | DownloadFromUrlResponse
-    | StartTerminalResponse
+    | StartBlitTerminalResponse
     | TerminalInputResponse
     | TerminalResizeResponse
     | StopTerminalResponse
     | ListTerminalsResponse
-    | StartBlitTerminalResponse
     | StreamingCodeExecutionResponseChunk
     | StreamingCodeExecutionResponse
     | StreamingErrorResponse;
@@ -789,31 +782,11 @@ When `BashToolInput.background = true`:
 
 ## 10. Terminal Management
 
-### 10.1 PTY Sessions (Legacy)
+All terminal/PTY management is handled exclusively through blit. There is no legacy `node-pty` / `os.openpty()` path — blit is the sole PTY backend.
 
-The CLI manages real PTY sessions via `os.openpty()` / `os.fork()` (Python) → `node-pty` (TypeScript).
+### 10.1 Blit Terminal Server
 
-**Terminal environment:**
-
-```
-TERM=xterm-256color
-COLORTERM=truecolor
-TERM_PROGRAM=indent
-```
-
-**Request/response types:**
-
-| Request                                                               | Response                                                             |
-| --------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `StartTerminalRequest { session_id, command, cols, rows, env, name }` | `StartTerminalResponse { session_id, success, error_message, name }` |
-| `TerminalInputRequest { session_id, data }`                           | `TerminalInputResponse { session_id, success }`                      |
-| `TerminalResizeRequest { session_id, cols, rows }`                    | `TerminalResizeResponse { session_id, success }`                     |
-| `StopTerminalRequest { session_id }`                                  | `StopTerminalResponse { session_id, success }`                       |
-| `ListTerminalsRequest {}`                                             | `ListTerminalsResponse { terminals: TerminalInfo[] }`                |
-
-### 10.2 Blit Terminal Server
-
-The CLI can use an external `blit-server` process for terminal management. Communicates via Unix socket using the blit binary protocol:
+The CLI delegates all terminal creation and management to the blit server process. Communicates via Unix socket using the blit binary protocol:
 
 - Socket path resolution: `INDENT_TERMINAL_CONTROLLER_BLIT_SOCKET` → `$TMPDIR/blit.sock` → `$XDG_RUNTIME_DIR/blit.sock` → `/tmp/blit-{user}.sock`
 - Auto-spawns `blit-server` if no existing socket found.
@@ -823,7 +796,7 @@ The CLI can use an external `blit-server` process for terminal management. Commu
 **Request type:** `StartBlitTerminalRequest { command, tag, cols, rows }`
 **Response type:** `StartBlitTerminalResponse { success, pty_id, error_message }`
 
-### 10.3 Terminal Controller (TLV Protocol)
+### 10.2 Terminal Controller (TLV Protocol)
 
 When `INDENT_TERMINAL_CONTROLLER_SOCKET` is set, the CLI starts a Unix socket server that the Indent desktop app connects to for live terminal viewing.
 
@@ -960,22 +933,9 @@ When a local TCP connection is accepted:
 3. Sandbox sends `0x00` byte = success, `0x01` = error.
 4. Bridge bidirectionally: TCP socket ↔ data channel.
 
-### 13.3 SSH Helper
+### 13.3 SSH Helper — Dropped
 
-`indent-ssh-helper` is a standalone binary entry point for SSH-over-WebRTC.
-
-**Usage:** `indent-ssh-helper <uuid>.indent`
-
-**Flow:**
-
-1. Parse chat UUID from hostname (strip `.indent`).
-2. Read API key from `INDENT_API_KEY` env var or config file.
-3. Connect to signaling WebSocket: `wss://ws-api.indent.com/api/ws/webrtc/{chat_uuid}`.
-4. Authenticate, create peer connection.
-5. Create `ssh` data channel targeting port 22.
-6. Bridge stdin/stdout ↔ data channel.
-
-Environment overrides: `INDENT_API_KEY`, `INDENT_ENV`, `INDENT_WS_URL`.
+The Python CLI's `indent-ssh-helper` binary (SSH-over-WebRTC) is **explicitly not included** in the TypeScript rewrite. It will not be ported, wrapped, or reimplemented. If SSH access to cloud sandboxes is needed in the future, it should be designed as a blit feature rather than a standalone binary.
 
 ---
 
@@ -1030,15 +990,13 @@ Braille character animation: `⣷⣯⣟⡿⢿⣻⣽⣾` at 10 frames/second, wit
 | `INDENT_TIMEOUT_SECONDS`                 | —            | Inactivity timeout for `run`        |
 | `INDENT_TERMINAL_CONTROLLER_SOCKET`      | —            | TLV terminal controller socket path |
 | `INDENT_TERMINAL_CONTROLLER_BLIT_SOCKET` | —            | Blit server socket path             |
-| `INDENT_API_KEY`                         | —            | SSH helper API key                  |
-| `INDENT_ENV`                             | —            | SSH helper environment selection    |
-| `INDENT_WS_URL`                          | —            | SSH helper WebSocket URL override   |
-| `SSH_TTY`                                | —            | Detect SSH session (read-only)      |
-| `SSH_CONNECTION`                         | —            | Detect SSH session (read-only)      |
-| `SHELL`                                  | `/bin/sh`    | User's shell                        |
-| `TMPDIR`                                 | `/tmp`       | Blit socket path fallback           |
-| `XDG_RUNTIME_DIR`                        | —            | Blit socket path fallback           |
-| `USER`                                   | —            | Blit socket path fallback           |
+
+| `SSH_TTY` | — | Detect SSH session (read-only) |
+| `SSH_CONNECTION` | — | Detect SSH session (read-only) |
+| `SHELL` | `/bin/sh` | User's shell |
+| `TMPDIR` | `/tmp` | Blit socket path fallback |
+| `XDG_RUNTIME_DIR` | — | Blit socket path fallback |
+| `USER` | — | Blit socket path fallback |
 
 ---
 
@@ -1161,7 +1119,6 @@ interface FileMetadata {
 | -------------------------------------- | -------------------- | ----------------------------------- |
 | `commander` or `clipanion`             | CLI argument parsing | Match Click's behavior              |
 | `ws`                                   | WebSocket client     | Match `websockets` library          |
-| `node-pty`                             | PTY management       | Replace Python `os.openpty`         |
 | `glob` / `fast-glob`                   | File globbing        | Replace Python `glob`               |
 | `@aspect-build/ripgrep` or native      | Grep                 | Replace `python-ripgrep`            |
 | `msgspec`-compatible serializer        | RPC serialization    | Match `msgspec.Struct` tag behavior |
@@ -1231,7 +1188,7 @@ interface FileMetadata {
 ### Integration Tests
 
 - **End-to-end with server:** start a real server instance, create chat, connect WebSocket, execute tool requests, verify results.
-- **Terminal management:** start PTY, send input, read output, resize, stop.
+- **Terminal management:** start blit terminal, send input, read output, resize, stop.
 - **Config file operations:** login → save key → read key → refresh key.
 - **Git integration:** detect repo, read branch/remote.
 
@@ -1254,10 +1211,10 @@ interface FileMetadata {
 | Phase | Scope                                                                                                            | Milestone                            |
 | ----- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
 | 1     | Core client: WebSocket connection, heartbeat, RPC dispatch, tool execution (bash, read, write, edit, glob, grep) | CLI can run a basic chat session     |
-| 2     | Terminal management: PTY sessions, blit terminal client, terminal controller (TLV)                               | Full terminal support                |
+| 2     | Terminal management: blit terminal client (sole PTY backend), terminal controller (TLV)                          | Full terminal support                |
 | 3     | `run` command complete: config, login, auto-upgrade, browser launch, connection UI                               | Drop-in replacement for `indent run` |
 | 4     | Hidden commands: checkout, cloud, debug, port-forward                                                            | Full command parity                  |
-| 5     | SSH helper, distribution pipeline, installer                                                                     | Ship standalone binaries             |
+| 5     | Distribution pipeline, installer                                                                                 | Ship standalone binaries             |
 | 6     | Deprecate Python CLI, remove from PyPI                                                                           | Complete migration                   |
 
 ### Compatibility Contract
