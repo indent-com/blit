@@ -915,6 +915,11 @@ impl VulkanRenderer {
         self.has_dmabuf
     }
 
+    /// Number of cached surface textures (diagnostic).
+    pub(crate) fn surface_texture_count(&self) -> usize {
+        self.surface_textures.len()
+    }
+
     // ---------------------------------------------------------------
     // Vulkan Video encoder management
     // ---------------------------------------------------------------

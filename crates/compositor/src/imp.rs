@@ -1286,14 +1286,26 @@ impl Compositor {
             (pw, ph)
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
-            vk.render_tree_sized(
+            let r = vk.render_tree_sized(
                 &root_id,
                 &self.surfaces,
                 &self.surface_meta,
                 s120,
                 target_phys,
                 toplevel_sid,
-            )
+            );
+            if r.is_none() {
+                static SC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 10 || n.is_multiple_of(1000) {
+                    eprintln!(
+                        "[commit #{n}] render_tree_sized=None sid={toplevel_sid} target={target_phys:?} meta={} textures={}",
+                        self.surface_meta.len(),
+                        vk.surface_texture_count(),
+                    );
+                }
+            }
+            r
         } else {
             None
         };
