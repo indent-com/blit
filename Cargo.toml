@@ -14,9 +14,7 @@ members = [
     "crates/proxy",
     "crates/ssh",
 ]
-exclude = [
-    "crates/launcher",
-]
+exclude = []
 
 [workspace.package]
 edition = "2024"

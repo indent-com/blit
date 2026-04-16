@@ -13,6 +13,21 @@ pick_prefix() {
 }
 PREFIX="${BLIT_PREFIX:-${BLIT_INSTALL_DIR:-$(pick_prefix)}}"
 
+detect_libc() {
+  if command -v ldd >/dev/null 2>&1; then
+    case "$(ldd --version 2>&1)" in
+      *musl*) echo "musl"; return ;;
+    esac
+  fi
+  for f in /lib/ld-musl-*; do
+    if [ -e "$f" ]; then
+      echo "musl"
+      return
+    fi
+  done
+  echo "gnu"
+}
+
 main() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
@@ -28,6 +43,14 @@ main() {
     aarch64|arm64)   arch="aarch64" ;;
     *) err "unsupported architecture: $arch" ;;
   esac
+
+  # On Linux, detect musl vs glibc to pick the right binary.
+  if [ "$os" = "linux" ]; then
+    libc=$(detect_libc)
+    if [ "$libc" = "musl" ]; then
+      os="linux-musl"
+    fi
+  fi
 
   version=$(fetch "$REPO/latest") || err "failed to fetch latest version"
   version=$(echo "$version" | tr -d '[:space:]')

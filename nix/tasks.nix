@@ -4,6 +4,7 @@
   browserWasm,
   blit,
   blit-release,
+  blit-release-musl ? null,
   webAppDist,
   websiteDist,
   rustToolchain,
@@ -166,7 +167,7 @@ let
         systemdDir = ../systemd;
       in
       ''
-        # Install the dynamic binary + musl loader alongside the launcher.
+        # Bundle shared library deps alongside the binary.
         if [ -d "${blit-release}/lib" ]; then
           cp -r "${blit-release}/lib" pkg/usr/lib
         fi
@@ -443,10 +444,22 @@ in
       ''
         outdir="''${1:-dist/tarballs}"
         mkdir -p "$outdir"
-        # Linux tarballs contain bin/ + lib/ (PREFIX layout).
-        # macOS tarballs contain bin/ only (single binary, no launcher).
-        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin lib 2>/dev/null || \
-        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+      ''
+      + (
+        if pkgs.stdenv.isLinux then
+          ''
+            # glibc tarball: bin/ + lib/ (bundled .so deps)
+            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin lib
+            # musl tarball: bin/ only (single binary, needs system musl libc)
+            tar -czf "$outdir/blit_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl}" bin
+          ''
+        else
+          ''
+            # macOS: single binary
+            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+          ''
+      )
+      + ''
         ls -lh "$outdir"
       '';
   };
