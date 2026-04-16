@@ -2428,9 +2428,7 @@ impl VulkanRenderer {
                     PixelData::DmaBuf { .. } => "dmabuf",
                     _ => "other",
                 };
-                eprintln!(
-                    "[upload #{n}] FAILED kind={kind} {width}x{height} sid={surface_id:?}",
-                );
+                eprintln!("[upload #{n}] FAILED kind={kind} {width}x{height} sid={surface_id:?}");
             }
         }
     }
