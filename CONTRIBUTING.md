@@ -124,7 +124,7 @@ Every `nix run` target has a corresponding script in `bin/`:
 
 `build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
 The version and platform are derived from `flake.nix` and the build host.
-Linkage is verified at `nix build` time — on Linux the main binary must be dynamically linked against musl libc only (for dlopen/GPU support), the launcher must be statically linked, and macOS binaries must not reference nix-store dylibs.
+Linkage is verified at `nix build` time — on Linux the musl binary must have only `libc.so` as a NEEDED library, the glibc binary bundles non-glibc `.so` deps with `RPATH=$ORIGIN/../lib/blit`, and macOS binaries must not reference nix-store dylibs.
 
 Individual packages can also be built directly:
 
@@ -232,7 +232,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 
 **Tests live next to the code.** `server/src/lib.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. Core tests are in `core/src/__tests__/`, React tests in `react/src/__tests__/`.
 
-**Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. On Linux, release tarballs ship a static launcher binary that exec()s the main binary (dynamically linked against musl libc for dlopen/GPU support) through a bundled musl dynamic linker. Nix verifies linkage at build time.
+**Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. On Linux, two release tarballs are produced: a glibc variant (dynamically linked, with bundled `.so` deps and `RPATH`) for most systems, and a musl variant (all deps statically linked except musl libc) for Alpine. Nix verifies linkage at build time.
 
 ## Versioning and releases
 

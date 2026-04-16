@@ -80,7 +80,9 @@ install.blit.sh/
   blit.gpg                # GPG public key for APT signature verification
   bin/
     blit_0.12.0_linux_x86_64.tar.gz
+    blit_0.12.0_linux-musl_x86_64.tar.gz
     blit_0.12.0_linux_aarch64.tar.gz
+    blit_0.12.0_linux-musl_aarch64.tar.gz
     blit_0.12.0_darwin_aarch64.tar.gz
     blit_0.12.0_windows_x86_64.zip
   pool/
@@ -103,10 +105,11 @@ install.blit.sh/
 [`install.sh`](install.sh) is a portable POSIX shell script that:
 
 1. Detects OS (`uname -s`) and architecture (`uname -m`), normalizing to `linux`/`darwin` and `x86_64`/`aarch64`.
-2. Fetches `/latest` from `install.blit.sh` to get the current version.
-3. Skips if the installed version already matches.
-4. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
-5. Extracts the tarball (`bin/` + `lib/` on Linux, `bin/` only on macOS) into `$BLIT_PREFIX` (default `/usr/local`), escalating with `sudo`/`doas` if needed.
+2. On Linux, detects the system libc (musl vs glibc) by checking `ldd --version` output and `/lib/ld-musl-*`. Musl systems get `linux-musl` tarballs.
+3. Fetches `/latest` from `install.blit.sh` to get the current version.
+4. Skips if the installed version already matches.
+5. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
+6. Extracts the tarball (`bin/` + `lib/blit/` on glibc Linux, `bin/` only on musl Linux and macOS) into `$BLIT_PREFIX` (default `/usr/local`), escalating with `sudo`/`doas` if needed.
 
 ### Windows installer
 
@@ -195,25 +198,36 @@ The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](
 ./bin/deploy-website --prod   # production deploy
 ```
 
-## Release binaries via Nix + musl
+## Release binaries via Nix
 
 All release binaries are built with Nix, which makes the entire toolchain reproducible and keeps the build definitions small.
 
-On Linux, the main binary is **dynamically linked against musl libc** so that `dlopen` works for GPU acceleration (VA-API, NVENC, Vulkan). All other dependencies (libopus, pixman, libxkbcommon, libgbm) are statically linked via `pkgs.pkgsStatic`. A tiny **static launcher binary** (`crates/launcher/`) resolves the bundled musl dynamic linker relative to its own location and `exec()`s the real binary through it — this is necessary because the ELF interpreter path must be absolute and is not known at build time. The release tarball layout is:
+On Linux, two variants are shipped:
+
+- **glibc** (`blit-gnu`) — dynamically linked against glibc. Non-glibc `.so` dependencies (libopus, pixman, libxkbcommon, libgbm, etc.) are bundled alongside the binary and found via `RPATH=$ORIGIN/../lib/blit`. The interpreter is set to the system `ld-linux`. `dlopen` works natively for GPU acceleration (VA-API, NVENC, Vulkan). This is the default for most Linux systems.
+- **musl** (`blit-musl`) — built with the LLVM musl cross toolchain. All dependencies except musl libc are statically linked, producing a single binary. The interpreter is set to the system `ld-musl-<arch>.so.1`. For Alpine and other musl-based systems.
+
+The glibc release tarball layout:
 
 ```
-bin/blit                          <- static launcher
-lib/blit/blit                     <- dynamically-linked musl binary
-lib/blit/ld-musl-<arch>.so.1     <- musl dynamic linker (bundled)
+bin/blit            <- dynamically-linked binary (RPATH=$ORIGIN/../lib/blit)
+lib/blit/
+  libopus.so.0
+  libpixman-1.so.0
+  libxkbcommon.so.0
+  libgbm.so.1
+  ...               <- all non-glibc .so deps
 ```
 
-The `blit-dynamic` derivation in [`nix/packages.nix`](nix/packages.nix) builds the main binary and verifies its only dynamic dependency is `ld-musl-*.so.1`. The `blit-launcher` derivation builds the static launcher and verifies it is genuinely statically linked. A `blit-release` derivation assembles both with the musl loader into a PREFIX layout (`bin/` + `lib/`).
+The musl release tarball contains only `bin/blit` (single binary).
 
-On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed. No launcher is needed on macOS.
+The `blit-release-gnu` derivation in [`nix/packages.nix`](nix/packages.nix) assembles the glibc tarball by running `ldd` on the built binary, bundling all non-glibc `.so` deps, and setting `RPATH` + system interpreter via `patchelf`. The `blit-release-musl` derivation patches the musl binary's interpreter to the standard system path. The `blit-musl` build verifies its only NEEDED library is `libc.so`. `install.sh` auto-detects the system libc (musl vs glibc) and downloads the right tarball.
+
+On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed.
 
 The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) in [`nix/common.nix`](nix/common.nix). The same toolchain also includes `wasm32-unknown-unknown` for the browser WASM build.
 
-The tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages have no required dependencies — download, extract, run.
+The glibc tarballs on `install.blit.sh/bin/` and `.deb` packages require only system glibc + GPU drivers. The musl tarballs require only system musl libc. macOS and Windows binaries have no required dependencies.
 
 On Windows, Nix isn't available, so the `_build-windows.yml` reusable workflow uses `cargo build --release` directly on a Windows runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
 
