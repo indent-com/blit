@@ -356,8 +356,10 @@ impl VulkanRenderer {
                 return None;
             }
         }
-        let mut device_extensions: Vec<*const std::ffi::c_char> =
-            required_base_extensions.iter().map(|e| e.as_ptr()).collect();
+        let mut device_extensions: Vec<*const std::ffi::c_char> = required_base_extensions
+            .iter()
+            .map(|e| e.as_ptr())
+            .collect();
         if has_external_fence_fd {
             device_extensions.push(ash::khr::external_fence::NAME.as_ptr());
             device_extensions.push(ash::khr::external_fence_fd::NAME.as_ptr());
