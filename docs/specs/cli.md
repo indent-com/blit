@@ -990,13 +990,12 @@ Braille character animation: `⣷⣯⣟⡿⢿⣻⣽⣾` at 10 frames/second, wit
 | `INDENT_TIMEOUT_SECONDS`                 | —            | Inactivity timeout for `run`        |
 | `INDENT_TERMINAL_CONTROLLER_SOCKET`      | —            | TLV terminal controller socket path |
 | `INDENT_TERMINAL_CONTROLLER_BLIT_SOCKET` | —            | Blit server socket path             |
-
-| `SSH_TTY` | — | Detect SSH session (read-only) |
-| `SSH_CONNECTION` | — | Detect SSH session (read-only) |
-| `SHELL` | `/bin/sh` | User's shell |
-| `TMPDIR` | `/tmp` | Blit socket path fallback |
-| `XDG_RUNTIME_DIR` | — | Blit socket path fallback |
-| `USER` | — | Blit socket path fallback |
+| `SSH_TTY`                                | —            | Detect SSH session (read-only)      |
+| `SSH_CONNECTION`                         | —            | Detect SSH session (read-only)      |
+| `SHELL`                                  | `/bin/sh`    | User's shell                        |
+| `TMPDIR`                                 | `/tmp`       | Blit socket path fallback           |
+| `XDG_RUNTIME_DIR`                        | —            | Blit socket path fallback           |
+| `USER`                                   | —            | Blit socket path fallback           |
 
 ---
 
