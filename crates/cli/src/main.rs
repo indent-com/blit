@@ -262,6 +262,7 @@ async fn async_main() {
                     .ok()
                     .and_then(|v| blit_server::SurfaceQuality::parse(&v))
                     .unwrap_or_default(),
+                chroma: blit_server::ChromaSubsampling::from_env(),
                 vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
                     .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
                 #[cfg(unix)]

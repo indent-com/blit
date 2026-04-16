@@ -1,0 +1,42 @@
+#version 450
+
+// Convert BGRA → YUV 4:4:4 via image storage (tiled surfaces).
+// Y, U, V planes written as separate R8 images (full resolution each).
+// Vulkan handles tiling internally — works with any DRM modifier.
+// Source pixels are edge-extended into encoder padding area.
+// Dispatch with (ceil(enc_width/16), ceil(enc_height/16), 1).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D bgra_in;
+layout(set = 0, binding = 1, r8)    writeonly uniform image2D y_out;
+layout(set = 0, binding = 2, r8)    writeonly uniform image2D u_out;
+layout(set = 0, binding = 3, r8)    writeonly uniform image2D v_out;
+
+layout(push_constant) uniform Params {
+    uint src_width;   // BGRA source dimensions
+    uint src_height;
+    uint enc_width;   // YUV444 output dimensions (>= src, encoder-aligned)
+    uint enc_height;
+};
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    if (pos.x >= enc_width || pos.y >= enc_height) return;
+
+    // Clamp to source dimensions for edge-extension into padding.
+    ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
+    vec4 bgra = imageLoad(bgra_in, src);
+    float r = bgra.z;  // BGRA: z=R
+    float g = bgra.y;  // BGRA: y=G
+    float b = bgra.x;  // BGRA: x=B
+
+    // BT.601 full-range RGB→YUV
+    float y_val = 0.299 * r + 0.587 * g + 0.114 * b;
+    float u_val = -0.169 * r - 0.331 * g + 0.500 * b + 0.5;
+    float v_val =  0.500 * r - 0.419 * g - 0.081 * b + 0.5;
+
+    imageStore(y_out, ivec2(pos), vec4(y_val, 0, 0, 0));
+    imageStore(u_out, ivec2(pos), vec4(u_val, 0, 0, 0));
+    imageStore(v_out, ivec2(pos), vec4(v_val, 0, 0, 0));
+}

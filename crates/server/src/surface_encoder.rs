@@ -146,6 +146,42 @@ impl SurfaceEncoderPreference {
     }
 }
 
+/// Chroma subsampling mode.
+///
+/// - **Cs420** (default): 4:2:0 — U/V at half horizontal and half vertical
+///   resolution.  Universally supported, lower bandwidth.
+/// - **Cs444**: 4:4:4 — full-resolution chroma.  Eliminates colour fringing
+///   on sharp edges (ideal for text / UI), but requires encoder support.
+///
+/// Set via `BLIT_CHROMA` env var. Default: 444 (fall back to 420 if unsupported).
+/// Use `BLIT_CHROMA=420` to force 4:2:0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ChromaSubsampling {
+    Cs420,
+    #[default]
+    Cs444,
+}
+
+impl ChromaSubsampling {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cs420 => "4:2:0",
+            Self::Cs444 => "4:4:4",
+        }
+    }
+
+    pub fn from_env() -> Self {
+        match std::env::var("BLIT_CHROMA").ok().as_deref() {
+            Some("420") => Self::Cs420,
+            _ => Self::Cs444,
+        }
+    }
+
+    pub fn is_444(self) -> bool {
+        matches!(self, Self::Cs444)
+    }
+}
+
 /// Video quality preset.  Higher quality uses more CPU / bandwidth.
 ///
 /// - **Low**: speed 10, quantizer 180 — minimal CPU, visibly lossy
@@ -288,6 +324,9 @@ pub struct SurfaceEncoder {
     source_width: u32,
     source_height: u32,
     kind: SurfaceEncoderKind,
+    /// Negotiated chroma subsampling (may differ from requested if backend
+    /// does not support 4:4:4).
+    chroma: ChromaSubsampling,
 }
 
 enum SurfaceEncoderKind {
@@ -313,13 +352,56 @@ impl SurfaceEncoder {
         quality: SurfaceQuality,
         verbose: bool,
         codec_support: u8,
+        chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         let source_width = width;
         let source_height = height;
         let mut last_err = String::from("no encoders configured");
 
+        // When 4:4:4 is requested, try each preference with 444 first.
+        // If none succeed, fall through to 4:2:0 below.
+        if chroma.is_444() {
+            for &pref in preferences {
+                if pref.is_vulkan_video() {
+                    continue;
+                }
+                if !pref.supported_by_client(codec_support) {
+                    continue;
+                }
+                match Self::try_one(
+                    pref,
+                    width,
+                    height,
+                    source_width,
+                    source_height,
+                    vaapi_device,
+                    quality,
+                    verbose,
+                    ChromaSubsampling::Cs444,
+                ) {
+                    Ok(enc) => {
+                        if verbose {
+                            eprintln!(
+                                "[surface-encoder] using {:?} 4:4:4 for {source_width}x{source_height}",
+                                pref
+                            );
+                        }
+                        return Ok(enc);
+                    }
+                    Err(err) => {
+                        if verbose {
+                            eprintln!(
+                                "[surface-encoder] {:?} 4:4:4 unavailable for {source_width}x{source_height}: {err}",
+                                pref
+                            );
+                        }
+                        last_err = err;
+                    }
+                }
+            }
+        }
+
         for &pref in preferences {
-            // Vulkan Video encoders live in the compositor, not in SurfaceEncoder.
             if pref.is_vulkan_video() {
                 continue;
             }
@@ -335,6 +417,7 @@ impl SurfaceEncoder {
                 vaapi_device,
                 quality,
                 verbose,
+                ChromaSubsampling::Cs420,
             ) {
                 Ok(enc) => {
                     if verbose {
@@ -368,6 +451,7 @@ impl SurfaceEncoder {
         vaapi_device: &str,
         quality: SurfaceQuality,
         verbose: bool,
+        chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         let _ = vaapi_device;
         validate_surface_dimensions(width, height, pref)?;
@@ -387,9 +471,10 @@ impl SurfaceEncoder {
                     source_height,
                     kind: SurfaceEncoderKind::NvencH264(Box::new(
                         crate::nvenc_encode::NvencDirectEncoder::try_new(
-                            "h264", width, height, qp, verbose,
+                            "h264", width, height, qp, verbose, chroma,
                         )?,
                     )),
+                    chroma,
                 })
             }
             SurfaceEncoderPreference::NvencAV1 => {
@@ -405,9 +490,10 @@ impl SurfaceEncoder {
                     source_height,
                     kind: SurfaceEncoderKind::NvencAV1(Box::new(
                         crate::nvenc_encode::NvencDirectEncoder::try_new(
-                            "av1", width, height, qp, verbose,
+                            "av1", width, height, qp, verbose, chroma,
                         )?,
                     )),
+                    chroma,
                 })
             }
             #[cfg(target_os = "linux")]
@@ -425,8 +511,10 @@ impl SurfaceEncoder {
                             vaapi_device,
                             quality.h264_qp(),
                             verbose,
+                            chroma,
                         )?,
                     )),
+                    chroma,
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -448,8 +536,10 @@ impl SurfaceEncoder {
                             vaapi_device,
                             quality.av1_quantizer() as u8,
                             verbose,
+                            chroma,
                         )?,
                     )),
+                    chroma,
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -460,10 +550,14 @@ impl SurfaceEncoder {
                 source_width,
                 source_height,
                 kind: SurfaceEncoderKind::AV1Software(Box::new(SoftwareAV1Encoder::new(
-                    width, height, quality,
+                    width, height, quality, chroma,
                 )?)),
+                chroma,
             }),
             SurfaceEncoderPreference::H264Software => {
+                if chroma.is_444() {
+                    return Err("openh264 does not support 4:4:4".into());
+                }
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
                 Ok(Self {
                     width,
@@ -473,6 +567,7 @@ impl SurfaceEncoder {
                     kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new(
                         quality,
                     )?)),
+                    chroma,
                 })
             }
         }
@@ -490,17 +585,24 @@ impl SurfaceEncoder {
     }
 
     /// Human-readable name of the active encoder backend, sent to clients
-    /// for display in debug panels.
+    /// for display in debug panels.  Includes chroma subsampling when 4:4:4.
     pub fn encoder_name(&self) -> &'static str {
-        match &self.kind {
-            SurfaceEncoderKind::H264Software(_) => "h264-software",
-            SurfaceEncoderKind::NvencH264(_) => "h264-nvenc",
-            SurfaceEncoderKind::NvencAV1(_) => "av1-nvenc",
+        match (&self.kind, self.chroma) {
+            (SurfaceEncoderKind::H264Software(_), _) => "h264-software",
+            (SurfaceEncoderKind::NvencH264(_), ChromaSubsampling::Cs444) => "h264-nvenc 4:4:4",
+            (SurfaceEncoderKind::NvencH264(_), _) => "h264-nvenc",
+            (SurfaceEncoderKind::NvencAV1(_), ChromaSubsampling::Cs444) => "av1-nvenc 4:4:4",
+            (SurfaceEncoderKind::NvencAV1(_), _) => "av1-nvenc",
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::H264Vaapi(_) => "h264-vaapi",
+            (SurfaceEncoderKind::H264Vaapi(_), ChromaSubsampling::Cs444) => "h264-vaapi 4:4:4",
             #[cfg(target_os = "linux")]
-            SurfaceEncoderKind::AV1Vaapi(_) => "av1-vaapi",
-            SurfaceEncoderKind::AV1Software(_) => "av1-software",
+            (SurfaceEncoderKind::H264Vaapi(_), _) => "h264-vaapi",
+            #[cfg(target_os = "linux")]
+            (SurfaceEncoderKind::AV1Vaapi(_), ChromaSubsampling::Cs444) => "av1-vaapi 4:4:4",
+            #[cfg(target_os = "linux")]
+            (SurfaceEncoderKind::AV1Vaapi(_), _) => "av1-vaapi",
+            (SurfaceEncoderKind::AV1Software(_), ChromaSubsampling::Cs444) => "av1-software 4:4:4",
+            (SurfaceEncoderKind::AV1Software(_), _) => "av1-software",
         }
     }
 
@@ -1065,7 +1167,11 @@ impl SurfaceEncoder {
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::AV1Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
             SurfaceEncoderKind::AV1Software(encoder) => {
-                let yuv = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
+                let yuv = if self.chroma.is_444() {
+                    bgra_to_yuv444_padded(bgra, src_w, src_h, enc_w, enc_h)
+                } else {
+                    bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h)
+                };
                 encoder.encode_yuv_planes(&yuv)
             }
         };
@@ -1314,6 +1420,68 @@ fn compute_uv_planes_padded(
     }
 }
 
+/// Compute full-resolution chroma planes (4:4:4) from packed 4-byte pixels
+/// with edge-pixel padding to encoder dimensions.
+#[inline(always)]
+fn compute_uv_planes_444_padded(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    enc_w: usize,
+    enc_h: usize,
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+    r_off: usize,
+    g_off: usize,
+    b_off: usize,
+) {
+    for row in 0..enc_h {
+        let sr = row.min(src_h - 1);
+        for col in 0..enc_w {
+            let sc = col.min(src_w - 1);
+            let i = (sr * src_w + sc) * 4;
+            let r = src[i + r_off] as i32;
+            let g = src[i + g_off] as i32;
+            let b = src[i + b_off] as i32;
+            let idx = row * enc_w + col;
+            u_plane[idx] = rgb_to_u(r, g, b);
+            v_plane[idx] = rgb_to_v(r, g, b);
+        }
+    }
+}
+
+/// BGRA -> I444 (YUV 4:4:4) with edge-pixel padding to encoder dimensions.
+fn bgra_to_yuv444_padded(
+    bgra: &[u8],
+    src_w: usize,
+    src_h: usize,
+    enc_w: usize,
+    enc_h: usize,
+) -> Vec<u8> {
+    let plane_size = enc_w * enc_h;
+    let mut yuv = vec![0u8; plane_size * 3];
+    let (y_plane, uv) = yuv.split_at_mut(plane_size);
+    let (u_plane, v_plane) = uv.split_at_mut(plane_size);
+    // BGRA offsets: B=0, G=1, R=2, A=3
+    compute_y_plane_padded(bgra, src_w, src_h, enc_w, enc_h, y_plane, 2, 1, 0);
+    compute_uv_planes_444_padded(bgra, src_w, src_h, enc_w, enc_h, u_plane, v_plane, 2, 1, 0);
+    yuv
+}
+
+/// RGBA -> I444 (YUV 4:4:4).
+fn rgba_to_yuv444(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let plane_size = width * height;
+    let mut yuv = vec![0u8; plane_size * 3];
+    let (y_plane, uv) = yuv.split_at_mut(plane_size);
+    let (u_plane, v_plane) = uv.split_at_mut(plane_size);
+    // RGBA offsets: R=0, G=1, B=2, A=3
+    compute_y_plane(rgba, width, height, y_plane, 0, 1, 2);
+    compute_uv_planes_444_padded(
+        rgba, width, height, width, height, u_plane, v_plane, 0, 1, 2,
+    );
+    yuv
+}
+
 /// BGRA -> I420 with edge-pixel padding to encoder dimensions.
 /// `src_w × src_h` is the actual pixel count in `bgra`.
 /// `enc_w × enc_h` is the encoder output dimensions (>= src).
@@ -1547,18 +1715,29 @@ struct SoftwareAV1Encoder {
     width: usize,
     height: usize,
     force_keyframe: bool,
+    chroma: ChromaSubsampling,
 }
 
 impl SoftwareAV1Encoder {
-    fn new(width: u32, height: u32, quality: SurfaceQuality) -> Result<Self, String> {
+    fn new(
+        width: u32,
+        height: u32,
+        quality: SurfaceQuality,
+        chroma: ChromaSubsampling,
+    ) -> Result<Self, String> {
         use rav1e::prelude::*;
 
+        let chroma_sampling = if chroma.is_444() {
+            ChromaSampling::Cs444
+        } else {
+            ChromaSampling::Cs420
+        };
         let mut speed = SpeedSettings::from_preset(quality.av1_speed());
         speed.rdo_lookahead_frames = 1;
         let enc = EncoderConfig {
             width: width as usize,
             height: height as usize,
-            chroma_sampling: ChromaSampling::Cs420,
+            chroma_sampling,
             chroma_sample_position: ChromaSamplePosition::Unknown,
             speed_settings: speed,
             low_latency: true,
@@ -1578,6 +1757,7 @@ impl SoftwareAV1Encoder {
             width: width as usize,
             height: height as usize,
             force_keyframe: false,
+            chroma,
         })
     }
 
@@ -1586,7 +1766,11 @@ impl SoftwareAV1Encoder {
     }
 
     fn encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        let yuv = rgba_to_yuv420(rgba, self.width, self.height);
+        let yuv = if self.chroma.is_444() {
+            rgba_to_yuv444(rgba, self.width, self.height)
+        } else {
+            rgba_to_yuv420(rgba, self.width, self.height)
+        };
         self.encode_yuv_planes(&yuv)
     }
 
@@ -1602,14 +1786,19 @@ impl SoftwareAV1Encoder {
         self.encode_yuv_planes(&yuv)
     }
 
-    /// Encode from pre-converted I420 planar YUV data (Y + U + V contiguous).
+    /// Encode from pre-converted planar YUV data (Y + U + V contiguous).
+    /// Layout depends on chroma: I420 (half-res UV) or I444 (full-res UV).
     fn encode_yuv_planes(&mut self, yuv: &[u8]) -> Option<(Vec<u8>, bool)> {
         let width = self.width;
         let height = self.height;
         let y_size = width * height;
-        let uv_w = width.div_ceil(2);
-        let uv_h = height.div_ceil(2);
-        let uv_size = uv_w * uv_h;
+        let (uv_w, uv_size) = if self.chroma.is_444() {
+            (width, width * height)
+        } else {
+            let uv_w = width.div_ceil(2);
+            let uv_h = height.div_ceil(2);
+            (uv_w, uv_w * uv_h)
+        };
 
         let y_plane = &yuv[..y_size];
         let u_plane = &yuv[y_size..y_size + uv_size];
