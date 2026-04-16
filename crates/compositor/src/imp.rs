@@ -4904,6 +4904,17 @@ fn run_compositor(
     let display: Display<Compositor> = Display::new().expect("failed to create display");
     let dh = display.handle();
 
+    // Probe Vulkan early so we know whether DMA-BUF is available
+    // before registering Wayland globals.
+    eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
+    let vulkan_renderer = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
+    let has_dmabuf = vulkan_renderer.as_ref().is_some_and(|vk| vk.has_dmabuf());
+    eprintln!(
+        "[compositor] Vulkan renderer: {} (dmabuf={})",
+        vulkan_renderer.is_some(),
+        has_dmabuf,
+    );
+
     // Create globals.
     dh.create_global::<Compositor, WlCompositor, ()>(6, ());
     dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
@@ -4911,7 +4922,13 @@ fn run_compositor(
     dh.create_global::<Compositor, WlShm, ()>(1, ());
     dh.create_global::<Compositor, WlOutput, ()>(4, ());
     dh.create_global::<Compositor, WlSeat, ()>(9, ());
-    dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    // Only advertise zwp_linux_dmabuf_v1 when the Vulkan device can
+    // actually import DMA-BUFs.  Advertising the global with zero
+    // formats confuses clients (Chrome, mpv) into not falling back to
+    // wl_shm.
+    if has_dmabuf {
+        dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    }
     dh.create_global::<Compositor, WpViewporter, ()>(1, ());
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
@@ -4951,12 +4968,7 @@ fn run_compositor(
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),
         dmabuf_params: HashMap::new(),
-        vulkan_renderer: {
-            eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
-            let r = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
-            eprintln!("[compositor] Vulkan renderer: {}", r.is_some());
-            r
-        },
+        vulkan_renderer,
         output_width: 1920,
         output_height: 1080,
         output_refresh_mhz: 60_000,
