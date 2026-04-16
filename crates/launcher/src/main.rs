@@ -1,4 +1,4 @@
-//! Tiny no_std static launcher for blit on Linux.
+//! Static launcher for blit on Linux.
 //!
 //! The main blit binary is dynamically linked against musl libc so that
 //! `dlopen` works (needed for GPU acceleration: VA-API, NVENC, Vulkan).
@@ -9,206 +9,78 @@
 //!
 //! Expected install layout (PREFIX = e.g. /usr/local):
 //!
-//!     PREFIX/bin/blit                          <- this launcher (static, no_std)
+//!     PREFIX/bin/blit                          <- this launcher (static)
 //!     PREFIX/lib/blit/blit                     <- real binary (dynamic musl)
 //!     PREFIX/lib/blit/ld-musl-<arch>.so.1      <- musl dynamic linker
 
-#![no_std]
-#![no_main]
-
-use core::panic::PanicInfo;
-use core::ptr;
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    unsafe { libc::_exit(127) }
-}
-
-const MAX_PATH: usize = libc::PATH_MAX as usize;
+use std::ffi::CString;
+use std::path::PathBuf;
 
 #[cfg(target_arch = "x86_64")]
-const LOADER_SUFFIX: &[u8] = b"/lib/blit/ld-musl-x86_64.so.1\0";
+const LOADER_NAME: &str = "ld-musl-x86_64.so.1";
 #[cfg(target_arch = "aarch64")]
-const LOADER_SUFFIX: &[u8] = b"/lib/blit/ld-musl-aarch64.so.1\0";
+const LOADER_NAME: &str = "ld-musl-aarch64.so.1";
 
-const BLIT_SUFFIX: &[u8] = b"/lib/blit/blit\0";
-const BIN_COMPONENT: &[u8] = b"/bin";
-const WRAPPER_PREFIX: &[u8] = b"BLIT_WRAPPER_DIR=";
-const PROC_SELF_EXE: &[u8] = b"/proc/self/exe\0";
+const WRAPPER_ENV: &str = "BLIT_WRAPPER_DIR";
 
-unsafe fn alloc_ptrs(count: usize) -> *mut *const libc::c_char {
-    let p = unsafe { libc::malloc(count * core::mem::size_of::<*const libc::c_char>()) };
-    if p.is_null() {
-        fatal(b"blit: out of memory\n");
+fn main() {
+    let exe = std::env::current_exe().unwrap_or_else(|e| fatal(&format!("cannot resolve self: {e}")));
+
+    // bin_dir = e.g. /usr/local/bin
+    let bin_dir = exe.parent().unwrap_or_else(|| fatal("cannot resolve parent dir"));
+
+    // Derive PREFIX by stripping the trailing /bin component.
+    let prefix: PathBuf = if bin_dir.file_name().map(|n| n == "bin").unwrap_or(false) {
+        bin_dir.parent().unwrap_or(bin_dir).to_path_buf()
+    } else {
+        bin_dir.to_path_buf()
+    };
+
+    let lib_dir = prefix.join("lib/blit");
+    let loader = lib_dir.join(LOADER_NAME);
+    let real_bin = lib_dir.join("blit");
+
+    // Set BLIT_WRAPPER_DIR so the real binary can find the launcher for re-exec.
+    // SAFETY: single-threaded launcher, no other threads can observe env.
+    unsafe { std::env::set_var(WRAPPER_ENV, bin_dir) };
+
+    // Build argv: [loader, real_bin, original_args[1..]]
+    let mut args: Vec<CString> = Vec::new();
+    let loader_c = to_cstring(&loader);
+    let real_bin_c = to_cstring(&real_bin);
+    args.push(loader_c.clone());
+    args.push(real_bin_c);
+    for arg in std::env::args_os().skip(1) {
+        args.push(CString::new(arg.into_encoded_bytes()).unwrap_or_else(|_| fatal("invalid argument")));
     }
-    let p = p.cast::<*const libc::c_char>();
+
+    // Build envp from current (modified) environment.
+    let envp: Vec<CString> = std::env::vars_os()
+        .map(|(k, v)| {
+            let mut entry = k.into_encoded_bytes();
+            entry.push(b'=');
+            entry.extend_from_slice(&v.into_encoded_bytes());
+            CString::new(entry).unwrap_or_else(|_| fatal("invalid env"))
+        })
+        .collect();
+
+    let argv_ptrs: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    let envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+
     unsafe {
-        libc::memset(p.cast(), 0, count * core::mem::size_of::<*const libc::c_char>());
+        libc::execve(loader_c.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
     }
-    p
+
+    // execve only returns on failure.
+    fatal(&format!("exec failed: {}", std::io::Error::last_os_error()));
 }
 
-unsafe fn count_null_terminated(p: *const *const libc::c_char) -> usize {
-    let mut n: usize = 0;
-    if !p.is_null() {
-        unsafe {
-            while !(*p.add(n)).is_null() {
-                n += 1;
-            }
-        }
-    }
-    n
+fn fatal(msg: &str) -> ! {
+    eprintln!("blit: {msg}");
+    std::process::exit(1);
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn main(
-    argc: libc::c_int,
-    argv: *const *const libc::c_char,
-    envp: *const *const libc::c_char,
-) -> libc::c_int {
-    unsafe {
-        // Resolve our own path via /proc/self/exe.
-        let mut exe_buf = [0u8; MAX_PATH];
-        let exe_len = libc::readlink(
-            PROC_SELF_EXE.as_ptr().cast(),
-            exe_buf.as_mut_ptr().cast(),
-            MAX_PATH - 1,
-        );
-        if exe_len <= 0 {
-            fatal(b"blit: cannot read /proc/self/exe\n");
-        }
-        let exe_len = exe_len as usize;
-
-        // Find parent directory of the binary (the bin/ dir).
-        let mut bin_dir_len = exe_len;
-        while bin_dir_len > 0 && exe_buf[bin_dir_len - 1] != b'/' {
-            bin_dir_len -= 1;
-        }
-        if bin_dir_len > 0 {
-            bin_dir_len -= 1; // strip the '/' itself
-        }
-
-        // Derive PREFIX by stripping the trailing /bin component.
-        // If the parent dir doesn't end in /bin, fall back to it directly
-        // (handles non-standard layouts where everything is in one dir).
-        let mut prefix_len = bin_dir_len;
-        if bin_dir_len >= BIN_COMPONENT.len() {
-            let tail_start = bin_dir_len - BIN_COMPONENT.len();
-            if slice_eq(&exe_buf[tail_start..bin_dir_len], BIN_COMPONENT) {
-                // Ends with /bin — strip it, but keep at least root.
-                prefix_len = if tail_start > 0 { tail_start } else { 1 };
-            }
-        }
-
-        // Build loader path: <prefix> + LOADER_SUFFIX.
-        let mut loader = [0u8; MAX_PATH];
-        if prefix_len + LOADER_SUFFIX.len() >= MAX_PATH {
-            fatal(b"blit: path too long\n");
-        }
-        copy_bytes(&exe_buf, prefix_len, &mut loader, 0);
-        copy_bytes(LOADER_SUFFIX, LOADER_SUFFIX.len(), &mut loader, prefix_len);
-
-        // Build real binary path: <prefix> + BLIT_SUFFIX.
-        let mut real_bin = [0u8; MAX_PATH];
-        if prefix_len + BLIT_SUFFIX.len() >= MAX_PATH {
-            fatal(b"blit: path too long\n");
-        }
-        copy_bytes(&exe_buf, prefix_len, &mut real_bin, 0);
-        copy_bytes(BLIT_SUFFIX, BLIT_SUFFIX.len(), &mut real_bin, prefix_len);
-
-        // Build BLIT_WRAPPER_DIR=<prefix>/bin (null-terminated).
-        // Points at the bin/ directory so blit_exe() returns the launcher path.
-        let mut wrapper_env = [0u8; MAX_PATH];
-        let env_pfx = WRAPPER_PREFIX.len();
-        if env_pfx + bin_dir_len + 1 >= MAX_PATH {
-            fatal(b"blit: path too long\n");
-        }
-        copy_bytes(WRAPPER_PREFIX, env_pfx, &mut wrapper_env, 0);
-        copy_bytes(&exe_buf, bin_dir_len, &mut wrapper_env, env_pfx);
-        wrapper_env[env_pfx + bin_dir_len] = 0;
-
-        // Build new argv: [loader, real_bin, original_argv[1..], NULL].
-        // argc + 2: one extra slot for loader (replacing argv[0]) plus the
-        // real binary inserted before the original args, plus NULL terminator.
-        let new_argc = argc as usize + 2;
-        let new_argv = alloc_ptrs(new_argc);
-        *new_argv.add(0) = loader.as_ptr().cast();
-        *new_argv.add(1) = real_bin.as_ptr().cast();
-        let mut i: usize = 1;
-        while i < argc as usize {
-            *new_argv.add(i + 1) = *argv.add(i);
-            i += 1;
-        }
-        *new_argv.add(argc as usize + 1) = ptr::null();
-
-        // Build new envp: existing env + BLIT_WRAPPER_DIR, NULL-terminated.
-        let envc = count_null_terminated(envp);
-        let new_envp = alloc_ptrs(envc + 2); // +1 for BLIT_WRAPPER_DIR, +1 for NULL
-        let mut dst: usize = 0;
-        let mut replaced = false;
-        let mut j: usize = 0;
-        while j < envc {
-            let entry = *envp.add(j);
-            if starts_with_cstr(entry, WRAPPER_PREFIX) {
-                *new_envp.add(dst) = wrapper_env.as_ptr().cast();
-                replaced = true;
-            } else {
-                *new_envp.add(dst) = entry;
-            }
-            dst += 1;
-            j += 1;
-        }
-        if !replaced {
-            *new_envp.add(dst) = wrapper_env.as_ptr().cast();
-            dst += 1;
-        }
-        *new_envp.add(dst) = ptr::null();
-
-        libc::execve(loader.as_ptr().cast(), new_argv, new_envp);
-
-        // execve only returns on failure.
-        fatal(b"blit: exec failed\n");
-    }
-}
-
-unsafe fn fatal(msg: &[u8]) -> ! {
-    unsafe {
-        libc::write(2, msg.as_ptr().cast(), msg.len());
-        libc::_exit(1)
-    }
-}
-
-fn copy_bytes(src: &[u8], len: usize, dst: &mut [u8], offset: usize) {
-    let mut i = 0;
-    while i < len {
-        dst[offset + i] = src[i];
-        i += 1;
-    }
-}
-
-fn slice_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-unsafe fn starts_with_cstr(cstr: *const libc::c_char, prefix: &[u8]) -> bool {
-    unsafe {
-        let mut i = 0;
-        while i < prefix.len() {
-            if *cstr.add(i) as u8 != prefix[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
+fn to_cstring(p: &std::path::Path) -> CString {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(p.as_os_str().as_bytes()).unwrap_or_else(|_| fatal("path contains null"))
 }

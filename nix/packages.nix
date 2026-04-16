@@ -101,20 +101,28 @@
           preBuild = copyWebAppDist;
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # Prevent Nix fixup from replacing the musl dynamic linker
+          # with glibc's ld-linux — the musl linker already sets the
+          # correct interpreter (ld-musl-<arch>.so.1).
+          dontPatchELF = true;
           postFixup = ''
             for bin in $out/bin/*; do
-              # Verify the binary is dynamically linked and its only
-              # dynamic dependency is the musl loader.
-              if file "$bin" | grep -q "statically linked"; then
-                echo "FATAL: $bin is statically linked (expected dynamic musl):"
-                file "$bin"
-                exit 1
-              fi
-              deps=$(ldd "$bin" 2>/dev/null | grep -oP '/\S+' || true)
-              for dep in $deps; do
-                case "$(basename "$dep")" in
-                  ld-musl-*) ;;
-                  *) echo "FATAL: unexpected dynamic dep: $dep"; exit 1 ;;
+              # Verify interpreter is musl (not glibc).  We use readelf
+              # because the build host's ldd is glibc and can't resolve
+              # musl binaries correctly.
+              interp=$(readelf -l "$bin" 2>/dev/null \
+                | grep -oP 'Requesting program interpreter: \K[^\]]+' || true)
+              case "$(basename "$interp")" in
+                ld-musl-*) ;;
+                *) echo "FATAL: expected musl interpreter, got: $interp"; exit 1 ;;
+              esac
+              # Verify NEEDED libs are only musl libc.
+              needed=$(readelf -d "$bin" 2>/dev/null \
+                | grep -oP '\(NEEDED\)\s+Shared library: \[\K[^\]]+' || true)
+              for lib in $needed; do
+                case "$lib" in
+                  libc.so) ;;
+                  *) echo "FATAL: unexpected NEEDED library: $lib"; exit 1 ;;
                 esac
               done
             done
@@ -150,9 +158,7 @@
         let
           launcherSrc = pkgs.lib.cleanSourceWith {
             src = ../crates/launcher;
-            filter = path: type:
-              (craneLibStatic.filterCargoSources path type)
-              || builtins.baseNameOf path == "build.rs";
+            filter = craneLibStatic.filterCargoSources;
           };
           muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
           muslLibcLib = pkgs.pkgsStatic.stdenv.cc.libc;
@@ -165,6 +171,7 @@
             strictDeps = true;
             doCheck = false;
             cargoVendorDir = craneLibStatic.vendorCargoDeps { cargoLock = ../crates/launcher/Cargo.lock; };
+            RUSTFLAGS = "-C target-feature=+crt-static";
             postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
               for bin in $out/bin/*; do
                 if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
@@ -176,15 +183,11 @@
             '';
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # craneLibStatic provides the musl CC.  CARGO_BUILD_TARGET makes
-            # build scripts compile for glibc (the build machine) while the
-            # final binary targets musl.
-            #
-            # We must NOT add musl libc to buildInputs — its setup hooks
-            # leak into the build-script environment and break glibc linking.
-            # Instead, unset RUSTFLAGS (so Cargo reads config-level flags)
-            # and inject target-specific rustflags via cargo config that
-            # pass +crt-static and -L<musl-libc>/lib only for the musl target.
+            # craneLibStatic provides the musl CC.  CARGO_BUILD_TARGET keeps
+            # build scripts targeting glibc (the build host) while the final
+            # binary targets musl.  std handles libc linking automatically,
+            # so we only need to inject -L<musl-libc>/lib via cargo config
+            # (target-scoped so build scripts aren't affected).
             CARGO_BUILD_TARGET = muslTarget;
             postUnpack = ''
               export NIX_CFLAGS_LINK=""

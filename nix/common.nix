@@ -149,7 +149,9 @@ let
     ];
     # Link musl libc dynamically so dlopen works (GPU acceleration).
     # All other deps (libopus, pixman, etc.) remain statically linked.
-    RUSTFLAGS = "-C target-feature=-crt-static";
+    # -no-pie: the musl static toolchain's libstdc++.a (pulled in by
+    # aws-lc-sys) wasn't built with -fPIE, so we can't produce a PIE.
+    RUSTFLAGS = "-C target-feature=-crt-static -C link-arg=-no-pie";
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
     CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
@@ -159,7 +161,31 @@ let
       pkgs.pkg-config
       pkgs.llvmPackages.libclang
     ];
-    postUnpack = "export NIX_CFLAGS_LINK=''";
+    # Rustc hardcodes `-lgcc_s` for dynamic-musl targets, but the musl
+    # static toolchain only ships libgcc.a (no libgcc_s.so).  Provide a
+    # libgcc_s.a containing just the unwinding symbols from libgcc.a.
+    # Scoped to the musl target via NIX_LDFLAGS_<role> so the glibc CC
+    # used for build scripts is unaffected.
+    postUnpack =
+      let
+        cc = pkgs.pkgsStatic.stdenv.cc;
+        ar = "${cc.bintools.bintools}/bin/${cc.targetPrefix}ar";
+        objcopy = "${cc.bintools.bintools}/bin/${cc.targetPrefix}objcopy";
+        role = builtins.replaceStrings [ "-" ] [ "_" ]
+          pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+      in
+      ''
+        export NIX_CFLAGS_LINK=""
+        gccLib=$(dirname $(${cc}/bin/${cc.targetPrefix}cc -print-libgcc-file-name))
+        mkdir -p $TMPDIR/gcc-compat
+        # Extract only the unwinding .o files from libgcc.a
+        pushd $TMPDIR/gcc-compat > /dev/null
+        ${ar} x "$gccLib/libgcc.a"
+        ${ar} rcs libgcc_s.a unwind-*.o
+        rm -f *.o
+        popd > /dev/null
+        export NIX_LDFLAGS_${role}="-L$TMPDIR/gcc-compat ''${NIX_LDFLAGS_${role}:-}"
+      '';
   };
 
   cargoArtifactsStatic = craneLibStatic.buildDepsOnly (

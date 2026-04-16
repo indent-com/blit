@@ -2,7 +2,7 @@
 name = "blit-launcher"
 version = "0.24.1"
 edition = "2024"
-description = "Tiny no_std static launcher that exec()s the dynamically-linked blit binary through the bundled musl dynamic linker"
+description = "Static launcher that exec()s the dynamically-linked blit binary through the bundled musl dynamic linker"
 license = "MIT"
 repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
@@ -12,10 +12,8 @@ name = "blit"
 path = "src/main.rs"
 
 [dependencies]
-libc = { version = "0.2", default-features = false }
-
-[profile.dev]
-panic = "abort"
+libc = "0.2"
 
 [profile.release]
-panic = "abort"
+strip = true
+lto = true
