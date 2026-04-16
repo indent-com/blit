@@ -3717,19 +3717,15 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
                     let mod_lo = (modifier & 0xFFFFFFFF) as u32;
                     dmabuf.modifier(drm_fmt, mod_hi, mod_lo);
                 }
-            } else {
-                // No Vulkan or no DMA-BUF extensions — only LINEAR is safe.
-                let formats = [
-                    drm_fourcc::ARGB8888,
-                    drm_fourcc::XRGB8888,
-                    drm_fourcc::ABGR8888,
-                    drm_fourcc::XBGR8888,
-                ];
-                for fmt in formats {
-                    dmabuf.modifier(fmt, 0, 0);
-                }
             }
-        } else {
+            // When Vulkan has no DMA-BUF extensions (SHM-only mode) we
+            // intentionally advertise zero modifiers so clients fall back
+            // to wl_shm.
+        } else if state
+            .vulkan_renderer
+            .as_ref()
+            .is_some_and(|vk| vk.has_dmabuf())
+        {
             dmabuf.format(drm_fourcc::ARGB8888);
             dmabuf.format(drm_fourcc::XRGB8888);
             dmabuf.format(drm_fourcc::ABGR8888);

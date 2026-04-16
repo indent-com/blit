@@ -911,7 +911,6 @@ impl VulkanRenderer {
     }
 
     /// Whether the device supports DMA-BUF import/export extensions.
-    #[expect(dead_code)]
     pub(crate) fn has_dmabuf(&self) -> bool {
         self.has_dmabuf
     }
