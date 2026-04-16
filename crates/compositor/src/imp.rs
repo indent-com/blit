@@ -3709,14 +3709,16 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
             // allocate DMA-BUFs with a tiling layout the compositor can
             // handle natively on the GPU, avoiding broken CPU mmap
             // fallbacks for vendor-specific tiled VRAM.
-            if let Some(ref vk) = state.vulkan_renderer {
+            if let Some(ref vk) = state.vulkan_renderer
+                && !vk.supported_dmabuf_modifiers.is_empty()
+            {
                 for &(drm_fmt, modifier) in &vk.supported_dmabuf_modifiers {
                     let mod_hi = (modifier >> 32) as u32;
                     let mod_lo = (modifier & 0xFFFFFFFF) as u32;
                     dmabuf.modifier(drm_fmt, mod_hi, mod_lo);
                 }
             } else {
-                // No Vulkan — only LINEAR is safe.
+                // No Vulkan or no DMA-BUF extensions — only LINEAR is safe.
                 let formats = [
                     drm_fourcc::ARGB8888,
                     drm_fourcc::XRGB8888,
