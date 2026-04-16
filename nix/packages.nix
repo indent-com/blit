@@ -6,6 +6,7 @@
       common = import ./common.nix { inherit inputs system; };
       inherit (common)
         pkgs
+        pkgsStaticLLVM
         version
         cargoLockConfig
         rustToolchain
@@ -160,8 +161,8 @@
             src = ../crates/launcher;
             filter = craneLibStatic.filterCargoSources;
           };
-          muslTarget = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-          muslLibcLib = pkgs.pkgsStatic.stdenv.cc.libc;
+          muslTarget = pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
+          muslLibcLib = pkgsStaticLLVM.stdenv.cc.libc;
         in
         craneLibStatic.buildPackage (
           {
@@ -208,7 +209,7 @@ EOF
       # On macOS the dynamic binary is used directly (no launcher needed).
       blit-release =
         let
-          muslLib = pkgs.pkgsStatic.stdenv.cc.libc;
+          muslLib = pkgsStaticLLVM.stdenv.cc.libc;
           arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
         in
         if pkgs.stdenv.isLinux then

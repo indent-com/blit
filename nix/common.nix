@@ -90,8 +90,29 @@ let
     }
   );
 
-  # Static (musl on Linux) Crane setup for release tarballs.
-  craneLibStatic = (inputs.crane.mkLib pkgs.pkgsStatic).overrideToolchain (
+  # LLVM-based musl static environment for release tarballs.
+  # Combines isStatic (musl) + useLLVM (clang/lld/compiler-rt/libc++)
+  # so we get PIC-clean C++ libs and avoid the libgcc_s hacks that the
+  # GCC musl toolchain requires.
+  pkgsStaticLLVM =
+    if pkgs.stdenv.isLinux then
+      import inputs.nixpkgs {
+        inherit system;
+        overlays = [ inputs.rust-overlay.overlays.default ];
+        crossSystem = {
+          isStatic = true;
+          useLLVM = true;
+          linker = "lld";
+          config = pkgs.lib.systems.parse.tripleFromSystem (
+            pkgs.lib.systems.parse.mkMuslSystem pkgs.stdenv.hostPlatform.parsed
+          );
+        };
+      }
+    else
+      # macOS doesn't cross-compile to musl — use pkgsStatic as-is.
+      pkgs.pkgsStatic;
+
+  craneLibStatic = (inputs.crane.mkLib pkgsStaticLLVM).overrideToolchain (
     p:
     p.rust-bin.stable.latest.default.override {
       targets = [
@@ -109,7 +130,7 @@ let
   # Mesa's meson.build uses shared_library() for libgbm, which the musl
   # static toolchain cannot link.  Override to use library() so meson
   # respects --default-library=static and produces libgbm.a.
-  staticLibgbm = pkgs.pkgsStatic.libgbm.overrideAttrs (old: {
+  staticLibgbm = pkgsStaticLLVM.libgbm.overrideAttrs (old: {
     postPatch = (old.postPatch or "") + ''
       substituteInPlace src/gbm/meson.build \
         --replace-fail "shared_library(" "library("
@@ -121,7 +142,7 @@ let
   # intrinsics and rtcd (runtime CPU detection depends on intrinsics).
   staticLibopus =
     if pkgs.stdenv.hostPlatform.isAarch64 then
-      pkgs.pkgsStatic.libopus.overrideAttrs (old: {
+      pkgsStaticLLVM.libopus.overrideAttrs (old: {
         mesonFlags = builtins.map (
           f:
           if f == "-Dintrinsics=enabled" then
@@ -133,7 +154,7 @@ let
         ) (old.mesonFlags or [ ]);
       })
     else
-      pkgs.pkgsStatic.libopus;
+      pkgsStaticLLVM.libopus;
 
   commonArgsStatic = {
     inherit src version;
@@ -141,44 +162,42 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       staticLibopus
-      pkgs.pkgsStatic.libxkbcommon
-      pkgs.pkgsStatic.pixman
+      pkgsStaticLLVM.libxkbcommon
+      pkgsStaticLLVM.pixman
     ]
     ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
       staticLibgbm
     ];
     # Link musl libc dynamically so dlopen works (GPU acceleration).
     # All other deps (libopus, pixman, etc.) remain statically linked.
-    # -no-pie: the musl static toolchain's libstdc++.a (pulled in by
-    # aws-lc-sys) wasn't built with -fPIE, so we can't produce a PIE.
-    RUSTFLAGS = "-C target-feature=-crt-static -C link-arg=-no-pie";
+    RUSTFLAGS = "-C target-feature=-crt-static";
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-    CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.pkgsStatic.stdenv.cc.libc}/include";
+    CARGO_BUILD_TARGET = pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
+    # Tell the `cc` crate to link libc++ instead of libstdc++ (LLVM toolchain).
+    CXXSTDLIB = "c++";
+    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgsStaticLLVM.stdenv.cc.libc}/include";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     nativeBuildInputs = [
       pkgs.pkg-config
       pkgs.llvmPackages.libclang
     ];
-    # Rustc hardcodes `-lgcc_s` for dynamic-musl targets, but the musl
-    # static toolchain only ships libgcc.a (no libgcc_s.so).  Provide
-    # libgcc.a under the name libgcc_s.a so the linker finds it.
-    # On aarch64 this also supplies LSE atomics and SME helpers.
+    # Rustc hardcodes `-lgcc_s` for dynamic-musl targets.  With the
+    # LLVM toolchain we provide compiler-rt builtins under that name.
     # Scoped to the musl target via NIX_LDFLAGS_<role> so the glibc CC
     # used for build scripts is unaffected.
     postUnpack =
       let
-        cc = pkgs.pkgsStatic.stdenv.cc;
+        compilerRt = pkgsStaticLLVM.llvmPackages.compiler-rt;
         role = builtins.replaceStrings [ "-" ] [ "_" ]
-          pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
+          pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
       in
       ''
         export NIX_CFLAGS_LINK=""
-        gccLib=$(dirname $(${cc}/bin/${cc.targetPrefix}cc -print-libgcc-file-name))
-        mkdir -p $TMPDIR/gcc-compat
-        cp "$gccLib/libgcc.a" $TMPDIR/gcc-compat/libgcc_s.a
-        export NIX_LDFLAGS_${role}="-L$TMPDIR/gcc-compat ''${NIX_LDFLAGS_${role}:-}"
+        mkdir -p $TMPDIR/rt-compat
+        builtins_lib=$(echo ${compilerRt}/lib/*/libclang_rt.builtins-*.a)
+        ln -s "$builtins_lib" $TMPDIR/rt-compat/libgcc_s.a
+        export NIX_LDFLAGS_${role}="-L$TMPDIR/rt-compat ''${NIX_LDFLAGS_${role}:-}"
       '';
   };
 
@@ -195,6 +214,7 @@ in
 {
   inherit
     pkgs
+    pkgsStaticLLVM
     version
     cargoLockConfig
     rustToolchain
