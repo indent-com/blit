@@ -1164,12 +1164,12 @@ interface FileMetadata {
 ### Distribution
 
 | Channel         | Method                                               |
-| --------------- | ---------------------------------------------------- | --- |
+| --------------- | ---------------------------------------------------- |
 | PyPI (current)  | Continue publishing Python package during transition |
 | GitHub Releases | Standalone binaries per platform                     |
 | npm             | `@indent-com/cli` for `npx indent`                   |
 | Homebrew        | Formula or tap                                       |
-| curl installer  | `curl -sf https://install.indent.com                 | sh` |
+| curl installer  | `curl -sf https://install.indent.com \| sh`          |
 
 ---
 
