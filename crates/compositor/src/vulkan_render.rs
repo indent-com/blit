@@ -2418,6 +2418,20 @@ impl VulkanRenderer {
 
         if let Some(tex) = cached {
             self.surface_textures.insert(surface_id.clone(), tex);
+        } else {
+            static UF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = UF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(1000) {
+                let kind = match pixels {
+                    PixelData::Bgra(_) => "bgra",
+                    PixelData::Rgba(_) => "rgba",
+                    PixelData::DmaBuf { .. } => "dmabuf",
+                    _ => "other",
+                };
+                eprintln!(
+                    "[upload #{n}] FAILED kind={kind} {width}x{height} sid={surface_id:?}",
+                );
+            }
         }
     }
 
