@@ -3337,13 +3337,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                 };
 
                 {
-                    static EC: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
+                    static EC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let n = EC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n < 5 || n.is_multiple_of(1000) {
                         eprintln!(
                             "[encode #{n}] sid={} {}x{} kf={is_keyframe} bytes={}",
-                            result.sid, result.px_w, result.px_h, nal_data.len(),
+                            result.sid,
+                            result.px_w,
+                            result.px_h,
+                            nal_data.len(),
                         );
                     }
                 }
