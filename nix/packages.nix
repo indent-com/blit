@@ -155,7 +155,7 @@
           interpreter =
             if pkgs.stdenv.hostPlatform.isAarch64
             then "/lib/ld-linux-aarch64.so.1"
-            else "/lib64/ld-linux-x86_64.so.2";
+            else "/lib64/ld-linux-x86-64.so.2";
         in
         pkgs.runCommand "blit-release-gnu-${version}" {
           nativeBuildInputs = [ pkgs.patchelf ];
