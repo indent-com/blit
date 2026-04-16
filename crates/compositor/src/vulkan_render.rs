@@ -3294,6 +3294,9 @@ impl VulkanRenderer {
             if raw == vk::Result::SUCCESS {
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
+                if r.is_none() {
+                    eprintln!("[render_tree_sized] fence OK but retire_pending=None");
+                }
                 r.map(|(w, h, p)| (prev_sid, w, h, p))
             } else if pending.external {
                 // External: defer cleanup, proceed immediately.
@@ -3301,6 +3304,7 @@ impl VulkanRenderer {
                 None
             } else {
                 // Self-allocated: need staging readback — must wait.
+                eprintln!("[render_tree_sized] fence not ready: {raw:?}");
                 self.pending_submit = Some(pending);
                 return None;
             }
@@ -3511,6 +3515,15 @@ impl VulkanRenderer {
         }
 
         if draws.is_empty() {
+            eprintln!(
+                "[render_tree_sized] draws empty! layers={} textures={}",
+                all_layers.len(),
+                self.surface_textures.len(),
+            );
+            for l in &all_layers {
+                let has = self.surface_textures.contains_key(&l.surface_id);
+                eprintln!("  layer sid={:?} has_texture={has}", l.surface_id);
+            }
             unsafe {
                 // Nothing to draw — clean up command buffer.
                 let _ = self.device.end_command_buffer(cb);
