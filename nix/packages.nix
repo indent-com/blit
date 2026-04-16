@@ -8,6 +8,7 @@
         pkgs
         pkgsStaticLLVM
         version
+        minGlibcVersion
         cargoLockConfig
         rustToolchain
         rustPlatform
@@ -15,9 +16,12 @@
         craneLibStatic
         src
         commonArgs
+        commonArgsGnu
         commonArgsStatic
         cargoArtifacts
+        cargoArtifactsGnu
         cargoArtifactsStatic
+        rustTargetGnu
         ;
       serverVaapiEnabled = pkgs.stdenv.isLinux;
       bindgenClangArgs = pkgs.lib.optionalString pkgs.stdenv.isLinux "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
@@ -92,16 +96,24 @@
       # system paths.
       # ------------------------------------------------------------------
 
-      # Linux glibc dynamic binary — links deps (libopus, pixman, etc.)
-      # dynamically.  dlopen works natively for GPU libraries.
+      # Linux glibc binary — all deps statically linked, only glibc is
+      # dynamic (so dlopen works for GPU).  Built with zig cc targeting
+      # glibc ${minGlibcVersion} for broad distro compatibility.
       blit-gnu = craneLib.buildPackage (
-        commonArgs
+        commonArgsGnu
         // {
           pname = "blit-gnu";
-          inherit cargoArtifacts;
+          cargoArtifacts = cargoArtifactsGnu;
           cargoExtraArgs = "-p blit-cli";
           doCheck = false;
           preBuild = copyWebAppDist;
+          # Use cargo-zigbuild for the final link so zig enforces
+          # the minimum glibc version on the Rust side too.
+          buildPhaseCargoCommand = "cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
+          installPhaseCommand = ''
+            mkdir -p $out/bin
+            cp target/${rustTargetGnu}/release/blit $out/bin/
+          '';
         }
       );
 
@@ -137,10 +149,10 @@
         }
       );
 
-      # Assembled glibc release: binary + bundled non-glibc .so deps.
+      # Assembled glibc release: single binary with system interpreter.
+      # All deps are statically linked; only glibc is dynamic.
       blit-release-gnu =
         let
-          arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
           interpreter =
             if pkgs.stdenv.hostPlatform.isAarch64
             then "/lib/ld-linux-aarch64.so.1"
@@ -149,29 +161,11 @@
         pkgs.runCommand "blit-release-gnu-${version}" {
           nativeBuildInputs = [ pkgs.patchelf ];
         } ''
-          mkdir -p $out/bin $out/lib/blit
-
-          # Bundle non-glibc shared library deps.
-          for dep in $(ldd ${blit-gnu}/bin/blit | grep -oP '/nix/store/\S+'); do
-            base=$(basename "$dep")
-            case "$base" in
-              ld-linux-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s.so*) ;;
-              linux-vdso*) ;;
-              *) cp "$dep" $out/lib/blit/ ;;
-            esac
-          done
-
-          # Fix RPATH on bundled .so files so they find each other.
-          for so in $out/lib/blit/*.so*; do
-            chmod +w "$so"
-            patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
-          done
-
-          # Copy binary, set RPATH + system interpreter.
+          mkdir -p $out/bin
           cp ${blit-gnu}/bin/blit $out/bin/blit
           chmod +w $out/bin/blit
           patchelf --set-interpreter ${interpreter} $out/bin/blit
-          patchelf --set-rpath '$ORIGIN/../lib/blit' $out/bin/blit
+          patchelf --remove-rpath $out/bin/blit
         '';
 
       # Assembled musl release: single binary, interpreter set to

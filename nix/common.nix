@@ -210,12 +210,132 @@ let
     }
   );
 
+  # ------------------------------------------------------------------
+  # Glibc + zig build for portable Linux release binaries.
+  #
+  # All deps are statically linked; only glibc itself is dynamic.
+  # zig cc targets a minimum glibc version so the binary runs on
+  # older distros.  dlopen still works (it's glibc's dlopen).
+  # ------------------------------------------------------------------
+
+  minGlibcVersion = "2.31";
+
+  zigTarget =
+    if pkgs.stdenv.hostPlatform.isAarch64
+    then "aarch64-linux-gnu.${minGlibcVersion}"
+    else "x86_64-linux-gnu.${minGlibcVersion}";
+
+  zigCC = pkgs.writeShellScript "zig-cc" ''
+    exec ${pkgs.zig}/bin/zig cc -target ${zigTarget} "$@"
+  '';
+
+  zigCXX = pkgs.writeShellScript "zig-c++" ''
+    exec ${pkgs.zig}/bin/zig c++ -target ${zigTarget} "$@"
+  '';
+
+  # Static glibc-targeting overrides of dep packages.
+  # These produce only .a files compiled against glibc ${minGlibcVersion}
+  # headers (via zig cc).
+  gnuStaticLibopus =
+    let
+      base =
+        if pkgs.stdenv.hostPlatform.isAarch64
+        then
+          pkgs.libopus.overrideAttrs (old: {
+            mesonFlags = builtins.map (
+              f:
+              if f == "-Dintrinsics=enabled" then
+                "-Dintrinsics=disabled"
+              else if f == "-Drtcd=enabled" then
+                "-Drtcd=disabled"
+              else
+                f
+            ) (old.mesonFlags or [ ]);
+          })
+        else
+          pkgs.libopus;
+    in
+    base.overrideAttrs (old: {
+      mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
+      postFixup = (old.postFixup or "") + ''
+        rm -f $out/lib/*.so*
+      '';
+    });
+
+  gnuStaticPixman = pkgs.pixman.overrideAttrs (old: {
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
+    postFixup = (old.postFixup or "") + ''
+      rm -f $out/lib/*.so*
+    '';
+  });
+
+  gnuStaticLibxkbcommon = pkgs.libxkbcommon.overrideAttrs (old: {
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
+    postFixup = (old.postFixup or "") + ''
+      rm -f $out/lib/*.so*
+    '';
+  });
+
+  # Mesa's meson.build hardcodes shared_library() for libgbm.
+  gnuStaticLibgbm = pkgs.libgbm.overrideAttrs (old: {
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
+    postPatch = (old.postPatch or "") + ''
+      substituteInPlace src/gbm/meson.build \
+        --replace-fail "shared_library(" "library("
+    '';
+    postFixup = (old.postFixup or "") + ''
+      rm -f $out/lib/*.so*
+    '';
+  });
+
+  rustTargetGnu =
+    if pkgs.stdenv.hostPlatform.isAarch64
+    then "aarch64-unknown-linux-gnu"
+    else "x86_64-unknown-linux-gnu";
+
+  commonArgsGnu = {
+    inherit src version;
+    strictDeps = true;
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.llvmPackages.libclang
+      pkgs.cargo-zigbuild
+      pkgs.zig
+    ];
+    buildInputs = [
+      gnuStaticLibopus
+      gnuStaticPixman
+      gnuStaticLibxkbcommon
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      gnuStaticLibgbm
+    ];
+    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
+    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+    # Use zig cc targeting minimum glibc so all compiled C code
+    # only references symbols available in that version.
+    CC = "${zigCC}";
+    CXX = "${zigCXX}";
+    # Build for explicit gnu target so artifacts go to target/<triple>/
+    CARGO_BUILD_TARGET = rustTargetGnu;
+  };
+
+  cargoArtifactsGnu = craneLib.buildDepsOnly (
+    commonArgsGnu
+    // {
+      pname = "blit-workspace-deps-gnu";
+      cargoExtraArgs = "--workspace --exclude blit-browser";
+      doCheck = false;
+    }
+  );
+
 in
 {
   inherit
     pkgs
     pkgsStaticLLVM
     version
+    minGlibcVersion
     cargoLockConfig
     rustToolchain
     rustPlatform
@@ -223,8 +343,11 @@ in
     craneLibStatic
     src
     commonArgs
+    commonArgsGnu
     commonArgsStatic
     cargoArtifacts
+    cargoArtifactsGnu
     cargoArtifactsStatic
+    rustTargetGnu
     ;
 }

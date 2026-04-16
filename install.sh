@@ -79,15 +79,9 @@ main() {
     elevate=$(pick_elevate)
     echo "installing to $PREFIX (requires $elevate)..."
   fi
-  # Tarball contains bin/ and (on Linux) lib/ — copy into PREFIX.
   $elevate mkdir -p "$PREFIX/bin"
   $elevate cp "$tmp/bin/blit" "$PREFIX/bin/blit"
   $elevate chmod +x "$PREFIX/bin/blit"
-  if [ -d "$tmp/lib/blit" ]; then
-    $elevate mkdir -p "$PREFIX/lib/blit"
-    $elevate cp "$tmp/lib/blit/"* "$PREFIX/lib/blit/"
-    $elevate chmod +x "$PREFIX/lib/blit/"*
-  fi
   echo "installed blit ${version} to $PREFIX/bin/blit"
 
   # Generate man pages and shell completions alongside the binary

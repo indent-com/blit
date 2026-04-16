@@ -167,10 +167,7 @@ let
         systemdDir = ../systemd;
       in
       ''
-        # Bundle shared library deps alongside the binary.
-        if [ -d "${blit-release}/lib" ]; then
-          cp -r "${blit-release}/lib" pkg/usr/lib
-        fi
+        # No shared lib deps to bundle — all statically linked.
         mkdir -p pkg/lib/systemd/system
         cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
         cp "${systemdDir}/blit-server@.service" "pkg/lib/systemd/system/blit-server@.service"
@@ -448,9 +445,9 @@ in
       + (
         if pkgs.stdenv.isLinux then
           ''
-            # glibc tarball: bin/ + lib/ (bundled .so deps)
-            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin lib
-            # musl tarball: bin/ only (single binary, needs system musl libc)
+            # glibc tarball: single binary (all deps statically linked, only glibc dynamic)
+            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+            # musl tarball: single binary (needs system musl libc)
             tar -czf "$outdir/blit_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl}" bin
           ''
         else

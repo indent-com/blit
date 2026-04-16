@@ -109,7 +109,7 @@ install.blit.sh/
 3. Fetches `/latest` from `install.blit.sh` to get the current version.
 4. Skips if the installed version already matches.
 5. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
-6. Extracts the tarball (`bin/` + `lib/blit/` on glibc Linux, `bin/` only on musl Linux and macOS) into `$BLIT_PREFIX` (default `/usr/local`), escalating with `sudo`/`doas` if needed.
+6. Extracts the tarball (`bin/blit` single binary) into `$BLIT_PREFIX` (default `/usr/local`), escalating with `sudo`/`doas` if needed.
 
 ### Windows installer
 
@@ -204,30 +204,18 @@ All release binaries are built with Nix, which makes the entire toolchain reprod
 
 On Linux, two variants are shipped:
 
-- **glibc** (`blit-gnu`) — dynamically linked against glibc. Non-glibc `.so` dependencies (libopus, pixman, libxkbcommon, libgbm, etc.) are bundled alongside the binary and found via `RPATH=$ORIGIN/../lib/blit`. The interpreter is set to the system `ld-linux`. `dlopen` works natively for GPU acceleration (VA-API, NVENC, Vulkan). This is the default for most Linux systems.
+- **glibc** (`blit-gnu`) — all dependencies (libopus, pixman, libxkbcommon, libgbm) are statically linked; only glibc itself is dynamic. Built with `zig cc` targeting glibc 2.31 and linked via `cargo-zigbuild`, so the binary runs on any glibc ≥ 2.31 system (Ubuntu 20.04+, Debian 11+, RHEL 8+). `dlopen` works natively for GPU acceleration (VA-API, NVENC, Vulkan). This is the default for most Linux systems.
 - **musl** (`blit-musl`) — built with the LLVM musl cross toolchain. All dependencies except musl libc are statically linked, producing a single binary. The interpreter is set to the system `ld-musl-<arch>.so.1`. For Alpine and other musl-based systems.
 
-The glibc release tarball layout:
+Both release tarballs contain a single binary at `bin/blit`.
 
-```
-bin/blit            <- dynamically-linked binary (RPATH=$ORIGIN/../lib/blit)
-lib/blit/
-  libopus.so.0
-  libpixman-1.so.0
-  libxkbcommon.so.0
-  libgbm.so.1
-  ...               <- all non-glibc .so deps
-```
-
-The musl release tarball contains only `bin/blit` (single binary).
-
-The `blit-release-gnu` derivation in [`nix/packages.nix`](nix/packages.nix) assembles the glibc tarball by running `ldd` on the built binary, bundling all non-glibc `.so` deps, and setting `RPATH` + system interpreter via `patchelf`. The `blit-release-musl` derivation patches the musl binary's interpreter to the standard system path. The `blit-musl` build verifies its only NEEDED library is `libc.so`. `install.sh` auto-detects the system libc (musl vs glibc) and downloads the right tarball.
+The `blit-gnu` derivation in [`nix/packages.nix`](nix/packages.nix) builds the glibc binary with static dep overrides and `cargo-zigbuild`. The `blit-release-gnu` derivation patches the interpreter to the standard system path via `patchelf`. The `blit-release-musl` derivation does the same for musl. The `blit-musl` build verifies its only NEEDED library is `libc.so`. `install.sh` auto-detects the system libc (musl vs glibc) and downloads the right tarball.
 
 On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed.
 
 The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) in [`nix/common.nix`](nix/common.nix). The same toolchain also includes `wasm32-unknown-unknown` for the browser WASM build.
 
-The glibc tarballs on `install.blit.sh/bin/` and `.deb` packages require only system glibc + GPU drivers. The musl tarballs require only system musl libc. macOS and Windows binaries have no required dependencies.
+The glibc tarballs on `install.blit.sh/bin/` and `.deb` packages require only system glibc ≥ 2.31. The musl tarballs require only system musl libc. All are single-binary downloads with no external library dependencies (GPU drivers are loaded via dlopen at runtime on glibc systems). macOS and Windows binaries have no required dependencies.
 
 On Windows, Nix isn't available, so the `_build-windows.yml` reusable workflow uses `cargo build --release` directly on a Windows runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
 
