@@ -60,14 +60,6 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       pkgs.libopus # system Opus for audiopus_sys (avoids cmake source build)
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.ffmpeg-headless
-      pkgs.libva
-      pkgs.libgbm # libgbm for GBM device / buffer allocation
-      pkgs.vulkan-loader # libvulkan.so.1 for Vulkan compositor renderer
     ];
     nativeCheckInputs = [ ];
   }
@@ -127,16 +119,6 @@ let
     }
   );
 
-  # Mesa's meson.build uses shared_library() for libgbm, which the musl
-  # static toolchain cannot link.  Override to use library() so meson
-  # respects --default-library=static and produces libgbm.a.
-  staticLibgbm = pkgsStaticLLVM.libgbm.overrideAttrs (old: {
-    postPatch = (old.postPatch or "") + ''
-      substituteInPlace src/gbm/meson.build \
-        --replace-fail "shared_library(" "library("
-    '';
-  });
-
   # Opus's meson.build doesn't support arm64 intrinsics, so the default
   # -Dintrinsics=enabled fails on aarch64 in pkgsStatic.  Disable
   # intrinsics and rtcd (runtime CPU detection depends on intrinsics).
@@ -162,14 +144,8 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       staticLibopus
-      pkgsStaticLLVM.libxkbcommon
-      pkgsStaticLLVM.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      staticLibgbm
     ];
     # Link musl libc dynamically so dlopen works (GPU acceleration).
-    # All other deps (libopus, pixman, etc.) remain statically linked.
     RUSTFLAGS = "-C target-feature=-crt-static";
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -220,79 +196,19 @@ let
 
   minGlibcVersion = "2.31";
 
-  zigTarget =
-    if pkgs.stdenv.hostPlatform.isAarch64
-    then "aarch64-linux-gnu.${minGlibcVersion}"
-    else "x86_64-linux-gnu.${minGlibcVersion}";
-
-  zigCC = pkgs.writeShellScript "zig-cc" ''
-    exec ${pkgs.zig}/bin/zig cc -target ${zigTarget} "$@"
-  '';
-
-  zigCXX = pkgs.writeShellScript "zig-c++" ''
-    exec ${pkgs.zig}/bin/zig c++ -target ${zigTarget} "$@"
-  '';
-
-  # Static glibc-targeting overrides of dep packages.
-  # These produce only .a files compiled against glibc ${minGlibcVersion}
-  # headers (via zig cc).
-  gnuStaticLibopus =
-    let
-      base =
-        if pkgs.stdenv.hostPlatform.isAarch64
-        then
-          pkgs.libopus.overrideAttrs (old: {
-            mesonFlags = builtins.map (
-              f:
-              if f == "-Dintrinsics=enabled" then
-                "-Dintrinsics=disabled"
-              else if f == "-Drtcd=enabled" then
-                "-Drtcd=disabled"
-              else
-                f
-            ) (old.mesonFlags or [ ]);
-          })
-        else
-          pkgs.libopus;
-    in
-    base.overrideAttrs (old: {
-      mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
-      postFixup = (old.postFixup or "") + ''
-        rm -f $out/lib/*.so*
-      '';
-    });
-
-  gnuStaticPixman = pkgs.pixman.overrideAttrs (old: {
-    mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
-    postFixup = (old.postFixup or "") + ''
-      rm -f $out/lib/*.so*
-    '';
-  });
-
-  gnuStaticLibxkbcommon = pkgs.libxkbcommon.overrideAttrs (old: {
-    mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
-    postFixup = (old.postFixup or "") + ''
-      rm -f $out/lib/*.so*
-    '';
-  });
-
-  # Mesa's meson.build hardcodes shared_library() for libgbm.
-  gnuStaticLibgbm = pkgs.libgbm.overrideAttrs (old: {
-    mesonFlags = (old.mesonFlags or [ ]) ++ [ "--default-library=static" ];
-    postPatch = (old.postPatch or "") + ''
-      substituteInPlace src/gbm/meson.build \
-        --replace-fail "shared_library(" "library("
-    '';
-    postFixup = (old.postFixup or "") + ''
-      rm -f $out/lib/*.so*
-    '';
-  });
-
   rustTargetGnu =
     if pkgs.stdenv.hostPlatform.isAarch64
     then "aarch64-unknown-linux-gnu"
     else "x86_64-unknown-linux-gnu";
 
+  # Static libopus for the glibc release build so the binary is
+  # fully self-contained (only glibc itself is dynamic).
+  gnuStaticLibopus = pkgs.libopus.overrideAttrs (old: {
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
+  });
+
+  # Only real build-time dep is libopus (audiopus_sys).  Everything
+  # else (gbm, va, vulkan) is dlopen'd at runtime.
   commonArgsGnu = {
     inherit src version;
     strictDeps = true;
@@ -304,18 +220,9 @@ let
     ];
     buildInputs = [
       gnuStaticLibopus
-      gnuStaticPixman
-      gnuStaticLibxkbcommon
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      gnuStaticLibgbm
     ];
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-    # Use zig cc targeting minimum glibc so all compiled C code
-    # only references symbols available in that version.
-    CC = "${zigCC}";
-    CXX = "${zigCXX}";
     # Build for explicit gnu target so artifacts go to target/<triple>/
     CARGO_BUILD_TARGET = rustTargetGnu;
   };

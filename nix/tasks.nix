@@ -342,19 +342,10 @@ let
       rustToolchain
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -372,19 +363,10 @@ let
       pkgs.python3
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -489,8 +471,6 @@ in
       rustToolchain
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
     ];
     text = ''
       ${fmt}/bin/blit-fmt --check
@@ -572,19 +552,10 @@ in
       pkgs.bun
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist

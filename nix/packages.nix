@@ -451,9 +451,7 @@
           pkgs.curl
           pkgs.flyctl
           pkgs.libopus
-          pkgs.libxkbcommon
           pkgs.nodejs
-          pkgs.pixman
           pkgs.pkg-config
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
@@ -467,10 +465,6 @@
           pkgs.dbus
           pkgs.pipewire
           pkgs.wireplumber
-        ]
-        ++ pkgs.lib.optionals serverVaapiEnabled [
-          pkgs.ffmpeg-headless
-          pkgs.libva
           pkgs.llvmPackages.libclang
         ];
 
@@ -480,22 +474,8 @@
           fi
           export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-            if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-          }${
-            if serverVaapiEnabled then
-              ":${pkgs.ffmpeg-headless.dev}/lib/pkgconfig:${pkgs.libva.dev}/lib/pkgconfig"
-            else
-              ""
-          }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-            if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-          }${
-            if serverVaapiEnabled then
-              ":${pkgs.ffmpeg-headless.lib}/lib:${pkgs.libva}/lib:${pkgs.vulkan-loader}/lib"
-            else
-              ""
-          }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           # Runtime dlopen: blit server loads VA-API / NVENC libraries at
           # runtime via dlopen.  See gpuRuntimeLibPath definition above.
           ${pkgs.lib.optionalString (
