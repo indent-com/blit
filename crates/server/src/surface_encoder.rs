@@ -1475,7 +1475,9 @@ fn rgba_to_yuv444(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let (u_plane, v_plane) = uv.split_at_mut(plane_size);
     // RGBA offsets: R=0, G=1, B=2, A=3
     compute_y_plane(rgba, width, height, y_plane, 0, 1, 2);
-    compute_uv_planes_444_padded(rgba, width, height, width, height, u_plane, v_plane, 0, 1, 2);
+    compute_uv_planes_444_padded(
+        rgba, width, height, width, height, u_plane, v_plane, 0, 1, 2,
+    );
     yuv
 }
 

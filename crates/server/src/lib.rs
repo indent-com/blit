@@ -36,10 +36,10 @@ mod vaapi_encode;
 
 pub use ipc::{IpcListener, default_ipc_path};
 use pty::{PtyHandle, PtyWriteTarget};
+pub use surface_encoder::ChromaSubsampling;
 use surface_encoder::SurfaceEncoder;
 pub use surface_encoder::SurfaceEncoderPreference;
 pub use surface_encoder::SurfaceH264EncoderPreference;
-pub use surface_encoder::ChromaSubsampling;
 pub use surface_encoder::SurfaceQuality;
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
@@ -2907,19 +2907,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                             SurfaceEncoderPreference::VulkanVideoAV1 => quality.av1_qp_for_vulkan(),
                             _ => quality.h264_qp(),
                         };
-                        let enc_name: &'static str =
-                            match (pref, state.config.chroma) {
-                                (SurfaceEncoderPreference::VulkanVideoH264, ChromaSubsampling::Cs444) => {
-                                    "h264-vulkan 4:4:4"
-                                }
-                                (SurfaceEncoderPreference::VulkanVideoH264, _) => "h264-vulkan",
-                                (SurfaceEncoderPreference::VulkanVideoAV1, ChromaSubsampling::Cs444) => {
-                                    "av1-vulkan 4:4:4"
-                                }
-                                (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
-                                (_, ChromaSubsampling::Cs444) => "vulkan 4:4:4",
-                                _ => "vulkan",
-                            };
+                        let enc_name: &'static str = match (pref, state.config.chroma) {
+                            (
+                                SurfaceEncoderPreference::VulkanVideoH264,
+                                ChromaSubsampling::Cs444,
+                            ) => "h264-vulkan 4:4:4",
+                            (SurfaceEncoderPreference::VulkanVideoH264, _) => "h264-vulkan",
+                            (
+                                SurfaceEncoderPreference::VulkanVideoAV1,
+                                ChromaSubsampling::Cs444,
+                            ) => "av1-vulkan 4:4:4",
+                            (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
+                            (_, ChromaSubsampling::Cs444) => "vulkan 4:4:4",
+                            _ => "vulkan",
+                        };
                         // Queue commands to send after the client loop.
                         pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
                             surface_id: sid as u32,
