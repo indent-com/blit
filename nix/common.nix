@@ -162,15 +162,14 @@ let
       pkgs.llvmPackages.libclang
     ];
     # Rustc hardcodes `-lgcc_s` for dynamic-musl targets, but the musl
-    # static toolchain only ships libgcc.a (no libgcc_s.so).  Provide a
-    # libgcc_s.a containing just the unwinding symbols from libgcc.a.
+    # static toolchain only ships libgcc.a (no libgcc_s.so).  Provide
+    # libgcc.a under the name libgcc_s.a so the linker finds it.
+    # On aarch64 this also supplies LSE atomics and SME helpers.
     # Scoped to the musl target via NIX_LDFLAGS_<role> so the glibc CC
     # used for build scripts is unaffected.
     postUnpack =
       let
         cc = pkgs.pkgsStatic.stdenv.cc;
-        ar = "${cc.bintools.bintools}/bin/${cc.targetPrefix}ar";
-        objcopy = "${cc.bintools.bintools}/bin/${cc.targetPrefix}objcopy";
         role = builtins.replaceStrings [ "-" ] [ "_" ]
           pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
       in
@@ -178,12 +177,7 @@ let
         export NIX_CFLAGS_LINK=""
         gccLib=$(dirname $(${cc}/bin/${cc.targetPrefix}cc -print-libgcc-file-name))
         mkdir -p $TMPDIR/gcc-compat
-        # Extract only the unwinding .o files from libgcc.a
-        pushd $TMPDIR/gcc-compat > /dev/null
-        ${ar} x "$gccLib/libgcc.a"
-        ${ar} rcs libgcc_s.a unwind-*.o
-        rm -f *.o
-        popd > /dev/null
+        cp "$gccLib/libgcc.a" $TMPDIR/gcc-compat/libgcc_s.a
         export NIX_LDFLAGS_${role}="-L$TMPDIR/gcc-compat ''${NIX_LDFLAGS_${role}:-}"
       '';
   };
