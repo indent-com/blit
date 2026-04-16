@@ -1169,7 +1169,7 @@ interface FileMetadata {
 | GitHub Releases | Standalone binaries per platform                     |
 | npm             | `@indent-com/cli` for `npx indent`                   |
 | Homebrew        | Formula or tap                                       |
-| curl installer  | `curl -sf https://install.indent.com \| sh`          |
+| curl installer  | Shell script: `curl -sf https://install.indent.com`  |
 
 ---
 
