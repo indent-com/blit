@@ -161,10 +161,15 @@ pub enum Command {
     /// Run the WebSocket/WebTransport gateway
     ///
     /// All configuration is via environment variables:
+    ///
     ///   BLIT_PASSPHRASE   Browser passphrase (required)
+    ///
     ///   BLIT_ADDR         Listen address (default: 0.0.0.0:3264)
+    ///
     ///   BLIT_REMOTES      Path to remotes file
+    ///
     ///   BLIT_QUIC         Set to 1 for WebTransport
+    ///
     ///   BLIT_PROXY        Set to 0 to disable blit-proxy
     Gateway,
 
