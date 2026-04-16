@@ -212,6 +212,7 @@ let
   # regular cargo (not cargo-zigbuild) can enforce the glibc floor
   # at link time while C deps compile with the system gcc.
   zigLinker = pkgs.writeShellScript "zig-linker" ''
+    export HOME="''${TMPDIR:-/tmp}"
     exec ${pkgs.zig}/bin/zig cc -target ${
       if pkgs.stdenv.hostPlatform.isAarch64
       then "aarch64-linux-gnu"
