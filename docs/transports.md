@@ -218,9 +218,9 @@ WebRTC peer connections are decoupled from the signaling WebSocket. An `establis
 ### Entry points
 
 ```bash
-blit share                         # auto-start server, run forwarder, print passphrase
-blit share --passphrase mysecret   # deterministic passphrase
-blit share                         # subcommand (BLIT_PASSPHRASE, BLIT_HUB)
+blit share                                    # auto-start server, run forwarder, print passphrase
+BLIT_PASSPHRASE=mysecret blit share           # deterministic passphrase
+blit share                                    # subcommand (BLIT_PASSPHRASE, BLIT_HUB)
 ```
 
 ### Gateway-proxied WebRTC

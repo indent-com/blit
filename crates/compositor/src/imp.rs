@@ -1286,14 +1286,26 @@ impl Compositor {
             (pw, ph)
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
-            vk.render_tree_sized(
+            let r = vk.render_tree_sized(
                 &root_id,
                 &self.surfaces,
                 &self.surface_meta,
                 s120,
                 target_phys,
                 toplevel_sid,
-            )
+            );
+            if r.is_none() {
+                static SC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 10 || n.is_multiple_of(1000) {
+                    eprintln!(
+                        "[commit #{n}] render_tree_sized=None sid={toplevel_sid} target={target_phys:?} meta={} textures={}",
+                        self.surface_meta.len(),
+                        vk.surface_texture_count(),
+                    );
+                }
+            }
+            r
         } else {
             None
         };
@@ -2257,7 +2269,11 @@ impl Compositor {
                 }
             }
             CompositorCommand::SetRefreshRate { mhz } => {
-                if mhz != self.output_refresh_mhz && mhz > 0 {
+                // Only update on meaningful changes (>2 Hz difference) to
+                // avoid flooding clients with mode events from jittery
+                // requestAnimationFrame measurements.
+                let diff = (mhz as i64 - self.output_refresh_mhz as i64).unsigned_abs();
+                if diff > 2000 && mhz > 0 {
                     self.output_refresh_mhz = mhz;
                     let s120 = self.output_scale_120 as i32;
                     let mode_w = self.output_width * s120 / 120;
@@ -3709,25 +3725,23 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
             // allocate DMA-BUFs with a tiling layout the compositor can
             // handle natively on the GPU, avoiding broken CPU mmap
             // fallbacks for vendor-specific tiled VRAM.
-            if let Some(ref vk) = state.vulkan_renderer {
+            if let Some(ref vk) = state.vulkan_renderer
+                && !vk.supported_dmabuf_modifiers.is_empty()
+            {
                 for &(drm_fmt, modifier) in &vk.supported_dmabuf_modifiers {
                     let mod_hi = (modifier >> 32) as u32;
                     let mod_lo = (modifier & 0xFFFFFFFF) as u32;
                     dmabuf.modifier(drm_fmt, mod_hi, mod_lo);
                 }
-            } else {
-                // No Vulkan — only LINEAR is safe.
-                let formats = [
-                    drm_fourcc::ARGB8888,
-                    drm_fourcc::XRGB8888,
-                    drm_fourcc::ABGR8888,
-                    drm_fourcc::XBGR8888,
-                ];
-                for fmt in formats {
-                    dmabuf.modifier(fmt, 0, 0);
-                }
             }
-        } else {
+            // When Vulkan has no DMA-BUF extensions (SHM-only mode) we
+            // intentionally advertise zero modifiers so clients fall back
+            // to wl_shm.
+        } else if state
+            .vulkan_renderer
+            .as_ref()
+            .is_some_and(|vk| vk.has_dmabuf())
+        {
             dmabuf.format(drm_fourcc::ARGB8888);
             dmabuf.format(drm_fourcc::XRGB8888);
             dmabuf.format(drm_fourcc::ABGR8888);
@@ -4906,6 +4920,17 @@ fn run_compositor(
     let display: Display<Compositor> = Display::new().expect("failed to create display");
     let dh = display.handle();
 
+    // Probe Vulkan early so we know whether DMA-BUF is available
+    // before registering Wayland globals.
+    eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
+    let vulkan_renderer = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
+    let has_dmabuf = vulkan_renderer.as_ref().is_some_and(|vk| vk.has_dmabuf());
+    eprintln!(
+        "[compositor] Vulkan renderer: {} (dmabuf={})",
+        vulkan_renderer.is_some(),
+        has_dmabuf,
+    );
+
     // Create globals.
     dh.create_global::<Compositor, WlCompositor, ()>(6, ());
     dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
@@ -4913,7 +4938,13 @@ fn run_compositor(
     dh.create_global::<Compositor, WlShm, ()>(1, ());
     dh.create_global::<Compositor, WlOutput, ()>(4, ());
     dh.create_global::<Compositor, WlSeat, ()>(9, ());
-    dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    // Only advertise zwp_linux_dmabuf_v1 when the Vulkan device can
+    // actually import DMA-BUFs.  Advertising the global with zero
+    // formats confuses clients (Chrome, mpv) into not falling back to
+    // wl_shm.
+    if has_dmabuf {
+        dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    }
     dh.create_global::<Compositor, WpViewporter, ()>(1, ());
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
@@ -4953,12 +4984,7 @@ fn run_compositor(
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),
         dmabuf_params: HashMap::new(),
-        vulkan_renderer: {
-            eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
-            let r = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
-            eprintln!("[compositor] Vulkan renderer: {}", r.is_some());
-            r
-        },
+        vulkan_renderer,
         output_width: 1920,
         output_height: 1080,
         output_refresh_mhz: 60_000,

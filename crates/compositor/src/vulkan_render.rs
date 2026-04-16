@@ -48,6 +48,8 @@ pub(crate) struct VulkanRenderer {
     has_video_encode: bool,
     /// Whether the device supports VK_KHR_video_encode_av1 extension.
     has_video_encode_av1: bool,
+    /// Whether the device supports DMA-BUF import/export extensions.
+    has_dmabuf: bool,
 
     // Render pipeline
     render_pass: vk::RenderPass,
@@ -338,14 +340,25 @@ impl VulkanRenderer {
         let has_external_fence_fd = ext_names_all.contains(&ash::khr::external_fence_fd::NAME)
             && ext_names_all.contains(&ash::khr::external_fence::NAME);
 
-        // Device extensions for DMA-BUF import/export.
-        let mut device_extensions: Vec<*const std::ffi::c_char> = vec![
-            ash::khr::external_memory_fd::NAME.as_ptr(),
-            ash::khr::external_memory::NAME.as_ptr(),
-            ash::ext::external_memory_dma_buf::NAME.as_ptr(),
-            ash::ext::image_drm_format_modifier::NAME.as_ptr(),
-            ash::khr::image_format_list::NAME.as_ptr(),
+        // DMA-BUF extensions are optional — llvmpipe and other software
+        // renderers lack them.  When absent the compositor runs in SHM-only
+        // mode: clients use wl_shm, and any DMA-BUF buffers that arrive
+        // are imported via the mmap fallback path.
+        let dmabuf_extensions: &[&std::ffi::CStr] = &[
+            ash::khr::external_memory_fd::NAME,
+            ash::khr::external_memory::NAME,
+            ash::ext::external_memory_dma_buf::NAME,
+            ash::ext::image_drm_format_modifier::NAME,
+            ash::khr::image_format_list::NAME,
         ];
+        let has_dmabuf = dmabuf_extensions.iter().all(|e| ext_names_all.contains(e));
+        if !has_dmabuf {
+            eprintln!("[vulkan-render] DMA-BUF extensions not available, SHM-only mode");
+        }
+        let mut device_extensions: Vec<*const std::ffi::c_char> = Vec::new();
+        if has_dmabuf {
+            device_extensions.extend(dmabuf_extensions.iter().map(|e| e.as_ptr()));
+        }
         if has_external_fence_fd {
             device_extensions.push(ash::khr::external_fence::NAME.as_ptr());
             device_extensions.push(ash::khr::external_fence_fd::NAME.as_ptr());
@@ -719,7 +732,9 @@ impl VulkanRenderer {
         // Clients (Chromium, mpv, …) will pick from these when allocating
         // DMA-BUFs, ensuring the GPU can import them with the correct
         // tiling layout.
-        let supported_dmabuf_modifiers = {
+        // Skip the query entirely when DMA-BUF extensions are absent —
+        // DrmFormatModifierPropertiesListEXT requires the extension.
+        let supported_dmabuf_modifiers = if has_dmabuf {
             use super::imp::drm_fourcc;
             let format_pairs: &[(u32, vk::Format)] = &[
                 (drm_fourcc::ARGB8888, vk::Format::B8G8R8A8_UNORM),
@@ -782,6 +797,8 @@ impl VulkanRenderer {
                 mods.len(),
             );
             mods
+        } else {
+            Vec::new()
         };
 
         Some(Self {
@@ -799,6 +816,7 @@ impl VulkanRenderer {
             vulkan_encoders: HashMap::new(),
             has_video_encode,
             has_video_encode_av1,
+            has_dmabuf,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -890,6 +908,16 @@ impl VulkanRenderer {
     /// Whether the device supports Vulkan Video AV1 encode.
     pub(crate) fn has_video_encode_av1(&self) -> bool {
         self.has_video_encode_av1
+    }
+
+    /// Whether the device supports DMA-BUF import/export extensions.
+    pub(crate) fn has_dmabuf(&self) -> bool {
+        self.has_dmabuf
+    }
+
+    /// Number of cached surface textures (diagnostic).
+    pub(crate) fn surface_texture_count(&self) -> usize {
+        self.surface_textures.len()
     }
 
     // ---------------------------------------------------------------
@@ -1001,6 +1029,9 @@ impl VulkanRenderer {
     ) {
         if buffers.is_empty() {
             self.destroy_external_outputs_for(surface_id);
+            return;
+        }
+        if !self.has_dmabuf {
             return;
         }
         // Import each encoder-allocated DMA-BUF as a Vulkan render target.
@@ -1431,6 +1462,9 @@ impl VulkanRenderer {
 
     /// Allocate NV12 output planes for the BGRA→NV12 compute path.
     fn create_nv12_outputs(&mut self, surface_id: u32, w: u32, h: u32) {
+        if !self.has_dmabuf {
+            return;
+        }
         use std::os::fd::FromRawFd;
         self.destroy_nv12_outputs_for(surface_id);
 
@@ -1564,6 +1598,9 @@ impl VulkanRenderer {
         surface_id: u32,
         fds: &[(Arc<OwnedFd>, u32, u32, u32, u32, u64)],
     ) {
+        if !self.has_dmabuf {
+            return;
+        }
         self.destroy_nv12_outputs_for(surface_id);
 
         for (fd, stride, uv_offset, w, h, modifier) in fds {
@@ -2209,7 +2246,15 @@ impl VulkanRenderer {
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
+        let image = unsafe {
+            self.device
+                .create_image(&image_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_image failed: {e} ({w}x{h})");
+                    e
+                })
+                .ok()?
+        };
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
         let mem_type = self
             .find_memory_type(
@@ -2221,12 +2266,35 @@ impl VulkanRenderer {
                     mem_reqs.memory_type_bits,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
-            })?;
+            });
+        if mem_type.is_none() {
+            eprintln!(
+                "[create_output_image] no suitable memory type for image (bits={:#x})",
+                mem_reqs.memory_type_bits
+            );
+        }
+        let mem_type = mem_type?;
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
-        let memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
-        unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
+        let memory = unsafe {
+            self.device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] allocate_memory(image) failed: {e}");
+                    e
+                })
+                .ok()?
+        };
+        unsafe {
+            self.device
+                .bind_image_memory(image, memory, 0)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] bind_image_memory failed: {e}");
+                    e
+                })
+                .ok()?
+        };
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -2239,38 +2307,85 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-        let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
+        let view = unsafe {
+            self.device
+                .create_image_view(&view_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_image_view failed: {e}");
+                    e
+                })
+                .ok()?
+        };
         let fb_info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(std::slice::from_ref(&view))
             .width(w)
             .height(h)
             .layers(1);
-        let framebuffer = unsafe { self.device.create_framebuffer(&fb_info, None).ok()? };
+        let framebuffer = unsafe {
+            self.device
+                .create_framebuffer(&fb_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_framebuffer failed: {e}");
+                    e
+                })
+                .ok()?
+        };
 
         let staging_size = (w * h * 4) as usize;
         let buf_info = vk::BufferCreateInfo::default()
             .size(staging_size as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let staging_buf = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
+        let staging_buf = unsafe {
+            self.device
+                .create_buffer(&buf_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_buffer(staging) failed: {e}");
+                    e
+                })
+                .ok()?
+        };
         let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
         let buf_mem_type = self.find_memory_type(
             buf_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        );
+        if buf_mem_type.is_none() {
+            eprintln!(
+                "[create_output_image] no HOST_VISIBLE memory for staging (bits={:#x})",
+                buf_reqs.memory_type_bits
+            );
+        }
+        let buf_mem_type = buf_mem_type?;
         let buf_alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(buf_reqs.size)
             .memory_type_index(buf_mem_type);
-        let staging_mem = unsafe { self.device.allocate_memory(&buf_alloc, None).ok()? };
+        let staging_mem = unsafe {
+            self.device
+                .allocate_memory(&buf_alloc, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] allocate_memory(staging) failed: {e}");
+                    e
+                })
+                .ok()?
+        };
         unsafe {
             self.device
                 .bind_buffer_memory(staging_buf, staging_mem, 0)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] bind_buffer_memory(staging) failed: {e}");
+                    e
+                })
                 .ok()?
         };
         let staging_ptr = unsafe {
             self.device
                 .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|e| {
+                    eprintln!("[create_output_image] map_memory(staging) failed: {e}");
+                    e
+                })
                 .ok()?
         } as *mut u8;
 
@@ -2329,15 +2444,41 @@ impl VulkanRenderer {
                 stride,
                 offset,
                 ..
-            } => self.create_cached_dmabuf(
-                fd.as_raw_fd(),
-                *fourcc,
-                *modifier,
-                *stride,
-                *offset,
-                width,
-                height,
-            ),
+            } => {
+                if self.has_dmabuf {
+                    self.create_cached_dmabuf(
+                        fd.as_raw_fd(),
+                        *fourcc,
+                        *modifier,
+                        *stride,
+                        *offset,
+                        width,
+                        height,
+                    )
+                } else {
+                    // No DMA-BUF extensions — go straight to the mmap
+                    // fallback which does a CPU copy into an SHM texture.
+                    let _result = self.import_linear_dmabuf_mmap(
+                        fd.as_raw_fd(),
+                        *fourcc,
+                        *stride,
+                        width,
+                        height,
+                    );
+                    if _result.is_some() {
+                        let temp = self.frame_textures.pop().unwrap();
+                        Some(CachedSurfaceTexture {
+                            image: temp.image,
+                            memory: temp.memory,
+                            view: temp.view,
+                            descriptor_set: temp.descriptor_set,
+                            initial_layout: vk::ImageLayout::PREINITIALIZED,
+                        })
+                    } else {
+                        None
+                    }
+                }
+            }
             PixelData::Bgra(data) => {
                 // Convert BGRA→RGBA for upload.
                 let mut rgba = vec![0u8; data.len()];
@@ -2355,6 +2496,18 @@ impl VulkanRenderer {
 
         if let Some(tex) = cached {
             self.surface_textures.insert(surface_id.clone(), tex);
+        } else {
+            static UF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = UF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(1000) {
+                let kind = match pixels {
+                    PixelData::Bgra(_) => "bgra",
+                    PixelData::Rgba(_) => "rgba",
+                    PixelData::DmaBuf { .. } => "dmabuf",
+                    _ => "other",
+                };
+                eprintln!("[upload #{n}] FAILED kind={kind} {width}x{height} sid={surface_id:?}");
+            }
         }
     }
 
@@ -3141,6 +3294,9 @@ impl VulkanRenderer {
             if raw == vk::Result::SUCCESS {
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
+                if r.is_none() {
+                    eprintln!("[render_tree_sized] fence OK but retire_pending=None");
+                }
                 r.map(|(w, h, p)| (prev_sid, w, h, p))
             } else if pending.external {
                 // External: defer cleanup, proceed immediately.
@@ -3148,6 +3304,7 @@ impl VulkanRenderer {
                 None
             } else {
                 // Self-allocated: need staging readback — must wait.
+                eprintln!("[render_tree_sized] fence not ready: {raw:?}");
                 self.pending_submit = Some(pending);
                 return None;
             }
@@ -3221,6 +3378,9 @@ impl VulkanRenderer {
         } else {
             self.ensure_output_images(phys_w, phys_h);
             if self.output_images.is_empty() {
+                eprintln!(
+                    "[render_tree_sized] output_images empty after ensure ({phys_w}x{phys_h})"
+                );
                 return None;
             }
             let idx = self.output_idx;
@@ -3233,11 +3393,27 @@ impl VulkanRenderer {
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cb = unsafe { self.device.allocate_command_buffers(&cb_alloc).ok()?[0] };
+        let cb = unsafe {
+            self.device
+                .allocate_command_buffers(&cb_alloc)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
+                    e
+                })
+                .ok()?[0]
+        };
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { self.device.begin_command_buffer(cb, &begin_info).ok()? };
+        unsafe {
+            self.device
+                .begin_command_buffer(cb, &begin_info)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] begin_command_buffer failed: {e}");
+                    e
+                })
+                .ok()?
+        };
 
         // Begin render pass.
         let clear = vk::ClearValue {
@@ -3339,6 +3515,15 @@ impl VulkanRenderer {
         }
 
         if draws.is_empty() {
+            eprintln!(
+                "[render_tree_sized] draws empty! layers={} textures={}",
+                all_layers.len(),
+                self.surface_textures.len(),
+            );
+            for l in &all_layers {
+                let has = self.surface_textures.contains_key(&l.surface_id);
+                eprintln!("  layer sid={:?} has_texture={has}", l.surface_id);
+            }
             unsafe {
                 // Nothing to draw — clean up command buffer.
                 let _ = self.device.end_command_buffer(cb);
@@ -3461,7 +3646,13 @@ impl VulkanRenderer {
 
         // Submit asynchronously.
         unsafe {
-            self.device.end_command_buffer(cb).ok()?;
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] end_command_buffer failed: {e}");
+                    e
+                })
+                .ok()?;
         }
         // When explicit sync is needed (tiled NV12 on radv), create the
         // fence with SYNC_FD export capability so we can hand a sync_fd
@@ -3475,15 +3666,35 @@ impl VulkanRenderer {
             let mut export_info = vk::ExportFenceCreateInfo::default()
                 .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
             let fence_info = vk::FenceCreateInfo::default().push_next(&mut export_info);
-            unsafe { self.device.create_fence(&fence_info, None).ok()? }
+            unsafe {
+                self.device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| {
+                        eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
+                        e
+                    })
+                    .ok()?
+            }
         } else {
             let fence_info = vk::FenceCreateInfo::default();
-            unsafe { self.device.create_fence(&fence_info, None).ok()? }
+            unsafe {
+                self.device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| {
+                        eprintln!("[render_tree_sized] create_fence failed: {e}");
+                        e
+                    })
+                    .ok()?
+            }
         };
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] queue_submit failed: {e}");
+                    e
+                })
                 .ok()?;
         }
 

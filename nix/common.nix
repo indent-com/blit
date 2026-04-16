@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.24.1";
+  version = "0.25.0";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
@@ -60,14 +60,6 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       pkgs.libopus # system Opus for audiopus_sys (avoids cmake source build)
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.ffmpeg-headless
-      pkgs.libva
-      pkgs.libgbm # libgbm for GBM device / buffer allocation
-      pkgs.vulkan-loader # libvulkan.so.1 for Vulkan compositor renderer
     ];
     nativeCheckInputs = [ ];
   }
@@ -90,8 +82,29 @@ let
     }
   );
 
-  # Static (musl on Linux) Crane setup for release tarballs.
-  craneLibStatic = (inputs.crane.mkLib pkgs.pkgsStatic).overrideToolchain (
+  # LLVM-based musl static environment for release tarballs.
+  # Combines isStatic (musl) + useLLVM (clang/lld/compiler-rt/libc++)
+  # so we get PIC-clean C++ libs and avoid the libgcc_s hacks that the
+  # GCC musl toolchain requires.
+  pkgsStaticLLVM =
+    if pkgs.stdenv.isLinux then
+      import inputs.nixpkgs {
+        inherit system;
+        overlays = [ inputs.rust-overlay.overlays.default ];
+        crossSystem = {
+          isStatic = true;
+          useLLVM = true;
+          linker = "lld";
+          config = pkgs.lib.systems.parse.tripleFromSystem (
+            pkgs.lib.systems.parse.mkMuslSystem pkgs.stdenv.hostPlatform.parsed
+          );
+        };
+      }
+    else
+      # macOS doesn't cross-compile to musl — use pkgsStatic as-is.
+      pkgs.pkgsStatic;
+
+  craneLibStatic = (inputs.crane.mkLib pkgsStaticLLVM).overrideToolchain (
     p:
     p.rust-bin.stable.latest.default.override {
       targets = [
@@ -106,22 +119,12 @@ let
     }
   );
 
-  # Mesa's meson.build uses shared_library() for libgbm, which the musl
-  # static toolchain cannot link.  Override to use library() so meson
-  # respects --default-library=static and produces libgbm.a.
-  staticLibgbm = pkgs.pkgsStatic.libgbm.overrideAttrs (old: {
-    postPatch = (old.postPatch or "") + ''
-      substituteInPlace src/gbm/meson.build \
-        --replace-fail "shared_library(" "library("
-    '';
-  });
-
   # Opus's meson.build doesn't support arm64 intrinsics, so the default
   # -Dintrinsics=enabled fails on aarch64 in pkgsStatic.  Disable
   # intrinsics and rtcd (runtime CPU detection depends on intrinsics).
   staticLibopus =
     if pkgs.stdenv.hostPlatform.isAarch64 then
-      pkgs.pkgsStatic.libopus.overrideAttrs (old: {
+      pkgsStaticLLVM.libopus.overrideAttrs (old: {
         mesonFlags = builtins.map (
           f:
           if f == "-Dintrinsics=enabled" then
@@ -133,7 +136,7 @@ let
         ) (old.mesonFlags or [ ]);
       })
     else
-      pkgs.pkgsStatic.libopus;
+      pkgsStaticLLVM.libopus;
 
   commonArgsStatic = {
     inherit src version;
@@ -141,23 +144,37 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       staticLibopus
-      pkgs.pkgsStatic.libxkbcommon
-      pkgs.pkgsStatic.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      staticLibgbm
     ];
-    RUSTFLAGS = "-C relocation-model=static";
+    # Link musl libc dynamically so dlopen works (GPU acceleration).
+    RUSTFLAGS = "-C target-feature=-crt-static";
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-    CARGO_BUILD_TARGET = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTargetSpec;
-    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.pkgsStatic.stdenv.cc.libc}/include";
+    CARGO_BUILD_TARGET = pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
+    # Tell the `cc` crate to link libc++ instead of libstdc++ (LLVM toolchain).
+    CXXSTDLIB = "c++";
+    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgsStaticLLVM.stdenv.cc.libc}/include";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     nativeBuildInputs = [
       pkgs.pkg-config
       pkgs.llvmPackages.libclang
     ];
-    postUnpack = "export NIX_CFLAGS_LINK=''";
+    # Rustc hardcodes `-lgcc_s` for dynamic-musl targets.  With the
+    # LLVM toolchain we provide compiler-rt builtins under that name.
+    # Scoped to the musl target via NIX_LDFLAGS_<role> so the glibc CC
+    # used for build scripts is unaffected.
+    postUnpack =
+      let
+        compilerRt = pkgsStaticLLVM.llvmPackages.compiler-rt;
+        role = builtins.replaceStrings [ "-" ] [ "_" ]
+          pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
+      in
+      ''
+        export NIX_CFLAGS_LINK=""
+        mkdir -p $TMPDIR/rt-compat
+        builtins_lib=$(echo ${compilerRt}/lib/*/libclang_rt.builtins-*.a)
+        ln -s "$builtins_lib" $TMPDIR/rt-compat/libgcc_s.a
+        export NIX_LDFLAGS_${role}="-L$TMPDIR/rt-compat ''${NIX_LDFLAGS_${role}:-}"
+      '';
   };
 
   cargoArtifactsStatic = craneLibStatic.buildDepsOnly (
@@ -169,11 +186,73 @@ let
     }
   );
 
+  # ------------------------------------------------------------------
+  # Glibc + cargo-zigbuild for portable Linux release binaries.
+  #
+  # cargo-zigbuild uses zig as the linker to enforce a glibc version
+  # floor.  It also sets CC/CXX to zig wrappers for C deps.
+  #
+  # aws-lc-sys's default cc-crate builder falsely detects zig cc as
+  # a buggy GCC (memcmp check).  Setting AWS_LC_SYS_CMAKE_BUILDER=1
+  # switches it to cmake, which identifies zig cc as Clang and works.
+  # ------------------------------------------------------------------
+
+  minGlibcVersion = "2.31";
+
+  rustTargetGnu =
+    if pkgs.stdenv.hostPlatform.isAarch64
+    then "aarch64-unknown-linux-gnu"
+    else "x86_64-unknown-linux-gnu";
+
+  # Static libopus for the glibc release build so the binary is
+  # fully self-contained (only glibc itself is dynamic).
+  gnuStaticLibopus = pkgs.libopus.overrideAttrs (old: {
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
+  });
+
+  commonArgsGnu = {
+    inherit src version;
+    strictDeps = true;
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.llvmPackages.libclang
+      pkgs.cargo-zigbuild
+      pkgs.zig
+      pkgs.cmake # needed by aws-lc-sys cmake builder
+    ];
+    buildInputs = [
+      gnuStaticLibopus
+    ];
+    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
+    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+    CARGO_BUILD_TARGET = rustTargetGnu;
+    # Use cmake builder for aws-lc-sys to avoid its false-positive
+    # zig-cc memcmp bug check in the cc-crate code path.
+    AWS_LC_SYS_CMAKE_BUILDER = "1";
+    # Force static linking of opus — zig's linker rejects .so files
+    # built against a newer glibc than the target version.
+    OPUS_STATIC = "1";
+  };
+
+  cargoArtifactsGnu = craneLib.buildDepsOnly (
+    commonArgsGnu
+    // {
+      pname = "blit-workspace-deps-gnu";
+      cargoExtraArgs = "--workspace --exclude blit-browser";
+      doCheck = false;
+      buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --profile release --target ${rustTargetGnu}.${minGlibcVersion} --workspace --exclude blit-browser";
+      doNotPostBuildInstallCargoBinaries = true;
+    }
+  );
+
 in
 {
   inherit
     pkgs
+    pkgsStaticLLVM
     version
+    minGlibcVersion
+    rustTargetGnu
     cargoLockConfig
     rustToolchain
     rustPlatform
@@ -181,8 +260,10 @@ in
     craneLibStatic
     src
     commonArgs
+    commonArgsGnu
     commonArgsStatic
     cargoArtifacts
+    cargoArtifactsGnu
     cargoArtifactsStatic
     ;
 }

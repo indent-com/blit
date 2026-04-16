@@ -64,8 +64,8 @@ fn install_and_start_script(socket_path: &str) -> String {
     format!(
         "sh -c 'export PATH=\"$HOME/.local/bin:$PATH\"; \
          if ! command -v blit >/dev/null 2>&1 && ! command -v blit-server >/dev/null 2>&1; then \
-           if command -v curl >/dev/null 2>&1; then BLIT_INSTALL_DIR=\"$HOME/.local/bin\" curl -sf https://install.blit.sh | sh >&2; \
-           elif command -v wget >/dev/null 2>&1; then BLIT_INSTALL_DIR=\"$HOME/.local/bin\" wget -qO- https://install.blit.sh | sh >&2; fi; \
+           if command -v curl >/dev/null 2>&1; then BLIT_PREFIX=\"$HOME/.local\" curl -sf https://install.blit.sh | sh >&2; \
+           elif command -v wget >/dev/null 2>&1; then BLIT_PREFIX=\"$HOME/.local\" wget -qO- https://install.blit.sh | sh >&2; fi; \
          fi; \
          S=\"{escaped}\"; \
          if [ -S \"$S\" ]; then \

@@ -2689,6 +2689,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         codec_flag: u8,
         /// Encoder name for S2C_SURFACE_ENCODER (set when encoder was just created).
         encoder_name: Option<&'static str>,
+        /// WebCodecs codec string (e.g. "av01.2.05M.08"), set when encoder was just created.
+        codec_string: Option<String>,
         /// GBM buffers to export to compositor (set when encoder was just created).
         #[cfg(target_os = "linux")]
         external_bufs: Option<(u32, Vec<blit_compositor::ExternalOutputBuffer>)>,
@@ -2935,7 +2937,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                         client
                             .vulkan_video_surfaces
                             .insert(sid, (enc_name, pref.codec_flag()));
-                        let enc_msg = msg_surface_encoder(sid, enc_name);
+                        let codec_str = match pref {
+                            SurfaceEncoderPreference::VulkanVideoH264 => {
+                                if state.config.chroma.is_444() {
+                                    "avc1.F4001f".to_string()
+                                } else {
+                                    "avc1.640034".to_string()
+                                }
+                            }
+                            SurfaceEncoderPreference::VulkanVideoAV1 => {
+                                let profile = if state.config.chroma.is_444() { 2 } else { 0 };
+                                let level = surface_encoder::av1_level_for(px_w, px_h);
+                                format!("av01.{profile}.{level}M.08")
+                            }
+                            _ => String::new(),
+                        };
+                        let enc_msg = msg_surface_encoder(sid, enc_name, &codec_str);
                         let _ = send_outbox(client, enc_msg);
                         if state.config.verbose {
                             eprintln!(
@@ -3120,6 +3137,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                         nal_data: None,
                                         codec_flag: 0,
                                         encoder_name: None,
+                                        codec_string: None,
                                         #[cfg(target_os = "linux")]
                                         external_bufs: None,
                                     };
@@ -3137,6 +3155,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 nal_data: None,
                                 codec_flag: 0,
                                 encoder_name: None,
+                                codec_string: None,
                                 #[cfg(target_os = "linux")]
                                 external_bufs: None,
                             };
@@ -3147,6 +3166,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let newly_created = job.create_params.is_some();
                         let encoder_name = if newly_created {
                             Some(encoder.encoder_name())
+                        } else {
+                            None
+                        };
+                        let codec_string = if newly_created {
+                            Some(encoder.webcodecs_codec_string())
                         } else {
                             None
                         };
@@ -3219,6 +3243,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             nal_data,
                             codec_flag,
                             encoder_name,
+                            codec_string,
                             #[cfg(target_os = "linux")]
                             external_bufs,
                         }
@@ -3316,7 +3341,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && !invalidated
                     {
                         if let Some(name) = result.encoder_name {
-                            let enc_msg = msg_surface_encoder(result.sid, name);
+                            let codec_str = result.codec_string.as_deref().unwrap_or("");
+                            let enc_msg = msg_surface_encoder(result.sid, name, codec_str);
                             let _ = send_outbox(client, enc_msg);
                         }
                         client.surface_encoders.insert(result.sid, encoder);
@@ -3329,8 +3355,26 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
 
                 let Some((nal_data, is_keyframe)) = result.nal_data else {
+                    eprintln!(
+                        "[encode] nal_data=None sid={} cid={} {}x{}",
+                        result.sid, result.cid, result.px_w, result.px_h,
+                    );
                     continue;
                 };
+
+                {
+                    static EC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = EC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 5 || n.is_multiple_of(1000) {
+                        eprintln!(
+                            "[encode #{n}] sid={} {}x{} kf={is_keyframe} bytes={}",
+                            result.sid,
+                            result.px_w,
+                            result.px_h,
+                            nal_data.len(),
+                        );
+                    }
+                }
 
                 local_encodes += 1;
                 local_encode_bytes += nal_data.len() as u64;

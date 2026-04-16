@@ -4,6 +4,21 @@ const platforms = [
   { os: "macOS", arch: "arm64", wayland: false },
   { os: "Windows", arch: "x86_64", wayland: false },
 ];
+
+const videoDeps = [
+  { lib: "libvulkan.so.1", pkg: "libvulkan1 + mesa-vulkan-drivers", use: "GPU compositing, Vulkan Video encode" },
+  { lib: "libva.so.2, libva-drm.so.2", pkg: "libva2, libva-drm2, va-driver-all", use: "VA-API hardware encode (Intel/AMD)" },
+  { lib: "libgbm.so.1", pkg: "libgbm1", use: "DMA-BUF allocation for zero-copy VA-API" },
+  { lib: "libcuda.so.1, libnvidia-encode.so.1", pkg: "NVIDIA proprietary driver", use: "NVENC hardware encode" },
+];
+
+const audioDeps = [
+  { bin: "pipewire", pkg: "pipewire", use: "Audio daemon (private instance)" },
+  { bin: "pipewire-pulse", pkg: "pipewire-pulse", use: "PulseAudio compatibility for apps" },
+  { bin: "pw-cat", pkg: "pipewire / pipewire-utils", use: "Monitor source capture" },
+  { bin: "dbus-daemon", pkg: "dbus", use: "Private D-Bus session for PipeWire" },
+  { bin: "wireplumber", pkg: "wireplumber", use: "Session manager (optional)" },
+];
 ---
 
 <section class="py-10 border-t border-[var(--border)]">
@@ -37,4 +52,60 @@ const platforms = [
       </tbody>
     </table>
   </div>
+
+  <h3 class="text-[13px] font-bold tracking-tight mt-8 mb-1 text-[var(--bright)]">
+    Optional dependencies <span class="text-[10px] font-normal uppercase tracking-wider text-[var(--dim)]">Linux only</span>
+  </h3>
+  <p class="text-[13px] text-[var(--dim)] mb-4">
+    No dependencies are required — software video encoding and CPU rendering are built in.
+    GPU acceleration and audio are enabled automatically when the right libraries or binaries are present.
+    All GPU libraries are loaded at runtime via <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">dlopen</code>; missing ones are silently skipped.
+  </p>
+
+  <p class="text-[12px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2 mt-4">Video — GPU compositing &amp; hardware encoding</p>
+  <div class="overflow-x-auto">
+    <table class="w-full text-[13px] border-collapse">
+      <thead>
+        <tr class="border-b border-[var(--border)]">
+          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Library</th>
+          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Packages (Debian/Ubuntu)</th>
+          <th class="text-left py-2 font-bold text-[var(--bright)]">Used for</th>
+        </tr>
+      </thead>
+      <tbody>
+        {videoDeps.map(({ lib, pkg, use: desc }) => (
+          <tr class="border-b border-[var(--border)] last:border-0">
+            <td class="py-2.5 pr-6 text-[var(--fg)] font-mono text-xs whitespace-nowrap">{lib}</td>
+            <td class="py-2.5 pr-6 text-[var(--dim)] font-mono text-xs">{pkg}</td>
+            <td class="py-2.5 text-[var(--dim)]">{desc}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="text-[12px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2 mt-6">Audio</p>
+  <div class="overflow-x-auto">
+    <table class="w-full text-[13px] border-collapse">
+      <thead>
+        <tr class="border-b border-[var(--border)]">
+          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Binary</th>
+          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Packages (Debian/Ubuntu)</th>
+          <th class="text-left py-2 font-bold text-[var(--bright)]">Used for</th>
+        </tr>
+      </thead>
+      <tbody>
+        {audioDeps.map(({ bin, pkg, use: desc }) => (
+          <tr class="border-b border-[var(--border)] last:border-0">
+            <td class="py-2.5 pr-6 text-[var(--fg)] font-mono text-xs whitespace-nowrap">{bin}</td>
+            <td class="py-2.5 pr-6 text-[var(--dim)] font-mono text-xs">{pkg}</td>
+            <td class="py-2.5 text-[var(--dim)]">{desc}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[13px] text-[var(--dim)] mt-2">
+    Audio is disabled automatically when PipeWire is not installed, or explicitly with <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">BLIT_AUDIO=0</code>.
+  </p>
 </section>

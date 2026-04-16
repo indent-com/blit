@@ -173,7 +173,7 @@ export async function handleDemoRequest(
       const image = await modal.images.fromId(DEMO_IMAGE_ID);
 
       const startupScript = [
-        'blit share --passphrase "$BLIT_NONCE" &',
+        'BLIT_PASSPHRASE="$BLIT_NONCE" blit share &',
         "sleep 2",
         "blit terminal start -t bash --cols 280 --rows 60 -- bash",
         "blit terminal start -t parrot --cols 280 --rows 60 -- mpv --vo=tct --no-osd-bar --osd-level=0 --no-terminal --loop=inf /home/blit/parrot.gif",

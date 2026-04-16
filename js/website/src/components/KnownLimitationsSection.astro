@@ -1,25 +1,26 @@
 ---
-type Status = "ok" | "untested";
+type Status = "ok" | "broken" | "untested";
 
 const encoders = ["NVENC", "VA-API AMD", "VA-API Intel", "Software"] as const;
 
-const apps: { name: string; status: Record<string, Status> }[] = [
+const apps: { name: string; note?: string; status: Record<string, Status> }[] = [
   {
     name: "Chromium / Brave / Electron",
     status: {
       NVENC:          "ok",
       "VA-API AMD":   "ok",
-      "VA-API Intel": "untested",
-      Software:       "untested",
+      "VA-API Intel": "ok",
+      Software:       "broken",
     },
   },
   {
-    name: "mpv / GPU video players",
+    name: "mpv",
+    note: "--vo=wlshm in software",
     status: {
       NVENC:          "ok",
       "VA-API AMD":   "ok",
-      "VA-API Intel": "untested",
-      Software:       "untested",
+      "VA-API Intel": "ok",
+      Software:       "ok",
     },
   },
   {
@@ -27,7 +28,7 @@ const apps: { name: string; status: Record<string, Status> }[] = [
     status: {
       NVENC:          "ok",
       "VA-API AMD":   "ok",
-      "VA-API Intel": "untested",
+      "VA-API Intel": "ok",
       Software:       "untested",
     },
   },
@@ -35,6 +36,7 @@ const apps: { name: string; status: Record<string, Status> }[] = [
 
 function badge(s: Status) {
   if (s === "ok") return { text: "Working", cls: "text-[var(--green)]" };
+  if (s === "broken") return { text: "Broken", cls: "text-[var(--red,red)]" };
   return { text: "Untested", cls: "text-[var(--dim)]" };
 }
 ---
@@ -60,9 +62,9 @@ function badge(s: Status) {
         </tr>
       </thead>
       <tbody>
-        {apps.map(({ name, status }) => (
+        {apps.map(({ name, note, status }) => (
           <tr class="border-b border-[var(--border)] last:border-0">
-            <td class="py-2.5 pr-6 text-[var(--fg)] font-medium whitespace-nowrap">{name}</td>
+            <td class="py-2.5 pr-6 text-[var(--fg)] font-medium whitespace-nowrap">{name}{note && <span class="text-[var(--dim)] font-normal text-[11px] ml-1">({note})</span>}</td>
             {encoders.map((enc) => {
               const b = badge(status[enc]);
               return (

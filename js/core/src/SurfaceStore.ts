@@ -29,23 +29,20 @@ export interface SurfaceFrameSample {
 
 type SurfaceCodec = "h264" | "av1";
 
-/**
- * Maximum decode queue depth before we defer the surface ACK.  When the
- * WebCodecs decoder's internal queue is at or above this threshold the ACK
- * is held back, which stalls the server's pacing window and prevents it
- * from flooding the client faster than it can decode.
- */
-const MAX_DECODE_QUEUE_FOR_ACK = 2;
-
 interface DecoderEntry {
   decoder: VideoDecoder;
   codec: SurfaceCodec;
   pendingKeyframe: boolean;
-  /** Last HVCC/AVCC description bytes, used to avoid reconfiguring on every
-   *  keyframe when the parameter sets haven't changed. */
-  lastDescription: string | null;
-  /** Surface IDs awaiting ACK, held back because the decode queue was deep. */
-  pendingAcks: number;
+  /** Last H.264 codec string (e.g. "avc1.42001e"), used to avoid
+   *  reconfiguring on every keyframe.  We compare the codec string
+   *  (profile/compat/level) rather than raw SPS bytes because some
+   *  encoders rotate sps_id on each IDR, which changes the AVCC
+   *  description without affecting decode parameters.  Unnecessary
+   *  reconfigures orphan in-flight VideoFrame objects (GC warning)
+   *  and can stall the decode pipeline. */
+  lastCodecString: string | null;
+  /** Last AVCC description passed to configure(). */
+  lastDescription: ArrayBuffer | null;
 }
 
 interface CanvasEntry {
@@ -59,56 +56,49 @@ function codecFromFlags(flags: number): SurfaceCodec {
   return "h264";
 }
 
-/**
- * Compute AV1 level index from coded dimensions, mirroring the server's
- * `compute_level()` in vaapi_encode.rs.  Returns the two-digit level
- * string used in the av01 codec string (e.g. "05" for level 3.1).
- */
-function av1LevelString(width: number, height: number): string {
-  // Assume 60 fps — matches the server's compute_level(w, h, 60).
-  const sps = width * height * 60;
-  const specs: [string, number, number, number][] = [
-    ["00", 2048, 1152, 5529600],
-    ["01", 2816, 1152, 10454400],
-    ["04", 4352, 2448, 24969600],
-    ["05", 5504, 3096, 39938400],
-    ["08", 6144, 3456, 77856768],
-    ["09", 6144, 3456, 155713536],
-    ["12", 8192, 4352, 273715200],
-    ["13", 8192, 4352, 547430400],
-    ["16", 16384, 8704, 1176502272],
-  ];
-  for (const [level, maxW, maxH, maxRate] of specs) {
-    if (width <= maxW && height <= maxH && sps <= maxRate) return level;
+/** Gracefully shut down a decoder, ensuring every in-flight VideoFrame
+ *  reaches the output callback (which calls frame.close()) before the
+ *  decoder is destroyed.
+ *
+ *  Chromium's reset()/close() drops internally-queued VideoFrame objects
+ *  without calling .close(), triggering the "VideoFrame was garbage
+ *  collected without being closed" console warning and potentially
+ *  stalling the frame buffer pool.  flush() drains the queue through
+ *  the normal output path first.
+ *
+ *  The flush is fire-and-forget — callers continue immediately.  The
+ *  output callback still closes every frame via its finally block even
+ *  after the decoder entry has been removed from the map. */
+function safeClose(decoder: VideoDecoder): void {
+  try {
+    if (decoder.state === "configured") {
+      const close = () => {
+        try {
+          if (decoder.state !== "closed") decoder.close();
+        } catch {
+          /* already closed */
+        }
+      };
+      decoder.flush().then(close, close);
+    } else if (decoder.state !== "closed") {
+      decoder.close();
+    }
+  } catch {
+    // Already closed or in an invalid state.
   }
-  return "16";
 }
 
-/** WebCodecs codec string for the given surface codec. */
-function codecString(
-  codec: SurfaceCodec,
-  width?: number,
-  height?: number,
-  sps?: Uint8Array,
-): string {
-  if (codec === "av1") {
-    const level = width && height ? av1LevelString(width, height) : "13";
-    return `av01.0.${level}M.08`;
-  }
-  // Derive the avc1 codec string from the SPS so it matches the actual
-  // profile/level NVENC (or any encoder) produces.  The old hardcoded
-  // "avc1.420034" claimed Baseline profile, but NVENC's P1 preset emits
-  // High profile (CABAC).  A decoder selected for Baseline can't handle
-  // CABAC, producing black macroblocks.
-  if (sps && sps.length >= 4) {
-    const profile = sps[1];
-    const compat = sps[2];
-    const level = sps[3];
-    const hex = (b: number) => b.toString(16).padStart(2, "0");
-    return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
-  }
-  // Fallback: High profile level 5.2 — safe for any modern decoder.
-  return "avc1.640034";
+/**
+ * Derive the H.264 WebCodecs codec string from the SPS NAL unit so it
+ * matches the actual profile/level the encoder produced.
+ */
+function h264CodecStringFromSps(sps: Uint8Array): string | null {
+  if (sps.length < 4) return null;
+  const profile = sps[1];
+  const compat = sps[2];
+  const level = sps[3];
+  const hex = (b: number) => b.toString(16).padStart(2, "0");
+  return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +218,7 @@ export class SurfaceStore {
   private frameListeners = new Set<SurfaceFrameCallback>();
   private cursorShapes = new Map<number, string>();
   private encoderNames = new Map<number, string>();
+  private codecStrings = new Map<number, string>();
   private cursorListeners = new Set<
     (surfaceId: number, shape: string) => void
   >();
@@ -359,8 +350,6 @@ export class SurfaceStore {
     errors: number;
     /** Current WebCodecs decode queue depth. */
     queueDepth: number;
-    /** ACKs deferred due to decode backpressure. */
-    pendingAcks: number;
   }[] {
     const result: ReturnType<SurfaceStore["getDebugStats"]> = [];
     for (const [id, surface] of this.surfaces) {
@@ -388,7 +377,6 @@ export class SurfaceStore {
         dropped: this._surfaceDrops.get(id) ?? 0,
         errors: this._surfaceErrors.get(id) ?? 0,
         queueDepth,
-        pendingAcks: entry?.pendingAcks ?? 0,
       });
     }
     return result;
@@ -439,13 +427,14 @@ export class SurfaceStore {
     this.surfaces.delete(surfaceId);
     this.canvases.delete(surfaceId);
     this.encoderNames.delete(surfaceId);
+    this.codecStrings.delete(surfaceId);
     this._surfaceFrameSamples.delete(surfaceId);
     this._surfaceOutputSamples.delete(surfaceId);
     this._surfaceDrops.delete(surfaceId);
     this._surfaceErrors.delete(surfaceId);
     const entry = this.decoders.get(surfaceId);
     if (entry) {
-      entry.decoder.close();
+      safeClose(entry.decoder);
       this.decoders.delete(surfaceId);
     }
     this.emitChange();
@@ -477,13 +466,8 @@ export class SurfaceStore {
     // Ensure we have a decoder for this surface with the right codec.
     let entry = this.decoders.get(surfaceId);
     if (!entry || entry.codec !== codec) {
-      // Flush deferred ACKs before discarding the old decoder —
-      // losing them permanently stalls the server's pacing window.
       if (entry) {
-        for (let i = 0; i < entry.pendingAcks; i++) {
-          this.sendAck(surfaceId);
-        }
-        entry.decoder.close();
+        safeClose(entry.decoder);
       }
       this.decoders.delete(surfaceId);
       this.initDecoder(surfaceId, codec, width, height);
@@ -535,25 +519,32 @@ export class SurfaceStore {
         if (isKey) {
           let sps: Uint8Array | undefined;
           let pps: Uint8Array | undefined;
+          const vclNals: Uint8Array[] = [];
           for (const nal of nals) {
             const t = h264NalType(nal);
             if (t === 7) sps = nal;
             else if (t === 8) pps = nal;
+            else vclNals.push(nal);
           }
           if (sps && pps) {
             const description = buildAvccDescription(sps, pps);
-            const descKey = Array.from(new Uint8Array(description)).join(",");
-            if (descKey !== entry.lastDescription) {
-              entry.lastDescription = descKey;
+            const cs = h264CodecStringFromSps(sps) ?? "avc1.42001e";
+            if (cs !== entry.lastCodecString) {
+              entry.lastCodecString = cs;
+              entry.lastDescription = description;
               entry.decoder.configure({
-                codec: codecString(codec, width, height, sps),
+                codec: cs,
                 optimizeForLatency: true,
                 description,
               });
             }
           }
+          // In AVCC mode, parameter-set NALs (SPS/PPS) belong in the
+          // description — strip them from the frame data.
+          frameData = toLengthPrefixed(vclNals.length > 0 ? vclNals : nals);
+        } else {
+          frameData = toLengthPrefixed(nals);
         }
-        frameData = toLengthPrefixed(nals);
       }
 
       // Guard: don't decode if the decoder was never configured
@@ -572,15 +563,12 @@ export class SurfaceStore {
       entry.decoder.decode(chunk);
       this._diag.decoded++;
 
-      // Backpressure: only ACK immediately if the decode queue is shallow.
-      // When the queue is deep the ACK is deferred until the decoder's
-      // output callback drains it below the threshold — this stalls the
-      // server's pacing window and prevents flooding.
-      if (entry.decoder.decodeQueueSize < MAX_DECODE_QUEUE_FOR_ACK) {
-        this.sendAck(surfaceId);
-      } else {
-        entry.pendingAcks++;
-      }
+      // ACK immediately — the server already paces delivery via its own
+      // inflight window and time-based send interval.  Deferring ACKs
+      // until the output callback adds decode latency to the effective
+      // round-trip, starving the server's pacing window on high-latency
+      // or software-decode paths.
+      this.sendAck(surfaceId);
     } catch (e) {
       console.warn(
         "[blit] surface decode error:",
@@ -637,8 +625,15 @@ export class SurfaceStore {
     };
   }
 
-  handleSurfaceEncoder(surfaceId: number, encoderName: string): void {
+  handleSurfaceEncoder(surfaceId: number, rawPayload: string): void {
+    // Format: "encoder-name\0codec-string" (NUL-separated).
+    const nul = rawPayload.indexOf("\0");
+    const encoderName = nul >= 0 ? rawPayload.slice(0, nul) : rawPayload;
+    const codecString = nul >= 0 ? rawPayload.slice(nul + 1) : null;
     this.encoderNames.set(surfaceId, encoderName);
+    if (codecString) {
+      this.codecStrings.set(surfaceId, codecString);
+    }
   }
 
   handleSurfaceAppId(surfaceId: number, appId: string): void {
@@ -678,11 +673,13 @@ export class SurfaceStore {
    */
   handleDisconnect(): void {
     for (const entry of this.decoders.values()) {
-      entry.decoder.close();
+      safeClose(entry.decoder);
     }
     this.decoders.clear();
     this.canvases.clear();
     this.surfaces.clear();
+    this.encoderNames.clear();
+    this.codecStrings.clear();
     this._surfaceFrameSamples.clear();
     this._surfaceOutputSamples.clear();
     this._surfaceDrops.clear();
@@ -699,11 +696,13 @@ export class SurfaceStore {
    */
   reset(): void {
     for (const entry of this.decoders.values()) {
-      entry.decoder.close();
+      safeClose(entry.decoder);
     }
     this.decoders.clear();
     this.canvases.clear();
     this.surfaces.clear();
+    this.encoderNames.clear();
+    this.codecStrings.clear();
     this._surfaceFrameSamples.clear();
     this._surfaceOutputSamples.clear();
     this._surfaceDrops.clear();
@@ -802,18 +801,6 @@ export class SurfaceStore {
           frame.close();
         }
 
-        // Flush deferred ACKs now that the decode queue has drained.
-        const entry = this.decoders.get(surfaceId);
-        if (entry && entry.pendingAcks > 0) {
-          // Send one ACK per deferred frame.  The server's pacing window
-          // opens one slot per ACK, so this naturally meters delivery.
-          const toSend = entry.pendingAcks;
-          entry.pendingAcks = 0;
-          for (let i = 0; i < toSend; i++) {
-            this.sendAck(surfaceId);
-          }
-        }
-
         // Notify frame listeners so they blit from getCanvas().
         for (const listener of this.frameListeners) {
           try {
@@ -835,17 +822,7 @@ export class SurfaceStore {
         );
         const entry = this.decoders.get(surfaceId);
         if (entry) {
-          // Flush any deferred ACKs before destroying the entry —
-          // losing them permanently shrinks the server's pacing window,
-          // eventually stalling frame delivery for this surface.
-          for (let i = 0; i < entry.pendingAcks; i++) {
-            this.sendAck(surfaceId);
-          }
-          try {
-            entry.decoder.close();
-          } catch {
-            // Already closed.
-          }
+          safeClose(entry.decoder);
           // Remove the broken decoder so the next frame triggers
           // re-initialization via initDecoder().
           this.decoders.delete(surfaceId);
@@ -859,30 +836,35 @@ export class SurfaceStore {
     // description (AVCC for H.264).  Configuring without a description
     // then reconfiguring with one causes VideoToolbox on macOS to drop
     // the first decoded frame.
-    // AV1 has no description — configure it eagerly.
+    // AV1 has no description — configure it eagerly using the server-
+    // provided WebCodecs codec string.
     if (codec === "av1") {
-      try {
-        decoder.configure({
-          codec: codecString(codec, width, height),
-          optimizeForLatency: true,
-        });
-      } catch (e) {
-        console.warn(
-          "[blit] surface decoder configure failed:",
-          surfaceId,
-          codec,
-          e,
-        );
-        decoder.close();
-        return;
+      const cs = this.codecStrings.get(surfaceId);
+      if (cs) {
+        try {
+          decoder.configure({
+            codec: cs,
+            optimizeForLatency: true,
+          });
+        } catch (e) {
+          console.warn(
+            "[blit] surface decoder configure failed:",
+            surfaceId,
+            codec,
+            cs,
+            e,
+          );
+          decoder.close();
+          return;
+        }
       }
     }
     this.decoders.set(surfaceId, {
       decoder,
       codec,
       pendingKeyframe: true,
+      lastCodecString: null,
       lastDescription: null,
-      pendingAcks: 0,
     });
   }
 

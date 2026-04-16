@@ -266,6 +266,8 @@ pub const SURFACE_FRAME_CODEC_PNG: u8 = 2 << 1;
 /// C2S_SURFACE_SUBSCRIBE.  0 means "accept anything".
 pub const CODEC_SUPPORT_H264: u8 = 1 << 0;
 pub const CODEC_SUPPORT_AV1: u8 = 1 << 1;
+pub const CODEC_SUPPORT_H264_444: u8 = 1 << 2;
+pub const CODEC_SUPPORT_AV1_444: u8 = 1 << 3;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;
@@ -2176,12 +2178,23 @@ pub fn msg_surface_app_id(surface_id: u16, app_id: &str) -> Vec<u8> {
     msg
 }
 
-pub fn msg_surface_encoder(surface_id: u16, encoder_name: &str) -> Vec<u8> {
+/// Build S2C_SURFACE_ENCODER: `[0x2A][surface_id:2][name\0codec_string]`.
+/// The codec_string is the WebCodecs codec string (e.g. "av01.2.05M.08")
+/// appended after a NUL separator.  Old clients that don't split on NUL
+/// will just display the full string as the encoder name, which is fine.
+pub fn msg_surface_encoder(
+    surface_id: u16,
+    encoder_name: &str,
+    codec_string: &str,
+) -> Vec<u8> {
     let name_bytes = encoder_name.as_bytes();
-    let mut msg = Vec::with_capacity(3 + name_bytes.len());
+    let codec_bytes = codec_string.as_bytes();
+    let mut msg = Vec::with_capacity(3 + name_bytes.len() + 1 + codec_bytes.len());
     msg.push(S2C_SURFACE_ENCODER);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(name_bytes);
+    msg.push(0); // NUL separator
+    msg.extend_from_slice(codec_bytes);
     msg
 }
 

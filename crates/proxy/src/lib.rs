@@ -62,11 +62,16 @@ pub async fn proxy_alive(path: &str) -> bool {
     }
 }
 
+/// Resolve the blit binary path for re-exec.
+pub fn blit_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_default()
+}
+
 /// Ensure a blit-proxy daemon is running, spawning one if necessary.
 ///
 /// `proxy_bin` is the path to the binary that accepts a `proxy-daemon`
-/// subcommand (typically `std::env::current_exe()`).  When the binary is
-/// the standalone `blit-proxy` it should be invoked without arguments;
+/// subcommand (typically [`blit_exe()`]).  When the binary is the
+/// standalone `blit-proxy` it should be invoked without arguments;
 /// when it is the `blit` CLI it needs the `proxy-daemon` subcommand.
 ///
 /// Returns the socket path on success.

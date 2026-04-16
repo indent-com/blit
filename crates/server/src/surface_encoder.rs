@@ -2,7 +2,8 @@
 
 use blit_compositor::PixelData;
 use blit_remote::{
-    CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_H264,
+    CODEC_SUPPORT_AV1, CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444,
+    SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_H264,
 };
 use openh264::encoder::Encoder as OpenH264Encoder;
 use openh264::formats::YUVBuffer;
@@ -95,6 +96,24 @@ impl SurfaceEncoderPreference {
         }
     }
 
+    /// Returns true if the client announced 4:4:4 chroma support for this
+    /// encoder's codec family.  Legacy clients (codec_support == 0) are
+    /// assumed to lack 4:4:4 support since the resulting Professional Profile
+    /// bitstreams are not universally decodable.
+    pub fn supports_444_by_client(self, codec_support: u8) -> bool {
+        if codec_support == 0 {
+            return false;
+        }
+        match self {
+            Self::H264Software | Self::H264Vaapi | Self::NvencH264 | Self::VulkanVideoH264 => {
+                codec_support & CODEC_SUPPORT_H264_444 != 0
+            }
+            Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 | Self::VulkanVideoAV1 => {
+                codec_support & CODEC_SUPPORT_AV1_444 != 0
+            }
+        }
+    }
+
     /// Maximum surface dimensions the encoder can handle.
     /// Returns `None` if there is no practical limit.
     pub fn max_dimensions(self) -> Option<(u16, u16)> {
@@ -180,6 +199,30 @@ impl ChromaSubsampling {
     pub fn is_444(self) -> bool {
         matches!(self, Self::Cs444)
     }
+}
+
+/// Compute the AV1 level index string (e.g. "05") for the given dimensions,
+/// assuming 60 fps.  Mirrors the client-side `av1LevelString()`.
+pub fn av1_level_for(width: u32, height: u32) -> &'static str {
+    let sps = width as u64 * height as u64 * 60;
+    // (level_string, max_w, max_h, max_sample_rate)
+    const SPECS: &[(&str, u32, u32, u64)] = &[
+        ("00", 2048, 1152, 5_529_600),
+        ("01", 2816, 1152, 10_454_400),
+        ("04", 4352, 2448, 24_969_600),
+        ("05", 5504, 3096, 39_938_400),
+        ("08", 6144, 3456, 77_856_768),
+        ("09", 6144, 3456, 155_713_536),
+        ("12", 8192, 4352, 273_715_200),
+        ("13", 8192, 4352, 547_430_400),
+        ("16", 16384, 8704, 1_176_502_272),
+    ];
+    for &(level, max_w, max_h, max_rate) in SPECS {
+        if width <= max_w && height <= max_h && sps <= max_rate {
+            return level;
+        }
+    }
+    "16"
 }
 
 /// Video quality preset.  Higher quality uses more CPU / bandwidth.
@@ -358,16 +401,27 @@ impl SurfaceEncoder {
         let source_height = height;
         let mut last_err = String::from("no encoders configured");
 
-        // When 4:4:4 is requested, try each preference with 444 first.
-        // If none succeed, fall through to 4:2:0 below.
-        if chroma.is_444() {
-            for &pref in preferences {
-                if pref.is_vulkan_video() {
-                    continue;
-                }
-                if !pref.supported_by_client(codec_support) {
-                    continue;
-                }
+        // Single pass: for each encoder preference, try 4:4:4 first
+        // (if requested and client-supported), then fall back to 4:2:0,
+        // before moving to the next encoder.  This ensures e.g.
+        // h264-software 4:2:0 beats av1-software 4:4:4.
+        let try_444 = chroma.is_444();
+        if try_444 && verbose {
+            eprintln!(
+                "[surface-encoder] 4:4:4 eligible: codec_support={codec_support:#04x} for {source_width}x{source_height}",
+            );
+        }
+
+        for &pref in preferences {
+            if pref.is_vulkan_video() {
+                continue;
+            }
+            if !pref.supported_by_client(codec_support) {
+                continue;
+            }
+
+            // Try 4:4:4 first for this encoder if the client supports it.
+            if try_444 && pref.supports_444_by_client(codec_support) {
                 match Self::try_one(
                     pref,
                     width,
@@ -399,15 +453,8 @@ impl SurfaceEncoder {
                     }
                 }
             }
-        }
 
-        for &pref in preferences {
-            if pref.is_vulkan_video() {
-                continue;
-            }
-            if !pref.supported_by_client(codec_support) {
-                continue;
-            }
+            // Fall back to 4:2:0 for this encoder.
             match Self::try_one(
                 pref,
                 width,
@@ -422,7 +469,7 @@ impl SurfaceEncoder {
                 Ok(enc) => {
                     if verbose {
                         eprintln!(
-                            "[surface-encoder] using {:?} for {source_width}x{source_height}",
+                            "[surface-encoder] using {:?} 4:2:0 for {source_width}x{source_height}",
                             pref
                         );
                     }
@@ -431,7 +478,7 @@ impl SurfaceEncoder {
                 Err(err) => {
                     if verbose {
                         eprintln!(
-                            "[surface-encoder] {:?} unavailable for {source_width}x{source_height}: {err}",
+                            "[surface-encoder] {:?} 4:2:0 unavailable for {source_width}x{source_height}: {err}",
                             pref
                         );
                     }
@@ -603,6 +650,41 @@ impl SurfaceEncoder {
             (SurfaceEncoderKind::AV1Vaapi(_), _) => "av1-vaapi",
             (SurfaceEncoderKind::AV1Software(_), ChromaSubsampling::Cs444) => "av1-software 4:4:4",
             (SurfaceEncoderKind::AV1Software(_), _) => "av1-software",
+        }
+    }
+
+    /// WebCodecs codec string for the active encoder.  Sent to the client
+    /// so it can configure `VideoDecoder` with the correct profile/level.
+    pub fn webcodecs_codec_string(&self) -> String {
+        match &self.kind {
+            SurfaceEncoderKind::H264Software(_) => {
+                if self.chroma.is_444() {
+                    "avc1.F4001f".to_string()
+                } else {
+                    "avc1.42001f".to_string()
+                }
+            }
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderKind::H264Vaapi(_) => {
+                if self.chroma.is_444() {
+                    "avc1.F4001f".to_string()
+                } else {
+                    "avc1.640034".to_string()
+                }
+            }
+            SurfaceEncoderKind::NvencH264(_) => "avc1.640034".to_string(),
+            SurfaceEncoderKind::NvencAV1(_)
+            | SurfaceEncoderKind::AV1Software(_) => {
+                let profile = if self.chroma.is_444() { 2 } else { 0 };
+                let level = av1_level_for(self.source_width, self.source_height);
+                format!("av01.{profile}.{level}M.08")
+            }
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderKind::AV1Vaapi(_) => {
+                let profile = if self.chroma.is_444() { 2 } else { 0 };
+                let level = av1_level_for(self.source_width, self.source_height);
+                format!("av01.{profile}.{level}M.08")
+            }
         }
     }
 

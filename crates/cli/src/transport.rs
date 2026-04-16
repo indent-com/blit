@@ -163,9 +163,8 @@ pub async fn ensure_proxy() -> Result<String, String> {
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
 
-    // Re-exec the current binary as a detached daemon.
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("blit-proxy: cannot determine executable path: {e}"))?;
+    // Re-exec through the launcher (or current binary in dev builds).
+    let exe = blit_proxy::blit_exe();
 
     #[cfg(unix)]
     {
