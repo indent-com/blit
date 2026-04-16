@@ -1167,7 +1167,6 @@ interface FileMetadata {
 | --------------- | ---------------------------------------------------- |
 | PyPI (current)  | Continue publishing Python package during transition |
 | GitHub Releases | Standalone binaries per platform                     |
-| npm             | `@indent-com/cli` for `npx indent`                   |
 | Homebrew        | Formula or tap                                       |
 | curl installer  | Shell script: `curl -sf https://install.indent.com`  |
 
