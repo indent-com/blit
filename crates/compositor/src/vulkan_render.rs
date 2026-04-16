@@ -48,6 +48,8 @@ pub(crate) struct VulkanRenderer {
     has_video_encode: bool,
     /// Whether the device supports VK_KHR_video_encode_av1 extension.
     has_video_encode_av1: bool,
+    /// Whether the device supports DMA-BUF import/export extensions.
+    has_dmabuf: bool,
 
     // Render pipeline
     render_pass: vk::RenderPass,
@@ -338,28 +340,27 @@ impl VulkanRenderer {
         let has_external_fence_fd = ext_names_all.contains(&ash::khr::external_fence_fd::NAME)
             && ext_names_all.contains(&ash::khr::external_fence::NAME);
 
-        // Device extensions for DMA-BUF import/export.
-        let required_base_extensions: &[&std::ffi::CStr] = &[
+        // DMA-BUF extensions are optional — llvmpipe and other software
+        // renderers lack them.  When absent the compositor runs in SHM-only
+        // mode: clients use wl_shm, and any DMA-BUF buffers that arrive
+        // are imported via the mmap fallback path.
+        let dmabuf_extensions: &[&std::ffi::CStr] = &[
             ash::khr::external_memory_fd::NAME,
             ash::khr::external_memory::NAME,
             ash::ext::external_memory_dma_buf::NAME,
             ash::ext::image_drm_format_modifier::NAME,
             ash::khr::image_format_list::NAME,
         ];
-        for ext in required_base_extensions {
-            if !ext_names_all.contains(ext) {
-                eprintln!(
-                    "[vulkan-render] required extension not available: {}",
-                    ext.to_string_lossy()
-                );
-                unsafe { instance.destroy_instance(None) };
-                return None;
-            }
-        }
-        let mut device_extensions: Vec<*const std::ffi::c_char> = required_base_extensions
+        let has_dmabuf = dmabuf_extensions
             .iter()
-            .map(|e| e.as_ptr())
-            .collect();
+            .all(|e| ext_names_all.contains(e));
+        if !has_dmabuf {
+            eprintln!("[vulkan-render] DMA-BUF extensions not available, SHM-only mode");
+        }
+        let mut device_extensions: Vec<*const std::ffi::c_char> = Vec::new();
+        if has_dmabuf {
+            device_extensions.extend(dmabuf_extensions.iter().map(|e| e.as_ptr()));
+        }
         if has_external_fence_fd {
             device_extensions.push(ash::khr::external_fence::NAME.as_ptr());
             device_extensions.push(ash::khr::external_fence_fd::NAME.as_ptr());
@@ -733,7 +734,9 @@ impl VulkanRenderer {
         // Clients (Chromium, mpv, …) will pick from these when allocating
         // DMA-BUFs, ensuring the GPU can import them with the correct
         // tiling layout.
-        let supported_dmabuf_modifiers = {
+        // Skip the query entirely when DMA-BUF extensions are absent —
+        // DrmFormatModifierPropertiesListEXT requires the extension.
+        let supported_dmabuf_modifiers = if has_dmabuf {
             use super::imp::drm_fourcc;
             let format_pairs: &[(u32, vk::Format)] = &[
                 (drm_fourcc::ARGB8888, vk::Format::B8G8R8A8_UNORM),
@@ -796,6 +799,8 @@ impl VulkanRenderer {
                 mods.len(),
             );
             mods
+        } else {
+            Vec::new()
         };
 
         Some(Self {
@@ -813,6 +818,7 @@ impl VulkanRenderer {
             vulkan_encoders: HashMap::new(),
             has_video_encode,
             has_video_encode_av1,
+            has_dmabuf,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -904,6 +910,12 @@ impl VulkanRenderer {
     /// Whether the device supports Vulkan Video AV1 encode.
     pub(crate) fn has_video_encode_av1(&self) -> bool {
         self.has_video_encode_av1
+    }
+
+    /// Whether the device supports DMA-BUF import/export extensions.
+    #[expect(dead_code)]
+    pub(crate) fn has_dmabuf(&self) -> bool {
+        self.has_dmabuf
     }
 
     // ---------------------------------------------------------------
@@ -1015,6 +1027,9 @@ impl VulkanRenderer {
     ) {
         if buffers.is_empty() {
             self.destroy_external_outputs_for(surface_id);
+            return;
+        }
+        if !self.has_dmabuf {
             return;
         }
         // Import each encoder-allocated DMA-BUF as a Vulkan render target.
@@ -1445,6 +1460,9 @@ impl VulkanRenderer {
 
     /// Allocate NV12 output planes for the BGRA→NV12 compute path.
     fn create_nv12_outputs(&mut self, surface_id: u32, w: u32, h: u32) {
+        if !self.has_dmabuf {
+            return;
+        }
         use std::os::fd::FromRawFd;
         self.destroy_nv12_outputs_for(surface_id);
 
@@ -1578,6 +1596,9 @@ impl VulkanRenderer {
         surface_id: u32,
         fds: &[(Arc<OwnedFd>, u32, u32, u32, u32, u64)],
     ) {
+        if !self.has_dmabuf {
+            return;
+        }
         self.destroy_nv12_outputs_for(surface_id);
 
         for (fd, stride, uv_offset, w, h, modifier) in fds {
@@ -2343,15 +2364,41 @@ impl VulkanRenderer {
                 stride,
                 offset,
                 ..
-            } => self.create_cached_dmabuf(
-                fd.as_raw_fd(),
-                *fourcc,
-                *modifier,
-                *stride,
-                *offset,
-                width,
-                height,
-            ),
+            } => {
+                if self.has_dmabuf {
+                    self.create_cached_dmabuf(
+                        fd.as_raw_fd(),
+                        *fourcc,
+                        *modifier,
+                        *stride,
+                        *offset,
+                        width,
+                        height,
+                    )
+                } else {
+                    // No DMA-BUF extensions — go straight to the mmap
+                    // fallback which does a CPU copy into an SHM texture.
+                    let _result = self.import_linear_dmabuf_mmap(
+                        fd.as_raw_fd(),
+                        *fourcc,
+                        *stride,
+                        width,
+                        height,
+                    );
+                    if _result.is_some() {
+                        let temp = self.frame_textures.pop().unwrap();
+                        Some(CachedSurfaceTexture {
+                            image: temp.image,
+                            memory: temp.memory,
+                            view: temp.view,
+                            descriptor_set: temp.descriptor_set,
+                            initial_layout: vk::ImageLayout::PREINITIALIZED,
+                        })
+                    } else {
+                        None
+                    }
+                }
+            }
             PixelData::Bgra(data) => {
                 // Convert BGRA→RGBA for upload.
                 let mut rgba = vec![0u8; data.len()];
