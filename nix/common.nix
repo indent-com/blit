@@ -229,6 +229,9 @@ let
     # Use cmake builder for aws-lc-sys to avoid its false-positive
     # zig-cc memcmp bug check in the cc-crate code path.
     AWS_LC_SYS_CMAKE_BUILDER = "1";
+    # Force static linking of opus — zig's linker rejects .so files
+    # built against a newer glibc than the target version.
+    OPUS_STATIC = "1";
   };
 
   cargoArtifactsGnu = craneLib.buildDepsOnly (
