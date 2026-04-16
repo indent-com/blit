@@ -339,13 +339,25 @@ impl VulkanRenderer {
             && ext_names_all.contains(&ash::khr::external_fence::NAME);
 
         // Device extensions for DMA-BUF import/export.
-        let mut device_extensions: Vec<*const std::ffi::c_char> = vec![
-            ash::khr::external_memory_fd::NAME.as_ptr(),
-            ash::khr::external_memory::NAME.as_ptr(),
-            ash::ext::external_memory_dma_buf::NAME.as_ptr(),
-            ash::ext::image_drm_format_modifier::NAME.as_ptr(),
-            ash::khr::image_format_list::NAME.as_ptr(),
+        let required_base_extensions: &[&std::ffi::CStr] = &[
+            ash::khr::external_memory_fd::NAME,
+            ash::khr::external_memory::NAME,
+            ash::ext::external_memory_dma_buf::NAME,
+            ash::ext::image_drm_format_modifier::NAME,
+            ash::khr::image_format_list::NAME,
         ];
+        for ext in required_base_extensions {
+            if !ext_names_all.contains(ext) {
+                eprintln!(
+                    "[vulkan-render] required extension not available: {}",
+                    ext.to_string_lossy()
+                );
+                unsafe { instance.destroy_instance(None) };
+                return None;
+            }
+        }
+        let mut device_extensions: Vec<*const std::ffi::c_char> =
+            required_base_extensions.iter().map(|e| e.as_ptr()).collect();
         if has_external_fence_fd {
             device_extensions.push(ash::khr::external_fence::NAME.as_ptr());
             device_extensions.push(ash::khr::external_fence_fd::NAME.as_ptr());
