@@ -1915,6 +1915,7 @@ pub struct VaapiAv1Encoder {
 unsafe impl Send for VaapiAv1Encoder {}
 
 impl VaapiAv1Encoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         width: u32,
         height: u32,
