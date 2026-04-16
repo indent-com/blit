@@ -209,6 +209,12 @@ let
 
   # Only real build-time dep is libopus (audiopus_sys).  Everything
   # else (gbm, va, vulkan) is dlopen'd at runtime.
+  #
+  # cargo-zigbuild uses zig as the *linker* (enforcing glibc 2.31),
+  # but we override CC/CXX back to the system gcc so C code compiled
+  # by crate build scripts (e.g. aws-lc-sys) doesn't hit zig cc's
+  # false-positive GCC bug checks.  The zig linker still enforces
+  # the glibc version floor on the final binary.
   commonArgsGnu = {
     inherit src version;
     strictDeps = true;
@@ -225,6 +231,11 @@ let
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     # Build for explicit gnu target so artifacts go to target/<triple>/
     CARGO_BUILD_TARGET = rustTargetGnu;
+    # Force system gcc for C deps — cargo-zigbuild sets CC/CXX to
+    # zig wrappers which trigger false-positive compiler bug checks
+    # in aws-lc-sys and other crates.
+    CC = "cc";
+    CXX = "c++";
   };
 
   cargoArtifactsGnu = craneLib.buildDepsOnly (
