@@ -351,9 +351,7 @@ impl VulkanRenderer {
             ash::ext::image_drm_format_modifier::NAME,
             ash::khr::image_format_list::NAME,
         ];
-        let has_dmabuf = dmabuf_extensions
-            .iter()
-            .all(|e| ext_names_all.contains(e));
+        let has_dmabuf = dmabuf_extensions.iter().all(|e| ext_names_all.contains(e));
         if !has_dmabuf {
             eprintln!("[vulkan-render] DMA-BUF extensions not available, SHM-only mode");
         }
