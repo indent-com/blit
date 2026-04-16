@@ -153,11 +153,12 @@ impl SurfaceEncoderPreference {
 /// - **Cs444**: 4:4:4 — full-resolution chroma.  Eliminates colour fringing
 ///   on sharp edges (ideal for text / UI), but requires encoder support.
 ///
-/// Set via `BLIT_CHROMA=444` (default: 420).
+/// Set via `BLIT_CHROMA` env var. Default: 444 (fall back to 420 if unsupported).
+/// Use `BLIT_CHROMA=420` to force 4:2:0.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ChromaSubsampling {
-    #[default]
     Cs420,
+    #[default]
     Cs444,
 }
 
@@ -171,8 +172,8 @@ impl ChromaSubsampling {
 
     pub fn from_env() -> Self {
         match std::env::var("BLIT_CHROMA").ok().as_deref() {
-            Some("444") => Self::Cs444,
-            _ => Self::Cs420,
+            Some("420") => Self::Cs420,
+            _ => Self::Cs444,
         }
     }
 
