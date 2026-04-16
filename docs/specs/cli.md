@@ -71,8 +71,8 @@
 
 ### Non-Goals
 
-- Reimplementing server-side components (the RPC server, message broker, WebSocket handler stay in Python).
-- Changing the wire protocol — the TypeScript CLI must be a drop-in replacement that the server cannot distinguish from the Python CLI.
+- Reimplementing server-side components (the RPC server, message broker, WebSocket handler stay in Python — though server-side changes to support the new CLI are in scope).
+- Blind wire-level compatibility — the server is allowed to know it's talking to the TypeScript CLI. The protocol can evolve; this is a clean room rewrite, not a shim.
 - **SSH helper is explicitly out of scope.** The `indent-ssh-helper` binary (SSH-over-WebRTC) will not be ported. If SSH access to sandboxes is needed in the future, it should be redesigned as a feature of blit rather than a standalone binary.
 
 ---
@@ -1194,9 +1194,8 @@ interface FileMetadata {
 
 ### Compatibility Tests
 
-- **Wire format parity:** record WebSocket traffic from Python CLI, replay against TypeScript CLI, diff responses.
-- **Heartbeat format:** compare JSON output from both implementations.
-- **Tool result format:** execute identical tool inputs, compare JSON outputs field-by-field.
+- **Server integration:** verify the TypeScript CLI can connect, authenticate, execute tools, and stream results against the real server.
+- **Tool result correctness:** execute tool inputs and verify the server accepts and processes the responses correctly.
 
 ### E2E Tests
 
@@ -1219,4 +1218,4 @@ interface FileMetadata {
 
 ### Compatibility Contract
 
-During phases 1–5, both CLIs must be able to connect to the same server. The server must not be able to distinguish which implementation is connected. This is verified by the wire format compatibility tests.
+This is a clean room rewrite — there is no requirement for wire-level indistinguishability from the Python CLI. The server is free to identify and differentiate the TypeScript client (e.g. via heartbeat `exponent_version` or a new client identifier field). The protocol can evolve alongside the rewrite; server-side changes to support the new CLI are expected and welcome.
