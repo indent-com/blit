@@ -2269,7 +2269,11 @@ impl Compositor {
                 }
             }
             CompositorCommand::SetRefreshRate { mhz } => {
-                if mhz != self.output_refresh_mhz && mhz > 0 {
+                // Only update on meaningful changes (>2 Hz difference) to
+                // avoid flooding clients with mode events from jittery
+                // requestAnimationFrame measurements.
+                let diff = (mhz as i64 - self.output_refresh_mhz as i64).unsigned_abs();
+                if diff > 2000 && mhz > 0 {
                     self.output_refresh_mhz = mhz;
                     let s120 = self.output_scale_120 as i32;
                     let mode_w = self.output_width * s120 / 120;
