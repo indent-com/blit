@@ -241,6 +241,7 @@ let
       cargoExtraArgs = "--workspace --exclude blit-browser";
       doCheck = false;
       buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --profile release --target ${rustTargetGnu}.${minGlibcVersion} --workspace --exclude blit-browser";
+      doNotPostBuildInstallCargoBinaries = true;
     }
   );
 

@@ -108,6 +108,7 @@
           doCheck = false;
           preBuild = copyWebAppDist;
           buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
+          doNotPostBuildInstallCargoBinaries = true;
           installPhaseCommand = ''
             mkdir -p $out/bin
             cp target/${rustTargetGnu}/release/blit $out/bin/
