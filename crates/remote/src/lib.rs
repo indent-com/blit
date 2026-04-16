@@ -266,6 +266,8 @@ pub const SURFACE_FRAME_CODEC_PNG: u8 = 2 << 1;
 /// C2S_SURFACE_SUBSCRIBE.  0 means "accept anything".
 pub const CODEC_SUPPORT_H264: u8 = 1 << 0;
 pub const CODEC_SUPPORT_AV1: u8 = 1 << 1;
+pub const CODEC_SUPPORT_H264_444: u8 = 1 << 2;
+pub const CODEC_SUPPORT_AV1_444: u8 = 1 << 3;
 
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;

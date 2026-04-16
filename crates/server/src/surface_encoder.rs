@@ -2,7 +2,8 @@
 
 use blit_compositor::PixelData;
 use blit_remote::{
-    CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_H264,
+    CODEC_SUPPORT_AV1, CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444,
+    SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_H264,
 };
 use openh264::encoder::Encoder as OpenH264Encoder;
 use openh264::formats::YUVBuffer;
@@ -91,6 +92,24 @@ impl SurfaceEncoderPreference {
             }
             Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 | Self::VulkanVideoAV1 => {
                 codec_support & CODEC_SUPPORT_AV1 != 0
+            }
+        }
+    }
+
+    /// Returns true if the client announced 4:4:4 chroma support for this
+    /// encoder's codec family.  Legacy clients (codec_support == 0) are
+    /// assumed to lack 4:4:4 support since the resulting Professional Profile
+    /// bitstreams are not universally decodable.
+    pub fn supports_444_by_client(self, codec_support: u8) -> bool {
+        if codec_support == 0 {
+            return false;
+        }
+        match self {
+            Self::H264Software | Self::H264Vaapi | Self::NvencH264 | Self::VulkanVideoH264 => {
+                codec_support & CODEC_SUPPORT_H264_444 != 0
+            }
+            Self::AV1Vaapi | Self::AV1Software | Self::NvencAV1 | Self::VulkanVideoAV1 => {
+                codec_support & CODEC_SUPPORT_AV1_444 != 0
             }
         }
     }
@@ -366,6 +385,9 @@ impl SurfaceEncoder {
                     continue;
                 }
                 if !pref.supported_by_client(codec_support) {
+                    continue;
+                }
+                if !pref.supports_444_by_client(codec_support) {
                     continue;
                 }
                 match Self::try_one(

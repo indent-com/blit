@@ -1,5 +1,10 @@
 import type { ConnectionId, BlitSurface } from "./types";
-import { CODEC_SUPPORT_H264, CODEC_SUPPORT_AV1 } from "./types";
+import {
+  CODEC_SUPPORT_H264,
+  CODEC_SUPPORT_AV1,
+  CODEC_SUPPORT_H264_444,
+  CODEC_SUPPORT_AV1_444,
+} from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
 import {
@@ -25,6 +30,8 @@ export async function detectCodecSupport(): Promise<number> {
   const checks: [string, number][] = [
     ["avc1.42001f", CODEC_SUPPORT_H264],
     ["av01.0.01M.08", CODEC_SUPPORT_AV1],
+    ["avc1.F4001f", CODEC_SUPPORT_H264_444],
+    ["av01.2.01M.08", CODEC_SUPPORT_AV1_444],
   ];
   await Promise.all(
     checks.map(async ([codec, bit]) => {
