@@ -14,18 +14,21 @@ pick_prefix() {
 PREFIX="${BLIT_PREFIX:-${BLIT_INSTALL_DIR:-$(pick_prefix)}}"
 
 detect_libc() {
+  # Prefer glibc when available (dlopen works for GPU drivers).
+  # Only use musl on musl-only systems (Alpine, Void musl, etc.).
   if command -v ldd >/dev/null 2>&1; then
     case "$(ldd --version 2>&1)" in
-      *musl*) echo "musl"; return ;;
+      *GNU*|*GLIBC*) echo "gnu"; return ;;
     esac
   fi
-  for f in /lib/ld-musl-*; do
+  # No glibc ldd found — check for glibc's ld.so directly.
+  for f in /lib64/ld-linux-* /lib/ld-linux-*; do
     if [ -e "$f" ]; then
-      echo "musl"
+      echo "gnu"
       return
     fi
   done
-  echo "gnu"
+  echo "musl"
 }
 
 main() {
