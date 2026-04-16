@@ -24,7 +24,8 @@ function isAllowedOrigin(origin: string): boolean {
       return true;
     if (url.hostname === "indent.com" || url.hostname.endsWith(".indent.com"))
       return true;
-    if (url.hostname.endsWith(".vercel.app")) return true;
+    if (url.hostname === "blit.sh" || url.hostname.endsWith(".blit.sh"))
+      return true;
     return false;
   } catch {
     return false;
@@ -57,10 +58,12 @@ async function acquireRateLimit(
   clientIp: string,
 ): Promise<boolean> {
   const key = rateLimitKey(clientIp);
-  const count = await redis.incr(key);
-  if (count === 1) {
-    await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS);
-  }
+  const count = (await redis.eval(
+    "local c = redis.call('INCR', KEYS[1]); if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; return c",
+    1,
+    key,
+    RATE_LIMIT_WINDOW_SECONDS,
+  )) as number;
   if (count > MAX_SANDBOXES_PER_IP) {
     await redis.decr(key);
     return false;

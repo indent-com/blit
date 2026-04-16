@@ -143,9 +143,16 @@ function hexEncode(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++)
+    binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
 function signPayload(secretKey: Uint8Array, payload: Uint8Array): string {
   const signed = nacl.sign(payload, secretKey); // 64-byte sig + payload
-  return btoa(String.fromCharCode(...signed));
+  return uint8ToBase64(signed);
 }
 
 /**
@@ -169,7 +176,7 @@ function buildSealedMessage(
   const sealed = new Uint8Array(nonce.length + ciphertext.length);
   sealed.set(nonce);
   sealed.set(ciphertext, nonce.length);
-  const sealedB64 = btoa(String.fromCharCode(...sealed));
+  const sealedB64 = uint8ToBase64(sealed);
   const inner = JSON.stringify({ box: sealedB64 });
   const innerBytes = new TextEncoder().encode(inner);
   const signed = signPayload(signingSecretKey, innerBytes);
@@ -407,7 +414,13 @@ export function createShareTransport(
           reject(new Error("timed out waiting for producer to join"));
         }, PEER_JOIN_TIMEOUT_MS);
         ws!.onmessage = (e) => {
-          const m = JSON.parse(e.data as string) as ServerMessage;
+          let m: ServerMessage;
+          try {
+            m = JSON.parse(e.data as string) as ServerMessage;
+          } catch {
+            dbg.warn("ignoring non-JSON signaling message");
+            return;
+          }
           dbg.log("signaling ← %s %o", m.type, m);
           if (m.type === "registered") {
             registered = true;
@@ -518,7 +531,13 @@ export function createShareTransport(
       // The producer sends replies encrypted with the consumer's X25519 public
       // key; try to decrypt, fall back to plaintext for legacy producers.
       ws!.onmessage = (e) => {
-        const m = JSON.parse(e.data as string) as ServerMessage;
+        let m: ServerMessage;
+        try {
+          m = JSON.parse(e.data as string) as ServerMessage;
+        } catch {
+          dbg.warn("ignoring non-JSON signaling message");
+          return;
+        }
         dbg.log(
           "signaling ← %s %o",
           m.type,
