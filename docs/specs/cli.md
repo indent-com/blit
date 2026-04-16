@@ -819,7 +819,7 @@ When `INDENT_TERMINAL_CONTROLLER_SOCKET` is set, the CLI starts a Unix socket se
 | `13` | `TERMINAL_SCROLL`    | C→S       | Scroll request             |
 | `14` | `TERMINAL_CLEAR`     | C→S       | Clear terminal             |
 
-Uses `vt100wasm.Screen` for terminal emulation with scrollback. Output debounced at 250fps (4ms). Supports DEC synchronized update mode.
+Terminal emulation is handled entirely by blit (Alacritty-based VT100 parser, cell grid state, scrollback). The TLV controller does **not** run its own terminal emulator — it receives `FrameState` snapshots and compressed cell diffs from blit and forwards them to the desktop app over TLV. Output debounced at 250fps (4ms).
 
 ---
 
@@ -1124,7 +1124,6 @@ interface FileMetadata {
 | `graphql-request`                      | GraphQL client       | Replace `gql[httpx]`                |
 | `@aspect-build/inquirer` or `inquirer` | Interactive prompts  | Replace `questionary`               |
 | `node-datachannel` or `wrtc`           | WebRTC               | Replace `aiortc`                    |
-| `xterm-headless` or `vt100wasm`        | Terminal emulation   | Replace `vt100wasm`                 |
 
 ### Build Dependencies
 
