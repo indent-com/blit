@@ -99,11 +99,9 @@ pub enum Command {
     },
 
     /// Share a terminal via WebRTC
+    ///
+    /// Set BLIT_PASSPHRASE to use a deterministic passphrase (default: random).
     Share {
-        /// Share passphrase (default: random)
-        #[arg(long, env = "BLIT_PASSPHRASE")]
-        passphrase: Option<String>,
-
         /// Don't print the sharing URL
         #[arg(long)]
         quiet: bool,

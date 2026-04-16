@@ -283,22 +283,19 @@ async fn async_main() {
             };
             blit_server::run(config).await;
         }
-        Command::Share {
-            passphrase,
-            quiet,
-            verbose,
-        } => {
+        Command::Share { quiet, verbose } => {
             let signal_url = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
-            let passphrase = passphrase.unwrap_or_else(|| {
-                use rand::RngExt as _;
-                const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-                let mut rng = rand::rng();
-                let bytes: [u8; 26] = rng.random();
-                bytes
-                    .iter()
-                    .map(|b| ALPHABET[(b & 0x1f) as usize] as char)
-                    .collect()
-            });
+            let passphrase =
+                std::env::var("BLIT_PASSPHRASE").ok().unwrap_or_else(|| {
+                    use rand::RngExt as _;
+                    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+                    let mut rng = rand::rng();
+                    let bytes: [u8; 26] = rng.random();
+                    bytes
+                        .iter()
+                        .map(|b| ALPHABET[(b & 0x1f) as usize] as char)
+                        .collect()
+                });
 
             let sock_path = transport::default_local_socket();
             if let Err(e) = transport::ensure_local_server(&sock_path).await {
