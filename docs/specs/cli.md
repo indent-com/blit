@@ -44,7 +44,6 @@
   - [9.6 Background Process Tracking](#96-background-process-tracking)
 - [10. Terminal Management](#10-terminal-management)
   - [10.1 Blit Terminal Server](#101-blit-terminal-server)
-  - [10.2 Terminal Controller (TLV Protocol)](#102-terminal-controller-tlv-protocol)
 - [11. REST API Endpoints](#11-rest-api-endpoints)
 - [12. GraphQL Operations](#12-graphql-operations)
 - [13. WebRTC Port Forwarding](#13-webrtc-port-forwarding)
@@ -88,7 +87,6 @@ graph TD
         TOOLS["Tool executors"]
         HEART["Heartbeat emitter"]
         BLIT["Blit terminal client"]
-        TCTL["Terminal controller (TLV)"]
         WEBRTC["WebRTC port forwarder"]
     end
 
@@ -106,7 +104,6 @@ graph TD
     REC --> TOOLS
     REC --> HEART
     REC --> BLIT
-    REC --> TCTL
     CLI --> WEBRTC
     WEBRTC -->|WebSocket signaling| SIG
     RUN -->|HTTP| REST
@@ -155,8 +152,7 @@ indent-cli-ts/
 │   │   ├── streaming.ts            # Streaming code execution
 │   │   └── background-tracker.ts   # Background process tracking
 │   ├── terminal/
-│   │   ├── blit-client.ts          # Blit terminal server client (all PTY via blit)
-│   │   └── controller.ts           # TLV terminal controller server
+│   │   └── blit-client.ts          # Blit terminal server client (all PTY via blit)
 │   ├── graphql/
 │   │   ├── client.ts               # GraphQL client
 │   │   └── operations.ts           # Query/mutation strings
@@ -796,31 +792,6 @@ The CLI delegates all terminal creation and management to the blit server proces
 **Request type:** `StartBlitTerminalRequest { command, tag, cols, rows }`
 **Response type:** `StartBlitTerminalResponse { success, pty_id, error_message }`
 
-### 10.2 Terminal Controller (TLV Protocol)
-
-When `INDENT_TERMINAL_CONTROLLER_SOCKET` is set, the CLI starts a Unix socket server that the Indent desktop app connects to for live terminal viewing.
-
-**TLV wire format:** `[tag:4 LE][length:4 LE][value:length]`
-
-| Tag  | Name                 | Direction | Description                |
-| ---- | -------------------- | --------- | -------------------------- |
-| `0`  | `SYNC_COMPLETE`      | S→C       | Initial state burst done   |
-| `1`  | `TERMINAL_STATE`     | S→C       | Full terminal state        |
-| `2`  | `TERMINAL_SNAPSHOT`  | S→C       | Terminal snapshot          |
-| `3`  | `TERMINAL_STREAM`    | S→C       | Terminal output stream     |
-| `4`  | `START_STREAMING`    | C→S       | Start streaming a terminal |
-| `5`  | `STOP_STREAMING`     | C→S       | Stop streaming a terminal  |
-| `6`  | `BG_TERMINAL_STATE`  | S→C       | Background terminal state  |
-| `7`  | `TERMINAL_INPUT`     | C→S       | Send input to terminal     |
-| `8`  | `TERMINAL_RESIZE`    | C→S       | Resize terminal            |
-| `9`  | `START_TERMINAL`     | C→S       | Start a new terminal       |
-| `11` | `TERMINAL_CELL_DIFF` | S→C       | Incremental cell diff      |
-| `12` | `TERMINAL_CELLS`     | S→C       | Full cell contents         |
-| `13` | `TERMINAL_SCROLL`    | C→S       | Scroll request             |
-| `14` | `TERMINAL_CLEAR`     | C→S       | Clear terminal             |
-
-Terminal emulation is handled entirely by blit (Alacritty-based VT100 parser, cell grid state, scrollback). The TLV controller does **not** run its own terminal emulator — it receives `FrameState` snapshots and compressed cell diffs from blit and forwards them to the desktop app over TLV. Output debounced at 250fps (4ms).
-
 ---
 
 ## 11. REST API Endpoints
@@ -980,22 +951,21 @@ Braille character animation: `⣷⣯⣟⡿⢿⣻⣽⣾` at 10 frames/second, wit
 
 ## 15. Environment Variables
 
-| Variable                                 | Default      | Purpose                             |
-| ---------------------------------------- | ------------ | ----------------------------------- |
-| `EXPONENT_API_KEY`                       | —            | Override API key                    |
-| `EXPONENT_LOG_LEVEL`                     | —            | Set log level                       |
-| `EXPONENT_TEST_AUTO_UPGRADE`             | —            | Force test upgrade path             |
-| `ENVIRONMENT`                            | `production` | Set environment                     |
-| `INDENT_HOME`                            | `~/.indent`  | Data directory                      |
-| `INDENT_TIMEOUT_SECONDS`                 | —            | Inactivity timeout for `run`        |
-| `INDENT_TERMINAL_CONTROLLER_SOCKET`      | —            | TLV terminal controller socket path |
-| `INDENT_TERMINAL_CONTROLLER_BLIT_SOCKET` | —            | Blit server socket path             |
-| `SSH_TTY`                                | —            | Detect SSH session (read-only)      |
-| `SSH_CONNECTION`                         | —            | Detect SSH session (read-only)      |
-| `SHELL`                                  | `/bin/sh`    | User's shell                        |
-| `TMPDIR`                                 | `/tmp`       | Blit socket path fallback           |
-| `XDG_RUNTIME_DIR`                        | —            | Blit socket path fallback           |
-| `USER`                                   | —            | Blit socket path fallback           |
+| Variable                                 | Default      | Purpose                        |
+| ---------------------------------------- | ------------ | ------------------------------ |
+| `EXPONENT_API_KEY`                       | —            | Override API key               |
+| `EXPONENT_LOG_LEVEL`                     | —            | Set log level                  |
+| `EXPONENT_TEST_AUTO_UPGRADE`             | —            | Force test upgrade path        |
+| `ENVIRONMENT`                            | `production` | Set environment                |
+| `INDENT_HOME`                            | `~/.indent`  | Data directory                 |
+| `INDENT_TIMEOUT_SECONDS`                 | —            | Inactivity timeout for `run`   |
+| `INDENT_TERMINAL_CONTROLLER_BLIT_SOCKET` | —            | Blit server socket path        |
+| `SSH_TTY`                                | —            | Detect SSH session (read-only) |
+| `SSH_CONNECTION`                         | —            | Detect SSH session (read-only) |
+| `SHELL`                                  | `/bin/sh`    | User's shell                   |
+| `TMPDIR`                                 | `/tmp`       | Blit socket path fallback      |
+| `XDG_RUNTIME_DIR`                        | —            | Blit socket path fallback      |
+| `USER`                                   | —            | Blit socket path fallback      |
 
 ---
 
@@ -1009,7 +979,6 @@ interface RemoteExecutionClient {
     chatUuid: string,
     connectionTracker?: ConnectionTracker,
     timeoutSeconds?: number,
-    terminalControllerSocketPath?: string,
   ): Promise<ExitInfo>;
 }
 
@@ -1207,7 +1176,7 @@ interface FileMetadata {
 | Phase | Scope                                                                                                            | Milestone                            |
 | ----- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
 | 1     | Core client: WebSocket connection, heartbeat, RPC dispatch, tool execution (bash, read, write, edit, glob, grep) | CLI can run a basic chat session     |
-| 2     | Terminal management: blit terminal client (sole PTY backend), terminal controller (TLV)                          | Full terminal support                |
+| 2     | Terminal management: blit terminal client (sole PTY backend)                                                     | Full terminal support                |
 | 3     | `run` command complete: config, login, auto-upgrade, browser launch, connection UI                               | Drop-in replacement for `indent run` |
 | 4     | Hidden commands: checkout, cloud, debug, port-forward                                                            | Full command parity                  |
 | 5     | Distribution pipeline, installer                                                                                 | Ship standalone binaries             |
