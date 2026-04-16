@@ -187,23 +187,59 @@ let
   );
 
   # ------------------------------------------------------------------
-  # Glibc release binaries.
+  # Glibc + cargo-zigbuild for portable Linux release binaries.
   #
-  # Built with nix's standard glibc toolchain.  The release assembly
-  # step (blit-release-gnu) verifies that the binary's glibc version
-  # requirement stays at or below minGlibcVersion.  In practice Rust
-  # and our deps only use ancient glibc symbols so this is easily
-  # satisfied.  Only glibc itself is dynamic; all other deps
-  # (including libopus) are statically linked.
+  # cargo-zigbuild uses zig as the linker to enforce a glibc version
+  # floor.  It also sets CC/CXX to zig wrappers for C deps.
+  #
+  # aws-lc-sys's default cc-crate builder falsely detects zig cc as
+  # a buggy GCC (memcmp check).  Setting AWS_LC_SYS_CMAKE_BUILDER=1
+  # switches it to cmake, which identifies zig cc as Clang and works.
   # ------------------------------------------------------------------
 
   minGlibcVersion = "2.31";
+
+  rustTargetGnu =
+    if pkgs.stdenv.hostPlatform.isAarch64
+    then "aarch64-unknown-linux-gnu"
+    else "x86_64-unknown-linux-gnu";
 
   # Static libopus for the glibc release build so the binary is
   # fully self-contained (only glibc itself is dynamic).
   gnuStaticLibopus = pkgs.libopus.overrideAttrs (old: {
     mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
   });
+
+  commonArgsGnu = {
+    inherit src version;
+    strictDeps = true;
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.llvmPackages.libclang
+      pkgs.cargo-zigbuild
+      pkgs.zig
+      pkgs.cmake # needed by aws-lc-sys cmake builder
+    ];
+    buildInputs = [
+      gnuStaticLibopus
+    ];
+    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
+    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+    CARGO_BUILD_TARGET = rustTargetGnu;
+    # Use cmake builder for aws-lc-sys to avoid its false-positive
+    # zig-cc memcmp bug check in the cc-crate code path.
+    AWS_LC_SYS_CMAKE_BUILDER = "1";
+  };
+
+  cargoArtifactsGnu = craneLib.buildDepsOnly (
+    commonArgsGnu
+    // {
+      pname = "blit-workspace-deps-gnu";
+      cargoExtraArgs = "--workspace --exclude blit-browser";
+      doCheck = false;
+      buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --profile release --target ${rustTargetGnu}.${minGlibcVersion} --workspace --exclude blit-browser";
+    }
+  );
 
 in
 {
@@ -212,7 +248,7 @@ in
     pkgsStaticLLVM
     version
     minGlibcVersion
-    gnuStaticLibopus
+    rustTargetGnu
     cargoLockConfig
     rustToolchain
     rustPlatform
@@ -220,8 +256,10 @@ in
     craneLibStatic
     src
     commonArgs
+    commonArgsGnu
     commonArgsStatic
     cargoArtifacts
+    cargoArtifactsGnu
     cargoArtifactsStatic
     ;
 }

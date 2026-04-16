@@ -9,7 +9,7 @@
         pkgsStaticLLVM
         version
         minGlibcVersion
-        gnuStaticLibopus
+        rustTargetGnu
         cargoLockConfig
         rustToolchain
         rustPlatform
@@ -17,8 +17,10 @@
         craneLibStatic
         src
         commonArgs
+        commonArgsGnu
         commonArgsStatic
         cargoArtifacts
+        cargoArtifactsGnu
         cargoArtifactsStatic
         ;
       serverVaapiEnabled = pkgs.stdenv.isLinux;
@@ -95,20 +97,21 @@
       # ------------------------------------------------------------------
 
       # Linux glibc binary — all deps statically linked, only glibc is
-      # dynamic (so dlopen works for GPU).  Built with nix's standard
-      # toolchain; the release assembly step verifies the binary stays
-      # within glibc ${minGlibcVersion}.
+      # dynamic (so dlopen works for GPU).  Built with cargo-zigbuild
+      # targeting glibc ${minGlibcVersion} for broad distro compat.
       blit-gnu = craneLib.buildPackage (
-        commonArgs
+        commonArgsGnu
         // {
           pname = "blit-gnu";
-          inherit cargoArtifacts;
+          cargoArtifacts = cargoArtifactsGnu;
           cargoExtraArgs = "-p blit-cli";
           doCheck = false;
           preBuild = copyWebAppDist;
-          # Override libopus to static so the binary is self-contained.
-          buildInputs = [ gnuStaticLibopus ];
-          meta.mainProgram = "blit";
+          buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
+          installPhaseCommand = ''
+            mkdir -p $out/bin
+            cp target/${rustTargetGnu}/release/blit $out/bin/
+          '';
         }
       );
 
@@ -154,29 +157,11 @@
             else "/lib64/ld-linux-x86_64.so.2";
         in
         pkgs.runCommand "blit-release-gnu-${version}" {
-          nativeBuildInputs = [
-            pkgs.patchelf
-            pkgs.binutils # readelf
-          ];
+          nativeBuildInputs = [ pkgs.patchelf ];
         } ''
           mkdir -p $out/bin
           cp ${blit-gnu}/bin/blit $out/bin/blit
           chmod +w $out/bin/blit
-
-          # Verify glibc version requirement stays at or below ${minGlibcVersion}.
-          max_ver=$(readelf -V $out/bin/blit 2>/dev/null \
-            | grep -oP 'GLIBC_\K[0-9]+\.[0-9]+' \
-            | sort -t. -k1,1n -k2,2n | tail -1)
-          if [ -n "$max_ver" ]; then
-            IFS='.' read -r maj min <<< "$max_ver"
-            IFS='.' read -r req_maj req_min <<< "${minGlibcVersion}"
-            if [ "$maj" -gt "$req_maj" ] || { [ "$maj" -eq "$req_maj" ] && [ "$min" -gt "$req_min" ]; }; then
-              echo "FATAL: binary requires GLIBC_$max_ver but target is ${minGlibcVersion}"
-              exit 1
-            fi
-            echo "glibc version check passed: GLIBC_$max_ver <= ${minGlibcVersion}"
-          fi
-
           patchelf --set-interpreter ${interpreter} $out/bin/blit
           patchelf --remove-rpath $out/bin/blit
         '';
