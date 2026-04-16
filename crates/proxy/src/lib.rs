@@ -63,18 +63,8 @@ pub async fn proxy_alive(path: &str) -> bool {
 }
 
 /// Resolve the blit binary path for re-exec.
-///
-/// When running through the static launcher, `BLIT_WRAPPER_DIR` is set to
-/// the directory containing the launcher.  Re-exec must go through the
-/// launcher (not the dynamic binary directly) so the bundled musl dynamic
-/// linker is used.  Falls back to `current_exe()` for dev builds and
-/// platforms without the launcher.
 pub fn blit_exe() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("BLIT_WRAPPER_DIR") {
-        std::path::PathBuf::from(dir).join("blit")
-    } else {
-        std::env::current_exe().unwrap_or_default()
-    }
+    std::env::current_exe().unwrap_or_default()
 }
 
 /// Ensure a blit-proxy daemon is running, spawning one if necessary.
