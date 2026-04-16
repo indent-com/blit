@@ -35,6 +35,8 @@ const VA_ENTRYPOINT_VIDEO_PROC: i32 = 10;
 const VA_RT_FORMAT_YUV420: u32 = 0x00000001;
 #[allow(dead_code)]
 const VA_RT_FORMAT_YUV420_10: u32 = 0x00000100;
+#[allow(dead_code)]
+const VA_RT_FORMAT_YUV444: u32 = 0x00000004;
 
 // Buffer types
 const VAEncCodedBufferType: i32 = 21;
@@ -834,7 +836,12 @@ impl VaapiDirectEncoder {
         vaapi_device: &str,
         qp: u8,
         verbose: bool,
+        chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
+        if chroma.is_444() {
+            return Err("VA-API H.264 4:4:4 encoding is not yet supported".into());
+        }
+
         let va = gpu_libs::va().map_err(|e| format!("VA-API: {e}"))?;
         let va_drm = gpu_libs::va_drm().map_err(|e| format!("VA-DRM: {e}"))?;
 
@@ -1916,7 +1923,11 @@ impl VaapiAv1Encoder {
         vaapi_device: &str,
         base_qindex: u8,
         verbose: bool,
+        chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
+        if chroma.is_444() {
+            return Err("VA-API AV1 4:4:4 encoding is not yet supported".into());
+        }
         let va = gpu_libs::va().map_err(|e| format!("VA-API: {e}"))?;
         let va_drm = gpu_libs::va_drm().map_err(|e| format!("VA-DRM: {e}"))?;
         let drm_fd = {

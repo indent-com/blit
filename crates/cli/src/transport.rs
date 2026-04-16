@@ -527,6 +527,7 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
             .ok()
             .and_then(|v| blit_server::SurfaceQuality::parse(&v))
             .unwrap_or_default(),
+        chroma: blit_server::ChromaSubsampling::from_env(),
         vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
             .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         #[cfg(unix)]
@@ -565,6 +566,7 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
             .ok()
             .and_then(|v| blit_server::SurfaceQuality::parse(&v))
             .unwrap_or_default(),
+        chroma: blit_server::ChromaSubsampling::from_env(),
         vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
             .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
         verbose: false,

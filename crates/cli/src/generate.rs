@@ -54,6 +54,7 @@ fn blit_server_cmd() -> Command {
              BLIT_FD_CHANNEL         File descriptor for fd-passing channel\n    \
              BLIT_SURFACE_ENCODERS   Comma-separated encoder priority list\n    \
              BLIT_SURFACE_QUALITY    Surface quality: low, medium, high, ultra\n    \
+             BLIT_CHROMA             Chroma subsampling: 444 for 4:4:4 (default: 4:2:0)\n    \
              BLIT_VAAPI_DEVICE       VA-API render node (default: /dev/dri/renderD128)\n    \
              BLIT_CUDA_DEVICE        CUDA device ordinal for NVENC (default: 0)\n    \
              BLIT_MAX_CONNECTIONS    Max simultaneous connections (0 = unlimited)\n    \

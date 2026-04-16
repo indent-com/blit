@@ -39,6 +39,7 @@ use pty::{PtyHandle, PtyWriteTarget};
 use surface_encoder::SurfaceEncoder;
 pub use surface_encoder::SurfaceEncoderPreference;
 pub use surface_encoder::SurfaceH264EncoderPreference;
+pub use surface_encoder::ChromaSubsampling;
 pub use surface_encoder::SurfaceQuality;
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
@@ -49,6 +50,7 @@ pub struct Config {
     pub ipc_path: String,
     pub surface_encoders: Vec<SurfaceEncoderPreference>,
     pub surface_quality: SurfaceQuality,
+    pub chroma: ChromaSubsampling,
     pub vaapi_device: String,
     #[cfg(unix)]
     pub fd_channel: Option<std::os::unix::io::RawFd>,
@@ -2674,6 +2676,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         quality: SurfaceQuality,
         verbose: bool,
         codec_support: u8,
+        chroma: ChromaSubsampling,
     }
     struct EncodeResult {
         cid: u64,
@@ -2894,15 +2897,29 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if !available {
                             continue;
                         }
+                        // Vulkan Video 4:4:4 requires a YUV444 compute pipeline
+                        // and 3-plane DPB surfaces that are not yet implemented.
+                        // Skip so the fallback chain tries NVENC/VA-API/software.
+                        if state.config.chroma.is_444() {
+                            continue;
+                        }
                         let qp = match pref {
                             SurfaceEncoderPreference::VulkanVideoAV1 => quality.av1_qp_for_vulkan(),
                             _ => quality.h264_qp(),
                         };
-                        let enc_name = match pref {
-                            SurfaceEncoderPreference::VulkanVideoH264 => "h264-vulkan",
-                            SurfaceEncoderPreference::VulkanVideoAV1 => "av1-vulkan",
-                            _ => "vulkan",
-                        };
+                        let enc_name: &'static str =
+                            match (pref, state.config.chroma) {
+                                (SurfaceEncoderPreference::VulkanVideoH264, ChromaSubsampling::Cs444) => {
+                                    "h264-vulkan 4:4:4"
+                                }
+                                (SurfaceEncoderPreference::VulkanVideoH264, _) => "h264-vulkan",
+                                (SurfaceEncoderPreference::VulkanVideoAV1, ChromaSubsampling::Cs444) => {
+                                    "av1-vulkan 4:4:4"
+                                }
+                                (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
+                                (_, ChromaSubsampling::Cs444) => "vulkan 4:4:4",
+                                _ => "vulkan",
+                            };
                         // Queue commands to send after the client loop.
                         pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
                             surface_id: sid as u32,
@@ -2957,6 +2974,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             quality,
                             verbose: state.config.verbose,
                             codec_support,
+                            chroma: state.config.chroma,
                         }),
                         generation: px_gen,
                     });
@@ -3081,6 +3099,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 params.quality,
                                 params.verbose,
                                 params.codec_support,
+                                params.chroma,
                             ) {
                                 Ok(enc) => enc,
                                 Err(err) => {

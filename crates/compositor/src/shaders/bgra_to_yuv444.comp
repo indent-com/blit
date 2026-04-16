@@ -1,0 +1,63 @@
+#version 450
+
+// Convert BGRA → YUV 4:4:4 (I444) into a single linear buffer.
+// Three full-resolution planes: Y at offset 0, U at u_offset, V at v_offset.
+// Source pixels are edge-extended into encoder padding area.
+// Dispatch with (ceil(enc_width/16), ceil(enc_height/16), 1).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D bgra_in;
+layout(set = 0, binding = 1, std430) buffer YUV444Out {
+    uint data[];
+} yuv;
+
+layout(push_constant) uniform Params {
+    uint src_width;   // BGRA source dimensions
+    uint src_height;
+    uint y_stride;    // bytes per row (all planes use the same stride)
+    uint u_offset;    // byte offset to U plane
+    uint v_offset;    // byte offset to V plane
+    uint enc_width;   // YUV444 output dimensions (>= src, encoder-aligned)
+    uint enc_height;
+};
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    if (pos.x >= enc_width || pos.y >= enc_height) return;
+
+    // Clamp to source dimensions for edge-extension into padding.
+    ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
+    vec4 bgra = imageLoad(bgra_in, src);
+    float r = bgra.z;  // BGRA: z=R
+    float g = bgra.y;  // BGRA: y=G
+    float b = bgra.x;  // BGRA: x=B
+
+    // BT.601 full-range RGB→YUV
+    float y_val = 0.299 * r + 0.587 * g + 0.114 * b;
+    float u_val = -0.169 * r - 0.331 * g + 0.500 * b + 0.5;
+    float v_val =  0.500 * r - 0.419 * g - 0.081 * b + 0.5;
+
+    uint y_byte = uint(clamp(y_val * 255.0, 0.0, 255.0));
+    uint u_byte = uint(clamp(u_val * 255.0, 0.0, 255.0));
+    uint v_byte = uint(clamp(v_val * 255.0, 0.0, 255.0));
+
+    uint idx = pos.y * y_stride + pos.x;
+
+    // Write Y byte via packed uint.
+    uint y_word = idx >> 2u;
+    uint y_bp = idx & 3u;
+    atomicOr(yuv.data[y_word], y_byte << (y_bp * 8u));
+
+    // Write U byte.
+    uint u_idx = u_offset + idx;
+    uint u_word = u_idx >> 2u;
+    uint u_bp = u_idx & 3u;
+    atomicOr(yuv.data[u_word], u_byte << (u_bp * 8u));
+
+    // Write V byte.
+    uint v_idx = v_offset + idx;
+    uint v_word = v_idx >> 2u;
+    uint v_bp = v_idx & 3u;
+    atomicOr(yuv.data[v_word], v_byte << (v_bp * 8u));
+}

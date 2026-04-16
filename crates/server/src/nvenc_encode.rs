@@ -51,6 +51,11 @@ const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
 const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x10000000; // R8G8B8A8 in memory (DRM ABGR8888)
 
+// Encoder capability query
+const NV_ENC_CAPS_PARAM_VER: u32 = nvencapi_struct_version(1);
+const NV_ENC_CAPS_PARAM_SIZE: usize = 256;
+const NV_ENC_CAPS_SUPPORT_YUV444_ENCODE: u32 = 15;
+
 // Resource types for nvEncRegisterResource
 const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 0x01;
 const NV_ENC_REGISTER_RESOURCE_VER: u32 = nvencapi_struct_version(4);
@@ -81,6 +86,14 @@ const NV_ENC_PRESET_P1_GUID: NvGuid = NvGuid(
     0x45F8,
     0x4CF8,
     [0x80, 0xC7, 0x29, 0x88, 0x71, 0x59, 0x0E, 0xBF],
+);
+
+// H.264 profile GUID — High 4:4:4 Predictive (from nvEncodeAPI.h)
+const NV_ENC_H264_PROFILE_HIGH_444_GUID: NvGuid = NvGuid(
+    0x7AC663CB,
+    0xA598,
+    0x49D8,
+    [0xB1, 0x0E, 0x10, 0x38, 0x6E, 0x79, 0xCB, 0x1B],
 );
 
 // Tuning info (NV_ENC_TUNING_INFO enum from nv-codec-headers 12.1)
@@ -119,7 +132,12 @@ struct NvEncFunctionList {
     nvEncGetEncodeProfileGUIDs: *const c_void,
     nvEncGetInputFormatCount: *const c_void,
     nvEncGetInputFormats: *const c_void,
-    nvEncGetEncodeCaps: *const c_void,
+    nvEncGetEncodeCaps: unsafe extern "C" fn(
+        encoder: *mut c_void,
+        encode_guid: NvGuid,
+        caps_param: *mut c_void,
+        caps_val: *mut i32,
+    ) -> u32,
     nvEncGetEncodePresetCount: *const c_void,
     nvEncGetEncodePresetGUIDs: *const c_void,
     nvEncGetEncodePresetConfig: *const c_void,
@@ -269,6 +287,7 @@ impl NvencDirectEncoder {
         height: u32,
         qp: u32,
         verbose: bool,
+        chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
         let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
         let nvenc_fns = gpu_libs::nvenc().map_err(|e| format!("NVENC: {e}"))?;
@@ -346,6 +365,28 @@ impl NvencDirectEncoder {
             _ => return Err(format!("unsupported NVENC codec: {codec}")),
         };
 
+        // Check 4:4:4 capability if requested.
+        if chroma.is_444() {
+            let mut caps_param = vec![0u8; NV_ENC_CAPS_PARAM_SIZE];
+            w32(&mut caps_param, 0, NV_ENC_CAPS_PARAM_VER);
+            w32(&mut caps_param, 4, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
+            let mut caps_val: i32 = 0;
+            let nv_status = unsafe {
+                (fns.nvEncGetEncodeCaps)(
+                    encoder,
+                    codec_guid,
+                    caps_param.as_mut_ptr() as *mut c_void,
+                    &mut caps_val,
+                )
+            };
+            if nv_status != NV_ENC_SUCCESS || caps_val == 0 {
+                unsafe { (fns.nvEncDestroyEncoder)(encoder) };
+                return Err(format!(
+                    "NVENC {codec} does not support 4:4:4 encoding on this GPU"
+                ));
+            }
+        }
+
         // Get preset config — uses exact SDK struct sizes to avoid version
         // mismatch (the driver validates struct size via the version tag).
         let mut preset_buf = vec![0u8; NVENC_PRESET_CONFIG_SIZE];
@@ -380,6 +421,14 @@ impl NvencDirectEncoder {
         w32(&mut config_buf, 44, qp); // qp_inter_p
         w32(&mut config_buf, 48, qp); // qp_inter_b
         w32(&mut config_buf, 52, qp); // qp_intra
+
+        // Set 4:4:4 profile when requested.  For H.264 this is the High 4:4:4
+        // Predictive profile; for AV1 the SDK auto-selects the right profile
+        // based on chromaFormatIDC in the codec config.
+        if chroma.is_444() && codec == "h264" {
+            // profileGUID @ offset 4 in NV_ENC_CONFIG
+            wguid(&mut config_buf, 4, NV_ENC_H264_PROFILE_HIGH_444_GUID);
+        }
 
         // Initialize encoder
         let mut init_buf = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
