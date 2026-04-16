@@ -204,7 +204,7 @@ All release binaries are built with Nix, which makes the entire toolchain reprod
 
 On Linux, two variants are shipped:
 
-- **glibc** (`blit-gnu`) — all dependencies (libopus, pixman, libxkbcommon, libgbm) are statically linked; only glibc itself is dynamic. Built with `zig cc` targeting glibc 2.31 and linked via `cargo-zigbuild`, so the binary runs on any glibc ≥ 2.31 system (Ubuntu 20.04+, Debian 11+, RHEL 8+). `dlopen` works natively for GPU acceleration (VA-API, NVENC, Vulkan). This is the default for most Linux systems.
+- **glibc** (`blit-gnu`) — libopus is statically linked; only glibc itself is dynamic. The release assembly verifies the binary requires glibc ≤ 2.31, so it runs on Ubuntu 20.04+, Debian 11+, RHEL 8+, etc. `dlopen` works natively for GPU acceleration (VA-API, NVENC, Vulkan). This is the default for most Linux systems.
 - **musl** (`blit-musl`) — built with the LLVM musl cross toolchain. All dependencies except musl libc are statically linked, producing a single binary. The interpreter is set to the system `ld-musl-<arch>.so.1`. For Alpine and other musl-based systems.
 
 Both release tarballs contain a single binary at `bin/blit`.

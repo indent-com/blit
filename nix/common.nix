@@ -187,78 +187,23 @@ let
   );
 
   # ------------------------------------------------------------------
-  # Glibc + zig build for portable Linux release binaries.
+  # Glibc release binaries.
   #
-  # All deps are statically linked; only glibc itself is dynamic.
-  # zig cc targets a minimum glibc version so the binary runs on
-  # older distros.  dlopen still works (it's glibc's dlopen).
+  # Built with nix's standard glibc toolchain.  The release assembly
+  # step (blit-release-gnu) verifies that the binary's glibc version
+  # requirement stays at or below minGlibcVersion.  In practice Rust
+  # and our deps only use ancient glibc symbols so this is easily
+  # satisfied.  Only glibc itself is dynamic; all other deps
+  # (including libopus) are statically linked.
   # ------------------------------------------------------------------
 
   minGlibcVersion = "2.31";
-
-  rustTargetGnu =
-    if pkgs.stdenv.hostPlatform.isAarch64
-    then "aarch64-unknown-linux-gnu"
-    else "x86_64-unknown-linux-gnu";
 
   # Static libopus for the glibc release build so the binary is
   # fully self-contained (only glibc itself is dynamic).
   gnuStaticLibopus = pkgs.libopus.overrideAttrs (old: {
     mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
   });
-
-  # Zig linker wrapper — invokes `zig cc` as a linker-driver with
-  # the glibc version floor.  Used as CARGO_TARGET_*_LINKER so
-  # regular cargo (not cargo-zigbuild) can enforce the glibc floor
-  # at link time while C deps compile with the system gcc.
-  zigLinker = pkgs.writeShellScript "zig-linker" ''
-    export HOME="''${TMPDIR:-/tmp}"
-    exec ${pkgs.zig}/bin/zig cc -target ${
-      if pkgs.stdenv.hostPlatform.isAarch64
-      then "aarch64-linux-gnu"
-      else "x86_64-linux-gnu"
-    }.${minGlibcVersion} "$@"
-  '';
-
-  cargoLinkerEnv =
-    if pkgs.stdenv.hostPlatform.isAarch64
-    then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
-    else "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER";
-
-  # Only real build-time dep is libopus (audiopus_sys).  Everything
-  # else (gbm, va, vulkan) is dlopen'd at runtime.
-  #
-  # We use plain `cargo build` with zig set as the *linker only*
-  # (via CARGO_TARGET_*_LINKER).  This avoids cargo-zigbuild setting
-  # CC to zig wrappers which trigger false-positive GCC bug checks
-  # in crates like aws-lc-sys and pixman.
-  commonArgsGnu = {
-    inherit src version;
-    strictDeps = true;
-    nativeBuildInputs = [
-      pkgs.pkg-config
-      pkgs.llvmPackages.libclang
-      pkgs.zig
-    ];
-    buildInputs = [
-      gnuStaticLibopus
-    ];
-    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
-    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-    CARGO_BUILD_TARGET = rustTargetGnu;
-    # Use zig only as linker — enforces glibc version floor without
-    # replacing the C compiler.
-    "${cargoLinkerEnv}" = "${zigLinker}";
-  };
-
-  cargoArtifactsGnu = craneLib.buildDepsOnly (
-    commonArgsGnu
-    // {
-      pname = "blit-workspace-deps-gnu";
-      cargoExtraArgs = "--workspace --exclude blit-browser";
-      doCheck = false;
-    }
-  );
 
 in
 {
@@ -267,6 +212,7 @@ in
     pkgsStaticLLVM
     version
     minGlibcVersion
+    gnuStaticLibopus
     cargoLockConfig
     rustToolchain
     rustPlatform
@@ -274,11 +220,8 @@ in
     craneLibStatic
     src
     commonArgs
-    commonArgsGnu
     commonArgsStatic
     cargoArtifacts
-    cargoArtifactsGnu
     cargoArtifactsStatic
-    rustTargetGnu
     ;
 }

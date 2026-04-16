@@ -124,7 +124,7 @@ Every `nix run` target has a corresponding script in `bin/`:
 
 `build-debs` and `build-tarballs` accept an optional output directory argument (default `dist/debs` and `dist/tarballs`).
 The version and platform are derived from `flake.nix` and the build host.
-Linkage is verified at `nix build` time — on Linux the musl binary must have only `libc.so` as a NEEDED library, the glibc binary is built with zig cc targeting glibc 2.31 (all deps statically linked), and macOS binaries must not reference nix-store dylibs.
+Linkage is verified at `nix build` time — on Linux the musl binary must have only `libc.so` as a NEEDED library, the glibc binary is verified to require glibc ≤ 2.31 (all other deps statically linked), and macOS binaries must not reference nix-store dylibs.
 
 Individual packages can also be built directly:
 
