@@ -2246,7 +2246,15 @@ impl VulkanRenderer {
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
+        let image = unsafe {
+            self.device
+                .create_image(&image_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_image failed: {e} ({w}x{h})");
+                    e
+                })
+                .ok()?
+        };
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
         let mem_type = self
             .find_memory_type(
@@ -2258,12 +2266,35 @@ impl VulkanRenderer {
                     mem_reqs.memory_type_bits,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
-            })?;
+            });
+        if mem_type.is_none() {
+            eprintln!(
+                "[create_output_image] no suitable memory type for image (bits={:#x})",
+                mem_reqs.memory_type_bits
+            );
+        }
+        let mem_type = mem_type?;
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
-        let memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
-        unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
+        let memory = unsafe {
+            self.device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] allocate_memory(image) failed: {e}");
+                    e
+                })
+                .ok()?
+        };
+        unsafe {
+            self.device
+                .bind_image_memory(image, memory, 0)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] bind_image_memory failed: {e}");
+                    e
+                })
+                .ok()?
+        };
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -2276,38 +2307,85 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-        let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
+        let view = unsafe {
+            self.device
+                .create_image_view(&view_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_image_view failed: {e}");
+                    e
+                })
+                .ok()?
+        };
         let fb_info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(std::slice::from_ref(&view))
             .width(w)
             .height(h)
             .layers(1);
-        let framebuffer = unsafe { self.device.create_framebuffer(&fb_info, None).ok()? };
+        let framebuffer = unsafe {
+            self.device
+                .create_framebuffer(&fb_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_framebuffer failed: {e}");
+                    e
+                })
+                .ok()?
+        };
 
         let staging_size = (w * h * 4) as usize;
         let buf_info = vk::BufferCreateInfo::default()
             .size(staging_size as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let staging_buf = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
+        let staging_buf = unsafe {
+            self.device
+                .create_buffer(&buf_info, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] create_buffer(staging) failed: {e}");
+                    e
+                })
+                .ok()?
+        };
         let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
         let buf_mem_type = self.find_memory_type(
             buf_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        );
+        if buf_mem_type.is_none() {
+            eprintln!(
+                "[create_output_image] no HOST_VISIBLE memory for staging (bits={:#x})",
+                buf_reqs.memory_type_bits
+            );
+        }
+        let buf_mem_type = buf_mem_type?;
         let buf_alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(buf_reqs.size)
             .memory_type_index(buf_mem_type);
-        let staging_mem = unsafe { self.device.allocate_memory(&buf_alloc, None).ok()? };
+        let staging_mem = unsafe {
+            self.device
+                .allocate_memory(&buf_alloc, None)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] allocate_memory(staging) failed: {e}");
+                    e
+                })
+                .ok()?
+        };
         unsafe {
             self.device
                 .bind_buffer_memory(staging_buf, staging_mem, 0)
+                .map_err(|e| {
+                    eprintln!("[create_output_image] bind_buffer_memory(staging) failed: {e}");
+                    e
+                })
                 .ok()?
         };
         let staging_ptr = unsafe {
             self.device
                 .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|e| {
+                    eprintln!("[create_output_image] map_memory(staging) failed: {e}");
+                    e
+                })
                 .ok()?
         } as *mut u8;
 
@@ -3296,6 +3374,9 @@ impl VulkanRenderer {
         } else {
             self.ensure_output_images(phys_w, phys_h);
             if self.output_images.is_empty() {
+                eprintln!(
+                    "[render_tree_sized] output_images empty after ensure ({phys_w}x{phys_h})"
+                );
                 return None;
             }
             let idx = self.output_idx;
@@ -3308,11 +3389,27 @@ impl VulkanRenderer {
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cb = unsafe { self.device.allocate_command_buffers(&cb_alloc).ok()?[0] };
+        let cb = unsafe {
+            self.device
+                .allocate_command_buffers(&cb_alloc)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
+                    e
+                })
+                .ok()?[0]
+        };
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { self.device.begin_command_buffer(cb, &begin_info).ok()? };
+        unsafe {
+            self.device
+                .begin_command_buffer(cb, &begin_info)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] begin_command_buffer failed: {e}");
+                    e
+                })
+                .ok()?
+        };
 
         // Begin render pass.
         let clear = vk::ClearValue {
@@ -3536,7 +3633,13 @@ impl VulkanRenderer {
 
         // Submit asynchronously.
         unsafe {
-            self.device.end_command_buffer(cb).ok()?;
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] end_command_buffer failed: {e}");
+                    e
+                })
+                .ok()?;
         }
         // When explicit sync is needed (tiled NV12 on radv), create the
         // fence with SYNC_FD export capability so we can hand a sync_fd
@@ -3550,15 +3653,35 @@ impl VulkanRenderer {
             let mut export_info = vk::ExportFenceCreateInfo::default()
                 .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
             let fence_info = vk::FenceCreateInfo::default().push_next(&mut export_info);
-            unsafe { self.device.create_fence(&fence_info, None).ok()? }
+            unsafe {
+                self.device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| {
+                        eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
+                        e
+                    })
+                    .ok()?
+            }
         } else {
             let fence_info = vk::FenceCreateInfo::default();
-            unsafe { self.device.create_fence(&fence_info, None).ok()? }
+            unsafe {
+                self.device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| {
+                        eprintln!("[render_tree_sized] create_fence failed: {e}");
+                        e
+                    })
+                    .ok()?
+            }
         };
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| {
+                    eprintln!("[render_tree_sized] queue_submit failed: {e}");
+                    e
+                })
                 .ok()?;
         }
 
