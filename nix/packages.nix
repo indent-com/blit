@@ -109,7 +109,7 @@
           preBuild = copyWebAppDist;
           # Use cargo-zigbuild for the final link so zig enforces
           # the minimum glibc version on the Rust side too.
-          buildPhaseCargoCommand = "cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
+          buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
           installPhaseCommand = ''
             mkdir -p $out/bin
             cp target/${rustTargetGnu}/release/blit $out/bin/
