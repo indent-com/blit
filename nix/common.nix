@@ -207,21 +207,36 @@ let
     mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
   });
 
+  # Zig linker wrapper — invokes `zig cc` as a linker-driver with
+  # the glibc version floor.  Used as CARGO_TARGET_*_LINKER so
+  # regular cargo (not cargo-zigbuild) can enforce the glibc floor
+  # at link time while C deps compile with the system gcc.
+  zigLinker = pkgs.writeShellScript "zig-linker" ''
+    exec ${pkgs.zig}/bin/zig cc -target ${
+      if pkgs.stdenv.hostPlatform.isAarch64
+      then "aarch64-linux-gnu"
+      else "x86_64-linux-gnu"
+    }.${minGlibcVersion} "$@"
+  '';
+
+  cargoLinkerEnv =
+    if pkgs.stdenv.hostPlatform.isAarch64
+    then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+    else "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER";
+
   # Only real build-time dep is libopus (audiopus_sys).  Everything
   # else (gbm, va, vulkan) is dlopen'd at runtime.
   #
-  # cargo-zigbuild uses zig as the *linker* (enforcing glibc 2.31),
-  # but we override CC/CXX back to the system gcc so C code compiled
-  # by crate build scripts (e.g. aws-lc-sys) doesn't hit zig cc's
-  # false-positive GCC bug checks.  The zig linker still enforces
-  # the glibc version floor on the final binary.
+  # We use plain `cargo build` with zig set as the *linker only*
+  # (via CARGO_TARGET_*_LINKER).  This avoids cargo-zigbuild setting
+  # CC to zig wrappers which trigger false-positive GCC bug checks
+  # in crates like aws-lc-sys and pixman.
   commonArgsGnu = {
     inherit src version;
     strictDeps = true;
     nativeBuildInputs = [
       pkgs.pkg-config
       pkgs.llvmPackages.libclang
-      pkgs.cargo-zigbuild
       pkgs.zig
     ];
     buildInputs = [
@@ -229,13 +244,10 @@ let
     ];
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-    # Build for explicit gnu target so artifacts go to target/<triple>/
     CARGO_BUILD_TARGET = rustTargetGnu;
-    # Force system gcc for C deps — cargo-zigbuild sets CC/CXX to
-    # zig wrappers which trigger false-positive compiler bug checks
-    # in aws-lc-sys and other crates.
-    CC = "cc";
-    CXX = "c++";
+    # Use zig only as linker — enforces glibc version floor without
+    # replacing the C compiler.
+    "${cargoLinkerEnv}" = "${zigLinker}";
   };
 
   cargoArtifactsGnu = craneLib.buildDepsOnly (

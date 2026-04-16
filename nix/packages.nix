@@ -97,8 +97,8 @@
       # ------------------------------------------------------------------
 
       # Linux glibc binary — all deps statically linked, only glibc is
-      # dynamic (so dlopen works for GPU).  Built with zig cc targeting
-      # glibc ${minGlibcVersion} for broad distro compatibility.
+      # dynamic (so dlopen works for GPU).  Zig linker enforces
+      # glibc >= ${minGlibcVersion} for broad distro compatibility.
       blit-gnu = craneLib.buildPackage (
         commonArgsGnu
         // {
@@ -107,9 +107,9 @@
           cargoExtraArgs = "-p blit-cli";
           doCheck = false;
           preBuild = copyWebAppDist;
-          # Use cargo-zigbuild for the final link so zig enforces
-          # the minimum glibc version on the Rust side too.
-          buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
+          # Zig is used only as the linker (CARGO_TARGET_*_LINKER)
+          # to enforce the glibc version floor.
+          buildPhaseCargoCommand = "cargo build --release --target ${rustTargetGnu} -p blit-cli";
           installPhaseCommand = ''
             mkdir -p $out/bin
             cp target/${rustTargetGnu}/release/blit $out/bin/
