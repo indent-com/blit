@@ -510,6 +510,8 @@ struct ClientState {
     browser_apply_ms: f32,
     last_metrics_update: Instant,
     last_log: Instant,
+    /// Throttle timestamp for "[surface-gate] blocked" diagnostic logs.
+    last_window_blocked_log: Instant,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
     surface_next_send_at: Instant,
@@ -2806,6 +2808,18 @@ async fn tick(state: &AppState) -> TickOutcome {
     if !pixel_snapshot.is_empty() {
         for (&cid, client) in sess.clients.iter_mut() {
             if !surface_window_open(client) {
+                // Log persistent blockage so hangs are visible.
+                let now_inst = Instant::now();
+                if now_inst.duration_since(client.last_window_blocked_log).as_secs_f32() > 5.0 {
+                    client.last_window_blocked_log = now_inst;
+                    eprintln!(
+                        "[surface-gate] cid={cid} surface_window_open=false outbox={} burst={} inflight={}/{}",
+                        outbox_queued_frames(client),
+                        client.surface_burst_remaining,
+                        client.surface_inflight_frames.len(),
+                        surface_inflight_limit(client),
+                    );
+                }
                 continue;
             }
             // During burst-start (first few frames after subscribe/keyframe
@@ -3832,7 +3846,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             match msg {
                 Some(m) => {
                     let bytes = m.len();
+                    let write_start = Instant::now();
                     let wrote = write_frame_interleaved(&mut writer, &m, &mut audio_rx).await;
+                    let write_elapsed = write_start.elapsed();
+                    if write_elapsed.as_millis() > 100 {
+                        eprintln!(
+                            "[sender] slow write: bytes={bytes} elapsed={}ms wrote={wrote}",
+                            write_elapsed.as_millis(),
+                        );
+                    }
                     mark_outbox_drained(
                         &sender_outbox_queued_frames,
                         &sender_outbox_queued_bytes,
@@ -3898,6 +3920,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 browser_apply_ms: 0.0,
                 last_metrics_update: Instant::now(),
                 last_log: Instant::now(),
+                last_window_blocked_log: Instant::now(),
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
                 surface_next_send_at: Instant::now(),
@@ -5452,6 +5475,7 @@ mod tests {
             browser_apply_ms: 0.0,
             last_metrics_update: Instant::now(),
             last_log: Instant::now(),
+            last_window_blocked_log: Instant::now(),
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
             surface_next_send_at: Instant::now(),
