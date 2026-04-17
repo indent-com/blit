@@ -2249,9 +2249,8 @@ impl VulkanRenderer {
         let image = unsafe {
             self.device
                 .create_image(&image_info, None)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] create_image failed: {e} ({w}x{h})");
-                    e
                 })
                 .ok()?
         };
@@ -2280,18 +2279,16 @@ impl VulkanRenderer {
         let memory = unsafe {
             self.device
                 .allocate_memory(&alloc_info, None)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] allocate_memory(image) failed: {e}");
-                    e
                 })
                 .ok()?
         };
         unsafe {
             self.device
                 .bind_image_memory(image, memory, 0)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] bind_image_memory failed: {e}");
-                    e
                 })
                 .ok()?
         };
@@ -2310,9 +2307,8 @@ impl VulkanRenderer {
         let view = unsafe {
             self.device
                 .create_image_view(&view_info, None)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] create_image_view failed: {e}");
-                    e
                 })
                 .ok()?
         };
@@ -2325,9 +2321,8 @@ impl VulkanRenderer {
         let framebuffer = unsafe {
             self.device
                 .create_framebuffer(&fb_info, None)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] create_framebuffer failed: {e}");
-                    e
                 })
                 .ok()?
         };
@@ -2340,9 +2335,8 @@ impl VulkanRenderer {
         let staging_buf = unsafe {
             self.device
                 .create_buffer(&buf_info, None)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] create_buffer(staging) failed: {e}");
-                    e
                 })
                 .ok()?
         };
@@ -2364,27 +2358,24 @@ impl VulkanRenderer {
         let staging_mem = unsafe {
             self.device
                 .allocate_memory(&buf_alloc, None)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] allocate_memory(staging) failed: {e}");
-                    e
                 })
                 .ok()?
         };
         unsafe {
             self.device
                 .bind_buffer_memory(staging_buf, staging_mem, 0)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] bind_buffer_memory(staging) failed: {e}");
-                    e
                 })
                 .ok()?
         };
         let staging_ptr = unsafe {
             self.device
                 .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[create_output_image] map_memory(staging) failed: {e}");
-                    e
                 })
                 .ok()?
         } as *mut u8;
@@ -3396,9 +3387,8 @@ impl VulkanRenderer {
         let cb = unsafe {
             self.device
                 .allocate_command_buffers(&cb_alloc)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
-                    e
                 })
                 .ok()?[0]
         };
@@ -3408,9 +3398,8 @@ impl VulkanRenderer {
         unsafe {
             self.device
                 .begin_command_buffer(cb, &begin_info)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[render_tree_sized] begin_command_buffer failed: {e}");
-                    e
                 })
                 .ok()?
         };
@@ -3648,9 +3637,8 @@ impl VulkanRenderer {
         unsafe {
             self.device
                 .end_command_buffer(cb)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[render_tree_sized] end_command_buffer failed: {e}");
-                    e
                 })
                 .ok()?;
         }
@@ -3669,9 +3657,8 @@ impl VulkanRenderer {
             unsafe {
                 self.device
                     .create_fence(&fence_info, None)
-                    .map_err(|e| {
+                    .inspect_err(|&e| {
                         eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
-                        e
                     })
                     .ok()?
             }
@@ -3680,9 +3667,8 @@ impl VulkanRenderer {
             unsafe {
                 self.device
                     .create_fence(&fence_info, None)
-                    .map_err(|e| {
+                    .inspect_err(|&e| {
                         eprintln!("[render_tree_sized] create_fence failed: {e}");
-                        e
                     })
                     .ok()?
             }
@@ -3691,9 +3677,8 @@ impl VulkanRenderer {
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
-                .map_err(|e| {
+                .inspect_err(|&e| {
                     eprintln!("[render_tree_sized] queue_submit failed: {e}");
-                    e
                 })
                 .ok()?;
         }
