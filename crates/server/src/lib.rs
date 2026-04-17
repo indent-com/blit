@@ -786,6 +786,79 @@ fn surface_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / surface_pacing_fps(client).max(1.0) as f64)
 }
 
+/// Emit a pacing-metrics line for this client if 10s have elapsed since
+/// the last one.  Called both from the ACK handler and from `tick()` so
+/// an idle client (no ACK traffic) still gets periodic metrics.
+fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
+    let Some(c) = sess.clients.get_mut(&client_id) else {
+        return;
+    };
+    if c.last_log.elapsed().as_secs_f32() < 10.0 {
+        return;
+    }
+    let log_elapsed = c.last_log.elapsed().as_secs_f32().max(1.0e-3);
+    let paced_fps = pacing_fps(c);
+    let display_need_bps_v = display_need_bps(c);
+    let surface_fps = surface_pacing_fps(c);
+    let frames_sent = c.frames_sent;
+    let acks_recv = c.acks_recv;
+    let rtt_ms = c.rtt_ms;
+    let min_rtt_ms = path_rtt_ms(c);
+    let eff_rtt_ms = window_rtt_ms(c);
+    let inflight_bytes = c.inflight_bytes;
+    let delivery_bps = c.delivery_bps;
+    let goodput_ewma_bps = c.goodput_bps;
+    let goodput_jitter_bps = c.goodput_jitter_bps;
+    let max_goodput_jitter_bps = c.max_goodput_jitter_bps;
+    let avg_frame_bytes = c.avg_frame_bytes;
+    let avg_paced_frame_bytes = c.avg_paced_frame_bytes;
+    let avg_preview_frame_bytes = c.avg_preview_frame_bytes;
+    let display_fps = c.display_fps;
+    let probe_frames = c.probe_frames;
+    let goodput_bps = c.acked_bytes_since_log as f32 / log_elapsed;
+    let window_frames = target_frame_window(c);
+    let window_bytes = target_byte_window(c);
+    let outbox_frames = outbox_queued_frames(c);
+    let browser_backlog_frames = c.browser_backlog_frames;
+    let browser_ack_ahead_frames = c.browser_ack_ahead_frames;
+    let browser_apply_ms = c.browser_apply_ms;
+    let avg_surface_frame_bytes = c.avg_surface_frame_bytes;
+
+    c.frames_sent = 0;
+    c.acks_recv = 0;
+    c.acked_bytes_since_log = 0;
+    c.last_log = Instant::now();
+
+    if verbose {
+        let surf_info = sess.compositor.as_ref().map(|cs| {
+            let surfaces = cs.surfaces.len();
+            let pending = 0usize;
+            let subs: usize = sess
+                .clients
+                .values()
+                .map(|c| c.surface_subscriptions.len())
+                .sum();
+            (surfaces, pending, subs)
+        });
+        let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
+        eprintln!(
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={}",
+            sess.tick_fires,
+            sess.tick_snaps,
+            sess.surface_commits,
+            sess.surface_encodes,
+            sess.surface_encode_bytes,
+            sess.surface_frames_sent,
+        );
+    }
+    sess.tick_fires = 0;
+    sess.tick_snaps = 0;
+    sess.surface_commits = 0;
+    sess.surface_encodes = 0;
+    sess.surface_encode_bytes = 0;
+    sess.surface_frames_sent = 0;
+}
+
 fn advance_deadline(deadline: &mut Instant, now: Instant, interval: Duration) {
     let scheduled = deadline.checked_add(interval).unwrap_or(now + interval);
     *deadline = if scheduled + interval < now {
@@ -2096,6 +2169,14 @@ async fn tick(state: &AppState) -> TickOutcome {
     sess.tick_fires += 1;
     let mut next_deadline: Option<Instant> = None;
     let now = Instant::now();
+
+    // Emit pacing metrics every 10s for each client, even when no ACKs
+    // are flowing (idle session): the ACK handler also calls this so the
+    // first client with traffic still owns the tick-counter reset.
+    let log_client_ids: Vec<u64> = sess.clients.keys().copied().collect();
+    for cid in log_client_ids {
+        maybe_log_pacing_metrics(&mut sess, cid, state.config.verbose);
+    }
 
     // Application-level keepalive.
     let ping_interval = state.config.ping_interval;
@@ -3930,112 +4011,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
         if data[0] == C2S_ACK {
             let mut sess = state.session.lock().await;
-            let (
-                do_log,
-                frames_sent,
-                acks_recv,
-                rtt_ms,
-                min_rtt_ms,
-                eff_rtt_ms,
-                inflight_bytes,
-                delivery_bps,
-                goodput_ewma_bps,
-                goodput_jitter_bps,
-                max_goodput_jitter_bps,
-                avg_frame_bytes,
-                avg_paced_frame_bytes,
-                avg_preview_frame_bytes,
-                display_fps,
-                paced_fps,
-                display_need_bps,
-                probe_frames,
-                goodput_bps,
-                window_frames,
-                window_bytes,
-                outbox_frames,
-                browser_backlog_frames,
-                browser_ack_ahead_frames,
-                browser_apply_ms,
-                surface_fps,
-                avg_surface_frame_bytes,
-            ) = {
-                let Some(c) = sess.clients.get_mut(&client_id) else {
-                    continue;
-                };
+            if let Some(c) = sess.clients.get_mut(&client_id) {
                 c.acks_recv += 1;
                 record_ack(c);
-                let do_log = c.last_log.elapsed().as_secs_f32() >= 10.0;
-                let log_elapsed = c.last_log.elapsed().as_secs_f32().max(1.0e-3);
-                let paced_fps = pacing_fps(c);
-                let display_need_bps = display_need_bps(c);
-                let surface_fps = surface_pacing_fps(c);
-                let out = (
-                    do_log,
-                    c.frames_sent,
-                    c.acks_recv,
-                    c.rtt_ms,
-                    path_rtt_ms(c),
-                    window_rtt_ms(c),
-                    c.inflight_bytes,
-                    c.delivery_bps,
-                    c.goodput_bps,
-                    c.goodput_jitter_bps,
-                    c.max_goodput_jitter_bps,
-                    c.avg_frame_bytes,
-                    c.avg_paced_frame_bytes,
-                    c.avg_preview_frame_bytes,
-                    c.display_fps,
-                    paced_fps,
-                    display_need_bps,
-                    c.probe_frames,
-                    c.acked_bytes_since_log as f32 / log_elapsed,
-                    target_frame_window(c),
-                    target_byte_window(c),
-                    outbox_queued_frames(c),
-                    c.browser_backlog_frames,
-                    c.browser_ack_ahead_frames,
-                    c.browser_apply_ms,
-                    surface_fps,
-                    c.avg_surface_frame_bytes,
-                );
-                if do_log {
-                    c.frames_sent = 0;
-                    c.acks_recv = 0;
-                    c.acked_bytes_since_log = 0;
-                    c.last_log = Instant::now();
-                }
-                out
-            };
-            if do_log && config.verbose {
-                let surf_info = sess.compositor.as_ref().map(|cs| {
-                    let surfaces = cs.surfaces.len();
-                    let pending = 0usize;
-                    let subs: usize = sess
-                        .clients
-                        .values()
-                        .map(|c| c.surface_subscriptions.len())
-                        .sum();
-                    (surfaces, pending, subs)
-                });
-                let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
-                eprintln!(
-                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={}",
-                    sess.tick_fires,
-                    sess.tick_snaps,
-                    sess.surface_commits,
-                    sess.surface_encodes,
-                    sess.surface_encode_bytes,
-                    sess.surface_frames_sent,
-                );
+            } else {
+                continue;
             }
-            if do_log {
-                sess.tick_fires = 0;
-                sess.tick_snaps = 0;
-                sess.surface_commits = 0;
-                sess.surface_encodes = 0;
-                sess.surface_encode_bytes = 0;
-                sess.surface_frames_sent = 0;
-            }
+            maybe_log_pacing_metrics(&mut sess, client_id, config.verbose);
             nudge_delivery(&state);
             continue;
         }
