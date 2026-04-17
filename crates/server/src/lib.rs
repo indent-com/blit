@@ -519,6 +519,14 @@ struct ClientState {
     skip_in_flight_count: u32,
     skip_pacing_count: u32,
     skip_vulkan_await_count: u32,
+    /// Client had no subscriptions when encode pass ran.
+    skip_no_subs_count: u32,
+    /// Client not subscribed to a given sid in pixel_snapshot.
+    skip_not_subbed_count: u32,
+    /// last_pixels entry missing / dimensions mismatched pixel_snapshot.
+    skip_last_pixels_mismatch_count: u32,
+    /// Iterations through pixel_snapshot for this client (sanity check).
+    encode_loop_iters: u32,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
     surface_next_send_at: Instant,
@@ -836,6 +844,11 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     let skip_in_flight = c.skip_in_flight_count;
     let skip_pacing = c.skip_pacing_count;
     let skip_vk_await = c.skip_vulkan_await_count;
+    let skip_no_subs = c.skip_no_subs_count;
+    let skip_not_subbed = c.skip_not_subbed_count;
+    let skip_mismatch = c.skip_last_pixels_mismatch_count;
+    let loop_iters = c.encode_loop_iters;
+    let own_subs = c.surface_subscriptions.len();
     let vk_surfs = c.vulkan_video_surfaces.len();
     let in_flight_set_len = c.surface_encodes_in_flight.len();
     let surface_burst = c.surface_burst_remaining;
@@ -847,6 +860,10 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     c.skip_in_flight_count = 0;
     c.skip_pacing_count = 0;
     c.skip_vulkan_await_count = 0;
+    c.skip_no_subs_count = 0;
+    c.skip_not_subbed_count = 0;
+    c.skip_last_pixels_mismatch_count = 0;
+    c.encode_loop_iters = 0;
     c.last_log = Instant::now();
 
     if verbose {
@@ -862,13 +879,15 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         });
         let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
         eprintln!(
-            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst}",
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst}",
             sess.tick_fires,
             sess.tick_snaps,
             sess.surface_commits,
             sess.surface_encodes,
             sess.surface_encode_bytes,
             sess.surface_frames_sent,
+            sess.ticks_pixel_snapshot_empty,
+            sess.pixel_snapshot_len,
         );
     }
     sess.tick_fires = 0;
@@ -877,6 +896,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     sess.surface_encodes = 0;
     sess.surface_encode_bytes = 0;
     sess.surface_frames_sent = 0;
+    sess.ticks_pixel_snapshot_empty = 0;
 }
 
 fn advance_deadline(deadline: &mut Instant, now: Instant, interval: Duration) {
@@ -1383,6 +1403,10 @@ struct Session {
     surface_encodes: u32,
     surface_encode_bytes: u64,
     surface_frames_sent: u32,
+    /// Ticks where pixel_snapshot was empty → entire encode loop skipped.
+    ticks_pixel_snapshot_empty: u32,
+    /// Number of (sid,w,h) tuples in the most recent non-empty pixel_snapshot.
+    pixel_snapshot_len: usize,
     last_ping: Instant,
     clients: HashMap<u64, ClientState>,
 }
@@ -1414,6 +1438,8 @@ impl Session {
             surface_commits: 0,
             surface_encodes: 0,
             surface_encode_bytes: 0,
+            ticks_pixel_snapshot_empty: 0,
+            pixel_snapshot_len: 0,
             last_ping: Instant::now(),
             surface_frames_sent: 0,
         }
@@ -2763,6 +2789,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .collect()
         })
         .unwrap_or_default();
+    if pixel_snapshot.is_empty() {
+        sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
+    } else {
+        sess.pixel_snapshot_len = pixel_snapshot.len();
+    }
 
     // ---- Surface encode (off main thread) + deliver ----
     //
@@ -2855,6 +2886,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 continue;
             }
             if client.surface_subscriptions.is_empty() {
+                client.skip_no_subs_count = client.skip_no_subs_count.saturating_add(1);
                 continue;
             }
             client_work.push(ClientWork {
@@ -2899,7 +2931,14 @@ async fn tick(state: &AppState) -> TickOutcome {
 
         for work in &client_work {
             for &(sid, px_w, px_h, px_gen) in &pixel_snapshot {
+                {
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.encode_loop_iters = client.encode_loop_iters.saturating_add(1);
+                }
                 if !work.subs.contains(&sid) {
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.skip_not_subbed_count =
+                        client.skip_not_subbed_count.saturating_add(1);
                     continue;
                 }
                 let client = sess.clients.get_mut(&work.cid).unwrap();
@@ -2918,11 +2957,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let (pixels, created_at) = {
                     let cs = sess.compositor.as_ref().unwrap();
                     let ca = cs.created_at;
-                    let px = match cs.last_pixels.get(&sid) {
-                        Some(lp) if lp.width == px_w && lp.height == px_h => lp.pixels.clone(),
-                        _ => continue,
+                    let maybe_px = match cs.last_pixels.get(&sid) {
+                        Some(lp) if lp.width == px_w && lp.height == px_h => {
+                            Some(lp.pixels.clone())
+                        }
+                        _ => None,
                     };
-                    (px, ca)
+                    match maybe_px {
+                        Some(px) => (px, ca),
+                        None => {
+                            let client = sess.clients.get_mut(&work.cid).unwrap();
+                            client.skip_last_pixels_mismatch_count = client
+                                .skip_last_pixels_mismatch_count
+                                .saturating_add(1);
+                            continue;
+                        }
+                    }
                 };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
 
@@ -3969,6 +4019,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 skip_in_flight_count: 0,
                 skip_pacing_count: 0,
                 skip_vulkan_await_count: 0,
+                skip_no_subs_count: 0,
+                skip_not_subbed_count: 0,
+                skip_last_pixels_mismatch_count: 0,
+                encode_loop_iters: 0,
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
                 surface_next_send_at: Instant::now(),
@@ -5529,6 +5583,10 @@ mod tests {
             skip_in_flight_count: 0,
             skip_pacing_count: 0,
             skip_vulkan_await_count: 0,
+            skip_no_subs_count: 0,
+            skip_not_subbed_count: 0,
+            skip_last_pixels_mismatch_count: 0,
+            encode_loop_iters: 0,
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
             surface_next_send_at: Instant::now(),
