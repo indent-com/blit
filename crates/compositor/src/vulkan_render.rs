@@ -3310,6 +3310,11 @@ impl VulkanRenderer {
         collect_gpu_layers(root_id, surfaces, meta, 0, 0, &mut all_layers);
 
         if all_layers.is_empty() {
+            eprintln!(
+                "[render_tree_sized] all_layers empty (sid={toplevel_sid} surfaces={} meta={})",
+                surfaces.len(),
+                meta.len(),
+            );
             return None;
         }
 
@@ -3330,6 +3335,10 @@ impl VulkanRenderer {
             });
 
         if log_w == 0 || log_h == 0 {
+            eprintln!(
+                "[render_tree_sized] zero logical size log={log_w}x{log_h} layers={}",
+                all_layers.len(),
+            );
             return None;
         }
 

@@ -1297,7 +1297,9 @@ impl Compositor {
             if r.is_none() {
                 static SC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = SC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n.is_multiple_of(1000) {
+                // Log the first 100 None results, then every 10th, so
+                // persistent hangs stay visible without flooding logs.
+                if n < 100 || n.is_multiple_of(10) {
                     eprintln!(
                         "[commit #{n}] render_tree_sized=None sid={toplevel_sid} target={target_phys:?} meta={} textures={}",
                         self.surface_meta.len(),
