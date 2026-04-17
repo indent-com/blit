@@ -3099,7 +3099,14 @@ impl VulkanRenderer {
         // fences have signalled, freeing their command buffers and textures.
         self.drain_deferred_submits();
 
-        let pending = self.pending_submit.take()?;
+        static TR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some(pending) = self.pending_submit.take() else {
+            let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(500) {
+                eprintln!("[try_retire_pending #{n}] no pending_submit");
+            }
+            return None;
+        };
         let raw = unsafe {
             (self.device.fp_v1_0().wait_for_fences)(
                 self.device.handle(),
@@ -3110,6 +3117,10 @@ impl VulkanRenderer {
             )
         };
         if raw != vk::Result::SUCCESS {
+            let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(500) {
+                eprintln!("[try_retire_pending #{n}] fence not ready: {raw:?}");
+            }
             self.pending_submit = Some(pending);
             return None;
         }
@@ -3117,9 +3128,8 @@ impl VulkanRenderer {
         let result = self.retire_pending(pending);
         // Free per-frame temporary textures now that the GPU is done.
         self.free_frame_textures();
-        static TR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 10 || n.is_multiple_of(1000) {
+        if n < 10 || n.is_multiple_of(100) {
             eprintln!(
                 "[try_retire_pending #{n}] sid={toplevel_sid} result_some={}",
                 result.is_some(),
@@ -3346,12 +3356,13 @@ impl VulkanRenderer {
             self.free_frame_textures();
             None
         };
-        if entry_n < 20 || entry_n.is_multiple_of(1000) {
+        if entry_n < 20 || entry_n.is_multiple_of(50) {
             eprintln!(
-                "[render_tree_sized #{entry_n}] had_pending={had_pending} prev_result={} ext_outputs={} deferred={}",
+                "[render_tree_sized #{entry_n}] had_pending={had_pending} prev_result={} ext_outputs={} deferred={} pending_after={}",
                 prev_result.is_some(),
                 self.external_outputs.len(),
                 self.deferred_submits.len(),
+                self.pending_submit.is_some(),
             );
         }
 
@@ -3903,14 +3914,14 @@ impl VulkanRenderer {
                 let ext_len = ext_vec.len();
                 *ext_idx = (*ext_idx + 1) % ext_len;
             }
-            if entry_n < 20 {
+            if entry_n < 20 || entry_n.is_multiple_of(50) {
                 eprintln!("[render_tree_sized #{entry_n}] return=external Some");
             }
             result
         } else {
             self.pending_submit = Some(submit_info);
             self.output_idx = (self.output_idx + 1) % self.output_images.len();
-            if entry_n < 20 || entry_n.is_multiple_of(1000) {
+            if entry_n < 20 || entry_n.is_multiple_of(50) {
                 eprintln!(
                     "[render_tree_sized #{entry_n}] return=self-alloc prev={}",
                     prev_result.is_some(),
