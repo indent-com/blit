@@ -1323,6 +1323,20 @@ impl Compositor {
             .surfaces
             .get(surface_id)
             .is_some_and(|s| s.pending_buffer.is_some());
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 40 || n.is_multiple_of(200) {
+                let children = self
+                    .surfaces
+                    .get(surface_id)
+                    .map(|s| s.children.len())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[commit-in #{n}] sid={surface_id:?} toplevel={toplevel_sid:?} root={root_id:?} had_buffer={had_buffer} children={children}",
+                );
+            }
+        }
         self.apply_pending_state(surface_id);
 
         let toplevel_sid = match toplevel_sid {
