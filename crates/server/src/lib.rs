@@ -512,6 +512,12 @@ struct ClientState {
     last_log: Instant,
     /// Throttle timestamp for "[surface-gate] blocked" diagnostic logs.
     last_window_blocked_log: Instant,
+    /// Throttle timestamp for "[encode-skip]" diagnostic logs.
+    last_skip_log: Instant,
+    /// Counters for silent encode-skip paths, reset each pacing log tick.
+    skip_same_gen_count: u32,
+    skip_in_flight_count: u32,
+    skip_pacing_count: u32,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
     surface_next_send_at: Instant,
@@ -825,10 +831,18 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     let browser_ack_ahead_frames = c.browser_ack_ahead_frames;
     let browser_apply_ms = c.browser_apply_ms;
     let avg_surface_frame_bytes = c.avg_surface_frame_bytes;
+    let skip_same_gen = c.skip_same_gen_count;
+    let skip_in_flight = c.skip_in_flight_count;
+    let skip_pacing = c.skip_pacing_count;
+    let in_flight_set_len = c.surface_encodes_in_flight.len();
+    let surface_burst = c.surface_burst_remaining;
 
     c.frames_sent = 0;
     c.acks_recv = 0;
     c.acked_bytes_since_log = 0;
+    c.skip_same_gen_count = 0;
+    c.skip_in_flight_count = 0;
+    c.skip_pacing_count = 0;
     c.last_log = Instant::now();
 
     if verbose {
@@ -844,7 +858,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         });
         let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
         eprintln!(
-            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={}",
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} enc_in_flight_set={in_flight_set_len} burst={surface_burst}",
             sess.tick_fires,
             sess.tick_snaps,
             sess.surface_commits,
@@ -2833,6 +2847,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     Some(existing) => existing.min(deadline),
                     None => deadline,
                 });
+                client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
                 continue;
             }
             if client.surface_subscriptions.is_empty() {
@@ -2892,6 +2907,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     && let Some(&last_gen) = client.surface_last_encoded_gen.get(&sid)
                     && last_gen == px_gen
                 {
+                    client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
                     continue;
                 }
 
@@ -2957,6 +2973,18 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // first, and concurrent C-library encode instances for the
                 // same client can corrupt memory.
                 if client.surface_encodes_in_flight.contains(&sid) {
+                    client.skip_in_flight_count = client.skip_in_flight_count.saturating_add(1);
+                    let now_inst = Instant::now();
+                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
+                        client.last_skip_log = now_inst;
+                        eprintln!(
+                            "[encode-skip] cid={} sid={sid} reason=in_flight same_gen={} in_flight={} burst={}",
+                            work.cid,
+                            client.skip_same_gen_count,
+                            client.skip_in_flight_count,
+                            client.surface_burst_remaining,
+                        );
+                    }
                     continue;
                 }
 
@@ -3921,6 +3949,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 last_metrics_update: Instant::now(),
                 last_log: Instant::now(),
                 last_window_blocked_log: Instant::now(),
+                last_skip_log: Instant::now(),
+                skip_same_gen_count: 0,
+                skip_in_flight_count: 0,
+                skip_pacing_count: 0,
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
                 surface_next_send_at: Instant::now(),
@@ -5476,6 +5508,10 @@ mod tests {
             last_metrics_update: Instant::now(),
             last_log: Instant::now(),
             last_window_blocked_log: Instant::now(),
+            last_skip_log: Instant::now(),
+            skip_same_gen_count: 0,
+            skip_in_flight_count: 0,
+            skip_pacing_count: 0,
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
             surface_next_send_at: Instant::now(),
