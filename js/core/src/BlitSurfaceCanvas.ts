@@ -1,5 +1,10 @@
 import type { ConnectionId, BlitSurface } from "./types";
-import { CODEC_SUPPORT_H264, CODEC_SUPPORT_AV1 } from "./types";
+import {
+  CODEC_SUPPORT_H264,
+  CODEC_SUPPORT_AV1,
+  CODEC_SUPPORT_H264_444,
+  CODEC_SUPPORT_AV1_444,
+} from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
 import {
@@ -11,9 +16,95 @@ import {
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
 
+// Minimal 64×64 4:4:4 test frames for real-decode probing.
+// isConfigSupported() is unreliable for 4:4:4 — e.g. Chromium reports AV1
+// Professional Profile as supported but dav1d chokes on actual 4:4:4 OBUs.
+// prettier-ignore
+const AV1_444_TEST_FRAME = new Uint8Array([
+  0x12, 0x00, 0x0a, 0x0d, 0x20, 0x00, 0x00, 0xf9, 0x57, 0xff, 0xc4, 0x21,
+  0x52, 0x04, 0x04, 0x04, 0xa0, 0x32, 0x29, 0x10, 0x02, 0x89, 0x1d, 0xa9,
+  0x9d, 0x8f, 0x81, 0x60, 0x00, 0x10, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x30, 0xc3, 0x0c, 0x10, 0x41, 0x10, 0xbb, 0x11, 0x0e,
+  0xc2, 0xb1, 0x4f, 0x18, 0x9e, 0x95, 0x58, 0xe7, 0x95, 0xb8, 0x14, 0x93,
+]);
+// prettier-ignore
+const H264_444_TEST_FRAME = new Uint8Array([
+  0x00, 0x00, 0x00, 0x01, 0x67, 0xf4, 0x00, 0x1f, 0x91, 0x9b, 0x28, 0x84,
+  0xd8, 0x08, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x19, 0x07,
+  0x8c, 0x18, 0xcb, 0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, 0xe3, 0xc4, 0x48,
+  0x44, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x2b, 0xff, 0xfe, 0xf5,
+  0xdb, 0xf3, 0x2c, 0x93, 0x97, 0x37, 0xc0, 0xa5, 0x92, 0x31, 0xf0, 0x29,
+  0xa0, 0xb6, 0xbf, 0xff, 0xc1, 0xed, 0x94, 0x6c, 0x08, 0x03, 0x84, 0x16,
+  0xdf, 0x31,
+]);
+
+/**
+ * Try to actually decode a 4:4:4 test frame.  Returns true only if the
+ * decoder produces a frame without error.
+ */
+async function tryDecode444(
+  codec: string,
+  testFrame: Uint8Array,
+  codedWidth: number,
+  codedHeight: number,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (v: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    try {
+      const decoder = new VideoDecoder({
+        output: (frame) => {
+          frame.close();
+          decoder.close();
+          settle(true);
+        },
+        error: () => {
+          try {
+            decoder.close();
+          } catch {
+            /* already closed */
+          }
+          settle(false);
+        },
+      });
+      decoder.configure({ codec, codedWidth, codedHeight });
+      decoder.decode(
+        new EncodedVideoChunk({
+          type: "key",
+          timestamp: 0,
+          data: testFrame,
+        }),
+      );
+      decoder.flush().then(
+        () => {
+          try {
+            decoder.close();
+          } catch {
+            /* already closed */
+          }
+          settle(settled ? true : false);
+        },
+        () => settle(false),
+      );
+      setTimeout(() => settle(false), 2000);
+    } catch {
+      settle(false);
+    }
+  });
+}
+
 /**
  * Probe which video codecs the browser can decode via WebCodecs and return
  * a bitmask of CODEC_SUPPORT_* flags.  Result is cached after first call.
+ *
+ * Basic codec support (H.264, AV1) is checked via isConfigSupported().
+ * 4:4:4 chroma variants are verified by actually decoding a small test
+ * frame, since isConfigSupported() is unreliable for subsampling modes.
  */
 export async function detectCodecSupport(): Promise<number> {
   if (_codecSupport !== null) return _codecSupport;
@@ -40,7 +131,26 @@ export async function detectCodecSupport(): Promise<number> {
       }
     }),
   );
+
+  // 4:4:4 probes: actually decode a test frame (isConfigSupported lies).
+  const decode444Checks: [string, Uint8Array, number][] = [
+    ["avc1.F4001f", H264_444_TEST_FRAME, CODEC_SUPPORT_H264_444],
+    ["av01.2.01M.08", AV1_444_TEST_FRAME, CODEC_SUPPORT_AV1_444],
+  ];
+  await Promise.all(
+    decode444Checks.map(async ([codec, frame, bit]) => {
+      if (await tryDecode444(codec, frame, 64, 64)) {
+        mask |= bit;
+      }
+    }),
+  );
+
   _codecSupport = mask;
+  console.log(
+    `[blit] codec support: 0x${mask.toString(16).padStart(2, "0")} ` +
+      `(h264=${!!(mask & CODEC_SUPPORT_H264)} av1=${!!(mask & CODEC_SUPPORT_AV1)} ` +
+      `h264-444=${!!(mask & CODEC_SUPPORT_H264_444)} av1-444=${!!(mask & CODEC_SUPPORT_AV1_444)})`,
+  );
   return mask;
 }
 

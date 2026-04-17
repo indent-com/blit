@@ -299,7 +299,7 @@ function DisconnectedOverlay(props: { passphrase: string; readOnly: boolean }) {
   const [copied, setCopied] = createSignal(false);
   let timeout: ReturnType<typeof setTimeout> | undefined;
 
-  const command = () => `blit share --passphrase ${props.passphrase}`;
+  const command = () => `BLIT_PASSPHRASE=${props.passphrase} blit share`;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(command());

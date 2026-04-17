@@ -190,7 +190,11 @@ impl PtyDriver for AlacrittyDriver {
 // are never dropped, but production is throttled (via `window_open` /
 // `surface_window_open`) once either counter exceeds these limits.
 const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 4;
-const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 128 * 1024;
+// Must comfortably hold one keyframe at 1920x1080 from a software encoder
+// (200-400 KB is typical).  Setting this too low deadlocks the outbox gate
+// when a single frame exceeds the cap — surface_window_open returns false
+// even at outbox=1, and no new frames can ever be produced.
+const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 1024 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
@@ -510,6 +514,23 @@ struct ClientState {
     browser_apply_ms: f32,
     last_metrics_update: Instant,
     last_log: Instant,
+    /// Throttle timestamp for "[surface-gate] blocked" diagnostic logs.
+    last_window_blocked_log: Instant,
+    /// Throttle timestamp for "[encode-skip]" diagnostic logs.
+    last_skip_log: Instant,
+    /// Counters for silent encode-skip paths, reset each pacing log tick.
+    skip_same_gen_count: u32,
+    skip_in_flight_count: u32,
+    skip_pacing_count: u32,
+    skip_vulkan_await_count: u32,
+    /// Client had no subscriptions when encode pass ran.
+    skip_no_subs_count: u32,
+    /// Client not subscribed to a given sid in pixel_snapshot.
+    skip_not_subbed_count: u32,
+    /// last_pixels entry missing / dimensions mismatched pixel_snapshot.
+    skip_last_pixels_mismatch_count: u32,
+    /// Iterations through pixel_snapshot for this client (sanity check).
+    encode_loop_iters: u32,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
     surface_next_send_at: Instant,
@@ -689,13 +710,22 @@ fn browser_pacing_fps(client: &ClientState) -> f32 {
     // Backlog and ack-ahead are direct signals from the browser about
     // whether it's keeping up.  No predictive apply-time bound — it
     // consistently underestimates capacity and causes 30fps death spirals.
+    //
+    // The backoff is steep: at the block threshold (backlog>8) we've
+    // already dropped to display_fps/4.  A gentler schedule (4/backlog)
+    // held 48fps at backlog=10 for software-encoded 1080p, which is
+    // faster than the browser can decode → backlog never drains, the
+    // hard block stays latched, and encoding stalls entirely.
     let backlog = client.browser_backlog_frames as f32;
-    if backlog > 4.0 {
-        fps = fps.min(fps * (4.0 / backlog));
+    if backlog > 2.0 {
+        fps = fps.min(fps * (2.0 / backlog));
     }
 
     if client.browser_ack_ahead_frames > 4 {
         fps = fps.min(client.display_fps.max(1.0) * 0.5);
+    }
+    if client.browser_ack_ahead_frames > 8 {
+        fps = fps.min(client.display_fps.max(1.0) * 0.25);
     }
 
     fps.max(1.0)
@@ -758,25 +788,128 @@ fn preview_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / preview_fps(client) as f64)
 }
 
-/// Surface frame rate: display rate capped by what the pipe can carry.
+/// Surface frame rate: simply the client's display refresh rate.
 ///
-/// `goodput_bps` is fed by terminal ACKs, surface ACKs, and audio send
-/// accounting — so it reflects total pipe utilisation.  Dividing by
-/// `avg_surface_frame_bytes` gives the sustainable surface fps.
-///
-/// Additional backpressure layers below this:
+/// Flow control is provided by three other layers:
+/// - `surface_inflight_limit` scales with RTT×display_fps and bounds
+///   queuing on high-latency paths.
+/// - `outbox_backpressured` triggers on either queued bytes or queued
+///   messages, catching links that can't drain the kernel TCP buffer.
 /// - `surface_encodes_in_flight` limits to 1 encode per (client, surface)
-/// - `outbox_backpressured` triggers on either queued bytes or queued messages
-/// - TCP / SSH flow control on the wire
+///   so a slow encoder can't queue work ahead of itself.
+///
+/// An earlier version of this function capped surface fps at
+/// `goodput_bps / avg_surface_frame_bytes`, but that cap misbehaved
+/// during bootstrap on high-latency links: the conservative initial
+/// goodput seed (262 KB/s) divided by the first keyframe-based
+/// frame-size estimate (25+ KB) yields ~10 fps, well below typical
+/// video sources (24 fps).  Because `goodput_bps` only updates from
+/// ACKs that have already traversed the RTT, it takes several
+/// hundred ms to converge — long enough that mpv @ 24 fps visibly
+/// stalls on a 200 ms link.  The inflight window + outbox backpressure
+/// already handle genuinely slow links without this bandwidth cap.
 fn surface_pacing_fps(client: &ClientState) -> f32 {
-    let frame_bytes = client.avg_surface_frame_bytes.max(256.0);
-    let bw = client.goodput_bps.max(client.delivery_bps);
-    let sustainable = bw / frame_bytes;
-    sustainable.min(client.display_fps).max(1.0)
+    client.display_fps.max(1.0)
 }
 
 fn surface_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / surface_pacing_fps(client).max(1.0) as f64)
+}
+
+/// Emit a pacing-metrics line for this client if 10s have elapsed since
+/// the last one.  Called both from the ACK handler and from `tick()` so
+/// an idle client (no ACK traffic) still gets periodic metrics.
+fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
+    let Some(c) = sess.clients.get_mut(&client_id) else {
+        return;
+    };
+    if c.last_log.elapsed().as_secs_f32() < 10.0 {
+        return;
+    }
+    let log_elapsed = c.last_log.elapsed().as_secs_f32().max(1.0e-3);
+    let paced_fps = pacing_fps(c);
+    let display_need_bps_v = display_need_bps(c);
+    let surface_fps = surface_pacing_fps(c);
+    let frames_sent = c.frames_sent;
+    let acks_recv = c.acks_recv;
+    let rtt_ms = c.rtt_ms;
+    let min_rtt_ms = path_rtt_ms(c);
+    let eff_rtt_ms = window_rtt_ms(c);
+    let inflight_bytes = c.inflight_bytes;
+    let delivery_bps = c.delivery_bps;
+    let goodput_ewma_bps = c.goodput_bps;
+    let goodput_jitter_bps = c.goodput_jitter_bps;
+    let max_goodput_jitter_bps = c.max_goodput_jitter_bps;
+    let avg_frame_bytes = c.avg_frame_bytes;
+    let avg_paced_frame_bytes = c.avg_paced_frame_bytes;
+    let avg_preview_frame_bytes = c.avg_preview_frame_bytes;
+    let display_fps = c.display_fps;
+    let probe_frames = c.probe_frames;
+    let goodput_bps = c.acked_bytes_since_log as f32 / log_elapsed;
+    let window_frames = target_frame_window(c);
+    let window_bytes = target_byte_window(c);
+    let outbox_frames = outbox_queued_frames(c);
+    let browser_backlog_frames = c.browser_backlog_frames;
+    let browser_ack_ahead_frames = c.browser_ack_ahead_frames;
+    let browser_apply_ms = c.browser_apply_ms;
+    let avg_surface_frame_bytes = c.avg_surface_frame_bytes;
+    let skip_same_gen = c.skip_same_gen_count;
+    let skip_in_flight = c.skip_in_flight_count;
+    let skip_pacing = c.skip_pacing_count;
+    let skip_vk_await = c.skip_vulkan_await_count;
+    let skip_no_subs = c.skip_no_subs_count;
+    let skip_not_subbed = c.skip_not_subbed_count;
+    let skip_mismatch = c.skip_last_pixels_mismatch_count;
+    let loop_iters = c.encode_loop_iters;
+    let own_subs = c.surface_subscriptions.len();
+    let vk_surfs = c.vulkan_video_surfaces.len();
+    let in_flight_set_len = c.surface_encodes_in_flight.len();
+    let surface_burst = c.surface_burst_remaining;
+
+    c.frames_sent = 0;
+    c.acks_recv = 0;
+    c.acked_bytes_since_log = 0;
+    c.skip_same_gen_count = 0;
+    c.skip_in_flight_count = 0;
+    c.skip_pacing_count = 0;
+    c.skip_vulkan_await_count = 0;
+    c.skip_no_subs_count = 0;
+    c.skip_not_subbed_count = 0;
+    c.skip_last_pixels_mismatch_count = 0;
+    c.encode_loop_iters = 0;
+    c.last_log = Instant::now();
+
+    if verbose {
+        let surf_info = sess.compositor.as_ref().map(|cs| {
+            let surfaces = cs.surfaces.len();
+            let pending = 0usize;
+            let subs: usize = sess
+                .clients
+                .values()
+                .map(|c| c.surface_subscriptions.len())
+                .sum();
+            (surfaces, pending, subs)
+        });
+        let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
+        eprintln!(
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst}",
+            sess.tick_fires,
+            sess.tick_snaps,
+            sess.surface_commits,
+            sess.surface_encodes,
+            sess.surface_encode_bytes,
+            sess.surface_frames_sent,
+            sess.ticks_pixel_snapshot_empty,
+            sess.pixel_snapshot_len,
+        );
+    }
+    sess.tick_fires = 0;
+    sess.tick_snaps = 0;
+    sess.surface_commits = 0;
+    sess.surface_encodes = 0;
+    sess.surface_encode_bytes = 0;
+    sess.surface_frames_sent = 0;
+    sess.ticks_pixel_snapshot_empty = 0;
 }
 
 fn advance_deadline(deadline: &mut Instant, now: Instant, interval: Duration) {
@@ -897,8 +1030,18 @@ fn outbox_queued_bytes(client: &ClientState) -> usize {
 }
 
 fn outbox_backpressured(client: &ClientState) -> bool {
-    outbox_queued_frames(client) >= OUTBOX_SOFT_QUEUE_LIMIT_FRAMES
-        || outbox_queued_bytes(client) >= OUTBOX_SOFT_QUEUE_LIMIT_BYTES
+    // Always allow at least one frame queued, even if it exceeds the byte
+    // soft limit.  Large keyframes from software encoders can be larger than
+    // OUTBOX_SOFT_QUEUE_LIMIT_BYTES; treating the first queued frame as
+    // backpressure would permanently close surface_window_open and deadlock
+    // encoding (the one queued frame cannot drain until the sender task
+    // flushes it, but the sender was waiting for a new frame that we
+    // refuse to produce — deadlock).
+    let frames = outbox_queued_frames(client);
+    if frames >= OUTBOX_SOFT_QUEUE_LIMIT_FRAMES {
+        return true;
+    }
+    frames >= 2 && outbox_queued_bytes(client) >= OUTBOX_SOFT_QUEUE_LIMIT_BYTES
 }
 
 fn mark_outbox_drained(
@@ -1283,6 +1426,10 @@ struct Session {
     surface_encodes: u32,
     surface_encode_bytes: u64,
     surface_frames_sent: u32,
+    /// Ticks where pixel_snapshot was empty → entire encode loop skipped.
+    ticks_pixel_snapshot_empty: u32,
+    /// Number of (sid,w,h) tuples in the most recent non-empty pixel_snapshot.
+    pixel_snapshot_len: usize,
     last_ping: Instant,
     clients: HashMap<u64, ClientState>,
 }
@@ -1314,6 +1461,8 @@ impl Session {
             surface_commits: 0,
             surface_encodes: 0,
             surface_encode_bytes: 0,
+            ticks_pixel_snapshot_empty: 0,
+            pixel_snapshot_len: 0,
             last_ping: Instant::now(),
             surface_frames_sent: 0,
         }
@@ -1372,7 +1521,11 @@ impl Session {
                     })
                 } else {
                     if verbose && !audio_disabled {
-                        eprintln!("[audio] PipeWire not available, audio disabled");
+                        let missing = audio::missing_pipewire_binaries();
+                        eprintln!(
+                            "[audio] audio disabled: missing binaries on $PATH: {}",
+                            missing.join(", ")
+                        );
                     }
                     None
                 }
@@ -2086,6 +2239,14 @@ async fn tick(state: &AppState) -> TickOutcome {
     let mut next_deadline: Option<Instant> = None;
     let now = Instant::now();
 
+    // Emit pacing metrics every 10s for each client, even when no ACKs
+    // are flowing (idle session): the ACK handler also calls this so the
+    // first client with traffic still owns the tick-counter reset.
+    let log_client_ids: Vec<u64> = sess.clients.keys().copied().collect();
+    for cid in log_client_ids {
+        maybe_log_pacing_metrics(&mut sess, cid, state.config.verbose);
+    }
+
     // Application-level keepalive.
     let ping_interval = state.config.ping_interval;
     if !ping_interval.is_zero() && now.duration_since(sess.last_ping) >= ping_interval {
@@ -2651,6 +2812,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .collect()
         })
         .unwrap_or_default();
+    if pixel_snapshot.is_empty() {
+        sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
+    } else {
+        sess.pixel_snapshot_len = pixel_snapshot.len();
+    }
 
     // ---- Surface encode (off main thread) + deliver ----
     //
@@ -2689,6 +2855,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         codec_flag: u8,
         /// Encoder name for S2C_SURFACE_ENCODER (set when encoder was just created).
         encoder_name: Option<&'static str>,
+        /// WebCodecs codec string (e.g. "av01.2.05M.08"), set when encoder was just created.
+        codec_string: Option<String>,
         /// GBM buffers to export to compositor (set when encoder was just created).
         #[cfg(target_os = "linux")]
         external_bufs: Option<(u32, Vec<blit_compositor::ExternalOutputBuffer>)>,
@@ -2712,6 +2880,26 @@ async fn tick(state: &AppState) -> TickOutcome {
     if !pixel_snapshot.is_empty() {
         for (&cid, client) in sess.clients.iter_mut() {
             if !surface_window_open(client) {
+                // Log persistent blockage so hangs are visible.
+                let now_inst = Instant::now();
+                if now_inst
+                    .duration_since(client.last_window_blocked_log)
+                    .as_secs_f32()
+                    > 5.0
+                {
+                    client.last_window_blocked_log = now_inst;
+                    eprintln!(
+                        "[surface-gate] cid={cid} surface_window_open=false outbox={}f/{}B (limits {}f/{}B) burst={} inflight={}/{} browser_backlog_blocked={}",
+                        outbox_queued_frames(client),
+                        outbox_queued_bytes(client),
+                        OUTBOX_SOFT_QUEUE_LIMIT_FRAMES,
+                        OUTBOX_SOFT_QUEUE_LIMIT_BYTES,
+                        client.surface_burst_remaining,
+                        client.surface_inflight_frames.len(),
+                        surface_inflight_limit(client),
+                        browser_backlog_blocked(client),
+                    );
+                }
                 continue;
             }
             // During burst-start (first few frames after subscribe/keyframe
@@ -2725,9 +2913,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     Some(existing) => existing.min(deadline),
                     None => deadline,
                 });
+                client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
                 continue;
             }
             if client.surface_subscriptions.is_empty() {
+                client.skip_no_subs_count = client.skip_no_subs_count.saturating_add(1);
                 continue;
             }
             client_work.push(ClientWork {
@@ -2772,7 +2962,13 @@ async fn tick(state: &AppState) -> TickOutcome {
 
         for work in &client_work {
             for &(sid, px_w, px_h, px_gen) in &pixel_snapshot {
+                {
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.encode_loop_iters = client.encode_loop_iters.saturating_add(1);
+                }
                 if !work.subs.contains(&sid) {
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.skip_not_subbed_count = client.skip_not_subbed_count.saturating_add(1);
                     continue;
                 }
                 let client = sess.clients.get_mut(&work.cid).unwrap();
@@ -2784,17 +2980,28 @@ async fn tick(state: &AppState) -> TickOutcome {
                     && let Some(&last_gen) = client.surface_last_encoded_gen.get(&sid)
                     && last_gen == px_gen
                 {
+                    client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
                     continue;
                 }
 
                 let (pixels, created_at) = {
                     let cs = sess.compositor.as_ref().unwrap();
                     let ca = cs.created_at;
-                    let px = match cs.last_pixels.get(&sid) {
-                        Some(lp) if lp.width == px_w && lp.height == px_h => lp.pixels.clone(),
-                        _ => continue,
+                    let maybe_px = match cs.last_pixels.get(&sid) {
+                        Some(lp) if lp.width == px_w && lp.height == px_h => {
+                            Some(lp.pixels.clone())
+                        }
+                        _ => None,
                     };
-                    (px, ca)
+                    match maybe_px {
+                        Some(px) => (px, ca),
+                        None => {
+                            let client = sess.clients.get_mut(&work.cid).unwrap();
+                            client.skip_last_pixels_mismatch_count =
+                                client.skip_last_pixels_mismatch_count.saturating_add(1);
+                            continue;
+                        }
+                    }
                 };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
 
@@ -2849,6 +3056,18 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // first, and concurrent C-library encode instances for the
                 // same client can corrupt memory.
                 if client.surface_encodes_in_flight.contains(&sid) {
+                    client.skip_in_flight_count = client.skip_in_flight_count.saturating_add(1);
+                    let now_inst = Instant::now();
+                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
+                        client.last_skip_log = now_inst;
+                        eprintln!(
+                            "[encode-skip] cid={} sid={sid} reason=in_flight same_gen={} in_flight={} burst={}",
+                            work.cid,
+                            client.skip_same_gen_count,
+                            client.skip_in_flight_count,
+                            client.surface_burst_remaining,
+                        );
+                    }
                     continue;
                 }
 
@@ -2935,7 +3154,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                         client
                             .vulkan_video_surfaces
                             .insert(sid, (enc_name, pref.codec_flag()));
-                        let enc_msg = msg_surface_encoder(sid, enc_name);
+                        let codec_str = match pref {
+                            SurfaceEncoderPreference::VulkanVideoH264 => {
+                                if state.config.chroma.is_444() {
+                                    "avc1.F4001f".to_string()
+                                } else {
+                                    "avc1.640034".to_string()
+                                }
+                            }
+                            SurfaceEncoderPreference::VulkanVideoAV1 => {
+                                let profile = if state.config.chroma.is_444() { 2 } else { 0 };
+                                let level = surface_encoder::av1_level_for(px_w, px_h);
+                                format!("av01.{profile}.{level}M.08")
+                            }
+                            _ => String::new(),
+                        };
+                        let enc_msg = msg_surface_encoder(sid, enc_name, &codec_str);
                         let _ = send_outbox(client, enc_msg);
                         if state.config.verbose {
                             eprintln!(
@@ -2990,6 +3224,17 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                     // The encoded frame comes via PixelData::Encoded on
                     // the next compositor commit, handled by the fast path.
+                    client.skip_vulkan_await_count =
+                        client.skip_vulkan_await_count.saturating_add(1);
+                    let now_inst = Instant::now();
+                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
+                        client.last_skip_log = now_inst;
+                        eprintln!(
+                            "[encode-skip] cid={} sid={sid} reason=vulkan_await \
+                             (compositor not producing PixelData::Encoded) count={}",
+                            work.cid, client.skip_vulkan_await_count,
+                        );
+                    }
                     continue;
                 }
 
@@ -3120,6 +3365,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                         nal_data: None,
                                         codec_flag: 0,
                                         encoder_name: None,
+                                        codec_string: None,
                                         #[cfg(target_os = "linux")]
                                         external_bufs: None,
                                     };
@@ -3137,6 +3383,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 nal_data: None,
                                 codec_flag: 0,
                                 encoder_name: None,
+                                codec_string: None,
                                 #[cfg(target_os = "linux")]
                                 external_bufs: None,
                             };
@@ -3147,6 +3394,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let newly_created = job.create_params.is_some();
                         let encoder_name = if newly_created {
                             Some(encoder.encoder_name())
+                        } else {
+                            None
+                        };
+                        let codec_string = if newly_created {
+                            Some(encoder.webcodecs_codec_string())
                         } else {
                             None
                         };
@@ -3219,6 +3471,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             nal_data,
                             codec_flag,
                             encoder_name,
+                            codec_string,
                             #[cfg(target_os = "linux")]
                             external_bufs,
                         }
@@ -3316,7 +3569,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && !invalidated
                     {
                         if let Some(name) = result.encoder_name {
-                            let enc_msg = msg_surface_encoder(result.sid, name);
+                            let codec_str = result.codec_string.as_deref().unwrap_or("");
+                            let enc_msg = msg_surface_encoder(result.sid, name, codec_str);
                             let _ = send_outbox(client, enc_msg);
                         }
                         client.surface_encoders.insert(result.sid, encoder);
@@ -3329,8 +3583,26 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
 
                 let Some((nal_data, is_keyframe)) = result.nal_data else {
+                    eprintln!(
+                        "[encode] nal_data=None sid={} cid={} {}x{}",
+                        result.sid, result.cid, result.px_w, result.px_h,
+                    );
                     continue;
                 };
+
+                {
+                    static EC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = EC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 5 || n.is_multiple_of(1000) {
+                        eprintln!(
+                            "[encode #{n}] sid={} {}x{} kf={is_keyframe} bytes={}",
+                            result.sid,
+                            result.px_w,
+                            result.px_h,
+                            nal_data.len(),
+                        );
+                    }
+                }
 
                 local_encodes += 1;
                 local_encode_bytes += nal_data.len() as u64;
@@ -3696,7 +3968,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             match msg {
                 Some(m) => {
                     let bytes = m.len();
+                    let write_start = Instant::now();
                     let wrote = write_frame_interleaved(&mut writer, &m, &mut audio_rx).await;
+                    let write_elapsed = write_start.elapsed();
+                    if write_elapsed.as_millis() > 100 {
+                        eprintln!(
+                            "[sender] slow write: bytes={bytes} elapsed={}ms wrote={wrote}",
+                            write_elapsed.as_millis(),
+                        );
+                    }
                     mark_outbox_drained(
                         &sender_outbox_queued_frames,
                         &sender_outbox_queued_bytes,
@@ -3762,6 +4042,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 browser_apply_ms: 0.0,
                 last_metrics_update: Instant::now(),
                 last_log: Instant::now(),
+                last_window_blocked_log: Instant::now(),
+                last_skip_log: Instant::now(),
+                skip_same_gen_count: 0,
+                skip_in_flight_count: 0,
+                skip_pacing_count: 0,
+                skip_vulkan_await_count: 0,
+                skip_no_subs_count: 0,
+                skip_not_subbed_count: 0,
+                skip_last_pixels_mismatch_count: 0,
+                encode_loop_iters: 0,
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
                 surface_next_send_at: Instant::now(),
@@ -3875,112 +4165,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
         if data[0] == C2S_ACK {
             let mut sess = state.session.lock().await;
-            let (
-                do_log,
-                frames_sent,
-                acks_recv,
-                rtt_ms,
-                min_rtt_ms,
-                eff_rtt_ms,
-                inflight_bytes,
-                delivery_bps,
-                goodput_ewma_bps,
-                goodput_jitter_bps,
-                max_goodput_jitter_bps,
-                avg_frame_bytes,
-                avg_paced_frame_bytes,
-                avg_preview_frame_bytes,
-                display_fps,
-                paced_fps,
-                display_need_bps,
-                probe_frames,
-                goodput_bps,
-                window_frames,
-                window_bytes,
-                outbox_frames,
-                browser_backlog_frames,
-                browser_ack_ahead_frames,
-                browser_apply_ms,
-                surface_fps,
-                avg_surface_frame_bytes,
-            ) = {
-                let Some(c) = sess.clients.get_mut(&client_id) else {
-                    continue;
-                };
+            if let Some(c) = sess.clients.get_mut(&client_id) {
                 c.acks_recv += 1;
                 record_ack(c);
-                let do_log = c.last_log.elapsed().as_secs_f32() >= 10.0;
-                let log_elapsed = c.last_log.elapsed().as_secs_f32().max(1.0e-3);
-                let paced_fps = pacing_fps(c);
-                let display_need_bps = display_need_bps(c);
-                let surface_fps = surface_pacing_fps(c);
-                let out = (
-                    do_log,
-                    c.frames_sent,
-                    c.acks_recv,
-                    c.rtt_ms,
-                    path_rtt_ms(c),
-                    window_rtt_ms(c),
-                    c.inflight_bytes,
-                    c.delivery_bps,
-                    c.goodput_bps,
-                    c.goodput_jitter_bps,
-                    c.max_goodput_jitter_bps,
-                    c.avg_frame_bytes,
-                    c.avg_paced_frame_bytes,
-                    c.avg_preview_frame_bytes,
-                    c.display_fps,
-                    paced_fps,
-                    display_need_bps,
-                    c.probe_frames,
-                    c.acked_bytes_since_log as f32 / log_elapsed,
-                    target_frame_window(c),
-                    target_byte_window(c),
-                    outbox_queued_frames(c),
-                    c.browser_backlog_frames,
-                    c.browser_ack_ahead_frames,
-                    c.browser_apply_ms,
-                    surface_fps,
-                    c.avg_surface_frame_bytes,
-                );
-                if do_log {
-                    c.frames_sent = 0;
-                    c.acks_recv = 0;
-                    c.acked_bytes_since_log = 0;
-                    c.last_log = Instant::now();
-                }
-                out
-            };
-            if do_log && config.verbose {
-                let surf_info = sess.compositor.as_ref().map(|cs| {
-                    let surfaces = cs.surfaces.len();
-                    let pending = 0usize;
-                    let subs: usize = sess
-                        .clients
-                        .values()
-                        .map(|c| c.surface_subscriptions.len())
-                        .sum();
-                    (surfaces, pending, subs)
-                });
-                let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
-                eprintln!(
-                    "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={}",
-                    sess.tick_fires,
-                    sess.tick_snaps,
-                    sess.surface_commits,
-                    sess.surface_encodes,
-                    sess.surface_encode_bytes,
-                    sess.surface_frames_sent,
-                );
+            } else {
+                continue;
             }
-            if do_log {
-                sess.tick_fires = 0;
-                sess.tick_snaps = 0;
-                sess.surface_commits = 0;
-                sess.surface_encodes = 0;
-                sess.surface_encode_bytes = 0;
-                sess.surface_frames_sent = 0;
-            }
+            maybe_log_pacing_metrics(&mut sess, client_id, config.verbose);
             nudge_delivery(&state);
             continue;
         }
@@ -5415,6 +5606,16 @@ mod tests {
             browser_apply_ms: 0.0,
             last_metrics_update: Instant::now(),
             last_log: Instant::now(),
+            last_window_blocked_log: Instant::now(),
+            last_skip_log: Instant::now(),
+            skip_same_gen_count: 0,
+            skip_in_flight_count: 0,
+            skip_pacing_count: 0,
+            skip_vulkan_await_count: 0,
+            skip_no_subs_count: 0,
+            skip_not_subbed_count: 0,
+            skip_last_pixels_mismatch_count: 0,
+            encode_loop_iters: 0,
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
             surface_next_send_at: Instant::now(),
@@ -5837,7 +6038,12 @@ mod tests {
     #[test]
     fn outbox_backpressured_by_large_queued_bytes() {
         let (client, _rx) = test_client_with_capacity(0);
+        // First frame is always allowed through, even at the byte limit, so
+        // pending encoders can make progress when keyframes exceed the cap.
         let _ = send_outbox(&client, vec![0u8; OUTBOX_SOFT_QUEUE_LIMIT_BYTES]);
+        assert!(!outbox_backpressured(&client));
+        // A second frame pushes total bytes past the soft limit.
+        let _ = send_outbox(&client, vec![0u8; 1]);
         assert!(outbox_backpressured(&client));
     }
 

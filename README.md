@@ -1,6 +1,6 @@
 # blit
 
-Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. One binary, nothing to configure.
+Terminal multiplexer and experimental Wayland compositor for browsers and AI agents. Nothing to configure, no required dependencies.
 
 We publish a [computer agent skill](https://install.blit.sh/SKILL.md).
 
@@ -90,7 +90,7 @@ curl -sf https://install.blit.sh | sh
 irm https://install.blit.sh/install.ps1 | iex
 ```
 
-This downloads `blit.exe` to `%LOCALAPPDATA%\blit\bin` and adds it to your user `PATH`. Set `BLIT_INSTALL_DIR` to override the install location.
+This downloads `blit.exe` to `%LOCALAPPDATA%\blit\bin` and adds it to your user `PATH`. Set `BLIT_INSTALL_DIR` to override the install location on Windows.
 
 ## How it works
 
@@ -116,6 +116,7 @@ For wire protocol details, frame encoding, and transport internals, see [ARCHITE
 | `BLIT_SCROLLBACK`       | `10000`                                                                                                                | Scrollback rows per PTY                                                                                                                                                                                                                   |
 | `BLIT_HUB`              | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing. On `blit gateway`, sets the default hub for `share:` remotes when `BLIT_GATEWAY_WEBRTC=1`.                                                                                                          |
 | `BLIT_GATEWAY_WEBRTC`   | unset                                                                                                                  | Set to `1` on `blit gateway` to proxy `share:` remotes via WebRTC. The gateway connects as a WebRTC consumer and bridges terminals to browsers over WebSocket/WebTransport. Without this, `share:` entries in `blit.remotes` are ignored. |
+| `BLIT_PREFIX`           | `/usr/local` or `~/.local` (Unix)                                                                                      | Override install prefix (`bin/`, `lib/`, `share/` go under this)                                                                                                                                                                          |
 | `BLIT_INSTALL_DIR`      | `%LOCALAPPDATA%\blit\bin` (Windows)                                                                                    | Override install location (Windows PowerShell installer)                                                                                                                                                                                  |
 | `BLIT_SURFACE_ENCODERS` | see below                                                                                                              | Comma-separated encoder priority list (see below)                                                                                                                                                                                         |
 | `BLIT_SURFACE_QUALITY`  | `medium`                                                                                                               | Video quality preset: `low`, `medium`, `high`, `lossless`                                                                                                                                                                                 |
@@ -152,6 +153,33 @@ its WebCodecs decoder accordingly. Clients can also advertise which codecs
 they support; the server skips encoders the client can't decode.
 
 For `blit gateway` configuration, running as a systemd/launchd service, and Nix module setup, see [SERVICES.md](SERVICES.md) and [`nix/README.md`](nix/README.md).
+
+### Optional dependencies
+
+blit has no required dependencies — software H.264 and AV1 encoders are statically linked, and the CPU software renderer works everywhere. GPU acceleration and audio are enabled automatically when the right libraries or binaries are present. All GPU libraries are loaded at runtime via `dlopen`; missing ones are silently skipped.
+
+**Video — GPU compositing and hardware encoding (Linux)**
+
+| Library                                 | Packages (Debian/Ubuntu)                             | Used for                                         |
+| --------------------------------------- | ---------------------------------------------------- | ------------------------------------------------ |
+| `libvulkan.so.1`                        | `libvulkan1`, `mesa-vulkan-drivers` or NVIDIA driver | GPU compositing, Vulkan Video encode             |
+| `libva.so.2`, `libva-drm.so.2`          | `libva2`, `libva-drm2`, `va-driver-all`              | VA-API hardware encode (Intel/AMD)               |
+| `libgbm.so.1`                           | `libgbm1`                                            | DMA-BUF allocation for zero-copy VA-API encoding |
+| `libcuda.so.1`, `libnvidia-encode.so.1` | NVIDIA proprietary driver                            | NVENC hardware encode                            |
+
+Without any of the above, the compositor falls back to CPU rendering and software encoding. No configuration needed.
+
+**Audio (Linux)**
+
+| Binary           | Packages (Debian/Ubuntu)       | Used for                                         |
+| ---------------- | ------------------------------ | ------------------------------------------------ |
+| `pipewire`       | `pipewire`                     | Audio daemon (private instance per compositor)   |
+| `pipewire-pulse` | `pipewire-pulse`               | PulseAudio compatibility for apps                |
+| `pw-cat`         | `pipewire` or `pipewire-utils` | Monitor source capture                           |
+| `dbus-daemon`    | `dbus`                         | Private D-Bus session (required by PipeWire)     |
+| `wireplumber`    | `wireplumber`                  | Session manager (optional, started if available) |
+
+Audio is disabled automatically when PipeWire is not installed, or explicitly with `BLIT_AUDIO=0`.
 
 ## How it compares
 

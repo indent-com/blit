@@ -549,9 +549,17 @@ pub(crate) struct Surface {
 struct ShmPool {
     resource: WlShmPool,
     fd: OwnedFd,
+    inner: std::sync::Mutex<ShmPoolInner>,
+}
+
+struct ShmPoolInner {
     size: usize,
     mmap_ptr: *mut u8,
 }
+
+// Safety: the raw ptr is never shared outside the mutex; the fd and resource
+// are Send by construction.
+unsafe impl Send for ShmPoolInner {}
 
 impl ShmPool {
     fn new(resource: WlShmPool, fd: OwnedFd, size: i32) -> Self {
@@ -573,23 +581,26 @@ impl ShmPool {
         ShmPool {
             resource,
             fd,
-            size: sz,
-            mmap_ptr: if ptr == libc::MAP_FAILED {
-                std::ptr::null_mut()
-            } else {
-                ptr as *mut u8
-            },
+            inner: std::sync::Mutex::new(ShmPoolInner {
+                size: sz,
+                mmap_ptr: if ptr == libc::MAP_FAILED {
+                    std::ptr::null_mut()
+                } else {
+                    ptr as *mut u8
+                },
+            }),
         }
     }
 
-    fn resize(&mut self, new_size: i32) {
+    fn resize(&self, new_size: i32) {
         let new_sz = new_size.max(0) as usize;
-        if new_sz <= self.size {
+        let mut inner = self.inner.lock().unwrap();
+        if new_sz <= inner.size {
             return;
         }
-        if !self.mmap_ptr.is_null() {
+        if !inner.mmap_ptr.is_null() {
             unsafe {
-                libc::munmap(self.mmap_ptr as *mut _, self.size);
+                libc::munmap(inner.mmap_ptr as *mut _, inner.size);
             }
         }
         let ptr = unsafe {
@@ -602,12 +613,12 @@ impl ShmPool {
                 0,
             )
         };
-        self.mmap_ptr = if ptr == libc::MAP_FAILED {
+        inner.mmap_ptr = if ptr == libc::MAP_FAILED {
             std::ptr::null_mut()
         } else {
             ptr as *mut u8
         };
-        self.size = new_sz;
+        inner.size = new_sz;
     }
 
     fn read_buffer(
@@ -618,7 +629,8 @@ impl ShmPool {
         stride: i32,
         format: wl_shm::Format,
     ) -> Option<(u32, u32, PixelData)> {
-        if self.mmap_ptr.is_null() {
+        let inner = self.inner.lock().unwrap();
+        if inner.mmap_ptr.is_null() {
             return None;
         }
         let w = width as u32;
@@ -627,17 +639,17 @@ impl ShmPool {
         let off = offset as usize;
         let row_bytes = w as usize * 4;
         let needed = off + s * (h as usize).saturating_sub(1) + row_bytes;
-        if needed > self.size {
+        if needed > inner.size {
             return None;
         }
         let mut bgra = if s == row_bytes && off == 0 {
             let total = row_bytes * h as usize;
-            unsafe { std::slice::from_raw_parts(self.mmap_ptr, total) }.to_vec()
+            unsafe { std::slice::from_raw_parts(inner.mmap_ptr, total) }.to_vec()
         } else {
             let mut packed = Vec::with_capacity(row_bytes * h as usize);
             for row in 0..h as usize {
                 let src = unsafe {
-                    std::slice::from_raw_parts(self.mmap_ptr.add(off + row * s), row_bytes)
+                    std::slice::from_raw_parts(inner.mmap_ptr.add(off + row * s), row_bytes)
                 };
                 packed.extend_from_slice(src);
             }
@@ -658,9 +670,10 @@ impl ShmPool {
 
 impl Drop for ShmPool {
     fn drop(&mut self) {
-        if !self.mmap_ptr.is_null() {
+        let inner = self.inner.get_mut().unwrap();
+        if !inner.mmap_ptr.is_null() {
             unsafe {
-                libc::munmap(self.mmap_ptr as *mut _, self.size);
+                libc::munmap(inner.mmap_ptr as *mut _, inner.size);
             }
         }
     }
@@ -669,7 +682,12 @@ impl Drop for ShmPool {
 unsafe impl Send for ShmPool {}
 
 struct ShmBufferData {
-    pool_id: ObjectId,
+    /// Keep the pool alive for the lifetime of the buffer: wl_shm_pool.destroy
+    /// does NOT invalidate buffers created from the pool (see the wl_shm_pool
+    /// XML — "destruction does not affect wl_shm_pool.create_buffer"). Client
+    /// processes such as Chromium routinely destroy the pool immediately
+    /// after creating a buffer. Holding an Arc here keeps the mmap alive.
+    pool: Arc<ShmPool>,
     offset: i32,
     width: i32,
     height: i32,
@@ -922,7 +940,7 @@ struct Compositor {
     surfaces: HashMap<ObjectId, Surface>,
     toplevel_surface_ids: HashMap<u16, ObjectId>,
     next_surface_id: u16,
-    shm_pools: HashMap<ObjectId, ShmPool>,
+    shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
     /// Replaces the old pixel_cache — pixel data now lives as persistent GPU
     /// textures inside VulkanRenderer.
@@ -1180,14 +1198,24 @@ impl Compositor {
 
     fn read_shm_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
         let data = buffer.data::<ShmBufferData>()?;
-        let pool = self.shm_pools.get(&data.pool_id)?;
-        pool.read_buffer(
+        let r = data.pool.read_buffer(
             data.offset,
             data.width,
             data.height,
             data.stride,
             data.format,
-        )
+        );
+        if r.is_none() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(100) {
+                eprintln!(
+                    "[read_shm_buffer #{n}] pool.read_buffer=None off={} {}x{} stride={} fmt={:?}",
+                    data.offset, data.width, data.height, data.stride, data.format,
+                );
+            }
+        }
+        r
     }
 
     fn read_dmabuf_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
@@ -1195,6 +1223,16 @@ impl Compositor {
         let width = data.width as u32;
         let height = data.height as u32;
         if width == 0 || height == 0 || data.planes.is_empty() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(100) {
+                eprintln!(
+                    "[read_dmabuf_buffer #{n}] empty: {}x{} planes={}",
+                    width,
+                    height,
+                    data.planes.len()
+                );
+            }
             return None;
         }
         let plane = &data.planes[0];
@@ -1239,12 +1277,35 @@ impl Compositor {
                 },
             ));
         }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 10 || n.is_multiple_of(100) {
+            eprintln!(
+                "[read_dmabuf_buffer #{n}] unsupported fourcc=0x{:08x} ({}x{}) modifier=0x{:x}",
+                data.fourcc, width, height, data.modifier,
+            );
+        }
         None
     }
 
     fn read_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
-        self.read_shm_buffer(buffer)
-            .or_else(|| self.read_dmabuf_buffer(buffer))
+        // Try SHM first, then DMA-BUF. Both paths now log their own
+        // failures, so here we only log when the buffer matches neither
+        // type (exotic buffer roles we don't recognise at all).
+        if buffer.data::<ShmBufferData>().is_some() {
+            return self.read_shm_buffer(buffer);
+        }
+        if buffer.data::<DmaBufBufferData>().is_some() {
+            return self.read_dmabuf_buffer(buffer);
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 10 || n.is_multiple_of(100) {
+            eprintln!(
+                "[read_buffer #{n}] buffer has unknown role (neither Shm nor DmaBuf data attached)",
+            );
+        }
+        None
     }
 
     fn handle_surface_commit(&mut self, surface_id: &ObjectId) {
@@ -1258,6 +1319,20 @@ impl Compositor {
             .surfaces
             .get(surface_id)
             .is_some_and(|s| s.pending_buffer.is_some());
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 40 || n.is_multiple_of(200) {
+                let children = self
+                    .surfaces
+                    .get(surface_id)
+                    .map(|s| s.children.len())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[commit-in #{n}] sid={surface_id:?} toplevel={toplevel_sid:?} root={root_id:?} had_buffer={had_buffer} children={children}",
+                );
+            }
+        }
         self.apply_pending_state(surface_id);
 
         let toplevel_sid = match toplevel_sid {
@@ -1286,14 +1361,28 @@ impl Compositor {
             (pw, ph)
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
-            vk.render_tree_sized(
+            let r = vk.render_tree_sized(
                 &root_id,
                 &self.surfaces,
                 &self.surface_meta,
                 s120,
                 target_phys,
                 toplevel_sid,
-            )
+            );
+            if r.is_none() {
+                static SC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Log the first 100 None results, then every 10th, so
+                // persistent hangs stay visible without flooding logs.
+                if n < 100 || n.is_multiple_of(10) {
+                    eprintln!(
+                        "[commit #{n}] render_tree_sized=None sid={toplevel_sid} target={target_phys:?} meta={} textures={}",
+                        self.surface_meta.len(),
+                        vk.surface_texture_count(),
+                    );
+                }
+            }
+            r
         } else {
             None
         };
@@ -2257,7 +2346,11 @@ impl Compositor {
                 }
             }
             CompositorCommand::SetRefreshRate { mhz } => {
-                if mhz != self.output_refresh_mhz && mhz > 0 {
+                // Only update on meaningful changes (>2 Hz difference) to
+                // avoid flooding clients with mode events from jittery
+                // requestAnimationFrame measurements.
+                let diff = (mhz as i64 - self.output_refresh_mhz as i64).unsigned_abs();
+                if diff > 2000 && mhz > 0 {
                     self.output_refresh_mhz = mhz;
                     let s120 = self.output_scale_120 as i32;
                     let mode_w = self.output_width * s120 / 120;
@@ -3422,7 +3515,7 @@ impl Dispatch<WlShm, ()> for Compositor {
             let pool_id = pool.id();
             state
                 .shm_pools
-                .insert(pool_id, ShmPool::new(pool, fd, size));
+                .insert(pool_id, Arc::new(ShmPool::new(pool, fd, size)));
         }
     }
 }
@@ -3454,10 +3547,13 @@ impl Dispatch<WlShmPool, ()> for Compositor {
                     wayland_server::WEnum::Value(f) => f,
                     _ => wl_shm::Format::Argb8888, // fallback
                 };
+                let Some(pool) = state.shm_pools.get(&pool_id).cloned() else {
+                    return;
+                };
                 data_init.init(
                     id,
                     ShmBufferData {
-                        pool_id: pool_id.clone(),
+                        pool,
                         offset,
                         width,
                         height,
@@ -3467,11 +3563,13 @@ impl Dispatch<WlShmPool, ()> for Compositor {
                 );
             }
             Request::Resize { size } => {
-                if let Some(pool) = state.shm_pools.get_mut(&pool_id) {
+                if let Some(pool) = state.shm_pools.get(&pool_id) {
                     pool.resize(size);
                 }
             }
             Request::Destroy => {
+                // Drop the map entry — Arc keeps the ShmPool alive while
+                // wl_buffers created from it still reference it.
                 state.shm_pools.remove(&pool_id);
             }
             _ => {}
@@ -3709,25 +3807,23 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
             // allocate DMA-BUFs with a tiling layout the compositor can
             // handle natively on the GPU, avoiding broken CPU mmap
             // fallbacks for vendor-specific tiled VRAM.
-            if let Some(ref vk) = state.vulkan_renderer {
+            if let Some(ref vk) = state.vulkan_renderer
+                && !vk.supported_dmabuf_modifiers.is_empty()
+            {
                 for &(drm_fmt, modifier) in &vk.supported_dmabuf_modifiers {
                     let mod_hi = (modifier >> 32) as u32;
                     let mod_lo = (modifier & 0xFFFFFFFF) as u32;
                     dmabuf.modifier(drm_fmt, mod_hi, mod_lo);
                 }
-            } else {
-                // No Vulkan — only LINEAR is safe.
-                let formats = [
-                    drm_fourcc::ARGB8888,
-                    drm_fourcc::XRGB8888,
-                    drm_fourcc::ABGR8888,
-                    drm_fourcc::XBGR8888,
-                ];
-                for fmt in formats {
-                    dmabuf.modifier(fmt, 0, 0);
-                }
             }
-        } else {
+            // When Vulkan has no DMA-BUF extensions (SHM-only mode) we
+            // intentionally advertise zero modifiers so clients fall back
+            // to wl_shm.
+        } else if state
+            .vulkan_renderer
+            .as_ref()
+            .is_some_and(|vk| vk.has_dmabuf())
+        {
             dmabuf.format(drm_fourcc::ARGB8888);
             dmabuf.format(drm_fourcc::XRGB8888);
             dmabuf.format(drm_fourcc::ABGR8888);
@@ -4906,6 +5002,17 @@ fn run_compositor(
     let display: Display<Compositor> = Display::new().expect("failed to create display");
     let dh = display.handle();
 
+    // Probe Vulkan early so we know whether DMA-BUF is available
+    // before registering Wayland globals.
+    eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
+    let vulkan_renderer = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
+    let has_dmabuf = vulkan_renderer.as_ref().is_some_and(|vk| vk.has_dmabuf());
+    eprintln!(
+        "[compositor] Vulkan renderer: {} (dmabuf={})",
+        vulkan_renderer.is_some(),
+        has_dmabuf,
+    );
+
     // Create globals.
     dh.create_global::<Compositor, WlCompositor, ()>(6, ());
     dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
@@ -4913,7 +5020,13 @@ fn run_compositor(
     dh.create_global::<Compositor, WlShm, ()>(1, ());
     dh.create_global::<Compositor, WlOutput, ()>(4, ());
     dh.create_global::<Compositor, WlSeat, ()>(9, ());
-    dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    // Only advertise zwp_linux_dmabuf_v1 when the Vulkan device can
+    // actually import DMA-BUFs.  Advertising the global with zero
+    // formats confuses clients (Chrome, mpv) into not falling back to
+    // wl_shm.
+    if has_dmabuf {
+        dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+    }
     dh.create_global::<Compositor, WpViewporter, ()>(1, ());
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
@@ -4953,12 +5066,7 @@ fn run_compositor(
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),
         dmabuf_params: HashMap::new(),
-        vulkan_renderer: {
-            eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
-            let r = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
-            eprintln!("[compositor] Vulkan renderer: {}", r.is_some());
-            r
-        },
+        vulkan_renderer,
         output_width: 1920,
         output_height: 1080,
         output_refresh_mhz: 60_000,

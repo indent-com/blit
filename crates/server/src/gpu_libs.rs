@@ -4,9 +4,11 @@
 //! missing the corresponding encoder backend is simply unavailable —
 //! the binary remains fully functional with software-only encoding.
 //!
-//! This allows the server binary to be statically linked (no build-time
-//! dependency on libva, libcuda, libnvidia-encode, etc.) while still
-//! using hardware acceleration when the drivers are installed.
+//! Release binaries are dynamically linked against musl libc so that
+//! dlopen works, while all other dependencies are statically linked.
+//! This avoids a build-time dependency on libva, libcuda,
+//! libnvidia-encode, etc. — hardware acceleration is available when
+//! the drivers are installed at runtime.
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 

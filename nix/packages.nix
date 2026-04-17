@@ -6,7 +6,10 @@
       common = import ./common.nix { inherit inputs system; };
       inherit (common)
         pkgs
+        pkgsStaticLLVM
         version
+        minGlibcVersion
+        rustTargetGnu
         cargoLockConfig
         rustToolchain
         rustPlatform
@@ -14,8 +17,10 @@
         craneLibStatic
         src
         commonArgs
+        commonArgsGnu
         commonArgsStatic
         cargoArtifacts
+        cargoArtifactsGnu
         cargoArtifactsStatic
         ;
       serverVaapiEnabled = pkgs.stdenv.isLinux;
@@ -82,50 +87,136 @@
       };
 
       # ------------------------------------------------------------------
-      # Static binaries (musl on Linux, for release tarballs)
+      # Release binaries
+      #
+      # Linux ships two variants:
+      #   glibc (blit-gnu)  — dynamically linked, dlopen works for GPU
+      #   musl  (blit-musl) — all deps statically linked except musl libc
+      # macOS ships a single binary with nix-store dylibs rewritten to
+      # system paths.
       # ------------------------------------------------------------------
 
-      blit-static = craneLibStatic.buildPackage (
+      # Linux glibc binary — all deps statically linked, only glibc is
+      # dynamic (so dlopen works for GPU).  Built with cargo-zigbuild
+      # targeting glibc ${minGlibcVersion} for broad distro compat.
+      blit-gnu = craneLib.buildPackage (
+        commonArgsGnu
+        // {
+          pname = "blit-gnu";
+          cargoArtifacts = cargoArtifactsGnu;
+          cargoExtraArgs = "-p blit-cli";
+          doCheck = false;
+          preBuild = copyWebAppDist;
+          buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
+          doNotPostBuildInstallCargoBinaries = true;
+          installPhaseCommand = ''
+            mkdir -p $out/bin
+            cp target/${rustTargetGnu}/release/blit $out/bin/
+          '';
+        }
+      );
+
+      # Linux musl dynamic binary — all deps statically linked except
+      # musl libc.  For Alpine and other musl-based systems.
+      blit-musl = craneLibStatic.buildPackage (
         commonArgsStatic
         // {
-          pname = "blit-static";
+          pname = "blit-musl";
           cargoArtifacts = cargoArtifactsStatic;
           cargoExtraArgs = "-p blit-cli";
           doCheck = false;
           preBuild = copyWebAppDist;
-        }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          postFixup = ''
+          dontPatchELF = true;
+          postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             for bin in $out/bin/*; do
-              if ! file "$bin" | grep -qE "static(ally|-pie) linked"; then
-                echo "FATAL: $bin is not statically linked:"
-                file "$bin"
-                exit 1
-              fi
-            done
-          '';
-        }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
-          postFixup = ''
-            for bin in $out/bin/*; do
-              for lib in $(otool -L "$bin" | tail -n +2 | awk '/\/nix\/store\//{print $1}'); do
-                base=$(basename "$lib")
-                case "$base" in
-                  libiconv.*|libiconv-*) sys="/usr/lib/libiconv.2.dylib" ;;
-                  libz.*|libz-*) sys="/usr/lib/libz.1.dylib" ;;
-                  libc++.*) sys="/usr/lib/libc++.1.dylib" ;;
-                  libc++abi.*) sys="/usr/lib/libc++abi.dylib" ;;
-                  libresolv.*) sys="/usr/lib/libresolv.9.dylib" ;;
-                  libSystem.*) sys="/usr/lib/libSystem.B.dylib" ;;
-                  *) echo "FATAL: unknown nix-store dylib: $lib"; exit 1 ;;
+              interp=$(readelf -l "$bin" 2>/dev/null \
+                | grep -oP 'Requesting program interpreter: \K[^\]]+' || true)
+              case "$(basename "$interp")" in
+                ld-musl-*) ;;
+                *) echo "FATAL: expected musl interpreter, got: $interp"; exit 1 ;;
+              esac
+              needed=$(readelf -d "$bin" 2>/dev/null \
+                | grep -oP '\(NEEDED\)\s+Shared library: \[\K[^\]]+' || true)
+              for lib in $needed; do
+                case "$lib" in
+                  libc.so) ;;
+                  *) echo "FATAL: unexpected NEEDED library: $lib"; exit 1 ;;
                 esac
-                echo "rewriting $lib -> $sys"
-                install_name_tool -change "$lib" "$sys" "$bin"
               done
             done
           '';
         }
       );
+
+      # Assembled glibc release: single binary with system interpreter.
+      # All deps are statically linked; only glibc is dynamic.
+      blit-release-gnu =
+        let
+          interpreter =
+            if pkgs.stdenv.hostPlatform.isAarch64
+            then "/lib/ld-linux-aarch64.so.1"
+            else "/lib64/ld-linux-x86-64.so.2";
+        in
+        pkgs.runCommand "blit-release-gnu-${version}" {
+          nativeBuildInputs = [ pkgs.patchelf ];
+        } ''
+          mkdir -p $out/bin
+          cp ${blit-gnu}/bin/blit $out/bin/blit
+          chmod +w $out/bin/blit
+          patchelf --set-interpreter ${interpreter} $out/bin/blit
+          patchelf --remove-rpath $out/bin/blit
+        '';
+
+      # Assembled musl release: single binary, interpreter set to
+      # system musl path.
+      blit-release-musl =
+        let
+          arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
+        in
+        pkgs.runCommand "blit-release-musl-${version}" {
+          nativeBuildInputs = [ pkgs.patchelf ];
+        } ''
+          mkdir -p $out/bin
+          cp ${blit-musl}/bin/blit $out/bin/blit
+          chmod +w $out/bin/blit
+          patchelf --set-interpreter /lib/ld-musl-${arch}.so.1 $out/bin/blit
+        '';
+
+      # Default release package per platform.
+      blit-release =
+        if pkgs.stdenv.isLinux then
+          blit-release-gnu
+        else
+          # macOS: rewrite nix-store dylibs to system paths.
+          craneLibStatic.buildPackage (
+            commonArgsStatic
+            // {
+              pname = "blit-release";
+              cargoArtifacts = cargoArtifactsStatic;
+              cargoExtraArgs = "-p blit-cli";
+              doCheck = false;
+              preBuild = copyWebAppDist;
+              postFixup = ''
+                for bin in $out/bin/*; do
+                  for lib in $(otool -L "$bin" | tail -n +2 | awk '/\/nix\/store\//{print $1}'); do
+                    base=$(basename "$lib")
+                    case "$base" in
+                      libiconv.*|libiconv-*) sys="/usr/lib/libiconv.2.dylib" ;;
+                      libz.*|libz-*) sys="/usr/lib/libz.1.dylib" ;;
+                      libc++.*) sys="/usr/lib/libc++.1.dylib" ;;
+                      libc++abi.*) sys="/usr/lib/libc++abi.dylib" ;;
+                      libresolv.*) sys="/usr/lib/libresolv.9.dylib" ;;
+                      libSystem.*) sys="/usr/lib/libSystem.B.dylib" ;;
+                      *) echo "FATAL: unknown nix-store dylib: $lib"; exit 1 ;;
+                    esac
+                    echo "rewriting $lib -> $sys"
+                    install_name_tool -change "$lib" "$sys" "$bin"
+                  done
+                done
+              '';
+            }
+          );
+
 
       # ------------------------------------------------------------------
       # JS / Web assets
@@ -222,11 +313,12 @@
           version
           browserWasm
           blit
-          blit-static
+          blit-release
           webAppDist
           websiteDist
           rustToolchain
           ;
+        blit-release-musl = if pkgs.stdenv.isLinux then blit-release-musl else null;
       };
 
       demoImage =
@@ -333,12 +425,15 @@
       packages = {
         inherit
           blit
-          blit-static
+          blit-release
           ;
         demo-image = demoImage;
         push-demo = pushDemo;
         publish-demo = publishDemo;
         default = blit;
+      }
+      // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        inherit blit-release-musl;
       }
       // tasks;
 
@@ -355,9 +450,7 @@
           pkgs.curl
           pkgs.flyctl
           pkgs.libopus
-          pkgs.libxkbcommon
           pkgs.nodejs
-          pkgs.pixman
           pkgs.pkg-config
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
@@ -371,10 +464,6 @@
           pkgs.dbus
           pkgs.pipewire
           pkgs.wireplumber
-        ]
-        ++ pkgs.lib.optionals serverVaapiEnabled [
-          pkgs.ffmpeg-headless
-          pkgs.libva
           pkgs.llvmPackages.libclang
         ];
 
@@ -384,22 +473,8 @@
           fi
           export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-            if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-          }${
-            if serverVaapiEnabled then
-              ":${pkgs.ffmpeg-headless.dev}/lib/pkgconfig:${pkgs.libva.dev}/lib/pkgconfig"
-            else
-              ""
-          }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-            if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-          }${
-            if serverVaapiEnabled then
-              ":${pkgs.ffmpeg-headless.lib}/lib:${pkgs.libva}/lib:${pkgs.vulkan-loader}/lib"
-            else
-              ""
-          }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           # Runtime dlopen: blit server loads VA-API / NVENC libraries at
           # runtime via dlopen.  See gpuRuntimeLibPath definition above.
           ${pkgs.lib.optionalString (

@@ -34,7 +34,6 @@ type SurfaceDebugInfo = {
   dropped: number;
   errors: number;
   queueDepth: number;
-  pendingAcks: number;
 };
 
 type DebugStats = {
@@ -506,10 +505,7 @@ function DebugPanel(props: {
               />
               <Row label="Dropped" value={surf.dropped} />
               <Row label="Errors" value={surf.errors} />
-              <Row
-                label="Queue"
-                value={`${surf.queueDepth} decode, ${surf.pendingAcks} ack`}
-              />
+              <Row label="Queue" value={`${surf.queueDepth} decode`} />
               <div style={graphSeparator()}>
                 <span style={{ opacity: 0.6, "font-size": `${scale().xs}px` }}>
                   Surface frames

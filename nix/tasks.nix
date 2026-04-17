@@ -3,7 +3,8 @@
   version,
   browserWasm,
   blit,
-  blit-static,
+  blit-release,
+  blit-release-musl ? null,
   webAppDist,
   websiteDist,
   rustToolchain,
@@ -159,13 +160,14 @@ let
 
   blit-deb = mkDeb {
     pname = "blit";
-    binPkg = blit-static;
+    binPkg = blit-release;
     description = "blit terminal multiplexer";
     extraInstall =
       let
         systemdDir = ../systemd;
       in
       ''
+        # No shared lib deps to bundle — all statically linked.
         mkdir -p pkg/lib/systemd/system
         cp "${systemdDir}/blit-server@.socket" "pkg/lib/systemd/system/blit-server@.socket"
         cp "${systemdDir}/blit-server@.service" "pkg/lib/systemd/system/blit-server@.service"
@@ -340,19 +342,10 @@ let
       rustToolchain
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -370,19 +363,10 @@ let
       pkgs.python3
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
@@ -439,7 +423,22 @@ in
       ''
         outdir="''${1:-dist/tarballs}"
         mkdir -p "$outdir"
-        tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-static}/bin" blit
+      ''
+      + (
+        if pkgs.stdenv.isLinux then
+          ''
+            # glibc tarball: single binary (all deps statically linked, only glibc dynamic)
+            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+            # musl tarball: single binary (needs system musl libc)
+            tar -czf "$outdir/blit_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl}" bin
+          ''
+        else
+          ''
+            # macOS: single binary
+            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+          ''
+      )
+      + ''
         ls -lh "$outdir"
       '';
   };
@@ -472,8 +471,6 @@ in
       rustToolchain
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
     ];
     text = ''
       ${fmt}/bin/blit-fmt --check
@@ -555,19 +552,10 @@ in
       pkgs.bun
       pkgs.pkg-config
       pkgs.libopus
-      pkgs.libxkbcommon
-      pkgs.pixman
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-      pkgs.libgbm
     ];
     text = ''
-      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib/pkgconfig" else ""
-      }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-      export LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libxkbcommon}/lib:${pkgs.pixman}/lib${
-        if pkgs.stdenv.isLinux then ":${pkgs.libgbm}/lib" else ""
-      }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist

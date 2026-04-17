@@ -283,13 +283,9 @@ async fn async_main() {
             };
             blit_server::run(config).await;
         }
-        Command::Share {
-            passphrase,
-            quiet,
-            verbose,
-        } => {
+        Command::Share { quiet, verbose } => {
             let signal_url = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
-            let passphrase = passphrase.unwrap_or_else(|| {
+            let passphrase = std::env::var("BLIT_PASSPHRASE").ok().unwrap_or_else(|| {
                 use rand::RngExt as _;
                 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
                 let mut rng = rand::rng();
@@ -322,7 +318,7 @@ async fn async_main() {
             // Provide a callback to restart the proxy if it dies mid-session.
             let proxy_ensure: Option<blit_webrtc_forwarder::ProxyEnsureFn> = if proxy_sock.is_some()
             {
-                let exe = std::env::current_exe().unwrap_or_default();
+                let exe = blit_proxy::blit_exe();
                 Some(std::sync::Arc::new(move || {
                     let exe = exe.clone();
                     Box::pin(async move { blit_proxy::ensure_proxy(&exe, true).await })
@@ -534,10 +530,11 @@ async fn cmd_install(host: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
-    let exe_path = std::env::current_exe()?;
-    let install_dir = exe_path
+    let exe_path = blit_proxy::blit_exe();
+    let bin_dir = exe_path
         .parent()
         .ok_or("cannot determine binary directory")?;
+    let prefix = bin_dir.parent().unwrap_or(bin_dir);
 
     let install_url = if cfg!(windows) {
         "https://install.blit.sh/install.ps1"
@@ -558,7 +555,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
     {
         let status = std::process::Command::new("sh")
             .arg(&tmp)
-            .env("BLIT_INSTALL_DIR", install_dir)
+            .env("BLIT_PREFIX", prefix)
             .status()?;
         if status.success() {
             transport::stop_proxy().await;
@@ -570,7 +567,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
         let status = std::process::Command::new("powershell")
             .args(["-ExecutionPolicy", "Bypass", "-File"])
             .arg(&tmp)
-            .env("BLIT_INSTALL_DIR", install_dir)
+            .env("BLIT_PREFIX", prefix)
             .status()?;
         if status.success() {
             transport::stop_proxy().await;
@@ -581,7 +578,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
     {
         let status = std::process::Command::new("sh")
             .arg(&tmp)
-            .env("BLIT_INSTALL_DIR", install_dir)
+            .env("BLIT_PREFIX", prefix)
             .status()?;
         if status.success() {
             transport::stop_proxy().await;

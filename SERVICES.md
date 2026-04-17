@@ -80,7 +80,9 @@ install.blit.sh/
   blit.gpg                # GPG public key for APT signature verification
   bin/
     blit_0.12.0_linux_x86_64.tar.gz
+    blit_0.12.0_linux-musl_x86_64.tar.gz
     blit_0.12.0_linux_aarch64.tar.gz
+    blit_0.12.0_linux-musl_aarch64.tar.gz
     blit_0.12.0_darwin_aarch64.tar.gz
     blit_0.12.0_windows_x86_64.zip
   pool/
@@ -103,10 +105,11 @@ install.blit.sh/
 [`install.sh`](install.sh) is a portable POSIX shell script that:
 
 1. Detects OS (`uname -s`) and architecture (`uname -m`), normalizing to `linux`/`darwin` and `x86_64`/`aarch64`.
-2. Fetches `/latest` from `install.blit.sh` to get the current version.
-3. Skips if the installed version already matches.
-4. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
-5. Extracts and installs to `$BLIT_INSTALL_DIR` (default `/usr/local/bin`), escalating with `sudo`/`doas` if needed.
+2. On Linux, detects the system libc (musl vs glibc) by checking `ldd --version` output and `/lib/ld-musl-*`. Musl systems get `linux-musl` tarballs.
+3. Fetches `/latest` from `install.blit.sh` to get the current version.
+4. Skips if the installed version already matches.
+5. Downloads the tarball from `/bin/blit_<version>_<os>_<arch>.tar.gz`.
+6. Extracts the tarball (`bin/blit` single binary) into `$BLIT_PREFIX` (default `/usr/local`), escalating with `sudo`/`doas` if needed.
 
 ### Windows installer
 
@@ -119,7 +122,7 @@ install.blit.sh/
 
 ### `blit upgrade`
 
-`blit upgrade` is the in-place self-update command. On Unix it fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_INSTALL_DIR` set to the directory of the currently running binary. On Windows it fetches `install.ps1` and runs it via PowerShell. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
+`blit upgrade` is the in-place self-update command. On Unix it fetches `install.sh` from `https://install.blit.sh`, writes it to a temp file, and `exec`s `sh` with `BLIT_PREFIX` set to the install prefix of the currently running binary. On Windows it fetches `install.ps1` and runs it via PowerShell. See [`crates/cli/src/main.rs`](crates/cli/src/main.rs).
 
 ### How the site is built
 
@@ -195,17 +198,24 @@ The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](
 ./bin/deploy-website --prod   # production deploy
 ```
 
-## Static binaries via Nix + musl
+## Release binaries via Nix
 
 All release binaries are built with Nix, which makes the entire toolchain reproducible and keeps the build definitions small.
 
-On Linux, binaries are statically linked against **musl libc** via `pkgs.pkgsStatic`. Nix's `pkgsStatic` overlay cross-compiles the entire dependency closure against musl, producing fully self-contained executables with zero runtime dependencies — no glibc version issues, no `LD_LIBRARY_PATH`, works on any Linux kernel from the past decade. The `blit-static` derivation in [`nix/packages.nix`](nix/packages.nix) builds this and includes a `postFixup` assertion that the output is genuinely statically linked (via `file`), failing the build if it isn't.
+On Linux, two variants are shipped:
+
+- **glibc** (`blit-gnu`) — libopus is statically linked; only glibc itself is dynamic. Built with `cargo-zigbuild` targeting glibc 2.31, so the binary runs on Ubuntu 20.04+, Debian 11+, RHEL 8+, etc. `dlopen` works natively for GPU acceleration (VA-API, NVENC, Vulkan). This is the default for most Linux systems.
+- **musl** (`blit-musl`) — built with the LLVM musl cross toolchain. All dependencies except musl libc are statically linked, producing a single binary. The interpreter is set to the system `ld-musl-<arch>.so.1`. For Alpine and other musl-based systems.
+
+Both release tarballs contain a single binary at `bin/blit`.
+
+The `blit-gnu` derivation in [`nix/packages.nix`](nix/packages.nix) builds the glibc binary with static dep overrides and `cargo-zigbuild`. The `blit-release-gnu` derivation patches the interpreter to the standard system path via `patchelf`. The `blit-release-musl` derivation does the same for musl. The `blit-musl` build verifies its only NEEDED library is `libc.so`. `install.sh` auto-detects the system libc (musl vs glibc) and downloads the right tarball.
 
 On macOS, true static linking isn't practical (Apple doesn't ship static system libraries). Instead, `postFixup` rewrites any nix-store dylib references to their `/usr/lib/` equivalents (`libSystem`, `libc++`, `libresolv`, etc.) using `install_name_tool`, so the binary runs on stock macOS without Nix installed.
 
 The Rust toolchain is configured with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) in [`nix/common.nix`](nix/common.nix). The same toolchain also includes `wasm32-unknown-unknown` for the browser WASM build.
 
-This means the tarballs on `install.blit.sh/bin/` and the binaries inside `.deb` packages are single-file, zero-dependency executables — download, `chmod +x`, run.
+The glibc tarballs on `install.blit.sh/bin/` and `.deb` packages require only system glibc ≥ 2.31. The musl tarballs require only system musl libc. All are single-binary downloads with no external library dependencies (GPU drivers are loaded via dlopen at runtime on glibc systems). macOS and Windows binaries have no required dependencies.
 
 On Windows, Nix isn't available, so the `_build-windows.yml` reusable workflow uses `cargo build --release` directly on a Windows runner with the MSVC toolchain. The resulting `.exe` files link against standard Windows system DLLs (kernel32, ws2_32, etc.) that are always present.
 

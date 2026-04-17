@@ -157,10 +157,16 @@ fn find_program(name: &str) -> Option<PathBuf> {
 
 /// Check whether the required PipeWire and D-Bus binaries are available.
 pub fn pipewire_available() -> bool {
-    find_program("pipewire").is_some()
-        && find_program("pipewire-pulse").is_some()
-        && find_program("pw-cat").is_some()
-        && find_program("dbus-daemon").is_some()
+    missing_pipewire_binaries().is_empty()
+}
+
+/// Returns the list of required PipeWire / D-Bus binaries that are not
+/// found on `$PATH`.  Empty list means audio can run.
+pub fn missing_pipewire_binaries() -> Vec<&'static str> {
+    ["pipewire", "pipewire-pulse", "pw-cat", "dbus-daemon"]
+        .into_iter()
+        .filter(|name| find_program(name).is_none())
+        .collect()
 }
 
 /// Poll for a socket file to appear, sleeping 50 ms between checks.
