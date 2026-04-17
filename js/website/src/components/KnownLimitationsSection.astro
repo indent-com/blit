@@ -1,82 +1,11 @@
----
-type Status = "ok" | "broken" | "untested";
-
-const encoders = ["NVENC", "VA-API AMD", "VA-API Intel", "Software"] as const;
-
-const apps: { name: string; note?: string; status: Record<string, Status> }[] = [
-  {
-    name: "Chromium / Brave / Electron",
-    status: {
-      NVENC:          "ok",
-      "VA-API AMD":   "ok",
-      "VA-API Intel": "ok",
-      Software:       "broken",
-    },
-  },
-  {
-    name: "mpv",
-    note: "--vo=wlshm in software",
-    status: {
-      NVENC:          "ok",
-      "VA-API AMD":   "ok",
-      "VA-API Intel": "ok",
-      Software:       "ok",
-    },
-  },
-  {
-    name: "GTK 4 / Qt 6 apps",
-    status: {
-      NVENC:          "ok",
-      "VA-API AMD":   "ok",
-      "VA-API Intel": "ok",
-      Software:       "untested",
-    },
-  },
-];
-
-function badge(s: Status) {
-  if (s === "ok") return { text: "Working", cls: "text-[var(--green)]" };
-  if (s === "broken") return { text: "Broken", cls: "text-[var(--red,red)]" };
-  return { text: "Untested", cls: "text-[var(--dim)]" };
-}
----
-
 <section class="py-10 border-t border-[var(--border)]">
   <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
     Known limitations
   </h2>
   <p class="text-[13px] text-[var(--dim)] mb-4">
-  The Wayland compositor is experimental. Built on Vulkan, it leverages NVENC or VAAPI where available, avoids GPU↔CPU crossings whenever found possible.
+    The Wayland compositor is experimental. Built on Vulkan, it leverages NVENC or VAAPI where available, avoids GPU<span class="inline-block" style="transform: translateY(-0.12em); padding: 0 2px;">↔</span>CPU crossings whenever found possible.
   </p>
   <p class="text-[13px] text-[var(--dim)] mb-4">
     The audio pipeline often crashes client-side and needs to be restarted.
   </p>
-  <div class="overflow-x-auto">
-    <table class="w-full text-[13px] border-collapse">
-      <thead>
-        <tr class="border-b border-[var(--border)]">
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]"></th>
-          {encoders.map((enc) => (
-            <th class="text-left py-2 pr-6 font-bold text-[var(--bright)] font-mono text-xs">{enc}</th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {apps.map(({ name, note, status }) => (
-          <tr class="border-b border-[var(--border)] last:border-0">
-            <td class="py-2.5 pr-6 text-[var(--fg)] font-medium whitespace-nowrap">{name}{note && <span class="text-[var(--dim)] font-normal text-[11px] ml-1">({note})</span>}</td>
-            {encoders.map((enc) => {
-              const b = badge(status[enc]);
-              return (
-                <td class:list={["py-2.5 pr-6 font-medium", b.cls]}>
-                  {b.text}
-                </td>
-              );
-            })}
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  </div>
-
 </section>
