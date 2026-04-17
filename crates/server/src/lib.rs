@@ -758,21 +758,28 @@ fn preview_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / preview_fps(client) as f64)
 }
 
-/// Surface frame rate: display rate capped by what the pipe can carry.
+/// Surface frame rate: simply the client's display refresh rate.
 ///
-/// `goodput_bps` is fed by terminal ACKs, surface ACKs, and audio send
-/// accounting — so it reflects total pipe utilisation.  Dividing by
-/// `avg_surface_frame_bytes` gives the sustainable surface fps.
-///
-/// Additional backpressure layers below this:
+/// Flow control is provided by three other layers:
+/// - `surface_inflight_limit` scales with RTT×display_fps and bounds
+///   queuing on high-latency paths.
+/// - `outbox_backpressured` triggers on either queued bytes or queued
+///   messages, catching links that can't drain the kernel TCP buffer.
 /// - `surface_encodes_in_flight` limits to 1 encode per (client, surface)
-/// - `outbox_backpressured` triggers on either queued bytes or queued messages
-/// - TCP / SSH flow control on the wire
+///   so a slow encoder can't queue work ahead of itself.
+///
+/// An earlier version of this function capped surface fps at
+/// `goodput_bps / avg_surface_frame_bytes`, but that cap misbehaved
+/// during bootstrap on high-latency links: the conservative initial
+/// goodput seed (262 KB/s) divided by the first keyframe-based
+/// frame-size estimate (25+ KB) yields ~10 fps, well below typical
+/// video sources (24 fps).  Because `goodput_bps` only updates from
+/// ACKs that have already traversed the RTT, it takes several
+/// hundred ms to converge — long enough that mpv @ 24 fps visibly
+/// stalls on a 200 ms link.  The inflight window + outbox backpressure
+/// already handle genuinely slow links without this bandwidth cap.
 fn surface_pacing_fps(client: &ClientState) -> f32 {
-    let frame_bytes = client.avg_surface_frame_bytes.max(256.0);
-    let bw = client.goodput_bps.max(client.delivery_bps);
-    let sustainable = bw / frame_bytes;
-    sustainable.min(client.display_fps).max(1.0)
+    client.display_fps.max(1.0)
 }
 
 fn surface_send_interval(client: &ClientState) -> Duration {

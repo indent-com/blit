@@ -532,6 +532,22 @@ export class SurfaceStore {
             if (cs !== entry.lastCodecString) {
               entry.lastCodecString = cs;
               entry.lastDescription = description;
+              // If the decoder already has queued work, calling
+              // configure() directly resets its state and orphans any
+              // in-flight VideoFrame objects — Chromium then logs
+              // "A VideoFrame was garbage collected without being
+              // closed" and eventually exhausts its frame pool,
+              // stalling decode.  Queue a flush() first so pending
+              // frames drain through the output callback (which
+              // closes them) before the reset.  WebCodecs processes
+              // control messages in order, so the subsequent
+              // configure() and decode() of the current keyframe
+              // simply run after the flush completes.
+              if (entry.decoder.state === "configured") {
+                entry.decoder.flush().catch(() => {
+                  /* flush rejected — decoder likely closed */
+                });
+              }
               entry.decoder.configure({
                 codec: cs,
                 optimizeForLatency: true,
