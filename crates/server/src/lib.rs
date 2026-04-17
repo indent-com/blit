@@ -518,6 +518,7 @@ struct ClientState {
     skip_same_gen_count: u32,
     skip_in_flight_count: u32,
     skip_pacing_count: u32,
+    skip_vulkan_await_count: u32,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
     surface_next_send_at: Instant,
@@ -834,6 +835,8 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     let skip_same_gen = c.skip_same_gen_count;
     let skip_in_flight = c.skip_in_flight_count;
     let skip_pacing = c.skip_pacing_count;
+    let skip_vk_await = c.skip_vulkan_await_count;
+    let vk_surfs = c.vulkan_video_surfaces.len();
     let in_flight_set_len = c.surface_encodes_in_flight.len();
     let surface_burst = c.surface_burst_remaining;
 
@@ -843,6 +846,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     c.skip_same_gen_count = 0;
     c.skip_in_flight_count = 0;
     c.skip_pacing_count = 0;
+    c.skip_vulkan_await_count = 0;
     c.last_log = Instant::now();
 
     if verbose {
@@ -858,7 +862,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         });
         let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
         eprintln!(
-            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} enc_in_flight_set={in_flight_set_len} burst={surface_burst}",
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f inflight={inflight_bytes}B outbox={outbox_frames}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms | tick_fires={} tick_snaps={} | surfaces={surf_count} subs={surf_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst}",
             sess.tick_fires,
             sess.tick_snaps,
             sess.surface_commits,
@@ -3141,6 +3145,17 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                     // The encoded frame comes via PixelData::Encoded on
                     // the next compositor commit, handled by the fast path.
+                    client.skip_vulkan_await_count =
+                        client.skip_vulkan_await_count.saturating_add(1);
+                    let now_inst = Instant::now();
+                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
+                        client.last_skip_log = now_inst;
+                        eprintln!(
+                            "[encode-skip] cid={} sid={sid} reason=vulkan_await \
+                             (compositor not producing PixelData::Encoded) count={}",
+                            work.cid, client.skip_vulkan_await_count,
+                        );
+                    }
                     continue;
                 }
 
@@ -3953,6 +3968,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 skip_same_gen_count: 0,
                 skip_in_flight_count: 0,
                 skip_pacing_count: 0,
+                skip_vulkan_await_count: 0,
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
                 surface_next_send_at: Instant::now(),
@@ -5512,6 +5528,7 @@ mod tests {
             skip_same_gen_count: 0,
             skip_in_flight_count: 0,
             skip_pacing_count: 0,
+            skip_vulkan_await_count: 0,
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
             surface_next_send_at: Instant::now(),
