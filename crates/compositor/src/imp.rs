@@ -1179,9 +1179,7 @@ impl Compositor {
     }
 
     fn read_shm_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
-        let Some(data) = buffer.data::<ShmBufferData>() else {
-            return None;
-        };
+        let data = buffer.data::<ShmBufferData>()?;
         let Some(pool) = self.shm_pools.get(&data.pool_id) else {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1214,16 +1212,7 @@ impl Compositor {
     }
 
     fn read_dmabuf_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
-        let Some(data) = buffer.data::<DmaBufBufferData>() else {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 || n.is_multiple_of(100) {
-                eprintln!(
-                    "[read_dmabuf_buffer #{n}] buffer has no ShmBufferData or DmaBufBufferData (unknown role)",
-                );
-            }
-            return None;
-        };
+        let data = buffer.data::<DmaBufBufferData>()?;
         let width = data.width as u32;
         let height = data.height as u32;
         if width == 0 || height == 0 || data.planes.is_empty() {
