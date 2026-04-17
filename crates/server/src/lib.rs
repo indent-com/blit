@@ -1379,7 +1379,11 @@ impl Session {
                     })
                 } else {
                     if verbose && !audio_disabled {
-                        eprintln!("[audio] PipeWire not available, audio disabled");
+                        let missing = audio::missing_pipewire_binaries();
+                        eprintln!(
+                            "[audio] audio disabled: missing binaries on $PATH: {}",
+                            missing.join(", ")
+                        );
                     }
                     None
                 }
