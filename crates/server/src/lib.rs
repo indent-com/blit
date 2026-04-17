@@ -190,7 +190,11 @@ impl PtyDriver for AlacrittyDriver {
 // are never dropped, but production is throttled (via `window_open` /
 // `surface_window_open`) once either counter exceeds these limits.
 const OUTBOX_SOFT_QUEUE_LIMIT_FRAMES: usize = 4;
-const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 128 * 1024;
+// Must comfortably hold one keyframe at 1920x1080 from a software encoder
+// (200-400 KB is typical).  Setting this too low deadlocks the outbox gate
+// when a single frame exceeds the cap — surface_window_open returns false
+// even at outbox=1, and no new frames can ever be produced.
+const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 1024 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
@@ -706,13 +710,22 @@ fn browser_pacing_fps(client: &ClientState) -> f32 {
     // Backlog and ack-ahead are direct signals from the browser about
     // whether it's keeping up.  No predictive apply-time bound — it
     // consistently underestimates capacity and causes 30fps death spirals.
+    //
+    // The backoff is steep: at the block threshold (backlog>8) we've
+    // already dropped to display_fps/4.  A gentler schedule (4/backlog)
+    // held 48fps at backlog=10 for software-encoded 1080p, which is
+    // faster than the browser can decode → backlog never drains, the
+    // hard block stays latched, and encoding stalls entirely.
     let backlog = client.browser_backlog_frames as f32;
-    if backlog > 4.0 {
-        fps = fps.min(fps * (4.0 / backlog));
+    if backlog > 2.0 {
+        fps = fps.min(fps * (2.0 / backlog));
     }
 
     if client.browser_ack_ahead_frames > 4 {
         fps = fps.min(client.display_fps.max(1.0) * 0.5);
+    }
+    if client.browser_ack_ahead_frames > 8 {
+        fps = fps.min(client.display_fps.max(1.0) * 0.25);
     }
 
     fps.max(1.0)
@@ -1017,8 +1030,18 @@ fn outbox_queued_bytes(client: &ClientState) -> usize {
 }
 
 fn outbox_backpressured(client: &ClientState) -> bool {
-    outbox_queued_frames(client) >= OUTBOX_SOFT_QUEUE_LIMIT_FRAMES
-        || outbox_queued_bytes(client) >= OUTBOX_SOFT_QUEUE_LIMIT_BYTES
+    // Always allow at least one frame queued, even if it exceeds the byte
+    // soft limit.  Large keyframes from software encoders can be larger than
+    // OUTBOX_SOFT_QUEUE_LIMIT_BYTES; treating the first queued frame as
+    // backpressure would permanently close surface_window_open and deadlock
+    // encoding (the one queued frame cannot drain until the sender task
+    // flushes it, but the sender was waiting for a new frame that we
+    // refuse to produce — deadlock).
+    let frames = outbox_queued_frames(client);
+    if frames >= OUTBOX_SOFT_QUEUE_LIMIT_FRAMES {
+        return true;
+    }
+    frames >= 2 && outbox_queued_bytes(client) >= OUTBOX_SOFT_QUEUE_LIMIT_BYTES
 }
 
 fn mark_outbox_drained(
@@ -6015,7 +6038,12 @@ mod tests {
     #[test]
     fn outbox_backpressured_by_large_queued_bytes() {
         let (client, _rx) = test_client_with_capacity(0);
+        // First frame is always allowed through, even at the byte limit, so
+        // pending encoders can make progress when keyframes exceed the cap.
         let _ = send_outbox(&client, vec![0u8; OUTBOX_SOFT_QUEUE_LIMIT_BYTES]);
+        assert!(!outbox_backpressured(&client));
+        // A second frame pushes total bytes past the soft limit.
+        let _ = send_outbox(&client, vec![0u8; 1]);
         assert!(outbox_backpressured(&client));
     }
 
