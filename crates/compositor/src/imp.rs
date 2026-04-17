@@ -1179,22 +1179,64 @@ impl Compositor {
     }
 
     fn read_shm_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
-        let data = buffer.data::<ShmBufferData>()?;
-        let pool = self.shm_pools.get(&data.pool_id)?;
-        pool.read_buffer(
+        let Some(data) = buffer.data::<ShmBufferData>() else {
+            return None;
+        };
+        let Some(pool) = self.shm_pools.get(&data.pool_id) else {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(100) {
+                eprintln!(
+                    "[read_shm_buffer #{n}] pool {:?} not found (buffer={}x{} fmt={:?})",
+                    data.pool_id, data.width, data.height, data.format,
+                );
+            }
+            return None;
+        };
+        let r = pool.read_buffer(
             data.offset,
             data.width,
             data.height,
             data.stride,
             data.format,
-        )
+        );
+        if r.is_none() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(100) {
+                eprintln!(
+                    "[read_shm_buffer #{n}] pool.read_buffer=None off={} {}x{} stride={} fmt={:?}",
+                    data.offset, data.width, data.height, data.stride, data.format,
+                );
+            }
+        }
+        r
     }
 
     fn read_dmabuf_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
-        let data = buffer.data::<DmaBufBufferData>()?;
+        let Some(data) = buffer.data::<DmaBufBufferData>() else {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(100) {
+                eprintln!(
+                    "[read_dmabuf_buffer #{n}] buffer has no ShmBufferData or DmaBufBufferData (unknown role)",
+                );
+            }
+            return None;
+        };
         let width = data.width as u32;
         let height = data.height as u32;
         if width == 0 || height == 0 || data.planes.is_empty() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(100) {
+                eprintln!(
+                    "[read_dmabuf_buffer #{n}] empty: {}x{} planes={}",
+                    width,
+                    height,
+                    data.planes.len()
+                );
+            }
             return None;
         }
         let plane = &data.planes[0];
@@ -1239,12 +1281,35 @@ impl Compositor {
                 },
             ));
         }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 10 || n.is_multiple_of(100) {
+            eprintln!(
+                "[read_dmabuf_buffer #{n}] unsupported fourcc=0x{:08x} ({}x{}) modifier=0x{:x}",
+                data.fourcc, width, height, data.modifier,
+            );
+        }
         None
     }
 
     fn read_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
-        self.read_shm_buffer(buffer)
-            .or_else(|| self.read_dmabuf_buffer(buffer))
+        // Try SHM first, then DMA-BUF. Both paths now log their own
+        // failures, so here we only log when the buffer matches neither
+        // type (exotic buffer roles we don't recognise at all).
+        if buffer.data::<ShmBufferData>().is_some() {
+            return self.read_shm_buffer(buffer);
+        }
+        if buffer.data::<DmaBufBufferData>().is_some() {
+            return self.read_dmabuf_buffer(buffer);
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 10 || n.is_multiple_of(100) {
+            eprintln!(
+                "[read_buffer #{n}] buffer has unknown role (neither Shm nor DmaBuf data attached)",
+            );
+        }
+        None
     }
 
     fn handle_surface_commit(&mut self, surface_id: &ObjectId) {
