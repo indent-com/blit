@@ -160,24 +160,24 @@ blit has no required dependencies — software H.264 and AV1 encoders are static
 
 **Video — GPU compositing and hardware encoding (Linux)**
 
-| Library | Packages (Debian/Ubuntu) | Used for |
-| --- | --- | --- |
-| `libvulkan.so.1` | `libvulkan1`, `mesa-vulkan-drivers` or NVIDIA driver | GPU compositing, Vulkan Video encode |
-| `libva.so.2`, `libva-drm.so.2` | `libva2`, `libva-drm2`, `va-driver-all` | VA-API hardware encode (Intel/AMD) |
-| `libgbm.so.1` | `libgbm1` | DMA-BUF allocation for zero-copy VA-API encoding |
-| `libcuda.so.1`, `libnvidia-encode.so.1` | NVIDIA proprietary driver | NVENC hardware encode |
+| Library                                 | Packages (Debian/Ubuntu)                             | Used for                                         |
+| --------------------------------------- | ---------------------------------------------------- | ------------------------------------------------ |
+| `libvulkan.so.1`                        | `libvulkan1`, `mesa-vulkan-drivers` or NVIDIA driver | GPU compositing, Vulkan Video encode             |
+| `libva.so.2`, `libva-drm.so.2`          | `libva2`, `libva-drm2`, `va-driver-all`              | VA-API hardware encode (Intel/AMD)               |
+| `libgbm.so.1`                           | `libgbm1`                                            | DMA-BUF allocation for zero-copy VA-API encoding |
+| `libcuda.so.1`, `libnvidia-encode.so.1` | NVIDIA proprietary driver                            | NVENC hardware encode                            |
 
 Without any of the above, the compositor falls back to CPU rendering and software encoding. No configuration needed.
 
 **Audio (Linux)**
 
-| Binary | Packages (Debian/Ubuntu) | Used for |
-| --- | --- | --- |
-| `pipewire` | `pipewire` | Audio daemon (private instance per compositor) |
-| `pipewire-pulse` | `pipewire-pulse` | PulseAudio compatibility for apps |
-| `pw-cat` | `pipewire` or `pipewire-utils` | Monitor source capture |
-| `dbus-daemon` | `dbus` | Private D-Bus session (required by PipeWire) |
-| `wireplumber` | `wireplumber` | Session manager (optional, started if available) |
+| Binary           | Packages (Debian/Ubuntu)       | Used for                                         |
+| ---------------- | ------------------------------ | ------------------------------------------------ |
+| `pipewire`       | `pipewire`                     | Audio daemon (private instance per compositor)   |
+| `pipewire-pulse` | `pipewire-pulse`               | PulseAudio compatibility for apps                |
+| `pw-cat`         | `pipewire` or `pipewire-utils` | Monitor source capture                           |
+| `dbus-daemon`    | `dbus`                         | Private D-Bus session (required by PipeWire)     |
+| `wireplumber`    | `wireplumber`                  | Session manager (optional, started if available) |
 
 Audio is disabled automatically when PipeWire is not installed, or explicitly with `BLIT_AUDIO=0`.
 
