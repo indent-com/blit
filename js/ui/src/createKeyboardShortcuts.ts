@@ -146,9 +146,17 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           return;
         }
       }
-      // Ctrl+Shift+Q: remove the current term/surface from the focused BSP pane
-      // (unassign without closing).
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "Q") {
+      // Ctrl+Shift+Q: remove the current term/surface from the main view
+      // (unassign without closing) so it falls back to the sidebar.  Also
+      // accept e.code === "KeyQ" to survive keyboard layouts where Shift+Q
+      // resolves e.key to lowercase "q".
+      if (
+        e.ctrlKey &&
+        e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        (e.key === "Q" || e.key === "q" || e.code === "KeyQ")
+      ) {
         if (h.overlay()) return;
         // Non-BSP surface focus: unfocus the surface (return to terminal view).
         if (h.focusedSurfaceId() != null) {
@@ -156,9 +164,19 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           h.unfocusSurface();
           return;
         }
-        if (!h.activeLayout() || !h.bspFocusedPaneId()) return;
-        e.preventDefault();
-        h.clearFocusedPaneAssignment();
+        if (h.activeLayout() && h.bspFocusedPaneId()) {
+          e.preventDefault();
+          h.clearFocusedPaneAssignment();
+          return;
+        }
+        // Single-terminal mode: unfocus the current session so the main
+        // area shows the EmptyState and the terminal lives only in the
+        // sidebar.
+        if (h.focusedSessionId() != null) {
+          e.preventDefault();
+          h.workspace.focusSession(null);
+          return;
+        }
         return;
       }
       // Ctrl+Alt+Shift+Q: close the focused terminal or surface entirely.

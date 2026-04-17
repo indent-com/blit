@@ -569,7 +569,34 @@ impl SurfaceEncoder {
             SurfaceEncoderPreference::H264Vaapi => Err("VA-API is only available on Unix".into()),
             #[cfg(target_os = "linux")]
             SurfaceEncoderPreference::AV1Vaapi => {
-                let (width, height) = (width.div_ceil(64) * 64, height.div_ceil(64) * 64);
+                // Round up to 64-pixel superblocks.  AMD's AV1 backend
+                // rejects `vaCreateContext` with VA_STATUS_ERROR_
+                // RESOLUTION_NOT_SUPPORTED (0x13) below a codec-
+                // specific minimum; 256 isn't enough on many chips, so
+                // we default to 512.  AV1's `render_width/height` in
+                // the frame header still carries the actual
+                // `source_width/source_height`, so the client's
+                // WebCodecs decoder crops back to the requested size.
+                //
+                // BUT: the encoder encodes every pixel including the
+                // padding.  For small thumbnails, the padded area can
+                // exceed the source by >10×, turning a bandwidth-
+                // saving thumbnail into a bandwidth *amplifier*.  Bail
+                // out when padding would waste more than the content
+                // area — the fallback encoder chain picks a smaller-
+                // friendly backend (e.g. H264Software) instead.
+                const VAAPI_AV1_MIN: u32 = 512;
+                let enc_w = width.div_ceil(64) * 64;
+                let enc_h = height.div_ceil(64) * 64;
+                let (width, height) = (enc_w.max(VAAPI_AV1_MIN), enc_h.max(VAAPI_AV1_MIN));
+                let source_area = (source_width as u64) * (source_height as u64);
+                let padded_area = (width as u64) * (height as u64);
+                if padded_area > source_area.saturating_mul(2) {
+                    return Err(format!(
+                        "AV1Vaapi padding {width}x{height} > 2× source \
+                         {source_width}x{source_height} — falling back",
+                    ));
+                }
                 Ok(Self {
                     width,
                     height,

@@ -33,6 +33,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_buffer_params_v1::{
     self, ZwpLinuxBufferParamsV1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::{
     self, ZwpLinuxDmabufV1,
 };
@@ -328,9 +329,107 @@ impl PixelData {
                 }
                 pixels
             }
-            PixelData::VaSurface { .. }
-            | PixelData::Nv12DmaBuf { .. }
-            | PixelData::Encoded { .. } => Vec::new(),
+            PixelData::Nv12DmaBuf {
+                fd,
+                stride,
+                uv_offset,
+                width: nv12_w,
+                height: nv12_h,
+                sync_fd,
+            } => {
+                // The compositor writes BGRA → NV12 from a Vulkan compute
+                // shader into this DMA-BUF.  Wait on the fence (if any) so
+                // we don't CPU-read a half-written buffer.  Without this,
+                // thumbnails (scaled subscriptions, which need CPU RGBA for
+                // the software downscale) get garbage or stale pixels.
+                if let Some(sync) = sync_fd {
+                    let mut pfd = libc::pollfd {
+                        fd: sync.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // Up to 10 ms: at 60 fps we have ~16 ms of budget; we
+                    // must not block the server delivery tick for longer
+                    // than one frame's worth of time.
+                    unsafe {
+                        libc::poll(&mut pfd, 1, 10);
+                    }
+                }
+                let nw = *nv12_w as usize;
+                let nh = *nv12_h as usize;
+                let stride_usize = *stride as usize;
+                let uv_off = *uv_offset as usize;
+                let y_plane_size = stride_usize * nh;
+                let uv_h = nh.div_ceil(2);
+                let uv_plane_size = stride_usize * uv_h;
+                let map_size = uv_off + uv_plane_size;
+                if map_size == 0 || nw == 0 || nh == 0 {
+                    return Vec::new();
+                }
+                let raw = fd.as_raw_fd();
+                const DMA_BUF_SYNC_READ: u64 = 1;
+                const DMA_BUF_SYNC_START: u64 = 0;
+                const DMA_BUF_SYNC_END: u64 = 4;
+                const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+                let s_start: u64 = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                let did_sync = unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &s_start) == 0 };
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        map_size,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        raw,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    if did_sync {
+                        let s_end: u64 = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                        unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &s_end) };
+                    }
+                    return Vec::new();
+                }
+                let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_size) };
+                let y_plane = &slice[..y_plane_size.min(slice.len())];
+                let uv_plane = &slice[uv_off.min(slice.len())..];
+                // The caller asks for (w, h) — typically matches (nw, nh)
+                // but we guard anyway.
+                let out_w = w.min(nw);
+                let out_h = h.min(nh);
+                let mut rgba = Vec::with_capacity(w * h * 4);
+                for row in 0..out_h {
+                    for col in 0..out_w {
+                        let y_idx = row * stride_usize + col;
+                        let uv_idx = (row / 2) * stride_usize + (col / 2) * 2;
+                        if y_idx >= y_plane.len() || uv_idx + 1 >= uv_plane.len() {
+                            rgba.extend_from_slice(&[0, 0, 0, 255]);
+                            continue;
+                        }
+                        let y = y_plane[y_idx];
+                        let u = uv_plane[uv_idx];
+                        let v = uv_plane[uv_idx + 1];
+                        let [r, g, b] = yuv420_to_rgb(y, u, v);
+                        rgba.extend_from_slice(&[r, g, b, 255]);
+                    }
+                    // Pad row if caller asked for more width than we have.
+                    for _ in out_w..w {
+                        rgba.extend_from_slice(&[0, 0, 0, 255]);
+                    }
+                }
+                for _ in out_h..h {
+                    for _ in 0..w {
+                        rgba.extend_from_slice(&[0, 0, 0, 255]);
+                    }
+                }
+                unsafe { libc::munmap(ptr, map_size) };
+                if did_sync {
+                    let s_end: u64 = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                    unsafe { libc::ioctl(raw, DMA_BUF_IOCTL_SYNC as _, &s_end) };
+                }
+                rgba
+            }
+            PixelData::VaSurface { .. } | PixelData::Encoded { .. } => Vec::new(),
         }
     }
 
@@ -384,6 +483,10 @@ pub enum CompositorEvent {
         width: u32,
         height: u32,
         pixels: PixelData,
+        /// CLOCK_MONOTONIC milliseconds at commit time so the server can
+        /// stamp surface frames with the source's presentation timing
+        /// rather than the (jittery) encode-delivery wall clock.
+        timestamp_ms: u32,
     },
     SurfaceTitle {
         surface_id: u16,
@@ -466,7 +569,8 @@ pub enum CompositorCommand {
         reply: mpsc::SyncSender<Option<Vec<u8>>>,
     },
     /// Set externally-allocated DMA-BUF fds as GPU renderer output targets
-    /// for a specific surface.
+    /// for a surface.  The compositor renders into these buffers so the
+    /// encoder can zero-copy them as input.
     SetExternalOutputBuffers {
         surface_id: u32,
         buffers: Vec<ExternalOutputBuffer>,
@@ -968,7 +1072,7 @@ struct Compositor {
     event_tx: mpsc::Sender<CompositorEvent>,
     event_notify: Arc<dyn Fn() + Send + Sync>,
     loop_signal: LoopSignal,
-    /// (phys_w, phys_h, log_w, log_h, pixels)
+    /// Pending per-surface commit data: `(phys_w, phys_h, log_w, log_h, pixels)`.
     pending_commits: HashMap<u16, (u32, u32, u32, u32, PixelData)>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
@@ -978,6 +1082,7 @@ struct Compositor {
     /// reconfigure before receiving new input events.
     pending_kb_reenter: bool,
 
+    gpu_device: String,
     verbose: bool,
     shutdown: Arc<AtomicBool>,
     /// Track last reported size per toplevel surface_id to detect changes.
@@ -1175,7 +1280,6 @@ impl Compositor {
 
     fn flush_pending_commits(&mut self) {
         for (surface_id, (width, height, log_w, log_h, pixels)) in self.pending_commits.drain() {
-            // Check for size change.
             let prev = self.last_reported_size.get(&surface_id).copied();
             if prev.is_none() || prev.map(|(pw, ph, _, _)| (pw, ph)) != Some((width, height)) {
                 self.last_reported_size
@@ -1191,6 +1295,7 @@ impl Compositor {
                 width,
                 height,
                 pixels,
+                timestamp_ms: elapsed_ms(),
             });
         }
         (self.event_notify)();
@@ -2395,6 +2500,73 @@ impl Compositor {
                 self.loop_signal.stop();
             }
         }
+    }
+
+    /// Send dmabuf feedback events on a `ZwpLinuxDmabufFeedbackV1` object.
+    /// Builds the format table from the Vulkan renderer's supported modifiers,
+    /// then sends main_device, one tranche, and done.
+    fn send_dmabuf_feedback(&self, fb: &ZwpLinuxDmabufFeedbackV1) {
+        use std::os::unix::fs::MetadataExt;
+
+        // Collect format+modifier pairs from the Vulkan renderer.
+        let modifiers: &[(u32, u64)] = self
+            .vulkan_renderer
+            .as_ref()
+            .map(|vk| vk.supported_dmabuf_modifiers.as_slice())
+            .unwrap_or(&[]);
+
+        // Build the format table: tightly packed (u32 format, u32 pad, u64 modifier).
+        let entry_size = 16usize;
+        let table_size = modifiers.len() * entry_size;
+        let mut table_data = vec![0u8; table_size];
+        for (i, &(fmt, modifier)) in modifiers.iter().enumerate() {
+            let off = i * entry_size;
+            table_data[off..off + 4].copy_from_slice(&fmt.to_ne_bytes());
+            // 4 bytes padding (already zero)
+            table_data[off + 8..off + 16].copy_from_slice(&modifier.to_ne_bytes());
+        }
+
+        // Create a memfd for the format table.
+        let name = c"dmabuf-feedback-table";
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if raw_fd < 0 {
+            eprintln!("[compositor] memfd_create for dmabuf feedback failed");
+            fb.done();
+            return;
+        }
+        let table_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        if !table_data.is_empty() {
+            use std::io::Write;
+            let mut file = std::fs::File::from(table_fd.try_clone().unwrap());
+            if file.write_all(&table_data).is_err() {
+                eprintln!("[compositor] failed to write dmabuf feedback table");
+                fb.done();
+                return;
+            }
+        }
+        fb.format_table(table_fd.as_fd(), table_size as u32);
+
+        // Get dev_t for the GPU device.
+        let dev = std::fs::metadata(&self.gpu_device)
+            .map(|m| m.rdev())
+            .unwrap_or(0);
+        let dev_bytes = dev.to_ne_bytes().to_vec();
+        fb.main_device(dev_bytes.clone());
+
+        // Single tranche with all format+modifier pairs.
+        fb.tranche_target_device(dev_bytes);
+
+        // Indices into the format table (array of u16 in native endianness).
+        let indices: Vec<u8> = (0..modifiers.len() as u16)
+            .flat_map(|i| i.to_ne_bytes())
+            .collect();
+        fb.tranche_formats(indices);
+
+        fb.tranche_flags(
+            wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty(),
+        );
+        fb.tranche_done();
+        fb.done();
     }
 }
 
@@ -3801,6 +3973,11 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let dmabuf = data_init.init(resource, ());
+        // v4+ clients use get_default_feedback / get_surface_feedback
+        // instead of the deprecated format/modifier events.
+        if dmabuf.version() >= 4 {
+            return;
+        }
         if dmabuf.version() >= 3 {
             // Advertise DRM format modifiers that the Vulkan device can
             // actually import.  This ensures clients (Chromium, mpv, …)
@@ -3834,7 +4011,7 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for Compositor {
 
 impl Dispatch<ZwpLinuxDmabufV1, ()> for Compositor {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
         _: &ZwpLinuxDmabufV1,
         request: <ZwpLinuxDmabufV1 as Resource>::Request,
@@ -3847,9 +4024,31 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for Compositor {
             Request::CreateParams { params_id } => {
                 data_init.init(params_id, ());
             }
+            Request::GetDefaultFeedback { id } => {
+                let fb = data_init.init(id, ());
+                state.send_dmabuf_feedback(&fb);
+            }
+            Request::GetSurfaceFeedback { id, .. } => {
+                let fb = data_init.init(id, ());
+                state.send_dmabuf_feedback(&fb);
+            }
             Request::Destroy => {}
             _ => {}
         }
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        _request: <ZwpLinuxDmabufFeedbackV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // Only request is Destroy, handled automatically.
     }
 }
 
@@ -5025,7 +5224,7 @@ fn run_compositor(
     // formats confuses clients (Chrome, mpv) into not falling back to
     // wl_shm.
     if has_dmabuf {
-        dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(3, ());
+        dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(4, ());
     }
     dh.create_global::<Compositor, WpViewporter, ()>(1, ());
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
@@ -5085,6 +5284,7 @@ fn run_compositor(
         focused_surface_id: 0,
         pointer_entered_id: None,
         pending_kb_reenter: false,
+        gpu_device,
         verbose,
         shutdown: shutdown.clone(),
         last_reported_size: HashMap::new(),

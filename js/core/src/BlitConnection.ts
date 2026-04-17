@@ -136,6 +136,29 @@ function toPublicSession(s: InternalSession): BlitSession {
   return s;
 }
 
+/** Per-surface subscription state.  One entry per visible surface on
+ *  this connection.  `refCount` tracks how many mounts (e.g. BSP view
+ *  plus side-panel preview) share the stream: the wire UNSUBSCRIBE
+ *  fires only when the last mount goes away.  Without ref-counting,
+ *  unmounting one of two mounts tears down the stream for both. */
+interface SurfaceSub {
+  surfaceId: number;
+  /** Number of live mounts currently referencing this sub. */
+  refCount: number;
+  /** Quality override set via {@link BlitConnection.sendSurfaceResubscribe}. */
+  qualityOverride: number | null;
+  /** Last quality value sent on the wire, for dedup. */
+  lastSentQuality: number | null;
+  /** When the last mount has gone away we schedule a deferred wire
+   *  UNSUBSCRIBE instead of firing it immediately.  Moving a surface
+   *  between two UI locations (e.g. side-panel preview → BSP) causes
+   *  an unmount + mount pair; without the grace window the server
+   *  tears down the encoder in between and the new mount waits for a
+   *  full re-init + keyframe.  A fresh subscribe within the window
+   *  cancels the pending UNSUB and the stream continues uninterrupted. */
+  pendingUnsub: ReturnType<typeof setTimeout> | null;
+}
+
 export class BlitConnection {
   readonly id: ConnectionId;
 
@@ -210,16 +233,15 @@ export class BlitConnection {
       // Re-subscribing triggers surface_needs_keyframe on the server,
       // which forces the next encoded frame to be a keyframe.
       if (
-        this.transport.status === "connected" &&
-        this.surfaceStreamingEnabled
+        this.transport.status !== "connected" ||
+        !this.surfaceStreamingEnabled
       ) {
-        this.transport.send(
-          buildSurfaceSubscribeMessage(
-            surfaceId,
-            0,
-            this.defaultSurfaceQuality,
-          ),
-        );
+        return;
+      }
+      const sub = this.surfaceSubs.get(surfaceId);
+      if (sub) {
+        sub.lastSentQuality = null;
+        this.maybeSendSurfaceSubscribe(sub);
       }
     });
     this.store = new TerminalStore(
@@ -324,9 +346,7 @@ export class BlitConnection {
     this.rejectPendingSearches(connectionError("Connection disposed"));
     this.rejectPendingReads(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
-    for (const t of this._pendingUnsubs.values()) clearTimeout(t);
-    this._pendingUnsubs.clear();
-    this.surfaceSubRefCounts.clear();
+    this.clearSurfaceSubs();
     this.store.destroy();
     this.surfaceStore.destroy();
     this.audioPlayer.destroy();
@@ -816,8 +836,22 @@ export class BlitConnection {
     this.transport.send(buildSurfaceCloseMessage(surfaceId));
   }
 
-  private surfaceSubRefCounts = new Map<number, number>();
-  private _pendingUnsubs = new Map<number, ReturnType<typeof setTimeout>>();
+  // Per-surface subscription state.  Multiple views (main BSP tile + a
+  // side-panel thumbnail + a popup preview…) can subscribe to the same
+  // surface simultaneously; each holds an opaque token so the connection
+  // can maintain a correct per-subscriber view rather than a collapsed
+  // refcount.  The effective subscribe sent on the wire is derived:
+  //   * target: if any subscriber wants unscaled (target = null),
+  //     subscribe unscaled; otherwise pick the largest requested target
+  //     (smaller subscribers can downscale from the larger stream
+  //     client-side, but the reverse would be lossy).
+  //   * quality: per-surface override (set by sendSurfaceResubscribe)
+  //     falling back to defaultSurfaceQuality.
+  // Keyed by sub_id (client-allocated u32).  Each `BlitSurfaceCanvas`
+  // (or equivalent caller) allocates its own sub_id and owns the
+  // subscribe/unsubscribe lifecycle for that id.
+  /** Active surface subscriptions keyed by surface id. */
+  private surfaceSubs = new Map<number, SurfaceSub>();
 
   /**
    * True once {@link detectCodecSupport} has resolved and
@@ -833,121 +867,154 @@ export class BlitConnection {
    */
   private _codecFeaturesSent = false;
 
-  sendSurfaceSubscribe(surfaceId: number): void {
-    const prev = this.surfaceSubRefCounts.get(surfaceId) ?? 0;
-    this.surfaceSubRefCounts.set(surfaceId, prev + 1);
-    // Cancel any pending debounced unsub — the surface is still wanted.
-    const pendingUnsub = this._pendingUnsubs.get(surfaceId);
-    if (pendingUnsub) {
-      clearTimeout(pendingUnsub);
-      this._pendingUnsubs.delete(surfaceId);
-      // The server still has the subscription — no need to re-send.
-      return;
-    }
-    if (
-      prev === 0 &&
-      this.transport.status === "connected" &&
-      this.surfaceStreamingEnabled
-    ) {
-      this._logger.info(`surface sub ${this.id}:${surfaceId}`);
-      this.transport.send(
-        buildSurfaceSubscribeMessage(surfaceId, 0, this.defaultSurfaceQuality),
-      );
+  /** Grace window before a refCount=0 subscription's wire UNSUB fires.
+   *  Chosen to comfortably cover typical Solid re-render ordering where
+   *  the old mount's `onCleanup` fires before the new mount's
+   *  `onMount`, but keeps dropped-stream latency tight if the user
+   *  really did stop watching. */
+  private static readonly SUB_UNSUB_GRACE_MS = 250;
+
+  /** Cancel any pending deferred unsubscribe timers and reset
+   *  `lastSentQuality` so the next refresh fires a wire subscribe.
+   *  Called on reconnect / S2C_HELLO: the refCounts (one per live
+   *  mount) are authoritative and must survive a reconnect — wiping
+   *  the map would leave the existing mounts with no way to reclaim
+   *  their subscriptions (`refreshSurfaceSubscribe` would no-op). */
+  private resetSurfaceSubsForReconnect(): void {
+    for (const sub of this.surfaceSubs.values()) {
+      if (sub.pendingUnsub !== null) {
+        clearTimeout(sub.pendingUnsub);
+        sub.pendingUnsub = null;
+      }
+      sub.lastSentQuality = null;
     }
   }
 
-  /**
-   * Re-subscribe active surfaces after the codec probe resolves so the
-   * server can switch to the optimal encoder for this client's
-   * capabilities.  Surfaces that were subscribed with codec_support=0
-   * ("accept anything") before the probe completed get updated.
-   */
+  /** Called from `dispose()` — the connection is going away permanently.
+   *  Drop everything, including ref-counts. */
+  private clearSurfaceSubs(): void {
+    for (const sub of this.surfaceSubs.values()) {
+      if (sub.pendingUnsub !== null) {
+        clearTimeout(sub.pendingUnsub);
+        sub.pendingUnsub = null;
+      }
+    }
+    this.surfaceSubs.clear();
+  }
+
+  private maybeSendSurfaceSubscribe(sub: SurfaceSub): void {
+    if (this.transport.status !== "connected") return;
+    if (!this.surfaceStreamingEnabled) return;
+    const quality = sub.qualityOverride ?? this.defaultSurfaceQuality;
+    if (sub.lastSentQuality === quality) return;
+    sub.lastSentQuality = quality;
+    this._logger.info(`surface sub ${this.id}:${sub.surfaceId}`);
+    this.transport.send(
+      buildSurfaceSubscribeMessage(sub.surfaceId, 0, quality),
+    );
+  }
+
+  /** Subscribe to frames for a surface.  A single subscription exists
+   *  per (connection, surface); additional views of the same surface
+   *  share it.  Callers should ref-count mounts above this layer. */
+  sendSurfaceSubscribe(surfaceId: number): void {
+    let sub = this.surfaceSubs.get(surfaceId);
+    if (!sub) {
+      sub = {
+        surfaceId,
+        refCount: 1,
+        qualityOverride: null,
+        lastSentQuality: null,
+        pendingUnsub: null,
+      };
+      this.surfaceSubs.set(surfaceId, sub);
+    } else {
+      sub.refCount += 1;
+      // Cancel any pending deferred UNSUB — the new mount wants the
+      // live stream and the server's encoder is still valid.
+      if (sub.pendingUnsub !== null) {
+        clearTimeout(sub.pendingUnsub);
+        sub.pendingUnsub = null;
+      }
+    }
+    this.maybeSendSurfaceSubscribe(sub);
+  }
+
+  /** Resend the wire subscribe without bumping the ref-count.  Used
+   *  after reconnect, where the server lost its subscription table but
+   *  the client still has all its mounts active — bumping the count
+   *  would leak references. */
+  refreshSurfaceSubscribe(surfaceId: number): void {
+    const sub = this.surfaceSubs.get(surfaceId);
+    if (!sub) return;
+    sub.lastSentQuality = null;
+    this.maybeSendSurfaceSubscribe(sub);
+  }
+
+  /** Re-subscribe active subs after the codec probe resolves so the
+   *  server can switch to the optimal encoder for this client's
+   *  capabilities.  Subs subscribed with codec_support=0 ("accept
+   *  anything") before the probe completed get updated. */
   private resubscribeWithCodecSupport(): void {
     if (this.transport.status !== "connected") return;
     if (!this.surfaceStreamingEnabled) return;
-    for (const [surfaceId, count] of this.surfaceSubRefCounts) {
-      if (count > 0) {
-        const surface = this.surfaceStore.getSurface(surfaceId);
-        if (surface) {
-          // Re-subscribe triggers the server to recreate the encoder
-          // with the now-known codec support bitmask.
-          this.transport.send(
-            buildSurfaceSubscribeMessage(
-              surfaceId,
-              0,
-              this.defaultSurfaceQuality,
-            ),
-          );
-        }
-      }
+    for (const sub of this.surfaceSubs.values()) {
+      sub.lastSentQuality = null;
+      this.maybeSendSurfaceSubscribe(sub);
     }
   }
 
   sendSurfaceUnsubscribe(surfaceId: number): void {
-    const prev = this.surfaceSubRefCounts.get(surfaceId) ?? 0;
-    const next = Math.max(0, prev - 1);
-    if (next === 0) {
-      this.surfaceSubRefCounts.delete(surfaceId);
-      // Defer the unsub so view transitions (destroy old → create new)
-      // can cancel it.  SolidJS does this synchronously; React batches
-      // useEffect cleanup and mount across separate macrotasks, so we
-      // need a short grace period rather than just setTimeout(0).
-      const existing = this._pendingUnsubs.get(surfaceId);
-      if (existing) clearTimeout(existing);
-      this._pendingUnsubs.set(
-        surfaceId,
-        setTimeout(() => {
-          this._pendingUnsubs.delete(surfaceId);
-          if (this.transport.status === "connected") {
-            this._logger.info(`surface unsub ${this.id}:${surfaceId}`);
-            this.transport.send(buildSurfaceUnsubscribeMessage(surfaceId));
-          }
-        }, 50),
-      );
-    } else {
-      this.surfaceSubRefCounts.set(surfaceId, next);
-    }
+    const sub = this.surfaceSubs.get(surfaceId);
+    if (!sub) return;
+    sub.refCount -= 1;
+    if (sub.refCount > 0) return;
+    // Defer the wire UNSUB so a remount within the grace window
+    // (typical when moving a surface between UI locations, e.g.
+    // BSP ↔ side-panel preview) finds the server-side encoder still
+    // alive and can resume without a full re-init + keyframe wait.
+    if (sub.pendingUnsub !== null) clearTimeout(sub.pendingUnsub);
+    sub.pendingUnsub = setTimeout(() => {
+      const cur = this.surfaceSubs.get(surfaceId);
+      if (!cur || cur.refCount > 0 || cur.pendingUnsub === null) return;
+      cur.pendingUnsub = null;
+      if (this.transport.status === "connected") {
+        this._logger.info(`surface unsub ${this.id}:${surfaceId}`);
+        this.transport.send(buildSurfaceUnsubscribeMessage(surfaceId));
+      }
+      this.surfaceSubs.delete(surfaceId);
+    }, BlitConnection.SUB_UNSUB_GRACE_MS);
   }
 
-  /**
-   * Re-send a surface subscribe with a quality override.
-   * Does not affect ref-counts -- only sends the wire message for already-
-   * subscribed surfaces.  The server treats a second SURFACE_SUBSCRIBE as
-   * a quality/codec update (same as AUDIO_SUBSCRIBE).
-   */
+  /** Set a per-surface quality override and re-send the subscribe.
+   *  The server treats a second SURFACE_SUBSCRIBE at the same sid
+   *  as a quality/codec update.  No-op when the sid is unknown. */
   sendSurfaceResubscribe(surfaceId: number, quality: number): void {
-    if (this.transport.status !== "connected") return;
-    if (!this.surfaceStreamingEnabled) return;
-    if ((this.surfaceSubRefCounts.get(surfaceId) ?? 0) <= 0) return;
-    this.transport.send(buildSurfaceSubscribeMessage(surfaceId, 0, quality));
+    const sub = this.surfaceSubs.get(surfaceId);
+    if (!sub) return;
+    sub.qualityOverride = quality;
+    sub.lastSentQuality = null;
+    this.maybeSendSurfaceSubscribe(sub);
   }
 
   /**
-   * Enable or disable surface video streaming.  When disabled, tracked
-   * ref-counts are preserved but no subscribe messages are sent.
-   * Re-enabling sends subscribe for every surface with refcount > 0.
+   * Enable or disable surface video streaming.  When disabled, per-sub
+   * state is preserved but no subscribe messages are sent.  Re-enabling
+   * sends subscribe for every active sub.
    */
   setSurfaceStreamingEnabled(enabled: boolean): void {
     if (this.surfaceStreamingEnabled === enabled) return;
     this.surfaceStreamingEnabled = enabled;
     if (this.transport.status !== "connected") return;
     if (enabled) {
-      for (const [surfaceId, count] of this.surfaceSubRefCounts) {
-        if (count > 0) {
-          this.transport.send(
-            buildSurfaceSubscribeMessage(
-              surfaceId,
-              0,
-              this.defaultSurfaceQuality,
-            ),
-          );
-        }
+      for (const sub of this.surfaceSubs.values()) {
+        sub.lastSentQuality = null;
+        this.maybeSendSurfaceSubscribe(sub);
       }
     } else {
-      for (const [surfaceId, count] of this.surfaceSubRefCounts) {
-        if (count > 0) {
-          this.transport.send(buildSurfaceUnsubscribeMessage(surfaceId));
-        }
+      for (const sub of this.surfaceSubs.values()) {
+        this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
+        sub.lastSentQuality = null;
       }
     }
   }
@@ -1023,9 +1090,7 @@ export class BlitConnection {
         // transport drops, so the UI clears instantly.
         this.surfaceStore.reset();
         this.audioPlayer.reset();
-        this.surfaceSubRefCounts.clear();
-        for (const t of this._pendingUnsubs.values()) clearTimeout(t);
-        this._pendingUnsubs.clear();
+        this.resetSurfaceSubsForReconnect();
         for (const session of this.sessions) {
           if (session.state !== "closed") {
             this.markSessionClosed(session.id, false);
@@ -1178,9 +1243,7 @@ export class BlitConnection {
         // through "disconnected".
         this.surfaceStore.reset();
         this.audioPlayer.reset();
-        this.surfaceSubRefCounts.clear();
-        for (const t of this._pendingUnsubs.values()) clearTimeout(t);
-        this._pendingUnsubs.clear();
+        this.resetSurfaceSubsForReconnect();
         for (const session of this.sessions) {
           if (session.state !== "closed") {
             this.markSessionClosed(session.id, false);
@@ -1243,6 +1306,7 @@ export class BlitConnection {
         return;
       }
       case S2C_SURFACE_FRAME: {
+        // Layout: [type][sid 2][timestamp 4][flags 1][w 2][h 2][data…]
         if (bytes.length < 12) return;
         const view = new DataView(data);
         const surfaceId = view.getUint16(1, true);
@@ -1314,8 +1378,10 @@ export class BlitConnection {
       }
       case S2C_SURFACE_ENCODER: {
         try {
+          // Layout: [type][sid 2][name + 0 + codec_str]
           if (bytes.length < 3) return;
-          const surfaceId = bytes[1] | (bytes[2] << 8);
+          const view = new DataView(data);
+          const surfaceId = view.getUint16(1, true);
           const encoderName = textDecoder.decode(bytes.subarray(3));
           this.surfaceStore.handleSurfaceEncoder(surfaceId, encoderName);
         } catch {}
@@ -1470,13 +1536,14 @@ export class BlitConnection {
       this.resolveAllPendingCloses();
       this.surfaceStore.handleDisconnect();
       this.audioPlayer.reset();
-      // All surface subscriptions are implicitly dropped when the transport
-      // dies.  Clear the ref-counts so that re-subscribes after reconnect
-      // are sent correctly (the check `if (prev === 0 ...)` would otherwise
-      // skip re-sending since the old count is still > 0).
-      this.surfaceSubRefCounts.clear();
-      for (const t of this._pendingUnsubs.values()) clearTimeout(t);
-      this._pendingUnsubs.clear();
+      // All server-side surface subscriptions are implicitly dropped
+      // when the transport dies, but the CLIENT-SIDE ref-counts (one
+      // per live mount) must be preserved: each mount is still there
+      // and will call `refreshSurfaceSubscribe` when the store's
+      // generation ticks forward, which is how the wire subscribe gets
+      // re-sent on reconnect.  Just reset `lastSentQuality` so the
+      // refresh actually fires.
+      this.resetSurfaceSubsForReconnect();
       // Dismiss all sessions so the UI doesn't show stale terminals from a
       // server that crashed without sending S2C_QUIT.  On reconnect the
       // server's S2C_HELLO + S2C_LIST sequence rebuilds the session list

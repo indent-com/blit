@@ -584,7 +584,12 @@ export class MuxTransport {
       setTimeout(() => {
         this.channelReconnectTimers.delete(ch.channelId);
         if (this.disposed || !this.channels.has(ch.channelId)) return;
-        if (ch._internalStatus === "closed") return;
+        if (
+          ch._internalStatus === "closed" ||
+          ch._internalStatus === "connected" ||
+          ch._internalStatus === "connecting"
+        )
+          return;
         if (this._status === "connected") {
           ch._setStatus("connecting");
           this._sendOpen(ch);
@@ -646,7 +651,7 @@ export class MuxTransport {
         break;
 
       case MUX_S2C_CLOSED:
-        if (ch) {
+        if (ch && ch._internalStatus !== "connecting") {
           ch._setStatus("disconnected");
           this.scheduleChannelReconnect(ch);
         }

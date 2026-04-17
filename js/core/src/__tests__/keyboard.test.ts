@@ -84,6 +84,12 @@ describe("keyToBytes", () => {
       expect(Array.from(keyToBytes(makeEvent("Tab"), false)!)).toEqual([0x09]);
     });
 
+    it("Shift+Tab sends CBT (ESC [ Z)", () => {
+      expect(
+        Array.from(keyToBytes(makeEvent("Tab", { shiftKey: true }), false)!),
+      ).toEqual([0x1b, 0x5b, 0x5a]);
+    });
+
     it("Escape sends ESC", () => {
       expect(Array.from(keyToBytes(makeEvent("Escape"), false)!)).toEqual([
         0x1b,

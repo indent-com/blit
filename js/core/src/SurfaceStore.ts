@@ -33,6 +33,12 @@ interface DecoderEntry {
   decoder: VideoDecoder;
   codec: SurfaceCodec;
   pendingKeyframe: boolean;
+  /** True once a keyframe request has been sent for the current
+   *  `pendingKeyframe` episode.  Reset when a keyframe successfully
+   *  decodes.  Prevents every errored delta frame from firing a fresh
+   *  keyframe request (which over the wire is a full SURFACE_SUBSCRIBE
+   *  — each one resets server-side pacing/burst state). */
+  keyframeRequested: boolean;
   /** Last H.264 codec string (e.g. "avc1.42001e"), used to avoid
    *  reconfiguring on every keyframe.  We compare the codec string
    *  (profile/compat/level) rather than raw SPS bytes because some
@@ -386,12 +392,10 @@ export class SurfaceStore {
     return this.surfaces.get(surfaceId);
   }
 
-  /**
-   * Return the shared backing canvas for *surfaceId*.  The canvas always
-   * contains the most-recently decoded frame and can be used as a source for
-   * `drawImage` on any number of visible canvases.  The canvas is never
-   * attached to the DOM.
-   */
+  /** Return the shared backing canvas for a surface — the server sends
+   *  one stream per `(cid, sid)`, so a single decoder and canvas per
+   *  surface suffice.  The canvas is never attached to the DOM;
+   *  callers blit from it into their visible canvases. */
   getCanvas(surfaceId: number): HTMLCanvasElement | null {
     return this.canvases.get(surfaceId)?.canvas ?? null;
   }
@@ -417,15 +421,13 @@ export class SurfaceStore {
       width,
       height,
     });
-    this.ensureCanvas(surfaceId, width, height);
-    // Don't init decoder yet — we'll init on the first frame when we know
-    // the codec from the flags byte.
+    // Don't create a canvas yet — canvases are per-subscription now,
+    // keyed by sub_id, and we don't have one until a view subscribes.
     this.emitChange();
   }
 
   handleSurfaceDestroyed(surfaceId: number): void {
     this.surfaces.delete(surfaceId);
-    this.canvases.delete(surfaceId);
     this.encoderNames.delete(surfaceId);
     this.codecStrings.delete(surfaceId);
     this._surfaceFrameSamples.delete(surfaceId);
@@ -433,10 +435,9 @@ export class SurfaceStore {
     this._surfaceDrops.delete(surfaceId);
     this._surfaceErrors.delete(surfaceId);
     const entry = this.decoders.get(surfaceId);
-    if (entry) {
-      safeClose(entry.decoder);
-      this.decoders.delete(surfaceId);
-    }
+    if (entry) safeClose(entry.decoder);
+    this.decoders.delete(surfaceId);
+    this.canvases.delete(surfaceId);
     this.emitChange();
   }
 
@@ -463,7 +464,6 @@ export class SurfaceStore {
 
     const codec = codecFromFlags(flags);
 
-    // Ensure we have a decoder for this surface with the right codec.
     let entry = this.decoders.get(surfaceId);
     if (!entry || entry.codec !== codec) {
       if (entry) {
@@ -490,15 +490,22 @@ export class SurfaceStore {
       return;
     }
     entry.pendingKeyframe = false;
+    // A keyframe landed (or at least was accepted for decode) — future
+    // decode errors will legitimately need a fresh keyframe request, so
+    // drop the "already asked" latch.
+    entry.keyframeRequested = false;
 
     const surface = this.surfaces.get(surfaceId);
     if (surface && (surface.width !== width || surface.height !== height)) {
       const wasEmpty = surface.width === 0 || surface.height === 0;
-      this.surfaces.set(surfaceId, { ...surface, width, height });
+      // Mutate in place so downstream <For> children keep their object
+      // identity (no remount → no decoder race).  Subscribers read the
+      // fresh fields on the next emitChange-driven recomputation.
+      surface.width = width;
+      surface.height = height;
       // Emit a change when the surface gets its first real dimensions
       // (the compositor sends SurfaceCreated with 0×0 before the first
-      // buffer commit).  Subsequent per-frame dimension tweaks are silent
-      // to avoid Solid re-render → unmount/remount → sub/unsub churn.
+      // buffer commit).  Subsequent per-frame dimension tweaks are silent.
       if (wasEmpty && width > 0 && height > 0) {
         this.emitChange();
       }
@@ -604,9 +611,13 @@ export class SurfaceStore {
       // Error — ACK immediately so the server doesn't permanently stall.
       this.sendAck(surfaceId);
       // Ask the server for a keyframe so the decoder can recover.
-      // Without this, the client drops every P-frame (pendingKeyframe
-      // gate) and the server never knows to send a keyframe.
-      this._keyframeSender?.(surfaceId);
+      // Fire at most once per pendingKeyframe episode — each request is
+      // a SURFACE_SUBSCRIBE on the wire and resets server-side pacing.
+      // The flag is cleared when a keyframe decodes successfully.
+      if (entry && !entry.keyframeRequested) {
+        entry.keyframeRequested = true;
+        this._keyframeSender?.(surfaceId);
+      }
     }
   }
 
@@ -672,8 +683,8 @@ export class SurfaceStore {
         surface.height === 0 ||
         Math.abs(surface.width - width) > 1 ||
         Math.abs(surface.height - height) > 1;
-      this.surfaces.set(surfaceId, { ...surface, width, height });
-      this.ensureCanvas(surfaceId, width, height);
+      surface.width = width;
+      surface.height = height;
       if (significant) this.emitChange();
     }
   }
@@ -750,9 +761,9 @@ export class SurfaceStore {
    */
   private ensureCanvas(surfaceId: number, width: number, height: number): void {
     if (typeof document === "undefined") return;
-    if (this.canvases.has(surfaceId)) return;
     const w = width || 640;
     const h = height || 480;
+    if (this.canvases.has(surfaceId)) return;
     try {
       const canvas = document.createElement("canvas");
       canvas.width = w;
@@ -770,8 +781,8 @@ export class SurfaceStore {
   private initDecoder(
     surfaceId: number,
     codec: SurfaceCodec,
-    width?: number,
-    height?: number,
+    width: number,
+    height: number,
   ): void {
     if (!this.canDecodeVideo) {
       if (!this.webCodecsUnavailableWarned) {
@@ -801,7 +812,6 @@ export class SurfaceStore {
           outputs.splice(0, outputs.length - SurfaceStore.OUTPUT_SAMPLE_MAX);
 
         try {
-          // Draw to the shared backing canvas.
           const ce = this.canvases.get(surfaceId);
           if (ce) {
             if (
@@ -817,7 +827,6 @@ export class SurfaceStore {
           frame.close();
         }
 
-        // Notify frame listeners so they blit from getCanvas().
         for (const listener of this.frameListeners) {
           try {
             listener(surfaceId);
@@ -830,6 +839,7 @@ export class SurfaceStore {
         console.warn(
           "[blit] surface decoder error:",
           surfaceId,
+          `${width}x${height}`,
           e.name,
           e.message,
           e.code,
@@ -839,8 +849,6 @@ export class SurfaceStore {
         const entry = this.decoders.get(surfaceId);
         if (entry) {
           safeClose(entry.decoder);
-          // Remove the broken decoder so the next frame triggers
-          // re-initialization via initDecoder().
           this.decoders.delete(surfaceId);
         }
         // Ask the server for a keyframe so the new decoder gets a
@@ -879,6 +887,7 @@ export class SurfaceStore {
       decoder,
       codec,
       pendingKeyframe: true,
+      keyframeRequested: false,
       lastCodecString: null,
       lastDescription: null,
     });

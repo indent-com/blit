@@ -140,13 +140,7 @@ pub(crate) fn pty_reader(handle: SendHandle, tx: mpsc::Sender<PtyInput>, notify:
                 let before = remaining[..boundary].to_vec();
                 let after = remaining[boundary..].to_vec();
                 crate::update_sync_scan_tail(&mut sync_scan_tail, &before);
-                if tx
-                    .blocking_send(PtyInput::SyncBoundary {
-                        before,
-                        after: after.clone(),
-                    })
-                    .is_err()
-                {
+                if tx.blocking_send(PtyInput::SyncBoundary { before }).is_err() {
                     return;
                 }
                 notify.notify_one();

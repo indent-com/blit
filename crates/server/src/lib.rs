@@ -207,19 +207,18 @@ const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 /// links instead of starving the pipeline with conservative initial rates.
 const SURFACE_BURST_FRAMES: u8 = 4;
 
-/// Minimum surface frames in flight per client.  Even on a zero-RTT
-/// local link we need a small buffer (decoding + wire + TCP send).
-const SURFACE_INFLIGHT_FLOOR: usize = 3;
-
 /// A chunk of data from the PTY reader, sent through a lock-free channel
 /// so the reader never contends with the delivery tick for the Session mutex.
 enum PtyInput {
     /// Raw bytes from the PTY, with the reader's sync-scan tail for boundary
     /// detection. The tick task calls `process()` + `respond_to_queries()`.
     Data(Vec<u8>),
-    /// Data up to a sync-output-close boundary. `before` should be processed
-    /// and then a snapshot taken. `after` is remainder for the next chunk.
-    SyncBoundary { before: Vec<u8>, after: Vec<u8> },
+    /// Data up to and including a sync-output-close (`\x1b[?2026l`).
+    /// Process `before` and then take a snapshot.  Any bytes following the
+    /// boundary are sent in a subsequent `Data` or `SyncBoundary` event —
+    /// the reader's loop re-scans them, so this event must not try to
+    /// process them itself.
+    SyncBoundary { before: Vec<u8> },
     /// The PTY fd hit EOF or an error — the child likely exited.
     Eof,
 }
@@ -332,11 +331,16 @@ struct LastPixels {
     /// Monotonically increasing counter bumped on every SurfaceCommit.
     /// Used to skip re-encoding when the pixel data hasn't changed.
     generation: u64,
+    /// CLOCK_MONOTONIC milliseconds captured at compositor commit time.
+    /// Used as the surface frame timestamp so the client sees the source's
+    /// presentation timing rather than the (jittery) encode-delivery clock.
+    timestamp_ms: u32,
 }
 
 struct SharedCompositor {
     handle: CompositorHandle,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
+    /// Latest pixel snapshot per surface.
     last_pixels: HashMap<u16, LastPixels>,
     /// Per-surface timestamp of the last RequestFrame sent.  Used to
     /// throttle requests to at most one per 1 ms so frame callbacks
@@ -447,6 +451,53 @@ async fn request_surface_capture_with_timeout(
         .flatten()
 }
 
+/// Per-surface bookkeeping for an active subscription.  Every field
+/// defaults to "no-op" so a fresh `entry(sid).or_default()` is safe
+/// even before any other state has been recorded.
+#[derive(Default)]
+struct SurfaceSubState {
+    /// Active encoder for this surface.  `None` between encode jobs
+    /// while the encoder is temporarily owned by the spawn_blocking
+    /// task (see `encode_in_flight`) or before the first encode.
+    encoder: Option<SurfaceEncoder>,
+    /// Next tick this surface may send a frame (pacing deadline).
+    next_send_at: Option<Instant>,
+    /// Frames remaining in the post-subscribe burst window that
+    /// bypass time-based pacing so bandwidth estimates ramp up fast
+    /// on high-latency links.
+    burst_remaining: u8,
+    /// True while an encoder-creation spawn_blocking task is running
+    /// for this surface.  Prevents dispatching a second creation in
+    /// parallel and (via the `needs_new_encoder` path) skips encode
+    /// dispatch until the creation task lands its result.
+    creation_in_flight: bool,
+    /// True while this surface's encoder is in an encode spawn_blocking
+    /// task.  Prevents dispatching a parallel encode for the same
+    /// surface (the encoder has been moved into the task).
+    encode_in_flight: bool,
+    /// Set if the in-flight encoder was invalidated by a codec /
+    /// quality change (resubscribe) while encoding — the completion
+    /// handler must drop the stale encoder instead of reinserting it.
+    encoder_invalidated: bool,
+    /// Pixel generation that was last encoded; used to skip re-
+    /// encoding identical pixel data on subsequent ticks.
+    last_encoded_gen: Option<u64>,
+    /// Consecutive `nal_data=None` encodes.  After too many, the
+    /// encoder is dropped so a fresh one is created on the next tick
+    /// (bounds runaway encoder-recreation loops).
+    nal_none_streak: u32,
+    /// When the streak last latched (hit the drop threshold).  Auto-
+    /// clears after a backoff so a freshly-created encoder can retry
+    /// without needing a user-driven resize/resubscribe.
+    nal_none_latched_at: Option<Instant>,
+    /// Per-surface codec support override from C2S_SURFACE_SUBSCRIBE
+    /// (bitmask of CODEC_SUPPORT_*).  0 = defer to client-wide
+    /// `surface_codec_support`.
+    codec_override: u8,
+    /// Per-surface quality override.  `None` = use server default.
+    quality_override: Option<SurfaceQuality>,
+}
+
 struct ClientState {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     outbox_queued_frames: Arc<AtomicUsize>,
@@ -457,6 +508,7 @@ struct ClientState {
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     lead: Option<u16>,
     subscriptions: HashSet<u16>,
+    /// Active surface subscriptions for this client.
     surface_subscriptions: HashSet<u16>,
     /// Whether this client is subscribed to audio frames.
     audio_subscribed: bool,
@@ -533,36 +585,20 @@ struct ClientState {
     encode_loop_iters: u32,
     goodput_window_bytes: usize,
     goodput_window_start: Instant,
-    surface_next_send_at: Instant,
+    /// Per-surface encode/pacing/override state.  Holds every piece of
+    /// bookkeeping the encode loop maintains between frames for a
+    /// subscribed surface.  Entries are created lazily via
+    /// `entry(sid).or_default()` on first touch and dropped wholesale
+    /// on UNSUBSCRIBE / SurfaceDestroyed.
+    surface_subs: HashMap<u16, SurfaceSubState>,
     surface_needs_keyframe: bool,
-    /// Number of surface frames delivered since the last keyframe request
-    /// (subscribe, resubscribe, or error recovery).  Used for burst-start:
-    /// the first few frames bypass time-based pacing so they flow at wire
-    /// speed, letting bandwidth estimates ramp up quickly on high-latency
-    /// links instead of starving the pipeline with conservative initial rates.
-    surface_burst_remaining: u8,
-    /// Per-client video encoders, one per subscribed surface.
-    surface_encoders: HashMap<u16, SurfaceEncoder>,
     /// Surfaces that use Vulkan Video encoding in the compositor rather than
     /// a local SurfaceEncoder.  Maps surface_id → (encoder_name, codec_flag).
-    /// These surfaces rely on the compositor producing `PixelData::Encoded`.
     vulkan_video_surfaces: HashMap<u16, (&'static str, u8)>,
     /// Surface frames in flight — separate from terminal inflight so surface
     /// ACKs feed shared RTT / goodput without corrupting terminal frame-size
     /// averages or probe_frames.
     surface_inflight_frames: VecDeque<InFlightFrame>,
-    /// Surfaces whose encoder is currently in a spawn_blocking encode task.
-    /// Prevents spawning parallel encode jobs for the same (client, surface)
-    /// pair — which would create throwaway encoders and risk concurrent
-    /// access to the underlying C codec library.
-    surface_encodes_in_flight: HashSet<u16>,
-    /// Surfaces whose in-flight encoder was invalidated by a quality or codec
-    /// change (resubscribe) while the encode was running.  The completion
-    /// handler must not reinsert the stale encoder for these surfaces.
-    surface_encoder_invalidated: HashSet<u16>,
-    /// Per-surface pixel generation that was last encoded for this client.
-    /// Used to skip re-encoding when pixel data hasn't changed.
-    surface_last_encoded_gen: HashMap<u16, u64>,
     /// Per-client desired surface sizes (surface_id → (width, height, scale_120, codec_support)).
     /// Mirrors `view_sizes` for PTYs: the server mediates across all clients
     /// and picks min(width), min(height), max(scale).
@@ -571,12 +607,6 @@ struct ClientState {
     /// Intersection of codec support across all surfaces for this client.
     /// Used to pick an encoder the client can decode.  0 = accept anything.
     surface_codec_support: u8,
-    /// Per-surface codec support override from C2S_SURFACE_SUBSCRIBE.
-    /// When non-zero, overrides `surface_codec_support` for encoder creation.
-    surface_codec_overrides: HashMap<u16, u8>,
-    /// Per-surface quality override from C2S_SURFACE_SUBSCRIBE.
-    /// `None` means use the server-global default.
-    surface_quality_overrides: HashMap<u16, SurfaceQuality>,
     /// Evdev keycodes currently held down by this client on compositor
     /// surfaces.  On disconnect we send synthetic key-up events for each
     /// so modifiers don't stay stuck and keys don't auto-repeat forever.
@@ -788,28 +818,12 @@ fn preview_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / preview_fps(client) as f64)
 }
 
-/// Surface frame rate: simply the client's display refresh rate.
-///
-/// Flow control is provided by three other layers:
-/// - `surface_inflight_limit` scales with RTT×display_fps and bounds
-///   queuing on high-latency paths.
-/// - `outbox_backpressured` triggers on either queued bytes or queued
-///   messages, catching links that can't drain the kernel TCP buffer.
-/// - `surface_encodes_in_flight` limits to 1 encode per (client, surface)
-///   so a slow encoder can't queue work ahead of itself.
-///
-/// An earlier version of this function capped surface fps at
-/// `goodput_bps / avg_surface_frame_bytes`, but that cap misbehaved
-/// during bootstrap on high-latency links: the conservative initial
-/// goodput seed (262 KB/s) divided by the first keyframe-based
-/// frame-size estimate (25+ KB) yields ~10 fps, well below typical
-/// video sources (24 fps).  Because `goodput_bps` only updates from
-/// ACKs that have already traversed the RTT, it takes several
-/// hundred ms to converge — long enough that mpv @ 24 fps visibly
-/// stalls on a 200 ms link.  The inflight window + outbox backpressure
-/// already handle genuinely slow links without this bandwidth cap.
+/// Surface frame rate: delegates to `browser_pacing_fps` so video backs off
+/// when the client reports it can't keep up (backlog / ack-ahead growth).
+/// Continuing at display_fps when the browser is behind just piles up video
+/// it will drop to catch up, which the user perceives as droppy playback.
 fn surface_pacing_fps(client: &ClientState) -> f32 {
-    client.display_fps.max(1.0)
+    browser_pacing_fps(client)
 }
 
 fn surface_send_interval(client: &ClientState) -> Duration {
@@ -861,10 +875,19 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     let skip_not_subbed = c.skip_not_subbed_count;
     let skip_mismatch = c.skip_last_pixels_mismatch_count;
     let loop_iters = c.encode_loop_iters;
-    let own_subs = c.surface_subscriptions.len();
+    let own_subs: usize = c.surface_subscriptions.len();
     let vk_surfs = c.vulkan_video_surfaces.len();
-    let in_flight_set_len = c.surface_encodes_in_flight.len();
-    let surface_burst = c.surface_burst_remaining;
+    let in_flight_set_len = c
+        .surface_subs
+        .values()
+        .filter(|s| s.encode_in_flight)
+        .count();
+    let surface_burst: u8 = c
+        .surface_subs
+        .values()
+        .map(|s| s.burst_remaining)
+        .max()
+        .unwrap_or(0);
 
     c.frames_sent = 0;
     c.acks_recv = 0;
@@ -1100,31 +1123,11 @@ fn window_open(client: &ClientState) -> bool {
         && client.inflight_bytes < target_byte_window(client)
 }
 
-/// Surface send window: outbox backpressure + RTT-scaled inflight limit.
-///
-/// Surface pacing is decoupled from terminal congestion control.  Surfaces
-/// have their own time-based pacing (`surface_send_interval`) derived from
-/// `display_fps` and `goodput_bps / avg_surface_frame_bytes`.  The shared
-/// inflight window (`target_frame_window`, `target_byte_window`) is sized
-/// for tiny terminal diffs and must not gate large video frames — doing so
-/// causes the two streams to drag each other down, especially on SSH links
-/// where the conservative bandwidth estimates are already fragile.
-///
-/// The inflight limit bounds queuing when the bandwidth estimator overshoots
-/// on jittery links (e.g. wifi).  It scales with RTT and display rate so
-/// high-latency links can still sustain high fps, floored at
-/// `SURFACE_INFLIGHT_FLOOR` for local/LAN paths.
+/// Surface send gate: outbox backpressure only.  Rate is governed by
+/// `surface_send_interval`; per-surface encode concurrency by the
+/// `encode_in_flight` flag on `SurfaceSubState`.
 fn surface_window_open(client: &ClientState) -> bool {
     !outbox_backpressured(client)
-        && (client.surface_burst_remaining > 0
-            || client.surface_inflight_frames.len() < surface_inflight_limit(client))
-}
-
-fn surface_inflight_limit(client: &ClientState) -> usize {
-    let rtt_s = client.rtt_ms.max(client.min_rtt_ms) / 1_000.0;
-    let frames_per_rtt = (client.display_fps * rtt_s).ceil() as usize;
-    // +1 for the frame currently being decoded/applied on the client side.
-    (frames_per_rtt + 1).max(SURFACE_INFLIGHT_FLOOR)
 }
 
 fn lead_window_open(client: &ClientState, reserve_preview_slot: bool) -> bool {
@@ -1660,6 +1663,9 @@ impl Session {
 
     /// Returns (width, height, scale_120) mediated across all clients.
     /// Resolution: min across clients.  DPI: max across clients.
+    /// Clients with a fixed per-surface target size (scaled subscription)
+    /// are excluded — they don't pull the compositor surface smaller for
+    /// anyone else; the server scales the native frame for them.
     fn mediated_size_for_surface(
         &self,
         surface_id: u16,
@@ -2230,8 +2236,25 @@ pub async fn run(config: Config) {
 /// Minimum interval between blanket RequestFrame rounds.  Keeps video
 /// players (mpv) and browsers ticking even when no client is consuming
 /// frames.  Also used as the maximum tick-loop sleep so the loop never
-/// blocks longer than this.  33 ms ≈ 30 Hz.
-const BLANKET_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// blocks longer than this.
+///
+/// When any client has an active surface subscription, use 8 ms (~120 Hz)
+/// so video players get consistent frame callbacks matching the display
+/// rate.  Without active surfaces, 33 ms (30 Hz) is sufficient.
+const BLANKET_FRAME_INTERVAL_IDLE: Duration = Duration::from_millis(33);
+const BLANKET_FRAME_INTERVAL_SURFACE: Duration = Duration::from_millis(8);
+
+fn blanket_frame_interval(sess: &Session) -> Duration {
+    let has_surface_subs = sess
+        .clients
+        .values()
+        .any(|c| !c.surface_subscriptions.is_empty());
+    if has_surface_subs {
+        BLANKET_FRAME_INTERVAL_SURFACE
+    } else {
+        BLANKET_FRAME_INTERVAL_IDLE
+    }
+}
 
 async fn tick(state: &AppState) -> TickOutcome {
     let mut sess = state.session.lock().await;
@@ -2257,6 +2280,1371 @@ async fn tick(state: &AppState) -> TickOutcome {
         let next_ping = sess.last_ping + ping_interval;
         next_deadline = Some(next_deadline.map_or(next_ping, |d: Instant| d.min(next_ping)));
     }
+
+    // Surface IDs whose per-client encoders need to be invalidated.
+    let mut invalidate_client_encoders: Vec<u16> = Vec::new();
+
+    let mut surface_commit_count = 0u32;
+    if let Some(cs) = sess.compositor.as_mut() {
+        let mut events = Vec::new();
+        while let Ok(event) = cs.handle.event_rx.try_recv() {
+            events.push(event);
+        }
+        let mut broadcast: Vec<Vec<u8>> = Vec::new();
+        for event in events {
+            match event {
+                CompositorEvent::SurfaceCreated {
+                    surface_id,
+                    title,
+                    app_id,
+                    parent_id,
+                    width,
+                    height,
+                } => {
+                    broadcast.push(msg_surface_created(
+                        surface_id, parent_id, width, height, &title, &app_id,
+                    ));
+                    cs.surfaces.insert(
+                        surface_id,
+                        CachedSurfaceInfo {
+                            surface_id,
+                            parent_id,
+                            width,
+                            height,
+                            title,
+                            app_id,
+                        },
+                    );
+                    cs.last_pixels.remove(&surface_id);
+                    invalidate_client_encoders.push(surface_id);
+                }
+                CompositorEvent::SurfaceDestroyed { surface_id } => {
+                    cs.surfaces.remove(&surface_id);
+                    cs.last_pixels.remove(&surface_id);
+                    cs.last_configured_size.remove(&surface_id);
+                    invalidate_client_encoders.push(surface_id);
+                    broadcast.push(msg_surface_destroyed(surface_id));
+                }
+                CompositorEvent::SurfaceCommit {
+                    surface_id,
+                    width,
+                    height,
+                    pixels,
+                    timestamp_ms,
+                } => {
+                    surface_commit_count += 1;
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.width = width as u16;
+                        info.height = height as u16;
+                    }
+                    cs.pixel_generation += 1;
+                    cs.last_pixels.insert(
+                        surface_id,
+                        LastPixels {
+                            width,
+                            height,
+                            pixels,
+                            generation: cs.pixel_generation,
+                            timestamp_ms,
+                        },
+                    );
+                }
+                CompositorEvent::SurfaceTitle { surface_id, title } => {
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.title = title.clone();
+                    }
+                    broadcast.push(msg_surface_title(surface_id, &title));
+                }
+                CompositorEvent::SurfaceAppId { surface_id, app_id } => {
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.app_id = app_id.clone();
+                    }
+                    broadcast.push(msg_surface_app_id(surface_id, &app_id));
+                }
+                CompositorEvent::SurfaceResized {
+                    surface_id,
+                    width,
+                    height,
+                } => {
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.width = width;
+                        info.height = height;
+                    }
+                    cs.last_pixels.remove(&surface_id);
+                    // Don't eagerly invalidate client encoders here.  The
+                    // encode path already checks for dimension mismatches
+                    // (source_dimensions != pixel size) and recreates the
+                    // encoder on demand.  Eagerly destroying encoders on
+                    // every intermediate size during a drag-resize causes
+                    // expensive encoder teardown+creation cycles for sizes
+                    // that may never actually be encoded (because a newer
+                    // SurfaceCommit arrives before the next encode tick).
+                    broadcast.push(msg_surface_resized(surface_id, width, height));
+                }
+                CompositorEvent::ClipboardContent {
+                    mime_type, data, ..
+                } => {
+                    broadcast.push(msg_s2c_clipboard_content(&mime_type, &data));
+                }
+                CompositorEvent::SurfaceCursor { surface_id, cursor } => {
+                    // Format: [0x29][surface_id:2][type:1][payload...]
+                    // type 0 = named: [name_len:1][name:N]
+                    // type 1 = hidden (no payload)
+                    // type 2 = custom: [hotx:2][hoty:2][w:2][h:2][png:N]
+                    let mut msg = Vec::new();
+                    msg.push(blit_remote::S2C_SURFACE_CURSOR);
+                    msg.extend_from_slice(&surface_id.to_le_bytes());
+                    match &cursor {
+                        blit_compositor::CursorImage::Named(name) => {
+                            msg.push(0); // type = named
+                            msg.push(name.len() as u8);
+                            msg.extend_from_slice(name.as_bytes());
+                        }
+                        blit_compositor::CursorImage::Hidden => {
+                            msg.push(1); // type = hidden
+                        }
+                        blit_compositor::CursorImage::Custom {
+                            hotspot_x,
+                            hotspot_y,
+                            width,
+                            height,
+                            rgba,
+                        } => {
+                            // Encode as PNG to keep message small.
+                            let mut png_buf = Vec::new();
+                            {
+                                let mut encoder =
+                                    png::Encoder::new(&mut png_buf, *width as u32, *height as u32);
+                                encoder.set_color(png::ColorType::Rgba);
+                                encoder.set_depth(png::BitDepth::Eight);
+                                if let Ok(mut writer) = encoder.write_header() {
+                                    let _ = writer.write_image_data(rgba);
+                                }
+                            }
+                            msg.push(2); // type = custom
+                            msg.extend_from_slice(&hotspot_x.to_le_bytes());
+                            msg.extend_from_slice(&hotspot_y.to_le_bytes());
+                            msg.extend_from_slice(&width.to_le_bytes());
+                            msg.extend_from_slice(&height.to_le_bytes());
+                            msg.extend_from_slice(&png_buf);
+                        }
+                    }
+                    broadcast.push(msg);
+                }
+            }
+        }
+        for msg in &broadcast {
+            sess.send_to_all(msg);
+        }
+    }
+    sess.surface_commits += surface_commit_count;
+
+    // Apply deferred per-client encoder invalidation (couldn't mutate
+    // sess.clients while sess.compositor was borrowed above).  Any
+    // surface event (resize, destroy, reconfigure) invalidates every
+    // encoder bound to that sid's pixel stream.
+    for sid in invalidate_client_encoders {
+        for c in sess.clients.values_mut() {
+            c.surface_subs.remove(&sid);
+            c.vulkan_video_surfaces.remove(&sid);
+        }
+    }
+
+    // Per-client surface encode + deliver.
+    // Each client has its own encoder per surface.  We encode from
+    // shared last_pixels into each client's encoder and deliver.
+    //
+    // Snapshot pixel metadata from the compositor first to avoid
+    // holding an immutable borrow on sess.compositor while mutating
+    // sess.clients.
+    // Snapshot every surface entry so each client's per-surface encoder
+    // can draw from the latest pixels without holding the compositor
+    // borrow through the (lengthy) encoder-dispatch loop below.
+    let pixel_snapshot: Vec<(u16, u32, u32, u64, u32)> = sess
+        .compositor
+        .as_ref()
+        .map(|cs| {
+            cs.last_pixels
+                .iter()
+                .map(|(&sid, lp)| (sid, lp.width, lp.height, lp.generation, lp.timestamp_ms))
+                .collect()
+        })
+        .unwrap_or_default();
+    if pixel_snapshot.is_empty() {
+        sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
+    } else {
+        sess.pixel_snapshot_len = pixel_snapshot.len();
+    }
+
+    // ---- Surface encode (off main thread) + deliver ----
+    //
+    // Collect encode jobs, drop the session lock, run encodes in
+    // spawn_blocking, re-acquire the lock, and deliver.
+
+    struct EncodeJob {
+        cid: u64,
+        sid: u16,
+        /// Dimensions the encoder operates at — always the compositor's
+        /// native pixel size.
+        px_w: u32,
+        px_h: u32,
+        /// Pixel data to encode.
+        pixels: blit_compositor::PixelData,
+        needs_keyframe: bool,
+        encoder: SurfaceEncoder,
+        generation: u64,
+        /// CLOCK_MONOTONIC ms captured at compositor commit time.
+        timestamp_ms: u32,
+    }
+    struct EncoderCreateParams {
+        preferences: Vec<SurfaceEncoderPreference>,
+        vaapi_device: String,
+        quality: SurfaceQuality,
+        verbose: bool,
+        codec_support: u8,
+        chroma: ChromaSubsampling,
+    }
+    /// A creation task runs `SurfaceEncoder::new` + GBM-buffer
+    /// allocation on a blocking thread, then hands back the encoder
+    /// and its external buffers to the main loop to register with the
+    /// compositor.  No encoding happens here — the first encode runs
+    /// on a subsequent tick after the compositor has committed into
+    /// the new buffers.
+    struct CreateJob {
+        cid: u64,
+        sid: u16,
+        px_w: u32,
+        px_h: u32,
+        params: EncoderCreateParams,
+    }
+    struct CreateResult {
+        cid: u64,
+        sid: u16,
+        /// None when `SurfaceEncoder::new` failed; the completion
+        /// handler logs and latches a backoff so the tick loop doesn't
+        /// spin on retries.
+        encoder: Option<SurfaceEncoder>,
+        fresh: Option<FreshEncoder>,
+    }
+    /// Metadata shipped with an encode result when the encoder was
+    /// created this tick (deferred to spawn_blocking).  `Some` = the
+    /// main loop should send S2C_SURFACE_ENCODER, register external
+    /// GBM buffers with the compositor, and accept the encoder back.
+    struct FreshEncoder {
+        name: &'static str,
+        codec_string: String,
+        #[cfg(target_os = "linux")]
+        external_bufs: Vec<blit_compositor::ExternalOutputBuffer>,
+    }
+    struct EncodeResult {
+        cid: u64,
+        sid: u16,
+        /// Encoded frame dimensions (what goes on the wire).
+        px_w: u32,
+        px_h: u32,
+        generation: u64,
+        encoder: SurfaceEncoder,
+        nal_data: Option<(Vec<u8>, bool)>, // (data, is_keyframe)
+        codec_flag: u8,
+        /// CLOCK_MONOTONIC ms from compositor commit time.
+        timestamp_ms: u32,
+    }
+
+    let mut encode_jobs: Vec<EncodeJob> = Vec::new();
+    let mut create_jobs: Vec<CreateJob> = Vec::new();
+    // Surfaces that had encode jobs dispatched this tick.  Used below to
+    // eagerly pre-request the next frame so the compositor renders in
+    // parallel with the in-flight encode (pipeline overlap).
+    let mut encode_dispatched_surfaces: HashSet<u16> = HashSet::new();
+
+    // Collect (cid, subs, needs_kf) for clients that are due, then build
+    // encode jobs in a second pass to avoid overlapping borrows.  `subs`
+    // is the set of surface ids this client subscribes to.
+    struct ClientWork {
+        cid: u64,
+        subs: HashSet<u16>,
+        needs_keyframe: bool,
+    }
+    let mut client_work: Vec<ClientWork> = Vec::new();
+
+    if !pixel_snapshot.is_empty() {
+        for (&cid, client) in sess.clients.iter_mut() {
+            if !surface_window_open(client) {
+                // Log persistent blockage so hangs are visible.
+                let now_inst = Instant::now();
+                if now_inst
+                    .duration_since(client.last_window_blocked_log)
+                    .as_secs_f32()
+                    > 5.0
+                {
+                    client.last_window_blocked_log = now_inst;
+                    let max_burst: u8 = client
+                        .surface_subs
+                        .values()
+                        .map(|s| s.burst_remaining)
+                        .max()
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[surface-gate] cid={cid} surface_window_open=false outbox={}f/{}B (limits {}f/{}B) burst={max_burst}",
+                        outbox_queued_frames(client),
+                        outbox_queued_bytes(client),
+                        OUTBOX_SOFT_QUEUE_LIMIT_FRAMES,
+                        OUTBOX_SOFT_QUEUE_LIMIT_BYTES,
+                    );
+                }
+                continue;
+            }
+            // Per-surface pacing is checked in the inner loop below so
+            // that each surface can run at full frame rate independently.
+            if client.surface_subscriptions.is_empty() {
+                client.skip_no_subs_count = client.skip_no_subs_count.saturating_add(1);
+                continue;
+            }
+            let subs: HashSet<u16> = client.surface_subscriptions.iter().copied().collect();
+            client_work.push(ClientWork {
+                cid,
+                subs,
+                needs_keyframe: client.surface_needs_keyframe,
+            });
+            // Don't advance the deadline here — wait until we know an
+            // encode job was actually collected (see below).  Advancing
+            // eagerly wastes time slots when the encode is skipped due
+            // to in-flight limits or unchanged pixel data.
+        }
+
+        // Track which (client, surface) pairs actually had encode jobs
+        // collected so we can advance per-surface deadlines afterwards.
+        let mut encoded_client_surfaces: HashSet<(u64, u16)> = HashSet::new();
+
+        // Pre-extract compositor Vulkan Video capabilities so we don't
+        // need to borrow sess.compositor inside the client-mutation loop.
+        let vk_encode_available = sess
+            .compositor
+            .as_ref()
+            .is_some_and(|cs| cs.handle.vulkan_video_encode);
+        let vk_encode_av1_available = sess
+            .compositor
+            .as_ref()
+            .is_some_and(|cs| cs.handle.vulkan_video_encode_av1);
+
+        // Vulkan Video encoder setup commands to send after the client loop.
+        struct VulkanEncoderSetup {
+            surface_id: u32,
+            codec: u8,
+            qp: u8,
+            width: u32,
+            height: u32,
+        }
+        let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
+        let mut pending_vulkan_keyframe_requests: Vec<u32> = Vec::new();
+
+        for work in &client_work {
+            for &sid in &work.subs {
+                let Some(&(_, px_w, px_h, px_gen, px_timestamp_ms)) =
+                    pixel_snapshot.iter().find(|&&(s, _, _, _, _)| s == sid)
+                else {
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.skip_last_pixels_mismatch_count =
+                        client.skip_last_pixels_mismatch_count.saturating_add(1);
+                    continue;
+                };
+                {
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.encode_loop_iters = client.encode_loop_iters.saturating_add(1);
+                }
+                let client = sess.clients.get_mut(&work.cid).unwrap();
+
+                // Per-surface pacing gate: during burst-start, skip the
+                // time-based check so frames flow at wire speed; otherwise
+                // each surface independently waits for its own deadline.
+                {
+                    let (burst, deadline) = client.surface_subs.get(&sid).map_or((0, now), |s| {
+                        (s.burst_remaining, s.next_send_at.unwrap_or(now))
+                    });
+                    if burst == 0 && deadline > now {
+                        // Safety clamp: the deadline should never be more
+                        // than 2× the send interval ahead.  If it is, snap
+                        // back to now so encoding doesn't stall permanently.
+                        let interval = surface_send_interval(client);
+                        if deadline > now + interval + interval {
+                            client.surface_subs.entry(sid).or_default().next_send_at = Some(now);
+                        } else {
+                            next_deadline = Some(match next_deadline {
+                                Some(existing) => existing.min(deadline),
+                                None => deadline,
+                            });
+                            client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
+
+                // Skip encoding if the pixel data hasn't changed since the
+                // last encode for this surface, unless a keyframe is needed.
+                if !work.needs_keyframe
+                    && let Some(last_gen) = client
+                        .surface_subs
+                        .get(&sid)
+                        .and_then(|s| s.last_encoded_gen)
+                    && last_gen == px_gen
+                {
+                    client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
+                    continue;
+                }
+
+                let pixels: blit_compositor::PixelData = {
+                    let cs = sess.compositor.as_ref().unwrap();
+                    match cs.last_pixels.get(&sid) {
+                        Some(lp) if lp.width == px_w && lp.height == px_h => lp.pixels.clone(),
+                        _ => {
+                            let client = sess.clients.get_mut(&work.cid).unwrap();
+                            client.skip_last_pixels_mismatch_count =
+                                client.skip_last_pixels_mismatch_count.saturating_add(1);
+                            continue;
+                        }
+                    }
+                };
+                let client = sess.clients.get_mut(&work.cid).unwrap();
+
+                let (enc_w, enc_h) = (px_w, px_h);
+
+                // Fast path: if the compositor already produced an encoded
+                // bitstream (Vulkan Video), skip the SurfaceEncoder entirely
+                // and send the pre-encoded data directly to the client.
+                if let blit_compositor::PixelData::Encoded {
+                    ref data,
+                    is_keyframe,
+                    codec_flag,
+                } = pixels
+                {
+                    let flags = codec_flag
+                        | if is_keyframe {
+                            SURFACE_FRAME_FLAG_KEYFRAME
+                        } else {
+                            0
+                        };
+                    let msg = msg_surface_frame(
+                        sid,
+                        px_timestamp_ms,
+                        flags,
+                        px_w as u16,
+                        px_h as u16,
+                        data,
+                    );
+                    let bytes = msg.len();
+                    match send_outbox(client, msg) {
+                        Err(_e) => {
+                            client.surface_needs_keyframe = true;
+                        }
+                        Ok(()) => {
+                            client.surface_inflight_frames.push_back(InFlightFrame {
+                                sent_at: now,
+                                bytes,
+                                paced: true,
+                            });
+                            if !is_keyframe {
+                                client.avg_surface_frame_bytes = ewma_with_direction(
+                                    client.avg_surface_frame_bytes,
+                                    bytes as f32,
+                                    0.5,
+                                    0.125,
+                                );
+                            }
+                            client.frames_sent = client.frames_sent.wrapping_add(1);
+                            if client.surface_needs_keyframe && is_keyframe {
+                                client.surface_needs_keyframe = false;
+                            }
+                            if let Some(s) = client.surface_subs.get_mut(&sid) {
+                                s.burst_remaining = s.burst_remaining.saturating_sub(1);
+                            }
+                        }
+                    }
+                    encoded_client_surfaces.insert((work.cid, sid));
+                    encode_dispatched_surfaces.insert(sid);
+                    client.surface_subs.entry(sid).or_default().last_encoded_gen = Some(px_gen);
+                    continue;
+                }
+
+                // Skip if an encode or creation job is already in
+                // flight for this surface.  Creations also block encode
+                // dispatch: the encoder is None while creation runs,
+                // and we don't want to re-queue another creation until
+                // the first one completes.
+                if client
+                    .surface_subs
+                    .get(&sid)
+                    .is_some_and(|s| s.encode_in_flight || s.creation_in_flight)
+                {
+                    client.skip_in_flight_count = client.skip_in_flight_count.saturating_add(1);
+                    let now_inst = Instant::now();
+                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
+                        client.last_skip_log = now_inst;
+                        let burst = client
+                            .surface_subs
+                            .get(&sid)
+                            .map_or(0, |s| s.burst_remaining);
+                        eprintln!(
+                            "[encode-skip] cid={} sid={sid} reason=in_flight same_gen={} in_flight={} burst={burst}",
+                            work.cid, client.skip_same_gen_count, client.skip_in_flight_count,
+                        );
+                    }
+                    continue;
+                }
+
+                let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
+                let needs_new_encoder = if has_vulkan_enc {
+                    false
+                } else {
+                    client
+                        .surface_subs
+                        .get(&sid)
+                        .and_then(|s| s.encoder.as_ref())
+                        .is_none_or(|e| e.source_dimensions() != (enc_w, enc_h))
+                };
+
+                // If the encoder was dropped due to persistent nal_data=None,
+                // back off for a short window before retrying.  Each retry
+                // allocates GBM fds, so we don't want a genuinely broken
+                // encoder (GPU lost) to recreate at tick rate and exhaust
+                // the process fd limit — but a warm-up burst (compositor
+                // hasn't imported the freshly-allocated external output
+                // buffers yet) should recover within seconds without
+                // requiring a user-driven resize/resubscribe.
+                const NAL_NONE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+                if needs_new_encoder
+                    && client
+                        .surface_subs
+                        .get(&sid)
+                        .is_some_and(|s| s.nal_none_streak >= 10)
+                {
+                    let ready_to_retry = client
+                        .surface_subs
+                        .get(&sid)
+                        .and_then(|s| s.nal_none_latched_at)
+                        .is_some_and(|t| now.duration_since(t) >= NAL_NONE_RETRY_BACKOFF);
+                    if ready_to_retry {
+                        if let Some(s) = client.surface_subs.get_mut(&sid) {
+                            s.nal_none_streak = 0;
+                            s.nal_none_latched_at = None;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+
+                // --- Try Vulkan Video first ---
+                if needs_new_encoder {
+                    let codec_support = client
+                        .surface_subs
+                        .get(&sid)
+                        .map(|s| s.codec_override)
+                        .filter(|&c| c != 0)
+                        .unwrap_or(client.surface_codec_support);
+                    let quality = client
+                        .surface_subs
+                        .get(&sid)
+                        .and_then(|s| s.quality_override)
+                        .unwrap_or(state.config.surface_quality);
+
+                    for &pref in &state.config.surface_encoders {
+                        if !pref.is_vulkan_video() {
+                            continue;
+                        }
+                        if !pref.supported_by_client(codec_support) {
+                            continue;
+                        }
+                        // Check compositor capability (pre-extracted above).
+                        let available = match pref {
+                            SurfaceEncoderPreference::VulkanVideoH264 => vk_encode_available,
+                            SurfaceEncoderPreference::VulkanVideoAV1 => vk_encode_av1_available,
+                            _ => false,
+                        };
+                        if !available {
+                            continue;
+                        }
+                        // Vulkan Video 4:4:4 requires a YUV444 compute pipeline
+                        // and 3-plane DPB surfaces that are not yet implemented.
+                        // Skip so the fallback chain tries NVENC/VA-API/software.
+                        if state.config.chroma.is_444() {
+                            continue;
+                        }
+                        let qp = match pref {
+                            SurfaceEncoderPreference::VulkanVideoAV1 => quality.av1_qp_for_vulkan(),
+                            _ => quality.h264_qp(),
+                        };
+                        let enc_name: &'static str = match (pref, state.config.chroma) {
+                            (
+                                SurfaceEncoderPreference::VulkanVideoH264,
+                                ChromaSubsampling::Cs444,
+                            ) => "h264-vulkan 4:4:4",
+                            (SurfaceEncoderPreference::VulkanVideoH264, _) => "h264-vulkan",
+                            (
+                                SurfaceEncoderPreference::VulkanVideoAV1,
+                                ChromaSubsampling::Cs444,
+                            ) => "av1-vulkan 4:4:4",
+                            (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
+                            (_, ChromaSubsampling::Cs444) => "vulkan 4:4:4",
+                            _ => "vulkan",
+                        };
+                        // Queue commands to send after the client loop.
+                        pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
+                            surface_id: sid as u32,
+                            codec: pref.vulkan_codec(),
+                            qp,
+                            width: px_w,
+                            height: px_h,
+                        });
+                        pending_vulkan_keyframe_requests.push(sid as u32);
+                        if let Some(s) = client.surface_subs.get_mut(&sid) {
+                            s.encoder = None;
+                        }
+                        client
+                            .vulkan_video_surfaces
+                            .insert(sid, (enc_name, pref.codec_flag()));
+                        let codec_str = match pref {
+                            SurfaceEncoderPreference::VulkanVideoH264 => {
+                                if state.config.chroma.is_444() {
+                                    "avc1.F4001f".to_string()
+                                } else {
+                                    "avc1.640034".to_string()
+                                }
+                            }
+                            SurfaceEncoderPreference::VulkanVideoAV1 => {
+                                let profile = if state.config.chroma.is_444() { 2 } else { 0 };
+                                let level = surface_encoder::av1_level_for(px_w, px_h);
+                                format!("av01.{profile}.{level}M.08")
+                            }
+                            _ => String::new(),
+                        };
+                        let enc_msg = msg_surface_encoder(sid, enc_name, &codec_str);
+                        let _ = send_outbox(client, enc_msg);
+                        if state.config.verbose {
+                            eprintln!(
+                                "[surface-encoder] cid={} sid={sid} {px_w}x{px_h}: using {enc_name}",
+                                work.cid,
+                            );
+                        }
+                        break;
+                    }
+
+                    // Defer encoder creation to spawn_blocking so the
+                    // tick loop isn't blocked by slow VA-API init.
+                    // The creation task allocates GBM buffers and
+                    // returns the encoder; the first encode runs on a
+                    // subsequent tick, after the main loop forwards
+                    // the buffers to the compositor and the compositor
+                    // commits a new frame through them.
+                    {
+                        let state = client.surface_subs.entry(sid).or_default();
+                        state.encoder = None;
+                        state.creation_in_flight = true;
+                    }
+                    create_jobs.push(CreateJob {
+                        cid: work.cid,
+                        sid,
+                        px_w: enc_w,
+                        px_h: enc_h,
+                        params: EncoderCreateParams {
+                            preferences: state.config.surface_encoders.clone(),
+                            vaapi_device: state.config.vaapi_device.clone(),
+                            quality,
+                            verbose: state.config.verbose,
+                            codec_support,
+                            chroma: state.config.chroma,
+                        },
+                    });
+                    continue;
+                }
+
+                // If using Vulkan Video, handle keyframe via compositor
+                // command and skip local encode — the fast path above
+                // handles delivery.
+                if client.vulkan_video_surfaces.contains_key(&sid) {
+                    if work.needs_keyframe {
+                        pending_vulkan_keyframe_requests.push(sid as u32);
+                    }
+                    client.skip_vulkan_await_count =
+                        client.skip_vulkan_await_count.saturating_add(1);
+                    let now_inst = Instant::now();
+                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
+                        client.last_skip_log = now_inst;
+                        eprintln!(
+                            "[encode-skip] cid={} sid={sid} reason=vulkan_await \
+                             (compositor not producing PixelData::Encoded) count={}",
+                            work.cid, client.skip_vulkan_await_count,
+                        );
+                    }
+                    continue;
+                }
+
+                let encoder = client
+                    .surface_subs
+                    .get_mut(&sid)
+                    .and_then(|s| s.encoder.take())
+                    .unwrap();
+                client.surface_subs.entry(sid).or_default().encode_in_flight = true;
+                let needs_kf = work.needs_keyframe || needs_new_encoder;
+                encoded_client_surfaces.insert((work.cid, sid));
+                encode_dispatched_surfaces.insert(sid);
+                encode_jobs.push(EncodeJob {
+                    cid: work.cid,
+                    sid,
+                    px_w: enc_w,
+                    px_h: enc_h,
+                    pixels,
+                    needs_keyframe: needs_kf,
+                    encoder,
+                    generation: px_gen,
+                    timestamp_ms: px_timestamp_ms,
+                });
+            }
+        }
+
+        // Send Vulkan Video encoder setup commands to compositor.
+        if (!pending_vulkan_encoder_setups.is_empty()
+            || !pending_vulkan_keyframe_requests.is_empty())
+            && let Some(cs) = sess.compositor.as_ref()
+        {
+            for setup in pending_vulkan_encoder_setups {
+                eprintln!(
+                    "[vulkan-video] sending SetVulkanEncoder sid={} codec={} {}x{} qp={}",
+                    setup.surface_id, setup.codec, setup.width, setup.height, setup.qp,
+                );
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::SetVulkanEncoder {
+                        surface_id: setup.surface_id,
+                        codec: setup.codec,
+                        qp: setup.qp,
+                        width: setup.width,
+                        height: setup.height,
+                    },
+                );
+            }
+            for surface_id in pending_vulkan_keyframe_requests {
+                let _ = cs
+                    .handle
+                    .command_tx
+                    .send(blit_compositor::CompositorCommand::RequestVulkanKeyframe { surface_id });
+            }
+            cs.handle.wake();
+        }
+
+        // Advance per-surface pacing deadlines only for surfaces that
+        // actually had an encode job collected.  Surfaces skipped due to
+        // in-flight limits or unchanged pixels keep their current
+        // deadline so the next tick retries without burning a time slot.
+        for work in &client_work {
+            if let Some(client) = sess.clients.get_mut(&work.cid) {
+                let interval = surface_send_interval(client);
+                for &sid in &work.subs {
+                    if encoded_client_surfaces.contains(&(work.cid, sid)) {
+                        let deadline = client
+                            .surface_subs
+                            .entry(sid)
+                            .or_default()
+                            .next_send_at
+                            .get_or_insert(now);
+                        advance_deadline(deadline, now, interval);
+                    }
+                }
+            }
+        }
+    }
+
+    if !encode_jobs.is_empty() {
+        // Fire-and-forget: spawn the encode and deliver asynchronously
+        // so the tick loop is never blocked by slow encoders.
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            // Track (cid, sid) for each job so we can clear the sub's
+            // `encode_in_flight` flag if the blocking task panics or
+            // times out (otherwise that surface is permanently blocked).
+            let job_ids: Vec<(u64, u16)> = encode_jobs.iter().map(|j| (j.cid, j.sid)).collect();
+
+            let handles: Vec<_> = encode_jobs
+                .into_iter()
+                .map(|job| {
+                    tokio::task::spawn_blocking(move || {
+                        let mut encoder = job.encoder;
+                        if job.needs_keyframe {
+                            encoder.request_keyframe();
+                        }
+                        let nal_data = encoder.encode_pixels(&job.pixels);
+                        let codec_flag = encoder.codec_flag();
+                        EncodeResult {
+                            cid: job.cid,
+                            sid: job.sid,
+                            px_w: job.px_w,
+                            px_h: job.px_h,
+                            generation: job.generation,
+                            encoder,
+                            nal_data,
+                            codec_flag,
+                            timestamp_ms: job.timestamp_ms,
+                        }
+                    })
+                })
+                .collect();
+
+            // Timeout: if a hardware encoder hangs (e.g. vaSyncSurface on
+            // AMD), don't block delivery of other surfaces' results forever.
+            const ENCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+            let mut results = Vec::with_capacity(handles.len());
+            let mut failed: Vec<(u64, u16)> = Vec::new();
+            for (i, h) in handles.into_iter().enumerate() {
+                // Wrap the timeout in a nested tokio::spawn so that
+                // panics from tokio::time::timeout during runtime
+                // shutdown ("A Tokio 1.x context was found, but it is
+                // being shutdown") are caught as JoinErrors instead of
+                // crashing the outer task.
+                let wrapper =
+                    tokio::spawn(async move { tokio::time::timeout(ENCODE_TIMEOUT, h).await });
+                match wrapper.await {
+                    Ok(Ok(Ok(r))) => results.push(r),
+                    Ok(Ok(Err(_join_err))) => {
+                        // spawn_blocking panicked — encoder is lost.
+                        let (cid, sid) = job_ids[i];
+                        eprintln!("[surface-encoder] encode task panicked: cid={cid} sid={sid}",);
+                        failed.push(job_ids[i]);
+                    }
+                    Ok(Err(_timeout)) => {
+                        // Encoder hung (e.g. GPU hang in vaSyncSurface).
+                        // The blocking thread is leaked but we must not
+                        // let it stall all other surfaces forever.
+                        let (cid, sid) = job_ids[i];
+                        eprintln!(
+                            "[surface-encoder] encode timed out ({}s): cid={cid} sid={sid}",
+                            ENCODE_TIMEOUT.as_secs(),
+                        );
+                        failed.push(job_ids[i]);
+                    }
+                    Err(_join_err) => {
+                        // Runtime shutting down — abandon remaining work.
+                        eprintln!("[surface-encoder] runtime shutting down, aborting delivery");
+                        return;
+                    }
+                }
+            }
+
+            // Deliver encoded frames.
+            let mut sess = state2.session.lock().await;
+            let now = Instant::now();
+            let mut local_encodes = 0u32;
+            let mut local_encode_bytes = 0u64;
+            let mut local_frames_sent = 0u32;
+
+            // Clean up in-flight tracking for panicked/timed-out encodes.
+            // Without this, the surface is permanently blocked from
+            // future encode jobs and frame delivery stops for it.
+            for (cid, sid) in failed {
+                if let Some(client) = sess.clients.get_mut(&cid) {
+                    if let Some(s) = client.surface_subs.get_mut(&sid) {
+                        s.encode_in_flight = false;
+                    }
+                    // The encoder was moved into the spawn_blocking closure
+                    // and is now lost.  A fresh encoder will be created on
+                    // the next tick when the sub's encoder is None.  Force
+                    // a keyframe so the new encoder starts with a clean
+                    // reference chain.
+                    client.surface_needs_keyframe = true;
+                }
+            }
+
+            for result in results {
+                // Return the encoder to the client, but only if its
+                // dimensions still match the current surface.  A resize
+                // that arrived while the encode was in flight will have
+                // invalidated the old encoder; reinserting the stale one
+                // would force the next tick to discard and recreate it,
+                // wasting work and risking feeding a C encoder (openh264)
+                // frames at the wrong resolution.
+                let expected_dims: Option<(u32, u32)> = sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.last_pixels.get(&result.sid))
+                    .map(|lp| (lp.width, lp.height));
+                let dims_match =
+                    expected_dims.is_some_and(|d| result.encoder.source_dimensions() == d);
+
+                if let Some(client) = sess.clients.get_mut(&result.cid) {
+                    let state = client.surface_subs.entry(result.sid).or_default();
+                    state.encode_in_flight = false;
+                    let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
+                    if dims_match && !invalidated {
+                        state.encoder = Some(result.encoder);
+                    }
+                    // Record the generation we just encoded so we don't
+                    // re-encode identical pixel data on subsequent ticks.
+                    state.last_encoded_gen = Some(result.generation);
+                }
+
+                let Some((nal_data, is_keyframe)) = result.nal_data else {
+                    if let Some(client) = sess.clients.get_mut(&result.cid) {
+                        let state = client.surface_subs.entry(result.sid).or_default();
+                        state.nal_none_streak += 1;
+                        let streak = state.nal_none_streak;
+                        if streak == 10 {
+                            state.encoder = None;
+                            state.nal_none_latched_at = Some(now);
+                            client.surface_needs_keyframe = true;
+                            eprintln!(
+                                "[encode] nal_data=None x{streak} sid={} cid={} {}x{} — dropping encoder, backing off retry",
+                                result.sid, result.cid, result.px_w, result.px_h,
+                            );
+                        } else if streak < 10 {
+                            eprintln!(
+                                "[encode] nal_data=None sid={} cid={} {}x{}",
+                                result.sid, result.cid, result.px_w, result.px_h,
+                            );
+                        }
+                        // streak >= 10: suppress the log spam
+                    }
+                    continue;
+                };
+                // Encoder produced output — reset the None streak.
+                if let Some(client) = sess.clients.get_mut(&result.cid)
+                    && let Some(s) = client.surface_subs.get_mut(&result.sid)
+                {
+                    s.nal_none_streak = 0;
+                }
+
+                {
+                    static EC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = EC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 5 || n.is_multiple_of(1000) {
+                        eprintln!(
+                            "[encode #{n}] sid={} {}x{} kf={is_keyframe} bytes={}",
+                            result.sid,
+                            result.px_w,
+                            result.px_h,
+                            nal_data.len(),
+                        );
+                    }
+                }
+
+                local_encodes += 1;
+                local_encode_bytes += nal_data.len() as u64;
+
+                let flags = result.codec_flag
+                    | if is_keyframe {
+                        SURFACE_FRAME_FLAG_KEYFRAME
+                    } else {
+                        0
+                    };
+                let msg = msg_surface_frame(
+                    result.sid,
+                    result.timestamp_ms,
+                    flags,
+                    result.px_w as u16,
+                    result.px_h as u16,
+                    &nal_data,
+                );
+                let bytes = msg.len();
+
+                let Some(client) = sess.clients.get_mut(&result.cid) else {
+                    continue;
+                };
+
+                // Don't check window_open here — we already checked before
+                // starting the encode job.  Dropping an encoded P-frame
+                // breaks the decoder's reference chain and causes glitches.
+                // With the per-sub `encode_in_flight` flag limiting to 1
+                // concurrent encode per surface, at most 1 frame arrives
+                // after the window closes, which is acceptable.
+                match send_outbox(client, msg) {
+                    Err(_e) => {
+                        // Receiver dropped (client disconnected during encode).
+                        // Request keyframe so the next encoder starts clean.
+                        client.surface_needs_keyframe = true;
+                    }
+                    Ok(()) => {
+                        // Track surface frames in their own inflight queue
+                        // so surface ACKs feed shared goodput / RTT without
+                        // polluting terminal frame-size averages or probing.
+                        client.surface_inflight_frames.push_back(InFlightFrame {
+                            sent_at: now,
+                            bytes,
+                            paced: true,
+                        });
+                        // Prefer updating avg_surface_frame_bytes from delta
+                        // (non-keyframe) frames — keyframes are 5-10× larger
+                        // than P-frames and would inflate the average, dragging
+                        // surface_pacing_fps below the sustainable rate.
+                        //
+                        // However, we must still update from keyframes with a
+                        // very slow alpha: all-intra encoders (e.g. AV1 VAAPI
+                        // before P-frame support) only produce keyframes, so
+                        // skipping them entirely leaves the average stuck at
+                        // the 8 KB initial value, causing the pacer to wildly
+                        // overshoot the send rate and saturate the transport.
+                        if !is_keyframe {
+                            client.avg_surface_frame_bytes = ewma_with_direction(
+                                client.avg_surface_frame_bytes,
+                                bytes as f32,
+                                0.5,
+                                0.125,
+                            );
+                        } else if client.avg_surface_frame_bytes <= 16_384.0 {
+                            // First keyframe while the estimate is still at or
+                            // near the initial 8 KB seed.  No P-frame data has
+                            // been seen yet, so the seed is pure fiction.  Use a
+                            // realistic P-frame estimate: keyframes are typically
+                            // 3-8× larger than P-frames, so divide by 4.  This
+                            // prevents surface_pacing_fps from being wildly
+                            // optimistic (8 KB → 32 fps at 256 KB/s) when the
+                            // actual frames are 50-200 KB keyframes.
+                            client.avg_surface_frame_bytes = (bytes as f32 / 4.0).max(4_096.0);
+                        } else {
+                            // Slow convergence so one keyframe doesn't wreck
+                            // the estimate for dozens of subsequent P-frames.
+                            client.avg_surface_frame_bytes = ewma_with_direction(
+                                client.avg_surface_frame_bytes,
+                                bytes as f32,
+                                0.05,
+                                0.05,
+                            );
+                        }
+                        client.frames_sent = client.frames_sent.wrapping_add(1);
+                        local_frames_sent += 1;
+                        if client.surface_needs_keyframe && is_keyframe {
+                            client.surface_needs_keyframe = false;
+                        }
+                        if let Some(s) = client.surface_subs.get_mut(&result.sid) {
+                            s.burst_remaining = s.burst_remaining.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            sess.surface_encodes += local_encodes;
+            sess.surface_encode_bytes += local_encode_bytes;
+            sess.surface_frames_sent += local_frames_sent;
+            drop(sess);
+            // Wake the tick loop so it can request the next frame.
+            state2.delivery_notify.notify_one();
+        });
+    }
+
+    if !create_jobs.is_empty() {
+        // Encoder creation runs on spawn_blocking so VA-API device open
+        // and context allocation don't stall the tick loop.  When the
+        // task lands, the main loop installs the encoder into the sub's
+        // `encoder` slot, forwards the GBM buffers to the compositor
+        // (`SetExternalOutputBuffers`), and sends S2C_SURFACE_ENCODER
+        // to the client.  Encoding starts on the NEXT tick — once the
+        // compositor has committed a frame through the new buffers.
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            // Track (cid, sid) for each job so we can clear
+            // `creation_in_flight` if a task panics or times out.
+            let job_ids: Vec<(u64, u16)> = create_jobs.iter().map(|j| (j.cid, j.sid)).collect();
+
+            let handles: Vec<_> = create_jobs
+                .into_iter()
+                .map(|job| {
+                    tokio::task::spawn_blocking(move || {
+                        let params = job.params;
+                        let mut encoder = match SurfaceEncoder::new(
+                            &params.preferences,
+                            job.px_w,
+                            job.px_h,
+                            &params.vaapi_device,
+                            params.quality,
+                            params.verbose,
+                            params.codec_support,
+                            params.chroma,
+                        ) {
+                            Ok(enc) => enc,
+                            Err(err) => {
+                                if params.verbose {
+                                    eprintln!(
+                                        "[surface-encoder] cid={} sid={} {}x{}: {err}",
+                                        job.cid, job.sid, job.px_w, job.px_h,
+                                    );
+                                }
+                                return CreateResult {
+                                    cid: job.cid,
+                                    sid: job.sid,
+                                    encoder: None,
+                                    fresh: None,
+                                };
+                            }
+                        };
+
+                        #[cfg(target_os = "linux")]
+                        let external_bufs = {
+                            {
+                                let drm_fd = encoder.drm_fd_raw();
+                                let count = encoder.gbm_buffers().len();
+                                if count > 0 {
+                                    encoder.allocate_nv12_buffers(drm_fd, count);
+                                }
+                            }
+                            let gbm_bufs = encoder.gbm_buffers();
+                            if gbm_bufs.is_empty() {
+                                Vec::new()
+                            } else {
+                                let nv12_bufs = encoder.gbm_nv12_buffers();
+                                let (enc_w, enc_h) = encoder.encoder_dimensions();
+                                let bufs: Result<Vec<_>, std::io::Error> = gbm_bufs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, b)| {
+                                        let nv12 = nv12_bufs.get(i);
+                                        Ok(blit_compositor::ExternalOutputBuffer {
+                                            fd: std::sync::Arc::new(b.fd.try_clone()?),
+                                            fourcc: 0x34325241,
+                                            modifier: 0,
+                                            stride: b.stride,
+                                            offset: 0,
+                                            width: b.width,
+                                            height: b.height,
+                                            va_surface_id: 0,
+                                            va_display: 0,
+                                            planes: vec![blit_compositor::ExternalOutputPlane {
+                                                offset: 0,
+                                                pitch: b.stride,
+                                            }],
+                                            nv12_fd: nv12.map(|n| n.fd.clone()),
+                                            nv12_stride: nv12.map_or(0, |n| n.stride),
+                                            nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
+                                            nv12_modifier: nv12.map_or(0, |n| n.modifier),
+                                            nv12_width: enc_w,
+                                            nv12_height: enc_h,
+                                        })
+                                    })
+                                    .collect();
+                                match bufs {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        eprintln!("[encode] dup gbm fd failed: {e}");
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        };
+                        let fresh = FreshEncoder {
+                            name: encoder.encoder_name(),
+                            codec_string: encoder.webcodecs_codec_string(),
+                            #[cfg(target_os = "linux")]
+                            external_bufs,
+                        };
+                        CreateResult {
+                            cid: job.cid,
+                            sid: job.sid,
+                            encoder: Some(encoder),
+                            fresh: Some(fresh),
+                        }
+                    })
+                })
+                .collect();
+
+            const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut results: Vec<CreateResult> = Vec::with_capacity(handles.len());
+            let mut failed: Vec<(u64, u16)> = Vec::new();
+            for (i, h) in handles.into_iter().enumerate() {
+                let wrapper =
+                    tokio::spawn(async move { tokio::time::timeout(CREATE_TIMEOUT, h).await });
+                match wrapper.await {
+                    Ok(Ok(Ok(r))) => results.push(r),
+                    Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                        let (cid, sid) = job_ids[i];
+                        eprintln!("[surface-encoder] create task failed: cid={cid} sid={sid}",);
+                        failed.push(job_ids[i]);
+                    }
+                    Err(_) => return,
+                }
+            }
+
+            let mut sess = state2.session.lock().await;
+            let now = Instant::now();
+
+            // Clear creation_in_flight for failed tasks; latch a brief
+            // backoff so the next tick doesn't immediately retry.
+            for (cid, sid) in failed {
+                if let Some(client) = sess.clients.get_mut(&cid)
+                    && let Some(s) = client.surface_subs.get_mut(&sid)
+                {
+                    s.creation_in_flight = false;
+                    s.nal_none_streak = 10;
+                    s.nal_none_latched_at = Some(now);
+                }
+            }
+
+            for result in results {
+                let Some(encoder) = result.encoder else {
+                    if let Some(client) = sess.clients.get_mut(&result.cid)
+                        && let Some(s) = client.surface_subs.get_mut(&result.sid)
+                    {
+                        s.creation_in_flight = false;
+                        s.nal_none_streak = 10;
+                        s.nal_none_latched_at = Some(now);
+                    }
+                    continue;
+                };
+
+                // Move the external buffers (and register them with the
+                // compositor) BEFORE stashing the encoder, so subsequent
+                // ticks see the encoder only once its buffers are live.
+                let fresh = result.fresh;
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(f) = &fresh
+                        && !f.external_bufs.is_empty()
+                        && let Some(cs) = sess.compositor.as_mut()
+                    {
+                        cs.last_pixels.remove(&result.sid);
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                let (fresh_meta, external_bufs) = match fresh {
+                    Some(f) => (Some((f.name, f.codec_string)), Some(f.external_bufs)),
+                    None => (None, None),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let fresh_meta = fresh.map(|f| (f.name, f.codec_string));
+
+                #[cfg(target_os = "linux")]
+                if let Some(bufs) = external_bufs
+                    && !bufs.is_empty()
+                    && let Some(cs) = sess.compositor.as_mut()
+                {
+                    let _ = cs.handle.command_tx.send(
+                        blit_compositor::CompositorCommand::SetExternalOutputBuffers {
+                            surface_id: result.sid as u32,
+                            buffers: bufs,
+                        },
+                    );
+                    cs.handle.wake();
+                }
+
+                if let Some(client) = sess.clients.get_mut(&result.cid) {
+                    let state = client.surface_subs.entry(result.sid).or_default();
+                    state.creation_in_flight = false;
+                    let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
+                    if invalidated {
+                        // Preferences changed mid-creation (codec/quality
+                        // resubscribe).  Drop the encoder we just built;
+                        // the next tick will dispatch a fresh creation
+                        // with the new prefs.
+                        continue;
+                    }
+                    state.encoder = Some(encoder);
+                    state.nal_none_streak = 0;
+                    state.nal_none_latched_at = None;
+                    if let Some((name, codec_string)) = fresh_meta {
+                        let enc_msg = msg_surface_encoder(result.sid, name, &codec_string);
+                        let _ = send_outbox(client, enc_msg);
+                    }
+                }
+            }
+            drop(sess);
+            state2.delivery_notify.notify_one();
+        });
+    }
+
+    // Request frames from the compositor for surfaces that have at least
+    // one subscriber whose pacing says it can accept a new frame.  This
+    // fires the surface's pending wl_surface.frame callback so the
+    // Wayland client will paint and commit its next frame.
+    //
+    // Demand-driven with pipeline overlap:
+    //   When an encode job is dispatched, we eagerly pre-request the next
+    //   frame so the Wayland client paints in parallel with the encode.
+    //   Fresh pixels are ready when the encode completes, turning the
+    //   serial   encode + round_trip   into   max(encode, round_trip).
+    {
+        // Only request frames for surfaces where at least one client is
+        // ready to consume the result.  Without this check, apps that are
+        // always ready to paint (video players like mpv) cause a hot loop:
+        // RequestFrame → commit → SurfaceCommit wakes tick → no client
+        // ready → RequestFrame again → 100% CPU.
+        let mut wanted: HashSet<u16> = HashSet::new();
+
+        // Pre-request: surfaces with an encode just dispatched.  The
+        // compositor will render the next frame while the encode runs,
+        // so pixels are ready when the next pacing window opens.
+        for &sid in &encode_dispatched_surfaces {
+            wanted.insert(sid);
+        }
+        let mut blanket_requested = false;
+        // Request frames for all known surfaces so Wayland apps can make
+        // rendering progress.  Video players (mpv) need frequent callbacks
+        // to advance their presentation clock; browsers need them for
+        // page loads and animations.
+        if let Some(cs) = sess.compositor.as_ref()
+            && now.duration_since(cs.last_blanket_frame_request) >= blanket_frame_interval(&sess)
+        {
+            for &sid in cs.surfaces.keys() {
+                wanted.insert(sid);
+            }
+            blanket_requested = true;
+        }
+        for client in sess.clients.values() {
+            // Don't gate frame requests on surface_window_open — the
+            // compositor should keep producing pixels even when the
+            // inflight window is closed.  Otherwise, recovery after a
+            // wifi stall has to wait for the full render pipeline to
+            // flush (request → paint → commit → encode) before the
+            // first frame can be sent, causing a visible hang.
+            if client.surface_subscriptions.is_empty() {
+                continue;
+            }
+            for &sid in &client.surface_subscriptions {
+                let (burst, deadline) = client.surface_subs.get(&sid).map_or((0, now), |s| {
+                    (s.burst_remaining, s.next_send_at.unwrap_or(now))
+                });
+                if deadline <= now || burst > 0 {
+                    wanted.insert(sid);
+                } else {
+                    next_deadline = Some(match next_deadline {
+                        Some(existing) => existing.min(deadline),
+                        None => deadline,
+                    });
+                }
+            }
+        }
+
+        if let Some(cs) = sess.compositor.as_mut() {
+            if blanket_requested {
+                cs.last_blanket_frame_request = now;
+            }
+
+            // Gate: at most one RequestFrame per surface per millisecond.
+            // This ensures each wl_callback.done carries a distinct
+            // elapsed_ms timestamp (video players like mpv use these to
+            // pace their presentation clock).  Supports up to 1 kHz.
+            // The gate auto-expires: if the app doesn't commit, the next
+            // tick ≥1 ms later will send a fresh request.
+            const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(1);
+            let mut sent_any = false;
+            for sid in &wanted {
+                let dominated = cs
+                    .last_frame_request
+                    .get(sid)
+                    .is_some_and(|&t| now.duration_since(t) < MIN_REQUEST_INTERVAL);
+                if !dominated {
+                    cs.last_frame_request.insert(*sid, now);
+                    let _ = cs
+                        .handle
+                        .command_tx
+                        .send(CompositorCommand::RequestFrame { surface_id: *sid });
+                    sent_any = true;
+                }
+            }
+            if sent_any {
+                cs.handle.wake();
+            }
+        }
+    }
+
+    // Yield the session lock briefly so pending encode deliveries from
+    // previous ticks can acquire the lock and send their frames without
+    // waiting for terminal processing to complete.  This reduces the
+    // latency between encode completion and frame-on-wire.
+    drop(sess);
+    tokio::task::yield_now().await;
+    sess = state.session.lock().await;
 
     let max_fps = sess
         .clients
@@ -2290,12 +3678,34 @@ async fn tick(state: &AppState) -> TickOutcome {
 
     // Drain bytes from PTY reader channels. This is the only place
     // process() is called, so there is no contention with the readers.
+    //
+    // End-to-end flow control: when at least one client is subscribed to
+    // a PTY and its `ready_frames` queue is full, stop draining `byte_rx`
+    // for that PTY.  `byte_rx` then fills to its bounded capacity, which
+    // blocks the reader task's `byte_tx.blocking_send`, which fills the
+    // kernel's PTY master buffer, which blocks the child process's
+    // `write(stdout, ...)`.  Sync-bracketed frames are never silently
+    // dropped; the producer is slowed instead.  PTYs with no subscribers
+    // drain unconditionally so background processes aren't throttled by
+    // nobody-watching.
+    let ptys_with_subscribers: HashSet<u16> = sess
+        .clients
+        .values()
+        .flat_map(|c| c.subscriptions.iter().copied())
+        .collect();
     let mut eof_ptys: Vec<u16> = Vec::with_capacity(ids.len());
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
         };
-        while let Ok(input) = pty.byte_rx.try_recv() {
+        let has_subscriber = ptys_with_subscribers.contains(&id);
+        loop {
+            if has_subscriber && pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP {
+                break;
+            }
+            let Ok(input) = pty.byte_rx.try_recv() else {
+                break;
+            };
             match input {
                 PtyInput::Data(data) => {
                     pty::respond_to_queries(
@@ -2307,7 +3717,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     pty.driver.process(&data);
                     pty.mark_dirty();
                 }
-                PtyInput::SyncBoundary { before, after } => {
+                PtyInput::SyncBoundary { before } => {
                     if !before.is_empty() {
                         pty::respond_to_queries(
                             &pty.handle,
@@ -2322,16 +3732,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let frame = take_snapshot(pty);
                         enqueue_ready_frame(&mut pty.ready_frames, frame);
                         pty.clear_dirty();
-                    }
-                    if !after.is_empty() {
-                        pty::respond_to_queries(
-                            &pty.handle,
-                            &after,
-                            pty.driver.size(),
-                            pty.driver.cursor_position(),
-                        );
-                        pty.driver.process(&after);
-                        pty.mark_dirty();
                     }
                 }
                 PtyInput::Eof => {
@@ -2629,1187 +4029,12 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
-    // Surface IDs whose per-client encoders need to be invalidated.
-    let mut invalidate_client_encoders: Vec<u16> = Vec::new();
-
-    let mut surface_commit_count = 0u32;
-    if let Some(cs) = sess.compositor.as_mut() {
-        let mut events = Vec::new();
-        while let Ok(event) = cs.handle.event_rx.try_recv() {
-            events.push(event);
-        }
-        let mut broadcast: Vec<Vec<u8>> = Vec::new();
-        for event in events {
-            match event {
-                CompositorEvent::SurfaceCreated {
-                    surface_id,
-                    title,
-                    app_id,
-                    parent_id,
-                    width,
-                    height,
-                } => {
-                    broadcast.push(msg_surface_created(
-                        surface_id, parent_id, width, height, &title, &app_id,
-                    ));
-                    cs.surfaces.insert(
-                        surface_id,
-                        CachedSurfaceInfo {
-                            surface_id,
-                            parent_id,
-                            width,
-                            height,
-                            title,
-                            app_id,
-                        },
-                    );
-                    cs.last_pixels.remove(&surface_id);
-                    invalidate_client_encoders.push(surface_id);
-                }
-                CompositorEvent::SurfaceDestroyed { surface_id } => {
-                    cs.surfaces.remove(&surface_id);
-                    cs.last_pixels.remove(&surface_id);
-                    cs.last_configured_size.remove(&surface_id);
-                    invalidate_client_encoders.push(surface_id);
-                    broadcast.push(msg_surface_destroyed(surface_id));
-                }
-                CompositorEvent::SurfaceCommit {
-                    surface_id,
-                    width,
-                    height,
-                    pixels,
-                } => {
-                    surface_commit_count += 1;
-                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
-                        info.width = width as u16;
-                        info.height = height as u16;
-                    }
-                    cs.pixel_generation += 1;
-                    cs.last_pixels.insert(
-                        surface_id,
-                        LastPixels {
-                            width,
-                            height,
-                            pixels,
-                            generation: cs.pixel_generation,
-                        },
-                    );
-                }
-                CompositorEvent::SurfaceTitle { surface_id, title } => {
-                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
-                        info.title = title.clone();
-                    }
-                    broadcast.push(msg_surface_title(surface_id, &title));
-                }
-                CompositorEvent::SurfaceAppId { surface_id, app_id } => {
-                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
-                        info.app_id = app_id.clone();
-                    }
-                    broadcast.push(msg_surface_app_id(surface_id, &app_id));
-                }
-                CompositorEvent::SurfaceResized {
-                    surface_id,
-                    width,
-                    height,
-                } => {
-                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
-                        info.width = width;
-                        info.height = height;
-                    }
-                    cs.last_pixels.remove(&surface_id);
-                    // Don't eagerly invalidate client encoders here.  The
-                    // encode path already checks for dimension mismatches
-                    // (source_dimensions != pixel size) and recreates the
-                    // encoder on demand.  Eagerly destroying encoders on
-                    // every intermediate size during a drag-resize causes
-                    // expensive encoder teardown+creation cycles for sizes
-                    // that may never actually be encoded (because a newer
-                    // SurfaceCommit arrives before the next encode tick).
-                    broadcast.push(msg_surface_resized(surface_id, width, height));
-                }
-                CompositorEvent::ClipboardContent {
-                    mime_type, data, ..
-                } => {
-                    broadcast.push(msg_s2c_clipboard_content(&mime_type, &data));
-                }
-                CompositorEvent::SurfaceCursor { surface_id, cursor } => {
-                    // Format: [0x29][surface_id:2][type:1][payload...]
-                    // type 0 = named: [name_len:1][name:N]
-                    // type 1 = hidden (no payload)
-                    // type 2 = custom: [hotx:2][hoty:2][w:2][h:2][png:N]
-                    let mut msg = Vec::new();
-                    msg.push(blit_remote::S2C_SURFACE_CURSOR);
-                    msg.extend_from_slice(&surface_id.to_le_bytes());
-                    match &cursor {
-                        blit_compositor::CursorImage::Named(name) => {
-                            msg.push(0); // type = named
-                            msg.push(name.len() as u8);
-                            msg.extend_from_slice(name.as_bytes());
-                        }
-                        blit_compositor::CursorImage::Hidden => {
-                            msg.push(1); // type = hidden
-                        }
-                        blit_compositor::CursorImage::Custom {
-                            hotspot_x,
-                            hotspot_y,
-                            width,
-                            height,
-                            rgba,
-                        } => {
-                            // Encode as PNG to keep message small.
-                            let mut png_buf = Vec::new();
-                            {
-                                let mut encoder =
-                                    png::Encoder::new(&mut png_buf, *width as u32, *height as u32);
-                                encoder.set_color(png::ColorType::Rgba);
-                                encoder.set_depth(png::BitDepth::Eight);
-                                if let Ok(mut writer) = encoder.write_header() {
-                                    let _ = writer.write_image_data(rgba);
-                                }
-                            }
-                            msg.push(2); // type = custom
-                            msg.extend_from_slice(&hotspot_x.to_le_bytes());
-                            msg.extend_from_slice(&hotspot_y.to_le_bytes());
-                            msg.extend_from_slice(&width.to_le_bytes());
-                            msg.extend_from_slice(&height.to_le_bytes());
-                            msg.extend_from_slice(&png_buf);
-                        }
-                    }
-                    broadcast.push(msg);
-                }
-            }
-        }
-        for msg in &broadcast {
-            sess.send_to_all(msg);
-        }
-    }
-    sess.surface_commits += surface_commit_count;
-
-    // Apply deferred per-client encoder invalidation (couldn't mutate
-    // sess.clients while sess.compositor was borrowed above).
-    for sid in invalidate_client_encoders {
-        for c in sess.clients.values_mut() {
-            c.surface_encoders.remove(&sid);
-            c.vulkan_video_surfaces.remove(&sid);
-            c.surface_last_encoded_gen.remove(&sid);
-        }
-    }
-
-    // Per-client surface encode + deliver.
-    // Each client has its own encoder per surface.  We encode from
-    // shared last_pixels into each client's encoder and deliver.
-    //
-    // Snapshot pixel metadata from the compositor first to avoid
-    // holding an immutable borrow on sess.compositor while mutating
-    // sess.clients.
-    let pixel_snapshot: Vec<(u16, u32, u32, u64)> = sess
-        .compositor
-        .as_ref()
-        .map(|cs| {
-            cs.last_pixels
-                .iter()
-                .map(|(&sid, lp)| (sid, lp.width, lp.height, lp.generation))
-                .collect()
-        })
-        .unwrap_or_default();
-    if pixel_snapshot.is_empty() {
-        sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
-    } else {
-        sess.pixel_snapshot_len = pixel_snapshot.len();
-    }
-
-    // ---- Surface encode (off main thread) + deliver ----
-    //
-    // Collect encode jobs, drop the session lock, run encodes in
-    // spawn_blocking, re-acquire the lock, and deliver.
-
-    struct EncodeJob {
-        cid: u64,
-        sid: u16,
-        px_w: u32,
-        px_h: u32,
-        pixels: blit_compositor::PixelData,
-        needs_keyframe: bool,
-        encoder: Option<SurfaceEncoder>,
-        /// When set, the encoder must be created inside spawn_blocking
-        /// (avoids blocking the tick loop with VA-API init).
-        create_params: Option<EncoderCreateParams>,
-        generation: u64,
-    }
-    struct EncoderCreateParams {
-        preferences: Vec<SurfaceEncoderPreference>,
-        vaapi_device: String,
-        quality: SurfaceQuality,
-        verbose: bool,
-        codec_support: u8,
-        chroma: ChromaSubsampling,
-    }
-    struct EncodeResult {
-        cid: u64,
-        sid: u16,
-        px_w: u32,
-        px_h: u32,
-        generation: u64,
-        encoder: Option<SurfaceEncoder>,
-        nal_data: Option<(Vec<u8>, bool)>, // (data, is_keyframe)
-        codec_flag: u8,
-        /// Encoder name for S2C_SURFACE_ENCODER (set when encoder was just created).
-        encoder_name: Option<&'static str>,
-        /// WebCodecs codec string (e.g. "av01.2.05M.08"), set when encoder was just created.
-        codec_string: Option<String>,
-        /// GBM buffers to export to compositor (set when encoder was just created).
-        #[cfg(target_os = "linux")]
-        external_bufs: Option<(u32, Vec<blit_compositor::ExternalOutputBuffer>)>,
-    }
-
-    let mut encode_jobs: Vec<EncodeJob> = Vec::new();
-    // Surfaces that had encode jobs dispatched this tick.  Used below to
-    // eagerly pre-request the next frame so the compositor renders in
-    // parallel with the in-flight encode (pipeline overlap).
-    let mut encode_dispatched_surfaces: HashSet<u16> = HashSet::new();
-
-    // Collect (cid, subs, needs_kf) for clients that are due, then build
-    // encode jobs in a second pass to avoid overlapping borrows.
-    struct ClientWork {
-        cid: u64,
-        subs: HashSet<u16>,
-        needs_keyframe: bool,
-    }
-    let mut client_work: Vec<ClientWork> = Vec::new();
-
-    if !pixel_snapshot.is_empty() {
-        for (&cid, client) in sess.clients.iter_mut() {
-            if !surface_window_open(client) {
-                // Log persistent blockage so hangs are visible.
-                let now_inst = Instant::now();
-                if now_inst
-                    .duration_since(client.last_window_blocked_log)
-                    .as_secs_f32()
-                    > 5.0
-                {
-                    client.last_window_blocked_log = now_inst;
-                    eprintln!(
-                        "[surface-gate] cid={cid} surface_window_open=false outbox={}f/{}B (limits {}f/{}B) burst={} inflight={}/{} browser_backlog_blocked={}",
-                        outbox_queued_frames(client),
-                        outbox_queued_bytes(client),
-                        OUTBOX_SOFT_QUEUE_LIMIT_FRAMES,
-                        OUTBOX_SOFT_QUEUE_LIMIT_BYTES,
-                        client.surface_burst_remaining,
-                        client.surface_inflight_frames.len(),
-                        surface_inflight_limit(client),
-                        browser_backlog_blocked(client),
-                    );
-                }
-                continue;
-            }
-            // During burst-start (first few frames after subscribe/keyframe
-            // request), skip the time-based pacing gate — let outbox
-            // backpressure (checked above) be the only flow control.
-            // This lets frames flow at wire speed, establishing bandwidth
-            // estimates quickly on high-latency links.
-            if client.surface_burst_remaining == 0 && client.surface_next_send_at > now {
-                let deadline = client.surface_next_send_at;
-                next_deadline = Some(match next_deadline {
-                    Some(existing) => existing.min(deadline),
-                    None => deadline,
-                });
-                client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
-                continue;
-            }
-            if client.surface_subscriptions.is_empty() {
-                client.skip_no_subs_count = client.skip_no_subs_count.saturating_add(1);
-                continue;
-            }
-            client_work.push(ClientWork {
-                cid,
-                subs: client.surface_subscriptions.clone(),
-                needs_keyframe: client.surface_needs_keyframe,
-            });
-            // Don't advance the deadline here — wait until we know an
-            // encode job was actually collected (see below).  Advancing
-            // eagerly wastes time slots when the encode is skipped due
-            // to in-flight limits or unchanged pixel data.
-        }
-
-        // Track which clients actually had encode jobs collected so we
-        // can advance their deadlines after the job-collection pass.
-        let mut clients_with_encodes: HashSet<u64> = HashSet::new();
-        #[cfg(target_os = "linux")]
-        let pending_external_bufs: Vec<(u32, Vec<blit_compositor::ExternalOutputBuffer>)> =
-            Vec::new();
-
-        // Pre-extract compositor Vulkan Video capabilities so we don't
-        // need to borrow sess.compositor inside the client-mutation loop.
-        let vk_encode_available = sess
-            .compositor
-            .as_ref()
-            .is_some_and(|cs| cs.handle.vulkan_video_encode);
-        let vk_encode_av1_available = sess
-            .compositor
-            .as_ref()
-            .is_some_and(|cs| cs.handle.vulkan_video_encode_av1);
-
-        // Vulkan Video encoder setup commands to send after the client loop.
-        struct VulkanEncoderSetup {
-            surface_id: u32,
-            codec: u8,
-            qp: u8,
-            width: u32,
-            height: u32,
-        }
-        let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
-        let mut pending_vulkan_keyframe_requests: Vec<u32> = Vec::new();
-
-        for work in &client_work {
-            for &(sid, px_w, px_h, px_gen) in &pixel_snapshot {
-                {
-                    let client = sess.clients.get_mut(&work.cid).unwrap();
-                    client.encode_loop_iters = client.encode_loop_iters.saturating_add(1);
-                }
-                if !work.subs.contains(&sid) {
-                    let client = sess.clients.get_mut(&work.cid).unwrap();
-                    client.skip_not_subbed_count = client.skip_not_subbed_count.saturating_add(1);
-                    continue;
-                }
-                let client = sess.clients.get_mut(&work.cid).unwrap();
-
-                // Skip encoding if the pixel data hasn't changed since the
-                // last encode for this client, unless a keyframe is needed
-                // (e.g. late-joining client).
-                if !work.needs_keyframe
-                    && let Some(&last_gen) = client.surface_last_encoded_gen.get(&sid)
-                    && last_gen == px_gen
-                {
-                    client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
-                    continue;
-                }
-
-                let (pixels, created_at) = {
-                    let cs = sess.compositor.as_ref().unwrap();
-                    let ca = cs.created_at;
-                    let maybe_px = match cs.last_pixels.get(&sid) {
-                        Some(lp) if lp.width == px_w && lp.height == px_h => {
-                            Some(lp.pixels.clone())
-                        }
-                        _ => None,
-                    };
-                    match maybe_px {
-                        Some(px) => (px, ca),
-                        None => {
-                            let client = sess.clients.get_mut(&work.cid).unwrap();
-                            client.skip_last_pixels_mismatch_count =
-                                client.skip_last_pixels_mismatch_count.saturating_add(1);
-                            continue;
-                        }
-                    }
-                };
-                let client = sess.clients.get_mut(&work.cid).unwrap();
-
-                // Fast path: if the compositor already produced an encoded
-                // bitstream (Vulkan Video), skip the SurfaceEncoder entirely
-                // and send the pre-encoded data directly to the client.
-                if let blit_compositor::PixelData::Encoded {
-                    ref data,
-                    is_keyframe,
-                    codec_flag,
-                } = pixels
-                {
-                    let flags = codec_flag
-                        | if is_keyframe {
-                            SURFACE_FRAME_FLAG_KEYFRAME
-                        } else {
-                            0
-                        };
-                    let timestamp = created_at.elapsed().as_millis() as u32;
-                    let msg =
-                        msg_surface_frame(sid, timestamp, flags, px_w as u16, px_h as u16, data);
-                    let bytes = msg.len();
-                    match send_outbox(client, msg) {
-                        Err(_e) => {
-                            client.surface_needs_keyframe = true;
-                        }
-                        Ok(()) => {
-                            client.surface_inflight_frames.push_back(InFlightFrame {
-                                sent_at: now,
-                                bytes,
-                                paced: true,
-                            });
-                            if !is_keyframe {
-                                client.avg_surface_frame_bytes = ewma_with_direction(
-                                    client.avg_surface_frame_bytes,
-                                    bytes as f32,
-                                    0.5,
-                                    0.125,
-                                );
-                            }
-                        }
-                    }
-                    clients_with_encodes.insert(work.cid);
-                    encode_dispatched_surfaces.insert(sid);
-                    client.surface_last_encoded_gen.insert(sid, px_gen);
-                    continue;
-                }
-
-                // Skip if an encode job is already in flight for this
-                // (client, surface) pair.  Spawning a second job would
-                // create a throwaway encoder whose output races with the
-                // first, and concurrent C-library encode instances for the
-                // same client can corrupt memory.
-                if client.surface_encodes_in_flight.contains(&sid) {
-                    client.skip_in_flight_count = client.skip_in_flight_count.saturating_add(1);
-                    let now_inst = Instant::now();
-                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
-                        client.last_skip_log = now_inst;
-                        eprintln!(
-                            "[encode-skip] cid={} sid={sid} reason=in_flight same_gen={} in_flight={} burst={}",
-                            work.cid,
-                            client.skip_same_gen_count,
-                            client.skip_in_flight_count,
-                            client.surface_burst_remaining,
-                        );
-                    }
-                    continue;
-                }
-
-                // Check if a Vulkan Video encoder should be used for this
-                // surface.  Vulkan Video encoders live in the compositor;
-                // the server only sends commands to create / keyframe /
-                // destroy them and the fast path above handles the
-                // resulting PixelData::Encoded.
-                let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
-                let needs_new_encoder = if has_vulkan_enc {
-                    // Vulkan Video encoder exists — no local SurfaceEncoder.
-                    false
-                } else {
-                    client
-                        .surface_encoders
-                        .get(&sid)
-                        .is_none_or(|e| e.source_dimensions() != (px_w, px_h))
-                };
-
-                // --- Try Vulkan Video first ---
-                if needs_new_encoder {
-                    let codec_support = client
-                        .surface_codec_overrides
-                        .get(&sid)
-                        .copied()
-                        .unwrap_or(client.surface_codec_support);
-                    let quality = client
-                        .surface_quality_overrides
-                        .get(&sid)
-                        .copied()
-                        .unwrap_or(state.config.surface_quality);
-
-                    for &pref in &state.config.surface_encoders {
-                        if !pref.is_vulkan_video() {
-                            continue;
-                        }
-                        if !pref.supported_by_client(codec_support) {
-                            continue;
-                        }
-                        // Check compositor capability (pre-extracted above).
-                        let available = match pref {
-                            SurfaceEncoderPreference::VulkanVideoH264 => vk_encode_available,
-                            SurfaceEncoderPreference::VulkanVideoAV1 => vk_encode_av1_available,
-                            _ => false,
-                        };
-                        if !available {
-                            continue;
-                        }
-                        // Vulkan Video 4:4:4 requires a YUV444 compute pipeline
-                        // and 3-plane DPB surfaces that are not yet implemented.
-                        // Skip so the fallback chain tries NVENC/VA-API/software.
-                        if state.config.chroma.is_444() {
-                            continue;
-                        }
-                        let qp = match pref {
-                            SurfaceEncoderPreference::VulkanVideoAV1 => quality.av1_qp_for_vulkan(),
-                            _ => quality.h264_qp(),
-                        };
-                        let enc_name: &'static str = match (pref, state.config.chroma) {
-                            (
-                                SurfaceEncoderPreference::VulkanVideoH264,
-                                ChromaSubsampling::Cs444,
-                            ) => "h264-vulkan 4:4:4",
-                            (SurfaceEncoderPreference::VulkanVideoH264, _) => "h264-vulkan",
-                            (
-                                SurfaceEncoderPreference::VulkanVideoAV1,
-                                ChromaSubsampling::Cs444,
-                            ) => "av1-vulkan 4:4:4",
-                            (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
-                            (_, ChromaSubsampling::Cs444) => "vulkan 4:4:4",
-                            _ => "vulkan",
-                        };
-                        // Queue commands to send after the client loop.
-                        pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
-                            surface_id: sid as u32,
-                            codec: pref.vulkan_codec(),
-                            qp,
-                            width: px_w,
-                            height: px_h,
-                        });
-                        pending_vulkan_keyframe_requests.push(sid as u32);
-                        // Remove any local encoder for this surface.
-                        client.surface_encoders.remove(&sid);
-                        client
-                            .vulkan_video_surfaces
-                            .insert(sid, (enc_name, pref.codec_flag()));
-                        let codec_str = match pref {
-                            SurfaceEncoderPreference::VulkanVideoH264 => {
-                                if state.config.chroma.is_444() {
-                                    "avc1.F4001f".to_string()
-                                } else {
-                                    "avc1.640034".to_string()
-                                }
-                            }
-                            SurfaceEncoderPreference::VulkanVideoAV1 => {
-                                let profile = if state.config.chroma.is_444() { 2 } else { 0 };
-                                let level = surface_encoder::av1_level_for(px_w, px_h);
-                                format!("av01.{profile}.{level}M.08")
-                            }
-                            _ => String::new(),
-                        };
-                        let enc_msg = msg_surface_encoder(sid, enc_name, &codec_str);
-                        let _ = send_outbox(client, enc_msg);
-                        if state.config.verbose {
-                            eprintln!(
-                                "[surface-encoder] cid={} sid={sid} {px_w}x{px_h}: using {enc_name}",
-                                work.cid,
-                            );
-                        }
-                        break;
-                    }
-
-                    // Even with Vulkan Video, we need a SurfaceEncoder to
-                    // allocate GBM BGRA buffers + VA-API NV12 surfaces for the
-                    // compositor's external output pipeline.  The encoder won't
-                    // be used for encoding — PixelData::Encoded bypasses it.
-
-                    // Defer encoder creation to spawn_blocking so the
-                    // tick loop isn't blocked by slow VA-API init.  The
-                    // EncodeJob carries creation parameters; the blocking
-                    // task creates the encoder, exports GBM buffers, and
-                    // performs the first encode in one shot.
-                    client.surface_encoders.remove(&sid);
-                    client.surface_encodes_in_flight.insert(sid);
-                    let needs_kf = true; // new encoder always needs keyframe
-                    clients_with_encodes.insert(work.cid);
-                    encode_dispatched_surfaces.insert(sid);
-                    encode_jobs.push(EncodeJob {
-                        cid: work.cid,
-                        sid,
-                        px_w,
-                        px_h,
-                        pixels,
-                        needs_keyframe: needs_kf,
-                        encoder: None,
-                        create_params: Some(EncoderCreateParams {
-                            preferences: state.config.surface_encoders.clone(),
-                            vaapi_device: state.config.vaapi_device.clone(),
-                            quality,
-                            verbose: state.config.verbose,
-                            codec_support,
-                            chroma: state.config.chroma,
-                        }),
-                        generation: px_gen,
-                    });
-                    continue;
-                }
-
-                // If using Vulkan Video, handle keyframe via compositor command
-                // and skip local encode — the fast path above handles delivery.
-                if client.vulkan_video_surfaces.contains_key(&sid) {
-                    if work.needs_keyframe {
-                        pending_vulkan_keyframe_requests.push(sid as u32);
-                    }
-                    // The encoded frame comes via PixelData::Encoded on
-                    // the next compositor commit, handled by the fast path.
-                    client.skip_vulkan_await_count =
-                        client.skip_vulkan_await_count.saturating_add(1);
-                    let now_inst = Instant::now();
-                    if now_inst.duration_since(client.last_skip_log).as_secs_f32() > 5.0 {
-                        client.last_skip_log = now_inst;
-                        eprintln!(
-                            "[encode-skip] cid={} sid={sid} reason=vulkan_await \
-                             (compositor not producing PixelData::Encoded) count={}",
-                            work.cid, client.skip_vulkan_await_count,
-                        );
-                    }
-                    continue;
-                }
-
-                let encoder = client.surface_encoders.remove(&sid).unwrap();
-                client.surface_encodes_in_flight.insert(sid);
-                // A fresh encoder always needs a keyframe, regardless of
-                // the client's global flag.
-                let needs_kf = work.needs_keyframe || needs_new_encoder;
-                clients_with_encodes.insert(work.cid);
-                encode_dispatched_surfaces.insert(sid);
-                encode_jobs.push(EncodeJob {
-                    cid: work.cid,
-                    sid,
-                    px_w,
-                    px_h,
-                    pixels,
-                    needs_keyframe: needs_kf,
-                    encoder: Some(encoder),
-                    create_params: None,
-                    generation: px_gen,
-                });
-            }
-        }
-
-        // Send Vulkan Video encoder setup commands to compositor.
-        if (!pending_vulkan_encoder_setups.is_empty()
-            || !pending_vulkan_keyframe_requests.is_empty())
-            && let Some(cs) = sess.compositor.as_ref()
-        {
-            for setup in pending_vulkan_encoder_setups {
-                eprintln!(
-                    "[vulkan-video] sending SetVulkanEncoder sid={} codec={} {}x{} qp={}",
-                    setup.surface_id, setup.codec, setup.width, setup.height, setup.qp,
-                );
-                let _ = cs.handle.command_tx.send(
-                    blit_compositor::CompositorCommand::SetVulkanEncoder {
-                        surface_id: setup.surface_id,
-                        codec: setup.codec,
-                        qp: setup.qp,
-                        width: setup.width,
-                        height: setup.height,
-                    },
-                );
-            }
-            for surface_id in pending_vulkan_keyframe_requests {
-                let _ = cs
-                    .handle
-                    .command_tx
-                    .send(blit_compositor::CompositorCommand::RequestVulkanKeyframe { surface_id });
-            }
-            cs.handle.wake();
-        }
-
-        // Send VA-API exported surfaces to compositor for each new encoder.
-        #[cfg(target_os = "linux")]
-        if !pending_external_bufs.is_empty()
-            && let Some(cs) = sess.compositor.as_ref()
-        {
-            for (surface_id, bufs) in pending_external_bufs {
-                let _ = cs.handle.command_tx.send(
-                    blit_compositor::CompositorCommand::SetExternalOutputBuffers {
-                        surface_id,
-                        buffers: bufs,
-                    },
-                );
-            }
-            cs.handle.wake();
-        }
-
-        // Advance the pacing deadline only for clients that actually had
-        // at least one encode job collected.  Clients skipped due to
-        // in-flight limits or unchanged pixels keep their current
-        // deadline so the next tick retries without burning a time slot.
-        for work in &client_work {
-            if let Some(client) = sess.clients.get_mut(&work.cid)
-                && clients_with_encodes.contains(&work.cid)
-            {
-                let interval = surface_send_interval(client);
-                advance_deadline(&mut client.surface_next_send_at, now, interval);
-            }
-        }
-    }
-
-    if !encode_jobs.is_empty() {
-        // Fire-and-forget: spawn the encode and deliver asynchronously
-        // so the tick loop is never blocked by slow encoders.
-        let state2 = state.clone();
-        tokio::spawn(async move {
-            // Track (cid, sid) for each job so we can clean up
-            // surface_encodes_in_flight if a task panics or times out.
-            let job_ids: Vec<(u64, u16)> = encode_jobs.iter().map(|j| (j.cid, j.sid)).collect();
-
-            let handles: Vec<_> = encode_jobs
-                .into_iter()
-                .map(|mut job| {
-                    tokio::task::spawn_blocking(move || {
-                        // Create encoder on the blocking thread if it was
-                        // deferred (avoids blocking the tick loop with
-                        // VA-API device open / context creation).
-                        let mut encoder = if let Some(enc) = job.encoder.take() {
-                            enc
-                        } else if let Some(ref params) = job.create_params {
-                            match SurfaceEncoder::new(
-                                &params.preferences,
-                                job.px_w,
-                                job.px_h,
-                                &params.vaapi_device,
-                                params.quality,
-                                params.verbose,
-                                params.codec_support,
-                                params.chroma,
-                            ) {
-                                Ok(enc) => enc,
-                                Err(err) => {
-                                    if params.verbose {
-                                        eprintln!(
-                                            "[surface-encoder] cid={} sid={} {}x{}: {err}",
-                                            job.cid, job.sid, job.px_w, job.px_h,
-                                        );
-                                    }
-                                    return EncodeResult {
-                                        cid: job.cid,
-                                        sid: job.sid,
-                                        px_w: job.px_w,
-                                        px_h: job.px_h,
-                                        generation: job.generation,
-                                        encoder: None,
-                                        nal_data: None,
-                                        codec_flag: 0,
-                                        encoder_name: None,
-                                        codec_string: None,
-                                        #[cfg(target_os = "linux")]
-                                        external_bufs: None,
-                                    };
-                                }
-                            }
-                        } else {
-                            // Neither encoder nor create_params — shouldn't happen.
-                            return EncodeResult {
-                                cid: job.cid,
-                                sid: job.sid,
-                                px_w: job.px_w,
-                                px_h: job.px_h,
-                                generation: job.generation,
-                                encoder: None,
-                                nal_data: None,
-                                codec_flag: 0,
-                                encoder_name: None,
-                                codec_string: None,
-                                #[cfg(target_os = "linux")]
-                                external_bufs: None,
-                            };
-                        };
-
-                        // If the encoder was just created, collect its name
-                        // and GBM buffers for the completion handler.
-                        let newly_created = job.create_params.is_some();
-                        let encoder_name = if newly_created {
-                            Some(encoder.encoder_name())
-                        } else {
-                            None
-                        };
-                        let codec_string = if newly_created {
-                            Some(encoder.webcodecs_codec_string())
-                        } else {
-                            None
-                        };
-
-                        #[cfg(target_os = "linux")]
-                        let external_bufs = if newly_created {
-                            // Allocate NV12 GBM buffers for the compositor's
-                            // BGRA→NV12 compute shader pipeline.
-                            {
-                                let drm_fd = encoder.drm_fd_raw();
-                                let count = encoder.gbm_buffers().len();
-                                if count > 0 {
-                                    encoder.allocate_nv12_buffers(drm_fd, count);
-                                }
-                            }
-                            let gbm_bufs = encoder.gbm_buffers();
-                            if !gbm_bufs.is_empty() {
-                                let nv12_bufs = encoder.gbm_nv12_buffers();
-                                let (enc_w, enc_h) = encoder.encoder_dimensions();
-                                let bufs = gbm_bufs
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, b)| {
-                                        let nv12 = nv12_bufs.get(i);
-                                        blit_compositor::ExternalOutputBuffer {
-                                            fd: std::sync::Arc::new(
-                                                b.fd.try_clone().expect("dup gbm fd"),
-                                            ),
-                                            fourcc: 0x34325241,
-                                            modifier: 0,
-                                            stride: b.stride,
-                                            offset: 0,
-                                            width: b.width,
-                                            height: b.height,
-                                            va_surface_id: 0,
-                                            va_display: 0,
-                                            planes: vec![blit_compositor::ExternalOutputPlane {
-                                                offset: 0,
-                                                pitch: b.stride,
-                                            }],
-                                            nv12_fd: nv12.map(|n| n.fd.clone()),
-                                            nv12_stride: nv12.map_or(0, |n| n.stride),
-                                            nv12_uv_offset: nv12.map_or(0, |n| n.uv_offset),
-                                            nv12_modifier: nv12.map_or(0, |n| n.modifier),
-                                            nv12_width: enc_w,
-                                            nv12_height: enc_h,
-                                        }
-                                    })
-                                    .collect();
-                                Some((job.sid as u32, bufs))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        if job.needs_keyframe {
-                            encoder.request_keyframe();
-                        }
-                        let nal_data = encoder.encode_pixels(&job.pixels);
-                        let codec_flag = encoder.codec_flag();
-                        EncodeResult {
-                            cid: job.cid,
-                            sid: job.sid,
-                            px_w: job.px_w,
-                            px_h: job.px_h,
-                            generation: job.generation,
-                            encoder: Some(encoder),
-                            nal_data,
-                            codec_flag,
-                            encoder_name,
-                            codec_string,
-                            #[cfg(target_os = "linux")]
-                            external_bufs,
-                        }
-                    })
-                })
-                .collect();
-
-            // Timeout: if a hardware encoder hangs (e.g. vaSyncSurface on
-            // AMD), don't block delivery of other surfaces' results forever.
-            const ENCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-            let mut results = Vec::with_capacity(handles.len());
-            let mut failed: Vec<(u64, u16)> = Vec::new();
-            for (i, h) in handles.into_iter().enumerate() {
-                match tokio::time::timeout(ENCODE_TIMEOUT, h).await {
-                    Ok(Ok(r)) => results.push(r),
-                    Ok(Err(_join_err)) => {
-                        // spawn_blocking panicked — encoder is lost.
-                        eprintln!(
-                            "[surface-encoder] encode task panicked: cid={} sid={}",
-                            job_ids[i].0, job_ids[i].1
-                        );
-                        failed.push(job_ids[i]);
-                    }
-                    Err(_timeout) => {
-                        // Encoder hung (e.g. GPU hang in vaSyncSurface).
-                        // The blocking thread is leaked but we must not
-                        // let it stall all other surfaces forever.
-                        eprintln!(
-                            "[surface-encoder] encode timed out ({}s): cid={} sid={}",
-                            ENCODE_TIMEOUT.as_secs(),
-                            job_ids[i].0,
-                            job_ids[i].1
-                        );
-                        failed.push(job_ids[i]);
-                    }
-                }
-            }
-
-            // Deliver encoded frames.
-            let mut sess = state2.session.lock().await;
-            let now = Instant::now();
-            let mut local_encodes = 0u32;
-            let mut local_encode_bytes = 0u64;
-            let mut local_frames_sent = 0u32;
-
-            // Clean up in-flight tracking for panicked/timed-out encodes.
-            // Without this, the surface is permanently blocked from future
-            // encode jobs and frame delivery stops for that surface.
-            for (cid, sid) in failed {
-                if let Some(client) = sess.clients.get_mut(&cid) {
-                    client.surface_encodes_in_flight.remove(&sid);
-                    // The encoder was moved into the spawn_blocking closure
-                    // and is now lost.  A fresh encoder will be created on
-                    // the next tick when surface_encoders doesn't contain
-                    // this sid.  Force a keyframe so the new encoder starts
-                    // with a clean reference chain.
-                    client.surface_needs_keyframe = true;
-                }
-            }
-
-            for result in results {
-                // Return the encoder to the client, but only if its
-                // dimensions still match the current surface.  A resize
-                // that arrived while the encode was in flight will have
-                // invalidated the old encoder; reinserting the stale one
-                // would force the next tick to discard and recreate it,
-                // wasting work and risking feeding a C encoder (openh264)
-                // frames at the wrong resolution.
-                // Send GBM buffers to compositor if the encoder was just
-                // created (deferred from the tick loop).
-                #[cfg(target_os = "linux")]
-                if let Some((surface_id, bufs)) = result.external_bufs
-                    && let Some(cs) = sess.compositor.as_ref()
-                {
-                    let _ = cs.handle.command_tx.send(
-                        blit_compositor::CompositorCommand::SetExternalOutputBuffers {
-                            surface_id,
-                            buffers: bufs,
-                        },
-                    );
-                    cs.handle.wake();
-                }
-                let dims_match = result.encoder.as_ref().is_some_and(|enc| {
-                    sess.compositor
-                        .as_ref()
-                        .and_then(|cs| cs.last_pixels.get(&result.sid))
-                        .is_some_and(|lp| enc.source_dimensions() == (lp.width, lp.height))
-                });
-                if let Some(client) = sess.clients.get_mut(&result.cid) {
-                    client.surface_encodes_in_flight.remove(&result.sid);
-                    let invalidated = client.surface_encoder_invalidated.remove(&result.sid);
-                    if let Some(encoder) = result.encoder
-                        && dims_match
-                        && !invalidated
-                    {
-                        if let Some(name) = result.encoder_name {
-                            let codec_str = result.codec_string.as_deref().unwrap_or("");
-                            let enc_msg = msg_surface_encoder(result.sid, name, codec_str);
-                            let _ = send_outbox(client, enc_msg);
-                        }
-                        client.surface_encoders.insert(result.sid, encoder);
-                    }
-                    // Record the generation we just encoded so we don't
-                    // re-encode identical pixel data on subsequent ticks.
-                    client
-                        .surface_last_encoded_gen
-                        .insert(result.sid, result.generation);
-                }
-
-                let Some((nal_data, is_keyframe)) = result.nal_data else {
-                    eprintln!(
-                        "[encode] nal_data=None sid={} cid={} {}x{}",
-                        result.sid, result.cid, result.px_w, result.px_h,
-                    );
-                    continue;
-                };
-
-                {
-                    static EC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = EC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 5 || n.is_multiple_of(1000) {
-                        eprintln!(
-                            "[encode #{n}] sid={} {}x{} kf={is_keyframe} bytes={}",
-                            result.sid,
-                            result.px_w,
-                            result.px_h,
-                            nal_data.len(),
-                        );
-                    }
-                }
-
-                local_encodes += 1;
-                local_encode_bytes += nal_data.len() as u64;
-
-                let created_at = sess
-                    .compositor
-                    .as_ref()
-                    .map(|cs| cs.created_at)
-                    .unwrap_or(now);
-
-                let flags = result.codec_flag
-                    | if is_keyframe {
-                        SURFACE_FRAME_FLAG_KEYFRAME
-                    } else {
-                        0
-                    };
-                let timestamp = created_at.elapsed().as_millis() as u32;
-                let msg = msg_surface_frame(
-                    result.sid,
-                    timestamp,
-                    flags,
-                    result.px_w as u16,
-                    result.px_h as u16,
-                    &nal_data,
-                );
-                let bytes = msg.len();
-
-                let Some(client) = sess.clients.get_mut(&result.cid) else {
-                    continue;
-                };
-
-                // Don't check window_open here — we already checked before
-                // starting the encode job.  Dropping an encoded P-frame
-                // breaks the decoder's reference chain and causes glitches.
-                // With surface_encodes_in_flight limiting to 1 concurrent
-                // encode per surface, at most 1 frame arrives after the
-                // window closes, which is acceptable.
-                match send_outbox(client, msg) {
-                    Err(_e) => {
-                        // Receiver dropped (client disconnected during encode).
-                        // Request keyframe so the next encoder starts clean.
-                        client.surface_needs_keyframe = true;
-                    }
-                    Ok(()) => {
-                        // Track surface frames in their own inflight queue
-                        // so surface ACKs feed shared goodput / RTT without
-                        // polluting terminal frame-size averages or probing.
-                        client.surface_inflight_frames.push_back(InFlightFrame {
-                            sent_at: now,
-                            bytes,
-                            paced: true,
-                        });
-                        // Prefer updating avg_surface_frame_bytes from delta
-                        // (non-keyframe) frames — keyframes are 5-10× larger
-                        // than P-frames and would inflate the average, dragging
-                        // surface_pacing_fps below the sustainable rate.
-                        //
-                        // However, we must still update from keyframes with a
-                        // very slow alpha: all-intra encoders (e.g. AV1 VAAPI
-                        // before P-frame support) only produce keyframes, so
-                        // skipping them entirely leaves the average stuck at
-                        // the 8 KB initial value, causing the pacer to wildly
-                        // overshoot the send rate and saturate the transport.
-                        if !is_keyframe {
-                            client.avg_surface_frame_bytes = ewma_with_direction(
-                                client.avg_surface_frame_bytes,
-                                bytes as f32,
-                                0.5,
-                                0.125,
-                            );
-                        } else if client.avg_surface_frame_bytes <= 16_384.0 {
-                            // First keyframe while the estimate is still at or
-                            // near the initial 8 KB seed.  No P-frame data has
-                            // been seen yet, so the seed is pure fiction.  Use a
-                            // realistic P-frame estimate: keyframes are typically
-                            // 3-8× larger than P-frames, so divide by 4.  This
-                            // prevents surface_pacing_fps from being wildly
-                            // optimistic (8 KB → 32 fps at 256 KB/s) when the
-                            // actual frames are 50-200 KB keyframes.
-                            client.avg_surface_frame_bytes = (bytes as f32 / 4.0).max(4_096.0);
-                        } else {
-                            // Slow convergence so one keyframe doesn't wreck
-                            // the estimate for dozens of subsequent P-frames.
-                            client.avg_surface_frame_bytes = ewma_with_direction(
-                                client.avg_surface_frame_bytes,
-                                bytes as f32,
-                                0.05,
-                                0.05,
-                            );
-                        }
-                        client.frames_sent = client.frames_sent.wrapping_add(1);
-                        local_frames_sent += 1;
-                        if client.surface_needs_keyframe && is_keyframe {
-                            client.surface_needs_keyframe = false;
-                        }
-                        client.surface_burst_remaining =
-                            client.surface_burst_remaining.saturating_sub(1);
-                    }
-                }
-            }
-            sess.surface_encodes += local_encodes;
-            sess.surface_encode_bytes += local_encode_bytes;
-            sess.surface_frames_sent += local_frames_sent;
-            drop(sess);
-            // Wake the tick loop so it can request the next frame.
-            state2.delivery_notify.notify_one();
-        });
-    }
-
-    // Request frames from the compositor for surfaces that have at least
-    // one subscriber whose pacing says it can accept a new frame.  This
-    // fires the surface's pending wl_surface.frame callback so the
-    // Wayland client will paint and commit its next frame.
-    //
-    // Demand-driven with pipeline overlap:
-    //   When an encode job is dispatched, we eagerly pre-request the next
-    //   frame so the Wayland client paints in parallel with the encode.
-    //   Fresh pixels are ready when the encode completes, turning the
-    //   serial   encode + round_trip   into   max(encode, round_trip).
-    {
-        // Only request frames for surfaces where at least one client is
-        // ready to consume the result.  Without this check, apps that are
-        // always ready to paint (video players like mpv) cause a hot loop:
-        // RequestFrame → commit → SurfaceCommit wakes tick → no client
-        // ready → RequestFrame again → 100% CPU.
-        let mut wanted: HashSet<u16> = HashSet::new();
-
-        // Pre-request: surfaces with an encode just dispatched.  The
-        // compositor will render the next frame while the encode runs,
-        // so pixels are ready when the next pacing window opens.
-        for &sid in &encode_dispatched_surfaces {
-            wanted.insert(sid);
-        }
-        let mut blanket_requested = false;
-        // Request frames for all known surfaces so Wayland apps can make
-        // rendering progress.  Video players (mpv) need frequent callbacks
-        // to advance their presentation clock; browsers need them for
-        // page loads and animations.
-        if let Some(cs) = sess.compositor.as_ref()
-            && now.duration_since(cs.last_blanket_frame_request) >= BLANKET_FRAME_INTERVAL
-        {
-            for &sid in cs.surfaces.keys() {
-                wanted.insert(sid);
-            }
-            blanket_requested = true;
-        }
-        for client in sess.clients.values() {
-            // Don't gate frame requests on surface_window_open — the
-            // compositor should keep producing pixels even when the
-            // inflight window is closed.  Otherwise, recovery after a
-            // wifi stall has to wait for the full render pipeline to
-            // flush (request → paint → commit → encode) before the
-            // first frame can be sent, causing a visible hang.
-            if client.surface_subscriptions.is_empty() {
-                continue;
-            }
-            let surface_ready =
-                client.surface_next_send_at <= now || client.surface_burst_remaining > 0;
-            if !surface_ready {
-                let deadline = client.surface_next_send_at;
-                next_deadline = Some(match next_deadline {
-                    Some(existing) => existing.min(deadline),
-                    None => deadline,
-                });
-                continue;
-            }
-            for &sid in &client.surface_subscriptions {
-                wanted.insert(sid);
-            }
-        }
-
-        if let Some(cs) = sess.compositor.as_mut() {
-            if blanket_requested {
-                cs.last_blanket_frame_request = now;
-            }
-
-            // Gate: at most one RequestFrame per surface per millisecond.
-            // This ensures each wl_callback.done carries a distinct
-            // elapsed_ms timestamp (video players like mpv use these to
-            // pace their presentation clock).  Supports up to 1 kHz.
-            // The gate auto-expires: if the app doesn't commit, the next
-            // tick ≥1 ms later will send a fresh request.
-            const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(1);
-            let mut sent_any = false;
-            for sid in &wanted {
-                let dominated = cs
-                    .last_frame_request
-                    .get(sid)
-                    .is_some_and(|&t| now.duration_since(t) < MIN_REQUEST_INTERVAL);
-                if !dominated {
-                    cs.last_frame_request.insert(*sid, now);
-                    let _ = cs
-                        .handle
-                        .command_tx
-                        .send(CompositorCommand::RequestFrame { surface_id: *sid });
-                    sent_any = true;
-                }
-            }
-            if sent_any {
-                cs.handle.wake();
-            }
-        }
-    }
-
     // -- Audio frame delivery -----------------------------------------------
     #[cfg(target_os = "linux")]
-    if let Some(ref mut cs) = sess.compositor
+    let any_audio_subscribed = sess.clients.values().any(|c| c.audio_subscribed);
+    #[cfg(target_os = "linux")]
+    if any_audio_subscribed
+        && let Some(ref mut cs) = sess.compositor
         && let Some(ref mut ap) = cs.audio_pipeline
         && ap.is_alive()
     {
@@ -3901,13 +4126,13 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
-    // Guarantee the tick loop wakes up at least every BLANKET_FRAME_INTERVAL
+    // Guarantee the tick loop wakes up at least every blanket interval
     // even when no other time-based work is pending.  Without this, the
     // loop blocks forever on delivery_notify when there are no events,
     // and the blanket RequestFrame (which keeps video players like mpv
     // ticking) never fires.
     {
-        let blanket_deadline = now + BLANKET_FRAME_INTERVAL;
+        let blanket_deadline = now + blanket_frame_interval(&sess);
         next_deadline = Some(next_deadline.map_or(blanket_deadline, |d| d.min(blanket_deadline)));
     }
 
@@ -4054,19 +4279,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 encode_loop_iters: 0,
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
-                surface_next_send_at: Instant::now(),
+                surface_subs: HashMap::new(),
                 surface_needs_keyframe: true,
-                surface_burst_remaining: SURFACE_BURST_FRAMES,
                 surface_inflight_frames: VecDeque::new(),
-                surface_encoders: HashMap::new(),
                 vulkan_video_surfaces: HashMap::new(),
-                surface_encodes_in_flight: HashSet::new(),
-                surface_encoder_invalidated: HashSet::new(),
-                surface_last_encoded_gen: HashMap::new(),
                 surface_view_sizes: HashMap::new(),
                 surface_codec_support: 0,
-                surface_codec_overrides: HashMap::new(),
-                surface_quality_overrides: HashMap::new(),
                 pressed_surface_keys: HashSet::new(),
             },
         );
@@ -4920,6 +5138,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         c.surface_view_sizes
                             .insert(surface_id, (width, height, scale_120));
                     }
+                    // Clear latched nal_data=None streak for this
+                    // surface so the encoder can be recreated.  The
+                    // streak is designed to stop infinite recreation
+                    // loops (GBM fd leak), not to permanently black out
+                    // a surface across a client-driven resize.
+                    if let Some(s) = c.surface_subs.get_mut(&surface_id) {
+                        s.nal_none_streak = 0;
+                        s.nal_none_latched_at = None;
+                    }
                 }
                 sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
@@ -4959,52 +5186,57 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     );
                 }
                 let mut destroy_vulkan_enc_sid = None;
+                let mut first_subscribe = false;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     let was_subscribed = !c.surface_subscriptions.insert(surface_id);
-                    c.surface_needs_keyframe = true;
-                    // Reset burst window so the first frames after (re)subscribe
-                    // bypass time-based pacing and flow at wire speed.
-                    c.surface_burst_remaining = SURFACE_BURST_FRAMES;
-
-                    // Track per-surface codec/quality overrides.
-                    let old_codec = c
-                        .surface_codec_overrides
-                        .get(&surface_id)
-                        .copied()
-                        .unwrap_or(0);
-                    let old_quality = c.surface_quality_overrides.get(&surface_id).copied();
                     let new_quality = SurfaceQuality::from_wire(quality_wire);
 
-                    if codec_support != 0 {
-                        c.surface_codec_overrides.insert(surface_id, codec_support);
-                    } else {
-                        c.surface_codec_overrides.remove(&surface_id);
-                    }
-                    if let Some(q) = new_quality {
-                        c.surface_quality_overrides.insert(surface_id, q);
-                    } else {
-                        c.surface_quality_overrides.remove(&surface_id);
-                    }
+                    let state = c.surface_subs.entry(surface_id).or_default();
+                    let old_codec = state.codec_override;
+                    let old_quality = state.quality_override;
 
-                    // Force encoder recreation if preferences changed on resubscribe.
+                    // A no-op resubscribe (same codec/quality, already
+                    // subscribed) should not disturb the steady encode
+                    // stream — resetting needs_keyframe/burst on every
+                    // repeated subscribe makes keyframes churn and skews
+                    // pacing.
+                    let meaningful_change =
+                        !was_subscribed || codec_support != old_codec || new_quality != old_quality;
+                    state.codec_override = codec_support;
+                    state.quality_override = new_quality;
+                    let task_in_flight = state.encode_in_flight || state.creation_in_flight;
+                    if meaningful_change {
+                        // Reset burst window so the first frames after a
+                        // (re)subscribe bypass time-based pacing and flow
+                        // at wire speed.  Clear the nal_data=None streak
+                        // too: a fresh subscription is a valid signal to
+                        // retry a previously-latched encoder.
+                        state.burst_remaining = SURFACE_BURST_FRAMES;
+                        state.nal_none_streak = 0;
+                        state.nal_none_latched_at = None;
+                    }
+                    // Force encoder recreation when preferences change on
+                    // resubscribe.  If an encode OR creation is in flight,
+                    // flag the completion handler to discard its encoder
+                    // instead of installing the stale one.
                     if was_subscribed && (codec_support != old_codec || new_quality != old_quality)
                     {
-                        c.surface_encoders.remove(&surface_id);
-                        // Also destroy Vulkan Video encoder so it gets
-                        // recreated with updated codec/quality settings.
-                        if c.vulkan_video_surfaces.remove(&surface_id).is_some() {
-                            destroy_vulkan_enc_sid = Some(surface_id);
-                        }
-                        // If the encoder is currently in a spawn_blocking
-                        // encode task, the remove above is a no-op.  Mark
-                        // the surface so the completion handler knows not
-                        // to reinsert the stale encoder.
-                        if c.surface_encodes_in_flight.contains(&surface_id) {
-                            c.surface_encoder_invalidated.insert(surface_id);
+                        state.encoder = None;
+                        if task_in_flight {
+                            state.encoder_invalidated = true;
                         }
                     }
+                    if meaningful_change {
+                        c.surface_needs_keyframe = true;
+                    }
+                    first_subscribe = !was_subscribed;
+                    if was_subscribed
+                        && (codec_support != old_codec || new_quality != old_quality)
+                        && c.vulkan_video_surfaces.remove(&surface_id).is_some()
+                    {
+                        destroy_vulkan_enc_sid = Some(surface_id);
+                    }
                 }
-                // Send Vulkan encoder destroy outside the client borrow.
                 if let Some(sid) = destroy_vulkan_enc_sid
                     && let Some(cs) = sess.compositor.as_ref()
                 {
@@ -5015,6 +5247,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     );
                     cs.handle.wake();
                 }
+                if first_subscribe {
+                    sess.resize_surfaces_to_mediated_sizes(
+                        std::iter::once(surface_id),
+                        &state.config.surface_encoders,
+                    );
+                }
                 state.delivery_notify.notify_one();
             }
             C2S_SURFACE_UNSUBSCRIBE if data.len() >= 3 => {
@@ -5022,11 +5260,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let mut removed_vulkan = false;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.surface_subscriptions.remove(&surface_id);
-                    c.surface_view_sizes.remove(&surface_id);
-                    c.surface_codec_overrides.remove(&surface_id);
-                    c.surface_quality_overrides.remove(&surface_id);
-                    c.surface_encoder_invalidated.remove(&surface_id);
+                    c.surface_subs.remove(&surface_id);
                     removed_vulkan = c.vulkan_video_surfaces.remove(&surface_id).is_some();
+                    c.surface_view_sizes.remove(&surface_id);
                 }
                 // Destroy Vulkan Video encoder if no remaining client needs it.
                 if removed_vulkan {
@@ -5618,19 +5854,12 @@ mod tests {
             encode_loop_iters: 0,
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
-            surface_next_send_at: Instant::now(),
+            surface_subs: HashMap::new(),
             surface_needs_keyframe: true,
-            surface_burst_remaining: SURFACE_BURST_FRAMES,
             surface_inflight_frames: VecDeque::new(),
-            surface_encoders: HashMap::new(),
             vulkan_video_surfaces: HashMap::new(),
-            surface_encodes_in_flight: HashSet::new(),
-            surface_encoder_invalidated: HashSet::new(),
-            surface_last_encoded_gen: HashMap::new(),
             surface_view_sizes: HashMap::new(),
             surface_codec_support: 0,
-            surface_codec_overrides: HashMap::new(),
-            surface_quality_overrides: HashMap::new(),
             pressed_surface_keys: HashSet::new(),
         };
         (client, rx)
@@ -5752,6 +5981,23 @@ mod tests {
         assert_eq!(
             session.mediated_size_for_surface(1, Some((3840, 2160))),
             Some((3840, 2160, 240))
+        );
+    }
+
+    #[test]
+    fn mediated_surface_size_picks_min_across_clients() {
+        let mut session = Session::new();
+        let mut c1 = test_client();
+        let mut c2 = test_client();
+        c1.surface_view_sizes.insert(1, (1920, 1080, 120));
+        c2.surface_view_sizes.insert(1, (640, 360, 120));
+        c1.surface_subscriptions.insert(1);
+        c2.surface_subscriptions.insert(1);
+        session.clients.insert(1, c1);
+        session.clients.insert(2, c2);
+        assert_eq!(
+            session.mediated_size_for_surface(1, None),
+            Some((640, 360, 120))
         );
     }
 

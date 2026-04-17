@@ -4,6 +4,7 @@ import {
   createMemo,
   onMount,
   onCleanup,
+  untrack,
   Show,
   For,
 } from "solid-js";
@@ -76,7 +77,7 @@ import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
 import { MediaOverlay } from "./MediaOverlay";
-import { BSPContainer } from "./bsp/BSPContainer";
+import { BSPContainer, EmptyPane } from "./bsp/BSPContainer";
 
 import { MobileToolbar } from "./MobileToolbar";
 import type { BSPAssignments, BSPLayout } from "./bsp/layout";
@@ -210,6 +211,18 @@ function WorkspaceScreen(props: {
 
   const [surfaces, setSurfaces] = createSignal<BlitSurface[]>([]);
 
+  // Per-surface signature of the fields that drive the thumbnail UI
+  // (title, appId, width, height).  SurfaceStore mutates width/height
+  // in place on each frame so ref-level diffing never sees dim changes,
+  // and <For each> keys by reference so a child component reading
+  // `props.surface.width` won't re-render when the underlying field is
+  // mutated.  We fix both by tracking a per-surface sig: when a
+  // surface's sig changes we emit a shallow copy (new ref → <For>
+  // remounts that one child and reads the new dims), while surfaces
+  // whose sig is unchanged keep their ref so their children aren't
+  // disturbed.
+  const surfaceSigs = new Map<string, string>();
+
   // Track the set of available connection IDs so the surface aggregation
   // effect re-runs when connections are added or removed.  The joined-string
   // comparison ensures the memo value only changes when the actual set of
@@ -235,33 +248,48 @@ function WorkspaceScreen(props: {
     const cleanups: (() => void)[] = [];
     const syncAll = () => {
       if (!streaming) {
-        if (surfaces().length !== 0) setSurfaces([]);
+        if (untrack(() => surfaces()).length !== 0) {
+          surfaceSigs.clear();
+          setSurfaces([]);
+        }
         return;
       }
       const all: BlitSurface[] = [];
+      const seenKeys = new Set<string>();
+      let anyChanged = false;
       for (const spec of props.connectionSpecs()) {
         const conn = workspace.getConnection(spec.id);
         if (!conn) continue;
         for (const s of conn.surfaceStore.getSurfaces().values()) {
-          all.push(s);
+          const key = `${s.connectionId}:${s.surfaceId}`;
+          seenKeys.add(key);
+          const sig = `${s.title}\0${s.appId}\0${s.width}x${s.height}`;
+          if (surfaceSigs.get(key) !== sig) {
+            surfaceSigs.set(key, sig);
+            // Shallow copy: a new ref forces <For> to rebuild this
+            // item's child, which is the only way a downstream
+            // `props.surface.width` JSX read picks up the fresh value
+            // (SolidJS doesn't track property access on plain objects).
+            all.push({ ...s });
+            anyChanged = true;
+          } else {
+            all.push(s);
+          }
         }
       }
-      // Avoid unnecessary signal updates (and <For> churn) when the
-      // surface set hasn't actually changed.
-      const prev = surfaces();
-      if (
-        prev.length === all.length &&
-        prev.every(
-          (s, i) =>
-            s.surfaceId === all[i].surfaceId &&
-            s.connectionId === all[i].connectionId &&
-            s.title === all[i].title &&
-            s.appId === all[i].appId &&
-            s.width === all[i].width &&
-            s.height === all[i].height,
-        )
-      )
-        return;
+      // Prune sigs for surfaces that no longer exist so stale entries
+      // don't forever block a new surface with the same id from
+      // getting a fresh ref on first frame.
+      if (surfaceSigs.size !== seenKeys.size) {
+        for (const key of surfaceSigs.keys()) {
+          if (!seenKeys.has(key)) {
+            surfaceSigs.delete(key);
+            anyChanged = true;
+          }
+        }
+      }
+      const prev = untrack(() => surfaces());
+      if (!anyChanged && prev.length === all.length) return;
       setSurfaces(all);
     };
     for (const spec of props.connectionSpecs()) {
@@ -1348,15 +1376,29 @@ function WorkspaceScreen(props: {
                     <Show
                       when={wsState().focusedSessionId}
                       fallback={
-                        <EmptyState
+                        <EmptyPane
+                          paneId="__workspace_empty__"
+                          label={null}
+                          isFocused={true}
                           theme={theme()}
-                          scale={chromeScale()}
-                          mod={mod}
-                          onNewTerminal={() => {
-                            if (allConnections().length <= 1) {
-                              void createAndFocus();
-                            } else {
+                          palette={palette()}
+                          fontSize={fontSize()}
+                          connectionId={activeConnectionId()}
+                          connectionLabels={connectionLabels()}
+                          onCreateInPane={(_paneId, command, connectionId) => {
+                            // In non-BSP mode, paneId is irrelevant — we just
+                            // create a terminal and focus it.  When the user
+                            // didn't type a remote prefix or command and there
+                            // are multiple connections, fall back to the
+                            // remote picker so they can choose.
+                            if (
+                              !command &&
+                              !connectionId &&
+                              allConnections().length > 1
+                            ) {
                               openNewTerminalPicker();
+                            } else {
+                              void createAndFocus(command, connectionId);
                             }
                           }}
                           onSwitcher={() => toggleOverlay("expose")}
@@ -1572,6 +1614,11 @@ function WorkspaceScreen(props: {
                 // effect (which runs before BSPContainer re-computes)
                 // doesn't write old pane IDs into the URL.
                 setLayoutAssignments(null);
+                // Clear any focused surface — BSP takes over the main
+                // area so the surface overlay won't render, and leaving
+                // focusedSurfaceId set would hide the surface from the
+                // side panel as well (offScreenSurfaces filters it out).
+                focusSurfaceById(null);
                 setActiveLayout(l);
                 saveActiveLayout(l);
                 saveToHistory(l);
@@ -1765,59 +1812,6 @@ function WorkspaceScreen(props: {
         </Show>
       </main>
     </BlitWorkspaceProvider>
-  );
-}
-
-function EmptyState(props: {
-  theme: Theme;
-  scale: UIScale;
-  mod: string;
-  onNewTerminal: () => void;
-  onSwitcher: () => void;
-  onHelp: () => void;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        "flex-direction": "column",
-        "align-items": "center",
-        "justify-content": "center",
-        height: "100%",
-        gap: `${props.scale.gap}px`,
-        opacity: 0.6,
-      }}
-    >
-      <div
-        style={{
-          "font-size": `${props.scale.sm}px`,
-          display: "flex",
-          "flex-direction": "column",
-          "align-items": "center",
-          gap: `${props.scale.tightGap}px`,
-        }}
-      >
-        <button
-          onClick={props.onNewTerminal}
-          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
-        >
-          {t("workspace.newTerminal")} <kbd style={ui.kbd}>Enter</kbd>{" "}
-          <kbd style={ui.kbd}>{props.mod}+Enter</kbd>
-        </button>
-        <button
-          onClick={props.onSwitcher}
-          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
-        >
-          {t("workspace.menu")} <kbd style={ui.kbd}>{props.mod}+K</kbd>
-        </button>
-        <button
-          onClick={props.onHelp}
-          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
-        >
-          {t("workspace.help")} <kbd style={ui.kbd}>Ctrl+?</kbd>
-        </button>
-      </div>
-    </div>
   );
 }
 
@@ -2160,9 +2154,45 @@ function SurfaceThumbnail(props: {
   const [swipeX, setSwipeX] = createSignal(0);
   const [swiping, setSwiping] = createSignal(false);
   const [dismissed, setDismissed] = createSignal(false);
+  // Measured CSS-pixel width of the thumbnail's video container; drives
+  // the scaled-subscription target so the server encodes at exactly the
+  // size we display.  Updated via ResizeObserver below.
+  const [containerCssWidth, setContainerCssWidth] = createSignal(0);
+  let thumbContainer!: HTMLDivElement;
   let touchStartX = 0;
   let touchStartY = 0;
   let locked = false;
+
+  onMount(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    let debounce: ReturnType<typeof setTimeout> | undefined;
+    let pending = 0;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect.width;
+        if (w > 0 && Math.abs(w - pending) >= 1) {
+          pending = w;
+          // Debounce so drag-resizing the side panel doesn't churn
+          // subscribe messages (each sub change invalidates the encoder).
+          clearTimeout(debounce);
+          debounce = setTimeout(() => setContainerCssWidth(pending), 150);
+        }
+      }
+    });
+    ro.observe(thumbContainer);
+    // Seed the signal with the current size so the first subscribe
+    // carries a target rather than going out unscaled and then updating
+    // 150 ms later (which would force an encoder rebuild for nothing).
+    const rect = thumbContainer.getBoundingClientRect();
+    if (rect.width > 0) {
+      pending = rect.width;
+      setContainerCssWidth(rect.width);
+    }
+    onCleanup(() => {
+      clearTimeout(debounce);
+      ro.disconnect();
+    });
+  });
 
   function onTouchStart(e: TouchEvent) {
     const t = e.touches[0];
@@ -2286,6 +2316,7 @@ function SurfaceThumbnail(props: {
         </Show>
       </button>
       <div
+        ref={thumbContainer}
         style={{
           overflow: "hidden",
           cursor: "pointer",
