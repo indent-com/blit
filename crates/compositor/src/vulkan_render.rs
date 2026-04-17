@@ -1401,6 +1401,24 @@ impl VulkanRenderer {
         {
             return;
         }
+        // A pending self-allocated submit references the current output
+        // images.  If we destroy them now, retire_pending will read freed
+        // memory (or hit a size-mismatch).  Wait for the fence and retire
+        // the staging data before recreating.
+        if let Some(pending) = self.pending_submit.take() {
+            unsafe {
+                let _ = self.device.wait_for_fences(
+                    &[pending.fence],
+                    true,
+                    1_000_000_000, // 1s
+                );
+            }
+            // Discard the retired frame — its dimensions are about to be
+            // stale anyway.  retire_pending still frees the fence / cb /
+            // textures.
+            let _ = self.retire_pending(pending);
+            self.free_frame_textures();
+        }
         // Destroy old.
         self.destroy_output_images();
         // Double-buffered: one being rendered to, one being read back.
@@ -3169,7 +3187,16 @@ impl VulkanRenderer {
             }
         } else if pending.output_idx < self.output_images.len() {
             let img = &self.output_images[pending.output_idx];
-            {
+            if img.width != pending.phys_w || img.height != pending.phys_h {
+                // Output images were recreated (resize) between submit
+                // and retire — the staging buffer we'd read has been
+                // freed.  Drop this frame.
+                eprintln!(
+                    "[retire_pending] output image size mismatch: pending={}x{} current={}x{} (resize during flight)",
+                    pending.phys_w, pending.phys_h, img.width, img.height,
+                );
+                None
+            } else {
                 let size = (pending.phys_w * pending.phys_h * 4) as usize;
                 let bgra = unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
                 Some((
@@ -3179,6 +3206,11 @@ impl VulkanRenderer {
                 ))
             }
         } else {
+            eprintln!(
+                "[retire_pending] output_idx {} out of range (len={})",
+                pending.output_idx,
+                self.output_images.len(),
+            );
             None
         };
 
