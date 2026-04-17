@@ -2859,7 +2859,11 @@ async fn tick(state: &AppState) -> TickOutcome {
             if !surface_window_open(client) {
                 // Log persistent blockage so hangs are visible.
                 let now_inst = Instant::now();
-                if now_inst.duration_since(client.last_window_blocked_log).as_secs_f32() > 5.0 {
+                if now_inst
+                    .duration_since(client.last_window_blocked_log)
+                    .as_secs_f32()
+                    > 5.0
+                {
                     client.last_window_blocked_log = now_inst;
                     eprintln!(
                         "[surface-gate] cid={cid} surface_window_open=false outbox={}f/{}B (limits {}f/{}B) burst={} inflight={}/{} browser_backlog_blocked={}",
@@ -2941,8 +2945,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
                 if !work.subs.contains(&sid) {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
-                    client.skip_not_subbed_count =
-                        client.skip_not_subbed_count.saturating_add(1);
+                    client.skip_not_subbed_count = client.skip_not_subbed_count.saturating_add(1);
                     continue;
                 }
                 let client = sess.clients.get_mut(&work.cid).unwrap();
@@ -2971,9 +2974,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         Some(px) => (px, ca),
                         None => {
                             let client = sess.clients.get_mut(&work.cid).unwrap();
-                            client.skip_last_pixels_mismatch_count = client
-                                .skip_last_pixels_mismatch_count
-                                .saturating_add(1);
+                            client.skip_last_pixels_mismatch_count =
+                                client.skip_last_pixels_mismatch_count.saturating_add(1);
                             continue;
                         }
                     }
