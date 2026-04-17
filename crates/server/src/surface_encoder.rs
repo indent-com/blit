@@ -451,7 +451,6 @@ impl SurfaceEncoder {
                         }
                         // The 4:2:0 fallback below will overwrite last_err
                         // on failure; no need to record this one.
-                        let _ = err;
                     }
                 }
             }
