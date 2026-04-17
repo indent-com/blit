@@ -673,8 +673,7 @@ impl SurfaceEncoder {
                 }
             }
             SurfaceEncoderKind::NvencH264(_) => "avc1.640034".to_string(),
-            SurfaceEncoderKind::NvencAV1(_)
-            | SurfaceEncoderKind::AV1Software(_) => {
+            SurfaceEncoderKind::NvencAV1(_) | SurfaceEncoderKind::AV1Software(_) => {
                 let profile = if self.chroma.is_444() { 2 } else { 0 };
                 let level = av1_level_for(self.source_width, self.source_height);
                 format!("av01.{profile}.{level}M.08")

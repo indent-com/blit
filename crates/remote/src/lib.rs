@@ -2182,11 +2182,7 @@ pub fn msg_surface_app_id(surface_id: u16, app_id: &str) -> Vec<u8> {
 /// The codec_string is the WebCodecs codec string (e.g. "av01.2.05M.08")
 /// appended after a NUL separator.  Old clients that don't split on NUL
 /// will just display the full string as the encoder name, which is fine.
-pub fn msg_surface_encoder(
-    surface_id: u16,
-    encoder_name: &str,
-    codec_string: &str,
-) -> Vec<u8> {
+pub fn msg_surface_encoder(surface_id: u16, encoder_name: &str, codec_string: &str) -> Vec<u8> {
     let name_bytes = encoder_name.as_bytes();
     let codec_bytes = codec_string.as_bytes();
     let mut msg = Vec::with_capacity(3 + name_bytes.len() + 1 + codec_bytes.len());
