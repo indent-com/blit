@@ -2862,11 +2862,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                 if now_inst.duration_since(client.last_window_blocked_log).as_secs_f32() > 5.0 {
                     client.last_window_blocked_log = now_inst;
                     eprintln!(
-                        "[surface-gate] cid={cid} surface_window_open=false outbox={} burst={} inflight={}/{}",
+                        "[surface-gate] cid={cid} surface_window_open=false outbox={}f/{}B (limits {}f/{}B) burst={} inflight={}/{} browser_backlog_blocked={}",
                         outbox_queued_frames(client),
+                        outbox_queued_bytes(client),
+                        OUTBOX_SOFT_QUEUE_LIMIT_FRAMES,
+                        OUTBOX_SOFT_QUEUE_LIMIT_BYTES,
                         client.surface_burst_remaining,
                         client.surface_inflight_frames.len(),
                         surface_inflight_limit(client),
+                        browser_backlog_blocked(client),
                     );
                 }
                 continue;
