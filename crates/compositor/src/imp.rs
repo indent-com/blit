@@ -549,9 +549,17 @@ pub(crate) struct Surface {
 struct ShmPool {
     resource: WlShmPool,
     fd: OwnedFd,
+    inner: std::sync::Mutex<ShmPoolInner>,
+}
+
+struct ShmPoolInner {
     size: usize,
     mmap_ptr: *mut u8,
 }
+
+// Safety: the raw ptr is never shared outside the mutex; the fd and resource
+// are Send by construction.
+unsafe impl Send for ShmPoolInner {}
 
 impl ShmPool {
     fn new(resource: WlShmPool, fd: OwnedFd, size: i32) -> Self {
@@ -573,23 +581,26 @@ impl ShmPool {
         ShmPool {
             resource,
             fd,
-            size: sz,
-            mmap_ptr: if ptr == libc::MAP_FAILED {
-                std::ptr::null_mut()
-            } else {
-                ptr as *mut u8
-            },
+            inner: std::sync::Mutex::new(ShmPoolInner {
+                size: sz,
+                mmap_ptr: if ptr == libc::MAP_FAILED {
+                    std::ptr::null_mut()
+                } else {
+                    ptr as *mut u8
+                },
+            }),
         }
     }
 
-    fn resize(&mut self, new_size: i32) {
+    fn resize(&self, new_size: i32) {
         let new_sz = new_size.max(0) as usize;
-        if new_sz <= self.size {
+        let mut inner = self.inner.lock().unwrap();
+        if new_sz <= inner.size {
             return;
         }
-        if !self.mmap_ptr.is_null() {
+        if !inner.mmap_ptr.is_null() {
             unsafe {
-                libc::munmap(self.mmap_ptr as *mut _, self.size);
+                libc::munmap(inner.mmap_ptr as *mut _, inner.size);
             }
         }
         let ptr = unsafe {
@@ -602,12 +613,12 @@ impl ShmPool {
                 0,
             )
         };
-        self.mmap_ptr = if ptr == libc::MAP_FAILED {
+        inner.mmap_ptr = if ptr == libc::MAP_FAILED {
             std::ptr::null_mut()
         } else {
             ptr as *mut u8
         };
-        self.size = new_sz;
+        inner.size = new_sz;
     }
 
     fn read_buffer(
@@ -618,7 +629,8 @@ impl ShmPool {
         stride: i32,
         format: wl_shm::Format,
     ) -> Option<(u32, u32, PixelData)> {
-        if self.mmap_ptr.is_null() {
+        let inner = self.inner.lock().unwrap();
+        if inner.mmap_ptr.is_null() {
             return None;
         }
         let w = width as u32;
@@ -627,17 +639,17 @@ impl ShmPool {
         let off = offset as usize;
         let row_bytes = w as usize * 4;
         let needed = off + s * (h as usize).saturating_sub(1) + row_bytes;
-        if needed > self.size {
+        if needed > inner.size {
             return None;
         }
         let mut bgra = if s == row_bytes && off == 0 {
             let total = row_bytes * h as usize;
-            unsafe { std::slice::from_raw_parts(self.mmap_ptr, total) }.to_vec()
+            unsafe { std::slice::from_raw_parts(inner.mmap_ptr, total) }.to_vec()
         } else {
             let mut packed = Vec::with_capacity(row_bytes * h as usize);
             for row in 0..h as usize {
                 let src = unsafe {
-                    std::slice::from_raw_parts(self.mmap_ptr.add(off + row * s), row_bytes)
+                    std::slice::from_raw_parts(inner.mmap_ptr.add(off + row * s), row_bytes)
                 };
                 packed.extend_from_slice(src);
             }
@@ -658,9 +670,10 @@ impl ShmPool {
 
 impl Drop for ShmPool {
     fn drop(&mut self) {
-        if !self.mmap_ptr.is_null() {
+        let inner = self.inner.get_mut().unwrap();
+        if !inner.mmap_ptr.is_null() {
             unsafe {
-                libc::munmap(self.mmap_ptr as *mut _, self.size);
+                libc::munmap(inner.mmap_ptr as *mut _, inner.size);
             }
         }
     }
@@ -669,7 +682,12 @@ impl Drop for ShmPool {
 unsafe impl Send for ShmPool {}
 
 struct ShmBufferData {
-    pool_id: ObjectId,
+    /// Keep the pool alive for the lifetime of the buffer: wl_shm_pool.destroy
+    /// does NOT invalidate buffers created from the pool (see the wl_shm_pool
+    /// XML — "destruction does not affect wl_shm_pool.create_buffer"). Client
+    /// processes such as Chromium routinely destroy the pool immediately
+    /// after creating a buffer. Holding an Arc here keeps the mmap alive.
+    pool: Arc<ShmPool>,
     offset: i32,
     width: i32,
     height: i32,
@@ -922,7 +940,7 @@ struct Compositor {
     surfaces: HashMap<ObjectId, Surface>,
     toplevel_surface_ids: HashMap<u16, ObjectId>,
     next_surface_id: u16,
-    shm_pools: HashMap<ObjectId, ShmPool>,
+    shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
     /// Replaces the old pixel_cache — pixel data now lives as persistent GPU
     /// textures inside VulkanRenderer.
@@ -1180,18 +1198,7 @@ impl Compositor {
 
     fn read_shm_buffer(&self, buffer: &WlBuffer) -> Option<(u32, u32, PixelData)> {
         let data = buffer.data::<ShmBufferData>()?;
-        let Some(pool) = self.shm_pools.get(&data.pool_id) else {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 || n.is_multiple_of(100) {
-                eprintln!(
-                    "[read_shm_buffer #{n}] pool {:?} not found (buffer={}x{} fmt={:?})",
-                    data.pool_id, data.width, data.height, data.format,
-                );
-            }
-            return None;
-        };
-        let r = pool.read_buffer(
+        let r = data.pool.read_buffer(
             data.offset,
             data.width,
             data.height,
@@ -3508,7 +3515,7 @@ impl Dispatch<WlShm, ()> for Compositor {
             let pool_id = pool.id();
             state
                 .shm_pools
-                .insert(pool_id, ShmPool::new(pool, fd, size));
+                .insert(pool_id, Arc::new(ShmPool::new(pool, fd, size)));
         }
     }
 }
@@ -3540,10 +3547,13 @@ impl Dispatch<WlShmPool, ()> for Compositor {
                     wayland_server::WEnum::Value(f) => f,
                     _ => wl_shm::Format::Argb8888, // fallback
                 };
+                let Some(pool) = state.shm_pools.get(&pool_id).cloned() else {
+                    return;
+                };
                 data_init.init(
                     id,
                     ShmBufferData {
-                        pool_id: pool_id.clone(),
+                        pool,
                         offset,
                         width,
                         height,
@@ -3553,11 +3563,13 @@ impl Dispatch<WlShmPool, ()> for Compositor {
                 );
             }
             Request::Resize { size } => {
-                if let Some(pool) = state.shm_pools.get_mut(&pool_id) {
+                if let Some(pool) = state.shm_pools.get(&pool_id) {
                     pool.resize(size);
                 }
             }
             Request::Destroy => {
+                // Drop the map entry — Arc keeps the ShmPool alive while
+                // wl_buffers created from it still reference it.
                 state.shm_pools.remove(&pool_id);
             }
             _ => {}
