@@ -3099,6 +3099,14 @@ impl VulkanRenderer {
         let result = self.retire_pending(pending);
         // Free per-frame temporary textures now that the GPU is done.
         self.free_frame_textures();
+        static TR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 10 || n.is_multiple_of(1000) {
+            eprintln!(
+                "[try_retire_pending #{n}] sid={toplevel_sid} result_some={}",
+                result.is_some(),
+            );
+        }
         result.map(|(w, h, p)| (toplevel_sid, w, h, p))
     }
 
@@ -3271,6 +3279,9 @@ impl VulkanRenderer {
         // encoder's VPP handles synchronisation via implicit DMA-BUF
         // fencing.  If the previous submit was external and still
         // in-flight, we defer it for later cleanup and proceed.
+        static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let entry_n = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let had_pending = self.pending_submit.is_some();
         let prev_result = if let Some(pending) = self.pending_submit.take() {
             let prev_sid = pending.toplevel_sid;
             let raw = unsafe {
@@ -3303,6 +3314,14 @@ impl VulkanRenderer {
             self.free_frame_textures();
             None
         };
+        if entry_n < 20 || entry_n.is_multiple_of(1000) {
+            eprintln!(
+                "[render_tree_sized #{entry_n}] had_pending={had_pending} prev_result={} ext_outputs={} deferred={}",
+                prev_result.is_some(),
+                self.external_outputs.len(),
+                self.deferred_submits.len(),
+            );
+        }
 
         let s120 = (output_scale_120 as u32).max(120);
 
@@ -3852,10 +3871,19 @@ impl VulkanRenderer {
                 let ext_len = ext_vec.len();
                 *ext_idx = (*ext_idx + 1) % ext_len;
             }
+            if entry_n < 20 {
+                eprintln!("[render_tree_sized #{entry_n}] return=external Some");
+            }
             result
         } else {
             self.pending_submit = Some(submit_info);
             self.output_idx = (self.output_idx + 1) % self.output_images.len();
+            if entry_n < 20 || entry_n.is_multiple_of(1000) {
+                eprintln!(
+                    "[render_tree_sized #{entry_n}] return=self-alloc prev={}",
+                    prev_result.is_some(),
+                );
+            }
             // Self-allocated: return the PREVIOUS frame's readback
             // (or None on the first frame).  The toplevel_sid in the
             // tuple correctly identifies which surface the previous
