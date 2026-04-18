@@ -50,7 +50,7 @@ fn blit_server_cmd() -> Command {
              BLIT_SOCK               Unix socket path\n    \
              SHELL                   Shell to spawn for new PTYs (default: /bin/sh)\n    \
              BLIT_SHELL_FLAGS        Shell flags (default: li)\n    \
-             BLIT_SCROLLBACK         Scrollback buffer rows per PTY (default: 10000)\n    \
+             BLIT_SCROLLBACK         Scrollback buffer rows per PTY (default: 1000000)\n    \
              BLIT_FD_CHANNEL         File descriptor for fd-passing channel\n    \
              BLIT_SURFACE_ENCODERS   Comma-separated encoder priority list\n    \
              BLIT_SURFACE_QUALITY    Surface quality: low, medium, high, ultra\n    \

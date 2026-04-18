@@ -921,11 +921,6 @@ impl VulkanRenderer {
         self.has_dmabuf
     }
 
-    /// Number of cached surface textures (diagnostic).
-    pub(crate) fn surface_texture_count(&self) -> usize {
-        self.surface_textures.len()
-    }
-
     // ---------------------------------------------------------------
     // Vulkan Video encoder management
     // ---------------------------------------------------------------
@@ -2590,6 +2585,194 @@ impl VulkanRenderer {
         }
     }
 
+    /// Zero-copy SHM upload: copies (with format conversion) directly from
+    /// the client's mmap'd pool memory into Vulkan-mapped texture memory,
+    /// skipping the intermediate owned `Vec<u8>` that the PixelData path
+    /// allocates. `mmap` is the full pool slice; `offset` is the byte
+    /// offset of the surface's first pixel; `stride` is bytes per row.
+    ///
+    /// `swap_rb` true means source pixels are BGRA byte-order; we swap the
+    /// first and third byte to produce RGBA as Vulkan expects. When false
+    /// the source is already RGBA byte-order. `force_opaque` forces the
+    /// alpha byte to 0xFF (for X-formats with undefined alpha).
+    pub(crate) fn upload_surface_shm_mmap(
+        &mut self,
+        surface_id: &ObjectId,
+        mmap: &[u8],
+        offset: usize,
+        stride: usize,
+        width: u32,
+        height: u32,
+        swap_rb: bool,
+        force_opaque: bool,
+    ) -> bool {
+        let row_bytes = width as usize * 4;
+        let end = offset.saturating_add(stride.saturating_mul(height as usize));
+        if end > mmap.len() && offset + stride * (height as usize - 1) + row_bytes > mmap.len() {
+            return false;
+        }
+
+        let fmt = vk::Format::R8G8B8A8_UNORM;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(fmt)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::PREINITIALIZED);
+
+        let image = match unsafe { self.device.create_image(&image_info, None) } {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
+        let Some(mem_type) = self.find_memory_type(
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) else {
+            unsafe { self.device.destroy_image(image, None) };
+            return false;
+        };
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type);
+        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(_) => {
+                unsafe { self.device.destroy_image(image, None) };
+                return false;
+            }
+        };
+        if unsafe { self.device.bind_image_memory(image, memory, 0) }.is_err() {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return false;
+        }
+
+        let subresource = vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            array_layer: 0,
+        };
+        let layout = unsafe { self.device.get_image_subresource_layout(image, subresource) };
+        let dst_row_pitch = layout.row_pitch as usize;
+
+        let map_ptr = match unsafe {
+            self.device
+                .map_memory(memory, 0, layout.size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p as *mut u8,
+            Err(_) => {
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return false;
+            }
+        };
+
+        // Single pass: read from the client mmap, convert, write into
+        // Vulkan mapped memory. Saves the intermediate `Vec<u8>` copy
+        // that the PixelData path allocates in `ShmPool::read_buffer`.
+        unsafe {
+            let dst_base = map_ptr.add(layout.offset as usize);
+            for row in 0..height as usize {
+                let src = mmap.as_ptr().add(offset + row * stride);
+                let dst = dst_base.add(row * dst_row_pitch);
+                if !swap_rb && !force_opaque {
+                    std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+                } else {
+                    for col in 0..width as usize {
+                        let s = src.add(col * 4);
+                        let d = dst.add(col * 4);
+                        if swap_rb {
+                            *d = *s.add(2);
+                            *d.add(1) = *s.add(1);
+                            *d.add(2) = *s;
+                        } else {
+                            *d = *s;
+                            *d.add(1) = *s.add(1);
+                            *d.add(2) = *s.add(2);
+                        }
+                        *d.add(3) = if force_opaque { 0xFF } else { *s.add(3) };
+                    }
+                }
+            }
+            self.device.unmap_memory(memory);
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(fmt)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = match unsafe { self.device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(_) => {
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return false;
+            }
+        };
+
+        let layouts = [self.descriptor_set_layout];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&ds_alloc) } {
+            Ok(sets) => sets[0],
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_image_view(view, None);
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return false;
+            }
+        };
+
+        let img_info = vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&img_info));
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+
+        let tex = CachedSurfaceTexture {
+            image,
+            memory,
+            view,
+            descriptor_set,
+            initial_layout: vk::ImageLayout::PREINITIALIZED,
+        };
+        if let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
+            self.pending_destroy_textures.push(old);
+        }
+        true
+    }
+
     fn create_cached_shm(
         &mut self,
         rgba: &[u8],
@@ -3158,18 +3341,13 @@ impl VulkanRenderer {
     /// main event loop so completed frames are flushed to the server
     /// without waiting for the next Wayland surface commit.
     pub fn try_retire_pending(&mut self) -> Option<(u16, u32, u32, PixelData)> {
-        // Skip the whole retirement path when there is nothing in flight.
-        // The compositor calls this every iteration of its event loop, so
-        // returning immediately when idle avoids the per-iteration overhead
-        // of the Vec::retain_mut sweep and (when applicable) syscalls.
-        if self.pending_submit.is_none() && self.deferred_submits.is_empty() {
-            return None;
-        }
-
-        // Opportunistically drain deferred external submissions whose
-        // fences have signalled, freeing their command buffers and textures.
-        self.drain_deferred_submits();
-
+        // The compositor calls this every iteration of its event loop
+        // (once per Wayland event). We deliberately do NOT drain
+        // deferred external submits here: that happens at submit time
+        // in render_tree_sized so cleanup frequency is bounded by GPU
+        // frame rate rather than by Wayland event rate. Only the
+        // self-allocated pending_submit needs per-iteration polling
+        // because its staging readback is what produces a frame.
         let pending = self.pending_submit.take()?;
         let raw = unsafe {
             (self.device.fp_v1_0().wait_for_fences)(
@@ -3298,6 +3476,26 @@ impl VulkanRenderer {
 
     /// Free deferred external submissions whose fences have signalled.
     fn drain_deferred_submits(&mut self) {
+        if self.deferred_submits.is_empty() {
+            return;
+        }
+        // Single batched probe: waitAll=false with timeout=0 returns
+        // SUCCESS iff at least one fence has signalled. This collapses
+        // N per-fence syscalls into one in the common "nothing ready"
+        // case — the compositor main loop calls us every iteration.
+        let fences: Vec<vk::Fence> = self.deferred_submits.iter().map(|p| p.fence).collect();
+        let any_ready = unsafe {
+            (self.device.fp_v1_0().wait_for_fences)(
+                self.device.handle(),
+                fences.len() as u32,
+                fences.as_ptr(),
+                vk::FALSE,
+                0,
+            )
+        };
+        if any_ready != vk::Result::SUCCESS {
+            return;
+        }
         self.deferred_submits.retain_mut(|pending| {
             let raw = unsafe {
                 (self.device.fp_v1_0().wait_for_fences)(
@@ -3360,10 +3558,6 @@ impl VulkanRenderer {
         target_phys: Option<(u32, u32)>,
         toplevel_sid: u16,
     ) -> Option<(u16, u32, u32, PixelData)> {
-        // Drain any completed deferred submissions (external outputs
-        // whose fences have signalled) to free GPU resources.
-        self.drain_deferred_submits();
-
         // Retire the previous submission if done (non-blocking).
         //
         // For self-allocated outputs we need the fence to complete
@@ -4016,6 +4210,10 @@ impl VulkanRenderer {
             };
 
             let result = Some((toplevel_sid, phys_w, phys_h, pixel_data));
+            // Drain completed deferred submits before appending a new
+            // one. Amortises cleanup with submit rate (bounded by GPU
+            // frame rate) rather than Wayland event rate.
+            self.drain_deferred_submits();
             self.deferred_submits.push(submit_info);
             if let Some((ext_vec, ext_idx)) = self.external_outputs.get_mut(&sid) {
                 let ext_len = ext_vec.len();

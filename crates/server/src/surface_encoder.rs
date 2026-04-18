@@ -8,7 +8,7 @@ use blit_remote::{
 use openh264::encoder::Encoder as OpenH264Encoder;
 use openh264::formats::YUVBuffer;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SurfaceEncoderPreference {
     VulkanVideoH264,
     VulkanVideoAV1,
@@ -174,7 +174,7 @@ impl SurfaceEncoderPreference {
 ///
 /// Set via `BLIT_CHROMA` env var. Default: 444 (fall back to 420 if unsupported).
 /// Use `BLIT_CHROMA=420` to force 4:2:0.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ChromaSubsampling {
     Cs420,
     #[default]
@@ -504,6 +504,46 @@ impl SurfaceEncoder {
         let _ = vaapi_device;
         validate_surface_dimensions(width, height, pref)?;
 
+        // Fast-fail on encoder families that have already been proven
+        // unavailable on this host (no NVENC driver, VA-API device without
+        // the requested codec, etc.).  Without this cache, every surface
+        // resize walks the full preference chain and re-runs expensive
+        // probes — cuInit on systems without CUDA, libva driver open on
+        // systems without H.264/AV1 encode — adding multi-second latency
+        // to each resize before the actual encoder is created.
+        if let Some(err) = cached_unavailable(pref, chroma) {
+            return Err(err);
+        }
+
+        let result = Self::try_one_inner(
+            pref,
+            width,
+            height,
+            source_width,
+            source_height,
+            vaapi_device,
+            quality,
+            verbose,
+            chroma,
+        );
+        if let Err(err) = &result {
+            record_unavailable(pref, chroma, err);
+        }
+        result
+    }
+
+    fn try_one_inner(
+        pref: SurfaceEncoderPreference,
+        width: u32,
+        height: u32,
+        source_width: u32,
+        source_height: u32,
+        vaapi_device: &str,
+        quality: SurfaceQuality,
+        verbose: bool,
+        chroma: ChromaSubsampling,
+    ) -> Result<Self, String> {
+        let _ = vaapi_device;
         match pref {
             SurfaceEncoderPreference::VulkanVideoH264
             | SurfaceEncoderPreference::VulkanVideoAV1 => {
@@ -1358,6 +1398,42 @@ fn validate_surface_dimensions(
     let _ = expected_rgba_len(width, height)
         .ok_or_else(|| format!("surface encoder dimensions overflow for {width}x{height}"))?;
     Ok(())
+}
+
+// Host-wide cache of encoder-family unavailability.  Populated the first
+// time a given `(preference, chroma)` try_one fails after passing the
+// per-call dimension validation — i.e. the error is systemic (missing
+// driver, codec not supported by the device) and will recur on every
+// future attempt.  Hits return the cached error string immediately,
+// skipping the probe cost (cuInit, libva driver open) entirely.
+//
+// Never evicts: drivers don't appear at runtime in practice, and the
+// cost of being wrong is only that a user must restart after plugging
+// in GPU support they didn't have.
+static ENCODER_UNAVAILABLE: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(SurfaceEncoderPreference, ChromaSubsampling), String>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn encoder_unavailable_map() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(SurfaceEncoderPreference, ChromaSubsampling), String>,
+> {
+    ENCODER_UNAVAILABLE.get_or_init(Default::default)
+}
+
+fn cached_unavailable(pref: SurfaceEncoderPreference, chroma: ChromaSubsampling) -> Option<String> {
+    encoder_unavailable_map()
+        .lock()
+        .ok()?
+        .get(&(pref, chroma))
+        .cloned()
+}
+
+fn record_unavailable(pref: SurfaceEncoderPreference, chroma: ChromaSubsampling, err: &str) {
+    if let Ok(mut map) = encoder_unavailable_map().lock() {
+        map.entry((pref, chroma)).or_insert_with(|| err.to_string());
+    }
 }
 
 fn expected_rgba_len(width: u32, height: u32) -> Option<usize> {

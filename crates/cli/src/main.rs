@@ -1,6 +1,7 @@
 mod agent;
 mod cli;
 mod generate;
+mod grep;
 mod interactive;
 mod transport;
 
@@ -125,6 +126,124 @@ async fn async_main() {
                     agent::cmd_kill(transport, id, &signal).await
                 }
                 TerminalCommand::Close { id } => agent::cmd_close(transport, id).await,
+                TerminalCommand::Grep {
+                    pattern,
+                    ids,
+                    regexps,
+                    pattern_files,
+                    fixed_strings,
+                    word_regexp,
+                    line_regexp,
+                    ignore_case,
+                    case_sensitive,
+                    smart_case,
+                    invert_match,
+                    multiline,
+                    multiline_dotall,
+                    after_context,
+                    before_context,
+                    context,
+                    context_separator,
+                    no_context_separator,
+                    line_number,
+                    no_line_number,
+                    with_filename,
+                    no_filename,
+                    heading,
+                    no_heading,
+                    column,
+                    count,
+                    count_matches,
+                    files_with_matches,
+                    files_without_match,
+                    only_matching,
+                    max_count,
+                    passthru,
+                    vimgrep,
+                    json,
+                    pretty,
+                    null,
+                    color,
+                    field_context_separator,
+                    field_match_separator,
+                    quiet,
+                    no_messages,
+                    stats,
+                    stop_on_nonmatch,
+                    sort,
+                    sortr,
+                    tag,
+                    title,
+                    running,
+                    exited,
+                    all,
+                } => {
+                    let opts = match grep::Opts::from_cli(
+                        pattern,
+                        ids,
+                        regexps,
+                        pattern_files,
+                        fixed_strings,
+                        word_regexp,
+                        line_regexp,
+                        ignore_case,
+                        case_sensitive,
+                        smart_case,
+                        multiline,
+                        multiline_dotall,
+                        after_context,
+                        before_context,
+                        context,
+                        context_separator,
+                        no_context_separator,
+                        line_number,
+                        no_line_number,
+                        with_filename,
+                        no_filename,
+                        heading,
+                        no_heading,
+                        column,
+                        count,
+                        count_matches,
+                        files_with_matches,
+                        files_without_match,
+                        only_matching,
+                        max_count,
+                        passthru,
+                        vimgrep,
+                        json,
+                        pretty,
+                        null,
+                        color,
+                        field_context_separator,
+                        field_match_separator,
+                        quiet,
+                        no_messages,
+                        stats,
+                        stop_on_nonmatch,
+                        invert_match,
+                        sort,
+                        sortr,
+                        tag,
+                        title,
+                        running,
+                        exited,
+                        all,
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("blit: {e}");
+                            std::process::exit(2);
+                        }
+                    };
+                    match grep::run(transport, opts).await {
+                        Ok(code) => std::process::exit(code),
+                        Err(e) => {
+                            eprintln!("blit: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
                 TerminalCommand::Record {
                     id,
                     output,
@@ -255,7 +374,7 @@ async fn async_main() {
                             .ok()
                             .and_then(|s| s.parse().ok())
                     })
-                    .unwrap_or(10_000),
+                    .unwrap_or(1_000_000),
                 ipc_path,
                 surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
                 surface_quality: std::env::var("BLIT_SURFACE_QUALITY")

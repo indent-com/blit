@@ -19,9 +19,11 @@ const MAX_BUFFER_FRAMES = 25; // 500 ms
  * Target jitter buffer depth in samples at 48 kHz.  The worklet
  * accumulates this much audio before starting playback and re-buffers
  * after a sustained underrun.  Absorbs network jitter, TCP write
- * bursts from video frames, and main-thread stalls.
+ * bursts from video frames, and main-thread stalls.  Trades latency
+ * for resilience: any single arrival gap larger than this causes an
+ * underrun.
  */
-const JITTER_BUFFER_SAMPLES = 4800; // 100 ms at 48 kHz
+const JITTER_BUFFER_SAMPLES = 2400; // 50 ms at 48 kHz
 
 // -- A/V sync constants ----------------------------------------------------
 
@@ -29,8 +31,22 @@ const JITTER_BUFFER_SAMPLES = 4800; // 100 ms at 48 kHz
 const POS_REPORT_INTERVAL = 4800; // ~100 ms at 48 kHz
 
 /**
- * Drift dead-zone: don't adjust rate if |drift| is below this (ms).
- * Avoids oscillation when sync is already good.
+ * Steady-state target for `audioMs - lastVideoTimestampMs` (ms).  Because
+ * video is rendered immediately on arrival but audio is held in the jitter
+ * buffer for ~JITTER_BUFFER_SAMPLES, the audio currently *playing* is
+ * naturally that many ms behind the most-recently-rendered video frame —
+ * even when the buffer is exactly at its target depth.  Targeting a drift
+ * of zero is therefore unattainable while keeping the buffer stocked: the
+ * controller would clamp the rate at the maximum offset, drain the buffer
+ * in seconds, and cause a periodic underrun cycle.  Subtract this offset
+ * so that drift = 0 (relative to target) corresponds to "buffer at the
+ * desired depth".
+ */
+const TARGET_DRIFT_MS = -(JITTER_BUFFER_SAMPLES / 48);
+
+/**
+ * Drift dead-zone: don't adjust rate if |drift - TARGET_DRIFT_MS| is below
+ * this (ms).  Avoids oscillation when sync is already good.
  */
 const DRIFT_DEADZONE_MS = 10;
 
@@ -83,6 +99,14 @@ const UNDERRUN_REBUFFER_THRESHOLD = 3;
 const SAMPLES_PER_20_MS = 960;
 
 /**
+ * Fade-envelope length in samples used to mask the waveform discontinuity at
+ * underrun boundaries (real audio → forced-zero output → real audio again).
+ * A hard jump from a non-zero sample to 0 is an audible click; ramping the
+ * output gain over ~1.3 ms turns the click into an inaudible soft fade.
+ */
+const FADE_SAMPLES = 64;
+
+/**
  * Inline AudioWorkletProcessor source.
  *
  * Runs on the audio render thread.  Receives Float32Array PCM frames
@@ -113,6 +137,8 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     this.buffering = true;  // true while accumulating the jitter buffer
     this.bufferTarget = ${JITTER_BUFFER_SAMPLES}; // samples to accumulate before playing
     this.underruns = 0;     // consecutive underruns, drives adaptive buffer growth
+    this.fadeGain = 0;      // applied output gain (0..1), ramps to mask underrun clicks
+    this.fadeInc = 1 / ${FADE_SAMPLES}; // per-sample ramp rate
 
     this.port.onmessage = (e) => {
       if (e.data === "flush") {
@@ -125,6 +151,7 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         this.buffering = true;
         this.underruns = 0;
         this.bufferTarget = ${JITTER_BUFFER_SAMPLES};
+        this.fadeGain = 0;
       } else if (e.data && e.data.type === "skip") {
         // Drop samples from the front to reduce drift without a full
         // flush.  Keeps playback running (no re-buffering silence).
@@ -180,20 +207,11 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
 
     // Jitter buffer: don't start playing until we've accumulated enough
     // audio.  This absorbs network jitter and main-thread stalls.
-    if (this.buffering) {
-      if (this.buffered >= this.bufferTarget) {
-        this.buffering = false;
-      } else {
-        // Output silence while buffering.
-        for (let i = 0; i < needed; i++) {
-          outL[i] = 0;
-          outR[i] = 0;
-        }
-        return true;
-      }
+    if (this.buffering && this.buffered >= this.bufferTarget) {
+      this.buffering = false;
     }
 
-    while (written < needed && this.buffer.length > 0) {
+    if (!this.buffering) while (written < needed && this.buffer.length > 0) {
       const pcm = this.buffer[0];
       const half = pcm.length / 2;
       if (half <= 0) {
@@ -250,15 +268,37 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
       this.offset += advance;
     }
 
-    // Underrun: output silence for the remainder.  Single-block underruns
-    // are common scheduling hiccups — only re-enter buffering after a
-    // sustained gap, otherwise the silence-while-refilling is worse than
-    // the original hiccup.
-    if (written < needed) {
-      for (let i = written; i < needed; i++) {
-        outL[i] = 0;
-        outR[i] = 0;
+    // Fill the remainder of the block with zeros (underrun or buffering).
+    for (let i = written; i < needed; i++) {
+      outL[i] = 0;
+      outR[i] = 0;
+    }
+
+    // Apply fade envelope: ramp the output gain toward 1 for samples that
+    // came from real audio and toward 0 for the silence-padded tail.  A
+    // hard non-zero → 0 jump at an underrun boundary is an audible click;
+    // ramping over ~1.3 ms makes the transition inaudible.  The gain
+    // persists across blocks, so a brief 1-sample dip barely attenuates.
+    const fadeInc = this.fadeInc;
+    let g = this.fadeGain;
+    for (let i = 0; i < needed; i++) {
+      const target = i < written ? 1 : 0;
+      if (g < target) {
+        g += fadeInc;
+        if (g > target) g = target;
+      } else if (g > target) {
+        g -= fadeInc;
+        if (g < target) g = target;
       }
+      outL[i] *= g;
+      outR[i] *= g;
+    }
+    this.fadeGain = g;
+
+    // Underrun: track consecutive underruns and re-enter buffering after
+    // a sustained gap.  Single-block underruns are common scheduling
+    // hiccups — re-buffering on every one is worse than the hiccup itself.
+    if (written < needed) {
       if (this.consumed > 0) {
         this.underruns++;
         if (this.underruns >= ${UNDERRUN_REBUFFER_THRESHOLD}) {
@@ -686,17 +726,21 @@ export class AudioPlayer {
     const audioMs = this.audioTimestampAtSample(consumed);
     if (audioMs === null) return;
 
-    // drift > 0 → audio is ahead of video → slow down (rate < 1)
-    // drift < 0 → audio is behind video → speed up (rate > 1)
-    const drift = audioMs - this.lastVideoTimestampMs;
+    // Drift is measured *relative to TARGET_DRIFT_MS*, the natural lag
+    // between currently-playing audio and currently-rendered video that
+    // results from holding the jitter buffer.  This makes "buffer at the
+    // target depth" the equilibrium so the rate controller stops draining
+    // the buffer toward zero.
+    // drift > 0 → audio is ahead of where it should be → slow down (rate < 1)
+    // drift < 0 → audio is behind where it should be → speed up (rate > 1)
+    const drift = audioMs - this.lastVideoTimestampMs - TARGET_DRIFT_MS;
 
-    // Hard jump: drift is too large for ±2% rate steering to close
+    // Hard jump: drift is too large for ±5% rate steering to close
     // quickly.  Handle ahead and behind differently.
     if (drift > DRIFT_JUMP_MS) {
-      // Audio ahead of video — too much audio buffered.  Skip forward
-      // in the worklet buffer to align, then reset sync to re-measure
-      // from the new position.  Avoids the flush→silence→rebuffer
-      // cycle that makes recovery so fragile.
+      // Audio is far ahead of target — too much audio buffered.  Skip
+      // forward in the worklet buffer to align, then reset sync to
+      // re-measure.  Avoids the flush→silence→rebuffer cycle.
       const skipSamples = ((drift - DRIFT_DEADZONE_MS) * 48) | 0;
       if (skipSamples > 0) {
         this.worklet?.port.postMessage({ type: "skip", samples: skipSamples });
@@ -704,11 +748,11 @@ export class AudioPlayer {
       this.resetSync();
       return;
     }
-    // Audio behind video (drift < -DRIFT_JUMP_MS): frames were dropped
-    // and audio is lagging.  Don't flush — that discards the only audio
-    // we have.  Fall through to normal rate steering which applies the
-    // full +2% correction.  At 2%, a 200 ms gap closes in ~10 s; not
-    // instantaneous, but audio keeps playing instead of going silent.
+    // Audio far behind target (drift < -DRIFT_JUMP_MS): the buffer
+    // emptied or frames were dropped.  Don't flush — that discards the
+    // only audio we have.  Fall through to normal rate steering, which
+    // applies the full +5% correction until the buffer refills to its
+    // target depth.
 
     let rate = 1.0;
     const absDrift = Math.abs(drift);
@@ -1067,9 +1111,14 @@ export class AudioPlayer {
       }
     }
 
-    // Record timeline entry: the server timestamp for this chunk of samples.
-    // The frame's timestamp (µs) was set from serverMs * 1000 in handleAudioFrame.
-    const serverMs = frame.timestamp / 1000;
+    // Record timeline entry: the server timestamp for the FIRST sample of
+    // this chunk.  The server stamps each 20 ms Opus frame after encoding
+    // it, so `frame.timestamp` corresponds to the *end* of the captured
+    // window — one chunk duration later than the content at sample 0.
+    // Video timestamps, by contrast, are content-commit time (start).
+    // Subtract n/48 ms here so audio and video timeline entries share a
+    // common "content time" convention and drift is directly comparable.
+    const serverMs = frame.timestamp / 1000 - n / 48;
     this.timeline.push({
       sampleOffset: this.samplesQueued,
       serverMs,

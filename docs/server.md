@@ -9,7 +9,7 @@
 | `BLIT_SOCK`             | see path cascade in [transports.md](transports.md) | Unix socket listen path          |
 | `SHELL`                 | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs       |
 | `BLIT_SHELL_FLAGS`      | `li` (Unix) / `` (Windows)                         | Shell invocation flags           |
-| `BLIT_SCROLLBACK`       | `10000`                                            | Scrollback buffer rows per PTY   |
+| `BLIT_SCROLLBACK`       | `1000000`                                          | Scrollback buffer rows per PTY   |
 | `BLIT_VAAPI_DEVICE`     | `/dev/dri/renderD128`                              | VA-API render node for encoding  |
 | `BLIT_CUDA_DEVICE`      | `0`                                                | CUDA device ordinal (NVENC)      |
 | `BLIT_FD_CHANNEL`       | unset                                              | fd-channel file descriptor       |

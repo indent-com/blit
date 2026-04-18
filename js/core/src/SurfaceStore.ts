@@ -49,11 +49,33 @@ interface DecoderEntry {
   lastCodecString: string | null;
   /** Last AVCC description passed to configure(). */
   lastDescription: ArrayBuffer | null;
+  /** Dimensions of the frame that triggered the most recent configure().
+   *  A resolution-only resize keeps the same profile/level (and thus the
+   *  same codec string), so the cs comparison above can't detect it — but
+   *  the SPS embedded in the description carries the new resolution and
+   *  the decoder needs to pick it up, otherwise it errors on the first
+   *  post-resize keyframe with "Decoding error" and closes. */
+  lastConfiguredWidth: number;
+  lastConfiguredHeight: number;
 }
 
 interface CanvasEntry {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
+}
+
+/** Per-surface presenter state.  Queues decoded frames so presentation
+ *  happens at vsync boundaries (one `requestAnimationFrame` per surface)
+ *  rather than at arbitrary decoder-output moments. */
+interface SurfacePresenter {
+  /** Decoded VideoFrames waiting to be presented.  On each rAF tick only
+   *  the newest is drawn; older frames are closed. */
+  queue: VideoFrame[];
+  /** Pending `requestAnimationFrame` handle, or null. */
+  rafId: number | null;
+  /** True after the first frame has been presented.  The first frame
+   *  paints synchronously to minimise time-to-first-pixel. */
+  initialized: boolean;
 }
 
 function codecFromFlags(flags: number): SurfaceCodec {
@@ -242,6 +264,12 @@ export class SurfaceStore {
 
   private static readonly FRAME_SAMPLE_MAX = 500;
   private static readonly OUTPUT_SAMPLE_MAX = 500;
+
+  /** Per-surface presenter: queues decoded frames and paints the freshest
+   *  one at the next vsync via rAF.  Older frames in the queue are closed
+   *  without drawing — equivalent to the original "drawImage on each decode
+   *  + coalesce via rAF" flow, consolidated into one layer. */
+  private presenters = new Map<number, SurfacePresenter>();
 
   /**
    * Callback to send a surface ACK to the server.  Injected by the
@@ -434,6 +462,7 @@ export class SurfaceStore {
     this._surfaceOutputSamples.delete(surfaceId);
     this._surfaceDrops.delete(surfaceId);
     this._surfaceErrors.delete(surfaceId);
+    this.discardPresenter(surfaceId);
     const entry = this.decoders.get(surfaceId);
     if (entry) safeClose(entry.decoder);
     this.decoders.delete(surfaceId);
@@ -536,9 +565,14 @@ export class SurfaceStore {
           if (sps && pps) {
             const description = buildAvccDescription(sps, pps);
             const cs = h264CodecStringFromSps(sps) ?? "avc1.42001e";
-            if (cs !== entry.lastCodecString) {
+            const dimsChanged =
+              width !== entry.lastConfiguredWidth ||
+              height !== entry.lastConfiguredHeight;
+            if (cs !== entry.lastCodecString || dimsChanged) {
               entry.lastCodecString = cs;
               entry.lastDescription = description;
+              entry.lastConfiguredWidth = width;
+              entry.lastConfiguredHeight = height;
               // If the decoder already has queued work, calling
               // configure() directly resets its state and orphans any
               // in-flight VideoFrame objects — Chromium then logs
@@ -685,6 +719,25 @@ export class SurfaceStore {
         Math.abs(surface.height - height) > 1;
       surface.width = width;
       surface.height = height;
+      // Flush any queued frames from the old resolution.  Without this,
+      // stale VideoFrames occupy the decode buffer pool and the presenter
+      // draws a wrong-sized frame, stalling the pipeline.  Discarding
+      // resets `initialized` so the first frame at the new resolution
+      // paints synchronously (fast path).
+      this.discardPresenter(surfaceId);
+      // Proactively ask the server for a keyframe at the new dimensions
+      // and drop any delta frames that arrive before it.  The decoder
+      // must be reconfigured with the new SPS/PPS (H.264) or size hint
+      // anyway, so a keyframe is mandatory; waiting passively for the
+      // server to produce one adds an extra round-trip to the recovery.
+      const entry = this.decoders.get(surfaceId);
+      if (entry) {
+        entry.pendingKeyframe = true;
+        if (!entry.keyframeRequested) {
+          entry.keyframeRequested = true;
+          this._keyframeSender?.(surfaceId);
+        }
+      }
       if (significant) this.emitChange();
     }
   }
@@ -699,6 +752,7 @@ export class SurfaceStore {
    * re-subscribe for video frames.
    */
   handleDisconnect(): void {
+    this.discardAllPresenters();
     for (const entry of this.decoders.values()) {
       safeClose(entry.decoder);
     }
@@ -722,6 +776,7 @@ export class SurfaceStore {
    * individual S2C_SURFACE_CREATED messages.
    */
   reset(): void {
+    this.discardAllPresenters();
     for (const entry of this.decoders.values()) {
       safeClose(entry.decoder);
     }
@@ -752,6 +807,102 @@ export class SurfaceStore {
   // -----------------------------------------------------------------------
   // Private
   // -----------------------------------------------------------------------
+
+  /** Push a decoded frame into the surface's presenter, paint the very
+   *  first one synchronously, and schedule the next vsync tick. */
+  private enqueueFrame(surfaceId: number, frame: VideoFrame): void {
+    let p = this.presenters.get(surfaceId);
+    if (!p) {
+      p = { queue: [], rafId: null, initialized: false };
+      this.presenters.set(surfaceId, p);
+    }
+
+    if (!p.initialized) {
+      p.initialized = true;
+      this.presentFrame(surfaceId, frame);
+      return;
+    }
+
+    p.queue.push(frame);
+    this.schedulePresent(surfaceId);
+  }
+
+  private schedulePresent(surfaceId: number): void {
+    const p = this.presenters.get(surfaceId);
+    if (!p || p.rafId !== null) return;
+    p.rafId = requestAnimationFrame(() => {
+      p.rafId = null;
+      this.tickPresent(surfaceId);
+    });
+  }
+
+  /** vsync tick: present the newest queued frame, drop any older ones. */
+  private tickPresent(surfaceId: number): void {
+    const p = this.presenters.get(surfaceId);
+    if (!p || p.queue.length === 0) return;
+    const last = p.queue.length - 1;
+    for (let i = 0; i < last; i++) {
+      try {
+        p.queue[i].close();
+      } catch {
+        /* already closed */
+      }
+    }
+    const chosen = p.queue[last];
+    p.queue.length = 0;
+    this.presentFrame(surfaceId, chosen);
+  }
+
+  /** Draw a frame to the backing canvas and notify listeners.  Closes the
+   *  frame on the way out. */
+  private presentFrame(surfaceId: number, frame: VideoFrame): void {
+    try {
+      const ce = this.canvases.get(surfaceId);
+      if (ce) {
+        if (
+          ce.canvas.width !== frame.displayWidth ||
+          ce.canvas.height !== frame.displayHeight
+        ) {
+          ce.canvas.width = frame.displayWidth;
+          ce.canvas.height = frame.displayHeight;
+        }
+        ce.ctx.drawImage(frame, 0, 0);
+      }
+    } finally {
+      try {
+        frame.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    for (const listener of this.frameListeners) {
+      try {
+        listener(surfaceId);
+      } catch {
+        // Prevent a single broken listener from blocking others.
+      }
+    }
+  }
+
+  private discardPresenter(surfaceId: number): void {
+    const p = this.presenters.get(surfaceId);
+    if (!p) return;
+    if (p.rafId !== null) cancelAnimationFrame(p.rafId);
+    for (const f of p.queue) {
+      try {
+        f.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    this.presenters.delete(surfaceId);
+  }
+
+  private discardAllPresenters(): void {
+    for (const sid of Array.from(this.presenters.keys())) {
+      this.discardPresenter(sid);
+    }
+  }
 
   /**
    * Create an off-DOM canvas for *surfaceId* if one does not already exist.
@@ -811,29 +962,11 @@ export class SurfaceStore {
         if (outputs.length > SurfaceStore.OUTPUT_SAMPLE_MAX)
           outputs.splice(0, outputs.length - SurfaceStore.OUTPUT_SAMPLE_MAX);
 
-        try {
-          const ce = this.canvases.get(surfaceId);
-          if (ce) {
-            if (
-              ce.canvas.width !== frame.displayWidth ||
-              ce.canvas.height !== frame.displayHeight
-            ) {
-              ce.canvas.width = frame.displayWidth;
-              ce.canvas.height = frame.displayHeight;
-            }
-            ce.ctx.drawImage(frame, 0, 0);
-          }
-        } finally {
-          frame.close();
-        }
-
-        for (const listener of this.frameListeners) {
-          try {
-            listener(surfaceId);
-          } catch {
-            // Prevent a single broken listener from blocking others.
-          }
-        }
+        // Queue + paced presentation absorbs network/decoder jitter and
+        // prevents 30 fps content from juddering on a 120 Hz display.
+        // The first frame paints synchronously inside enqueueFrame to
+        // minimise time-to-first-pixel.
+        this.enqueueFrame(surfaceId, frame);
       },
       error: (e: DOMException) => {
         console.warn(
@@ -844,15 +977,18 @@ export class SurfaceStore {
           e.message,
           e.code,
           "state:",
-          this.decoders.get(surfaceId)?.decoder?.state,
+          decoder.state,
         );
+        // Only clean up if this decoder is still the active one —
+        // handleSurfaceFrame may have already replaced it with a fresh
+        // instance by the time this async callback fires.
         const entry = this.decoders.get(surfaceId);
-        if (entry) {
+        if (entry?.decoder === decoder) {
           safeClose(entry.decoder);
           this.decoders.delete(surfaceId);
         }
-        // Ask the server for a keyframe so the new decoder gets a
-        // clean reference point instead of only P-frames.
+        // Ask the server for a keyframe so the next decoder gets a
+        // clean reference point.
         this._keyframeSender?.(surfaceId);
       },
     });
@@ -890,6 +1026,8 @@ export class SurfaceStore {
       keyframeRequested: false,
       lastCodecString: null,
       lastDescription: null,
+      lastConfiguredWidth: 0,
+      lastConfiguredHeight: 0,
     });
   }
 

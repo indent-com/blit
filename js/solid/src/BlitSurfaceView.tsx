@@ -79,27 +79,39 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     detectCodecSupport();
 
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
-    let hasSentInitial = false;
-    const RESIZE_DEBOUNCE_MS = 80;
+    let lastResizeAt = 0;
+    let lastSentW = 0;
+    let lastSentH = 0;
+    const RESIZE_DEBOUNCE_MS = 100;
+    // If no resize event for this long, the next one is treated as the
+    // start of a fresh drag and fires immediately — so each user-visible
+    // drag gets a leading-edge dispatch and the perceived reaction is
+    // bounded by RTT rather than the trailing-edge debounce.
+    const DRAG_GAP_MS = 250;
+
+    const send = (w: number, h: number) => {
+      if (w === lastSentW && h === lastSentH) return;
+      lastSentW = w;
+      lastSentH = h;
+      s.requestResize(w, h, dprToScale120());
+    };
 
     const applySize = (cssW: number, cssH: number) => {
       const w = Math.round(cssW * devicePixelRatio);
       const h = Math.round(cssH * devicePixelRatio);
       if (w <= 0 || h <= 0) return;
       s.setDisplaySize(w, h);
-      if (!hasSentInitial) {
-        // First resize: send immediately so the Wayland client
-        // gets its configure without the debounce delay.
-        hasSentInitial = true;
-        s.requestResize(w, h, dprToScale120());
-      } else {
-        // Subsequent resizes (drag-resize): debounce to avoid
-        // flooding configure -> repaint -> encode -> keyframe.
-        clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(() => {
-          s.requestResize(w, h, dprToScale120());
-        }, RESIZE_DEBOUNCE_MS);
-      }
+      const now = performance.now();
+      const isDragStart = now - lastResizeAt > DRAG_GAP_MS;
+      lastResizeAt = now;
+      // Leading edge: first event of a new interaction dispatches at
+      // wire speed so the server pipeline (configure → repaint → encode)
+      // starts as soon as possible.
+      if (isDragStart) send(w, h);
+      // Trailing edge: settle on the final size after the interaction
+      // ends, in case it differs from the leading-edge value.
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => send(w, h), RESIZE_DEBOUNCE_MS);
     };
 
     const ro = new ResizeObserver((entries) => {

@@ -873,9 +873,9 @@ function WorkspaceScreen(props: {
     const parts: string[] = [];
     const fs = focusedSession();
     if (fs) {
+      if (fs.title) parts.push(fs.title);
       const label = connectionLabels().get(fs.connectionId);
       if (label) parts.push(label);
-      if (fs.title) parts.push(fs.title);
     } else {
       const surf =
         focusedSurfaceId() != null
@@ -887,14 +887,17 @@ function WorkspaceScreen(props: {
             ) ?? null)
           : bspFocusedSurface();
       if (surf) {
-        const label = connectionLabels().get(surf.connectionId);
-        if (label) parts.push(label);
         const name = surf.title || surf.appId;
         if (name) parts.push(name);
+        const label = connectionLabels().get(surf.connectionId);
+        if (label) parts.push(label);
       }
     }
     if (host && host !== "localhost" && host !== "127.0.0.1") parts.push(host);
-    parts.push("blit");
+    // Don't append "Blit" — installed PWA windows and most browsers already
+    // prefix the tab with the app/manifest name, producing redundant
+    // "Blit - … — Blit" titles.  Falling back to an empty document.title
+    // when nothing is focused lets the OS/browser show just the app name.
     document.title = parts.join(" \u2014 ");
   });
 
@@ -1815,7 +1818,6 @@ function WorkspaceScreen(props: {
   );
 }
 
-const SURFACE_PANEL_WIDTH = 280;
 const MIN_PANEL_WIDTH = 160;
 
 function PreviewPanel(props: {
@@ -1977,20 +1979,22 @@ const SWIPE_THRESHOLD = 60;
 /** Minimum ratio of horizontal to vertical movement for a swipe. */
 const SWIPE_RATIO = 1.5;
 
-function SessionThumbnail(props: {
-  session: BlitSession;
-  connectionLabel?: string;
+/** Shared wrapper for preview-panel thumbnails.  Handles swipe-to-dismiss,
+ *  hover state, dismiss animation, header bar with close button. */
+function Thumbnail(props: {
   theme: Theme;
   scale: UIScale;
-  palette: TerminalPalette;
-  fontFamily: string;
-  fontSize: number;
   isMobileTouch: boolean;
   onFocus: () => void;
   onClose: () => void;
+  closeTitle: string;
+  /** Extra header-bar background (e.g. for focused highlight). */
+  headerBg?: string;
+  /** Inline elements rendered inside the header button. */
+  header: () => any;
+  /** Body content (terminal preview, surface view, etc.). */
+  body: () => any;
 }) {
-  const label = () => sessionName(props.session);
-
   const [hover, setHover] = createSignal(false);
   const [swipeX, setSwipeX] = createSignal(0);
   const [swiping, setSwiping] = createSignal(false);
@@ -2012,7 +2016,6 @@ function SessionThumbnail(props: {
     const t = e.touches[0];
     const dx = t.clientX - touchStartX;
     const dy = t.clientY - touchStartY;
-
     if (!locked) {
       if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
       locked = true;
@@ -2072,40 +2075,17 @@ function SessionThumbnail(props: {
           "text-align": "left",
           opacity: 1,
           "flex-shrink": 0,
+          "background-color": props.headerBg ?? "transparent",
         }}
       >
-        <span
-          style={{
-            flex: 1,
-            overflow: "hidden",
-            "text-overflow": "ellipsis",
-            "white-space": "nowrap",
-          }}
-        >
-          <span style={{ opacity: 0.5 }}>
-            {sessionPrefix(props.session, props.connectionLabel)}
-          </span>
-          {" \u203A "}
-          {label()}
-        </span>
-        <Show when={props.session.state === "exited"}>
-          <mark
-            style={{
-              ...ui.badge,
-              "background-color": "rgba(255,100,100,0.3)",
-              "font-size": `${props.scale.xs}px`,
-            }}
-          >
-            exited
-          </mark>
-        </Show>
+        {props.header()}
         <Show when={!props.isMobileTouch && hover()}>
           <button
             onClick={(e) => {
               e.stopPropagation();
               props.onClose();
             }}
-            title="Close terminal"
+            title={props.closeTitle}
             style={{
               ...ui.btn,
               "font-size": `${props.scale.sm}px`,
@@ -2119,12 +2099,65 @@ function SessionThumbnail(props: {
         </Show>
       </button>
       <div
-        style={{
-          overflow: "hidden",
-          cursor: "pointer",
-        }}
+        style={{ overflow: "hidden", cursor: "pointer" }}
         onClick={props.onFocus}
       >
+        {props.body()}
+      </div>
+    </div>
+  );
+}
+
+function SessionThumbnail(props: {
+  session: BlitSession;
+  connectionLabel?: string;
+  theme: Theme;
+  scale: UIScale;
+  palette: TerminalPalette;
+  fontFamily: string;
+  fontSize: number;
+  isMobileTouch: boolean;
+  onFocus: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Thumbnail
+      theme={props.theme}
+      scale={props.scale}
+      isMobileTouch={props.isMobileTouch}
+      onFocus={props.onFocus}
+      onClose={props.onClose}
+      closeTitle="Close terminal"
+      header={() => (
+        <>
+          <span
+            style={{
+              flex: 1,
+              overflow: "hidden",
+              "text-overflow": "ellipsis",
+              "white-space": "nowrap",
+            }}
+          >
+            <span style={{ opacity: 0.5 }}>
+              {sessionPrefix(props.session, props.connectionLabel)}
+            </span>
+            {" \u203A "}
+            {sessionName(props.session)}
+          </span>
+          <Show when={props.session.state === "exited"}>
+            <mark
+              style={{
+                ...ui.badge,
+                "background-color": "rgba(255,100,100,0.3)",
+                "font-size": `${props.scale.xs}px`,
+              }}
+            >
+              exited
+            </mark>
+          </Show>
+        </>
+      )}
+      body={() => (
         <BlitTerminal
           sessionId={props.session.id}
           readOnly
@@ -2134,8 +2167,8 @@ function SessionThumbnail(props: {
           fontSize={props.fontSize}
           palette={props.palette}
         />
-      </div>
-    </div>
+      )}
+    />
   );
 }
 
@@ -2150,179 +2183,44 @@ function SurfaceThumbnail(props: {
   onFocus: () => void;
   onClose: () => void;
 }) {
-  const [hover, setHover] = createSignal(false);
-  const [swipeX, setSwipeX] = createSignal(0);
-  const [swiping, setSwiping] = createSignal(false);
-  const [dismissed, setDismissed] = createSignal(false);
-  // Measured CSS-pixel width of the thumbnail's video container; drives
-  // the scaled-subscription target so the server encodes at exactly the
-  // size we display.  Updated via ResizeObserver below.
-  const [containerCssWidth, setContainerCssWidth] = createSignal(0);
-  let thumbContainer!: HTMLDivElement;
-  let touchStartX = 0;
-  let touchStartY = 0;
-  let locked = false;
-
-  onMount(() => {
-    if (typeof ResizeObserver === "undefined") return;
-    let debounce: ReturnType<typeof setTimeout> | undefined;
-    let pending = 0;
-    const ro = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const w = entry.contentRect.width;
-        if (w > 0 && Math.abs(w - pending) >= 1) {
-          pending = w;
-          // Debounce so drag-resizing the side panel doesn't churn
-          // subscribe messages (each sub change invalidates the encoder).
-          clearTimeout(debounce);
-          debounce = setTimeout(() => setContainerCssWidth(pending), 150);
-        }
-      }
-    });
-    ro.observe(thumbContainer);
-    // Seed the signal with the current size so the first subscribe
-    // carries a target rather than going out unscaled and then updating
-    // 150 ms later (which would force an encoder rebuild for nothing).
-    const rect = thumbContainer.getBoundingClientRect();
-    if (rect.width > 0) {
-      pending = rect.width;
-      setContainerCssWidth(rect.width);
-    }
-    onCleanup(() => {
-      clearTimeout(debounce);
-      ro.disconnect();
-    });
-  });
-
-  function onTouchStart(e: TouchEvent) {
-    const t = e.touches[0];
-    touchStartX = t.clientX;
-    touchStartY = t.clientY;
-    locked = false;
-    setSwiping(false);
-    setSwipeX(0);
-  }
-
-  function onTouchMove(e: TouchEvent) {
-    const t = e.touches[0];
-    const dx = t.clientX - touchStartX;
-    const dy = t.clientY - touchStartY;
-
-    if (!locked) {
-      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
-      locked = true;
-      if (Math.abs(dx) < Math.abs(dy) * SWIPE_RATIO) return;
-      setSwiping(true);
-    }
-    if (!swiping()) return;
-    e.preventDefault();
-    setSwipeX(dx);
-  }
-
-  function onTouchEnd() {
-    if (swiping() && Math.abs(swipeX()) >= SWIPE_THRESHOLD) {
-      setDismissed(true);
-      setSwipeX(swipeX() > 0 ? 400 : -400);
-      setTimeout(() => props.onClose(), 200);
-    } else {
-      setSwipeX(0);
-    }
-    setSwiping(false);
-  }
-
   return (
-    <div
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onTouchStart={onTouchStart}
-      onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
-      style={{
-        "border-bottom": `1px solid ${props.theme.subtleBorder}`,
-        display: dismissed() ? "none" : "flex",
-        "flex-direction": "column",
-        "flex-shrink": 0,
-        overflow: "hidden",
-        position: "relative",
-        transform: `translateX(${swipeX()}px)`,
-        opacity: swiping()
-          ? Math.max(0, 1 - Math.abs(swipeX()) / 200)
-          : dismissed()
-            ? 0
-            : 1,
-        transition: swiping() ? "none" : "transform 0.2s, opacity 0.2s",
-        "touch-action": "pan-y",
-      }}
-    >
-      <button
-        onClick={props.onFocus}
-        style={{
-          ...ui.btn,
-          display: "flex",
-          "align-items": "center",
-          gap: `${props.scale.tightGap}px`,
-          padding: `${props.scale.controlY}px ${props.scale.tightGap}px`,
-          "font-size": `${props.scale.sm}px`,
-          width: "100%",
-          "text-align": "left",
-          opacity: 1,
-          "flex-shrink": 0,
-          "background-color": props.focused
-            ? props.theme.selectedBg
-            : "transparent",
-        }}
-      >
-        <span
-          style={{
-            flex: 1,
-            overflow: "hidden",
-            "text-overflow": "ellipsis",
-            "white-space": "nowrap",
-          }}
-        >
-          <Show when={props.connectionLabel}>
-            <span style={{ opacity: 0.5 }}>{props.connectionLabel}</span>
-            {" \u203A "}
-          </Show>
-          {props.surface.title ||
-            props.surface.appId ||
-            `Surface ${props.surface.surfaceId}`}
-        </span>
-        <span
-          style={{
-            "font-size": `${props.scale.xs}px`,
-            color: props.theme.dimFg,
-          }}
-        >
-          {props.surface.width}x{props.surface.height}
-        </span>
-        <Show when={!props.isMobileTouch && hover()}>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              props.onClose();
-            }}
-            title="Close surface"
+    <Thumbnail
+      theme={props.theme}
+      scale={props.scale}
+      isMobileTouch={props.isMobileTouch}
+      onFocus={props.onFocus}
+      onClose={props.onClose}
+      closeTitle="Close surface"
+      headerBg={props.focused ? props.theme.selectedBg : undefined}
+      header={() => (
+        <>
+          <span
             style={{
-              ...ui.btn,
-              "font-size": `${props.scale.sm}px`,
-              padding: `0 ${props.scale.tightGap}px`,
-              opacity: 0.6,
-              "flex-shrink": 0,
+              flex: 1,
+              overflow: "hidden",
+              "text-overflow": "ellipsis",
+              "white-space": "nowrap",
             }}
           >
-            {"\u00D7"}
-          </button>
-        </Show>
-      </button>
-      <div
-        ref={thumbContainer}
-        style={{
-          overflow: "hidden",
-          cursor: "pointer",
-        }}
-        onClick={props.onFocus}
-      >
+            <Show when={props.connectionLabel}>
+              <span style={{ opacity: 0.5 }}>{props.connectionLabel}</span>
+              {" \u203A "}
+            </Show>
+            {props.surface.title ||
+              props.surface.appId ||
+              `Surface ${props.surface.surfaceId}`}
+          </span>
+          <span
+            style={{
+              "font-size": `${props.scale.xs}px`,
+              color: props.theme.dimFg,
+            }}
+          >
+            {props.surface.width}x{props.surface.height}
+          </span>
+        </>
+      )}
+      body={() => (
         <BlitSurfaceView
           connectionId={props.surface.connectionId}
           surfaceId={props.surface.surfaceId}
@@ -2333,7 +2231,7 @@ function SurfaceThumbnail(props: {
             "object-fit": "contain",
           }}
         />
-      </div>
-    </div>
+      )}
+    />
   );
 }

@@ -746,8 +746,13 @@ fn browser_pacing_fps(client: &ClientState) -> f32 {
     // held 48fps at backlog=10 for software-encoded 1080p, which is
     // faster than the browser can decode → backlog never drains, the
     // hard block stays latched, and encoding stalls entirely.
+    //
+    // Trigger threshold (backlog > 4) gives a few frames of transient
+    // headroom before backoff engages — at 120 Hz, a 30 fps source naturally
+    // queues 1-2 frames during decoder hiccups, and triggering backoff there
+    // chops the rate just to absorb normal jitter.
     let backlog = client.browser_backlog_frames as f32;
-    if backlog > 2.0 {
+    if backlog > 4.0 {
         fps = fps.min(fps * (2.0 / backlog));
     }
 
@@ -2241,18 +2246,26 @@ pub async fn run(config: Config) {
 /// When any client has an active surface subscription, use 8 ms (~120 Hz)
 /// so video players get consistent frame callbacks matching the display
 /// rate.  Without active surfaces, 33 ms (30 Hz) is sufficient.
-const BLANKET_FRAME_INTERVAL_IDLE: Duration = Duration::from_millis(33);
-const BLANKET_FRAME_INTERVAL_SURFACE: Duration = Duration::from_millis(8);
+const BLANKET_FRAME_INTERVAL_IDLE: Duration = Duration::from_millis(250);
+const BLANKET_FRAME_INTERVAL_SURFACE: Duration = Duration::from_micros(62_500);
 
-fn blanket_frame_interval(sess: &Session) -> Duration {
+/// Returns the interval at which the tick loop must send blanket
+/// `RequestFrame` events to keep Wayland apps (mpv, browsers, etc.)
+/// making progress. Returns `None` when no clients are connected — in
+/// that state the loop can sleep purely on event notifications, and
+/// apps pause until a viewer reconnects (resuming within SURFACE).
+fn blanket_frame_interval(sess: &Session) -> Option<Duration> {
+    if sess.clients.is_empty() {
+        return None;
+    }
     let has_surface_subs = sess
         .clients
         .values()
         .any(|c| !c.surface_subscriptions.is_empty());
     if has_surface_subs {
-        BLANKET_FRAME_INTERVAL_SURFACE
+        Some(BLANKET_FRAME_INTERVAL_SURFACE)
     } else {
-        BLANKET_FRAME_INTERVAL_IDLE
+        Some(BLANKET_FRAME_INTERVAL_IDLE)
     }
 }
 
@@ -2270,19 +2283,26 @@ async fn tick(state: &AppState) -> TickOutcome {
         maybe_log_pacing_metrics(&mut sess, cid, state.config.verbose);
     }
 
-    // Application-level keepalive.
+    // Application-level keepalive. Only scheduled when a client is
+    // connected — otherwise there's no one to ping and the timer would
+    // be pure polling cost.
     let ping_interval = state.config.ping_interval;
-    if !ping_interval.is_zero() && now.duration_since(sess.last_ping) >= ping_interval {
-        sess.send_to_all(&[S2C_PING]);
-        sess.last_ping = now;
-    }
-    if !ping_interval.is_zero() {
+    if !ping_interval.is_zero() && !sess.clients.is_empty() {
+        if now.duration_since(sess.last_ping) >= ping_interval {
+            sess.send_to_all(&[S2C_PING]);
+            sess.last_ping = now;
+        }
         let next_ping = sess.last_ping + ping_interval;
         next_deadline = Some(next_deadline.map_or(next_ping, |d: Instant| d.min(next_ping)));
     }
 
     // Surface IDs whose per-client encoders need to be invalidated.
     let mut invalidate_client_encoders: Vec<u16> = Vec::new();
+    // Surface IDs resized by the compositor this tick.  After the
+    // compositor borrow is released we wake pacing for every client
+    // subscribed to each sid so the first post-resize frame bypasses
+    // the per-surface time gate.
+    let mut resized_surface_ids: Vec<u16> = Vec::new();
 
     let mut surface_commit_count = 0u32;
     if let Some(cs) = sess.compositor.as_mut() {
@@ -2380,6 +2400,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // that may never actually be encoded (because a newer
                     // SurfaceCommit arrives before the next encode tick).
                     broadcast.push(msg_surface_resized(surface_id, width, height));
+                    resized_surface_ids.push(surface_id);
                 }
                 CompositorEvent::ClipboardContent {
                     mime_type, data, ..
@@ -2447,6 +2468,26 @@ async fn tick(state: &AppState) -> TickOutcome {
         for c in sess.clients.values_mut() {
             c.surface_subs.remove(&sid);
             c.vulkan_video_surfaces.remove(&sid);
+        }
+    }
+
+    // Wake pacing for every subscriber of a compositor-resized surface.
+    // Reset the burst window and clear next_send_at so the first frame
+    // at the new dimensions flows at wire speed instead of waiting for
+    // the per-surface time gate (up to ~1/fps), and force a keyframe
+    // so decoders recover cleanly after the dimension change.
+    for sid in resized_surface_ids {
+        for c in sess.clients.values_mut() {
+            if !c.surface_subscriptions.contains(&sid) {
+                continue;
+            }
+            if let Some(s) = c.surface_subs.get_mut(&sid) {
+                s.burst_remaining = SURFACE_BURST_FRAMES;
+                s.next_send_at = None;
+                s.nal_none_streak = 0;
+                s.nal_none_latched_at = None;
+            }
+            c.surface_needs_keyframe = true;
         }
     }
 
@@ -3573,7 +3614,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         // to advance their presentation clock; browsers need them for
         // page loads and animations.
         if let Some(cs) = sess.compositor.as_ref()
-            && now.duration_since(cs.last_blanket_frame_request) >= blanket_frame_interval(&sess)
+            && let Some(interval) = blanket_frame_interval(&sess)
+            && now.duration_since(cs.last_blanket_frame_request) >= interval
         {
             for &sid in cs.surfaces.keys() {
                 wanted.insert(sid);
@@ -4032,6 +4074,14 @@ async fn tick(state: &AppState) -> TickOutcome {
     // -- Audio frame delivery -----------------------------------------------
     #[cfg(target_os = "linux")]
     let any_audio_subscribed = sess.clients.values().any(|c| c.audio_subscribed);
+    // Propagate the subscription state to the encoder task so it can skip
+    // the Opus encode step when no one is listening.
+    #[cfg(target_os = "linux")]
+    if let Some(ref cs) = sess.compositor
+        && let Some(ref ap) = cs.audio_pipeline
+    {
+        ap.set_has_listener(any_audio_subscribed);
+    }
     #[cfg(target_os = "linux")]
     if any_audio_subscribed
         && let Some(ref mut cs) = sess.compositor
@@ -4127,12 +4177,12 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 
     // Guarantee the tick loop wakes up at least every blanket interval
-    // even when no other time-based work is pending.  Without this, the
-    // loop blocks forever on delivery_notify when there are no events,
-    // and the blanket RequestFrame (which keeps video players like mpv
-    // ticking) never fires.
-    {
-        let blanket_deadline = now + blanket_frame_interval(&sess);
+    // even when other time-based work isn't pending.  When no client is
+    // connected the interval is `None` and the loop sleeps purely on
+    // delivery_notify, so a truly-idle server consumes ~zero CPU until
+    // a client connects or the compositor emits an event.
+    if let Some(interval) = blanket_frame_interval(&sess) {
+        let blanket_deadline = now + interval;
         next_deadline = Some(next_deadline.map_or(blanket_deadline, |d| d.min(blanket_deadline)));
     }
 
@@ -5143,10 +5193,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // streak is designed to stop infinite recreation
                     // loops (GBM fd leak), not to permanently black out
                     // a surface across a client-driven resize.
+                    //
+                    // Also wake the pacing gate: reset the burst window
+                    // and clear next_send_at so the first frame after
+                    // resize bypasses time-based pacing and flows at
+                    // wire speed.  Without this, the client waits up to
+                    // one send interval (~1/fps) after the encoder is
+                    // recreated before seeing the first new frame.
                     if let Some(s) = c.surface_subs.get_mut(&surface_id) {
                         s.nal_none_streak = 0;
                         s.nal_none_latched_at = None;
+                        s.burst_remaining = SURFACE_BURST_FRAMES;
+                        s.next_send_at = None;
                     }
+                    c.surface_needs_keyframe = true;
                 }
                 sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),

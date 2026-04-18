@@ -39,6 +39,7 @@ pub struct ConnectOpts {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Manage terminals (PTYs)
     #[command(alias = "t")]
@@ -188,8 +189,10 @@ pub enum Command {
 // ── Terminal subcommands ─────────────────────────────────────────────────
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum TerminalCommand {
     /// List all terminals (TSV: ID, TAG, TITLE, STATUS)
+    #[command(alias = "ls")]
     List,
 
     /// Start a new terminal and print its ID
@@ -267,6 +270,236 @@ pub enum TerminalCommand {
         /// Resize to this many columns before capturing
         #[arg(long)]
         cols: Option<u16>,
+    },
+
+    /// Ripgrep-compatible search over terminals' backlog + viewport.
+    ///
+    /// Each terminal is treated as a "file". Trailing IDs pick specific terminals
+    /// (same numbers `blit terminal list` prints); with no IDs and no filters,
+    /// every terminal is searched. Logical lines that soft-wrap across multiple
+    /// physical rows are stitched back into one line before matching — a regex
+    /// like 'Error: .* refused' matches even if the message wrapped at column 80.
+    ///
+    /// Target selection:
+    ///   blit terminal grep PATTERN            # all terminals
+    ///   blit terminal grep PATTERN 3 5        # just PTYs 3 and 5
+    ///   blit terminal grep PATTERN --tag build
+    ///   blit terminal grep PATTERN --title vim --running
+    ///   blit terminal grep PATTERN --all
+    ///
+    /// Uses the Rust `regex` crate (RE2-style — same default engine as ripgrep).
+    /// Lookaround and backreferences are not supported; pipe through external
+    /// ripgrep if you need them: `blit terminal history 3 | rg -P '(?<=...)'`.
+    #[command(alias = "rg")]
+    Grep {
+        /// Regex pattern (or literal string with -F). May be omitted if -e/-f is used.
+        pattern: Option<String>,
+
+        /// Terminal IDs to search (empty = all terminals, subject to filters)
+        ids: Vec<u16>,
+
+        // ── Patterns ─────────────────────────────────────────────────────
+        /// Additional regex pattern (may be given multiple times)
+        #[arg(short = 'e', long = "regexp", action = clap::ArgAction::Append)]
+        regexps: Vec<String>,
+
+        /// Read one pattern per line from FILE (may be given multiple times)
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        pattern_files: Vec<String>,
+
+        /// Treat pattern as a literal string, not a regex
+        #[arg(short = 'F', long)]
+        fixed_strings: bool,
+
+        /// Only match whole words (wrap pattern in \b…\b)
+        #[arg(short = 'w', long)]
+        word_regexp: bool,
+
+        /// Only match whole lines (anchor pattern with \A…\z)
+        #[arg(short = 'x', long)]
+        line_regexp: bool,
+
+        // ── Case ─────────────────────────────────────────────────────────
+        /// Case-insensitive match
+        #[arg(short = 'i', long, conflicts_with_all = ["case_sensitive", "smart_case"])]
+        ignore_case: bool,
+
+        /// Force case-sensitive match (overrides -i, -S)
+        #[arg(short = 's', long, conflicts_with_all = ["ignore_case", "smart_case"])]
+        case_sensitive: bool,
+
+        /// Case-insensitive if pattern is all-lowercase, else sensitive
+        #[arg(short = 'S', long, conflicts_with_all = ["ignore_case", "case_sensitive"])]
+        smart_case: bool,
+
+        /// Invert: print lines that do NOT match
+        #[arg(short = 'v', long)]
+        invert_match: bool,
+
+        // ── Multiline ────────────────────────────────────────────────────
+        /// Allow patterns to span multiple lines
+        #[arg(short = 'U', long)]
+        multiline: bool,
+
+        /// In multiline mode, let `.` match newline as well
+        #[arg(long, requires = "multiline")]
+        multiline_dotall: bool,
+
+        // ── Context ──────────────────────────────────────────────────────
+        /// Show N lines of context after each match
+        #[arg(short = 'A', long, default_value_t = 0)]
+        after_context: usize,
+
+        /// Show N lines of context before each match
+        #[arg(short = 'B', long, default_value_t = 0)]
+        before_context: usize,
+
+        /// Show N lines of context before and after each match
+        #[arg(short = 'C', long)]
+        context: Option<usize>,
+
+        /// Separator printed between non-contiguous context groups
+        #[arg(long, default_value = "--")]
+        context_separator: String,
+
+        /// Suppress the context separator line
+        #[arg(long)]
+        no_context_separator: bool,
+
+        // ── Output shaping ───────────────────────────────────────────────
+        /// Show 1-based line numbers (default on)
+        #[arg(short = 'n', long, conflicts_with = "no_line_number")]
+        line_number: bool,
+
+        /// Suppress line numbers
+        #[arg(short = 'N', long)]
+        no_line_number: bool,
+
+        /// Always print the terminal "filename" (pty:N) with each match
+        #[arg(short = 'H', long, conflicts_with = "no_filename")]
+        with_filename: bool,
+
+        /// Never print the terminal "filename"
+        #[arg(short = 'I', long)]
+        no_filename: bool,
+
+        /// Group matches per terminal under a heading (default on TTY, multi-PTY)
+        #[arg(long, conflicts_with = "no_heading")]
+        heading: bool,
+
+        /// Do not group matches under a per-terminal heading
+        #[arg(long)]
+        no_heading: bool,
+
+        /// Show 1-based column of the first match on each line
+        #[arg(long)]
+        column: bool,
+
+        /// Print only "pty:N:<count>" per terminal (no match lines)
+        #[arg(short = 'c', long)]
+        count: bool,
+
+        /// Like -c but count every match, not every matching line
+        #[arg(long, conflicts_with = "count")]
+        count_matches: bool,
+
+        /// Print only the IDs of terminals with at least one match
+        #[arg(short = 'l', long)]
+        files_with_matches: bool,
+
+        /// Print only the IDs of terminals with no matches
+        #[arg(long, conflicts_with = "files_with_matches")]
+        files_without_match: bool,
+
+        /// Print only the matched text, one per line
+        #[arg(short = 'o', long)]
+        only_matching: bool,
+
+        /// Stop after N matches per terminal
+        #[arg(short = 'm', long)]
+        max_count: Option<u64>,
+
+        /// Print every line; matching lines use the match separator
+        #[arg(long)]
+        passthru: bool,
+
+        /// Emit one line per match as pty:N:line:col:text
+        #[arg(long)]
+        vimgrep: bool,
+
+        /// Emit ripgrep's JSON event stream (begin/match/context/end/summary)
+        #[arg(long)]
+        json: bool,
+
+        /// Alias for --color=always --heading -n
+        #[arg(short = 'p', long)]
+        pretty: bool,
+
+        /// Separate filename from the rest with a NUL byte
+        #[arg(short = '0', long)]
+        null: bool,
+
+        /// When to colorize output: auto, always, never, ansi
+        #[arg(long, default_value = "auto", value_parser = ["auto", "always", "never", "ansi"])]
+        color: String,
+
+        /// String between filename and line number for context lines
+        #[arg(long, default_value = "-")]
+        field_context_separator: String,
+
+        /// String between filename and line number for match lines
+        #[arg(long, default_value = ":")]
+        field_match_separator: String,
+
+        // ── Limiters & meta ──────────────────────────────────────────────
+        /// Do not print anything; exit 0 on any match, 1 otherwise
+        #[arg(short = 'q', long)]
+        quiet: bool,
+
+        /// Suppress warnings about unreadable files / missing IDs
+        #[arg(long)]
+        no_messages: bool,
+
+        /// Print match-count statistics after searching
+        #[arg(long)]
+        stats: bool,
+
+        /// In a terminal, stop searching after the first non-matching line
+        /// that follows a match (useful for tailing recent events)
+        #[arg(long)]
+        stop_on_nonmatch: bool,
+
+        // ── Sorting ──────────────────────────────────────────────────────
+        /// Sort results: "path" (by numeric terminal ID) or "none"
+        #[arg(long, value_parser = ["path", "none"], conflicts_with = "sortr")]
+        sort: Option<String>,
+
+        /// Like --sort but reversed
+        #[arg(long, value_parser = ["path", "none"])]
+        sortr: Option<String>,
+
+        // ── Target selection (blit extensions) ───────────────────────────
+        /// Keep terminals whose tag contains this substring
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Keep terminals whose title contains this substring
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Keep only running terminals
+        #[arg(long, conflicts_with = "exited")]
+        running: bool,
+
+        /// Keep only exited terminals
+        #[arg(long)]
+        exited: bool,
+
+        /// Explicitly opt in to "no filter, no positional IDs"
+        #[arg(long, conflicts_with_all = [
+            "tag", "title", "running", "exited"
+        ])]
+        all: bool,
     },
 
     /// Send input to a terminal.
@@ -351,6 +584,7 @@ pub enum TerminalCommand {
 #[derive(Subcommand)]
 pub enum SurfaceCommand {
     /// List all compositor surfaces (TSV: ID, TITLE, SIZE, APP_ID)
+    #[command(alias = "ls")]
     List,
 
     /// Close a compositor surface (sends xdg_toplevel close event)
@@ -459,6 +693,7 @@ pub enum SurfaceCommand {
 #[derive(Subcommand)]
 pub enum ClipboardCommand {
     /// List available MIME types on the clipboard
+    #[command(alias = "ls")]
     List,
 
     /// Read clipboard content
@@ -484,6 +719,7 @@ pub enum ClipboardCommand {
 #[derive(Subcommand)]
 pub enum RemoteCommand {
     /// List all named remotes
+    #[command(alias = "ls")]
     List {
         /// Show share passphrases in full instead of masking them
         #[arg(long)]

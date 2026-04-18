@@ -16,22 +16,22 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::transport::{Transport, read_frame, write_frame};
 
-struct PtyInfo {
-    id: u16,
-    tag: String,
-    command: String,
+pub(crate) struct PtyInfo {
+    pub(crate) id: u16,
+    pub(crate) tag: String,
+    pub(crate) command: String,
 }
 
-struct AgentConn {
+pub(crate) struct AgentConn {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
-    ptys: Vec<PtyInfo>,
-    titles: HashMap<u16, String>,
-    exited: HashMap<u16, i32>,
+    pub(crate) ptys: Vec<PtyInfo>,
+    pub(crate) titles: HashMap<u16, String>,
+    pub(crate) exited: HashMap<u16, i32>,
 }
 
 impl AgentConn {
-    async fn connect(transport: Transport) -> Result<Self, String> {
+    pub(crate) async fn connect(transport: Transport) -> Result<Self, String> {
         let (mut reader, writer) = transport.split();
 
         let mut ptys = Vec::new();
@@ -94,7 +94,7 @@ impl AgentConn {
         })
     }
 
-    async fn send(&mut self, msg: &[u8]) -> Result<(), String> {
+    pub(crate) async fn send(&mut self, msg: &[u8]) -> Result<(), String> {
         write_frame(&mut self.writer, msg)
             .await
             .then_some(())
@@ -121,7 +121,7 @@ impl AgentConn {
         .await;
     }
 
-    async fn recv(&mut self) -> Result<Vec<u8>, String> {
+    pub(crate) async fn recv(&mut self) -> Result<Vec<u8>, String> {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             read_frame(&mut self.reader),
@@ -131,7 +131,7 @@ impl AgentConn {
         .ok_or_else(|| "server closed connection".to_string())
     }
 
-    fn has_pty(&self, id: u16) -> bool {
+    pub(crate) fn has_pty(&self, id: u16) -> bool {
         self.ptys.iter().any(|p| p.id == id)
     }
 

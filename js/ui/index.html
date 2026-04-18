@@ -4,11 +4,19 @@
     <meta charset="UTF-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
-    <title>blit</title>
+    <meta name="theme-color" content="#000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>Blit</title>
     <link
       rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='16' fill='%23222'/><text x='12' y='76' font-family='monospace' font-size='72' font-weight='bold' fill='%2358f'>b</text><rect x='60' y='24' width='8' height='52' rx='2' fill='%2358f' opacity='.7'/></svg>"
+    />
+    <link
+      rel="apple-touch-icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='16' fill='%23222'/><text x='12' y='76' font-family='monospace' font-size='72' font-weight='bold' fill='%2358f'>b</text><rect x='60' y='24' width='8' height='52' rx='2' fill='%2358f' opacity='.7'/></svg>"
     />
     <style>
@@ -25,6 +33,16 @@
         width: 100%;
         height: 100%;
         overflow: hidden;
+        overscroll-behavior: none;
+      }
+      html,
+      body {
+        position: fixed;
+        -webkit-tap-highlight-color: transparent;
+      }
+      #root {
+        padding: env(safe-area-inset-top) env(safe-area-inset-right)
+          env(safe-area-inset-bottom) env(safe-area-inset-left);
       }
       button {
         font-family: inherit;

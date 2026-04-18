@@ -43,9 +43,18 @@ pathlib.Path('js/ui/dist/index.html.br').write_bytes(brotli.compress(html))
 " 2>/dev/null || cp js/ui/dist/index.html js/ui/dist/index.html.br
 fi
 
-echo "=== Installing blit CLI ==="
-curl -sf https://install.blit.sh | sh
-BLIT="blit"
+echo "=== Building blit CLI ==="
+# Use the same profiling binary that bin/dev/process-compose builds, rather
+# than downloading a release via install.blit.sh — the installer's cleanup
+# trap races with the surrounding nix-shell's read-only TMPDIR layout in CI
+# and returns non-zero (`rm: Permission denied`) even when the install
+# itself succeeded, failing dev-check before it ever starts the stack.
+cargo build -p blit-cli --profile profiling
+BLIT="$(pwd)/target/profiling/blit"
+if [ ! -x "$BLIT" ]; then
+    echo "FATAL: $BLIT not found or not executable"
+    exit 1
+fi
 
 echo "=== Starting bin/dev ==="
 ./bin/dev -t=false &

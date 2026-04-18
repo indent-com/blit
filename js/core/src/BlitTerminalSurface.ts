@@ -700,12 +700,13 @@ export class BlitTerminalSurface {
     this.resizeObserver = new ResizeObserver(() => this.handleResize());
     this.resizeObserver.observe(this.container);
     window.addEventListener("resize", this.windowResizeHandler);
-    this.handleResize();
+    this.handleResize(true /* immediate */);
   }
 
   private teardownResizeObserver(): void {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    clearTimeout(this._resizeTimer);
     if (this.windowResizeHandler) {
       window.removeEventListener("resize", this.windowResizeHandler);
       this.windowResizeHandler = null;
@@ -715,7 +716,9 @@ export class BlitTerminalSurface {
     }
   }
 
-  private handleResize(): void {
+  private _resizeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private handleResize(immediate?: boolean): void {
     if (!this.container || this._readOnly) return;
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
@@ -725,8 +728,26 @@ export class BlitTerminalSurface {
     if (sizeChanged) {
       this._rows = rows;
       this._cols = cols;
+      // Debounce the server notification to avoid flooding the server
+      // with intermediate sizes during drag-resize, which causes
+      // expensive encoder recreation cycles for h264-software.
+      // Render locally is immediate; only the network message is delayed.
       if (this._sessionId !== null && this._blitConn && this.viewId) {
-        this._blitConn.setViewSize(this._sessionId, this.viewId, rows, cols);
+        if (immediate) {
+          this._blitConn.setViewSize(this._sessionId, this.viewId, rows, cols);
+        } else {
+          clearTimeout(this._resizeTimer);
+          this._resizeTimer = setTimeout(() => {
+            if (this._sessionId !== null && this._blitConn && this.viewId) {
+              this._blitConn.setViewSize(
+                this._sessionId,
+                this.viewId,
+                rows,
+                cols,
+              );
+            }
+          }, 150);
+        }
       }
     }
     this.contentDirty = true;
