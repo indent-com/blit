@@ -636,7 +636,9 @@ export class BlitSurfaceCanvas {
         if (this._subscribedGeneration !== store.generation) {
           const c = this.getConn();
           if (c) {
-            c.sendSurfaceSubscribe(this._surfaceId);
+            // Refresh on reconnect — don't bump the ref-count, we
+            // already own a ref from the initial subscribe() call.
+            c.refreshSurfaceSubscribe(this._surfaceId);
             this._subscribedGeneration = store.generation;
           }
         }
@@ -928,10 +930,13 @@ export class BlitSurfaceCanvas {
     const conn = this.getConn();
     if (!conn || !this.surface) return;
 
-    // On keydown, sync CapsLock if the browser state drifted from the
-    // compositor's (e.g. the user toggled CapsLock while a different
-    // element or window was focused).
+    // On keydown, reconcile modifier state with the browser before
+    // forwarding the key.  Window managers may intercept modifier keys
+    // (especially Super/Meta) without delivering the key-up to the
+    // browser, leaving pressedKeys and the compositor's mods_depressed
+    // out of sync.
     if (pressed) {
+      this.syncModifiers(e, conn);
       this.syncCapsLock(e, conn);
     }
 
@@ -1065,6 +1070,35 @@ export class BlitSurfaceCanvas {
   }
 
   /**
+   * Release any modifier keys that the browser says are no longer held.
+   *
+   * Window managers (especially on Linux) may grab modifier keys like
+   * Super/Meta without forwarding the key-up event to the browser.  When
+   * that happens our `pressedKeys` set and the compositor's modifier
+   * state drift from reality.  On every key-down we compare the browser's
+   * authoritative modifier flags against `pressedKeys` and inject
+   * synthetic releases for anything that should no longer be held.
+   */
+  private syncModifiers(e: KeyboardEvent, conn: BlitConnection): void {
+    const checks: [boolean, number[]][] = [
+      [e.shiftKey, [42, 54]], // ShiftLeft, ShiftRight
+      [e.ctrlKey, [29, 97]], // ControlLeft, ControlRight
+      [e.altKey, [56, 100]], // AltLeft, AltRight
+      [e.metaKey, [125, 126]], // MetaLeft, MetaRight
+    ];
+    for (const [held, keycodes] of checks) {
+      if (held) continue;
+      for (const kc of keycodes) {
+        if (!this.pressedKeys.has(kc)) continue;
+        // Don't release the synthetic Ctrl from Meta→Ctrl paste translation.
+        if (this._metaToCtrl && kc === 29) continue;
+        this.pressedKeys.delete(kc);
+        conn.sendSurfaceInput(this._surfaceId, kc, false);
+      }
+    }
+  }
+
+  /**
    * Ensure the compositor's CapsLock state matches the browser before the
    * current key event is forwarded.
    *
@@ -1117,22 +1151,7 @@ export class BlitSurfaceCanvas {
 
   private handleFocus(): void {
     const conn = this.getConn();
-    if (!conn || !this.surface) return;
+    if (!conn || !this.surface || !this._displaySize) return;
     conn.sendSurfaceFocus(this._surfaceId);
-
-    // Best-effort: pre-load the browser clipboard so it is already
-    // available as a wl_data_offer if the Wayland client pastes via a
-    // mechanism other than Ctrl/Cmd+V (e.g. right-click context menu).
-    // This may fail without a user gesture in some browsers — that is
-    // fine; the Ctrl/Cmd+V path handles clipboard reading reliably.
-    navigator.clipboard.readText().then(
-      (text) => {
-        if (text) {
-          const enc = new TextEncoder();
-          conn.sendClipboard("text/plain;charset=utf-8", enc.encode(text));
-        }
-      },
-      () => {},
-    );
   }
 }

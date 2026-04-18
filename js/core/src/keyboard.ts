@@ -114,6 +114,12 @@ export function keyToBytes(
     return encoder.encode(`\x1b[${fkeys[e.key]}~`);
   }
 
+  // Shift+Tab → CBT (cursor backward tabulation).  Must be checked before
+  // the plain Tab mapping below or it would fall through to HT.
+  if (e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    return encoder.encode("\x1b[Z");
+  }
+
   const simple: Record<string, string> = {
     Enter: "\r",
     Backspace: "\x7f",

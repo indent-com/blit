@@ -407,15 +407,17 @@ export function buildSurfaceSubscribeMessage(
   codecSupport?: number,
   quality?: number,
 ): Uint8Array {
-  const hasExtended =
-    (codecSupport && codecSupport !== 0) || (quality && quality !== 0);
-  const msg = new Uint8Array(hasExtended ? 5 : 3);
+  const cs = (codecSupport ?? 0) & 0xff;
+  const q = (quality ?? 0) & 0xff;
+  const hasExtended = cs !== 0 || q !== 0;
+  const len = hasExtended ? 5 : 3;
+  const msg = new Uint8Array(len);
   msg[0] = C2S_SURFACE_SUBSCRIBE;
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
   if (hasExtended) {
-    msg[3] = (codecSupport ?? 0) & 0xff;
-    msg[4] = (quality ?? 0) & 0xff;
+    msg[3] = cs;
+    msg[4] = q;
   }
   return msg;
 }

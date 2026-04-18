@@ -13,15 +13,15 @@
  */
 
 /** Maximum jitter buffer depth in decoded frames (~20 ms each). */
-const MAX_BUFFER_FRAMES = 10; // 200 ms
+const MAX_BUFFER_FRAMES = 25; // 500 ms
 
 /**
  * Target jitter buffer depth in samples at 48 kHz.  The worklet
  * accumulates this much audio before starting playback and re-buffers
- * after an underrun.  Absorbs network jitter and main-thread stalls
- * without adding perceptible latency.
+ * after a sustained underrun.  Absorbs network jitter, TCP write
+ * bursts from video frames, and main-thread stalls.
  */
-const JITTER_BUFFER_SAMPLES = 2400; // 50 ms at 48 kHz
+const JITTER_BUFFER_SAMPLES = 4800; // 100 ms at 48 kHz
 
 // -- A/V sync constants ----------------------------------------------------
 
@@ -38,10 +38,10 @@ const DRIFT_DEADZONE_MS = 10;
  * Drift threshold for maximum correction (ms).  Beyond this we apply the
  * full ±MAX_RATE_OFFSET.  Between DEADZONE and this, we interpolate.
  */
-const DRIFT_FULL_CORRECTION_MS = 150;
+const DRIFT_FULL_CORRECTION_MS = 300;
 
 /** Maximum rate offset from 1.0 in either direction. */
-const MAX_RATE_OFFSET = 0.02; // ±2%
+const MAX_RATE_OFFSET = 0.05; // ±5%
 
 /**
  * Hard ceiling on worklet buffer depth (samples at 48 kHz).  If the buffer
@@ -49,7 +49,7 @@ const MAX_RATE_OFFSET = 0.02; // ±2%
  * jitter-buffer target.  This caps the maximum latency that can accumulate
  * from network bursts, tab backgrounding, or decode stalls.
  */
-const MAX_BUFFERED_SAMPLES = 7200; // 150 ms at 48 kHz
+const MAX_BUFFERED_SAMPLES = 24000; // 500 ms at 48 kHz
 
 /**
  * Drift threshold for a hard jump (ms).  When audio is *ahead* of video by
@@ -58,7 +58,7 @@ const MAX_BUFFERED_SAMPLES = 7200; // 150 ms at 48 kHz
  * just reset sync and let rate steering or new frames catch up — flushing
  * would discard the only audio we have, making the gap worse.
  */
-const DRIFT_JUMP_MS = 200;
+const DRIFT_JUMP_MS = 500;
 
 /** Minimum number of audio frames received before we start sync adjustment. */
 const SYNC_WARMUP_FRAMES = 10;
@@ -70,6 +70,17 @@ const SYNC_WARMUP_FRAMES = 10;
  * eliminating the wow-and-flutter artifacts from jittery drift readings.
  */
 const RATE_SMOOTHING_ALPHA = 0.15;
+
+/**
+ * Consecutive render-block underruns before the worklet re-enters full
+ * buffering mode.  A single underrun is usually just a scheduling hiccup
+ * where the next PCM chunk is already in the port queue; three
+ * consecutive underruns indicate a real gap.
+ */
+const UNDERRUN_REBUFFER_THRESHOLD = 3;
+
+/** Samples per 20 ms Opus frame at 48 kHz (per-channel). */
+const SAMPLES_PER_20_MS = 960;
 
 /**
  * Inline AudioWorkletProcessor source.
@@ -239,29 +250,28 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
       this.offset += advance;
     }
 
-    // Underrun: output silence and re-enter buffering mode so we
-    // accumulate a full jitter buffer before resuming playback.
+    // Underrun: output silence for the remainder.  Single-block underruns
+    // are common scheduling hiccups — only re-enter buffering after a
+    // sustained gap, otherwise the silence-while-refilling is worse than
+    // the original hiccup.
     if (written < needed) {
       for (let i = written; i < needed; i++) {
         outL[i] = 0;
         outR[i] = 0;
       }
       if (this.consumed > 0) {
-        // Only re-buffer after we've started playing (not on initial silence).
         this.underruns++;
-        // Adaptive buffer: after repeated underruns, require more audio
-        // before resuming to avoid stutter loops.  Grows up to 150 ms
-        // (capped at MAX_BUFFERED_SAMPLES) then decays on clean playback.
-        this.bufferTarget = Math.min(
-          ${JITTER_BUFFER_SAMPLES} + this.underruns * 960, // +20 ms per consecutive underrun
-          ${MAX_BUFFERED_SAMPLES}
-        );
-        this.buffering = true;
+        if (this.underruns >= ${UNDERRUN_REBUFFER_THRESHOLD}) {
+          this.bufferTarget = Math.min(
+            ${JITTER_BUFFER_SAMPLES} +
+              (this.underruns - ${UNDERRUN_REBUFFER_THRESHOLD}) * ${SAMPLES_PER_20_MS},
+            ${MAX_BUFFERED_SAMPLES}
+          );
+          this.buffering = true;
+        }
       }
     } else if (this.underruns > 0) {
-      // Successful render with no underrun — slowly decay the underrun
-      // counter so the buffer target returns to baseline.
-      this.underruns = Math.max(0, this.underruns - 0.002);
+      this.underruns = Math.max(0, this.underruns - 0.01);
     }
 
     // Report position periodically.  Include this.offset for accuracy
@@ -482,17 +492,17 @@ export class AudioPlayer {
     this.startHealthCheck();
 
     // Inline decoder stall check: if we've been feeding the decoder for
-    // > 2 s but it hasn't produced any output, the decode pipeline is
-    // dead.  Catches failures within one frame interval (~20 ms) rather
-    // than waiting for the next health-check tick.
+    // > 5 s but it hasn't produced any output, the decoder is dead.
+    // Only reset the decoder — the AudioContext and worklet are fine.
+    // If this doesn't help, the health-check escalates to a full reset.
     if (
       this.lastDecodedAt > 0 &&
       this.decodesRequested > 0 &&
-      now - this.lastDecodedAt > 2_000
+      now - this.lastDecodedAt > 5_000
     ) {
       if (now - this.lastAutoResetAt > 10_000) {
         this.lastAutoResetAt = now;
-        this.resetPipeline();
+        this.resetDecoder();
       }
       return;
     }
@@ -533,14 +543,11 @@ export class AudioPlayer {
       );
       this.decodesRequested++;
     } catch {
-      // Decoder threw — close and null it immediately so the next
-      // handleAudioFrame creates a fresh one instead of repeatedly
-      // calling decode() on a broken decoder until the async error
-      // callback fires.
-      try {
-        this.decoder.close();
-      } catch {}
-      this.decoder = null;
+      // Decoder threw — reset it so the next handleAudioFrame creates a
+      // fresh one.  resetDecoder also clears stall-detection counters to
+      // prevent the inline stall check from immediately nuking the
+      // replacement decoder on the very next frame.
+      this.resetDecoder();
     }
   }
 
@@ -606,6 +613,27 @@ export class AudioPlayer {
     this.lastVideoTimestampMs = -1;
     this.currentRate = 1.0;
     this.smoothedRate = 1.0;
+    this.resetDecoderState();
+  }
+
+  /**
+   * Close and null the decoder, resetting all stall-detection counters.
+   * The AudioContext and worklet are left intact — only the decode chain
+   * is rebuilt.  This avoids the expensive teardown+async-reinit of the
+   * full pipeline when only the decoder is broken.
+   */
+  private resetDecoder(): void {
+    if (this.decoder && this.decoder.state !== "closed") {
+      try {
+        this.decoder.close();
+      } catch {}
+    }
+    this.decoder = null;
+    this.resetDecoderState();
+  }
+
+  /** Reset decoder-related counters without touching the decoder itself. */
+  private resetDecoderState(): void {
     this.decodesRequested = 0;
     this.framesDecoded = 0;
     this.lastHealthDecodesRequested = 0;
@@ -768,7 +796,7 @@ export class AudioPlayer {
    *
    * Checks for four failure modes:
    * 1. **Worklet stall** — frames arrive from the server but the worklet
-   *    hasn't reported a consumed-sample position in over 2 seconds.  The
+   *    hasn't reported a consumed-sample position in over 5 seconds.  The
    *    decode → worklet chain has silently broken.
    * 2. **Decoder stall** — frames are being sent to the decoder but no
    *    decoded output arrives for two consecutive checks (4 s).  The
@@ -779,7 +807,7 @@ export class AudioPlayer {
    *    device removal, GPU process crash).  The statechange listener
    *    handles this immediately, but this is a safety net.
    * 4. **Persistent suspension** — context is "suspended" and resume()
-   *    fails for > 2 s.  Tear down and rebuild from scratch.
+   *    fails for > 5 s.  Tear down and rebuild from scratch.
    *
    * Also resumes a suspended AudioContext (can happen after device
    * changes or resource pressure without transitioning to "closed").
@@ -810,7 +838,7 @@ export class AudioPlayer {
     if (this.ctx && this.ctx.state === "suspended") {
       if (this.suspendedSince === 0) this.suspendedSince = now;
       this.ctx.resume().catch(() => {});
-      if (now - this.suspendedSince > 2_000 && canAutoReset) {
+      if (now - this.suspendedSince > 5_000 && canAutoReset) {
         this.suspendedSince = 0;
         this.lastAutoResetAt = now;
         this.resetPipeline();
@@ -827,17 +855,17 @@ export class AudioPlayer {
       // Will rebuild on next handleAudioFrame().
     }
 
-    // 1. Worklet stall: frames arriving but worklet silent for > 2 s.
+    // 1. Worklet stall: frames arriving but worklet silent for > 5 s.
     //    Also catches the case where the worklet was created and fed
     //    decoded audio but never produced a position report (e.g.
     //    processorerror before the first report, or stuck buffering).
     const workletSilent =
       this.lastWorkletReportAt > 0
-        ? now - this.lastWorkletReportAt > 2_000
+        ? now - this.lastWorkletReportAt > 5_000
         : this.worklet != null && this.framesDecoded > 0;
     if (
       this.lastFrameAt > 0 &&
-      now - this.lastFrameAt < 3000 &&
+      now - this.lastFrameAt < 5000 &&
       workletSilent
     ) {
       if (canAutoReset) {
@@ -861,7 +889,7 @@ export class AudioPlayer {
     if (wasSilent && decodesGrew && !decodesProduced && canAutoReset) {
       this.decoderSilentLastCheck = false;
       this.lastAutoResetAt = now;
-      this.resetPipeline();
+      this.resetDecoder();
       return;
     }
   }
@@ -941,10 +969,12 @@ export class AudioPlayer {
         URL.revokeObjectURL(url);
       }
 
-      // If we were destroyed or the context was replaced while awaiting
-      // the module load, bail out.
-      if (this._destroyed || this.ctx.state === "closed") {
-        this.ctx.close().catch(() => {});
+      // If we were destroyed or the context was torn down while awaiting
+      // the module load (e.g. resetPipeline fired during the await), bail.
+      if (this._destroyed || !this.ctx || this.ctx.state === "closed") {
+        if (this.ctx && this.ctx.state !== "closed") {
+          this.ctx.close().catch(() => {});
+        }
         this.ctx = null;
         return;
       }

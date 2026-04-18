@@ -111,8 +111,9 @@ pub const C2S_SURFACE_CAPTURE: u8 = 0x27;
 pub const CAPTURE_FORMAT_PNG: u8 = 0;
 pub const CAPTURE_FORMAT_AVIF: u8 = 1;
 /// Subscribe to surface frame updates:
-/// [0x28][surface_id:2]                     — legacy (server defaults)
-/// [0x28][surface_id:2][codec:1][quality:1]  — extended
+/// [0x28][surface_id:2]                                        — legacy (server defaults)
+/// [0x28][surface_id:2][codec:1][quality:1]                    — extended
+/// [0x28][surface_id:2][codec:1][quality:1][width:2][height:2] — scaled
 ///
 /// codec: CODEC_SUPPORT_* bitmask restricting which codecs the server may use
 ///        for this surface.  0 = use connection-level default (from C2S_CLIENT_FEATURES).
@@ -122,8 +123,17 @@ pub const CAPTURE_FORMAT_AVIF: u8 = 1;
 ///   10–255 = custom AV1 quantizer (wire value IS the quantizer).
 ///   See `SURFACE_QUALITY_*` constants.
 ///
+/// width, height: optional fixed target size (in pixels) for this subscription.
+///   When both are nonzero, the server encodes this surface at exactly
+///   `width × height` for this client by scaling the native frame down
+///   server-side, independent of the compositor's surface size.  Such
+///   "scaled" subscriptions are excluded from the server's surface-size
+///   mediation (they never pull the compositor surface smaller for other
+///   viewers).  Both 0 (or fields absent) means the client participates in
+///   mediation via C2S_SURFACE_RESIZE like today.
+///
 /// Re-subscribing to an already-subscribed surface updates the codec/quality
-/// preferences and forces encoder recreation.
+/// preferences and/or scaled size and forces encoder recreation.
 pub const C2S_SURFACE_SUBSCRIBE: u8 = 0x28;
 
 /// Quality values for the `quality` byte in C2S_SURFACE_SUBSCRIBE.
@@ -2282,6 +2292,31 @@ pub fn msg_surface_subscribe_ext(surface_id: u16, codec_support: u8, quality: u8
     msg
 }
 
+/// Scaled surface subscribe: ask the server to encode this surface at
+/// exactly `width × height` for this client, bypassing surface-size
+/// mediation.  Intended for side-panel thumbnails and any viewer that
+/// wants a fixed-size stream independent of the compositor's native
+/// surface size and of other clients' view sizes.
+///
+/// `width` / `height` in pixels.  Passing `0, 0` is equivalent to
+/// `msg_surface_subscribe_ext` (mediated subscription).
+pub fn msg_surface_subscribe_scaled(
+    surface_id: u16,
+    codec_support: u8,
+    quality: u8,
+    width: u16,
+    height: u16,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9);
+    msg.push(C2S_SURFACE_SUBSCRIBE);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(codec_support);
+    msg.push(quality);
+    msg.extend_from_slice(&width.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg
+}
+
 pub fn msg_surface_unsubscribe(surface_id: u16) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3);
     msg.push(C2S_SURFACE_UNSUBSCRIBE);
@@ -2531,6 +2566,16 @@ fn serialize_overflow_strings(frame: &FrameState) -> Vec<u8> {
 
 fn build_patch_op(current: &FrameState, previous: &FrameState) -> Option<Vec<u8>> {
     let total_cells = current.rows as usize * current.cols as usize;
+    let total_bytes = total_cells * CELL_SIZE;
+    // Fast path: a single bulk memcmp short-circuits the common idle case
+    // where nothing has changed, avoiding both the per-cell loop and the
+    // bitmask allocation.
+    if current.cells.len() >= total_bytes
+        && previous.cells.len() >= total_bytes
+        && current.cells[..total_bytes] == previous.cells[..total_bytes]
+    {
+        return None;
+    }
     let bitmask_len = total_cells.div_ceil(8);
     let mut bitmask = vec![0u8; bitmask_len];
     let mut dirty_count = 0usize;

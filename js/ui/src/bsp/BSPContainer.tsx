@@ -1122,7 +1122,7 @@ function LeafPane(props: {
   );
 }
 
-function EmptyPane(props: {
+export function EmptyPane(props: {
   paneId: string;
   label: string | null;
   isFocused: boolean;

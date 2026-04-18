@@ -130,6 +130,7 @@ mod stub {
             width: u32,
             height: u32,
             pixels: PixelData,
+            timestamp_ms: u32,
         },
         SurfaceTitle {
             surface_id: u16,

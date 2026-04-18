@@ -94,12 +94,13 @@ pub(crate) struct VulkanRenderer {
     pub(crate) supported_dmabuf_modifiers: Vec<(u32, u64)>,
 
     /// Encoder-allocated output buffers imported as Vulkan render targets,
-    /// keyed by surface_id.  Each surface has its own pool so different
-    /// surfaces never share buffers.
+    /// keyed by surface id.  One set of buffers per surface — the
+    /// compositor renders natively into these, then the encoder consumes
+    /// them zero-copy.
     external_outputs: HashMap<u32, (Vec<ExternalOutput>, usize)>,
 
-    /// NV12 output buffers for zero-copy BGRA→NV12 compute conversion,
-    /// keyed by surface_id.  The `usize` is the round-robin index.
+    /// NV12 output buffers for BGRA→NV12 compute conversion, keyed by
+    /// surface id.  The `usize` is the round-robin index.
     nv12_outputs: HashMap<u32, (Vec<Nv12Output>, usize)>,
 
     /// Persistent texture cache keyed by Wayland surface ObjectId.
@@ -621,7 +622,8 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        // Push constants: src_width, src_height, y_stride, uv_offset, enc_width, enc_height (6 × u32 = 24 bytes).
+        // Push constants: src_width, src_height, y_stride, uv_offset,
+        // enc_width, enc_height (6 × u32 = 24 bytes).
         let compute_push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -685,7 +687,8 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        // Push constants: src_width, src_height, enc_width, enc_height (4 × u32 = 16 bytes).
+        // Push constants: src_width, src_height, enc_width, enc_height
+        // (4 × u32 = 16 bytes).
         let compute_image_push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -726,6 +729,9 @@ impl VulkanRenderer {
             device.destroy_shader_module(comp_image_mod, None);
         }
 
+        // -----------------------------------------------------------
+        // BGRA→I420 compute pipeline — planar YUV for software encoders
+        // -----------------------------------------------------------
         eprintln!("[vulkan-render] initialized on {drm_device}");
 
         // Query supported DRM format modifiers for each format we accept.
@@ -1028,7 +1034,7 @@ impl VulkanRenderer {
         buffers: Vec<ExternalOutputBuffer>,
     ) {
         if buffers.is_empty() {
-            self.destroy_external_outputs_for(surface_id);
+            self.destroy_external_outputs(surface_id);
             return;
         }
         if !self.has_dmabuf {
@@ -1036,9 +1042,9 @@ impl VulkanRenderer {
         }
         // Import each encoder-allocated DMA-BUF as a Vulkan render target.
         // The encoder owns the buffer; we borrow it for compositing.
-        // After rendering, we return PixelData::VaSurface and the encoder
+        // After rendering, we return PixelData::Nv12DmaBuf and the encoder
         // encodes directly — zero copies, zero bus crossings.
-        self.destroy_external_outputs_for(surface_id);
+        self.destroy_external_outputs(surface_id);
         let format = vk::Format::B8G8R8A8_UNORM;
         let mut imported = Vec::new();
         for buf in &buffers {
@@ -1094,7 +1100,7 @@ impl VulkanRenderer {
         self.external_outputs.insert(surface_id, (imported, 0));
     }
 
-    fn destroy_external_outputs_for(&mut self, surface_id: u32) {
+    fn destroy_external_outputs(&mut self, surface_id: u32) {
         if let Some((exts, _)) = self.external_outputs.remove(&surface_id) {
             for ext in exts {
                 unsafe {
@@ -1105,7 +1111,7 @@ impl VulkanRenderer {
                 }
             }
         }
-        self.destroy_nv12_outputs_for(surface_id);
+        self.destroy_nv12_outputs(surface_id);
     }
 
     fn destroy_all_external_outputs(&mut self) {
@@ -1465,7 +1471,7 @@ impl VulkanRenderer {
         }
     }
 
-    fn destroy_nv12_outputs_for(&mut self, surface_id: u32) {
+    fn destroy_nv12_outputs(&mut self, surface_id: u32) {
         if let Some((nv12s, _)) = self.nv12_outputs.remove(&surface_id) {
             self.destroy_nv12_vec(nv12s);
         }
@@ -1484,7 +1490,7 @@ impl VulkanRenderer {
             return;
         }
         use std::os::fd::FromRawFd;
-        self.destroy_nv12_outputs_for(surface_id);
+        self.destroy_nv12_outputs(surface_id);
 
         type GetMemoryFdKHR = unsafe extern "system" fn(
             vk::Device,
@@ -1517,8 +1523,32 @@ impl VulkanRenderer {
                     .push_next(&mut ext_info);
                 let buffer = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
                 let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+                // Prefer HOST_VISIBLE so CPU encoders (openh264 etc) can
+                // mmap the exported DMA-BUF for their fallback read path.
+                // DEVICE_LOCAL-only memory on discrete AMD is not
+                // CPU-mappable, which silently fails the encoder's mmap
+                // and turns thumbnails black.  DEVICE_LOCAL|HOST_VISIBLE
+                // (unified memory / iGPU) is preferred when available.
                 let mem_type = self
-                    .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    .find_memory_type(
+                        reqs.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT
+                            | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )
+                    .or_else(|| {
+                        self.find_memory_type(
+                            reqs.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                    })
+                    .or_else(|| {
+                        self.find_memory_type(
+                            reqs.memory_type_bits,
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        )
+                    })
                     .or_else(|| {
                         self.find_memory_type(
                             reqs.memory_type_bits,
@@ -1619,7 +1649,7 @@ impl VulkanRenderer {
         if !self.has_dmabuf {
             return;
         }
-        self.destroy_nv12_outputs_for(surface_id);
+        self.destroy_nv12_outputs(surface_id);
 
         for (fd, stride, uv_offset, w, h, modifier) in fds {
             let (fd, stride, uv_offset, w, h, modifier) =
@@ -1648,8 +1678,11 @@ impl VulkanRenderer {
                 }
             }
         }
-        let nv12_entry = self.nv12_outputs.get(&surface_id);
-        if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty()) {
+        if let Some((nv12s, _)) = self
+            .nv12_outputs
+            .get(&surface_id)
+            .filter(|(v, _)| !v.is_empty())
+        {
             let kind_str = match &nv12s[0].kind {
                 Nv12OutputKind::Buffer { .. } => "buffer",
                 Nv12OutputKind::Image { .. } => "image",
@@ -1992,6 +2025,7 @@ impl VulkanRenderer {
         nv12_idx: usize,
         src_w: u32,
         src_h: u32,
+        transition_bgra: bool,
     ) {
         let nv12 = &nv12_vec[nv12_idx];
         let enc_w = nv12.width;
@@ -2040,32 +2074,35 @@ impl VulkanRenderer {
             .image_info(std::slice::from_ref(&bgra_info));
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
-        // Barrier: BGRA TRANSFER_SRC → GENERAL for storage read.
-        let img_barrier = vk::ImageMemoryBarrier::default()
-            .image(bgra_image)
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
+        // First dispatch for this render owns the BGRA transition;
+        // subsequent dispatches find it already in GENERAL.
+        if transition_bgra {
+            let img_barrier = vk::ImageMemoryBarrier::default()
+                .image(bgra_image)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[img_barrier],
+                );
+            }
+        }
         unsafe {
-            self.device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[img_barrier],
-            );
-
             // Zero the NV12 buffer (atomicOr needs zeroed memory).
             self.device.cmd_fill_buffer(cb, *buffer, 0, *buf_size, 0);
 
@@ -2133,6 +2170,7 @@ impl VulkanRenderer {
         nv12_idx: usize,
         src_w: u32,
         src_h: u32,
+        transition_bgra: bool,
     ) {
         let nv12 = &nv12_vec[nv12_idx];
         let enc_w = nv12.width;
@@ -2173,7 +2211,9 @@ impl VulkanRenderer {
             .image_info(std::slice::from_ref(&bgra_info));
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
-        // Barriers: BGRA → GENERAL, NV12 image → GENERAL.
+        // NV12 image barrier always runs (UNDEFINED→GENERAL is a no-op
+        // after the first frame but correctly sets up writes).  BGRA
+        // barrier only on the first dispatch for this render.
         let bgra_barrier = vk::ImageMemoryBarrier::default()
             .image(bgra_image)
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -2187,7 +2227,6 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-
         let nv12_barrier = vk::ImageMemoryBarrier::default()
             .image(*image)
             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -2201,18 +2240,29 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-
         unsafe {
-            self.device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[bgra_barrier, nv12_barrier],
-            );
+            if transition_bgra {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[bgra_barrier, nv12_barrier],
+                );
+            } else {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[nv12_barrier],
+                );
+            }
 
             self.device.cmd_bind_pipeline(
                 cb,
@@ -2245,9 +2295,15 @@ impl VulkanRenderer {
     fn create_output_image(&self, w: u32, h: u32) -> Option<OutputImage> {
         let format = vk::Format::B8G8R8A8_UNORM;
 
+        // STORAGE + MUTABLE_FORMAT let the BGRA→NV12 compute shader read
+        // this image via an R8G8B8A8 storage view on the self-alloc path.
+        // Without them, a thumbnail-only surface (scaled sub, no native
+        // sub → no encoder-allocated external BGRA) would ship zeroed
+        // NV12 and decode to black.
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
             .extent(vk::Extent3D {
                 width: w,
                 height: h,
@@ -2260,7 +2316,8 @@ impl VulkanRenderer {
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST,
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::STORAGE,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -2430,9 +2487,13 @@ impl VulkanRenderer {
     // ---------------------------------------------------------------
 
     /// Upload or import a surface's pixel data as a persistent GPU texture.
-    /// Called from the compositor at surface commit time.  If the surface
-    /// already has a cached texture, the old one is moved to the
-    /// pending-destroy list (freed after the current GPU submission completes).
+    /// Called from the compositor at surface commit time.  If the new
+    /// import succeeds the previous texture is moved to the pending-destroy
+    /// list (freed after the current GPU submission completes).  If the
+    /// import fails the old texture is kept so the surface continues to
+    /// render its last good frame instead of going black — this matters
+    /// when a client reallocates buffers with a modifier the Vulkan device
+    /// can't import (e.g. mpv on video reload).
     pub(crate) fn upload_surface(
         &mut self,
         surface_id: &ObjectId,
@@ -2440,11 +2501,6 @@ impl VulkanRenderer {
         width: u32,
         height: u32,
     ) {
-        // Evict any existing texture for this surface.
-        if let Some(old) = self.surface_textures.remove(surface_id) {
-            self.pending_destroy_textures.push(old);
-        }
-
         let cached = match pixels {
             PixelData::DmaBuf {
                 fd,
@@ -2504,18 +2560,25 @@ impl VulkanRenderer {
         };
 
         if let Some(tex) = cached {
-            self.surface_textures.insert(surface_id.clone(), tex);
+            if let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
+                self.pending_destroy_textures.push(old);
+            }
         } else {
             static UF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = UF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 10 || n.is_multiple_of(1000) {
-                let kind = match pixels {
-                    PixelData::Bgra(_) => "bgra",
-                    PixelData::Rgba(_) => "rgba",
-                    PixelData::DmaBuf { .. } => "dmabuf",
-                    _ => "other",
+                let had_prev = self.surface_textures.contains_key(surface_id);
+                let detail = match pixels {
+                    PixelData::Bgra(_) => "bgra".to_string(),
+                    PixelData::Rgba(_) => "rgba".to_string(),
+                    PixelData::DmaBuf {
+                        fourcc, modifier, ..
+                    } => format!("dmabuf fourcc=0x{fourcc:08x} modifier=0x{modifier:x}"),
+                    _ => "other".to_string(),
                 };
-                eprintln!("[upload #{n}] FAILED kind={kind} {width}x{height} sid={surface_id:?}");
+                eprintln!(
+                    "[upload #{n}] FAILED {detail} {width}x{height} sid={surface_id:?} kept_prev={had_prev}",
+                );
             }
         }
     }
@@ -3095,18 +3158,19 @@ impl VulkanRenderer {
     /// main event loop so completed frames are flushed to the server
     /// without waiting for the next Wayland surface commit.
     pub fn try_retire_pending(&mut self) -> Option<(u16, u32, u32, PixelData)> {
+        // Skip the whole retirement path when there is nothing in flight.
+        // The compositor calls this every iteration of its event loop, so
+        // returning immediately when idle avoids the per-iteration overhead
+        // of the Vec::retain_mut sweep and (when applicable) syscalls.
+        if self.pending_submit.is_none() && self.deferred_submits.is_empty() {
+            return None;
+        }
+
         // Opportunistically drain deferred external submissions whose
         // fences have signalled, freeing their command buffers and textures.
         self.drain_deferred_submits();
 
-        static TR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let Some(pending) = self.pending_submit.take() else {
-            let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 || n.is_multiple_of(500) {
-                eprintln!("[try_retire_pending #{n}] no pending_submit");
-            }
-            return None;
-        };
+        let pending = self.pending_submit.take()?;
         let raw = unsafe {
             (self.device.fp_v1_0().wait_for_fences)(
                 self.device.handle(),
@@ -3117,10 +3181,6 @@ impl VulkanRenderer {
             )
         };
         if raw != vk::Result::SUCCESS {
-            let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 || n.is_multiple_of(500) {
-                eprintln!("[try_retire_pending #{n}] fence not ready: {raw:?}");
-            }
             self.pending_submit = Some(pending);
             return None;
         }
@@ -3128,13 +3188,6 @@ impl VulkanRenderer {
         let result = self.retire_pending(pending);
         // Free per-frame temporary textures now that the GPU is done.
         self.free_frame_textures();
-        let n = TR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 10 || n.is_multiple_of(100) {
-            eprintln!(
-                "[try_retire_pending #{n}] sid={toplevel_sid} result_some={}",
-                result.is_some(),
-            );
-        }
         result.map(|(w, h, p)| (toplevel_sid, w, h, p))
     }
 
@@ -3652,30 +3705,70 @@ impl VulkanRenderer {
             self.device.cmd_end_render_pass(cb);
         }
 
-        // Dispatch BGRA→NV12 compute for external outputs with NV12 planes.
-        if external
-            && self
-                .nv12_outputs
-                .get(&sid)
-                .is_some_and(|(v, _)| !v.is_empty())
-        {
-            let &(ref nv12_vec, nv12_cur_idx) = &self.nv12_outputs[&sid];
-            let nv12_idx = nv12_cur_idx % nv12_vec.len();
-            match &nv12_vec[nv12_idx].kind {
-                Nv12OutputKind::Buffer { .. } => {
-                    self.dispatch_nv12_compute(cb, out_image, nv12_vec, nv12_idx, phys_w, phys_h);
+        // Dispatch BGRA→NV12 compute if this surface has NV12 output
+        // buffers.  Runs for both the external (encoder-allocated BGRA)
+        // and self-alloc (compositor BGRA image created with
+        // STORAGE|MUTABLE) paths.
+        #[derive(Clone, Copy)]
+        enum NvDispatchKind {
+            Buffer,
+            Image,
+        }
+        let dispatch_info: Option<(usize, NvDispatchKind)> =
+            self.nv12_outputs.get(&sid).and_then(|(nv12_vec, cur_idx)| {
+                if nv12_vec.is_empty() {
+                    return None;
                 }
-                Nv12OutputKind::Image { .. } => {
-                    self.dispatch_nv12_compute_image(
-                        cb, out_image, nv12_vec, nv12_idx, phys_w, phys_h,
-                    );
-                }
+                let nv12_idx = cur_idx % nv12_vec.len();
+                let kind = match nv12_vec[nv12_idx].kind {
+                    Nv12OutputKind::Buffer { .. } => NvDispatchKind::Buffer,
+                    Nv12OutputKind::Image { .. } => NvDispatchKind::Image,
+                };
+                Some((nv12_idx, kind))
+            });
+        let ran_compute = dispatch_info.is_some();
+        if let Some((nv12_idx, kind)) = dispatch_info {
+            let nv12_vec = &self.nv12_outputs[&sid].0;
+            match kind {
+                NvDispatchKind::Image => self.dispatch_nv12_compute_image(
+                    cb, out_image, nv12_vec, nv12_idx, phys_w, phys_h, true,
+                ),
+                NvDispatchKind::Buffer => self
+                    .dispatch_nv12_compute(cb, out_image, nv12_vec, nv12_idx, phys_w, phys_h, true),
             }
         }
 
         // Copy to staging buffer for CPU readback (only for self-allocated
         // output images — external outputs are encoded directly).
         if !external {
+            // If compute just ran, out_image is in GENERAL; transition
+            // it back to TRANSFER_SRC_OPTIMAL for the buffer copy below.
+            if ran_compute {
+                let back = vk::ImageMemoryBarrier::default()
+                    .image(out_image)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[back],
+                    );
+                }
+            }
             let region = vk::BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
@@ -3716,6 +3809,13 @@ impl VulkanRenderer {
         // When explicit sync is needed (tiled NV12 on radv), create the
         // fence with SYNC_FD export capability so we can hand a sync_fd
         // to the encoder instead of blocking the compositor thread.
+        //
+        // Only exported for the external path: vkGetFenceFdKHR with
+        // SYNC_FD transfers the fence payload to the fd and resets the
+        // VkFence, so a subsequent wait_for_fences on it (which the
+        // self-alloc path does via try_retire_pending) would stall
+        // forever.  The self-alloc path instead block-waits on the
+        // fence before emitting scaled frames (see `else` branch below).
         let needs_sync_fd_export = external
             && self.external_fence_fd_fn.is_some()
             && self.nv12_outputs.get(&sid).is_some_and(|(v, idx)| {
@@ -3786,19 +3886,25 @@ impl VulkanRenderer {
                 }
             } else if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty()) {
                 let nv12 = &nv12s[nv12_idx];
-                let (stride, uv_offset) = match &nv12.kind {
+                match &nv12.kind {
                     Nv12OutputKind::Buffer {
                         stride, uv_offset, ..
-                    } => (*stride, *uv_offset),
-                    Nv12OutputKind::Image { .. } => (0, 0),
-                };
-                PixelData::Nv12DmaBuf {
-                    fd: nv12.fd.clone(),
-                    stride,
-                    uv_offset,
-                    width: phys_w,
-                    height: phys_h,
-                    sync_fd: None, // set below when explicit sync is needed
+                    } => PixelData::Nv12DmaBuf {
+                        fd: nv12.fd.clone(),
+                        stride: *stride,
+                        uv_offset: *uv_offset,
+                        width: phys_w,
+                        height: phys_h,
+                        sync_fd: None,
+                    },
+                    Nv12OutputKind::Image { .. } => PixelData::Nv12DmaBuf {
+                        fd: nv12.fd.clone(),
+                        stride: 0,
+                        uv_offset: 0,
+                        width: phys_w,
+                        height: phys_h,
+                        sync_fd: None,
+                    },
                 }
             } else {
                 PixelData::DmaBuf {
@@ -3827,11 +3933,12 @@ impl VulkanRenderer {
                     match unsafe { ext_fence_fn.get_fence_fd(&get_info) } {
                         Ok(raw_fd) => {
                             let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+                            let shared = Arc::new(owned);
                             if let PixelData::Nv12DmaBuf {
                                 ref mut sync_fd, ..
                             } = pixel_data
                             {
-                                *sync_fd = Some(Arc::new(owned));
+                                *sync_fd = Some(shared);
                             }
                         }
                         Err(e) => {

@@ -396,7 +396,18 @@ pub async fn handle_peer(
     // spin the drive loop at full CPU.  After the cutoff, SCTP retransmits
     // only what is already buffered with natural RTO backoff.
     const SEND_IDLE_CUTOFF: Duration = Duration::from_secs(10);
+    // Tear down peers whose DataChannels have all closed but whose ICE
+    // is still "alive" (e.g. browser crashed, tab closed without clean
+    // teardown — ICE consent / SCTP SACKs keep `last_peer_activity`
+    // fresh so PEER_IDLE_TIMEOUT never fires, and str0m's drive loop
+    // burns CPU processing ICE/DTLS/SCTP forever).  A healthy browser
+    // reopens a channel immediately after closing one, so anything
+    // longer than a few seconds without any channel means the peer is
+    // really gone.
+    const CHANNELS_EMPTY_TIMEOUT: Duration = Duration::from_secs(5);
     let mut last_peer_activity = Instant::now();
+    let mut ever_had_channel = false;
+    let mut channels_empty_since: Option<Instant> = None;
 
     // Reusable sleep future — avoids allocating/dropping a TimerEntry on every
     // loop iteration, which was responsible for ~15% of steady-state CPU
@@ -448,6 +459,15 @@ pub async fn handle_peer(
             );
             break;
         }
+        if let Some(t) = channels_empty_since
+            && t.elapsed() > CHANNELS_EMPTY_TIMEOUT
+        {
+            verbose!(
+                "all data channels closed for >{}s, tearing down",
+                CHANNELS_EMPTY_TIMEOUT.as_secs()
+            );
+            break;
+        }
 
         let timeout = loop {
             // After every poll_output step, try to flush pending_send.
@@ -493,6 +513,8 @@ pub async fn handle_peer(
                     match ev {
                         Event::ChannelOpen(cid, label) => {
                             verbose!("data channel opened: {label}");
+                            ever_had_channel = true;
+                            channels_empty_since = None;
                             if label == "mux" {
                                 // Mux channel: virtual streams are opened
                                 // via control messages on stream_id=0.
@@ -759,7 +781,7 @@ pub async fn handle_peer(
                             }
                         }
                         Event::ChannelClose(cid) => {
-                            verbose!("data channel closed, keeping session alive");
+                            verbose!("data channel closed");
                             if let Some(state) = channels.remove(&cid) {
                                 state.abort.abort();
                             }
@@ -767,6 +789,9 @@ pub async fn handle_peer(
                                 for (_, state) in mux_streams {
                                     state.abort.abort();
                                 }
+                            }
+                            if ever_had_channel && channels.is_empty() && mux_channels.is_empty() {
+                                channels_empty_since.get_or_insert_with(Instant::now);
                             }
                         }
                         Event::IceConnectionStateChange(state) => {

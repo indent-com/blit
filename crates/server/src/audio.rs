@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
@@ -46,6 +46,13 @@ pub const DEFAULT_BITRATE: i32 = 64_000;
 /// Server-side ring buffer depth: 200 ms = 10 Opus frames at 20 ms.
 const RING_CAPACITY: usize = 10;
 
+/// Minimum interval between sub-process heal attempts.
+const HEAL_COOLDOWN: Duration = Duration::from_secs(1);
+/// Maximum sub-process restarts in a burst window before giving up.
+const MAX_HEALS: u32 = 5;
+/// Duration of the burst window for counting heal attempts.
+const HEAL_WINDOW: Duration = Duration::from_secs(30);
+
 /// An encoded Opus frame ready for wire delivery.
 #[derive(Clone)]
 pub struct OpusFrame {
@@ -76,6 +83,20 @@ pub struct AudioPipeline {
     /// Shared flag set to `false` when the reader/encoder task exits.
     /// Lets `is_alive()` detect a dead encoder even if pw-cat hasn't exited.
     encoder_alive: Arc<AtomicBool>,
+    /// D-Bus session bus address for restarting sub-processes.
+    dbus_address: String,
+    /// Cloned sender for spawning new encoder tasks on pw-cat restart.
+    opus_tx: mpsc::Sender<OpusFrame>,
+    /// Verbose logging flag.
+    verbose: bool,
+    /// Shared time origin for A/V sync timestamps.
+    epoch: Instant,
+    /// Last sub-process heal attempt timestamp.
+    last_heal: Option<Instant>,
+    /// Start of the current heal burst window.
+    first_heal_at: Option<Instant>,
+    /// Number of heals in the current burst window.
+    heals: u32,
 }
 
 /// PipeWire configuration template.
@@ -182,6 +203,52 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     false
+}
+
+/// Look up blit-sink's PipeWire object serial via `pw-cli ls Node`.
+/// Returns `None` if the serial can't be determined.
+fn lookup_sink_serial(runtime_dir: &Path) -> Option<String> {
+    let pipewire_remote = runtime_dir.join("pipewire-0");
+    let output = Command::new("pw-cli")
+        .args(["ls", "Node"])
+        .env("PIPEWIRE_REMOTE", &pipewire_remote)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // Strategy 1: serial appears after node.name in the pw-cli output.
+    let mut serial = None;
+    let mut in_blit_sink = false;
+    for line in text.lines() {
+        if line.contains("node.name") && line.contains("blit-sink") {
+            in_blit_sink = true;
+        } else if in_blit_sink && line.contains("object.serial") {
+            serial = line.split('"').nth(1).map(|s| s.to_string());
+            break;
+        } else if line.starts_with('\t') && line.contains("id ") {
+            in_blit_sink = false;
+        }
+    }
+    if serial.is_some() {
+        return serial;
+    }
+
+    // Strategy 2: serial appears before node.name (some PipeWire versions).
+    let mut current_serial = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("object.serial = \"") {
+            current_serial = rest.strip_suffix('"').map(|s| s.to_string());
+        }
+        if trimmed.contains("node.name") && trimmed.contains("blit-sink") {
+            return current_serial;
+        }
+    }
+    None
 }
 
 impl AudioPipeline {
@@ -400,64 +467,7 @@ impl AudioPipeline {
         //    `--target blit-sink.monitor` no longer resolves in PipeWire 1.x,
         //    and `--target blit-sink` (by name) fails for record→sink routes.
         //    Using the numeric serial works reliably.
-        let pipewire_remote_path = audio_dir.join("pipewire-0");
-        let sink_serial = Command::new("pw-cli")
-            .args(["ls", "Node"])
-            .env("PIPEWIRE_REMOTE", &pipewire_remote_path)
-            .env("XDG_RUNTIME_DIR", &audio_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .and_then(|out| {
-                let text = String::from_utf8_lossy(&out.stdout);
-                // Find: object.serial = "N" on a line after node.name = "blit-sink"
-                let mut serial = None;
-                let mut in_blit_sink = false;
-                for line in text.lines() {
-                    if line.contains("node.name") && line.contains("blit-sink") {
-                        in_blit_sink = true;
-                    } else if in_blit_sink && line.contains("object.serial") {
-                        serial = line.split('"').nth(1).map(|s| s.to_string());
-                        break;
-                    } else if line.starts_with('\t') && line.contains("id ") {
-                        in_blit_sink = false;
-                    }
-                }
-                serial
-            });
-
-        // pw-cli ls Node lists serial BEFORE node.name, so re-parse:
-        // each entry starts with \tid N, then props.  Find the entry
-        // containing blit-sink and extract its serial.
-        let sink_serial = sink_serial.or_else(|| {
-            Command::new("pw-cli")
-                .args(["ls", "Node"])
-                .env("PIPEWIRE_REMOTE", &pipewire_remote_path)
-                .env("XDG_RUNTIME_DIR", &audio_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .and_then(|out| {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    let mut current_serial = None;
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if let Some(rest) = trimmed.strip_prefix("object.serial = \"") {
-                            current_serial = rest.strip_suffix('"').map(|s| s.to_string());
-                        }
-                        if trimmed.contains("node.name") && trimmed.contains("blit-sink") {
-                            return current_serial;
-                        }
-                    }
-                    None
-                })
-        });
-
-        let target = sink_serial.as_deref().unwrap_or("blit-sink");
+        let target = lookup_sink_serial(&audio_dir).unwrap_or_else(|| "blit-sink".to_string());
         if verbose {
             eprintln!("[audio] pw-cat target: {target}");
         }
@@ -474,7 +484,7 @@ impl AudioPipeline {
                     "--channels",
                     "2",
                     "--target",
-                    target,
+                    &target,
                     "-", // write to stdout
                 ])
                 .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
@@ -544,6 +554,7 @@ impl AudioPipeline {
 
         // Spawn the async reader + encoder task.
         let (opus_tx, opus_rx) = mpsc::channel::<OpusFrame>(RING_CAPACITY * 2);
+        let opus_tx_keep = opus_tx.clone();
         let bitrate = if bitrate > 0 {
             bitrate
         } else {
@@ -583,6 +594,13 @@ impl AudioPipeline {
             alive: true,
             bitrate_tx,
             encoder_alive,
+            dbus_address: dbus_address.to_string(),
+            opus_tx: opus_tx_keep,
+            verbose,
+            epoch,
+            last_heal: None,
+            first_heal_at: None,
+            heals: 0,
         })
     }
 
@@ -606,52 +624,91 @@ impl AudioPipeline {
         self.ring.iter()
     }
 
-    /// Returns true if the pipeline processes are still alive.
+    /// Returns true if the pipeline is still producing (or can resume
+    /// producing) audio.
     ///
-    /// Checks every child process — not just pw-cat.  If WirePlumber or
-    /// pipewire-pulse dies, the pipeline appears to work (pw-cat reads
-    /// silence from the monitor) but apps can no longer connect or their
-    /// existing streams are orphaned, producing permanent silence that
-    /// the old check never detected.
+    /// Automatically restarts dead sub-processes (WirePlumber,
+    /// pipewire-pulse, pw-cat/encoder) without tearing down the entire
+    /// pipeline.  Only returns false when core processes (PipeWire,
+    /// dbus-daemon) die or when sub-process restarts keep failing.
     pub fn is_alive(&mut self) -> bool {
         if !self.alive {
             return false;
         }
-        // Check if the encoder task exited (Opus failure, pipe error, etc.).
-        if !self.encoder_alive.load(Ordering::Acquire) {
-            self.alive = false;
-            return false;
-        }
-        // Check pw-cat — the audio capture process.
-        if matches!(self.pw_cat_child.try_wait(), Ok(Some(_))) {
-            self.alive = false;
-            return false;
-        }
-        // Check PipeWire core daemon.
-        if matches!(self.pipewire_child.try_wait(), Ok(Some(_))) {
-            self.alive = false;
-            return false;
-        }
-        // Check pipewire-pulse — the PulseAudio compatibility layer.
-        // Without it, PulseAudio clients can't connect.
-        if matches!(self.pipewire_pulse_child.try_wait(), Ok(Some(_))) {
-            self.alive = false;
-            return false;
-        }
-        // Check WirePlumber — the session manager that links app streams
-        // to blit-sink.  Without it, new streams hang because nothing
-        // creates the links.
-        if let Some(ref mut wp) = self.wireplumber_child
-            && matches!(wp.try_wait(), Ok(Some(_)))
+
+        // Core processes: if dead, the whole pipeline must be rebuilt.
+        if matches!(self.pipewire_child.try_wait(), Ok(Some(_)))
+            || matches!(self.dbus_child.try_wait(), Ok(Some(_)))
         {
             self.alive = false;
             return false;
         }
-        // Check dbus-daemon — PipeWire modules depend on the session bus.
-        if matches!(self.dbus_child.try_wait(), Ok(Some(_))) {
+
+        // Detect dead sub-processes.  Compute booleans first so we don't
+        // hold borrows across the restart calls that take &mut self.
+        let wp_dead = self
+            .wireplumber_child
+            .as_mut()
+            .is_some_and(|wp| matches!(wp.try_wait(), Ok(Some(_))));
+        let pulse_dead = matches!(self.pipewire_pulse_child.try_wait(), Ok(Some(_)));
+        let encoder_dead = !self.encoder_alive.load(Ordering::Acquire);
+        let pw_cat_dead = matches!(self.pw_cat_child.try_wait(), Ok(Some(_)));
+
+        let needs_heal = wp_dead || pulse_dead || encoder_dead || pw_cat_dead;
+        if !needs_heal {
+            return true;
+        }
+
+        // Rate-limit heal attempts.
+        let now = Instant::now();
+        let can_heal = self
+            .last_heal
+            .is_none_or(|t| now.duration_since(t) >= HEAL_COOLDOWN);
+        if !can_heal {
+            // Still in cooldown — return true so the outer code doesn't
+            // trigger a full pipeline restart while we're healing.
+            return true;
+        }
+
+        // Burst limiter: give up after too many restarts in a window.
+        if self
+            .first_heal_at
+            .is_none_or(|t| now.duration_since(t) > HEAL_WINDOW)
+        {
+            self.first_heal_at = Some(now);
+            self.heals = 0;
+        }
+        self.heals += 1;
+        if self.heals > MAX_HEALS {
+            eprintln!(
+                "[audio] too many sub-process restarts ({}), giving up",
+                self.heals
+            );
             self.alive = false;
             return false;
         }
+        self.last_heal = Some(now);
+
+        // Restart dead sub-processes individually.
+
+        if wp_dead {
+            eprintln!("[audio] wireplumber died, restarting");
+            self.restart_wireplumber();
+        }
+
+        if pulse_dead {
+            eprintln!("[audio] pipewire-pulse died, restarting");
+            self.restart_pipewire_pulse();
+        }
+
+        if encoder_dead || pw_cat_dead {
+            eprintln!("[audio] pw-cat/encoder died, restarting");
+            if !self.restart_pw_cat() {
+                self.alive = false;
+                return false;
+            }
+        }
+
         true
     }
 
@@ -675,6 +732,151 @@ impl AudioPipeline {
         // Remove the private runtime directory and everything in it
         // (config file, PipeWire socket, pulse/native socket, etc.).
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
+    }
+
+    /// Restart a dead WirePlumber sub-process.
+    fn restart_wireplumber(&mut self) {
+        if let Some(ref mut wp) = self.wireplumber_child {
+            let _ = wp.kill();
+            let _ = wp.wait();
+        }
+        let child = unsafe {
+            Command::new("wireplumber")
+                .env("PIPEWIRE_REMOTE", self.runtime_dir.join("pipewire-0"))
+                .env("XDG_CONFIG_HOME", &self.runtime_dir)
+                .env("DBUS_SESSION_BUS_ADDRESS", &self.dbus_address)
+                .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(if self.verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+        };
+        match child {
+            Ok(c) => {
+                self.wireplumber_child = Some(c);
+            }
+            Err(e) => {
+                eprintln!("[audio] failed to restart wireplumber: {e}");
+                self.wireplumber_child = None;
+            }
+        }
+    }
+
+    /// Restart a dead pipewire-pulse sub-process.
+    fn restart_pipewire_pulse(&mut self) {
+        let _ = self.pipewire_pulse_child.kill();
+        let _ = self.pipewire_pulse_child.wait();
+        // Remove stale PulseAudio socket to avoid "Address already in use".
+        let _ = std::fs::remove_dir_all(self.runtime_dir.join("pulse"));
+        match unsafe {
+            Command::new("pipewire-pulse")
+                .env("PIPEWIRE_REMOTE", self.runtime_dir.join("pipewire-0"))
+                .env("DBUS_SESSION_BUS_ADDRESS", &self.dbus_address)
+                .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(if self.verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+        } {
+            Ok(c) => {
+                self.pipewire_pulse_child = c;
+            }
+            Err(e) => {
+                eprintln!("[audio] failed to restart pipewire-pulse: {e}");
+            }
+        }
+    }
+
+    /// Restart pw-cat and the encoder task.  Returns false if the spawn
+    /// failed and the pipeline should be considered dead.
+    fn restart_pw_cat(&mut self) -> bool {
+        let _ = self.pw_cat_child.kill();
+        let _ = self.pw_cat_child.wait();
+
+        // Re-lookup the sink serial (it may have changed).
+        let target =
+            lookup_sink_serial(&self.runtime_dir).unwrap_or_else(|| "blit-sink".to_string());
+
+        let mut new_child = match unsafe {
+            Command::new("pw-cat")
+                .args([
+                    "--record",
+                    "--rate",
+                    "48000",
+                    "--format",
+                    "f32",
+                    "--channels",
+                    "2",
+                    "--target",
+                    &target,
+                    "-",
+                ])
+                .env("PIPEWIRE_REMOTE", self.runtime_dir.join("pipewire-0"))
+                .env("DBUS_SESSION_BUS_ADDRESS", &self.dbus_address)
+                .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(if self.verbose {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .pre_exec(pdeathsig_hook())
+                .spawn()
+        } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[audio] failed to restart pw-cat: {e}");
+                return false;
+            }
+        };
+
+        let stdout = match new_child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = new_child.kill();
+                return false;
+            }
+        };
+
+        self.pw_cat_child = new_child;
+
+        // Spawn a new encoder task.  The old task has already exited
+        // (its pipe read returned EOF or error), so it won't compete.
+        let encoder_alive = Arc::new(AtomicBool::new(true));
+        self.encoder_alive = encoder_alive.clone();
+
+        let opus_tx = self.opus_tx.clone();
+        let bitrate = *self.bitrate_tx.borrow();
+        let bitrate_rx = self.bitrate_tx.subscribe();
+        let verbose = self.verbose;
+        let epoch = self.epoch;
+
+        tokio::spawn(async move {
+            let result =
+                reader_encoder_task(stdout, opus_tx, bitrate, verbose, epoch, bitrate_rx).await;
+            encoder_alive.store(false, Ordering::Release);
+            if let Err(e) = result
+                && verbose
+            {
+                eprintln!("[audio] reader/encoder task exited: {e}");
+            }
+        });
+
+        if self.verbose {
+            eprintln!("[audio] restarted pw-cat (target={target}) and encoder");
+        }
+        true
     }
 
     /// Update the Opus encoder bitrate. Takes effect on the next frame.
@@ -798,10 +1000,20 @@ async fn reader_encoder_task(
                 ]);
             }
 
-            // Encode.
-            let encoded_len = encoder
-                .encode_float(&pcm_buf, &mut opus_out)
-                .map_err(|e| format!("Opus encode error: {e}"))?;
+            // Encode.  Skip the frame on error instead of killing the
+            // entire pipeline — a single dropped 20 ms frame is inaudible.
+            let encoded_len = match encoder.encode_float(&pcm_buf, &mut opus_out) {
+                Ok(len) => len,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[audio] Opus encode error, skipping frame: {e}");
+                    }
+                    let consumed = FRAME_FLOATS * 4;
+                    byte_buf.copy_within(consumed..byte_offset, 0);
+                    byte_offset -= consumed;
+                    continue;
+                }
+            };
 
             let frame = OpusFrame {
                 // Wall-clock ms since the shared epoch — same timebase as
