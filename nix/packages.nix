@@ -41,6 +41,22 @@
         ]
       );
 
+      # Runtime library search path for blit server's in-process
+      # libpipewire-0.3 capture stream.  Loaded via dlopen (see
+      # crates/server/src/audio_pw.rs) so it is not in the binary's
+      # DT_NEEDED, which means Nix won't patchelf it for us — we have
+      # to add its location explicitly.
+      audioRuntimeLibPath = pkgs.lib.optionalString pkgs.stdenv.isLinux (
+        pkgs.lib.makeLibraryPath [ pkgs.pipewire ]
+      );
+
+      # Combined LD_LIBRARY_PATH for dlopen'd runtime libraries.  Empty
+      # on non-Linux where none of the above apply.
+      serverRuntimeLibPath = pkgs.lib.concatStringsSep ":" (
+        pkgs.lib.optional (gpuRuntimeLibPath != "") gpuRuntimeLibPath
+        ++ pkgs.lib.optional (audioRuntimeLibPath != "") audioRuntimeLibPath
+      );
+
       # ------------------------------------------------------------------
       # Crane build
       # ------------------------------------------------------------------
@@ -474,12 +490,23 @@
           export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
-          # Runtime dlopen: blit server loads VA-API / NVENC libraries at
-          # runtime via dlopen.  See gpuRuntimeLibPath definition above.
+          # LIBRARY_PATH is propagated by nix-direnv while LD_LIBRARY_PATH
+          # is filtered out — .envrc reconstructs LD_LIBRARY_PATH from
+          # LIBRARY_PATH, so anything we need at runtime has to land
+          # here.  libopus is for the Opus encoder; libpipewire-0.3 is
+          # dlopened by the server's in-process audio capture path (see
+          # crates/server/src/audio_pw.rs).
+          export LIBRARY_PATH="${pkgs.libopus}/lib${
+            pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.pipewire}/lib"
+          }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          # Runtime dlopen: blit server loads VA-API / NVENC GPU libs
+          # and libpipewire-0.3 at runtime via dlopen.  See the
+          # serverRuntimeLibPath definition above.  (Direct LD_LIBRARY_PATH
+          # export is effective for plain `nix develop`; under direnv,
+          # the .envrc reconstruction from LIBRARY_PATH takes over.)
           ${pkgs.lib.optionalString (
-            gpuRuntimeLibPath != ""
-          ) ''export LD_LIBRARY_PATH="${gpuRuntimeLibPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"''}
+            serverRuntimeLibPath != ""
+          ) ''export LD_LIBRARY_PATH="${serverRuntimeLibPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"''}
           export PATH="$PWD/target/profiling:$PWD/bin:$PATH"
         '';
       };

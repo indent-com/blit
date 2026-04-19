@@ -171,15 +171,15 @@ Without any of the above, the compositor falls back to CPU rendering and softwar
 
 **Audio (Linux)**
 
-| Binary           | Packages (Debian/Ubuntu)       | Used for                                         |
-| ---------------- | ------------------------------ | ------------------------------------------------ |
-| `pipewire`       | `pipewire`                     | Audio daemon (private instance per compositor)   |
-| `pipewire-pulse` | `pipewire-pulse`               | PulseAudio compatibility for apps                |
-| `pw-cat`         | `pipewire` or `pipewire-utils` | Monitor source capture                           |
-| `dbus-daemon`    | `dbus`                         | Private D-Bus session (required by PipeWire)     |
-| `wireplumber`    | `wireplumber`                  | Session manager (optional, started if available) |
+| Dependency             | Packages (Debian/Ubuntu)          | Used for                                          |
+| ---------------------- | --------------------------------- | ------------------------------------------------- |
+| `pipewire`             | `pipewire`                        | Audio daemon (private instance per compositor)    |
+| `pipewire-pulse`       | `pipewire-pulse`                  | PulseAudio compatibility for apps                 |
+| `libpipewire-0.3.so.0` | `pipewire` or `libpipewire-0.3-0` | Monitor capture (in-process, loaded via `dlopen`) |
+| `dbus-daemon`          | `dbus`                            | Private D-Bus session (required by PipeWire)      |
+| `wireplumber`          | `wireplumber`                     | Session manager (optional, started if available)  |
 
-Audio is disabled automatically when PipeWire is not installed, or explicitly with `BLIT_AUDIO=0`.
+Audio is disabled automatically when PipeWire is not installed or `libpipewire-0.3.so.0` is not resolvable via `ld.so` (set `LD_LIBRARY_PATH` if you have it in a non-default location), or explicitly with `BLIT_AUDIO=0`.
 
 ## How it compares
 

@@ -58,6 +58,39 @@ pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Read one logical S2C message, transparently reassembling any
+/// `S2C_FRAGMENT` sequence emitted by the server.  Callers that consume
+/// server messages should use this instead of raw `read_frame` so a
+/// chunked bulk message (video keyframe, large terminal snapshot) is
+/// delivered as a single contiguous buffer matching its original type.
+///
+/// `pending` is the caller-owned reassembly buffer — pass the same
+/// `&mut Vec<u8>` across successive calls on the same stream.  Fragments
+/// of a single message do not interleave with fragments of another
+/// (TCP order + single-message-at-a-time sender), so one buffer is
+/// enough.  Audio frames and other non-fragment messages pass through
+/// untouched.
+pub async fn read_message(
+    r: &mut (impl AsyncRead + Unpin),
+    pending: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
+    loop {
+        let frame = read_frame(r).await?;
+        if frame.is_empty() || frame[0] != blit_remote::S2C_FRAGMENT {
+            return Some(frame);
+        }
+        if frame.len() < 2 {
+            // Malformed fragment header — drop, keep reading.
+            continue;
+        }
+        let flags = frame[1];
+        pending.extend_from_slice(&frame[2..]);
+        if flags & blit_remote::FRAGMENT_FLAG_LAST != 0 {
+            return Some(std::mem::take(pending));
+        }
+    }
+}
+
 pub fn make_frame(payload: &[u8]) -> Vec<u8> {
     debug_assert!(payload.len() <= u32::MAX as usize);
     let mut v = Vec::with_capacity(4 + payload.len());

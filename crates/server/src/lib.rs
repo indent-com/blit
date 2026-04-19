@@ -26,6 +26,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 #[cfg(target_os = "linux")]
 mod audio;
+#[cfg(target_os = "linux")]
+mod audio_pw;
 mod gpu_libs;
 mod ipc;
 mod nvenc_encode;
@@ -251,30 +253,69 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
     writer.write_all(&buf).await.is_ok()
 }
 
-/// Write a length-prefixed frame, draining any pending audio frames
-/// before the bulk write.  Audio frames are complete length-prefixed
-/// messages on the same stream, so they MUST be written between bulk
-/// frames — never interleaved within one.
+/// Largest bulk-frame payload we'll write in a single length-prefixed
+/// message.  Payloads above this are split into `S2C_FRAGMENT` messages
+/// so audio frames can be drained between chunks, bounding the time
+/// audio sits blocked behind a bulk write to (roughly) `CHUNK_BYTES /
+/// network_bandwidth`.  Too small and per-message overhead dominates
+/// (each fragment adds an 8-byte length prefix + 2-byte fragment header);
+/// too large and audio suffers head-of-line blocking again.  4 KiB keeps
+/// per-chunk write time under ~4 ms even on a 1 MB/s link — well below
+/// the 20 ms audio frame cadence with headroom for a handful of chunks
+/// in flight.
+const BULK_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Write a bulk message, draining pending audio frames between chunks.
 ///
-/// Previous code inserted audio frames between write-syscall chunks of
-/// a single bulk frame.  This corrupted the stream: the reader does
-/// `read_exact(len, 4)` then `read_exact(payload, len)` and expects a
-/// contiguous `4+len` bytes.  Inserting audio bytes inside that span
-/// corrupts the payload and desynchronises every subsequent frame.
+/// Payloads that fit within `BULK_CHUNK_BYTES` are written as a single
+/// length-prefixed frame after a pre-drain of pending audio (same as
+/// before).  Larger payloads are split into `S2C_FRAGMENT` messages so
+/// audio frames written between fragments remain valid, complete,
+/// length-prefixed messages on the wire — never interleaved inside a
+/// single `read_exact`-delimited payload, which would desynchronise
+/// the reader's framing.
 async fn write_frame_interleaved(
     writer: &mut (impl AsyncWrite + Unpin),
     payload: &[u8],
     audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> bool {
-    // Drain pending audio *before* the bulk frame so audio is never
-    // starved for more than one bulk-frame write time.  Audio frames
-    // are tiny (~160 B) so this is near-instant.
-    while let Ok(audio_msg) = audio_rx.try_recv() {
-        if !write_frame(writer, &audio_msg).await {
+    // Small message: drain any queued audio, then write as-is.
+    if payload.len() <= BULK_CHUNK_BYTES {
+        while let Ok(audio_msg) = audio_rx.try_recv() {
+            if !write_frame(writer, &audio_msg).await {
+                return false;
+            }
+        }
+        return write_frame(writer, payload).await;
+    }
+
+    // Large message: split into S2C_FRAGMENT messages, draining audio
+    // between each chunk.  The chunks carry the original payload bytes
+    // verbatim (including its type byte in the first chunk); the
+    // receiver concatenates them and dispatches the reassembled buffer.
+    let mut offset = 0;
+    while offset < payload.len() {
+        while let Ok(audio_msg) = audio_rx.try_recv() {
+            if !write_frame(writer, &audio_msg).await {
+                return false;
+            }
+        }
+        let end = (offset + BULK_CHUNK_BYTES).min(payload.len());
+        let is_last = end == payload.len();
+        let mut frag = Vec::with_capacity(2 + (end - offset));
+        frag.push(blit_remote::S2C_FRAGMENT);
+        frag.push(if is_last {
+            blit_remote::FRAGMENT_FLAG_LAST
+        } else {
+            0
+        });
+        frag.extend_from_slice(&payload[offset..end]);
+        if !write_frame(writer, &frag).await {
             return false;
         }
+        offset = end;
     }
-    write_frame(writer, payload).await
+    true
 }
 
 struct Pty {
@@ -360,10 +401,17 @@ struct SharedCompositor {
     /// when the Wayland client sets `xdg_geometry` (e.g. excluding a
     /// title bar), so we compare against the actually-requested values.
     last_configured_size: HashMap<u16, (u16, u16, u16)>,
-    /// Audio capture pipeline (PipeWire → pw-cat → Opus encode).
+    /// Audio capture pipeline (PipeWire daemon → in-process libpipewire capture → Opus encode).
     /// `None` when PipeWire is not available or `BLIT_AUDIO=0`.
     #[cfg(target_os = "linux")]
     audio_pipeline: Option<audio::AudioPipeline>,
+    /// Shared fan-out state for audio — subscribers, catch-up ring,
+    /// listener flag.  Persistent across pipeline restarts so clients
+    /// stay subscribed even when the pipeline is restarted.  Always present on Linux;
+    /// subscribe/unsubscribe succeeds even when the pipeline itself is
+    /// absent (frames just don't flow until it's back).
+    #[cfg(target_os = "linux")]
+    audio_broadcast: Arc<audio::AudioBroadcast>,
     /// Compositor instance ID passed to `AudioPipeline::spawn()` so restarts
     /// reuse the same audio runtime directory.
     #[cfg(target_os = "linux")]
@@ -1490,6 +1538,8 @@ impl Session {
             let created_at = Instant::now();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             #[cfg(target_os = "linux")]
+            let audio_broadcast = audio::AudioBroadcast::new();
+            #[cfg(target_os = "linux")]
             let audio_pipeline = {
                 let audio_disabled = std::env::var("BLIT_AUDIO")
                     .map(|v| v == "0")
@@ -1504,6 +1554,7 @@ impl Session {
                         .unwrap_or(0);
                     // Wrap in block_in_place so the thread::sleep calls
                     // inside spawn() don't stall the tokio runtime.
+                    let broadcast = audio_broadcast.clone();
                     tokio::task::block_in_place(|| {
                         match audio::AudioPipeline::spawn(
                             runtime_dir,
@@ -1511,6 +1562,7 @@ impl Session {
                             bitrate,
                             verbose,
                             created_at,
+                            broadcast,
                         ) {
                             Ok(pipeline) => {
                                 if verbose {
@@ -1530,10 +1582,21 @@ impl Session {
                 } else {
                     if verbose && !audio_disabled {
                         let missing = audio::missing_pipewire_binaries();
-                        eprintln!(
-                            "[audio] audio disabled: missing binaries on $PATH: {}",
-                            missing.join(", ")
-                        );
+                        let load_err = audio_pw::load_error();
+                        if !missing.is_empty() {
+                            eprintln!(
+                                "[audio] audio disabled: missing binaries on $PATH: {}",
+                                missing.join(", ")
+                            );
+                        }
+                        if !load_err.is_empty() {
+                            eprintln!("[audio] audio disabled: {load_err}");
+                        }
+                        if missing.is_empty() && load_err.is_empty() {
+                            eprintln!(
+                                "[audio] audio disabled (reason not recorded; call pipewire_available() logged above)"
+                            );
+                        }
                     }
                     None
                 }
@@ -1550,6 +1613,8 @@ impl Session {
                 last_configured_size: HashMap::new(),
                 #[cfg(target_os = "linux")]
                 audio_pipeline,
+                #[cfg(target_os = "linux")]
+                audio_broadcast,
                 #[cfg(target_os = "linux")]
                 audio_session_id: session_id,
                 #[cfg(target_os = "linux")]
@@ -4072,51 +4137,23 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 
     // -- Audio frame delivery -----------------------------------------------
-    #[cfg(target_os = "linux")]
-    let any_audio_subscribed = sess.clients.values().any(|c| c.audio_subscribed);
-    // Propagate the subscription state to the encoder task so it can skip
-    // the Opus encode step when no one is listening.
-    #[cfg(target_os = "linux")]
-    if let Some(ref cs) = sess.compositor
-        && let Some(ref ap) = cs.audio_pipeline
-    {
-        ap.set_has_listener(any_audio_subscribed);
-    }
-    #[cfg(target_os = "linux")]
-    if any_audio_subscribed
-        && let Some(ref mut cs) = sess.compositor
-        && let Some(ref mut ap) = cs.audio_pipeline
-        && ap.is_alive()
-    {
-        let new_frames = ap.poll_frames();
-        if !new_frames.is_empty() {
-            for client in sess.clients.values_mut() {
-                if client.audio_subscribed {
-                    for frame in &new_frames {
-                        let msg = audio::msg_audio_frame(frame);
-                        let bytes = msg.len();
-                        // Send via the dedicated audio channel so audio is
-                        // never blocked behind large video/terminal messages
-                        // in the shared outbox.  The writer task interleaves
-                        // audio between write syscalls of bulk messages.
-                        if client.audio_tx.send(msg).is_ok() {
-                            // Count audio bytes into the goodput window so
-                            // the shared bandwidth estimate reflects total
-                            // pipe utilisation (terminals + video + audio).
-                            client.goodput_window_bytes += bytes;
-                        }
-                    }
-                }
-            }
-        }
-        // Schedule the next tick soon so audio frames don't accumulate.
-        // 20 ms matches the Opus frame interval.
-        let next_audio = now + Duration::from_millis(20);
-        next_deadline = Some(next_deadline.map_or(next_audio, |d: Instant| d.min(next_audio)));
-    }
+    //
+    // Audio is no longer delivered from the tick loop — a dedicated
+    // fan-out task (spawned in `AudioPipeline::spawn`) drains encoded
+    // frames from the encoder mpsc and pushes them to each subscribed
+    // client's `audio_tx` independently of compositor/video work.  This
+    // keeps audio flowing at a steady 20 ms cadence even when a tick is
+    // blocked by a long video write, and keeps the encoder's bounded
+    // mpsc from overflowing into silent frame drops.
+    //
+    // Audio bytes are intentionally excluded from `goodput_window_bytes`:
+    // at ~8 KB/s they're negligible next to video (MB/s) and keeping the
+    // accounting on the tick loop would defeat the whole point of the
+    // off-tick fan-out.  The has_listener flag is now managed by the
+    // subscribe/unsubscribe API on `AudioBroadcast`.
 
     // -- Audio pipeline auto-restart ----------------------------------------
-    // If the pipeline died (pw-cat exited, encoder crashed, PipeWire gone),
+    // If the pipeline died (encoder crashed, PipeWire gone, capture stream dropped),
     // drop it, wait for a cooldown, and respawn.  This avoids permanent
     // audio loss that previously required a full client reconnect.
     //
@@ -4150,6 +4187,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let session_id = cs.audio_session_id;
                 let epoch = cs.created_at;
                 let verbose = state.config.verbose;
+                // Reuse the existing broadcast so currently-subscribed
+                // clients pick up frames from the restarted pipeline
+                // without re-subscribing.
+                let broadcast = cs.audio_broadcast.clone();
                 eprintln!("[audio] pipeline died, restarting...");
                 let pipeline = tokio::task::block_in_place(|| {
                     audio::AudioPipeline::spawn(
@@ -4158,6 +4199,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         audio_restart_bitrate,
                         verbose,
                         epoch,
+                        broadcast,
                     )
                 });
                 match pipeline {
@@ -4207,12 +4249,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let sender_outbox_queued_frames = outbox_frame_counter.clone();
     let sender_outbox_queued_bytes = outbox_byte_counter.clone();
     let sender = tokio::spawn(async move {
+        let audio_debug = std::env::var_os("BLIT_AUDIO_DEBUG").is_some();
+        let mut audio_window_start = Instant::now();
+        let mut last_audio_pick_at = Instant::now();
+        let mut audio_sends_in_window: u32 = 0;
+        let mut max_audio_pick_gap: u32 = 0;
+        let mut max_audio_write_ms: u32 = 0;
         loop {
             // Drain all pending audio before waiting for the next message.
             // Audio frames are tiny (~160 B) so this is near-instant.
             while let Ok(audio_msg) = audio_rx.try_recv() {
                 if !write_frame(&mut writer, &audio_msg).await {
                     return;
+                }
+                if audio_debug {
+                    audio_sends_in_window += 1;
+                    let now = Instant::now();
+                    let pick_gap = now.duration_since(last_audio_pick_at).as_millis() as u32;
+                    last_audio_pick_at = now;
+                    if pick_gap > max_audio_pick_gap {
+                        max_audio_pick_gap = pick_gap;
+                    }
                 }
             }
 
@@ -4225,8 +4282,39 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // Pure audio message — write it directly (tiny).
                     match msg {
                         Some(m) => {
+                            let audio_write_start = Instant::now();
                             if !write_frame(&mut writer, &m).await {
                                 break;
+                            }
+                            if audio_debug {
+                                let now = Instant::now();
+                                audio_sends_in_window += 1;
+                                let pick_gap = now
+                                    .duration_since(last_audio_pick_at)
+                                    .as_millis() as u32;
+                                last_audio_pick_at = now;
+                                let write_ms =
+                                    now.duration_since(audio_write_start).as_millis() as u32;
+                                if pick_gap > max_audio_pick_gap {
+                                    max_audio_pick_gap = pick_gap;
+                                }
+                                if write_ms > max_audio_write_ms {
+                                    max_audio_write_ms = write_ms;
+                                }
+                                if now.duration_since(audio_window_start)
+                                    >= Duration::from_secs(1)
+                                {
+                                    eprintln!(
+                                        "[sender audio] writes={} max_pick_gap={}ms max_write={}ms",
+                                        audio_sends_in_window,
+                                        max_audio_pick_gap,
+                                        max_audio_write_ms,
+                                    );
+                                    audio_sends_in_window = 0;
+                                    max_audio_pick_gap = 0;
+                                    max_audio_write_ms = 0;
+                                    audio_window_start = now;
+                                }
                             }
                             continue;
                         }
@@ -4246,7 +4334,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let write_start = Instant::now();
                     let wrote = write_frame_interleaved(&mut writer, &m, &mut audio_rx).await;
                     let write_elapsed = write_start.elapsed();
-                    if write_elapsed.as_millis() > 100 {
+                    // Threshold lowered from 100 ms to 30 ms so sub-chunk
+                    // stalls on slow links (the band that can still
+                    // block audio delivery for longer than the 20 ms
+                    // Opus frame cadence) show up in the log.
+                    if write_elapsed.as_millis() > 30 {
                         eprintln!(
                             "[sender] slow write: bytes={bytes} elapsed={}ms wrote={wrote}",
                             write_elapsed.as_millis(),
@@ -5347,6 +5439,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             #[cfg(target_os = "linux")]
             C2S_AUDIO_SUBSCRIBE if data.len() >= 3 => {
                 let bitrate_kbps = u16::from_le_bytes([data[1], data[2]]);
+                let audio_tx = sess.clients.get(&client_id).map(|c| c.audio_tx.clone());
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.audio_subscribed = true;
                     c.audio_bitrate_kbps = bitrate_kbps;
@@ -5355,17 +5448,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             "C2S_AUDIO_SUBSCRIBE: cid={client_id} bitrate_kbps={bitrate_kbps}"
                         );
                     }
-                    // Send ring buffer catch-up frames via the audio channel.
-                    if let Some(cs) = sess.compositor.as_mut()
-                        && let Some(ref ap) = cs.audio_pipeline
-                    {
-                        let msgs: Vec<_> = ap.ring_frames().map(audio::msg_audio_frame).collect();
-                        if let Some(c) = sess.clients.get(&client_id) {
-                            for msg in msgs {
-                                let _ = c.audio_tx.send(msg);
-                            }
-                        }
-                    }
+                }
+                // Register with the audio broadcast — atomically enqueues
+                // catch-up frames and registers for live frames from the
+                // fan-out task.  Succeeds even if the pipeline itself is
+                // currently down (frames resume once it's respawned).
+                if let (Some(cs), Some(tx)) = (sess.compositor.as_ref(), audio_tx) {
+                    cs.audio_broadcast.subscribe(client_id, tx);
                 }
                 // Recompute the effective audio bitrate across all
                 // subscribed clients (use the max requested bitrate).
@@ -5396,6 +5485,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     if state.config.verbose {
                         eprintln!("C2S_AUDIO_UNSUBSCRIBE: cid={client_id}");
                     }
+                }
+                if let Some(cs) = sess.compositor.as_ref() {
+                    cs.audio_broadcast.unsubscribe(client_id);
                 }
                 // Recompute effective bitrate after unsubscribe.
                 if let Some(cs) = sess.compositor.as_ref()
@@ -5793,6 +5885,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     {
         let mut sess = state.session.lock().await;
         let mut need_nudge = false;
+        // Drop any audio subscription before removing the client so the
+        // fan-out task doesn't hold a dead tx for the full mpsc-buffered
+        // lifetime.
+        #[cfg(target_os = "linux")]
+        if let Some(cs) = sess.compositor.as_ref() {
+            cs.audio_broadcast.unsubscribe(client_id);
+        }
         let client = sess.clients.remove(&client_id);
         let affected_ptys = client
             .as_ref()

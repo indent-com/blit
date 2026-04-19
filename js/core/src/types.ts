@@ -217,6 +217,16 @@ export const S2C_SURFACE_APP_ID = 0x28;
 export const S2C_SURFACE_CURSOR = 0x29;
 /** Encoder backend info for a surface: [0x2A][surface_id:2][name:N] */
 export const S2C_SURFACE_ENCODER = 0x2a;
+/**
+ * Fragment of a larger S2C message: [0x2B][flags:1][chunk:N].
+ * Bulk messages above the server's chunk threshold are split into
+ * fragments so audio frames can interleave on the shared TCP stream.
+ * Receiver concatenates fragment chunks (in order; no reordering on
+ * the same stream) until a fragment with FRAGMENT_FLAG_LAST set, then
+ * dispatches the reassembled buffer as the original message.
+ */
+export const S2C_FRAGMENT = 0x2b;
+export const FRAGMENT_FLAG_LAST = 1 << 0;
 export const SURFACE_FRAME_FLAG_KEYFRAME = 1 << 0;
 export const SURFACE_FRAME_CODEC_MASK = 0b110;
 export const SURFACE_FRAME_CODEC_H264 = 0 << 1;

@@ -7,7 +7,7 @@
 
 use blit_remote::{AUDIO_FRAME_CODEC_OPUS, S2C_AUDIO_FRAME};
 use opus::{Application, Channels, Encoder as OpusEncoder};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 /// Returns a closure suitable for `Command::pre_exec` that sets
@@ -63,37 +62,122 @@ pub struct OpusFrame {
     pub data: Vec<u8>,
 }
 
+/// Shared state between the per-client subscribe/unsubscribe API on
+/// [`AudioPipeline`] and the fan-out task that drains encoded frames
+/// from the encoder.
+///
+/// Lives outside the pipeline so it persists across pipeline restarts:
+/// clients stay subscribed even when pw-cat or the encoder task dies and
+/// is respawned.  Wrap in `Arc` at the caller.
+pub struct AudioBroadcast {
+    /// Per-client audio MPSC senders, keyed by client id.
+    subscribers: std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
+    /// Recent frames for catch-up on new subscribers.  Kept in sync with
+    /// delivery: every frame delivered to subscribers is first appended
+    /// here, so a late-subscribing client gets the same tail.
+    ring: std::sync::Mutex<VecDeque<OpusFrame>>,
+    /// Shared flag telling the encoder task whether to bother encoding.
+    /// Updated atomically from subscribe/unsubscribe.  Encoder still
+    /// drains pw-cat's pipe (to avoid PipeWire backpressure) but skips
+    /// the Opus encode when no one is listening.
+    has_listener: Arc<AtomicBool>,
+}
+
+impl AudioBroadcast {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            subscribers: std::sync::Mutex::new(HashMap::new()),
+            ring: std::sync::Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
+            has_listener: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Register a client for future frames and push the current ring
+    /// (catch-up) onto its tx queue.
+    ///
+    /// Ordering guarantee: the fan-out task cannot deliver a frame to
+    /// this client before we finish snapshotting+enqueuing the catch-up
+    /// tail, because we hold the ring lock while inserting into the
+    /// subscribers map — and the fan-out task takes ring-then-subs in
+    /// that order.  Callers can therefore rely on strict ordering of
+    /// the client's mpsc queue: catch-up frames first, then live frames.
+    pub fn subscribe(&self, id: u64, tx: mpsc::UnboundedSender<Vec<u8>>) {
+        let ring_guard = self.ring.lock().unwrap();
+        // Push catch-up into the client's queue while the fan-out task
+        // is blocked on ring lock.  Any frame the fan-out task is about
+        // to publish is either already in the ring we just enumerated
+        // (so replayed as catch-up) or will arrive after we release the
+        // lock and register (so delivered live) — never both, never
+        // neither.
+        for frame in ring_guard.iter() {
+            let _ = tx.send(msg_audio_frame(frame));
+        }
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.insert(id, tx);
+        self.has_listener.store(true, Ordering::Release);
+    }
+
+    /// Remove a client from the subscriber set.  Idempotent.
+    pub fn unsubscribe(&self, id: u64) {
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.remove(&id);
+        if subs.is_empty() {
+            self.has_listener.store(false, Ordering::Release);
+        }
+    }
+
+    fn has_listener_flag(&self) -> Arc<AtomicBool> {
+        self.has_listener.clone()
+    }
+}
+
+/// Dedicated task: drains encoded Opus frames from the encoder's MPSC and
+/// fans them out to every subscribed client, **off the main server tick
+/// loop**.  Running independently is the whole point — on a shared-tick
+/// design, long video writes or compositor work would starve audio
+/// delivery and the bounded encoder channel would overflow and silently
+/// drop frames, starving the client's jitter buffer below real-time.
+async fn fanout_task(mut opus_rx: mpsc::Receiver<OpusFrame>, broadcast: Arc<AudioBroadcast>) {
+    while let Some(frame) = opus_rx.recv().await {
+        // Serialize once per frame, then clone the Vec per subscriber.
+        // Opus packets are small (~100–300 B at 64 kbps), so the clone
+        // cost is dwarfed by the MPSC send syscall overhead.
+        let msg = msg_audio_frame(&frame);
+        {
+            let mut ring = broadcast.ring.lock().unwrap();
+            if ring.len() >= RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(frame);
+        }
+        let subs = broadcast.subscribers.lock().unwrap();
+        for tx in subs.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
+}
+
 /// Manages the PipeWire child processes and produces Opus frames.
 pub struct AudioPipeline {
     dbus_child: Child,
     pipewire_child: Child,
     wireplumber_child: Option<Child>,
     pipewire_pulse_child: Child,
-    pw_cat_child: Child,
-    /// Receives encoded Opus frames from the reader/encoder task.
-    opus_rx: mpsc::Receiver<OpusFrame>,
-    /// Recent frames for catch-up on new subscribers.
-    ring: VecDeque<OpusFrame>,
+    /// In-process PipeWire capture stream (replaces pw-cat).  `None`
+    /// only transiently during construction failure paths.
+    capture: Option<crate::audio_pw::Capture>,
     /// The XDG_RUNTIME_DIR used by this pipeline's PipeWire instance.
     pub runtime_dir: PathBuf,
     /// True when the pipeline is still running.
     alive: bool,
     /// Send bitrate updates to the encoder task.
     bitrate_tx: tokio::sync::watch::Sender<i32>,
-    /// Shared flag set to `false` when the reader/encoder task exits.
-    /// Lets `is_alive()` detect a dead encoder even if pw-cat hasn't exited.
+    /// Shared flag set to `false` when the encoder task exits.
     encoder_alive: Arc<AtomicBool>,
-    /// True while at least one client is subscribed to audio. When false
-    /// the encoder drains the pipe but skips the Opus encode step.
-    has_listener: Arc<AtomicBool>,
     /// D-Bus session bus address for restarting sub-processes.
     dbus_address: String,
-    /// Cloned sender for spawning new encoder tasks on pw-cat restart.
-    opus_tx: mpsc::Sender<OpusFrame>,
     /// Verbose logging flag.
     verbose: bool,
-    /// Shared time origin for A/V sync timestamps.
-    epoch: Instant,
     /// Last sub-process heal attempt timestamp.
     last_heal: Option<Instant>,
     /// Start of the current heal burst window.
@@ -179,15 +263,18 @@ fn find_program(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Check whether the required PipeWire and D-Bus binaries are available.
+/// Check whether the required PipeWire + D-Bus binaries and
+/// `libpipewire-0.3.so.0` are available.  Capture is done in-process
+/// via `audio_pw`, so `pw-cat` is no longer required.
 pub fn pipewire_available() -> bool {
-    missing_pipewire_binaries().is_empty()
+    missing_pipewire_binaries().is_empty() && crate::audio_pw::available()
 }
 
 /// Returns the list of required PipeWire / D-Bus binaries that are not
-/// found on `$PATH`.  Empty list means audio can run.
+/// found on `$PATH`.  Empty list means audio can run (provided
+/// libpipewire is also loadable at runtime; see `pipewire_available`).
 pub fn missing_pipewire_binaries() -> Vec<&'static str> {
-    ["pipewire", "pipewire-pulse", "pw-cat", "dbus-daemon"]
+    ["pipewire", "pipewire-pulse", "dbus-daemon"]
         .into_iter()
         .filter(|name| find_program(name).is_none())
         .collect()
@@ -208,52 +295,6 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> bool {
     false
 }
 
-/// Look up blit-sink's PipeWire object serial via `pw-cli ls Node`.
-/// Returns `None` if the serial can't be determined.
-fn lookup_sink_serial(runtime_dir: &Path) -> Option<String> {
-    let pipewire_remote = runtime_dir.join("pipewire-0");
-    let output = Command::new("pw-cli")
-        .args(["ls", "Node"])
-        .env("PIPEWIRE_REMOTE", &pipewire_remote)
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    // Strategy 1: serial appears after node.name in the pw-cli output.
-    let mut serial = None;
-    let mut in_blit_sink = false;
-    for line in text.lines() {
-        if line.contains("node.name") && line.contains("blit-sink") {
-            in_blit_sink = true;
-        } else if in_blit_sink && line.contains("object.serial") {
-            serial = line.split('"').nth(1).map(|s| s.to_string());
-            break;
-        } else if line.starts_with('\t') && line.contains("id ") {
-            in_blit_sink = false;
-        }
-    }
-    if serial.is_some() {
-        return serial;
-    }
-
-    // Strategy 2: serial appears before node.name (some PipeWire versions).
-    let mut current_serial = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("object.serial = \"") {
-            current_serial = rest.strip_suffix('"').map(|s| s.to_string());
-        }
-        if trimmed.contains("node.name") && trimmed.contains("blit-sink") {
-            return current_serial;
-        }
-    }
-    None
-}
-
 impl AudioPipeline {
     /// Spawn a new PipeWire instance and start capturing audio.
     ///
@@ -262,12 +303,15 @@ impl AudioPipeline {
     /// `bitrate` is the Opus encoder bitrate in bits/sec (0 = default).
     /// `epoch` is the shared time origin (same `Instant` used by video
     /// timestamps) so audio and video share a common timebase for A/V sync.
+    /// `broadcast` is the shared fan-out state; pass the same `Arc` across
+    /// restarts so subscribed clients stay connected to the output.
     pub fn spawn(
         runtime_dir: &Path,
         instance_id: u16,
         bitrate: i32,
         verbose: bool,
         epoch: Instant,
+        broadcast: Arc<AudioBroadcast>,
     ) -> Result<Self, String> {
         // Use a private subdirectory so the PulseAudio socket doesn't
         // collide with the system's or with other blit instances.
@@ -466,44 +510,12 @@ impl AudioPipeline {
             return Err("pipewire-pulse exited before creating its socket".into());
         }
 
-        // 3. Look up blit-sink's object serial for pw-cat --target.
-        //    `--target blit-sink.monitor` no longer resolves in PipeWire 1.x,
-        //    and `--target blit-sink` (by name) fails for record→sink routes.
-        //    Using the numeric serial works reliably.
-        let target = lookup_sink_serial(&audio_dir).unwrap_or_else(|| "blit-sink".to_string());
-        if verbose {
-            eprintln!("[audio] pw-cat target: {target}");
-        }
-
-        // 4. Start pw-cat to capture the monitor source.
-        let pw_cat_child = match unsafe {
-            Command::new("pw-cat")
-                .args([
-                    "--record",
-                    "--rate",
-                    "48000",
-                    "--format",
-                    "f32",
-                    "--channels",
-                    "2",
-                    "--target",
-                    &target,
-                    "-", // write to stdout
-                ])
-                .env("PIPEWIRE_REMOTE", audio_dir.join("pipewire-0"))
-                .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
-                .env("XDG_RUNTIME_DIR", &audio_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(if verbose {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .pre_exec(pdeathsig_hook())
-                .spawn()
-        } {
-            Ok(c) => c,
+        // 3. Open an in-process PipeWire capture stream on blit-sink's
+        //    monitor.  No more pw-cat subprocess, no pipe buffer — the
+        //    RT callback hands us PCM frames directly.  Target by name
+        //    since the `target.object` property accepts node names.
+        let (capture, capture_rx) = match crate::audio_pw::Capture::start(&audio_dir, "blit-sink") {
+            Ok(pair) => pair,
             Err(e) => {
                 let _ = pipewire_pulse_child.kill();
                 if let Some(ref mut wp) = wireplumber_child {
@@ -517,47 +529,22 @@ impl AudioPipeline {
                 }
                 let _ = pipewire_child.wait();
                 let _ = dbus_child.wait();
-                return Err(format!("failed to start pw-cat: {e}"));
+                return Err(format!("failed to start PipeWire capture: {e}"));
             }
         };
 
         if verbose {
             eprintln!(
-                "[audio] spawned dbus={} pipewire={} pipewire-pulse={} pw-cat={} dir={}",
+                "[audio] spawned dbus={} pipewire={} pipewire-pulse={} capture=in-process dir={}",
                 dbus_child.id(),
                 pipewire_child.id(),
                 pipewire_pulse_child.id(),
-                pw_cat_child.id(),
                 audio_dir.display(),
             );
         }
 
-        // Take the stdout pipe from pw-cat for async reading.
-        let mut pw_cat_child = pw_cat_child;
-        let pw_cat_stdout = match pw_cat_child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = pw_cat_child.kill();
-                let _ = pipewire_pulse_child.kill();
-                if let Some(ref mut wp) = wireplumber_child {
-                    let _ = wp.kill();
-                }
-                let _ = pipewire_child.kill();
-                let _ = dbus_child.kill();
-                let _ = pw_cat_child.wait();
-                let _ = pipewire_pulse_child.wait();
-                if let Some(ref mut wp) = wireplumber_child {
-                    let _ = wp.wait();
-                }
-                let _ = pipewire_child.wait();
-                let _ = dbus_child.wait();
-                return Err("pw-cat stdout missing".into());
-            }
-        };
-
-        // Spawn the async reader + encoder task.
+        // Spawn the async encoder task.
         let (opus_tx, opus_rx) = mpsc::channel::<OpusFrame>(RING_CAPACITY * 2);
-        let opus_tx_keep = opus_tx.clone();
         let bitrate = if bitrate > 0 {
             bitrate
         } else {
@@ -566,12 +553,12 @@ impl AudioPipeline {
         let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(bitrate);
         let encoder_alive = Arc::new(AtomicBool::new(true));
         let encoder_alive_clone = encoder_alive.clone();
-        let has_listener = Arc::new(AtomicBool::new(false));
+        let has_listener = broadcast.has_listener_flag();
         let has_listener_clone = has_listener.clone();
         let verbose_copy = verbose;
         tokio::spawn(async move {
-            let result = reader_encoder_task(
-                pw_cat_stdout,
+            let result = encoder_task(
+                capture_rx,
                 opus_tx,
                 bitrate,
                 verbose_copy,
@@ -584,8 +571,17 @@ impl AudioPipeline {
             if let Err(e) = result
                 && verbose_copy
             {
-                eprintln!("[audio] reader/encoder task exited: {e}");
+                eprintln!("[audio] encoder task exited: {e}");
             }
+        });
+
+        // Spawn the fan-out task: drains encoded frames from the encoder
+        // and pushes them to every subscribed client's mpsc, independent
+        // of the main server tick loop so long video writes can't starve
+        // audio delivery.
+        let broadcast_for_fanout = broadcast.clone();
+        tokio::spawn(async move {
+            fanout_task(opus_rx, broadcast_for_fanout).await;
         });
 
         Ok(Self {
@@ -593,42 +589,17 @@ impl AudioPipeline {
             pipewire_child,
             wireplumber_child,
             pipewire_pulse_child,
-            pw_cat_child,
-            opus_rx,
-            ring: VecDeque::with_capacity(RING_CAPACITY),
+            capture: Some(capture),
             runtime_dir: audio_dir,
             alive: true,
             bitrate_tx,
             encoder_alive,
-            has_listener,
             dbus_address: dbus_address.to_string(),
-            opus_tx: opus_tx_keep,
             verbose,
-            epoch,
             last_heal: None,
             first_heal_at: None,
             heals: 0,
         })
-    }
-
-    /// Drain newly encoded frames from the channel into the ring buffer.
-    /// Returns a slice of all new frames received this call.
-    pub fn poll_frames(&mut self) -> Vec<OpusFrame> {
-        let mut new_frames = Vec::new();
-        while let Ok(frame) = self.opus_rx.try_recv() {
-            // Maintain ring capacity.
-            if self.ring.len() >= RING_CAPACITY {
-                self.ring.pop_front();
-            }
-            self.ring.push_back(frame.clone());
-            new_frames.push(frame);
-        }
-        new_frames
-    }
-
-    /// Get the recent ring buffer (for catch-up on new subscribers).
-    pub fn ring_frames(&self) -> impl Iterator<Item = &OpusFrame> {
-        self.ring.iter()
     }
 
     /// Returns true if the pipeline is still producing (or can resume
@@ -659,9 +630,8 @@ impl AudioPipeline {
             .is_some_and(|wp| matches!(wp.try_wait(), Ok(Some(_))));
         let pulse_dead = matches!(self.pipewire_pulse_child.try_wait(), Ok(Some(_)));
         let encoder_dead = !self.encoder_alive.load(Ordering::Acquire);
-        let pw_cat_dead = matches!(self.pw_cat_child.try_wait(), Ok(Some(_)));
 
-        let needs_heal = wp_dead || pulse_dead || encoder_dead || pw_cat_dead;
+        let needs_heal = wp_dead || pulse_dead || encoder_dead;
         if !needs_heal {
             return true;
         }
@@ -708,12 +678,15 @@ impl AudioPipeline {
             self.restart_pipewire_pulse();
         }
 
-        if encoder_dead || pw_cat_dead {
-            eprintln!("[audio] pw-cat/encoder died, restarting");
-            if !self.restart_pw_cat() {
-                self.alive = false;
-                return false;
-            }
+        if encoder_dead {
+            // The encoder task can only exit if its capture receiver
+            // closed (PipeWire stream gone) or it hit an unrecoverable
+            // encode error.  Restarting the in-process capture cleanly
+            // is not supported yet — bail so the caller triggers a full
+            // pipeline restart (which re-spawns everything).
+            eprintln!("[audio] encoder died, triggering full pipeline restart");
+            self.alive = false;
+            return false;
         }
 
         true
@@ -722,14 +695,15 @@ impl AudioPipeline {
     /// Kill all child processes and clean up.
     pub fn shutdown(&mut self) {
         self.alive = false;
-        let _ = self.pw_cat_child.kill();
+        // Stop the in-process capture first so the PW thread-loop has
+        // joined before we tear the daemon down under it.
+        self.capture.take();
         let _ = self.pipewire_pulse_child.kill();
         if let Some(ref mut wp) = self.wireplumber_child {
             let _ = wp.kill();
         }
         let _ = self.pipewire_child.kill();
         let _ = self.dbus_child.kill();
-        let _ = self.pw_cat_child.wait();
         let _ = self.pipewire_pulse_child.wait();
         if let Some(ref mut wp) = self.wireplumber_child {
             let _ = wp.wait();
@@ -804,107 +778,9 @@ impl AudioPipeline {
         }
     }
 
-    /// Restart pw-cat and the encoder task.  Returns false if the spawn
-    /// failed and the pipeline should be considered dead.
-    fn restart_pw_cat(&mut self) -> bool {
-        let _ = self.pw_cat_child.kill();
-        let _ = self.pw_cat_child.wait();
-
-        // Re-lookup the sink serial (it may have changed).
-        let target =
-            lookup_sink_serial(&self.runtime_dir).unwrap_or_else(|| "blit-sink".to_string());
-
-        let mut new_child = match unsafe {
-            Command::new("pw-cat")
-                .args([
-                    "--record",
-                    "--rate",
-                    "48000",
-                    "--format",
-                    "f32",
-                    "--channels",
-                    "2",
-                    "--target",
-                    &target,
-                    "-",
-                ])
-                .env("PIPEWIRE_REMOTE", self.runtime_dir.join("pipewire-0"))
-                .env("DBUS_SESSION_BUS_ADDRESS", &self.dbus_address)
-                .env("XDG_RUNTIME_DIR", &self.runtime_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(if self.verbose {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .pre_exec(pdeathsig_hook())
-                .spawn()
-        } {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[audio] failed to restart pw-cat: {e}");
-                return false;
-            }
-        };
-
-        let stdout = match new_child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = new_child.kill();
-                return false;
-            }
-        };
-
-        self.pw_cat_child = new_child;
-
-        // Spawn a new encoder task.  The old task has already exited
-        // (its pipe read returned EOF or error), so it won't compete.
-        let encoder_alive = Arc::new(AtomicBool::new(true));
-        self.encoder_alive = encoder_alive.clone();
-
-        let opus_tx = self.opus_tx.clone();
-        let bitrate = *self.bitrate_tx.borrow();
-        let bitrate_rx = self.bitrate_tx.subscribe();
-        let verbose = self.verbose;
-        let epoch = self.epoch;
-        let has_listener = self.has_listener.clone();
-
-        tokio::spawn(async move {
-            let result = reader_encoder_task(
-                stdout,
-                opus_tx,
-                bitrate,
-                verbose,
-                epoch,
-                bitrate_rx,
-                has_listener,
-            )
-            .await;
-            encoder_alive.store(false, Ordering::Release);
-            if let Err(e) = result
-                && verbose
-            {
-                eprintln!("[audio] reader/encoder task exited: {e}");
-            }
-        });
-
-        if self.verbose {
-            eprintln!("[audio] restarted pw-cat (target={target}) and encoder");
-        }
-        true
-    }
-
     /// Update the Opus encoder bitrate. Takes effect on the next frame.
     pub fn set_bitrate(&self, bitrate: i32) {
         let _ = self.bitrate_tx.send(bitrate);
-    }
-
-    /// Tell the encoder whether any client is currently subscribed.
-    /// When false, the encoder still drains pw-cat's pipe (to avoid
-    /// backpressure into PipeWire) but skips the Opus encode step.
-    pub fn set_has_listener(&self, has: bool) {
-        self.has_listener.store(has, Ordering::Release);
     }
 
     /// Build the `PULSE_SERVER` value for child process environments.
@@ -944,14 +820,15 @@ pub fn msg_audio_frame(frame: &OpusFrame) -> Vec<u8> {
     msg
 }
 
-/// Async task: reads raw PCM from pw-cat stdout, frames into 20 ms chunks,
-/// Opus-encodes, and sends to the channel.
+/// Async task: consumes raw PCM chunks delivered by the in-process
+/// PipeWire capture (`audio_pw::Capture`), frames into 20 ms windows,
+/// Opus-encodes, and sends to the fan-out channel.
 ///
-/// `epoch` is the shared time origin for A/V sync — the same `Instant` used
-/// by the video pipeline's `created_at`.  Audio timestamps are
+/// `epoch` is the shared time origin for A/V sync — the same `Instant`
+/// used by the video pipeline's `created_at`.  Audio timestamps are
 /// `epoch.elapsed().as_millis()`, matching the video frame timestamps.
-async fn reader_encoder_task(
-    stdout: std::process::ChildStdout,
+async fn encoder_task(
+    mut pcm_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     tx: mpsc::Sender<OpusFrame>,
     bitrate: i32,
     verbose: bool,
@@ -959,10 +836,6 @@ async fn reader_encoder_task(
     mut bitrate_rx: tokio::sync::watch::Receiver<i32>,
     has_listener: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // Wrap the synchronous ChildStdout in a tokio async reader.
-    let mut reader = tokio::process::ChildStdout::from_std(stdout)
-        .map_err(|e| format!("failed to convert pw-cat stdout to async: {e}"))?;
-
     // Init Opus encoder.
     let mut encoder = OpusEncoder::new(48000, Channels::Stereo, Application::Audio)
         .map_err(|e| format!("failed to create Opus encoder: {e}"))?;
@@ -983,8 +856,7 @@ async fn reader_encoder_task(
     }
 
     let mut pcm_buf = vec![0f32; FRAME_FLOATS];
-    let mut byte_buf = vec![0u8; FRAME_FLOATS * 4]; // f32 = 4 bytes
-    let mut byte_offset = 0usize;
+    let mut byte_buf: Vec<u8> = Vec::with_capacity(FRAME_FLOATS * 4 * 2);
     let mut opus_out = vec![0u8; MAX_OPUS_PACKET];
 
     loop {
@@ -1007,29 +879,26 @@ async fn reader_encoder_task(
             }
         }
 
-        let needed = (FRAME_FLOATS * 4) - byte_offset;
-        let n = reader
-            .read(&mut byte_buf[byte_offset..byte_offset + needed])
-            .await
-            .map_err(|e| format!("pipe read error: {e}"))?;
-        if n == 0 {
-            // Pipe closed — pw-cat exited.
-            return Ok(());
-        }
-        byte_offset += n;
+        // Receive the next capture chunk.  Chunks are whatever size
+        // PipeWire gave us (typically one quantum ≈ 5 ms at 48 kHz for
+        // the latency we requested), which we accumulate until we have
+        // a full 20 ms Opus frame's worth of bytes.
+        let chunk = match pcm_rx.recv().await {
+            Some(c) => c,
+            None => return Ok(()), // capture closed
+        };
+        byte_buf.extend_from_slice(&chunk);
 
         // Process all complete 20 ms frames in the buffer.
-        while byte_offset >= FRAME_FLOATS * 4 {
+        while byte_buf.len() >= FRAME_FLOATS * 4 {
             let consumed = FRAME_FLOATS * 4;
 
-            // When no client is listening, drain the pipe but skip the
+            // When no client is listening, drain samples but skip the
             // per-frame f32 conversion and Opus encode — those are the
-            // expensive steps. We still must consume the bytes so
-            // pw-cat's stdout pipe doesn't fill and apply backpressure
-            // into PipeWire.
+            // expensive steps.  We still must consume the bytes so the
+            // capture's unbounded mpsc doesn't grow without bound.
             if !has_listener.load(Ordering::Acquire) {
-                byte_buf.copy_within(consumed..byte_offset, 0);
-                byte_offset -= consumed;
+                byte_buf.drain(..consumed);
                 continue;
             }
 
@@ -1052,8 +921,7 @@ async fn reader_encoder_task(
                     if verbose {
                         eprintln!("[audio] Opus encode error, skipping frame: {e}");
                     }
-                    byte_buf.copy_within(consumed..byte_offset, 0);
-                    byte_offset -= consumed;
+                    byte_buf.drain(..consumed);
                     continue;
                 }
             };
@@ -1069,10 +937,9 @@ async fn reader_encoder_task(
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Channel full — drop this frame rather than blocking.
-                    // Blocking here propagates back through pw-cat's stdout
-                    // pipe → PipeWire's realtime thread → the app's audio
-                    // submission, hanging mpv et al.  A dropped 20 ms Opus
-                    // frame is inaudible; a hung audio pipeline is not.
+                    // A dropped 20 ms Opus frame is inaudible; blocking
+                    // here would propagate backpressure into PipeWire's
+                    // RT thread and hang audio-producing apps.
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Receiver dropped — pipeline shutting down.
@@ -1080,9 +947,7 @@ async fn reader_encoder_task(
                 }
             }
 
-            // Shift remaining bytes to the front.
-            byte_buf.copy_within(consumed..byte_offset, 0);
-            byte_offset -= consumed;
+            byte_buf.drain(..consumed);
         }
     }
 }

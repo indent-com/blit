@@ -338,6 +338,25 @@ export class BlitSurfaceCanvas {
   /** Non-zero when a Meta→Ctrl translation is in flight (stores the Meta
    *  evdev keycode that was swapped so the release can be translated back). */
   private _metaToCtrl = 0;
+  /** The non-modifier key that Meta→Ctrl translated alongside (e.g. V for
+   *  Cmd+V).  Used to keep Ctrl held on the Wayland side until this key
+   *  is released, so releasing Cmd early doesn't leave a bare V press
+   *  that the app interprets as plain 'v' via client-side keyrepeat. */
+  private _metaToCtrlKey = 0;
+  /** Ctrl release is waiting for the paste-chord key to be released. */
+  private _ctrlReleaseDeferred = false;
+  /** In-flight Ctrl+V/Cmd+V state.  We defer the V press until the
+   *  clipboard read completes (readText resolve, paste event, or
+   *  timeout) so the Wayland app sees `selection` before `key` — and
+   *  defer the V release and Ctrl release that may fire physically
+   *  during that window, otherwise V arrives at the compositor with
+   *  Ctrl already released and the app types 'v' repeatedly. */
+  private _pendingPaste: {
+    keycode: number;
+    released: boolean;
+    deferredCtrlRelease: boolean;
+  } | null = null;
+  private _pendingPasteFlush: ((text: string | null) => void) | null = null;
 
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
@@ -352,6 +371,8 @@ export class BlitSurfaceCanvas {
   private boundTextInput: ((e: Event) => void) | null = null;
   private boundCompositionStart: ((e: Event) => void) | null = null;
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
+  private boundPaste: ((e: ClipboardEvent) => void) | null = null;
+  private boundDocumentPaste: ((e: ClipboardEvent) => void) | null = null;
 
   constructor(options: BlitSurfaceCanvasOptions) {
     this._workspace = options.workspace;
@@ -754,6 +775,14 @@ export class BlitSurfaceCanvas {
     this.boundFocus = () => this.handleFocus();
     this.boundBlur = () => this.handleBlur();
     this.boundContextMenu = (e) => e.preventDefault();
+    this.boundPaste = (e) => this.handlePaste(e);
+    // Some browsers don't dispatch `paste` to a focused non-editable
+    // canvas; a document-level capture listener picks those up.  Only
+    // act while we have a paste shortcut in flight so we don't
+    // interfere with other elements.
+    this.boundDocumentPaste = (e) => {
+      if (this._pendingPasteFlush) this.handlePaste(e);
+    };
 
     canvas.addEventListener("mousedown", this.boundMouseDown);
     canvas.addEventListener("mouseup", this.boundMouseUp);
@@ -764,6 +793,8 @@ export class BlitSurfaceCanvas {
     canvas.addEventListener("focus", this.boundFocus);
     canvas.addEventListener("blur", this.boundBlur);
     canvas.addEventListener("contextmenu", this.boundContextMenu);
+    canvas.addEventListener("paste", this.boundPaste);
+    document.addEventListener("paste", this.boundDocumentPaste, true);
 
     // Hidden textarea is only used for IME composition.  Focus stays on
     // the canvas during normal typing; we redirect to the textarea when
@@ -779,6 +810,10 @@ export class BlitSurfaceCanvas {
       // (e.g. Enter to confirm, Escape to cancel) still get routed.
       ta.addEventListener("keydown", this.boundKeyDown);
       ta.addEventListener("keyup", this.boundKeyUp);
+      // Paste into the textarea would otherwise insert text that the
+      // `input` handler forwards as surface text — intercept it so the
+      // content goes through the Wayland clipboard path instead.
+      if (this.boundPaste) ta.addEventListener("paste", this.boundPaste);
     }
 
     // Detect IME composition start on the canvas and redirect focus
@@ -813,6 +848,9 @@ export class BlitSurfaceCanvas {
         "compositionstart",
         this.boundCompositionStart,
       );
+    if (this.boundPaste) canvas.removeEventListener("paste", this.boundPaste);
+    if (this.boundDocumentPaste)
+      document.removeEventListener("paste", this.boundDocumentPaste, true);
 
     const ta = this.textInput;
     if (ta) {
@@ -823,6 +861,7 @@ export class BlitSurfaceCanvas {
       if (this.boundKeyDown)
         ta.removeEventListener("keydown", this.boundKeyDown);
       if (this.boundKeyUp) ta.removeEventListener("keyup", this.boundKeyUp);
+      if (this.boundPaste) ta.removeEventListener("paste", this.boundPaste);
     }
   }
 
@@ -887,6 +926,28 @@ export class BlitSurfaceCanvas {
     conn.sendSurfaceAxis(this._surfaceId, axis, Math.round(value * 100));
   }
 
+  // Fallback clipboard-read path for browsers/contexts where
+  // `navigator.clipboard.readText()` is denied (Brave without granted
+  // permission, Firefox, insecure contexts, ...).  The `paste` event
+  // delivers clipboard data synchronously without a permission prompt.
+  private handlePaste(e: ClipboardEvent): void {
+    e.preventDefault();
+    if (!this._displaySize) return;
+    const conn = this.getConn();
+    if (!conn || !this.surface) return;
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (this._pendingPasteFlush) {
+      const flush = this._pendingPasteFlush;
+      this._pendingPasteFlush = null;
+      flush(text || null);
+    } else if (text) {
+      conn.sendClipboard(
+        "text/plain;charset=utf-8",
+        new TextEncoder().encode(text),
+      );
+    }
+  }
+
   private handleKey(e: KeyboardEvent, pressed: boolean): void {
     // If a global shortcut (capture-phase) already handled this event,
     // don't forward it to the Wayland surface.
@@ -906,7 +967,19 @@ export class BlitSurfaceCanvas {
       return;
     }
 
-    e.preventDefault();
+    // Paste shortcut: skip preventDefault so the browser fires a `paste`
+    // event on the focused element.  Our paste handler uses it as a
+    // fallback when `navigator.clipboard.readText()` is denied (e.g.
+    // Brave without granted clipboard permission).  `!e.repeat` keeps
+    // OS autorepeat from re-triggering paste — native apps treat Cmd+V
+    // as a one-shot action regardless of how long it's held.
+    const isPasteShortcut =
+      pressed &&
+      !e.repeat &&
+      (e.key === "v" || e.key === "V") &&
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey;
+    if (!isPasteShortcut) e.preventDefault();
     const conn = this.getConn();
     if (!conn || !this.surface) return;
 
@@ -922,15 +995,18 @@ export class BlitSurfaceCanvas {
 
     // Paste: read the browser clipboard and offer it to the Wayland
     // compositor *before* forwarding the key, so the data offer is in
-    // place when the app processes the paste shortcut.
-    if (
-      pressed &&
-      (e.key === "v" || e.key === "V") &&
-      (e.ctrlKey || e.metaKey) &&
-      !e.altKey
-    ) {
+    // place when the app processes the paste shortcut.  The V press,
+    // V release, and Ctrl release are all deferred until the clipboard
+    // has been sent — otherwise the app can see Ctrl release (or V
+    // release) before V press and interpret it as plain 'v' typing.
+    if (isPasteShortcut) {
       const keycode = domKeyToEvdev(e.code);
-      if (keycode !== 0) this.pressedKeys.add(keycode);
+      // Do NOT add keycode to pressedKeys yet — the flush below does it.
+      this._pendingPaste = {
+        keycode,
+        released: false,
+        deferredCtrlRelease: false,
+      };
 
       // On macOS, Cmd+V arrives with metaKey set.  Wayland apps expect
       // Ctrl+V, so swap the already-pressed Meta → Ctrl before forwarding
@@ -947,24 +1023,93 @@ export class BlitSurfaceCanvas {
           this.pressedKeys.add(29); // ControlLeft
           conn.sendSurfaceInput(this._surfaceId, 29, true);
           this._metaToCtrl = metaCode;
+          this._metaToCtrlKey = keycode;
         }
       }
 
       const surfaceId = this._surfaceId;
+      const enc = new TextEncoder();
+      const flush = (clipboardText: string | null) => {
+        const p = this._pendingPaste;
+        if (!p || p.keycode !== keycode) return;
+        this._pendingPaste = null;
+        this._pendingPasteFlush = null;
+        if (clipboardText) {
+          conn.sendClipboard(
+            "text/plain;charset=utf-8",
+            enc.encode(clipboardText),
+          );
+        }
+        if (keycode !== 0) {
+          this.pressedKeys.add(keycode);
+          conn.sendSurfaceInput(surfaceId, keycode, true);
+          if (p.released) {
+            this.pressedKeys.delete(keycode);
+            conn.sendSurfaceInput(surfaceId, keycode, false);
+          }
+        }
+        if (p.deferredCtrlRelease) {
+          if (keycode !== 0 && !p.released) {
+            // V is still physically held — defer Ctrl release until the
+            // keyup V event arrives.  Releasing Ctrl now would leave a
+            // bare V press on the Wayland side which the app would
+            // interpret as plain 'v' typing via client-side keyrepeat.
+            this._ctrlReleaseDeferred = true;
+          } else {
+            this.pressedKeys.delete(29);
+            conn.sendSurfaceInput(surfaceId, 29, false);
+            this._metaToCtrlKey = 0;
+          }
+        }
+        // Restore focus to the canvas after the paste event processed on
+        // the hidden textarea (see focus shuffle below).
+        if (this.canvas && document.activeElement === this.textInput) {
+          this.canvas.focus();
+        }
+      };
+      this._pendingPasteFlush = flush;
+
+      // Chromium/Brave don't reliably dispatch `paste` to a focused
+      // non-editable canvas, and `navigator.clipboard.readText()` is
+      // often denied without an explicit user-granted permission.  Move
+      // focus to the hidden (editable) textarea so the browser's native
+      // paste handling targets it — the paste event fires reliably
+      // there with populated clipboardData.  handleBlur ignores the
+      // transient blur via the `_pendingPaste` check above.
+      if (this.textInput) this.textInput.focus();
+
       navigator.clipboard.readText().then(
         (text) => {
-          if (text) {
-            const enc = new TextEncoder();
-            conn.sendClipboard("text/plain;charset=utf-8", enc.encode(text));
-          }
-          if (keycode !== 0) conn.sendSurfaceInput(surfaceId, keycode, true);
+          // Only flush when readText actually returned content.  Some
+          // browsers (Brave with sanitization) resolve with `""` instead
+          // of rejecting — if we flushed on empty here, we'd close out
+          // the pending paste and dispatch V with no clipboard update,
+          // causing the Wayland app to paste its previous selection.
+          if (text) flush(text);
         },
         () => {
-          // Clipboard read failed (no permission, empty, etc.) —
-          // forward the key anyway so the shortcut still reaches the app.
-          if (keycode !== 0) conn.sendSurfaceInput(surfaceId, keycode, true);
+          /* paste event will flush */
         },
       );
+      // Safety net — if neither readText nor the paste event ever
+      // delivers (both paths blocked), clean up the pending state and
+      // undo the Meta→Ctrl translation.  Don't force V through without
+      // clipboard data; pasting stale content is worse than doing
+      // nothing.
+      setTimeout(() => {
+        const p = this._pendingPaste;
+        if (!p || p.keycode !== keycode) return;
+        this._pendingPaste = null;
+        this._pendingPasteFlush = null;
+        if (p.deferredCtrlRelease) {
+          this.pressedKeys.delete(29);
+          conn.sendSurfaceInput(surfaceId, 29, false);
+          this._metaToCtrlKey = 0;
+        }
+        if (this.canvas && document.activeElement === this.textInput) {
+          this.canvas.focus();
+        }
+      }, 300);
       return;
     }
 
@@ -979,6 +1124,12 @@ export class BlitSurfaceCanvas {
       !e.metaKey &&
       e.key.length === 1
     ) {
+      // If the key is already pressed on the Wayland side (e.g. dispatched
+      // via a paste-shortcut flush), skip the text path.  Otherwise, after
+      // the user releases Cmd mid-hold, OS autorepeat keydowns of V arrive
+      // with no modifier flags and get typed as literal 'v' characters.
+      const kc = domKeyToEvdev(e.code);
+      if (kc !== 0 && this.pressedKeys.has(kc)) return;
       conn.sendSurfaceText(this._surfaceId, e.key);
       return;
     }
@@ -987,12 +1138,40 @@ export class BlitSurfaceCanvas {
     // send raw evdev keycode.
     const keycode = domKeyToEvdev(e.code);
     if (keycode !== 0) {
+      // Paste in flight: defer V release and Ctrl release until the
+      // clipboard has been sent and the V press dispatched.
+      if (!pressed && this._pendingPaste) {
+        if (keycode === this._pendingPaste.keycode) {
+          this._pendingPaste.released = true;
+          return;
+        }
+        if (keycode === this._metaToCtrl) {
+          this._pendingPaste.deferredCtrlRelease = true;
+          this._metaToCtrl = 0;
+          return;
+        }
+        if (keycode === 29) {
+          this._pendingPaste.deferredCtrlRelease = true;
+          return;
+        }
+      }
       // Finish Meta→Ctrl translation: when the physical Meta key is
-      // released after a translated Cmd+V paste, release Ctrl instead.
+      // released after a translated Cmd+V paste, release Ctrl instead —
+      // unless the chord's V is still held, in which case defer until V
+      // is released so the app doesn't see a bare V and keyrepeat 'v'.
       if (!pressed && keycode === this._metaToCtrl) {
+        if (
+          this._metaToCtrlKey !== 0 &&
+          this.pressedKeys.has(this._metaToCtrlKey)
+        ) {
+          this._ctrlReleaseDeferred = true;
+          this._metaToCtrl = 0;
+          return;
+        }
         this.pressedKeys.delete(29); // ControlLeft
         conn.sendSurfaceInput(this._surfaceId, 29, false);
         this._metaToCtrl = 0;
+        this._metaToCtrlKey = 0;
         return;
       }
       if (pressed) {
@@ -1007,6 +1186,16 @@ export class BlitSurfaceCanvas {
         this.pressedKeys.delete(keycode);
       }
       conn.sendSurfaceInput(this._surfaceId, keycode, pressed);
+      // If this was the paste-chord key being released, flush any
+      // deferred Ctrl release that was held back while V was still down.
+      if (!pressed && keycode === this._metaToCtrlKey) {
+        if (this._ctrlReleaseDeferred) {
+          this._ctrlReleaseDeferred = false;
+          this.pressedKeys.delete(29);
+          conn.sendSurfaceInput(this._surfaceId, 29, false);
+        }
+        this._metaToCtrlKey = 0;
+      }
     }
   }
 
@@ -1041,6 +1230,10 @@ export class BlitSurfaceCanvas {
   /** Send synthetic key-up for every key still held.  Prevents stuck
    *  modifiers and runaway key-repeat when focus leaves the canvas. */
   private releaseAllKeys(): void {
+    this._pendingPaste = null;
+    this._pendingPasteFlush = null;
+    this._ctrlReleaseDeferred = false;
+    this._metaToCtrlKey = 0;
     if (this.pressedKeys.size === 0) return;
     const conn = this.getConn();
     if (!conn || !this.surface) return;
@@ -1052,6 +1245,11 @@ export class BlitSurfaceCanvas {
   }
 
   private handleBlur(): void {
+    // During an in-flight paste shortcut we may have temporarily moved
+    // focus to the hidden textarea (so the browser dispatches the paste
+    // event to an editable element).  Don't tear down key state — the
+    // paste flush will refocus the canvas and cleanup naturally.
+    if (this._pendingPaste) return;
     this.releaseAllKeys();
   }
 
@@ -1076,8 +1274,11 @@ export class BlitSurfaceCanvas {
       if (held) continue;
       for (const kc of keycodes) {
         if (!this.pressedKeys.has(kc)) continue;
-        // Don't release the synthetic Ctrl from Meta→Ctrl paste translation.
-        if (this._metaToCtrl && kc === 29) continue;
+        // Don't release the synthetic Ctrl from Meta→Ctrl paste
+        // translation — either while the original Cmd is still held
+        // (_metaToCtrl set) or while V is held with Ctrl release pending.
+        if ((this._metaToCtrl || this._ctrlReleaseDeferred) && kc === 29)
+          continue;
         this.pressedKeys.delete(kc);
         conn.sendSurfaceInput(this._surfaceId, kc, false);
       }

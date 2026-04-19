@@ -266,6 +266,28 @@ pub const S2C_AUDIO_FRAME: u8 = 0x30;
 pub const AUDIO_FRAME_CODEC_MASK: u8 = 0b110;
 pub const AUDIO_FRAME_CODEC_OPUS: u8 = 0 << 1;
 
+/// A fragment of a larger S2C message: [0x2B][flags:1][chunk:N]
+///
+/// Large bulk messages (video keyframes, terminal snapshots) are split
+/// into multiple fragments so audio frames can be written between them
+/// on the same stream.  Without this the writer task would hold the
+/// socket for the full duration of a multi-hundred-KB write, starving
+/// audio delivery and producing audible gaps on the client.
+///
+/// Flags:
+///   bit 0 (FRAGMENT_FLAG_LAST) — this is the last fragment; the receiver
+///     should concatenate all fragments of this message (in order) and
+///     dispatch the reassembled buffer as if it were a single message.
+///
+/// Fragments of different messages do NOT interleave: TCP preserves
+/// order and the server only splits one message at a time, so the
+/// receiver can use a single pending-reassembly buffer with no fragment
+/// id or sequence number.  S2C_AUDIO_FRAME messages may appear between
+/// fragments and are handled normally — they don't contribute to the
+/// reassembly buffer.
+pub const S2C_FRAGMENT: u8 = 0x2B;
+pub const FRAGMENT_FLAG_LAST: u8 = 1 << 0;
+
 pub const SURFACE_FRAME_FLAG_KEYFRAME: u8 = 1 << 0;
 pub const SURFACE_FRAME_CODEC_MASK: u8 = 0b110;
 pub const SURFACE_FRAME_CODEC_H264: u8 = 0 << 1;

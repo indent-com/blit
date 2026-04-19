@@ -22,6 +22,19 @@ let
   # symlink farm (/run/opengl-driver) for the active GPU driver (NVIDIA,
   # Mesa, etc.) and covers NVENC, CUDA, and VA-API backend drivers.
   gpuLibSearchPath = lib.makeLibraryPath (cfg.gpuLibraries ++ [ pkgs.addDriverRunpath.driverLink ]);
+
+  # The server also dlopens libpipewire-0.3.so.0 directly when audio is
+  # enabled (replacing the former pw-cat subprocess).  Add pipewire's
+  # library dir to the loader path so the dlopen resolves.
+  audioLibSearchPath = lib.makeLibraryPath [ pkgs.pipewire ];
+
+  # Combined LD_LIBRARY_PATH for the server unit — empty when neither
+  # GPU nor audio contributes a path, which keeps the Environment line
+  # absent (systemd chokes on bare `LD_LIBRARY_PATH=`).
+  serverLibSearchPath = lib.concatStringsSep ":" (
+    lib.optional (gpuLibSearchPath != "") gpuLibSearchPath
+    ++ lib.optional cfg.audio.enable audioLibSearchPath
+  );
 in
 {
   options.services.blit = {
@@ -260,7 +273,7 @@ in
                 ++ [
                   "BLIT_SCROLLBACK=${toString cfg.scrollback}"
                 ]
-                ++ lib.optional (gpuLibSearchPath != "") "LD_LIBRARY_PATH=${gpuLibSearchPath}"
+                ++ lib.optional (serverLibSearchPath != "") "LD_LIBRARY_PATH=${serverLibSearchPath}"
                 ++ lib.optionals cfg.audio.enable [
                   "BLIT_AUDIO=1"
                   "BLIT_AUDIO_BITRATE=${toString cfg.audio.bitrate}"
