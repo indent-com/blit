@@ -3595,7 +3595,6 @@ impl VulkanRenderer {
                 None
             } else {
                 // Self-allocated: need staging readback — must wait.
-                eprintln!("[render_tree_sized] fence not ready: {raw:?}");
                 self.pending_submit = Some(pending);
                 return None;
             }
