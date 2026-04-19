@@ -47,6 +47,69 @@ const VAEncPackedHeaderParameterBufferType: i32 = 25;
 const VAEncPackedHeaderDataBufferType: i32 = 26;
 const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 1;
 const VA_ENC_PACKED_HEADER_PICTURE: u32 = 2;
+const VAEncMiscParameterBufferType: i32 = 27;
+
+// Misc parameter sub-types
+const VAEncMiscParameterTypeFrameRate: u32 = 0;
+const VAEncMiscParameterTypeQualityLevel: u32 = 6;
+
+// Realtime defaults — hardcoded here because the encoder isn't plumbed with
+// the client's actual pacing rate.  The frame-rate hint helps the driver
+// pace internal stages; the actual submission rate doesn't have to match.
+const REALTIME_FPS: u32 = 60;
+/// AMD radeonsi maps quality_level to AMF preset: 0=balanced, 1-2=quality,
+/// 3-7=speed.  7 is the fastest preset.
+const REALTIME_QUALITY_LEVEL: u32 = 7;
+
+#[repr(C)]
+struct VAEncMiscParameterFrameRate {
+    framerate: u32,
+    framerate_flags: u32,
+    va_reserved: [u32; 4],
+}
+
+#[repr(C)]
+struct VAEncMiscParameterBufferQualityLevel {
+    quality_level: u32,
+    va_reserved: [u32; 4],
+}
+
+/// Allocate a `VAEncMiscParameterBufferType` containing `inner`.  The driver
+/// expects a 4-byte type tag followed by the inner struct in a single buffer.
+fn create_misc_param_buffer<T>(
+    va: &gpu_libs::VaFns,
+    display: VADisplay,
+    context: VAContextID,
+    sub_type: u32,
+    inner: T,
+) -> Option<VABufferID> {
+    #[repr(C)]
+    struct Wrapper<T> {
+        type_: u32,
+        inner: T,
+    }
+    let wrapper = Wrapper {
+        type_: sub_type,
+        inner,
+    };
+    let mut buf_id: VABufferID = 0;
+    let st = unsafe {
+        (va.vaCreateBuffer)(
+            display,
+            context,
+            VAEncMiscParameterBufferType,
+            std::mem::size_of::<Wrapper<T>>() as u32,
+            1,
+            &wrapper as *const _ as *mut c_void,
+            &mut buf_id,
+        )
+    };
+    if st == VA_STATUS_SUCCESS {
+        Some(buf_id)
+    } else {
+        None
+    }
+}
 
 /// Packed header parameter buffer (va.h VAEncPackedHeaderParameterBuffer).
 #[repr(C)]
@@ -592,9 +655,12 @@ fn r32(buf: &[u8], off: usize) -> u32 {
 
 /// Number of reconstructed reference surfaces (double-buffered).
 const NUM_REF_SURFACES: usize = 2;
-/// Number of input surfaces.
-const NUM_INPUT_SURFACES: usize = 1;
+/// Number of input surfaces — 2 for pipelining: while the GPU encodes one,
+/// the CPU can be uploading the next.
+const NUM_INPUT_SURFACES: usize = 2;
 const TOTAL_SURFACES: usize = NUM_REF_SURFACES + NUM_INPUT_SURFACES;
+/// Coded output buffers — one per in-flight frame.
+const NUM_CODED_BUFFERS: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Minimal H.264 bitstream writer for SPS/PPS NAL generation
@@ -802,13 +868,165 @@ fn find_annex_b_start(data: &[u8]) -> Option<usize> {
     None
 }
 
+/// BGRA → NV12 fast path: source and encode dimensions match exactly,
+/// no per-pixel clamping needed.  Processes 2×2 input blocks at a time so
+/// each chroma sample reuses the four BGRA pixels just loaded for Y.
+///
+/// Caller must ensure `src.len() >= src_w * src_h * 4` and that `dst` has
+/// `y_offset + (src_h-1)*y_pitch + src_w` bytes for Y plus chroma room.
+#[allow(clippy::too_many_arguments)]
+unsafe fn bgra_to_nv12_fast(
+    src: &[u8],
+    dst: *mut u8,
+    y_offset: usize,
+    uv_offset: usize,
+    y_pitch: usize,
+    uv_pitch: usize,
+    src_w: usize,
+    src_h: usize,
+) {
+    debug_assert!(src.len() >= src_w * src_h * 4);
+    let src_ptr = src.as_ptr();
+    let chroma_h = src_h / 2;
+    let chroma_w = src_w / 2;
+    let row_stride = src_w * 4;
+
+    for cy in 0..chroma_h {
+        let row0 = cy * 2;
+        let src_row0 = unsafe { src_ptr.add(row0 * row_stride) };
+        let src_row1 = unsafe { src_ptr.add((row0 + 1) * row_stride) };
+        let dst_y0 = unsafe { dst.add(y_offset + row0 * y_pitch) };
+        let dst_y1 = unsafe { dst.add(y_offset + (row0 + 1) * y_pitch) };
+        let dst_uv = unsafe { dst.add(uv_offset + cy * uv_pitch) };
+
+        for cx in 0..chroma_w {
+            let off = cx * 8; // 2 BGRA pixels = 8 bytes
+            // Load 4 BGRA pixels (top-left, top-right, bottom-left, bottom-right).
+            let b00 = unsafe { *src_row0.add(off) } as i32;
+            let g00 = unsafe { *src_row0.add(off + 1) } as i32;
+            let r00 = unsafe { *src_row0.add(off + 2) } as i32;
+            let b01 = unsafe { *src_row0.add(off + 4) } as i32;
+            let g01 = unsafe { *src_row0.add(off + 5) } as i32;
+            let r01 = unsafe { *src_row0.add(off + 6) } as i32;
+            let b10 = unsafe { *src_row1.add(off) } as i32;
+            let g10 = unsafe { *src_row1.add(off + 1) } as i32;
+            let r10 = unsafe { *src_row1.add(off + 2) } as i32;
+            let b11 = unsafe { *src_row1.add(off + 4) } as i32;
+            let g11 = unsafe { *src_row1.add(off + 5) } as i32;
+            let r11 = unsafe { *src_row1.add(off + 6) } as i32;
+
+            // BT.601 limited-range Y for each pixel.
+            let y00 = ((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16;
+            let y01 = ((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16;
+            let y10 = ((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16;
+            let y11 = ((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16;
+            unsafe {
+                *dst_y0.add(cx * 2) = y00.clamp(0, 255) as u8;
+                *dst_y0.add(cx * 2 + 1) = y01.clamp(0, 255) as u8;
+                *dst_y1.add(cx * 2) = y10.clamp(0, 255) as u8;
+                *dst_y1.add(cx * 2 + 1) = y11.clamp(0, 255) as u8;
+            }
+
+            // U/V are linear in (R,G,B), so averaging the four BGR samples
+            // first and computing one U/V is mathematically equivalent to
+            // averaging the four U/V results — and ~4× cheaper.
+            let avg_r = (r00 + r01 + r10 + r11) >> 2;
+            let avg_g = (g00 + g01 + g10 + g11) >> 2;
+            let avg_b = (b00 + b01 + b10 + b11) >> 2;
+            let u = ((-38 * avg_r - 74 * avg_g + 112 * avg_b + 128) >> 8) + 128;
+            let v = ((112 * avg_r - 94 * avg_g - 18 * avg_b + 128) >> 8) + 128;
+            unsafe {
+                *dst_uv.add(cx * 2) = u.clamp(0, 255) as u8;
+                *dst_uv.add(cx * 2 + 1) = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// BGRA → NV12 with per-pixel edge clamping.  Used when the encoder is
+/// rounded up to even dimensions and the source isn't.
+#[allow(clippy::too_many_arguments)]
+unsafe fn bgra_to_nv12_padded(
+    src: &[u8],
+    dst: *mut u8,
+    y_offset: usize,
+    uv_offset: usize,
+    y_pitch: usize,
+    uv_pitch: usize,
+    src_w: usize,
+    src_h: usize,
+    enc_w: usize,
+    enc_h: usize,
+) {
+    for row in 0..enc_h {
+        let sr = row.min(src_h - 1);
+        let dst_row = unsafe { dst.add(y_offset + row * y_pitch) };
+        for col in 0..enc_w {
+            let sc = col.min(src_w - 1);
+            let i = (sr * src_w + sc) * 4;
+            let r = src[i + 2] as i32;
+            let g = src[i + 1] as i32;
+            let b = src[i] as i32;
+            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            unsafe { *dst_row.add(col) = y.clamp(0, 255) as u8 };
+        }
+    }
+    let chroma_h = enc_h / 2;
+    let chroma_w = enc_w / 2;
+    for cy in 0..chroma_h {
+        let dst_row = unsafe { dst.add(uv_offset + cy * uv_pitch) };
+        for cx in 0..chroma_w {
+            let row = cy * 2;
+            let col = cx * 2;
+            let mut r_sum = 0i32;
+            let mut g_sum = 0i32;
+            let mut b_sum = 0i32;
+            for dy in 0..2usize {
+                for dx in 0..2usize {
+                    let sr = (row + dy).min(src_h - 1);
+                    let sc = (col + dx).min(src_w - 1);
+                    let i = (sr * src_w + sc) * 4;
+                    r_sum += src[i + 2] as i32;
+                    g_sum += src[i + 1] as i32;
+                    b_sum += src[i] as i32;
+                }
+            }
+            let avg_r = r_sum >> 2;
+            let avg_g = g_sum >> 2;
+            let avg_b = b_sum >> 2;
+            let u = ((-38 * avg_r - 74 * avg_g + 112 * avg_b + 128) >> 8) + 128;
+            let v = ((112 * avg_r - 94 * avg_g - 18 * avg_b + 128) >> 8) + 128;
+            unsafe {
+                *dst_row.add(cx * 2) = u.clamp(0, 255) as u8;
+                *dst_row.add(cx * 2 + 1) = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// In-flight encode submitted to the GPU but not yet drained.  The next
+/// `encode_surface` call syncs on its `input_surface` and reads `coded_buf`.
+struct PendingFrame {
+    input_surface: VASurfaceID,
+    coded_buf: VABufferID,
+    /// Whether this submission is an IDR — needed for NAL header patching
+    /// and SPS/PPS prepend checks when we eventually drain its bitstream.
+    was_idr: bool,
+}
+
 pub struct VaapiDirectEncoder {
     va: &'static gpu_libs::VaFns,
     display: VADisplay,
     config: VAConfigID,
     context: VAContextID,
     surfaces: [VASurfaceID; TOTAL_SURFACES],
-    coded_buf: VABufferID,
+    coded_bufs: [VABufferID; NUM_CODED_BUFFERS],
+    /// Next coded buffer slot to use for the upcoming submission.
+    next_coded_slot: usize,
+    /// Next input surface slot for upload_bgra/upload_nv12.
+    next_input_slot: usize,
+    /// In-flight encode awaiting drain on the next call.
+    pending: Option<PendingFrame>,
     width: u32,
     height: u32,
     width_in_mbs: u16,
@@ -823,8 +1041,8 @@ pub struct VaapiDirectEncoder {
     /// Optional VA-API VPP context for zero-copy DMA-BUF import.
     /// Present when VAEntrypointVideoProc is supported by the driver.
     pub(crate) vpp: Option<VppContext>,
-    /// Cached vaDeriveImage for the input surface.
-    cached_input_image: Option<CachedDerivedImage>,
+    /// Cached vaDeriveImage per input surface slot.
+    cached_input_images: [Option<CachedDerivedImage>; NUM_INPUT_SURFACES],
 }
 
 unsafe impl Send for VaapiDirectEncoder {}
@@ -890,7 +1108,9 @@ impl VaapiDirectEncoder {
             return Err("H.264 encode not supported on this VA-API device".into());
         };
 
-        // Create config
+        // Create config — leave rate control at driver default (CQP).  CBR
+        // caused visible quality saccades on screen content as the rate
+        // controller hit its QP ceiling during motion bursts.
         let mut config: VAConfigID = 0;
         let st = unsafe {
             (va.vaCreateConfig)(
@@ -954,28 +1174,35 @@ impl VaapiDirectEncoder {
             return Err(format!("vaCreateContext failed: {st}"));
         }
 
-        // Coded buffer (output bitstream) — allocate generously
-        let coded_buf_size = width * height; // ~1 byte per pixel is generous
-        let mut coded_buf: VABufferID = 0;
-        let st = unsafe {
-            (va.vaCreateBuffer)(
-                display,
-                context,
-                VAEncCodedBufferType,
-                coded_buf_size,
-                1,
-                ptr::null_mut(),
-                &mut coded_buf,
-            )
-        };
-        if st != VA_STATUS_SUCCESS {
-            unsafe {
-                (va.vaDestroyContext)(display, context);
-                (va.vaDestroySurfaces)(display, surfaces.as_mut_ptr(), TOTAL_SURFACES as i32);
-                (va.vaDestroyConfig)(display, config);
-                (va.vaTerminate)(display);
+        // Coded buffers (output bitstream) — one per pipeline slot, allocated
+        // generously at ~1 byte per pixel.  While the GPU writes one, the CPU
+        // reads the other.
+        let coded_buf_size = width * height;
+        let mut coded_bufs = [0u32; NUM_CODED_BUFFERS];
+        for slot in 0..NUM_CODED_BUFFERS {
+            let st = unsafe {
+                (va.vaCreateBuffer)(
+                    display,
+                    context,
+                    VAEncCodedBufferType,
+                    coded_buf_size,
+                    1,
+                    ptr::null_mut(),
+                    &mut coded_bufs[slot],
+                )
+            };
+            if st != VA_STATUS_SUCCESS {
+                unsafe {
+                    for &prev in coded_bufs.iter().take(slot) {
+                        (va.vaDestroyBuffer)(display, prev);
+                    }
+                    (va.vaDestroyContext)(display, context);
+                    (va.vaDestroySurfaces)(display, surfaces.as_mut_ptr(), TOTAL_SURFACES as i32);
+                    (va.vaDestroyConfig)(display, config);
+                    (va.vaTerminate)(display);
+                }
+                return Err(format!("vaCreateBuffer(coded) failed: {st}"));
             }
-            return Err(format!("vaCreateBuffer(coded) failed: {st}"));
         }
 
         let width_in_mbs = width.div_ceil(16) as u16;
@@ -983,7 +1210,8 @@ impl VaapiDirectEncoder {
 
         if verbose {
             eprintln!(
-                "[vaapi-direct] initialized H.264 CB encoder for {width}x{height} (ep={entrypoint})"
+                "[vaapi-direct] initialized H.264 encoder for {width}x{height} \
+                 (ep={entrypoint}, qp={qp})"
             );
         }
         Ok(Self {
@@ -992,7 +1220,10 @@ impl VaapiDirectEncoder {
             config,
             context,
             surfaces,
-            coded_buf,
+            coded_bufs,
+            next_coded_slot: 0,
+            next_input_slot: 0,
+            pending: None,
             width,
             height,
             width_in_mbs,
@@ -1016,7 +1247,7 @@ impl VaapiDirectEncoder {
                 )
             },
             _drm_fd: drm_fd,
-            cached_input_image: None,
+            cached_input_images: [None, None],
         })
     }
 
@@ -1047,10 +1278,10 @@ impl VaapiDirectEncoder {
         }
     }
 
-    /// Get or create a cached derived image for the input surface.
-    fn derive_input_image(&mut self) -> Option<&CachedDerivedImage> {
-        if self.cached_input_image.is_none() {
-            let surface = self.surfaces[NUM_REF_SURFACES];
+    /// Get or create a cached derived image for the given input surface slot.
+    fn derive_input_image(&mut self, slot: usize) -> Option<&CachedDerivedImage> {
+        if self.cached_input_images[slot].is_none() {
+            let surface = self.surfaces[NUM_REF_SURFACES + slot];
             let mut image = [0u8; VA_IMAGE_SIZE];
             let st = unsafe {
                 (self.va.vaDeriveImage)(self.display, surface, image.as_mut_ptr() as *mut c_void)
@@ -1058,7 +1289,7 @@ impl VaapiDirectEncoder {
             if st != VA_STATUS_SUCCESS {
                 return None;
             }
-            self.cached_input_image = Some(CachedDerivedImage {
+            self.cached_input_images[slot] = Some(CachedDerivedImage {
                 image_id: r32(&image, VAIMG_ID_OFF),
                 buf_id: r32(&image, VAIMG_BUF_OFF),
                 y_pitch: r32(&image, VAIMG_PITCHES_OFF) as usize,
@@ -1067,7 +1298,7 @@ impl VaapiDirectEncoder {
                 uv_offset: r32(&image, VAIMG_OFFSETS_OFF + 4) as usize,
             });
         }
-        self.cached_input_image.as_ref()
+        self.cached_input_images[slot].as_ref()
     }
 
     /// Encode an NV12 frame (Y + UV interleaved planes).
@@ -1078,8 +1309,10 @@ impl VaapiDirectEncoder {
         y_stride: usize,
         uv_stride: usize,
     ) -> Option<(Vec<u8>, bool)> {
-        self.upload_nv12(y_data, uv_data, y_stride, uv_stride)?;
-        let input_surface = self.surfaces[NUM_REF_SURFACES];
+        let slot = self.next_input_slot;
+        self.next_input_slot = (slot + 1) % NUM_INPUT_SURFACES;
+        self.upload_nv12(slot, y_data, uv_data, y_stride, uv_stride)?;
+        let input_surface = self.surfaces[NUM_REF_SURFACES + slot];
         self.encode_surface(input_surface)
     }
 
@@ -1090,19 +1323,22 @@ impl VaapiDirectEncoder {
         src_w: usize,
         src_h: usize,
     ) -> Option<(Vec<u8>, bool)> {
-        self.upload_bgra(bgra, src_w, src_h)?;
-        let input_surface = self.surfaces[NUM_REF_SURFACES];
+        let slot = self.next_input_slot;
+        self.next_input_slot = (slot + 1) % NUM_INPUT_SURFACES;
+        self.upload_bgra(slot, bgra, src_w, src_h)?;
+        let input_surface = self.surfaces[NUM_REF_SURFACES + slot];
         self.encode_surface(input_surface)
     }
 
     fn upload_nv12(
         &mut self,
+        slot: usize,
         y_data: &[u8],
         uv_data: &[u8],
         src_y_stride: usize,
         src_uv_stride: usize,
     ) -> Option<()> {
-        let img = self.derive_input_image()?;
+        let img = self.derive_input_image(slot)?;
         let buf_id = img.buf_id;
         let y_pitch = img.y_pitch;
         let uv_pitch = img.uv_pitch;
@@ -1148,8 +1384,8 @@ impl VaapiDirectEncoder {
         Some(())
     }
 
-    fn upload_bgra(&mut self, bgra: &[u8], src_w: usize, src_h: usize) -> Option<()> {
-        let img = self.derive_input_image()?;
+    fn upload_bgra(&mut self, slot: usize, bgra: &[u8], src_w: usize, src_h: usize) -> Option<()> {
+        let img = self.derive_input_image(slot)?;
         let buf_id = img.buf_id;
         let y_pitch = img.y_pitch;
         let uv_pitch = img.uv_pitch;
@@ -1166,53 +1402,25 @@ impl VaapiDirectEncoder {
         let enc_h = self.height as usize;
         let dst = map_ptr as *mut u8;
 
-        // BGRA→NV12 directly into mapped surface memory
         unsafe {
-            // Y plane
-            for row in 0..enc_h {
-                let sr = row.min(src_h - 1);
-                let dst_row = dst.add(y_offset + row * y_pitch);
-                for col in 0..enc_w {
-                    let sc = col.min(src_w - 1);
-                    let i = (sr * src_w + sc) * 4;
-                    let r = bgra[i + 2] as i32;
-                    let g = bgra[i + 1] as i32;
-                    let b = bgra[i] as i32;
-                    let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                    *dst_row.add(col) = y.clamp(0, 255) as u8;
-                }
-            }
-            // UV plane (interleaved)
-            let chroma_h = enc_h / 2;
-            let chroma_w = enc_w / 2;
-            for cy in 0..chroma_h {
-                let dst_row = dst.add(uv_offset + cy * uv_pitch);
-                for cx in 0..chroma_w {
-                    let row = cy * 2;
-                    let col = cx * 2;
-                    let mut u_sum = 0i32;
-                    let mut v_sum = 0i32;
-                    for dy in 0..2usize {
-                        for dx in 0..2usize {
-                            let sr = (row + dy).min(src_h - 1);
-                            let sc = (col + dx).min(src_w - 1);
-                            let i = (sr * src_w + sc) * 4;
-                            let r = bgra[i + 2] as i32;
-                            let g = bgra[i + 1] as i32;
-                            let b = bgra[i] as i32;
-                            u_sum += ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                            v_sum += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                        }
-                    }
-                    *dst_row.add(cx * 2) = (u_sum / 4).clamp(0, 255) as u8;
-                    *dst_row.add(cx * 2 + 1) = (v_sum / 4).clamp(0, 255) as u8;
-                }
+            if src_w == enc_w && src_h == enc_h && src_w >= 2 && src_h >= 2 {
+                bgra_to_nv12_fast(
+                    bgra, dst, y_offset, uv_offset, y_pitch, uv_pitch, src_w, src_h,
+                );
+            } else {
+                bgra_to_nv12_padded(
+                    bgra, dst, y_offset, uv_offset, y_pitch, uv_pitch, src_w, src_h, enc_w, enc_h,
+                );
             }
             (self.va.vaUnmapBuffer)(self.display, buf_id);
         }
         Some(())
     }
 
+    /// Submit a frame to the GPU and drain the bitstream of the *previous*
+    /// submission.  Returns `None` on the very first call (nothing to drain
+    /// yet) or on submit failure.  The 1-frame pipeline depth lets the CPU
+    /// upload of frame N+1 overlap with the GPU encode of frame N.
     pub(crate) fn encode_surface(&mut self, input_surface: VASurfaceID) -> Option<(Vec<u8>, bool)> {
         let is_idr = self.force_idr || self.frame_num == 0;
         if is_idr {
@@ -1225,16 +1433,49 @@ impl VaapiDirectEncoder {
         let recon_idx = (self.cur_ref_idx + 1) % NUM_REF_SURFACES;
         let recon_surface = self.surfaces[recon_idx];
 
-        // Submit parameter buffers
+        // Pick this submission's coded buffer slot.
+        let coded_slot = self.next_coded_slot;
+        let coded_buf = self.coded_bufs[coded_slot];
+        self.next_coded_slot = (coded_slot + 1) % NUM_CODED_BUFFERS;
+
+        // Build parameter buffers.
         let sps_buf = self.create_sps_buffer()?;
-        let pps_buf = self.create_pps_buffer(is_idr, ref_surface, recon_surface)?;
+        let pps_buf = self.create_pps_buffer(is_idr, ref_surface, recon_surface, coded_buf)?;
         let slice_buf = self.create_slice_buffer(is_idr, ref_surface)?;
 
         let mut buffers: Vec<VABufferID> = vec![sps_buf, pps_buf, slice_buf];
 
+        // Realtime tuning misc parameters.  AMD's VA-API backend defaults to
+        // its slowest preset; QualityLevel flips it to "speed" for much lower
+        // encode latency.  FrameRate hints the driver's internal pacing.
+        if let Some(b) = create_misc_param_buffer(
+            self.va,
+            self.display,
+            self.context,
+            VAEncMiscParameterTypeQualityLevel,
+            VAEncMiscParameterBufferQualityLevel {
+                quality_level: REALTIME_QUALITY_LEVEL,
+                va_reserved: [0; 4],
+            },
+        ) {
+            buffers.push(b);
+        }
+        if let Some(b) = create_misc_param_buffer(
+            self.va,
+            self.display,
+            self.context,
+            VAEncMiscParameterTypeFrameRate,
+            VAEncMiscParameterFrameRate {
+                framerate: REALTIME_FPS,
+                framerate_flags: 0,
+                va_reserved: [0; 4],
+            },
+        ) {
+            buffers.push(b);
+        }
+
         // Submit packed SPS + PPS NALs on IDR frames so the driver includes
-        // them in the coded buffer.  This replaces the manual prepend that
-        // used synthetic NAL builders.
+        // them in the coded buffer.
         if is_idr {
             let sps_nal = build_h264_sps_nal(
                 self.width_in_mbs,
@@ -1265,105 +1506,106 @@ impl VaapiDirectEncoder {
             }
         }
 
-        let st = unsafe { (self.va.vaBeginPicture)(self.display, self.context, input_surface) };
-        if st != VA_STATUS_SUCCESS {
-            self.destroy_buffers(&buffers);
-            return None;
-        }
-
-        let st = unsafe {
-            (self.va.vaRenderPicture)(
-                self.display,
-                self.context,
-                buffers.as_mut_ptr(),
-                buffers.len() as i32,
-            )
-        };
-        if st != VA_STATUS_SUCCESS {
-            unsafe {
-                (self.va.vaEndPicture)(self.display, self.context);
+        // Submit (Begin/Render/End queue commands; do not block).
+        let submit_ok = unsafe {
+            let st = (self.va.vaBeginPicture)(self.display, self.context, input_surface);
+            if st != VA_STATUS_SUCCESS {
+                false
+            } else {
+                let st2 = (self.va.vaRenderPicture)(
+                    self.display,
+                    self.context,
+                    buffers.as_mut_ptr(),
+                    buffers.len() as i32,
+                );
+                let st3 = (self.va.vaEndPicture)(self.display, self.context);
+                st2 == VA_STATUS_SUCCESS && st3 == VA_STATUS_SUCCESS
             }
-            self.destroy_buffers(&buffers);
-            return None;
-        }
-
-        let st = unsafe { (self.va.vaEndPicture)(self.display, self.context) };
-        if st != VA_STATUS_SUCCESS {
-            self.destroy_buffers(&buffers);
-            return None;
-        }
-
-        // Wait for encode
-        let st = unsafe { (self.va.vaSyncSurface)(self.display, input_surface) };
-        if st != VA_STATUS_SUCCESS {
-            self.destroy_buffers(&buffers);
-            return None;
-        }
-
-        // Read bitstream
-        let mut nal_data = self.read_coded_buffer()?;
-
+        };
+        // Param buffers are consumed by vaRenderPicture; the driver no longer
+        // needs them after vaEndPicture even if encode hasn't finished.
         self.destroy_buffers(&buffers);
 
-        // Update state
-        self.frame_num += 1;
-        self.cur_ref_idx = recon_idx;
+        // Drain the previous submission's bitstream — this is where we block
+        // on the GPU.  The CPU upload for the next frame can begin as soon as
+        // we return.
+        let result = self.drain_pending();
 
-        if nal_data.is_empty() {
-            None
-        } else {
-            // AMD VA-API outputs slice NALs with header byte 0x00 instead of
-            // the correct H.264 NAL header.  Patch the first NAL header.
-            // Find the slice NAL (skip any SPS/PPS that the driver included
-            // from our packed headers).
-            let mut pos = 0;
-            while let Some(sc) = find_annex_b_start(&nal_data[pos..]) {
-                let abs = pos + sc;
-                let hdr_pos = abs + if nal_data[abs + 2] == 1 { 3 } else { 4 };
-                if hdr_pos < nal_data.len() {
-                    let nal_type = nal_data[hdr_pos] & 0x1f;
-                    // Only patch slice NALs (type 1 or 5), not SPS/PPS
-                    if nal_type == 0 {
-                        nal_data[hdr_pos] = if is_idr {
-                            0x65 // nal_ref_idc=3, nal_unit_type=5 (IDR)
-                        } else {
-                            0x41 // nal_ref_idc=2, nal_unit_type=1 (non-IDR)
-                        };
-                    }
-                }
-                pos = hdr_pos + 1;
-            }
-            // Check if driver included SPS from packed headers.
-            // If not, prepend SPS+PPS on IDR frames.
-            if is_idr {
-                let has_sps = {
-                    let mut found = false;
-                    let mut p = 0;
-                    while let Some(sc) = find_annex_b_start(&nal_data[p..]) {
-                        let abs = p + sc;
-                        let hp = abs + if nal_data[abs + 2] == 1 { 3 } else { 4 };
-                        if hp < nal_data.len() && (nal_data[hp] & 0x1f) == 7 {
-                            found = true;
-                            break;
-                        }
-                        p = hp + 1;
-                    }
-                    found
-                };
-                if !has_sps {
-                    let mut out = build_h264_sps_nal(
-                        self.width_in_mbs,
-                        self.height_in_mbs,
-                        self.width,
-                        self.height,
-                    );
-                    out.extend_from_slice(&build_h264_pps_nal());
-                    out.extend_from_slice(&nal_data);
-                    return Some((out, true));
-                }
-            }
-            Some((nal_data, is_idr))
+        if submit_ok {
+            self.frame_num += 1;
+            self.cur_ref_idx = recon_idx;
+            self.pending = Some(PendingFrame {
+                input_surface,
+                coded_buf,
+                was_idr: is_idr,
+            });
         }
+        // If submit failed: pending stays empty (or whatever drain_pending
+        // left it as — it's now None).  Next call retries with same state.
+
+        result
+    }
+
+    /// Sync the in-flight frame and read its bitstream.  Returns `None` if
+    /// nothing is pending or the readback fails.
+    fn drain_pending(&mut self) -> Option<(Vec<u8>, bool)> {
+        let pending = self.pending.take()?;
+        let st = unsafe { (self.va.vaSyncSurface)(self.display, pending.input_surface) };
+        if st != VA_STATUS_SUCCESS {
+            return None;
+        }
+        let mut nal_data = self.read_coded_buffer(pending.coded_buf)?;
+        if nal_data.is_empty() {
+            return None;
+        }
+
+        // AMD VA-API outputs slice NALs with header byte 0x00 instead of
+        // the correct H.264 NAL header.  Patch the first slice NAL header.
+        let mut pos = 0;
+        while let Some(sc) = find_annex_b_start(&nal_data[pos..]) {
+            let abs = pos + sc;
+            let hdr_pos = abs + if nal_data[abs + 2] == 1 { 3 } else { 4 };
+            if hdr_pos < nal_data.len() {
+                let nal_type = nal_data[hdr_pos] & 0x1f;
+                if nal_type == 0 {
+                    nal_data[hdr_pos] = if pending.was_idr {
+                        0x65 // nal_ref_idc=3, nal_unit_type=5 (IDR)
+                    } else {
+                        0x41 // nal_ref_idc=2, nal_unit_type=1 (non-IDR)
+                    };
+                }
+            }
+            pos = hdr_pos + 1;
+        }
+
+        if pending.was_idr {
+            let has_sps = {
+                let mut found = false;
+                let mut p = 0;
+                while let Some(sc) = find_annex_b_start(&nal_data[p..]) {
+                    let abs = p + sc;
+                    let hp = abs + if nal_data[abs + 2] == 1 { 3 } else { 4 };
+                    if hp < nal_data.len() && (nal_data[hp] & 0x1f) == 7 {
+                        found = true;
+                        break;
+                    }
+                    p = hp + 1;
+                }
+                found
+            };
+            if !has_sps {
+                let mut out = build_h264_sps_nal(
+                    self.width_in_mbs,
+                    self.height_in_mbs,
+                    self.width,
+                    self.height,
+                );
+                out.extend_from_slice(&build_h264_pps_nal());
+                out.extend_from_slice(&nal_data);
+                return Some((out, true));
+            }
+        }
+        Some((nal_data, pending.was_idr))
     }
 
     fn create_sps_buffer(&self) -> Option<VABufferID> {
@@ -1394,8 +1636,8 @@ impl VaapiDirectEncoder {
         w32(&mut sps, 8, 0x7FFF_FFFF);
         // ip_period (offset 12, u32)
         w32(&mut sps, 12, 1);
-        // bits_per_second (offset 16, u32)
-        w32(&mut sps, 16, 0); // VBR
+        // bits_per_second (offset 16, u32) — 0 means CQP / driver default.
+        w32(&mut sps, 16, 0);
         // max_num_ref_frames (offset 20, u32)
         w32(&mut sps, 20, 1);
         // picture_width_in_mbs (offset 24, u16)
@@ -1451,6 +1693,7 @@ impl VaapiDirectEncoder {
         is_idr: bool,
         ref_surface: VASurfaceID,
         recon_surface: VASurfaceID,
+        coded_buf: VABufferID,
     ) -> Option<VABufferID> {
         let mut pps = [0u8; PPS_SIZE];
 
@@ -1475,7 +1718,7 @@ impl VaapiDirectEncoder {
         }
 
         // coded_buf (offset 612, VABufferID)
-        w32(&mut pps, 612, self.coded_buf);
+        w32(&mut pps, 612, coded_buf);
         // pic_parameter_set_id (offset 616, u8)
         w8(&mut pps, 616, 0);
         // seq_parameter_set_id (offset 617, u8)
@@ -1574,9 +1817,9 @@ impl VaapiDirectEncoder {
         Some(buf_id)
     }
 
-    fn read_coded_buffer(&self) -> Option<Vec<u8>> {
+    fn read_coded_buffer(&self, coded_buf: VABufferID) -> Option<Vec<u8>> {
         let mut buf_ptr: *mut c_void = ptr::null_mut();
-        let st = unsafe { (self.va.vaMapBuffer)(self.display, self.coded_buf, &mut buf_ptr) };
+        let st = unsafe { (self.va.vaMapBuffer)(self.display, coded_buf, &mut buf_ptr) };
         if st != VA_STATUS_SUCCESS {
             return None;
         }
@@ -1604,7 +1847,7 @@ impl VaapiDirectEncoder {
         }
 
         unsafe {
-            (self.va.vaUnmapBuffer)(self.display, self.coded_buf);
+            (self.va.vaUnmapBuffer)(self.display, coded_buf);
         }
         Some(nal_data)
     }
@@ -1620,16 +1863,27 @@ impl VaapiDirectEncoder {
 
 impl Drop for VaapiDirectEncoder {
     fn drop(&mut self) {
+        // Sync any in-flight encode before tearing down the surfaces it
+        // references — otherwise the GPU could be writing into freed memory.
+        if let Some(pending) = self.pending.take() {
+            unsafe {
+                (self.va.vaSyncSurface)(self.display, pending.input_surface);
+            }
+        }
         // Drop VPP context first — it shares our VA display handle and must
         // be destroyed before vaTerminate() invalidates the display.
         self.vpp.take();
-        if let Some(img) = self.cached_input_image.take() {
-            unsafe {
-                (self.va.vaDestroyImage)(self.display, img.image_id);
+        for slot in 0..NUM_INPUT_SURFACES {
+            if let Some(img) = self.cached_input_images[slot].take() {
+                unsafe {
+                    (self.va.vaDestroyImage)(self.display, img.image_id);
+                }
             }
         }
         unsafe {
-            (self.va.vaDestroyBuffer)(self.display, self.coded_buf);
+            for &buf in &self.coded_bufs {
+                (self.va.vaDestroyBuffer)(self.display, buf);
+            }
             (self.va.vaDestroyContext)(self.display, self.context);
             (self.va.vaDestroySurfaces)(
                 self.display,

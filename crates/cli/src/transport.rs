@@ -519,7 +519,7 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
         scrollback: std::env::var("BLIT_SCROLLBACK")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10_000),
+            .unwrap_or(1_000_000),
         ipc_path: socket_path.to_string(),
         surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
         surface_quality: std::env::var("BLIT_SURFACE_QUALITY")
@@ -558,7 +558,7 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
         scrollback: std::env::var("BLIT_SCROLLBACK")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10_000),
+            .unwrap_or(1_000_000),
         ipc_path: pipe_path.to_string(),
         surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
         surface_quality: std::env::var("BLIT_SURFACE_QUALITY")

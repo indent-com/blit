@@ -44,6 +44,8 @@ import {
   type BSPLayout,
 } from "./bsp/layout";
 import { t, tp } from "./i18n";
+import { isEncrypted, decryptPassphrase } from "./passphrase-crypto";
+import { getInstallPrompt, clearInstallPrompt } from "./main";
 
 const SOURCE_LABEL: Record<number, string> = {
   [SEARCH_SOURCE_TITLE]: t("switcher.sourceTitle"),
@@ -92,6 +94,8 @@ type ActionItem = {
   subtitle: string;
   action:
     | "new-terminal"
+    | "share-url"
+    | "install-app"
     | "clear-layout"
     | "clear-local-storage"
     | "change-font"
@@ -212,6 +216,35 @@ function ActionGlyph(props: {
             <path d="M11.5 14h3.5" stroke={props.fg} />
             <path d="M18 7.5v5" stroke={props.fg} />
             <path d="M15.5 10h5" stroke={props.fg} />
+          </svg>
+        );
+      case "share-url":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <circle cx="17" cy="6" r="2.5" stroke={props.fg} />
+            <circle cx="7" cy="12" r="2.5" stroke={props.fg} />
+            <circle cx="17" cy="18" r="2.5" stroke={props.fg} />
+            <path d="M9.5 11l5-4M9.5 13l5 4" stroke={props.dimFg} />
+          </svg>
+        );
+      case "install-app":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path d="M12 4v12" stroke={props.fg} />
+            <path d="M8 12l4 4 4-4" stroke={props.fg} />
+            <path d="M5 18h14" stroke={props.dimFg} />
           </svg>
         );
       case "change-layout":
@@ -1135,6 +1168,36 @@ export function SwitcherOverlay(props: {
         action: "new-terminal",
       });
     }
+    // Offer "Share URL" when the hash contains an encrypted passphrase.
+    {
+      const raw = location.hash.slice(1);
+      const first = raw.split("&")[0];
+      if (first && isEncrypted(decodeURIComponent(first))) {
+        actions.push({
+          type: "action",
+          key: "action:share-url",
+          title: "Share URL",
+          subtitle: "Copy URL with passphrase to clipboard",
+          action: "share-url",
+        });
+      }
+    }
+    {
+      const isStandalone =
+        window.matchMedia("(display-mode: standalone)").matches ||
+        (navigator as any).standalone === true;
+      if (!isStandalone) {
+        actions.push({
+          type: "action",
+          key: "action:install-app",
+          title: "Install App",
+          subtitle: getInstallPrompt()
+            ? "Add blit to your home screen"
+            : "Use your browser's install option",
+          action: "install-app",
+        });
+      }
+    }
     if (props.onChangeRemotes) {
       actions.push({
         type: "action",
@@ -1493,6 +1556,34 @@ export function SwitcherOverlay(props: {
       } else {
         props.onFocusSurface?.(item.surfaceId, item.connectionId);
       }
+      return;
+    }
+    if (item.action === "install-app") {
+      const prompt = getInstallPrompt();
+      if (prompt) {
+        clearInstallPrompt();
+        props.onClose();
+        void prompt.prompt();
+      }
+      return;
+    }
+    if (item.action === "share-url") {
+      const raw = location.hash.slice(1);
+      const parts = raw.split("&");
+      const first = parts[0];
+      const decoded = decodeURIComponent(first);
+      const passphrase = isEncrypted(decoded)
+        ? decryptPassphrase(decoded)
+        : decoded;
+      if (passphrase) {
+        const rest = parts.slice(1);
+        const hash = [encodeURIComponent(passphrase), ...rest]
+          .filter(Boolean)
+          .join("&");
+        const url = `${location.origin}${location.pathname}#${hash}`;
+        navigator.clipboard.writeText(url).catch(() => {});
+      }
+      props.onClose();
       return;
     }
     if (item.action === "change-layout") {

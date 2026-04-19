@@ -2,6 +2,8 @@ import {
   createSignal,
   createEffect,
   createMemo,
+  createContext,
+  useContext,
   onCleanup,
   Show,
   For,
@@ -35,6 +37,38 @@ import { ResizeHandle } from "./ResizeHandle";
 import type { Theme } from "../theme";
 import { themeFor, ui, uiScale } from "../theme";
 import { t, tp } from "../i18n";
+
+/** Props that stay constant through the BSPPane recursion tree.  Hoisted
+ *  into context so each level only passes the values that actually change. */
+interface BSPTreeCtx {
+  connectionId: string;
+  connectionLabels?: Map<string, string>;
+  multiPane: boolean;
+  onFocusPane: (paneId: string) => void;
+  onCreateInPane?: (
+    paneId: string,
+    command?: string,
+    connectionId?: string,
+  ) => void;
+  onSwitcher?: () => void;
+  onHelp?: () => void;
+  onResize: (
+    split: BSPSplit,
+    indexA: number,
+    indexB: number,
+    fraction: number,
+  ) => void;
+  palette: TerminalPalette;
+  fontFamily: string;
+  fontSize: number;
+  tabMemory: Record<string, number>;
+  onRender?: (renderMs?: number) => void;
+}
+
+const BSPTreeContext = createContext<BSPTreeCtx>();
+function useBSPTree(): BSPTreeCtx {
+  return useContext(BSPTreeContext)!;
+}
 
 function resolveLeafFontSize(leaf: BSPLeaf, baseFontSize: number): number {
   const raw = leaf.fontSize;
@@ -295,14 +329,12 @@ export function BSPContainer(props: {
   // pane assignments to newly created sessions for the same PTY.
   const durableSessionKeys = new Map<string, string>();
 
-  // Build a map from closed session IDs to their replacement live session
-  // IDs.  After a reconnect the server re-issues the same PTYs under new
-  // session IDs; this map lets reconciliation re-attach panes to the
-  // reappearing terminals instead of dumping them into the sidebar.
-  //
-  // Also uses durableSessionKeys to remap sessions that were fully removed
-  // (connection destroyed) but whose underlying PTY now has a live session.
-  const sessionReplacements = createMemo(() => {
+  // Single memo that builds both the session-replacement map (closed →
+  // live session ID for the same PTY) and the session→connectionId map
+  // (including entries for removed connections).  Both share the same
+  // durableSessionKeys bookkeeping, so computing them together avoids
+  // iterating sessions() twice.
+  const sessionMaps = createMemo(() => {
     const allSessions = sessions();
     // Record every session we've ever seen so we can remap after a
     // remove-then-readd of a connection.
@@ -312,52 +344,37 @@ export function BSPContainer(props: {
       }
     }
     const liveByKey = new Map<string, string>();
+    const connectionIds = new Map<string, string>();
     for (const s of allSessions) {
+      connectionIds.set(s.id, s.connectionId);
       if (s.state !== "closed") {
         liveByKey.set(`${s.connectionId}:${s.ptyId}`, s.id);
       }
     }
-    const map = new Map<string, string>();
+    const replacements = new Map<string, string>();
     for (const s of allSessions) {
       if (s.state === "closed") {
         const replacement = liveByKey.get(`${s.connectionId}:${s.ptyId}`);
         if (replacement && replacement !== s.id) {
-          map.set(s.id, replacement);
+          replacements.set(s.id, replacement);
         }
       }
     }
     // Remap sessions that were completely removed (connection destroyed)
-    // but whose underlying PTY now has a live session again.
+    // but whose underlying PTY now has a live session again.  Also fill
+    // in connectionIds for removed sessions.
     const currentIds = new Set(allSessions.map((s) => s.id));
     for (const [oldId, key] of durableSessionKeys) {
-      if (!currentIds.has(oldId) && !map.has(oldId)) {
-        const replacement = liveByKey.get(key);
-        if (replacement) {
-          map.set(oldId, replacement);
+      if (!currentIds.has(oldId)) {
+        if (!replacements.has(oldId)) {
+          const replacement = liveByKey.get(key);
+          if (replacement) replacements.set(oldId, replacement);
         }
-      }
-    }
-    return map;
-  });
-
-  // Durable mapping from session ID → connectionId.  Uses the same
-  // durableSessionKeys map so connections that were removed still have
-  // their sessionId→connectionId mapping available for reconciliation.
-  const sessionConnectionIds = createMemo(() => {
-    const allSessions = sessions();
-    const map = new Map<string, string>();
-    for (const s of allSessions) {
-      map.set(s.id, s.connectionId);
-    }
-    // Include entries for sessions whose connection has been removed so
-    // reconciliation can still determine which connection they belonged to.
-    for (const [sessionId, key] of durableSessionKeys) {
-      if (!map.has(sessionId)) {
         const colonIdx = key.indexOf(":");
-        if (colonIdx > 0) map.set(sessionId, key.slice(0, colonIdx));
+        if (colonIdx > 0) connectionIds.set(oldId, key.slice(0, colonIdx));
       }
     }
-    return map;
+    return { replacements, connectionIds };
   });
 
   createEffect(() => {
@@ -368,8 +385,7 @@ export function BSPContainer(props: {
     const live = liveSessionIds();
     const known = knownSessionIds();
     const surfaceKeys = props.liveSurfaceKeys;
-    const replacements = sessionReplacements();
-    const sessionConns = sessionConnectionIds();
+    const { replacements, connectionIds: sessionConns } = sessionMaps();
     // Only include connections that are both present AND ready.  A
     // connection that is present but not ready (reconnecting) has its
     // surface list momentarily empty — treating it as "ready" would
@@ -635,60 +651,68 @@ export function BSPContainer(props: {
 
   const multiPane = () => leafCount(root()) > 1;
 
+  // Each reactive field is exposed via a getter so consumers reading
+  // `ctx.foo` see the current value.  Solid's Provider captures `props.value`
+  // once under `untrack`, so a plain-object literal would freeze every field
+  // to the mount-time snapshot — breaking e.g. connectionLabels when a new
+  // remote is added after BSPContainer mounts.
+  const ctxValue: BSPTreeCtx = {
+    get connectionId() {
+      return props.connectionId;
+    },
+    get connectionLabels() {
+      return props.connectionLabels;
+    },
+    get multiPane() {
+      return multiPane();
+    },
+    onFocusPane: focusPane,
+    get onCreateInPane() {
+      return props.onCreateInPane;
+    },
+    get onSwitcher() {
+      return props.onSwitcher;
+    },
+    get onHelp() {
+      return props.onHelp;
+    },
+    onResize: handleResize,
+    get palette() {
+      return props.palette;
+    },
+    get fontFamily() {
+      return props.fontFamily;
+    },
+    get fontSize() {
+      return props.fontSize;
+    },
+    tabMemory,
+    get onRender() {
+      return props.onRender;
+    },
+  };
   return (
-    <div style={{ width: "100%", height: "100%", display: "flex" }}>
-      <BSPPane
-        node={root()}
-        assignments={layoutState().assignments}
-        connectionId={props.connectionId}
-        connectionLabels={props.connectionLabels}
-        multiPane={multiPane()}
-        focusedPaneId={focusedPaneId()}
-        onFocusPane={focusPane}
-        onCreateInPane={props.onCreateInPane}
-        onSwitcher={props.onSwitcher}
-        onHelp={props.onHelp}
-        onResize={handleResize}
-        palette={props.palette}
-        fontFamily={props.fontFamily}
-        fontSize={props.fontSize}
-        visible={props.manageVisibility ?? true}
-        tabMemory={tabMemory}
-        onRender={props.onRender}
-      />
-    </div>
+    <BSPTreeContext.Provider value={ctxValue}>
+      <div style={{ width: "100%", height: "100%", display: "flex" }}>
+        <BSPPane
+          node={root()}
+          assignments={layoutState().assignments}
+          focusedPaneId={focusedPaneId()}
+          visible={props.manageVisibility ?? true}
+        />
+      </div>
+    </BSPTreeContext.Provider>
   );
 }
 
 function BSPPane(props: {
   node: BSPNode;
   assignments: Record<string, SessionId | null>;
-  connectionId: string;
-  connectionLabels?: Map<string, string>;
-  multiPane: boolean;
   focusedPaneId: string | null;
-  onFocusPane: (paneId: string) => void;
-  onCreateInPane?: (
-    paneId: string,
-    command?: string,
-    connectionId?: string,
-  ) => void;
-  onSwitcher?: () => void;
-  onHelp?: () => void;
-  onResize: (
-    split: BSPSplit,
-    indexA: number,
-    indexB: number,
-    fraction: number,
-  ) => void;
-  palette: TerminalPalette;
-  fontFamily: string;
-  fontSize: number;
   visible: boolean;
-  tabMemory: Record<string, number>;
   path?: number[];
-  onRender?: (renderMs?: number) => void;
 }) {
+  const ctx = useBSPTree();
   // All branching uses <Show> so Solid re-evaluates when props.node changes
   // (e.g. on layout switch or resize).  <Index> is used for split children
   // so that components persist by position — only the item signal updates,
@@ -708,19 +732,8 @@ function BSPPane(props: {
           paneId={paneId()}
           leaf={props.node as BSPLeaf}
           sessionId={props.assignments[paneId()] ?? null}
-          connectionId={props.connectionId}
-          connectionLabels={props.connectionLabels}
-          multiPane={props.multiPane}
           isFocused={paneId() === props.focusedPaneId}
-          onFocusPane={() => props.onFocusPane(paneId())}
-          onCreateInPane={props.onCreateInPane}
-          onSwitcher={props.onSwitcher}
-          onHelp={props.onHelp}
-          palette={props.palette}
-          fontFamily={props.fontFamily}
-          fontSize={props.fontSize}
           visible={props.visible}
-          onRender={props.onRender}
         />
       }
     >
@@ -746,7 +759,7 @@ function BSPPane(props: {
                           split().direction as "horizontal" | "vertical"
                         }
                         onDrag={(fraction) =>
-                          props.onResize(split(), index - 1, index, fraction)
+                          ctx.onResize(split(), index - 1, index, fraction)
                         }
                       />
                     </Show>
@@ -762,22 +775,9 @@ function BSPPane(props: {
                       <BSPPane
                         node={child().node}
                         assignments={props.assignments}
-                        connectionId={props.connectionId}
-                        connectionLabels={props.connectionLabels}
-                        multiPane={props.multiPane}
                         focusedPaneId={props.focusedPaneId}
-                        onFocusPane={props.onFocusPane}
-                        onCreateInPane={props.onCreateInPane}
-                        onSwitcher={props.onSwitcher}
-                        onHelp={props.onHelp}
-                        onResize={props.onResize}
-                        palette={props.palette}
-                        fontFamily={props.fontFamily}
-                        fontSize={props.fontSize}
                         visible={props.visible}
-                        tabMemory={props.tabMemory}
                         path={[...(props.path ?? []), index]}
-                        onRender={props.onRender}
                       />
                     </div>
                   </>
@@ -787,8 +787,8 @@ function BSPPane(props: {
           }
         >
           {(() => {
-            const theme = () => themeFor(props.palette);
-            const scale = () => uiScale(props.fontSize);
+            const theme = () => themeFor(ctx.palette);
+            const scale = () => uiScale(ctx.fontSize);
             const tabKey = () => path().join(".") || "root";
 
             const activeTab = () => {
@@ -806,11 +806,11 @@ function BSPPane(props: {
                 }
               }
               if (active >= 0) {
-                props.tabMemory[tabKey()] = active;
+                ctx.tabMemory[tabKey()] = active;
                 return active;
               }
               return Math.min(
-                props.tabMemory[tabKey()] ?? 0,
+                ctx.tabMemory[tabKey()] ?? 0,
                 s.children.length - 1,
               );
             };
@@ -846,7 +846,7 @@ function BSPPane(props: {
                       const childPath = () => [...path(), index()].join(".");
                       return (
                         <button
-                          onClick={() => props.onFocusPane(childPath())}
+                          onClick={() => ctx.onFocusPane(childPath())}
                           style={{
                             ...ui.btn,
                             flex: 1,
@@ -881,22 +881,9 @@ function BSPPane(props: {
                   <BSPPane
                     node={split().children[activeTab()].node}
                     assignments={props.assignments}
-                    connectionId={props.connectionId}
-                    connectionLabels={props.connectionLabels}
-                    multiPane={props.multiPane}
                     focusedPaneId={props.focusedPaneId}
-                    onFocusPane={props.onFocusPane}
-                    onCreateInPane={props.onCreateInPane}
-                    onSwitcher={props.onSwitcher}
-                    onHelp={props.onHelp}
-                    onResize={props.onResize}
-                    palette={props.palette}
-                    fontFamily={props.fontFamily}
-                    fontSize={props.fontSize}
                     visible={props.visible}
-                    tabMemory={props.tabMemory}
                     path={[...path(), activeTab()]}
-                    onRender={props.onRender}
                   />
                 </div>
               </div>
@@ -912,26 +899,12 @@ function LeafPane(props: {
   paneId: string;
   leaf: BSPLeaf;
   sessionId: SessionId | null;
-  connectionId: string;
-  connectionLabels?: Map<string, string>;
-  multiPane: boolean;
   isFocused: boolean;
-  onFocusPane: () => void;
-  onCreateInPane?: (
-    paneId: string,
-    command?: string,
-    connectionId?: string,
-  ) => void;
-  onSwitcher?: () => void;
-  onHelp?: () => void;
-  palette: TerminalPalette;
-  fontFamily: string;
-  fontSize: number;
   visible: boolean;
-  onRender?: (renderMs?: number) => void;
 }) {
-  const theme = () => themeFor(props.palette);
-  const scale = () => uiScale(props.fontSize);
+  const ctx = useBSPTree();
+  const theme = () => themeFor(ctx.palette);
+  const scale = () => uiScale(ctx.fontSize);
   const workspace = createBlitWorkspace();
   const sessions = createBlitSessions(workspace);
   const workspaceState = createBlitWorkspaceState(workspace);
@@ -940,7 +913,7 @@ function LeafPane(props: {
   const isSurface = () => surfaceParsed() != null;
   const surfaceId = () => surfaceParsed()?.surfaceId ?? null;
   const surfaceConnectionId = () =>
-    surfaceParsed()?.connectionId ?? props.connectionId;
+    surfaceParsed()?.connectionId ?? ctx.connectionId;
 
   /** True when the surface's owning connection is present in the workspace.
    *  When the remote is removed the connection disappears — we hide the
@@ -960,7 +933,7 @@ function LeafPane(props: {
 
   const connection = () => {
     const snap = workspaceState();
-    return snap.connections.find((c) => c.id === props.connectionId) ?? null;
+    return snap.connections.find((c) => c.id === ctx.connectionId) ?? null;
   };
 
   let paneContainer!: HTMLDivElement;
@@ -970,7 +943,7 @@ function LeafPane(props: {
     if (props.sessionId || !props.leaf.command || autoCreated) return;
     if (connection()?.status !== "connected") return;
     autoCreated = true;
-    props.onCreateInPane?.(props.paneId, props.leaf.command);
+    ctx.onCreateInPane?.(props.paneId, props.leaf.command);
   });
 
   createEffect(() => {
@@ -1003,16 +976,94 @@ function LeafPane(props: {
         width: "100%",
         height: "100%",
         position: "relative",
-        border: props.multiPane
+        border: ctx.multiPane
           ? props.isFocused
             ? `1px solid ${theme().accent}`
             : "1px solid transparent"
           : "none",
       }}
-      onPointerDown={() => props.onFocusPane()}
-      onFocusIn={() => props.onFocusPane()}
+      onPointerDown={() => ctx.onFocusPane(props.paneId)}
+      onFocusIn={() => ctx.onFocusPane(props.paneId)}
     >
-      <Show when={isSurface()}>
+      <Show
+        when={isSurface()}
+        fallback={
+          <Show
+            when={props.sessionId && session()}
+            fallback={
+              <EmptyPane
+                paneId={props.paneId}
+                label={props.leaf.tag || null}
+                isFocused={props.isFocused}
+                theme={theme()}
+                palette={ctx.palette}
+                fontSize={ctx.fontSize}
+                connectionId={ctx.connectionId}
+                connectionLabels={ctx.connectionLabels}
+                onCreateInPane={ctx.onCreateInPane}
+                onSwitcher={ctx.onSwitcher}
+                onHelp={ctx.onHelp}
+              />
+            }
+          >
+            <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
+              <BlitTerminal
+                sessionId={props.sessionId}
+                fontSize={resolveLeafFontSize(props.leaf, ctx.fontSize)}
+                fontFamily={ctx.fontFamily}
+                palette={ctx.palette}
+                style={{ width: "100%", height: "100%" }}
+                showCursor={props.isFocused}
+                onRender={ctx.onRender}
+              />
+            </div>
+            <Show when={session()?.state === "exited"}>
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "8px",
+                  left: "50%",
+                  transform: "translateX(-50%)",
+                  background: theme().solidPanelBg,
+                  border: `1px solid ${theme().border}`,
+                  padding: `${scale().controlY}px ${scale().controlX}px`,
+                  "font-size": `${scale().sm}px`,
+                  display: "flex",
+                  "align-items": "center",
+                  gap: `${scale().gap}px`,
+                }}
+              >
+                <mark
+                  style={{
+                    ...ui.badge,
+                    "background-color": "rgba(255,100,100,0.3)",
+                  }}
+                >
+                  {t("bsp.exited")}
+                </mark>
+                <Show when={connection()?.supportsRestart}>
+                  <button
+                    onClick={() => workspace.restartSession(props.sessionId!)}
+                    style={{ ...ui.btn, "font-size": `${scale().sm}px` }}
+                  >
+                    {t("bsp.restart")} <kbd style={ui.kbd}>Enter</kbd>
+                  </button>
+                </Show>
+                <button
+                  onClick={() => void workspace.closeSession(props.sessionId!)}
+                  style={{
+                    ...ui.btn,
+                    "font-size": `${scale().sm}px`,
+                    opacity: 0.5,
+                  }}
+                >
+                  {t("bsp.close")} <kbd style={ui.kbd}>Esc</kbd>
+                </button>
+              </div>
+            </Show>
+          </Show>
+        }
+      >
         <Show
           when={surfaceConnPresent()}
           fallback={
@@ -1021,13 +1072,13 @@ function LeafPane(props: {
               label={props.leaf.tag || null}
               isFocused={props.isFocused}
               theme={theme()}
-              palette={props.palette}
-              fontSize={props.fontSize}
-              connectionId={props.connectionId}
-              connectionLabels={props.connectionLabels}
-              onCreateInPane={props.onCreateInPane}
-              onSwitcher={props.onSwitcher}
-              onHelp={props.onHelp}
+              palette={ctx.palette}
+              fontSize={ctx.fontSize}
+              connectionId={ctx.connectionId}
+              connectionLabels={ctx.connectionLabels}
+              onCreateInPane={ctx.onCreateInPane}
+              onSwitcher={ctx.onSwitcher}
+              onHelp={ctx.onHelp}
             />
           }
         >
@@ -1040,82 +1091,6 @@ function LeafPane(props: {
               style={{ width: "100%", height: "100%" }}
             />
           </div>
-        </Show>
-      </Show>
-      <Show when={!isSurface()}>
-        <Show
-          when={props.sessionId && session()}
-          fallback={
-            <EmptyPane
-              paneId={props.paneId}
-              label={props.leaf.tag || null}
-              isFocused={props.isFocused}
-              theme={theme()}
-              palette={props.palette}
-              fontSize={props.fontSize}
-              connectionId={props.connectionId}
-              connectionLabels={props.connectionLabels}
-              onCreateInPane={props.onCreateInPane}
-              onSwitcher={props.onSwitcher}
-              onHelp={props.onHelp}
-            />
-          }
-        >
-          <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
-            <BlitTerminal
-              sessionId={props.sessionId}
-              fontSize={resolveLeafFontSize(props.leaf, props.fontSize)}
-              fontFamily={props.fontFamily}
-              palette={props.palette}
-              style={{ width: "100%", height: "100%" }}
-              showCursor={props.isFocused}
-              onRender={props.onRender}
-            />
-          </div>
-          <Show when={session()?.state === "exited"}>
-            <div
-              style={{
-                position: "absolute",
-                bottom: "8px",
-                left: "50%",
-                transform: "translateX(-50%)",
-                background: theme().solidPanelBg,
-                border: `1px solid ${theme().border}`,
-                padding: `${scale().controlY}px ${scale().controlX}px`,
-                "font-size": `${scale().sm}px`,
-                display: "flex",
-                "align-items": "center",
-                gap: `${scale().gap}px`,
-              }}
-            >
-              <mark
-                style={{
-                  ...ui.badge,
-                  "background-color": "rgba(255,100,100,0.3)",
-                }}
-              >
-                {t("bsp.exited")}
-              </mark>
-              <Show when={connection()?.supportsRestart}>
-                <button
-                  onClick={() => workspace.restartSession(props.sessionId!)}
-                  style={{ ...ui.btn, "font-size": `${scale().sm}px` }}
-                >
-                  {t("bsp.restart")} <kbd style={ui.kbd}>Enter</kbd>
-                </button>
-              </Show>
-              <button
-                onClick={() => void workspace.closeSession(props.sessionId!)}
-                style={{
-                  ...ui.btn,
-                  "font-size": `${scale().sm}px`,
-                  opacity: 0.5,
-                }}
-              >
-                {t("bsp.close")} <kbd style={ui.kbd}>Esc</kbd>
-              </button>
-            </div>
-          </Show>
         </Show>
       </Show>
     </div>

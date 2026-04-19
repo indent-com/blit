@@ -316,13 +316,8 @@ export class BlitSurfaceCanvas {
   private unsubCursor: (() => void) | null = null;
   private unsubChange: (() => void) | null = null;
 
-  /** Dirty flag for rAF-coalesced blits — avoids redundant drawImage calls
-   *  when multiple frames decode between display refreshes. */
-  private _blitDirty = false;
-  private _blitRafId: number | null = null;
-  /** True after the first frame has been blitted.  The very first decoded
-   *  frame is painted synchronously (bypassing rAF) to minimise
-   *  time-to-first-paint on remote connections. */
+  /** True after the first frame has been blitted.  Kept as a tripwire so
+   *  resubscribe paths can restart the first-frame fast path. */
   private _hasBlitFirstFrame = false;
   /** Cached store reference so we can keep the frame listener alive
    *  even when the connection is temporarily unavailable. */
@@ -670,22 +665,12 @@ export class BlitSurfaceCanvas {
 
     this.unsubFrame = store.onFrame((sid) => {
       if (sid !== this._surfaceId) return;
-      // Paint the very first decoded frame synchronously to minimise
-      // time-to-first-paint.  Subsequent frames are coalesced via rAF
-      // so we don't drawImage more than once per display refresh.
-      if (!this._hasBlitFirstFrame) {
-        this._hasBlitFirstFrame = true;
-        this.blitFromStore(store);
-        return;
-      }
-      if (!this._blitDirty) {
-        this._blitDirty = true;
-        this._blitRafId = requestAnimationFrame(() => {
-          this._blitRafId = null;
-          this._blitDirty = false;
-          this.blitFromStore(store);
-        });
-      }
+      // Paint synchronously: the SurfaceStore presenter already fires this
+      // listener from inside its own rAF (at most once per vsync), so a
+      // second rAF layer here just adds another vsync of visible latency
+      // without any coalescing benefit.
+      if (!this._hasBlitFirstFrame) this._hasBlitFirstFrame = true;
+      this.blitFromStore(store);
     });
   }
 
@@ -696,11 +681,6 @@ export class BlitSurfaceCanvas {
     this.unsubFrame = null;
     this.unsubChange = null;
     this.unsubCursor = null;
-    if (this._blitRafId !== null) {
-      cancelAnimationFrame(this._blitRafId);
-      this._blitRafId = null;
-    }
-    this._blitDirty = false;
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */
@@ -1018,6 +998,12 @@ export class BlitSurfaceCanvas {
       if (pressed) {
         this.pressedKeys.add(keycode);
       } else {
+        // If the keydown was handled via the text path (sendSurfaceText),
+        // the compositor already synthesized a full press+release cycle.
+        // Sending another release here would be an orphaned event that
+        // confuses Chromium-based clients (e.g. Space in YouTube toggling
+        // play/pause twice).
+        if (!this.pressedKeys.has(keycode)) return;
         this.pressedKeys.delete(keycode);
       }
       conn.sendSurfaceInput(this._surfaceId, keycode, pressed);

@@ -725,6 +725,23 @@ impl ShmPool {
         inner.size = new_sz;
     }
 
+    /// Run `f` with the mapped SHM region as a `&[u8]`, holding the pool
+    /// mutex for the duration. Returns `None` if the mmap is invalid.
+    /// Used by the zero-copy upload path so we can stream bytes straight
+    /// from client-shared memory into Vulkan-mapped memory without going
+    /// through an intermediate owned `Vec`.
+    fn with_mmap<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let inner = self.inner.lock().unwrap();
+        if inner.mmap_ptr.is_null() {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(inner.mmap_ptr, inner.size) };
+        Some(f(slice))
+    }
+
     fn read_buffer(
         &self,
         offset: i32,
@@ -1466,28 +1483,14 @@ impl Compositor {
             (pw, ph)
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
-            let r = vk.render_tree_sized(
+            vk.render_tree_sized(
                 &root_id,
                 &self.surfaces,
                 &self.surface_meta,
                 s120,
                 target_phys,
                 toplevel_sid,
-            );
-            if r.is_none() {
-                static SC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = SC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Log the first 100 None results, then every 10th, so
-                // persistent hangs stay visible without flooding logs.
-                if n < 100 || n.is_multiple_of(10) {
-                    eprintln!(
-                        "[commit #{n}] render_tree_sized=None sid={toplevel_sid} target={target_phys:?} meta={} textures={}",
-                        self.surface_meta.len(),
-                        vk.surface_texture_count(),
-                    );
-                }
-            }
-            r
+            )
         } else {
             None
         };
@@ -1747,6 +1750,60 @@ impl Compositor {
         // commit supersedes it.
         if let Some(old) = self.held_buffers.remove(surface_id) {
             old.release();
+        }
+
+        // Fast path for non-cursor SHM buffers: the client's mmap'd pool
+        // has the pixels already; we copy+convert straight into Vulkan
+        // memory and skip the `read_buffer → Vec<u8>` intermediate. Cursor
+        // surfaces still go through the slow path because they need an
+        // owned RGBA copy for the cursor protocol.
+        if !is_cursor && let Some(shm) = buf.data::<ShmBufferData>() {
+            let w = shm.width as u32;
+            let h = shm.height as u32;
+            let stride = shm.stride as usize;
+            let offset = shm.offset as usize;
+            let format = shm.format;
+            if w > 0
+                && h > 0
+                && let Some(ref mut vk) = self.vulkan_renderer
+            {
+                let swap_rb =
+                    !matches!(format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
+                let force_opaque =
+                    matches!(format, wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888);
+                let row_bytes = w as usize * 4;
+                let uploaded = shm
+                    .pool
+                    .with_mmap(|slice| {
+                        if offset + stride * (h as usize - 1) + row_bytes > slice.len() {
+                            return false;
+                        }
+                        vk.upload_surface_shm_mmap(
+                            surface_id,
+                            slice,
+                            offset,
+                            stride,
+                            w,
+                            h,
+                            swap_rb,
+                            force_opaque,
+                        )
+                    })
+                    .unwrap_or(false);
+                if uploaded {
+                    self.surface_meta.insert(
+                        surface_id.clone(),
+                        super::render::SurfaceMeta {
+                            width: w,
+                            height: h,
+                            scale,
+                            y_invert: false,
+                        },
+                    );
+                    buf.release();
+                    return;
+                }
+            }
         }
 
         if let Some((w, h, pixels)) = self.read_buffer(&buf) {

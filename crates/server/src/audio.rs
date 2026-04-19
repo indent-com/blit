@@ -83,6 +83,9 @@ pub struct AudioPipeline {
     /// Shared flag set to `false` when the reader/encoder task exits.
     /// Lets `is_alive()` detect a dead encoder even if pw-cat hasn't exited.
     encoder_alive: Arc<AtomicBool>,
+    /// True while at least one client is subscribed to audio. When false
+    /// the encoder drains the pipe but skips the Opus encode step.
+    has_listener: Arc<AtomicBool>,
     /// D-Bus session bus address for restarting sub-processes.
     dbus_address: String,
     /// Cloned sender for spawning new encoder tasks on pw-cat restart.
@@ -563,6 +566,8 @@ impl AudioPipeline {
         let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(bitrate);
         let encoder_alive = Arc::new(AtomicBool::new(true));
         let encoder_alive_clone = encoder_alive.clone();
+        let has_listener = Arc::new(AtomicBool::new(false));
+        let has_listener_clone = has_listener.clone();
         let verbose_copy = verbose;
         tokio::spawn(async move {
             let result = reader_encoder_task(
@@ -572,6 +577,7 @@ impl AudioPipeline {
                 verbose_copy,
                 epoch,
                 bitrate_rx,
+                has_listener_clone,
             )
             .await;
             encoder_alive_clone.store(false, Ordering::Release);
@@ -594,6 +600,7 @@ impl AudioPipeline {
             alive: true,
             bitrate_tx,
             encoder_alive,
+            has_listener,
             dbus_address: dbus_address.to_string(),
             opus_tx: opus_tx_keep,
             verbose,
@@ -861,10 +868,19 @@ impl AudioPipeline {
         let bitrate_rx = self.bitrate_tx.subscribe();
         let verbose = self.verbose;
         let epoch = self.epoch;
+        let has_listener = self.has_listener.clone();
 
         tokio::spawn(async move {
-            let result =
-                reader_encoder_task(stdout, opus_tx, bitrate, verbose, epoch, bitrate_rx).await;
+            let result = reader_encoder_task(
+                stdout,
+                opus_tx,
+                bitrate,
+                verbose,
+                epoch,
+                bitrate_rx,
+                has_listener,
+            )
+            .await;
             encoder_alive.store(false, Ordering::Release);
             if let Err(e) = result
                 && verbose
@@ -882,6 +898,13 @@ impl AudioPipeline {
     /// Update the Opus encoder bitrate. Takes effect on the next frame.
     pub fn set_bitrate(&self, bitrate: i32) {
         let _ = self.bitrate_tx.send(bitrate);
+    }
+
+    /// Tell the encoder whether any client is currently subscribed.
+    /// When false, the encoder still drains pw-cat's pipe (to avoid
+    /// backpressure into PipeWire) but skips the Opus encode step.
+    pub fn set_has_listener(&self, has: bool) {
+        self.has_listener.store(has, Ordering::Release);
     }
 
     /// Build the `PULSE_SERVER` value for child process environments.
@@ -934,6 +957,7 @@ async fn reader_encoder_task(
     verbose: bool,
     epoch: Instant,
     mut bitrate_rx: tokio::sync::watch::Receiver<i32>,
+    has_listener: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // Wrap the synchronous ChildStdout in a tokio async reader.
     let mut reader = tokio::process::ChildStdout::from_std(stdout)
@@ -945,6 +969,13 @@ async fn reader_encoder_task(
     encoder
         .set_bitrate(opus::Bitrate::Bits(bitrate))
         .map_err(|e| format!("failed to set Opus bitrate: {e}"))?;
+    // DTX: during silence the encoder emits tiny frames (or none at all),
+    // cutting both bitrate and CPU across the CELT analysis pipeline.
+    if let Err(e) = encoder.set_dtx(true)
+        && verbose
+    {
+        eprintln!("[audio] failed to enable Opus DTX: {e}");
+    }
     let mut current_bitrate = bitrate;
 
     if verbose {
@@ -989,6 +1020,19 @@ async fn reader_encoder_task(
 
         // Process all complete 20 ms frames in the buffer.
         while byte_offset >= FRAME_FLOATS * 4 {
+            let consumed = FRAME_FLOATS * 4;
+
+            // When no client is listening, drain the pipe but skip the
+            // per-frame f32 conversion and Opus encode — those are the
+            // expensive steps. We still must consume the bytes so
+            // pw-cat's stdout pipe doesn't fill and apply backpressure
+            // into PipeWire.
+            if !has_listener.load(Ordering::Acquire) {
+                byte_buf.copy_within(consumed..byte_offset, 0);
+                byte_offset -= consumed;
+                continue;
+            }
+
             // Convert bytes to f32 samples (little-endian).
             for (i, sample) in pcm_buf.iter_mut().enumerate() {
                 let off = i * 4;
@@ -1008,7 +1052,6 @@ async fn reader_encoder_task(
                     if verbose {
                         eprintln!("[audio] Opus encode error, skipping frame: {e}");
                     }
-                    let consumed = FRAME_FLOATS * 4;
                     byte_buf.copy_within(consumed..byte_offset, 0);
                     byte_offset -= consumed;
                     continue;
@@ -1038,7 +1081,6 @@ async fn reader_encoder_task(
             }
 
             // Shift remaining bytes to the front.
-            let consumed = FRAME_FLOATS * 4;
             byte_buf.copy_within(consumed..byte_offset, 0);
             byte_offset -= consumed;
         }
