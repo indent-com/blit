@@ -11,7 +11,13 @@ pick_prefix() {
     *) echo "/usr/local" ;;
   esac
 }
-PREFIX="${BLIT_PREFIX:-${BLIT_INSTALL_DIR:-$(pick_prefix)}}"
+# Legacy BLIT_INSTALL_DIR pointed at the bin directory; strip the trailing /bin
+# so it can be used as a prefix.
+legacy_prefix="${BLIT_INSTALL_DIR:-}"
+case "$legacy_prefix" in
+  */bin) legacy_prefix="${legacy_prefix%/bin}" ;;
+esac
+PREFIX="${BLIT_PREFIX:-${legacy_prefix:-$(pick_prefix)}}"
 
 detect_libc() {
   # Prefer glibc when available (dlopen works for GPU drivers).
@@ -77,10 +83,20 @@ main() {
 
   tar -xzf "$tmp/$tarball" -C "$tmp"
 
+  # Walk up to the deepest existing ancestor to test writability — `-w` on a
+  # nonexistent directory always fails and would force sudo needlessly.
+  check="$PREFIX/bin"
+  while [ ! -e "$check" ]; do
+    parent=$(dirname -- "$check")
+    [ "$parent" = "$check" ] && break
+    check="$parent"
+  done
   elevate=""
-  if ! [ -w "$PREFIX/bin" ] 2>/dev/null && [ "$(id -u)" != "0" ]; then
+  if ! [ -w "$check" ] && [ "$(id -u)" != "0" ]; then
     elevate=$(pick_elevate)
-    echo "installing to $PREFIX (requires $elevate)..."
+    echo "installing to $PREFIX/bin (requires $elevate)..."
+  else
+    echo "installing to $PREFIX/bin..."
   fi
   $elevate mkdir -p "$PREFIX/bin"
   $elevate cp "$tmp/bin/blit" "$PREFIX/bin/blit"
