@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.27.1";
+  version = "0.27.2";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;

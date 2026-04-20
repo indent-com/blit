@@ -871,7 +871,22 @@ function WorkspaceScreen(props: {
   createEffect(() => {
     const host = blitHost();
     const parts: string[] = [];
-    const fs = focusedSession();
+    // In BSP, the workspace's focusedSessionId can be resurrected by
+    // resolveFocusedSessionId's per-connection fallback on any connection
+    // event (e.g. a terminal title update), even after BSP explicitly
+    // cleared it to focus a surface or empty pane.  Gate on BSP's focused
+    // pane actually holding a session so a background terminal's title
+    // can't leak into the browser title bar.
+    const al = activeLayout();
+    const bspHasSession =
+      al != null &&
+      (() => {
+        const pid = bspFocusedPaneId();
+        if (!pid) return false;
+        const assignment = layoutAssignments()?.assignments[pid] ?? null;
+        return assignment != null && !isSurfaceAssignment(assignment);
+      })();
+    const fs = al && !bspHasSession ? null : focusedSession();
     if (fs) {
       if (fs.title) parts.push(fs.title);
       const label = connectionLabels().get(fs.connectionId);
