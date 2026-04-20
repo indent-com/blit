@@ -877,6 +877,12 @@ function WorkspaceScreen(props: {
     // cleared it to focus a surface or empty pane.  Gate on BSP's focused
     // pane actually holding a session so a background terminal's title
     // can't leak into the browser title bar.
+    //
+    // Outside BSP the same leak happens when a surface is focused:
+    // focusedSessionId still points at the terminal that was showing
+    // before the surface took over, so terminal title updates would
+    // bleed into document.title.  Suppress the session branch when a
+    // surface is focused.
     const al = activeLayout();
     const bspHasSession =
       al != null &&
@@ -886,7 +892,8 @@ function WorkspaceScreen(props: {
         const assignment = layoutAssignments()?.assignments[pid] ?? null;
         return assignment != null && !isSurfaceAssignment(assignment);
       })();
-    const fs = al && !bspHasSession ? null : focusedSession();
+    const sessionFocused = al ? bspHasSession : focusedSurfaceId() == null;
+    const fs = sessionFocused ? focusedSession() : null;
     if (fs) {
       if (fs.title) parts.push(fs.title);
       const label = connectionLabels().get(fs.connectionId);
@@ -1792,7 +1799,6 @@ function WorkspaceScreen(props: {
             metrics={metrics()}
             palette={palette()}
             fontSize={fontSize()}
-            termSize={null}
             fontLoading={fontLoading()}
             debug={debugPanel()}
             toggleDebug={toggleDebug}

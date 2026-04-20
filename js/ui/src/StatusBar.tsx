@@ -70,7 +70,6 @@ export function StatusBar(props: {
   metrics: Metrics;
   palette: TerminalPalette;
   fontSize: number;
-  termSize: string | null;
   fontLoading: boolean;
   debug: boolean;
   toggleDebug: () => void;
@@ -179,17 +178,6 @@ export function StatusBar(props: {
             );
           }}
         </Show>
-      </span>
-      <span
-        style={{
-          "font-size": `${scale().xs}px`,
-          opacity: 0.5,
-          "flex-shrink": 0,
-          "white-space": "nowrap",
-        }}
-      >
-        {props.termSize ? `${props.termSize}@` : ""}
-        {props.metrics.fps}/{props.metrics.ups}
       </span>
       <Show when={props.audioAvailable || props.hasSurfaces}>
         <button

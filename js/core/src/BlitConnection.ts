@@ -1122,9 +1122,13 @@ export class BlitConnection {
         // surfaces so the UI doesn't show stale windows while reconnecting.
         // This mirrors the S2C_HELLO reset path but happens *before* the
         // transport drops, so the UI clears instantly.
-        this.surfaceStore.reset();
-        this.audioPlayer.reset();
-        this.resetSurfaceSubsForReconnect();
+        //
+        // Flip ready=false *before* wiping the surface store so consumers
+        // (e.g. the BSP reconciler) observe the "not ready" state at the
+        // moment surfaces drop out of the live list.  Otherwise a
+        // reactive flush driven by surfaceStore.reset() can race ahead
+        // and wipe surface pane assignments because the connection still
+        // looks ready.
         for (const session of this.sessions) {
           if (session.state !== "closed") {
             this.markSessionClosed(session.id, false);
@@ -1137,6 +1141,9 @@ export class BlitConnection {
           focusedSessionId: null,
         };
         this.emit();
+        this.surfaceStore.reset();
+        this.audioPlayer.reset();
+        this.resetSurfaceSubsForReconnect();
         // Immediately reconnect so the UI recovers as fast as possible
         // when the server restarts.  Do NOT call transport.close() — that
         // permanently disposes the transport.  transport.reconnect() tears
@@ -1275,9 +1282,12 @@ export class BlitConnection {
         // the initial burst and sets `ready: true`.  This also handles
         // transparent gateway reconnects where the transport never went
         // through "disconnected".
-        this.surfaceStore.reset();
-        this.audioPlayer.reset();
-        this.resetSurfaceSubsForReconnect();
+        //
+        // Flip ready=false *before* wiping the surface store: a
+        // reactive flush driven by surfaceStore.reset() would otherwise
+        // see the connection still "ready" with an empty surface list
+        // and nuke pane surface assignments before we had a chance to
+        // mark the connection as reconnecting.
         for (const session of this.sessions) {
           if (session.state !== "closed") {
             this.markSessionClosed(session.id, false);
@@ -1298,6 +1308,9 @@ export class BlitConnection {
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
         };
         this.emit();
+        this.surfaceStore.reset();
+        this.audioPlayer.reset();
+        this.resetSurfaceSubsForReconnect();
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -1564,16 +1577,6 @@ export class BlitConnection {
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
-      this.surfaceStore.handleDisconnect();
-      this.audioPlayer.reset();
-      // All server-side surface subscriptions are implicitly dropped
-      // when the transport dies, but the CLIENT-SIDE ref-counts (one
-      // per live mount) must be preserved: each mount is still there
-      // and will call `refreshSurfaceSubscribe` when the store's
-      // generation ticks forward, which is how the wire subscribe gets
-      // re-sent on reconnect.  Just reset `lastSentQuality` so the
-      // refresh actually fires.
-      this.resetSurfaceSubsForReconnect();
       // Dismiss all sessions so the UI doesn't show stale terminals from a
       // server that crashed without sending S2C_QUIT.  On reconnect the
       // server's S2C_HELLO + S2C_LIST sequence rebuilds the session list
@@ -1589,6 +1592,24 @@ export class BlitConnection {
         sessions: this.publicSessions,
         focusedSessionId: null,
       };
+      // Emit the ready=false snapshot *before* wiping the surface store
+      // so reactive consumers (BSP reconciliation) see the connection
+      // as "not ready" when surfaces drop out of the live list.
+      // Otherwise surfaceStore.handleDisconnect() can synchronously
+      // trigger a reconcile that still thinks the connection is ready
+      // and nuke the pane surface assignments.
+      this.emit();
+      this.surfaceStore.handleDisconnect();
+      this.audioPlayer.reset();
+      // All server-side surface subscriptions are implicitly dropped
+      // when the transport dies, but the CLIENT-SIDE ref-counts (one
+      // per live mount) must be preserved: each mount is still there
+      // and will call `refreshSurfaceSubscribe` when the store's
+      // generation ticks forward, which is how the wire subscribe gets
+      // re-sent on reconnect.  Just reset `lastSentQuality` so the
+      // refresh actually fires.
+      this.resetSurfaceSubsForReconnect();
+      return;
     }
 
     this.emit();

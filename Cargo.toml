@@ -23,16 +23,16 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.27.2", path = "crates/remote" }
-blit-alacritty = { version = "0.27.2", path = "crates/alacritty-driver" }
-blit-fonts = { version = "0.27.2", path = "crates/fonts" }
-blit-webserver = { version = "0.27.2", path = "crates/webserver" }
-blit-server = { version = "0.27.2", path = "crates/server" }
-blit-gateway = { version = "0.27.2", path = "crates/gateway" }
-blit-proxy = { version = "0.27.2", path = "crates/proxy" }
-blit-webrtc-forwarder = { version = "0.27.2", path = "crates/webrtc-forwarder" }
-blit-compositor = { version = "0.27.2", path = "crates/compositor" }
-blit-ssh = { version = "0.27.2", path = "crates/ssh" }
+blit-remote = { version = "0.27.3", path = "crates/remote" }
+blit-alacritty = { version = "0.27.3", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.27.3", path = "crates/fonts" }
+blit-webserver = { version = "0.27.3", path = "crates/webserver" }
+blit-server = { version = "0.27.3", path = "crates/server" }
+blit-gateway = { version = "0.27.3", path = "crates/gateway" }
+blit-proxy = { version = "0.27.3", path = "crates/proxy" }
+blit-webrtc-forwarder = { version = "0.27.3", path = "crates/webrtc-forwarder" }
+blit-compositor = { version = "0.27.3", path = "crates/compositor" }
+blit-ssh = { version = "0.27.3", path = "crates/ssh" }
 
 [patch.crates-io]
 alacritty_terminal = { git = "https://github.com/indent-com/alacritty.git", branch = "blit/emoji-width-fix" }

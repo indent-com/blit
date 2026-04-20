@@ -304,10 +304,14 @@ export class BlitSurfaceCanvas {
   private pressedKeys = new Set<number>();
 
   /**
-   * When non-null the canvas internal resolution is controlled externally
-   * (by the framework binding's ResizeObserver) and frames are drawn
-   * scaled to fill the canvas rather than the canvas being resized to
-   * match each frame.
+   * When non-null the surface is in resizable mode: the framework binding's
+   * ResizeObserver calls setDisplaySize with the container's physical pixel
+   * size and a server-side resize is requested.  The canvas backing buffer
+   * always mirrors the decoded frame; CSS (width:100%/height:100% +
+   * object-fit: contain) scales it to fill the container.  Keeping the
+   * canvas at the frame's native size avoids a blurry "jump" mid-drag
+   * where an old, smaller frame would get drawImage-upscaled into a
+   * prematurely enlarged canvas before the new keyframe arrives.
    */
   private _displaySize: { width: number; height: number } | null = null;
 
@@ -402,18 +406,9 @@ export class BlitSurfaceCanvas {
     canvas.style.outline = "none";
     canvas.style.width = "100%";
     canvas.style.height = "100%";
-    if (this._displaySize) {
-      // Resizable mode: canvas resolution is pinned by the framework
-      // binding.  No object-fit needed since canvas.width/height matches
-      // the container's physical pixel size.
-      canvas.width = this._displaySize.width;
-      canvas.height = this._displaySize.height;
-    } else {
-      // Non-resizable (thumbnail) mode: scale to fit.
-      canvas.style.objectFit = "contain";
-      canvas.width = this.surface?.width || 640;
-      canvas.height = this.surface?.height || 480;
-    }
+    canvas.style.objectFit = "contain";
+    canvas.width = this.surface?.width || 640;
+    canvas.height = this.surface?.height || 480;
     // Hidden textarea for capturing IME composition and properly-shifted
     // characters.  Positioned behind the canvas so it doesn't interfere
     // with rendering but still receives focus and keyboard events.
@@ -534,26 +529,19 @@ export class BlitSurfaceCanvas {
   setDisplaySize(width: number | null, height?: number): void {
     if (width == null) {
       this._displaySize = null;
-      if (this.canvas) {
-        this.canvas.style.objectFit = "contain";
-      }
       return;
     }
     const w = Math.round(width);
     const h = Math.round(height!);
     if (w <= 0 || h <= 0) return;
     this._displaySize = { width: w, height: h };
-    if (this.canvas) {
-      // Switch from object-fit scaling to display-size pinned mode.
-      this.canvas.style.objectFit = "";
-      if (this.canvas.width !== w || this.canvas.height !== h) {
-        this.canvas.width = w;
-        this.canvas.height = h;
-      }
-      // Re-blit the last frame at the new canvas size.
-      const conn = this.getConn();
-      if (conn) this.blitFromStore(conn.surfaceStore);
-    }
+    // Canvas backing buffer is intentionally NOT resized here.  It tracks
+    // the decoded frame size (set in blitFromStore) so the last sharp
+    // frame stays sharp while CSS (object-fit: contain) scales it to the
+    // new container size.  Resizing the canvas pre-emptively would clear
+    // the backing buffer and force a drawImage upscale of the stale
+    // frame, producing a visible "blurry intermediate" step until the
+    // server's keyframe at the requested size arrives.
   }
 
   /**
@@ -658,9 +646,11 @@ export class BlitSurfaceCanvas {
             this._subscribedGeneration = store.generation;
           }
         }
-        // Update canvas size when surface info first arrives,
-        // unless the display size is pinned by a ResizeObserver.
-        if (!prev && this.canvas && !this._displaySize) {
+        // Size the canvas backing buffer to the surface when info first
+        // arrives so the canvas has sensible intrinsic dimensions before
+        // any frame has been decoded.  blitFromStore will re-snap it to
+        // the actual frame size on first paint.
+        if (!prev && this.canvas) {
           this.canvas.width = this.surface.width;
           this.canvas.height = this.surface.height;
         }
@@ -712,36 +702,14 @@ export class BlitSurfaceCanvas {
     if (!src || !canvas || !ctx) return;
     if (src.width === 0 || src.height === 0) return;
 
-    if (this._displaySize) {
-      // Resizable mode: canvas resolution is pinned to the container's
-      // physical pixel size.  Draw the source frame scaled to fit,
-      // preserving aspect ratio (letterbox/pillarbox).
-      const srcAR = src.width / src.height;
-      const dstAR = canvas.width / canvas.height;
-      let dw: number, dh: number, dx: number, dy: number;
-      if (srcAR > dstAR) {
-        // Source is wider — pillarbox (bars top/bottom)
-        dw = canvas.width;
-        dh = canvas.width / srcAR;
-        dx = 0;
-        dy = (canvas.height - dh) / 2;
-      } else {
-        // Source is taller — letterbox (bars left/right)
-        dh = canvas.height;
-        dw = canvas.height * srcAR;
-        dx = (canvas.width - dw) / 2;
-        dy = 0;
-      }
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(src, dx, dy, dw, dh);
-    } else {
-      // Frame-tracking mode: canvas resolution follows the source frame.
-      if (canvas.width !== src.width || canvas.height !== src.height) {
-        canvas.width = src.width;
-        canvas.height = src.height;
-      }
-      ctx.drawImage(src, 0, 0);
+    // Canvas backing buffer mirrors the source frame exactly.  CSS
+    // (width:100%/height:100% + object-fit: contain) scales to the
+    // container and handles letterboxing, so no drawImage upscale.
+    if (canvas.width !== src.width || canvas.height !== src.height) {
+      canvas.width = src.width;
+      canvas.height = src.height;
     }
+    ctx.drawImage(src, 0, 0);
   }
 
   private resubscribe(): void {
@@ -875,27 +843,31 @@ export class BlitSurfaceCanvas {
       this.pressedButtons.delete(e.button);
     }
     const rect = this.canvas.getBoundingClientRect();
-    // Convert CSS-pixel coordinates to canvas (physical) pixel coordinates.
-    const canvasX = (e.clientX - rect.left) * (this.canvas.width / rect.width);
-    const canvasY = (e.clientY - rect.top) * (this.canvas.height / rect.height);
-    // Compute the letterbox/pillarbox geometry (same as blitFromStore) so
-    // we map through the actual drawn region, not the full canvas.
-    const srcAR = this.surface.width / this.surface.height;
-    const dstAR = this.canvas.width / this.canvas.height;
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+    if (cw === 0 || ch === 0 || rect.width === 0 || rect.height === 0) return;
+    // The canvas's CSS box fills the container; its intrinsic aspect
+    // (canvas.width/height === src frame) is letterboxed within via
+    // object-fit: contain.  Compute the drawn content region in CSS
+    // coordinates, then map a click into surface coordinates.
+    const srcAR = cw / ch;
+    const dstAR = rect.width / rect.height;
     let dw: number, dh: number, dx: number, dy: number;
     if (srcAR > dstAR) {
-      dw = this.canvas.width;
-      dh = this.canvas.width / srcAR;
+      dw = rect.width;
+      dh = rect.width / srcAR;
       dx = 0;
-      dy = (this.canvas.height - dh) / 2;
+      dy = (rect.height - dh) / 2;
     } else {
-      dh = this.canvas.height;
-      dw = this.canvas.height * srcAR;
-      dx = (this.canvas.width - dw) / 2;
+      dh = rect.height;
+      dw = rect.height * srcAR;
+      dx = (rect.width - dw) / 2;
       dy = 0;
     }
-    const x = Math.round(((canvasX - dx) / dw) * this.surface.width);
-    const y = Math.round(((canvasY - dy) / dh) * this.surface.height);
+    const px = e.clientX - rect.left - dx;
+    const py = e.clientY - rect.top - dy;
+    const x = Math.round((px / dw) * this.surface.width);
+    const y = Math.round((py / dh) * this.surface.height);
     conn.sendSurfacePointer(this._surfaceId, type, e.button, x, y);
   }
 
