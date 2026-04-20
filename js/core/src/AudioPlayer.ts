@@ -16,37 +16,46 @@
 const MAX_BUFFER_FRAMES = 25; // 500 ms
 
 /**
- * Target jitter buffer depth in samples at 48 kHz.  The worklet
- * accumulates this much audio before starting playback and re-buffers
- * after a sustained underrun.  Absorbs network jitter, TCP write
- * bursts from video frames, and main-thread stalls.  Trades latency
- * for resilience: any single arrival gap larger than this causes an
- * underrun.
+ * Adaptive jitter buffer: the worklet starts at MIN_BUFFER_SAMPLES, grows
+ * by one 20 ms frame on the leading edge of each underrun event, and
+ * shrinks back one frame at a time after DECAY_STABLE_SAMPLES of
+ * underrun-free playback.  No hard upper bound — the DRIFT_JUMP_MS skip
+ * path reclaims excess latency if the buffer ever runs away.  Hysteresis
+ * is provided by the MIN floor: once bufferTarget hits it, shrinking
+ * stops.  Floor is three frames (60 ms) to absorb two back-to-back late
+ * arrivals before the buffer empties; stable connections steady-state at
+ * 60 ms while jittery ones self-size to whatever headroom they need.
  */
-const JITTER_BUFFER_SAMPLES = 2400; // 50 ms at 48 kHz
+const MIN_BUFFER_SAMPLES = 2880; // 3 frames = 60 ms at 48 kHz
+
+/**
+ * Samples of uninterrupted, non-buffering playback required before
+ * bufferTarget shrinks by one frame.  Set long enough that recurring
+ * jitter (underrun every few seconds) never decays the buffer back
+ * toward the floor between events — otherwise the buffer oscillates
+ * and glitches on every cycle.  Shrinking is slow by design; growth
+ * reacts within one event.
+ */
+const DECAY_STABLE_SAMPLES = 720000; // 15 s at 48 kHz
 
 // -- A/V sync constants ----------------------------------------------------
 
 /** How often the worklet reports its consumed-sample position (in samples). */
 const POS_REPORT_INTERVAL = 4800; // ~100 ms at 48 kHz
 
-/**
- * Steady-state target for `audioMs - lastVideoTimestampMs` (ms).  Because
- * video is rendered immediately on arrival but audio is held in the jitter
- * buffer for ~JITTER_BUFFER_SAMPLES, the audio currently *playing* is
- * naturally that many ms behind the most-recently-rendered video frame —
- * even when the buffer is exactly at its target depth.  Targeting a drift
- * of zero is therefore unattainable while keeping the buffer stocked: the
- * controller would clamp the rate at the maximum offset, drain the buffer
- * in seconds, and cause a periodic underrun cycle.  Subtract this offset
- * so that drift = 0 (relative to target) corresponds to "buffer at the
- * desired depth".
+/*
+ * The steady-state target for `audioMs - lastVideoTimestampMs` is computed
+ * per-position from the worklet's current bufferTarget (reported alongside
+ * each pos message).  Audio held in the jitter buffer lags video by that
+ * many ms, so treating the current (adaptive) depth as the equilibrium
+ * keeps drift=0 aligned with "buffer at desired depth" even as the target
+ * grows or shrinks during the session.
  */
-const TARGET_DRIFT_MS = -(JITTER_BUFFER_SAMPLES / 48);
 
 /**
- * Drift dead-zone: don't adjust rate if |drift - TARGET_DRIFT_MS| is below
- * this (ms).  Avoids oscillation when sync is already good.
+ * Drift dead-zone: don't adjust rate if |drift| is below this (ms).
+ * Drift is already measured relative to the adaptive target, so zero
+ * means "buffer at target depth".  Avoids oscillation when sync is good.
  */
 const DRIFT_DEADZONE_MS = 10;
 
@@ -57,15 +66,7 @@ const DRIFT_DEADZONE_MS = 10;
 const DRIFT_FULL_CORRECTION_MS = 300;
 
 /** Maximum rate offset from 1.0 in either direction. */
-const MAX_RATE_OFFSET = 0.05; // ±5%
-
-/**
- * Hard ceiling on worklet buffer depth (samples at 48 kHz).  If the buffer
- * exceeds this, the worklet drops the oldest chunks until it is back at the
- * jitter-buffer target.  This caps the maximum latency that can accumulate
- * from network bursts, tab backgrounding, or decode stalls.
- */
-const MAX_BUFFERED_SAMPLES = 24000; // 500 ms at 48 kHz
+const MAX_RATE_OFFSET = 0.02; // ±2%
 
 /**
  * Drift threshold for a hard jump (ms).  When audio is *ahead* of video by
@@ -97,6 +98,18 @@ const UNDERRUN_REBUFFER_THRESHOLD = 3;
 
 /** Samples per 20 ms Opus frame at 48 kHz (per-channel). */
 const SAMPLES_PER_20_MS = 960;
+
+/**
+ * How many 20 ms frames to grow bufferTarget by on each underrun event.
+ * Transport head-of-line blocking (audio serialized behind video bulk
+ * writes on the same TCP stream) produces arrival gaps proportional to
+ * the video bulk-write time — typically 100–200 ms on keyframes.  Growing
+ * by a single frame makes convergence take dozens of audible underruns;
+ * 5 frames (100 ms per event) reaches a buffer depth that absorbs those
+ * bursts within a handful of events.  Decay (15 s of clean playback per
+ * frame shrunk) claws back any overshoot.
+ */
+const GROW_FRAMES_PER_UNDERRUN = 5;
 
 /**
  * Fade-envelope length in samples used to mask the waveform discontinuity at
@@ -135,7 +148,8 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     this.lastReport = 0;    // consumed+offset at last report
     this.buffered = 0;      // total samples currently buffered
     this.buffering = true;  // true while accumulating the jitter buffer
-    this.bufferTarget = ${JITTER_BUFFER_SAMPLES}; // samples to accumulate before playing
+    this.bufferTarget = ${MIN_BUFFER_SAMPLES}; // adaptive: grows on underrun, shrinks on stability
+    this.stableSamples = 0; // consumed samples of underrun-free playback (drives shrinking)
     this.underruns = 0;     // consecutive underruns, drives adaptive buffer growth
     this.fadeGain = 0;      // applied output gain (0..1), ramps to mask underrun clicks
     this.fadeInc = 1 / ${FADE_SAMPLES}; // per-sample ramp rate
@@ -150,12 +164,14 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         this.buffered = 0;
         this.buffering = true;
         this.underruns = 0;
-        this.bufferTarget = ${JITTER_BUFFER_SAMPLES};
+        this.bufferTarget = ${MIN_BUFFER_SAMPLES};
+        this.stableSamples = 0;
         this.fadeGain = 0;
       } else if (e.data && e.data.type === "skip") {
         // Drop samples from the front to reduce drift without a full
         // flush.  Keeps playback running (no re-buffering silence).
-        let toSkip = e.data.samples | 0;
+        const requested = e.data.samples | 0;
+        let toSkip = requested;
         while (toSkip > 0 && this.buffer.length > 0) {
           const pcm = this.buffer[0];
           const half = pcm.length / 2;
@@ -173,26 +189,19 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
           }
         }
         this.frac = 0;
+        this.port.postMessage({
+          type: "event",
+          kind: "skip",
+          requested,
+          skipped: requested - toSkip,
+        });
       } else if (e.data && e.data.type === "rate") {
         this.rate = e.data.value;
       } else {
         this.buffer.push(e.data);
         this.buffered += e.data.length / 2; // half = per-channel sample count
-
-        // Hard buffer cap: if too much audio has accumulated (network burst,
-        // tab was backgrounded, decode stall, etc.), drop the oldest chunks
-        // to get back near the jitter-buffer target.  A brief discontinuity
-        // is far less jarring than ever-growing latency.
-        if (this.buffered > ${MAX_BUFFERED_SAMPLES}) {
-          while (this.buffer.length > 1 && this.buffered > this.bufferTarget) {
-            const dropped = this.buffer.shift();
-            const droppedSamples = dropped.length / 2;
-            this.buffered -= droppedSamples;
-            this.consumed += droppedSamples;
-            this.offset = 0;
-          }
-          this.frac = 0;
-        }
+        // No hard buffer cap: the DRIFT_JUMP_MS skip path (main thread)
+        // reclaims excess latency if something pathological accumulates.
       }
     };
   }
@@ -209,6 +218,12 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     // audio.  This absorbs network jitter and main-thread stalls.
     if (this.buffering && this.buffered >= this.bufferTarget) {
       this.buffering = false;
+      this.port.postMessage({
+        type: "event",
+        kind: "rebuffer_end",
+        target: this.bufferTarget,
+        buffered: this.buffered,
+      });
     }
 
     if (!this.buffering) while (written < needed && this.buffer.length > 0) {
@@ -295,23 +310,65 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     }
     this.fadeGain = g;
 
-    // Underrun: track consecutive underruns and re-enter buffering after
-    // a sustained gap.  Single-block underruns are common scheduling
-    // hiccups — re-buffering on every one is worse than the hiccup itself.
+    // Underrun handling has two jobs:
+    //   1. Grow bufferTarget on the *leading edge* of any underrun event,
+    //      so a single-block hiccup also buys headroom — not just
+    //      multi-block gaps.  Without this, short-but-frequent jitter
+    //      never grows the buffer and keeps producing ticks.
+    //   2. Re-enter buffering mode only when the gap is sustained
+    //      (>= UNDERRUN_REBUFFER_THRESHOLD consecutive blocks), since a
+    //      single-block dip is usually just scheduling and rebuffering
+    //      would be worse than the dip itself.
+    // Underrun blocks while already buffering don't count toward either —
+    // the silence is intentional while the buffer refills.
     if (written < needed) {
-      if (this.consumed > 0) {
+      this.stableSamples = 0;
+      if (this.consumed > 0 && !this.buffering) {
         this.underruns++;
+        if (this.underruns === 1) {
+          this.bufferTarget += ${SAMPLES_PER_20_MS * GROW_FRAMES_PER_UNDERRUN};
+          this.port.postMessage({
+            type: "event",
+            kind: "grow",
+            target: this.bufferTarget,
+            buffered: this.buffered,
+          });
+        }
         if (this.underruns >= ${UNDERRUN_REBUFFER_THRESHOLD}) {
-          this.bufferTarget = Math.min(
-            ${JITTER_BUFFER_SAMPLES} +
-              (this.underruns - ${UNDERRUN_REBUFFER_THRESHOLD}) * ${SAMPLES_PER_20_MS},
-            ${MAX_BUFFERED_SAMPLES}
-          );
           this.buffering = true;
+          this.port.postMessage({
+            type: "event",
+            kind: "rebuffer_start",
+            target: this.bufferTarget,
+            consecutive: this.underruns,
+          });
         }
       }
-    } else if (this.underruns > 0) {
-      this.underruns = Math.max(0, this.underruns - 0.01);
+    } else {
+      // End of any underrun event.
+      this.underruns = 0;
+      // Adaptive shrink: after DECAY_STABLE_SAMPLES of underrun-free,
+      // non-buffering playback, drop bufferTarget by one frame toward
+      // MIN_BUFFER_SAMPLES.  The MIN floor is the hysteresis — once there,
+      // shrinking halts until the next underrun grows the target again.
+      if (!this.buffering) {
+        this.stableSamples += needed;
+        if (
+          this.stableSamples >= ${DECAY_STABLE_SAMPLES} &&
+          this.bufferTarget > ${MIN_BUFFER_SAMPLES}
+        ) {
+          this.bufferTarget = Math.max(
+            this.bufferTarget - ${SAMPLES_PER_20_MS},
+            ${MIN_BUFFER_SAMPLES}
+          );
+          this.stableSamples = 0;
+          this.port.postMessage({
+            type: "event",
+            kind: "shrink",
+            target: this.bufferTarget,
+          });
+        }
+      }
     }
 
     // Report position periodically.  Include this.offset for accuracy
@@ -319,7 +376,12 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     const totalPos = this.consumed + this.offset;
     if (totalPos - this.lastReport >= ${POS_REPORT_INTERVAL}) {
       this.lastReport = totalPos;
-      this.port.postMessage({ type: "pos", value: totalPos });
+      this.port.postMessage({
+        type: "pos",
+        value: totalPos,
+        target: this.bufferTarget,
+        buffered: this.buffered,
+      });
     }
 
     // Keep processor alive even during silence.
@@ -330,13 +392,6 @@ registerProcessor("blit-audio", BlitAudioProcessor);
 `;
 
 // -- Timeline entry for mapping samples → server timestamps ----------------
-
-interface TimelineEntry {
-  /** Cumulative source sample offset at the start of this audio frame. */
-  sampleOffset: number;
-  /** Server timestamp (ms) of this audio frame. */
-  serverMs: number;
-}
 
 export class AudioPlayer {
   private ctx: AudioContext | null = null;
@@ -359,22 +414,28 @@ export class AudioPlayer {
    */
   private initializingContext = false;
 
-  // -- A/V sync state ------------------------------------------------------
+  // -- Rate servo state ---------------------------------------------------
+  //
+  // Audio runs a simple depth-based servo: if the worklet buffer sits
+  // below `bufferTarget` we slow consumption (rate < 1) to refill;
+  // above target we speed up (rate > 1) to drain.  Video is played
+  // back at its own real-time pace with no explicit A/V sync — both
+  // media are delivered as fast as the transport allows, so they stay
+  // aligned within the ppm-level clock skew of the sample-rate
+  // converters, which is imperceptible for sub-hour sessions.
 
-  /** Timeline: maps cumulative sample offsets to server timestamps. */
-  private timeline: TimelineEntry[] = [];
-  /** Cumulative source samples queued to the worklet. */
-  private samplesQueued = 0;
   /** Last consumed-sample position reported by the worklet. */
   private samplesConsumed = 0;
   /** Number of audio frames received (for warmup). */
   private framesReceived = 0;
-  /** Latest video frame server timestamp (ms), set externally. */
-  private lastVideoTimestampMs = -1;
   /** Current playback rate sent to the worklet. */
   private currentRate = 1.0;
   /** Smoothed rate — exponentially filtered to avoid wow/flutter. */
   private smoothedRate = 1.0;
+  /** Worklet's current adaptive bufferTarget (samples), mirrored from pos reports. */
+  private currentBufferTarget = MIN_BUFFER_SAMPLES;
+  /** Last observed buffered depth (samples, from pos reports) — feeds the drift servo. */
+  private lastBufferedSamples = 0;
 
   // -- Stall detection / auto-recovery ------------------------------------
 
@@ -514,21 +575,12 @@ export class AudioPlayer {
     this.emit();
   }
 
-  /**
-   * Notify the audio player of the latest video frame's server timestamp.
-   * Called from the connection layer whenever a surface frame arrives.
-   * Video is never delayed — this is used only to steer audio rate.
-   */
-  notifyVideoTimestamp(serverMs: number): void {
-    this.lastVideoTimestampMs = serverMs;
-  }
-
   /** Handle an incoming S2C_AUDIO_FRAME. */
   handleAudioFrame(timestamp: number, _flags: number, data: Uint8Array): void {
-    if (this._destroyed || this._muted) return;
-
+    if (this._destroyed) return;
     const now = Date.now();
     this.lastFrameAt = now;
+    if (this._muted) return;
     this.startHealthCheck();
 
     // Inline decoder stall check: if we've been feeding the decoder for
@@ -643,16 +695,14 @@ export class AudioPlayer {
     this.listeners.clear();
   }
 
-  // -- Internal: sync ------------------------------------------------------
+  // -- Internal: rate servo -------------------------------------------------
 
   private resetSync(): void {
-    this.timeline = [];
-    this.samplesQueued = 0;
     this.samplesConsumed = 0;
     this.framesReceived = 0;
-    this.lastVideoTimestampMs = -1;
     this.currentRate = 1.0;
     this.smoothedRate = 1.0;
+    this.currentBufferTarget = MIN_BUFFER_SAMPLES;
     this.resetDecoderState();
   }
 
@@ -683,76 +733,29 @@ export class AudioPlayer {
   }
 
   /**
-   * Given the worklet's consumed sample count, estimate the server
-   * timestamp (ms) of the audio currently being played back.
-   */
-  private audioTimestampAtSample(consumed: number): number | null {
-    const tl = this.timeline;
-    if (tl.length === 0) return null;
-
-    // Binary search for the last entry where sampleOffset <= consumed.
-    let lo = 0;
-    let hi = tl.length - 1;
-    if (consumed < tl[0].sampleOffset) return tl[0].serverMs;
-    if (consumed >= tl[hi].sampleOffset) return tl[hi].serverMs;
-
-    while (lo < hi - 1) {
-      const mid = (lo + hi) >> 1;
-      if (tl[mid].sampleOffset <= consumed) lo = mid;
-      else hi = mid;
-    }
-
-    // Linearly interpolate between lo and hi.
-    const a = tl[lo];
-    const b = tl[hi];
-    const sampleSpan = b.sampleOffset - a.sampleOffset;
-    if (sampleSpan <= 0) return a.serverMs;
-    const t = (consumed - a.sampleOffset) / sampleSpan;
-    return a.serverMs + t * (b.serverMs - a.serverMs);
-  }
-
-  /**
    * Called when the worklet reports its consumed-sample position.
-   * Computes drift and adjusts playback rate.
+   * Runs the buffer-depth servo: compares actual buffered depth against
+   * the adaptive target and nudges the worklet's playback rate within
+   * ±5 % to push the buffer back toward target.
    */
   private onWorkletPosition(consumed: number): void {
+    const now = Date.now();
     this.samplesConsumed = consumed;
-    this.lastWorkletReportAt = Date.now();
+    this.lastWorkletReportAt = now;
 
-    // Don't adjust during warmup — not enough data to estimate drift.
+    // Don't adjust during warmup — not enough samples to stabilise.
     if (this.framesReceived < SYNC_WARMUP_FRAMES) return;
-    if (this.lastVideoTimestampMs < 0) return;
 
-    const audioMs = this.audioTimestampAtSample(consumed);
-    if (audioMs === null) return;
-
-    // Drift is measured *relative to TARGET_DRIFT_MS*, the natural lag
-    // between currently-playing audio and currently-rendered video that
-    // results from holding the jitter buffer.  This makes "buffer at the
-    // target depth" the equilibrium so the rate controller stops draining
-    // the buffer toward zero.
-    // drift > 0 → audio is ahead of where it should be → slow down (rate < 1)
-    // drift < 0 → audio is behind where it should be → speed up (rate > 1)
-    const drift = audioMs - this.lastVideoTimestampMs - TARGET_DRIFT_MS;
-
-    // Hard jump: drift is too large for ±5% rate steering to close
-    // quickly.  Handle ahead and behind differently.
-    if (drift > DRIFT_JUMP_MS) {
-      // Audio is far ahead of target — too much audio buffered.  Skip
-      // forward in the worklet buffer to align, then reset sync to
-      // re-measure.  Avoids the flush→silence→rebuffer cycle.
-      const skipSamples = ((drift - DRIFT_DEADZONE_MS) * 48) | 0;
-      if (skipSamples > 0) {
-        this.worklet?.port.postMessage({ type: "skip", samples: skipSamples });
-      }
-      this.resetSync();
-      return;
-    }
-    // Audio far behind target (drift < -DRIFT_JUMP_MS): the buffer
-    // emptied or frames were dropped.  Don't flush — that discards the
-    // only audio we have.  Fall through to normal rate steering, which
-    // applies the full +5% correction until the buffer refills to its
-    // target depth.
+    // Servo target: keep `buffered` at `bufferTarget`.
+    //   buffered < target → drift > 0 → rate < 1 (slow down, refill)
+    //   buffered > target → drift < 0 → rate > 1 (speed up, drain)
+    // No A/V sync: video is played as it arrives and audio targets a
+    // small buffer; both ride the same real-time network pacing, so
+    // they stay aligned to within ppm-level clock skew which is
+    // imperceptible over typical session lengths.
+    const targetMs = this.currentBufferTarget / 48;
+    const bufferedMs = this.lastBufferedSamples / 48;
+    const drift = targetMs - bufferedMs;
 
     let rate = 1.0;
     const absDrift = Math.abs(drift);
@@ -764,13 +767,11 @@ export class AudioPlayer {
             (DRIFT_FULL_CORRECTION_MS - DRIFT_DEADZONE_MS),
           1.0,
         ) * MAX_RATE_OFFSET;
-      // Audio ahead → consume source slower (rate < 1) to let video catch up.
-      // Audio behind → consume source faster (rate > 1) to catch up to video.
       rate = drift > 0 ? 1.0 - correction : 1.0 + correction;
     }
 
-    // Exponential smoothing: blend toward target rate to avoid abrupt
-    // pitch changes (wow/flutter) from jittery drift measurements.
+    // Exponential smoothing: avoids abrupt pitch changes from jittery
+    // per-100 ms drift measurements.
     this.smoothedRate += RATE_SMOOTHING_ALPHA * (rate - this.smoothedRate);
 
     if (this.smoothedRate !== this.currentRate) {
@@ -779,14 +780,6 @@ export class AudioPlayer {
         type: "rate",
         value: this.smoothedRate,
       });
-    }
-
-    // Prune old timeline entries (keep at most 100 behind consumed position).
-    while (
-      this.timeline.length > 2 &&
-      this.timeline[1].sampleOffset < consumed
-    ) {
-      this.timeline.shift();
     }
   }
 
@@ -1037,10 +1030,22 @@ export class AudioPlayer {
         if (!this._destroyed) this.resetPipeline();
       });
 
-      // Listen for position reports from the worklet.
+      // Listen for position reports and buffer events from the worklet.
       this.worklet.port.onmessage = (e: MessageEvent) => {
-        if (e.data && e.data.type === "pos") {
-          this.onWorkletPosition(e.data.value);
+        const d = e.data;
+        if (!d) return;
+        if (d.type === "pos") {
+          if (typeof d.target === "number") {
+            this.currentBufferTarget = d.target;
+          }
+          if (typeof d.buffered === "number") {
+            this.lastBufferedSamples = d.buffered;
+          }
+          this.onWorkletPosition(d.value);
+        } else if (d.type === "event") {
+          if (typeof d.target === "number") {
+            this.currentBufferTarget = d.target;
+          }
         }
       };
 
@@ -1110,20 +1115,6 @@ export class AudioPlayer {
         return;
       }
     }
-
-    // Record timeline entry: the server timestamp for the FIRST sample of
-    // this chunk.  The server stamps each 20 ms Opus frame after encoding
-    // it, so `frame.timestamp` corresponds to the *end* of the captured
-    // window — one chunk duration later than the content at sample 0.
-    // Video timestamps, by contrast, are content-commit time (start).
-    // Subtract n/48 ms here so audio and video timeline entries share a
-    // common "content time" convention and drift is directly comparable.
-    const serverMs = frame.timestamp / 1000 - n / 48;
-    this.timeline.push({
-      sampleOffset: this.samplesQueued,
-      serverMs,
-    });
-    this.samplesQueued += n;
 
     frame.close();
 

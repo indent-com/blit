@@ -113,11 +113,17 @@ The invariants: Vulkan objects must be destroyed in the correct order — images
 
 ## `PR_SET_PDEATHSIG` in the audio pipeline
 
-`AudioPipeline::shutdown` (and its `Drop` impl) kills all child processes (dbus-daemon, pipewire, wireplumber, pipewire-pulse, pw-cat) and waits for them. But when the blit server is killed via SIGKILL (e.g. process-compose restart after a rebuild), Rust destructors don't run and the children become orphans reparented to PID 1.
+`AudioPipeline::shutdown` (and its `Drop` impl) kills all child processes (dbus-daemon, pipewire, wireplumber, pipewire-pulse) and waits for them. But when the blit server is killed via SIGKILL (e.g. process-compose restart after a rebuild), Rust destructors don't run and the children become orphans reparented to PID 1.
 
 To prevent this, every `Command::new()…spawn()` in [`crates/server/src/audio.rs`](crates/server/src/audio.rs) uses `pre_exec(pdeathsig_hook())` to call `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the child between fork and exec. This makes the kernel send SIGTERM to the child when its parent dies, regardless of how the parent exits.
 
 `prctl(PR_SET_PDEATHSIG, …)` is async-signal-safe and is invoked inside the closure passed to `CommandExt::pre_exec`. The `unsafe` block is confined to the closure body — the outer `pdeathsig_hook()` function is safe. SIGTERM (not SIGKILL) is used so children can clean up their own resources before exiting. The entire audio module is `#[cfg(target_os = "linux")]` since PipeWire is Linux-only, so there is no cross-platform shim needed.
+
+## Runtime-loaded libpipewire in the audio pipeline
+
+[`crates/server/src/audio_pw.rs`](crates/server/src/audio_pw.rs) dlopens `libpipewire-0.3.so.0` at runtime and drives a capture stream directly, in place of the former pw-cat subprocess + pipe read. Calling C through `dlsym`-resolved function pointers plus a hand-declared `#[repr(C)]` mirror of `pw_stream_events` and the SPA buffer structs means any ABI drift between the Rust declarations and the installed libpipewire will be memory unsafety — wrong struct sizes corrupt callback data, and mismatched `pw_stream_events` versions can read past the struct's end.
+
+The invariants: we target `PW_VERSION_STREAM_EVENTS = 2` (present since PipeWire 0.3.39, so any distribution libpipewire is at least that new), the struct layouts mirror the 1.6.x public headers exactly, and the SPA POD is built with 8-byte-aligned bodies matching the documented binary format. The `pw_thread_loop` is stopped _before_ the user_data `Box` holding the mpsc sender is freed in `Drop`, so the RT callback can't race a freed pointer. The library handle is intentionally never `dlclose`'d — leaking it for process lifetime avoids any risk of dangling function pointers if a shutdown path accidentally held one. A `CaptureState::active` flag lets the callback short-circuit cheaply before touching the mpsc during Drop, but correctness does not depend on it — the thread-loop stop is what actually prevents further callbacks.
 
 ## Audit checklist
 

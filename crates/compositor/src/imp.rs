@@ -2427,8 +2427,14 @@ impl Compositor {
             }
             CompositorCommand::ClipboardOffer { mime_type, data } => {
                 self.external_clipboard = Some(ExternalClipboard { mime_type, data });
-                // Invalidate the Wayland-side selection — external takes over.
-                self.selection_source = None;
+                // Tell the previous selection owner it's no longer selected.
+                // Without this, apps that set their own selection keep
+                // thinking they're the owner and paste from their internal
+                // buffer on Ctrl+V instead of requesting data from the new
+                // offer we're about to advertise.
+                if let Some(src) = self.selection_source.take() {
+                    src.cancelled();
+                }
                 self.offer_external_clipboard();
             }
             CompositorCommand::Capture {

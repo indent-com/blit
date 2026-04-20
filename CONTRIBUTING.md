@@ -182,7 +182,8 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | `crates/server/src/vaapi_encode.rs`      | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                              |
 | `crates/server/src/nvenc_encode.rs`      | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                          |
 | `crates/server/src/gpu_libs.rs`          | Runtime dlopen loaders for libva, NVENC, GBM shared across encoders                                                   |
-| `crates/server/src/audio.rs`             | Audio capture pipeline: PipeWire spawn, pw-cat PCM pipe, Opus encoding                                                |
+| `crates/server/src/audio.rs`             | Audio capture pipeline: PipeWire daemon spawn, in-process capture via `audio_pw`, Opus encoding                       |
+| `crates/server/src/audio_pw.rs`          | In-process libpipewire-0.3 capture client (runtime `dlopen`), replaces the former pw-cat subprocess                   |
 | `crates/remote/src/lib.rs`               | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
 | `crates/compositor/src/imp.rs`           | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates     |
 | `crates/compositor/src/render.rs`        | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer                   |

@@ -229,8 +229,8 @@ Audio capture, encoding, and playback are handled by a PipeWire-based pipeline.
 graph LR
     subgraph "Server (blit server)"
         App["Wayland/PTY app"] -->|"audio output"| PW["PipeWire<br/>blit-sink"]
-        PW -->|"monitor source"| PWCAT["pw-cat --record<br/>48kHz f32 stereo"]
-        PWCAT -->|"raw PCM pipe"| ENC["Opus encoder<br/>20ms frames"]
+        PW -->|"monitor source"| CAP["in-process capture<br/>libpipewire (dlopen)<br/>48kHz f32 stereo"]
+        CAP -->|"raw PCM"| ENC["Opus encoder<br/>20ms frames"]
         ENC -->|"OpusFrame"| RING["ring buffer<br/>10 frames"]
     end
     subgraph "Client (browser)"
@@ -244,21 +244,20 @@ graph LR
 
 `AudioPipeline::spawn()` (`crates/server/src/audio.rs`) starts a private, isolated PipeWire stack per compositor instance:
 
-| Process           | Role                                                      |
-| ----------------- | --------------------------------------------------------- |
-| `dbus-daemon`     | Private D-Bus session (required by PipeWire modules)      |
-| `pipewire`        | Core daemon with a null sink (`blit-sink`, 48 kHz stereo) |
-| `wireplumber`     | Minimal session manager (hardware monitors disabled)      |
-| `pipewire-pulse`  | PulseAudio compatibility socket                           |
-| `pw-cat --record` | Captures `blit-sink` monitor, writes raw PCM to stdout    |
+| Process          | Role                                                      |
+| ---------------- | --------------------------------------------------------- |
+| `dbus-daemon`    | Private D-Bus session (required by PipeWire modules)      |
+| `pipewire`       | Core daemon with a null sink (`blit-sink`, 48 kHz stereo) |
+| `wireplumber`    | Minimal session manager (hardware monitors disabled)      |
+| `pipewire-pulse` | PulseAudio compatibility socket                           |
 
-Child processes inherit `PIPEWIRE_REMOTE` and `PULSE_SERVER` pointing at the private sockets. Audio availability is gated by `pipewire_available()` (checks for required binaries on PATH) and can be disabled with `BLIT_AUDIO=0`.
+Child processes inherit `PIPEWIRE_REMOTE` and `PULSE_SERVER` pointing at the private sockets. Monitor capture is handled in-process by `audio_pw::Capture` (`crates/server/src/audio_pw.rs`), which dlopens `libpipewire-0.3.so.0` at runtime and opens a capture stream directly on `blit-sink`'s monitor — no `pw-cat` subprocess, no pipe buffer, and the PipeWire quantum (~5 ms) is set from client side so we don't inherit any third-party batching. Audio availability is gated by `pipewire_available()` (checks for required binaries on PATH and for the libpipewire shared object being loadable) and can be disabled with `BLIT_AUDIO=0`.
 
 ### Encoding
 
-`reader_encoder_task()` is an async tokio task that reads the `pw-cat` stdout pipe:
+`encoder_task()` is an async tokio task that consumes PCM chunks delivered by the in-process capture via an unbounded mpsc:
 
-1. Buffers raw PCM and frames it into 20 ms chunks (960 samples/channel, stereo).
+1. Accumulates raw PCM and frames it into 20 ms chunks (960 samples/channel, stereo).
 2. Encodes each chunk with libopus at the current bitrate (default 64 kbps, adjustable per-subscriber via `C2S_AUDIO_SUBSCRIBE`).
 3. Timestamps each frame using the same epoch as video frame timestamps, enabling A/V sync on the client.
 4. Sends frames through an mpsc channel (capacity 20). Frames are dropped if the channel is full to avoid stalling PipeWire's realtime thread.
@@ -280,7 +279,7 @@ On subscribe, the server sends ring-buffer catch-up frames and recomputes the Op
 `AudioPlayer` (`js/core/src/AudioPlayer.ts`) handles decode and render in the browser:
 
 1. **Decode**: WebCodecs `AudioDecoder` with `codec: "opus"`, 48 kHz stereo. Decoded `AudioData` frames (f32 planar PCM) are transferred to the worklet via `MessagePort`.
-2. **Render**: An `AudioWorkletProcessor` maintains a jitter buffer (target 100 ms / 4800 samples). Outputs silence until the buffer fills; re-enters buffering on underrun.
+2. **Render**: An `AudioWorkletProcessor` maintains an adaptive jitter buffer — floor 60 ms / 2880 samples, grows one 20 ms frame per sustained underrun (capped at 500 ms), shrinks one frame per 3 s of underrun-free playback. Outputs silence until the buffer fills; re-enters buffering on underrun.
 3. **A/V sync**: The worklet reports its consumed-sample position. The main thread maps this to a server timestamp via a recorded timeline, computes drift against video timestamps, and steers the playback rate within +/-2% to converge. Rate changes are exponentially smoothed (alpha 0.15) to prevent audible wow/flutter.
 
 ```mermaid

@@ -34,6 +34,8 @@ import {
   S2C_SURFACE_FRAME,
   S2C_SURFACE_RESIZED,
   S2C_SURFACE_TITLE,
+  S2C_FRAGMENT,
+  FRAGMENT_FLAG_LAST,
   S2C_PING,
   S2C_QUIT,
   S2C_TEXT,
@@ -202,6 +204,16 @@ export class BlitConnection {
   surfaceStreamingEnabled = true;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pingIntervalMs = 10_000;
+
+  /**
+   * Reassembly buffer for `S2C_FRAGMENT` messages.  TCP preserves order
+   * and the server only splits one bulk message at a time, so a single
+   * buffer is enough — fragments of different messages never interleave.
+   * Audio frames and other small messages may arrive between fragments
+   * and are dispatched immediately, bypassing this buffer.
+   */
+  private fragmentChunks: Uint8Array[] = [];
+  private fragmentBytes = 0;
 
   private snapshot: BlitConnectionSnapshot;
   private sessions: InternalSession[] = [];
@@ -1079,6 +1091,28 @@ export class BlitConnection {
     if (bytes.length === 0) return;
 
     const type = bytes[0];
+    // Fragment reassembly is handled before the normal dispatch so the
+    // reconstituted buffer flows through the same switch as any other
+    // message — callers don't need to know their message was chunked.
+    if (type === S2C_FRAGMENT) {
+      if (bytes.length < 2) return;
+      const flags = bytes[1];
+      const chunk = bytes.subarray(2);
+      this.fragmentChunks.push(chunk);
+      this.fragmentBytes += chunk.length;
+      if (flags & FRAGMENT_FLAG_LAST) {
+        const reassembled = new Uint8Array(this.fragmentBytes);
+        let offset = 0;
+        for (const c of this.fragmentChunks) {
+          reassembled.set(c, offset);
+          offset += c.length;
+        }
+        this.fragmentChunks = [];
+        this.fragmentBytes = 0;
+        this.handleMessage(reassembled.buffer);
+      }
+      return;
+    }
     switch (type) {
       case S2C_PING:
         // Application-level keepalive — no action needed.
@@ -1330,10 +1364,6 @@ export class BlitConnection {
           // window doesn't permanently stall.
           this.surfaceStore.sendAckFallback(surfaceId);
         }
-        // Feed the video frame's server timestamp to the audio player
-        // for A/V sync.  Video is never delayed — the audio player uses
-        // this to steer its playback rate.
-        this.audioPlayer.notifyVideoTimestamp(timestamp);
         return;
       }
       case S2C_SURFACE_TITLE: {

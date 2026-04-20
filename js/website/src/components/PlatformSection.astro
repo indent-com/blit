@@ -15,7 +15,7 @@ const videoDeps = [
 const audioDeps = [
   { bin: "pipewire", pkg: "pipewire", use: "Audio daemon (private instance)" },
   { bin: "pipewire-pulse", pkg: "pipewire-pulse", use: "PulseAudio compatibility for apps" },
-  { bin: "pw-cat", pkg: "pipewire / pipewire-utils", use: "Monitor source capture" },
+  { bin: "libpipewire-0.3.so.0", pkg: "pipewire", use: "Monitor capture (in-process, dlopened)" },
   { bin: "dbus-daemon", pkg: "dbus", use: "Private D-Bus session for PipeWire" },
   { bin: "wireplumber", pkg: "wireplumber", use: "Session manager (optional)" },
 ];

@@ -14,7 +14,9 @@ use blit_remote::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::transport::{Transport, read_frame, write_frame};
+#[cfg(test)]
+use crate::transport::read_frame;
+use crate::transport::{Transport, read_message, write_frame};
 
 pub(crate) struct PtyInfo {
     pub(crate) id: u16,
@@ -28,6 +30,8 @@ pub(crate) struct AgentConn {
     pub(crate) ptys: Vec<PtyInfo>,
     pub(crate) titles: HashMap<u16, String>,
     pub(crate) exited: HashMap<u16, i32>,
+    /// Reassembly buffer for `S2C_FRAGMENT` messages from the server.
+    fragment_buf: Vec<u8>,
 }
 
 impl AgentConn {
@@ -37,13 +41,16 @@ impl AgentConn {
         let mut ptys = Vec::new();
         let mut titles = HashMap::new();
         let mut exited = HashMap::new();
+        let mut fragment_buf: Vec<u8> = Vec::new();
 
         loop {
-            let data =
-                tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut reader))
-                    .await
-                    .map_err(|_| "timeout waiting for server".to_string())?
-                    .ok_or_else(|| "server closed connection".to_string())?;
+            let data = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                read_message(&mut reader, &mut fragment_buf),
+            )
+            .await
+            .map_err(|_| "timeout waiting for server".to_string())?
+            .ok_or_else(|| "server closed connection".to_string())?;
 
             if data.is_empty() {
                 continue;
@@ -91,6 +98,7 @@ impl AgentConn {
             ptys,
             titles,
             exited,
+            fragment_buf,
         })
     }
 
@@ -124,7 +132,7 @@ impl AgentConn {
     pub(crate) async fn recv(&mut self) -> Result<Vec<u8>, String> {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            read_frame(&mut self.reader),
+            read_message(&mut self.reader, &mut self.fragment_buf),
         )
         .await
         .map_err(|_| "timeout waiting for server response".to_string())?
@@ -136,10 +144,13 @@ impl AgentConn {
     }
 
     async fn recv_deadline(&mut self, deadline: tokio::time::Instant) -> Result<Vec<u8>, String> {
-        tokio::time::timeout_at(deadline, read_frame(&mut self.reader))
-            .await
-            .map_err(|_| "timeout".to_string())?
-            .ok_or_else(|| "server closed connection".to_string())
+        tokio::time::timeout_at(
+            deadline,
+            read_message(&mut self.reader, &mut self.fragment_buf),
+        )
+        .await
+        .map_err(|_| "timeout".to_string())?
+        .ok_or_else(|| "server closed connection".to_string())
     }
 
     async fn maybe_resize(&mut self, id: u16, size: Option<(u16, u16)>) -> Result<(), String> {
