@@ -415,6 +415,7 @@ in
 
   build-tarballs = pkgs.writeShellApplication {
     name = "blit-build-tarballs";
+    runtimeInputs = [ pkgs.gnutar ];
     text =
       let
         os = if pkgs.stdenv.isDarwin then "darwin" else "linux";
@@ -428,14 +429,14 @@ in
         if pkgs.stdenv.isLinux then
           ''
             # glibc tarball: single binary (all deps statically linked, only glibc dynamic)
-            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+            tar --mode='u+w' -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
             # musl tarball: single binary (needs system musl libc)
-            tar -czf "$outdir/blit_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl}" bin
+            tar --mode='u+w' -czf "$outdir/blit_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl}" bin
           ''
         else
           ''
             # macOS: single binary
-            tar -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
+            tar --mode='u+w' -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
           ''
       )
       + ''
