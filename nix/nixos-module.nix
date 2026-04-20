@@ -263,6 +263,16 @@ in
           value = {
             description = "blit terminal multiplexer for ${user}";
             requires = [ "blit-server@${user}.socket" ];
+            # Audio spawns pipewire / wireplumber / dbus-daemon by name,
+            # so they need to be on $PATH.  Use systemd.services.*.path
+            # (which prepends to the default PATH) rather than overriding
+            # $PATH in Environment — that would clobber coreutils and
+            # friends for PTY shells, which inherit the service env.
+            path = lib.optionals cfg.audio.enable [
+              pkgs.pipewire
+              pkgs.wireplumber
+              pkgs.dbus
+            ];
             serviceConfig = {
               Type = "simple";
               User = user;
@@ -277,13 +287,6 @@ in
                 ++ lib.optionals cfg.audio.enable [
                   "BLIT_AUDIO=1"
                   "BLIT_AUDIO_BITRATE=${toString cfg.audio.bitrate}"
-                  "PATH=${
-                    lib.makeBinPath [
-                      pkgs.pipewire
-                      pkgs.wireplumber
-                      pkgs.dbus
-                    ]
-                  }"
                 ]
                 ++ lib.optional (!cfg.audio.enable) "BLIT_AUDIO=0";
             };
