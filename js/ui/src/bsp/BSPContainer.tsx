@@ -643,7 +643,6 @@ export function BSPContainer(props: {
   createEffect(() => {
     const fsId = props.focusedSessionId;
     const live = liveSessions();
-    const fpId = focusedPaneId();
     const handler = (event: KeyboardEvent) => {
       if (!fsId) return;
       const session = live.find((item) => item.id === fsId);
@@ -651,19 +650,6 @@ export function BSPContainer(props: {
       if (event.key === "Enter") {
         event.preventDefault();
         workspace.restartSession(fsId);
-      } else if (event.key === "Escape") {
-        event.preventDefault();
-        // Immediately clear the pane assignment so the exited terminal
-        // disappears without waiting for the server round-trip.
-        if (fpId) {
-          setLayoutState((prev) => {
-            if (prev.assignments[fpId] !== fsId) return prev;
-            return {
-              assignments: { ...prev.assignments, [fpId]: null },
-            };
-          });
-        }
-        void workspace.closeSession(fsId);
       }
     };
     window.addEventListener("keydown", handler);
