@@ -91,6 +91,7 @@
   "devDependencies": {
     "@vitest/coverage-v8": "^4",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "@types/bun": "^1",
     "@types/node": "^22",
     "jsdom": "^29.0.1",
     "typescript": "^6",

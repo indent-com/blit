@@ -9,5 +9,7 @@ export type { WebRtcDataChannelTransportOptions } from "./webrtc";
 
 export { createShareTransport } from "./webrtc-share";
 
-export { UnixSocketTransport } from "./unix";
-export type { UnixSocketTransportOptions } from "./unix";
+export { NodeUnixSocketTransport } from "./unix";
+export { BunUnixSocketTransport } from "./unix-bun";
+export { DenoUnixSocketTransport } from "./unix-deno";
+export type { UnixSocketTransportOptions } from "./unix-base";
