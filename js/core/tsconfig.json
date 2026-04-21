@@ -6,6 +6,7 @@
     "paths": {
       "@blit-sh/browser": ["../../crates/browser/pkg/blit_browser.d.ts"]
     },
+    "types": ["node"],
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,

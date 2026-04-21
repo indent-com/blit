@@ -8,3 +8,6 @@ export { createWebRtcDataChannelTransport } from "./webrtc";
 export type { WebRtcDataChannelTransportOptions } from "./webrtc";
 
 export { createShareTransport } from "./webrtc-share";
+
+export { UnixSocketTransport } from "./unix";
+export type { UnixSocketTransportOptions } from "./unix";
