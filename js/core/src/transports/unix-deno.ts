@@ -13,10 +13,7 @@ interface DenoUnixConn {
   close(): void;
 }
 interface DenoLike {
-  connect(opts: {
-    transport: "unix";
-    path: string;
-  }): Promise<DenoUnixConn>;
+  connect(opts: { transport: "unix"; path: string }): Promise<DenoUnixConn>;
 }
 declare const Deno: DenoLike | undefined;
 
@@ -53,13 +50,11 @@ export class DenoUnixSocketTransport extends AbstractUnixSocketTransport {
         this.conn = conn;
         this.writer = conn.writable.getWriter();
         this.onRawConnect(attempt);
-        this.pump(attempt, conn.readable.getReader()).catch(
-          (err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.onRawError(attempt, msg);
-            this.onRawClose(attempt);
-          },
-        );
+        this.pump(attempt, conn.readable.getReader()).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.onRawError(attempt, msg);
+          this.onRawClose(attempt);
+        });
       })
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);

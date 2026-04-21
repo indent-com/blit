@@ -51,4 +51,3 @@ export class NodeUnixSocketTransport extends AbstractUnixSocketTransport {
     this.socket = null;
   }
 }
-
