@@ -231,6 +231,8 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 4. Client-side handling in `cli/src/agent.rs` (agent subcommands) and/or `cli/src/interactive.rs` (TUI)
 5. Update the protocol tables in [ARCHITECTURE.md](ARCHITECTURE.md)
 
+**Core-first JS architecture.** `@blit-sh/core` is the framework-agnostic shared package — transports, workspace state, BSP layout, keyboard shortcuts, renderers, and protocol logic all live here. `@blit-sh/react` and `@blit-sh/solid` are thin glue layers that wrap core primitives in framework-specific hooks/components (React hooks, Solid signals). When adding new UI-related logic (keyboard shortcuts, session cycling, layout management, etc.), implement it in `@blit-sh/core` and expose a framework-agnostic API. The framework packages should only bridge reactive state to core interfaces and bindDOM events — never duplicate decision logic.
+
 **Tests live next to the code.** `server/src/lib.rs` has a `#[cfg(test)]` module at the bottom. `cli/src/agent.rs` has its own test module with `MockServer`/`MockPty` — an in-process test harness using Unix socket pairs. Core tests are in `core/src/__tests__/`, React tests in `react/src/__tests__/`.
 
 **Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. On Linux, two release tarballs are produced: a glibc variant (all deps statically linked, glibc 2.31+ via zig cc, dlopen works for GPU) and a musl variant (all deps statically linked except musl libc) for Alpine. Both are single-binary tarballs. Nix verifies linkage at build time.

@@ -6,7 +6,8 @@ import type {
   ConnectionId,
   BSPAssignments,
 } from "@blit-sh/core";
-import { isSurfaceAssignment, parseSurfaceAssignment } from "./bsp/layout";
+import { installKeyboardShortcuts } from "@blit-sh/core";
+import type { ShortcutContext, ShortcutActions } from "@blit-sh/core";
 import type { Overlay } from "./Workspace";
 
 export interface KeyboardShortcutHandlers {
@@ -56,238 +57,47 @@ export interface KeyboardShortcutHandlers {
 /**
  * Installs global keyboard shortcuts for the workspace.
  * Must be called inside a Solid component (uses onMount/onCleanup).
+ *
+ * This is a thin Solid wrapper over `@blit-sh/core`'s
+ * `installKeyboardShortcuts`.  The shortcut matching logic lives
+ * entirely in core so it can be reused by `@blit-sh/react` and
+ * other framework bindings.
  */
 export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
+  const ctx: ShortcutContext = {
+    overlay: () => h.overlay() != null,
+    hasActiveLayout: () => h.activeLayout() != null,
+    bspFocusedPaneId: h.bspFocusedPaneId,
+    layoutAssignments: h.layoutAssignments,
+    focusedSession: h.focusedSession,
+    sessions: h.sessions,
+    focusedSessionId: h.focusedSessionId,
+    supportsRestart: h.supportsRestart,
+    focusedSurfaceId: h.focusedSurfaceId,
+    focusedSurfaceConnId: h.focusedSurfaceConnId,
+    connectionCount: h.connectionCount,
+    activeElementTag: () => document.activeElement?.tagName ?? null,
+  };
+
+  const act: ShortcutActions = {
+    toggleOverlay: (target) => h.toggleOverlay(target as Overlay),
+    cancelOverlay: h.cancelOverlay,
+    toggleDebug: h.toggleDebug,
+    togglePreviewPanel: h.togglePreviewPanel,
+    createAndFocus: () => void h.createAndFocus(),
+    createInPane: (paneId) => void h.createInPane(paneId),
+    openNewTerminalPicker: h.openNewTerminalPicker,
+    handleRestartOrClose: h.handleRestartOrClose,
+    focusBySession: h.focusBySession,
+    focusSession: (id) => h.workspace.focusSession(id),
+    closeSurface: h.closeSurface,
+    closeSession: (id) => void h.workspace.closeSession(id),
+    unfocusSurface: h.unfocusSurface,
+    clearFocusedPaneAssignment: h.clearFocusedPaneAssignment,
+    resetAudio: h.resetAudio,
+  };
+
   onMount(() => {
-    const handler = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
-
-      if (mod && !e.shiftKey && e.key === "k") {
-        e.preventDefault();
-        h.toggleOverlay("expose");
-        return;
-      }
-      if (e.ctrlKey && e.shiftKey && (e.key === "?" || e.code === "Slash")) {
-        e.preventDefault();
-        h.toggleOverlay("help");
-        return;
-      }
-      if (e.ctrlKey && e.shiftKey && (e.key === "~" || e.key === "`")) {
-        e.preventDefault();
-        h.toggleDebug();
-        return;
-      }
-      if (e.ctrlKey && e.shiftKey && e.key === "B") {
-        e.preventDefault();
-        h.togglePreviewPanel();
-        return;
-      }
-      // Ctrl+Shift+A: reset audio pipeline (recover from stalled audio).
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "A") {
-        e.preventDefault();
-        h.resetAudio();
-        return;
-      }
-      if (mod && !e.shiftKey && e.key === "Enter") {
-        e.preventDefault();
-        if (h.overlay()) {
-          // Let the overlay handle it.
-          return;
-        }
-        if (h.activeLayout() && h.bspFocusedPaneId()) {
-          if (h.connectionCount() <= 1) {
-            void h.createInPane(h.bspFocusedPaneId()!);
-          } else {
-            h.openNewTerminalPicker(h.bspFocusedPaneId()!);
-          }
-        } else if (h.connectionCount() <= 1) {
-          void h.createAndFocus();
-        } else {
-          h.openNewTerminalPicker();
-        }
-        return;
-      }
-      if (mod && e.shiftKey && e.key === "Enter") {
-        e.preventDefault();
-        if (h.activeLayout() && h.bspFocusedPaneId()) {
-          void h.createInPane(h.bspFocusedPaneId()!);
-        } else {
-          void h.createAndFocus();
-        }
-        return;
-      }
-      if (e.key === "Enter" && !mod && !e.shiftKey && !h.overlay()) {
-        // Enter on an exited session restarts/closes it (works in BSP layouts too).
-        // When a surface is focused, Enter is not special.
-        if (h.focusedSurfaceId() != null) return;
-        // In BSP mode, the focused pane may hold a surface assignment rather
-        // than a session.  Don't intercept Enter in that case either.
-        const fpId = h.bspFocusedPaneId();
-        if (fpId) {
-          const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
-          if (isSurfaceAssignment(assign)) return;
-        }
-        // Don't intercept Enter when an input/textarea/canvas is focused (e.g.
-        // the EmptyPane command input handles Enter itself, and the surface
-        // canvas forwards keys to the Wayland compositor).
-        const tag = document.activeElement?.tagName;
-        if (
-          tag === "INPUT" ||
-          tag === "TEXTAREA" ||
-          tag === "CANVAS" ||
-          tag === "BUTTON"
-        )
-          return;
-        const fid = h.focusedSessionId();
-        const focused = fid ? h.sessions().find((s) => s.id === fid) : null;
-        if ((focused && focused.state === "exited") || fid == null) {
-          e.preventDefault();
-          h.handleRestartOrClose();
-          return;
-        }
-      }
-      // Ctrl+Shift+Q: remove the current term/surface from the main view
-      // (unassign without closing) so it falls back to the sidebar.  Also
-      // accept e.code === "KeyQ" to survive keyboard layouts where Shift+Q
-      // resolves e.key to lowercase "q".
-      if (
-        e.ctrlKey &&
-        e.shiftKey &&
-        !e.altKey &&
-        !e.metaKey &&
-        (e.key === "Q" || e.key === "q" || e.code === "KeyQ")
-      ) {
-        if (h.overlay()) return;
-        // Non-BSP surface focus: unfocus the surface (return to terminal view).
-        if (h.focusedSurfaceId() != null) {
-          e.preventDefault();
-          h.unfocusSurface();
-          return;
-        }
-        if (h.activeLayout() && h.bspFocusedPaneId()) {
-          e.preventDefault();
-          h.clearFocusedPaneAssignment();
-          return;
-        }
-        // Single-terminal mode: unfocus the current session so the main
-        // area shows the EmptyState and the terminal lives only in the
-        // sidebar.
-        if (h.focusedSessionId() != null) {
-          e.preventDefault();
-          h.workspace.focusSession(null);
-          return;
-        }
-        return;
-      }
-      // Ctrl+Alt+Shift+Q: close the focused terminal or surface entirely.
-      // Check e.code because Alt on Mac transforms the key value.
-      if (
-        e.ctrlKey &&
-        e.altKey &&
-        e.shiftKey &&
-        (e.key === "Q" || e.code === "KeyQ")
-      ) {
-        if (h.overlay()) return;
-        e.preventDefault();
-        // Non-BSP surface focus.
-        const sid = h.focusedSurfaceId();
-        const sConnId = h.focusedSurfaceConnId();
-        if (sid != null && sConnId != null) {
-          h.closeSurface(sConnId, sid);
-          return;
-        }
-        // BSP pane may hold a surface assignment.
-        const fpId = h.bspFocusedPaneId();
-        if (fpId) {
-          const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
-          if (assign && isSurfaceAssignment(assign)) {
-            const parsed = parseSurfaceAssignment(assign);
-            if (parsed != null) {
-              h.closeSurface(parsed.connectionId, parsed.surfaceId);
-              return;
-            }
-          }
-        }
-        const fid = h.focusedSessionId();
-        if (fid) void h.workspace.closeSession(fid);
-        return;
-      }
-      // Prev/next terminal: Alt+Shift+[ / ] on all platforms.
-      // Avoids browser tab-switching (Cmd/Ctrl+Shift+[/]) on Mac and Windows.
-      // Use e.code (physical key) rather than e.key because Alt on Mac
-      // transforms [ to " and ] to '.
-      if (
-        e.altKey &&
-        e.shiftKey &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        (e.code === "BracketLeft" || e.code === "BracketRight")
-      ) {
-        e.preventDefault();
-        // When a surface is focused, cycling leaves the surface first.
-        if (h.focusedSurfaceId() != null) {
-          h.unfocusSurface();
-          return;
-        }
-        const all = h
-          .sessions()
-          .filter((s) => s.state !== "closed")
-          .map((s) => s.id);
-        if (all.length === 0) return;
-        const currentId = h.focusedSessionId();
-        const la = h.layoutAssignments();
-        const fpId = h.bspFocusedPaneId();
-        if (la && fpId) {
-          // BSP layout active: rotate sessions within the focused pane.
-          // The candidate pool is sessions not locked into a *different* pane.
-          const assignedElsewhere = new Set(
-            Object.entries(la.assignments)
-              .filter(([pid, sid]) => pid !== fpId && sid != null)
-              .map(([, sid]) => sid as string),
-          );
-          const candidates = all.filter((id) => !assignedElsewhere.has(id));
-          if (candidates.length === 0) return;
-          const index = currentId ? candidates.indexOf(currentId) : -1;
-          if (index >= 0 && candidates.length < 2) return;
-          let nextId: string;
-          if (index < 0) {
-            nextId =
-              e.code === "BracketRight"
-                ? candidates[0]
-                : candidates[candidates.length - 1];
-          } else {
-            nextId =
-              e.code === "BracketRight"
-                ? candidates[(index + 1) % candidates.length]
-                : candidates[
-                    (index - 1 + candidates.length) % candidates.length
-                  ];
-          }
-          h.focusBySession(nextId);
-        } else {
-          // No layout: simple global cycle.
-          const index = currentId ? all.indexOf(currentId) : -1;
-          if (index >= 0 && all.length < 2) return;
-          let nextId: string;
-          if (index < 0) {
-            nextId = e.code === "BracketRight" ? all[0] : all[all.length - 1];
-          } else {
-            nextId =
-              e.code === "BracketRight"
-                ? all[(index + 1) % all.length]
-                : all[(index - 1 + all.length) % all.length];
-          }
-          h.focusBySession(nextId);
-        }
-        return;
-      }
-      if (e.key === "Escape" && h.overlay()) {
-        e.preventDefault();
-        h.cancelOverlay();
-      }
-    };
-
-    window.addEventListener("keydown", handler, true);
-    onCleanup(() => window.removeEventListener("keydown", handler, true));
+    onCleanup(installKeyboardShortcuts(ctx, act));
   });
 }

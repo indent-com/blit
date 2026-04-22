@@ -51,6 +51,13 @@ export { PALETTES } from "./palettes";
 export { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 export { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 
+export { handleWorkspaceShortcut, installKeyboardShortcuts } from "./shortcuts";
+export type {
+  ShortcutKeyEvent,
+  ShortcutContext,
+  ShortcutActions,
+} from "./shortcuts";
+
 export type { GlRenderer, RendererBackend } from "./gl-renderer";
 export { createWebGpuRenderer } from "./webgpu-renderer";
 
