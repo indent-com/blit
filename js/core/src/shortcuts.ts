@@ -1,4 +1,5 @@
-import type { BlitSession, SessionId, ConnectionId, BSPAssignments } from "./types";
+import type { BlitSession, SessionId, ConnectionId } from "./types";
+import type { BSPAssignments } from "./bsp/layout";
 import { isSurfaceAssignment, parseSurfaceAssignment } from "./bsp/layout";
 
 /**
