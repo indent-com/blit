@@ -200,10 +200,12 @@ export class BlitTerminalSurface {
   }
 
   get status(): ConnectionStatus {
-    // Derive from the connection snapshot; callers can also check directly.
-    return this._blitConn
-      ? ((this._blitConn as any).getSnapshot?.()?.status ?? "disconnected")
-      : "disconnected";
+    // Reflect the transport's send-readiness, not the post-handshake
+    // "authenticating→connected" promotion on S2C_READY.  Input/resize/mouse
+    // sends succeed as soon as the transport is connected; gating on the
+    // snapshot would block interaction whenever S2C_READY is delayed or lost,
+    // even though the server is already accepting C2S_CREATE2 and input.
+    return this._blitConn?.transport.status ?? "disconnected";
   }
 
   focus(): void {
@@ -281,36 +283,38 @@ export class BlitTerminalSurface {
     }
     container.appendChild(this.glCanvas);
 
-    // Create hidden textarea for keyboard input (unless readOnly)
-    if (!this._readOnly) {
-      this.inputEl = document.createElement("textarea");
-      this.inputEl.setAttribute("aria-label", "Terminal input");
-      this.inputEl.setAttribute("autocapitalize", "off");
-      this.inputEl.setAttribute("autocomplete", "off");
-      this.inputEl.setAttribute("autocorrect", "off");
-      this.inputEl.setAttribute("spellcheck", "false");
-      this.inputEl.setAttribute("tabindex", "0");
-      // Give each textarea a name so browsers don't flag it as an
-      // anonymous form field (Chrome DevTools "Issues" warning).
-      this.inputEl.setAttribute(
-        "name",
-        `blit-input-${this._sessionId ?? `anon-${++surfaceCounter}`}`,
-      );
-      Object.assign(this.inputEl.style, {
-        position: "absolute",
-        opacity: "0",
-        width: "1px",
-        height: "1px",
-        top: "0",
-        left: "0",
-        padding: "0",
-        border: "none",
-        outline: "none",
-        resize: "none",
-        overflow: "hidden",
-      });
-      container.appendChild(this.inputEl);
-    }
+    // Hidden textarea: hosts keyboard focus even in read-only mode so
+    // scrollback-navigation keys (Shift+PageUp/PageDown/Home/End) work.
+    // In read-only, input-producing event handlers are not wired up in
+    // setupKeyboard — only the scroll-key paths run.
+    this.inputEl = document.createElement("textarea");
+    this.inputEl.setAttribute("aria-label", "Terminal input");
+    this.inputEl.setAttribute("autocapitalize", "off");
+    this.inputEl.setAttribute("autocomplete", "off");
+    this.inputEl.setAttribute("autocorrect", "off");
+    this.inputEl.setAttribute("spellcheck", "false");
+    this.inputEl.setAttribute("tabindex", "0");
+    if (this._readOnly) this.inputEl.setAttribute("readonly", "");
+    // Give each textarea a name so browsers don't flag it as an
+    // anonymous form field (Chrome DevTools "Issues" warning).
+    this.inputEl.setAttribute(
+      "name",
+      `blit-input-${this._sessionId ?? `anon-${++surfaceCounter}`}`,
+    );
+    Object.assign(this.inputEl.style, {
+      position: "absolute",
+      opacity: "0",
+      width: "1px",
+      height: "1px",
+      top: "0",
+      left: "0",
+      padding: "0",
+      border: "none",
+      outline: "none",
+      resize: "none",
+      overflow: "hidden",
+    });
+    container.appendChild(this.inputEl);
 
     this.setupDprDetection();
     this.setupCursorBlink();
@@ -793,12 +797,12 @@ export class BlitTerminalSurface {
       const shared = conn.getSharedRenderer();
       if (shared) this.renderer = shared.renderer;
       if (!this.renderer?.supported) {
-        if (!this._readOnly) conn.noteFrameRendered();
+        conn.noteFrameRendered();
         return;
       }
     }
     if (!this.terminal) {
-      if (!this._readOnly) conn.noteFrameRendered();
+      conn.noteFrameRendered();
       return;
     }
 
@@ -822,7 +826,7 @@ export class BlitTerminalSurface {
 
     const mem = conn.wasmMemory();
     if (!mem) {
-      if (!this._readOnly) conn.noteFrameRendered();
+      conn.noteFrameRendered();
       return;
     }
     if (mem.buffer !== this.lastWasmBuffer) {
@@ -912,7 +916,12 @@ export class BlitTerminalSurface {
       }
     }
 
-    if (!this._readOnly) conn.noteFrameRendered();
+    // Notify flow control in all modes — the server paces on
+    // `pendingAppliedFrames` / `ackAheadFrames`, and suppressing this
+    // call in read-only lets those counters climb to 0xffff, which the
+    // server reads as "client is completely backlogged" and throttles
+    // updates to a crawl.
+    conn.noteFrameRendered();
     this._onRender?.(performance.now() - t0);
   }
 
@@ -1083,13 +1092,46 @@ export class BlitTerminalSurface {
 
   private setupKeyboard(): void {
     const input = this.inputEl;
-    if (!input || this._readOnly) return;
+    if (!input) return;
 
     this.boundKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (this._sessionId === null || this.status !== "connected") return;
       if (e.isComposing) return;
       if (e.key === "Dead") return;
+
+      // Scroll-key shortcuts run in all modes, including read-only.
+      if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
+        const t2 = this.terminal;
+        const maxScroll = t2 ? t2.scrollback_lines() : 0;
+        if (maxScroll > 0 || this.scrollOffset > 0) {
+          e.preventDefault();
+          const delta = e.key === "PageUp" ? this._rows : -this._rows;
+          this.scrollOffset = Math.max(
+            0,
+            Math.min(maxScroll, this.scrollOffset + delta),
+          );
+          this.sendScroll(this._sessionId!, this.scrollOffset);
+          this.flashScrollbar();
+          this.scheduleRender();
+        }
+        return;
+      }
+      if (e.shiftKey && (e.key === "Home" || e.key === "End")) {
+        const t2 = this.terminal;
+        const maxScroll = t2 ? t2.scrollback_lines() : 0;
+        if (maxScroll > 0 || this.scrollOffset > 0) {
+          e.preventDefault();
+          this.scrollOffset = e.key === "Home" ? maxScroll : 0;
+          this.sendScroll(this._sessionId!, this.scrollOffset);
+          this.flashScrollbar();
+          this.scheduleRender();
+        }
+        return;
+      }
+
+      // Past this point: input-producing paths, blocked in read-only.
+      if (this._readOnly) return;
 
       // Ctrl modifier from mobile toolbar: intercept the next printable key
       if (
@@ -1122,35 +1164,6 @@ export class BlitTerminalSurface {
         return;
       }
 
-      if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
-        const t2 = this.terminal;
-        const maxScroll = t2 ? t2.scrollback_lines() : 0;
-        if (maxScroll > 0 || this.scrollOffset > 0) {
-          e.preventDefault();
-          const delta = e.key === "PageUp" ? this._rows : -this._rows;
-          this.scrollOffset = Math.max(
-            0,
-            Math.min(maxScroll, this.scrollOffset + delta),
-          );
-          this.sendScroll(this._sessionId!, this.scrollOffset);
-          this.flashScrollbar();
-          this.scheduleRender();
-        }
-        return;
-      }
-      if (e.shiftKey && (e.key === "Home" || e.key === "End")) {
-        const t2 = this.terminal;
-        const maxScroll = t2 ? t2.scrollback_lines() : 0;
-        if (maxScroll > 0 || this.scrollOffset > 0) {
-          e.preventDefault();
-          this.scrollOffset = e.key === "Home" ? maxScroll : 0;
-          this.sendScroll(this._sessionId!, this.scrollOffset);
-          this.flashScrollbar();
-          this.scheduleRender();
-        }
-        return;
-      }
-
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
       const bytes = keyToBytes(e, appCursor);
@@ -1180,6 +1193,11 @@ export class BlitTerminalSurface {
         this.sendInput(this._sessionId!, bytes);
       }
     };
+
+    if (this._readOnly) {
+      input.addEventListener("keydown", this.boundKeyDown);
+      return;
+    }
 
     this.boundCompositionEnd = (e: CompositionEvent) => {
       if (e.data && this._sessionId !== null && this.status === "connected") {
@@ -1281,10 +1299,14 @@ export class BlitTerminalSurface {
   // --- Container wheel ---
 
   private setupContainerWheel(): void {
-    if (!this.container || this._readOnly) return;
+    if (!this.container) return;
     this.boundContainerWheel = (e: WheelEvent) => {
       const t = this.terminal;
-      if (t && t.mouse_mode() > 0 && !e.shiftKey) return;
+      // In read-only, always do scrollback — we never forward wheel as
+      // mouse events to the host shell.  In read/write, let the canvas
+      // wheel handler (setupMouse) take the event when the PTY is in
+      // mouse-reporting mode, unless shift is held.
+      if (!this._readOnly && t && t.mouse_mode() > 0 && !e.shiftKey) return;
       if (this._sessionId !== null && this.status === "connected") {
         const maxScroll = t ? t.scrollback_lines() : 0;
         if (maxScroll === 0 && this.scrollOffset === 0) return;

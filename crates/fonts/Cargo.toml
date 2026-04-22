@@ -1,6 +1,6 @@
 [package]
 name = "blit-fonts"
-version = "0.28.1"
+version = "0.28.2"
 edition.workspace = true
 description = "Font discovery and serving for blit"
 license.workspace = true
