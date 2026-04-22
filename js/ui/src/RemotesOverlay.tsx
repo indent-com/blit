@@ -137,7 +137,13 @@ export function RemotesOverlay(props: {
   });
 
   const hasShare = () => props.remotes.some((r) => isShareUri(r.uri));
-  const gatewayDown = () => props.gatewayStatus === "unavailable";
+  // Mutating remotes (add/remove/reorder/set-default/reconnect) requires
+  // the config WebSocket to round-trip `set remotes …` to the gateway.
+  // Block and visually disable these controls while the gateway handshake
+  // is still in progress or unreachable.  When gatewayStatus is undefined
+  // (no config WS wired up), allow mutations — local-only callers.
+  const mutationsBlocked = () =>
+    props.gatewayStatus !== undefined && props.gatewayStatus !== "connected";
 
   // Only include the reveal/hide column if any remote is a share URI.
   const cols = () => {
@@ -244,7 +250,7 @@ export function RemotesOverlay(props: {
               >
                 {t("remotes.empty")}
               </div>
-              <Show when={!gatewayDown()}>
+              <Show when={!mutationsBlocked()}>
                 <div>{t("remotes.emptyHint")}</div>
               </Show>
             </div>
@@ -318,7 +324,7 @@ export function RemotesOverlay(props: {
                 return (
                   <div
                     role="listitem"
-                    draggable={!props.readOnly}
+                    draggable={!props.readOnly && !mutationsBlocked()}
                     onDragStart={(e) => handleDragStart(e, index)}
                     onDragOver={(e) => handleDragOver(e, index)}
                     onDragLeave={handleDragLeave}
@@ -354,11 +360,12 @@ export function RemotesOverlay(props: {
                           "align-self": "stretch",
                           "justify-content": "center",
                           padding: `0 ${scale().controlX}px`,
-                          cursor: "grab",
+                          cursor: mutationsBlocked() ? "not-allowed" : "grab",
                           color: theme().dimFg,
                           "font-size": `${scale().md}px`,
                           "user-select": "none",
                           "border-right": `1px solid ${theme().subtleBorder}`,
+                          opacity: mutationsBlocked() ? 0.4 : 1,
                         }}
                       >
                         ⠿
@@ -420,10 +427,14 @@ export function RemotesOverlay(props: {
                           <button
                             type="button"
                             title={t("remotes.setDefault")}
+                            disabled={mutationsBlocked()}
                             onClick={() => props.onSetDefault(remote().name)}
                             style={{
                               ...btnStyle(),
-                              opacity: 0.5,
+                              opacity: mutationsBlocked() ? 0.3 : 0.5,
+                              cursor: mutationsBlocked()
+                                ? "not-allowed"
+                                : "pointer",
                               "border-left": `1px solid ${theme().subtleBorder}`,
                             }}
                           >
@@ -468,8 +479,15 @@ export function RemotesOverlay(props: {
                       <button
                         type="button"
                         title={t("disconnected.reconnectNow")}
+                        disabled={mutationsBlocked()}
                         onClick={() => props.onReconnect?.(remote().name)}
-                        style={btnStyle()}
+                        style={{
+                          ...btnStyle(),
+                          opacity: mutationsBlocked() ? 0.3 : 0.7,
+                          cursor: mutationsBlocked()
+                            ? "not-allowed"
+                            : "pointer",
+                        }}
                       >
                         {t("disconnected.reconnectNow")}
                       </button>
@@ -478,8 +496,15 @@ export function RemotesOverlay(props: {
                       <button
                         type="button"
                         title={t("remotes.remove")}
+                        disabled={mutationsBlocked()}
                         onClick={() => props.onRemove(remote().name)}
-                        style={btnStyle()}
+                        style={{
+                          ...btnStyle(),
+                          opacity: mutationsBlocked() ? 0.3 : 0.7,
+                          cursor: mutationsBlocked()
+                            ? "not-allowed"
+                            : "pointer",
+                        }}
                       >
                         {t("remotes.remove")}
                       </button>
@@ -491,7 +516,7 @@ export function RemotesOverlay(props: {
           </div>
         </Show>
 
-        <Show when={!props.readOnly && !gatewayDown()}>
+        <Show when={!props.readOnly && !mutationsBlocked()}>
           {/* share: warning */}
           <Show when={hasShare()}>
             <div

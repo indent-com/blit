@@ -281,9 +281,31 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         }
         return;
       }
-      if (e.key === "Escape" && h.overlay()) {
-        e.preventDefault();
-        h.cancelOverlay();
+      if (e.key === "Escape") {
+        if (h.overlay()) {
+          e.preventDefault();
+          h.cancelOverlay();
+          return;
+        }
+        // Escape while a surface is focused returns to the terminal view.
+        if (h.focusedSurfaceId() != null) {
+          e.preventDefault();
+          h.unfocusSurface();
+          return;
+        }
+        // When a BSP layout is active, BSPContainer handles Escape on
+        // exited sessions itself (it needs to clear the pane assignment
+        // before closing).  If we close here on the capture phase the
+        // session state flips to "closed" synchronously, which
+        // invalidates the BSPContainer effect before its bubble-phase
+        // handler can fire.
+        if (!h.activeLayout()) {
+          const fs = h.focusedSession();
+          if (fs?.state === "exited") {
+            e.preventDefault();
+            void h.workspace.closeSession(fs.id);
+          }
+        }
       }
     };
 

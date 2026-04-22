@@ -1295,11 +1295,15 @@ export class BlitConnection {
         }
         this.snapshot = {
           ...this.snapshot,
-          // S2C_HELLO means a new handshake is starting — the connection
-          // is not yet fully operational until S2C_READY arrives.
+          // S2C_HELLO proves the server is responsive: if the transport
+          // is open, promote the UI status straight to "connected" so the
+          // indicator stops pulsing orange while the user is already able
+          // to create and interact with terminals.  `ready` remains false
+          // until S2C_READY so BSP reconciliation still waits for the
+          // initial surface/session burst.
           status:
-            this.snapshot.status === "connected"
-              ? "authenticating"
+            this.transport.status === "connected"
+              ? "connected"
               : this.snapshot.status,
           ready: false,
           supportsRestart: (features & FEATURE_RESTART) !== 0,

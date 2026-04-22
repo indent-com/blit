@@ -428,9 +428,11 @@ describe("BlitConnection", () => {
 
   it("accepts hello with version 1", () => {
     transport.pushHello(1, FEATURE_CREATE_NONCE);
-    // After S2C_HELLO but before S2C_READY, the connection is in the
-    // handshake phase — status should be "authenticating", not "connected".
-    expect(conn.getSnapshot().status).toBe("authenticating");
+    // S2C_HELLO proves the server is responsive — promote status to
+    // "connected" so the UI indicator stops pulsing orange.  `ready`
+    // still waits for S2C_READY to gate BSP reconciliation.
+    expect(conn.getSnapshot().status).toBe("connected");
+    expect(conn.getSnapshot().ready).toBe(false);
   });
 
   it("supportsRestart reflects FEATURE_RESTART", () => {
