@@ -1,6 +1,6 @@
 {
   "name": "@blit-sh/core",
-  "version": "0.28.2",
+  "version": "0.28.3",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -10,6 +10,10 @@
       "default": "./src/index.ts"
     },
     "./transports": {
+      "browser": {
+        "types": "./src/transports/browser.ts",
+        "default": "./src/transports/browser.ts"
+      },
       "types": "./src/transports/index.ts",
       "default": "./src/transports/index.ts"
     },
@@ -35,6 +39,10 @@
         "default": "./dist/index.js"
       },
       "./transports": {
+        "browser": {
+          "types": "./dist/transports/browser.d.ts",
+          "default": "./dist/transports/browser.js"
+        },
         "types": "./dist/transports/index.d.ts",
         "default": "./dist/transports/index.js"
       },
