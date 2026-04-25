@@ -1,46 +1,84 @@
 ---
 import ThemeToggle from "./ThemeToggle.tsx";
+
+interface Props {
+  version?: string;
+}
+
+const { version = "v0.28" } = Astro.props;
 ---
 
 <header
-  class="flex items-center justify-between px-6 py-2.5 border-b border-[var(--border)] bg-[var(--surface)] sticky top-0 z-10"
+  class="sticky top-0 z-20 border-b border-[var(--border)] bg-[color-mix(in_oklab,var(--bg)_85%,transparent)] backdrop-blur-md"
 >
-  <div class="flex items-center gap-2">
-    <svg viewBox="0 0 100 100" width="24" height="24">
-      <rect
-        width="100"
-        height="100"
-        rx="16"
-        fill="currentColor"
-        class="text-[var(--fg)]"></rect>
-      <text
-        x="12"
-        y="76"
-        font-family="monospace"
-        font-size="72"
-        font-weight="bold"
-        fill="var(--bg)">b</text
+  <div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-3 max-sm:px-4">
+    <a href="/" class="flex items-center gap-2.5 no-underline text-[var(--fg)]">
+      <span class="grid h-7 w-7 place-items-center rounded-md bg-[var(--bright)]">
+        <svg viewBox="0 0 100 100" width="18" height="18" aria-hidden="true">
+          <text
+            x="12"
+            y="76"
+            font-family="monospace"
+            font-size="72"
+            font-weight="bold"
+            fill="var(--bg)">b</text
+          >
+          <rect
+            x="60"
+            y="24"
+            width="8"
+            height="52"
+            rx="2"
+            fill="var(--accent)"
+            opacity="0.85"></rect>
+        </svg>
+      </span>
+      <span class="font-mono font-bold text-[15px] tracking-tight">blit</span>
+      <span
+        class="hidden sm:inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-[var(--dim)]"
+        >{version}</span
       >
-      <rect
-        x="60"
-        y="24"
-        width="8"
-        height="52"
-        rx="2"
-        fill="var(--accent)"
-        opacity="0.7"></rect>
-    </svg>
-    <span class="font-bold text-base tracking-tight">blit</span>
-  </div>
-  <nav class="flex items-center gap-4">
-    <a
-      href="https://github.com/indent-com/blit"
-      target="_blank"
-      rel="noopener noreferrer"
-      class="text-[var(--dim)] text-[13px] no-underline hover:text-[var(--fg)] transition-colors"
-    >
-      GitHub
     </a>
-    <ThemeToggle client:load />
-  </nav>
+    <nav class="flex items-center gap-1 text-[13px] sm:gap-3">
+      <a
+        href="#install"
+        class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] sm:inline-flex"
+        >Install</a
+      >
+      <a
+        href="#features"
+        class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] sm:inline-flex"
+        >Features</a
+      >
+      <a
+        href="#agents"
+        class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] sm:inline-flex"
+        >Agents</a
+      >
+      <a
+        href="#embed"
+        class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] md:inline-flex"
+        >Embed</a
+      >
+      <a
+        href="https://github.com/indent-com/blit"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)]"
+      >
+        <svg
+          viewBox="0 0 16 16"
+          width="14"
+          height="14"
+          fill="currentColor"
+          aria-hidden="true"
+          ><path
+            d="M8 .2A8 8 0 0 0 5.5 15.8c.4.1.5-.2.5-.4v-1.5c-2.2.5-2.7-1-2.7-1-.4-.9-.9-1.2-.9-1.2-.7-.5.1-.5.1-.5.8 0 1.2.8 1.2.8.7 1.2 1.9.9 2.4.7.1-.5.3-.9.5-1.1-1.8-.2-3.6-.9-3.6-3.9 0-.9.3-1.6.8-2.1-.1-.2-.4-1 .1-2.1 0 0 .7-.2 2.2.8a7.7 7.7 0 0 1 4 0c1.5-1 2.2-.8 2.2-.8.4 1.1.2 1.9.1 2.1.5.5.8 1.2.8 2.1 0 3-1.8 3.7-3.6 3.9.3.2.5.7.5 1.5v2.2c0 .2.1.5.6.4A8 8 0 0 0 8 .2Z"
+          ></path></svg
+        >
+        <span>GitHub</span>
+      </a>
+      <ThemeToggle client:load />
+    </nav>
+  </div>
 </header>

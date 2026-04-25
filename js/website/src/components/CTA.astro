@@ -1,0 +1,78 @@
+---
+import CopyButton from "./CopyButton.tsx";
+
+const DOCKER_CMD = "docker run --rm grab/blit-demo";
+---
+
+<section class="relative isolate overflow-hidden border-b border-[var(--border)] bg-[var(--bg)]">
+  <div
+    aria-hidden="true"
+    class="absolute inset-0 -z-10 hero-bg pointer-events-none"
+  >
+  </div>
+  <div
+    aria-hidden="true"
+    class="absolute inset-x-0 -top-32 -z-10 mx-auto h-64 max-w-3xl opacity-50 blur-3xl pointer-events-none"
+    style="background: radial-gradient(40rem 16rem at 50% 50%, var(--accent-glow), transparent 70%);"
+  >
+  </div>
+
+  <div class="mx-auto max-w-4xl px-6 py-20 text-center max-sm:px-4 max-sm:py-14">
+    <h2
+      class="font-sans text-[clamp(2rem,4vw,3rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]"
+    >
+      Try it without installing.
+    </h2>
+    <p class="mx-auto mt-4 max-w-xl text-[15px] leading-relaxed text-[var(--dim)]">
+      The demo image runs unprivileged and starts a shareable terminal,
+      with foot, mpv, neovim, and a few Wayland toys preloaded. Spin it up
+      to feel the latency.
+    </p>
+
+    <div
+      class="mx-auto mt-8 inline-flex max-w-full items-center gap-2 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elevated)] px-4 py-3 shadow-lg"
+    >
+      <span class="shrink-0 select-none text-[var(--green)]">$</span>
+      <code class="flex-1 truncate font-mono text-[14px] text-[var(--code-fg)]"
+        >{DOCKER_CMD}</code
+      >
+      <CopyButton text={DOCKER_CMD} client:load />
+    </div>
+
+    <div
+      class="mt-6 flex flex-wrap items-center justify-center gap-3 font-mono text-[12px] text-[var(--dim)]"
+    >
+      <a
+        href="https://github.com/indent-com/blit"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="inline-flex items-center gap-1.5 text-[var(--accent)] no-underline hover:underline"
+        >GitHub →</a
+      >
+      <span class="opacity-40">·</span>
+      <a
+        href="https://github.com/indent-com/blit/blob/main/CONTRIBUTING.md"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-[var(--accent)] no-underline hover:underline"
+        >Contribute</a
+      >
+      <span class="opacity-40">·</span>
+      <a
+        href="https://github.com/indent-com/blit/blob/main/EMBEDDING.md"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-[var(--accent)] no-underline hover:underline"
+        >Embedding guide</a
+      >
+      <span class="opacity-40">·</span>
+      <a
+        href="https://install.blit.sh/SKILL.md"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-[var(--accent)] no-underline hover:underline"
+        >Agent skill</a
+      >
+    </div>
+  </div>
+</section>

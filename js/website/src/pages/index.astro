@@ -2,24 +2,32 @@
 import Layout from "../layouts/Layout.astro";
 import Header from "../components/Header.astro";
 import Hero from "../components/Hero.astro";
+import WhyCards from "../components/WhyCards.astro";
+import HowItWorks from "../components/HowItWorks.astro";
 import DemoBlocks from "../components/DemoBlocks.astro";
+import Comparison from "../components/Comparison.astro";
 import AgentSkillSection from "../components/AgentSkillSection.astro";
+import EmbedSection from "../components/EmbedSection.astro";
 import PlatformSection from "../components/PlatformSection.astro";
 import KnownLimitationsSection from "../components/KnownLimitationsSection.astro";
-import EmbedSection from "../components/EmbedSection.astro";
+import CTA from "../components/CTA.astro";
 import Footer from "../components/Footer.astro";
 ---
 
 <Layout>
-  <div class="flex flex-col min-h-screen">
+  <div class="flex min-h-screen flex-col bg-[var(--bg)]">
     <Header />
-    <main class="flex-1 max-w-4xl mx-auto px-6 w-full max-sm:px-4">
+    <main class="flex-1">
       <Hero />
+      <WhyCards />
+      <div id="how"><HowItWorks /></div>
       <DemoBlocks />
+      <div id="compare"><Comparison /></div>
       <AgentSkillSection />
       <EmbedSection />
       <PlatformSection />
       <KnownLimitationsSection />
+      <CTA />
     </main>
     <Footer />
   </div>

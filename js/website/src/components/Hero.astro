@@ -7,47 +7,297 @@ const INSTALL_PS = "irm https://install.blit.sh/install.ps1 | iex";
 const DOCKER_CMD = "docker run --rm grab/blit-demo";
 ---
 
-<section class="pt-16 pb-8 [container-type:inline-size]">
-  <div class="mb-2 text-[11px] font-bold uppercase tracking-widest text-[var(--accent)] opacity-80">
-    Stream · Share · Automate
-  </div>
-  <h1 class="text-[clamp(2.8rem,8cqw,7rem)] font-bold leading-[1.05] tracking-tight text-[var(--bright)]">
-    Terminals for the Web and machines.
-  </h1>
-  <p class="mt-4 text-[14px] leading-relaxed text-[var(--dim)]">
-    Low-latency terminal streaming to any browser. Share a terminal with one
-    command. Drive it from AI agents. Tunnel into remote SSH hosts or
-    connect through NAT-friendly sharing. Zero config, no required dependencies.
-  </p>
-  <p class="mt-2 text-xs text-[var(--dim)] opacity-60">
-    MIT-licensed · Wide chars, emoji &amp; Unicode · WebGPU, WebGL, canvas2d
-  </p>
-
-  <div class="mt-8 bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3 flex flex-col gap-1.5">
-    <div class="flex items-center gap-2">
-      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-24">Try it</span>
-      <span class="text-[var(--green)] select-none shrink-0">$</span>
-      <span class="flex-1 min-w-0 text-[13px]">{DOCKER_CMD}</span>
-      <CopyButton text={DOCKER_CMD} client:load />
-    </div>
-    <div class="flex items-center gap-2 pt-1.5 border-t border-[var(--border)]">
-      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-24">Linux/Mac</span>
-      <span class="text-[var(--green)] select-none shrink-0">$</span>
-      <span class="flex-1 min-w-0 text-[13px]">{INSTALL_CMD}</span>
-      <CopyButton text={INSTALL_CMD} client:load />
-    </div>
-    <div class="flex items-center gap-2 pt-1.5 border-t border-[var(--border)]">
-      <span class="text-[var(--dim)] text-[11px] font-bold uppercase tracking-wider shrink-0 w-24">Windows</span>
-      <span class="text-[var(--green)] select-none shrink-0">&gt;</span>
-      <span class="flex-1 min-w-0 text-[13px]">{INSTALL_PS}</span>
-      <CopyButton text={INSTALL_PS} client:load />
-    </div>
+<section
+  id="install"
+  class="relative isolate overflow-hidden border-b border-[var(--border)] hero-bg"
+>
+  <div
+    aria-hidden="true"
+    class="absolute inset-0 -z-10 grid-bg pointer-events-none"
+  >
   </div>
 
-  <div class="mt-5">
-    <div class="text-[12px] text-[var(--dim)] mb-2">
-      or join an existing terminal
+  <div class="relative mx-auto max-w-6xl px-6 pt-16 pb-20 max-sm:px-4 max-sm:pt-12 max-sm:pb-14">
+    <div class="grid grid-cols-1 gap-12 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:gap-10 lg:items-center">
+      <!-- LEFT: copy + CTAs -->
+      <div class="flex flex-col">
+        <a
+          href="https://github.com/indent-com/blit/releases"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="group inline-flex w-fit items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1 text-[12px] no-underline transition-colors hover:border-[var(--accent)]"
+        >
+          <span class="relative flex h-1.5 w-1.5">
+            <span
+              class="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--accent)] opacity-60"
+            ></span>
+            <span
+              class="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--accent)]"
+            ></span>
+          </span>
+          <span class="font-mono text-[var(--dim)]">v0.28.3</span>
+          <span class="text-[var(--fg)]">— Vulkan video encode, zero-copy SHM</span>
+          <span
+            class="text-[var(--dim)] transition-transform group-hover:translate-x-0.5"
+            >→</span
+          >
+        </a>
+
+        <h1
+          class="mt-6 font-sans text-[clamp(2.6rem,6vw,4.6rem)] font-bold leading-[1.02] tracking-[-0.025em] text-[var(--bright)]"
+        >
+          Terminals for the <span class="grad-text">web</span> and
+          <span class="grad-text">machines</span>.
+        </h1>
+
+        <p class="mt-5 max-w-xl text-[16px] leading-relaxed text-[var(--dim)]">
+          Low-latency terminal streaming to any browser. Share with a link.
+          Drive from AI agents. Tunnel into SSH hosts. <span
+            class="text-[var(--fg)]"
+            >Single binary, no required dependencies.</span
+          >
+        </p>
+
+        <!-- Install card -->
+        <div class="mt-8 max-w-xl">
+          <div
+            class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-[0_1px_0_0_var(--border)]"
+          >
+            <div
+              class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2"
+            >
+              <span
+                class="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--dim)]"
+                >Install in 3 seconds</span
+              >
+              <a
+                href="https://github.com/indent-com/blit#install"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-[11px] text-[var(--accent)] no-underline hover:underline"
+                >Other ways →</a
+              >
+            </div>
+            <div class="flex flex-col gap-px bg-[var(--border)]">
+              <div class="flex items-center gap-2 bg-[var(--bg-elevated)] px-4 py-2.5">
+                <span
+                  class="w-16 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+                  >Docker</span
+                >
+                <span class="shrink-0 select-none text-[var(--green)]">$</span>
+                <code
+                  class="flex-1 min-w-0 truncate font-mono text-[13px] text-[var(--code-fg)]"
+                  >{DOCKER_CMD}</code
+                >
+                <CopyButton text={DOCKER_CMD} client:load />
+              </div>
+              <div class="flex items-center gap-2 bg-[var(--bg-elevated)] px-4 py-2.5">
+                <span
+                  class="w-16 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+                  >Unix</span
+                >
+                <span class="shrink-0 select-none text-[var(--green)]">$</span>
+                <code
+                  class="flex-1 min-w-0 truncate font-mono text-[13px] text-[var(--code-fg)]"
+                  >{INSTALL_CMD}</code
+                >
+                <CopyButton text={INSTALL_CMD} client:load />
+              </div>
+              <div class="flex items-center gap-2 bg-[var(--bg-elevated)] px-4 py-2.5">
+                <span
+                  class="w-16 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+                  >Windows</span
+                >
+                <span class="shrink-0 select-none text-[var(--green)]">&gt;</span>
+                <code
+                  class="flex-1 min-w-0 truncate font-mono text-[13px] text-[var(--code-fg)]"
+                  >{INSTALL_PS}</code
+                >
+                <CopyButton text={INSTALL_PS} client:load />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Secondary CTAs -->
+        <div class="mt-5 flex flex-wrap items-center gap-3">
+          <a
+            href="https://github.com/indent-com/blit"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="inline-flex items-center gap-2 rounded-md border border-[var(--border-strong)] bg-[var(--surface)] px-3.5 py-2 text-[13px] font-medium text-[var(--fg)] no-underline transition-colors hover:border-[var(--accent)]"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"
+              ><path
+                d="M8 .2A8 8 0 0 0 5.5 15.8c.4.1.5-.2.5-.4v-1.5c-2.2.5-2.7-1-2.7-1-.4-.9-.9-1.2-.9-1.2-.7-.5.1-.5.1-.5.8 0 1.2.8 1.2.8.7 1.2 1.9.9 2.4.7.1-.5.3-.9.5-1.1-1.8-.2-3.6-.9-3.6-3.9 0-.9.3-1.6.8-2.1-.1-.2-.4-1 .1-2.1 0 0 .7-.2 2.2.8a7.7 7.7 0 0 1 4 0c1.5-1 2.2-.8 2.2-.8.4 1.1.2 1.9.1 2.1.5.5.8 1.2.8 2.1 0 3-1.8 3.7-3.6 3.9.3.2.5.7.5 1.5v2.2c0 .2.1.5.6.4A8 8 0 0 0 8 .2Z"
+              ></path></svg
+            >
+            Star on GitHub
+          </a>
+          <a
+            href="#agents"
+            class="inline-flex items-center gap-1.5 px-1 text-[13px] font-medium text-[var(--accent)] no-underline hover:underline"
+          >
+            Read the agent skill
+            <span aria-hidden="true">→</span>
+          </a>
+        </div>
+
+        <!-- Join existing terminal -->
+        <div class="mt-7">
+          <div
+            class="mb-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+          >
+            Or join an existing terminal
+          </div>
+          <JoinForm client:load />
+        </div>
+      </div>
+
+      <!-- RIGHT: always-dark terminal mock -->
+      <div class="relative" data-theme="dark">
+        <div
+          aria-hidden="true"
+          class="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] opacity-70 blur-2xl"
+          style="background: radial-gradient(40rem 18rem at 60% 40%, var(--accent-glow), transparent 70%);"
+        >
+        </div>
+        <div
+          class="overflow-hidden rounded-xl border border-[#21262d] bg-[#0a0d12] shadow-2xl shadow-[color:var(--accent-glow)]"
+        >
+          <!-- chrome -->
+          <div
+            class="flex items-center gap-3 border-b border-[#21262d] bg-[#11161d] px-3 py-2"
+          >
+            <div class="flex items-center gap-1.5">
+              <span class="h-2.5 w-2.5 rounded-full bg-[#ff5f57]"></span>
+              <span class="h-2.5 w-2.5 rounded-full bg-[#febc2e]"></span>
+              <span class="h-2.5 w-2.5 rounded-full bg-[#28c840]"></span>
+            </div>
+            <div
+              class="flex flex-1 items-center justify-center gap-2 font-mono text-[11px] text-[var(--dim)]"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="11"
+                height="11"
+                fill="currentColor"
+                ><path
+                  d="M5 3.5h6a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5Zm-1.5 1V11h.5V4.5H5Zm9 7v-7h-.5V11h.5Z"
+                ></path><path
+                  d="M2 1.75A.75.75 0 0 1 2.75 1h10.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 1.75Z"
+                ></path></svg
+              >
+              <span>blit.sh/s#rf6e…</span>
+            </div>
+            <span class="font-mono text-[10px] uppercase tracking-wider text-[var(--green)]"
+              >● live</span
+            >
+          </div>
+          <!-- tabs -->
+          <div
+            class="flex items-center gap-px border-b border-[var(--border)] bg-[var(--surface)] px-2 py-0 text-[12px]"
+          >
+            <div
+              class="flex items-center gap-1.5 border-b-2 border-[var(--accent)] bg-[var(--bg-elevated)] px-3 py-1.5 font-mono text-[var(--fg)]"
+            >
+              <span class="h-1.5 w-1.5 rounded-full bg-[var(--green)]"></span>
+              build
+            </div>
+            <div
+              class="flex items-center gap-1.5 px-3 py-1.5 font-mono text-[var(--dim)]"
+            >
+              shell
+            </div>
+            <div
+              class="flex items-center gap-1.5 px-3 py-1.5 font-mono text-[var(--dim)]"
+            >
+              foot
+              <span class="rounded bg-[var(--accent-soft)] px-1 py-0 text-[9px] font-bold uppercase tracking-wider text-[var(--accent)]"
+                >GUI</span
+              >
+            </div>
+            <div class="ml-auto px-2 font-mono text-[10px] text-[var(--dim)]">
+              ⌘ K
+            </div>
+          </div>
+          <!-- body -->
+          <pre
+            class="m-0 overflow-hidden bg-[var(--code-bg)] px-4 py-4 font-mono text-[13px] leading-relaxed text-[var(--code-fg)]"><code class="block"><span class="anim-line block" style="animation-delay:.05s"><span class="text-[var(--green)] select-none">$</span> <span class="text-[var(--code-fg)]">blit share</span></span><span class="anim-line block text-[var(--dim)]" style="animation-delay:.5s">Terminals at <span class="text-[var(--accent)] underline">https://blit.sh/s#rf6e…</span></span><span class="anim-line block text-[var(--dim)]" style="animation-delay:.6s">Read-only:  <span class="text-[var(--accent)] underline">https://blit.sh/s#EMPs…</span></span><span class="anim-line block" style="animation-delay:.9s">&nbsp;</span><span class="anim-line block" style="animation-delay:1.0s"><span class="text-[var(--green)] select-none">$</span> blit terminal start -t build <span class="text-[var(--hl-str)]">make -j8</span></span><span class="anim-line block text-[var(--hl-num)]" style="animation-delay:1.3s">1</span><span class="anim-line block" style="animation-delay:1.4s"><span class="text-[var(--green)] select-none">$</span> blit terminal wait 1 --pattern <span class="text-[var(--hl-str)]">'BUILD OK'</span></span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.0s">[ 12%] Building CXX object src/CMakeFiles/app.dir/main.cpp.o</span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.2s">[ 38%] Building CXX object src/CMakeFiles/app.dir/io.cpp.o</span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.4s">[ 71%] Building CXX object src/CMakeFiles/app.dir/render.cpp.o</span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.6s">[ 92%] Linking CXX executable bin/app</span><span class="anim-line block" style="animation-delay:2.9s"><span class="text-[var(--green)]">[100%] Built target app</span></span><span class="anim-line block" style="animation-delay:3.1s"><span class="text-[var(--green)] font-bold">BUILD OK</span></span><span class="anim-line block" style="animation-delay:3.3s">&nbsp;</span><span class="anim-line block" style="animation-delay:3.4s"><span class="text-[var(--green)] select-none">$</span> blit terminal send 1 <span class="text-[var(--hl-str)]">"./bin/app --serve"</span></span><span class="anim-line block" style="animation-delay:3.7s"><span class="text-[var(--green)] select-none">$</span> <span class="blit-cursor"></span></span></code></pre>
+          <!-- status bar -->
+          <div
+            class="flex items-center justify-between gap-2 border-t border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono text-[10px] text-[var(--dim)]"
+          >
+            <div class="flex items-center gap-3">
+              <span><span class="text-[var(--green)]">●</span> 3 terminals</span>
+              <span class="opacity-60">|</span>
+              <span>1 viewer</span>
+              <span class="opacity-60">|</span>
+              <span class="text-[var(--accent)]">webrtc</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span>14ms RTT</span>
+              <span class="opacity-60">|</span>
+              <span>LZ4 · 96% diff</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Annotations -->
+        <div
+          class="mt-4 hidden flex-wrap items-center justify-center gap-x-4 gap-y-1 text-center font-mono text-[10px] uppercase tracking-wider text-[var(--dim)] sm:flex"
+        >
+          <span><span class="text-[var(--accent)]">▲</span> WebGL render</span>
+          <span class="opacity-40">·</span>
+          <span><span class="text-[var(--accent)]">▲</span> binary diffs</span>
+          <span class="opacity-40">·</span>
+          <span><span class="text-[var(--accent)]">▲</span> per-client pacing</span>
+          <span class="opacity-40">·</span>
+          <span><span class="text-[var(--accent)]">▲</span> WebRTC NAT punch</span>
+        </div>
+      </div>
     </div>
-    <JoinForm client:load />
+
+    <!-- Stats strip -->
+    <div
+      class="mt-16 grid grid-cols-2 gap-y-6 border-y border-[var(--border)] py-6 sm:grid-cols-4 sm:gap-x-8"
+    >
+      <div>
+        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">1</div>
+        <div
+          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+        >
+          Single binary
+        </div>
+      </div>
+      <div>
+        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">0</div>
+        <div
+          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+        >
+          Required deps
+        </div>
+      </div>
+      <div>
+        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">
+          4 <span class="text-[var(--dim)] text-[18px] font-medium">transports</span>
+        </div>
+        <div
+          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+        >
+          WS · WebTransport · WebRTC · Unix
+        </div>
+      </div>
+      <div>
+        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">
+          MIT
+        </div>
+        <div
+          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+        >
+          Open source · Linux · macOS · Windows
+        </div>
+      </div>
+    </div>
   </div>
 </section>
