@@ -21,30 +21,8 @@ const DOCKER_CMD = "docker run --rm grab/blit-demo";
     <div class="grid grid-cols-1 gap-12 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:gap-10 lg:items-center">
       <!-- LEFT: copy + CTAs -->
       <div class="flex flex-col">
-        <a
-          href="https://github.com/indent-com/blit/releases"
-          target="_blank"
-          rel="noopener noreferrer"
-          class="group inline-flex w-fit items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1 text-[12px] no-underline transition-colors hover:border-[var(--accent)]"
-        >
-          <span class="relative flex h-1.5 w-1.5">
-            <span
-              class="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--accent)] opacity-60"
-            ></span>
-            <span
-              class="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--accent)]"
-            ></span>
-          </span>
-          <span class="font-mono text-[var(--dim)]">v0.28.3</span>
-          <span class="text-[var(--fg)]">— Vulkan video encode, zero-copy SHM</span>
-          <span
-            class="text-[var(--dim)] transition-transform group-hover:translate-x-0.5"
-            >→</span
-          >
-        </a>
-
         <h1
-          class="mt-6 font-sans text-[clamp(2.6rem,6vw,4.6rem)] font-bold leading-[1.02] tracking-[-0.025em] text-[var(--bright)]"
+          class="font-sans text-[clamp(2.6rem,6vw,4.6rem)] font-bold leading-[1.02] tracking-[-0.025em] text-[var(--bright)]"
         >
           Terminals for the <span class="grad-text">web</span> and
           <span class="grad-text">machines</span>.
