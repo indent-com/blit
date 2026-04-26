@@ -274,9 +274,6 @@ in
               pkgs.dbus
             ];
             serviceConfig = {
-              # `blit server` sends sd_notify(READY=1) once its IPC listener
-              # is bound, so units depending on this service can wait on
-              # actual readiness instead of the systemctl-fork-exec moment.
               Type = "notify";
               User = user;
               WorkingDirectory = "~";
@@ -309,9 +306,6 @@ in
               requires = lib.optional (gw.user != null) "blit-server@${gw.user}.socket";
               wantedBy = [ "multi-user.target" ];
               serviceConfig = {
-                # `blit gateway` sends sd_notify(READY=1) once it's bound
-                # the listening TCP socket, just before axum::serve starts
-                # accepting connections.
                 Type = "notify";
                 ExecStart = "${gw.package}/bin/blit gateway";
                 Environment = [
@@ -348,10 +342,6 @@ in
             requires = [ "blit-server@${shr.user}.socket" ];
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
-              # `blit share` sends sd_notify(READY=1) once the signaling
-              # hub registers the producer — i.e. once the share URL is
-              # actually consumable. Earlier than that, the printed URL
-              # wouldn't connect.
               Type = "notify";
               User = shr.user;
               ExecStart =

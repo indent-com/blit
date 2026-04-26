@@ -442,12 +442,6 @@ pub async fn run(config: Config) {
         match event {
             signaling::Event::Registered { session_id } => {
                 verbose!("registered with signaling server (session {session_id})");
-                // The share URL printed at startup is only actually
-                // consumable once the hub has registered us — this is the
-                // earliest point at which a Type=notify systemd unit can
-                // truthfully advertise readiness. Idempotent on reconnects:
-                // sd_notify treats repeated READY=1 as a no-op and we also
-                // don't care if the env var is unset.
                 blit_sd_notify::notify_ready(false);
                 // Do NOT abort unestablished peers here.  The hub will
                 // re-send peer_joined for every consumer that is still

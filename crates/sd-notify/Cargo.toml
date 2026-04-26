@@ -11,7 +11,5 @@ homepage.workspace = true
 name = "blit_sd_notify"
 path = "src/lib.rs"
 
-# systemd is Linux-only — gate libc here so we don't spuriously pull it in on
-# macOS/BSDs/Windows where notify_ready is a no-op stub.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
