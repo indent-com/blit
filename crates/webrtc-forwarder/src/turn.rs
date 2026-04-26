@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use sha1::Sha1;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};

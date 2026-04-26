@@ -3,7 +3,7 @@ Description=blit terminal multiplexer
 Requires=blit.socket
 
 [Service]
-Type=simple
+Type=notify
 WorkingDirectory=~
 ExecStart=blit server
 Restart=no

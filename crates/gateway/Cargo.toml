@@ -16,6 +16,7 @@ blit-webserver = { workspace = true }
 blit-webrtc-forwarder = { workspace = true }
 blit-ssh = { workspace = true }
 blit-proxy = { workspace = true }
+blit-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"

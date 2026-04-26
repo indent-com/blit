@@ -3,7 +3,7 @@ Description=blit share %i
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 EnvironmentFile=/etc/blit/share-%i.env
 ExecStart=blit share --quiet
 Restart=on-failure

@@ -71,6 +71,7 @@ The server is the stateful half. It owns PTYs, scrollback, parsed terminal state
 | `blit-fonts`            | `crates/fonts/`            | lib           | Font discovery and metadata (TTF/OTF `name`/`post`/`hmtx` table parsing)                                             |
 | `blit-webserver`        | `crates/webserver/`        | lib           | Shared axum helpers: HTML serving, font routes, config WebSocket, remotes file                                       |
 | `blit-compositor`       | `crates/compositor/`       | lib           | Experimental headless Wayland compositor (wayland-server): surface multiplexing, input injection                     |
+| `blit-sd-notify`        | `crates/sd-notify/`        | lib           | Tiny pure-`libc` `sd_notify(3)` for daemon readiness; no `libsystemd` dependency                                     |
 
 Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`blit-server`, `blit-compositor`, `blit-cli`, `blit-webrtc-forwarder`) use a small number of sibling files in the same directory.
 

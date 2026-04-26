@@ -21,6 +21,16 @@ sudo systemctl enable --now blit-server@alice.socket
 sudo systemctl enable --now blit-share@alice.service
 ```
 
+All three `blit` daemons (`server`, `gateway`, `share`) send `READY=1`
+over `$NOTIFY_SOCKET` once they're actually serving — server after the
+IPC listener is bound, gateway after the TCP listener is bound, share
+after the signaling hub registers the producer. Units in this repo
+ship with `Type=notify` so `systemctl start` returns only after the
+service is genuinely consumable. The notify implementation is in
+[`crates/sd-notify/`](crates/sd-notify/) and is a no-op when
+`NOTIFY_SOCKET` is unset, so the same binaries still work outside
+systemd.
+
 ### Multi-remote gateway (blit gateway)
 
 `blit gateway` can front multiple remote hosts in a single browser UI.

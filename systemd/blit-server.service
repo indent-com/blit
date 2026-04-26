@@ -3,7 +3,7 @@ Description=blit terminal multiplexer
 Requires=blit-server.socket
 
 [Service]
-Type=simple
+Type=notify
 WorkingDirectory=~
 ExecStart=blit server
 # Keep running after all clients disconnect — PTYs stay alive.

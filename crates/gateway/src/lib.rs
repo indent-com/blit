@@ -562,6 +562,8 @@ pub async fn run() {
         },
     );
 
+    blit_sd_notify::notify_ready(false);
+
     let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
         #[cfg(unix)]
         {

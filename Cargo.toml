@@ -12,6 +12,7 @@ members = [
     "crates/webrtc-forwarder",
     "crates/compositor",
     "crates/proxy",
+    "crates/sd-notify",
     "crates/ssh",
 ]
 exclude = []
@@ -32,6 +33,7 @@ blit-gateway = { version = "0.28.3", path = "crates/gateway" }
 blit-proxy = { version = "0.28.3", path = "crates/proxy" }
 blit-webrtc-forwarder = { version = "0.28.3", path = "crates/webrtc-forwarder" }
 blit-compositor = { version = "0.28.3", path = "crates/compositor" }
+blit-sd-notify = { version = "0.28.3", path = "crates/sd-notify" }
 blit-ssh = { version = "0.28.3", path = "crates/ssh" }
 
 [patch.crates-io]

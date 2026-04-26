@@ -274,7 +274,7 @@ in
               pkgs.dbus
             ];
             serviceConfig = {
-              Type = "simple";
+              Type = "notify";
               User = user;
               WorkingDirectory = "~";
               ExecStart = "${cfg.package}/bin/blit server";
@@ -306,7 +306,7 @@ in
               requires = lib.optional (gw.user != null) "blit-server@${gw.user}.socket";
               wantedBy = [ "multi-user.target" ];
               serviceConfig = {
-                Type = "simple";
+                Type = "notify";
                 ExecStart = "${gw.package}/bin/blit gateway";
                 Environment = [
                   "BLIT_ADDR=${gw.addr}:${toString gw.port}"
@@ -342,7 +342,7 @@ in
             requires = [ "blit-server@${shr.user}.socket" ];
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
-              Type = "simple";
+              Type = "notify";
               User = shr.user;
               ExecStart =
                 "${shr.package}/bin/blit share"

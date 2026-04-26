@@ -19,7 +19,7 @@ axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 rand = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 clap_complete = "4"
 regex = "1"
 serde_json = "1"
@@ -30,13 +30,13 @@ blit-webrtc-forwarder = { workspace = true }
 blit-ssh = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
 ] }

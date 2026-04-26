@@ -9,19 +9,19 @@
     "typecheck": "astro check && tsc --noEmit"
   },
   "dependencies": {
-    "@astrojs/solid-js": "^6",
+    "@astrojs/solid-js": "^6.0.1",
     "@blit-sh/core": "workspace:*",
     "@blit-sh/solid": "workspace:*",
-    "astro": "^6",
-    "solid-js": "^1.9.0",
+    "astro": "^6.1.9",
+    "solid-js": "^1.9.12",
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "@astrojs/check": "^0.9",
+    "@astrojs/check": "^0.9.8",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
-    "@tailwindcss/vite": "^4",
-    "@vitejs/plugin-basic-ssl": "^2",
-    "tailwindcss": "^4",
-    "typescript": "^6"
+    "@tailwindcss/vite": "^4.2.4",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "tailwindcss": "^4.2.4",
+    "typescript": "^6.0.3"
   }
 }

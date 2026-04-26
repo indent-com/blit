@@ -2223,6 +2223,7 @@ pub async fn run(config: Config) {
 
     #[cfg(unix)]
     if let Some(channel_fd) = state.config.fd_channel {
+        blit_sd_notify::notify_ready(state.config.verbose);
         ipc::run_fd_channel(channel_fd, state).await;
         return;
     }
@@ -2237,6 +2238,8 @@ pub async fn run(config: Config) {
     };
     #[cfg(not(unix))]
     let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose);
+
+    blit_sd_notify::notify_ready(state.config.verbose);
 
     // Broadcast S2C_QUIT on SIGTERM / SIGINT so clients can reconnect promptly
     // instead of waiting for a transport-level timeout.

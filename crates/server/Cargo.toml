@@ -15,20 +15,21 @@ path = "src/lib.rs"
 blit-remote = { workspace = true }
 blit-alacritty = { workspace = true }
 blit-compositor = { workspace = true }
+blit-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 memchr = "2"
-openh264 = "0.6"
-rav1e = { version = "0.7", default-features = false }
-ravif = { version = "0.11", default-features = false }
+openh264 = "0.9"
+rav1e = { version = "0.8", default-features = false }
+ravif = { version = "0.13", default-features = false }
 rgb = "0.8"
-png = "0.17"
+png = "0.18"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 opus = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_Threading",

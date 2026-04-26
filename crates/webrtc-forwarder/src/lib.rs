@@ -442,6 +442,7 @@ pub async fn run(config: Config) {
         match event {
             signaling::Event::Registered { session_id } => {
                 verbose!("registered with signaling server (session {session_id})");
+                blit_sd_notify::notify_ready(false);
                 // Do NOT abort unestablished peers here.  The hub will
                 // re-send peer_joined for every consumer that is still
                 // connected; the PeerJoined handler below replaces the peer

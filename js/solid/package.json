@@ -63,14 +63,14 @@
     "solid-js": ">=1.8.0"
   },
   "devDependencies": {
-    "@blit-sh/core": "workspace:*",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
-    "@solidjs/testing-library": "^0.8",
-    "jsdom": "^29",
-    "solid-js": "^1.9.0",
-    "typescript": "^6",
-    "vite-plugin-solid": "^2",
-    "vitest": "^4"
+    "@blit-sh/core": "workspace:*",
+    "@solidjs/testing-library": "^0.8.10",
+    "jsdom": "^29.0.2",
+    "solid-js": "^1.9.12",
+    "typescript": "^6.0.3",
+    "vite-plugin-solid": "^2.11.12",
+    "vitest": "^4.1.5"
   },
   "license": "MIT"
 }
