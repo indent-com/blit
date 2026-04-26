@@ -8,18 +8,20 @@ import {
 } from "solid-js";
 import {
   BlitTerminal,
+  BlitSurfaceView,
   BlitWorkspaceProvider,
   createBlitWorkspaceState,
   createBlitSessions,
 } from "@blit-sh/solid";
 import { BlitWorkspace, PALETTES } from "@blit-sh/core";
 import type {
-  BlitSession,
+  BlitSurface,
   BlitTerminalSurface,
   BlitWasmModule,
   SessionId,
 } from "@blit-sh/core";
 import { initWasm } from "../../lib/wasm";
+import { createSurfaces } from "../../lib/surfaces";
 import {
   isEncrypted,
   encryptPassphrase,
@@ -366,6 +368,38 @@ function DisconnectedOverlay(props: { passphrase: string; readOnly: boolean }) {
 // TabShell: manages sessions, tab bar, terminal rendering
 // ---------------------------------------------------------------------------
 
+// Tab IDs are encoded so the TabBar can address sessions and surfaces with a
+// single string key.  `s:<sessionId>` for terminal sessions, `w:<surfaceId>`
+// for Wayland surfaces (single connection in the website demo).
+const SESSION_TAB_PREFIX = "s:";
+const SURFACE_TAB_PREFIX = "w:";
+
+type ActiveTab =
+  | { kind: "session"; sessionId: SessionId }
+  | { kind: "surface"; surfaceId: number };
+
+function tabIdFor(tab: ActiveTab): string {
+  return tab.kind === "session"
+    ? `${SESSION_TAB_PREFIX}${tab.sessionId}`
+    : `${SURFACE_TAB_PREFIX}${tab.surfaceId}`;
+}
+
+function parseTabId(id: string): ActiveTab | null {
+  if (id.startsWith(SESSION_TAB_PREFIX)) {
+    return { kind: "session", sessionId: id.slice(SESSION_TAB_PREFIX.length) };
+  }
+  if (id.startsWith(SURFACE_TAB_PREFIX)) {
+    const sid = Number(id.slice(SURFACE_TAB_PREFIX.length));
+    if (!Number.isFinite(sid)) return null;
+    return { kind: "surface", surfaceId: sid };
+  }
+  return null;
+}
+
+function surfaceTabTitle(s: BlitSurface): string | null {
+  return s.title || s.appId || null;
+}
+
 function TabShell(props: {
   workspace: BlitWorkspace;
   palette: () => typeof GITHUB_DARK;
@@ -377,6 +411,7 @@ function TabShell(props: {
   const workspace = props.workspace;
   const state = createBlitWorkspaceState(workspace);
   const sessions = createBlitSessions(workspace);
+  const surfaces = createSurfaces(workspace, CONNECTION_ID);
 
   const [showShortcuts, setShowShortcuts] = createSignal(false);
   const [menuOpen, setMenuOpen] = createSignal(false);
@@ -443,19 +478,60 @@ function TabShell(props: {
   const visibleSessions = createMemo(() =>
     sessions().filter((s) => s.state !== "closed"),
   );
-  const focusedId = createMemo(() => state().focusedSessionId);
 
-  // Track previous focused for fallback
+  // Unified tab list: sessions first, then surfaces.  TabBar keys by ID so a
+  // surface that disappears doesn't disturb the session ordering.
+  const tabs = createMemo(() => {
+    const vs = visibleSessions();
+    const ws = surfaces();
+    const result: { id: string; title: string | null; fallback?: string }[] =
+      [];
+    for (let i = 0; i < vs.length; i++) {
+      const s = vs[i];
+      result.push({
+        id: tabIdFor({ kind: "session", sessionId: s.id }),
+        title: s.title || s.tag || null,
+        fallback: `Tab ${i + 1}`,
+      });
+    }
+    for (const s of ws) {
+      result.push({
+        id: tabIdFor({ kind: "surface", surfaceId: s.surfaceId }),
+        title: surfaceTabTitle(s),
+        fallback: `Surface ${s.surfaceId}`,
+      });
+    }
+    return result;
+  });
+
+  // Track the active tab ourselves so surfaces can be focused too — the
+  // workspace's focusedSessionId only knows about terminal sessions.
+  const [activeTab, setActiveTab] = createSignal<ActiveTab | null>(null);
+  const activeTabId = createMemo(() => {
+    const t = activeTab();
+    return t ? tabIdFor(t) : null;
+  });
+
+  // Keep workspace.focusSession in sync when a session tab is active so the
+  // server learns we're driving that PTY.
+  createEffect(() => {
+    const t = activeTab();
+    if (t?.kind === "session") workspace.focusSession(t.sessionId);
+  });
+
+  // Track previous focused session for fallback after a session closes.
   let prevFocused: { id: SessionId; index: number } | null = null;
   createEffect(() => {
-    const fid = focusedId();
-    if (fid) {
-      const idx = visibleSessions().findIndex((s) => s.id === fid);
-      if (idx >= 0) prevFocused = { id: fid, index: idx };
+    const t = activeTab();
+    if (t?.kind === "session") {
+      const idx = visibleSessions().findIndex((s) => s.id === t.sessionId);
+      if (idx >= 0) prevFocused = { id: t.sessionId, index: idx };
     }
   });
 
-  // Auto-create session when connected + no visible sessions (RW only)
+  // Auto-create a session when connected and there's nothing to show
+  // (no surfaces, no sessions).  Surfaces alone are enough — host may
+  // be sharing a Wayland app without an open terminal.
   let creating = false;
   createEffect(() => {
     const conn = state().connections[0];
@@ -464,6 +540,7 @@ function TabShell(props: {
       conn?.status === "connected" &&
       conn?.ready &&
       visibleSessions().length === 0 &&
+      surfaces().length === 0 &&
       !creating
     ) {
       creating = true;
@@ -473,19 +550,32 @@ function TabShell(props: {
           rows: 24,
           cols: 80,
         })
-        .then((s) => workspace.focusSession(s.id))
+        .then((s) => setActiveTab({ kind: "session", sessionId: s.id }))
         .finally(() => {
           creating = false;
         });
-    } else if (visibleSessions().length > 0 && !focusedId()) {
-      const idx = prevFocused
-        ? Math.min(prevFocused.index, visibleSessions().length - 1)
-        : 0;
-      workspace.focusSession(visibleSessions()[idx].id);
     }
   });
 
-  // Keep visible sessions in sync
+  // Pick a tab to focus when nothing is active but tabs exist.  Prefer the
+  // last focused session by index, then the first session, then the first
+  // surface.
+  createEffect(() => {
+    if (activeTab()) return;
+    const vs = visibleSessions();
+    if (vs.length > 0) {
+      const idx = prevFocused ? Math.min(prevFocused.index, vs.length - 1) : 0;
+      setActiveTab({ kind: "session", sessionId: vs[idx].id });
+      return;
+    }
+    const ws = surfaces();
+    if (ws.length > 0) {
+      setActiveTab({ kind: "surface", surfaceId: ws[0].surfaceId });
+    }
+  });
+
+  // Keep visible sessions in sync — only sessions need to be marked
+  // visible; surface streaming is driven by BlitSurfaceView's mount.
   createEffect(() => {
     const desired = new Set<SessionId>();
     const vs = visibleSessions();
@@ -493,35 +583,59 @@ function TabShell(props: {
     workspace.setVisibleSessions(desired);
   });
 
-  const focusedSession = createMemo(() =>
-    sessions().find((s) => s.id === focusedId()),
-  );
+  const focusedSession = createMemo(() => {
+    const t = activeTab();
+    if (t?.kind !== "session") return undefined;
+    return sessions().find((s) => s.id === t.sessionId);
+  });
   const focusedExited = createMemo(() => focusedSession()?.state === "exited");
 
   // Handle Enter/Esc on exited sessions
   createEffect(() => {
-    const fid = focusedId();
-    if (!focusedExited() || !fid) return;
+    const t = activeTab();
+    if (t?.kind !== "session" || !focusedExited()) return;
+    const sid = t.sessionId;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        workspace.restartSession(fid);
+        workspace.restartSession(sid);
       } else if (e.key === "Escape") {
         e.preventDefault();
-        workspace.closeSession(fid);
+        workspace.closeSession(sid);
       }
     };
     window.addEventListener("keydown", handler);
     onCleanup(() => window.removeEventListener("keydown", handler));
   });
 
-  // If focused session vanished, focus the last visible
+  // If the active tab vanished, fall back to the last available tab.
+  // Prefer the same kind first (session→session, surface→surface) so a
+  // closed terminal doesn't unexpectedly hand focus to a Wayland window.
   createEffect(() => {
-    const fid = focusedId();
+    const t = activeTab();
+    if (!t) return;
     const vs = visibleSessions();
-    if (fid && vs.every((s) => s.id !== fid)) {
-      const next = vs[vs.length - 1];
-      workspace.focusSession(next?.id ?? null);
+    const ws = surfaces();
+    if (t.kind === "session") {
+      if (vs.some((s) => s.id === t.sessionId)) return;
+      const fallback = vs[vs.length - 1];
+      if (fallback) {
+        setActiveTab({ kind: "session", sessionId: fallback.id });
+      } else if (ws.length > 0) {
+        setActiveTab({ kind: "surface", surfaceId: ws[0].surfaceId });
+      } else {
+        setActiveTab(null);
+      }
+    } else {
+      if (ws.some((s) => s.surfaceId === t.surfaceId)) return;
+      const fallback = ws[ws.length - 1];
+      if (fallback) {
+        setActiveTab({ kind: "surface", surfaceId: fallback.surfaceId });
+      } else if (vs.length > 0) {
+        setActiveTab({ kind: "session", sessionId: vs[vs.length - 1].id });
+      } else {
+        setActiveTab(null);
+      }
     }
   });
 
@@ -533,7 +647,7 @@ function TabShell(props: {
         e.preventDefault();
         workspace
           .createSession({ connectionId: CONNECTION_ID, rows: 24, cols: 80 })
-          .then((s) => workspace.focusSession(s.id))
+          .then((s) => setActiveTab({ kind: "session", sessionId: s.id }))
           .catch(() => {});
       } else if (
         e.ctrlKey &&
@@ -544,15 +658,17 @@ function TabShell(props: {
         setShowShortcuts((v) => !v);
       } else if (mod && !e.shiftKey && (e.key === "[" || e.key === "]")) {
         e.preventDefault();
-        const vs = visibleSessions();
-        const fid = focusedId();
-        if (vs.length < 2 || !fid) return;
-        const idx = vs.findIndex((s) => s.id === fid);
-        const next =
+        const all = tabs();
+        if (all.length < 2) return;
+        const cur = activeTabId();
+        const idx = cur ? all.findIndex((t) => t.id === cur) : -1;
+        if (idx < 0) return;
+        const nextItem =
           e.key === "]"
-            ? vs[(idx + 1) % vs.length]
-            : vs[(idx - 1 + vs.length) % vs.length];
-        workspace.focusSession(next.id);
+            ? all[(idx + 1) % all.length]
+            : all[(idx - 1 + all.length) % all.length];
+        const nextTab = parseTabId(nextItem.id);
+        if (nextTab) setActiveTab(nextTab);
       }
     };
     window.addEventListener("keydown", handler, true);
@@ -579,11 +695,10 @@ function TabShell(props: {
     const conn = state().connections[0];
     if (!conn) return "Connecting...";
     if (conn.status === "connected") {
-      return visibleSessions().length === 0
-        ? props.readOnly
-          ? "Connected \u2014 waiting for host to open a terminal..."
-          : "Connected \u2014 waiting for terminals..."
-        : null;
+      if (tabs().length > 0) return null;
+      return props.readOnly
+        ? "Connected \u2014 waiting for host to open a terminal or window..."
+        : "Connected \u2014 waiting for terminals or windows...";
     }
     if (conn.status === "connecting")
       return "Connecting \u2014 waiting for blit share...";
@@ -592,21 +707,43 @@ function TabShell(props: {
     return "Connecting...";
   });
 
-  const handleSelectTab = (id: SessionId) => workspace.focusSession(id);
-  const handleCloseTab = (id: SessionId) => workspace.closeSession(id);
+  const handleSelectTab = (id: string) => {
+    const t = parseTabId(id);
+    if (t) setActiveTab(t);
+  };
+  const handleCloseTab = (id: string) => {
+    const t = parseTabId(id);
+    if (!t) return;
+    if (t.kind === "session") {
+      workspace.closeSession(t.sessionId);
+    } else {
+      workspace.closeSurface(CONNECTION_ID, t.surfaceId);
+    }
+  };
   const handleNewTab = () => {
     if (props.readOnly) return;
-    const fid = focusedId();
+    const cur = activeTab();
+    const cwdFromSessionId =
+      cur?.kind === "session" ? cur.sessionId : undefined;
     workspace
       .createSession({
         connectionId: CONNECTION_ID,
         rows: 24,
         cols: 80,
-        ...(fid ? { cwdFromSessionId: fid } : {}),
+        ...(cwdFromSessionId ? { cwdFromSessionId } : {}),
       })
-      .then((s) => workspace.focusSession(s.id))
+      .then((s) => setActiveTab({ kind: "session", sessionId: s.id }))
       .catch(() => {});
   };
+
+  const activeSessionId = createMemo(() => {
+    const t = activeTab();
+    return t?.kind === "session" ? t.sessionId : null;
+  });
+  const activeSurfaceId = createMemo(() => {
+    const t = activeTab();
+    return t?.kind === "surface" ? t.surfaceId : null;
+  });
 
   return (
     <div
@@ -616,12 +753,12 @@ function TabShell(props: {
         top: isMobileTouch() && vpOffset() ? `${vpOffset()}px` : "0",
       }}
     >
-      <Show when={visibleSessions().length > 0}>
+      <Show when={tabs().length > 0}>
         <div class="flex items-stretch shrink-0 border-b border-[var(--border)] bg-[var(--surface)]">
           <div class="flex-1 min-w-0">
             <TabBar
-              sessions={visibleSessions()}
-              focusedSessionId={focusedId()}
+              tabs={tabs()}
+              focusedId={activeTabId()}
               onSelect={handleSelectTab}
               onClose={handleCloseTab}
               disabled={isDisconnected()}
@@ -705,15 +842,24 @@ function TabShell(props: {
         <Show when={statusText()}>
           <StatusOverlay status={statusText()!} />
         </Show>
-        <Show when={focusedId()}>
+        <Show when={activeSessionId()}>
           <BlitTerminal
-            sessionId={focusedId()!}
+            sessionId={activeSessionId()!}
             fontFamily={FONT_FAMILY}
             fontSize={FONT_SIZE}
             palette={props.palette()}
             readOnly={props.readOnly}
             style={{ width: "100%", height: "100%" }}
             surfaceRef={setTerminalSurface}
+          />
+        </Show>
+        <Show when={activeSurfaceId() !== null}>
+          <BlitSurfaceView
+            connectionId={CONNECTION_ID}
+            surfaceId={activeSurfaceId()!}
+            focus={!props.readOnly}
+            resizable
+            class="block w-full h-full"
           />
         </Show>
         <Show when={isDisconnected()}>
@@ -729,7 +875,10 @@ function TabShell(props: {
               role="button"
               tabIndex={0}
               class="cursor-pointer px-3 py-1 rounded-md border border-[var(--border)] bg-[var(--surface)] transition-colors hover:brightness-110"
-              onClick={() => workspace.restartSession(focusedId()!)}
+              onClick={() => {
+                const sid = activeSessionId();
+                if (sid) workspace.restartSession(sid);
+              }}
             >
               Enter &mdash; reopen
             </span>
@@ -737,16 +886,19 @@ function TabShell(props: {
               role="button"
               tabIndex={0}
               class="cursor-pointer px-3 py-1 rounded-md border border-[var(--border)] bg-[var(--surface)] transition-colors hover:brightness-110"
-              onClick={() => workspace.closeSession(focusedId()!)}
+              onClick={() => {
+                const sid = activeSessionId();
+                if (sid) workspace.closeSession(sid);
+              }}
             >
               Esc &mdash; close
             </span>
           </div>
         </Show>
-        <Show when={isMobileTouch() && !isDisconnected()}>
+        <Show when={isMobileTouch() && !isDisconnected() && activeSessionId()}>
           <MobileToolbar
             workspace={workspace}
-            focusedSessionId={focusedId}
+            focusedSessionId={activeSessionId}
             surface={terminalSurface}
             keyboardOpen={keyboardOpen}
           />
