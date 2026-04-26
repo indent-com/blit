@@ -1,6 +1,6 @@
 [package]
 name = "blit-sd-notify"
-version = "0.28.3"
+version = "0.29.0"
 edition.workspace = true
 description = "Tiny no-dep sd_notify(3) implementation used by blit daemons"
 license.workspace = true
