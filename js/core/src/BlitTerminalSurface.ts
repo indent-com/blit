@@ -128,6 +128,7 @@ export class BlitTerminalSurface {
   private selStart: SelPos | null = null;
   private selEnd: SelPos | null = null;
   private selecting = false;
+  private _selectionListeners = new Set<(hasSelection: boolean) => void>();
   private hoveredUrl: {
     row: number;
     startCol: number;
@@ -256,6 +257,140 @@ export class BlitTerminalSurface {
     return () => this._altModifierListeners.delete(listener);
   }
 
+  /** True when there is a non-empty active selection on this terminal. */
+  hasSelection(): boolean {
+    const a = this.selStart;
+    const b = this.selEnd;
+    if (!a || !b) return false;
+    return a.tailOffset !== b.tailOffset || a.col !== b.col;
+  }
+
+  /** Subscribe to selection-presence changes. Returns unsubscribe function. */
+  onSelectionChange(listener: (hasSelection: boolean) => void): () => void {
+    this._selectionListeners.add(listener);
+    return () => this._selectionListeners.delete(listener);
+  }
+
+  /** Clear any active selection. */
+  clearSelection(): void {
+    if (!this.selStart && !this.selEnd) return;
+    this.selStart = null;
+    this.selEnd = null;
+    this.scheduleRender();
+    this.notifySelectionChange();
+  }
+
+  /**
+   * Copy the current selection to the clipboard. Returns the copied text,
+   * or null when there is no selection or copy is unavailable. Must be
+   * invoked from a user gesture (click / pointer / key handler) for
+   * `navigator.clipboard.writeText` to succeed in browsers that gate it.
+   */
+  async copySelection(): Promise<string | null> {
+    const ss = this.selStart;
+    const se = this.selEnd;
+    const t = this.terminal;
+    if (!ss || !se || !t) return null;
+    let start = ss;
+    let end = se;
+    // Normalise so start precedes end.
+    if (
+      start.tailOffset < end.tailOffset ||
+      (start.tailOffset === end.tailOffset && start.col > end.col)
+    ) {
+      [start, end] = [end, start];
+    }
+    const curScroll = this.scrollOffset;
+    const rows = this._rows;
+    const startViewRow = rows - 1 - start.tailOffset + curScroll;
+    const endViewRow = rows - 1 - end.tailOffset + curScroll;
+    const inViewport =
+      startViewRow >= 0 &&
+      startViewRow < rows &&
+      endViewRow >= 0 &&
+      endViewRow < rows;
+    let text: string | null = null;
+    if (inViewport) {
+      text = t.get_text(startViewRow, start.col, endViewRow, end.col);
+    } else if (
+      this._blitConn &&
+      this._sessionId !== null &&
+      this._blitConn.supportsCopyRange()
+    ) {
+      try {
+        text = await this._blitConn.copyRange(
+          this._sessionId,
+          start.tailOffset,
+          start.col,
+          end.tailOffset,
+          end.col,
+        );
+      } catch {
+        return null;
+      }
+    }
+    if (!text) return null;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Clipboard write rejected (e.g. no permission). Surface the text
+      // so callers can fall back to a manual copy affordance.
+    }
+    return text;
+  }
+
+  /**
+   * Read text from the system clipboard and send it to the focused
+   * session, wrapped in bracketed-paste markers when the terminal is in
+   * bracketed-paste mode. Must be invoked from a user gesture for
+   * `navigator.clipboard.readText` to succeed in most browsers. Returns
+   * the pasted text, or null when nothing is available.
+   */
+  async pasteFromClipboard(): Promise<string | null> {
+    if (this._readOnly) return null;
+    if (this._sessionId === null || this.status !== "connected") return null;
+    let text: string;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      return null;
+    }
+    if (!text) return null;
+    this.pasteText(text);
+    return text;
+  }
+
+  /**
+   * Send arbitrary text to the focused session as if pasted, wrapped in
+   * bracketed-paste markers when the terminal is in bracketed-paste mode.
+   * Newlines are normalised to CR so shells that read them as "Enter"
+   * behave the same as a desktop paste.
+   */
+  pasteText(text: string): void {
+    if (this._readOnly || !text) return;
+    if (this._sessionId === null || this.status !== "connected") return;
+    const payload = encoder.encode(text.replace(/\r?\n/g, "\r"));
+    const t = this.terminal;
+    if (t && t.bracketed_paste()) {
+      const open = encoder.encode("\x1b[200~");
+      const close = encoder.encode("\x1b[201~");
+      const wrapped = new Uint8Array(
+        open.length + payload.length + close.length,
+      );
+      wrapped.set(open, 0);
+      wrapped.set(payload, open.length);
+      wrapped.set(close, open.length + payload.length);
+      this.sendInput(this._sessionId, wrapped);
+    } else {
+      this.sendInput(this._sessionId, payload);
+    }
+  }
+
+  private notifySelectionChange(): void {
+    const has = this.hasSelection();
+    for (const l of this._selectionListeners) l(has);
+  }
+
   /** Attach to a container element. Creates the canvas + textarea inside it. */
   attach(container: HTMLDivElement): void {
     if (this.container === container) return;
@@ -279,6 +414,14 @@ export class BlitTerminalSurface {
         top: "0",
         left: "0",
         cursor: "text",
+        // Suppress mobile-browser default touch behaviour so vertical
+        // swipes don't scroll the page or trigger pull-to-refresh, and
+        // long-press doesn't pop the iOS callout / Android selection
+        // handles on top of our own selection rendering.
+        touchAction: "none",
+        userSelect: "none",
+        WebkitUserSelect: "none",
+        WebkitTouchCallout: "none",
       });
     }
     container.appendChild(this.glCanvas);
@@ -1563,47 +1706,14 @@ export class BlitTerminalSurface {
     };
 
     const clearSelection = () => {
-      this.selStart = this.selEnd = null;
-      this.scheduleRender();
+      this.clearSelection();
     };
 
     const copySelection = () => {
-      if (!this.selStart || !this.selEnd) return;
-      const t = this.terminal;
-      if (!t) return;
-      let start = this.selStart;
-      let end = this.selEnd;
-      if (selPosBefore(end, start)) [start, end] = [end, start];
-      const curScroll = this.scrollOffset;
-      const rows = this._rows;
-      const startViewRow = rows - 1 - start.tailOffset + curScroll;
-      const endViewRow = rows - 1 - end.tailOffset + curScroll;
-      const inViewport =
-        startViewRow >= 0 &&
-        startViewRow < rows &&
-        endViewRow >= 0 &&
-        endViewRow < rows;
-      if (inViewport) {
-        const text = t.get_text(startViewRow, start.col, endViewRow, end.col);
-        if (text) navigator.clipboard.writeText(text);
-      } else if (
-        this._blitConn &&
-        this._sessionId !== null &&
-        this._blitConn.supportsCopyRange()
-      ) {
-        this._blitConn
-          .copyRange(
-            this._sessionId,
-            start.tailOffset,
-            start.col,
-            end.tailOffset,
-            end.col,
-          )
-          .then((text) => {
-            if (text) navigator.clipboard.writeText(text);
-          })
-          .catch(() => {});
-      }
+      // Public copySelection() is async but mouse handlers don't await; the
+      // copy still happens within the user gesture's microtask, which is
+      // sufficient for clipboard permission in browsers that gate it.
+      void this.copySelection();
     };
 
     const urlAt = (row: number, col: number) => {
@@ -1844,20 +1954,96 @@ export class BlitTerminalSurface {
       }
     };
 
-    // --- Touch-based scrolling (mobile) ---
+    // --- Touch-based scrolling and selection (mobile) ---
     // On mobile, vertical swipes don't reliably produce wheel events.
     // Track single-finger vertical movement and translate into scroll
     // events (mouse-mode wheel buttons or scrollback navigation).
+    //
+    // Long-press also enters a selection mode so users can pick text
+    // without a physical pointer:
+    //   * Tap and hold ~500ms — start selecting at the touched word.
+    //   * Drag — extend selection toward the finger.
+    //   * Lift — selection persists; the mobile toolbar exposes Copy.
+    //   * Tap elsewhere — clear the selection.
+    const LONG_PRESS_MS = 500;
+    const LONG_PRESS_SLOP_PX = 8;
     let touchId: number | null = null;
+    let touchStartX = 0;
     let touchStartY = 0;
+    let touchLastY = 0;
     let touchAccum = 0;
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+    let touchSelecting = false;
+    let touchSelAnchor: SelPos | null = null;
+    let touchScrolled = false;
+
+    const cancelLongPress = () => {
+      if (longPressTimer !== null) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    };
+
+    const startTouchSelection = (clientX: number, clientY: number) => {
+      // Cancel any in-flight mouse selection and seed a fresh anchor at the
+      // tapped word. The selection persists past touchend so the user can
+      // act on it from the mobile toolbar.
+      this.clearSelection();
+      const cell = mouseToCell(new MouseEvent("touch", { clientX, clientY }));
+      const sel = cellToSel(cell);
+      const wb = wordBoundsAt(cell.row, cell.col);
+      const start: SelPos = {
+        row: cell.row,
+        col: wb.start,
+        tailOffset: this.scrollOffset + (this._rows - 1 - cell.row),
+      };
+      const end: SelPos = {
+        row: cell.row,
+        col: wb.end,
+        tailOffset: this.scrollOffset + (this._rows - 1 - cell.row),
+      };
+      this.selStart = start;
+      this.selEnd = end;
+      touchSelAnchor = sel;
+      touchSelecting = true;
+      this.scheduleRender();
+      this.notifySelectionChange();
+      // Haptic nudge if the platform supports it.
+      navigator.vibrate?.(15);
+    };
 
     const handleTouchStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) return;
+      if (e.touches.length !== 1) {
+        // A second finger arrived — abort any pending long-press and any
+        // in-progress touch selection so the user can pinch/zoom or use
+        // multi-touch gestures without dragging the selection along.
+        cancelLongPress();
+        if (touchSelecting) {
+          touchSelecting = false;
+          touchSelAnchor = null;
+        }
+        return;
+      }
       const touch = e.touches[0]!;
+      // If the user taps while a selection is showing, treat it as
+      // "dismiss" — but only when the tap doesn't land inside the
+      // existing selection rectangle. Tapping inside is reserved for
+      // future drag-handle work; for now, also dismiss.
+      if (this.hasSelection() && !touchSelecting) {
+        this.clearSelection();
+      }
       touchId = touch.identifier;
+      touchStartX = touch.clientX;
       touchStartY = touch.clientY;
+      touchLastY = touch.clientY;
       touchAccum = 0;
+      touchScrolled = false;
+      cancelLongPress();
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        if (touchId === null || touchScrolled) return;
+        startTouchSelection(touchStartX, touchStartY);
+      }, LONG_PRESS_MS);
     };
 
     const handleTouchMove = (e: TouchEvent) => {
@@ -1870,8 +2056,41 @@ export class BlitTerminalSurface {
         }
       }
       if (!touch) return;
-      const dy = touchStartY - touch.clientY;
-      touchStartY = touch.clientY;
+
+      // While selecting, drag extends the selection toward the finger.
+      if (touchSelecting && touchSelAnchor) {
+        e.preventDefault();
+        const cell = mouseToCell(
+          new MouseEvent("touch", {
+            clientX: touch.clientX,
+            clientY: touch.clientY,
+          }),
+        );
+        const sel = cellToSel(cell);
+        if (selPosBefore(sel, touchSelAnchor)) {
+          this.selStart = sel;
+          this.selEnd = touchSelAnchor;
+        } else {
+          this.selStart = touchSelAnchor;
+          this.selEnd = sel;
+        }
+        this.scheduleRender();
+        this.notifySelectionChange();
+        return;
+      }
+
+      // Cancel long-press if the finger drifts beyond the slop radius.
+      if (longPressTimer !== null) {
+        const dxAbs = Math.abs(touch.clientX - touchStartX);
+        const dyAbs = Math.abs(touch.clientY - touchStartY);
+        if (dxAbs > LONG_PRESS_SLOP_PX || dyAbs > LONG_PRESS_SLOP_PX) {
+          cancelLongPress();
+          touchScrolled = true;
+        }
+      }
+
+      const dy = touchLastY - touch.clientY;
+      touchLastY = touch.clientY;
       touchAccum += dy;
 
       const t = this.terminal;
@@ -1879,6 +2098,7 @@ export class BlitTerminalSurface {
 
       // Emit one scroll event per cell-height of accumulated movement.
       while (Math.abs(touchAccum) >= lineH) {
+        touchScrolled = true;
         const dir = touchAccum > 0 ? 1 : -1; // 1 = scroll up, -1 = scroll down
         touchAccum -= dir * lineH;
 
@@ -1918,8 +2138,19 @@ export class BlitTerminalSurface {
     const handleTouchEnd = (e: TouchEvent) => {
       for (let i = 0; i < e.changedTouches.length; i++) {
         if (e.changedTouches[i]!.identifier === touchId) {
+          cancelLongPress();
           touchId = null;
           touchAccum = 0;
+          if (touchSelecting) {
+            // Selection persists past touchend; the toolbar's Copy button
+            // can act on it within the user's next gesture.
+            touchSelecting = false;
+            touchSelAnchor = null;
+            // Suppress the synthetic mousedown/click iOS dispatches after
+            // a long-press touch sequence, otherwise our mouse handler
+            // would clear the freshly built selection.
+            e.preventDefault();
+          }
           break;
         }
       }
@@ -1927,8 +2158,8 @@ export class BlitTerminalSurface {
 
     canvas.addEventListener("touchstart", handleTouchStart, { passive: true });
     canvas.addEventListener("touchmove", handleTouchMove, { passive: false });
-    canvas.addEventListener("touchend", handleTouchEnd, { passive: true });
-    canvas.addEventListener("touchcancel", handleTouchEnd, { passive: true });
+    canvas.addEventListener("touchend", handleTouchEnd, { passive: false });
+    canvas.addEventListener("touchcancel", handleTouchEnd, { passive: false });
 
     canvas.addEventListener("mousedown", handleMouseDown);
     window.addEventListener("mousemove", handleMouseMove);

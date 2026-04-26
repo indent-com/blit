@@ -1,10 +1,4 @@
-import {
-  createSignal,
-  createEffect,
-  onCleanup,
-  Show,
-  type JSX,
-} from "solid-js";
+import { createSignal, createEffect, onCleanup } from "solid-js";
 import type { BlitTerminalSurface, SessionId } from "@blit-sh/core";
 import { encoder } from "@blit-sh/core";
 import type { BlitWorkspace } from "@blit-sh/core";
@@ -37,15 +31,18 @@ function ToolbarButton(props: {
   onPress: () => void;
   active?: boolean;
   wide?: boolean;
+  disabled?: boolean;
   theme: Theme;
   scale: UIScale;
 }) {
   return (
     <button
       type="button"
+      disabled={props.disabled}
       onPointerDown={(e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (props.disabled) return;
         props.onPress();
       }}
       title={props.title}
@@ -59,7 +56,8 @@ function ToolbarButton(props: {
         height: "30px",
         "font-size": `${props.scale.sm}px`,
         "font-family": "ui-monospace, monospace",
-        cursor: "pointer",
+        cursor: props.disabled ? "default" : "pointer",
+        opacity: props.disabled ? 0.4 : 1,
         "flex-shrink": 0,
         display: "flex",
         "align-items": "center",
@@ -69,7 +67,7 @@ function ToolbarButton(props: {
         "touch-action": "manipulation",
         "white-space": "nowrap",
         "line-height": 1,
-        transition: "background 0.1s, color 0.1s",
+        transition: "background 0.1s, color 0.1s, opacity 0.1s",
       }}
     >
       {props.label}
@@ -159,6 +157,8 @@ export function MobileToolbar(props: {
 }) {
   const [ctrlActive, setCtrlActive] = createSignal(false);
   const [altActive, setAltActive] = createSignal(false);
+  const [hasSelection, setHasSelection] = createSignal(false);
+  const [canPaste, setCanPaste] = createSignal(false);
 
   // Sync Ctrl modifier state from surface
   let ctrlUnsub: (() => void) | undefined;
@@ -184,9 +184,41 @@ export function MobileToolbar(props: {
   });
   onCleanup(() => altUnsub?.());
 
+  // Sync selection presence from surface so the Copy button only lights
+  // up when there's something to copy.
+  let selUnsub: (() => void) | undefined;
+  createEffect(() => {
+    selUnsub?.();
+    const surface = props.surface();
+    if (surface) {
+      setHasSelection(surface.hasSelection());
+      selUnsub = surface.onSelectionChange((has) => setHasSelection(has));
+    } else {
+      setHasSelection(false);
+    }
+  });
+  onCleanup(() => selUnsub?.());
+
+  // Optimistically enable Paste when the Clipboard API is present so the
+  // user gets a button to tap; the underlying readText() call is still
+  // gated by the browser permission prompt.
+  setCanPaste(typeof navigator !== "undefined" && !!navigator.clipboard);
+
   const send = (bytes: Uint8Array) => {
     const sid = props.focusedSessionId();
     if (sid) props.workspace.sendInput(sid, bytes);
+  };
+
+  const handleCopy = () => {
+    const surface = props.surface();
+    if (!surface) return;
+    void surface.copySelection().finally(() => surface.clearSelection());
+  };
+
+  const handlePaste = () => {
+    const surface = props.surface();
+    if (!surface) return;
+    void surface.pasteFromClipboard();
   };
 
   const toggleCtrl = () => {
@@ -257,6 +289,28 @@ export function MobileToolbar(props: {
           title="Alt modifier (one-shot)"
           onPress={toggleAlt}
           active={altActive()}
+          theme={props.theme}
+          scale={props.scale}
+        />
+      </div>
+
+      {/* Copy / Paste */}
+      <div style={{ display: "flex", gap: "3px" }}>
+        <ToolbarButton
+          label="Copy"
+          title="Copy selection (long-press to select)"
+          onPress={handleCopy}
+          disabled={!hasSelection()}
+          wide
+          theme={props.theme}
+          scale={props.scale}
+        />
+        <ToolbarButton
+          label="Paste"
+          title="Paste clipboard"
+          onPress={handlePaste}
+          disabled={!canPaste()}
+          wide
           theme={props.theme}
           scale={props.scale}
         />
