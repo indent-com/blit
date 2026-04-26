@@ -901,6 +901,7 @@ function TabShell(props: {
             focusedSessionId={activeSessionId}
             surface={terminalSurface}
             keyboardOpen={keyboardOpen}
+            readOnly={props.readOnly}
           />
         </Show>
       </div>
