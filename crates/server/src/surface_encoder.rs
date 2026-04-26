@@ -927,6 +927,36 @@ impl SurfaceEncoder {
         }
     }
 
+    /// Encode a frame whose pixel buffer is at `(native_w, native_h)` for an
+    /// encoder that was constructed at a smaller per-client target size.
+    ///
+    /// When `(native_w, native_h)` matches the encoder's source dimensions
+    /// this is identical to [`encode_pixels`] (zero-copy paths preserved).
+    /// When they differ, the pixel data is read into a CPU BGRA buffer and
+    /// downscaled with Lanczos3 to the encoder's source dimensions before
+    /// being handed to `encode_bgra`.
+    ///
+    /// Mediation across clients makes downscaling unavoidable when their
+    /// physical viewports differ: the compositor renders one surface at
+    /// the highest-density viewer's resolution and the per-client encoder
+    /// pre-shrinks for the others.  This loses zero-copy DMA-BUF /
+    /// Vulkan-Video benefits, by design — see the call site in `lib.rs`
+    /// for the heuristic that gates GPU-direct paths on size match.
+    pub fn encode_pixels_scaled(
+        &mut self,
+        pixels: &PixelData,
+        native_w: u32,
+        native_h: u32,
+    ) -> Option<(Vec<u8>, bool)> {
+        let (target_w, target_h) = (self.source_width, self.source_height);
+        if (native_w, native_h) == (target_w, target_h) {
+            return self.encode_pixels(pixels);
+        }
+        let bgra = pixel_data_to_bgra(pixels, native_w, native_h)?;
+        let scaled = downscale_bgra(&bgra, native_w, native_h, target_w, target_h)?;
+        self.encode_bgra(&scaled)
+    }
+
     /// Encode a frame from native pixel data (BGRA, NV12, RGBA, or DMA-BUF).
     /// Dispatches to the most efficient path for each format.
     pub fn encode_pixels(&mut self, pixels: &PixelData) -> Option<(Vec<u8>, bool)> {
@@ -1383,6 +1413,42 @@ impl SurfaceEncoder {
         self.fixup_keyframe(&mut result);
         result
     }
+}
+
+/// Read `pixels` into a CPU-side BGRA buffer at `(width, height)`.
+///
+/// Used by the per-client downscale path so we have a single uniform
+/// representation we can hand to `fast_image_resize`.  GPU-resident
+/// pixel data (DMA-BUF, NV12-DMA-BUF, VA-API surfaces) is read back
+/// to CPU here — the compositor's `to_rgba` mirrors what the existing
+/// `encode_dmabuf_cpu_fallback` path already does.
+fn pixel_data_to_bgra(pixels: &PixelData, width: u32, height: u32) -> Option<Vec<u8>> {
+    // PixelData::to_rgba returns RGBA; swap to BGRA for the encoders that
+    // consume BGRA directly (VA-API, NVENC) and that `encode_bgra` calls.
+    let rgba = pixels.to_rgba(width, height);
+    if rgba.is_empty() {
+        return None;
+    }
+    let mut bgra = rgba;
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Some(bgra)
+}
+
+/// Lanczos3 downscale of a packed BGRA buffer.  Returns `None` when
+/// `fast_image_resize` rejects the inputs (zero-sized image, mismatched
+/// buffer length, etc.) — caller falls through to skipping this frame.
+fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Option<Vec<u8>> {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+
+    let src_img = ImageRef::new(src_w, src_h, src, PixelType::U8x4).ok()?;
+    let mut dst_img = Image::new(dst_w, dst_h, PixelType::U8x4);
+    let mut resizer = Resizer::new();
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+    resizer.resize(&src_img, &mut dst_img, &opts).ok()?;
+    Some(dst_img.into_vec())
 }
 
 fn validate_surface_dimensions(
