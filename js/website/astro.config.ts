@@ -1,6 +1,7 @@
 import { defineConfig, fontProviders } from "astro/config";
 import solidJs from "@astrojs/solid-js";
 import tailwindcss from "@tailwindcss/vite";
+import basicSsl from "@vitejs/plugin-basic-ssl";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 
@@ -34,6 +35,7 @@ export default defineConfig({
   ],
   vite: {
     plugins: [
+      basicSsl(),
       tailwindcss(),
       {
         name: "inline-wasm",
