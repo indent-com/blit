@@ -7,6 +7,12 @@ const SHORTCUTS: [string, string][] = [
   ["Ctrl+?", "Toggle this panel"],
 ];
 
+const TOUCH: [string, string][] = [
+  ["Long-press + drag", "Select text and copy"],
+  ["Toolbar Paste", "Paste clipboard"],
+  ["Swipe", "Scroll"],
+];
+
 const MOD_LABEL =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Mac")
     ? "\u2318"
@@ -41,6 +47,17 @@ export default function ShortcutsPanel(props: { onClose: () => void }) {
                 <td class="pr-6 text-[var(--dim)] whitespace-nowrap">
                   {key.replace(/Mod/g, MOD_LABEL)}
                 </td>
+                <td>{desc}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div class="font-bold text-sm mt-5 mb-4">Touch</div>
+        <table style={{ "border-spacing": "0 8px" }}>
+          <tbody>
+            {TOUCH.map(([key, desc]) => (
+              <tr>
+                <td class="pr-6 text-[var(--dim)] whitespace-nowrap">{key}</td>
                 <td>{desc}</td>
               </tr>
             ))}

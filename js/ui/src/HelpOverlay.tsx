@@ -58,8 +58,8 @@ export function HelpOverlay(props: {
       title: t("help.touch"),
       items: [
         ["Swipe", t("help.touchScroll")],
-        ["Long-press + drag", t("help.touchSelect")],
-        ["Toolbar Copy / Paste", t("help.touchCopyPaste")],
+        ["Long-press + drag", t("help.touchSelectCopy")],
+        ["Toolbar Paste", t("help.touchPaste")],
       ],
     },
   ];

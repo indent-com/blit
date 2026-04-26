@@ -96,11 +96,11 @@ function CloseIcon() {
 }
 
 // ---------------------------------------------------------------------------
-// Arc layout: positions for 6 buttons around the FAB
+// Arc layout: positions for 8 buttons around the FAB
 // ---------------------------------------------------------------------------
 
-const ARC_RADIUS = 72;
-const ARC_ITEMS = 6;
+const ARC_RADIUS = 92;
+const ARC_ITEMS = 7;
 // Arc spans 180° as a semicircle opening to the left of the FAB.
 // 90° = down, 180° = left, 270° = up (in screen coordinates where Y+ is down).
 const ARC_START = 90;
@@ -125,6 +125,7 @@ function ArcButton(props: {
   children: JSX.Element;
   onPress: () => void;
   active?: boolean;
+  disabled?: boolean;
   onPointerDown?: (e: PointerEvent) => void;
   onPointerMove?: (e: PointerEvent) => void;
   onPointerUp?: (e: PointerEvent) => void;
@@ -150,16 +151,20 @@ function ArcButton(props: {
     >
       <button
         type="button"
+        disabled={props.disabled}
         onPointerDown={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          if (props.disabled) return;
           props.onPointerDown?.(e) ?? props.onPress();
         }}
         onPointerMove={props.onPointerMove}
         onPointerUp={props.onPointerUp}
         onPointerCancel={props.onPointerCancel}
         onPointerLeave={props.onPointerLeave}
-        class={`flex items-center justify-center w-10 h-10 rounded-full border-2 shadow-md select-none active:scale-90 transition-transform ${
+        class={`flex items-center justify-center w-10 h-10 rounded-full border-2 shadow-md select-none transition-[transform,opacity] ${
+          props.disabled ? "opacity-40" : "active:scale-90"
+        } ${
           props.active
             ? "bg-[var(--fg)] text-[var(--bg)] border-[var(--fg)]"
             : "bg-[var(--surface)] text-[var(--fg)] border-[var(--dim)]/30"
@@ -273,9 +278,14 @@ export default function MobileToolbar(props: {
   focusedSessionId: () => SessionId | null;
   surface: () => BlitTerminalSurface | null;
   keyboardOpen: () => boolean;
+  readOnly?: boolean;
 }) {
   const [isOpen, setIsOpen] = createSignal(false);
   const [ctrlActive, setCtrlActive] = createSignal(false);
+  const canPaste =
+    typeof navigator !== "undefined" &&
+    !!navigator.clipboard &&
+    !props.readOnly;
 
   // Ctrl sync
   let unsub: (() => void) | undefined;
@@ -306,6 +316,13 @@ export default function MobileToolbar(props: {
     const next = !surface.ctrlModifier;
     surface.setCtrlModifier(next);
     setCtrlActive(next);
+  };
+
+  const handlePaste = () => {
+    const surface = props.surface();
+    if (!surface) return;
+    void surface.pasteFromClipboard();
+    setIsOpen(false);
   };
 
   const visible = () => props.keyboardOpen();
@@ -376,10 +393,20 @@ export default function MobileToolbar(props: {
             <ChevronDown />
           </SendArcButton>
 
-          {/* Arrow Up (top of arc) */}
+          {/* Arrow Up */}
           <SendArcButton index={5} open={isOpen()} bytes={ARROW_UP} send={send}>
             <ChevronUp />
           </SendArcButton>
+
+          {/* Paste (top of arc) — Copy happens automatically on long-press selection */}
+          <ArcButton
+            index={6}
+            open={isOpen()}
+            disabled={!canPaste}
+            onPress={handlePaste}
+          >
+            <span class="text-[10px] font-mono">Paste</span>
+          </ArcButton>
         </div>
 
         {/* FAB button */}

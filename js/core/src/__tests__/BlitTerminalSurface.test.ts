@@ -111,6 +111,23 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
     expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
   });
 
+  it("copySelection() reads from the wasm terminal for in-viewport selections", async () => {
+    const s = newSurface();
+    // Stub the wasm terminal so copySelection's in-viewport branch runs
+    // synchronously through to navigator.clipboard.writeText.
+    const get_text = vi.fn().mockReturnValue("hello");
+    // @ts-expect-error — install a fake wasm terminal stub.
+    s["terminal"] = { get_text, bracketed_paste: () => false };
+    // @ts-expect-error — force a non-empty selection that lands in the
+    // viewport (tailOffset 0 maps to the bottom row regardless of _rows).
+    s.selStart = { row: 0, col: 0, tailOffset: 0 };
+    // @ts-expect-error — touching private state purely to drive the test.
+    s.selEnd = { row: 0, col: 5, tailOffset: 0 };
+    const result = await s.copySelection();
+    expect(result).toBe("hello");
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("hello");
+  });
+
   it("pasteFromClipboard() returns null when read-only", async () => {
     const s = new BlitTerminalSurface({ sessionId: "s1", readOnly: true });
     const result = await s.pasteFromClipboard();

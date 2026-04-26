@@ -2142,8 +2142,11 @@ export class BlitTerminalSurface {
           touchId = null;
           touchAccum = 0;
           if (touchSelecting) {
-            // Selection persists past touchend; the toolbar's Copy button
-            // can act on it within the user's next gesture.
+            // Auto-copy the freshly built selection while the user gesture
+            // is still live for navigator.clipboard.writeText. Synchronous
+            // for in-viewport selections (the common touch case), so the
+            // clipboard write fires before the gesture token expires.
+            void this.copySelection();
             touchSelecting = false;
             touchSelAnchor = null;
             // Suppress the synthetic mousedown/click iOS dispatches after
