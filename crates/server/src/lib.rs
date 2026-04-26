@@ -32,6 +32,7 @@ mod gpu_libs;
 mod ipc;
 mod nvenc_encode;
 mod pty;
+mod sd_notify;
 mod surface_encoder;
 #[cfg(target_os = "linux")]
 mod vaapi_encode;
@@ -2223,6 +2224,11 @@ pub async fn run(config: Config) {
 
     #[cfg(unix)]
     if let Some(channel_fd) = state.config.fd_channel {
+        // The fd-channel sender already holds a bound socket and is the one
+        // gating client traffic, so we're "ready" the instant we accept the
+        // channel. Notify systemd before entering the recv loop so a
+        // Type=notify unit can advance past readiness.
+        sd_notify::notify_ready(state.config.verbose);
         ipc::run_fd_channel(channel_fd, state).await;
         return;
     }
@@ -2237,6 +2243,13 @@ pub async fn run(config: Config) {
     };
     #[cfg(not(unix))]
     let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose);
+
+    // Listener is bound (either via socket activation or self-bind) and the
+    // accept loop is about to start — this is the moment the IPC path is
+    // observable from outside, so it's the correct point to send READY=1
+    // to a Type=notify systemd unit. No-op when NOTIFY_SOCKET is unset
+    // (i.e. anywhere outside of systemd).
+    sd_notify::notify_ready(state.config.verbose);
 
     // Broadcast S2C_QUIT on SIGTERM / SIGINT so clients can reconnect promptly
     // instead of waiting for a transport-level timeout.

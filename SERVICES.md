@@ -21,6 +21,14 @@ sudo systemctl enable --now blit-server@alice.socket
 sudo systemctl enable --now blit-share@alice.service
 ```
 
+`blit server` sends `READY=1` over `$NOTIFY_SOCKET` once the IPC listener
+is bound, so units that are *not* using socket activation (i.e. when
+blit-server has to bind its own UNIX socket via `BLIT_SOCK`) can use
+`Type=notify` instead of `Type=simple` to avoid the well-known
+exec-only-readiness race where `systemctl start` returns before the
+socket file exists. Units that already use socket activation get the
+same guarantee from systemd itself and don't need `Type=notify`.
+
 ### Multi-remote gateway (blit gateway)
 
 `blit gateway` can front multiple remote hosts in a single browser UI.
