@@ -195,30 +195,10 @@ const DOCKER_CMD = "docker run --rm grab/blit-demo";
                 >GUI</span
               >
             </div>
-            <div class="ml-auto px-2 font-mono text-[10px] text-[var(--dim)]">
-              ⌘ K
-            </div>
           </div>
           <!-- body -->
           <pre
             class="m-0 overflow-hidden bg-[var(--code-bg)] px-4 py-4 font-mono text-[13px] leading-relaxed text-[var(--code-fg)]"><code class="block"><span class="anim-line block" style="animation-delay:.05s"><span class="text-[var(--green)] select-none">$</span> <span class="text-[var(--code-fg)]">blit share</span></span><span class="anim-line block text-[var(--dim)]" style="animation-delay:.5s">Terminals at <span class="text-[var(--accent)] underline">https://blit.sh/s#rf6e…</span></span><span class="anim-line block text-[var(--dim)]" style="animation-delay:.6s">Read-only:  <span class="text-[var(--accent)] underline">https://blit.sh/s#EMPs…</span></span><span class="anim-line block" style="animation-delay:.9s">&nbsp;</span><span class="anim-line block" style="animation-delay:1.0s"><span class="text-[var(--green)] select-none">$</span> blit terminal start -t build <span class="text-[var(--hl-str)]">make -j8</span></span><span class="anim-line block text-[var(--hl-num)]" style="animation-delay:1.3s">1</span><span class="anim-line block" style="animation-delay:1.4s"><span class="text-[var(--green)] select-none">$</span> blit terminal wait 1 --pattern <span class="text-[var(--hl-str)]">'BUILD OK'</span></span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.0s">[ 12%] Building CXX object src/CMakeFiles/app.dir/main.cpp.o</span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.2s">[ 38%] Building CXX object src/CMakeFiles/app.dir/io.cpp.o</span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.4s">[ 71%] Building CXX object src/CMakeFiles/app.dir/render.cpp.o</span><span class="anim-line block text-[var(--dim)]" style="animation-delay:2.6s">[ 92%] Linking CXX executable bin/app</span><span class="anim-line block" style="animation-delay:2.9s"><span class="text-[var(--green)]">[100%] Built target app</span></span><span class="anim-line block" style="animation-delay:3.1s"><span class="text-[var(--green)] font-bold">BUILD OK</span></span><span class="anim-line block" style="animation-delay:3.3s">&nbsp;</span><span class="anim-line block" style="animation-delay:3.4s"><span class="text-[var(--green)] select-none">$</span> blit terminal send 1 <span class="text-[var(--hl-str)]">"./bin/app --serve"</span></span><span class="anim-line block" style="animation-delay:3.7s"><span class="text-[var(--green)] select-none">$</span> <span class="blit-cursor"></span></span></code></pre>
-          <!-- status bar -->
-          <div
-            class="flex items-center justify-between gap-2 border-t border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono text-[10px] text-[var(--dim)]"
-          >
-            <div class="flex items-center gap-3">
-              <span><span class="text-[var(--green)]">●</span> 3 terminals</span>
-              <span class="opacity-60">|</span>
-              <span>1 viewer</span>
-              <span class="opacity-60">|</span>
-              <span class="text-[var(--accent)]">webrtc</span>
-            </div>
-            <div class="flex items-center gap-3">
-              <span>14ms RTT</span>
-              <span class="opacity-60">|</span>
-              <span>LZ4 · 96% diff</span>
-            </div>
-          </div>
         </div>
 
         <!-- Annotations -->
