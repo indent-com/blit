@@ -1,0 +1,15 @@
+[package]
+name = "blit-sd-notify"
+version = "0.28.3"
+edition.workspace = true
+description = "Tiny no-dep sd_notify(3) implementation used by blit daemons"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "blit_sd_notify"
+path = "src/lib.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

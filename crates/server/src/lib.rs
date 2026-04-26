@@ -32,7 +32,6 @@ mod gpu_libs;
 mod ipc;
 mod nvenc_encode;
 mod pty;
-mod sd_notify;
 mod surface_encoder;
 #[cfg(target_os = "linux")]
 mod vaapi_encode;
@@ -2228,7 +2227,7 @@ pub async fn run(config: Config) {
         // gating client traffic, so we're "ready" the instant we accept the
         // channel. Notify systemd before entering the recv loop so a
         // Type=notify unit can advance past readiness.
-        sd_notify::notify_ready(state.config.verbose);
+        blit_sd_notify::notify_ready(state.config.verbose);
         ipc::run_fd_channel(channel_fd, state).await;
         return;
     }
@@ -2249,7 +2248,7 @@ pub async fn run(config: Config) {
     // observable from outside, so it's the correct point to send READY=1
     // to a Type=notify systemd unit. No-op when NOTIFY_SOCKET is unset
     // (i.e. anywhere outside of systemd).
-    sd_notify::notify_ready(state.config.verbose);
+    blit_sd_notify::notify_ready(state.config.verbose);
 
     // Broadcast S2C_QUIT on SIGTERM / SIGINT so clients can reconnect promptly
     // instead of waiting for a transport-level timeout.

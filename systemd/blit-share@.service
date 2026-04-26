@@ -3,7 +3,9 @@ Description=blit share %i
 After=network.target
 
 [Service]
-Type=simple
+# blit share sends sd_notify(READY=1) once the signaling hub registers
+# the producer — i.e. once the share URL is actually consumable.
+Type=notify
 EnvironmentFile=/etc/blit/share-%i.env
 ExecStart=blit share --quiet
 Restart=on-failure

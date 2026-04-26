@@ -541,6 +541,7 @@ version = "0.28.3"
 dependencies = [
  "axum",
  "blit-proxy",
+ "blit-sd-notify",
  "blit-ssh",
  "blit-webrtc-forwarder",
  "blit-webserver",
@@ -584,12 +585,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blit-sd-notify"
+version = "0.28.3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "blit-server"
 version = "0.28.3"
 dependencies = [
  "blit-alacritty",
  "blit-compositor",
  "blit-remote",
+ "blit-sd-notify",
  "libc",
  "memchr",
  "openh264",
@@ -618,6 +627,7 @@ version = "0.28.3"
 dependencies = [
  "base64",
  "blit-remote",
+ "blit-sd-notify",
  "clap",
  "crypto_box",
  "ed25519-dalek 2.2.0",

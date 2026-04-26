@@ -3,7 +3,11 @@ Description=blit terminal multiplexer
 Requires=blit-server.socket
 
 [Service]
-Type=simple
+# blit server sends sd_notify(READY=1) once the IPC listener is bound,
+# so systemctl start blocks until the daemon is actually accepting
+# connections — closes the well-known Type=simple race for any unit that
+# orders other services After=blit-server.service.
+Type=notify
 WorkingDirectory=~
 ExecStart=blit server
 # Keep running after all clients disconnect — PTYs stay alive.

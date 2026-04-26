@@ -3,7 +3,8 @@ Description=blit terminal multiplexer
 Requires=blit.socket
 
 [Service]
-Type=simple
+# blit server sends sd_notify(READY=1) once the IPC listener is bound.
+Type=notify
 WorkingDirectory=~
 ExecStart=blit server
 Restart=no

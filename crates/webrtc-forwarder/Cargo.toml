@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 blit-remote = { workspace = true }
+blit-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }

@@ -21,13 +21,15 @@ sudo systemctl enable --now blit-server@alice.socket
 sudo systemctl enable --now blit-share@alice.service
 ```
 
-`blit server` sends `READY=1` over `$NOTIFY_SOCKET` once the IPC listener
-is bound, so units that are *not* using socket activation (i.e. when
-blit-server has to bind its own UNIX socket via `BLIT_SOCK`) can use
-`Type=notify` instead of `Type=simple` to avoid the well-known
-exec-only-readiness race where `systemctl start` returns before the
-socket file exists. Units that already use socket activation get the
-same guarantee from systemd itself and don't need `Type=notify`.
+All three `blit` daemons (`server`, `gateway`, `share`) send `READY=1`
+over `$NOTIFY_SOCKET` once they're actually serving — server after the
+IPC listener is bound, gateway after the TCP listener is bound, share
+after the signaling hub registers the producer. Units in this repo
+ship with `Type=notify` so `systemctl start` returns only after the
+service is genuinely consumable. The notify implementation is in
+[`crates/sd-notify/`](crates/sd-notify/) and is a no-op when
+`NOTIFY_SOCKET` is unset, so the same binaries still work outside
+systemd.
 
 ### Multi-remote gateway (blit gateway)
 

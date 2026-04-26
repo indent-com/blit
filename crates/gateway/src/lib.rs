@@ -562,6 +562,12 @@ pub async fn run() {
         },
     );
 
+    // TCP listener is bound, axum::serve below is about to start accepting —
+    // this is the right moment to tell systemd we're ready. WebTransport
+    // (QUIC) is best-effort on top, so a Type=notify unit doesn't need to
+    // wait for it. No-op when NOTIFY_SOCKET is unset.
+    blit_sd_notify::notify_ready(false);
+
     let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
         #[cfg(unix)]
         {

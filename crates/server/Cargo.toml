@@ -15,6 +15,7 @@ path = "src/lib.rs"
 blit-remote = { workspace = true }
 blit-alacritty = { workspace = true }
 blit-compositor = { workspace = true }
+blit-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 memchr = "2"
 openh264 = "0.6"

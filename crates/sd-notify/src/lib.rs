@@ -1,11 +1,11 @@
 //! Minimal `sd_notify(3)` implementation for signalling readiness to systemd.
 //!
-//! No `libsystemd` linkage and no new crate dependencies — `libc` is already a
-//! workspace dependency on Unix targets. Mirrors the documented protocol:
-//! a single `SOCK_DGRAM` datagram of `KEY=VALUE` pairs (LF-separated) sent to
-//! the path in the `NOTIFY_SOCKET` environment variable. A leading `@` selects
-//! the Linux abstract namespace (replaced with a NUL byte). Per the spec,
-//! `NOTIFY_SOCKET` may also begin with `/` (filesystem path).
+//! No `libsystemd` linkage — pure `libc` socket + sendto. Mirrors the
+//! documented protocol: a single `SOCK_DGRAM` datagram of `KEY=VALUE` pairs
+//! (LF-separated) sent to the path in the `NOTIFY_SOCKET` environment
+//! variable. A leading `@` selects the Linux abstract namespace (replaced
+//! with a NUL byte). Per the spec, `NOTIFY_SOCKET` may also begin with `/`
+//! (filesystem path).
 //!
 //! All operations are best-effort: if `NOTIFY_SOCKET` is unset, the socket
 //! cannot be created, the address is malformed, or the send fails, the
