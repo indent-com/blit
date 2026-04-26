@@ -13,18 +13,19 @@
 //! `TimeoutStartSec` failure rather than the daemon's responsibility to
 //! recover from, so we never want to surface our own error here.
 //!
-//! Compiled out on non-Unix targets — the entry point is a no-op stub so
-//! callers don't need their own `cfg(unix)` gates.
+//! systemd is Linux-only, so the implementation is gated on
+//! `target_os = "linux"`. macOS, Windows, BSDs, etc. get a no-op stub so
+//! callers don't need their own `cfg` gates.
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn notify_ready(verbose: bool) {
     notify(b"READY=1\n", verbose);
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn notify_ready(_verbose: bool) {}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn notify(payload: &[u8], verbose: bool) {
     let path = match std::env::var_os("NOTIFY_SOCKET") {
         Some(p) => p,
@@ -76,8 +77,7 @@ fn notify(payload: &[u8], verbose: bool) {
     };
 
     // SOCK_CLOEXEC keeps the fd from leaking into PTY children. SOCK_DGRAM
-    // is the format systemd documents; SEQPACKET also works but isn't
-    // universally available on macOS, so we stick with DGRAM.
+    // is the format systemd documents.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         if verbose {
@@ -109,7 +109,7 @@ fn notify(payload: &[u8], verbose: bool) {
     unsafe { libc::close(fd) };
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram;
