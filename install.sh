@@ -101,6 +101,12 @@ main() {
   $elevate mkdir -p "$PREFIX/bin"
   $elevate cp "$tmp/bin/blit" "$PREFIX/bin/blit"
   $elevate chmod +x "$PREFIX/bin/blit"
+
+  # Ad-hoc codesign on macOS so Gatekeeper doesn't kill the binary.
+  case "$os" in
+    darwin) $elevate codesign -s - "$PREFIX/bin/blit" 2>/dev/null || true ;;
+  esac
+
   echo "installed blit ${version} to $PREFIX/bin/blit"
 
   # Generate man pages and shell completions alongside the binary
