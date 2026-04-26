@@ -1847,9 +1847,9 @@ struct SoftwareH264Encoder {
 
 impl SoftwareH264Encoder {
     fn new(quality: SurfaceQuality) -> Result<Self, String> {
-        use openh264::encoder::{EncoderConfig, RateControlMode};
+        use openh264::encoder::{BitRate, EncoderConfig, RateControlMode};
         let config = EncoderConfig::new()
-            .set_bitrate_bps(quality.openh264_bitrate())
+            .bitrate(BitRate::from_bps(quality.openh264_bitrate()))
             .rate_control_mode(RateControlMode::Bitrate);
         let encoder =
             OpenH264Encoder::with_api_config(openh264::OpenH264API::from_source(), config)

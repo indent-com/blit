@@ -64,17 +64,17 @@
     "react-dom": ">=18.0.0"
   },
   "devDependencies": {
-    "@blit-sh/core": "workspace:*",
-    "@testing-library/react": "^16",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
-    "jsdom": "^29",
-    "react": "^19",
-    "react-dom": "^19",
-    "typescript": "^6",
-    "@vitest/coverage-v8": "^4",
-    "vitest": "^4"
+    "@blit-sh/core": "workspace:*",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitest/coverage-v8": "^4.1.5",
+    "jsdom": "^29.0.2",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
   },
   "license": "MIT"
 }

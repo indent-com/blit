@@ -80,6 +80,22 @@
       # WASM (still uses wasm-pack, not crane)
       # ------------------------------------------------------------------
 
+      # wasm-bindgen requires the CLI version to match the crate version
+      # exactly (shared schema). Cargo.lock pins wasm-bindgen 0.2.118, but
+      # nixpkgs only ships up to 0.2.117 — build the matching CLI here.
+      wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
+        src = pkgs.fetchCrate {
+          pname = "wasm-bindgen-cli";
+          version = "0.2.118";
+          hash = "sha256-ve783oYH0TGv8Z8lIPdGjItzeLDQLOT5uv/jbFOlZpI=";
+        };
+        cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+          inherit src;
+          inherit (src) pname version;
+          hash = "sha256-EYDfuBlH3zmTxACBL+sjicRna84CvoesKSQVcYiG9P0=";
+        };
+      };
+
       browserWasm = rustPlatform.buildRustPackage {
         pname = "blit-browser";
         inherit version;
@@ -91,7 +107,7 @@
         cargoLock = cargoLockConfig;
         nativeBuildInputs = [
           pkgs.wasm-pack
-          pkgs.wasm-bindgen-cli
+          wasmBindgenCli
           pkgs.binaryen
         ];
         buildPhase = ''
@@ -260,7 +276,7 @@
         postPatch = setupBrowserPkg + ''
           cd js
         '';
-        hash = "sha256-2lt71ytoK2ZYlZOL81DtFRMV4Y6k8+IiGe7TPRabrBs=";
+        hash = "sha256-lyYCjGQFeFOV/oe8echLAbx9lVegLowKSODawGqqAe4=";
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {
