@@ -20,6 +20,7 @@
     "@astrojs/check": "^0.9",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
     "@tailwindcss/vite": "^4",
+    "@vitejs/plugin-basic-ssl": "^2",
     "tailwindcss": "^4",
     "typescript": "^6"
   }
