@@ -378,11 +378,29 @@ struct LastPixels {
     timestamp_ms: u32,
 }
 
+/// Drop every `last_pixels` entry belonging to `sid`, regardless of
+/// per-target size.  Used when the surface is destroyed/resized/created
+/// to avoid serving stale frames to encoders that were sized against
+/// the prior composite.
+fn last_pixels_remove_for_sid(last_pixels: &mut HashMap<(u16, u32, u32), LastPixels>, sid: u16) {
+    let keys: Vec<(u16, u32, u32)> = last_pixels.keys().filter(|k| k.0 == sid).copied().collect();
+    for k in keys {
+        last_pixels.remove(&k);
+    }
+}
+
 struct SharedCompositor {
     handle: CompositorHandle,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
-    /// Latest pixel snapshot per surface.
-    last_pixels: HashMap<u16, LastPixels>,
+    /// Latest pixel snapshot per `(surface_id, width, height)`.  The
+    /// compositor renders one surface into multiple per-target buffers
+    /// (one per registered per-client encoder size) plus a native BGRA
+    /// staging readback, so the same surface produces several entries
+    /// here — one per distinct size.  The encode loop picks the entry
+    /// matching its client's per-client encode target; CPU encoders
+    /// without a registered external fall back to the largest entry
+    /// (the native composite) and downscale themselves.
+    last_pixels: HashMap<(u16, u32, u32), LastPixels>,
     /// Per-surface timestamp of the last RequestFrame sent.  Used to
     /// throttle requests to at most one per 1 ms so frame callbacks
     /// carry distinct `elapsed_ms` timestamps — video players (mpv)
@@ -2468,12 +2486,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             app_id,
                         },
                     );
-                    cs.last_pixels.remove(&surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     invalidate_client_encoders.push(surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.surfaces.remove(&surface_id);
-                    cs.last_pixels.remove(&surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     cs.last_configured_size.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
@@ -2486,13 +2504,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                     timestamp_ms,
                 } => {
                     surface_commit_count += 1;
+                    // The compositor emits one SurfaceCommit per
+                    // (surface, target size).  The largest entry is
+                    // the native composite (also used by the pointer
+                    // path), but `info.width/height` always reflect
+                    // the most-recent emission — that's fine because
+                    // info dims are only read for fallback display in
+                    // the surface-created event when nothing else is
+                    // known.
                     if let Some(info) = cs.surfaces.get_mut(&surface_id) {
                         info.width = width as u16;
                         info.height = height as u16;
                     }
                     cs.pixel_generation += 1;
                     cs.last_pixels.insert(
-                        surface_id,
+                        (surface_id, width, height),
                         LastPixels {
                             width,
                             height,
@@ -2523,7 +2549,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.width = width;
                         info.height = height;
                     }
-                    cs.last_pixels.remove(&surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     // Don't eagerly invalidate client encoders here.  The
                     // encode path already checks for dimension mismatches
                     // (source_dimensions != pixel size) and recreates the
@@ -2634,13 +2660,19 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Snapshot every surface entry so each client's per-surface encoder
     // can draw from the latest pixels without holding the compositor
     // borrow through the (lengthy) encoder-dispatch loop below.
+    // (sid, width, height, generation, timestamp_ms) per per-target
+    // entry.  One sid can appear several times — once for each
+    // distinct (width, height) the renderer produced (per-encoder
+    // target plus the native composite).
     let pixel_snapshot: Vec<(u16, u32, u32, u64, u32)> = sess
         .compositor
         .as_ref()
         .map(|cs| {
             cs.last_pixels
                 .iter()
-                .map(|(&sid, lp)| (sid, lp.width, lp.height, lp.generation, lp.timestamp_ms))
+                .map(|(&(sid, _, _), lp)| {
+                    (sid, lp.width, lp.height, lp.generation, lp.timestamp_ms)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -2658,16 +2690,22 @@ async fn tick(state: &AppState) -> TickOutcome {
     struct EncodeJob {
         cid: u64,
         sid: u16,
-        /// The compositor-native frame size of `pixels` — what the encoder
-        /// is being asked to read in.  May differ from the encoder's own
-        /// source dimensions (`(target_w, target_h)`) when the per-client
-        /// target was downscaled below the mediated compositor size.
+        /// The frame size of `pixels` as supplied by the compositor.
+        /// When this client's per-client encoder has external
+        /// buffers registered, the compositor blits (LINEAR) the
+        /// native composite into a target-sized BGRA DMA-BUF and
+        /// emits one `SurfaceCommit` per registered target — so
+        /// `(px_w, px_h) == (target_w, target_h)` and the encoder
+        /// runs without scaling.  Without externals (NVENC, CPU
+        /// software encoders) we fall back to the largest cached
+        /// snapshot (the native composite) and `encode_pixels_scaled`
+        /// CPU-downscales into the encoder's source dims.
         px_w: u32,
         px_h: u32,
-        /// The encoder's source (post-downscale) dimensions, equal to this
-        /// client's physical viewport.  These go on the wire as the frame
-        /// `width`/`height` so each viewer can size its `<canvas>` to its
-        /// own bitstream rather than the compositor's native size.
+        /// The encoder's source dimensions, equal to this client's
+        /// physical viewport.  These go on the wire as the frame
+        /// `width`/`height` so each viewer can size its `<canvas>` to
+        /// its own bitstream rather than the compositor's native size.
         target_w: u32,
         target_h: u32,
         /// Pixel data to encode.
@@ -2835,8 +2873,14 @@ async fn tick(state: &AppState) -> TickOutcome {
 
         for work in &client_work {
             for &sid in &work.subs {
-                let Some(&(_, px_w, px_h, px_gen, px_timestamp_ms)) =
-                    pixel_snapshot.iter().find(|&&(s, _, _, _, _)| s == sid)
+                // Pick the largest snapshot entry for this surface — that's
+                // the compositor's native composite, which we use both for
+                // the per-client target clamp and as a fallback source for
+                // CPU encoders that don't have a registered external.
+                let Some(&(_, native_w, native_h, native_gen, native_ts)) = pixel_snapshot
+                    .iter()
+                    .filter(|&&(s, _, _, _, _)| s == sid)
+                    .max_by_key(|&&(_, w, h, _, _)| (w as u64) * (h as u64))
                 else {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     client.skip_last_pixels_mismatch_count =
@@ -2874,6 +2918,32 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
 
+                let (target_w, target_h) = Session::per_client_encode_target(
+                    client.surface_view_sizes.get(&sid).copied(),
+                    native_w,
+                    native_h,
+                    &state.config.surface_encoders,
+                );
+                let (enc_w, enc_h) = (target_w, target_h);
+
+                // Look for a snapshot entry sized exactly for this
+                // client's encoder — the compositor produces one when the
+                // per-client encoder has registered external buffers.  If
+                // one doesn't exist, fall back to the native composite (a
+                // CPU encoder will downscale on the encode worker).
+                let (px_w, px_h, px_gen, px_timestamp_ms) = if pixel_snapshot
+                    .iter()
+                    .any(|&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
+                {
+                    pixel_snapshot
+                        .iter()
+                        .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
+                        .map(|&(_, w, h, g, t)| (w, h, g, t))
+                        .unwrap()
+                } else {
+                    (native_w, native_h, native_gen, native_ts)
+                };
+
                 // Skip encoding if the pixel data hasn't changed since the
                 // last encode for this surface, unless a keyframe is needed.
                 if !work.needs_keyframe
@@ -2889,9 +2959,9 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                 let pixels: blit_compositor::PixelData = {
                     let cs = sess.compositor.as_ref().unwrap();
-                    match cs.last_pixels.get(&sid) {
-                        Some(lp) if lp.width == px_w && lp.height == px_h => lp.pixels.clone(),
-                        _ => {
+                    match cs.last_pixels.get(&(sid, px_w, px_h)) {
+                        Some(lp) => lp.pixels.clone(),
+                        None => {
                             let client = sess.clients.get_mut(&work.cid).unwrap();
                             client.skip_last_pixels_mismatch_count =
                                 client.skip_last_pixels_mismatch_count.saturating_add(1);
@@ -2900,14 +2970,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
-
-                let (target_w, target_h) = Session::per_client_encode_target(
-                    client.surface_view_sizes.get(&sid).copied(),
-                    px_w,
-                    px_h,
-                    &state.config.surface_encoders,
-                );
-                let (enc_w, enc_h) = (target_w, target_h);
 
                 // Fast path: if the compositor already produced an encoded
                 // bitstream (Vulkan Video), skip the SurfaceEncoder entirely
@@ -3775,7 +3837,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && !f.external_bufs.is_empty()
                         && let Some(cs) = sess.compositor.as_mut()
                     {
-                        cs.last_pixels.remove(&result.sid);
+                        // Drop every cached snapshot for this surface so
+                        // the next compositor frame re-fills with the
+                        // newly-registered NV12 DMA-BUF target.  Stale
+                        // entries (e.g. native BGRA from a previous
+                        // tick) will be re-added by SurfaceCommit.
+                        last_pixels_remove_for_sid(&mut cs.last_pixels, result.sid);
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -3791,9 +3858,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                     && !bufs.is_empty()
                     && let Some(cs) = sess.compositor.as_mut()
                 {
+                    let (tw, th) = encoder.source_dimensions();
                     let _ = cs.handle.command_tx.send(
                         blit_compositor::CompositorCommand::SetExternalOutputBuffers {
                             surface_id: result.sid as u32,
+                            target_w: tw,
+                            target_h: th,
                             buffers: bufs,
                         },
                     );
@@ -4633,11 +4703,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(cs) = sess.compositor.as_ref() {
             for info in cs.surfaces.values() {
                 // Use the latest known pixel dimensions if the stored
-                // width/height is still 0 (surface created before first commit).
+                // width/height is still 0 (surface created before first
+                // commit).  The largest cached entry for this surface is
+                // its native composite — use that.
                 let (w, h) = if info.width == 0 && info.height == 0 {
                     cs.last_pixels
-                        .get(&info.surface_id)
-                        .map(|lp| (lp.width as u16, lp.height as u16))
+                        .iter()
+                        .filter(|(k, _)| k.0 == info.surface_id)
+                        .max_by_key(|(_, lp)| (lp.width as u64) * (lp.height as u64))
+                        .map(|(_, lp)| (lp.width as u16, lp.height as u16))
                         .unwrap_or((0, 0))
                 } else {
                     (info.width, info.height)
@@ -4860,11 +4934,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let (snapshot, command_tx) = {
                 let sess = state.session.lock().await;
                 eprintln!("[capture] lock acquired");
-                let snap = sess
-                    .compositor
-                    .as_ref()
-                    .and_then(|cs| cs.last_pixels.get(&surface_id))
-                    .map(|lp| (lp.width, lp.height, lp.pixels.clone()));
+                // Snapshot the largest cached entry for this surface
+                // (the native composite) for the capture fallback path.
+                let snap = sess.compositor.as_ref().and_then(|cs| {
+                    cs.last_pixels
+                        .iter()
+                        .filter(|(k, _)| k.0 == surface_id)
+                        .max_by_key(|(_, lp)| (lp.width as u64) * (lp.height as u64))
+                        .map(|(_, lp)| (lp.width, lp.height, lp.pixels.clone()))
+                });
                 let cmd_tx = sess
                     .compositor
                     .as_ref()

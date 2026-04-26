@@ -568,11 +568,17 @@ pub enum CompositorCommand {
         mime_type: String,
         reply: mpsc::SyncSender<Option<Vec<u8>>>,
     },
-    /// Set externally-allocated DMA-BUF fds as GPU renderer output targets
-    /// for a surface.  The compositor renders into these buffers so the
-    /// encoder can zero-copy them as input.
+    /// Set externally-allocated DMA-BUF fds as GPU renderer output
+    /// targets for a (surface, encoder target size) pair.  Each
+    /// per-client encoder owns its own pool of target-sized buffers;
+    /// the compositor composites at native size, then GPU-blits
+    /// (LINEAR) into each registered target so every viewer gets a
+    /// zero-copy stream at its own physical viewport.  Pass an empty
+    /// `buffers` to clear a target.
     SetExternalOutputBuffers {
         surface_id: u32,
+        target_w: u32,
+        target_h: u32,
         buffers: Vec<ExternalOutputBuffer>,
     },
     /// Synthesize text input as key press/release sequences.
@@ -1089,8 +1095,20 @@ struct Compositor {
     event_tx: mpsc::Sender<CompositorEvent>,
     event_notify: Arc<dyn Fn() + Send + Sync>,
     loop_signal: LoopSignal,
-    /// Pending per-surface commit data: `(phys_w, phys_h, log_w, log_h, pixels)`.
-    pending_commits: HashMap<u16, (u32, u32, u32, u32, PixelData)>,
+    /// Pending per-(surface, target) commit data, keyed by `(sid,
+    /// width, height)`.  Each render of one surface can produce
+    /// several frames — one per registered per-client encoder target
+    /// size — and each lands here as its own entry so the server sees
+    /// one `SurfaceCommit` per target.  Value is `(log_w, log_h, pixels)`
+    /// where the logicals are derived from the per-target physical size.
+    pending_commits: HashMap<(u16, u32, u32), (u32, u32, PixelData)>,
+    /// Latest composited (native) size per surface, used to gate
+    /// `SurfaceResized` events.  The renderer emits one frame per
+    /// per-client encoder target (downscaled), but `SurfaceResized`
+    /// must reflect the compositor's native output so pointer
+    /// coordinate mapping stays consistent regardless of how many
+    /// clients are subscribed at what sizes.
+    pending_native_sizes: HashMap<u16, (u32, u32, u32, u32)>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
@@ -1296,7 +1314,13 @@ impl Compositor {
     }
 
     fn flush_pending_commits(&mut self) {
-        for (surface_id, (width, height, log_w, log_h, pixels)) in self.pending_commits.drain() {
+        // First emit at most one SurfaceResized per surface, derived
+        // from the compositor's NATIVE composite size (not any
+        // per-client downscaled target).  The server's pointer
+        // coordinate mapping depends on the native size staying
+        // consistent regardless of how many viewers are subscribed at
+        // what sizes.
+        for (surface_id, (width, height, log_w, log_h)) in self.pending_native_sizes.drain() {
             let prev = self.last_reported_size.get(&surface_id).copied();
             if prev.is_none() || prev.map(|(pw, ph, _, _)| (pw, ph)) != Some((width, height)) {
                 self.last_reported_size
@@ -1307,12 +1331,21 @@ impl Compositor {
                     height: height as u16,
                 });
             }
+        }
+        // Drain into a stable order so per-surface targets are emitted
+        // in a deterministic sequence.
+        let now_ms = elapsed_ms();
+        #[allow(clippy::type_complexity)]
+        let mut entries: Vec<((u16, u32, u32), (u32, u32, PixelData))> =
+            self.pending_commits.drain().collect();
+        entries.sort_by_key(|((sid, w, h), _)| (*sid, *w, *h));
+        for ((surface_id, width, height), (_log_w, _log_h, pixels)) in entries {
             let _ = self.event_tx.send(CompositorEvent::SurfaceCommit {
                 surface_id,
                 width,
                 height,
                 pixels,
-                timestamp_ms: elapsed_ms(),
+                timestamp_ms: now_ms,
             });
         }
         (self.event_notify)();
@@ -1492,13 +1525,36 @@ impl Compositor {
                 toplevel_sid,
             )
         } else {
-            None
+            Vec::new()
         };
 
-        if let Some((result_sid, w, h, ref pixels)) = composited
-            && !pixels.is_empty()
+        // Record the compositor's native size once for this surface
+        // (used to drive SurfaceResized).  All per-target results carry
+        // the same toplevel_sid and the native composite is produced at
+        // `target_phys`; pull native dims from there when present, else
+        // fall back to the largest result's dims (multi-target frames
+        // are downscaled from one shared native composite).
+        let s120_u32 = (s120 as u32).max(120);
+        if let Some((nw, nh)) = target_phys {
+            let nlog_w = (nw * 120).div_ceil(s120_u32);
+            let nlog_h = (nh * 120).div_ceil(s120_u32);
+            self.pending_native_sizes
+                .insert(toplevel_sid, (nw, nh, nlog_w, nlog_h));
+        } else if let Some((sid, nw, nh, _)) = composited
+            .iter()
+            .max_by_key(|(_, w, h, _)| (*w as u64) * (*h as u64))
         {
-            let kind = match pixels {
+            let nlog_w = (nw * 120).div_ceil(s120_u32);
+            let nlog_h = (nh * 120).div_ceil(s120_u32);
+            self.pending_native_sizes
+                .insert(*sid, (*nw, *nh, nlog_w, nlog_h));
+        }
+
+        for (result_sid, w, h, pixels) in composited {
+            if pixels.is_empty() {
+                continue;
+            }
+            let kind = match &pixels {
                 PixelData::Bgra(_) => "bgra",
                 PixelData::Rgba(_) => "rgba",
                 PixelData::Nv12 { .. } => "nv12",
@@ -1527,25 +1583,14 @@ impl Compositor {
                     eprintln!("[pending #{lc}] {w}x{h} kind={kind}");
                 }
             }
-            // Determine the logical size for pointer coordinate mapping.
-            // The composited frame's physical dimensions (w, h) must pair
-            // with a logical size that preserves the true DPR ratio so the
-            // PointerMotion handler can convert browser pixel coords back
-            // to Wayland logical coords correctly.  The simplest correct
-            // approach is to derive logical size directly from the physical
-            // size and the output scale — this works regardless of whether
-            // the frame came from the Vulkan renderer (which targets the
-            // browser's requested size) or the CPU renderer (which targets
-            // the xdg_geometry content area).  The PointerMotion handler
-            // separately adds the xdg_geometry offset to translate from
-            // composited-frame space into surface-tree space, so the
-            // logical size here should represent the full composited frame,
-            // not just the xdg_geometry window extents.
-            let s120_u32 = (s120 as u32).max(120);
+            // Logical size derived from this target's physical size at
+            // the same scale.  Each entry in `pending_commits` produces
+            // one `SurfaceCommit` so the server can route the per-target
+            // frame to the correct per-client encoder.
             let log_w = (w * 120).div_ceil(s120_u32);
             let log_h = (h * 120).div_ceil(s120_u32);
             self.pending_commits
-                .insert(result_sid, (w, h, log_w, log_h, composited.unwrap().3));
+                .insert((result_sid, w, h), (log_w, log_h, pixels));
         }
 
         // Compositing is done — the VulkanRenderer holds its own dup'd
@@ -1591,7 +1636,10 @@ impl Compositor {
 
         if self.verbose {
             let cache_entries = self.surface_meta.len();
-            let has_pending = self.pending_commits.contains_key(&toplevel_sid);
+            let has_pending = self
+                .pending_commits
+                .keys()
+                .any(|(sid, _, _)| *sid == toplevel_sid);
             static COMMIT_COUNT: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = COMMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1939,6 +1987,9 @@ impl Compositor {
                     self.toplevel_surface_ids.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
+                    if let Some(ref mut vk) = self.vulkan_renderer {
+                        vk.destroy_external_outputs_for_surface(surf.surface_id as u32);
+                    }
                     let _ = self.event_tx.send(CompositorEvent::SurfaceDestroyed {
                         surface_id: surf.surface_id,
                     });
@@ -2451,6 +2502,12 @@ impl Compositor {
                 };
                 let result = if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id) {
                     if let Some(ref mut vk) = self.vulkan_renderer {
+                        // Capture asks for the compositor's native
+                        // composite at `cap_s120`.  No external targets
+                        // are registered for capture, so the renderer
+                        // returns 0..1 results — pick the first (or
+                        // None if the render failed to produce
+                        // anything).
                         vk.render_tree_sized(
                             root_id,
                             &self.surfaces,
@@ -2459,6 +2516,8 @@ impl Compositor {
                             None,
                             surface_id,
                         )
+                        .into_iter()
+                        .next()
                         .map(|(_sid, w, h, pixels)| {
                             let rgba = pixels.to_rgba(w, h);
                             (w, h, rgba)
@@ -2507,10 +2566,12 @@ impl Compositor {
             }
             CompositorCommand::SetExternalOutputBuffers {
                 surface_id,
+                target_w,
+                target_h,
                 buffers,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.set_external_output_buffers(surface_id, buffers);
+                    vk.set_external_output_buffers(surface_id, target_w, target_h, buffers);
                 }
             }
             CompositorCommand::SetRefreshRate { mhz } => {
@@ -2938,6 +2999,9 @@ impl Dispatch<WlSurface, ()> for Compositor {
                         state.toplevel_surface_ids.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
                         state.surface_sizes.remove(&surf.surface_id);
+                        if let Some(ref mut vk) = state.vulkan_renderer {
+                            vk.destroy_external_outputs_for_surface(surf.surface_id as u32);
+                        }
                         let _ = state.event_tx.send(CompositorEvent::SurfaceDestroyed {
                             surface_id: surf.surface_id,
                         });
@@ -3484,6 +3548,9 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                         state.toplevel_surface_ids.remove(&sid);
                         state.last_reported_size.remove(&sid);
                         state.surface_sizes.remove(&sid);
+                        if let Some(ref mut vk) = state.vulkan_renderer {
+                            vk.destroy_external_outputs_for_surface(sid as u32);
+                        }
                         let _ = state
                             .event_tx
                             .send(CompositorEvent::SurfaceDestroyed { surface_id: sid });
@@ -5344,6 +5411,7 @@ fn run_compositor(
         event_notify,
         loop_signal: loop_signal.clone(),
         pending_commits: HashMap::new(),
+        pending_native_sizes: HashMap::new(),
         focused_surface_id: 0,
         pointer_entered_id: None,
         pending_kb_reenter: false,
@@ -5458,15 +5526,26 @@ fn run_compositor(
         if let Some(ref mut vk) = compositor.vulkan_renderer
             && let Some((sid, w, h, pixels)) = vk.try_retire_pending()
         {
+            // The renderer's previous-frame staging readback completed
+            // — emit it as the native composite for this surface.  The
+            // log_w/log_h fields aren't read by the consumer (server
+            // derives logicals from physical + output scale) but we
+            // still need to populate them.
             let s120_u32 = (compositor.output_scale_120 as u32).max(120);
             let log_w = (w * 120).div_ceil(s120_u32);
             let log_h = (h * 120).div_ceil(s120_u32);
             compositor
                 .pending_commits
-                .insert(sid, (w, h, log_w, log_h, pixels));
+                .insert((sid, w, h), (log_w, log_h, pixels));
+            // Also drive SurfaceResized off the native staging readback
+            // when no fresh handle_surface_commit has populated it.
+            compositor
+                .pending_native_sizes
+                .entry(sid)
+                .or_insert((w, h, log_w, log_h));
         }
 
-        if !compositor.pending_commits.is_empty() {
+        if !compositor.pending_commits.is_empty() || !compositor.pending_native_sizes.is_empty() {
             compositor.flush_pending_commits();
         }
 
