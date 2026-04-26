@@ -93,15 +93,20 @@ pub(crate) struct VulkanRenderer {
     /// Supported DRM format modifiers queried from the Vulkan device.
     pub(crate) supported_dmabuf_modifiers: Vec<(u32, u64)>,
 
-    /// Encoder-allocated output buffers imported as Vulkan render targets,
-    /// keyed by surface id.  One set of buffers per surface — the
-    /// compositor renders natively into these, then the encoder consumes
-    /// them zero-copy.
-    external_outputs: HashMap<u32, (Vec<ExternalOutput>, usize)>,
+    /// Encoder-allocated output buffers imported as Vulkan render
+    /// targets, keyed by `(surface_id, target_w, target_h)`.  Multiple
+    /// distinct target sizes can coexist for one surface (one per-client
+    /// encoder per size).  After compositing the surface at native size
+    /// into `output_images`, the renderer `vkCmdBlitImage`s (LINEAR)
+    /// from the native frame into each per-target external buffer so
+    /// each per-client encoder consumes a downscaled frame zero-copy.
+    /// The `usize` is the round-robin index per pool.
+    external_outputs: HashMap<(u32, u32, u32), (Vec<ExternalOutput>, usize)>,
 
     /// NV12 output buffers for BGRA→NV12 compute conversion, keyed by
-    /// surface id.  The `usize` is the round-robin index.
-    nv12_outputs: HashMap<u32, (Vec<Nv12Output>, usize)>,
+    /// `(surface_id, target_w, target_h)` to mirror `external_outputs`.
+    /// The `usize` is the round-robin index.
+    nv12_outputs: HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)>,
 
     /// Persistent texture cache keyed by Wayland surface ObjectId.
     /// Textures are created at surface commit time and reused across
@@ -114,14 +119,15 @@ pub(crate) struct VulkanRenderer {
     pending_destroy_textures: Vec<CachedSurfaceTexture>,
 }
 
-/// Encoder-allocated DMA-BUF imported as a Vulkan framebuffer.
+/// Encoder-allocated DMA-BUF imported as a Vulkan framebuffer.  The
+/// size lives in the `external_outputs` key (`(sid, target_w,
+/// target_h)`), not in this struct, so multiple distinct target sizes
+/// can coexist for one surface.
 struct ExternalOutput {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     framebuffer: vk::Framebuffer,
-    width: u32,
-    height: u32,
     va_surface_id: u32,
     va_display: usize,
     fourcc: u32,
@@ -189,16 +195,15 @@ struct PendingSubmit {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
     textures: Vec<TempTexture>,
-    output_idx: usize,
+    /// Self-allocated output image index used for the native composite
+    /// (and the staging readback).
+    self_output_idx: usize,
+    /// Native (compositor) frame size — the size we composited at.
     phys_w: u32,
     phys_h: u32,
-    /// True when the render targeted an encoder-allocated external buffer.
-    external: bool,
     /// Toplevel surface_id this submission was rendered for, so async
     /// retirement can attribute the pixels to the correct surface.
     toplevel_sid: u16,
-    /// Surface id used to look up per-surface external/NV12 output pools.
-    surface_id: u32,
 }
 
 unsafe impl Send for VulkanRenderer {}
@@ -1026,10 +1031,12 @@ impl VulkanRenderer {
     pub(crate) fn set_external_output_buffers(
         &mut self,
         surface_id: u32,
+        target_w: u32,
+        target_h: u32,
         buffers: Vec<ExternalOutputBuffer>,
     ) {
         if buffers.is_empty() {
-            self.destroy_external_outputs(surface_id);
+            self.destroy_external_outputs_for_target(surface_id, target_w, target_h);
             return;
         }
         if !self.has_dmabuf {
@@ -1039,7 +1046,7 @@ impl VulkanRenderer {
         // The encoder owns the buffer; we borrow it for compositing.
         // After rendering, we return PixelData::Nv12DmaBuf and the encoder
         // encodes directly — zero copies, zero bus crossings.
-        self.destroy_external_outputs(surface_id);
+        self.destroy_external_outputs_for_target(surface_id, target_w, target_h);
         let format = vk::Format::B8G8R8A8_UNORM;
         let mut imported = Vec::new();
         for buf in &buffers {
@@ -1054,7 +1061,7 @@ impl VulkanRenderer {
         }
         if !imported.is_empty() {
             eprintln!(
-                "[vulkan-render] {} external output buffers imported for surface {surface_id} ({}x{})",
+                "[vulkan-render] {} external output buffers imported for surface {surface_id} target {target_w}x{target_h} (buffer {}x{})",
                 imported.len(),
                 buffers[0].width,
                 buffers[0].height,
@@ -1087,16 +1094,32 @@ impl VulkanRenderer {
                 })
                 .collect();
             if !nv12_fds.is_empty() {
-                self.create_nv12_outputs_from_fds(surface_id, &nv12_fds);
+                self.create_nv12_outputs_from_fds(surface_id, target_w, target_h, &nv12_fds);
             } else {
-                self.create_nv12_outputs(surface_id, buffers[0].width, buffers[0].height);
+                self.create_nv12_outputs(
+                    surface_id,
+                    target_w,
+                    target_h,
+                    buffers[0].width,
+                    buffers[0].height,
+                );
             }
         }
-        self.external_outputs.insert(surface_id, (imported, 0));
+        self.external_outputs
+            .insert((surface_id, target_w, target_h), (imported, 0));
     }
 
-    fn destroy_external_outputs(&mut self, surface_id: u32) {
-        if let Some((exts, _)) = self.external_outputs.remove(&surface_id) {
+    /// Destroy the external + NV12 buffers for a single (sid, target) pair.
+    fn destroy_external_outputs_for_target(
+        &mut self,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+    ) {
+        if let Some((exts, _)) = self
+            .external_outputs
+            .remove(&(surface_id, target_w, target_h))
+        {
             for ext in exts {
                 unsafe {
                     self.device.destroy_framebuffer(ext.framebuffer, None);
@@ -1106,7 +1129,31 @@ impl VulkanRenderer {
                 }
             }
         }
-        self.destroy_nv12_outputs(surface_id);
+        self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+    }
+
+    /// Destroy every external + NV12 buffer pool belonging to a surface,
+    /// regardless of target size.  Used on full surface teardown.
+    pub(crate) fn destroy_external_outputs_for_surface(&mut self, surface_id: u32) {
+        let keys: Vec<(u32, u32, u32)> = self
+            .external_outputs
+            .keys()
+            .filter(|k| k.0 == surface_id)
+            .copied()
+            .collect();
+        for k in keys {
+            if let Some((exts, _)) = self.external_outputs.remove(&k) {
+                for ext in exts {
+                    unsafe {
+                        self.device.destroy_framebuffer(ext.framebuffer, None);
+                        self.device.destroy_image_view(ext.view, None);
+                        self.device.destroy_image(ext.image, None);
+                        self.device.free_memory(ext.memory, None);
+                    }
+                }
+            }
+        }
+        self.destroy_nv12_outputs_for_surface(surface_id);
     }
 
     fn destroy_all_external_outputs(&mut self) {
@@ -1284,6 +1331,7 @@ impl VulkanRenderer {
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
                     | vk::ImageUsageFlags::STORAGE,
             )
             .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
@@ -1379,8 +1427,6 @@ impl VulkanRenderer {
             memory,
             view,
             framebuffer,
-            width: w,
-            height: h,
             va_surface_id: buf.va_surface_id,
             va_display: buf.va_display,
             fourcc: buf.fourcc,
@@ -1466,9 +1512,23 @@ impl VulkanRenderer {
         }
     }
 
-    fn destroy_nv12_outputs(&mut self, surface_id: u32) {
-        if let Some((nv12s, _)) = self.nv12_outputs.remove(&surface_id) {
+    fn destroy_nv12_outputs_for_target(&mut self, surface_id: u32, target_w: u32, target_h: u32) {
+        if let Some((nv12s, _)) = self.nv12_outputs.remove(&(surface_id, target_w, target_h)) {
             self.destroy_nv12_vec(nv12s);
+        }
+    }
+
+    fn destroy_nv12_outputs_for_surface(&mut self, surface_id: u32) {
+        let keys: Vec<(u32, u32, u32)> = self
+            .nv12_outputs
+            .keys()
+            .filter(|k| k.0 == surface_id)
+            .copied()
+            .collect();
+        for k in keys {
+            if let Some((nv12s, _)) = self.nv12_outputs.remove(&k) {
+                self.destroy_nv12_vec(nv12s);
+            }
         }
     }
 
@@ -1480,12 +1540,19 @@ impl VulkanRenderer {
     }
 
     /// Allocate NV12 output planes for the BGRA→NV12 compute path.
-    fn create_nv12_outputs(&mut self, surface_id: u32, w: u32, h: u32) {
+    fn create_nv12_outputs(
+        &mut self,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+        w: u32,
+        h: u32,
+    ) {
         if !self.has_dmabuf {
             return;
         }
         use std::os::fd::FromRawFd;
-        self.destroy_nv12_outputs(surface_id);
+        self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
 
         type GetMemoryFdKHR = unsafe extern "system" fn(
             vk::Device,
@@ -1615,20 +1682,20 @@ impl VulkanRenderer {
                 return;
             };
             self.nv12_outputs
-                .entry(surface_id)
+                .entry((surface_id, target_w, target_h))
                 .or_insert_with(|| (Vec::new(), 0))
                 .0
                 .push(nv12);
         }
-        if let Some(entry) = self.nv12_outputs.get_mut(&surface_id) {
+        if let Some(entry) = self.nv12_outputs.get_mut(&(surface_id, target_w, target_h)) {
             entry.1 = 0;
         }
         let count = self
             .nv12_outputs
-            .get(&surface_id)
+            .get(&(surface_id, target_w, target_h))
             .map_or(0, |(v, _)| v.len());
         eprintln!(
-            "[vulkan-render] created {count} NV12 buffers {w}x{h} stride={stride} uv_offset={uv_offset}",
+            "[vulkan-render] created {count} NV12 buffers {w}x{h} stride={stride} uv_offset={uv_offset} for target {target_w}x{target_h}",
         );
     }
 
@@ -1639,12 +1706,14 @@ impl VulkanRenderer {
     fn create_nv12_outputs_from_fds(
         &mut self,
         surface_id: u32,
+        target_w: u32,
+        target_h: u32,
         fds: &[(Arc<OwnedFd>, u32, u32, u32, u32, u64)],
     ) {
         if !self.has_dmabuf {
             return;
         }
-        self.destroy_nv12_outputs(surface_id);
+        self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
 
         for (fd, stride, uv_offset, w, h, modifier) in fds {
             let (fd, stride, uv_offset, w, h, modifier) =
@@ -1661,7 +1730,7 @@ impl VulkanRenderer {
             match nv12 {
                 Some(n) => {
                     self.nv12_outputs
-                        .entry(surface_id)
+                        .entry((surface_id, target_w, target_h))
                         .or_insert_with(|| (Vec::new(), 0))
                         .0
                         .push(n);
@@ -1675,7 +1744,7 @@ impl VulkanRenderer {
         }
         if let Some((nv12s, _)) = self
             .nv12_outputs
-            .get(&surface_id)
+            .get(&(surface_id, target_w, target_h))
             .filter(|(v, _)| !v.is_empty())
         {
             let kind_str = match &nv12s[0].kind {
@@ -1683,11 +1752,11 @@ impl VulkanRenderer {
                 Nv12OutputKind::Image { .. } => "image",
             };
             eprintln!(
-                "[vulkan-render] imported {} NV12 outputs ({kind_str})",
+                "[vulkan-render] imported {} NV12 outputs ({kind_str}) for target {target_w}x{target_h}",
                 nv12s.len(),
             );
         }
-        if let Some(entry) = self.nv12_outputs.get_mut(&surface_id) {
+        if let Some(entry) = self.nv12_outputs.get_mut(&(surface_id, target_w, target_h)) {
             entry.1 = 0;
         }
     }
@@ -3369,65 +3438,12 @@ impl VulkanRenderer {
         result.map(|(w, h, p)| (toplevel_sid, w, h, p))
     }
 
-    /// Produce the result from a completed GPU submission.
+    /// Produce the native BGRA result from a completed GPU submission.
+    /// External targets were emitted immediately by `render_tree_sized`
+    /// — `retire_pending` only handles the self-alloc staging readback.
     fn retire_pending(&mut self, pending: PendingSubmit) -> Option<(u32, u32, PixelData)> {
-        // Build the result payload — external or staging readback.
-        let result = if pending.external {
-            let sid = pending.surface_id;
-            let (ext_vec, _) = self.external_outputs.get(&sid)?;
-            let ext = ext_vec.get(pending.output_idx)?;
-            if ext.va_surface_id != 0 {
-                // Legacy VA-API surface path.
-                Some((
-                    pending.phys_w,
-                    pending.phys_h,
-                    PixelData::VaSurface {
-                        surface_id: ext.va_surface_id,
-                        va_display: ext.va_display,
-                        _fd: ext._fd.clone(),
-                    },
-                ))
-            } else if let Some(&(ref nv12_vec, nv12_cur_idx)) =
-                self.nv12_outputs.get(&sid).filter(|(v, _)| !v.is_empty())
-            {
-                // NV12 zero-copy: compute shader already wrote Y+UV planes.
-                let nv12_idx = (nv12_cur_idx + nv12_vec.len() - 1) % nv12_vec.len();
-                let nv12 = &nv12_vec[nv12_idx];
-                let (stride, uv_offset) = match &nv12.kind {
-                    Nv12OutputKind::Buffer {
-                        stride, uv_offset, ..
-                    } => (*stride, *uv_offset),
-                    Nv12OutputKind::Image { .. } => (0, 0),
-                };
-                Some((
-                    pending.phys_w,
-                    pending.phys_h,
-                    PixelData::Nv12DmaBuf {
-                        fd: nv12.fd.clone(),
-                        stride,
-                        uv_offset,
-                        width: pending.phys_w,
-                        height: pending.phys_h,
-                        sync_fd: None,
-                    },
-                ))
-            } else {
-                // BGRA DMA-BUF fallback.
-                Some((
-                    pending.phys_w,
-                    pending.phys_h,
-                    PixelData::DmaBuf {
-                        fd: ext._fd.clone(),
-                        fourcc: ext.fourcc,
-                        modifier: ext.modifier,
-                        stride: ext.stride,
-                        offset: 0,
-                        y_invert: true,
-                    },
-                ))
-            }
-        } else if pending.output_idx < self.output_images.len() {
-            let img = &self.output_images[pending.output_idx];
+        let result = if pending.self_output_idx < self.output_images.len() {
+            let img = &self.output_images[pending.self_output_idx];
             if img.width != pending.phys_w || img.height != pending.phys_h {
                 // Output images were recreated (resize) between submit
                 // and retire — the staging buffer we'd read has been
@@ -3448,8 +3464,8 @@ impl VulkanRenderer {
             }
         } else {
             eprintln!(
-                "[retire_pending] output_idx {} out of range (len={})",
-                pending.output_idx,
+                "[retire_pending] self_output_idx {} out of range (len={})",
+                pending.self_output_idx,
                 self.output_images.len(),
             );
             None
@@ -3557,21 +3573,18 @@ impl VulkanRenderer {
         output_scale_120: u16,
         target_phys: Option<(u32, u32)>,
         toplevel_sid: u16,
-    ) -> Option<(u16, u32, u32, PixelData)> {
-        // Retire the previous submission if done (non-blocking).
-        //
-        // For self-allocated outputs we need the fence to complete
-        // before we can read back the staging buffer, so a busy fence
-        // means we must skip this compositing pass.
-        //
-        // For external outputs we never block on the fence here — the
-        // encoder's VPP handles synchronisation via implicit DMA-BUF
-        // fencing.  If the previous submit was external and still
-        // in-flight, we defer it for later cleanup and proceed.
+    ) -> Vec<(u16, u32, u32, PixelData)> {
+        // Retire the previous submission if done (non-blocking).  The
+        // self-alloc readback (compositor BGRA at native) is one frame
+        // delayed — staging buffer copy needs the fence to complete.
+        // External targets have already returned their pixels
+        // immediately (zero-delay; the encoder's VPP waits on the
+        // GPU via implicit DMA-BUF fencing or an exported sync_fd).
         static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let entry_n = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let had_pending = self.pending_submit.is_some();
-        let prev_result = if let Some(pending) = self.pending_submit.take() {
+        let mut results: Vec<(u16, u32, u32, PixelData)> = Vec::new();
+        if let Some(pending) = self.pending_submit.take() {
             let prev_sid = pending.toplevel_sid;
             let raw = unsafe {
                 (self.device.fp_v1_0().wait_for_fences)(
@@ -3588,24 +3601,24 @@ impl VulkanRenderer {
                 if r.is_none() {
                     eprintln!("[render_tree_sized] fence OK but retire_pending=None");
                 }
-                r.map(|(w, h, p)| (prev_sid, w, h, p))
-            } else if pending.external {
-                // External: defer cleanup, proceed immediately.
-                self.deferred_submits.push(pending);
-                None
+                if let Some((w, h, p)) = r {
+                    results.push((prev_sid, w, h, p));
+                }
             } else {
-                // Self-allocated: need staging readback — must wait.
+                // Self-alloc readback: must wait for fence — re-stash
+                // and return any results already collected (probably
+                // none, but be conservative).  External targets in this
+                // submit will be returned alongside the next render.
                 self.pending_submit = Some(pending);
-                return None;
+                return results;
             }
         } else {
             self.free_frame_textures();
-            None
-        };
+        }
         if entry_n < 20 || entry_n.is_multiple_of(50) {
             eprintln!(
-                "[render_tree_sized #{entry_n}] had_pending={had_pending} prev_result={} ext_outputs={} deferred={} pending_after={}",
-                prev_result.is_some(),
+                "[render_tree_sized #{entry_n}] had_pending={had_pending} prev_results={} ext_outputs={} deferred={} pending_after={}",
+                results.len(),
                 self.external_outputs.len(),
                 self.deferred_submits.len(),
                 self.pending_submit.is_some(),
@@ -3623,7 +3636,7 @@ impl VulkanRenderer {
                 surfaces.len(),
                 meta.len(),
             );
-            return None;
+            return results;
         }
 
         // Compute output dimensions.
@@ -3647,7 +3660,7 @@ impl VulkanRenderer {
                 "[render_tree_sized] zero logical size log={log_w}x{log_h} layers={}",
                 all_layers.len(),
             );
-            return None;
+            return results;
         }
 
         // Use the target size from the browser if available, otherwise
@@ -3669,31 +3682,54 @@ impl VulkanRenderer {
             );
         }
 
-        // Prefer encoder-allocated external outputs (zero-copy to
-        // encoder).  Fall back to self-allocated output images with
-        // staging readback.
+        // Always composite the surface at native size into a
+        // self-allocated `output_image`.  After the render pass we
+        // GPU-blit (LINEAR) the native frame into each per-target
+        // external buffer for the per-client encoders, then dispatch
+        // the BGRA→NV12 compute against the resized BGRA copy.  A
+        // staging readback of the native frame always runs so callers
+        // that want plain BGRA at native (e.g. CPU encoders, the
+        // Capture command) get pixels even when no external target is
+        // registered.
         let sid = toplevel_sid as u32;
-        let use_external = self
-            .external_outputs
-            .get(&sid)
-            .is_some_and(|(v, _)| !v.is_empty() && v[0].width == phys_w && v[0].height == phys_h);
 
-        let (out_framebuffer, out_image, out_staging_buf, out_idx, external) = if use_external {
-            let (ext_vec, ext_idx) = &self.external_outputs[&sid];
-            let idx = ext_idx % ext_vec.len();
-            let ext = &ext_vec[idx];
-            (ext.framebuffer, ext.image, vk::Buffer::null(), idx, true)
-        } else {
-            self.ensure_output_images(phys_w, phys_h);
-            if self.output_images.is_empty() {
-                eprintln!(
-                    "[render_tree_sized] output_images empty after ensure ({phys_w}x{phys_h})"
-                );
-                return None;
-            }
-            let idx = self.output_idx;
-            let img = &self.output_images[idx];
-            (img.framebuffer, img.image, img.staging_buf, idx, false)
+        // Collect every (target_w, target_h, ext_idx) we will blit to
+        // this frame, paired with the resolved external buffer slot.
+        // Distinct target sizes share the same native render and one
+        // command buffer / fence / submit.
+        let mut external_targets_keys: Vec<(u32, u32, u32)> = self
+            .external_outputs
+            .keys()
+            .filter(|k| k.0 == sid)
+            .copied()
+            .collect();
+        // Stable order: target_w then target_h.  Determinism helps
+        // debugging and keeps perf predictable across runs.
+        external_targets_keys.sort_unstable();
+
+        // Resolve each external target to (target_w, target_h, idx).
+        let external_targets: Vec<(u32, u32, usize)> = external_targets_keys
+            .iter()
+            .filter_map(|&key| {
+                let (ext_vec, ext_idx) = self.external_outputs.get(&key)?;
+                if ext_vec.is_empty() {
+                    return None;
+                }
+                let idx = ext_idx % ext_vec.len();
+                Some((key.1, key.2, idx))
+            })
+            .collect();
+
+        // Self-allocated native output image — always present.
+        self.ensure_output_images(phys_w, phys_h);
+        if self.output_images.is_empty() {
+            eprintln!("[render_tree_sized] output_images empty after ensure ({phys_w}x{phys_h})");
+            return results;
+        }
+        let self_output_idx = self.output_idx;
+        let (out_framebuffer, out_image, out_staging_buf) = {
+            let img = &self.output_images[self_output_idx];
+            (img.framebuffer, img.image, img.staging_buf)
         };
 
         // Allocate command buffer.
@@ -3702,23 +3738,23 @@ impl VulkanRenderer {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         let cb = unsafe {
-            self.device
-                .allocate_command_buffers(&cb_alloc)
-                .inspect_err(|&e| {
+            match self.device.allocate_command_buffers(&cb_alloc) {
+                Ok(v) => v[0],
+                Err(e) => {
                     eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
-                })
-                .ok()?[0]
+                    return results;
+                }
+            }
         };
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
-            self.device
-                .begin_command_buffer(cb, &begin_info)
-                .inspect_err(|&e| {
-                    eprintln!("[render_tree_sized] begin_command_buffer failed: {e}");
-                })
-                .ok()?
+            if let Err(e) = self.device.begin_command_buffer(cb, &begin_info) {
+                eprintln!("[render_tree_sized] begin_command_buffer failed: {e}");
+                self.device.free_command_buffers(self.command_pool, &[cb]);
+                return results;
+            }
         };
 
         // Begin render pass.
@@ -3835,7 +3871,7 @@ impl VulkanRenderer {
                 let _ = self.device.end_command_buffer(cb);
                 self.device.free_command_buffers(self.command_pool, &[cb]);
             }
-            return None;
+            return results;
         }
 
         // Transition all input textures to SHADER_READ_ONLY_OPTIMAL.
@@ -3898,50 +3934,114 @@ impl VulkanRenderer {
             self.device.cmd_end_render_pass(cb);
         }
 
-        // Dispatch BGRA→NV12 compute if this surface has NV12 output
-        // buffers.  Runs for both the external (encoder-allocated BGRA)
-        // and self-alloc (compositor BGRA image created with
-        // STORAGE|MUTABLE) paths.
-        #[derive(Clone, Copy)]
-        enum NvDispatchKind {
-            Buffer,
-            Image,
-        }
-        let dispatch_info: Option<(usize, NvDispatchKind)> =
-            self.nv12_outputs.get(&sid).and_then(|(nv12_vec, cur_idx)| {
-                if nv12_vec.is_empty() {
-                    return None;
-                }
-                let nv12_idx = cur_idx % nv12_vec.len();
-                let kind = match nv12_vec[nv12_idx].kind {
-                    Nv12OutputKind::Buffer { .. } => NvDispatchKind::Buffer,
-                    Nv12OutputKind::Image { .. } => NvDispatchKind::Image,
-                };
-                Some((nv12_idx, kind))
-            });
-        let ran_compute = dispatch_info.is_some();
-        if let Some((nv12_idx, kind)) = dispatch_info {
-            let nv12_vec = &self.nv12_outputs[&sid].0;
-            match kind {
-                NvDispatchKind::Image => self.dispatch_nv12_compute_image(
-                    cb, out_image, nv12_vec, nv12_idx, phys_w, phys_h, true,
-                ),
-                NvDispatchKind::Buffer => self
-                    .dispatch_nv12_compute(cb, out_image, nv12_vec, nv12_idx, phys_w, phys_h, true),
+        // For each registered external target: blit (LINEAR) the
+        // native frame into the target's BGRA buffer, then dispatch
+        // BGRA→NV12 compute against that resized BGRA copy.  All
+        // distinct target sizes share the single command buffer so
+        // one GPU submission handles every consumer.
+        //
+        // The native `out_image` is in TRANSFER_SRC_OPTIMAL after the
+        // render pass so it's already a valid blit source.  Each
+        // external target is freshly imported (UNDEFINED) or was last
+        // left in TRANSFER_DST_OPTIMAL by the previous render — we
+        // transition to TRANSFER_DST_OPTIMAL unconditionally before
+        // the blit (UNDEFINED → TRANSFER_DST_OPTIMAL is a no-op
+        // discarding the previous contents, which is what we want).
+        for &(tw, th, ext_idx) in &external_targets {
+            let ext_image = {
+                let (ext_vec, _) = &self.external_outputs[&(sid, tw, th)];
+                ext_vec[ext_idx].image
+            };
+            // Transition the destination to TRANSFER_DST_OPTIMAL.
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .image(ext_image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
             }
-        }
 
-        // Copy to staging buffer for CPU readback (only for self-allocated
-        // output images — external outputs are encoded directly).
-        if !external {
-            // If compute just ran, out_image is in GENERAL; transition
-            // it back to TRANSFER_SRC_OPTIMAL for the buffer copy below.
-            if ran_compute {
-                let back = vk::ImageMemoryBarrier::default()
-                    .image(out_image)
-                    .old_layout(vk::ImageLayout::GENERAL)
+            let blit = vk::ImageBlit::default()
+                .src_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: phys_w as i32,
+                        y: phys_h as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: tw as i32,
+                        y: th as i32,
+                        z: 1,
+                    },
+                ]);
+            unsafe {
+                self.device.cmd_blit_image(
+                    cb,
+                    out_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ext_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::LINEAR,
+                );
+            }
+
+            // Dispatch BGRA→NV12 compute on the resized external BGRA
+            // image, if NV12 outputs are registered for this target.
+            // The dispatch helpers expect the BGRA source to be in
+            // TRANSFER_SRC_OPTIMAL when `transition_bgra=true`; the
+            // external image is currently TRANSFER_DST_OPTIMAL, so
+            // transition it first.
+            let nv12_dispatch: Option<(usize, bool)> = self
+                .nv12_outputs
+                .get(&(sid, tw, th))
+                .and_then(|(nv12_vec, cur_idx)| {
+                    if nv12_vec.is_empty() {
+                        return None;
+                    }
+                    let nv12_idx = cur_idx % nv12_vec.len();
+                    let is_image = matches!(nv12_vec[nv12_idx].kind, Nv12OutputKind::Image { .. });
+                    Some((nv12_idx, is_image))
+                });
+            if let Some((nv12_idx, is_image)) = nv12_dispatch {
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .image(ext_image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -3953,129 +4053,225 @@ impl VulkanRenderer {
                 unsafe {
                     self.device.cmd_pipeline_barrier(
                         cb,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],
-                        &[back],
+                        &[to_src],
                     );
                 }
+                let nv12_vec = &self.nv12_outputs[&(sid, tw, th)].0;
+                if is_image {
+                    self.dispatch_nv12_compute_image(
+                        cb, ext_image, nv12_vec, nv12_idx, tw, th, true,
+                    );
+                } else {
+                    self.dispatch_nv12_compute(cb, ext_image, nv12_vec, nv12_idx, tw, th, true);
+                }
             }
-            let region = vk::BufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: 0,
-                buffer_image_height: 0,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                image_extent: vk::Extent3D {
-                    width: phys_w,
-                    height: phys_h,
-                    depth: 1,
-                },
-            };
-            unsafe {
-                self.device.cmd_copy_image_to_buffer(
-                    cb,
-                    out_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    out_staging_buf,
-                    &[region],
-                );
-            }
+        }
+
+        // Always copy the native composite into the staging buffer for
+        // CPU readback.  Out_image is in TRANSFER_SRC_OPTIMAL after the
+        // render pass — we never transitioned it (the blits above use
+        // it as a source) so the copy can run directly.
+        let region = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: phys_w,
+                height: phys_h,
+                depth: 1,
+            },
+        };
+        unsafe {
+            self.device.cmd_copy_image_to_buffer(
+                cb,
+                out_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                out_staging_buf,
+                &[region],
+            );
         }
 
         // Submit asynchronously.
         unsafe {
-            self.device
-                .end_command_buffer(cb)
-                .inspect_err(|&e| {
-                    eprintln!("[render_tree_sized] end_command_buffer failed: {e}");
-                })
-                .ok()?;
+            if let Err(e) = self.device.end_command_buffer(cb) {
+                eprintln!("[render_tree_sized] end_command_buffer failed: {e}");
+                self.device.free_command_buffers(self.command_pool, &[cb]);
+                return results;
+            }
         }
-        // When explicit sync is needed (tiled NV12 on radv), create the
-        // fence with SYNC_FD export capability so we can hand a sync_fd
-        // to the encoder instead of blocking the compositor thread.
-        //
-        // Only exported for the external path: vkGetFenceFdKHR with
-        // SYNC_FD transfers the fence payload to the fd and resets the
-        // VkFence, so a subsequent wait_for_fences on it (which the
-        // self-alloc path does via try_retire_pending) would stall
-        // forever.  The self-alloc path instead block-waits on the
-        // fence before emitting scaled frames (see `else` branch below).
-        let needs_sync_fd_export = external
-            && self.external_fence_fd_fn.is_some()
-            && self.nv12_outputs.get(&sid).is_some_and(|(v, idx)| {
-                !v.is_empty() && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
+
+        // When any external target needs explicit sync (tiled NV12 on
+        // radv) we export a SYNC_FD so the encoder can wait off-thread.
+        // Note: vkGetFenceFdKHR with SYNC_FD transfers the payload and
+        // resets the source VkFence — we cannot use the same fence for
+        // both export and our own cleanup tracking.  When sync_fd
+        // export is needed we submit two signal targets: an
+        // export-only fence (consumed by sync_fd) and a separate
+        // tracking fence we use to retire `cb` and per-frame textures.
+        let needs_sync_fd_export = self.external_fence_fd_fn.is_some()
+            && external_targets.iter().any(|&(tw, th, _)| {
+                self.nv12_outputs
+                    .get(&(sid, tw, th))
+                    .is_some_and(|(v, idx)| {
+                        !v.is_empty()
+                            && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
+                    })
             });
-        let fence = if needs_sync_fd_export {
+
+        let tracking_fence = unsafe {
+            match self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[render_tree_sized] create_fence(tracking) failed: {e}");
+                    self.device.free_command_buffers(self.command_pool, &[cb]);
+                    return results;
+                }
+            }
+        };
+        // Optional secondary fence whose payload we will export as a
+        // sync_fd for the encoder.  Created with SYNC_FD export
+        // capability when needed; destroyed once the export is done.
+        let export_fence: Option<vk::Fence> = if needs_sync_fd_export {
             let mut export_info = vk::ExportFenceCreateInfo::default()
                 .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
             let fence_info = vk::FenceCreateInfo::default().push_next(&mut export_info);
             unsafe {
-                self.device
-                    .create_fence(&fence_info, None)
-                    .inspect_err(|&e| {
+                match self.device.create_fence(&fence_info, None) {
+                    Ok(f) => Some(f),
+                    Err(e) => {
                         eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
-                    })
-                    .ok()?
+                        // Continue without sync_fd export — fall back to
+                        // the blocking wait branch below.
+                        None
+                    }
+                }
             }
         } else {
-            let fence_info = vk::FenceCreateInfo::default();
-            unsafe {
-                self.device
-                    .create_fence(&fence_info, None)
-                    .inspect_err(|&e| {
-                        eprintln!("[render_tree_sized] create_fence failed: {e}");
-                    })
-                    .ok()?
-            }
+            None
         };
+
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
+        // Submit twice with different fences so each gets the GPU
+        // completion signal independently.  The driver collapses these
+        // into a single dispatch since the second submit only carries
+        // a fence and no work.
         unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit], fence)
-                .inspect_err(|&e| {
-                    eprintln!("[render_tree_sized] queue_submit failed: {e}");
-                })
-                .ok()?;
+            if let Err(e) = self
+                .device
+                .queue_submit(self.queue, &[submit], tracking_fence)
+            {
+                eprintln!("[render_tree_sized] queue_submit (tracking) failed: {e}");
+                if let Some(ef) = export_fence {
+                    self.device.destroy_fence(ef, None);
+                }
+                self.device.destroy_fence(tracking_fence, None);
+                self.device.free_command_buffers(self.command_pool, &[cb]);
+                return results;
+            }
+            if let Some(ef) = export_fence {
+                let empty = vk::SubmitInfo::default();
+                if let Err(e) = self.device.queue_submit(self.queue, &[empty], ef) {
+                    eprintln!("[render_tree_sized] queue_submit (export fence) failed: {e}");
+                    self.device.destroy_fence(ef, None);
+                    // Continue with tracking fence; encoder will block.
+                }
+            }
         }
+        let fence = tracking_fence;
 
         let submit_info = PendingSubmit {
             fence,
             cb,
             textures: std::mem::take(&mut self.frame_textures),
-            output_idx: out_idx,
+            self_output_idx,
             phys_w,
             phys_h,
-            external,
             toplevel_sid,
-            surface_id: sid,
         };
 
-        if external {
-            // External output — return the VaSurface for the CURRENT
-            // frame immediately.  The GPU may still be rendering, but
-            // the encoder's VPP will wait for it via implicit DMA-BUF
-            // fencing.  This eliminates the 1-frame pipeline delay and
-            // the 1 ms poll-to-retire latency for the zero-copy path.
-            let (ext_vec, _) = &self.external_outputs[&sid];
-            let ext = &ext_vec[out_idx];
-            let nv12_entry = self.nv12_outputs.get(&sid);
+        // Export the dedicated export-fence as a sync_fd ONCE (shared
+        // across all targets that need explicit sync).
+        // vkGetFenceFdKHR(SYNC_FD) consumes the fence's payload and
+        // resets it, so we use a dedicated `export_fence` distinct
+        // from `tracking_fence` (which we use to know when the cb is
+        // safe to free).  Each consumer Arc-shares the OwnedFd so
+        // dup()/poll() works independently per consumer.
+        let shared_sync_fd: Option<Arc<std::os::fd::OwnedFd>> =
+            if let (Some(ext_fence_fn), Some(ef)) =
+                (self.external_fence_fd_fn.as_ref(), export_fence)
+            {
+                let get_info = vk::FenceGetFdInfoKHR::default()
+                    .fence(ef)
+                    .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+                let result = match unsafe { ext_fence_fn.get_fence_fd(&get_info) } {
+                    Ok(raw_fd) if raw_fd >= 0 => {
+                        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+                        Some(Arc::new(owned))
+                    }
+                    Ok(_) | Err(_) => {
+                        // Fallback: block on tracking_fence so the encoder
+                        // still sees a finished frame.
+                        eprintln!(
+                            "[vulkan-render] vkGetFenceFdKHR failed; \
+                         falling back to blocking wait"
+                        );
+                        unsafe {
+                            let _ = self.device.wait_for_fences(&[fence], true, 5_000_000_000);
+                        }
+                        None
+                    }
+                };
+                // The export-fence's payload has been consumed and the
+                // VkFence is now reset; we can safely destroy it.
+                unsafe { self.device.destroy_fence(ef, None) };
+                result
+            } else {
+                None
+            };
+
+        // Build immediate per-target results.  Each external target
+        // emits its own SurfaceCommit so the matching per-client
+        // encoder picks up the correctly-sized frame.  These return
+        // immediately without waiting for the fence (the encoder VPP
+        // synchronises via DMA-BUF implicit fencing or the exported
+        // sync_fd we attach below).
+        for &(tw, th, ext_idx) in &external_targets {
+            let (ext_va, ext_va_display, ext_fd, ext_fourcc, ext_mod, ext_stride) = {
+                let (ext_vec, _) = &self.external_outputs[&(sid, tw, th)];
+                let ext = &ext_vec[ext_idx];
+                (
+                    ext.va_surface_id,
+                    ext.va_display,
+                    ext._fd.clone(),
+                    ext.fourcc,
+                    ext.modifier,
+                    ext.stride,
+                )
+            };
+            let nv12_entry = self.nv12_outputs.get(&(sid, tw, th));
             let nv12_cur_idx = nv12_entry.map_or(0, |(_, idx)| *idx);
             let nv12_len = nv12_entry.map_or(0, |(v, _)| v.len()).max(1);
             let nv12_idx = nv12_cur_idx % nv12_len;
-            let pixel_data = if ext.va_surface_id != 0 {
+            let mut pixel_data = if ext_va != 0 {
                 PixelData::VaSurface {
-                    surface_id: ext.va_surface_id,
-                    va_display: ext.va_display,
-                    _fd: ext._fd.clone(),
+                    surface_id: ext_va,
+                    va_display: ext_va_display,
+                    _fd: ext_fd.clone(),
                 }
             } else if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty()) {
                 let nv12 = &nv12s[nv12_idx];
@@ -4086,100 +4282,47 @@ impl VulkanRenderer {
                         fd: nv12.fd.clone(),
                         stride: *stride,
                         uv_offset: *uv_offset,
-                        width: phys_w,
-                        height: phys_h,
+                        width: tw,
+                        height: th,
                         sync_fd: None,
                     },
                     Nv12OutputKind::Image { .. } => PixelData::Nv12DmaBuf {
                         fd: nv12.fd.clone(),
                         stride: 0,
                         uv_offset: 0,
-                        width: phys_w,
-                        height: phys_h,
+                        width: tw,
+                        height: th,
                         sync_fd: None,
                     },
                 }
             } else {
                 PixelData::DmaBuf {
-                    fd: ext._fd.clone(),
-                    fourcc: ext.fourcc,
-                    modifier: ext.modifier,
-                    stride: ext.stride,
+                    fd: ext_fd.clone(),
+                    fourcc: ext_fourcc,
+                    modifier: ext_mod,
+                    stride: ext_stride,
                     offset: 0,
-                    y_invert: true,
+                    y_invert: false,
                 }
             };
-            if let Some(entry) = self.nv12_outputs.get_mut(&sid) {
-                entry.1 = (nv12_cur_idx + 1) % nv12_len;
-            }
 
-            // For tiled NV12 images: radv doesn't do implicit DMA-BUF sync,
-            // so we export the Vulkan fence as a sync_fd and pass it to the
-            // encoder.  The encoder waits on the sync_fd (in spawn_blocking)
-            // instead of blocking the compositor thread here.
-            let mut pixel_data = pixel_data;
-            if needs_sync_fd_export {
-                if let Some(ref ext_fence_fn) = self.external_fence_fd_fn {
-                    let get_info = vk::FenceGetFdInfoKHR::default()
-                        .fence(submit_info.fence)
-                        .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-                    match unsafe { ext_fence_fn.get_fence_fd(&get_info) } {
-                        Ok(raw_fd) => {
-                            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
-                            let shared = Arc::new(owned);
-                            if let PixelData::Nv12DmaBuf {
-                                ref mut sync_fd, ..
-                            } = pixel_data
-                            {
-                                *sync_fd = Some(shared);
-                            }
+            // Vulkan Video encode (compositor-resident, only at native
+            // size) — only valid when this target matches native and
+            // there's a registered encoder for the surface.
+            if (tw, th) == (phys_w, phys_h) && self.vulkan_encoders.contains_key(&sid) {
+                let nv12_image_and_view =
+                    self.nv12_outputs.get(&(sid, tw, th)).and_then(|(v, _)| {
+                        if v.is_empty() {
+                            return None;
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[vulkan-render] vkGetFenceFdKHR failed: {e:?}, \
-                                 falling back to blocking wait"
-                            );
-                            unsafe {
-                                let _ = self.device.wait_for_fences(
-                                    &[submit_info.fence],
-                                    true,
-                                    5_000_000_000,
-                                );
-                            }
+                        match &v[nv12_idx].kind {
+                            Nv12OutputKind::Image {
+                                image, encode_view, ..
+                            } => encode_view.map(|ev| (*image, ev)),
+                            _ => None,
                         }
-                    }
-                }
-            } else {
-                // Tiled NV12 but no sync_fd export support — block here as
-                // a last resort (same as the old code path).
-                let needs_explicit_sync = self.nv12_outputs.get(&sid).is_some_and(|(v, _)| {
-                    !v.is_empty() && matches!(v[nv12_idx].kind, Nv12OutputKind::Image { .. })
-                });
-                if needs_explicit_sync {
-                    unsafe {
-                        let _ =
-                            self.device
-                                .wait_for_fences(&[submit_info.fence], true, 5_000_000_000);
-                    }
-                }
-            }
-
-            // Vulkan Video encode: if we have a vulkan encoder for this
-            // surface and the NV12 output is a tiled image with an
-            // encode-compatible view, encode the frame directly on the GPU.
-            let pixel_data = if self.vulkan_encoders.contains_key(&sid) {
-                let nv12_image_and_view = self.nv12_outputs.get(&sid).and_then(|(v, _)| {
-                    if v.is_empty() {
-                        return None;
-                    }
-                    match &v[nv12_idx].kind {
-                        Nv12OutputKind::Image {
-                            image, encode_view, ..
-                        } => encode_view.map(|ev| (*image, ev)),
-                        _ => None,
-                    }
-                });
-                if let Some((_nv12_img, ev)) = nv12_image_and_view {
+                    });
+                if let Some((nv12_img, ev)) = nv12_image_and_view {
                     let encoder = self.vulkan_encoders.get_mut(&sid).unwrap();
                     let encoded = unsafe {
                         encoder.encode(
@@ -4187,56 +4330,66 @@ impl VulkanRenderer {
                             self.video_fns.as_ref().unwrap(),
                             self.video_encode_queue.unwrap(),
                             self.video_encode_command_pool.unwrap(),
-                            _nv12_img,
+                            nv12_img,
                             ev,
-                            false, // force_keyframe handled via request_idr
+                            false,
                         )
                     };
                     if let Some((bitstream, is_keyframe)) = encoded {
-                        PixelData::Encoded {
+                        pixel_data = PixelData::Encoded {
                             data: Arc::new(bitstream),
                             is_keyframe,
                             codec_flag: encoder.codec_flag(),
-                        }
-                    } else {
-                        pixel_data
+                        };
                     }
-                } else {
-                    pixel_data
                 }
-            } else {
-                pixel_data
-            };
+            }
 
-            let result = Some((toplevel_sid, phys_w, phys_h, pixel_data));
-            // Drain completed deferred submits before appending a new
-            // one. Amortises cleanup with submit rate (bounded by GPU
-            // frame rate) rather than Wayland event rate.
-            self.drain_deferred_submits();
-            self.deferred_submits.push(submit_info);
-            if let Some((ext_vec, ext_idx)) = self.external_outputs.get_mut(&sid) {
-                let ext_len = ext_vec.len();
-                *ext_idx = (*ext_idx + 1) % ext_len;
+            // Attach the shared sync_fd to this NV12 result so the
+            // encoder can wait off-thread instead of blocking the
+            // compositor.
+            if let Some(ref shared) = shared_sync_fd
+                && let PixelData::Nv12DmaBuf {
+                    ref mut sync_fd, ..
+                } = pixel_data
+            {
+                *sync_fd = Some(shared.clone());
             }
-            if entry_n < 20 || entry_n.is_multiple_of(50) {
-                eprintln!("[render_tree_sized #{entry_n}] return=external Some");
+
+            results.push((toplevel_sid, tw, th, pixel_data));
+
+            // Advance the round-robin cursors for this target.
+            if let Some(entry) = self.external_outputs.get_mut(&(sid, tw, th)) {
+                let n = entry.0.len().max(1);
+                entry.1 = (entry.1 + 1) % n;
             }
-            result
-        } else {
-            self.pending_submit = Some(submit_info);
-            self.output_idx = (self.output_idx + 1) % self.output_images.len();
-            if entry_n < 20 || entry_n.is_multiple_of(50) {
-                eprintln!(
-                    "[render_tree_sized #{entry_n}] return=self-alloc prev={}",
-                    prev_result.is_some(),
-                );
+            if let Some(entry) = self.nv12_outputs.get_mut(&(sid, tw, th)) {
+                let n = entry.0.len().max(1);
+                entry.1 = (entry.1 + 1) % n;
             }
-            // Self-allocated: return the PREVIOUS frame's readback
-            // (or None on the first frame).  The toplevel_sid in the
-            // tuple correctly identifies which surface the previous
-            // frame belonged to.
-            prev_result
         }
+
+        // Drain completed deferred submits before stashing this frame.
+        // Amortises cleanup with submit rate (bounded by GPU frame
+        // rate) rather than Wayland event rate.
+        self.drain_deferred_submits();
+
+        // Stash the submit so retire_pending picks up the staging BGRA
+        // on the next call.  This is one frame delayed because we need
+        // the fence to signal before reading the staging buffer —
+        // the standard self-alloc latency model.
+        self.pending_submit = Some(submit_info);
+        self.output_idx = (self.output_idx + 1) % self.output_images.len();
+
+        if entry_n < 20 || entry_n.is_multiple_of(50) {
+            eprintln!(
+                "[render_tree_sized #{entry_n}] return targets={} prev_results={} pending={}",
+                external_targets.len(),
+                results.len(),
+                self.pending_submit.is_some(),
+            );
+        }
+        results
     }
 }
 
