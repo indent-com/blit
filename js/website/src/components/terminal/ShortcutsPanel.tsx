@@ -8,8 +8,8 @@ const SHORTCUTS: [string, string][] = [
 ];
 
 const TOUCH: [string, string][] = [
-  ["Long-press + drag", "Select text"],
-  ["Toolbar Copy / Paste", "Copy selection / paste clipboard"],
+  ["Long-press + drag", "Select text and copy"],
+  ["Toolbar Paste", "Paste clipboard"],
   ["Swipe", "Scroll"],
 ];
 

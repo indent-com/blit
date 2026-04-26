@@ -99,8 +99,8 @@ function CloseIcon() {
 // Arc layout: positions for 8 buttons around the FAB
 // ---------------------------------------------------------------------------
 
-const ARC_RADIUS = 104;
-const ARC_ITEMS = 8;
+const ARC_RADIUS = 92;
+const ARC_ITEMS = 7;
 // Arc spans 180° as a semicircle opening to the left of the FAB.
 // 90° = down, 180° = left, 270° = up (in screen coordinates where Y+ is down).
 const ARC_START = 90;
@@ -282,7 +282,6 @@ export default function MobileToolbar(props: {
 }) {
   const [isOpen, setIsOpen] = createSignal(false);
   const [ctrlActive, setCtrlActive] = createSignal(false);
-  const [hasSelection, setHasSelection] = createSignal(false);
   const canPaste =
     typeof navigator !== "undefined" &&
     !!navigator.clipboard &&
@@ -298,20 +297,6 @@ export default function MobileToolbar(props: {
     }
   });
   onCleanup(() => unsub?.());
-
-  // Selection-presence sync
-  let selUnsub: (() => void) | undefined;
-  createEffect(() => {
-    selUnsub?.();
-    const surface = props.surface();
-    if (surface) {
-      setHasSelection(surface.hasSelection());
-      selUnsub = surface.onSelectionChange((has) => setHasSelection(has));
-    } else {
-      setHasSelection(false);
-    }
-  });
-  onCleanup(() => selUnsub?.());
 
   // Collapse when keyboard closes
   createEffect(() => {
@@ -331,13 +316,6 @@ export default function MobileToolbar(props: {
     const next = !surface.ctrlModifier;
     surface.setCtrlModifier(next);
     setCtrlActive(next);
-  };
-
-  const handleCopy = () => {
-    const surface = props.surface();
-    if (!surface) return;
-    void surface.copySelection().finally(() => surface.clearSelection());
-    setIsOpen(false);
   };
 
   const handlePaste = () => {
@@ -420,19 +398,9 @@ export default function MobileToolbar(props: {
             <ChevronUp />
           </SendArcButton>
 
-          {/* Copy */}
+          {/* Paste (top of arc) — Copy happens automatically on long-press selection */}
           <ArcButton
             index={6}
-            open={isOpen()}
-            disabled={!hasSelection()}
-            onPress={handleCopy}
-          >
-            <span class="text-[10px] font-mono">Copy</span>
-          </ArcButton>
-
-          {/* Paste (top of arc) */}
-          <ArcButton
-            index={7}
             open={isOpen()}
             disabled={!canPaste}
             onPress={handlePaste}

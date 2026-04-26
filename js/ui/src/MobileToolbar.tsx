@@ -157,8 +157,7 @@ export function MobileToolbar(props: {
 }) {
   const [ctrlActive, setCtrlActive] = createSignal(false);
   const [altActive, setAltActive] = createSignal(false);
-  const [hasSelection, setHasSelection] = createSignal(false);
-  const [canPaste, setCanPaste] = createSignal(false);
+  const canPaste = typeof navigator !== "undefined" && !!navigator.clipboard;
 
   // Sync Ctrl modifier state from surface
   let ctrlUnsub: (() => void) | undefined;
@@ -184,35 +183,9 @@ export function MobileToolbar(props: {
   });
   onCleanup(() => altUnsub?.());
 
-  // Sync selection presence from surface so the Copy button only lights
-  // up when there's something to copy.
-  let selUnsub: (() => void) | undefined;
-  createEffect(() => {
-    selUnsub?.();
-    const surface = props.surface();
-    if (surface) {
-      setHasSelection(surface.hasSelection());
-      selUnsub = surface.onSelectionChange((has) => setHasSelection(has));
-    } else {
-      setHasSelection(false);
-    }
-  });
-  onCleanup(() => selUnsub?.());
-
-  // Optimistically enable Paste when the Clipboard API is present so the
-  // user gets a button to tap; the underlying readText() call is still
-  // gated by the browser permission prompt.
-  setCanPaste(typeof navigator !== "undefined" && !!navigator.clipboard);
-
   const send = (bytes: Uint8Array) => {
     const sid = props.focusedSessionId();
     if (sid) props.workspace.sendInput(sid, bytes);
-  };
-
-  const handleCopy = () => {
-    const surface = props.surface();
-    if (!surface) return;
-    void surface.copySelection().finally(() => surface.clearSelection());
   };
 
   const handlePaste = () => {
@@ -294,22 +267,13 @@ export function MobileToolbar(props: {
         />
       </div>
 
-      {/* Copy / Paste */}
+      {/* Paste — Copy happens automatically on long-press selection */}
       <div style={{ display: "flex", gap: "3px" }}>
-        <ToolbarButton
-          label="Copy"
-          title="Copy selection (long-press to select)"
-          onPress={handleCopy}
-          disabled={!hasSelection()}
-          wide
-          theme={props.theme}
-          scale={props.scale}
-        />
         <ToolbarButton
           label="Paste"
           title="Paste clipboard"
           onPress={handlePaste}
-          disabled={!canPaste()}
+          disabled={!canPaste}
           wide
           theme={props.theme}
           scale={props.scale}
