@@ -1,8 +1,53 @@
-<section class="py-10 border-t border-[var(--border)]">
-  <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
-    Known limitations
-  </h2>
-  <p class="text-[13px] text-[var(--dim)] mb-4">
-    The Wayland compositor is experimental.
-  </p>
+---
+const items = [
+  {
+    title: "Wayland compositor",
+    body: "Headless compositor and surface streaming are experimental. Some apps will draw fine; others won't. Linux only.",
+  },
+  {
+    title: "macOS / Windows GUI",
+    body: "Both platforms multiplex PTYs and stream them to browsers. The GUI compositor is Linux-only and not on the roadmap for either.",
+  },
+  {
+    title: "Hardware encoding",
+    body: "NVENC requires the proprietary NVIDIA driver. VA-API needs Intel/AMD with libva. Falls back to software at any time.",
+  },
+];
+---
+
+<section class="border-b border-[var(--border)] bg-[var(--bg)]">
+  <div class="mx-auto max-w-6xl px-6 py-14 max-sm:px-4 max-sm:py-10">
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] lg:items-start">
+      <div>
+        <div
+          class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+        >
+          Honest limitations
+        </div>
+        <h2
+          class="mt-3 font-sans text-[clamp(1.5rem,3vw,2rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+        >
+          Things to know.
+        </h2>
+        <p class="mt-3 max-w-md text-[14px] leading-relaxed text-[var(--dim)]">
+          We'd rather flag what's rough than oversell. blit's PTY core is
+          stable; the experimental bits are clearly marked and shipping
+          regularly.
+        </p>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        {
+          items.map(({ title, body }) => (
+            <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] p-4">
+              <div class="font-mono text-[11px] font-bold uppercase tracking-wider text-[var(--bright)]">
+                {title}
+              </div>
+              <p class="mt-2 text-[12.5px] leading-relaxed text-[var(--dim)]">{body}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </div>
 </section>

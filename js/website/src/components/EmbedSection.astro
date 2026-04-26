@@ -16,17 +16,86 @@ const embedCode = `<span class="text-[var(--hl-kw)]">import</span> { <span class
 &lt;<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span> <span class="text-[var(--hl-attr)]">workspace</span>={workspace}&gt;
   &lt;<span class="text-[var(--hl-fn)]">BlitTerminal</span> <span class="text-[var(--hl-attr)]">sessionId</span>={<span class="text-[var(--hl-fn)]">useBlitFocusedSession</span>()?.id ?? <span class="text-[var(--hl-kw)]">null</span>} /&gt;
 &lt;/<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span>&gt;`;
+
+const packages = [
+  { name: "@blit-sh/core", desc: "framework-agnostic core, transports, renderer" },
+  { name: "@blit-sh/react", desc: "thin React wrapper: provider, hooks, components" },
+  { name: "@blit-sh/solid", desc: "thin Solid wrapper: primitives + components" },
+  { name: "@blit-sh/browser", desc: "WASM diff engine + WebGL vertex builder" },
+];
 ---
 
-<section class="py-10 border-t border-[var(--border)]">
-  <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
-    Drop into any React or Solid app
-  </h2>
-  <p class="text-[13px] text-[var(--dim)] mb-4">
-    <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">@blit-sh/react</code> and
-    <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">@blit-sh/solid</code> provide
-    framework bindings. WebGPU-rendered (WebGL2 fallback), fully interactive, zero DOM manipulation.
-  </p>
-  <pre
-    class="bg-[var(--surface)] border border-[var(--border)] rounded-lg p-4 overflow-x-auto"><code class="font-mono text-[13px] leading-relaxed text-[var(--code-fg)]" set:html={embedCode} /></pre>
+<section id="embed" class="border-b border-[var(--border)] bg-[var(--bg)]">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div class="grid grid-cols-1 gap-10 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] lg:items-start lg:gap-14">
+      <div class="order-2 lg:order-1" data-theme="dark">
+        <div
+          class="relative overflow-hidden rounded-xl border border-[#21262d] bg-[#0a0d12] shadow-lg"
+        >
+          <div
+            class="flex items-center justify-between border-b border-[#21262d] bg-[#11161d] px-4 py-2"
+          >
+            <div class="flex items-center gap-2">
+              <span class="h-2 w-2 rounded-full bg-[#ff5f57]"></span>
+              <span class="h-2 w-2 rounded-full bg-[#febc2e]"></span>
+              <span class="h-2 w-2 rounded-full bg-[#28c840]"></span>
+              <span
+                class="ml-2 font-mono text-[10px] uppercase tracking-wider text-[var(--dim)]"
+                >app.tsx</span
+              >
+            </div>
+            <span
+              class="font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]"
+              >TypeScript</span
+            >
+          </div>
+          <pre
+            class="m-0 overflow-x-auto bg-[var(--code-bg)] px-4 py-4"><code class="font-mono text-[12.5px] leading-relaxed text-[var(--code-fg)]" set:html={embedCode} /></pre>
+        </div>
+      </div>
+
+      <div class="order-1 lg:order-2">
+        <div
+          class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+        >
+          For developers
+        </div>
+        <h2
+          class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+        >
+          Drop a real terminal into your app.
+        </h2>
+        <p class="mt-3 max-w-md text-[15px] leading-relaxed text-[var(--dim)]">
+          <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1.5 py-0.5 font-mono text-[12.5px]">@blit-sh/react</code>
+          and
+          <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1.5 py-0.5 font-mono text-[12.5px]">@blit-sh/solid</code>
+          give you a workspace context, hooks for sessions and focus, and
+          a <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1.5 py-0.5 font-mono text-[12.5px]">&lt;BlitTerminal&gt;</code>
+          component. WebGPU rendered with a WebGL2 fallback. Zero DOM
+          manipulation.
+        </p>
+
+        <ul class="mt-6 flex flex-col gap-2">
+          {
+            packages.map(({ name, desc }) => (
+              <li class="flex items-baseline gap-3 border-b border-dashed border-[var(--border)] pb-2 last:border-0">
+                <code class="font-mono text-[12.5px] font-bold text-[var(--accent)]">{name}</code>
+                <span class="text-[12.5px] text-[var(--dim)]">{desc}</span>
+              </li>
+            ))
+          }
+        </ul>
+
+        <a
+          href="https://github.com/indent-com/blit/blob/main/EMBEDDING.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="mt-6 inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--accent)] no-underline hover:underline"
+        >
+          Read the embedding guide
+          <span aria-hidden="true">→</span>
+        </a>
+      </div>
+    </div>
+  </div>
 </section>

@@ -16,11 +16,11 @@ export default function JoinForm() {
 
   return (
     <form
-      class="inline-flex items-center border border-[var(--border)] rounded overflow-hidden bg-[var(--surface)] focus-within:border-[var(--accent)]"
+      class="inline-flex max-w-full items-stretch overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] shadow-sm transition-colors focus-within:border-[var(--accent)]"
       onSubmit={handleSubmit}
     >
       <input
-        class="bg-transparent border-none outline-none text-[var(--fg)] font-mono text-sm px-3 py-1.5 w-64 max-sm:w-48 placeholder:text-[var(--dim)] placeholder:opacity-60"
+        class="w-72 max-w-full border-none bg-transparent px-3.5 py-2 font-mono text-[13.5px] text-[var(--fg)] outline-none placeholder:text-[var(--dim)] placeholder:opacity-60 max-sm:w-52"
         classList={{ "[-webkit-text-security:disc]": !visible() }}
         type="text"
         placeholder="share secret"
@@ -34,7 +34,7 @@ export default function JoinForm() {
       />
       <button
         type="button"
-        class="flex items-center justify-center bg-transparent border-none border-l border-l-[var(--border)] text-[var(--dim)] px-2 cursor-pointer hover:text-[var(--fg)] transition-colors"
+        class="flex items-center justify-center border-l border-[var(--border)] bg-transparent px-2.5 text-[var(--dim)] transition-colors hover:text-[var(--fg)]"
         onClick={() => setVisible((v) => !v)}
         aria-label={visible() ? "Hide secret" : "Show secret"}
         tabIndex={-1}
@@ -69,7 +69,7 @@ export default function JoinForm() {
         )}
       </button>
       <button
-        class="px-3 py-1.5 bg-[var(--accent)] text-white border-none font-mono text-[13px] font-semibold cursor-pointer hover:opacity-85 disabled:opacity-40 disabled:cursor-default transition-opacity"
+        class="cursor-pointer border-none bg-[var(--accent)] px-4 py-2 font-mono text-[13px] font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-default disabled:opacity-40"
         type="submit"
         disabled={!secret().trim()}
       >

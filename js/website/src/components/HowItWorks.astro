@@ -1,0 +1,145 @@
+---
+const stages = [
+  {
+    title: "Browser",
+    chips: ["WebGL renderer", "WASM diff engine", "Glyph atlas"],
+    note: "Applies LZ4-compressed binary diffs; reports render metrics back for pacing.",
+  },
+  {
+    title: "Connection layer",
+    chips: ["WS · WebTransport", "WebRTC · Unix", "blit gateway · proxy-daemon"],
+    note: "Stateless. Restartable. PTYs survive gateway and proxy restarts.",
+  },
+  {
+    title: "blit server",
+    chips: ["alacritty parser", "FrameState diff", "Wayland compositor (exp.)"],
+    note: "Owns PTYs, scrollback, parsed state, per-client frame pacing, GPU encode.",
+  },
+];
+---
+
+<section class="border-b border-[var(--border)] bg-[var(--bg)]">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div class="grid grid-cols-1 gap-10 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] lg:items-center lg:gap-16">
+      <div>
+        <div
+          class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+        >
+          How it works
+        </div>
+        <h2
+          class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+        >
+          Three layers, one socket.
+        </h2>
+        <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
+          The server parses PTY output into structured state, computes
+          per-client binary diffs, and ships only the delta. The browser
+          applies diffs in WASM and renders with WebGL. Keystrokes travel
+          the reverse path with no queuing — latency is bounded by link RTT.
+        </p>
+        <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
+          Above the Unix socket, everything is stateless: gateways and
+          proxies can restart without touching your terminals.
+        </p>
+
+        <dl class="mt-6 grid grid-cols-2 gap-x-6 gap-y-4 border-t border-[var(--border)] pt-5">
+          <div>
+            <dt
+              class="font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+            >
+              Parser
+            </dt>
+            <dd class="mt-1 font-mono text-[13px] text-[var(--fg)]">
+              alacritty_terminal
+            </dd>
+          </div>
+          <div>
+            <dt
+              class="font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+            >
+              Render
+            </dt>
+            <dd class="mt-1 font-mono text-[13px] text-[var(--fg)]">
+              WebGL · WASM
+            </dd>
+          </div>
+          <div>
+            <dt
+              class="font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+            >
+              Compression
+            </dt>
+            <dd class="mt-1 font-mono text-[13px] text-[var(--fg)]">
+              LZ4 · binary diff
+            </dd>
+          </div>
+          <div>
+            <dt
+              class="font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+            >
+              Encode
+            </dt>
+            <dd class="mt-1 font-mono text-[13px] text-[var(--fg)]">
+              H.264 · AV1 · Vulkan
+            </dd>
+          </div>
+        </dl>
+
+        <a
+          href="https://github.com/indent-com/blit/blob/main/ARCHITECTURE.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="mt-6 inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--accent)] no-underline hover:underline"
+        >
+          Read ARCHITECTURE.md
+          <span aria-hidden="true">→</span>
+        </a>
+      </div>
+
+      <div class="relative">
+        <div
+          aria-hidden="true"
+          class="pointer-events-none absolute -inset-6 -z-10 rounded-3xl opacity-60 blur-3xl"
+          style="background: radial-gradient(30rem 18rem at 70% 50%, var(--accent-glow), transparent 70%);"
+        >
+        </div>
+        <div class="flex flex-col gap-3">
+          {stages.map(({ title, chips, note }, i) => (
+            <div class="relative">
+              <div class="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-4">
+                <div class="flex flex-wrap items-baseline justify-between gap-2">
+                  <div class="font-mono text-[12px] font-bold uppercase tracking-[0.14em] text-[var(--bright)]">
+                    {title}
+                  </div>
+                  <div class="font-mono text-[10px] uppercase tracking-wider text-[var(--dim)]">
+                    Layer {i + 1}
+                  </div>
+                </div>
+                <div class="mt-3 flex flex-wrap gap-1.5">
+                  {chips.map((c) => (
+                    <span class="rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 font-mono text-[11px] text-[var(--fg)]">
+                      {c}
+                    </span>
+                  ))}
+                </div>
+                <p class="mt-3 text-[12.5px] leading-relaxed text-[var(--dim)]">
+                  {note}
+                </p>
+              </div>
+              {i < stages.length - 1 && (
+                <div class="my-1 flex items-center justify-center">
+                  <div class="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-wider text-[var(--dim)]">
+                    <span class="h-3 w-px bg-[var(--border-strong)]" />
+                    <span class="opacity-70">{i === 0 ? "diffs ↓ · keys ↑" : "Unix socket"}</span>
+                    <span class="h-3 w-px bg-[var(--border-strong)]" />
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

@@ -10,9 +10,9 @@ interface Props {
 }
 
 const {
-  title = "blit - terminals for the web and machines",
-  description = "Low-latency terminal streaming to any browser. Share with a link. Let AI agents drive them. Zero config, no required dependencies, instant.",
-  bodyClass = "min-h-screen bg-[var(--bg)] text-[var(--fg)] font-mono text-sm leading-relaxed",
+  title = "blit — terminals for the web and machines",
+  description = "Low-latency terminal streaming to any browser. Share with a link. Drive from AI agents. Single binary, no required dependencies.",
+  bodyClass = "min-h-screen bg-[var(--bg)] text-[var(--fg)] font-sans text-[15px] leading-relaxed antialiased",
 } = Astro.props;
 ---
 
@@ -34,7 +34,7 @@ const {
     <meta name="twitter:title" content="blit — your terminal, everywhere" />
     <meta
       name="twitter:description"
-      content="Low-latency terminal streaming to any browser. Share with a link. Let AI agents drive them."
+      content="Low-latency terminal streaming to any browser. Share with a link. Drive from AI agents."
     />
     <meta name="twitter:image" content="https://blit.sh/og.png" />
     <link
@@ -44,13 +44,147 @@ const {
     <Font cssVariable="--font-mono" />
     <Font cssVariable="--font-sans" />
     <style is:inline>
-      :root{--bg:#fff;--fg:#1f2328;--dim:#656d76;--bright:#1f2328;--border:#d1d9e0;--surface:#f6f8fa;--accent:#0969da;--green:#1a7f37;--code-bg:#f6f8fa;--code-fg:#1f2328;--hl-kw:#cf222e;--hl-fn:#8250df;--hl-str:#0a3069;--hl-num:#0550ae;--hl-cm:#6e7781;--hl-attr:#0550ae}
-      [data-theme="dark"]{--bg:#0d1117;--fg:#c9d1d9;--dim:#6e7681;--bright:#e6edf3;--border:#21262d;--surface:#161b22;--accent:#58a6ff;--green:#3fb950;--code-bg:#161b22;--code-fg:#e6edf3;--hl-kw:#ff7b72;--hl-fn:#d2a8ff;--hl-str:#a5d6ff;--hl-num:#79c0ff;--hl-cm:#8b949e;--hl-attr:#79c0ff}
-      [data-theme="dark"] .theme-icon-sun{display:inline}
-      [data-theme="dark"] .theme-icon-moon{display:none}
-      [data-theme="light"] .theme-icon-sun{display:none}
-      [data-theme="light"] .theme-icon-moon{display:inline}
-      .theme-icon-sun,.theme-icon-moon{display:none}
+      :root {
+        --bg: #ffffff;
+        --bg-elevated: #ffffff;
+        --bg-soft: #f6f8fa;
+        --fg: #1f2328;
+        --dim: #59636e;
+        --bright: #0d1117;
+        --border: #d1d9e0;
+        --border-strong: #afb8c1;
+        --surface: #f6f8fa;
+        --surface-hover: #eef1f4;
+        --accent: #0969da;
+        --accent-soft: rgba(9, 105, 218, 0.08);
+        --accent-glow: rgba(9, 105, 218, 0.18);
+        --accent-2: #8250df;
+        --accent-grad: linear-gradient(135deg, #0969da 0%, #8250df 100%);
+        --green: #1a7f37;
+        --code-bg: #f6f8fa;
+        --code-fg: #1f2328;
+        --hl-kw: #cf222e;
+        --hl-fn: #8250df;
+        --hl-str: #0a3069;
+        --hl-num: #0550ae;
+        --hl-cm: #6e7781;
+        --hl-attr: #0550ae;
+        --hero-radial: radial-gradient(
+            ellipse 60rem 40rem at 50% -10%,
+            rgba(9, 105, 218, 0.10),
+            transparent 60%
+          ),
+          radial-gradient(
+            ellipse 40rem 30rem at 90% 20%,
+            rgba(130, 80, 223, 0.07),
+            transparent 60%
+          );
+        --grid-mask: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, var(--bg) 80%);
+      }
+      [data-theme="dark"] {
+        --bg: #0a0d12;
+        --bg-elevated: #0f1318;
+        --bg-soft: #0f1318;
+        --fg: #c9d1d9;
+        --dim: #7d8590;
+        --bright: #f0f6fc;
+        --border: #21262d;
+        --border-strong: #30363d;
+        --surface: #11161d;
+        --surface-hover: #161b22;
+        --accent: #58a6ff;
+        --accent-soft: rgba(88, 166, 255, 0.10);
+        --accent-glow: rgba(88, 166, 255, 0.28);
+        --accent-2: #a371f7;
+        --accent-grad: linear-gradient(135deg, #58a6ff 0%, #a371f7 100%);
+        --green: #3fb950;
+        --code-bg: #0d1117;
+        --code-fg: #e6edf3;
+        --hl-kw: #ff7b72;
+        --hl-fn: #d2a8ff;
+        --hl-str: #a5d6ff;
+        --hl-num: #79c0ff;
+        --hl-cm: #8b949e;
+        --hl-attr: #79c0ff;
+        --hero-radial: radial-gradient(
+            ellipse 70rem 45rem at 50% -10%,
+            rgba(88, 166, 255, 0.13),
+            transparent 60%
+          ),
+          radial-gradient(
+            ellipse 40rem 30rem at 90% 20%,
+            rgba(163, 113, 247, 0.10),
+            transparent 60%
+          );
+        --grid-mask: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, var(--bg) 80%);
+      }
+      [data-theme="dark"] .theme-icon-sun { display: inline; }
+      [data-theme="dark"] .theme-icon-moon { display: none; }
+      [data-theme="light"] .theme-icon-sun { display: none; }
+      [data-theme="light"] .theme-icon-moon { display: inline; }
+      .theme-icon-sun, .theme-icon-moon { display: none; }
+
+      html { scroll-behavior: smooth; }
+      ::selection { background: var(--accent-glow); color: var(--bright); }
+
+      .grad-text {
+        background: var(--accent-grad);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .hero-bg {
+        background-image: var(--hero-radial);
+      }
+      .grid-bg {
+        background-image:
+          linear-gradient(var(--border) 1px, transparent 1px),
+          linear-gradient(90deg, var(--border) 1px, transparent 1px);
+        background-size: 56px 56px;
+        opacity: 0.35;
+        mask-image: var(--grid-mask);
+        -webkit-mask-image: var(--grid-mask);
+      }
+
+      @keyframes blit-cursor {
+        0%, 49% { opacity: 1; }
+        50%, 100% { opacity: 0; }
+      }
+      .blit-cursor {
+        display: inline-block;
+        width: 0.55em;
+        height: 1em;
+        vertical-align: -0.15em;
+        background: var(--accent);
+        animation: blit-cursor 1s steps(1) infinite;
+        margin-left: 1px;
+        border-radius: 1px;
+      }
+
+      @keyframes blit-type {
+        0%, 100% { width: 100%; }
+      }
+
+      @keyframes blit-fade {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: none; }
+      }
+
+      .anim-line {
+        opacity: 1;
+        animation: blit-fade 0.4s ease-out backwards;
+      }
+
+      .card-hover {
+        transition: border-color 0.18s ease, box-shadow 0.18s ease,
+          transform 0.18s ease, background-color 0.18s ease;
+      }
+      .card-hover:hover {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent), 0 12px 28px -16px var(--accent-glow);
+        transform: translateY(-1px);
+      }
     </style>
     <script is:inline>
       (function () {

@@ -1,111 +1,193 @@
 ---
 const platforms = [
-  { os: "Linux", arch: "x86_64, arm64", wayland: true },
-  { os: "macOS", arch: "arm64", wayland: false },
-  { os: "Windows", arch: "x86_64", wayland: false },
+  {
+    os: "Linux",
+    arch: "x86_64 · arm64",
+    note: "Full features, including the experimental Wayland compositor.",
+    full: true,
+  },
+  {
+    os: "macOS",
+    arch: "arm64",
+    note: "PTY multiplexing, sharing, agent API. No GUI compositor.",
+    full: false,
+  },
+  {
+    os: "Windows",
+    arch: "x86_64",
+    note: "PTY multiplexing, sharing, agent API. No GUI compositor.",
+    full: false,
+  },
 ];
 
 const videoDeps = [
-  { lib: "libvulkan.so.1", pkg: "libvulkan1 + mesa-vulkan-drivers", use: "GPU compositing, Vulkan Video encode" },
-  { lib: "libva.so.2, libva-drm.so.2", pkg: "libva2, libva-drm2, va-driver-all", use: "VA-API hardware encode (Intel/AMD)" },
-  { lib: "libgbm.so.1", pkg: "libgbm1", use: "DMA-BUF allocation for zero-copy VA-API" },
-  { lib: "libcuda.so.1, libnvidia-encode.so.1", pkg: "NVIDIA proprietary driver", use: "NVENC hardware encode" },
+  { lib: "libvulkan.so.1", pkg: "libvulkan1, mesa-vulkan-drivers", use: "GPU compositing, Vulkan Video encode" },
+  { lib: "libva.so.2 + libva-drm.so.2", pkg: "libva2, libva-drm2, va-driver-all", use: "VA-API hardware encode (Intel/AMD)" },
+  { lib: "libgbm.so.1", pkg: "libgbm1", use: "DMA-BUF zero-copy for VA-API" },
+  { lib: "libcuda.so.1 + libnvidia-encode.so.1", pkg: "NVIDIA proprietary driver", use: "NVENC hardware encode" },
 ];
 
 const audioDeps = [
   { bin: "pipewire", pkg: "pipewire", use: "Audio daemon (private instance)" },
-  { bin: "pipewire-pulse", pkg: "pipewire-pulse", use: "PulseAudio compatibility for apps" },
-  { bin: "libpipewire-0.3.so.0", pkg: "pipewire", use: "Monitor capture (in-process, dlopened)" },
-  { bin: "dbus-daemon", pkg: "dbus", use: "Private D-Bus session for PipeWire" },
+  { bin: "pipewire-pulse", pkg: "pipewire-pulse", use: "PulseAudio compatibility" },
+  { bin: "libpipewire-0.3.so.0", pkg: "pipewire", use: "Monitor capture (in-process)" },
+  { bin: "dbus-daemon", pkg: "dbus", use: "Private D-Bus session" },
   { bin: "wireplumber", pkg: "wireplumber", use: "Session manager (optional)" },
 ];
 ---
 
-<section class="py-10 border-t border-[var(--border)]">
-  <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
-    Supported platforms
-  </h2>
-  <p class="text-[13px] text-[var(--dim)] mb-4">
-    SSH remotes are auto-installed on first connection — requires <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">curl</code> or <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">wget</code> and CA certificates on the remote.
-  </p>
-  <div class="overflow-x-auto">
-    <table class="w-full text-[13px] border-collapse">
-      <thead>
-        <tr class="border-b border-[var(--border)]">
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Platform</th>
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Arch</th>
-          <th class="text-left py-2 font-bold text-[var(--bright)]">Wayland compositor <span class="text-[10px] font-normal uppercase tracking-wider text-[var(--accent)] opacity-70">Experimental</span></th>
-        </tr>
-      </thead>
-      <tbody>
-        {platforms.map(({ os, arch, wayland }) => (
-          <tr class="border-b border-[var(--border)] last:border-0">
-            <td class="py-2.5 pr-6 text-[var(--fg)] font-medium">{os}</td>
-            <td class="py-2.5 pr-6 text-[var(--dim)] font-mono text-xs">{arch}</td>
-            <td class="py-2.5">
-              {wayland
-                ? <span class="text-[var(--green)]">Yes</span>
-                : <span class="text-[var(--dim)] opacity-60">No</span>}
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  </div>
+<section id="platforms" class="border-b border-[var(--border)] bg-[var(--bg-soft)]/50">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div class="max-w-2xl">
+      <div
+        class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+      >
+        Platforms & dependencies
+      </div>
+      <h2
+        class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+      >
+        Nothing to install. Optional accelerators.
+      </h2>
+      <p class="mt-3 text-[14.5px] text-[var(--dim)]">
+        Software H.264 and AV1 encoders are statically linked into blit;
+        the CPU compositor works everywhere. GPU and audio kick in
+        automatically when the right libraries are present — every shared
+        object is loaded at runtime via
+        <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1 py-0.5 font-mono text-[12px]">dlopen</code>, missing ones silently skipped.
+      </p>
+    </div>
 
-  <h3 class="text-[13px] font-bold tracking-tight mt-8 mb-1 text-[var(--bright)]">
-    Optional dependencies <span class="text-[10px] font-normal uppercase tracking-wider text-[var(--dim)]">Linux only</span>
-  </h3>
-  <p class="text-[13px] text-[var(--dim)] mb-4">
-    No dependencies are required — software video encoding and CPU rendering are built in.
-    GPU acceleration and audio are enabled automatically when the right libraries or binaries are present.
-    All GPU libraries are loaded at runtime via <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">dlopen</code>; missing ones are silently skipped.
-  </p>
+    <!-- platform cards -->
+    <div class="mt-10 grid grid-cols-1 gap-3 sm:grid-cols-3">
+      {
+        platforms.map(({ os, arch, note, full }) => (
+          <div class="card-hover rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-4">
+            <div class="flex items-center justify-between">
+              <span class="font-mono text-[14px] font-bold tracking-tight text-[var(--bright)]">
+                {os}
+              </span>
+              <span
+                class:list={[
+                  "rounded-full border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider",
+                  full
+                    ? "border-[var(--green)]/40 bg-[var(--green)]/10 text-[var(--green)]"
+                    : "border-[var(--border)] bg-[var(--surface)] text-[var(--dim)]",
+                ]}
+              >
+                {full ? "Full" : "PTY only"}
+              </span>
+            </div>
+            <div class="mt-1 font-mono text-[11px] text-[var(--dim)]">{arch}</div>
+            <p class="mt-3 text-[12.5px] leading-relaxed text-[var(--dim)]">{note}</p>
+          </div>
+        ))
+      }
+    </div>
 
-  <p class="text-[12px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2 mt-4">Video — GPU compositing &amp; hardware encoding</p>
-  <div class="overflow-x-auto">
-    <table class="w-full text-[13px] border-collapse">
-      <thead>
-        <tr class="border-b border-[var(--border)]">
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Library</th>
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Packages (Debian/Ubuntu)</th>
-          <th class="text-left py-2 font-bold text-[var(--bright)]">Used for</th>
-        </tr>
-      </thead>
-      <tbody>
-        {videoDeps.map(({ lib, pkg, use: desc }) => (
-          <tr class="border-b border-[var(--border)] last:border-0">
-            <td class="py-2.5 pr-6 text-[var(--fg)] font-mono text-xs whitespace-nowrap">{lib}</td>
-            <td class="py-2.5 pr-6 text-[var(--dim)] font-mono text-xs">{pkg}</td>
-            <td class="py-2.5 text-[var(--dim)]">{desc}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  </div>
+    <p class="mt-3 text-[12.5px] text-[var(--dim)]">
+      SSH remotes are auto-installed on first connection — requires
+      <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1 py-0.5 font-mono text-[11px]">curl</code> or
+      <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1 py-0.5 font-mono text-[11px]">wget</code>
+      and CA certificates on the remote.
+    </p>
 
-  <p class="text-[12px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2 mt-6">Audio</p>
-  <div class="overflow-x-auto">
-    <table class="w-full text-[13px] border-collapse">
-      <thead>
-        <tr class="border-b border-[var(--border)]">
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Binary</th>
-          <th class="text-left py-2 pr-6 font-bold text-[var(--bright)]">Packages (Debian/Ubuntu)</th>
-          <th class="text-left py-2 font-bold text-[var(--bright)]">Used for</th>
-        </tr>
-      </thead>
-      <tbody>
-        {audioDeps.map(({ bin, pkg, use: desc }) => (
-          <tr class="border-b border-[var(--border)] last:border-0">
-            <td class="py-2.5 pr-6 text-[var(--fg)] font-mono text-xs whitespace-nowrap">{bin}</td>
-            <td class="py-2.5 pr-6 text-[var(--dim)] font-mono text-xs">{pkg}</td>
-            <td class="py-2.5 text-[var(--dim)]">{desc}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <!-- dependency tables -->
+    <div class="mt-12 grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div
+        class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)]"
+      >
+        <div
+          class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5"
+        >
+          <span
+            class="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]"
+            >Video — GPU compositing & hardware encoding</span
+          >
+          <span
+            class="font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]"
+            >Linux</span
+          >
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full border-collapse text-[12.5px]">
+            <thead>
+              <tr class="border-b border-[var(--border)]">
+                <th class="px-4 py-2 text-left font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
+                  Library
+                </th>
+                <th class="px-4 py-2 text-left font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
+                  Used for
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {
+                videoDeps.map(({ lib, pkg, use }) => (
+                  <tr class="border-b border-[var(--border)] last:border-0">
+                    <td class="px-4 py-2.5 align-top">
+                      <code class="font-mono text-[12px] text-[var(--fg)]">{lib}</code>
+                      <div class="mt-0.5 font-mono text-[10.5px] text-[var(--dim)]">{pkg}</div>
+                    </td>
+                    <td class="px-4 py-2.5 align-top text-[var(--dim)]">{use}</td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div
+        class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)]"
+      >
+        <div
+          class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5"
+        >
+          <span
+            class="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]"
+            >Audio</span
+          >
+          <span
+            class="font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]"
+            >Linux</span
+          >
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full border-collapse text-[12.5px]">
+            <thead>
+              <tr class="border-b border-[var(--border)]">
+                <th class="px-4 py-2 text-left font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
+                  Binary
+                </th>
+                <th class="px-4 py-2 text-left font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
+                  Used for
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {
+                audioDeps.map(({ bin, pkg, use }) => (
+                  <tr class="border-b border-[var(--border)] last:border-0">
+                    <td class="px-4 py-2.5 align-top">
+                      <code class="font-mono text-[12px] text-[var(--fg)]">{bin}</code>
+                      <div class="mt-0.5 font-mono text-[10.5px] text-[var(--dim)]">{pkg}</div>
+                    </td>
+                    <td class="px-4 py-2.5 align-top text-[var(--dim)]">{use}</td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <p class="mt-4 text-[12.5px] text-[var(--dim)]">
+      Without GPU libraries, the compositor falls back to CPU rendering and software
+      encoding. Audio is disabled when PipeWire is not installed, or
+      explicitly with
+      <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1 py-0.5 font-mono text-[11px]">BLIT_AUDIO=0</code>.
+    </p>
   </div>
-  <p class="text-[13px] text-[var(--dim)] mt-2">
-    Audio is disabled automatically when PipeWire is not installed, or explicitly with <code class="text-xs bg-[var(--code-bg)] px-1 py-0.5 rounded border border-[var(--border)]">BLIT_AUDIO=0</code>.
-  </p>
 </section>

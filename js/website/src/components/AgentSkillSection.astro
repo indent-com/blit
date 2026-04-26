@@ -2,35 +2,109 @@
 import CopyButton from "./CopyButton.tsx";
 
 const skillUrl = "https://install.blit.sh/SKILL.md";
+const examplePrompt = `<span class="text-[var(--hl-cm)]">// In your agent system prompt or tools manifest:</span>
+<span class="text-[var(--hl-kw)]">read</span>(<span class="text-[var(--hl-str)]">"https://install.blit.sh/SKILL.md"</span>)`;
 ---
 
-<section class="py-10 border-t border-[var(--border)]">
-  <h2 class="text-base font-bold tracking-tight mb-1 text-[var(--bright)]">
-    Agent skill
-  </h2>
-  <p class="text-[13px] leading-relaxed text-[var(--dim)] mb-4 max-w-[42rem]">
-    We publish a <strong class="text-[var(--fg)]">computer agent skill</strong> — a
-    ready-made instruction set that teaches any LLM to start terminals, send
-    keystrokes, wait for patterns, capture GUI surfaces, and more.
-    Drop it straight into your agent's context.
-  </p>
-  <div class="bg-[var(--surface)] border border-[var(--border)] rounded-lg px-4 py-3">
-    <div class="text-[11px] font-bold uppercase tracking-wider text-[var(--dim)] mb-2">
-      Skill URL
-    </div>
-    <div class="flex items-center gap-2">
-      <a
-        href={skillUrl}
-        target="_blank"
-        rel="noopener noreferrer"
-        class="flex-1 min-w-0 text-[13px] font-mono text-[var(--accent)] no-underline hover:underline truncate"
-      >
-        {skillUrl}
-      </a>
-      <CopyButton text={skillUrl} client:load />
+<section
+  id="agents"
+  class="border-b border-[var(--border)] bg-[var(--bg-soft)]/50"
+>
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div
+      class="grid grid-cols-1 gap-10 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] lg:items-center lg:gap-14"
+    >
+      <div>
+        <div
+          class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+        >
+          For agents
+        </div>
+        <h2
+          class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+        >
+          A skill any LLM can pick up.
+        </h2>
+        <p class="mt-3 max-w-md text-[15px] leading-relaxed text-[var(--dim)]">
+          We publish a <span class="text-[var(--fg)]"
+            >computer-agent skill</span
+          > — a ready-made instruction set that teaches a model to start
+          terminals, send keystrokes, wait for patterns, capture surfaces,
+          click, type. One URL, no extra glue.
+        </p>
+
+        <ul
+          class="mt-6 grid grid-cols-2 gap-x-4 gap-y-2 font-mono text-[12px] text-[var(--dim)]"
+        >
+          <li class="flex items-start gap-2">
+            <span class="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]"></span>
+            PTY lifecycle
+          </li>
+          <li class="flex items-start gap-2">
+            <span class="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]"></span>
+            Keystroke encoding
+          </li>
+          <li class="flex items-start gap-2">
+            <span class="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]"></span>
+            Pattern-matched waits
+          </li>
+          <li class="flex items-start gap-2">
+            <span class="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]"></span>
+            Output reading
+          </li>
+          <li class="flex items-start gap-2">
+            <span class="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]"></span>
+            Surface capture <span class="text-[10px] uppercase tracking-wider text-[var(--accent)]">exp.</span>
+          </li>
+          <li class="flex items-start gap-2">
+            <span class="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]"></span>
+            Click + type into GUIs
+          </li>
+        </ul>
+      </div>
+
+      <div class="flex flex-col gap-4">
+        <div
+          class="overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elevated)] shadow-lg"
+        >
+          <div
+            class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5"
+          >
+            <div
+              class="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]"
+            >
+              Skill URL
+            </div>
+            <span
+              class="rounded-full border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--green)]"
+            >
+              <span class="text-[var(--green)]">●</span> live
+            </span>
+          </div>
+          <div class="flex items-center gap-2 px-4 py-3">
+            <a
+              href={skillUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="flex-1 min-w-0 truncate font-mono text-[13.5px] text-[var(--accent)] no-underline hover:underline"
+            >
+              {skillUrl}
+            </a>
+            <CopyButton text={skillUrl} client:load />
+          </div>
+        </div>
+
+        <div
+          class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)]"
+        >
+          <div
+            class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]"
+          >
+            One-line bootstrap
+          </div>
+          <pre class="m-0 px-4 py-3 font-mono text-[12.5px] leading-relaxed text-[var(--code-fg)]"><code set:html={examplePrompt} /></pre>
+        </div>
+      </div>
     </div>
   </div>
-  <p class="mt-3 text-[12px] text-[var(--dim)] opacity-70">
-    Covers PTY lifecycle, keystroke sending, output reading, and terminal management. Wayland surface capture, click, and type are experimental (Linux only).
-  </p>
 </section>
