@@ -581,6 +581,27 @@ pub enum CompositorCommand {
         target_h: u32,
         buffers: Vec<ExternalOutputBuffer>,
     },
+    /// Allocate a server-side BGRA "downscale target" for a per-client
+    /// encoder that doesn't import GBM buffers (NVENC, software h264,
+    /// software AV1).  After registration the renderer GPU-blits
+    /// (LINEAR) the native composite into a target-sized BGRA image
+    /// then copies it into a CPU-mapped staging buffer; the resulting
+    /// frame is delivered as `PixelData::Bgra` sized at
+    /// `(target_w, target_h)` so the per-client encoder consumes
+    /// already-downscaled pixels.  Sending the same `(surface_id,
+    /// target_w, target_h)` again is a no-op.
+    RegisterDownscaleTarget {
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+    },
+    /// Tear down the BGRA downscale target previously registered for
+    /// `(surface_id, target_w, target_h)`.  No-op when none exists.
+    ClearDownscaleTarget {
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+    },
     /// Synthesize text input as key press/release sequences.
     TextInput {
         text: String,
@@ -2572,6 +2593,24 @@ impl Compositor {
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.set_external_output_buffers(surface_id, target_w, target_h, buffers);
+                }
+            }
+            CompositorCommand::RegisterDownscaleTarget {
+                surface_id,
+                target_w,
+                target_h,
+            } => {
+                if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.register_downscale_target(surface_id, target_w, target_h);
+                }
+            }
+            CompositorCommand::ClearDownscaleTarget {
+                surface_id,
+                target_w,
+                target_h,
+            } => {
+                if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.clear_downscale_target(surface_id, target_w, target_h);
                 }
             }
             CompositorCommand::SetRefreshRate { mhz } => {
@@ -5522,27 +5561,35 @@ fn run_compositor(
 
         // Check for completed Vulkan GPU work.  This runs independently
         // of surface commits so completed frames are flushed to the
-        // server without waiting for the next Wayland event.
-        if let Some(ref mut vk) = compositor.vulkan_renderer
-            && let Some((sid, w, h, pixels)) = vk.try_retire_pending()
-        {
-            // The renderer's previous-frame staging readback completed
-            // — emit it as the native composite for this surface.  The
-            // log_w/log_h fields aren't read by the consumer (server
-            // derives logicals from physical + output scale) but we
-            // still need to populate them.
-            let s120_u32 = (compositor.output_scale_120 as u32).max(120);
-            let log_w = (w * 120).div_ceil(s120_u32);
-            let log_h = (h * 120).div_ceil(s120_u32);
-            compositor
-                .pending_commits
-                .insert((sid, w, h), (log_w, log_h, pixels));
-            // Also drive SurfaceResized off the native staging readback
-            // when no fresh handle_surface_commit has populated it.
-            compositor
-                .pending_native_sizes
-                .entry(sid)
-                .or_insert((w, h, log_w, log_h));
+        // server without waiting for the next Wayland event.  One submit
+        // can yield multiple results (one per per-client downscale target
+        // plus the native composite).
+        if let Some(ref mut vk) = compositor.vulkan_renderer {
+            let retired = vk.try_retire_pending();
+            if !retired.is_empty() {
+                let s120_u32 = (compositor.output_scale_120 as u32).max(120);
+                // The largest result is the compositor's native
+                // composite — drive SurfaceResized off it when no fresh
+                // handle_surface_commit has populated pending_native_sizes.
+                if let Some(&(sid, nw, nh, _)) = retired
+                    .iter()
+                    .max_by_key(|&&(_, w, h, _)| (w as u64) * (h as u64))
+                {
+                    let log_w = (nw * 120).div_ceil(s120_u32);
+                    let log_h = (nh * 120).div_ceil(s120_u32);
+                    compositor
+                        .pending_native_sizes
+                        .entry(sid)
+                        .or_insert((nw, nh, log_w, log_h));
+                }
+                for (sid, w, h, pixels) in retired {
+                    let log_w = (w * 120).div_ceil(s120_u32);
+                    let log_h = (h * 120).div_ceil(s120_u32);
+                    compositor
+                        .pending_commits
+                        .insert((sid, w, h), (log_w, log_h, pixels));
+                }
+            }
         }
 
         if !compositor.pending_commits.is_empty() || !compositor.pending_native_sizes.is_empty() {
