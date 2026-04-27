@@ -1857,6 +1857,14 @@ impl Session {
         let mut min_lh: Option<u32> = None;
         let mut max_scale: u16 = 0;
         for c in self.clients.values() {
+            // Only count clients that are actually subscribed.  A
+            // stale view_size left behind by a client that
+            // unsubscribed but didn't clear the size (or that resized
+            // before its first subscribe) shouldn't shrink everyone
+            // else's surface.
+            if !c.surface_subscriptions.contains(&surface_id) {
+                continue;
+            }
             let Some(&(pw, ph, s)) = c.surface_view_sizes.get(&surface_id) else {
                 continue;
             };
@@ -2960,23 +2968,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // either an external buffer (VAAPI GBM) or a downscale
                 // target (NVENC, software).  Find it.  On the very
                 // first tick after encoder install the snapshot may not
-                // exist yet — skip and pick it up next tick.
-                let (px_w, px_h, px_gen, px_timestamp_ms) = match pixel_snapshot
+                // exist yet; we use native as the source for the
+                // Vulkan-Video / generation gate below, but the pixels
+                // lookup further down requires an exact (sid, w, h)
+                // match — feeding mis-sized pixels to a target-sized
+                // encoder garbles content (the encoder reads at
+                // `source_dimensions` stride into a different-sized
+                // buffer, which wraps rows).
+                let target_snapshot = pixel_snapshot
                     .iter()
                     .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
-                {
-                    Some(&(_, w, h, g, t)) => (w, h, g, t),
-                    None => {
-                        // No target-sized snapshot yet (compositor
-                        // hasn't seen the registration roundtrip).
-                        // Use the native snapshot for the
-                        // Vulkan-Video / generation gate below; the
-                        // pixels lookup further down will fall back
-                        // to the native entry only when no external
-                        // / downscale target exists.
-                        (native_w, native_h, native_gen, native_ts)
-                    }
-                };
+                    .copied();
+                let (px_w, px_h, px_gen, px_timestamp_ms) = target_snapshot
+                    .map(|(_, w, h, g, t)| (w, h, g, t))
+                    .unwrap_or((native_w, native_h, native_gen, native_ts));
 
                 // Skip encoding if the pixel data hasn't changed since the
                 // last encode for this surface, unless a keyframe is needed.
@@ -3310,6 +3315,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                             work.cid, client.skip_vulkan_await_count,
                         );
                     }
+                    continue;
+                }
+
+                // The per-client encoder reads pixels at its
+                // `source_dimensions` stride.  If the only available
+                // snapshot is at native dims (e.g. the compositor
+                // hasn't blitted to the freshly-registered downscale
+                // target yet), feeding it would read at the wrong
+                // stride and garble content (rows wrap horizontally,
+                // looking like the encoded frame is letterboxed AND
+                // stretched).  Skip — the next tick after the
+                // compositor commits a target-sized frame will
+                // pick it up.
+                if (px_w, px_h) != (target_w, target_h) {
+                    client.skip_last_pixels_mismatch_count =
+                        client.skip_last_pixels_mismatch_count.saturating_add(1);
                     continue;
                 }
 
@@ -6373,7 +6394,9 @@ mod tests {
         // Client 2: 1280×720 physical at 1× ⇒ 1280×720 logical.
         // min logical = 960×540, max scale = 240 ⇒ 1920×1080 physical at 240.
         c1.surface_view_sizes.insert(1, (1920, 1080, 240));
+        c1.surface_subscriptions.insert(1);
         c2.surface_view_sizes.insert(1, (1280, 720, 120));
+        c2.surface_subscriptions.insert(1);
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
@@ -6393,7 +6416,9 @@ mod tests {
         let mut c2 = test_client();
         // Both clients want the surface at 800×600 logical.
         c1.surface_view_sizes.insert(1, (800, 600, 120)); // 1×
+        c1.surface_subscriptions.insert(1);
         c2.surface_view_sizes.insert(1, (1600, 1200, 240)); // 2×
+        c2.surface_subscriptions.insert(1);
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         // Compositor must render at 800×600 logical (preserved across DPRs).
@@ -6415,6 +6440,7 @@ mod tests {
         let mut session = Session::new();
         let mut c1 = test_client();
         c1.surface_view_sizes.insert(3, (800, 600, 120));
+        c1.surface_subscriptions.insert(3);
         session.clients.insert(1, c1);
         assert_eq!(
             session.mediated_size_for_surface(3, None),
@@ -6428,6 +6454,8 @@ mod tests {
         let mut c1 = test_client();
         c1.surface_view_sizes.insert(1, (1920, 1080, 240));
         c1.surface_view_sizes.insert(2, (640, 480, 120));
+        c1.surface_subscriptions.insert(1);
+        c1.surface_subscriptions.insert(2);
         session.clients.insert(1, c1);
         assert_eq!(
             session.mediated_size_for_surface(1, None),
@@ -6445,6 +6473,7 @@ mod tests {
         let mut session = Session::new();
         let mut c1 = test_client();
         c1.surface_view_sizes.insert(1, (5000, 3000, 240));
+        c1.surface_subscriptions.insert(1);
         session.clients.insert(1, c1);
         assert_eq!(
             session.mediated_size_for_surface(1, None),
@@ -6453,6 +6482,25 @@ mod tests {
         assert_eq!(
             session.mediated_size_for_surface(1, Some((3840, 2160))),
             Some((3840, 2160, 240))
+        );
+    }
+
+    #[test]
+    fn mediated_surface_size_ignores_unsubscribed_client() {
+        // Stale view_size from a client that hasn't (re)subscribed
+        // shouldn't drag the mediated size down for everyone.
+        let mut session = Session::new();
+        let mut c1 = test_client();
+        let mut c2 = test_client();
+        c1.surface_view_sizes.insert(1, (1920, 1080, 120));
+        c1.surface_subscriptions.insert(1);
+        // c2 has a tiny view_size but no subscription — should be skipped.
+        c2.surface_view_sizes.insert(1, (100, 100, 120));
+        session.clients.insert(1, c1);
+        session.clients.insert(2, c2);
+        assert_eq!(
+            session.mediated_size_for_surface(1, None),
+            Some((1920, 1080, 120))
         );
     }
 
