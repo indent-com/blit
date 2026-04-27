@@ -3261,26 +3261,16 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
 
             for result in results {
-                // Return the encoder to the client, but only if its
-                // dimensions still match the current surface.  A resize
-                // that arrived while the encode was in flight will have
-                // invalidated the old encoder; reinserting the stale one
-                // would force the next tick to discard and recreate it,
-                // wasting work and risking feeding a C encoder (openh264)
-                // frames at the wrong resolution.
-                let expected_dims: Option<(u32, u32)> = sess
-                    .compositor
-                    .as_ref()
-                    .and_then(|cs| cs.last_pixels.get(&result.sid))
-                    .map(|lp| (lp.width, lp.height));
-                let dims_match =
-                    expected_dims.is_some_and(|d| result.encoder.source_dimensions() == d);
-
+                // Return the encoder unless a resubscribe invalidated
+                // it mid-encode.  Don't compare against `last_pixels`
+                // here — it races with concurrent ticks.  The next
+                // tick's `needs_new_encoder` check rebuilds the
+                // encoder before any encode at the new size.
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     let state = client.surface_subs.entry(result.sid).or_default();
                     state.encode_in_flight = false;
                     let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
-                    if dims_match && !invalidated {
+                    if !invalidated {
                         state.encoder = Some(result.encoder);
                     }
                     // Record the generation we just encoded so we don't
