@@ -4305,10 +4305,12 @@ impl VulkanRenderer {
 
             // Dispatch BGRA→NV12 compute on the resized external BGRA
             // image, if NV12 outputs are registered for this target.
-            // The dispatch helpers expect the BGRA source to be in
-            // TRANSFER_SRC_OPTIMAL when `transition_bgra=true`; the
-            // external image is currently TRANSFER_DST_OPTIMAL, so
-            // transition it first.
+            // The dispatch helpers' built-in transition assumes the
+            // BGRA source is leaving the COLOR_ATTACHMENT_OUTPUT stage,
+            // which isn't true here — the source was written by a blit
+            // (TRANSFER stage).  Transition it ourselves with the right
+            // stages/access masks and pass `transition_bgra=false` so
+            // the helper doesn't double-transition.
             let nv12_dispatch: Option<(usize, bool)> = self
                 .nv12_outputs
                 .get(&(sid, tw, th))
@@ -4321,12 +4323,12 @@ impl VulkanRenderer {
                     Some((nv12_idx, is_image))
                 });
             if let Some((nv12_idx, is_image)) = nv12_dispatch {
-                let to_src = vk::ImageMemoryBarrier::default()
+                let to_general = vk::ImageMemoryBarrier::default()
                     .image(ext_image)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -4338,20 +4340,20 @@ impl VulkanRenderer {
                     self.device.cmd_pipeline_barrier(
                         cb,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],
-                        &[to_src],
+                        &[to_general],
                     );
                 }
                 let nv12_vec = &self.nv12_outputs[&(sid, tw, th)].0;
                 if is_image {
                     self.dispatch_nv12_compute_image(
-                        cb, ext_image, nv12_vec, nv12_idx, tw, th, true,
+                        cb, ext_image, nv12_vec, nv12_idx, tw, th, false,
                     );
                 } else {
-                    self.dispatch_nv12_compute(cb, ext_image, nv12_vec, nv12_idx, tw, th, true);
+                    self.dispatch_nv12_compute(cb, ext_image, nv12_vec, nv12_idx, tw, th, false);
                 }
             }
         }
@@ -4718,7 +4720,11 @@ impl VulkanRenderer {
                     modifier: ext_mod,
                     stride: ext_stride,
                     offset: 0,
-                    y_invert: false,
+                    // Render pass + blit both write top-down; the
+                    // encoder VPP's importer treats DMA-BUFs as
+                    // OpenGL-origin so we flag y_invert=true to keep
+                    // the previous semantics.
+                    y_invert: true,
                 }
             };
 
