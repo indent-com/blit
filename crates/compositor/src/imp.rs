@@ -6,7 +6,7 @@
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
 use crate::positioner::PositionerGeometry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1130,6 +1130,17 @@ struct Compositor {
     /// coordinate mapping stays consistent regardless of how many
     /// clients are subscribed at what sizes.
     pending_native_sizes: HashMap<u16, (u32, u32, u32, u32)>,
+    /// Toplevels that need a re-composite the next time the GPU
+    /// pipeline is idle.  Populated when a per-client encoder target
+    /// is installed (`SetExternalOutputBuffers` /
+    /// `RegisterDownscaleTarget`) — without a follow-up render the
+    /// new target buffer never gets pixels and the per-client encoder
+    /// skips forever.  An immediate `render_tree_sized` from the
+    /// command handler would early-return whenever the previous
+    /// commit's GPU submit hasn't completed yet, so the work is
+    /// deferred here and drained in the main loop after
+    /// `try_retire_pending` clears `pending_submit`.
+    pending_recomposite_toplevels: HashSet<u16>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
@@ -1527,6 +1538,76 @@ impl Compositor {
             }
         };
 
+        self.composite_toplevel_into_pending(&root_id, toplevel_sid);
+
+        // Compositing is done — the VulkanRenderer holds its own dup'd
+        // fd reference to the DMA-BUF via the persistent texture cache.
+        // Release the held buffer so the client can reuse it for the
+        // next frame.
+        if let Some(held) = self.held_buffers.remove(surface_id) {
+            held.release();
+        }
+
+        // Always fire frame callbacks after processing a commit, so
+        // clients can continue their render loop.  Without this, clients
+        // stall when the server doesn't send RequestFrame (e.g. during
+        // resize or when no subscribers are connected).
+        self.fire_frame_callbacks_for_toplevel(toplevel_sid);
+
+        // After an output scale change, re-send keyboard leave/enter on
+        // the first commit so clients (especially Firefox) resume input
+        // processing.  Deferred to here so the client has processed the
+        // reconfigure before we re-enter.
+        if self.pending_kb_reenter {
+            self.pending_kb_reenter = false;
+            let root_ids: Vec<ObjectId> = self.toplevel_surface_ids.values().cloned().collect();
+            for root_id in root_ids {
+                let wl = self.surfaces.get(&root_id).map(|s| s.wl_surface.clone());
+                if let Some(wl) = wl {
+                    let serial = self.next_serial();
+                    for kb in &self.keyboards {
+                        if same_client(kb, &wl) {
+                            kb.leave(serial, &wl);
+                        }
+                    }
+                    let serial = self.next_serial();
+                    for kb in &self.keyboards {
+                        if same_client(kb, &wl) {
+                            kb.enter(serial, &wl, vec![]);
+                        }
+                    }
+                }
+            }
+            let _ = self.display_handle.flush_clients();
+        }
+
+        if self.verbose {
+            let cache_entries = self.surface_meta.len();
+            let has_pending = self
+                .pending_commits
+                .keys()
+                .any(|(sid, _, _)| *sid == toplevel_sid);
+            static COMMIT_COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = COMMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n.is_multiple_of(1000) {
+                eprintln!(
+                    "[commit #{n}] sid={surface_id:?} root={root_id:?} cache={cache_entries} pending={has_pending} buf={had_buffer}",
+                );
+            }
+        }
+    }
+
+    /// Run the GPU compositor for `toplevel_sid` and store the produced
+    /// frames into `pending_commits` / `pending_native_sizes` so they're
+    /// drained by the next `flush_pending_commits` tick.  Drives both the
+    /// surface-commit path (after applying a fresh client buffer) and
+    /// the per-target registration paths (so a freshly-installed
+    /// downscale target / external buffer pool is populated immediately
+    /// from the most-recent surface state — without it, an idle wayland
+    /// client never produces pixels at the new target size and the
+    /// per-client encoder skips forever, wedging the surface).
+    fn composite_toplevel_into_pending(&mut self, root_id: &ObjectId, toplevel_sid: u16) {
         // Composite at the output scale so HiDPI clients are rendered
         // at full resolution.  Use the browser's requested size as the
         // target so the frame fits the canvas without letterboxing.
@@ -1538,7 +1619,7 @@ impl Compositor {
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
             vk.render_tree_sized(
-                &root_id,
+                root_id,
                 &self.surfaces,
                 &self.surface_meta,
                 s120,
@@ -1612,63 +1693,6 @@ impl Compositor {
             let log_h = (h * 120).div_ceil(s120_u32);
             self.pending_commits
                 .insert((result_sid, w, h), (log_w, log_h, pixels));
-        }
-
-        // Compositing is done — the VulkanRenderer holds its own dup'd
-        // fd reference to the DMA-BUF via the persistent texture cache.
-        // Release the held buffer so the client can reuse it for the
-        // next frame.
-        if let Some(held) = self.held_buffers.remove(surface_id) {
-            held.release();
-        }
-
-        // Always fire frame callbacks after processing a commit, so
-        // clients can continue their render loop.  Without this, clients
-        // stall when the server doesn't send RequestFrame (e.g. during
-        // resize or when no subscribers are connected).
-        self.fire_frame_callbacks_for_toplevel(toplevel_sid);
-
-        // After an output scale change, re-send keyboard leave/enter on
-        // the first commit so clients (especially Firefox) resume input
-        // processing.  Deferred to here so the client has processed the
-        // reconfigure before we re-enter.
-        if self.pending_kb_reenter {
-            self.pending_kb_reenter = false;
-            let root_ids: Vec<ObjectId> = self.toplevel_surface_ids.values().cloned().collect();
-            for root_id in root_ids {
-                let wl = self.surfaces.get(&root_id).map(|s| s.wl_surface.clone());
-                if let Some(wl) = wl {
-                    let serial = self.next_serial();
-                    for kb in &self.keyboards {
-                        if same_client(kb, &wl) {
-                            kb.leave(serial, &wl);
-                        }
-                    }
-                    let serial = self.next_serial();
-                    for kb in &self.keyboards {
-                        if same_client(kb, &wl) {
-                            kb.enter(serial, &wl, vec![]);
-                        }
-                    }
-                }
-            }
-            let _ = self.display_handle.flush_clients();
-        }
-
-        if self.verbose {
-            let cache_entries = self.surface_meta.len();
-            let has_pending = self
-                .pending_commits
-                .keys()
-                .any(|(sid, _, _)| *sid == toplevel_sid);
-            static COMMIT_COUNT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = COMMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 || n.is_multiple_of(1000) {
-                eprintln!(
-                    "[commit #{n}] sid={surface_id:?} root={root_id:?} cache={cache_entries} pending={has_pending} buf={had_buffer}",
-                );
-            }
         }
     }
 
@@ -2591,8 +2615,22 @@ impl Compositor {
                 target_h,
                 buffers,
             } => {
+                let installed = !buffers.is_empty();
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.set_external_output_buffers(surface_id, target_w, target_h, buffers);
+                }
+                // Populate the freshly-installed external buffer pool
+                // from the most-recent committed surface state.  An
+                // idle wayland client (steady-state UI after a resize)
+                // doesn't volunteer another commit, so without this
+                // re-blit the per-client encoder skips forever waiting
+                // for `last_pixels[(sid, target)]` to appear.  The
+                // re-composite is deferred until the GPU is idle —
+                // calling `render_tree_sized` here while a previous
+                // submit's fence is still pending would early-return
+                // and skip the new submit entirely.
+                if installed && self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
+                    self.pending_recomposite_toplevels.insert(surface_id as u16);
                 }
             }
             CompositorCommand::RegisterDownscaleTarget {
@@ -2602,6 +2640,11 @@ impl Compositor {
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.register_downscale_target(surface_id, target_w, target_h);
+                }
+                // See the SetExternalOutputBuffers handler above for
+                // why we re-composite here.
+                if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
+                    self.pending_recomposite_toplevels.insert(surface_id as u16);
                 }
             }
             CompositorCommand::ClearDownscaleTarget {
@@ -5451,6 +5494,7 @@ fn run_compositor(
         loop_signal: loop_signal.clone(),
         pending_commits: HashMap::new(),
         pending_native_sizes: HashMap::new(),
+        pending_recomposite_toplevels: HashSet::new(),
         focused_surface_id: 0,
         pointer_entered_id: None,
         pending_kb_reenter: false,
@@ -5589,6 +5633,32 @@ fn run_compositor(
                         .pending_commits
                         .insert((sid, w, h), (log_w, log_h, pixels));
                 }
+            }
+        }
+
+        // Drain deferred recomposites queued by per-client target
+        // installs (Set/RegisterDownscaleTarget).  Only run when the
+        // GPU pipeline is idle — `render_tree_sized` early-returns
+        // when `pending_submit` is held, which would silently drop
+        // the new submit and leave the freshly-installed target
+        // empty.  Each recomposite submits one render, so process
+        // one toplevel per iteration; remaining queued toplevels get
+        // their turn after the next retire.
+        let can_recomposite = compositor
+            .vulkan_renderer
+            .as_ref()
+            .is_some_and(|vk| !vk.has_pending());
+        if can_recomposite
+            && let Some(&sid) = compositor.pending_recomposite_toplevels.iter().next()
+        {
+            compositor.pending_recomposite_toplevels.remove(&sid);
+            if let Some(root_id) = compositor.toplevel_surface_ids.get(&sid).cloned() {
+                compositor.composite_toplevel_into_pending(&root_id, sid);
+                // Wake the loop so the retire path runs again
+                // promptly — without an explicit wakeup the loop
+                // would idle on its 1s dispatch timeout instead of
+                // the 1ms has_pending poll.
+                loop_signal.wakeup();
             }
         }
 
