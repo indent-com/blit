@@ -3261,24 +3261,11 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
 
             for result in results {
-                // Return the encoder to the client unless a resubscribe
-                // invalidated it mid-encode (codec/quality changed).
-                //
-                // We deliberately do NOT discard based on the current
-                // `last_pixels` size: that races with SurfaceCommit /
-                // SurfaceResized events processed by ticks that ran
-                // while this encode was in flight, so the encoder was
-                // dropped on every transient mismatch and the next
-                // tick had to rebuild it from scratch — visible as a
-                // continuous `[surface-encoder] ... using ...` log
-                // spam even when the user hasn't resized anything.
-                //
-                // The next tick's `needs_new_encoder` check
-                // (`source_dimensions() != (enc_w, enc_h)`) is the
-                // authoritative gate against feeding pixels at the
-                // wrong resolution to a C encoder (openh264): if the
-                // surface really has resized, that check rebuilds the
-                // encoder before the first encode at the new size.
+                // Return the encoder unless a resubscribe invalidated
+                // it mid-encode.  Don't compare against `last_pixels`
+                // here — it races with concurrent ticks.  The next
+                // tick's `needs_new_encoder` check rebuilds the
+                // encoder before any encode at the new size.
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     let state = client.surface_subs.entry(result.sid).or_default();
                     state.encode_in_flight = false;
