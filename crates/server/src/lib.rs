@@ -378,11 +378,29 @@ struct LastPixels {
     timestamp_ms: u32,
 }
 
+/// Drop every `last_pixels` entry belonging to `sid`, regardless of
+/// per-target size.  Used when the surface is destroyed/resized/created
+/// to avoid serving stale frames to encoders that were sized against
+/// the prior composite.
+fn last_pixels_remove_for_sid(last_pixels: &mut HashMap<(u16, u32, u32), LastPixels>, sid: u16) {
+    let keys: Vec<(u16, u32, u32)> = last_pixels.keys().filter(|k| k.0 == sid).copied().collect();
+    for k in keys {
+        last_pixels.remove(&k);
+    }
+}
+
 struct SharedCompositor {
     handle: CompositorHandle,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
-    /// Latest pixel snapshot per surface.
-    last_pixels: HashMap<u16, LastPixels>,
+    /// Latest pixel snapshot per `(surface_id, width, height)`.  The
+    /// compositor renders one surface into multiple per-target buffers
+    /// (one per registered per-client encoder size) plus a native BGRA
+    /// staging readback, so the same surface produces several entries
+    /// here — one per distinct size.  The encode loop picks the entry
+    /// matching its client's per-client encode target; CPU encoders
+    /// without a registered external fall back to the largest entry
+    /// (the native composite) and downscale themselves.
+    last_pixels: HashMap<(u16, u32, u32), LastPixels>,
     /// Per-surface timestamp of the last RequestFrame sent.  Used to
     /// throttle requests to at most one per 1 ms so frame callbacks
     /// carry distinct `elapsed_ms` timestamps — video players (mpv)
@@ -1731,38 +1749,140 @@ impl Session {
     // compositor accordingly.
     // ------------------------------------------------------------------
 
-    /// Returns (width, height, scale_120) mediated across all clients.
-    /// Resolution: min across clients.  DPI: max across clients.
-    /// Clients with a fixed per-surface target size (scaled subscription)
-    /// are excluded — they don't pull the compositor surface smaller for
-    /// anyone else; the server scales the native frame for them.
+    /// Returns the compositor's mediated (width, height, scale_120) for
+    /// `surface_id`, mediated across every client subscribed to it.
+    ///
+    /// Mediation rule (mirrors PTY sizing): the compositor surface must
+    /// fit every viewer at the highest density any viewer has.
+    ///
+    /// - **Smallest logical size wins** so the surface fits on every
+    ///   client's screen.  Each client reports its viewport in *physical*
+    ///   pixels along with its DPR (`scale_120`), so we convert each
+    ///   client's report to logical pixels (`physical * 120 / scale`)
+    ///   before taking the min.  Otherwise a 1× client and a 2× client
+    ///   reporting the same logical size would mediate at half the
+    ///   intended logical area.
+    /// - **Highest scale wins** so the densest client gets native pixels.
+    ///   Lower-DPR clients get the same logical size at higher density;
+    ///   the per-client encoder then downscales to their physical
+    ///   viewport.
+    ///
+    /// The returned `(width, height)` is in *physical* pixels at the
+    /// returned `scale_120` (i.e. `min_logical * max_scale_120 / 120`),
+    /// so the existing compositor handler — which converts physical →
+    /// logical with the same scale — sees the correct logical surface
+    /// size.  `max` clamps the physical size to the encoder's limits.
+    /// Pick the per-client encoder source dimensions for one
+    /// (client, surface) pair.  This is the size each viewer's bitstream
+    /// is encoded at — the encode pipeline downscales from
+    /// `(native_w, native_h)` (the compositor's mediated size) into
+    /// these dimensions before handing pixels to the encoder.
+    ///
+    /// Clamping rules (in order):
+    ///   1. Preserve native aspect ratio.  The viewport gives us a max
+    ///      box; we inscribe a `native_w × native_h`-shaped box inside
+    ///      it.  Stretching to fill the viewport would distort the
+    ///      frame because the JS canvas blits the encoded image at its
+    ///      intrinsic aspect (object-fit: contain) — any aspect
+    ///      mismatch we encode is locked into the bitstream and
+    ///      letterboxed by the browser.
+    ///   2. Cap at `(native_w, native_h)` so we never upscale —
+    ///      asking for a larger encoder just wastes bandwidth.
+    ///   3. Cap at the encoder family's hard maxima (e.g. H.264
+    ///      3840×2160), preserving aspect across the cap.
+    ///   4. Floor at 2×2 (and even) so the encoder doesn't reject the
+    ///      dimensions and chroma subsampling has a valid grid.
+    ///
+    /// `view_size` is `Some((physical_w, physical_h, scale_120))` when
+    /// the client has sent at least one `C2S_SURFACE_RESIZE`; the
+    /// fallback (`None` or zero dimensions) is the compositor's native
+    /// size, matching how the surface looked to the very first
+    /// subscriber.
+    fn per_client_encode_target(
+        view_size: Option<(u16, u16, u16)>,
+        native_w: u32,
+        native_h: u32,
+        encoder_preferences: &[SurfaceEncoderPreference],
+    ) -> (u32, u32) {
+        // Largest box no larger than `(box_w, box_h)` that has the
+        // same aspect ratio as `(native_w, native_h)`.
+        let inscribe = |box_w: u32, box_h: u32| -> (u32, u32) {
+            if native_w == 0 || native_h == 0 || box_w == 0 || box_h == 0 {
+                return (box_w, box_h);
+            }
+            // Use u64 to avoid overflow on the cross-multiply.
+            let nw = native_w as u64;
+            let nh = native_h as u64;
+            let bw = box_w as u64;
+            let bh = box_h as u64;
+            // Two candidates: width-bound (w=box_w, h=box_w*nh/nw) and
+            // height-bound (h=box_h, w=box_h*nw/nh).  Pick whichever
+            // fits inside the box.
+            let h_for_full_w = (bw * nh) / nw;
+            if h_for_full_w <= bh {
+                (box_w, h_for_full_w as u32)
+            } else {
+                let w_for_full_h = (bh * nw) / nh;
+                (w_for_full_h as u32, box_h)
+            }
+        };
+
+        let max = SurfaceEncoderPreference::max_dimensions_for_list(encoder_preferences);
+        let (w, h) = view_size
+            .map(|(w, h, _)| (w as u32, h as u32))
+            .filter(|&(w, h)| w > 0 && h > 0)
+            // Cap viewport box to native (no upscale) before inscribing.
+            .map(|(w, h)| (w.min(native_w), h.min(native_h)))
+            .map(|(w, h)| inscribe(w, h))
+            .unwrap_or((native_w, native_h));
+        // Encoder-family cap, also aspect-preserving.
+        let (w, h) = match max {
+            Some((mw, mh)) if w > mw as u32 || h > mh as u32 => inscribe(mw as u32, mh as u32),
+            _ => (w, h),
+        };
+        // Round to even and floor at 2 — H.264/H.265/AV1 NV12 sampling
+        // grids and most encoder APIs (NVENC, VAAPI) require even
+        // dimensions.
+        let w = (w & !1).max(2);
+        let h = (h & !1).max(2);
+        (w, h)
+    }
+
     fn mediated_size_for_surface(
         &self,
         surface_id: u16,
         max: Option<(u16, u16)>,
     ) -> Option<(u16, u16, u16)> {
-        let mut min_w: Option<u16> = None;
-        let mut min_h: Option<u16> = None;
+        let mut min_lw: Option<u32> = None;
+        let mut min_lh: Option<u32> = None;
         let mut max_scale: u16 = 0;
         for c in self.clients.values() {
-            if let Some(&(w, h, s)) = c.surface_view_sizes.get(&surface_id) {
-                min_w = Some(min_w.map_or(w, |m: u16| m.min(w)));
-                min_h = Some(min_h.map_or(h, |m: u16| m.min(h)));
-                max_scale = max_scale.max(s);
-            }
+            let Some(&(pw, ph, s)) = c.surface_view_sizes.get(&surface_id) else {
+                continue;
+            };
+            let s_eff = (s as u32).max(120);
+            // Round-half-up so a 1× client and a 2× client both reporting
+            // the same logical size land on the same logical integer.
+            let lw = ((pw as u32) * 120 + s_eff / 2) / s_eff;
+            let lh = ((ph as u32) * 120 + s_eff / 2) / s_eff;
+            min_lw = Some(min_lw.map_or(lw, |m| m.min(lw)));
+            min_lh = Some(min_lh.map_or(lh, |m| m.min(lh)));
+            max_scale = max_scale.max(s);
         }
-        match (min_w, min_h) {
-            (Some(w), Some(h)) => {
-                let (w, h) = (w.max(1), h.max(1));
-                let (w, h) = if let Some((mw, mh)) = max {
-                    (w.min(mw), h.min(mh))
-                } else {
-                    (w, h)
-                };
-                Some((w, h, max_scale))
-            }
-            _ => None,
-        }
+        let (lw, lh) = match (min_lw, min_lh) {
+            (Some(w), Some(h)) => (w.max(1), h.max(1)),
+            _ => return None,
+        };
+        let s = max_scale.max(120) as u32;
+        // Convert back to physical at the chosen (highest) scale.
+        let pw = ((lw * s) / 120).clamp(1, u16::MAX as u32) as u16;
+        let ph = ((lh * s) / 120).clamp(1, u16::MAX as u32) as u16;
+        let (pw, ph) = if let Some((mw, mh)) = max {
+            (pw.min(mw), ph.min(mh))
+        } else {
+            (pw, ph)
+        };
+        Some((pw.max(1), ph.max(1), s as u16))
     }
 
     fn resize_surface(&mut self, surface_id: u16, width: u16, height: u16, scale_120: u16) -> bool {
@@ -2403,12 +2523,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             app_id,
                         },
                     );
-                    cs.last_pixels.remove(&surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     invalidate_client_encoders.push(surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.surfaces.remove(&surface_id);
-                    cs.last_pixels.remove(&surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     cs.last_configured_size.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
@@ -2421,13 +2541,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                     timestamp_ms,
                 } => {
                     surface_commit_count += 1;
+                    // The compositor emits one SurfaceCommit per
+                    // (surface, target size).  The largest entry is
+                    // the native composite (also used by the pointer
+                    // path), but `info.width/height` always reflect
+                    // the most-recent emission — that's fine because
+                    // info dims are only read for fallback display in
+                    // the surface-created event when nothing else is
+                    // known.
                     if let Some(info) = cs.surfaces.get_mut(&surface_id) {
                         info.width = width as u16;
                         info.height = height as u16;
                     }
                     cs.pixel_generation += 1;
                     cs.last_pixels.insert(
-                        surface_id,
+                        (surface_id, width, height),
                         LastPixels {
                             width,
                             height,
@@ -2458,7 +2586,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.width = width;
                         info.height = height;
                     }
-                    cs.last_pixels.remove(&surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     // Don't eagerly invalidate client encoders here.  The
                     // encode path already checks for dimension mismatches
                     // (source_dimensions != pixel size) and recreates the
@@ -2569,13 +2697,19 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Snapshot every surface entry so each client's per-surface encoder
     // can draw from the latest pixels without holding the compositor
     // borrow through the (lengthy) encoder-dispatch loop below.
+    // (sid, width, height, generation, timestamp_ms) per per-target
+    // entry.  One sid can appear several times — once for each
+    // distinct (width, height) the renderer produced (per-encoder
+    // target plus the native composite).
     let pixel_snapshot: Vec<(u16, u32, u32, u64, u32)> = sess
         .compositor
         .as_ref()
         .map(|cs| {
             cs.last_pixels
                 .iter()
-                .map(|(&sid, lp)| (sid, lp.width, lp.height, lp.generation, lp.timestamp_ms))
+                .map(|(&(sid, _, _), lp)| {
+                    (sid, lp.width, lp.height, lp.generation, lp.timestamp_ms)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -2593,11 +2727,17 @@ async fn tick(state: &AppState) -> TickOutcome {
     struct EncodeJob {
         cid: u64,
         sid: u16,
-        /// Dimensions the encoder operates at — always the compositor's
-        /// native pixel size.
-        px_w: u32,
-        px_h: u32,
-        /// Pixel data to encode.
+        /// The encoder's source dimensions, equal to this client's
+        /// physical viewport.  Pixels arrive at this size from the
+        /// compositor — either zero-copy via NV12/VA-Surface DMA-BUFs
+        /// (VAAPI GBM-backed externals) or a server-allocated BGRA
+        /// staging buffer that the compositor GPU-blit into at this
+        /// size (NVENC, software encoders).  These dims go on the
+        /// wire as the frame `width`/`height` so each viewer sizes
+        /// its `<canvas>` to its own bitstream.
+        target_w: u32,
+        target_h: u32,
+        /// Pixel data to encode (already at target size).
         pixels: blit_compositor::PixelData,
         needs_keyframe: bool,
         encoder: SurfaceEncoder,
@@ -2622,8 +2762,11 @@ async fn tick(state: &AppState) -> TickOutcome {
     struct CreateJob {
         cid: u64,
         sid: u16,
-        px_w: u32,
-        px_h: u32,
+        /// Encoder source dimensions = this client's physical viewport.
+        /// The compositor may render larger; the encode pipeline
+        /// downscales per-client into these dimensions.
+        target_w: u32,
+        target_h: u32,
         params: EncoderCreateParams,
     }
     struct CreateResult {
@@ -2648,9 +2791,11 @@ async fn tick(state: &AppState) -> TickOutcome {
     struct EncodeResult {
         cid: u64,
         sid: u16,
-        /// Encoded frame dimensions (what goes on the wire).
-        px_w: u32,
-        px_h: u32,
+        /// Encoded frame dimensions (what goes on the wire).  Equal to
+        /// the encoder's source dimensions, i.e. this client's physical
+        /// viewport — not the compositor's native size.
+        target_w: u32,
+        target_h: u32,
         generation: u64,
         encoder: SurfaceEncoder,
         nal_data: Option<(Vec<u8>, bool)>, // (data, is_keyframe)
@@ -2736,6 +2881,14 @@ async fn tick(state: &AppState) -> TickOutcome {
             .as_ref()
             .is_some_and(|cs| cs.handle.vulkan_video_encode_av1);
 
+        // Surfaces whose Vulkan Video encoder should be torn down after
+        // the client loop because at least one subscriber wants a smaller
+        // per-client target than the compositor's native size.  Vulkan
+        // Video can only emit at native — deferred so we can mutate every
+        // client's `vulkan_video_surfaces` and the compositor without
+        // holding the per-client mutable borrow used inside the loop.
+        let mut vulkan_teardown_sids: Vec<u16> = Vec::new();
+
         // Vulkan Video encoder setup commands to send after the client loop.
         struct VulkanEncoderSetup {
             surface_id: u32,
@@ -2749,8 +2902,14 @@ async fn tick(state: &AppState) -> TickOutcome {
 
         for work in &client_work {
             for &sid in &work.subs {
-                let Some(&(_, px_w, px_h, px_gen, px_timestamp_ms)) =
-                    pixel_snapshot.iter().find(|&&(s, _, _, _, _)| s == sid)
+                // Pick the largest snapshot entry for this surface — that's
+                // the compositor's native composite, which we use both for
+                // the per-client target clamp and as a fallback source for
+                // CPU encoders that don't have a registered external.
+                let Some(&(_, native_w, native_h, native_gen, native_ts)) = pixel_snapshot
+                    .iter()
+                    .filter(|&&(s, _, _, _, _)| s == sid)
+                    .max_by_key(|&&(_, w, h, _, _)| (w as u64) * (h as u64))
                 else {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     client.skip_last_pixels_mismatch_count =
@@ -2788,6 +2947,37 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
 
+                let (target_w, target_h) = Session::per_client_encode_target(
+                    client.surface_view_sizes.get(&sid).copied(),
+                    native_w,
+                    native_h,
+                    &state.config.surface_encoders,
+                );
+                let (enc_w, enc_h) = (target_w, target_h);
+
+                // The compositor produces one snapshot per (sid,
+                // target) once the per-client encoder has registered
+                // either an external buffer (VAAPI GBM) or a downscale
+                // target (NVENC, software).  Find it.  On the very
+                // first tick after encoder install the snapshot may not
+                // exist yet — skip and pick it up next tick.
+                let (px_w, px_h, px_gen, px_timestamp_ms) = match pixel_snapshot
+                    .iter()
+                    .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
+                {
+                    Some(&(_, w, h, g, t)) => (w, h, g, t),
+                    None => {
+                        // No target-sized snapshot yet (compositor
+                        // hasn't seen the registration roundtrip).
+                        // Use the native snapshot for the
+                        // Vulkan-Video / generation gate below; the
+                        // pixels lookup further down will fall back
+                        // to the native entry only when no external
+                        // / downscale target exists.
+                        (native_w, native_h, native_gen, native_ts)
+                    }
+                };
+
                 // Skip encoding if the pixel data hasn't changed since the
                 // last encode for this surface, unless a keyframe is needed.
                 if !work.needs_keyframe
@@ -2803,9 +2993,9 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                 let pixels: blit_compositor::PixelData = {
                     let cs = sess.compositor.as_ref().unwrap();
-                    match cs.last_pixels.get(&sid) {
-                        Some(lp) if lp.width == px_w && lp.height == px_h => lp.pixels.clone(),
-                        _ => {
+                    match cs.last_pixels.get(&(sid, px_w, px_h)) {
+                        Some(lp) => lp.pixels.clone(),
+                        None => {
                             let client = sess.clients.get_mut(&work.cid).unwrap();
                             client.skip_last_pixels_mismatch_count =
                                 client.skip_last_pixels_mismatch_count.saturating_add(1);
@@ -2815,63 +3005,89 @@ async fn tick(state: &AppState) -> TickOutcome {
                 };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
 
-                let (enc_w, enc_h) = (px_w, px_h);
-
                 // Fast path: if the compositor already produced an encoded
                 // bitstream (Vulkan Video), skip the SurfaceEncoder entirely
                 // and send the pre-encoded data directly to the client.
+                //
+                // Only valid when this client's target dimensions match the
+                // bitstream's dimensions — Vulkan Video output is at the
+                // compositor's native size and cannot be re-scaled per
+                // client.  When a smaller-viewport client also subscribes
+                // we fall through to the per-client SurfaceEncoder, which
+                // CPU-downscales the pixels.  (The compositor still emits
+                // `Encoded` for whichever client kicked off Vulkan Video;
+                // see the Vulkan-Video selection below for how new clients
+                // avoid re-selecting it when sizes diverge.)
                 if let blit_compositor::PixelData::Encoded {
                     ref data,
                     is_keyframe,
                     codec_flag,
                 } = pixels
                 {
-                    let flags = codec_flag
-                        | if is_keyframe {
-                            SURFACE_FRAME_FLAG_KEYFRAME
-                        } else {
-                            0
-                        };
-                    let msg = msg_surface_frame(
-                        sid,
-                        px_timestamp_ms,
-                        flags,
-                        px_w as u16,
-                        px_h as u16,
-                        data,
-                    );
-                    let bytes = msg.len();
-                    match send_outbox(client, msg) {
-                        Err(_e) => {
-                            client.surface_needs_keyframe = true;
+                    if (target_w, target_h) != (px_w, px_h) {
+                        // This client wants a smaller encode than the
+                        // compositor's native size.  Vulkan Video can
+                        // only emit at native; defer a teardown so that
+                        // after the loop we drop every client's Vulkan
+                        // tracking AND the compositor's Vulkan encoder
+                        // for this surface.  Subsequent ticks will see
+                        // PixelData::Bgra / Nv12DmaBuf and route through
+                        // `encode_jobs`.
+                        if !vulkan_teardown_sids.contains(&sid) {
+                            vulkan_teardown_sids.push(sid);
                         }
-                        Ok(()) => {
-                            client.surface_inflight_frames.push_back(InFlightFrame {
-                                sent_at: now,
-                                bytes,
-                                paced: true,
-                            });
-                            if !is_keyframe {
-                                client.avg_surface_frame_bytes = ewma_with_direction(
-                                    client.avg_surface_frame_bytes,
-                                    bytes as f32,
-                                    0.5,
-                                    0.125,
-                                );
+                        // Skip this tick for this client; the next tick
+                        // will run the per-client encoder path once the
+                        // compositor has produced raw pixels.
+                        continue;
+                    } else {
+                        let flags = codec_flag
+                            | if is_keyframe {
+                                SURFACE_FRAME_FLAG_KEYFRAME
+                            } else {
+                                0
+                            };
+                        let msg = msg_surface_frame(
+                            sid,
+                            px_timestamp_ms,
+                            flags,
+                            target_w as u16,
+                            target_h as u16,
+                            data,
+                        );
+                        let bytes = msg.len();
+                        match send_outbox(client, msg) {
+                            Err(_e) => {
+                                client.surface_needs_keyframe = true;
                             }
-                            client.frames_sent = client.frames_sent.wrapping_add(1);
-                            if client.surface_needs_keyframe && is_keyframe {
-                                client.surface_needs_keyframe = false;
-                            }
-                            if let Some(s) = client.surface_subs.get_mut(&sid) {
-                                s.burst_remaining = s.burst_remaining.saturating_sub(1);
+                            Ok(()) => {
+                                client.surface_inflight_frames.push_back(InFlightFrame {
+                                    sent_at: now,
+                                    bytes,
+                                    paced: true,
+                                });
+                                if !is_keyframe {
+                                    client.avg_surface_frame_bytes = ewma_with_direction(
+                                        client.avg_surface_frame_bytes,
+                                        bytes as f32,
+                                        0.5,
+                                        0.125,
+                                    );
+                                }
+                                client.frames_sent = client.frames_sent.wrapping_add(1);
+                                if client.surface_needs_keyframe && is_keyframe {
+                                    client.surface_needs_keyframe = false;
+                                }
+                                if let Some(s) = client.surface_subs.get_mut(&sid) {
+                                    s.burst_remaining = s.burst_remaining.saturating_sub(1);
+                                }
                             }
                         }
+                        encoded_client_surfaces.insert((work.cid, sid));
+                        encode_dispatched_surfaces.insert(sid);
+                        client.surface_subs.entry(sid).or_default().last_encoded_gen = Some(px_gen);
+                        continue;
                     }
-                    encoded_client_surfaces.insert((work.cid, sid));
-                    encode_dispatched_surfaces.insert(sid);
-                    client.surface_subs.entry(sid).or_default().last_encoded_gen = Some(px_gen);
-                    continue;
                 }
 
                 // Skip if an encode or creation job is already in
@@ -2955,8 +3171,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .and_then(|s| s.quality_override)
                         .unwrap_or(state.config.surface_quality);
 
+                    // Vulkan Video encodes at the compositor's native size
+                    // and is broadcast verbatim — only valid when this
+                    // client's per-client target matches native.  If we
+                    // selected Vulkan Video here for a smaller-target
+                    // client, the bitstream would be at the wrong
+                    // resolution and we'd have no way to scale it.
+                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h);
+
                     for &pref in &state.config.surface_encoders {
                         if !pref.is_vulkan_video() {
+                            continue;
+                        }
+                        if !vulkan_eligible {
                             continue;
                         }
                         if !pref.supported_by_client(codec_support) {
@@ -3051,8 +3278,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     create_jobs.push(CreateJob {
                         cid: work.cid,
                         sid,
-                        px_w: enc_w,
-                        px_h: enc_h,
+                        target_w: enc_w,
+                        target_h: enc_h,
                         params: EncoderCreateParams {
                             preferences: state.config.surface_encoders.clone(),
                             vaapi_device: state.config.vaapi_device.clone(),
@@ -3098,14 +3325,39 @@ async fn tick(state: &AppState) -> TickOutcome {
                 encode_jobs.push(EncodeJob {
                     cid: work.cid,
                     sid,
-                    px_w: enc_w,
-                    px_h: enc_h,
+                    target_w: enc_w,
+                    target_h: enc_h,
                     pixels,
                     needs_keyframe: needs_kf,
                     encoder,
                     generation: px_gen,
                     timestamp_ms: px_timestamp_ms,
                 });
+            }
+        }
+
+        // Tear down Vulkan Video for surfaces where at least one client
+        // wants a per-client target smaller than the compositor's native
+        // size.  After this, the compositor produces raw NV12/BGRA on
+        // the next frame and every subscriber's per-client encoder takes
+        // over.
+        for sid in &vulkan_teardown_sids {
+            for c in sess.clients.values_mut() {
+                if c.vulkan_video_surfaces.remove(sid).is_some() {
+                    c.surface_needs_keyframe = true;
+                }
+            }
+            if let Some(cs) = sess.compositor.as_ref() {
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::DestroyVulkanEncoder {
+                        surface_id: *sid as u32,
+                    },
+                );
+                cs.handle.wake();
+                eprintln!(
+                    "[vulkan-video] teardown sid={sid}: at least one subscriber's target \
+                     ≠ native size; switching to per-client SurfaceEncoders",
+                );
             }
         }
 
@@ -3178,13 +3430,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if job.needs_keyframe {
                             encoder.request_keyframe();
                         }
+                        // The compositor produces a target-sized
+                        // PixelData per registered (sid, target) — either
+                        // a zero-copy NV12/VA-Surface DMA-BUF (VAAPI
+                        // GBM-backed) or a server-allocated BGRA blit
+                        // staging buffer (NVENC, software).  Both arrive
+                        // at the encoder's source dimensions, so the
+                        // encoder consumes them directly with no CPU
+                        // resize step.
                         let nal_data = encoder.encode_pixels(&job.pixels);
                         let codec_flag = encoder.codec_flag();
                         EncodeResult {
                             cid: job.cid,
                             sid: job.sid,
-                            px_w: job.px_w,
-                            px_h: job.px_h,
+                            target_w: job.target_w,
+                            target_h: job.target_h,
                             generation: job.generation,
                             encoder,
                             nal_data,
@@ -3262,17 +3522,27 @@ async fn tick(state: &AppState) -> TickOutcome {
 
             for result in results {
                 // Return the encoder to the client, but only if its
-                // dimensions still match the current surface.  A resize
+                // dimensions still match this client's target.  A resize
                 // that arrived while the encode was in flight will have
                 // invalidated the old encoder; reinserting the stale one
                 // would force the next tick to discard and recreate it,
                 // wasting work and risking feeding a C encoder (openh264)
                 // frames at the wrong resolution.
+                //
+                // The encoder runs at the *target* size (this client's
+                // physical viewport).  The compositor produces pixels
+                // pre-downscaled to that target via GPU blit, so we
+                // never feed a wrong-resolution frame here — but if
+                // the client's view size has shifted while the encode
+                // was in flight the encoder's source dims won't match
+                // the new viewport and we drop it instead of risking a
+                // mismatched frame on the next tick.
                 let expected_dims: Option<(u32, u32)> = sess
-                    .compositor
-                    .as_ref()
-                    .and_then(|cs| cs.last_pixels.get(&result.sid))
-                    .map(|lp| (lp.width, lp.height));
+                    .clients
+                    .get(&result.cid)
+                    .and_then(|c| c.surface_view_sizes.get(&result.sid))
+                    .map(|&(w, h, _)| (w as u32, h as u32))
+                    .or(Some((result.target_w, result.target_h)));
                 let dims_match =
                     expected_dims.is_some_and(|d| result.encoder.source_dimensions() == d);
 
@@ -3299,12 +3569,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             client.surface_needs_keyframe = true;
                             eprintln!(
                                 "[encode] nal_data=None x{streak} sid={} cid={} {}x{} — dropping encoder, backing off retry",
-                                result.sid, result.cid, result.px_w, result.px_h,
+                                result.sid, result.cid, result.target_w, result.target_h,
                             );
                         } else if streak < 10 {
                             eprintln!(
                                 "[encode] nal_data=None sid={} cid={} {}x{}",
-                                result.sid, result.cid, result.px_w, result.px_h,
+                                result.sid, result.cid, result.target_w, result.target_h,
                             );
                         }
                         // streak >= 10: suppress the log spam
@@ -3325,8 +3595,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         eprintln!(
                             "[encode #{n}] sid={} {}x{} kf={is_keyframe} bytes={}",
                             result.sid,
-                            result.px_w,
-                            result.px_h,
+                            result.target_w,
+                            result.target_h,
                             nal_data.len(),
                         );
                     }
@@ -3345,8 +3615,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     result.sid,
                     result.timestamp_ms,
                     flags,
-                    result.px_w as u16,
-                    result.px_h as u16,
+                    result.target_w as u16,
+                    result.target_h as u16,
                     &nal_data,
                 );
                 let bytes = msg.len();
@@ -3455,8 +3725,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let params = job.params;
                         let mut encoder = match SurfaceEncoder::new(
                             &params.preferences,
-                            job.px_w,
-                            job.px_h,
+                            job.target_w,
+                            job.target_h,
                             &params.vaapi_device,
                             params.quality,
                             params.verbose,
@@ -3468,7 +3738,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 if params.verbose {
                                     eprintln!(
                                         "[surface-encoder] cid={} sid={} {}x{}: {err}",
-                                        job.cid, job.sid, job.px_w, job.px_h,
+                                        job.cid, job.sid, job.target_w, job.target_h,
                                     );
                                 }
                                 return CreateResult {
@@ -3602,7 +3872,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && !f.external_bufs.is_empty()
                         && let Some(cs) = sess.compositor.as_mut()
                     {
-                        cs.last_pixels.remove(&result.sid);
+                        // Drop every cached snapshot for this surface so
+                        // the next compositor frame re-fills with the
+                        // newly-registered NV12 DMA-BUF target.  Stale
+                        // entries (e.g. native BGRA from a previous
+                        // tick) will be re-added by SurfaceCommit.
+                        last_pixels_remove_for_sid(&mut cs.last_pixels, result.sid);
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -3614,18 +3889,39 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let fresh_meta = fresh.map(|f| (f.name, f.codec_string));
 
                 #[cfg(target_os = "linux")]
-                if let Some(bufs) = external_bufs
-                    && !bufs.is_empty()
-                    && let Some(cs) = sess.compositor.as_mut()
                 {
-                    let _ = cs.handle.command_tx.send(
-                        blit_compositor::CompositorCommand::SetExternalOutputBuffers {
-                            surface_id: result.sid as u32,
-                            buffers: bufs,
-                        },
-                    );
-                    cs.handle.wake();
+                    let (tw, th) = encoder.source_dimensions();
+                    if let Some(bufs) = external_bufs
+                        && !bufs.is_empty()
+                        && let Some(cs) = sess.compositor.as_mut()
+                    {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::SetExternalOutputBuffers {
+                                surface_id: result.sid as u32,
+                                target_w: tw,
+                                target_h: th,
+                                buffers: bufs,
+                            },
+                        );
+                        cs.handle.wake();
+                    } else if let Some(cs) = sess.compositor.as_mut() {
+                        // No GBM externals — register a server-allocated
+                        // BGRA downscale target so the compositor can
+                        // GPU-blit the native composite into target-sized
+                        // BGRA for this encoder.  Idempotent in the
+                        // renderer.
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::RegisterDownscaleTarget {
+                                surface_id: result.sid as u32,
+                                target_w: tw,
+                                target_h: th,
+                            },
+                        );
+                        cs.handle.wake();
+                    }
                 }
+                #[cfg(not(target_os = "linux"))]
+                let _ = &encoder;
 
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     let state = client.surface_subs.entry(result.sid).or_default();
@@ -4460,11 +4756,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(cs) = sess.compositor.as_ref() {
             for info in cs.surfaces.values() {
                 // Use the latest known pixel dimensions if the stored
-                // width/height is still 0 (surface created before first commit).
+                // width/height is still 0 (surface created before first
+                // commit).  The largest cached entry for this surface is
+                // its native composite — use that.
                 let (w, h) = if info.width == 0 && info.height == 0 {
                     cs.last_pixels
-                        .get(&info.surface_id)
-                        .map(|lp| (lp.width as u16, lp.height as u16))
+                        .iter()
+                        .filter(|(k, _)| k.0 == info.surface_id)
+                        .max_by_key(|(_, lp)| (lp.width as u64) * (lp.height as u64))
+                        .map(|(_, lp)| (lp.width as u16, lp.height as u16))
                         .unwrap_or((0, 0))
                 } else {
                     (info.width, info.height)
@@ -4687,11 +4987,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let (snapshot, command_tx) = {
                 let sess = state.session.lock().await;
                 eprintln!("[capture] lock acquired");
-                let snap = sess
-                    .compositor
-                    .as_ref()
-                    .and_then(|cs| cs.last_pixels.get(&surface_id))
-                    .map(|lp| (lp.width, lp.height, lp.pixels.clone()));
+                // Snapshot the largest cached entry for this surface
+                // (the native composite) for the capture fallback path.
+                let snap = sess.compositor.as_ref().and_then(|cs| {
+                    cs.last_pixels
+                        .iter()
+                        .filter(|(k, _)| k.0 == surface_id)
+                        .max_by_key(|(_, lp)| (lp.width as u64) * (lp.height as u64))
+                        .map(|(_, lp)| (lp.width, lp.height, lp.pixels.clone()))
+                });
                 let cmd_tx = sess
                     .compositor
                     .as_ref()
@@ -6084,13 +6388,38 @@ mod tests {
         let mut session = Session::new();
         let mut c1 = test_client();
         let mut c2 = test_client();
-        c1.surface_view_sizes.insert(1, (1920, 1080, 240)); // 2×
-        c2.surface_view_sizes.insert(1, (1280, 720, 120)); // 1×
+        // Client 1: 1920×1080 physical at 2× ⇒ 960×540 logical.
+        // Client 2: 1280×720 physical at 1× ⇒ 1280×720 logical.
+        // min logical = 960×540, max scale = 240 ⇒ 1920×1080 physical at 240.
+        c1.surface_view_sizes.insert(1, (1920, 1080, 240));
+        c2.surface_view_sizes.insert(1, (1280, 720, 120));
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
             session.mediated_size_for_surface(1, None),
-            Some((1280, 720, 240))
+            Some((1920, 1080, 240))
+        );
+    }
+
+    #[test]
+    fn mediated_surface_size_same_logical_different_dpr_keeps_logical() {
+        // Regression: with the old implementation that took
+        // `min(physical), max(scale)` directly, two clients reporting the
+        // SAME logical size at different DPRs produced a surface that was
+        // half the intended logical size for the lower-DPR client.
+        let mut session = Session::new();
+        let mut c1 = test_client();
+        let mut c2 = test_client();
+        // Both clients want the surface at 800×600 logical.
+        c1.surface_view_sizes.insert(1, (800, 600, 120)); // 1×
+        c2.surface_view_sizes.insert(1, (1600, 1200, 240)); // 2×
+        session.clients.insert(1, c1);
+        session.clients.insert(2, c2);
+        // Compositor must render at 800×600 logical (preserved across DPRs).
+        // Highest scale wins (240) ⇒ 1600×1200 physical at scale 240.
+        assert_eq!(
+            session.mediated_size_for_surface(1, None),
+            Some((1600, 1200, 240))
         );
     }
 
@@ -6143,6 +6472,108 @@ mod tests {
         assert_eq!(
             session.mediated_size_for_surface(1, Some((3840, 2160))),
             Some((3840, 2160, 240))
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_uses_view_size() {
+        // 1280×720 viewport, 1920×1080 native (both 16:9) ⇒ 1280×720.
+        assert_eq!(
+            Session::per_client_encode_target(Some((1280, 720, 120)), 1920, 1080, &[]),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_clamps_to_native() {
+        // Viewport 4000×3000 but native is only 1920×1080 — encoding bigger
+        // would just upscale, so the encoder runs at native.
+        assert_eq!(
+            Session::per_client_encode_target(Some((4000, 3000, 240)), 1920, 1080, &[]),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_clamps_to_encoder_max() {
+        // Viewport 8000×4500 and native 8000×4500, but H.264 caps at
+        // 3840×2160 — same 16:9 aspect, picks (3840, 2160).
+        assert_eq!(
+            Session::per_client_encode_target(
+                Some((8000, 4500, 240)),
+                8000,
+                4500,
+                &[SurfaceEncoderPreference::H264Software],
+            ),
+            (3840, 2160)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_falls_back_to_native_without_view_size() {
+        // Client hasn't sent C2S_SURFACE_RESIZE yet — encode at native.
+        assert_eq!(
+            Session::per_client_encode_target(None, 800, 600, &[]),
+            (800, 600)
+        );
+        // Zero-dim viewport (cleared by client) ⇒ also fall back.
+        assert_eq!(
+            Session::per_client_encode_target(Some((0, 0, 120)), 800, 600, &[]),
+            (800, 600)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_preserves_native_aspect_landscape() {
+        // Native 1920×1080 (16:9).  Client viewport 1000×1000 (square).
+        // Width-bound at 1000 keeps height at 1000*1080/1920 = 562 →
+        // round even = 562 (already even).
+        assert_eq!(
+            Session::per_client_encode_target(Some((1000, 1000, 120)), 1920, 1080, &[]),
+            (1000, 562)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_preserves_native_aspect_portrait_client() {
+        // Native 1920×1080 (16:9).  Client viewport 500×1000 (1:2).
+        // Width-bound at 500 keeps height at 500*1080/1920 = 281,
+        // rounded even = 280.
+        assert_eq!(
+            Session::per_client_encode_target(Some((500, 1000, 120)), 1920, 1080, &[]),
+            (500, 280)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_preserves_native_aspect_landscape_client_portrait_native() {
+        // Native 1080×1920 (9:16).  Client viewport 1000×500 (2:1).
+        // Height-bound at 500 keeps width at 500*1080/1920 = 281,
+        // rounded even = 280.
+        assert_eq!(
+            Session::per_client_encode_target(Some((1000, 500, 120)), 1080, 1920, &[]),
+            (280, 500)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_rounds_to_even() {
+        // Native 101×51 — odd dimensions.  Same-shape viewport rounds
+        // down to even.
+        assert_eq!(
+            Session::per_client_encode_target(Some((101, 51, 120)), 101, 51, &[]),
+            (100, 50)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_floors_at_two() {
+        // Tiny viewport on a tall native — height-bound at 1 → width 0
+        // → floor to 2.  Encoders reject 0-dim and most reject 1-dim
+        // because chroma subsampling needs at least a 2×2 grid.
+        assert_eq!(
+            Session::per_client_encode_target(Some((1, 1, 120)), 100, 1000, &[]),
+            (2, 2)
         );
     }
 
