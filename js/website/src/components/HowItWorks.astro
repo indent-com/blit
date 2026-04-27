@@ -2,7 +2,7 @@
 const stages = [
   {
     title: "Browser",
-    chips: ["WebGL renderer", "WASM diff engine", "Glyph atlas"],
+    chips: ["WebGPU / WebGL2 / canvas2d", "WASM diff engine", "Glyph atlas"],
     note: "Applies LZ4-compressed binary diffs; reports render metrics back for pacing.",
   },
   {
@@ -35,8 +35,9 @@ const stages = [
         <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
           The server parses PTY output into structured state, computes
           per-client binary diffs, and ships only the delta. The browser
-          applies diffs in WASM and renders with WebGL. Keystrokes travel
-          the reverse path with no queuing — latency is bounded by link RTT.
+          applies diffs in WASM and paints with WebGPU — falling back to
+          WebGL2, then canvas2d. Keystrokes travel the reverse path with
+          no queuing; latency is bounded by link RTT.
         </p>
         <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
           Above the Unix socket, everything is stateless: gateways and
@@ -61,7 +62,7 @@ const stages = [
               Render
             </dt>
             <dd class="mt-1 font-mono text-[13px] text-[var(--fg)]">
-              WebGL · WASM
+              WebGPU · WebGL2 · canvas2d
             </dd>
           </div>
           <div>
