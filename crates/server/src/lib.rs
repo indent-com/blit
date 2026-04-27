@@ -1779,13 +1779,19 @@ impl Session {
     /// these dimensions before handing pixels to the encoder.
     ///
     /// Clamping rules (in order):
-    ///   1. Drop to `(native_w, native_h)` if the viewport is bigger —
-    ///      there's no extra signal to encode beyond what the compositor
-    ///      produced; asking for a larger encoder just wastes bandwidth
-    ///      on an upscale.
-    ///   2. Drop to the encoder family's hard maxima
-    ///      (e.g. H.264 3840×2160).
-    ///   3. Floor at 1×1 so we never emit a 0-dim encoder.
+    ///   1. Preserve native aspect ratio.  The viewport gives us a max
+    ///      box; we inscribe a `native_w × native_h`-shaped box inside
+    ///      it.  Stretching to fill the viewport would distort the
+    ///      frame because the JS canvas blits the encoded image at its
+    ///      intrinsic aspect (object-fit: contain) — any aspect
+    ///      mismatch we encode is locked into the bitstream and
+    ///      letterboxed by the browser.
+    ///   2. Cap at `(native_w, native_h)` so we never upscale —
+    ///      asking for a larger encoder just wastes bandwidth.
+    ///   3. Cap at the encoder family's hard maxima (e.g. H.264
+    ///      3840×2160), preserving aspect across the cap.
+    ///   4. Floor at 2×2 (and even) so the encoder doesn't reject the
+    ///      dimensions and chroma subsampling has a valid grid.
     ///
     /// `view_size` is `Some((physical_w, physical_h, scale_120))` when
     /// the client has sent at least one `C2S_SURFACE_RESIZE`; the
@@ -1798,17 +1804,48 @@ impl Session {
         native_h: u32,
         encoder_preferences: &[SurfaceEncoderPreference],
     ) -> (u32, u32) {
+        // Largest box no larger than `(box_w, box_h)` that has the
+        // same aspect ratio as `(native_w, native_h)`.
+        let inscribe = |box_w: u32, box_h: u32| -> (u32, u32) {
+            if native_w == 0 || native_h == 0 || box_w == 0 || box_h == 0 {
+                return (box_w, box_h);
+            }
+            // Use u64 to avoid overflow on the cross-multiply.
+            let nw = native_w as u64;
+            let nh = native_h as u64;
+            let bw = box_w as u64;
+            let bh = box_h as u64;
+            // Two candidates: width-bound (w=box_w, h=box_w*nh/nw) and
+            // height-bound (h=box_h, w=box_h*nw/nh).  Pick whichever
+            // fits inside the box.
+            let h_for_full_w = (bw * nh) / nw;
+            if h_for_full_w <= bh {
+                (box_w, h_for_full_w as u32)
+            } else {
+                let w_for_full_h = (bh * nw) / nh;
+                (w_for_full_h as u32, box_h)
+            }
+        };
+
         let max = SurfaceEncoderPreference::max_dimensions_for_list(encoder_preferences);
         let (w, h) = view_size
             .map(|(w, h, _)| (w as u32, h as u32))
             .filter(|&(w, h)| w > 0 && h > 0)
+            // Cap viewport box to native (no upscale) before inscribing.
             .map(|(w, h)| (w.min(native_w), h.min(native_h)))
-            .map(|(w, h)| match max {
-                Some((mw, mh)) => (w.min(mw as u32), h.min(mh as u32)),
-                None => (w, h),
-            })
+            .map(|(w, h)| inscribe(w, h))
             .unwrap_or((native_w, native_h));
-        (w.max(1), h.max(1))
+        // Encoder-family cap, also aspect-preserving.
+        let (w, h) = match max {
+            Some((mw, mh)) if w > mw as u32 || h > mh as u32 => inscribe(mw as u32, mh as u32),
+            _ => (w, h),
+        };
+        // Round to even and floor at 2 — H.264/H.265/AV1 NV12 sampling
+        // grids and most encoder APIs (NVENC, VAAPI) require even
+        // dimensions.
+        let w = (w & !1).max(2);
+        let h = (h & !1).max(2);
+        (w, h)
     }
 
     fn mediated_size_for_surface(
@@ -6440,7 +6477,7 @@ mod tests {
 
     #[test]
     fn per_client_encode_target_uses_view_size() {
-        // 1280×720 viewport, 1920×1080 native, no encoder limit ⇒ 1280×720.
+        // 1280×720 viewport, 1920×1080 native (both 16:9) ⇒ 1280×720.
         assert_eq!(
             Session::per_client_encode_target(Some((1280, 720, 120)), 1920, 1080, &[]),
             (1280, 720)
@@ -6460,7 +6497,7 @@ mod tests {
     #[test]
     fn per_client_encode_target_clamps_to_encoder_max() {
         // Viewport 8000×4500 and native 8000×4500, but H.264 caps at
-        // 3840×2160.
+        // 3840×2160 — same 16:9 aspect, picks (3840, 2160).
         assert_eq!(
             Session::per_client_encode_target(
                 Some((8000, 4500, 240)),
@@ -6483,6 +6520,60 @@ mod tests {
         assert_eq!(
             Session::per_client_encode_target(Some((0, 0, 120)), 800, 600, &[]),
             (800, 600)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_preserves_native_aspect_landscape() {
+        // Native 1920×1080 (16:9).  Client viewport 1000×1000 (square).
+        // Width-bound at 1000 keeps height at 1000*1080/1920 = 562 →
+        // round even = 562 (already even).
+        assert_eq!(
+            Session::per_client_encode_target(Some((1000, 1000, 120)), 1920, 1080, &[]),
+            (1000, 562)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_preserves_native_aspect_portrait_client() {
+        // Native 1920×1080 (16:9).  Client viewport 500×1000 (1:2).
+        // Width-bound at 500 keeps height at 500*1080/1920 = 281,
+        // rounded even = 280.
+        assert_eq!(
+            Session::per_client_encode_target(Some((500, 1000, 120)), 1920, 1080, &[]),
+            (500, 280)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_preserves_native_aspect_landscape_client_portrait_native() {
+        // Native 1080×1920 (9:16).  Client viewport 1000×500 (2:1).
+        // Height-bound at 500 keeps width at 500*1080/1920 = 281,
+        // rounded even = 280.
+        assert_eq!(
+            Session::per_client_encode_target(Some((1000, 500, 120)), 1080, 1920, &[]),
+            (280, 500)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_rounds_to_even() {
+        // Native 101×51 — odd dimensions.  Same-shape viewport rounds
+        // down to even.
+        assert_eq!(
+            Session::per_client_encode_target(Some((101, 51, 120)), 101, 51, &[]),
+            (100, 50)
+        );
+    }
+
+    #[test]
+    fn per_client_encode_target_floors_at_two() {
+        // Tiny viewport on a tall native — height-bound at 1 → width 0
+        // → floor to 2.  Encoders reject 0-dim and most reject 1-dim
+        // because chroma subsampling needs at least a 2×2 grid.
+        assert_eq!(
+            Session::per_client_encode_target(Some((1, 1, 120)), 100, 1000, &[]),
+            (2, 2)
         );
     }
 
