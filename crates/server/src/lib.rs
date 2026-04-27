@@ -562,6 +562,13 @@ struct SurfaceSubState {
     codec_override: u8,
     /// Per-surface quality override.  `None` = use server default.
     quality_override: Option<SurfaceQuality>,
+    /// Last per-client downscale target dims registered with the
+    /// compositor.  Used to send `ClearDownscaleTarget` for the old
+    /// dims when the encoder is recreated at a new size, so stale
+    /// downscale outputs don't accumulate in the compositor.  `None`
+    /// = no target registered yet (or the encoder was an external
+    /// GBM path that uses `external_outputs` instead).
+    last_registered_target: Option<(u32, u32)>,
 }
 
 struct ClientState {
@@ -3893,6 +3900,33 @@ async fn tick(state: &AppState) -> TickOutcome {
                 #[cfg(target_os = "linux")]
                 {
                     let (tw, th) = encoder.source_dimensions();
+                    // Clear the previously-registered downscale target
+                    // for this client/surface (if any) so stale entries
+                    // don't accumulate when the per-client target dims
+                    // change.  Externals replace by key in the renderer
+                    // (`set_external_output_buffers`) so they don't
+                    // need an explicit clear, but downscale targets do.
+                    let prev_target = sess
+                        .clients
+                        .get(&result.cid)
+                        .and_then(|c| c.surface_subs.get(&result.sid))
+                        .and_then(|s| s.last_registered_target);
+                    if let Some((pw, ph)) = prev_target
+                        && (pw, ph) != (tw, th)
+                        && let Some(cs) = sess.compositor.as_mut()
+                    {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::ClearDownscaleTarget {
+                                surface_id: result.sid as u32,
+                                target_w: pw,
+                                target_h: ph,
+                            },
+                        );
+                        // Drop any cached snapshot at the old size so
+                        // the encode loop can't pick it up after we've
+                        // moved on.
+                        cs.last_pixels.remove(&(result.sid, pw, ph));
+                    }
                     if let Some(bufs) = external_bufs
                         && !bufs.is_empty()
                         && let Some(cs) = sess.compositor.as_mut()
@@ -3920,6 +3954,13 @@ async fn tick(state: &AppState) -> TickOutcome {
                             },
                         );
                         cs.handle.wake();
+                    }
+                    if let Some(client) = sess.clients.get_mut(&result.cid) {
+                        client
+                            .surface_subs
+                            .entry(result.sid)
+                            .or_default()
+                            .last_registered_target = Some((tw, th));
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -5719,11 +5760,31 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             C2S_SURFACE_UNSUBSCRIBE if data.len() >= 3 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let mut removed_vulkan = false;
+                let mut clear_target: Option<(u32, u32)> = None;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
+                    clear_target = c
+                        .surface_subs
+                        .get(&surface_id)
+                        .and_then(|s| s.last_registered_target);
                     c.surface_subscriptions.remove(&surface_id);
                     c.surface_subs.remove(&surface_id);
                     removed_vulkan = c.vulkan_video_surfaces.remove(&surface_id).is_some();
                     c.surface_view_sizes.remove(&surface_id);
+                }
+                // Drop the per-client downscale target this client had
+                // registered so the compositor stops blitting into a
+                // BGRA buffer no encoder will ever read.
+                if let Some((tw, th)) = clear_target
+                    && let Some(cs) = sess.compositor.as_mut()
+                {
+                    let _ = cs.handle.command_tx.send(
+                        blit_compositor::CompositorCommand::ClearDownscaleTarget {
+                            surface_id: surface_id as u32,
+                            target_w: tw,
+                            target_h: th,
+                        },
+                    );
+                    cs.last_pixels.remove(&(surface_id, tw, th));
                 }
                 // Destroy Vulkan Video encoder if no remaining client needs it.
                 if removed_vulkan {
