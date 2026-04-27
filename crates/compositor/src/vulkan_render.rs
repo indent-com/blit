@@ -108,6 +108,16 @@ pub(crate) struct VulkanRenderer {
     /// The `usize` is the round-robin index.
     nv12_outputs: HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)>,
 
+    /// Server-allocated BGRA downscale targets, keyed by
+    /// `(surface_id, target_w, target_h)`.  Populated for per-client
+    /// encoders that don't import GBM buffers (NVENC, software h264,
+    /// software AV1).  After compositing at native size, the renderer
+    /// `vkCmdBlitImage`s (LINEAR) into each downscale target then
+    /// copies the result into a CPU-mapped staging buffer.  `retire_pending`
+    /// emits one `PixelData::Bgra` per downscale target so the per-client
+    /// encoder consumes target-sized BGRA without a CPU resize step.
+    downscale_outputs: HashMap<(u32, u32, u32), DownscaleOutput>,
+
     /// Persistent texture cache keyed by Wayland surface ObjectId.
     /// Textures are created at surface commit time and reused across
     /// frames until the surface commits a new buffer or is destroyed.
@@ -201,6 +211,12 @@ struct PendingSubmit {
     /// Native (compositor) frame size — the size we composited at.
     phys_w: u32,
     phys_h: u32,
+    /// Surface id used to look up downscale outputs at retire time.
+    surface_id: u32,
+    /// Per-target sizes whose downscale staging buffers contain valid
+    /// pixels that should be emitted as `PixelData::Bgra` once the
+    /// fence signals.
+    downscale_targets: Vec<(u32, u32)>,
     /// Toplevel surface_id this submission was rendered for, so async
     /// retirement can attribute the pixels to the correct surface.
     toplevel_sid: u16,
@@ -217,6 +233,21 @@ struct OutputImage {
     height: u32,
 
     /// Staging buffer for CPU readback (fallback when DMA-BUF export unavailable).
+    staging_buf: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    staging_ptr: *mut u8,
+}
+
+/// Server-allocated BGRA target sized at `(width, height)` for a
+/// per-client encoder that doesn't import GBM buffers.  The render
+/// loop blits the native composite into `image` (LINEAR downscale)
+/// and copies the result into `staging_*` for CPU readback by the
+/// per-client `SurfaceEncoder`.
+struct DownscaleOutput {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    width: u32,
+    height: u32,
     staging_buf: vk::Buffer,
     staging_mem: vk::DeviceMemory,
     staging_ptr: *mut u8,
@@ -849,6 +880,7 @@ impl VulkanRenderer {
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
             nv12_outputs: HashMap::new(),
+            downscale_outputs: HashMap::new(),
             surface_textures: HashMap::new(),
             pending_destroy_textures: Vec::new(),
         })
@@ -1154,6 +1186,7 @@ impl VulkanRenderer {
             }
         }
         self.destroy_nv12_outputs_for_surface(surface_id);
+        self.destroy_downscale_outputs_for_surface(surface_id);
     }
 
     fn destroy_all_external_outputs(&mut self) {
@@ -1168,6 +1201,213 @@ impl VulkanRenderer {
             }
         }
         self.destroy_all_nv12_outputs();
+        self.destroy_all_downscale_outputs();
+    }
+
+    // ---------------------------------------------------------------
+    // Server-allocated BGRA downscale targets
+    // ---------------------------------------------------------------
+
+    /// Allocate a BGRA downscale target sized at `(target_w, target_h)`
+    /// for `surface_id`.  Used by per-client encoders that don't import
+    /// GBM buffers (NVENC, software).  Re-registering an identical
+    /// target is a no-op so callers can register idempotently.
+    pub(crate) fn register_downscale_target(
+        &mut self,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+    ) {
+        let key = (surface_id, target_w, target_h);
+        if self.downscale_outputs.contains_key(&key) {
+            return;
+        }
+        let Some(out) = self.create_downscale_output(target_w, target_h) else {
+            eprintln!(
+                "[vulkan-render] failed to allocate downscale target {target_w}x{target_h} for sid {surface_id}",
+            );
+            return;
+        };
+        self.downscale_outputs.insert(key, out);
+        eprintln!(
+            "[vulkan-render] registered downscale target sid {surface_id} {target_w}x{target_h}",
+        );
+    }
+
+    /// Tear down a single downscale target, if registered.
+    pub(crate) fn clear_downscale_target(&mut self, surface_id: u32, target_w: u32, target_h: u32) {
+        if let Some(out) = self
+            .downscale_outputs
+            .remove(&(surface_id, target_w, target_h))
+        {
+            self.destroy_downscale_output(out);
+        }
+    }
+
+    fn destroy_downscale_outputs_for_surface(&mut self, surface_id: u32) {
+        let keys: Vec<(u32, u32, u32)> = self
+            .downscale_outputs
+            .keys()
+            .filter(|k| k.0 == surface_id)
+            .copied()
+            .collect();
+        for k in keys {
+            if let Some(out) = self.downscale_outputs.remove(&k) {
+                self.destroy_downscale_output(out);
+            }
+        }
+    }
+
+    fn destroy_all_downscale_outputs(&mut self) {
+        let outs: Vec<DownscaleOutput> = self.downscale_outputs.drain().map(|(_, v)| v).collect();
+        for out in outs {
+            self.destroy_downscale_output(out);
+        }
+    }
+
+    fn destroy_downscale_output(&self, out: DownscaleOutput) {
+        unsafe {
+            self.device.unmap_memory(out.staging_mem);
+            self.device.destroy_buffer(out.staging_buf, None);
+            self.device.free_memory(out.staging_mem, None);
+            self.device.destroy_image(out.image, None);
+            self.device.free_memory(out.memory, None);
+        }
+    }
+
+    fn create_downscale_output(&self, w: u32, h: u32) -> Option<DownscaleOutput> {
+        let format = vk::Format::B8G8R8A8_UNORM;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe {
+            self.device
+                .create_image(&image_info, None)
+                .inspect_err(|&e| {
+                    eprintln!("[create_downscale_output] create_image failed: {e}");
+                })
+                .ok()?
+        };
+        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
+        let mem_type = self.find_memory_type(
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe {
+            match self.device.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[create_downscale_output] allocate_memory failed: {e}");
+                    self.device.destroy_image(image, None);
+                    return None;
+                }
+            }
+        };
+        if unsafe { self.device.bind_image_memory(image, memory, 0) }.is_err() {
+            unsafe {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+            }
+            return None;
+        }
+
+        // Staging buffer for CPU readback.
+        let staging_size = (w as u64) * (h as u64) * 4;
+        let buf_info = vk::BufferCreateInfo::default()
+            .size(staging_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_buf = unsafe {
+            match self.device.create_buffer(&buf_info, None) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[create_downscale_output] create_buffer failed: {e}");
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return None;
+                }
+            }
+        };
+        let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
+        let buf_mem_type = self.find_memory_type(
+            buf_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        let Some(buf_mem_type) = buf_mem_type else {
+            unsafe {
+                self.device.destroy_buffer(staging_buf, None);
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+            }
+            return None;
+        };
+        let buf_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(buf_reqs.size)
+            .memory_type_index(buf_mem_type);
+        let staging_mem = unsafe {
+            match self.device.allocate_memory(&buf_alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[create_downscale_output] allocate_memory(staging) failed: {e}");
+                    self.device.destroy_buffer(staging_buf, None);
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return None;
+                }
+            }
+        };
+        if unsafe { self.device.bind_buffer_memory(staging_buf, staging_mem, 0) }.is_err() {
+            unsafe {
+                self.device.destroy_buffer(staging_buf, None);
+                self.device.free_memory(staging_mem, None);
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+            }
+            return None;
+        }
+        let staging_ptr = unsafe {
+            match self.device.map_memory(
+                staging_mem,
+                0,
+                vk::WHOLE_SIZE,
+                vk::MemoryMapFlags::empty(),
+            ) {
+                Ok(p) => p as *mut u8,
+                Err(e) => {
+                    eprintln!("[create_downscale_output] map_memory failed: {e}");
+                    self.device.destroy_buffer(staging_buf, None);
+                    self.device.free_memory(staging_mem, None);
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return None;
+                }
+            }
+        };
+
+        Some(DownscaleOutput {
+            image,
+            memory,
+            width: w,
+            height: h,
+            staging_buf,
+            staging_mem,
+            staging_ptr,
+        })
     }
 
     /// Query the Vulkan driver for the plane layout it expects for a
@@ -3406,10 +3646,12 @@ impl VulkanRenderer {
     }
 
     /// Non-blocking check: if the previous GPU submission has completed,
-    /// read back its result and return it.  Called from the compositor's
+    /// read back its results and return them.  Called from the compositor's
     /// main event loop so completed frames are flushed to the server
-    /// without waiting for the next Wayland surface commit.
-    pub fn try_retire_pending(&mut self) -> Option<(u16, u32, u32, PixelData)> {
+    /// without waiting for the next Wayland surface commit.  Returns one
+    /// entry for the native composite plus one per registered downscale
+    /// target (server-allocated BGRA at the per-client encoder size).
+    pub fn try_retire_pending(&mut self) -> Vec<(u16, u32, u32, PixelData)> {
         // The compositor calls this every iteration of its event loop
         // (once per Wayland event). We deliberately do NOT drain
         // deferred external submits here: that happens at submit time
@@ -3417,7 +3659,9 @@ impl VulkanRenderer {
         // frame rate rather than by Wayland event rate. Only the
         // self-allocated pending_submit needs per-iteration polling
         // because its staging readback is what produces a frame.
-        let pending = self.pending_submit.take()?;
+        let Some(pending) = self.pending_submit.take() else {
+            return Vec::new();
+        };
         let raw = unsafe {
             (self.device.fp_v1_0().wait_for_fences)(
                 self.device.handle(),
@@ -3429,20 +3673,27 @@ impl VulkanRenderer {
         };
         if raw != vk::Result::SUCCESS {
             self.pending_submit = Some(pending);
-            return None;
+            return Vec::new();
         }
         let toplevel_sid = pending.toplevel_sid;
-        let result = self.retire_pending(pending);
+        let results = self.retire_pending(pending);
         // Free per-frame temporary textures now that the GPU is done.
         self.free_frame_textures();
-        result.map(|(w, h, p)| (toplevel_sid, w, h, p))
+        results
+            .into_iter()
+            .map(|(w, h, p)| (toplevel_sid, w, h, p))
+            .collect()
     }
 
-    /// Produce the native BGRA result from a completed GPU submission.
-    /// External targets were emitted immediately by `render_tree_sized`
-    /// — `retire_pending` only handles the self-alloc staging readback.
-    fn retire_pending(&mut self, pending: PendingSubmit) -> Option<(u32, u32, PixelData)> {
-        let result = if pending.self_output_idx < self.output_images.len() {
+    /// Produce the native BGRA + per-downscale-target BGRA results from
+    /// a completed GPU submission.  External targets were emitted
+    /// immediately by `render_tree_sized` — `retire_pending` only
+    /// handles staging readback (native + downscale targets).
+    fn retire_pending(&mut self, pending: PendingSubmit) -> Vec<(u32, u32, PixelData)> {
+        let mut results: Vec<(u32, u32, PixelData)> = Vec::new();
+
+        // Native BGRA from the self-alloc output_image staging buffer.
+        if pending.self_output_idx < self.output_images.len() {
             let img = &self.output_images[pending.self_output_idx];
             if img.width != pending.phys_w || img.height != pending.phys_h {
                 // Output images were recreated (resize) between submit
@@ -3452,15 +3703,14 @@ impl VulkanRenderer {
                     "[retire_pending] output image size mismatch: pending={}x{} current={}x{} (resize during flight)",
                     pending.phys_w, pending.phys_h, img.width, img.height,
                 );
-                None
             } else {
                 let size = (pending.phys_w * pending.phys_h * 4) as usize;
                 let bgra = unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
-                Some((
+                results.push((
                     pending.phys_w,
                     pending.phys_h,
                     PixelData::Bgra(Arc::new(bgra)),
-                ))
+                ));
             }
         } else {
             eprintln!(
@@ -3468,8 +3718,25 @@ impl VulkanRenderer {
                 pending.self_output_idx,
                 self.output_images.len(),
             );
-            None
-        };
+        }
+
+        // Per-downscale-target BGRA — server-allocated targets that the
+        // render loop blitted into and copied to staging this frame.
+        for &(tw, th) in &pending.downscale_targets {
+            let Some(out) = self.downscale_outputs.get(&(pending.surface_id, tw, th)) else {
+                // Target was cleared between submit and retire.  Drop.
+                continue;
+            };
+            if out.width != tw || out.height != th {
+                eprintln!(
+                    "[retire_pending] downscale target {tw}x{th} resized mid-flight; dropping",
+                );
+                continue;
+            }
+            let size = (tw as usize) * (th as usize) * 4;
+            let bgra = unsafe { std::slice::from_raw_parts(out.staging_ptr, size) }.to_vec();
+            results.push((tw, th, PixelData::Bgra(Arc::new(bgra))));
+        }
 
         // Always free the fence, command buffer, and per-frame textures.
         unsafe {
@@ -3487,7 +3754,7 @@ impl VulkanRenderer {
                 self.device.free_memory(t.memory, None);
             }
         }
-        result
+        results
     }
 
     /// Free deferred external submissions whose fences have signalled.
@@ -3598,10 +3865,10 @@ impl VulkanRenderer {
             if raw == vk::Result::SUCCESS {
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
-                if r.is_none() {
-                    eprintln!("[render_tree_sized] fence OK but retire_pending=None");
+                if r.is_empty() {
+                    eprintln!("[render_tree_sized] fence OK but retire_pending=empty");
                 }
-                if let Some((w, h, p)) = r {
+                for (w, h, p) in r {
                     results.push((prev_sid, w, h, p));
                 }
             } else {
@@ -3718,6 +3985,23 @@ impl VulkanRenderer {
                 let idx = ext_idx % ext_vec.len();
                 Some((key.1, key.2, idx))
             })
+            .collect();
+
+        // Downscale targets (server-allocated BGRA, no GBM): same
+        // (sid, target_w, target_h) keying as externals.  These are
+        // for per-client encoders that don't import DMA-BUFs (NVENC,
+        // software).  Skip any (tw, th) that already has an external —
+        // the external path already produces a target-sized frame.
+        let mut downscale_target_keys: Vec<(u32, u32, u32)> = self
+            .downscale_outputs
+            .keys()
+            .filter(|k| k.0 == sid && !self.external_outputs.contains_key(k))
+            .copied()
+            .collect();
+        downscale_target_keys.sort_unstable();
+        let downscale_targets: Vec<(u32, u32)> = downscale_target_keys
+            .iter()
+            .map(|&(_, w, h)| (w, h))
             .collect();
 
         // Self-allocated native output image — always present.
@@ -4072,6 +4356,136 @@ impl VulkanRenderer {
             }
         }
 
+        // For each downscale target (server-allocated BGRA, no GBM):
+        // blit (LINEAR) the native composite into the target image
+        // then copy it into the CPU-mapped staging buffer.  retire_pending
+        // emits one PixelData::Bgra per downscale target so the per-client
+        // encoder receives target-sized BGRA without a CPU resize step.
+        for &(tw, th) in &downscale_targets {
+            let (ds_image, ds_staging) = {
+                let out = &self.downscale_outputs[&(sid, tw, th)];
+                (out.image, out.staging_buf)
+            };
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .image(ds_image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
+            }
+
+            let blit = vk::ImageBlit::default()
+                .src_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: phys_w as i32,
+                        y: phys_h as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: tw as i32,
+                        y: th as i32,
+                        z: 1,
+                    },
+                ]);
+            unsafe {
+                self.device.cmd_blit_image(
+                    cb,
+                    out_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ds_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::LINEAR,
+                );
+            }
+
+            // Transition to TRANSFER_SRC_OPTIMAL for the buffer copy.
+            let to_src = vk::ImageMemoryBarrier::default()
+                .image(ds_image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_src],
+                );
+            }
+
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width: tw,
+                    height: th,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                self.device.cmd_copy_image_to_buffer(
+                    cb,
+                    ds_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ds_staging,
+                    &[region],
+                );
+            }
+        }
+
         // Always copy the native composite into the staging buffer for
         // CPU readback.  Out_image is in TRANSFER_SRC_OPTIMAL after the
         // render pass — we never transitioned it (the blits above use
@@ -4201,6 +4615,8 @@ impl VulkanRenderer {
             self_output_idx,
             phys_w,
             phys_h,
+            surface_id: sid,
+            downscale_targets: downscale_targets.clone(),
             toplevel_sid,
         };
 

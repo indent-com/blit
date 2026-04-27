@@ -2690,25 +2690,17 @@ async fn tick(state: &AppState) -> TickOutcome {
     struct EncodeJob {
         cid: u64,
         sid: u16,
-        /// The frame size of `pixels` as supplied by the compositor.
-        /// When this client's per-client encoder has external
-        /// buffers registered, the compositor blits (LINEAR) the
-        /// native composite into a target-sized BGRA DMA-BUF and
-        /// emits one `SurfaceCommit` per registered target — so
-        /// `(px_w, px_h) == (target_w, target_h)` and the encoder
-        /// runs without scaling.  Without externals (NVENC, CPU
-        /// software encoders) we fall back to the largest cached
-        /// snapshot (the native composite) and `encode_pixels_scaled`
-        /// CPU-downscales into the encoder's source dims.
-        px_w: u32,
-        px_h: u32,
         /// The encoder's source dimensions, equal to this client's
-        /// physical viewport.  These go on the wire as the frame
-        /// `width`/`height` so each viewer can size its `<canvas>` to
-        /// its own bitstream rather than the compositor's native size.
+        /// physical viewport.  Pixels arrive at this size from the
+        /// compositor — either zero-copy via NV12/VA-Surface DMA-BUFs
+        /// (VAAPI GBM-backed externals) or a server-allocated BGRA
+        /// staging buffer that the compositor GPU-blit into at this
+        /// size (NVENC, software encoders).  These dims go on the
+        /// wire as the frame `width`/`height` so each viewer sizes
+        /// its `<canvas>` to its own bitstream.
         target_w: u32,
         target_h: u32,
-        /// Pixel data to encode.
+        /// Pixel data to encode (already at target size).
         pixels: blit_compositor::PixelData,
         needs_keyframe: bool,
         encoder: SurfaceEncoder,
@@ -2926,22 +2918,27 @@ async fn tick(state: &AppState) -> TickOutcome {
                 );
                 let (enc_w, enc_h) = (target_w, target_h);
 
-                // Look for a snapshot entry sized exactly for this
-                // client's encoder — the compositor produces one when the
-                // per-client encoder has registered external buffers.  If
-                // one doesn't exist, fall back to the native composite (a
-                // CPU encoder will downscale on the encode worker).
-                let (px_w, px_h, px_gen, px_timestamp_ms) = if pixel_snapshot
+                // The compositor produces one snapshot per (sid,
+                // target) once the per-client encoder has registered
+                // either an external buffer (VAAPI GBM) or a downscale
+                // target (NVENC, software).  Find it.  On the very
+                // first tick after encoder install the snapshot may not
+                // exist yet — skip and pick it up next tick.
+                let (px_w, px_h, px_gen, px_timestamp_ms) = match pixel_snapshot
                     .iter()
-                    .any(|&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
+                    .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
                 {
-                    pixel_snapshot
-                        .iter()
-                        .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
-                        .map(|&(_, w, h, g, t)| (w, h, g, t))
-                        .unwrap()
-                } else {
-                    (native_w, native_h, native_gen, native_ts)
+                    Some(&(_, w, h, g, t)) => (w, h, g, t),
+                    None => {
+                        // No target-sized snapshot yet (compositor
+                        // hasn't seen the registration roundtrip).
+                        // Use the native snapshot for the
+                        // Vulkan-Video / generation gate below; the
+                        // pixels lookup further down will fall back
+                        // to the native entry only when no external
+                        // / downscale target exists.
+                        (native_w, native_h, native_gen, native_ts)
+                    }
                 };
 
                 // Skip encoding if the pixel data hasn't changed since the
@@ -3291,8 +3288,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                 encode_jobs.push(EncodeJob {
                     cid: work.cid,
                     sid,
-                    px_w,
-                    px_h,
                     target_w: enc_w,
                     target_h: enc_h,
                     pixels,
@@ -3398,14 +3393,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if job.needs_keyframe {
                             encoder.request_keyframe();
                         }
-                        // The encoder runs at this client's target size.
-                        // The pixel buffer comes from the compositor at the
-                        // mediated native size; pass both so the encoder
-                        // can downscale (or skip the step entirely when
-                        // the dimensions match — the common single-client
-                        // case).
-                        let nal_data =
-                            encoder.encode_pixels_scaled(&job.pixels, job.px_w, job.px_h);
+                        // The compositor produces a target-sized
+                        // PixelData per registered (sid, target) — either
+                        // a zero-copy NV12/VA-Surface DMA-BUF (VAAPI
+                        // GBM-backed) or a server-allocated BGRA blit
+                        // staging buffer (NVENC, software).  Both arrive
+                        // at the encoder's source dimensions, so the
+                        // encoder consumes them directly with no CPU
+                        // resize step.
+                        let nal_data = encoder.encode_pixels(&job.pixels);
                         let codec_flag = encoder.codec_flag();
                         EncodeResult {
                             cid: job.cid,
@@ -3496,12 +3492,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // wasting work and risking feeding a C encoder (openh264)
                 // frames at the wrong resolution.
                 //
-                // The compositor's native size doesn't enter the check —
-                // the encoder runs at the *target* size (this client's
-                // physical viewport), and `encode_pixels_scaled`
-                // downscales from native into target.  Mismatches between
-                // native and target are expected and not a reason to
-                // discard the encoder.
+                // The encoder runs at the *target* size (this client's
+                // physical viewport).  The compositor produces pixels
+                // pre-downscaled to that target via GPU blit, so we
+                // never feed a wrong-resolution frame here — but if
+                // the client's view size has shifted while the encode
+                // was in flight the encoder's source dims won't match
+                // the new viewport and we drop it instead of risking a
+                // mismatched frame on the next tick.
                 let expected_dims: Option<(u32, u32)> = sess
                     .clients
                     .get(&result.cid)
@@ -3854,21 +3852,39 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let fresh_meta = fresh.map(|f| (f.name, f.codec_string));
 
                 #[cfg(target_os = "linux")]
-                if let Some(bufs) = external_bufs
-                    && !bufs.is_empty()
-                    && let Some(cs) = sess.compositor.as_mut()
                 {
                     let (tw, th) = encoder.source_dimensions();
-                    let _ = cs.handle.command_tx.send(
-                        blit_compositor::CompositorCommand::SetExternalOutputBuffers {
-                            surface_id: result.sid as u32,
-                            target_w: tw,
-                            target_h: th,
-                            buffers: bufs,
-                        },
-                    );
-                    cs.handle.wake();
+                    if let Some(bufs) = external_bufs
+                        && !bufs.is_empty()
+                        && let Some(cs) = sess.compositor.as_mut()
+                    {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::SetExternalOutputBuffers {
+                                surface_id: result.sid as u32,
+                                target_w: tw,
+                                target_h: th,
+                                buffers: bufs,
+                            },
+                        );
+                        cs.handle.wake();
+                    } else if let Some(cs) = sess.compositor.as_mut() {
+                        // No GBM externals — register a server-allocated
+                        // BGRA downscale target so the compositor can
+                        // GPU-blit the native composite into target-sized
+                        // BGRA for this encoder.  Idempotent in the
+                        // renderer.
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::RegisterDownscaleTarget {
+                                surface_id: result.sid as u32,
+                                target_w: tw,
+                                target_h: th,
+                            },
+                        );
+                        cs.handle.wake();
+                    }
                 }
+                #[cfg(not(target_os = "linux"))]
+                let _ = &encoder;
 
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     let state = client.surface_subs.entry(result.sid).or_default();
