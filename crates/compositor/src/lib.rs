@@ -226,7 +226,19 @@ mod stub {
         },
         SetExternalOutputBuffers {
             surface_id: u32,
+            target_w: u32,
+            target_h: u32,
             buffers: Vec<ExternalOutputBuffer>,
+        },
+        RegisterDownscaleTarget {
+            surface_id: u32,
+            target_w: u32,
+            target_h: u32,
+        },
+        ClearDownscaleTarget {
+            surface_id: u32,
+            target_w: u32,
+            target_h: u32,
         },
         /// Update the advertised output refresh rate (millihertz).
         SetRefreshRate {
