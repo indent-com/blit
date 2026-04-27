@@ -1,11 +1,5 @@
 ---
 import ThemeToggle from "./ThemeToggle.tsx";
-
-interface Props {
-  version?: string;
-}
-
-const { version = "v0.28" } = Astro.props;
 ---
 
 <header
@@ -34,10 +28,6 @@ const { version = "v0.28" } = Astro.props;
         </svg>
       </span>
       <span class="font-mono font-bold text-[15px] tracking-tight">blit</span>
-      <span
-        class="hidden sm:inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-[var(--dim)]"
-        >{version}</span
-      >
     </a>
     <nav class="flex items-center gap-1 text-[13px] sm:gap-3">
       <a
