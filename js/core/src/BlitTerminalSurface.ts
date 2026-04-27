@@ -108,6 +108,7 @@ export class BlitTerminalSurface {
   private dpr: number;
 
   private scrollOffset = 0;
+  private wheelLineAccum = 0;
   private scrollFade = 0;
   private scrollFadeTimer: ReturnType<typeof setTimeout> | null = null;
   private scrollbarGeo: {
@@ -1314,6 +1315,7 @@ export class BlitTerminalSurface {
         e.preventDefault();
         if (this.scrollOffset > 0) {
           this.scrollOffset = 0;
+          this.wheelLineAccum = 0;
           this.sendScroll(this._sessionId!, 0);
         }
         if (
@@ -1454,13 +1456,33 @@ export class BlitTerminalSurface {
         const maxScroll = t ? t.scrollback_lines() : 0;
         if (maxScroll === 0 && this.scrollOffset === 0) return;
         e.preventDefault();
-        const delta =
+        const rawDelta =
           Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
-        const lines = Math.round(-delta / 20) || (delta > 0 ? -3 : 3);
-        this.scrollOffset = Math.max(
+        // Honour the browser-reported deltaMode so notched wheels,
+        // high-precision trackpads, and page-mode devices all map
+        // onto whole terminal lines via the same accumulator.
+        let lineDelta: number;
+        switch (e.deltaMode) {
+          case WheelEvent.DOM_DELTA_PIXEL:
+            lineDelta = rawDelta / Math.max(1, this.cell.h);
+            break;
+          case WheelEvent.DOM_DELTA_PAGE:
+            lineDelta = rawDelta * (t ? t.rows : 24);
+            break;
+          default:
+            lineDelta = rawDelta;
+        }
+        this.wheelLineAccum -= lineDelta;
+        const lines = Math.trunc(this.wheelLineAccum);
+        if (lines === 0) return;
+        this.wheelLineAccum -= lines;
+        const next = Math.max(
           0,
           Math.min(maxScroll, this.scrollOffset + lines),
         );
+        if (next === 0 || next === maxScroll) this.wheelLineAccum = 0;
+        if (next === this.scrollOffset) return;
+        this.scrollOffset = next;
         this.sendScroll(this._sessionId!, this.scrollOffset);
         if (this.scrollOffset > 0) this.flashScrollbar();
         this.scheduleRender();
