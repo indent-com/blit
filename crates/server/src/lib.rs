@@ -1944,6 +1944,20 @@ impl Session {
                 continue;
             }
             if let Some((w, h, scale_120)) = self.mediated_size_for_surface(sid, max) {
+                static RDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = RDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 30 || n.is_multiple_of(200) {
+                    eprintln!(
+                        "[mediate-resize #{n}] sid={sid} -> {w}x{h} scale={scale_120} (clients: {})",
+                        self.clients
+                            .values()
+                            .filter(|c| c.surface_subscriptions.contains(&sid))
+                            .filter_map(|c| c.surface_view_sizes.get(&sid))
+                            .map(|&(w, h, s)| format!("{w}x{h}@{s}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
                 self.resize_surface(sid, w, h, scale_120);
             }
         }
@@ -2962,13 +2976,24 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
 
+                let view = client.surface_view_sizes.get(&sid).copied();
                 let (target_w, target_h) = Session::per_client_encode_target(
-                    client.surface_view_sizes.get(&sid).copied(),
+                    view,
                     native_w,
                     native_h,
                     &state.config.surface_encoders,
                 );
                 let (enc_w, enc_h) = (target_w, target_h);
+                if state.config.verbose {
+                    static EDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = EDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 30 || n.is_multiple_of(500) {
+                        eprintln!(
+                            "[encode-target #{n}] cid={} sid={sid} view={view:?} native={native_w}x{native_h} target={target_w}x{target_h}",
+                            work.cid,
+                        );
+                    }
+                }
 
                 // The compositor produces one snapshot per (sid,
                 // target) once the per-client encoder has registered
