@@ -18,10 +18,10 @@ const embedCode = `<span class="text-[var(--hl-kw)]">import</span> { <span class
 &lt;/<span class="text-[var(--hl-fn)]">BlitWorkspaceProvider</span>&gt;`;
 
 const packages = [
-  { name: "@blit-sh/core", desc: "framework-agnostic core, transports, renderer" },
+  { name: "@blit-sh/core", desc: "framework-agnostic core, transports, renderers" },
   { name: "@blit-sh/react", desc: "thin React wrapper: provider, hooks, components" },
   { name: "@blit-sh/solid", desc: "thin Solid wrapper: primitives + components" },
-  { name: "@blit-sh/browser", desc: "WASM diff engine + WebGL vertex builder" },
+  { name: "@blit-sh/browser", desc: "WASM diff engine + vertex builder" },
 ];
 ---
 
@@ -71,8 +71,8 @@ const packages = [
           <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1.5 py-0.5 font-mono text-[12.5px]">@blit-sh/solid</code>
           give you a workspace context, hooks for sessions and focus, and
           a <code class="rounded border border-[var(--border)] bg-[var(--code-bg)] px-1.5 py-0.5 font-mono text-[12.5px]">&lt;BlitTerminal&gt;</code>
-          component. WebGPU rendered with a WebGL2 fallback. Zero DOM
-          manipulation.
+          component. WebGPU when available, WebGL2 and canvas2d
+          fallbacks. Zero DOM manipulation.
         </p>
 
         <ul class="mt-6 flex flex-col gap-2">
