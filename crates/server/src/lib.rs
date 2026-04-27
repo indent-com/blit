@@ -3261,26 +3261,29 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
 
             for result in results {
-                // Return the encoder to the client, but only if its
-                // dimensions still match the current surface.  A resize
-                // that arrived while the encode was in flight will have
-                // invalidated the old encoder; reinserting the stale one
-                // would force the next tick to discard and recreate it,
-                // wasting work and risking feeding a C encoder (openh264)
-                // frames at the wrong resolution.
-                let expected_dims: Option<(u32, u32)> = sess
-                    .compositor
-                    .as_ref()
-                    .and_then(|cs| cs.last_pixels.get(&result.sid))
-                    .map(|lp| (lp.width, lp.height));
-                let dims_match =
-                    expected_dims.is_some_and(|d| result.encoder.source_dimensions() == d);
-
+                // Return the encoder to the client unless a resubscribe
+                // invalidated it mid-encode (codec/quality changed).
+                //
+                // We deliberately do NOT discard based on the current
+                // `last_pixels` size: that races with SurfaceCommit /
+                // SurfaceResized events processed by ticks that ran
+                // while this encode was in flight, so the encoder was
+                // dropped on every transient mismatch and the next
+                // tick had to rebuild it from scratch — visible as a
+                // continuous `[surface-encoder] ... using ...` log
+                // spam even when the user hasn't resized anything.
+                //
+                // The next tick's `needs_new_encoder` check
+                // (`source_dimensions() != (enc_w, enc_h)`) is the
+                // authoritative gate against feeding pixels at the
+                // wrong resolution to a C encoder (openh264): if the
+                // surface really has resized, that check rebuilds the
+                // encoder before the first encode at the new size.
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     let state = client.surface_subs.entry(result.sid).or_default();
                     state.encode_in_flight = false;
                     let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
-                    if dims_match && !invalidated {
+                    if !invalidated {
                         state.encoder = Some(result.encoder);
                     }
                     // Record the generation we just encoded so we don't
