@@ -1,6 +1,6 @@
 {
   "name": "@blit-sh/core",
-  "version": "0.30.0",
+  "version": "0.30.1",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
