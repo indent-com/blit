@@ -389,6 +389,34 @@ fn last_pixels_remove_for_sid(last_pixels: &mut HashMap<(u16, u32, u32), LastPix
     }
 }
 
+/// Authoritative compositor native dims for `sid`, preferring the value
+/// stored from the most recent `SurfaceResized` event.  Falls back to the
+/// largest entry in the per-target pixel snapshot when the resized event
+/// hasn't been received yet (very first render after `SurfaceCreated`).
+///
+/// Native MUST NOT be derived from `pixel_snapshot.max_by_key(area)` once
+/// the `SurfaceResized` value exists: the renderer can blit into stale
+/// `external_outputs` / `downscale_outputs` entries (registered for prior
+/// per-client targets) and those produce extra pixel snapshots at the
+/// old, possibly-larger sizes.  The largest-area pick then yields a
+/// stale value, mis-clamping `per_client_encode_target` and triggering
+/// avoidable encoder rebuilds — and on aspect-ratio mismatches, freezing
+/// visible frames at the stale target until the entry is cleared.
+fn compositor_native_for_sid(
+    native_sizes: &HashMap<u16, (u32, u32)>,
+    pixel_snapshot: &[(u16, u32, u32, u64, u32)],
+    sid: u16,
+) -> Option<(u32, u32)> {
+    if let Some(&dims) = native_sizes.get(&sid) {
+        return Some(dims);
+    }
+    pixel_snapshot
+        .iter()
+        .filter(|&&(s, _, _, _, _)| s == sid)
+        .max_by_key(|&&(_, w, h, _, _)| (w as u64) * (h as u64))
+        .map(|&(_, w, h, _, _)| (w, h))
+}
+
 struct SharedCompositor {
     handle: CompositorHandle,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
@@ -419,6 +447,22 @@ struct SharedCompositor {
     /// when the Wayland client sets `xdg_geometry` (e.g. excluding a
     /// title bar), so we compare against the actually-requested values.
     last_configured_size: HashMap<u16, (u16, u16, u16)>,
+    /// Authoritative compositor native (physical) size per surface, set from
+    /// `CompositorEvent::SurfaceResized`.  Used by the per-client encode
+    /// target computation as the `(native_w, native_h)` clamp.
+    ///
+    /// Why not derive native from `last_pixels.max_by_key((w, h))`?  The
+    /// renderer can blit into stale `external_outputs` / `downscale_outputs`
+    /// entries (registered for prior per-client targets that no longer match
+    /// the current native).  Those produce extra `last_pixels` entries at
+    /// the old, possibly-larger sizes.  Picking the largest entry as
+    /// "native" then yields a stale value, which mis-clamps
+    /// `per_client_encode_target` and triggers an avoidable encoder
+    /// rebuild — and on aspect-ratio mismatches between old downscale
+    /// targets and new compositor native, the encoder ends up sized for
+    /// the stale target, freezing visible frames at the wrong size until
+    /// the stale entry is cleared.
+    native_sizes: HashMap<u16, (u32, u32)>,
     /// Audio capture pipeline (PipeWire daemon → in-process libpipewire capture → Opus encode).
     /// `None` when PipeWire is not available or `BLIT_AUDIO=0`.
     #[cfg(target_os = "linux")]
@@ -1636,6 +1680,7 @@ impl Session {
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
                 last_configured_size: HashMap::new(),
+                native_sizes: HashMap::new(),
                 #[cfg(target_os = "linux")]
                 audio_pipeline,
                 #[cfg(target_os = "linux")]
@@ -2559,6 +2604,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.surfaces.remove(&surface_id);
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     cs.last_configured_size.remove(&surface_id);
+                    cs.native_sizes.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
                 }
@@ -2615,6 +2661,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.width = width;
                         info.height = height;
                     }
+                    cs.native_sizes
+                        .insert(surface_id, (width as u32, height as u32));
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     // Don't eagerly invalidate client encoders here.  The
                     // encode path already checks for dimension mismatches
@@ -2931,20 +2979,37 @@ async fn tick(state: &AppState) -> TickOutcome {
 
         for work in &client_work {
             for &sid in &work.subs {
-                // Pick the largest snapshot entry for this surface — that's
-                // the compositor's native composite, which we use both for
-                // the per-client target clamp and as a fallback source for
-                // CPU encoders that don't have a registered external.
-                let Some(&(_, native_w, native_h, native_gen, native_ts)) = pixel_snapshot
-                    .iter()
-                    .filter(|&&(s, _, _, _, _)| s == sid)
-                    .max_by_key(|&&(_, w, h, _, _)| (w as u64) * (h as u64))
-                else {
+                // Native dims come from the authoritative `native_sizes`
+                // map (see `compositor_native_for_sid` for why the
+                // historical "largest pixel snapshot" pick is wrong
+                // after a resize).
+                let Some((native_w, native_h)) = sess.compositor.as_ref().and_then(|cs| {
+                    compositor_native_for_sid(&cs.native_sizes, &pixel_snapshot, sid)
+                }) else {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     client.skip_last_pixels_mismatch_count =
                         client.skip_last_pixels_mismatch_count.saturating_add(1);
                     continue;
                 };
+                // Generation / timestamp for the same-gen skip and the
+                // Vulkan-Video fast-path fallback come from the
+                // matching native pixel entry when present, else from
+                // the largest entry for this surface (best effort).
+                // These are only consulted when no exact-target snapshot
+                // exists, in which case the dispatch loop skips with
+                // `(px_w, px_h) != (target_w, target_h)` anyway, so the
+                // values are not safety-critical.
+                let (native_gen, native_ts) = pixel_snapshot
+                    .iter()
+                    .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (native_w, native_h))
+                    .or_else(|| {
+                        pixel_snapshot
+                            .iter()
+                            .filter(|&&(s, _, _, _, _)| s == sid)
+                            .max_by_key(|&&(_, w, h, _, _)| (w as u64) * (h as u64))
+                    })
+                    .map(|&(_, _, _, g, t)| (g, t))
+                    .unwrap_or((0, 0));
                 {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     client.encode_loop_iters = client.encode_loop_iters.saturating_add(1);
@@ -4823,16 +4888,23 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // surface list and wipes restored surface assignments.
         if let Some(cs) = sess.compositor.as_ref() {
             for info in cs.surfaces.values() {
-                // Use the latest known pixel dimensions if the stored
+                // Use the authoritative native size if the stored
                 // width/height is still 0 (surface created before first
-                // commit).  The largest cached entry for this surface is
-                // its native composite — use that.
+                // commit).  Falling back to the largest pixel snapshot
+                // entry would give a stale per-client downscale-target
+                // size for surfaces that have already cycled through
+                // resizes (see `compositor_native_for_sid`).
                 let (w, h) = if info.width == 0 && info.height == 0 {
-                    cs.last_pixels
-                        .iter()
-                        .filter(|(k, _)| k.0 == info.surface_id)
-                        .max_by_key(|(_, lp)| (lp.width as u64) * (lp.height as u64))
-                        .map(|(_, lp)| (lp.width as u16, lp.height as u16))
+                    cs.native_sizes
+                        .get(&info.surface_id)
+                        .map(|&(w, h)| (w as u16, h as u16))
+                        .or_else(|| {
+                            cs.last_pixels
+                                .iter()
+                                .filter(|(k, _)| k.0 == info.surface_id)
+                                .max_by_key(|(_, lp)| (lp.width as u64) * (lp.height as u64))
+                                .map(|(_, lp)| (lp.width as u16, lp.height as u16))
+                        })
                         .unwrap_or((0, 0))
                 } else {
                     (info.width, info.height)
@@ -6689,6 +6761,57 @@ mod tests {
         assert_eq!(
             Session::per_client_encode_target(Some((1, 1, 120)), 100, 1000, &[]),
             (2, 2)
+        );
+    }
+
+    /// Regression: after a resize-shrink, stale per-client downscale
+    /// targets (registered for the prior, larger native) can still
+    /// produce `last_pixels` entries at sizes larger than the actual
+    /// new native.  `compositor_native_for_sid` MUST consult the
+    /// authoritative `native_sizes` map first so
+    /// `per_client_encode_target` is computed against the real native,
+    /// not the stale entry.  Without this, the encoder rebuilds at the
+    /// wrong size and visible frames freeze until the stale target is
+    /// cleared.
+    #[test]
+    fn compositor_native_for_sid_prefers_resize_event_over_stale_pixel_snapshot() {
+        let mut native_sizes = HashMap::new();
+        native_sizes.insert(1u16, (640u32, 360u32));
+        // Renderer just blitted into a stale 1920x1080 downscale target
+        // and a fresh 640x360 native composite, so `last_pixels` (and
+        // `pixel_snapshot`) carry both sizes.  The 1920x1080 entry is
+        // larger, so the legacy `max_by_key((w, h))` pick would mis-
+        // identify it as native.
+        let pixel_snapshot: Vec<(u16, u32, u32, u64, u32)> =
+            vec![(1, 640, 360, 10, 0), (1, 1920, 1080, 9, 0)];
+        assert_eq!(
+            compositor_native_for_sid(&native_sizes, &pixel_snapshot, 1),
+            Some((640, 360)),
+        );
+    }
+
+    /// First render after `SurfaceCreated` may arrive before the
+    /// `SurfaceResized` event, so `native_sizes` is empty.  Falling
+    /// back to the largest pixel-snapshot entry keeps the encode loop
+    /// from skipping forever in that bootstrap window.
+    #[test]
+    fn compositor_native_for_sid_falls_back_to_largest_snapshot_entry() {
+        let native_sizes = HashMap::new();
+        let pixel_snapshot: Vec<(u16, u32, u32, u64, u32)> =
+            vec![(1, 320, 240, 5, 0), (1, 800, 600, 6, 0)];
+        assert_eq!(
+            compositor_native_for_sid(&native_sizes, &pixel_snapshot, 1),
+            Some((800, 600)),
+        );
+    }
+
+    #[test]
+    fn compositor_native_for_sid_returns_none_for_unknown_sid() {
+        let native_sizes = HashMap::new();
+        let pixel_snapshot: Vec<(u16, u32, u32, u64, u32)> = vec![(2, 640, 360, 1, 0)];
+        assert_eq!(
+            compositor_native_for_sid(&native_sizes, &pixel_snapshot, 1),
+            None,
         );
     }
 
