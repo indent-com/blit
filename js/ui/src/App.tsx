@@ -19,7 +19,6 @@ import {
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
-import { isEncrypted, decryptPassphrase } from "./passphrase-crypto";
 import { PASSPHRASE_KEY } from "./passphrase-storage";
 
 function readPassphrase(): string | null {
@@ -37,7 +36,6 @@ function readPassphrase(): string | null {
   // to localStorage and strip it from the URL so it doesn't end up in
   // browser history or get re-shared accidentally.
   const decoded = decodeURIComponent(first);
-  const fromHash = isEncrypted(decoded) ? decryptPassphrase(decoded) : decoded;
   const rest = raw.split("&").slice(1);
   const newHash = rest.filter(Boolean).join("&");
   history.replaceState(
@@ -45,11 +43,11 @@ function readPassphrase(): string | null {
     "",
     `${location.pathname}${newHash ? `#${newHash}` : ""}`,
   );
-  if (fromHash) {
+  if (decoded) {
     try {
-      localStorage.setItem(PASSPHRASE_KEY, fromHash);
+      localStorage.setItem(PASSPHRASE_KEY, decoded);
     } catch {}
-    return fromHash;
+    return decoded;
   }
   return stored;
 }

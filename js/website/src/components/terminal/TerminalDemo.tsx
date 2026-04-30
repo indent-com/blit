@@ -22,7 +22,6 @@ import type {
 } from "@blit-sh/core";
 import { initWasm } from "../../lib/wasm";
 import { createSurfaces } from "../../lib/surfaces";
-import { isEncrypted, decryptPassphrase } from "../../lib/passphrase-crypto";
 import { readStoredSecret, writeStoredSecret } from "../../lib/secret-storage";
 import { createDebugLog, type DebugLog } from "./DebugPanel";
 import TabBar from "./TabBar";
@@ -51,28 +50,11 @@ function resolvePassphrase(): PassphraseResult {
   const raw = decodeURIComponent(location.hash.slice(1));
 
   if (raw) {
-    // Secret arrived via URL — accept legacy encrypted form too. Migrate to
-    // localStorage and clean the URL so the secret doesn't linger in browser
-    // history.
-    const passphrase = isEncrypted(raw) ? decryptPassphrase(raw) : raw;
+    // Secret arrived via URL — migrate to localStorage and clean the URL
+    // so the secret doesn't linger in browser history.
     history.replaceState(null, "", "/s");
-    if (!passphrase) {
-      const stored = readStoredSecret();
-      if (stored) {
-        return { ok: true, passphrase: stored, readOnly: stored.endsWith(".ro") };
-      }
-      return {
-        ok: false,
-        error:
-          "Cannot decrypt link. This link was created on a different device.",
-      };
-    }
-    writeStoredSecret(passphrase);
-    return {
-      ok: true,
-      passphrase,
-      readOnly: passphrase.endsWith(".ro"),
-    };
+    writeStoredSecret(raw);
+    return { ok: true, passphrase: raw, readOnly: raw.endsWith(".ro") };
   }
 
   const stored = readStoredSecret();
