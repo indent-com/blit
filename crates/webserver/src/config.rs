@@ -245,10 +245,7 @@ pub fn parse_remotes_full(contents: &str) -> Vec<RemoteEntry> {
             },
         );
     }
-    order
-        .into_iter()
-        .map(|k| map.remove(&k).unwrap())
-        .collect()
+    order.into_iter().map(|k| map.remove(&k).unwrap()).collect()
 }
 
 fn serialize_remotes(entries: &[RemoteEntry]) -> String {

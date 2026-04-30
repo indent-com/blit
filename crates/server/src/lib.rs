@@ -1,15 +1,14 @@
 use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
 use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use blit_remote::{
-    C2S_ACK, C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS,
-    C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST, C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE,
-    C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT,
-    C2S_KILL, C2S_MOUSE, C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL,
-    C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE,
-    C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
-    C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
-    C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG,
-    CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_AUDIO, FEATURE_COMPOSITOR,
+    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
+    C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
+    C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE, C2S_PING, C2S_QUIT,
+    C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK,
+    C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
+    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE,
+    C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_COMPOSITOR,
     FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
     READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
     S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
@@ -17,6 +16,8 @@ use blit_remote::{
     msg_s2c_clipboard_list, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
     msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
 };
+#[cfg(target_os = "linux")]
+use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -434,6 +435,7 @@ struct SharedCompositor {
     /// carry distinct `elapsed_ms` timestamps — video players (mpv)
     /// use these to pace their presentation clock.  Supports up to 1 kHz.
     last_frame_request: HashMap<u16, Instant>,
+    #[cfg(target_os = "linux")]
     created_at: Instant,
     /// Monotonically increasing counter for pixel generations.
     pixel_generation: u64,
@@ -622,12 +624,14 @@ struct ClientState {
     /// Dedicated channel for audio frames.  The writer task selects on this
     /// with higher priority than the main outbox so audio is never starved
     /// by large video/terminal messages.
+    #[cfg(target_os = "linux")]
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     lead: Option<u16>,
     subscriptions: HashSet<u16>,
     /// Active surface subscriptions for this client.
     surface_subscriptions: HashSet<u16>,
     /// Whether this client is subscribed to audio frames.
+    #[cfg(target_os = "linux")]
     audio_subscribed: bool,
     /// Per-client audio bitrate preference in kbps from C2S_AUDIO_SUBSCRIBE.
     /// 0 means use the server/env default.
@@ -1600,10 +1604,12 @@ impl Session {
         gpu_device: &str,
     ) -> &str {
         if self.compositor.is_none() {
+            #[cfg(target_os = "linux")]
             let session_id = self.next_compositor_id;
             self.next_compositor_id = self.next_compositor_id.wrapping_add(1);
             // Create the epoch before spawning anything so audio and video
             // share the same time origin for A/V sync.
+            #[cfg(target_os = "linux")]
             let created_at = Instant::now();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             #[cfg(target_os = "linux")]
@@ -1676,6 +1682,7 @@ impl Session {
                 surfaces: HashMap::new(),
                 last_pixels: HashMap::new(),
                 last_frame_request: HashMap::new(),
+                #[cfg(target_os = "linux")]
                 created_at,
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
@@ -3822,7 +3829,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .map(|job| {
                     tokio::task::spawn_blocking(move || {
                         let params = job.params;
-                        let mut encoder = match SurfaceEncoder::new(
+                        let encoder = match SurfaceEncoder::new(
                             &params.preferences,
                             job.target_w,
                             job.target_h,
@@ -4675,7 +4682,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    #[cfg(target_os = "linux")]
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    #[cfg(not(target_os = "linux"))]
+    let (_, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
     let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
     let sender_outbox_queued_frames = outbox_frame_counter.clone();
@@ -4801,10 +4811,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 tx: out_tx,
                 outbox_queued_frames: outbox_frame_counter,
                 outbox_queued_bytes: outbox_byte_counter,
+                #[cfg(target_os = "linux")]
                 audio_tx,
                 lead: None,
                 subscriptions: HashSet::new(),
                 surface_subscriptions: HashSet::new(),
+                #[cfg(target_os = "linux")]
                 audio_subscribed: false,
                 #[cfg(target_os = "linux")]
                 audio_bitrate_kbps: 0,
@@ -4865,11 +4877,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // Wake the tick loop so the new client gets its first frame.
         state.delivery_notify.notify_one();
         if let Some(c) = sess.clients.get(&client_id) {
-            let mut features = FEATURE_CREATE_NONCE
+            let features = FEATURE_CREATE_NONCE
                 | FEATURE_RESTART
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
                 | FEATURE_COMPOSITOR;
+            #[cfg(target_os = "linux")]
+            let mut features = features;
             #[cfg(target_os = "linux")]
             {
                 let audio_disabled = std::env::var("BLIT_AUDIO")

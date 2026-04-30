@@ -297,7 +297,9 @@ export function RemotesOverlay(props: {
                     ? "share:\u2022\u2022\u2022\u2022"
                     : remote().uri;
                 const status = () =>
-                  disabled() ? null : (props.statuses?.get(remote().name) ?? null);
+                  disabled()
+                    ? null
+                    : (props.statuses?.get(remote().name) ?? null);
                 const statusColor = () => {
                   const s = status();
                   return s
@@ -480,10 +482,7 @@ export function RemotesOverlay(props: {
                       </Show>
 
                       {/* Reconnect — hidden for disabled entries */}
-                      <Show
-                        when={!disabled()}
-                        fallback={<div />}
-                      >
+                      <Show when={!disabled()} fallback={<div />}>
                         <button
                           type="button"
                           title={t("disconnected.reconnectNow")}

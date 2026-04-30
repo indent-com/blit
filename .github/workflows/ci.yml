@@ -20,6 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
       - run: ./bin/lint
 
   dev-check:
@@ -29,6 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
       - run: nix develop --command ./bin/dev-check
 
   test:
@@ -42,6 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
       - run: ./bin/tests
 
   e2e:
@@ -50,6 +53,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
       - run: ./bin/e2e
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
@@ -66,6 +70,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
       - name: Run tests with coverage
         run: ./bin/coverage
       - name: Upload HTML report

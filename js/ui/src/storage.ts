@@ -1,7 +1,10 @@
 import { createSignal, onCleanup } from "solid-js";
 import { PALETTES, DEFAULT_FONT } from "@blit-sh/core";
 import type { TerminalPalette } from "@blit-sh/core";
-import { readStoredPassphrase, clearStoredPassphrase } from "./passphrase-storage";
+import {
+  readStoredPassphrase,
+  clearStoredPassphrase,
+} from "./passphrase-storage";
 
 // ---------------------------------------------------------------------------
 // Remotes — live list of named remote connections from the config WebSocket

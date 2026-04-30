@@ -349,6 +349,7 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
+      rm -f js/ui/dist/index.html js/ui/dist/index.html.br
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
 
       echo "=== Clippy ==="
@@ -370,6 +371,7 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
+      rm -f js/ui/dist/index.html js/ui/dist/index.html.br
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
 
       outdir="''${1:-coverage-report}"
