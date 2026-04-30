@@ -1,5 +1,5 @@
 import { createSignal } from "solid-js";
-import { encryptPassphrase } from "../lib/passphrase-crypto";
+import { writeStoredSecret } from "../lib/secret-storage";
 
 export default function JoinForm() {
   const [secret, setSecret] = createSignal("");
@@ -9,8 +9,8 @@ export default function JoinForm() {
     e.preventDefault();
     const trimmed = secret().trim();
     if (trimmed) {
-      const encrypted = encryptPassphrase(trimmed);
-      window.location.href = `/s#${encodeURIComponent(encrypted)}`;
+      writeStoredSecret(trimmed);
+      window.location.href = "/s";
     }
   };
 

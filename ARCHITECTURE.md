@@ -200,9 +200,9 @@ Special key: `target = <uri-or-name>` — sets the default connection target for
 
 ### `blit.remotes` — named remotes (mode 0600)
 
-`name = uri` pairs, one per line. Contains passphrases for `share:` destinations and SSH host references, so permissions are restricted.
+`name = uri` pairs, one per line. Lines starting with `# name = uri` are **disabled** entries: kept on disk but excluded from connection resolution until re-enabled. Other `#` lines are plain comments and ignored. Contains passphrases for `share:` destinations and SSH host references, so permissions are restricted.
 
-Managed with `blit remote add/remove/list/set-default`. Watched at runtime by `blit gateway` and the CLI's embedded gateway — changes are pushed live to all open `/config` WebSocket clients as `remotes:<text>` messages.
+Managed with `blit remote add/remove/toggle/list/set-default`. Watched at runtime by `blit gateway` and the CLI's embedded gateway — changes are pushed live to all open `/config` WebSocket clients as `remotes:<text>` messages.
 
 ---
 

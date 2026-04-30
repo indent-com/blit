@@ -1,7 +1,7 @@
 import { createSignal, onCleanup } from "solid-js";
 import { PALETTES, DEFAULT_FONT } from "@blit-sh/core";
 import type { TerminalPalette } from "@blit-sh/core";
-import { isEncrypted, decryptPassphrase } from "./passphrase-crypto";
+import { readStoredPassphrase, clearStoredPassphrase } from "./passphrase-storage";
 
 // ---------------------------------------------------------------------------
 // Remotes — live list of named remote connections from the config WebSocket
@@ -10,19 +10,29 @@ import { isEncrypted, decryptPassphrase } from "./passphrase-crypto";
 export interface Remote {
   name: string;
   uri: string;
+  /** True for `# name = uri` lines: kept on disk but excluded from resolution. */
+  disabled: boolean;
 }
 
-/** Parse a raw blit.remotes text (`name = uri` lines) into an ordered array. */
+/** Parse a raw blit.remotes text into an ordered array.
+ *  `name = uri` is enabled, `# name = uri` is disabled. Pure comments (no
+ *  `name = uri` body) and blank lines are ignored. */
 export function parseRemotesText(text: string): Remote[] {
   const result: Remote[] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
+    if (!trimmed) continue;
+    let body = trimmed;
+    let disabled = false;
+    if (body.startsWith("#")) {
+      body = body.slice(1).trimStart();
+      disabled = true;
+    }
+    const eq = body.indexOf("=");
     if (eq <= 0) continue;
-    const name = trimmed.slice(0, eq).trim();
-    const uri = trimmed.slice(eq + 1).trim();
-    if (name && uri) result.push({ name, uri });
+    const name = body.slice(0, eq).trim();
+    const uri = body.slice(eq + 1).trim();
+    if (name && uri) result.push({ name, uri, disabled });
   }
   return result;
 }
@@ -57,6 +67,13 @@ export function addRemote(name: string, uri: string): void {
 export function removeRemote(name: string): void {
   if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
   configWs.send(`remotes-remove ${name}`);
+}
+
+/** Toggle a remote's enabled/disabled state. Disabled remotes are kept
+ *  in blit.remotes (commented out) so they can be re-enabled later. */
+export function toggleRemote(name: string): void {
+  if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
+  configWs.send(`remotes-toggle ${name}`);
 }
 
 /** Set the default remote by writing `target = <name>` to blit.conf. */
@@ -149,16 +166,6 @@ const [configWsStatus, setConfigWsStatus] =
   createSignal<ConfigWsStatus>("connecting");
 export { configWsStatus };
 
-function getPassphraseFromHash(): string | null {
-  const raw = location.hash.slice(1);
-  if (!raw) return null;
-  const first = raw.split("&")[0];
-  if (/^[lpa]=/.test(first)) return null;
-  const decoded = decodeURIComponent(first);
-  if (isEncrypted(decoded)) return decryptPassphrase(decoded);
-  return decoded;
-}
-
 /** Close the config WebSocket and stop reconnection attempts. */
 export function disconnectConfigWs(): void {
   if (configWs) {
@@ -172,7 +179,7 @@ export function disconnectConfigWs(): void {
 
 export function connectConfigWs(): void {
   if (configWs || configUnavailable) return;
-  const pass = getPassphraseFromHash();
+  const pass = readStoredPassphrase();
   if (!pass) return;
 
   const ws = new WebSocket(configWsUrl());
@@ -191,14 +198,8 @@ export function connectConfigWs(): void {
       configReady = false;
       ws.onclose = null;
       ws.close();
-      // Clear passphrase from URL hash, preserving layout params.
-      const raw = location.hash.slice(1);
-      const keep = raw.split("&").filter((s) => /^[lpast]=/.test(s));
-      history.replaceState(
-        null,
-        "",
-        location.pathname + (keep.length ? `#${keep.join("&")}` : ""),
-      );
+      clearStoredPassphrase();
+      // App listens to hashchange to re-evaluate passphrase state.
       window.dispatchEvent(new Event("hashchange"));
       return;
     }

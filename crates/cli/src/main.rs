@@ -517,17 +517,21 @@ fn mask_share_passphrase(uri: &str) -> String {
 fn cmd_remote(cmd: RemoteCommand) {
     match cmd {
         RemoteCommand::List { reveal } => {
-            let entries = blit_webserver::config::read_remotes();
+            let entries = blit_webserver::config::read_remotes_full();
             if entries.is_empty() {
                 eprintln!("blit: no remotes configured (blit.remotes is empty or missing)");
             } else {
-                for (name, uri) in &entries {
+                for e in &entries {
                     let display_uri = if !reveal {
-                        mask_share_passphrase(uri)
+                        mask_share_passphrase(&e.uri)
                     } else {
-                        uri.clone()
+                        e.uri.clone()
                     };
-                    println!("{name}\t{display_uri}");
+                    if e.disabled {
+                        println!("{}\t{}\t(disabled)", e.name, display_uri);
+                    } else {
+                        println!("{}\t{}", e.name, display_uri);
+                    }
                 }
             }
         }
@@ -549,10 +553,15 @@ fn cmd_remote(cmd: RemoteCommand) {
                 }
             };
             blit_webserver::config::modify_remotes(|entries| {
-                if let Some(pos) = entries.iter().position(|(n, _)| n == &name) {
-                    entries[pos].1 = uri.clone();
+                if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                    entries[pos].uri = uri.clone();
+                    entries[pos].disabled = false;
                 } else {
-                    entries.push((name.clone(), uri.clone()));
+                    entries.push(blit_webserver::config::RemoteEntry {
+                        name: name.clone(),
+                        uri: uri.clone(),
+                        disabled: false,
+                    });
                 }
             });
             eprintln!("blit: remote '{name}' set to '{uri}'");
@@ -561,7 +570,7 @@ fn cmd_remote(cmd: RemoteCommand) {
             let mut found = false;
             blit_webserver::config::modify_remotes(|entries| {
                 let before = entries.len();
-                entries.retain(|(n, _)| n != &name);
+                entries.retain(|e| e.name != name);
                 found = entries.len() < before;
             });
             if !found {
@@ -569,6 +578,23 @@ fn cmd_remote(cmd: RemoteCommand) {
                 std::process::exit(1);
             }
             eprintln!("blit: remote '{name}' removed");
+        }
+        RemoteCommand::Toggle { name } => {
+            let mut new_state: Option<bool> = None;
+            blit_webserver::config::modify_remotes(|entries| {
+                if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                    entries[pos].disabled = !entries[pos].disabled;
+                    new_state = Some(entries[pos].disabled);
+                }
+            });
+            match new_state {
+                None => {
+                    eprintln!("blit: no remote named '{name}'");
+                    std::process::exit(1);
+                }
+                Some(true) => eprintln!("blit: remote '{name}' disabled"),
+                Some(false) => eprintln!("blit: remote '{name}' enabled"),
+            }
         }
         RemoteCommand::SetDefault { target } => {
             blit_webserver::config::modify_config(|config| {

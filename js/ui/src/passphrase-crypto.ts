@@ -1,18 +1,12 @@
 import nacl from "tweetnacl";
 
+// Legacy decrypt-only support — secrets are now stored in localStorage and
+// no longer encrypted into URL fragments. These helpers exist so older
+// share/auth URLs in browser history or bookmarks still work on first load.
+
 const STORAGE_KEY = "blit-share-key";
 const ENCRYPTED_PREFIX = "e=";
 const LEGACY_PREFIX = "e.";
-
-function base64urlEncode(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++)
-    binary += String.fromCharCode(bytes[i]);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
 
 function base64urlDecode(str: string): Uint8Array {
   const padded = str.replace(/-/g, "+").replace(/_/g, "/");
@@ -36,25 +30,9 @@ function hexDecode(hex: string): Uint8Array {
   return bytes;
 }
 
-function getOrCreateKey(): Uint8Array {
+function readKey(): Uint8Array | null {
   const stored = localStorage.getItem(STORAGE_KEY);
-  if (stored) {
-    return hexDecode(stored);
-  }
-  const key = nacl.randomBytes(32);
-  localStorage.setItem(STORAGE_KEY, hexEncode(key));
-  return key;
-}
-
-export function encryptPassphrase(passphrase: string): string {
-  const key = getOrCreateKey();
-  const message = new TextEncoder().encode(passphrase);
-  const nonce = nacl.randomBytes(24);
-  const box = nacl.secretbox(message, nonce, key);
-  const combined = new Uint8Array(nonce.length + box.length);
-  combined.set(nonce);
-  combined.set(box, nonce.length);
-  return ENCRYPTED_PREFIX + base64urlEncode(combined);
+  return stored ? hexDecode(stored) : null;
 }
 
 export function isEncrypted(hash: string): boolean {
@@ -63,7 +41,8 @@ export function isEncrypted(hash: string): boolean {
 
 export function decryptPassphrase(ciphertext: string): string | null {
   try {
-    const key = getOrCreateKey();
+    const key = readKey();
+    if (!key) return null;
     const prefix = ciphertext.startsWith(ENCRYPTED_PREFIX)
       ? ENCRYPTED_PREFIX
       : LEGACY_PREFIX;

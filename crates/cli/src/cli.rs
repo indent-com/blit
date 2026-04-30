@@ -741,6 +741,14 @@ pub enum RemoteCommand {
         name: String,
     },
 
+    /// Disable or enable a named remote without removing it.
+    /// Disabled remotes are kept in blit.remotes (commented out) and excluded
+    /// from connection resolution until re-enabled.
+    Toggle {
+        /// Name of the remote to toggle
+        name: String,
+    },
+
     /// Set the default remote in blit.conf
     ///
     /// After this, all agent subcommands (list, start, show, …) will connect
