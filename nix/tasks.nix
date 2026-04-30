@@ -349,6 +349,7 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
+      rm -f js/ui/dist/index.html js/ui/dist/index.html.br
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
 
       echo "=== Clippy ==="
@@ -370,6 +371,7 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
+      rm -f js/ui/dist/index.html js/ui/dist/index.html.br
       cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
 
       outdir="''${1:-coverage-report}"
@@ -448,21 +450,18 @@ in
     name = "blit-e2e";
     runtimeInputs = [
       pkgs.nodejs
-      pkgs.pnpm
+      # Use Nix's Playwright CLI so the JS package and browser bundle
+      # come from the same nixpkgs revision. Do not install/run the npm
+      # Playwright package here; its browser revision can drift from Nix.
+      pkgs.playwright-test
     ];
     text = ''
-      export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
-      export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-
       echo "=== Setting up binaries ==="
       mkdir -p target/debug
       ln -sf "${blit}/bin/blit" target/debug/blit
 
-      echo "=== Installing e2e deps ==="
-      (cd e2e && if ! pnpm install --frozen-lockfile 2>/dev/null; then pnpm install; fi)
-
       echo "=== Running Playwright ==="
-      (cd e2e && pnpm exec playwright test)
+      (cd e2e && playwright test)
     '';
   };
 

@@ -56,6 +56,7 @@ import {
   configWsStatus,
   addRemote,
   removeRemote,
+  toggleRemote,
   setDefaultRemote,
   reorderRemotes,
 } from "./storage";
@@ -1732,6 +1733,7 @@ function WorkspaceScreen(props: {
               readOnly={false}
               onAdd={(name, uri) => addRemote(name, uri)}
               onRemove={(name) => removeRemote(name)}
+              onToggle={(name) => toggleRemote(name)}
               onSetDefault={(name) => setDefaultRemote(name)}
               onReorder={(names) => reorderRemotes(names)}
               onReconnect={(name) => workspace.reconnectConnection(name)}
@@ -1872,10 +1874,18 @@ function PreviewPanel(props: {
     setResizeActive(true);
     const startX = e.clientX;
     const startWidth = props.width;
+    // Cap the panel at a fraction of the viewport so a touch drag can't
+    // push the terminal off-screen.
+    const maxWidth = Math.max(
+      MIN_PANEL_WIDTH,
+      Math.floor(window.innerWidth * 0.85),
+    );
 
     const onMove = (me: PointerEvent) => {
       const delta = startX - me.clientX;
-      props.onResize(Math.max(MIN_PANEL_WIDTH, startWidth + delta));
+      props.onResize(
+        Math.min(maxWidth, Math.max(MIN_PANEL_WIDTH, startWidth + delta)),
+      );
     };
 
     const onUp = () => {
@@ -1887,6 +1897,10 @@ function PreviewPanel(props: {
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp);
   }
+
+  // Touch targets need a fatter hit area than the 3px desktop bar to be
+  // reliably grabbable with a finger.
+  const handleWidth = () => (props.isMobileTouch ? 14 : 3);
 
   const resizeBg = () =>
     resizeActive()
@@ -1909,16 +1923,35 @@ function PreviewPanel(props: {
         onPointerDown={handleResizePointerDown}
         onPointerEnter={() => setResizeHover(true)}
         onPointerLeave={() => setResizeHover(false)}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize panel"
         style={{
-          width: "3px",
+          width: `${handleWidth()}px`,
           "flex-shrink": 0,
           cursor: "col-resize",
           background: resizeBg(),
           "border-left": `1px solid ${props.theme.subtleBorder}`,
           transition: "background 0.1s",
           "touch-action": "none",
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "center",
         }}
-      />
+      >
+        <Show when={props.isMobileTouch}>
+          <div
+            style={{
+              width: "3px",
+              height: "32px",
+              "border-radius": "2px",
+              "background-color": props.theme.dimFg,
+              opacity: resizeActive() ? 0.8 : 0.4,
+              "pointer-events": "none",
+            }}
+          />
+        </Show>
+      </div>
       <div
         style={{
           flex: 1,

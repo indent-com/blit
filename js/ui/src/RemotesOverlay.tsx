@@ -30,6 +30,7 @@ export function RemotesOverlay(props: {
   readOnly?: boolean;
   onAdd: (name: string, uri: string) => void;
   onRemove: (name: string) => void;
+  onToggle?: (name: string) => void;
   onSetDefault: (name: string) => void;
   onReorder: (names: string[]) => void;
   onReconnect?: (name: string) => void;
@@ -146,11 +147,12 @@ export function RemotesOverlay(props: {
     props.gatewayStatus !== undefined && props.gatewayStatus !== "connected";
 
   // Only include the reveal/hide column if any remote is a share URI.
+  // Columns: drag, name, uri, default, [reveal], reconnect, toggle, remove.
   const cols = () => {
     if (props.readOnly) return "auto 1fr";
     return hasShare()
-      ? "auto auto 1fr auto auto auto auto"
-      : "auto auto 1fr auto auto auto";
+      ? "auto auto 1fr auto auto auto auto auto"
+      : "auto auto 1fr auto auto auto auto";
   };
 
   return (
@@ -284,6 +286,7 @@ export function RemotesOverlay(props: {
               {(remote, index) => {
                 const share = () => isShareUri(remote().uri);
                 const show = () => revealed().has(remote().name);
+                const disabled = () => remote().disabled;
                 const effectiveDefault = () =>
                   props.defaultRemote && props.defaultRemote !== "local"
                     ? props.defaultRemote
@@ -293,7 +296,10 @@ export function RemotesOverlay(props: {
                   share() && !show()
                     ? "share:\u2022\u2022\u2022\u2022"
                     : remote().uri;
-                const status = () => props.statuses?.get(remote().name) ?? null;
+                const status = () =>
+                  disabled()
+                    ? null
+                    : (props.statuses?.get(remote().name) ?? null);
                 const statusColor = () => {
                   const s = status();
                   return s
@@ -346,7 +352,7 @@ export function RemotesOverlay(props: {
                       "border-left": `1px solid ${theme().subtleBorder}`,
                       "border-right": `1px solid ${theme().subtleBorder}`,
                       "background-color": theme().solidPanelBg,
-                      opacity: rowOpacity(),
+                      opacity: rowOpacity() * (disabled() ? 0.55 : 1),
                       transition: "opacity 0.1s",
                     }}
                   >
@@ -475,21 +481,48 @@ export function RemotesOverlay(props: {
                         </Show>
                       </Show>
 
-                      {/* Reconnect */}
+                      {/* Reconnect — hidden for disabled entries */}
+                      <Show when={!disabled()} fallback={<div />}>
+                        <button
+                          type="button"
+                          title={t("disconnected.reconnectNow")}
+                          disabled={mutationsBlocked()}
+                          onClick={() => props.onReconnect?.(remote().name)}
+                          style={{
+                            ...btnStyle(),
+                            opacity: mutationsBlocked() ? 0.3 : 0.7,
+                            cursor: mutationsBlocked()
+                              ? "not-allowed"
+                              : "pointer",
+                          }}
+                        >
+                          {t("disconnected.reconnectNow")}
+                        </button>
+                      </Show>
+
+                      {/* Disable / Enable */}
                       <button
                         type="button"
-                        title={t("disconnected.reconnectNow")}
-                        disabled={mutationsBlocked()}
-                        onClick={() => props.onReconnect?.(remote().name)}
+                        title={
+                          disabled()
+                            ? t("remotes.enable")
+                            : t("remotes.disable")
+                        }
+                        disabled={mutationsBlocked() || !props.onToggle}
+                        onClick={() => props.onToggle?.(remote().name)}
                         style={{
                           ...btnStyle(),
-                          opacity: mutationsBlocked() ? 0.3 : 0.7,
-                          cursor: mutationsBlocked()
-                            ? "not-allowed"
-                            : "pointer",
+                          opacity:
+                            mutationsBlocked() || !props.onToggle ? 0.3 : 0.7,
+                          cursor:
+                            mutationsBlocked() || !props.onToggle
+                              ? "not-allowed"
+                              : "pointer",
                         }}
                       >
-                        {t("disconnected.reconnectNow")}
+                        {disabled()
+                          ? t("remotes.enable")
+                          : t("remotes.disable")}
                       </button>
 
                       {/* Remove */}

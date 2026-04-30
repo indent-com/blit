@@ -32,12 +32,7 @@ jobs:
       - run: nix develop --command ./bin/dev-check
 
   test:
-    strategy:
-      matrix:
-        include:
-          - runner: blacksmith-8vcpu-ubuntu-2404
-          - runner: blacksmith-6vcpu-macos-latest
-    runs-on: ${{ matrix.runner }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main

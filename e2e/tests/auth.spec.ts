@@ -50,7 +50,7 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
-  test("passphrase in hash auto-connects on reload", async ({ page }) => {
+  test("stored passphrase auto-connects on reload", async ({ page }) => {
     await page.goto("/");
     const passInput = page.locator('input[type="password"]');
     await expect(passInput).toBeVisible();
@@ -63,19 +63,16 @@ test.describe("Auth flow", () => {
       .first();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
-    // The encrypted passphrase is written to the hash asynchronously
-    // after the WebSocket handshake completes — wait for it.
-    await page.waitForFunction(() => location.hash.length > 1, {
-      timeout: 5_000,
-    });
-    const url = page.url();
-    expect(url).toContain("#");
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("blit-passphrase")))
+      .toBe("test-secret");
+    expect(page.url()).not.toContain("test-secret");
 
     await page.reload();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
-  test("raw passphrase in hash is encrypted and connects", async ({ page }) => {
+  test("raw passphrase in hash is stored and stripped", async ({ page }) => {
     await page.goto("/#test-secret");
 
     const passInput = page.locator('input[type="password"]');
@@ -88,24 +85,12 @@ test.describe("Auth flow", () => {
 
     const url = page.url();
     expect(url).not.toContain("#test-secret");
-    expect(url).toContain("#e=");
-  });
-
-  test("encrypted hash survives reload", async ({ page }) => {
-    await page.goto("/#test-secret");
-
-    const newTerminal = page
-      .getByRole("button", { name: "New terminal" })
-      .first();
-    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
-
-    const urlBefore = page.url();
-    expect(urlBefore).toContain("#e=");
+    expect(url).not.toContain("#e=");
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("blit-passphrase")))
+      .toBe("test-secret");
 
     await page.reload();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
-
-    const urlAfter = page.url();
-    expect(urlAfter).toContain("#e=");
   });
 });

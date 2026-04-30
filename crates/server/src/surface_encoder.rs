@@ -695,6 +695,7 @@ impl SurfaceEncoder {
 
     /// The encoder's padded dimensions (may be larger than source due to
     /// alignment requirements, e.g. AV1 64-pixel superblock alignment).
+    #[cfg(target_os = "linux")]
     pub fn encoder_dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }

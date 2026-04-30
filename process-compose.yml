@@ -11,7 +11,20 @@ version: "0.5"
 
 processes:
   build:
-    command: cargo build -p blit-cli --profile profiling
+    # Stub js/ui/dist/index.html{,.br} on fresh checkouts so cargo can
+    # compile blit-gateway / blit-cli (they embed the file via
+    # include_bytes!).  Vite only writes index.html.br on a production
+    # build (`vite build`); the `ui` process runs the dev server, so
+    # nothing in this stack produces the file otherwise.  Mirrors
+    # bin/dev-check.  Content doesn't matter — at runtime the dev UI is
+    # served from the vite dev server, not this embedded blob.
+    command: >-
+      if [ ! -f js/ui/dist/index.html.br ]; then
+      mkdir -p js/ui/dist;
+      echo '<html><body>stub</body></html>' > js/ui/dist/index.html;
+      python3 -c "import brotli, pathlib; pathlib.Path('js/ui/dist/index.html.br').write_bytes(brotli.compress(pathlib.Path('js/ui/dist/index.html').read_bytes()))" 2>/dev/null || cp js/ui/dist/index.html js/ui/dist/index.html.br;
+      fi;
+      exec cargo build -p blit-cli --profile profiling
 
   browser-wasm:
     command: cargo watch -w crates/browser/src -w crates/remote/src -s "cd crates/browser && wasm-pack build --target web --release --out-dir pkg"

@@ -138,14 +138,38 @@ pub fn read_config() -> HashMap<String, String> {
     parse_config_str(&contents)
 }
 
-/// Read `blit.remotes` and return ordered `(name, uri)` pairs.
+/// A single entry in `blit.remotes`. `disabled` entries are persisted as
+/// `# name = uri` and are excluded from connection resolution but preserved
+/// across restarts so users can re-enable them later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub uri: String,
+    pub disabled: bool,
+}
+
+/// Read `blit.remotes` and return ordered enabled `(name, uri)` pairs.
 /// If the file does not exist, provisions it with `local = local` (0600).
+/// Disabled entries are filtered out — use [`read_remotes_full`] to keep them.
 pub fn read_remotes() -> Vec<(String, String)> {
+    read_remotes_full()
+        .into_iter()
+        .filter(|e| !e.disabled)
+        .map(|e| (e.name, e.uri))
+        .collect()
+}
+
+/// Read `blit.remotes` including disabled entries.
+pub fn read_remotes_full() -> Vec<RemoteEntry> {
     let path = remotes_path();
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let default = vec![("local".to_string(), "local".to_string())];
+            let default = vec![RemoteEntry {
+                name: "local".to_string(),
+                uri: "local".to_string(),
+                disabled: false,
+            }];
             write_remotes(&default);
             return default;
         }
@@ -154,7 +178,7 @@ pub fn read_remotes() -> Vec<(String, String)> {
             return vec![];
         }
     };
-    parse_remotes_str(&contents)
+    parse_remotes_full(&contents)
 }
 
 /// Atomically read-modify-write `blit.conf` under an exclusive flock.
@@ -166,59 +190,80 @@ pub fn modify_config(f: impl FnOnce(&mut HashMap<String, String>)) {
 }
 
 /// Atomically read-modify-write `blit.remotes` under an exclusive flock.
-pub fn modify_remotes(f: impl FnOnce(&mut Vec<(String, String)>)) {
+pub fn modify_remotes(f: impl FnOnce(&mut Vec<RemoteEntry>)) {
     let _lock = lock_config_dir();
-    let mut entries = read_remotes();
+    let mut entries = read_remotes_full();
     f(&mut entries);
     write_remotes(&entries);
 }
 
-/// Parse `blit.remotes` content into ordered `(name, uri)` pairs.
-/// Format: `name = uri` lines; `#` comments; blank lines ignored.
-/// Duplicate names: last wins (same as blit.conf).
+/// Parse `blit.remotes` content into ordered enabled `(name, uri)` pairs.
+/// Disabled entries (`# name = uri`) are filtered out — use
+/// [`parse_remotes_full`] to keep them.
 pub fn parse_remotes_str(contents: &str) -> Vec<(String, String)> {
-    // Use an index map to preserve insertion order while allowing last-wins
-    // for duplicates, without pulling in an extra dependency.
-    let mut order: Vec<String> = Vec::new();
-    let mut map: HashMap<String, String> = HashMap::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim().to_string();
-            let v = v.trim().to_string();
-            if !k.is_empty() && !v.is_empty() {
-                if !map.contains_key(&k) {
-                    order.push(k.clone());
-                }
-                map.insert(k, v);
-            }
-        }
-    }
-    order
+    parse_remotes_full(contents)
         .into_iter()
-        .map(|k| {
-            let v = map.remove(&k).unwrap();
-            (k, v)
-        })
+        .filter(|e| !e.disabled)
+        .map(|e| (e.name, e.uri))
         .collect()
 }
 
-fn serialize_remotes(entries: &[(String, String)]) -> String {
+/// Parse `blit.remotes` content including disabled entries.
+/// Format: `name = uri` for enabled; `# name = uri` (with optional whitespace
+/// after `#`) for disabled. Other `#` lines and blank lines are ignored.
+/// Duplicate names: last wins (same as blit.conf).
+pub fn parse_remotes_full(contents: &str) -> Vec<RemoteEntry> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, RemoteEntry> = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (body, disabled) = if let Some(rest) = line.strip_prefix('#') {
+            (rest.trim_start(), true)
+        } else {
+            (line, false)
+        };
+        let Some((k, v)) = body.split_once('=') else {
+            continue;
+        };
+        let name = k.trim().to_string();
+        let uri = v.trim().to_string();
+        if name.is_empty() || uri.is_empty() {
+            continue;
+        }
+        if !map.contains_key(&name) {
+            order.push(name.clone());
+        }
+        map.insert(
+            name.clone(),
+            RemoteEntry {
+                name,
+                uri,
+                disabled,
+            },
+        );
+    }
+    order.into_iter().map(|k| map.remove(&k).unwrap()).collect()
+}
+
+fn serialize_remotes(entries: &[RemoteEntry]) -> String {
     let mut out = String::new();
-    for (k, v) in entries {
-        out.push_str(k);
+    for e in entries {
+        if e.disabled {
+            out.push_str("# ");
+        }
+        out.push_str(&e.name);
         out.push_str(" = ");
-        out.push_str(v);
+        out.push_str(&e.uri);
         out.push('\n');
     }
     out
 }
 
 /// Write `blit.remotes` atomically with mode 0o600 (owner read/write only).
-pub fn write_remotes(entries: &[(String, String)]) {
+pub fn write_remotes(entries: &[RemoteEntry]) {
     let path = remotes_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -366,7 +411,7 @@ impl RemotesState {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(64);
         let inner = Arc::new(RemotesInner {
-            contents: RwLock::new(serialize_remotes(&read_remotes())),
+            contents: RwLock::new(serialize_remotes(&read_remotes_full())),
             tx,
         });
         let watcher_inner = inner.clone();
@@ -399,7 +444,7 @@ impl RemotesState {
     }
 
     /// Overwrite `blit.remotes` with `entries` and broadcast the change.
-    pub fn set(&self, entries: &[(String, String)]) {
+    pub fn set(&self, entries: &[RemoteEntry]) {
         write_remotes(entries);
         let text = serialize_remotes(entries);
         *self.inner.contents.write().unwrap() = text.clone();
@@ -408,9 +453,9 @@ impl RemotesState {
 
     /// Atomically read-modify-write `blit.remotes` under an exclusive flock,
     /// then update the in-memory cache and broadcast.
-    pub fn modify(&self, f: impl FnOnce(&mut Vec<(String, String)>)) {
+    pub fn modify(&self, f: impl FnOnce(&mut Vec<RemoteEntry>)) {
         let _lock = lock_config_dir();
-        let mut entries = parse_remotes_str(&self.get());
+        let mut entries = parse_remotes_full(&self.get());
         f(&mut entries);
         self.set(&entries);
     }
@@ -454,7 +499,8 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 ///   1. `"ok"` — authentication accepted.
 ///   2. `"remotes:<text>"` — sent immediately (and re-sent on any change to
 ///      `blit.remotes`).  `<text>` is the raw `blit.remotes` file contents:
-///      `name = uri` lines.  Empty string if the file does not exist.
+///      `name = uri` lines for enabled remotes, `# name = uri` lines for
+///      disabled ones.  Empty string if the file does not exist.
 ///   3. Zero or more `"key=value"` messages — current browser settings.
 ///   4. `"ready"` — end of initial burst; live updates follow.
 ///
@@ -465,15 +511,20 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 /// The client may send:
 ///   - `"set key value"` — persist a browser setting.
 ///   - `"remotes-add name uri"` — add or update a remote; name must not
-///     contain `=` or whitespace; uri must be non-empty.
-///   - `"remotes-remove name"` — remove a remote by name.
+///     contain `=` or whitespace; uri must be non-empty.  If the entry
+///     existed and was disabled, it is re-enabled.
+///   - `"remotes-remove name"` — remove a remote by name (regardless of
+///     enabled/disabled state).
+///   - `"remotes-toggle name"` — flip a remote's disabled state.  Disabled
+///     remotes are persisted as `# name = uri` and excluded from connection
+///     resolution.
 ///   - `"remotes-set-default name"` — write `target = name` to `blit.conf`
 ///     (or remove the key if name is empty or `"local"`).  The updated
 ///     `target` value is then broadcast to all config-WS clients as a
 ///     normal `"target=value"` message via the config-file watcher.
 ///   - `"remotes-reorder name1 name2 …"` — reorder remotes to match the
 ///     supplied name sequence; any names not listed are appended at the end
-///     in their original relative order.
+///     in their original relative order.  Disabled state is preserved.
 pub async fn handle_config_ws(
     mut ws: WebSocket,
     token: &str,
@@ -574,10 +625,17 @@ pub async fn handle_config_ws(
                                     && let Some(r) = remotes
                                 {
                                     r.modify(|entries| {
-                                        if let Some(pos) = entries.iter().position(|(n, _)| n == &name) {
-                                            entries[pos].1 = uri;
+                                        if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                                            entries[pos].uri = uri;
+                                            // An explicit add re-enables a previously
+                                            // disabled entry.
+                                            entries[pos].disabled = false;
                                         } else {
-                                            entries.push((name, uri));
+                                            entries.push(RemoteEntry {
+                                                name,
+                                                uri,
+                                                disabled: false,
+                                            });
                                         }
                                     });
                                 }
@@ -588,7 +646,20 @@ pub async fn handle_config_ws(
                                 && let Some(r) = remotes
                             {
                                 r.modify(|entries| {
-                                    entries.retain(|(n, _)| n != &name);
+                                    entries.retain(|e| e.name != name);
+                                });
+                            }
+                        } else if let Some(name) = text.strip_prefix("remotes-toggle ") {
+                            let name = name.trim().replace(['\n', '\r'], "");
+                            if !name.is_empty()
+                                && let Some(r) = remotes
+                            {
+                                r.modify(|entries| {
+                                    if let Some(pos) =
+                                        entries.iter().position(|e| e.name == name)
+                                    {
+                                        entries[pos].disabled = !entries[pos].disabled;
+                                    }
                                 });
                             }
                         } else if let Some(name) = text.strip_prefix("remotes-set-default ") {
@@ -612,22 +683,20 @@ pub async fn handle_config_ws(
                                     .collect();
                                 if !desired.is_empty() {
                                     r.modify(|entries| {
-                                        let map: std::collections::HashMap<&str, &str> = entries
+                                        let by_name: std::collections::HashMap<String, RemoteEntry> =
+                                            entries
+                                                .iter()
+                                                .map(|e| (e.name.clone(), e.clone()))
+                                                .collect();
+                                        let mut reordered: Vec<RemoteEntry> = desired
                                             .iter()
-                                            .map(|(n, u)| (n.as_str(), u.as_str()))
-                                            .collect();
-                                        let mut reordered: Vec<(String, String)> = desired
-                                            .iter()
-                                            .filter_map(|n| {
-                                                map.get(n.as_str())
-                                                    .map(|u| (n.clone(), u.to_string()))
-                                            })
+                                            .filter_map(|n| by_name.get(n).cloned())
                                             .collect();
                                         let desired_set: std::collections::HashSet<&str> =
                                             desired.iter().map(|s| s.as_str()).collect();
-                                        for (n, u) in entries.iter() {
-                                            if !desired_set.contains(n.as_str()) {
-                                                reordered.push((n.clone(), u.clone()));
+                                        for e in entries.iter() {
+                                            if !desired_set.contains(e.name.as_str()) {
+                                                reordered.push(e.clone());
                                             }
                                         }
                                         *entries = reordered;
@@ -809,11 +878,19 @@ mod tests {
 
     // ── RemotesState mutations (remotes-add / remotes-remove) ──
 
+    fn entry(name: &str, uri: &str) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            disabled: false,
+        }
+    }
+
     #[test]
     fn remotes_add_new_entry() {
         let state = RemotesState::ephemeral(String::new());
-        let mut entries = parse_remotes_str(&state.get());
-        entries.push(("rabbit".to_string(), "ssh:rabbit".to_string()));
+        let mut entries = parse_remotes_full(&state.get());
+        entries.push(entry("rabbit", "ssh:rabbit"));
         state.set(&entries);
         let got = parse_remotes_str(&state.get());
         assert_eq!(got.len(), 1);
@@ -824,9 +901,9 @@ mod tests {
     fn remotes_add_updates_existing() {
         let initial = "rabbit = ssh:rabbit\n";
         let state = RemotesState::ephemeral(initial.to_string());
-        let mut entries = parse_remotes_str(&state.get());
-        if let Some(pos) = entries.iter().position(|(n, _)| n == "rabbit") {
-            entries[pos].1 = "tcp:rabbit:3264".to_string();
+        let mut entries = parse_remotes_full(&state.get());
+        if let Some(pos) = entries.iter().position(|e| e.name == "rabbit") {
+            entries[pos].uri = "tcp:rabbit:3264".to_string();
         }
         state.set(&entries);
         let got = parse_remotes_str(&state.get());
@@ -838,8 +915,8 @@ mod tests {
     fn remotes_remove_existing() {
         let initial = "rabbit = ssh:rabbit\nhound = ssh:hound\n";
         let state = RemotesState::ephemeral(initial.to_string());
-        let mut entries = parse_remotes_str(&state.get());
-        entries.retain(|(n, _)| n != "rabbit");
+        let mut entries = parse_remotes_full(&state.get());
+        entries.retain(|e| e.name != "rabbit");
         state.set(&entries);
         let got = parse_remotes_str(&state.get());
         assert_eq!(got.len(), 1);
@@ -850,10 +927,114 @@ mod tests {
     fn remotes_remove_nonexistent_is_noop() {
         let initial = "rabbit = ssh:rabbit\n";
         let state = RemotesState::ephemeral(initial.to_string());
-        let mut entries = parse_remotes_str(&state.get());
+        let mut entries = parse_remotes_full(&state.get());
         let before = entries.len();
-        entries.retain(|(n, _)| n != "does-not-exist");
+        entries.retain(|e| e.name != "does-not-exist");
         assert_eq!(entries.len(), before);
+    }
+
+    // ── Disabled remotes (commented) ──
+
+    #[test]
+    fn parse_disabled_entry() {
+        let entries = parse_remotes_full("# rabbit = ssh:rabbit\nhound = ssh:hound\n");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "rabbit");
+        assert_eq!(entries[0].uri, "ssh:rabbit");
+        assert!(entries[0].disabled);
+        assert_eq!(entries[1].name, "hound");
+        assert!(!entries[1].disabled);
+    }
+
+    #[test]
+    fn parse_disabled_no_space_after_hash() {
+        let entries = parse_remotes_full("#rabbit = ssh:rabbit\n");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].disabled);
+    }
+
+    #[test]
+    fn parse_remotes_str_filters_disabled() {
+        let active = parse_remotes_str("# rabbit = ssh:rabbit\nhound = ssh:hound\n");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, "hound");
+    }
+
+    #[test]
+    fn parse_skips_pure_comments() {
+        let entries = parse_remotes_full("# This is just a header\n# also a comment\n");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn round_trip_disabled() {
+        let initial = "rabbit = ssh:rabbit\n# hound = ssh:hound\n";
+        let entries = parse_remotes_full(initial);
+        let serialized = serialize_remotes(&entries);
+        let reparsed = parse_remotes_full(&serialized);
+        assert_eq!(entries, reparsed);
+        assert!(serialized.contains("# hound = ssh:hound"));
+    }
+
+    #[test]
+    fn remotes_toggle_flips_state() {
+        let state = RemotesState::ephemeral("rabbit = ssh:rabbit\n".into());
+        state.modify(|entries| {
+            if let Some(pos) = entries.iter().position(|e| e.name == "rabbit") {
+                entries[pos].disabled = !entries[pos].disabled;
+            }
+        });
+        let entries = parse_remotes_full(&state.get());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].disabled);
+        // Active view excludes it.
+        assert!(parse_remotes_str(&state.get()).is_empty());
+    }
+
+    #[test]
+    fn remotes_add_reenables_disabled() {
+        let state = RemotesState::ephemeral("# rabbit = ssh:old\n".into());
+        // Simulate the WS handler's add logic.
+        state.modify(|entries| {
+            let name = "rabbit".to_string();
+            if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                entries[pos].uri = "ssh:new".to_string();
+                entries[pos].disabled = false;
+            } else {
+                entries.push(RemoteEntry {
+                    name,
+                    uri: "ssh:new".to_string(),
+                    disabled: false,
+                });
+            }
+        });
+        let entries = parse_remotes_full(&state.get());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uri, "ssh:new");
+        assert!(!entries[0].disabled);
+    }
+
+    #[test]
+    fn remotes_reorder_preserves_disabled() {
+        let initial = "alpha = a\n# beta = b\ngamma = c\n";
+        let entries = parse_remotes_full(initial);
+        // Reorder alpha → gamma → beta.
+        let desired = ["gamma", "alpha", "beta"];
+        let by_name: std::collections::HashMap<String, RemoteEntry> = entries
+            .iter()
+            .map(|e| (e.name.clone(), e.clone()))
+            .collect();
+        let reordered: Vec<RemoteEntry> = desired
+            .iter()
+            .filter_map(|n| by_name.get(*n).cloned())
+            .collect();
+        let serialized = serialize_remotes(&reordered);
+        let reparsed = parse_remotes_full(&serialized);
+        assert_eq!(reparsed.len(), 3);
+        assert_eq!(reparsed[0].name, "gamma");
+        assert!(!reparsed[0].disabled);
+        assert_eq!(reparsed[2].name, "beta");
+        assert!(reparsed[2].disabled);
     }
 
     #[test]
