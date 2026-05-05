@@ -517,6 +517,53 @@ pub enum TerminalCommand {
         text: String,
     },
 
+    /// Send a mouse event to a terminal.
+    ///
+    /// Coordinates are zero-based cell positions, matching browser terminal
+    /// mouse reporting. The server translates the event using the terminal's
+    /// active mouse mode/encoding (X10, normal, button-motion, any-motion, SGR).
+    /// Examples:
+    ///   blit terminal mouse 3 click 10 5
+    ///   blit terminal mouse 3 down 10 5 --button right
+    ///   blit terminal mouse 3 move 12 5 --button left
+    ///   blit terminal mouse 3 wheel-up 10 5
+    Mouse {
+        /// Terminal ID
+        id: u16,
+
+        /// Mouse event: down, up, move, click, hover, wheel-up, or wheel-down
+        event: String,
+
+        /// Zero-based terminal column
+        col: u16,
+
+        /// Zero-based terminal row
+        row: u16,
+
+        /// Mouse button for down/up/click/move
+        #[arg(long, short = 'b', default_value = "left")]
+        button: String,
+    },
+
+    /// Click at terminal cell coordinates.
+    ///
+    /// Shorthand for terminal mouse ID click COL ROW. Coordinates are
+    /// zero-based cells, not pixels.
+    Click {
+        /// Terminal ID
+        id: u16,
+
+        /// Zero-based terminal column
+        col: u16,
+
+        /// Zero-based terminal row
+        row: u16,
+
+        /// Mouse button: left, middle, or right
+        #[arg(long, short = 'b', default_value = "left")]
+        button: String,
+    },
+
     /// Wait for a terminal to exit or match a pattern.
     ///
     /// Without --pattern, blocks until the PTY process exits and returns

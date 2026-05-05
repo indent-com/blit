@@ -1993,6 +1993,17 @@ pub fn msg_input(pty_id: u16, data: &[u8]) -> Vec<u8> {
     msg
 }
 
+pub fn msg_mouse(pty_id: u16, type_: u8, button: u8, col: u16, row: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9);
+    msg.push(C2S_MOUSE);
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.push(type_);
+    msg.push(button);
+    msg.extend_from_slice(&col.to_le_bytes());
+    msg.extend_from_slice(&row.to_le_bytes());
+    msg
+}
+
 pub fn msg_resize(pty_id: u16, rows: u16, cols: u16) -> Vec<u8> {
     let mut msg = Vec::with_capacity(7);
     msg.push(C2S_RESIZE);

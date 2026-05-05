@@ -110,6 +110,19 @@ async fn async_main() {
                     };
                     agent::cmd_send(transport, id, text).await
                 }
+                TerminalCommand::Mouse {
+                    id,
+                    event,
+                    col,
+                    row,
+                    button,
+                } => agent::cmd_mouse(transport, id, &event, col, row, &button).await,
+                TerminalCommand::Click {
+                    id,
+                    col,
+                    row,
+                    button,
+                } => agent::cmd_terminal_click(transport, id, col, row, &button).await,
                 TerminalCommand::Wait {
                     id,
                     timeout,
