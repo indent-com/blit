@@ -19,31 +19,37 @@ import {
 import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
-import {
-  encryptPassphrase,
-  isEncrypted,
-  decryptPassphrase,
-} from "./passphrase-crypto";
+import { PASSPHRASE_KEY } from "./passphrase-storage";
 
 function readPassphrase(): string | null {
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(PASSPHRASE_KEY);
+  } catch {}
+
   const raw = location.hash.slice(1);
-  if (!raw) return null;
+  if (!raw) return stored;
   const first = raw.split("&")[0];
-  if (/^[lpa]=/.test(first)) return null;
+  if (!first || /^[lpa]=/.test(first)) return stored;
+
+  // First contact — secret is being delivered via the URL fragment. Move it
+  // to localStorage and strip it from the URL so it doesn't end up in
+  // browser history or get re-shared accidentally.
   const decoded = decodeURIComponent(first);
-  if (isEncrypted(decoded)) {
-    // Already encrypted — decrypt and return. If decryption fails (wrong
-    // browser key) return null without touching the hash, so the layout
-    // params (l=, a=, p=, t=) are preserved for after the user authenticates.
-    return decryptPassphrase(decoded);
-  }
-  // Plain-text passphrase — encrypt it in-place so it isn't visible in
-  // browser history, preserving all other hash params.
-  const encrypted = encryptPassphrase(decoded);
   const rest = raw.split("&").slice(1);
-  const parts = [encrypted, ...rest].filter(Boolean);
-  history.replaceState(null, "", `${location.pathname}#${parts.join("&")}`);
-  return decoded;
+  const newHash = rest.filter(Boolean).join("&");
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}${newHash ? `#${newHash}` : ""}`,
+  );
+  if (decoded) {
+    try {
+      localStorage.setItem(PASSPHRASE_KEY, decoded);
+    } catch {}
+    return decoded;
+  }
+  return stored;
 }
 
 readPassphrase();
@@ -113,29 +119,17 @@ export function App(props: { wasm: BlitWasmModule }) {
   });
 
   function handleAuth(pass: string) {
-    const encrypted = encryptPassphrase(pass);
-    // Keep layout/assignment params (l=, a=, p=, t=, s=) from the existing
-    // hash so that layout state is restored after authentication.
-    const otherParams = location.hash
-      .slice(1)
-      .split("&")
-      .filter((s) => /^[lpast]=/.test(s));
-    const newHash = [encrypted, ...otherParams].join("&");
-    history.replaceState(null, "", `${location.pathname}#${newHash}`);
+    try {
+      localStorage.setItem(PASSPHRASE_KEY, pass);
+    } catch {}
     setPassphrase(pass);
     connectConfigWs();
   }
 
   function handleAuthError() {
-    // Remove passphrase from hash, preserving layout params.
-    const rawHash = location.hash.slice(1);
-    const keep = rawHash.split("&").filter((s) => /^[lpast]=/.test(s));
-    const newHash = keep.join("&");
-    history.replaceState(
-      null,
-      "",
-      location.pathname + (newHash ? `#${newHash}` : ""),
-    );
+    try {
+      localStorage.removeItem(PASSPHRASE_KEY);
+    } catch {}
     disconnectConfigWs();
     setPassphrase(null);
   }
@@ -243,7 +237,9 @@ function ConnectedApp(props: {
 
   const connections = createMemo<ConnectionSpec[]>(() => {
     const m = mux();
-    const live = remotes();
+    // Disabled remotes are kept on disk for re-enabling later but must not
+    // produce live transports — skip them here.
+    const live = remotes().filter((r) => !r.disabled);
     const dflt = defaultRemote();
     if (!m) return [];
     const next: ConnectionSpec[] = [];

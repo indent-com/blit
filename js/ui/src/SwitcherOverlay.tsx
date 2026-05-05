@@ -44,7 +44,7 @@ import {
   type BSPLayout,
 } from "./bsp/layout";
 import { t, tp } from "./i18n";
-import { isEncrypted, decryptPassphrase } from "./passphrase-crypto";
+import { readStoredPassphrase } from "./passphrase-storage";
 import { getInstallPrompt, clearInstallPrompt } from "./main";
 
 const SOURCE_LABEL: Record<number, string> = {
@@ -994,6 +994,7 @@ export function SwitcherOverlay(props: {
       const items: RemoteItem[] = [];
       if (props.remotes) {
         for (const r of props.remotes) {
+          if (r.disabled) continue;
           if (
             !q ||
             r.name.toLowerCase().includes(q) ||
@@ -1168,19 +1169,15 @@ export function SwitcherOverlay(props: {
         action: "new-terminal",
       });
     }
-    // Offer "Share URL" when the hash contains an encrypted passphrase.
-    {
-      const raw = location.hash.slice(1);
-      const first = raw.split("&")[0];
-      if (first && isEncrypted(decodeURIComponent(first))) {
-        actions.push({
-          type: "action",
-          key: "action:share-url",
-          title: "Share URL",
-          subtitle: "Copy URL with passphrase to clipboard",
-          action: "share-url",
-        });
-      }
+    // Offer "Share URL" when a passphrase is stored locally.
+    if (readStoredPassphrase()) {
+      actions.push({
+        type: "action",
+        key: "action:share-url",
+        title: "Share URL",
+        subtitle: "Copy URL with passphrase to clipboard",
+        action: "share-url",
+      });
     }
     {
       const isStandalone =
@@ -1285,9 +1282,11 @@ export function SwitcherOverlay(props: {
     }
 
     // Remotes section — show configured remotes with connection status.
+    // Disabled remotes are kept on disk but not actionable from the switcher.
     if (props.remotes && props.remotes.length > 0 && !layoutMode()) {
       const q = searchPart().toLowerCase();
       const remoteItems: RemoteItem[] = props.remotes
+        .filter((r) => !r.disabled)
         .filter(
           (r) =>
             !searching() ||
@@ -1568,18 +1567,13 @@ export function SwitcherOverlay(props: {
       return;
     }
     if (item.action === "share-url") {
-      const raw = location.hash.slice(1);
-      const parts = raw.split("&");
-      const first = parts[0];
-      const decoded = decodeURIComponent(first);
-      const passphrase = isEncrypted(decoded)
-        ? decryptPassphrase(decoded)
-        : decoded;
+      const passphrase = readStoredPassphrase();
       if (passphrase) {
-        const rest = parts.slice(1);
-        const hash = [encodeURIComponent(passphrase), ...rest]
-          .filter(Boolean)
-          .join("&");
+        const rest = location.hash
+          .slice(1)
+          .split("&")
+          .filter((s) => /^[lpast]=/.test(s));
+        const hash = [encodeURIComponent(passphrase), ...rest].join("&");
         const url = `${location.origin}${location.pathname}#${hash}`;
         navigator.clipboard.writeText(url).catch(() => {});
       }

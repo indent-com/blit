@@ -114,6 +114,8 @@ const en: Messages = {
   "remotes.uriPlaceholder": "ssh:host, local, share:…",
   "remotes.add": "Add",
   "remotes.remove": "Remove",
+  "remotes.disable": "Disable",
+  "remotes.enable": "Enable",
   "remotes.isDefault": "Default",
   "remotes.setDefault": "Set as default",
   "remotes.empty": "No remotes configured",

@@ -59,6 +59,22 @@ function effectiveDpr(): number {
 }
 
 // ---------------------------------------------------------------------------
+// Scroll surface stylesheet — WebKit/Blink expose no JS property to hide
+// the scrollbar, so we ship a one-shot stylesheet on first attach.
+// ---------------------------------------------------------------------------
+
+let scrollSurfaceStylesInjected = false;
+function injectScrollSurfaceStyles(): void {
+  if (scrollSurfaceStylesInjected || typeof document === "undefined") return;
+  scrollSurfaceStylesInjected = true;
+  const style = document.createElement("style");
+  style.setAttribute("data-blit-scroll-surface", "");
+  style.textContent =
+    ".blit-scroll-surface::-webkit-scrollbar{width:0;height:0;display:none}";
+  document.head.appendChild(style);
+}
+
+// ---------------------------------------------------------------------------
 // BlitTerminalSurface
 // ---------------------------------------------------------------------------
 
@@ -91,6 +107,16 @@ export class BlitTerminalSurface {
   private container: HTMLDivElement | null = null;
   private glCanvas: HTMLCanvasElement | null = null;
   private inputEl: HTMLTextAreaElement | null = null;
+  /** Transparent overlay sized to the canvas that captures pointer/wheel/
+   *  touch input and provides native scrolling for scrollback navigation. */
+  private scrollEl: HTMLDivElement | null = null;
+  /** Inner spacer that gives `scrollEl` enough scrollable content height
+   *  for the current scrollback range. */
+  private scrollSpacer: HTMLDivElement | null = null;
+  /** True while we're updating `scrollEl.scrollTop` from inside our own
+   *  scrollOffset → scrollTop sync, so the scroll listener doesn't feed
+   *  the change back. */
+  private suppressScrollSync = false;
 
   // --- mutable state ---
   private viewId: string | null = null;
@@ -108,7 +134,6 @@ export class BlitTerminalSurface {
   private dpr: number;
 
   private scrollOffset = 0;
-  private wheelLineAccum = 0;
   private scrollFade = 0;
   private scrollFadeTimer: ReturnType<typeof setTimeout> | null = null;
   private scrollbarGeo: {
@@ -160,7 +185,7 @@ export class BlitTerminalSurface {
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
   private boundInput: ((e: Event) => void) | null = null;
-  private boundContainerWheel: ((e: WheelEvent) => void) | null = null;
+  private boundScrollListener: (() => void) | null = null;
   private mouseCleanup: (() => void) | null = null;
   private windowResizeHandler: (() => void) | null = null;
 
@@ -414,15 +439,9 @@ export class BlitTerminalSurface {
         position: "absolute",
         top: "0",
         left: "0",
-        cursor: "text",
-        // Suppress mobile-browser default touch behaviour so vertical
-        // swipes don't scroll the page or trigger pull-to-refresh, and
-        // long-press doesn't pop the iOS callout / Android selection
-        // handles on top of our own selection rendering.
-        touchAction: "none",
-        userSelect: "none",
-        WebkitUserSelect: "none",
-        WebkitTouchCallout: "none",
+        // Pointer/wheel/touch input is handled by `scrollEl` which sits
+        // on top of the canvas — let those events fall through.
+        pointerEvents: "none",
       });
     }
     container.appendChild(this.glCanvas);
@@ -460,6 +479,46 @@ export class BlitTerminalSurface {
     });
     container.appendChild(this.inputEl);
 
+    // Native scroll surface — sits over the canvas, captures all pointer/
+    // wheel/touch input, and lets the browser handle scrollback navigation
+    // with native momentum. For read-only views we don't render a scroll
+    // surface (no scrollback navigation to expose).
+    if (!this._readOnly) {
+      this.scrollEl = document.createElement("div");
+      Object.assign(this.scrollEl.style, {
+        position: "absolute",
+        inset: "0",
+        // Vertical native scroll; horizontal is never scrollable.
+        overflowX: "hidden",
+        overflowY: "auto",
+        // Allow vertical pan to scroll natively; custom JS handlers still
+        // receive touchmove and can preventDefault for selection / mouse-
+        // mode reporting.
+        touchAction: "pan-y",
+        // The terminal draws its own scrollbar; hide the browser one.
+        scrollbarWidth: "none",
+        // Same caret affordances as the canvas had.
+        cursor: "text",
+        userSelect: "none",
+        WebkitUserSelect: "none",
+        WebkitTouchCallout: "none",
+        zIndex: "1",
+        background: "transparent",
+      });
+      // WebKit/Blink scrollbar hider (no JS-readable property for it).
+      this.scrollEl.classList.add("blit-scroll-surface");
+      injectScrollSurfaceStyles();
+
+      this.scrollSpacer = document.createElement("div");
+      Object.assign(this.scrollSpacer.style, {
+        width: "1px",
+        height: "0px",
+        pointerEvents: "none",
+      });
+      this.scrollEl.appendChild(this.scrollSpacer);
+      container.appendChild(this.scrollEl);
+    }
+
     this.setupDprDetection();
     this.setupCursorBlink();
     this.setupRenderer();
@@ -469,7 +528,7 @@ export class BlitTerminalSurface {
     this.setupResizeObserver();
     this.setupRenderLoop();
     this.setupKeyboard();
-    this.setupContainerWheel();
+    this.setupScrollSurface();
     this.setupMouse();
     this.scheduleRender();
   }
@@ -477,7 +536,7 @@ export class BlitTerminalSurface {
   /** Detach from the current container. Removes all DOM elements and listeners. */
   detach(): void {
     this.teardownMouse();
-    this.teardownContainerWheel();
+    this.teardownScrollSurface();
     this.teardownKeyboard();
     this.teardownRenderLoop();
     this.teardownResizeObserver();
@@ -494,8 +553,13 @@ export class BlitTerminalSurface {
     if (this.inputEl && this.container?.contains(this.inputEl)) {
       this.container.removeChild(this.inputEl);
     }
+    if (this.scrollEl && this.container?.contains(this.scrollEl)) {
+      this.container.removeChild(this.scrollEl);
+    }
     this.glCanvas = null;
     this.inputEl = null;
+    this.scrollEl = null;
+    this.scrollSpacer = null;
     this.displayCtx = null;
     this.container = null;
   }
@@ -1060,6 +1124,11 @@ export class BlitTerminalSurface {
       }
     }
 
+    // Keep the native scroll surface in sync with the current scrollback
+    // depth and offset.  Cheap idempotent — only touches the DOM when
+    // values actually changed.
+    this.syncScrollSurface(/* preserveOffset */ true);
+
     // Notify flow control in all modes — the server paces on
     // `pendingAppliedFrames` / `ackAheadFrames`, and suppressing this
     // call in read-only lets those counters climb to 0xffff, which the
@@ -1315,7 +1384,6 @@ export class BlitTerminalSurface {
         e.preventDefault();
         if (this.scrollOffset > 0) {
           this.scrollOffset = 0;
-          this.wheelLineAccum = 0;
           this.sendScroll(this._sessionId!, 0);
         }
         if (
@@ -1441,70 +1509,92 @@ export class BlitTerminalSurface {
     this.boundInput = null;
   }
 
-  // --- Container wheel ---
+  // --- Scroll surface ---
+  //
+  // The scrollback navigation is driven by native scroll on `scrollEl`:
+  // a transparent overlay over the canvas containing a spacer sized to
+  // (scrollback_lines * cell.h). Wheel and touch gestures over the
+  // terminal therefore produce native scroll events with momentum on
+  // mobile and OS-consistent feel on desktop.
+  //
+  // Mapping:
+  //   scrollTop = (scrollback_lines - scrollOffset) * cell.h
+  // i.e. scrollTop=max → newest output (scrollOffset=0); scrollTop=0 →
+  // oldest in scrollback. The user therefore swipes UP / wheels UP to
+  // travel back in time, matching every other scrollable surface.
 
-  private setupContainerWheel(): void {
-    if (!this.container) return;
-    this.boundContainerWheel = (e: WheelEvent) => {
+  private setupScrollSurface(): void {
+    const el = this.scrollEl;
+    if (!el) return;
+    this.boundScrollListener = () => {
+      if (this.suppressScrollSync) return;
       const t = this.terminal;
-      // In read-only, always do scrollback — we never forward wheel as
-      // mouse events to the host shell.  In read/write, let the canvas
-      // wheel handler (setupMouse) take the event when the PTY is in
-      // mouse-reporting mode, unless shift is held.
-      if (!this._readOnly && t && t.mouse_mode() > 0 && !e.shiftKey) return;
+      if (!t) return;
+      const maxLines = t.scrollback_lines();
+      const cellH = Math.max(1, this.cell.h);
+      // scrollTop=max → offset 0 (newest); scrollTop=0 → offset maxLines.
+      const maxScrollTop = maxLines * cellH;
+      const fromTop = maxScrollTop - el.scrollTop;
+      const next = Math.max(0, Math.min(maxLines, Math.round(fromTop / cellH)));
+      if (next === this.scrollOffset) return;
+      this.scrollOffset = next;
       if (this._sessionId !== null && this.status === "connected") {
-        const maxScroll = t ? t.scrollback_lines() : 0;
-        if (maxScroll === 0 && this.scrollOffset === 0) return;
-        e.preventDefault();
-        const rawDelta =
-          Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
-        // Honour the browser-reported deltaMode so notched wheels,
-        // high-precision trackpads, and page-mode devices all map
-        // onto whole terminal lines via the same accumulator.
-        let lineDelta: number;
-        switch (e.deltaMode) {
-          case WheelEvent.DOM_DELTA_PIXEL:
-            lineDelta = rawDelta / Math.max(1, this.cell.h);
-            break;
-          case WheelEvent.DOM_DELTA_PAGE:
-            lineDelta = rawDelta * (t ? t.rows : 24);
-            break;
-          default:
-            lineDelta = rawDelta;
-        }
-        this.wheelLineAccum -= lineDelta;
-        const lines = Math.trunc(this.wheelLineAccum);
-        if (lines === 0) return;
-        this.wheelLineAccum -= lines;
-        const next = Math.max(
-          0,
-          Math.min(maxScroll, this.scrollOffset + lines),
-        );
-        if (next === 0 || next === maxScroll) this.wheelLineAccum = 0;
-        if (next === this.scrollOffset) return;
-        this.scrollOffset = next;
-        this.sendScroll(this._sessionId!, this.scrollOffset);
-        if (this.scrollOffset > 0) this.flashScrollbar();
-        this.scheduleRender();
+        this.sendScroll(this._sessionId, this.scrollOffset);
       }
+      if (this.scrollOffset > 0) this.flashScrollbar();
+      this.scheduleRender();
     };
-    this.container.addEventListener("wheel", this.boundContainerWheel, {
-      passive: false,
-    });
+    el.addEventListener("scroll", this.boundScrollListener, { passive: true });
+    this.syncScrollSurface(/* preserveOffset */ false);
   }
 
-  private teardownContainerWheel(): void {
-    if (this.boundContainerWheel && this.container) {
-      this.container.removeEventListener("wheel", this.boundContainerWheel);
+  private teardownScrollSurface(): void {
+    if (this.scrollEl && this.boundScrollListener) {
+      this.scrollEl.removeEventListener("scroll", this.boundScrollListener);
     }
-    this.boundContainerWheel = null;
+    this.boundScrollListener = null;
+  }
+
+  /**
+   * Resize the spacer so the scroll range matches the current scrollback
+   * depth, and align scrollEl.scrollTop with this.scrollOffset.
+   *
+   * Called from the render loop (cheap idempotent updates) and whenever
+   * scrollOffset changes from a non-scroll source (e.g. Shift+PageUp).
+   */
+  private syncScrollSurface(preserveOffset: boolean): void {
+    const el = this.scrollEl;
+    const spacer = this.scrollSpacer;
+    const t = this.terminal;
+    if (!el || !spacer || !t) return;
+    const cellH = Math.max(1, this.cell.h);
+    const lines = t.scrollback_lines();
+    // The spacer alone provides the extra scrollable height; the visible
+    // viewport is the scrollEl's own height, so total content is
+    // (viewport + scrollback*cellH).
+    const desired = `${lines * cellH}px`;
+    if (spacer.style.height !== desired) spacer.style.height = desired;
+    // Clamp scrollOffset to the (possibly shrunken) range first.
+    if (preserveOffset) {
+      this.scrollOffset = Math.max(0, Math.min(lines, this.scrollOffset));
+    }
+    const targetTop = (lines - this.scrollOffset) * cellH;
+    if (Math.abs(el.scrollTop - targetTop) > 0.5) {
+      this.suppressScrollSync = true;
+      el.scrollTop = targetTop;
+      // The scroll event is async; clear the flag in the next frame.
+      requestAnimationFrame(() => {
+        this.suppressScrollSync = false;
+      });
+    }
   }
 
   // --- Mouse input ---
 
   private setupMouse(): void {
     const canvas = this.glCanvas;
-    if (!canvas || this._readOnly) return;
+    const target = this.scrollEl;
+    if (!canvas || !target || this._readOnly) return;
 
     const SCROLLBAR_HIT_PX = 20;
     const WORD_CHARS = /[A-Za-z0-9_\-./~:@]/;
@@ -1760,7 +1850,7 @@ export class BlitTerminalSurface {
         const geo = this.scrollbarGeo;
         const y = canvasYFromEvent(e);
         this.scrollDragging = true;
-        canvas.style.cursor = "grabbing";
+        target.style.cursor = "grabbing";
         if (y >= geo.barY && y <= geo.barY + geo.barH) {
           this.scrollDragOffset = y - geo.barY;
         } else {
@@ -1805,7 +1895,7 @@ export class BlitTerminalSurface {
         return;
       }
       const overCanvas =
-        mouseDownButton >= 0 || canvas.contains(e.target as Node);
+        mouseDownButton >= 0 || target.contains(e.target as Node);
       if (!e.shiftKey && overCanvas) {
         const t = this.terminal;
         if (t) {
@@ -1862,7 +1952,7 @@ export class BlitTerminalSurface {
     const handleMouseUp = (e: MouseEvent) => {
       if (this.scrollDragging) {
         this.scrollDragging = false;
-        canvas.style.cursor = "text";
+        target.style.cursor = "text";
         this.scheduleRender();
         return;
       }
@@ -1887,7 +1977,7 @@ export class BlitTerminalSurface {
         }
         clearSelection();
       }
-      if (canvas.contains(e.target as Node)) {
+      if (target.contains(e.target as Node)) {
         this.inputEl?.focus();
       }
     };
@@ -1921,18 +2011,18 @@ export class BlitTerminalSurface {
 
     const handleHoverMove = (e: MouseEvent) => {
       if (this.scrollDragging) {
-        canvas.style.cursor = "grabbing";
+        target.style.cursor = "grabbing";
         return;
       }
       if (this.scrollbarGeo && isNearScrollbar(e)) {
-        canvas.style.cursor = "default";
+        target.style.cursor = "default";
         return;
       }
       if (selecting) {
         if (this.hoveredUrl) {
           this.hoveredUrl = null;
           this.scheduleRender();
-          canvas.style.cursor = "text";
+          target.style.cursor = "text";
           lastHoverUrl = null;
         }
         return;
@@ -1942,7 +2032,7 @@ export class BlitTerminalSurface {
       const url = hit?.url ?? null;
       if (url !== lastHoverUrl) {
         lastHoverUrl = url;
-        canvas.style.cursor = hit ? "pointer" : "text";
+        target.style.cursor = hit ? "pointer" : "text";
         this.hoveredUrl = hit
           ? {
               row: cell.row,
@@ -2111,21 +2201,21 @@ export class BlitTerminalSurface {
         }
       }
 
-      const dy = touchLastY - touch.clientY;
-      touchLastY = touch.clientY;
-      touchAccum += dy;
-
       const t = this.terminal;
-      const lineH = this.cell.h || 20;
-
-      // Emit one scroll event per cell-height of accumulated movement.
-      while (Math.abs(touchAccum) >= lineH) {
-        touchScrolled = true;
-        const dir = touchAccum > 0 ? 1 : -1; // 1 = scroll up, -1 = scroll down
-        touchAccum -= dir * lineH;
-
-        if (t && t.mouse_mode() > 0) {
-          // Mouse mode — send wheel button events (64=up, 65=down)
+      // Mouse-reporting apps (htop, vim, …) need wheel-button events for
+      // their internal scrolling. Native browser scroll would silently
+      // swallow those gestures, so we synthesise wheel reports per cell-
+      // height of vertical movement and preventDefault to stop the
+      // browser from also scrolling the surface.
+      if (t && t.mouse_mode() > 0) {
+        const dy = touchLastY - touch.clientY;
+        touchLastY = touch.clientY;
+        touchAccum += dy;
+        const lineH = this.cell.h || 20;
+        while (Math.abs(touchAccum) >= lineH) {
+          touchScrolled = true;
+          const dir = touchAccum > 0 ? 1 : -1;
+          touchAccum -= dir * lineH;
           const button = dir > 0 ? 64 : 65;
           const pos = mouseToCell(
             new MouseEvent("wheel", {
@@ -2140,21 +2230,17 @@ export class BlitTerminalSurface {
             pos.col,
             pos.row,
           );
-        } else if (this._sessionId !== null && this.status === "connected") {
-          // Normal mode — scrollback
-          const maxScroll = t ? t.scrollback_lines() : 0;
-          if (maxScroll > 0 || this.scrollOffset > 0) {
-            this.scrollOffset = Math.max(
-              0,
-              Math.min(maxScroll, this.scrollOffset + dir),
-            );
-            this.sendScroll(this._sessionId!, this.scrollOffset);
-            if (this.scrollOffset > 0) this.flashScrollbar();
-            this.scheduleRender();
-          }
+          e.preventDefault();
         }
-        e.preventDefault();
+        return;
       }
+
+      // Normal mode: vertical pan is handled by native scroll on
+      // `scrollEl` (touch-action: pan-y). Just track that the gesture is
+      // a scroll so touchend doesn't synthesise a tap.
+      const dyAbsTotal = Math.abs(touch.clientY - touchStartY);
+      if (dyAbsTotal > LONG_PRESS_SLOP_PX) touchScrolled = true;
+      touchLastY = touch.clientY;
     };
 
     const handleTouchEnd = (e: TouchEvent) => {
@@ -2181,33 +2267,33 @@ export class BlitTerminalSurface {
       }
     };
 
-    canvas.addEventListener("touchstart", handleTouchStart, { passive: true });
-    canvas.addEventListener("touchmove", handleTouchMove, { passive: false });
-    canvas.addEventListener("touchend", handleTouchEnd, { passive: false });
-    canvas.addEventListener("touchcancel", handleTouchEnd, { passive: false });
+    target.addEventListener("touchstart", handleTouchStart, { passive: true });
+    target.addEventListener("touchmove", handleTouchMove, { passive: false });
+    target.addEventListener("touchend", handleTouchEnd, { passive: false });
+    target.addEventListener("touchcancel", handleTouchEnd, { passive: false });
 
-    canvas.addEventListener("mousedown", handleMouseDown);
+    target.addEventListener("mousedown", handleMouseDown);
     window.addEventListener("mousemove", handleMouseMove);
-    canvas.addEventListener("mousemove", handleHoverMove);
+    target.addEventListener("mousemove", handleHoverMove);
     window.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("blur", handleBlur);
-    canvas.addEventListener("wheel", handleCanvasWheel, { passive: false });
-    canvas.addEventListener("contextmenu", handleContextMenu);
-    canvas.addEventListener("click", handleClick);
+    target.addEventListener("wheel", handleCanvasWheel, { passive: false });
+    target.addEventListener("contextmenu", handleContextMenu);
+    target.addEventListener("click", handleClick);
 
     this.mouseCleanup = () => {
-      canvas.removeEventListener("touchstart", handleTouchStart);
-      canvas.removeEventListener("touchmove", handleTouchMove);
-      canvas.removeEventListener("touchend", handleTouchEnd);
-      canvas.removeEventListener("touchcancel", handleTouchEnd);
-      canvas.removeEventListener("mousedown", handleMouseDown);
+      target.removeEventListener("touchstart", handleTouchStart);
+      target.removeEventListener("touchmove", handleTouchMove);
+      target.removeEventListener("touchend", handleTouchEnd);
+      target.removeEventListener("touchcancel", handleTouchEnd);
+      target.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mousemove", handleMouseMove);
-      canvas.removeEventListener("mousemove", handleHoverMove);
+      target.removeEventListener("mousemove", handleHoverMove);
       window.removeEventListener("mouseup", handleMouseUp);
       window.removeEventListener("blur", handleBlur);
-      canvas.removeEventListener("wheel", handleCanvasWheel);
-      canvas.removeEventListener("contextmenu", handleContextMenu);
-      canvas.removeEventListener("click", handleClick);
+      target.removeEventListener("wheel", handleCanvasWheel);
+      target.removeEventListener("contextmenu", handleContextMenu);
+      target.removeEventListener("click", handleClick);
       if (this.scrollFadeTimer) clearTimeout(this.scrollFadeTimer);
       stopAutoScroll();
     };
