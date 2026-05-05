@@ -8,7 +8,7 @@ use blit_remote::{
     S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
     SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
     msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
-    msg_input, msg_kill, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
+    msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
     msg_surface_close, msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext,
     parse_server_msg,
 };
@@ -325,6 +325,82 @@ pub async fn cmd_send(transport: Transport, id: u16, text: String) -> Result<(),
     conn.send(&msg_input(id, &bytes)).await?;
     conn.finish().await;
     Ok(())
+}
+
+pub async fn cmd_terminal_click(
+    transport: Transport,
+    id: u16,
+    col: u16,
+    row: u16,
+    button: &str,
+) -> Result<(), String> {
+    cmd_mouse(transport, id, "click", col, row, button).await
+}
+
+pub async fn cmd_mouse(
+    transport: Transport,
+    id: u16,
+    event: &str,
+    col: u16,
+    row: u16,
+    button: &str,
+) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+
+    if !conn.has_pty(id) {
+        return Err(format!("pty {id} not found"));
+    }
+
+    if conn.exited.contains_key(&id) {
+        return Err(format!("pty {id} has exited"));
+    }
+
+    let btn = parse_terminal_mouse_button(button)?;
+    match event {
+        "down" | "press" => {
+            conn.send(&msg_mouse(id, 0, btn, col, row)).await?;
+        }
+        "up" | "release" => {
+            conn.send(&msg_mouse(id, 1, btn, col, row)).await?;
+        }
+        "move" | "drag" => {
+            let move_button = if btn < 32 { btn + 32 } else { btn };
+            conn.send(&msg_mouse(id, 2, move_button, col, row)).await?;
+        }
+        "hover" => {
+            conn.send(&msg_mouse(id, 2, 35, col, row)).await?;
+        }
+        "click" => {
+            conn.send(&msg_mouse(id, 0, btn, col, row)).await?;
+            conn.send(&msg_mouse(id, 1, btn, col, row)).await?;
+        }
+        "wheel-up" | "wheelup" | "scroll-up" | "scrollup" => {
+            conn.send(&msg_mouse(id, 0, 64, col, row)).await?;
+        }
+        "wheel-down" | "wheeldown" | "scroll-down" | "scrolldown" => {
+            conn.send(&msg_mouse(id, 0, 65, col, row)).await?;
+        }
+        other => {
+            return Err(format!(
+                "unknown mouse event '{other}': expected down, up, move, hover, click, wheel-up, or wheel-down"
+            ));
+        }
+    }
+
+    conn.finish().await;
+    Ok(())
+}
+
+fn parse_terminal_mouse_button(button: &str) -> Result<u8, String> {
+    match button {
+        "left" => Ok(0),
+        "middle" => Ok(1),
+        "right" => Ok(2),
+        "release" => Ok(3),
+        other => Err(format!(
+            "unknown button '{other}': expected left, right, middle, or release"
+        )),
+    }
 }
 
 pub async fn cmd_quit(transport: Transport) -> Result<(), String> {
@@ -1835,6 +1911,88 @@ mod tests {
         let transport = Transport::Unix(client);
         let result = cmd_send(transport, 1, "\\x1b[A".to_string()).await;
         assert!(result.is_ok());
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_terminal_click() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.add_pty(1, "shell", "bash", false, "");
+            mock.send_initial_burst().await;
+
+            let down = mock.recv().await.unwrap();
+            assert_eq!(down, vec![blit_remote::C2S_MOUSE, 1, 0, 0, 0, 10, 0, 5, 0]);
+
+            let up = mock.recv().await.unwrap();
+            assert_eq!(up, vec![blit_remote::C2S_MOUSE, 1, 0, 1, 0, 10, 0, 5, 0]);
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_terminal_click(transport, 1, 10, 5, "left").await;
+        assert!(result.is_ok());
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_terminal_mouse_move() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.add_pty(1, "shell", "bash", false, "");
+            mock.send_initial_burst().await;
+
+            let data = mock.recv().await.unwrap();
+            assert_eq!(data, vec![blit_remote::C2S_MOUSE, 1, 0, 2, 34, 12, 0, 5, 0]);
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_mouse(transport, 1, "move", 12, 5, "right").await;
+        assert!(result.is_ok());
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_terminal_mouse_wheel() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.add_pty(1, "shell", "bash", false, "");
+            mock.send_initial_burst().await;
+
+            let data = mock.recv().await.unwrap();
+            assert_eq!(data, vec![blit_remote::C2S_MOUSE, 1, 0, 0, 64, 12, 0, 5, 0]);
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_mouse(transport, 1, "wheel-up", 12, 5, "left").await;
+        assert!(result.is_ok());
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_terminal_mouse_bad_button() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.add_pty(1, "shell", "bash", false, "");
+            mock.send_initial_burst().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_mouse(transport, 1, "click", 12, 5, "nope").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown button"));
 
         mock.await.unwrap();
     }
