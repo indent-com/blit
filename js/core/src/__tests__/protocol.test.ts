@@ -29,6 +29,7 @@ import {
   C2S_CREATE2,
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
+  CREATE2_HAS_CWD,
 } from "../types";
 
 const textDecoder = new TextDecoder();
@@ -221,6 +222,36 @@ describe("protocol message builders", () => {
       expect(msg[12]).toBe(0x01);
       // command after srcPtyId
       expect(textDecoder.decode(msg.subarray(13))).toBe("ls");
+    });
+
+    it("with cwd", () => {
+      const msg = buildCreate2Message(0, 24, 80, { cwd: "/src/blit" });
+      expect(msg[7]).toBe(CREATE2_HAS_CWD);
+      const tagLen = msg[8] | (msg[9] << 8);
+      expect(tagLen).toBe(0);
+      const cwdLen = msg[10] | (msg[11] << 8);
+      expect(cwdLen).toBe(9);
+      expect(textDecoder.decode(msg.subarray(12, 12 + cwdLen))).toBe(
+        "/src/blit",
+      );
+      expect(msg.length).toBe(21);
+    });
+
+    it("with srcPtyId, cwd, and command", () => {
+      const msg = buildCreate2Message(0, 24, 80, {
+        srcPtyId: 0x0102,
+        cwd: "/tmp",
+        command: "pwd",
+      });
+      expect(msg[7]).toBe(
+        CREATE2_HAS_SRC_PTY | CREATE2_HAS_CWD | CREATE2_HAS_COMMAND,
+      );
+      expect(msg[10]).toBe(0x02);
+      expect(msg[11]).toBe(0x01);
+      const cwdLen = msg[12] | (msg[13] << 8);
+      expect(cwdLen).toBe(4);
+      expect(textDecoder.decode(msg.subarray(14, 18))).toBe("/tmp");
+      expect(textDecoder.decode(msg.subarray(18))).toBe("pwd");
     });
 
     it("trims whitespace-only command", () => {

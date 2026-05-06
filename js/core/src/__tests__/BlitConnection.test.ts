@@ -10,6 +10,7 @@ import {
   C2S_CLOSE,
   C2S_CREATE2,
   CREATE2_HAS_COMMAND,
+  CREATE2_HAS_CWD,
   FEATURE_CREATE_NONCE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
@@ -221,6 +222,15 @@ describe("BlitConnection", () => {
     conn.createSession({ rows: 24, cols: 80, tag: "bg", command: "make" });
     const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
     expect(msg[7]).toBe(CREATE2_HAS_COMMAND);
+  });
+
+  it("createSession with cwd sets features", () => {
+    conn.createSession({ rows: 24, cols: 80, cwd: "/src/blit" });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    expect(msg[7]).toBe(CREATE2_HAS_CWD);
+    const cwdLen = msg[10] | (msg[11] << 8);
+    expect(cwdLen).toBe(9);
+    expect(new TextDecoder().decode(msg.subarray(12, 21))).toBe("/src/blit");
   });
 
   it("createSession resolves via S2C_CREATED_N when nonce supported", async () => {

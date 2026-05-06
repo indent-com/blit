@@ -101,6 +101,8 @@ export interface CreateSessionOptions {
   tag?: string;
   command?: string;
   cwdFromSessionId?: SessionId;
+  /** Working directory for the new session. Interpreted on the target server. */
+  cwd?: string;
 }
 
 type ResizeSessionOptions = {
@@ -423,6 +425,7 @@ export class BlitConnection {
           tag: options.tag,
           command: options.command,
           srcPtyId,
+          cwd: options.cwd,
         }),
       );
     });

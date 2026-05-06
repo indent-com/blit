@@ -31,6 +31,7 @@ import {
   C2S_AUDIO_UNSUBSCRIBE,
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
+  CREATE2_HAS_CWD,
 } from "./types";
 
 const textEncoder = new TextEncoder();
@@ -185,20 +186,31 @@ export function buildCreate2Message(
   nonce: number,
   rows: number,
   cols: number,
-  options?: { tag?: string; command?: string; srcPtyId?: number },
+  options?: { tag?: string; command?: string; srcPtyId?: number; cwd?: string },
 ): Uint8Array {
   const tagBytes = options?.tag
     ? textEncoder.encode(options.tag)
     : new Uint8Array(0);
   let features = 0;
   const hasSrc = options?.srcPtyId != null;
+  const cwdText = options?.cwd?.trim() ?? "";
+  const rawCwdBytes = cwdText.length > 0 ? textEncoder.encode(cwdText) : null;
+  const cwdBytes = rawCwdBytes
+    ? rawCwdBytes.subarray(0, Math.min(rawCwdBytes.length, 0xffff))
+    : new Uint8Array(0);
+  const hasCwd = cwdBytes.length > 0;
   const cmdText = options?.command?.trim() ?? "";
   const hasCmd = cmdText.length > 0;
   if (hasSrc) features |= CREATE2_HAS_SRC_PTY;
+  if (hasCwd) features |= CREATE2_HAS_CWD;
   if (hasCmd) features |= CREATE2_HAS_COMMAND;
   const cmdBytes = hasCmd ? textEncoder.encode(cmdText) : new Uint8Array(0);
   const msg = new Uint8Array(
-    10 + tagBytes.length + (hasSrc ? 2 : 0) + cmdBytes.length,
+    10 +
+      tagBytes.length +
+      (hasSrc ? 2 : 0) +
+      (hasCwd ? 2 + cwdBytes.length : 0) +
+      cmdBytes.length,
   );
   msg[0] = C2S_CREATE2;
   msg[1] = nonce & 0xff;
@@ -219,6 +231,13 @@ export function buildCreate2Message(
     msg[cursor] = options!.srcPtyId! & 0xff;
     msg[cursor + 1] = (options!.srcPtyId! >> 8) & 0xff;
     cursor += 2;
+  }
+  if (hasCwd) {
+    msg[cursor] = cwdBytes.length & 0xff;
+    msg[cursor + 1] = (cwdBytes.length >> 8) & 0xff;
+    cursor += 2;
+    msg.set(cwdBytes, cursor);
+    cursor += cwdBytes.length;
   }
   if (cmdBytes.length) msg.set(cmdBytes, cursor);
   return msg;
