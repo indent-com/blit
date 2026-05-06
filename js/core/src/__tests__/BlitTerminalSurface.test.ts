@@ -1,6 +1,29 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { BlitTerminalSurface } from "../BlitTerminalSurface";
 
+function mockCanvasContext(): void {
+  // jsdom returns null for getContext("2d") on detached canvases.
+  // Stub it with a minimal mock that satisfies measureCell().
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => {
+    return {
+      font: "",
+      textBaseline: "",
+      measureText: () => ({ width: 8 }) as TextMetrics,
+      getImageData: () =>
+        ({ data: new Uint8ClampedArray(40000) }) as unknown as ImageData,
+      fillRect: () => {},
+      fillText: () => {},
+      clearRect: () => {},
+      save: () => {},
+      restore: () => {},
+      beginPath: () => {},
+      rect: () => {},
+      clip: () => {},
+      fill: () => {},
+    } as unknown as CanvasRenderingContext2D;
+  });
+}
+
 describe("BlitTerminalSurface mobile copy/paste API", () => {
   beforeEach(() => {
     // jsdom doesn't ship a clipboard mock; install one we can spy on.
@@ -12,28 +35,7 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
         readText: vi.fn().mockResolvedValue(""),
       },
     });
-    // jsdom returns null for getContext("2d") on detached canvases.
-    // Stub it with a minimal mock that satisfies measureCell().
-    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
-      () => {
-        return {
-          font: "",
-          textBaseline: "",
-          measureText: () => ({ width: 8 }) as TextMetrics,
-          getImageData: () =>
-            ({ data: new Uint8ClampedArray(40000) }) as unknown as ImageData,
-          fillRect: () => {},
-          fillText: () => {},
-          clearRect: () => {},
-          save: () => {},
-          restore: () => {},
-          beginPath: () => {},
-          rect: () => {},
-          clip: () => {},
-          fill: () => {},
-        } as unknown as CanvasRenderingContext2D;
-      },
-    );
+    mockCanvasContext();
   });
 
   afterEach(() => {
@@ -149,5 +151,107 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
     s["_workspace"] = { sendInput };
     s.pasteText("hello");
     expect(sendInput).not.toHaveBeenCalled();
+  });
+});
+
+describe("BlitTerminalSurface native scroll surface", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function setClientHeight(el: HTMLElement, value: number): void {
+    Object.defineProperty(el, "clientHeight", {
+      configurable: true,
+      value,
+    });
+  }
+
+  function makeSurface(lines = 100, cellH = 10, clientHeight = 80) {
+    const s = new BlitTerminalSurface({ sessionId: null });
+    const el = document.createElement("div");
+    const spacer = document.createElement("div");
+    el.appendChild(spacer);
+    setClientHeight(el, clientHeight);
+
+    // @ts-expect-error — install DOM/terminal stubs for private scroll sync.
+    s.scrollEl = el;
+    // @ts-expect-error — install DOM/terminal stubs for private scroll sync.
+    s.scrollSpacer = spacer;
+    // @ts-expect-error — install DOM/terminal stubs for private scroll sync.
+    s.terminal = { scrollback_lines: () => lines };
+    // @ts-expect-error — only cell.h is read by the scroll surface methods.
+    s.cell = { h: cellH };
+
+    return { s, el, spacer };
+  }
+
+  it("sizes content so native bottom is reachable when offset is zero", () => {
+    const { s, el, spacer } = makeSurface(100, 10, 80);
+    // @ts-expect-error — touching private scrollOffset for direct sync test.
+    s.scrollOffset = 0;
+
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+
+    expect(spacer.style.height).toBe("1080px");
+    expect(el.scrollTop).toBe(1000);
+  });
+
+  it("maps native scroll to bottom back to zero offset", () => {
+    const { s, el } = makeSurface(100, 10, 80);
+    // @ts-expect-error — start scrolled back so the listener must update it.
+    s.scrollOffset = 25;
+
+    // @ts-expect-error — install and invoke the private scroll listener.
+    s.setupScrollSurface();
+    el.scrollTop = 1000;
+    // @ts-expect-error — requestAnimationFrame stub already cleared this.
+    s.boundScrollListener();
+
+    // @ts-expect-error — assert private scrollback state after native scroll.
+    expect(s.scrollOffset).toBe(0);
+  });
+
+  it("maps native scroll to top back to full scrollback offset", () => {
+    const { s, el } = makeSurface(100, 10, 80);
+
+    // @ts-expect-error — install and invoke the private scroll listener.
+    s.setupScrollSurface();
+    el.scrollTop = 0;
+    // @ts-expect-error — requestAnimationFrame stub already cleared this.
+    s.boundScrollListener();
+
+    // @ts-expect-error — assert private scrollback state after native scroll.
+    expect(s.scrollOffset).toBe(100);
+  });
+
+  it("keeps native scroll at bottom when the viewport height changes", () => {
+    const { s, el, spacer } = makeSurface(100, 10, 80);
+    // @ts-expect-error — touching private scrollOffset for direct sync test.
+    s.scrollOffset = 0;
+
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+    expect(spacer.style.height).toBe("1080px");
+    expect(el.scrollTop).toBe(1000);
+
+    setClientHeight(el, 120);
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+
+    expect(spacer.style.height).toBe("1120px");
+    expect(el.scrollTop).toBe(1000);
   });
 });
