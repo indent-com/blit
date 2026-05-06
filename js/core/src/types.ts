@@ -176,6 +176,7 @@ export const C2S_KILL = 0x1a;
 export const C2S_COPY_RANGE = 0x1b;
 export const CREATE2_HAS_SRC_PTY = 1 << 0;
 export const CREATE2_HAS_COMMAND = 1 << 1;
+export const CREATE2_HAS_CWD = 1 << 2;
 
 /** Wire protocol constants: server-to-client message types. */
 export const S2C_UPDATE = 0x00;

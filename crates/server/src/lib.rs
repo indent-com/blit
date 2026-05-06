@@ -8,13 +8,14 @@ use blit_remote::{
     C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE,
     C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
-    CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_SRC_PTY, FEATURE_COMPOSITOR,
-    FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
-    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
-    SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg, msg_hello, msg_s2c_clipboard_content,
-    msg_s2c_clipboard_list, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
-    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
+    CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_SRC_PTY,
+    FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
+    FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N,
+    S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE,
+    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg,
+    msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_surface_app_id,
+    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
+    msg_surface_resized, msg_surface_title,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -5559,13 +5560,32 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     ""
                 };
                 let mut cursor = 10 + tag_len;
-                let dir = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
+                let src_dir = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
                     let src_id = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
                     cursor += 2;
                     sess.ptys.get(&src_id).and_then(|p| pty::pty_cwd(&p.handle))
                 } else {
                     None
                 };
+                let explicit_dir = if features & CREATE2_HAS_CWD != 0 {
+                    if data.len() < cursor + 2 {
+                        continue;
+                    }
+                    let cwd_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+                    cursor += 2;
+                    if data.len() < cursor + cwd_len {
+                        continue;
+                    }
+                    let cwd = std::str::from_utf8(&data[cursor..cursor + cwd_len]).ok();
+                    cursor += cwd_len;
+                    cwd.filter(|p| !p.contains('\0'))
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let dir = explicit_dir.or(src_dir);
                 let create_payload = if features & CREATE2_HAS_COMMAND != 0 {
                     data.get(cursor..).and_then(|b| std::str::from_utf8(b).ok())
                 } else {

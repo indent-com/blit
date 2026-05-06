@@ -58,11 +58,12 @@ pub const C2S_SEARCH: u8 = 0x15;
 pub const C2S_CREATE_AT: u8 = 0x16;
 pub const C2S_CREATE_N: u8 = 0x17;
 /// Generic create: [0x18][nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][...optional fields]
-/// Features: bit 0 = has src_pty_id (2 bytes after tag), bit 1 = has command (remaining bytes after src_pty_id if present)
+/// Features: bit 0 = has src_pty_id (2 bytes after tag), bit 1 = has command (remaining bytes after length-prefixed cwd if present), bit 2 = has cwd ([len:2][utf8])
 /// Server responds with S2C_CREATED_N using the same nonce.
 pub const C2S_CREATE2: u8 = 0x18;
 pub const CREATE2_HAS_SRC_PTY: u8 = 1 << 0;
 pub const CREATE2_HAS_COMMAND: u8 = 1 << 1;
+pub const CREATE2_HAS_CWD: u8 = 1 << 2;
 /// Read text from a PTY's scrollback + viewport: [0x19][nonce:2][pty_id:2][offset:4][limit:4][flags:1]
 /// offset: number of lines to skip from the top (oldest = 0), or from the end if READ_TAIL is set
 /// limit: max lines to return (0 = all)
@@ -1957,18 +1958,41 @@ pub fn msg_create2(
     command: &str,
     features: u8,
 ) -> Vec<u8> {
+    msg_create2_with_cwd(nonce, rows, cols, tag, command, features, None)
+}
+
+pub fn msg_create2_with_cwd(
+    nonce: u16,
+    rows: u16,
+    cols: u16,
+    tag: &str,
+    command: &str,
+    features: u8,
+    cwd: Option<&str>,
+) -> Vec<u8> {
     let tag_bytes = tag.as_bytes();
     let cmd_bytes = command.as_bytes();
+    let cwd_bytes = cwd.unwrap_or_default().as_bytes();
     let has_cmd = !command.is_empty();
-    let feat = features | if has_cmd { CREATE2_HAS_COMMAND } else { 0 };
-    let mut msg = Vec::with_capacity(10 + tag_bytes.len() + cmd_bytes.len());
+    let cwd_len = cwd_bytes.len().min(u16::MAX as usize);
+    let has_cwd = cwd_len > 0;
+    let feat = features
+        | if has_cmd { CREATE2_HAS_COMMAND } else { 0 }
+        | if has_cwd { CREATE2_HAS_CWD } else { 0 };
+    let tag_len = tag_bytes.len().min(u16::MAX as usize);
+    let mut msg =
+        Vec::with_capacity(10 + tag_len + if has_cwd { 2 + cwd_len } else { 0 } + cmd_bytes.len());
     msg.push(C2S_CREATE2);
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.extend_from_slice(&rows.to_le_bytes());
     msg.extend_from_slice(&cols.to_le_bytes());
     msg.push(feat);
-    msg.extend_from_slice(&(tag_bytes.len() as u16).to_le_bytes());
-    msg.extend_from_slice(tag_bytes);
+    msg.extend_from_slice(&(tag_len as u16).to_le_bytes());
+    msg.extend_from_slice(&tag_bytes[..tag_len]);
+    if has_cwd {
+        msg.extend_from_slice(&(cwd_len as u16).to_le_bytes());
+        msg.extend_from_slice(&cwd_bytes[..cwd_len]);
+    }
     if has_cmd {
         msg.extend_from_slice(cmd_bytes);
     }
