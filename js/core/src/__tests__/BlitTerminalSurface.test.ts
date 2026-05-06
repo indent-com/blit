@@ -4,26 +4,24 @@ import { BlitTerminalSurface } from "../BlitTerminalSurface";
 function mockCanvasContext(): void {
   // jsdom returns null for getContext("2d") on detached canvases.
   // Stub it with a minimal mock that satisfies measureCell().
-  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
-    () => {
-      return {
-        font: "",
-        textBaseline: "",
-        measureText: () => ({ width: 8 }) as TextMetrics,
-        getImageData: () =>
-          ({ data: new Uint8ClampedArray(40000) }) as unknown as ImageData,
-        fillRect: () => {},
-        fillText: () => {},
-        clearRect: () => {},
-        save: () => {},
-        restore: () => {},
-        beginPath: () => {},
-        rect: () => {},
-        clip: () => {},
-        fill: () => {},
-      } as unknown as CanvasRenderingContext2D;
-    },
-  );
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => {
+    return {
+      font: "",
+      textBaseline: "",
+      measureText: () => ({ width: 8 }) as TextMetrics,
+      getImageData: () =>
+        ({ data: new Uint8ClampedArray(40000) }) as unknown as ImageData,
+      fillRect: () => {},
+      fillText: () => {},
+      clearRect: () => {},
+      save: () => {},
+      restore: () => {},
+      beginPath: () => {},
+      rect: () => {},
+      clip: () => {},
+      fill: () => {},
+    } as unknown as CanvasRenderingContext2D;
+  });
 }
 
 describe("BlitTerminalSurface mobile copy/paste API", () => {
