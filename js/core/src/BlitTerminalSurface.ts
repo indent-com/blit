@@ -1512,10 +1512,10 @@ export class BlitTerminalSurface {
   // --- Scroll surface ---
   //
   // The scrollback navigation is driven by native scroll on `scrollEl`:
-  // a transparent overlay over the canvas containing a spacer sized to
-  // (scrollback_lines * cell.h). Wheel and touch gestures over the
-  // terminal therefore produce native scroll events with momentum on
-  // mobile and OS-consistent feel on desktop.
+  // a transparent overlay over the canvas containing a spacer sized so its
+  // reachable scroll range is (scrollback_lines * cell.h). Wheel and touch
+  // gestures over the terminal therefore produce native scroll events with
+  // momentum on mobile and OS-consistent feel on desktop.
   //
   // Mapping:
   //   scrollTop = (scrollback_lines - scrollOffset) * cell.h
@@ -1569,10 +1569,11 @@ export class BlitTerminalSurface {
     if (!el || !spacer || !t) return;
     const cellH = Math.max(1, this.cell.h);
     const lines = t.scrollback_lines();
-    // The spacer alone provides the extra scrollable height; the visible
-    // viewport is the scrollEl's own height, so total content is
-    // (viewport + scrollback*cellH).
-    const desired = `${lines * cellH}px`;
+    // Browser scrollTop is capped at scrollHeight - clientHeight. Size the
+    // content to viewport + scrollback range so the maximum reachable
+    // scrollTop is exactly (scrollback_lines * cellH), matching the mapping
+    // above and allowing offset 0 to land at native bottom.
+    const desired = `${el.clientHeight + lines * cellH}px`;
     if (spacer.style.height !== desired) spacer.style.height = desired;
     // Clamp scrollOffset to the (possibly shrunken) range first.
     if (preserveOffset) {
