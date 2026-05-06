@@ -1,8 +1,8 @@
-export { BlitTerminal } from "./BlitTerminal.jsx";
-export type { BlitTerminalProps } from "./BlitTerminal.jsx";
+export { BlitTerminal } from "./BlitTerminal";
+export type { BlitTerminalProps } from "./BlitTerminal";
 
-export { BlitSurfaceView } from "./BlitSurfaceView.jsx";
-export type { BlitSurfaceViewProps } from "./BlitSurfaceView.jsx";
+export { BlitSurfaceView } from "./BlitSurfaceView";
+export type { BlitSurfaceViewProps } from "./BlitSurfaceView";
 
 export { useBlitConnection } from "./hooks/useBlitConnection";
 export { createBlitSessions } from "./hooks/createBlitSessions";
@@ -13,5 +13,5 @@ export {
 export { useBlitSession, useBlitFocusedSession } from "./hooks/useBlitSession";
 export { createBlitWorkspaceConnection } from "./hooks/createBlitWorkspaceConnection";
 
-export { BlitWorkspaceProvider } from "./BlitContext.jsx";
-export type { BlitContextValue, BlitProviderProps } from "./BlitContext.jsx";
+export { BlitWorkspaceProvider } from "./BlitContext";
+export type { BlitContextValue, BlitProviderProps } from "./BlitContext";
