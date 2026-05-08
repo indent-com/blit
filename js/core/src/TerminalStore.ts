@@ -529,14 +529,9 @@ export class TerminalStore {
     for (const id of this.desired) {
       if (!this.subscribed.has(id)) {
         this.subscribed.add(id);
-        // Move the old terminal to stale so the component can keep
-        // rendering it until the first fresh frame arrives and creates
-        // a new terminal — avoids a black flash.
-        const old = this.terminals.get(id);
-        if (old) {
-          this.terminals.delete(id);
-          this.staleTerminals.set(id, old);
-        }
+        // Keep existing terminals across re-subscriptions so scrollback
+        // is preserved.  The server's fresh frame updates the visible
+        // state on the same WASM object.
         this.delegate.send(buildSubscribeMessage(id));
       }
     }
