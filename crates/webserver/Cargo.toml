@@ -1,6 +1,6 @@
 [package]
 name = "blit-webserver"
-version = "0.33.1"
+version = "0.33.2"
 edition.workspace = true
 description = "Embedded web server for blit"
 license.workspace = true
