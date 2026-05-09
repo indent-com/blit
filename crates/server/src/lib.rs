@@ -344,6 +344,8 @@ struct Pty {
     exit_status: i32,
     /// Command used to create this PTY (None = default shell).
     command: Option<String>,
+    /// Explicit working directory used to create this PTY.
+    cwd: Option<String>,
 }
 
 impl Pty {
@@ -6187,12 +6189,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             C2S_RESTART if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
-                let restart_info = sess
-                    .ptys
-                    .get(&pid)
-                    .filter(|p| p.exited)
-                    .map(|p| (p.driver.size(), p.command.clone(), p.tag.clone()));
-                if let Some(((rows, cols), command, tag)) = restart_info {
+                let restart_info = sess.ptys.get(&pid).filter(|p| p.exited).map(|p| {
+                    (
+                        p.driver.size(),
+                        p.command.clone(),
+                        p.cwd.clone(),
+                        p.tag.clone(),
+                    )
+                });
+                if let Some(((rows, cols), command, cwd, tag)) = restart_info {
                     let wayland_display = sess
                         .compositor
                         .as_ref()
@@ -6212,6 +6217,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         cols,
                         pid,
                         command.as_deref(),
+                        cwd.as_deref(),
                         state.clone(),
                         wayland_display.as_deref(),
                         pulse_server.as_deref(),

@@ -482,6 +482,7 @@ pub fn spawn_pty(
         exited: false,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
+        cwd: dir.map(|s| s.to_owned()),
     })
 }
 
@@ -493,6 +494,7 @@ pub fn respawn_child(
     cols: u16,
     pty_id: u16,
     command: Option<&str>,
+    dir: Option<&str>,
     state: AppState,
     wayland_display: Option<&str>,
     pulse_server: Option<&str>,
@@ -556,6 +558,13 @@ pub fn respawn_child(
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
         set_qos_user_interactive();
+        if let Some(d) = dir
+            && let Ok(dir_c) = CString::new(d)
+        {
+            unsafe {
+                libc::chdir(dir_c.as_ptr());
+            }
+        }
         if let Some(cmd) = command {
             let shell_c = match &shell_path {
                 Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),

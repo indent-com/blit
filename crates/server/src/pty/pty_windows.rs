@@ -347,6 +347,7 @@ pub fn spawn_pty(
         exited: false,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
+        cwd: dir.map(|s| s.to_owned()),
     })
 }
 
@@ -357,6 +358,7 @@ pub fn respawn_child(
     cols: u16,
     pty_id: u16,
     command: Option<&str>,
+    dir: Option<&str>,
     state: AppState,
     _wayland_display: Option<&str>,
     _pulse_server: Option<&str>,
