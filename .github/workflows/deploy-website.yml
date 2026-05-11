@@ -27,12 +27,18 @@ jobs:
       - name: Deploy to Vercel
         id: deploy
         run: |
+          set -o pipefail
+
           args=()
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
             args+=(--prod)
           fi
           output=$(./bin/deploy-website "${args[@]}" 2>&1 | tee /dev/stderr) || exit $?
           url=$(echo "$output" | grep -o 'https://[^ ]*\.vercel\.app' | tail -1)
+          if [ -z "$url" ]; then
+            echo "::error::deploy-website succeeded but no Vercel URL was found in its output" >&2
+            exit 1
+          fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
