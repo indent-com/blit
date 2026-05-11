@@ -198,7 +198,7 @@ The site is an Astro + Solid app built from [`js/website/`](js/website/). It con
 
 The website is built as a Nix derivation (`websiteDist` in [`nix/packages.nix`](nix/packages.nix)) which compiles the WASM crate, installs pnpm deps via `fetchPnpmDeps`, and runs `astro build`. The `deploy-website` task in [`nix/tasks.nix`](nix/tasks.nix) assembles a Vercel prebuilt output directory and deploys via `pnpm dlx vercel deploy --prebuilt`.
 
-- **Production deploy** — pushes to `main` that touch `js/website/**`, `js/core/**`, `js/solid/**`, or `crates/browser/**` trigger `./bin/deploy-website --prod`.
+- **Production deploy** — pushes to `main` that touch `js/website/**`, `js/core/**`, `js/react/**`, or `crates/browser/**` trigger `./bin/deploy-website --prod`.
 - **Preview deploy** — PRs with the same path changes get a preview deploy with the URL posted as a PR comment.
 
 ### Local usage
