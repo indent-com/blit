@@ -283,10 +283,13 @@ let
     ];
     text = ''
             tmp=$(mktemp -d)
-            trap 'rm -rf "$tmp"' EXIT
+            trap 'chmod -R u+w "$tmp" 2>/dev/null; rm -rf "$tmp"' EXIT
 
             mkdir -p "$tmp/.vercel/output/static"
             cp -r ${websiteDist}/* "$tmp/.vercel/output/static/"
+            # Files copied from the Nix store keep their read-only mode,
+            # which makes the cleanup trap fail under `set -o pipefail`.
+            chmod -R u+w "$tmp/.vercel"
             cat > "$tmp/.vercel/output/config.json" <<'JSON'
       {"version":3,"routes":[{"handle":"filesystem"},{"src":"/(.*)", "dest":"/index.html"}]}
       JSON
