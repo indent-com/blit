@@ -55,7 +55,7 @@ describe("BlitConnection", () => {
 
   it("starts with transport status", () => {
     // MockTransport starts as "connected" but since the blit handshake
-    // (S2C_READY) hasn't completed, the snapshot reports "authenticating".
+    // has not produced any server frames, the snapshot reports "authenticating".
     expect(conn.getSnapshot().status).toBe("authenticating");
   });
 
@@ -127,15 +127,23 @@ describe("BlitConnection", () => {
   // --- LIST reconciliation ---
 
   it("becomes ready after READY", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
     transport.pushList([{ ptyId: 1, tag: "a" }]);
     expect(conn.getSnapshot().ready).toBe(false);
-    // Before S2C_READY, status is "authenticating" (blit handshake incomplete).
-    expect(conn.getSnapshot().status).toBe("authenticating");
+    // S2C_HELLO/server activity proves the upstream is usable before READY.
+    expect(conn.getSnapshot().status).toBe("connected");
     transport.pushReady();
     expect(conn.getSnapshot().ready).toBe(true);
-    // S2C_READY promotes status to "connected".
+    // S2C_READY keeps status "connected" and marks the initial burst complete.
     expect(conn.getSnapshot().status).toBe("connected");
     expect(conn.getSnapshot().sessions.length).toBe(1);
+  });
+
+  it("promotes status on server activity before READY", () => {
+    expect(conn.getSnapshot().status).toBe("authenticating");
+    transport.pushList([{ ptyId: 1, tag: "a" }]);
+    expect(conn.getSnapshot().status).toBe("connected");
+    expect(conn.getSnapshot().ready).toBe(false);
   });
 
   it("reconciles LIST — marks missing PTYs as closed, adds new", () => {

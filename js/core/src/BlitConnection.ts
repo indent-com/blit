@@ -272,8 +272,9 @@ export class BlitConnection {
     );
     this.snapshot = {
       id,
-      // When the transport is already connected, the blit handshake hasn't
-      // completed yet — report "authenticating" until S2C_READY arrives.
+      // When the transport is already connected, the blit server may not have
+      // sent its first frame yet — report "authenticating" until server
+      // activity proves the upstream is responsive.
       status:
         transport.status === "connected" ? "authenticating" : transport.status,
       ready: false,
@@ -1089,6 +1090,25 @@ export class BlitConnection {
     for (const listener of this.listeners) listener();
   }
 
+  private noteServerResponsive(emit = false): void {
+    // Some older blit-server builds do not send S2C_HELLO/S2C_READY, but they
+    // can still accept C2S_CREATE and stream terminal data. Any server frame
+    // on an open transport proves the upstream is usable, so promote the user-
+    // visible status to connected while leaving `ready` false until S2C_READY
+    // for BSP/surface reconciliation.
+    if (
+      this.transport.status !== "connected" ||
+      this.snapshot.status === "connected"
+    ) {
+      return;
+    }
+    this.snapshot = {
+      ...this.snapshot,
+      status: "connected",
+    };
+    if (emit) this.emit();
+  }
+
   private handleMessage = (data: ArrayBuffer): void => {
     const bytes = new Uint8Array(data);
     if (bytes.length === 0) return;
@@ -1116,6 +1136,11 @@ export class BlitConnection {
       }
       return;
     }
+
+    if (type !== S2C_QUIT && type !== S2C_HELLO && type !== S2C_READY) {
+      this.noteServerResponsive(true);
+    }
+
     switch (type) {
       case S2C_PING:
         // Application-level keepalive — no action needed.
@@ -1553,10 +1578,10 @@ export class BlitConnection {
       this.lastError = lastError;
     }
 
-    // When the transport connects, the blit protocol handshake (S2C_HELLO →
-    // S2C_LIST → S2C_READY) hasn't completed yet.  Report "authenticating"
-    // so the UI doesn't show a connection as online until S2C_READY confirms
-    // the remote is actually reachable and functional.
+    // When the transport connects, the blit protocol handshake has not
+    // necessarily produced any server frames yet. Report "authenticating" until
+    // noteServerResponsive()/S2C_HELLO/S2C_READY confirms the upstream blit
+    // server is reachable. `ready` still waits for S2C_READY.
     const snapshotStatus =
       status === "connected" && !this.snapshot.ready
         ? ("authenticating" as ConnectionStatus)

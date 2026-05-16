@@ -227,10 +227,10 @@ export class BlitTerminalSurface {
   }
 
   get status(): ConnectionStatus {
-    // Reflect the transport's send-readiness, not the post-handshake
-    // "authenticating→connected" promotion on S2C_READY.  Input/resize/mouse
-    // sends succeed as soon as the transport is connected; gating on the
-    // snapshot would block interaction whenever S2C_READY is delayed or lost,
+    // Reflect the transport's send-readiness, not the snapshot-level
+    // "authenticating→connected" promotion. Input/resize/mouse sends succeed
+    // as soon as the transport is connected; gating on the snapshot would
+    // block interaction whenever S2C_READY/server activity is delayed or lost,
     // even though the server is already accepting C2S_CREATE2 and input.
     return this._blitConn?.transport.status ?? "disconnected";
   }
