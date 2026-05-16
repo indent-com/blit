@@ -50,6 +50,22 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
+  test("bad stored passphrase is cleared and prompts again", async ({ page }) => {
+    await page.goto("/");
+    await page.evaluate(() =>
+      localStorage.setItem("blit-passphrase", "wrong-password"),
+    );
+
+    await page.reload();
+
+    const passInput = page.locator('input[type="password"]');
+    await expect(passInput).toBeVisible({ timeout: 10_000 });
+    await expect(passInput).not.toBeDisabled();
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("blit-passphrase")))
+      .toBeNull();
+  });
+
   test("stored passphrase auto-connects on reload", async ({ page }) => {
     await page.goto("/");
     const passInput = page.locator('input[type="password"]');

@@ -495,7 +495,10 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 
 /// Handle the `/config` WebSocket connection.
 ///
-/// Protocol (server → client, after auth):
+/// Protocol (server → client):
+///   - `"auth"` then close — authentication rejected.
+///
+/// After auth:
 ///   1. `"ok"` — authentication accepted.
 ///   2. `"remotes:<text>"` — sent immediately (and re-sent on any change to
 ///      `blit.remotes`).  `<text>` is the raw `blit.remotes` file contents:
@@ -540,6 +543,7 @@ pub async fn handle_config_ws(
                     let _ = ws.send(Message::Text("ok".into())).await;
                     break true;
                 } else {
+                    let _ = ws.send(Message::Text("auth".into())).await;
                     let _ = ws.close().await;
                     break false;
                 }
