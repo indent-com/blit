@@ -11,12 +11,12 @@
   "dependencies": {
     "@blit-sh/core": "workspace:*",
     "@blit-sh/solid": "workspace:*",
-    "solid-js": "^1.9.12"
+    "solid-js": "^1.9.13"
   },
   "devDependencies": {
     "@blit-sh/browser": "file:../../crates/browser/pkg",
     "typescript": "^6.0.3",
-    "vite": "^8.0.10",
+    "vite": "^8.0.13",
     "vite-plugin-singlefile": "^2.3.3",
     "vite-plugin-solid": "^2.11.12"
   }

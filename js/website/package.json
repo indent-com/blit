@@ -12,17 +12,17 @@
     "@astrojs/solid-js": "^6.0.1",
     "@blit-sh/core": "workspace:*",
     "@blit-sh/solid": "workspace:*",
-    "astro": "^6.1.9",
-    "solid-js": "^1.9.12",
+    "astro": "^6.3.3",
+    "solid-js": "^1.9.13",
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "@astrojs/check": "^0.9.8",
+    "@astrojs/check": "^0.9.9",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
-    "@tailwindcss/vite": "^4.2.4",
+    "@tailwindcss/vite": "^4.3.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
-    "tailwindcss": "^4.2.4",
+    "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
-    "vite": "^7.3.2"
+    "vite": "^8.0.13"
   }
 }

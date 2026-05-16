@@ -81,18 +81,18 @@
       # ------------------------------------------------------------------
 
       # wasm-bindgen requires the CLI version to match the crate version
-      # exactly (shared schema). Cargo.lock pins wasm-bindgen 0.2.118, but
-      # nixpkgs only ships up to 0.2.117 — build the matching CLI here.
+      # exactly (shared schema). Cargo.lock pins wasm-bindgen 0.2.121, but
+      # nixpkgs can lag behind — build the matching CLI here.
       wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
         src = pkgs.fetchCrate {
           pname = "wasm-bindgen-cli";
-          version = "0.2.118";
-          hash = "sha256-ve783oYH0TGv8Z8lIPdGjItzeLDQLOT5uv/jbFOlZpI=";
+          version = "0.2.121";
+          hash = "sha256-ZOMgFNOcGkO66Jz/Z83eoIu+DIzo3Z/vq6Z5g6BDY/w=";
         };
         cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
           inherit src;
           inherit (src) pname version;
-          hash = "sha256-EYDfuBlH3zmTxACBL+sjicRna84CvoesKSQVcYiG9P0=";
+          hash = "sha256-DPdCDPTAPBrbqLUqnCwQu1dePs9lGg85JCJOCIr9qjU=";
         };
       };
 
@@ -276,7 +276,7 @@
         postPatch = setupBrowserPkg + ''
           cd js
         '';
-        hash = "sha256-lyYCjGQFeFOV/oe8echLAbx9lVegLowKSODawGqqAe4=";
+        hash = "sha256-bD5kbL9i3F9uAbmw71jomSbrVDTBmREN647NSKsFXCI=";
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {
