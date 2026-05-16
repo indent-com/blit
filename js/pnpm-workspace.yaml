@@ -4,3 +4,6 @@ packages:
   - solid
   - ui
   - website
+
+overrides:
+  yaml: ^2.8.3

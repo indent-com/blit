@@ -20,7 +20,7 @@ in
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.blit;
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.blit;
       defaultText = "self.packages.\${system}.blit";
       description = "The blit package to use.";
     };
@@ -140,7 +140,7 @@ in
             };
             package = mkOption {
               type = types.package;
-              default = self.packages.${pkgs.system}.blit;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.blit;
               defaultText = "self.packages.\${system}.blit";
               description = "The blit package to use for the gateway.";
             };
@@ -181,7 +181,7 @@ in
             };
             package = mkOption {
               type = types.package;
-              default = self.packages.${pkgs.system}.blit;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.blit;
               defaultText = "self.packages.\${system}.blit";
               description = "The blit package to use for the share service.";
             };

@@ -268,12 +268,27 @@
         done
       '';
 
+      # fetchPnpmDeps hashes the pnpm store, including the packed local
+      # file:../../crates/browser/pkg dependency.  Do not feed it the real
+      # browserWasm output: its store path differs by platform/toolchain and
+      # would make pnpmDeps.hash churn even when js/pnpm-lock.yaml is stable.
+      setupBrowserPkgForDeps = ''
+        mkdir -p crates/browser/pkg/snippets
+        cat > crates/browser/pkg/package.json <<'EOF'
+        {"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}
+        EOF
+        : > crates/browser/pkg/blit_browser.js
+        : > crates/browser/pkg/blit_browser_bg.wasm
+        : > crates/browser/pkg/blit_browser.d.ts
+        : > crates/browser/pkg/blit_browser_bg.wasm.d.ts
+      '';
+
       pnpmDeps = pkgs.fetchPnpmDeps {
         pname = "blit-js";
         inherit version;
         src = ../.;
         fetcherVersion = 3;
-        postPatch = setupBrowserPkg + ''
+        postPatch = setupBrowserPkgForDeps + ''
           cd js
         '';
         hash = "sha256-bD5kbL9i3F9uAbmw71jomSbrVDTBmREN647NSKsFXCI=";
