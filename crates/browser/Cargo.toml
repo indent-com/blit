@@ -1,6 +1,6 @@
 [package]
 name = "blit-browser"
-version = "0.33.3"
+version = "0.33.4"
 edition.workspace = true
 publish = false
 
