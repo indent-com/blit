@@ -3,7 +3,7 @@ import { test, expect } from "@playwright/test";
 async function authenticate(page: import("@playwright/test").Page) {
   await page.goto("/");
   await page.evaluate(() => localStorage.clear());
-  await page.goto("/#test-secret");
+  await page.goto("/#psk=test-secret");
   await expect(
     page
       .getByRole("button", { name: "New terminal" })

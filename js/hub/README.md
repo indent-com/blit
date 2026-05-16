@@ -105,7 +105,7 @@ terminal is shared:
 
 ```jsonc
 {
-  "template": "Terminals at https://blit.sh/s#{secret}\nor BLIT_PASSPHRASE={secret} blit open",
+  "template": "Terminals at https://blit.sh/s#psk={secret}\nor BLIT_PASSPHRASE={secret} blit open",
 }
 ```
 

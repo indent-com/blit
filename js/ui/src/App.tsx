@@ -21,6 +21,14 @@ import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
 import { PASSPHRASE_KEY } from "./passphrase-storage";
 
+function decodeHashValue(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function readPassphrase(): string | null {
   let stored: string | null = null;
   try {
@@ -29,20 +37,32 @@ function readPassphrase(): string | null {
 
   const raw = location.hash.slice(1);
   if (!raw) return stored;
-  const first = raw.split("&")[0];
-  if (!first || /^[lpa]=/.test(first)) return stored;
+  const parts = raw.split("&");
+  let decoded: string | null = null;
+  let secretPartIndex = -1;
+
+  // Canonical first-contact delivery: #psk=<url-encoded passphrase>.
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const eq = part.indexOf("=");
+    if (eq > 0 && decodeHashValue(part.slice(0, eq)) === "psk") {
+      decoded = decodeHashValue(part.slice(eq + 1));
+      secretPartIndex = i;
+      break;
+    }
+  }
+
+  if (secretPartIndex < 0) return stored;
 
   // First contact — secret is being delivered via the URL fragment. Move it
-  // to localStorage and strip it from the URL so it doesn't end up in
+  // to localStorage and strip it from the URL so it does not end up in
   // browser history or get re-shared accidentally.
-  const decoded = decodeURIComponent(first);
-  const rest = raw.split("&").slice(1);
-  const newHash = rest.filter(Boolean).join("&");
-  history.replaceState(
-    null,
-    "",
-    `${location.pathname}${newHash ? `#${newHash}` : ""}`,
-  );
+  const newHash = parts
+    .filter((part, i) => i !== secretPartIndex && part)
+    .join("&");
+  const newUrl =
+    location.pathname + location.search + (newHash ? `#${newHash}` : "");
+  history.replaceState(null, "", newUrl);
   if (decoded) {
     try {
       localStorage.setItem(PASSPHRASE_KEY, decoded);

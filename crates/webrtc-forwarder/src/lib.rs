@@ -70,7 +70,7 @@ pub fn default_local_ip() -> Option<std::net::IpAddr> {
     default_local_ips().into_iter().next()
 }
 const DEFAULT_MESSAGE_TEMPLATE: &str =
-    "Terminals at https://blit.sh/s#{secret}\nRead-only: https://blit.sh/s#{ro_secret}";
+    "Terminals at https://blit.sh/s#psk={secret}\nRead-only: https://blit.sh/s#psk={ro_secret}";
 
 pub fn normalize_hub(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');

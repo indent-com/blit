@@ -50,7 +50,9 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
-  test("bad stored passphrase is cleared and prompts again", async ({ page }) => {
+  test("bad stored passphrase is cleared and prompts again", async ({
+    page,
+  }) => {
     await page.goto("/");
     await page.evaluate(() =>
       localStorage.setItem("blit-passphrase", "wrong-password"),
@@ -88,8 +90,8 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
   });
 
-  test("raw passphrase in hash is stored and stripped", async ({ page }) => {
-    await page.goto("/#test-secret");
+  test("psk passphrase in hash is stored and stripped", async ({ page }) => {
+    await page.goto("/#psk=test-secret");
 
     const passInput = page.locator('input[type="password"]');
     await expect(passInput).toBeHidden({ timeout: 10_000 });
@@ -100,7 +102,7 @@ test.describe("Auth flow", () => {
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
 
     const url = page.url();
-    expect(url).not.toContain("#test-secret");
+    expect(url).not.toContain("psk=test-secret");
     expect(url).not.toContain("#e=");
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("blit-passphrase")))
@@ -108,5 +110,24 @@ test.describe("Auth flow", () => {
 
     await page.reload();
     await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("terminal focus hash does not replace stored passphrase", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.evaluate(() =>
+      localStorage.setItem("blit-passphrase", "test-secret"),
+    );
+
+    await page.goto("/#t=hound:19");
+
+    const newTerminal = page
+      .getByRole("button", { name: "New terminal" })
+      .first();
+    await expect(newTerminal).toBeVisible({ timeout: 10_000 });
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("blit-passphrase")))
+      .toBe("test-secret");
   });
 });

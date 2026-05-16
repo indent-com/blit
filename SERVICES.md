@@ -190,7 +190,7 @@ For protocol details, deployment instructions, and configuration, see [`js/hub/R
 `blit.sh` is the public website, deployed to **Vercel**. It serves two purposes:
 
 1. **Landing page** (`/`) — marketing page with install instructions, feature overview, and a join form to connect to a shared terminal.
-2. **Terminal viewer** (`/#<secret>`) — browser-based terminal that connects to a shared terminal via WebRTC through `hub.blit.sh`.
+2. **Terminal viewer** (`/#psk=<secret>`) — browser-based terminal that connects to a shared terminal via WebRTC through `hub.blit.sh`.
 
 The site is an Astro + Solid app built from [`js/website/`](js/website/). It consumes `@blit-sh/core` and `@blit-sh/solid` via workspace aliases and inlines the browser WASM module at build time.
 

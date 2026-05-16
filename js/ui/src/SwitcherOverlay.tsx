@@ -1573,7 +1573,9 @@ export function SwitcherOverlay(props: {
           .slice(1)
           .split("&")
           .filter((s) => /^[lpast]=/.test(s));
-        const hash = [encodeURIComponent(passphrase), ...rest].join("&");
+        const hash = [`psk=${encodeURIComponent(passphrase)}`, ...rest].join(
+          "&",
+        );
         const url = `${location.origin}${location.pathname}#${hash}`;
         navigator.clipboard.writeText(url).catch(() => {});
       }
