@@ -126,6 +126,9 @@ export function keyToBytes(
     Tab: "\t",
     Escape: "\x1b",
   };
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key === "Enter") {
+    return encoder.encode("\x1b" + simple.Enter);
+  }
   if (simple[e.key]) return encoder.encode(simple[e.key]);
 
   if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.length === 1) {

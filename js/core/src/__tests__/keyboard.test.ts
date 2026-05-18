@@ -74,6 +74,12 @@ describe("keyToBytes", () => {
       ]);
     });
 
+    it("Alt+Enter sends ESC CR", () => {
+      expect(
+        Array.from(keyToBytes(makeEvent("Enter", { altKey: true }), false)!),
+      ).toEqual([0x1b, 0x0d]);
+    });
+
     it("Backspace sends DEL", () => {
       expect(Array.from(keyToBytes(makeEvent("Backspace"), false)!)).toEqual([
         0x7f,
