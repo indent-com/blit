@@ -130,7 +130,7 @@ describe("BlitConnection", () => {
     transport.pushHello(1, FEATURE_CREATE_NONCE);
     transport.pushList([{ ptyId: 1, tag: "a" }]);
     expect(conn.getSnapshot().ready).toBe(false);
-    // S2C_HELLO/server activity proves the upstream is usable before READY.
+    // S2C_LIST proves terminal state is available before READY.
     expect(conn.getSnapshot().status).toBe("connected");
     transport.pushReady();
     expect(conn.getSnapshot().ready).toBe(true);
@@ -139,11 +139,39 @@ describe("BlitConnection", () => {
     expect(conn.getSnapshot().sessions.length).toBe(1);
   });
 
-  it("promotes status on server activity before READY", () => {
+  it("promotes status on LIST before READY", () => {
     expect(conn.getSnapshot().status).toBe("authenticating");
     transport.pushList([{ ptyId: 1, tag: "a" }]);
     expect(conn.getSnapshot().status).toBe("connected");
     expect(conn.getSnapshot().ready).toBe(false);
+  });
+
+  it("does not look connected until LIST arrives", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    expect(conn.getSnapshot().status).toBe("authenticating");
+    // Surface frames/other server activity can arrive before the terminal
+    // list. They should not make the remote look connected while terminals
+    // are still unknown.
+    transport.push(
+      new Uint8Array([
+        0x20, // S2C_SURFACE_CREATED
+        0x01,
+        0x00, // surface_id
+        0x00,
+        0x00, // parent_id
+        0x40,
+        0x00, // width
+        0x30,
+        0x00, // height
+        0x00,
+        0x00, // title_len
+        0x00,
+        0x00, // app_id_len
+      ]),
+    );
+    expect(conn.getSnapshot().status).toBe("authenticating");
+    transport.pushList([{ ptyId: 1, tag: "a" }]);
+    expect(conn.getSnapshot().status).toBe("connected");
   });
 
   it("reconciles LIST — marks missing PTYs as closed, adds new", () => {
@@ -446,10 +474,10 @@ describe("BlitConnection", () => {
 
   it("accepts hello with version 1", () => {
     transport.pushHello(1, FEATURE_CREATE_NONCE);
-    // S2C_HELLO proves the server is responsive — promote status to
-    // "connected" so the UI indicator stops pulsing orange.  `ready`
-    // still waits for S2C_READY to gate BSP reconciliation.
-    expect(conn.getSnapshot().status).toBe("connected");
+    // S2C_HELLO proves the server is responsive, but terminals are not known
+    // until S2C_LIST arrives. Keep the remote authenticating so it does not
+    // appear connected while its terminal list is still missing.
+    expect(conn.getSnapshot().status).toBe("authenticating");
     expect(conn.getSnapshot().ready).toBe(false);
   });
 

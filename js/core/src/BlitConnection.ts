@@ -124,6 +124,17 @@ type PendingSearch = {
 
 type InternalSession = BlitSession;
 
+type ListEntry = {
+  ptyId: number;
+  tag: string;
+  command: string | null;
+};
+
+type ParsedList = {
+  entries: ListEntry[];
+  complete: boolean;
+};
+
 function connectionError(message: string): Error {
   return new Error(message);
 }
@@ -194,6 +205,7 @@ export class BlitConnection {
   >();
   private viewIdCounter = 0;
   private hasConnected = false;
+  private hasReceivedList = false;
   private retryCount = 0;
   private lastError: string | null = null;
 
@@ -1091,13 +1103,13 @@ export class BlitConnection {
   }
 
   private noteServerResponsive(emit = false): void {
-    // Some older blit-server builds do not send S2C_HELLO/S2C_READY, but they
-    // can still accept C2S_CREATE and stream terminal data. Any server frame
-    // on an open transport proves the upstream is usable, so promote the user-
-    // visible status to connected while leaving `ready` false until S2C_READY
-    // for BSP/surface reconciliation.
+    // Some older blit-server builds do not send S2C_READY, but they still send
+    // S2C_LIST. Wait for that list before showing a remote as connected: HELLO,
+    // pings, or surface frames prove the upstream socket is responsive, but not
+    // that terminal state has arrived.
     if (
       this.transport.status !== "connected" ||
+      !this.hasReceivedList ||
       this.snapshot.status === "connected"
     ) {
       return;
@@ -1162,8 +1174,13 @@ export class BlitConnection {
             this.markSessionClosed(session.id, false);
           }
         }
+        this.hasReceivedList = false;
         this.snapshot = {
           ...this.snapshot,
+          status:
+            this.transport.status === "connected"
+              ? "authenticating"
+              : this.snapshot.status,
           ready: false,
           sessions: this.publicSessions,
           focusedSessionId: null,
@@ -1244,7 +1261,10 @@ export class BlitConnection {
         return;
       }
       case S2C_LIST: {
-        this.handleListMessage(bytes);
+        if (this.handleListMessage(bytes)) {
+          this.hasReceivedList = true;
+          this.noteServerResponsive(true);
+        }
         return;
       }
       case S2C_READY: {
@@ -1254,16 +1274,16 @@ export class BlitConnection {
         // surface store is already populated when the BSP reconciliation
         // runs, preventing surface assignments from being wiped.
         //
-        // Also promote the snapshot status to "connected" — until now it
-        // was held at "authenticating" (see handleStatusChange) because
-        // the transport being open doesn't mean the remote blit server
-        // is reachable and functional.
+        // Also promote the snapshot status to "connected" once a LIST has
+        // arrived — until then it is held at "authenticating" because the
+        // transport being open (or HELLO arriving) does not mean terminal
+        // state is available for rendering.
         if (!this.snapshot.ready || this.snapshot.status !== "connected") {
           this.snapshot = {
             ...this.snapshot,
             ready: true,
             status:
-              this.transport.status === "connected"
+              this.transport.status === "connected" && this.hasReceivedList
                 ? "connected"
                 : this.snapshot.status,
           };
@@ -1303,13 +1323,14 @@ export class BlitConnection {
           return;
         }
         this.features = features;
+        this.hasReceivedList = false;
         // S2C_HELLO is the first message on every new server connection.
         // Reset all surfaces and close stale sessions — the server's
         // initial message sequence (S2C_SURFACE_CREATED, S2C_LIST,
-        // S2C_READY) will rebuild both.  S2C_READY marks the end of
-        // the initial burst and sets `ready: true`.  This also handles
-        // transparent gateway reconnects where the transport never went
-        // through "disconnected".
+        // S2C_READY) will rebuild both.  S2C_LIST is the point at which
+        // terminals are known again, and S2C_READY marks the end of the
+        // initial burst.  This also handles transparent gateway reconnects
+        // where the transport never went through "disconnected".
         //
         // Flip ready=false *before* wiping the surface store: a
         // reactive flush driven by surfaceStore.reset() would otherwise
@@ -1323,15 +1344,14 @@ export class BlitConnection {
         }
         this.snapshot = {
           ...this.snapshot,
-          // S2C_HELLO proves the server is responsive: if the transport
-          // is open, promote the UI status straight to "connected" so the
-          // indicator stops pulsing orange while the user is already able
-          // to create and interact with terminals.  `ready` remains false
-          // until S2C_READY so BSP reconciliation still waits for the
-          // initial surface/session burst.
+          // The upstream server is responsive, but terminals are not known
+          // until S2C_LIST arrives. Keep the user-visible state at
+          // "authenticating" here so a remote does not appear connected
+          // while its terminal list is still missing. S2C_LIST (via
+          // noteServerResponsive) or S2C_READY promotes to "connected".
           status:
             this.transport.status === "connected"
-              ? "connected"
+              ? "authenticating"
               : this.snapshot.status,
           ready: false,
           supportsRestart: (features & FEATURE_RESTART) !== 0,
@@ -1540,6 +1560,7 @@ export class BlitConnection {
 
     if (status === "connected") {
       this.hasConnected = true;
+      this.hasReceivedList = false;
       this.retryCount = 0;
       this.lastError = null;
       this._codecFeaturesSent = false;
@@ -1609,6 +1630,7 @@ export class BlitConnection {
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
+      this.hasReceivedList = false;
       // Dismiss all sessions so the UI doesn't show stale terminals from a
       // server that crashed without sending S2C_QUIT.  On reconnect the
       // server's S2C_HELLO + S2C_LIST sequence rebuilds the session list
@@ -1647,34 +1669,67 @@ export class BlitConnection {
     this.emit();
   };
 
-  private handleListMessage(bytes: Uint8Array): void {
-    if (bytes.length < 3) return;
+  private parseListMessage(
+    bytes: Uint8Array,
+    includeCommand: boolean,
+  ): ParsedList {
+    if (bytes.length < 3) return { entries: [], complete: false };
 
     const count = bytes[1] | (bytes[2] << 8);
-    const entries: Array<{
-      ptyId: number;
-      tag: string;
-      command: string | null;
-    }> = [];
+    const entries: ListEntry[] = [];
     let offset = 3;
     for (let index = 0; index < count; index++) {
-      if (offset + 4 > bytes.length) break;
+      if (offset + 4 > bytes.length) {
+        return { entries, complete: false };
+      }
       const ptyId = bytes[offset] | (bytes[offset + 1] << 8);
       const tagLen = bytes[offset + 2] | (bytes[offset + 3] << 8);
       offset += 4;
+      if (offset + tagLen > bytes.length) {
+        return { entries, complete: false };
+      }
       const tag = textDecoder.decode(bytes.subarray(offset, offset + tagLen));
       offset += tagLen;
+
       let command: string | null = null;
-      if (offset + 2 <= bytes.length) {
+      if (includeCommand) {
+        if (offset + 2 > bytes.length) {
+          return { entries, complete: false };
+        }
         const cmdLen = bytes[offset] | (bytes[offset + 1] << 8);
         offset += 2;
-        if (cmdLen > 0 && offset + cmdLen <= bytes.length) {
+        if (offset + cmdLen > bytes.length) {
+          return { entries, complete: false };
+        }
+        if (cmdLen > 0) {
           command = textDecoder.decode(bytes.subarray(offset, offset + cmdLen));
         }
         offset += cmdLen;
       }
+
       entries.push({ ptyId, tag, command });
     }
+
+    return { entries, complete: offset === bytes.length };
+  }
+
+  private handleListMessage(bytes: Uint8Array): boolean {
+    if (bytes.length < 3) return false;
+
+    // Current servers include a command length after every tag. Older remote
+    // servers did not, so a multi-entry legacy list can otherwise be
+    // misparsed by treating the next PTY id as a command length and dropping
+    // the remaining terminals. Prefer the current format when it parses
+    // exactly; fall back to legacy when the current parse is incomplete.
+    const withCommand = this.parseListMessage(bytes, true);
+    const legacy = withCommand.complete
+      ? withCommand
+      : this.parseListMessage(bytes, false);
+    const parsed =
+      withCommand.complete || !legacy.complete
+        ? withCommand
+        : legacy;
+    const entries = parsed.entries;
 
     const livePtys = new Set(entries.map((entry) => entry.ptyId));
     for (const session of this.sessions) {
@@ -1757,6 +1812,8 @@ export class BlitConnection {
     if (this.snapshot.ready) {
       queueMicrotask(() => this.pruneSupersededSessions());
     }
+
+    return parsed.complete;
   }
 
   /**

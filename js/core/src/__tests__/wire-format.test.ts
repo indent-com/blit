@@ -136,6 +136,40 @@ describe("wire format parsing", () => {
       expect(s[1].tag).toBe("");
     });
 
+    it("parses legacy entries without command lengths", () => {
+      // Older remote servers encoded LIST entries as pty_id + tag only.
+      // A current-format-only parser treats the second pty_id as cmd_len for
+      // the first entry and drops the rest, making a connected remote show no
+      // or only some terminals.
+      transport.push(
+        new Uint8Array([
+          S2C_LIST,
+          0x02,
+          0x00,
+          // entry 1: pty_id=1, tag_len=2, tag="ab"
+          0x01,
+          0x00,
+          0x02,
+          0x00,
+          0x61,
+          0x62,
+          // entry 2: pty_id=2, tag_len=2, tag="cd"
+          0x02,
+          0x00,
+          0x02,
+          0x00,
+          0x63,
+          0x64,
+        ]),
+      );
+      const s = conn.getSnapshot().sessions;
+      expect(s.map((session) => [session.ptyId, session.tag])).toEqual([
+        [1, "ab"],
+        [2, "cd"],
+      ]);
+      expect(s.every((session) => session.command === null)).toBe(true);
+    });
+
     it("parses empty list", () => {
       transport.push(new Uint8Array([S2C_LIST, 0x00, 0x00]));
       expect(conn.getSnapshot().sessions.length).toBe(0);
