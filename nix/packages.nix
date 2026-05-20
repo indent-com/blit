@@ -291,7 +291,7 @@
         postPatch = setupBrowserPkgForDeps + ''
           cd js
         '';
-        hash = "sha256-bD5kbL9i3F9uAbmw71jomSbrVDTBmREN647NSKsFXCI=";
+        hash = "sha256-vPDT6vH37qdVX3jyRoqBrcnvFhDfCikz2H7GqoKje9k=";
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {
@@ -474,6 +474,7 @@
           blit
           blit-release
           ;
+        inherit pnpmDeps;
         demo-image = demoImage;
         push-demo = pushDemo;
         publish-demo = publishDemo;

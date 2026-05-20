@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+nix_file="nix/packages.nix"
+
+# 1. Zero out pnpmDeps.hash (target only the hash inside fetchPnpmDeps).
+sed -i '/fetchPnpmDeps/,/};/{s|hash = "sha256-[^"]*";|hash = "";|}' "$nix_file"
+
+# 2. Build pnpmDeps; it will fail and print the expected hash.
+got=$(nix build .#pnpmDeps 2>&1 | grep -oP 'got:\s+\Ksha256-\S+' || true)
+
+if [[ -z "$got" ]]; then
+  echo "error: could not extract hash from build output" >&2
+  echo "  (restoring file from git)" >&2
+  git checkout -- "$nix_file"
+  exit 1
+fi
+
+# 3. Write the real hash back.
+sed -i "s|hash = \"\";|hash = \"$got\";|" "$nix_file"
+
+echo "updated pnpmDeps.hash to $got"
