@@ -4688,8 +4688,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     #[cfg(target_os = "linux")]
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // On non-Linux, keep the audio sender alive for the lifetime of the
+    // outer function so audio_rx.recv() never resolves to None — the
+    // biased select below would otherwise hit the audio branch first and
+    // break out of the sender loop before any HELLO/LIST/READY frames
+    // are written.
     #[cfg(not(target_os = "linux"))]
-    let (_, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (_audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
     let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
     let sender_outbox_queued_frames = outbox_frame_counter.clone();
