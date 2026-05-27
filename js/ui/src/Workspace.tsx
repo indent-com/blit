@@ -531,6 +531,38 @@ function WorkspaceScreen(props: {
     });
   }
   const [serverFonts, setServerFonts] = createSignal<string[]>([]);
+  let serverFontsLoaded = false;
+  let serverFontsRequest: Promise<void> | null = null;
+
+  function loadServerFonts(): void {
+    if (serverFontsLoaded || serverFontsRequest) return;
+
+    serverFontsRequest = fetch(`${basePath}fonts`)
+      .then(async (r): Promise<string[]> => {
+        if (!r.ok) throw new Error(`font list ${r.status}`);
+        const json: unknown = await r.json();
+        if (!Array.isArray(json)) {
+          throw new Error("font list response is not an array");
+        }
+        return json.filter(
+          (font): font is string =>
+            typeof font === "string" && font.trim().length > 0,
+        );
+      })
+      .then((fonts) => {
+        setServerFonts(fonts);
+        serverFontsLoaded = true;
+      })
+      .catch(() => {
+        // Retry when the font picker is opened.  Font listing is served by the
+        // HTTP /fonts route and must not depend on config-WS/server-side config
+        // persistence being available.
+      })
+      .finally(() => {
+        serverFontsRequest = null;
+      });
+  }
+
   const { resolvedFont, fontLoading, advanceRatio } = createFontLoader(
     font,
     DEFAULT_FONT,
@@ -768,12 +800,7 @@ function WorkspaceScreen(props: {
     return rf === DEFAULT_FONT ? rf : `${rf}, ${DEFAULT_FONT}`;
   };
 
-  onMount(() => {
-    fetch(`${basePath}fonts`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then(setServerFonts)
-      .catch(() => {});
-  });
+  onMount(loadServerFonts);
 
   let lru: SessionId[] = [];
 
@@ -999,6 +1026,7 @@ function WorkspaceScreen(props: {
       paletteOverlayOrigin = palette();
     } else if (target === "font") {
       fontOverlayOrigin = { family: font(), size: fontSize() };
+      loadServerFonts();
     }
     setOverlay(target);
   }
