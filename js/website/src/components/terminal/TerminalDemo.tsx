@@ -435,42 +435,52 @@ function TabShell(props: {
   // iOS keyboard viewport fix: track visualViewport to resize the app container
   const [vpHeight, setVpHeight] = createSignal<number | null>(null);
   const [vpOffset, setVpOffset] = createSignal(0);
+  const [vpBaseHeight, setVpBaseHeight] = createSignal(0);
   onMount(() => {
     const vv = window.visualViewport;
     if (!vv) return;
+    let baseWidth = 0;
     const update = () => {
-      setVpHeight(vv.height);
+      const height = vv.height;
+      const width = vv.width;
+      const fullHeight = Math.max(height, window.innerHeight);
+      setVpHeight(height);
       setVpOffset(vv.offsetTop);
+      setVpBaseHeight((prev) => {
+        // Reset across orientation/device-mode width changes so a tall portrait
+        // baseline does not make landscape look like the keyboard is open.
+        if (baseWidth === 0 || Math.abs(width - baseWidth) > 48) {
+          baseWidth = width;
+          return fullHeight;
+        }
+
+        // Track browser chrome collapse and small viewport changes, but do not
+        // learn the keyboard-shrunken height as the baseline.
+        if (fullHeight > prev || prev - height <= 150) {
+          baseWidth = width;
+          return fullHeight;
+        }
+        return prev;
+      });
     };
+    update();
     vv.addEventListener("resize", update);
     vv.addEventListener("scroll", update);
+    window.addEventListener("resize", update);
+    const onOrientationChange = () => setTimeout(update, 150);
+    screen.orientation?.addEventListener("change", onOrientationChange);
     onCleanup(() => {
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      screen.orientation?.removeEventListener("change", onOrientationChange);
     });
   });
 
-  // Capture the full viewport height at mount and on orientation change only.
-  // We can't use window.innerHeight live because on Chrome Android with
-  // interactive-widget=resizes-content, innerHeight shrinks with the keyboard,
-  // making the difference vs visualViewport always ~0.
-  const [fullHeight, setFullHeight] = createSignal(0);
-  onMount(() => {
-    setFullHeight(window.innerHeight);
-    const onOrientationChange = () => {
-      // Small delay: orientation change fires before dimensions update
-      setTimeout(() => setFullHeight(window.innerHeight), 150);
-    };
-    screen.orientation?.addEventListener("change", onOrientationChange);
-    onCleanup(() =>
-      screen.orientation?.removeEventListener("change", onOrientationChange),
-    );
-  });
-
-  // Keyboard open detection: visualViewport shrinks >150px from captured full height
+  // Keyboard open detection: visualViewport shrinks >150px from its baseline.
   const keyboardOpen = createMemo(() => {
     const h = vpHeight();
-    const full = fullHeight();
+    const full = vpBaseHeight();
     if (h === null || full === 0) return false;
     return full - h > 150;
   });
@@ -749,8 +759,14 @@ function TabShell(props: {
     <div
       class="fixed inset-x-0 top-0 z-50 flex flex-col bg-[var(--bg)]"
       style={{
-        height: isMobileTouch() && vpHeight() ? `${vpHeight()}px` : "100%",
-        top: isMobileTouch() && vpOffset() ? `${vpOffset()}px` : "0",
+        height:
+          isMobileTouch() && keyboardOpen() && vpHeight()
+            ? `${vpHeight()}px`
+            : "100%",
+        transform:
+          isMobileTouch() && keyboardOpen() && vpOffset()
+            ? `translateY(${vpOffset()}px)`
+            : "translateY(0)",
       }}
     >
       <Show when={tabs().length > 0}>

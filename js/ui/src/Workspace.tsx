@@ -365,40 +365,54 @@ function WorkspaceScreen(props: {
   // Track visualViewport to detect keyboard open/close on mobile.
   const [vpHeight, setVpHeight] = createSignal<number | null>(null);
   const [vpOffset, setVpOffset] = createSignal(0);
+  const [vpBaseHeight, setVpBaseHeight] = createSignal(0);
   onMount(() => {
     const vv = window.visualViewport;
     if (!vv) return;
+    let baseWidth = 0;
     const update = () => {
-      setVpHeight(vv.height);
+      const height = vv.height;
+      const width = vv.width;
+      const fullHeight = Math.max(height, window.innerHeight);
+      setVpHeight(height);
       setVpOffset(vv.offsetTop);
+      setVpBaseHeight((prev) => {
+        // A large width change means rotation or device-mode resize; reset the
+        // baseline instead of carrying a portrait height into landscape.
+        if (baseWidth === 0 || Math.abs(width - baseWidth) > 48) {
+          baseWidth = width;
+          return fullHeight;
+        }
+
+        // Grow with browser chrome collapse.  Also allow small decreases so
+        // address-bar changes do not look like a keyboard; never learn a
+        // keyboard-shrunken viewport (>150px) as the new baseline.
+        if (fullHeight > prev || prev - height <= 150) {
+          baseWidth = width;
+          return fullHeight;
+        }
+        return prev;
+      });
     };
     update(); // initialise immediately
     vv.addEventListener("resize", update);
     vv.addEventListener("scroll", update);
+    window.addEventListener("resize", update);
+    const onOrientationChange = () => setTimeout(update, 150);
+    screen.orientation?.addEventListener("change", onOrientationChange);
     onCleanup(() => {
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      screen.orientation?.removeEventListener("change", onOrientationChange);
     });
   });
 
-  // Capture full viewport height at mount and on orientation change.
-  const [fullHeight, setFullHeight] = createSignal(0);
-  onMount(() => {
-    setFullHeight(window.innerHeight);
-    const onOrientationChange = () => {
-      setTimeout(() => setFullHeight(window.innerHeight), 150);
-    };
-    screen.orientation?.addEventListener("change", onOrientationChange);
-    onCleanup(() =>
-      screen.orientation?.removeEventListener("change", onOrientationChange),
-    );
-  });
-
-  // Keyboard open when visualViewport shrinks >150px from full height.
+  // Keyboard open when visualViewport shrinks >150px from its baseline.
   const keyboardOpen = createMemo(() => {
     if (!isMobileTouch()) return false;
     const h = vpHeight();
-    const full = fullHeight();
+    const full = vpBaseHeight();
     if (h === null || full === 0) return false;
     return full - h > 150;
   });
@@ -1374,13 +1388,16 @@ function WorkspaceScreen(props: {
           "background-color": theme().bg,
           color: theme().fg,
           "font-family": resolvedFontWithFallback(),
-          // On mobile, pin to visualViewport so the keyboard doesn't hide content.
-          ...(isMobileTouch() && vpHeight()
+          // While the virtual keyboard is open, pin to the visual viewport so
+          // content is not hidden.  When closed, let the 100dvh root size the
+          // app natively to avoid double-counting keyboard/browser-chrome space.
+          ...(isMobileTouch() && keyboardOpen() && vpHeight()
             ? {
                 position: "fixed",
                 "inset-inline": "0",
-                top: `${vpOffset()}px`,
+                top: "0",
                 height: `${vpHeight()}px`,
+                transform: `translateY(${vpOffset()}px)`,
               }
             : {}),
         }}
