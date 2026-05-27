@@ -283,10 +283,11 @@ let
     ];
     text = ''
             tmp=$(mktemp -d)
-            trap 'rm -rf "$tmp"' EXIT
+            trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 
             mkdir -p "$tmp/.vercel/output/static"
             cp -r ${websiteDist}/* "$tmp/.vercel/output/static/"
+            chmod -R u+w "$tmp"
             cat > "$tmp/.vercel/output/config.json" <<'JSON'
       {"version":3,"routes":[{"handle":"filesystem"},{"src":"/(.*)", "dest":"/index.html"}]}
       JSON
