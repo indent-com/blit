@@ -1401,6 +1401,10 @@ function WorkspaceScreen(props: {
   const theme = () => themeFor(palette());
   const chromeScale = () => uiScale(fontSize());
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
+  const showMobileToolbar = createMemo(
+    () => isMobileTouch() && keyboardWanted(),
+  );
+  const statusBarHeight = () => chromeScale().md + chromeScale().controlY * 3;
 
   return (
     <BlitWorkspaceProvider
@@ -1808,11 +1812,15 @@ function WorkspaceScreen(props: {
         <footer
           style={{
             ...layout.statusBar,
-            padding: "0 1em",
+            padding: showMobileToolbar()
+              ? "0 1em"
+              : "0 1em env(safe-area-inset-bottom)",
             "background-color": theme().bg,
             color: theme().fg,
             "border-top-color": theme().border,
-            height: `${chromeScale().md + chromeScale().controlY * 3}px`,
+            height: showMobileToolbar()
+              ? `${statusBarHeight()}px`
+              : `calc(${statusBarHeight()}px + env(safe-area-inset-bottom))`,
             "font-size": `${chromeScale().md}px`,
           }}
         >
@@ -1872,7 +1880,7 @@ function WorkspaceScreen(props: {
             onMedia={() => toggleOverlay("media")}
           />
         </footer>
-        <Show when={isMobileTouch() && keyboardWanted()}>
+        <Show when={showMobileToolbar()}>
           <MobileToolbar
             workspace={workspace}
             focusedSessionId={() => wsState().focusedSessionId}
