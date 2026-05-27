@@ -146,6 +146,8 @@ struct BrowserState {
     /// Broadcast notification triggered on SIGINT so active WebSocket
     /// handlers can send `S2C_QUIT` before the process exits.
     shutdown: Arc<tokio::sync::Notify>,
+    /// Shared auth throttle for config WebSocket handshakes.
+    auth_throttle: blit_webserver::config::AuthThrottle,
 }
 
 pub async fn run_browser(port: Option<u16>, hub: &str) {
@@ -195,6 +197,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
         hub: hub.to_string(),
         ssh_pool,
         shutdown: shutdown.clone(),
+        auth_throttle: blit_webserver::config::AuthThrottle::new(),
     });
 
     // Reconcile destinations whenever blit.remotes changes (from the
@@ -247,6 +250,8 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                                     Some(&state.remotes),
                                     None,
                                     &[],
+                                    &state.auth_throttle,
+                                    "local",
                                 )
                                 .await;
                             })

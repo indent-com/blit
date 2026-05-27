@@ -3,9 +3,10 @@ use crate::ice::{self, IceConfig, Transport};
 use crate::signaling;
 use crate::turn::{self, TurnRelay};
 use blit_remote::{
-    C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_INPUT,
-    C2S_KILL, C2S_MOUSE, C2S_RESTART, C2S_SURFACE_CLOSE, C2S_SURFACE_INPUT, C2S_SURFACE_POINTER,
-    C2S_SURFACE_POINTER_AXIS, S2C_QUIT,
+    C2S_ACK, C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS,
+    C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST, C2S_COPY_RANGE, C2S_FOCUS, C2S_PING, C2S_READ,
+    C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
+    C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE, S2C_QUIT,
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
@@ -23,25 +24,32 @@ use tokio::sync::{Notify, mpsc};
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Returns `true` for C2S message tags that mutate state (input, create, kill,
-/// etc.).  Read-only consumers have these messages silently dropped.
-fn is_write_message(tag: u8) -> bool {
+/// Returns `true` for C2S message tags that are safe to forward for
+/// read-only consumers. Unknown and newly-added opcodes are blocked by default
+/// so they cannot become write-capability bypasses.
+fn is_read_only_allowed_message(tag: u8) -> bool {
     matches!(
         tag,
-        C2S_INPUT
-            | C2S_MOUSE
-            | C2S_CLIPBOARD_SET
-            | C2S_KILL
-            | C2S_RESTART
-            | C2S_CLOSE
-            | C2S_CREATE
-            | C2S_CREATE_AT
-            | C2S_CREATE_N
-            | C2S_CREATE2
-            | C2S_SURFACE_INPUT
-            | C2S_SURFACE_POINTER
-            | C2S_SURFACE_POINTER_AXIS
-            | C2S_SURFACE_CLOSE
+        C2S_ACK
+            | C2S_PING
+            | C2S_CLIENT_FEATURES
+            | C2S_CLIENT_METRICS
+            | C2S_SCROLL
+            | C2S_FOCUS
+            | C2S_SUBSCRIBE
+            | C2S_UNSUBSCRIBE
+            | C2S_SEARCH
+            | C2S_READ
+            | C2S_COPY_RANGE
+            | C2S_SURFACE_LIST
+            | C2S_SURFACE_CAPTURE
+            | C2S_SURFACE_SUBSCRIBE
+            | C2S_SURFACE_UNSUBSCRIBE
+            | C2S_SURFACE_ACK
+            | C2S_CLIPBOARD_LIST
+            | C2S_CLIPBOARD_GET
+            | C2S_AUDIO_SUBSCRIBE
+            | C2S_AUDIO_UNSUBSCRIBE
     )
 }
 
@@ -583,7 +591,7 @@ pub async fn handle_peer(
                                             while let Some(data) = write_rx.recv().await {
                                                 if access == crate::Access::ReadOnly
                                                     && !data.is_empty()
-                                                    && is_write_message(data[0])
+                                                    && !is_read_only_allowed_message(data[0])
                                                 {
                                                     continue;
                                                 }
@@ -704,7 +712,9 @@ pub async fn handle_peer(
                                                     while let Some(data) = write_rx.recv().await {
                                                         if access == crate::Access::ReadOnly
                                                             && !data.is_empty()
-                                                            && is_write_message(data[0])
+                                                            && !is_read_only_allowed_message(
+                                                                data[0],
+                                                            )
                                                         {
                                                             continue;
                                                         }
@@ -978,4 +988,78 @@ pub async fn handle_peer(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blit_remote::{
+        C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2,
+        C2S_DISPLAY_RATE, C2S_INPUT, C2S_KILL, C2S_MOUSE, C2S_QUIT, C2S_RESIZE, C2S_RESTART,
+        C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_POINTER,
+        C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_TEXT,
+    };
+
+    #[test]
+    fn read_only_allows_only_passive_messages() {
+        for tag in [
+            C2S_ACK,
+            C2S_PING,
+            C2S_CLIENT_FEATURES,
+            C2S_CLIENT_METRICS,
+            C2S_SCROLL,
+            C2S_FOCUS,
+            C2S_SUBSCRIBE,
+            C2S_UNSUBSCRIBE,
+            C2S_SEARCH,
+            C2S_READ,
+            C2S_COPY_RANGE,
+            C2S_SURFACE_LIST,
+            C2S_SURFACE_CAPTURE,
+            C2S_SURFACE_SUBSCRIBE,
+            C2S_SURFACE_UNSUBSCRIBE,
+            C2S_SURFACE_ACK,
+            C2S_CLIPBOARD_LIST,
+            C2S_CLIPBOARD_GET,
+            C2S_AUDIO_SUBSCRIBE,
+            C2S_AUDIO_UNSUBSCRIBE,
+        ] {
+            assert!(
+                is_read_only_allowed_message(tag),
+                "tag {tag:#04x} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_blocks_mutating_and_unknown_messages() {
+        for tag in [
+            C2S_INPUT,
+            C2S_MOUSE,
+            C2S_RESIZE,
+            C2S_DISPLAY_RATE,
+            C2S_CLIPBOARD_SET,
+            C2S_KILL,
+            C2S_RESTART,
+            C2S_QUIT,
+            C2S_CREATE,
+            C2S_CLOSE,
+            C2S_CREATE_AT,
+            C2S_CREATE_N,
+            C2S_CREATE2,
+            C2S_SURFACE_INPUT,
+            C2S_SURFACE_POINTER,
+            C2S_SURFACE_POINTER_AXIS,
+            C2S_SURFACE_RESIZE,
+            C2S_SURFACE_FOCUS,
+            C2S_SURFACE_CLOSE,
+            C2S_SURFACE_TEXT,
+            0xff,
+        ] {
+            assert!(
+                !is_read_only_allowed_message(tag),
+                "tag {tag:#04x} should be blocked"
+            );
+        }
+    }
 }
