@@ -20,14 +20,15 @@ export function FontOverlay(props: {
   const originalSize = props.currentSize;
   const initialFamily = originalFamily.trim();
   const initialFamilyLower = initialFamily.toLowerCase();
-  const initialIdx = props.serverFonts.findIndex(
-    (font) => font.toLowerCase() === initialFamilyLower,
-  );
+  const initialIdx = () =>
+    props.serverFonts.findIndex(
+      (font) => font.toLowerCase() === initialFamilyLower,
+    );
 
   const [query, setQuery] = createSignal(initialFamily);
   const [filterQuery, setFilterQuery] = createSignal("");
   const [size, setSize] = createSignal(props.currentSize);
-  const [selectedIdx, setSelectedIdx] = createSignal(initialIdx);
+  const [selectedIdx, setSelectedIdx] = createSignal(initialIdx());
   const [hoverIdx, setHoverIdx] = createSignal(-1);
 
   let inputRef!: HTMLInputElement;
@@ -99,7 +100,7 @@ export function FontOverlay(props: {
   // Reset selection when query changes from typing (not from selectFont)
   createEffect(() => {
     if (showAllFonts()) {
-      setSelectedIdx(initialIdx);
+      setSelectedIdx(initialIdx());
     } else {
       setSelectedIdx(-1);
     }

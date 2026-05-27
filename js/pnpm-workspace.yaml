@@ -7,3 +7,12 @@ packages:
 
 overrides:
   yaml: ^2.8.3
+  vite: ^7
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+
+allowBuilds:
+  esbuild: true
+  sharp: true
