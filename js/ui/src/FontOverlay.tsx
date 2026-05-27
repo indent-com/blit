@@ -20,9 +20,10 @@ export function FontOverlay(props: {
   const originalSize = props.currentSize;
   const initialFamily = originalFamily.trim();
   const initialFamilyLower = initialFamily.toLowerCase();
-  const initialIdx = () => props.serverFonts.findIndex(
-    (font) => font.toLowerCase() === initialFamilyLower,
-  );
+  const initialIdx = () =>
+    props.serverFonts.findIndex(
+      (font) => font.toLowerCase() === initialFamilyLower,
+    );
 
   const [query, setQuery] = createSignal(initialFamily);
   const [filterQuery, setFilterQuery] = createSignal("");

@@ -7,3 +7,11 @@ packages:
 
 overrides:
   yaml: ^2.8.3
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+
+allowBuilds:
+  esbuild: true
+  sharp: true
