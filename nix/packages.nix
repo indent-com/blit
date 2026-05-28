@@ -87,6 +87,7 @@
         src = pkgs.fetchCrate {
           pname = "wasm-bindgen-cli";
           version = "0.2.121";
+          registryDl = "https://static.crates.io/crates";
           hash = "sha256-ZOMgFNOcGkO66Jz/Z83eoIu+DIzo3Z/vq6Z5g6BDY/w=";
         };
         cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
@@ -96,6 +97,32 @@
         };
       };
 
+      browserCargoDeps =
+        let
+          rawVendorDir = pkgs.rustPlatform.importCargoLock (cargoLockConfig // {
+            extraRegistries = {
+              # crates.io's API download endpoint rejects generic fetchers
+              # without a Cargo-style User-Agent. Use the static download host
+              # for the fetch phase, then remove the extra Cargo source block
+              # below because it aliases Cargo's built-in crates-io source.
+              "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
+            };
+          });
+        in
+        pkgs.runCommand "cargo-vendor-dir" { } ''
+          mkdir -p "$out"
+          cp -R ${rawVendorDir}/. "$out/"
+
+          config="$out/.cargo/config.toml"
+          chmod u+w "$out/.cargo" "$config"
+          awk '
+            /^\[source\."https:\/\/github\.com\/rust-lang\/crates\.io-index"\]$/ { skip = 2; next }
+            skip > 0 { skip -= 1; next }
+            { print }
+          ' "$config" > "$config.tmp"
+          mv "$config.tmp" "$config"
+        '';
+
       browserWasm = rustPlatform.buildRustPackage {
         pname = "blit-browser";
         inherit version;
@@ -104,7 +131,7 @@
           "-p"
           "blit-browser"
         ];
-        cargoLock = cargoLockConfig;
+        cargoDeps = browserCargoDeps;
         nativeBuildInputs = [
           pkgs.wasm-pack
           wasmBindgenCli

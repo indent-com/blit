@@ -250,8 +250,10 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                                     Some(&state.remotes),
                                     None,
                                     &[],
-                                    &state.auth_throttle,
-                                    "local",
+                                    blit_webserver::config::AuthContext {
+                                        throttle: &state.auth_throttle,
+                                        peer: "local",
+                                    },
                                 )
                                 .await;
                             })

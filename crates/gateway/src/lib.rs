@@ -712,8 +712,10 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
                     Some(&state.remotes),
                     transform,
                     &extra_init,
-                    &state.auth_throttle,
-                    &auth_peer,
+                    blit_webserver::config::AuthContext {
+                        throttle: &state.auth_throttle,
+                        peer: &auth_peer,
+                    },
                 )
                 .await;
             }),

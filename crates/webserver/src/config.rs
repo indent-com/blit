@@ -69,6 +69,11 @@ impl Default for AuthThrottle {
     }
 }
 
+pub struct AuthContext<'a> {
+    pub throttle: &'a AuthThrottle,
+    pub peer: &'a str,
+}
+
 impl AuthThrottle {
     pub fn new() -> Self {
         Self::with_limits(
@@ -760,10 +765,9 @@ pub async fn handle_config_ws(
     remotes: Option<&RemotesState>,
     remotes_transform: Option<fn(&str) -> String>,
     extra_init: &[String],
-    auth_throttle: &AuthThrottle,
-    auth_peer: &str,
+    auth: AuthContext<'_>,
 ) {
-    if !authenticate_text_ws(&mut ws, token, auth_throttle, auth_peer, Some("ok")).await {
+    if !authenticate_text_ws(&mut ws, token, auth.throttle, auth.peer, Some("ok")).await {
         return;
     }
 
