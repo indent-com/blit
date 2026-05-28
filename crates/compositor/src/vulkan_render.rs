@@ -127,6 +127,12 @@ pub(crate) struct VulkanRenderer {
     /// referenced by in-flight GPU work.  Freed when the pending
     /// submission completes (retire_pending / free_frame_textures).
     pending_destroy_textures: Vec<CachedSurfaceTexture>,
+
+    /// External / NV12 / downscale targets removed while a Vulkan submit
+    /// may still reference them.  Freed once all tracked submits retire.
+    pending_destroy_external_outputs: Vec<ExternalOutput>,
+    pending_destroy_nv12_outputs: Vec<Nv12Output>,
+    pending_destroy_downscale_outputs: Vec<DownscaleOutput>,
 }
 
 /// Encoder-allocated DMA-BUF imported as a Vulkan framebuffer.  The
@@ -883,6 +889,9 @@ impl VulkanRenderer {
             downscale_outputs: HashMap::new(),
             surface_textures: HashMap::new(),
             pending_destroy_textures: Vec::new(),
+            pending_destroy_external_outputs: Vec::new(),
+            pending_destroy_nv12_outputs: Vec::new(),
+            pending_destroy_downscale_outputs: Vec::new(),
         })
     }
 
@@ -1152,14 +1161,7 @@ impl VulkanRenderer {
             .external_outputs
             .remove(&(surface_id, target_w, target_h))
         {
-            for ext in exts {
-                unsafe {
-                    self.device.destroy_framebuffer(ext.framebuffer, None);
-                    self.device.destroy_image_view(ext.view, None);
-                    self.device.destroy_image(ext.image, None);
-                    self.device.free_memory(ext.memory, None);
-                }
-            }
+            self.defer_or_destroy_external_outputs(exts);
         }
         self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
     }
@@ -1175,14 +1177,7 @@ impl VulkanRenderer {
             .collect();
         for k in keys {
             if let Some((exts, _)) = self.external_outputs.remove(&k) {
-                for ext in exts {
-                    unsafe {
-                        self.device.destroy_framebuffer(ext.framebuffer, None);
-                        self.device.destroy_image_view(ext.view, None);
-                        self.device.destroy_image(ext.image, None);
-                        self.device.free_memory(ext.memory, None);
-                    }
-                }
+                self.defer_or_destroy_external_outputs(exts);
             }
         }
         self.destroy_nv12_outputs_for_surface(surface_id);
@@ -1190,15 +1185,13 @@ impl VulkanRenderer {
     }
 
     fn destroy_all_external_outputs(&mut self) {
-        for (_, (exts, _)) in self.external_outputs.drain() {
-            for ext in exts {
-                unsafe {
-                    self.device.destroy_framebuffer(ext.framebuffer, None);
-                    self.device.destroy_image_view(ext.view, None);
-                    self.device.destroy_image(ext.image, None);
-                    self.device.free_memory(ext.memory, None);
-                }
-            }
+        let all: Vec<Vec<ExternalOutput>> = self
+            .external_outputs
+            .drain()
+            .map(|(_, (exts, _))| exts)
+            .collect();
+        for exts in all {
+            self.defer_or_destroy_external_outputs(exts);
         }
         self.destroy_all_nv12_outputs();
         self.destroy_all_downscale_outputs();
@@ -1240,7 +1233,7 @@ impl VulkanRenderer {
             .downscale_outputs
             .remove(&(surface_id, target_w, target_h))
         {
-            self.destroy_downscale_output(out);
+            self.defer_or_destroy_downscale_output(out);
         }
     }
 
@@ -1253,7 +1246,7 @@ impl VulkanRenderer {
             .collect();
         for k in keys {
             if let Some(out) = self.downscale_outputs.remove(&k) {
-                self.destroy_downscale_output(out);
+                self.defer_or_destroy_downscale_output(out);
             }
         }
     }
@@ -1261,6 +1254,33 @@ impl VulkanRenderer {
     fn destroy_all_downscale_outputs(&mut self) {
         let outs: Vec<DownscaleOutput> = self.downscale_outputs.drain().map(|(_, v)| v).collect();
         for out in outs {
+            self.defer_or_destroy_downscale_output(out);
+        }
+    }
+
+    fn defer_or_destroy_external_outputs(&mut self, exts: Vec<ExternalOutput>) {
+        if self.has_tracked_in_flight_work() {
+            self.pending_destroy_external_outputs.extend(exts);
+        } else {
+            for ext in exts {
+                self.destroy_external_output(ext);
+            }
+        }
+    }
+
+    fn destroy_external_output(&self, ext: ExternalOutput) {
+        unsafe {
+            self.device.destroy_framebuffer(ext.framebuffer, None);
+            self.device.destroy_image_view(ext.view, None);
+            self.device.destroy_image(ext.image, None);
+            self.device.free_memory(ext.memory, None);
+        }
+    }
+
+    fn defer_or_destroy_downscale_output(&mut self, out: DownscaleOutput) {
+        if self.has_tracked_in_flight_work() {
+            self.pending_destroy_downscale_outputs.push(out);
+        } else {
             self.destroy_downscale_output(out);
         }
     }
@@ -1719,33 +1739,41 @@ impl VulkanRenderer {
 
     fn destroy_nv12_vec(&mut self, nv12s: Vec<Nv12Output>) {
         for n in nv12s {
-            unsafe {
-                self.device
-                    .free_descriptor_sets(self.descriptor_pool, &[n.descriptor_set])
-                    .ok();
-                match n.kind {
-                    Nv12OutputKind::Buffer { buffer, memory, .. } => {
-                        self.device.destroy_buffer(buffer, None);
-                        self.device.free_memory(memory, None);
+            if self.has_tracked_in_flight_work() {
+                self.pending_destroy_nv12_outputs.push(n);
+            } else {
+                self.destroy_nv12_output(n);
+            }
+        }
+    }
+
+    fn destroy_nv12_output(&self, n: Nv12Output) {
+        unsafe {
+            self.device
+                .free_descriptor_sets(self.descriptor_pool, &[n.descriptor_set])
+                .ok();
+            match n.kind {
+                Nv12OutputKind::Buffer { buffer, memory, .. } => {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                Nv12OutputKind::Image {
+                    image,
+                    y_memory,
+                    y_view,
+                    uv_memory,
+                    uv_view,
+                    encode_view,
+                } => {
+                    if let Some(ev) = encode_view {
+                        self.device.destroy_image_view(ev, None);
                     }
-                    Nv12OutputKind::Image {
-                        image,
-                        y_memory,
-                        y_view,
-                        uv_memory,
-                        uv_view,
-                        encode_view,
-                    } => {
-                        if let Some(ev) = encode_view {
-                            self.device.destroy_image_view(ev, None);
-                        }
-                        self.device.destroy_image_view(y_view, None);
-                        self.device.destroy_image_view(uv_view, None);
-                        self.device.destroy_image(image, None);
-                        self.device.free_memory(y_memory, None);
-                        if uv_memory != vk::DeviceMemory::null() {
-                            self.device.free_memory(uv_memory, None);
-                        }
+                    self.device.destroy_image_view(y_view, None);
+                    self.device.destroy_image_view(uv_view, None);
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(y_memory, None);
+                    if uv_memory != vk::DeviceMemory::null() {
+                        self.device.free_memory(uv_memory, None);
                     }
                 }
             }
@@ -3231,6 +3259,32 @@ impl VulkanRenderer {
         }
     }
 
+    fn has_tracked_in_flight_work(&self) -> bool {
+        self.pending_submit.is_some() || !self.deferred_submits.is_empty()
+    }
+
+    fn drain_pending_destroy_targets_if_idle(&mut self) {
+        if self.has_tracked_in_flight_work() {
+            return;
+        }
+
+        let exts: Vec<ExternalOutput> = self.pending_destroy_external_outputs.drain(..).collect();
+        for ext in exts {
+            self.destroy_external_output(ext);
+        }
+
+        let nv12s: Vec<Nv12Output> = self.pending_destroy_nv12_outputs.drain(..).collect();
+        for n in nv12s {
+            self.destroy_nv12_output(n);
+        }
+
+        let downscale: Vec<DownscaleOutput> =
+            self.pending_destroy_downscale_outputs.drain(..).collect();
+        for out in downscale {
+            self.destroy_downscale_output(out);
+        }
+    }
+
     // ---------------------------------------------------------------
     // Texture import (used by persistent cache for DMA-BUF)
     // ---------------------------------------------------------------
@@ -3810,6 +3864,7 @@ impl VulkanRenderer {
                 true // keep
             }
         });
+        self.drain_pending_destroy_targets_if_idle();
     }
 
     fn free_frame_textures(&mut self) {
@@ -3826,6 +3881,7 @@ impl VulkanRenderer {
         // Also free textures that were evicted from the persistent cache
         // while GPU work was in flight.
         self.drain_pending_destroy_textures();
+        self.drain_pending_destroy_targets_if_idle();
     }
 
     // ---------------------------------------------------------------
@@ -4852,6 +4908,7 @@ impl Drop for VulkanRenderer {
             }
             // Destroy all per-surface external and NV12 outputs.
             self.destroy_all_external_outputs();
+            self.drain_pending_destroy_targets_if_idle();
             // Destroy per-frame temp textures.
             for t in self.frame_textures.drain(..) {
                 self.device.destroy_image_view(t.view, None);
