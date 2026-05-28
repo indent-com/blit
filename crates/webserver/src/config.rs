@@ -2,7 +2,8 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::SinkExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 pub struct ConfigState {
@@ -20,6 +21,235 @@ impl ConfigState {
         let (tx, _) = broadcast::channel::<String>(64);
         spawn_watcher(tx.clone());
         Self { tx }
+    }
+}
+
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTH_MAX_UNAUTHENTICATED: usize = 32;
+const AUTH_MAX_FAILURES: u32 = 5;
+const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const AUTH_LOCKOUT: Duration = Duration::from_secs(60);
+
+/// Shared authentication throttle for WebSocket/WebTransport passphrase checks.
+///
+/// It limits concurrent unauthenticated handshakes globally and temporarily
+/// locks out peers that repeatedly fail authentication. Peer keys are supplied
+/// by callers (typically the remote IP address, or a global fallback when the
+/// transport cannot expose one).
+#[derive(Clone)]
+pub struct AuthThrottle {
+    inner: Arc<Mutex<AuthThrottleInner>>,
+    max_unauthenticated: usize,
+    max_failures: u32,
+    failure_window: Duration,
+    lockout: Duration,
+}
+
+struct AuthThrottleInner {
+    active_unauthenticated: usize,
+    peers: HashMap<String, PeerAuthState>,
+}
+
+struct PeerAuthState {
+    failures: u32,
+    first_failure: Instant,
+    locked_until: Option<Instant>,
+}
+
+/// RAII guard for one in-progress unauthenticated auth attempt.
+pub struct AuthAttemptGuard {
+    throttle: AuthThrottle,
+    peer: String,
+    released: bool,
+}
+
+impl Default for AuthThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct AuthContext<'a> {
+    pub throttle: &'a AuthThrottle,
+    pub peer: &'a str,
+}
+
+impl AuthThrottle {
+    pub fn new() -> Self {
+        Self::with_limits(
+            AUTH_MAX_UNAUTHENTICATED,
+            AUTH_MAX_FAILURES,
+            AUTH_FAILURE_WINDOW,
+            AUTH_LOCKOUT,
+        )
+    }
+
+    fn with_limits(
+        max_unauthenticated: usize,
+        max_failures: u32,
+        failure_window: Duration,
+        lockout: Duration,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AuthThrottleInner {
+                active_unauthenticated: 0,
+                peers: HashMap::new(),
+            })),
+            max_unauthenticated,
+            max_failures: max_failures.max(1),
+            failure_window,
+            lockout,
+        }
+    }
+
+    pub fn begin(&self, peer: impl Into<String>) -> Option<AuthAttemptGuard> {
+        let peer = peer.into();
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.prune(now, self.failure_window);
+
+        if inner.active_unauthenticated >= self.max_unauthenticated {
+            return None;
+        }
+        if inner
+            .peers
+            .get(&peer)
+            .and_then(|state| state.locked_until)
+            .is_some_and(|until| until > now)
+        {
+            return None;
+        }
+
+        inner.active_unauthenticated += 1;
+        Some(AuthAttemptGuard {
+            throttle: self.clone(),
+            peer,
+            released: false,
+        })
+    }
+
+    fn record_success(&self, peer: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.peers.remove(peer);
+    }
+
+    fn record_failure(&self, peer: &str) {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.prune(now, self.failure_window);
+        let state = inner
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(|| PeerAuthState {
+                failures: 0,
+                first_failure: now,
+                locked_until: None,
+            });
+
+        if now.duration_since(state.first_failure) > self.failure_window {
+            state.failures = 0;
+            state.first_failure = now;
+            state.locked_until = None;
+        }
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= self.max_failures {
+            state.failures = 0;
+            state.first_failure = now;
+            state.locked_until = Some(now + self.lockout);
+        }
+    }
+
+    fn release(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.active_unauthenticated = inner.active_unauthenticated.saturating_sub(1);
+    }
+}
+
+impl AuthThrottleInner {
+    fn prune(&mut self, now: Instant, failure_window: Duration) {
+        self.peers.retain(|_, state| {
+            if state
+                .locked_until
+                .is_some_and(|locked_until| locked_until > now)
+            {
+                return true;
+            }
+            state.failures > 0 && now.duration_since(state.first_failure) <= failure_window
+        });
+    }
+}
+
+impl AuthAttemptGuard {
+    pub fn record_success(mut self) {
+        self.throttle.record_success(&self.peer);
+        self.release();
+    }
+
+    pub fn record_failure(mut self) {
+        self.throttle.record_failure(&self.peer);
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.throttle.release();
+        }
+    }
+}
+
+impl Drop for AuthAttemptGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Authenticate a text WebSocket passphrase with timeout, active-connection
+/// limiting, and failed-attempt backoff. Sends "auth" and closes on any
+/// rejected/throttled attempt. When ok_message is present, it is sent after a
+/// successful authentication before returning.
+pub async fn authenticate_text_ws(
+    ws: &mut WebSocket,
+    token: &str,
+    throttle: &AuthThrottle,
+    peer: &str,
+    ok_message: Option<&str>,
+) -> bool {
+    let Some(guard) = throttle.begin(peer.to_string()) else {
+        let _ = ws.send(Message::Text("auth".into())).await;
+        let _ = ws.close().await;
+        return false;
+    };
+
+    let accepted = tokio::time::timeout(AUTH_TIMEOUT, async {
+        loop {
+            match ws.recv().await {
+                Some(Ok(Message::Text(pass))) => {
+                    break constant_time_eq(pass.trim().as_bytes(), token.as_bytes());
+                }
+                Some(Ok(Message::Ping(d))) => {
+                    let _ = ws.send(Message::Pong(d)).await;
+                }
+                _ => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    if accepted {
+        guard.record_success();
+        if let Some(msg) = ok_message
+            && ws.send(Message::Text(msg.into())).await.is_err()
+        {
+            return false;
+        }
+        true
+    } else {
+        guard.record_failure();
+        let _ = ws.send(Message::Text("auth".into())).await;
+        let _ = ws.close().await;
+        false
     }
 }
 
@@ -535,26 +765,9 @@ pub async fn handle_config_ws(
     remotes: Option<&RemotesState>,
     remotes_transform: Option<fn(&str) -> String>,
     extra_init: &[String],
+    auth: AuthContext<'_>,
 ) {
-    let authed = loop {
-        match ws.recv().await {
-            Some(Ok(Message::Text(pass))) => {
-                if constant_time_eq(pass.trim().as_bytes(), token.as_bytes()) {
-                    let _ = ws.send(Message::Text("ok".into())).await;
-                    break true;
-                } else {
-                    let _ = ws.send(Message::Text("auth".into())).await;
-                    let _ = ws.close().await;
-                    break false;
-                }
-            }
-            Some(Ok(Message::Ping(d))) => {
-                let _ = ws.send(Message::Pong(d)).await;
-            }
-            _ => break false,
-        }
-    };
-    if !authed {
+    if !authenticate_text_ws(&mut ws, token, auth.throttle, auth.peer, Some("ok")).await {
         return;
     }
 
@@ -1078,5 +1291,32 @@ mod tests {
         let reparsed = parse_config_str(&serialized);
         assert!(!reparsed.contains_key("blit.target"));
         assert_eq!(reparsed.get("font").map(|s| s.as_str()), Some("Mono"));
+    }
+    #[test]
+    fn auth_throttle_limits_concurrent_unauthenticated_attempts() {
+        let throttle =
+            AuthThrottle::with_limits(1, 5, Duration::from_secs(60), Duration::from_secs(60));
+        let first = throttle.begin("peer").expect("first attempt allowed");
+        assert!(throttle.begin("other").is_none());
+        drop(first);
+        assert!(throttle.begin("other").is_some());
+    }
+
+    #[test]
+    fn auth_throttle_locks_out_repeated_failures_and_clears_on_success() {
+        let throttle =
+            AuthThrottle::with_limits(4, 2, Duration::from_secs(60), Duration::from_secs(60));
+        throttle.begin("peer").unwrap().record_failure();
+        let success = throttle.begin("peer").expect("not locked before threshold");
+        success.record_success();
+        throttle.begin("peer").unwrap().record_failure();
+        assert!(
+            throttle.begin("peer").is_some(),
+            "success reset failure count"
+        );
+        throttle.begin("bad").unwrap().record_failure();
+        throttle.begin("bad").unwrap().record_failure();
+        assert!(throttle.begin("bad").is_none(), "bad peer is locked out");
+        assert!(throttle.begin("other").is_some(), "lockout is per peer");
     }
 }

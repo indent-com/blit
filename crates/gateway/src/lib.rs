@@ -1,9 +1,11 @@
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{FromRequest, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
@@ -63,36 +65,6 @@ async fn connect_ipc(path: &str) -> Result<IpcStream, String> {
     }
 }
 
-/// Wraps TcpListener to set TCP_NODELAY on every accepted connection,
-/// disabling Nagle's algorithm for low-latency frame delivery.
-struct NoDelayListener(tokio::net::TcpListener);
-
-impl axum::serve::Listener for NoDelayListener {
-    type Io = tokio::net::TcpStream;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        {
-            loop {
-                match self.0.accept().await {
-                    Ok((stream, addr)) => {
-                        let _ = stream.set_nodelay(true);
-                        return (stream, addr);
-                    }
-                    Err(e) => {
-                        eprintln!("accept error: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.0.local_addr()
-    }
-}
-
 const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
 
 static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML_BR));
@@ -126,6 +98,8 @@ struct Config {
     /// Broadcast notification triggered on SIGINT/SIGTERM so active
     /// WebSocket/WebTransport handlers can send `S2C_QUIT` before exit.
     shutdown: Arc<tokio::sync::Notify>,
+    /// Shared auth throttle for config and gateway transports.
+    auth_throttle: blit_webserver::config::AuthThrottle,
 }
 
 impl Config {
@@ -506,6 +480,7 @@ pub async fn run() {
         hub_url,
         webrtc_enabled,
         shutdown: shutdown.clone(),
+        auth_throttle: blit_webserver::config::AuthThrottle::new(),
     });
 
     // --- Reconcile destinations whenever blit.remotes changes ---
@@ -551,7 +526,9 @@ pub async fn run() {
             eprintln!("blit gateway: cannot bind to {addr}: {e}");
             std::process::exit(1);
         });
-    let listener = NoDelayListener(tcp);
+    let listener = tcp.tap_io(|stream| {
+        let _ = stream.set_nodelay(true);
+    });
     eprintln!(
         "listening on {addr} (WebSocket{}){}",
         if quic_enabled { " + WebTransport" } else { "" },
@@ -564,7 +541,11 @@ pub async fn run() {
 
     blit_sd_notify::notify_ready(false);
 
-    let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let graceful = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -697,6 +678,11 @@ fn mux_error(ch: u16, msg: &str) -> Vec<u8> {
 }
 
 async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let auth_peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let path = request.uri().path().to_string();
 
     if let Some(resp) = blit_webserver::try_font_route(&path, state.cors_origin.as_deref()) {
@@ -726,6 +712,10 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
                     Some(&state.remotes),
                     transform,
                     &extra_init,
+                    blit_webserver::config::AuthContext {
+                        throttle: &state.auth_throttle,
+                        peer: &auth_peer,
+                    },
                 )
                 .await;
             }),
@@ -735,7 +725,7 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         match WebSocketUpgrade::from_request(request, &state).await {
             Ok(ws) => ws
                 .max_message_size(MAX_FRAME_SIZE + 2) // +2 for channel ID prefix
-                .on_upgrade(move |socket| handle_mux_ws(socket, state)),
+                .on_upgrade(move |socket| handle_mux_ws(socket, state, auth_peer)),
             Err(e) => e.into_response(),
         }
     } else if is_ws {
@@ -743,7 +733,7 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         match WebSocketUpgrade::from_request(request, &state).await {
             Ok(ws) => ws
                 .max_message_size(MAX_FRAME_SIZE)
-                .on_upgrade(move |socket| handle_ws(socket, state, dest_name)),
+                .on_upgrade(move |socket| handle_ws(socket, state, dest_name, auth_peer)),
             Err(e) => e.into_response(),
         }
     } else {
@@ -768,35 +758,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-async fn handle_ws(mut ws: WebSocket, state: AppState, dest_name: Option<String>) {
-    let authed = match tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            match ws.recv().await {
-                Some(Ok(Message::Text(pass))) => {
-                    if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
-                        break true;
-                    } else {
-                        let _ = ws.send(Message::Text("auth".into())).await;
-                        let _ = ws.close().await;
-                        break false;
-                    }
-                }
-                Some(Ok(Message::Ping(d))) => {
-                    let _ = ws.send(Message::Pong(d)).await;
-                }
-                _ => break false,
-            }
-        }
-    })
+async fn handle_ws(
+    mut ws: WebSocket,
+    state: AppState,
+    dest_name: Option<String>,
+    auth_peer: String,
+) {
+    if !blit_webserver::config::authenticate_text_ws(
+        &mut ws,
+        &state.passphrase,
+        &state.auth_throttle,
+        &auth_peer,
+        None,
+    )
     .await
     {
-        Ok(result) => result,
-        Err(_) => {
-            let _ = ws.close().await;
-            false
-        }
-    };
-    if !authed {
         return;
     }
 
@@ -906,36 +882,17 @@ impl MuxChannelState {
     }
 }
 
-async fn handle_mux_ws(mut ws: WebSocket, state: AppState) {
+async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
     // --- Authentication (identical to handle_ws) ---
-    let authed = match tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            match ws.recv().await {
-                Some(Ok(Message::Text(pass))) => {
-                    if constant_time_eq(pass.trim().as_bytes(), state.passphrase.as_bytes()) {
-                        break true;
-                    } else {
-                        let _ = ws.send(Message::Text("auth".into())).await;
-                        let _ = ws.close().await;
-                        break false;
-                    }
-                }
-                Some(Ok(Message::Ping(d))) => {
-                    let _ = ws.send(Message::Pong(d)).await;
-                }
-                _ => break false,
-            }
-        }
-    })
+    if !blit_webserver::config::authenticate_text_ws(
+        &mut ws,
+        &state.passphrase,
+        &state.auth_throttle,
+        &auth_peer,
+        None,
+    )
     .await
     {
-        Ok(result) => result,
-        Err(_) => {
-            let _ = ws.close().await;
-            false
-        }
-    };
-    if !authed {
         return;
     }
 
@@ -1410,6 +1367,7 @@ async fn wt_authenticate(
     send: &mut wt::SendStream,
     recv: &mut wt::RecvStream,
     passphrase: &str,
+    guard: blit_webserver::config::AuthAttemptGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut len_buf = [0u8; 2];
@@ -1418,7 +1376,7 @@ async fn wt_authenticate(
             .map_err(|e| format!("auth read len: {e}"))?;
         let pass_len = u16::from_le_bytes(len_buf) as usize;
         if pass_len > 4096 {
-            return Err::<(), String>("passphrase too long".into());
+            return Err::<bool, String>("passphrase too long".into());
         }
         let mut pass_buf = vec![0u8; pass_len];
         recv.read_exact(&mut pass_buf)
@@ -1428,16 +1386,26 @@ async fn wt_authenticate(
 
         if !constant_time_eq(pass.trim().as_bytes(), passphrase.as_bytes()) {
             send.write_all(&[0]).await.ok();
-            return Err("authentication failed".into());
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     })
     .await;
 
     match auth_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err("authentication timed out".into()),
+        Ok(Ok(true)) => guard.record_success(),
+        Ok(Ok(false)) => {
+            guard.record_failure();
+            return Err("authentication failed".into());
+        }
+        Ok(Err(e)) => {
+            guard.record_failure();
+            return Err(e.into());
+        }
+        Err(_) => {
+            guard.record_failure();
+            return Err("authentication timed out".into());
+        }
     }
     send.write_all(&[1])
         .await
@@ -1450,13 +1418,32 @@ async fn handle_webtransport_session(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = request.url.path().to_string();
+    let auth_peer = request.conn().remote_address().ip().to_string();
     let is_mux = is_mux_path(&path);
     let dest_name = resolve_destination_name(&path);
+    let Some(auth_guard) = state.auth_throttle.begin(auth_peer.clone()) else {
+        request
+            .reject(axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .await?;
+        return Ok(());
+    };
     let session = request.ok().await?;
 
-    let (mut send, mut recv) = session.accept_bi().await?;
+    let (mut send, mut recv) =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), session.accept_bi()).await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                auth_guard.record_failure();
+                return Err(e.into());
+            }
+            Err(_) => {
+                auth_guard.record_failure();
+                session.close(1, b"authentication timed out");
+                return Err("authentication timed out".into());
+            }
+        };
 
-    wt_authenticate(&mut send, &mut recv, &state.passphrase).await?;
+    wt_authenticate(&mut send, &mut recv, &state.passphrase, auth_guard).await?;
 
     if is_mux {
         return handle_mux_wt(send, recv, state).await;
@@ -1716,6 +1703,7 @@ mod tests {
             hub_url: blit_webrtc_forwarder::normalize_hub(blit_webrtc_forwarder::DEFAULT_HUB_URL),
             webrtc_enabled: false,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            auth_throttle: blit_webserver::config::AuthThrottle::new(),
         })
     }
 

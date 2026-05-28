@@ -39,8 +39,15 @@
       #root {
         /* Keep the root out of the unsafe top/side areas, but let the bottom
            chrome own the bottom inset so it can paint behind the home area. */
-        padding: env(safe-area-inset-top) env(safe-area-inset-right)
-          0 env(safe-area-inset-left);
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) 0
+          env(safe-area-inset-left);
+      }
+      @supports (height: 100dvh) {
+        html,
+        body,
+        #root {
+          height: 100dvh;
+        }
       }
       @supports (height: 100dvh) {
         html,
