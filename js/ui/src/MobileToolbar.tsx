@@ -227,7 +227,7 @@ export function MobileToolbar(props: {
         "align-items": "center",
         "flex-wrap": "wrap-reverse",
         gap: "3px",
-        padding: "4px 6px",
+        padding: "4px 6px calc(4px + env(safe-area-inset-bottom))",
         "background-color": props.theme.bg,
         "border-top": `1px solid ${props.theme.subtleBorder}`,
         "flex-shrink": 0,

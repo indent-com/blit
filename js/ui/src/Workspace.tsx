@@ -545,6 +545,38 @@ function WorkspaceScreen(props: {
     });
   }
   const [serverFonts, setServerFonts] = createSignal<string[]>([]);
+  let serverFontsLoaded = false;
+  let serverFontsRequest: Promise<void> | null = null;
+
+  function loadServerFonts(): void {
+    if (serverFontsLoaded || serverFontsRequest) return;
+
+    serverFontsRequest = fetch(`${basePath}fonts`)
+      .then(async (r): Promise<string[]> => {
+        if (!r.ok) throw new Error(`font list ${r.status}`);
+        const json: unknown = await r.json();
+        if (!Array.isArray(json)) {
+          throw new Error("font list response is not an array");
+        }
+        return json.filter(
+          (font): font is string =>
+            typeof font === "string" && font.trim().length > 0,
+        );
+      })
+      .then((fonts) => {
+        setServerFonts(fonts);
+        serverFontsLoaded = true;
+      })
+      .catch(() => {
+        // Retry when the font picker is opened.  Font listing is served by the
+        // HTTP /fonts route and must not depend on config-WS/server-side config
+        // persistence being available.
+      })
+      .finally(() => {
+        serverFontsRequest = null;
+      });
+  }
+
   const { resolvedFont, fontLoading, advanceRatio } = createFontLoader(
     font,
     DEFAULT_FONT,
@@ -782,12 +814,7 @@ function WorkspaceScreen(props: {
     return rf === DEFAULT_FONT ? rf : `${rf}, ${DEFAULT_FONT}`;
   };
 
-  onMount(() => {
-    fetch(`${basePath}fonts`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then(setServerFonts)
-      .catch(() => {});
-  });
+  onMount(loadServerFonts);
 
   let lru: SessionId[] = [];
 
@@ -1013,6 +1040,7 @@ function WorkspaceScreen(props: {
       paletteOverlayOrigin = palette();
     } else if (target === "font") {
       fontOverlayOrigin = { family: font(), size: fontSize() };
+      loadServerFonts();
     }
     setOverlay(target);
   }
@@ -1373,6 +1401,10 @@ function WorkspaceScreen(props: {
   const theme = () => themeFor(palette());
   const chromeScale = () => uiScale(fontSize());
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
+  const showMobileToolbar = createMemo(
+    () => isMobileTouch() && keyboardWanted(),
+  );
+  const statusBarHeight = () => chromeScale().md + chromeScale().controlY * 3;
 
   return (
     <BlitWorkspaceProvider
@@ -1780,11 +1812,15 @@ function WorkspaceScreen(props: {
         <footer
           style={{
             ...layout.statusBar,
-            padding: "0 1em",
+            padding: showMobileToolbar()
+              ? "0 1em"
+              : "0 1em env(safe-area-inset-bottom)",
             "background-color": theme().bg,
             color: theme().fg,
             "border-top-color": theme().border,
-            height: `${chromeScale().md + chromeScale().controlY * 3}px`,
+            height: showMobileToolbar()
+              ? `${statusBarHeight()}px`
+              : `calc(${statusBarHeight()}px + env(safe-area-inset-bottom))`,
             "font-size": `${chromeScale().md}px`,
           }}
         >
@@ -1844,7 +1880,7 @@ function WorkspaceScreen(props: {
             onMedia={() => toggleOverlay("media")}
           />
         </footer>
-        <Show when={isMobileTouch() && keyboardWanted()}>
+        <Show when={showMobileToolbar()}>
           <MobileToolbar
             workspace={workspace}
             focusedSessionId={() => wsState().focusedSessionId}

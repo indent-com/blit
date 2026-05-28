@@ -1726,9 +1726,7 @@ export class BlitConnection {
       ? withCommand
       : this.parseListMessage(bytes, false);
     const parsed =
-      withCommand.complete || !legacy.complete
-        ? withCommand
-        : legacy;
+      withCommand.complete || !legacy.complete ? withCommand : legacy;
     const entries = parsed.entries;
 
     const livePtys = new Set(entries.map((entry) => entry.ptyId));
