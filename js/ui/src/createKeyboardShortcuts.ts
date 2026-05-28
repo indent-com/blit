@@ -59,6 +59,87 @@ export interface KeyboardShortcutHandlers {
  */
 export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
   onMount(() => {
+    const eventElement = (target: EventTarget | null): Element | null => {
+      if (target instanceof Element) return target;
+      return document.activeElement instanceof Element
+        ? document.activeElement
+        : null;
+    };
+
+    const isTerminalInput = (el: Element | null): boolean =>
+      el?.tagName === "TEXTAREA" &&
+      el.getAttribute("aria-label") === "Terminal input";
+
+    const isEnterInputEvent = (e: InputEvent): boolean =>
+      e.inputType === "insertLineBreak" ||
+      e.inputType === "insertParagraph" ||
+      e.data === "\n" ||
+      e.data === "\r";
+
+    const isEnterKeyEvent = (e: KeyboardEvent): boolean =>
+      e.key === "Enter" ||
+      e.key === "Return" ||
+      e.code === "Enter" ||
+      e.code === "NumpadEnter" ||
+      e.keyCode === 13;
+
+    const textareaHasLineBreak = (target: Element | null): boolean =>
+      target instanceof HTMLTextAreaElement &&
+      (target.value.includes("\n") || target.value.includes("\r"));
+
+    const isReservedInputTarget = (el: Element | null): boolean => {
+      const tag = el?.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        tag === "CANVAS" ||
+        tag === "BUTTON"
+      );
+    };
+
+    const shouldHandleRestartEnter = (target: Element | null): boolean => {
+      if (h.overlay()) return false;
+      // When a surface is focused, Enter is not special.
+      if (h.focusedSurfaceId() != null) return false;
+
+      // In BSP mode, the focused pane may hold a surface assignment rather
+      // than a session.  Don't intercept Enter in that case either.
+      const fpId = h.bspFocusedPaneId();
+      if (fpId) {
+        const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
+        if (isSurfaceAssignment(assign)) return false;
+      }
+
+      const fid = h.focusedSessionId();
+      const focused = fid ? h.sessions().find((s) => s.id === fid) : null;
+      if (!((focused && focused.state === "exited") || fid == null)) {
+        return false;
+      }
+
+      // Don't steal Enter from normal inputs (e.g. EmptyPane command input) or
+      // buttons.  The exception is the hidden terminal textarea: iPadOS keeps
+      // it focused and sends the software keyboard Return key as text input,
+      // so an exited terminal must be allowed to restart from there.
+      if (isReservedInputTarget(target)) {
+        return (
+          isTerminalInput(target) &&
+          (focused?.state === "exited" || fid == null)
+        );
+      }
+
+      return true;
+    };
+
+    const handleRestartEnter = (e: Event): boolean => {
+      if (!shouldHandleRestartEnter(eventElement(e.target))) return false;
+      e.preventDefault();
+      // If this is an input/input-like event, stop it before BlitTerminalSurface's
+      // textarea listener forwards the inserted newline to the exited PTY.
+      e.stopImmediatePropagation();
+      h.handleRestartOrClose();
+      return true;
+    };
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
 
@@ -116,35 +197,9 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         }
         return;
       }
-      if (e.key === "Enter" && !mod && !e.shiftKey && !h.overlay()) {
+      if (isEnterKeyEvent(e) && !mod && !e.shiftKey) {
         // Enter on an exited session restarts/closes it (works in BSP layouts too).
-        // When a surface is focused, Enter is not special.
-        if (h.focusedSurfaceId() != null) return;
-        // In BSP mode, the focused pane may hold a surface assignment rather
-        // than a session.  Don't intercept Enter in that case either.
-        const fpId = h.bspFocusedPaneId();
-        if (fpId) {
-          const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
-          if (isSurfaceAssignment(assign)) return;
-        }
-        // Don't intercept Enter when an input/textarea/canvas is focused (e.g.
-        // the EmptyPane command input handles Enter itself, and the surface
-        // canvas forwards keys to the Wayland compositor).
-        const tag = document.activeElement?.tagName;
-        if (
-          tag === "INPUT" ||
-          tag === "TEXTAREA" ||
-          tag === "CANVAS" ||
-          tag === "BUTTON"
-        )
-          return;
-        const fid = h.focusedSessionId();
-        const focused = fid ? h.sessions().find((s) => s.id === fid) : null;
-        if ((focused && focused.state === "exited") || fid == null) {
-          e.preventDefault();
-          h.handleRestartOrClose();
-          return;
-        }
+        if (handleRestartEnter(e)) return;
       }
       // Ctrl+Shift+Q: remove the current term/surface from the main view
       // (unassign without closing) so it falls back to the sidebar.  Also
@@ -309,7 +364,39 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       }
     };
 
+    const beforeInputHandler = (e: InputEvent) => {
+      if (!isEnterInputEvent(e)) return;
+      // iPadOS software keyboard Return in a textarea may arrive as
+      // beforeinput/input rather than a useful keydown.  Mirror the keydown
+      // restart path before the textarea inserts a newline.
+      handleRestartEnter(e);
+    };
+
+    const inputHandler = (e: Event) => {
+      const target = eventElement(e.target);
+      if (!isTerminalInput(target)) return;
+      const inputEvent =
+        typeof InputEvent !== "undefined" && e instanceof InputEvent ? e : null;
+      if (!textareaHasLineBreak(target) && !inputEvent?.inputType) return;
+      if (
+        inputEvent &&
+        !isEnterInputEvent(inputEvent) &&
+        !textareaHasLineBreak(target)
+      ) {
+        return;
+      }
+      if (handleRestartEnter(e) && target instanceof HTMLTextAreaElement) {
+        target.value = "";
+      }
+    };
+
     window.addEventListener("keydown", handler, true);
-    onCleanup(() => window.removeEventListener("keydown", handler, true));
+    window.addEventListener("beforeinput", beforeInputHandler, true);
+    window.addEventListener("input", inputHandler, true);
+    onCleanup(() => {
+      window.removeEventListener("keydown", handler, true);
+      window.removeEventListener("beforeinput", beforeInputHandler, true);
+      window.removeEventListener("input", inputHandler, true);
+    });
   });
 }
