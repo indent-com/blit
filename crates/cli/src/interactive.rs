@@ -663,11 +663,20 @@ async fn cli_mux_open_channel(
         }
     };
 
-    let transport = match connector.connect().await {
-        Ok(t) => t,
-        Err(e) => {
+    let connect_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), connector.connect()).await;
+
+    let transport = match connect_result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             eprintln!("blit: mux: cannot connect to '{name}': {e}");
             let _ = merge_tx.send(mux_error(ch_id, &e));
+            return;
+        }
+        Err(_) => {
+            let msg = format!("connection to '{name}' timed out");
+            eprintln!("blit: mux: {msg}");
+            let _ = merge_tx.send(mux_error(ch_id, &msg));
             return;
         }
     };

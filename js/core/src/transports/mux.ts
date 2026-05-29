@@ -53,6 +53,10 @@ export interface MuxTransportOptions extends BlitTransportOptions {
   wtUrl?: string;
   /** SHA-256 cert hash (hex) for self-signed WebTransport certs. */
   wtCertHash?: string;
+  /** Timeout for the optional WebTransport attempt before falling back to WebSocket. Default: 3000 ms. */
+  wtConnectTimeoutMs?: number;
+  /** Timeout waiting for a virtual channel OPEN acknowledgement before retrying. Default: 10000 ms. */
+  channelConnectTimeoutMs?: number;
   /** Optional debug logger for connection diagnostics. */
   debug?: BlitDebug;
 }
@@ -84,6 +88,8 @@ export class MuxTransport {
   private readonly backoff: number;
   private readonly wtUrl: string | undefined;
   private readonly wtCertHash: Uint8Array | undefined;
+  private readonly wtConnectTimeoutMs: number;
+  private readonly channelConnectTimeoutMs: number;
   /** Set to true after the first WT failure so we stop retrying WT. */
   private wtFailed = false;
   private readonly dbg: BlitDebug;
@@ -96,6 +102,11 @@ export class MuxTransport {
   private readonly pendingReopen = new Set<MuxChannel>();
   /** Per-channel reconnect timers for channels that received S2C_CLOSED/ERROR. */
   private readonly channelReconnectTimers = new Map<
+    number,
+    ReturnType<typeof setTimeout>
+  >();
+  /** Per-channel timers while waiting for S2C_OPENED. */
+  private readonly channelConnectTimers = new Map<
     number,
     ReturnType<typeof setTimeout>
   >();
@@ -112,6 +123,17 @@ export class MuxTransport {
     this.maxDelay = options?.maxReconnectDelay ?? 10000;
     this.backoff = options?.reconnectBackoff ?? 1.5;
     this.currentDelay = this.initialDelay;
+    // WebTransport is an optimization; if UDP/QUIC is blocked we should fall
+    // back to WebSocket quickly rather than making first load sit on the
+    // browser's long connection timeout. `connectTimeoutMs` remains an alias
+    // for callers that use the generic BlitTransportOptions field.
+    this.wtConnectTimeoutMs =
+      options?.wtConnectTimeoutMs ?? options?.connectTimeoutMs ?? 3_000;
+    // Opening a mux channel may involve SSH/WebRTC/proxy setup on the gateway.
+    // If the first attempt wedges, retry automatically — this is the same
+    // recovery path as pressing the Reconnect button, just without user action.
+    this.channelConnectTimeoutMs =
+      options?.channelConnectTimeoutMs ?? options?.connectTimeoutMs ?? 10_000;
     this.dbg = options?.debug ?? noopDebug;
     if (options?.wtUrl) {
       this.wtUrl = options.wtUrl;
@@ -176,6 +198,10 @@ export class MuxTransport {
       clearTimeout(timer);
     }
     this.channelReconnectTimers.clear();
+    for (const timer of this.channelConnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.channelConnectTimers.clear();
     for (const ch of this.channels.values()) {
       ch._setStatus("closed");
     }
@@ -209,6 +235,7 @@ export class MuxTransport {
     this.channels.delete(ch.channelId);
     this.pendingReopen.delete(ch);
     this._cancelChannelReconnect(ch.channelId);
+    this.cancelChannelConnectTimer(ch.channelId);
     if (this._status === "connected") {
       this._sendClose(ch.channelId);
     }
@@ -258,6 +285,7 @@ export class MuxTransport {
     view.setUint16(5, nameBytes.length, true);
     buf.set(nameBytes, 7);
     this._sendRaw(buf);
+    this.armChannelConnectTimer(ch);
   }
 
   // -- Internal: WebSocket --------------------------------------------------
@@ -373,10 +401,14 @@ export class MuxTransport {
       }
 
       const wt = new WebTransport(this.wtUrl, opts);
+      this.wt = wt;
       await Promise.race([
         wt.ready,
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("WT connect timeout")), 10_000),
+          setTimeout(
+            () => reject(new Error("WT connect timeout")),
+            this.wtConnectTimeoutMs,
+          ),
         ),
       ]);
 
@@ -384,8 +416,6 @@ export class MuxTransport {
         wt.close();
         return;
       }
-
-      this.wt = wt;
 
       // Open a bidirectional stream for the mux protocol.
       const stream = await wt.createBidirectionalStream();
@@ -539,6 +569,10 @@ export class MuxTransport {
       clearTimeout(timer);
     }
     this.channelReconnectTimers.clear();
+    for (const timer of this.channelConnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.channelConnectTimers.clear();
     if (this._authRejected) {
       this.setStatus("disconnected");
       return;
@@ -601,6 +635,48 @@ export class MuxTransport {
     );
   }
 
+  private armChannelConnectTimer(ch: MuxChannel): void {
+    if (this.channelConnectTimeoutMs <= 0) return;
+    this.cancelChannelConnectTimer(ch.channelId);
+    this.channelConnectTimers.set(
+      ch.channelId,
+      setTimeout(() => {
+        this.channelConnectTimers.delete(ch.channelId);
+        if (this.disposed || !this.channels.has(ch.channelId)) return;
+        if (ch._internalStatus !== "connecting") return;
+
+        ch._lastError = "connect timeout";
+        this.dbg.warn(
+          "channel %d (%s) open timed out after %dms; retrying",
+          ch.channelId,
+          ch.destName,
+          this.channelConnectTimeoutMs,
+        );
+
+        // Ask the gateway to cancel any in-flight OPEN. Gateways that support
+        // pending-open cancellation will abort the slow attempt; older/local
+        // handlers ignore it until their connect attempt returns, which is no
+        // worse than the previous stuck state.
+        if (this._status === "connected") {
+          this._sendClose(ch.channelId);
+        } else {
+          this.pendingReopen.add(ch);
+        }
+
+        ch._setStatus("disconnected");
+        this.scheduleChannelReconnect(ch);
+      }, this.channelConnectTimeoutMs),
+    );
+  }
+
+  cancelChannelConnectTimer(channelId: number): void {
+    const timer = this.channelConnectTimers.get(channelId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.channelConnectTimers.delete(channelId);
+    }
+  }
+
   /** @internal */
   _sendClose(channelId: number): void {
     const buf = new Uint8Array(5);
@@ -644,6 +720,7 @@ export class MuxTransport {
     switch (opcode) {
       case MUX_S2C_OPENED:
         if (ch) {
+          this.cancelChannelConnectTimer(ch.channelId);
           ch._lastError = null;
           ch._reconnectDelay = this.initialDelay;
           ch._setStatus("connected");
@@ -652,6 +729,7 @@ export class MuxTransport {
 
       case MUX_S2C_CLOSED:
         if (ch && ch._internalStatus !== "connecting") {
+          this.cancelChannelConnectTimer(ch.channelId);
           ch._setStatus("disconnected");
           this.scheduleChannelReconnect(ch);
         }
@@ -665,6 +743,7 @@ export class MuxTransport {
             ? textDecoder.decode(bytes.subarray(7, 7 + msgLen))
             : "unknown error";
         if (ch) {
+          this.cancelChannelConnectTimer(ch.channelId);
           ch._lastError = msg;
           ch._setStatus("error");
           this.scheduleChannelReconnect(ch);
@@ -734,6 +813,7 @@ export class MuxChannel implements BlitTransport {
   reconnect(): void {
     if (this._internalStatus === "closed") return;
     this.mux._cancelChannelReconnect(this.channelId);
+    this.mux.cancelChannelConnectTimer(this.channelId);
     // Ask the server to tear down the existing channel.
     if (
       this._internalStatus === "connected" ||
