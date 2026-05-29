@@ -154,6 +154,73 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
   });
 });
 
+describe("BlitTerminalSurface iPad autocorrect", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function attachConnected(sendInput: () => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // Wire just the input path — bypass attach() so we don't have to stub the
+    // full renderer/dirty-listener connection surface.  The input handler only
+    // needs sendInput (via _workspace) and a connected transport status.
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/compositionend/input listeners.
+    s["setupKeyboard"]();
+    return { s, input };
+  }
+
+  function fireInput(
+    input: HTMLTextAreaElement,
+    value: string,
+    inputType: string,
+  ) {
+    input.value = value;
+    // jsdom's InputEvent doesn't surface inputType from the init dict, so set
+    // it explicitly to mirror what Safari/iPadOS deliver.
+    const ev = new Event("input") as InputEvent;
+    Object.defineProperty(ev, "inputType", { value: inputType });
+    Object.defineProperty(ev, "isComposing", { value: false });
+    input.dispatchEvent(ev);
+  }
+
+  it("forwards normally typed characters to the session", () => {
+    const sendInput = vi.fn();
+    const { input } = attachConnected(sendInput);
+    fireInput(input, "a", "insertText");
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(input.value).toBe("");
+  });
+
+  it("drops iPad autocorrect (insertReplacementText) substitutions", () => {
+    const sendInput = vi.fn();
+    const { input } = attachConnected(sendInput);
+    // iPadOS ignores autocorrect="off" and delivers the correction as an
+    // insertReplacementText input event; it must never reach the shell.
+    fireInput(input, "corrected", "insertReplacementText");
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+  });
+});
+
 describe("BlitTerminalSurface native scroll surface", () => {
   beforeEach(() => {
     mockCanvasContext();

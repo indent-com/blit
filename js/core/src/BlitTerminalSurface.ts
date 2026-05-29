@@ -1432,6 +1432,17 @@ export class BlitTerminalSurface {
         }
         return;
       }
+      // iPadOS (and desktop spellcheck) ignore autocorrect="off" on this
+      // hidden capture textarea and instead deliver autocorrect/suggestion
+      // substitutions as an "insertReplacementText" input event.  Each
+      // literally-typed character has already been streamed to the shell as
+      // its own insertText event, so forwarding the replacement would both
+      // duplicate and "correct" terminal input.  Drop it — this is what makes
+      // autocorrect-off actually stick on iPad keyboards.
+      if (inputEvent.inputType === "insertReplacementText") {
+        input.value = "";
+        return;
+      }
       // Ctrl modifier: convert the next typed character to Ctrl+char
       if (
         this._ctrlModifier &&
