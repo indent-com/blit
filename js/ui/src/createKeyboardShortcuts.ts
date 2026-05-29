@@ -342,10 +342,11 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           h.cancelOverlay();
           return;
         }
-        // Escape while a surface is focused returns to the terminal view.
+        // Do not capture Escape while a Wayland surface is focused: many
+        // apps rely on it, and BlitSurfaceCanvas will forward it if the
+        // event is left unhandled here. Use Ctrl+Shift+Q to return to the
+        // terminal view without sending input to the surface.
         if (h.focusedSurfaceId() != null) {
-          e.preventDefault();
-          h.unfocusSurface();
           return;
         }
         // When a BSP layout is active, BSPContainer handles Escape on
