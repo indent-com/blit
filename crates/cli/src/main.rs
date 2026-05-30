@@ -492,6 +492,12 @@ async fn async_main() {
                 std::process::exit(1);
             }
         }
+        Command::HashPassphrase { value } => {
+            if let Err(e) = cmd_hash_passphrase(value) {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Open { port } => {
             let hub = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);
             interactive::run_browser(port, &hub).await;
@@ -509,6 +515,29 @@ async fn async_main() {
             blit_proxy::run(false);
         }
     }
+}
+
+fn cmd_hash_passphrase(value: Option<String>) -> Result<(), String> {
+    use std::io::Read;
+
+    let passphrase = match value.as_deref() {
+        Some("-") | None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("failed to read passphrase from stdin: {e}"))?;
+            buf.trim_end_matches(['\r', '\n']).to_string()
+        }
+        Some(value) => value.to_string(),
+    };
+
+    if passphrase.is_empty() {
+        return Err("passphrase must be non-empty".to_string());
+    }
+
+    let hash = blit_webserver::passphrase::hash(&passphrase)?;
+    println!("{hash}");
+    Ok(())
 }
 
 /// Replace the passphrase in a `share:PASSPHRASE` URI with `****`.

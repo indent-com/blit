@@ -136,6 +136,7 @@ struct DestinationInfo {
 
 struct BrowserState {
     token: String,
+    auth_token: blit_webserver::config::AuthPassphrase,
     destinations: std::sync::RwLock<std::collections::HashMap<String, DestinationInfo>>,
     config: blit_webserver::config::ConfigState,
     remotes: blit_webserver::config::RemotesState,
@@ -191,6 +192,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
 
     let state = Arc::new(BrowserState {
         token: token.clone(),
+        auth_token: blit_webserver::config::AuthPassphrase::plaintext(token.clone()),
         destinations: std::sync::RwLock::new(destinations),
         config: blit_webserver::config::ConfigState::new(),
         remotes,
@@ -245,7 +247,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                             .on_upgrade(move |socket| async move {
                                 blit_webserver::config::handle_config_ws(
                                     socket,
-                                    &state.token,
+                                    &state.auth_token,
                                     &state.config,
                                     Some(&state.remotes),
                                     None,

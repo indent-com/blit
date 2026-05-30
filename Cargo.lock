@@ -698,6 +698,7 @@ dependencies = [
 name = "blit-webserver"
 version = "0.33.6"
 dependencies = [
+ "argon2",
  "axum",
  "blit-fonts",
  "brotli",

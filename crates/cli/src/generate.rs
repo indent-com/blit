@@ -80,7 +80,7 @@ fn blit_gateway_cmd() -> Command {
         )
         .after_help(
             "ENVIRONMENT:\n    \
-             BLIT_PASSPHRASE    Browser passphrase (required)\n    \
+             BLIT_PASSPHRASE    Browser passphrase, or argon2 PHC hash from blit hash-passphrase (required)\n    \
              BLIT_ADDR          Listen address (default: 0.0.0.0:3264)\n    \
              BLIT_REMOTES       Path to remotes file (default: ~/.config/blit/blit.remotes)\n    \
              BLIT_FONT_DIRS     Colon-separated extra font directories\n    \

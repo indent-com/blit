@@ -128,7 +128,7 @@ in
             };
             passFile = mkOption {
               type = types.path;
-              description = "File containing the gateway passphrase.";
+              description = "File containing BLIT_PASSPHRASE=<passphrase> or BLIT_PASSPHRASE=<argon2 PHC hash>.";
             };
             fontDirs = mkOption {
               type = types.listOf types.str;

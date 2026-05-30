@@ -72,7 +72,7 @@ static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag
 type DestMap = std::collections::HashMap<String, GatewayConnector>;
 
 struct Config {
-    passphrase: String,
+    passphrase: blit_webserver::config::AuthPassphrase,
     /// Resolved connectors for routing WebSocket/WebTransport connections.
     /// Derived from `remotes` on startup and reconciled on file changes.
     destinations: std::sync::RwLock<DestMap>,
@@ -409,10 +409,11 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
 /// (`BLIT_PASSPHRASE`, `BLIT_ADDR`, `BLIT_REMOTES`, …).  Does not return
 /// under normal operation.
 pub async fn run() {
-    let passphrase = std::env::var("BLIT_PASSPHRASE").unwrap_or_else(|_| {
+    let passphrase_raw = std::env::var("BLIT_PASSPHRASE").unwrap_or_else(|_| {
         eprintln!("BLIT_PASSPHRASE environment variable required");
         std::process::exit(1);
     });
+    let passphrase = blit_webserver::config::AuthPassphrase::from_env_value(passphrase_raw);
     let ssh_pool = blit_ssh::SshPool::new();
 
     // When BLIT_GATEWAY_WEBRTC=1, proxy share: remotes via WebRTC.
@@ -748,14 +749,6 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
             .and_then(|v| v.to_str().ok());
         blit_webserver::html_response(INDEX_HTML_BR, etag, inm, ae)
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
-    for i in 0..a.len().min(b.len()) {
-        diff |= a[i] ^ b[i];
-    }
-    std::hint::black_box(diff) == 0
 }
 
 async fn handle_ws(
@@ -1366,7 +1359,7 @@ async fn run_wt_accept_loop(state: &AppState, server: &mut wt::Server, permanent
 async fn wt_authenticate(
     send: &mut wt::SendStream,
     recv: &mut wt::RecvStream,
-    passphrase: &str,
+    passphrase: &blit_webserver::config::AuthPassphrase,
     guard: blit_webserver::config::AuthAttemptGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -1384,7 +1377,7 @@ async fn wt_authenticate(
             .map_err(|e| format!("auth read pass: {e}"))?;
         let pass = std::str::from_utf8(&pass_buf).unwrap_or("");
 
-        if !constant_time_eq(pass.trim().as_bytes(), passphrase.as_bytes()) {
+        if !passphrase.verify(pass.trim()) {
             send.write_all(&[0]).await.ok();
             return Ok(false);
         }
@@ -1692,7 +1685,7 @@ mod tests {
 
     fn make_test_state(destinations: DestMap, cors_origin: Option<String>) -> AppState {
         Arc::new(Config {
-            passphrase: "test".into(),
+            passphrase: blit_webserver::config::AuthPassphrase::plaintext("test"),
             destinations: std::sync::RwLock::new(destinations),
             remotes: blit_webserver::config::RemotesState::ephemeral(String::new()),
             cors_origin,

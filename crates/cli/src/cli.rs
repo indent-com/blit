@@ -157,6 +157,16 @@ pub enum Command {
     /// Upgrade blit to the latest version
     Upgrade,
 
+    /// Hash a gateway passphrase for BLIT_PASSPHRASE
+    ///
+    /// Prints an argon2id PHC string suitable for BLIT_PASSPHRASE. If VALUE is
+    /// omitted or "-", reads from stdin. The stored hash is salted; browser
+    /// clients still enter the original plaintext passphrase.
+    HashPassphrase {
+        /// Plaintext passphrase to hash (or -/omitted to read from stdin)
+        value: Option<String>,
+    },
+
     /// Run the WebSocket/WebTransport gateway
     ///
     /// All configuration is via environment variables:

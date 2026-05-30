@@ -45,6 +45,14 @@ hound = ssh:alice@hound
 BLIT_PASSPHRASE=secret blit gateway
 ```
 
+To avoid storing the gateway passphrase in plaintext, store an argon2id PHC hash instead:
+
+```bash
+BLIT_PASSPHRASE=$(blit hash-passphrase secret) blit gateway
+```
+
+Browsers still enter `secret`; the hash embeds its random salt and argon2 parameters.
+
 SSH remotes are connected via the embedded SSH client (russh) with
 ssh-agent authentication. blit is auto-installed on remote hosts if missing.
 

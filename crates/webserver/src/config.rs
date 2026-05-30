@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+pub use crate::passphrase::AuthPassphrase;
+
 pub struct ConfigState {
     pub tx: broadcast::Sender<String>,
 }
@@ -210,7 +212,7 @@ impl Drop for AuthAttemptGuard {
 /// successful authentication before returning.
 pub async fn authenticate_text_ws(
     ws: &mut WebSocket,
-    token: &str,
+    token: &AuthPassphrase,
     throttle: &AuthThrottle,
     peer: &str,
     ok_message: Option<&str>,
@@ -225,7 +227,7 @@ pub async fn authenticate_text_ws(
         loop {
             match ws.recv().await {
                 Some(Ok(Message::Text(pass))) => {
-                    break constant_time_eq(pass.trim().as_bytes(), token.as_bytes());
+                    break token.verify(pass.trim());
                 }
                 Some(Ok(Message::Ping(d))) => {
                     let _ = ws.send(Message::Pong(d)).await;
@@ -701,14 +703,6 @@ impl Default for RemotesState {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
-    for i in 0..a.len().min(b.len()) {
-        diff |= a[i] ^ b[i];
-    }
-    std::hint::black_box(diff) == 0
-}
-
 fn parse_config_str(contents: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in contents.lines() {
@@ -760,7 +754,7 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 ///     in their original relative order.  Disabled state is preserved.
 pub async fn handle_config_ws(
     mut ws: WebSocket,
-    token: &str,
+    token: &AuthPassphrase,
     config: &ConfigState,
     remotes: Option<&RemotesState>,
     remotes_transform: Option<fn(&str) -> String>,
@@ -983,38 +977,6 @@ pub async fn handle_config_ws(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── constant_time_eq ──
-
-    #[test]
-    fn ct_eq_equal_slices() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-    }
-
-    #[test]
-    fn ct_eq_different_slices() {
-        assert!(!constant_time_eq(b"hello", b"world"));
-    }
-
-    #[test]
-    fn ct_eq_different_lengths() {
-        assert!(!constant_time_eq(b"short", b"longer"));
-    }
-
-    #[test]
-    fn ct_eq_empty_slices() {
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn ct_eq_single_bit_diff() {
-        assert!(!constant_time_eq(b"\x00", b"\x01"));
-    }
-
-    #[test]
-    fn ct_eq_one_empty_one_not() {
-        assert!(!constant_time_eq(b"", b"x"));
-    }
 
     // ── parse_config_str ──
 

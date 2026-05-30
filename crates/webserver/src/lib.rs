@@ -1,4 +1,5 @@
 pub mod config;
+pub mod passphrase;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
