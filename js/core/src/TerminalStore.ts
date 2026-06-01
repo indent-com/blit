@@ -317,27 +317,18 @@ export class TerminalStore {
     this.fontSize = fontSize;
   }
 
-  /** Get a shared renderer for readOnly (preview) terminals.
-   *  Prefers WebGPU (async probe), falls back to WebGL2, then Canvas 2D. */
-  /**
-   * Resolve the canvas a caller should composite FROM via drawImage. For the
-   * WebGPU backend this is NOT the raw WebGPU canvas — on WebKit that canvas
-   * reads back blank as a drawImage source (bug webgpu-ipad-blank). The WebGPU
-   * renderer mirrors each frame into a sampleable 2D `readbackCanvas`, so we
-   * hand that out instead. Other backends composite from their own canvas.
-   */
+  /** Resolve the canvas a caller should composite FROM via drawImage. Every
+   *  backend renders into its own canvas which the caller drawImages
+   *  synchronously right after render(), so we hand back the canvas directly. */
   private compositeCanvas(
-    renderer: GlRenderer,
+    _renderer: GlRenderer,
     canvas: HTMLCanvasElement,
   ): HTMLCanvasElement {
-    if (renderer.backend === "webgpu") {
-      const rb = (renderer as { readbackCanvas?: HTMLCanvasElement })
-        .readbackCanvas;
-      if (rb) return rb;
-    }
     return canvas;
   }
 
+  /** Get a shared renderer for all surfaces. Prefers WebGPU (async probe),
+   *  falls back to WebGL2, then Canvas 2D. */
   getSharedRenderer(): {
     renderer: GlRenderer;
     canvas: HTMLCanvasElement;

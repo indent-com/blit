@@ -1097,46 +1097,32 @@ export class BlitTerminalSurface {
       this._showCursor,
     );
 
-    // Copy GL to display canvas, then draw overlay content on top.
+    // Copy GL to display canvas, then draw overlay content on top. This runs
+    // synchronously right after render(), so each surface composites its own
+    // just-rendered frame from the shared canvas — no cross-pane bleed.
     const shared = conn.getSharedRenderer();
     const displayCanvas = this.glCanvas;
     if (shared && displayCanvas) {
-      const src = shared.canvas;
-      const waitingForWebGpuMirror =
-        shared.renderer.backend === "webgpu" &&
-        (src.width < pw || src.height < ph);
-      if (waitingForWebGpuMirror) {
-        this.scheduleRender();
-      } else {
-        if (displayCanvas.width !== pw) {
-          displayCanvas.width = pw;
-          this.displayCtx = null;
-        }
-        if (displayCanvas.height !== ph) {
-          displayCanvas.height = ph;
-          this.displayCtx = null;
-        }
-        if (!this.displayCtx) {
-          this.displayCtx = displayCanvas.getContext("2d");
-          this.displayCtx?.resetTransform();
-        }
-        const ctx = this.displayCtx;
-        if (ctx) {
-          // BUG FIX (webgpu-ipad-blank): for the WebGPU backend `shared.canvas`
-          // is a 2D readback mirror that is asynchronously populated, so on the
-          // first frame(s) it may still be 0x0. Drawing an explicit source rect
-          // larger than the source throws IndexSizeError, so guard on its size.
-          if (src.width >= pw && src.height >= ph) {
-            ctx.drawImage(src, 0, 0, pw, ph, 0, 0, pw, ph);
-          } else {
-            ctx.clearRect(0, 0, pw, ph);
-          }
-          this.drawSelectionOverlay(ctx, cell);
-          this.drawUrlOverlay(ctx, cell);
-          this.drawOverflowText(ctx, t, cell);
-          this.drawPredictedEcho(ctx, t, cell);
-          this.drawScrollbar(ctx, t, cell);
-        }
+      if (displayCanvas.width !== pw) {
+        displayCanvas.width = pw;
+        this.displayCtx = null;
+      }
+      if (displayCanvas.height !== ph) {
+        displayCanvas.height = ph;
+        this.displayCtx = null;
+      }
+      if (!this.displayCtx) {
+        this.displayCtx = displayCanvas.getContext("2d");
+        this.displayCtx?.resetTransform();
+      }
+      const ctx = this.displayCtx;
+      if (ctx) {
+        ctx.drawImage(shared.canvas, 0, 0, pw, ph, 0, 0, pw, ph);
+        this.drawSelectionOverlay(ctx, cell);
+        this.drawUrlOverlay(ctx, cell);
+        this.drawOverflowText(ctx, t, cell);
+        this.drawPredictedEcho(ctx, t, cell);
+        this.drawScrollbar(ctx, t, cell);
       }
     }
 
