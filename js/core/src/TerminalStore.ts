@@ -25,6 +25,16 @@ export interface TerminalStoreDelegate {
   log?(msg: string): void;
 }
 
+function isIosWebKit(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  const platform = navigator.platform;
+  const isIos =
+    /iPad|iPhone|iPod/.test(ua) ||
+    (platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  return isIos && /AppleWebKit/.test(ua);
+}
+
 export class TerminalStore {
   private mod: BlitWasmModule | null = null;
   private terminals = new Map<number, Terminal>();
@@ -97,6 +107,7 @@ export class TerminalStore {
    *  call will pick it up. If it fails, we silently fall through to WebGL2. */
   private probeWebGpu(): void {
     if (typeof navigator === "undefined" || !navigator.gpu) return;
+    if (isIosWebKit()) return;
     const canvas = document.createElement("canvas");
     this.webgpuProbe = createWebGpuRenderer(canvas)
       .then((r) => {
@@ -308,18 +319,43 @@ export class TerminalStore {
 
   /** Get a shared renderer for readOnly (preview) terminals.
    *  Prefers WebGPU (async probe), falls back to WebGL2, then Canvas 2D. */
+  /**
+   * Resolve the canvas a caller should composite FROM via drawImage. For the
+   * WebGPU backend this is NOT the raw WebGPU canvas — on WebKit that canvas
+   * reads back blank as a drawImage source (bug webgpu-ipad-blank). The WebGPU
+   * renderer mirrors each frame into a sampleable 2D `readbackCanvas`, so we
+   * hand that out instead. Other backends composite from their own canvas.
+   */
+  private compositeCanvas(
+    renderer: GlRenderer,
+    canvas: HTMLCanvasElement,
+  ): HTMLCanvasElement {
+    if (renderer.backend === "webgpu") {
+      const rb = (renderer as { readbackCanvas?: HTMLCanvasElement })
+        .readbackCanvas;
+      if (rb) return rb;
+    }
+    return canvas;
+  }
+
   getSharedRenderer(): {
     renderer: GlRenderer;
     canvas: HTMLCanvasElement;
   } | null {
     if (this.sharedRenderer?.supported) {
-      return { renderer: this.sharedRenderer, canvas: this.sharedCanvas! };
+      return {
+        renderer: this.sharedRenderer,
+        canvas: this.compositeCanvas(this.sharedRenderer, this.sharedCanvas!),
+      };
     }
     // Use WebGPU renderer if the async probe has completed.
     if (this.webgpuRenderer?.supported && this.webgpuCanvas) {
       this.sharedRenderer = this.webgpuRenderer;
       this.sharedCanvas = this.webgpuCanvas;
-      return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
+      return {
+        renderer: this.sharedRenderer,
+        canvas: this.compositeCanvas(this.sharedRenderer, this.sharedCanvas),
+      };
     }
     // Synchronous fallback: WebGL2 → Canvas 2D.
     if (!this.sharedCanvas) {
@@ -330,7 +366,10 @@ export class TerminalStore {
       this.sharedRenderer = createCanvas2dRenderer(this.sharedCanvas);
     }
     if (!this.sharedRenderer.supported) return null;
-    return { renderer: this.sharedRenderer, canvas: this.sharedCanvas };
+    return {
+      renderer: this.sharedRenderer,
+      canvas: this.compositeCanvas(this.sharedRenderer, this.sharedCanvas),
+    };
   }
 
   /**

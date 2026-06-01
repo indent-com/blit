@@ -781,12 +781,22 @@ impl ShmPool {
         if inner.mmap_ptr.is_null() {
             return None;
         }
+        // Client-controlled geometry. Reject non-positive/negative values
+        // (a negative i32 cast to usize becomes a huge value) and use checked
+        // arithmetic: a crafted stride/height/offset can otherwise wrap the
+        // bounds check below and trigger an out-of-bounds read of the mmap.
+        if offset < 0 || width <= 0 || height <= 0 || stride < 0 {
+            return None;
+        }
         let w = width as u32;
         let h = height as u32;
         let s = stride as usize;
         let off = offset as usize;
-        let row_bytes = w as usize * 4;
-        let needed = off + s * (h as usize).saturating_sub(1) + row_bytes;
+        let row_bytes = (w as usize).checked_mul(4)?;
+        let needed = s
+            .checked_mul(h as usize - 1)
+            .and_then(|body| body.checked_add(off))
+            .and_then(|n| n.checked_add(row_bytes))?;
         if needed > inner.size {
             return None;
         }
@@ -1856,8 +1866,13 @@ impl Compositor {
             let stride = shm.stride as usize;
             let offset = shm.offset as usize;
             let format = shm.format;
-            if w > 0
-                && h > 0
+            // Reject negative/degenerate client geometry before it is cast to
+            // usize (a negative i32 becomes a huge value that can wrap the
+            // bounds check in the closure below).
+            if shm.width > 0
+                && shm.height > 0
+                && shm.stride >= 0
+                && shm.offset >= 0
                 && let Some(ref mut vk) = self.vulkan_renderer
             {
                 let swap_rb =
@@ -1868,8 +1883,16 @@ impl Compositor {
                 let uploaded = shm
                     .pool
                     .with_mmap(|slice| {
-                        if offset + stride * (h as usize - 1) + row_bytes > slice.len() {
-                            return false;
+                        // Checked arithmetic: a crafted stride/height/offset
+                        // could otherwise wrap this sum and pass the bounds
+                        // check, causing an out-of-bounds read of the mmap.
+                        let needed = stride
+                            .checked_mul(h as usize - 1)
+                            .and_then(|body| body.checked_add(offset))
+                            .and_then(|n| n.checked_add(row_bytes));
+                        match needed {
+                            Some(n) if n <= slice.len() => {}
+                            _ => return false,
                         }
                         vk.upload_surface_shm_mmap(
                             surface_id,

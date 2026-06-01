@@ -34,7 +34,7 @@ pub enum Error {
 ///
 /// Wrapped in `sh -c` so the POSIX script runs correctly even when the
 /// remote user's login shell is fish or another non-POSIX shell.
-const SOCK_SEARCH: &str = r#"sh -c 'if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else S=/tmp/blit.sock; fi; echo "$S"'"#;
+const SOCK_SEARCH: &str = r#"sh -c 'if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; elif [ -n "$TMPDIR" ]; then S="$TMPDIR/blit.sock"; elif [ -n "$XDG_RUNTIME_DIR" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else U="$(id -un 2>/dev/null || true)"; if [ -n "$U" ]; then S="/tmp/blit-$U.sock"; else S=/tmp/blit.sock; fi; fi; echo "$S"'"#;
 
 /// Escape a string for use inside double quotes in a POSIX shell.
 /// Handles `\`, `$`, `` ` ``, and `"`.
@@ -52,7 +52,7 @@ fn dq_escape(s: &str) -> String {
     out
 }
 
-/// Install blit on the remote if missing, then start blit-server and
+/// Install blit on the remote if missing, then start `blit server` and
 /// detach it from the session.
 ///
 /// Wrapped in `sh -c` so the POSIX script runs correctly even when the
@@ -63,7 +63,7 @@ fn install_and_start_script(socket_path: &str) -> String {
     let escaped = dq_escape(socket_path);
     format!(
         "sh -c 'export PATH=\"$HOME/.local/bin:$PATH\"; \
-         if ! command -v blit >/dev/null 2>&1 && ! command -v blit-server >/dev/null 2>&1; then \
+         if ! command -v blit >/dev/null 2>&1; then \
            if command -v curl >/dev/null 2>&1; then BLIT_PREFIX=\"$HOME/.local\" curl -sf https://install.blit.sh | sh >&2; \
            elif command -v wget >/dev/null 2>&1; then BLIT_PREFIX=\"$HOME/.local\" wget -qO- https://install.blit.sh | sh >&2; fi; \
          fi; \
@@ -73,8 +73,8 @@ fn install_and_start_script(socket_path: &str) -> String {
            elif command -v socat >/dev/null 2>&1; then socat /dev/null \"UNIX-CONNECT:$S\" 2>/dev/null || rm -f \"$S\"; fi; \
          fi; \
          if ! [ -S \"$S\" ]; then \
-           if command -v blit >/dev/null 2>&1; then nohup blit server </dev/null >/dev/null 2>&1 & \
-           elif command -v blit-server >/dev/null 2>&1; then nohup blit-server </dev/null >/dev/null 2>&1 & fi; \
+           if command -v blit >/dev/null 2>&1; then BLIT_SOCK=\"$S\" nohup blit server </dev/null >/dev/null 2>&1 & \
+           fi; \
          fi; \
          echo ok'"
     )

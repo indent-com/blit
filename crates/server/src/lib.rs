@@ -2271,7 +2271,15 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
             }
             b't' if params == b"14" => {
                 let (rows, cols) = size;
-                Some(format!("\x1b[4;{};{}t", rows * 16, cols * 8))
+                // Widen to u32 so the cell-size multiply cannot overflow for any
+                // u16 terminal dimension (max 65535*16 = 1_048_560, fits in u32).
+                // Previously `rows * 16` / `cols * 8` were u16*u16 and panicked
+                // (debug) or wrapped (release) for large terminals.
+                Some(format!(
+                    "\x1b[4;{};{}t",
+                    rows as u32 * 16,
+                    cols as u32 * 8
+                ))
             }
             _ => None,
         };
@@ -5086,12 +5094,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     pty.mark_dirty();
                     need_nudge = true;
                 }
+                // Write input to the PTY fd while still holding the session
+                // lock. The fd's lifecycle (remove from pty_fds + libc::close)
+                // is guarded by this lock, so releasing it before the write
+                // would let a concurrent close run and the OS reuse the fd
+                // integer between lookup and write — routing input to the
+                // wrong fd. (Mirrors the C2S_MOUSE handler above.)
+                if let Some(&fd) = state.pty_fds.read().unwrap().get(&pid) {
+                    pty::pty_write_all(fd, &data[3..]);
+                }
             }
             if need_nudge {
                 nudge_delivery(&state);
-            }
-            if let Some(&fd) = state.pty_fds.read().unwrap().get(&pid) {
-                pty::pty_write_all(fd, &data[3..]);
             }
             continue;
         }

@@ -305,6 +305,12 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     depth: false,
     stencil: false,
     premultipliedAlpha: true,
+    // We render into this (offscreen) canvas and then `drawImage` it onto each
+    // surface's 2D display canvas. iOS/iPadOS WebKit discards the drawing
+    // buffer after compositing, so without this the canvas reads back as a
+    // black frame when used as a drawImage source — the whole terminal renders
+    // black on iPad. Preserving the buffer keeps the rendered pixels readable.
+    preserveDrawingBuffer: true,
   }) as WebGL2RenderingContext | null;
 
   if (!gl) return { ...UNSUPPORTED };

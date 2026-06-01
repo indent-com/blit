@@ -440,7 +440,7 @@ async fn browser_handle_ws(mut ws: WebSocket, state: Arc<BrowserState>, dest_nam
         if frames == 0 {
             let _ = ws_tx
                 .send(Message::Text(
-                    "error:blit-server not reachable (is it running on the remote host?)".into(),
+                    "error:blit server not reachable (is it running on the remote host?)".into(),
                 ))
                 .await;
         } else {

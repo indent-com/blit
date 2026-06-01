@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import type { BlitWasmModule } from "../TerminalStore";
 import { TerminalStore, type TerminalStoreDelegate } from "../TerminalStore";
 import { MockTransport } from "./mock-transport";
@@ -25,6 +25,44 @@ class FakeTerminal {
 const wasm = {
   Terminal: FakeTerminal,
 } as unknown as BlitWasmModule;
+
+function setNavigatorField(name: string, value: unknown): void {
+  Object.defineProperty(navigator, name, {
+    configurable: true,
+    value,
+  });
+}
+
+afterEach(() => {
+  delete (navigator as Navigator & { gpu?: unknown }).gpu;
+  delete (navigator as Navigator & { userAgent?: unknown }).userAgent;
+  delete (navigator as Navigator & { platform?: unknown }).platform;
+  delete (navigator as Navigator & { maxTouchPoints?: unknown }).maxTouchPoints;
+});
+
+describe("TerminalStore WebGPU probe", () => {
+  it("skips WebGPU on iPadOS WebKit", () => {
+    setNavigatorField("gpu", {});
+    setNavigatorField(
+      "userAgent",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    );
+    setNavigatorField("platform", "MacIntel");
+    setNavigatorField("maxTouchPoints", 5);
+
+    const delegate: TerminalStoreDelegate = {
+      send: () => {},
+      getStatus: () => "disconnected",
+    };
+    const store = new TerminalStore(delegate, wasm);
+
+    expect(
+      (store as unknown as { webgpuProbe: Promise<void> | null }).webgpuProbe,
+    ).toBeNull();
+
+    store.destroy();
+  });
+});
 
 describe("TerminalStore client metrics", () => {
   it("reports applied-frame backlog and clears it after render", async () => {
