@@ -4,64 +4,6 @@ use clap_complete::Shell;
 use std::fs;
 use std::path::Path;
 
-/// Build a clap Command for blit-server (mirrors its manual arg parser).
-fn blit_server_cmd() -> Command {
-    Command::new("blit-server")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about("Terminal streaming server")
-        .long_about(
-            "blit-server multiplexes PTYs on a Unix socket. It tracks terminal state, \
-             diffs cell grids into LZ4-compressed binary frames, and publishes updates to \
-             connected clients.\n\n\
-             Supports systemd socket activation via LISTEN_FDS=1.",
-        )
-        .arg(
-            Arg::new("socket")
-                .long("socket")
-                .value_name("PATH")
-                .help("IPC socket/pipe path (or set BLIT_SOCK)"),
-        )
-        .arg(
-            Arg::new("fd-channel")
-                .long("fd-channel")
-                .value_name("FD")
-                .help("Accept clients via fd-passing on FD (Unix only, or set BLIT_FD_CHANNEL)"),
-        )
-        .arg(
-            Arg::new("shell-flags")
-                .long("shell-flags")
-                .value_name("FLAGS")
-                .help("Shell flags (default: li, or set BLIT_SHELL_FLAGS)"),
-        )
-        .arg(
-            Arg::new("verbose")
-                .long("verbose")
-                .short('v')
-                .action(clap::ArgAction::SetTrue)
-                .help("Enable verbose logging (or set BLIT_VERBOSE=1)"),
-        )
-        .arg(
-            Arg::new("path")
-                .value_name("PATH")
-                .help("Socket path (positional alternative to --socket)"),
-        )
-        .after_help(
-            "ENVIRONMENT:\n    \
-             BLIT_SOCK               Unix socket path\n    \
-             SHELL                   Shell to spawn for new PTYs (default: /bin/sh)\n    \
-             BLIT_SHELL_FLAGS        Shell flags (default: li)\n    \
-             BLIT_SCROLLBACK         Scrollback buffer rows per PTY (default: 1000000)\n    \
-             BLIT_FD_CHANNEL         File descriptor for fd-passing channel\n    \
-             BLIT_SURFACE_ENCODERS   Comma-separated encoder priority list\n    \
-             BLIT_SURFACE_QUALITY    Surface quality: low, medium, high, ultra\n    \
-             BLIT_CHROMA             Chroma subsampling: 420 or 444 (default: 4:4:4)\n    \
-             BLIT_VAAPI_DEVICE       VA-API render node (default: /dev/dri/renderD128)\n    \
-             BLIT_CUDA_DEVICE        CUDA device ordinal for NVENC (default: 0)\n    \
-             BLIT_MAX_CONNECTIONS    Max simultaneous connections (0 = unlimited)\n    \
-             BLIT_MAX_PTYS           Max simultaneous PTYs (0 = unlimited)",
-        )
-}
-
 /// Build a clap Command for blit-gateway (mirrors its env-var config).
 fn blit_gateway_cmd() -> Command {
     Command::new("blit-gateway")
@@ -69,7 +11,7 @@ fn blit_gateway_cmd() -> Command {
         .about("Terminal streaming WebSocket gateway")
         .long_about(
             "blit-gateway serves the browser UI and proxies WebSocket traffic to one or \
-             more blit-server(1) Unix sockets. It handles passphrase authentication and \
+             more blit server Unix sockets. It handles passphrase authentication and \
              serves static web assets.\n\n\
              Use it for always-on deployments behind a reverse proxy or as a systemd \
              service. For local and SSH use, the blit(1) CLI embeds equivalent gateway \
@@ -96,9 +38,9 @@ fn blit_gateway_cmd() -> Command {
 fn blit_webrtc_forwarder_cmd() -> Command {
     Command::new("blit-webrtc-forwarder")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Forward a blit-server terminal over WebRTC")
+        .about("Forward a blit server terminal over WebRTC")
         .long_about(
-            "blit-webrtc-forwarder connects to a blit-server(1) Unix socket and \
+            "blit-webrtc-forwarder connects to a blit server Unix socket and \
              bridges it to browsers over WebRTC data channels. It handles signaling, \
              STUN/TURN NAT traversal, and peer-to-peer connections.\n\n\
              For most use cases, blit share is simpler -- it runs the forwarder \
@@ -111,7 +53,7 @@ fn blit_webrtc_forwarder_cmd() -> Command {
                 .value_name("PATH")
                 .env("BLIT_SOCK")
                 .required(true)
-                .help("Path to the blit-server Unix socket"),
+                .help("Path to the blit server Unix socket"),
         )
         .arg(
             Arg::new("passphrase")
@@ -179,7 +121,6 @@ pub fn run(output: &str) {
     fs::create_dir_all(&man_dir).unwrap();
 
     clap_mangen::generate_to(cli::Cli::command(), &man_dir).expect("failed to generate man pages");
-    generate_man_page(blit_server_cmd(), &man_dir);
     generate_man_page(blit_gateway_cmd(), &man_dir);
     generate_man_page(blit_webrtc_forwarder_cmd(), &man_dir);
 

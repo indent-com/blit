@@ -86,7 +86,7 @@ pub enum Command {
         about = "Open the terminal UI in the browser",
         long_about = "Open the terminal UI in the browser\n\n\
             Opens the browser with all named remotes from ~/.config/blit/blit.remotes\n\
-            plus the local blit-server. Manage remotes with `blit remote add/remove`\n\
+            plus the local blit server. Manage remotes with `blit remote add/remove`\n\
             or through the Remotes dialog in the browser.\n\n\
             Examples:\n\
               blit open                        # local + all configured remotes\n\
