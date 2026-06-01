@@ -1,6 +1,6 @@
 [package]
 name = "blit-compositor"
-version = "0.33.6"
+version = "0.33.7"
 edition = "2024"
 description = "blit headless Wayland compositor"
 license.workspace = true
