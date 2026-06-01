@@ -47,7 +47,11 @@ void main() {
 `;
 
 const GLYPH_FS = `#version 300 es
-precision mediump float;
+// Texture coordinates address individual glyphs in a 2K-8K atlas.  Some
+// mobile WebKit/iPad GPUs implement mediump with too little fragment
+// precision for that, which can round samples into transparent padding and
+// make terminal text disappear.
+precision highp float;
 in vec2 v_uv;
 in vec4 v_color;
 uniform sampler2D u_texture;

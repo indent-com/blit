@@ -61,11 +61,29 @@ export function measureCell(
     const metrics = ctx.measureText(sample);
     w = metrics.width / sample.length;
   }
-  const hMetrics = ctx.measureText("M");
-  const h = hMetrics.fontBoundingBoxAscent + hMetrics.fontBoundingBoxDescent;
+  if (!Number.isFinite(w) || w <= 0) {
+    // Last-ditch fallback for browsers returning incomplete TextMetrics.
+    w = fontSize * 0.6;
+  }
+
+  const hMetrics = ctx.measureText("Mg");
+  const ascent =
+    hMetrics.fontBoundingBoxAscent ??
+    hMetrics.actualBoundingBoxAscent ??
+    fontSize;
+  const descent =
+    hMetrics.fontBoundingBoxDescent ??
+    hMetrics.actualBoundingBoxDescent ??
+    fontSize * 0.2;
+  let h = ascent + descent;
+  if (!Number.isFinite(h) || h <= 0) {
+    // iPadOS/Safari versions without fontBoundingBox* used to produce NaN
+    // here, which collapses terminal canvases and leaves them textless.
+    h = fontSize * 1.2;
+  }
 
   const d = dpr ?? (window.devicePixelRatio || 1);
-  const pw = Math.round(w * d);
-  const ph = Math.round(h * d);
+  const pw = Math.max(1, Math.round(w * d));
+  const ph = Math.max(1, Math.round(h * d));
   return { w: pw / d, h: ph / d, pw, ph };
 }
