@@ -41,7 +41,9 @@ afterEach(() => {
 });
 
 describe("TerminalStore WebGPU probe", () => {
-  it("skips WebGPU on iPadOS WebKit", () => {
+  it("probes WebGPU on iPadOS WebKit when navigator.gpu is present", () => {
+    // iPad was previously force-disabled; we now let it use WebGPU like any
+    // other platform (it falls back to WebGL2 if the probe fails).
     setNavigatorField("gpu", {});
     setNavigatorField(
       "userAgent",
@@ -50,6 +52,20 @@ describe("TerminalStore WebGPU probe", () => {
     setNavigatorField("platform", "MacIntel");
     setNavigatorField("maxTouchPoints", 5);
 
+    const delegate: TerminalStoreDelegate = {
+      send: () => {},
+      getStatus: () => "disconnected",
+    };
+    const store = new TerminalStore(delegate, wasm);
+
+    expect(
+      (store as unknown as { webgpuProbe: Promise<void> | null }).webgpuProbe,
+    ).not.toBeNull();
+
+    store.destroy();
+  });
+
+  it("does not probe WebGPU when navigator.gpu is absent", () => {
     const delegate: TerminalStoreDelegate = {
       send: () => {},
       getStatus: () => "disconnected",

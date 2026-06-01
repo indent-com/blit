@@ -25,16 +25,6 @@ export interface TerminalStoreDelegate {
   log?(msg: string): void;
 }
 
-function isIosWebKit(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const ua = navigator.userAgent;
-  const platform = navigator.platform;
-  const isIos =
-    /iPad|iPhone|iPod/.test(ua) ||
-    (platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  return isIos && /AppleWebKit/.test(ua);
-}
-
 export class TerminalStore {
   private mod: BlitWasmModule | null = null;
   private terminals = new Map<number, Terminal>();
@@ -107,7 +97,6 @@ export class TerminalStore {
    *  call will pick it up. If it fails, we silently fall through to WebGL2. */
   private probeWebGpu(): void {
     if (typeof navigator === "undefined" || !navigator.gpu) return;
-    if (isIosWebKit()) return;
     const canvas = document.createElement("canvas");
     this.webgpuProbe = createWebGpuRenderer(canvas)
       .then((r) => {
