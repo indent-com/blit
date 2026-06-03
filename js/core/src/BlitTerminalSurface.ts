@@ -43,15 +43,27 @@ type SelPos = { row: number; col: number; tailOffset: number };
 // DPR detection
 // ---------------------------------------------------------------------------
 
-const isSafari =
-  typeof navigator !== "undefined"
-    ? /^((?!chrome|android).)*safari/i.test(navigator.userAgent)
-    : false;
+function isSafari(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+}
+
+function isIPadOS(): boolean {
+  if (typeof navigator === "undefined") return false;
+  // Modern iPadOS often reports itself as Macintosh; maxTouchPoints is the
+  // reliable discriminator from desktop Safari.  The Safari outer/inner-width
+  // zoom heuristic below is only valid on desktop; on iPad it double-counts
+  // viewport scaling and can produce huge backing DPR/text rasters.
+  return (
+    /iPad/.test(navigator.platform) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
 
 function effectiveDpr(): number {
   if (typeof window === "undefined") return 1;
   const base = window.devicePixelRatio || 1;
-  if (isSafari && window.outerWidth && window.innerWidth) {
+  if (isSafari() && !isIPadOS() && window.outerWidth && window.innerWidth) {
     const zoom = window.outerWidth / window.innerWidth;
     if (zoom > 0.25 && zoom < 8) return Math.round(base * zoom * 100) / 100;
   }

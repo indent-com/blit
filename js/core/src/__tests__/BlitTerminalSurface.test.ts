@@ -221,6 +221,65 @@ describe("BlitTerminalSurface iPad autocorrect", () => {
   });
 });
 
+describe("BlitTerminalSurface DPR detection", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function stubNavigator(platform: string, maxTouchPoints: number): void {
+    vi.stubGlobal("navigator", {
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+      platform,
+      maxTouchPoints,
+      clipboard: navigator.clipboard,
+    });
+  }
+
+  function stubWindowDpr(devicePixelRatio: number): void {
+    Object.defineProperty(window, "devicePixelRatio", {
+      configurable: true,
+      value: devicePixelRatio,
+    });
+    Object.defineProperty(window, "outerWidth", {
+      configurable: true,
+      value: 2048,
+    });
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 1024,
+    });
+  }
+
+  it("keeps desktop Safari zoom compensation", () => {
+    stubNavigator("MacIntel", 0);
+    stubWindowDpr(2);
+
+    const s = new BlitTerminalSurface({ sessionId: null, fontSize: 10 });
+
+    // @ts-expect-error — assert private raster metrics produced by DPR helper.
+    expect(s.cell.ph).toBe(48);
+  });
+
+  it("does not double-count iPadOS Safari viewport scaling", () => {
+    stubNavigator("MacIntel", 5);
+    stubWindowDpr(2);
+
+    const s = new BlitTerminalSurface({ sessionId: null, fontSize: 10 });
+
+    // iPadOS reports a desktop-like Safari UA, but outerWidth / innerWidth is
+    // not desktop page zoom.  Use raw devicePixelRatio so text rasters are not
+    // inflated from 2x to 4x.
+    // @ts-expect-error — assert private raster metrics produced by DPR helper.
+    expect(s.cell.ph).toBe(24);
+  });
+});
+
 describe("BlitTerminalSurface native scroll surface", () => {
   beforeEach(() => {
     mockCanvasContext();
