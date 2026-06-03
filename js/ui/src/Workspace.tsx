@@ -7,6 +7,7 @@ import {
   untrack,
   Show,
   For,
+  Index,
 } from "solid-js";
 import {
   BlitTerminal,
@@ -1149,11 +1150,17 @@ function WorkspaceScreen(props: {
   });
 
   function switchSession(sessionId: SessionId) {
-    focusSurfaceById(null);
-    workspace.focusSession(sessionId);
-    focusBySessionFn?.(sessionId);
+    focusSessionFromUi(sessionId);
     previousFocus = null;
     closeOverlay();
+  }
+
+  function focusSessionFromUi(sessionId: SessionId) {
+    focusSurfaceById(null);
+    if (activeLayout()) {
+      focusBySessionFn?.(sessionId);
+    }
+    workspace.focusSession(sessionId);
   }
 
   function focusSurface(surfaceId: number, connectionId?: ConnectionId) {
@@ -1270,8 +1277,9 @@ function WorkspaceScreen(props: {
     connectionId?: string,
   ) {
     if (sessionId && !command) {
-      workspace.focusSession(sessionId);
+      focusSurfaceById(null);
       focusPaneFn?.(paneId);
+      workspace.focusSession(sessionId);
     } else if (command || connectionId) {
       void createInPane(paneId, command, connectionId);
     } else {
@@ -1328,8 +1336,7 @@ function WorkspaceScreen(props: {
     handleRestartOrClose,
     connectionCount: () => allConnections().length,
     focusBySession: (sessionId) => {
-      workspace.focusSession(sessionId);
-      focusBySessionFn?.(sessionId);
+      focusSessionFromUi(sessionId);
     },
     clearFocusedPaneAssignment: () => {
       const paneId = bspFocusedPaneId();
@@ -2088,44 +2095,48 @@ function PreviewPanel(props: {
           </button>
         </div>
         <div style={{ flex: "1 1 0", "min-height": 0, "overflow-y": "auto" }}>
-          <For each={props.offScreenSessions}>
+          <Index each={props.offScreenSessions}>
             {(s) => (
               <SessionThumbnail
-                session={s}
-                connectionLabel={props.connectionLabels?.get(s.connectionId)}
+                session={s()}
+                connectionLabel={props.connectionLabels?.get(
+                  s().connectionId,
+                )}
                 theme={props.theme}
                 scale={props.scale}
                 palette={props.palette}
                 fontFamily={props.fontFamily}
                 fontSize={props.fontSize}
                 isMobileTouch={props.isMobileTouch}
-                onFocus={() => props.onFocusSession(s.id)}
-                onClose={() => props.onCloseSession(s.id)}
+                onFocus={() => props.onFocusSession(s().id)}
+                onClose={() => props.onCloseSession(s().id)}
               />
             )}
-          </For>
-          <For each={props.surfaces}>
+          </Index>
+          <Index each={props.surfaces}>
             {(s) => (
               <SurfaceThumbnail
-                surface={s}
-                connectionId={s.connectionId}
-                connectionLabel={props.connectionLabels?.get(s.connectionId)}
+                surface={s()}
+                connectionId={s().connectionId}
+                connectionLabel={props.connectionLabels?.get(
+                  s().connectionId,
+                )}
                 theme={props.theme}
                 scale={props.scale}
                 focused={
-                  s.surfaceId === props.focusedSurfaceId &&
-                  s.connectionId === props.focusedSurfaceConnId
+                  s().surfaceId === props.focusedSurfaceId &&
+                  s().connectionId === props.focusedSurfaceConnId
                 }
                 isMobileTouch={props.isMobileTouch}
                 onFocus={() =>
-                  props.onFocusSurface(s.connectionId, s.surfaceId)
+                  props.onFocusSurface(s().connectionId, s().surfaceId)
                 }
                 onClose={() =>
-                  props.onCloseSurface(s.connectionId, s.surfaceId)
+                  props.onCloseSurface(s().connectionId, s().surfaceId)
                 }
               />
             )}
-          </For>
+          </Index>
         </div>
       </div>
     </div>
