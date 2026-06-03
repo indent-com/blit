@@ -1184,6 +1184,26 @@ function WorkspaceScreen(props: {
   const surfaceKey = (surface: BlitSurface) =>
     `${surface.connectionId}:${surface.surfaceId}`;
 
+  function surfaceVisibleInWorkspace(surface: BlitSurface): boolean {
+    const key = surfaceKey(surface);
+    if (
+      surface.surfaceId === focusedSurfaceId() &&
+      (focusedSurfaceConnId() == null ||
+        surface.connectionId === focusedSurfaceConnId())
+    ) {
+      return true;
+    }
+    const la = layoutAssignments();
+    if (!la) return false;
+    for (const value of Object.values(la.assignments)) {
+      const parsed = parseSurfaceAssignment(value);
+      if (parsed && `${parsed.connectionId}:${parsed.surfaceId}` === key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   createEffect(() => {
     const streaming = surfaceStreaming();
     const topLevelSurfaces = surfaces().filter((s) => s.parentId === 0);
@@ -1197,20 +1217,32 @@ function WorkspaceScreen(props: {
     if (!autoShowSurfacesPrimed) {
       for (const key of byKey.keys()) autoShownSurfaceKeys.add(key);
       autoShowSurfacesPrimed = true;
-      return;
-    }
-
-    const added = topLevelSurfaces.filter(
-      (surface) => !autoShownSurfaceKeys.has(surfaceKey(surface)),
-    );
-    if (added.length > 0) {
-      for (const surface of added) autoShownSurfaceKeys.add(surfaceKey(surface));
-      pendingAutoShowSurfaceKey = surfaceKey(added[added.length - 1]);
+      const candidate = [...topLevelSurfaces]
+        .reverse()
+        .find((surface) => !surfaceVisibleInWorkspace(surface));
+      if (candidate) pendingAutoShowSurfaceKey = surfaceKey(candidate);
+    } else {
+      const added = topLevelSurfaces.filter(
+        (surface) => !autoShownSurfaceKeys.has(surfaceKey(surface)),
+      );
+      if (added.length > 0) {
+        for (const surface of added) {
+          autoShownSurfaceKeys.add(surfaceKey(surface));
+        }
+        const candidate = [...added]
+          .reverse()
+          .find((surface) => !surfaceVisibleInWorkspace(surface));
+        if (candidate) pendingAutoShowSurfaceKey = surfaceKey(candidate);
+      }
     }
 
     if (!pendingAutoShowSurfaceKey) return;
     const surface = byKey.get(pendingAutoShowSurfaceKey);
     if (!surface) {
+      pendingAutoShowSurfaceKey = null;
+      return;
+    }
+    if (surfaceVisibleInWorkspace(surface)) {
       pendingAutoShowSurfaceKey = null;
       return;
     }
