@@ -2116,6 +2116,23 @@ fn spawn_compositor_child(
                 }
             }
             std::env::set_var("WAYLAND_DISPLAY", wayland_socket);
+            // blit is a Wayland-only compositor (no XWayland), and DISPLAY is
+            // removed just below — so steer GUI toolkits to their Wayland
+            // backends. Without these, Electron/Chromium (Cursor), Firefox,
+            // GTK and Qt default to X11 and come up with no window. Only set
+            // when unset so an explicit caller/environment override still wins.
+            for (k, v) in [
+                ("NIXOS_OZONE_WL", "1"),
+                ("ELECTRON_OZONE_PLATFORM_HINT", "wayland"),
+                ("MOZ_ENABLE_WAYLAND", "1"),
+                ("GDK_BACKEND", "wayland"),
+                ("QT_QPA_PLATFORM", "wayland"),
+                ("SDL_VIDEODRIVER", "wayland"),
+            ] {
+                if std::env::var_os(k).is_none() {
+                    std::env::set_var(k, v);
+                }
+            }
             std::env::remove_var("DISPLAY");
             std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
             std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
