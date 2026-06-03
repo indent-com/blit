@@ -75,13 +75,15 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     const s = mounted();
     if (!props.resizable || !s) return;
 
-    const dprToScale120 = () => Math.round(devicePixelRatio * 120);
+    const fallbackScale120 = () =>
+      Math.round((window.devicePixelRatio || 1) * 120);
     detectCodecSupport();
 
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let lastResizeAt = 0;
     let lastSentW = 0;
     let lastSentH = 0;
+    let lastSentScale120 = 0;
     const RESIZE_DEBOUNCE_MS = 100;
     // If no resize event for this long, the next one is treated as the
     // start of a fresh drag and fires immediately — so each user-visible
@@ -89,40 +91,65 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     // bounded by RTT rather than the trailing-edge debounce.
     const DRAG_GAP_MS = 250;
 
-    const send = (w: number, h: number) => {
-      if (w === lastSentW && h === lastSentH) return;
+    const send = (w: number, h: number, scale120: number) => {
+      if (w === lastSentW && h === lastSentH && scale120 === lastSentScale120)
+        return;
       lastSentW = w;
       lastSentH = h;
-      s.requestResize(w, h, dprToScale120());
+      lastSentScale120 = scale120;
+      s.requestResize(w, h, scale120);
     };
 
-    const applySize = (cssW: number, cssH: number) => {
-      const w = Math.round(cssW * devicePixelRatio);
-      const h = Math.round(cssH * devicePixelRatio);
+    const applySize = (
+      cssW: number,
+      cssH: number,
+      physicalW?: number,
+      physicalH?: number,
+    ) => {
+      const w = Math.round(physicalW ?? cssW * (window.devicePixelRatio || 1));
+      const h = Math.round(physicalH ?? cssH * (window.devicePixelRatio || 1));
       if (w <= 0 || h <= 0) return;
-      s.setDisplaySize(w, h);
+      const scale120 =
+        cssW > 0 && cssH > 0
+          ? Math.round(((w / cssW + h / cssH) / 2) * 120)
+          : fallbackScale120();
+      s.setDisplaySize(w, h, scale120);
       const now = performance.now();
       const isDragStart = now - lastResizeAt > DRAG_GAP_MS;
       lastResizeAt = now;
       // Leading edge: first event of a new interaction dispatches at
       // wire speed so the server pipeline (configure → repaint → encode)
       // starts as soon as possible.
-      if (isDragStart) send(w, h);
+      if (isDragStart) send(w, h, scale120);
       // Trailing edge: settle on the final size after the interaction
       // ends, in case it differs from the leading-edge value.
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => send(w, h), RESIZE_DEBOUNCE_MS);
+      resizeTimer = setTimeout(() => send(w, h, scale120), RESIZE_DEBOUNCE_MS);
+    };
+
+    const devicePixelSize = (entry: ResizeObserverEntry) => {
+      const box = entry.devicePixelContentBoxSize;
+      const size = Array.isArray(box) ? box[0] : box;
+      if (!size) return null;
+      const width = Math.round(size.inlineSize);
+      const height = Math.round(size.blockSize);
+      return width > 0 && height > 0 ? { width, height } : null;
     };
 
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
         if (width > 0 && height > 0) {
-          applySize(width, height);
+          const dpx = devicePixelSize(entry);
+          applySize(width, height, dpx?.width, dpx?.height);
         }
       }
     });
-    ro.observe(containerRef);
+    try {
+      ro.observe(containerRef, { box: "device-pixel-content-box" });
+    } catch {
+      ro.observe(containerRef);
+    }
 
     const rect = containerRef.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {

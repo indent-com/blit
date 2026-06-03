@@ -313,7 +313,14 @@ export class BlitSurfaceCanvas {
    * where an old, smaller frame would get drawImage-upscaled into a
    * prematurely enlarged canvas before the new keyframe arrives.
    */
-  private _displaySize: { width: number; height: number } | null = null;
+  private _displaySize: {
+    width: number;
+    height: number;
+    scale120: number;
+  } | null = null;
+  /** True after this view has sent a nonzero surface resize that must be
+   *  cleared when the view stops owning foreground/BSP sizing. */
+  private _resizeConstraintActive = false;
 
   // subscriptions
   private unsubFrame: (() => void) | null = null;
@@ -332,6 +339,12 @@ export class BlitSurfaceCanvas {
    *  Used to detect reconnects (generation bumps on disconnect) so we
    *  re-subscribe even when the surfaceId hasn't changed. */
   private _subscribedGeneration = -1;
+  /** The exact subscription this canvas owns.  Kept separate from current
+   *  props so prop changes can unsubscribe the old surface correctly. */
+  private _subscribedSurface: {
+    connectionId: ConnectionId;
+    surfaceId: number;
+  } | null = null;
 
   /** Hidden textarea used to capture IME composition.  Focus stays on
    *  the canvas for normal typing; the textarea only receives focus when
@@ -456,6 +469,7 @@ export class BlitSurfaceCanvas {
     }
     this.releaseAllKeys();
     this.releaseAllButtons();
+    this.setDisplaySize(null);
     this.serverUnsubscribe();
     this.detachEvents();
     this.unsubscribeAll();
@@ -473,6 +487,7 @@ export class BlitSurfaceCanvas {
 
   setConnectionId(connectionId: ConnectionId): void {
     if (this._connectionId === connectionId) return;
+    this.clearResizeConstraint();
     this._connectionId = connectionId;
     this.resubscribe();
     this.resendDisplaySize();
@@ -480,6 +495,7 @@ export class BlitSurfaceCanvas {
 
   setSurfaceId(surfaceId: number): void {
     if (this._surfaceId === surfaceId) return;
+    this.clearResizeConstraint();
     this._surfaceId = surfaceId;
     this.resubscribe();
     this.resendDisplaySize();
@@ -515,6 +531,14 @@ export class BlitSurfaceCanvas {
     const { w, h, scale120 } = this._pendingResize;
     this._pendingResize = null;
     conn.sendSurfaceResize(this._surfaceId, w, h, scale120);
+    this._resizeConstraintActive = true;
+  }
+
+  private clearResizeConstraint(): void {
+    this._pendingResize = null;
+    if (!this._resizeConstraintActive) return;
+    this._resizeConstraintActive = false;
+    this.getConn()?.sendSurfaceResize(this._surfaceId, 0, 0, 0);
   }
 
   /**
@@ -526,15 +550,25 @@ export class BlitSurfaceCanvas {
    * This should be called by the framework binding's ResizeObserver so the
    * canvas is immediately at the correct resolution — no CSS scaling needed.
    */
-  setDisplaySize(width: number | null, height?: number): void {
+  setDisplaySize(
+    width: number | null,
+    height?: number,
+    scale120?: number,
+  ): void {
     if (width == null) {
       this._displaySize = null;
+      this.clearResizeConstraint();
       return;
     }
     const w = Math.round(width);
     const h = Math.round(height!);
     if (w <= 0 || h <= 0) return;
-    this._displaySize = { width: w, height: h };
+    const s =
+      scale120 ??
+      (typeof devicePixelRatio === "number"
+        ? Math.round(devicePixelRatio * 120)
+        : 0);
+    this._displaySize = { width: w, height: h, scale120: s };
     // Canvas backing buffer is intentionally NOT resized here.  It tracks
     // the decoded frame size (set in blitFromStore) so the last sharp
     // frame stays sharp while CSS (object-fit: contain) scales it to the
@@ -555,11 +589,7 @@ export class BlitSurfaceCanvas {
    */
   private resendDisplaySize(): void {
     if (!this._displaySize) return;
-    const { width, height } = this._displaySize;
-    const scale120 =
-      typeof devicePixelRatio === "number"
-        ? Math.round(devicePixelRatio * 120)
-        : 0;
+    const { width, height, scale120 } = this._displaySize;
     this._pendingResize = { w: width, h: height, scale120 };
     this.flushPendingResize();
   }
@@ -621,6 +651,10 @@ export class BlitSurfaceCanvas {
     if (conn && store.canDecodeVideo) {
       conn.sendSurfaceSubscribe(this._surfaceId);
       this._subscribedGeneration = store.generation;
+      this._subscribedSurface = {
+        connectionId: this._connectionId,
+        surfaceId: this._surfaceId,
+      };
     }
 
     // Flush any pending resize and paint the latest frame immediately
@@ -720,9 +754,13 @@ export class BlitSurfaceCanvas {
   }
 
   private serverUnsubscribe(): void {
-    const conn = this.getConn();
-    if (!conn || !this.surface) return;
-    conn.sendSurfaceUnsubscribe(this._surfaceId);
+    const sub = this._subscribedSurface;
+    if (!sub) return;
+    const conn =
+      (this._workspace as any).getConnection(sub.connectionId) ?? null;
+    conn?.sendSurfaceUnsubscribe(sub.surfaceId);
+    this._subscribedSurface = null;
+    this._subscribedGeneration = -1;
   }
 
   // -----------------------------------------------------------------------
