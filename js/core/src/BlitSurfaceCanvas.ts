@@ -303,6 +303,20 @@ export class BlitSurfaceCanvas {
    *  stuck modifiers and runaway key-repeat in the compositor. */
   private pressedKeys = new Set<number>();
 
+  /** Active single-finger gesture used to emulate mouse input on iPadOS. */
+  private activeTouch:
+    | {
+        identifier: number;
+        startX: number;
+        startY: number;
+        lastX: number;
+        lastY: number;
+        mode: "pending" | "scroll" | "drag";
+        longPressTimer: ReturnType<typeof setTimeout> | null;
+        pointerId?: number;
+      }
+    | null = null;
+
   /**
    * When non-null the surface is in resizable mode: the framework binding's
    * ResizeObserver calls setDisplaySize with the container's physical pixel
@@ -380,6 +394,14 @@ export class BlitSurfaceCanvas {
   private boundMouseUp: ((e: MouseEvent) => void) | null = null;
   private boundMouseMove: ((e: MouseEvent) => void) | null = null;
   private boundWheel: ((e: WheelEvent) => void) | null = null;
+  private boundTouchStart: ((e: TouchEvent) => void) | null = null;
+  private boundTouchMove: ((e: TouchEvent) => void) | null = null;
+  private boundTouchEnd: ((e: TouchEvent) => void) | null = null;
+  private boundTouchCancel: ((e: TouchEvent) => void) | null = null;
+  private boundPointerDown: ((e: PointerEvent) => void) | null = null;
+  private boundPointerMove: ((e: PointerEvent) => void) | null = null;
+  private boundPointerUp: ((e: PointerEvent) => void) | null = null;
+  private boundPointerCancel: ((e: PointerEvent) => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
   private boundFocus: (() => void) | null = null;
@@ -420,6 +442,12 @@ export class BlitSurfaceCanvas {
     canvas.style.width = "100%";
     canvas.style.height = "100%";
     canvas.style.objectFit = "contain";
+    // Let Blit handle iPad touch gestures itself instead of Safari turning
+    // them into page panning/zooming while interacting with a surface.
+    canvas.style.touchAction = "none";
+    canvas.style.webkitUserSelect = "none";
+    (canvas.style as CSSStyleDeclaration & { webkitTouchCallout?: string }).webkitTouchCallout =
+      "none";
     canvas.width = this.surface?.width || 640;
     canvas.height = this.surface?.height || 480;
     // Hidden textarea for capturing IME composition and properly-shifted
@@ -776,6 +804,14 @@ export class BlitSurfaceCanvas {
     this.boundMouseUp = (e) => this.handleMouse(e, SURFACE_POINTER_UP);
     this.boundMouseMove = (e) => this.handleMouse(e, SURFACE_POINTER_MOVE);
     this.boundWheel = (e) => this.handleWheel(e);
+    this.boundTouchStart = (e) => this.handleTouchStart(e);
+    this.boundTouchMove = (e) => this.handleTouchMove(e);
+    this.boundTouchEnd = (e) => this.handleTouchEnd(e);
+    this.boundTouchCancel = (e) => this.handleTouchCancel(e);
+    this.boundPointerDown = (e) => this.handlePointerDown(e);
+    this.boundPointerMove = (e) => this.handlePointerMove(e);
+    this.boundPointerUp = (e) => this.handlePointerUp(e);
+    this.boundPointerCancel = (e) => this.handlePointerCancel(e);
     this.boundKeyDown = (e) => this.handleKey(e, true);
     this.boundKeyUp = (e) => this.handleKey(e, false);
     this.boundFocus = () => this.handleFocus();
@@ -794,6 +830,22 @@ export class BlitSurfaceCanvas {
     canvas.addEventListener("mouseup", this.boundMouseUp);
     canvas.addEventListener("mousemove", this.boundMouseMove);
     canvas.addEventListener("wheel", this.boundWheel, { passive: false });
+    canvas.addEventListener("pointerdown", this.boundPointerDown);
+    canvas.addEventListener("pointermove", this.boundPointerMove);
+    canvas.addEventListener("pointerup", this.boundPointerUp);
+    canvas.addEventListener("pointercancel", this.boundPointerCancel);
+    canvas.addEventListener("touchstart", this.boundTouchStart, {
+      passive: false,
+    });
+    canvas.addEventListener("touchmove", this.boundTouchMove, {
+      passive: false,
+    });
+    canvas.addEventListener("touchend", this.boundTouchEnd, {
+      passive: false,
+    });
+    canvas.addEventListener("touchcancel", this.boundTouchCancel, {
+      passive: false,
+    });
     canvas.addEventListener("keydown", this.boundKeyDown);
     canvas.addEventListener("keyup", this.boundKeyUp);
     canvas.addEventListener("focus", this.boundFocus);
@@ -842,6 +894,23 @@ export class BlitSurfaceCanvas {
     if (this.boundMouseMove)
       canvas.removeEventListener("mousemove", this.boundMouseMove);
     if (this.boundWheel) canvas.removeEventListener("wheel", this.boundWheel);
+    if (this.boundPointerDown)
+      canvas.removeEventListener("pointerdown", this.boundPointerDown);
+    if (this.boundPointerMove)
+      canvas.removeEventListener("pointermove", this.boundPointerMove);
+    if (this.boundPointerUp)
+      canvas.removeEventListener("pointerup", this.boundPointerUp);
+    if (this.boundPointerCancel)
+      canvas.removeEventListener("pointercancel", this.boundPointerCancel);
+    if (this.boundTouchStart)
+      canvas.removeEventListener("touchstart", this.boundTouchStart);
+    if (this.boundTouchMove)
+      canvas.removeEventListener("touchmove", this.boundTouchMove);
+    if (this.boundTouchEnd)
+      canvas.removeEventListener("touchend", this.boundTouchEnd);
+    if (this.boundTouchCancel)
+      canvas.removeEventListener("touchcancel", this.boundTouchCancel);
+    this.clearActiveTouch();
     if (this.boundKeyDown)
       canvas.removeEventListener("keydown", this.boundKeyDown);
     if (this.boundKeyUp) canvas.removeEventListener("keyup", this.boundKeyUp);
@@ -872,18 +941,44 @@ export class BlitSurfaceCanvas {
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
+    this.sendPointerAt(e.clientX, e.clientY, type, e.button);
+  }
+
+  private sendPointerAt(
+    clientX: number,
+    clientY: number,
+    type: number,
+    button: number,
+  ): void {
     const conn = this.getConn();
     if (!conn || !this.canvas || !this.surface || !this._displaySize) return;
     if (type === SURFACE_POINTER_DOWN) {
       this.canvas.focus();
-      this.pressedButtons.add(e.button);
+      this.pressedButtons.add(button);
     } else if (type === SURFACE_POINTER_UP) {
-      this.pressedButtons.delete(e.button);
+      this.pressedButtons.delete(button);
     }
+    const point = this.surfacePointFromClient(clientX, clientY);
+    if (!point) return;
+    conn.sendSurfacePointer(
+      this._surfaceId,
+      type,
+      button,
+      point.x,
+      point.y,
+    );
+  }
+
+  private surfacePointFromClient(
+    clientX: number,
+    clientY: number,
+  ): { x: number; y: number } | null {
+    if (!this.canvas || !this.surface) return null;
     const rect = this.canvas.getBoundingClientRect();
     const cw = this.canvas.width;
     const ch = this.canvas.height;
-    if (cw === 0 || ch === 0 || rect.width === 0 || rect.height === 0) return;
+    if (cw === 0 || ch === 0 || rect.width === 0 || rect.height === 0)
+      return null;
     // The canvas's CSS box fills the container; its intrinsic aspect
     // (canvas.width/height === src frame) is letterboxed within via
     // object-fit: contain.  Compute the drawn content region in CSS
@@ -902,11 +997,12 @@ export class BlitSurfaceCanvas {
       dx = (rect.width - dw) / 2;
       dy = 0;
     }
-    const px = e.clientX - rect.left - dx;
-    const py = e.clientY - rect.top - dy;
-    const x = Math.round((px / dw) * this.surface.width);
-    const y = Math.round((py / dh) * this.surface.height);
-    conn.sendSurfacePointer(this._surfaceId, type, e.button, x, y);
+    const px = clientX - rect.left - dx;
+    const py = clientY - rect.top - dy;
+    return {
+      x: Math.round((px / dw) * this.surface.width),
+      y: Math.round((py / dh) * this.surface.height),
+    };
   }
 
   /** Send synthetic pointer-up for any buttons still held.  Prevents the
@@ -925,6 +1021,187 @@ export class BlitSurfaceCanvas {
       );
     }
     this.pressedButtons.clear();
+  }
+
+  private clearActiveTouch(): void {
+    if (this.activeTouch?.longPressTimer) {
+      clearTimeout(this.activeTouch.longPressTimer);
+    }
+    this.activeTouch = null;
+  }
+
+  private findActiveTouch(list: TouchList): Touch | null {
+    const active = this.activeTouch;
+    if (!active) return null;
+    for (let i = 0; i < list.length; i++) {
+      const touch = list.item(i);
+      if (touch && touch.identifier === active.identifier) return touch;
+    }
+    return null;
+  }
+
+  private startTouchGesture(
+    identifier: number,
+    clientX: number,
+    clientY: number,
+    pointerId?: number,
+  ): void {
+    if (!this.canvas || !this.surface || !this._displaySize) return;
+    this.canvas.focus();
+    this.clearActiveTouch();
+    this.activeTouch = {
+      identifier,
+      startX: clientX,
+      startY: clientY,
+      lastX: clientX,
+      lastY: clientY,
+      mode: "pending",
+      pointerId,
+      longPressTimer: setTimeout(() => {
+        const active = this.activeTouch;
+        if (!active || active.identifier !== identifier) return;
+        active.longPressTimer = null;
+        active.mode = "drag";
+        this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_MOVE, 0);
+        this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_DOWN, 0);
+      }, 350),
+    };
+  }
+
+  private moveTouchGesture(clientX: number, clientY: number): void {
+    const active = this.activeTouch;
+    if (!active) return;
+
+    const dx = clientX - active.lastX;
+    const dy = clientY - active.lastY;
+    const totalDx = clientX - active.startX;
+    const totalDy = clientY - active.startY;
+    const moved = Math.hypot(totalDx, totalDy);
+
+    if (active.mode === "pending" && moved > 8) {
+      if (active.longPressTimer) clearTimeout(active.longPressTimer);
+      active.longPressTimer = null;
+      active.mode = "scroll";
+    }
+
+    active.lastX = clientX;
+    active.lastY = clientY;
+
+    if (active.mode === "drag") {
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
+    } else if (active.mode === "scroll") {
+      const conn = this.getConn();
+      if (!conn || !this.surface || !this._displaySize) return;
+      const axis = Math.abs(dx) > Math.abs(dy) ? 1 : 0;
+      const value = axis === 0 ? -dy : -dx;
+      if (value !== 0) {
+        conn.sendSurfaceAxis(this._surfaceId, axis, Math.round(value * 100));
+      }
+    }
+  }
+
+  private endTouchGesture(clientX: number, clientY: number): void {
+    const active = this.activeTouch;
+    if (!active) return;
+    if (active.longPressTimer) clearTimeout(active.longPressTimer);
+
+    if (active.mode === "drag") {
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "pending") {
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_DOWN, 0);
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_UP, 0);
+    }
+    this.activeTouch = null;
+  }
+
+  private handlePointerDown(e: PointerEvent): void {
+    if (e.pointerType === "mouse") return;
+    if (!this.canvas || !this.surface || !this._displaySize) return;
+    e.preventDefault();
+    this.canvas.setPointerCapture?.(e.pointerId);
+    this.startTouchGesture(e.pointerId, e.clientX, e.clientY, e.pointerId);
+  }
+
+  private handlePointerMove(e: PointerEvent): void {
+    const active = this.activeTouch;
+    if (e.pointerType === "mouse" || !active || active.pointerId !== e.pointerId)
+      return;
+    e.preventDefault();
+    this.moveTouchGesture(e.clientX, e.clientY);
+  }
+
+  private handlePointerUp(e: PointerEvent): void {
+    const active = this.activeTouch;
+    if (e.pointerType === "mouse" || !active || active.pointerId !== e.pointerId)
+      return;
+    e.preventDefault();
+    this.canvas?.releasePointerCapture?.(e.pointerId);
+    this.endTouchGesture(e.clientX, e.clientY);
+  }
+
+  private handlePointerCancel(e: PointerEvent): void {
+    const active = this.activeTouch;
+    if (e.pointerType === "mouse" || !active || active.pointerId !== e.pointerId)
+      return;
+    e.preventDefault();
+    this.canvas?.releasePointerCapture?.(e.pointerId);
+    if (active.mode === "drag") {
+      this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
+    }
+    this.clearActiveTouch();
+  }
+
+  private handleTouchStart(e: TouchEvent): void {
+    if (!this.canvas || !this.surface || !this._displaySize) return;
+    if (this.activeTouch?.pointerId != null) return;
+    if (e.touches.length !== 1) {
+      this.handleTouchCancel(e);
+      return;
+    }
+    e.preventDefault();
+    const touch = e.touches.item(0);
+    if (!touch) return;
+    this.startTouchGesture(touch.identifier, touch.clientX, touch.clientY);
+  }
+
+  private handleTouchMove(e: TouchEvent): void {
+    const active = this.activeTouch;
+    if (!active || active.pointerId != null) return;
+    const touch = this.findActiveTouch(e.touches);
+    if (!touch) return;
+    e.preventDefault();
+    this.moveTouchGesture(touch.clientX, touch.clientY);
+  }
+
+  private handleTouchEnd(e: TouchEvent): void {
+    const active = this.activeTouch;
+    if (!active) return;
+    const touch = this.findActiveTouch(e.changedTouches);
+    if (!touch) return;
+    e.preventDefault();
+    if (active.longPressTimer) clearTimeout(active.longPressTimer);
+
+    if (active.mode === "drag") {
+      this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "pending") {
+      // A tap is a left click.  Use the release coordinate to match what the
+      // user sees if their finger drifted slightly during the tap.
+      this.sendPointerAt(touch.clientX, touch.clientY, SURFACE_POINTER_DOWN, 0);
+      this.sendPointerAt(touch.clientX, touch.clientY, SURFACE_POINTER_UP, 0);
+    }
+    this.activeTouch = null;
+  }
+
+  private handleTouchCancel(e: TouchEvent): void {
+    const active = this.activeTouch;
+    if (!active) return;
+    e.preventDefault();
+    if (active.longPressTimer) clearTimeout(active.longPressTimer);
+    if (active.mode === "drag") {
+      this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
+    }
+    this.activeTouch = null;
   }
 
   private handleWheel(e: WheelEvent): void {
