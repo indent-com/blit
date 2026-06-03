@@ -432,8 +432,8 @@ export function BSPContainer(props: {
     });
   });
 
-  // Surfaces are only assigned to panes by explicit user action (switcher,
-  // drag-and-drop, etc.) — never automatically.
+  // BSPContainer does not discover surfaces on its own; callers assign them
+  // explicitly via moveToPane.
 
   const assignedInPaneOrder = createMemo(() =>
     paneIds()

@@ -1171,6 +1171,57 @@ function WorkspaceScreen(props: {
     closeOverlay();
   }
 
+  const autoShownSurfaceKeys = new Set<string>();
+  let autoShowSurfacesPrimed = false;
+  let pendingAutoShowSurfaceKey: string | null = null;
+  const surfaceKey = (surface: BlitSurface) =>
+    `${surface.connectionId}:${surface.surfaceId}`;
+
+  createEffect(() => {
+    const streaming = surfaceStreaming();
+    const topLevelSurfaces = surfaces().filter((s) => s.parentId === 0);
+    if (!streaming) return;
+
+    const byKey = new Map(topLevelSurfaces.map((s) => [surfaceKey(s), s]));
+    for (const key of autoShownSurfaceKeys) {
+      if (!byKey.has(key)) autoShownSurfaceKeys.delete(key);
+    }
+
+    if (!autoShowSurfacesPrimed) {
+      for (const key of byKey.keys()) autoShownSurfaceKeys.add(key);
+      autoShowSurfacesPrimed = true;
+      return;
+    }
+
+    const added = topLevelSurfaces.filter(
+      (surface) => !autoShownSurfaceKeys.has(surfaceKey(surface)),
+    );
+    if (added.length > 0) {
+      for (const surface of added) autoShownSurfaceKeys.add(surfaceKey(surface));
+      pendingAutoShowSurfaceKey = surfaceKey(added[added.length - 1]);
+    }
+
+    if (!pendingAutoShowSurfaceKey) return;
+    const surface = byKey.get(pendingAutoShowSurfaceKey);
+    if (!surface) {
+      pendingAutoShowSurfaceKey = null;
+      return;
+    }
+
+    if (activeLayout()) {
+      const paneId = bspFocusedPaneId();
+      if (!paneId || !layoutAssignments() || !assignmentsResolved()) return;
+      moveToPaneFn?.(
+        surfaceAssignment(surface.connectionId, surface.surfaceId),
+        paneId,
+      );
+      focusSurfaceById(null);
+    } else {
+      focusSurfaceById(surface.surfaceId, surface.connectionId);
+    }
+    pendingAutoShowSurfaceKey = null;
+  });
+
   let termHandle: { rows: number; cols: number; focus: () => void } | null =
     null;
 

@@ -53,6 +53,8 @@ fn build_child_env(
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| wd.into());
         set(&mut env, "WAYLAND_DISPLAY", &wd_name);
+        set(&mut env, "NIXOS_OZONE_WL", "1");
+        set(&mut env, "XDG_SESSION_TYPE", "wayland");
         // DISPLAY was already filtered out above.
     }
     if let Some(ps) = pulse_server {
@@ -630,4 +632,44 @@ pub fn respawn_child(
         child_pid: pid,
     };
     Some((handle, reader_handle, byte_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_child_env;
+    use std::collections::HashMap;
+
+    fn child_env_map(env: Vec<std::ffi::CString>) -> HashMap<String, String> {
+        env.into_iter()
+            .filter_map(|entry| {
+                let entry = entry.into_string().ok()?;
+                let (key, value) = entry.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn child_env_enables_electron_wayland_when_compositor_is_available() {
+        let env = child_env_map(build_child_env(
+            Some("/tmp/blit-test/wayland-7"),
+            None,
+            None,
+        ));
+
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/tmp/blit-test")
+        );
+        assert_eq!(
+            env.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-7")
+        );
+        assert_eq!(env.get("NIXOS_OZONE_WL").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("XDG_SESSION_TYPE").map(String::as_str),
+            Some("wayland"),
+        );
+        assert!(!env.contains_key("DISPLAY"));
+    }
 }
