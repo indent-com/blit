@@ -78,6 +78,7 @@ trait PtyDriver: Send {
     fn title(&self) -> &str;
     fn search_result(&self, query: &str) -> Option<PtySearchResult>;
     fn take_title_dirty(&mut self) -> bool;
+    fn take_clipboard_stores(&mut self) -> Vec<String>;
     fn cursor_position(&self) -> (u16, u16);
     fn synced_output(&self) -> bool;
     fn snapshot(&mut self, echo: bool, icanon: bool) -> FrameState;
@@ -141,6 +142,10 @@ impl PtyDriver for AlacrittyDriver {
 
     fn take_title_dirty(&mut self) -> bool {
         AlacrittyDriver::take_title_dirty(self)
+    }
+
+    fn take_clipboard_stores(&mut self) -> Vec<String> {
+        AlacrittyDriver::take_clipboard_stores(self)
     }
 
     fn cursor_position(&self) -> (u16, u16) {
@@ -4228,6 +4233,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .fold(1.0_f32, f32::max);
     let title_interval = Duration::from_secs_f64(1.0 / max_fps as f64);
     let ids: Vec<u16> = sess.ptys.keys().copied().collect();
+    let mut clipboard_msgs: Vec<Vec<u8>> = Vec::new();
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
@@ -4235,6 +4241,12 @@ async fn tick(state: &AppState) -> TickOutcome {
         if pty.driver.take_title_dirty() {
             pty.mark_dirty();
             pty.title_pending = true;
+        }
+        for text in pty.driver.take_clipboard_stores() {
+            clipboard_msgs.push(msg_s2c_clipboard_content(
+                "text/plain;charset=utf-8",
+                text.as_bytes(),
+            ));
         }
         if pty.title_pending && now.duration_since(pty.last_title_send) >= title_interval {
             let msg = {
@@ -4249,6 +4261,9 @@ async fn tick(state: &AppState) -> TickOutcome {
             pty.title_pending = false;
             sess.send_to_all(&msg);
         }
+    }
+    for msg in clipboard_msgs {
+        sess.send_to_all(&msg);
     }
 
     // Drain bytes from PTY reader channels. This is the only place
