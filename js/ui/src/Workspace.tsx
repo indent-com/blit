@@ -421,6 +421,29 @@ function WorkspaceScreen(props: {
   // Sticky virtual keyboard: track explicit user intent so the keyboard
   // isn't dismissed when tapping elsewhere on the page.
   const [keyboardWanted, setKeyboardWanted] = createSignal(false);
+  const terminalInputSelector =
+    'textarea[aria-label="Terminal input"][tabindex]:not([readonly])';
+
+  function focusedTerminalInput(): HTMLElement | null {
+    const focusedPane = document.querySelector<HTMLElement>(
+      '[data-blit-bsp-focused="true"]',
+    );
+    if (focusedPane) {
+      return focusedPane.querySelector<HTMLElement>(terminalInputSelector);
+    }
+    if (document.querySelector("[data-blit-bsp-pane-id]")) return null;
+    return document.querySelector<HTMLElement>(
+      `section ${terminalInputSelector}`,
+    );
+  }
+
+  function focusSettledElsewhere(): boolean {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return false;
+    if (active.matches(terminalInputSelector)) return true;
+    if (!active.closest("section")) return false;
+    return active.matches("input, textarea, select, canvas[tabindex]");
+  }
 
   // Re-focus the terminal textarea when it blurs while the user wants
   // the keyboard open, unless an overlay is active.
@@ -428,14 +451,13 @@ function WorkspaceScreen(props: {
     if (!isMobileTouch() || !keyboardWanted()) return;
     const handler = (e: FocusEvent) => {
       if (!(e.target instanceof HTMLTextAreaElement)) return;
+      if (!e.target.matches(terminalInputSelector)) return;
       if (!(e.target as Element).closest?.("section")) return;
       if (overlay()) return;
       setTimeout(() => {
         if (!keyboardWanted() || overlay()) return;
-        const el = document.querySelector<HTMLElement>(
-          "section textarea[tabindex]",
-        );
-        el?.focus();
+        if (focusSettledElsewhere()) return;
+        focusedTerminalInput()?.focus();
       }, 50);
     };
     document.addEventListener("focusout", handler, true);
@@ -444,14 +466,20 @@ function WorkspaceScreen(props: {
 
   /** Toggle the virtual keyboard on mobile. */
   function toggleMobileKeyboard() {
-    const el = document.querySelector<HTMLElement>(
-      "section textarea[tabindex]",
-    );
-    if (!el) return;
     if (keyboardWanted()) {
       setKeyboardWanted(false);
-      el.blur();
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        active.matches(terminalInputSelector)
+      ) {
+        active.blur();
+      } else {
+        focusedTerminalInput()?.blur();
+      }
     } else {
+      const el = focusedTerminalInput();
+      if (!el) return;
       setKeyboardWanted(true);
       el.focus();
     }

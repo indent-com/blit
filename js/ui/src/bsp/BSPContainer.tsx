@@ -993,6 +993,8 @@ function LeafPane(props: {
 
   return (
     <div
+      data-blit-bsp-pane-id={props.paneId}
+      data-blit-bsp-focused={props.isFocused ? "true" : undefined}
       style={{
         width: "100%",
         height: "100%",
