@@ -481,6 +481,7 @@ pub fn spawn_pty(
         lflag_last: std::time::Instant::now(),
         last_title_send: std::time::Instant::now(),
         title_pending: false,
+        last_used_rows_sent: 0,
         exited: false,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),

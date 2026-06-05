@@ -41,6 +41,7 @@ import {
   S2C_TEXT,
   S2C_TITLE,
   S2C_UPDATE,
+  S2C_USED_ROWS,
   C2S_PING,
 } from "./types";
 import {
@@ -1309,6 +1310,16 @@ export class BlitConnection {
         });
         return;
       }
+      case S2C_USED_ROWS: {
+        if (bytes.length < 5) return;
+        const ptyId = bytes[1] | (bytes[2] << 8);
+        const usedRows = bytes[3] | (bytes[4] << 8);
+        const sessionId = this.currentSessionIdByPtyId.get(ptyId);
+        if (sessionId) {
+          this.updateSession(sessionId, { usedRows });
+        }
+        return;
+      }
       case S2C_SEARCH_RESULTS: {
         this.handleSearchResults(bytes);
         return;
@@ -1940,6 +1951,7 @@ export class BlitConnection {
       ptyId,
       tag,
       title: current?.title ?? null,
+      usedRows: current?.usedRows ?? 0,
       command,
       state,
     };
