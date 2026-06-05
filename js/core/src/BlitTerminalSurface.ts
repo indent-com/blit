@@ -140,6 +140,10 @@ export class BlitTerminalSurface {
   private _cols = 80;
   private contentDirty = true;
   private lastOffset = 0;
+  /** Last composited device pixel size, used to detect resizes and schedule a
+   *  one-frame catch-up render on the WebGPU backend (see doRender). */
+  private lastRenderedPw = 0;
+  private lastRenderedPh = 0;
   private lastWasmBuffer: ArrayBuffer | null = null;
   private raf = 0;
   private renderScheduled = false;
@@ -1137,6 +1141,24 @@ export class BlitTerminalSurface {
         this.drawScrollbar(ctx, t, cell);
       }
     }
+
+    // WebGPU presents asynchronously, so `drawImage(webgpuCanvas)` above reads
+    // the *previously* presented frame, not the one just submitted. While the
+    // size is stable this is an imperceptible one-frame content lag that the
+    // next render heals. But on a resize the stale frame is the wrong size,
+    // and because rendering is event-driven it stops once the resize settles —
+    // leaving that wrong-size frame composited forever as whole-screen trails.
+    // Schedule one catch-up render so the new-size frame, now presented, gets
+    // re-composited. WebGL2 doesn't need this (preserveDrawingBuffer gives a
+    // synchronous same-frame readback).
+    if (
+      shared?.renderer.backend === "webgpu" &&
+      (pw !== this.lastRenderedPw || ph !== this.lastRenderedPh)
+    ) {
+      this.scheduleRender();
+    }
+    this.lastRenderedPw = pw;
+    this.lastRenderedPh = ph;
 
     // Keep the native scroll surface in sync with the current scrollback
     // depth and offset.  Cheap idempotent — only touches the DOM when
