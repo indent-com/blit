@@ -29,6 +29,14 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/build-tarballs dist
+        env:
+          # The macOS runner has less headroom than Linux and has OOM-killed
+          # the pnpm dependency fetch derivation under unrestricted Nix
+          # parallelism (exit 137). Keep this build bounded; Linux packaging is
+          # still dominated by cached Cargo artifacts.
+          NIX_CONFIG: |
+            max-jobs = 2
+            cores = 4
       - run: ./bin/build-debs debs
         if: ${{ matrix.debs }}
       - uses: actions/upload-artifact@v4

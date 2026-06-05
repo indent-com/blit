@@ -2131,9 +2131,7 @@ function PreviewPanel(props: {
             {(s) => (
               <SessionThumbnail
                 session={s()}
-                connectionLabel={props.connectionLabels?.get(
-                  s().connectionId,
-                )}
+                connectionLabel={props.connectionLabels?.get(s().connectionId)}
                 theme={props.theme}
                 scale={props.scale}
                 palette={props.palette}
@@ -2150,9 +2148,7 @@ function PreviewPanel(props: {
               <SurfaceThumbnail
                 surface={s()}
                 connectionId={s().connectionId}
-                connectionLabel={props.connectionLabels?.get(
-                  s().connectionId,
-                )}
+                connectionLabel={props.connectionLabels?.get(s().connectionId)}
                 theme={props.theme}
                 scale={props.scale}
                 focused={

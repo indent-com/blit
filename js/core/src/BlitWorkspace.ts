@@ -17,8 +17,10 @@ import { WebSocketTransport } from "./transports/websocket";
 import { WebTransportTransport } from "./transports/webtransport";
 import { createShareTransport } from "./transports/webrtc-share";
 
-export interface AddBlitConnectionOptions
-  extends Omit<CreateBlitConnectionOptions, "wasm" | "transport"> {
+export interface AddBlitConnectionOptions extends Omit<
+  CreateBlitConnectionOptions,
+  "wasm" | "transport"
+> {
   transport?: BlitTransport | TransportConfig;
   wasm?: BlitWasmModule | Promise<BlitWasmModule>;
 }

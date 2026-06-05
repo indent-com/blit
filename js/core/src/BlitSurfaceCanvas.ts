@@ -304,18 +304,16 @@ export class BlitSurfaceCanvas {
   private pressedKeys = new Set<number>();
 
   /** Active single-finger gesture used to emulate mouse input on iPadOS. */
-  private activeTouch:
-    | {
-        identifier: number;
-        startX: number;
-        startY: number;
-        lastX: number;
-        lastY: number;
-        mode: "pending" | "scroll" | "drag";
-        longPressTimer: ReturnType<typeof setTimeout> | null;
-        pointerId?: number;
-      }
-    | null = null;
+  private activeTouch: {
+    identifier: number;
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    mode: "pending" | "scroll" | "drag";
+    longPressTimer: ReturnType<typeof setTimeout> | null;
+    pointerId?: number;
+  } | null = null;
 
   /**
    * When non-null the surface is in resizable mode: the framework binding's
@@ -446,8 +444,9 @@ export class BlitSurfaceCanvas {
     // them into page panning/zooming while interacting with a surface.
     canvas.style.touchAction = "none";
     canvas.style.webkitUserSelect = "none";
-    (canvas.style as CSSStyleDeclaration & { webkitTouchCallout?: string }).webkitTouchCallout =
-      "none";
+    (
+      canvas.style as CSSStyleDeclaration & { webkitTouchCallout?: string }
+    ).webkitTouchCallout = "none";
     canvas.width = this.surface?.width || 640;
     canvas.height = this.surface?.height || 480;
     // Hidden textarea for capturing IME composition and properly-shifted
@@ -960,13 +959,7 @@ export class BlitSurfaceCanvas {
     }
     const point = this.surfacePointFromClient(clientX, clientY);
     if (!point) return;
-    conn.sendSurfacePointer(
-      this._surfaceId,
-      type,
-      button,
-      point.x,
-      point.y,
-    );
+    conn.sendSurfacePointer(this._surfaceId, type, button, point.x, point.y);
   }
 
   private surfacePointFromClient(
@@ -1125,7 +1118,11 @@ export class BlitSurfaceCanvas {
 
   private handlePointerMove(e: PointerEvent): void {
     const active = this.activeTouch;
-    if (e.pointerType === "mouse" || !active || active.pointerId !== e.pointerId)
+    if (
+      e.pointerType === "mouse" ||
+      !active ||
+      active.pointerId !== e.pointerId
+    )
       return;
     e.preventDefault();
     this.moveTouchGesture(e.clientX, e.clientY);
@@ -1133,7 +1130,11 @@ export class BlitSurfaceCanvas {
 
   private handlePointerUp(e: PointerEvent): void {
     const active = this.activeTouch;
-    if (e.pointerType === "mouse" || !active || active.pointerId !== e.pointerId)
+    if (
+      e.pointerType === "mouse" ||
+      !active ||
+      active.pointerId !== e.pointerId
+    )
       return;
     e.preventDefault();
     this.canvas?.releasePointerCapture?.(e.pointerId);
@@ -1142,7 +1143,11 @@ export class BlitSurfaceCanvas {
 
   private handlePointerCancel(e: PointerEvent): void {
     const active = this.activeTouch;
-    if (e.pointerType === "mouse" || !active || active.pointerId !== e.pointerId)
+    if (
+      e.pointerType === "mouse" ||
+      !active ||
+      active.pointerId !== e.pointerId
+    )
       return;
     e.preventDefault();
     this.canvas?.releasePointerCapture?.(e.pointerId);
