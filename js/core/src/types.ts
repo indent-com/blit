@@ -98,6 +98,8 @@ export type BlitSession = {
   ptyId: number;
   tag: string;
   title: string | null;
+  /** Highest visible terminal row reached since the last terminal reset. */
+  usedRows: number;
   command: string | null;
   state: "creating" | "active" | "exited" | "closed";
 };
@@ -192,6 +194,7 @@ export const S2C_READY = 0x09;
 export const S2C_TEXT = 0x0a;
 export const S2C_PING = 0x0b;
 export const S2C_QUIT = 0x0c;
+export const S2C_USED_ROWS = 0x0d;
 export const C2S_PING = 0x08;
 export const C2S_QUIT = 0x0f;
 

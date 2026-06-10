@@ -77,6 +77,12 @@ struct ModeTracker {
     parse_state: EscapeParseState,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsedRowsAction {
+    None,
+    Reset,
+}
+
 impl Default for ModeTracker {
     fn default() -> Self {
         Self {
@@ -93,11 +99,14 @@ impl Default for ModeTracker {
 }
 
 impl ModeTracker {
-    fn process(&mut self, data: &[u8]) {
+    fn process(&mut self, data: &[u8]) -> UsedRowsAction {
+        let mut used_rows_action = UsedRowsAction::None;
         for &byte in data {
             match self.parse_state {
                 EscapeParseState::Ground => {
-                    if byte == 0x1b {
+                    if byte == 0x0c {
+                        used_rows_action = UsedRowsAction::Reset;
+                    } else if byte == 0x1b {
                         self.parse_state = EscapeParseState::Escape;
                     }
                 }
@@ -113,6 +122,7 @@ impl ModeTracker {
                     }
                     b'c' => {
                         self.reset();
+                        used_rows_action = UsedRowsAction::Reset;
                         self.parse_state = EscapeParseState::Ground;
                     }
                     0x1b => {}
@@ -156,7 +166,9 @@ impl ModeTracker {
                         }
                         0x40..=0x7e => {
                             csi.push_current();
-                            self.handle_csi(csi, byte);
+                            if self.handle_csi(csi, byte) == UsedRowsAction::Reset {
+                                used_rows_action = UsedRowsAction::Reset;
+                            }
                             self.parse_state = EscapeParseState::Ground;
                         }
                         _ => self.parse_state = EscapeParseState::Ground,
@@ -164,6 +176,7 @@ impl ModeTracker {
                 }
             }
         }
+        used_rows_action
     }
 
     fn reset(&mut self) {
@@ -182,20 +195,26 @@ impl ModeTracker {
         self.cursor_style = 0;
     }
 
-    fn handle_csi(&mut self, csi: CsiState, final_byte: u8) {
+    fn handle_csi(&mut self, csi: CsiState, final_byte: u8) -> UsedRowsAction {
         if csi.bang && final_byte == b'p' {
             self.soft_reset();
-            return;
+            return UsedRowsAction::Reset;
         }
         if csi.space && final_byte == b'q' {
             let style = csi.params().first().copied().unwrap_or(0);
             self.cursor_style = if style <= 6 { style } else { 0 };
-            return;
+            return UsedRowsAction::None;
+        }
+        if !csi.private && matches!(final_byte, b'J' | b'K') {
+            let params = csi.params();
+            if params.is_empty() || params.iter().any(|&p| p == 2 || p == 3) {
+                return UsedRowsAction::Reset;
+            }
         }
         let set = match final_byte {
             b'h' => true,
             b'l' => false,
-            _ => return,
+            _ => return UsedRowsAction::None,
         };
         for &param in csi.params() {
             if csi.private {
@@ -209,6 +228,7 @@ impl ModeTracker {
                 }
             }
         }
+        UsedRowsAction::None
     }
 
     fn update_mouse_mode(&mut self, param: u16, set: bool) {
@@ -291,16 +311,21 @@ impl alacritty_terminal::vte::ansi::Timeout for NoSyncTimeout {
 #[derive(Clone)]
 struct BlitEventProxy {
     title: Arc<Mutex<Option<String>>>,
+    clipboard_stores: Arc<Mutex<Vec<String>>>,
 }
 
 impl BlitEventProxy {
     fn new() -> Self {
         Self {
             title: Arc::new(Mutex::new(None)),
+            clipboard_stores: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn take_title(&self) -> Option<String> {
         self.title.lock().unwrap().take()
+    }
+    fn take_clipboard_stores(&self) -> Vec<String> {
+        std::mem::take(&mut *self.clipboard_stores.lock().unwrap())
     }
 }
 
@@ -312,6 +337,9 @@ impl EventListener for BlitEventProxy {
             }
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = Some(String::new());
+            }
+            Event::ClipboardStore(_, text) => {
+                self.clipboard_stores.lock().unwrap().push(text);
             }
             _ => {}
         }
@@ -379,6 +407,8 @@ pub struct TerminalDriver {
     title: String,
     title_dirty: bool,
     saw_explicit_title: bool,
+    used_rows: u16,
+    used_rows_dirty: bool,
 }
 
 impl TerminalDriver {
@@ -402,12 +432,18 @@ impl TerminalDriver {
             title: String::new(),
             title_dirty: false,
             saw_explicit_title: false,
+            used_rows: 0,
+            used_rows_dirty: true,
         }
     }
 
     pub fn process(&mut self, data: &[u8]) {
-        self.modes.process(data);
+        let used_rows_action = self.modes.process(data);
         self.processor.advance(&mut self.term, data);
+        if used_rows_action == UsedRowsAction::Reset {
+            self.reset_used_rows();
+        }
+        self.update_used_rows_from_visible_grid();
         self.refresh_title();
     }
 
@@ -422,6 +458,55 @@ impl TerminalDriver {
             rows: rows as usize,
         };
         self.term.resize(dims);
+        let capped = self.used_rows.min(rows);
+        if capped != self.used_rows {
+            self.used_rows = capped;
+            self.used_rows_dirty = true;
+        }
+    }
+
+    pub fn used_rows(&self) -> u16 {
+        self.used_rows
+    }
+
+    pub fn take_used_rows_dirty(&mut self) -> bool {
+        let dirty = self.used_rows_dirty;
+        self.used_rows_dirty = false;
+        dirty
+    }
+
+    fn reset_used_rows(&mut self) {
+        if self.used_rows != 0 {
+            self.used_rows = 0;
+            self.used_rows_dirty = true;
+        }
+    }
+
+    fn update_used_rows_from_visible_grid(&mut self) {
+        let grid = self.term.grid();
+        let screen = grid.screen_lines();
+        let cols = grid.columns();
+        let mut observed = 0usize;
+
+        'rows: for row in (0..screen).rev() {
+            let grid_row = &grid[Line(row as i32)];
+            for col_idx in 0..cols {
+                let cell = &grid_row[Column(col_idx)];
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                if cell.c != '\0' && cell.c != ' ' {
+                    observed = row + 1;
+                    break 'rows;
+                }
+            }
+        }
+
+        let observed = observed.min(screen).min(u16::MAX as usize) as u16;
+        if observed > self.used_rows {
+            self.used_rows = observed;
+            self.used_rows_dirty = true;
+        }
     }
 
     pub fn reset_modes(&mut self) {
@@ -493,6 +578,10 @@ impl TerminalDriver {
 
     pub fn take_title_dirty(&mut self) -> bool {
         std::mem::take(&mut self.title_dirty)
+    }
+
+    pub fn take_clipboard_stores(&mut self) -> Vec<String> {
+        self.event_proxy.take_clipboard_stores()
     }
 
     pub fn synced_output(&self) -> bool {
@@ -1075,6 +1164,39 @@ mod tests {
         driver.process(b"\x1b]0;My Title\x07");
         assert!(driver.take_title_dirty());
         assert_eq!(driver.title(), "My Title");
+    }
+
+    #[test]
+    fn osc52_clipboard_store() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        driver.process(b"\x1b]52;c;SGVsbG8sIE9TQyA1MiE=\x07");
+        assert_eq!(driver.take_clipboard_stores(), vec!["Hello, OSC 52!"]);
+        assert!(driver.take_clipboard_stores().is_empty());
+    }
+
+    #[test]
+    fn used_rows_grows_resets_and_caps() {
+        let mut driver = TerminalDriver::new(10, 80, 1000);
+        assert_eq!(driver.used_rows(), 0);
+        assert!(driver.take_used_rows_dirty());
+
+        driver.process(b"hello");
+        assert_eq!(driver.used_rows(), 1);
+        assert!(driver.take_used_rows_dirty());
+        assert!(!driver.take_used_rows_dirty());
+
+        driver.process(b"\x1b[6;1Hbottom");
+        assert_eq!(driver.used_rows(), 6);
+        assert!(driver.take_used_rows_dirty());
+
+        driver.process(b"\x1b[2J");
+        assert_eq!(driver.used_rows(), 0);
+        assert!(driver.take_used_rows_dirty());
+
+        driver.process(b"\x1b[10;1Hagain");
+        assert_eq!(driver.used_rows(), 10);
+        driver.resize(4, 80);
+        assert_eq!(driver.used_rows(), 4);
     }
 
     #[test]

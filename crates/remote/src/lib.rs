@@ -201,12 +201,25 @@ pub const S2C_PING: u8 = 0x0B;
 /// Server is shutting down: [0x0C].  No payload.
 /// Broadcast to all connected clients before the server exits.
 pub const S2C_QUIT: u8 = 0x0C;
+/// Terminal used visible rows changed: [0x0D][pty_id:2][used_rows:2]
+///
+/// `used_rows` is the highest visible row reached since the last terminal
+/// reset/clear-like sequence, capped to the current PTY height.
+pub const S2C_USED_ROWS: u8 = 0x0D;
 /// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
 /// nonce: echoed from C2S_READ request
 /// total_lines: total available lines (scrollback + viewport rows)
 /// offset: the offset that was requested
 /// text: UTF-8 text, lines separated by \n
 pub const S2C_TEXT: u8 = 0x0A;
+
+pub fn msg_s2c_used_rows(pty_id: u16, used_rows: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5);
+    msg.push(S2C_USED_ROWS);
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&used_rows.to_le_bytes());
+    msg
+}
 
 /// A new Wayland toplevel surface was created:
 /// [0x20][surface_id:2][parent_id:2][width:2][height:2][title_len:2][title:N][app_id_len:2][app_id:N]
