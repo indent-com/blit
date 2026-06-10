@@ -310,11 +310,20 @@
         : > crates/browser/pkg/blit_browser_bg.wasm.d.ts
       '';
 
+      # pnpm 11's worker pool churns through enough kqueue file descriptors
+      # on macOS that the Nix sandbox's per-process FD limit (256 by default)
+      # gets hit and libuv aborts with
+      #   Assertion failed: (errno == EINTR), function uv__io_poll, kqueue.c
+      # right after "added N, done".  Raising the soft limit before the
+      # install side-steps it.
       pnpmDeps = pkgs.fetchPnpmDeps {
         pname = "blit-js";
         inherit version;
         src = ../.;
         fetcherVersion = 3;
+        prePnpmInstall = ''
+          ulimit -n 8192 || true
+        '';
         postPatch = setupBrowserPkgForDeps + ''
           cd js
         '';

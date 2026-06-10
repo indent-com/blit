@@ -16,3 +16,10 @@ onlyBuiltDependencies:
 allowBuilds:
   esbuild: true
   sharp: true
+
+# pnpm 11's supply-chain verification holds per-package registry metadata
+# in memory for every entry during install; on a 600-package workspace
+# that pushes the macOS Nix sandbox over jetsam and the install gets
+# SIGKILL'd just after "added N, done".  The lockfile is committed and
+# reviewed, so treat it as trusted.
+trustLockfile: true
