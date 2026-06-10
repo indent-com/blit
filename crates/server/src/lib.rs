@@ -13,9 +13,9 @@ use blit_remote::{
     FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N,
     S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE,
     S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg,
-    msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_surface_app_id,
-    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
-    msg_surface_resized, msg_surface_title,
+    msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows,
+    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
+    msg_surface_frame, msg_surface_resized, msg_surface_title,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -79,6 +79,8 @@ trait PtyDriver: Send {
     fn search_result(&self, query: &str) -> Option<PtySearchResult>;
     fn take_title_dirty(&mut self) -> bool;
     fn take_clipboard_stores(&mut self) -> Vec<String>;
+    fn used_rows(&self) -> u16;
+    fn take_used_rows_dirty(&mut self) -> bool;
     fn cursor_position(&self) -> (u16, u16);
     fn synced_output(&self) -> bool;
     fn snapshot(&mut self, echo: bool, icanon: bool) -> FrameState;
@@ -146,6 +148,14 @@ impl PtyDriver for AlacrittyDriver {
 
     fn take_clipboard_stores(&mut self) -> Vec<String> {
         AlacrittyDriver::take_clipboard_stores(self)
+    }
+
+    fn used_rows(&self) -> u16 {
+        AlacrittyDriver::used_rows(self)
+    }
+
+    fn take_used_rows_dirty(&mut self) -> bool {
+        AlacrittyDriver::take_used_rows_dirty(self)
     }
 
     fn cursor_position(&self) -> (u16, u16) {
@@ -342,6 +352,8 @@ struct Pty {
     last_title_send: Instant,
     /// Title changed but not yet sent (debounced).
     title_pending: bool,
+    /// Last used visible rows value broadcast for this PTY.
+    last_used_rows_sent: u16,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
     /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
@@ -649,6 +661,7 @@ struct ClientState {
     scroll_offsets: HashMap<u16, usize>,
     scroll_caches: HashMap<u16, FrameState>,
     last_sent: HashMap<u16, FrameState>,
+    last_used_rows_sent: HashMap<u16, u16>,
     preview_next_send_at: HashMap<u16, Instant>,
     /// EWMA RTT estimate in milliseconds.
     rtt_ms: f32,
@@ -1503,6 +1516,7 @@ fn is_unset_view_size(rows: u16, cols: u16) -> bool {
 fn subscribe_client_to(client: &mut ClientState, pty_id: u16) {
     if client.subscriptions.insert(pty_id) {
         client.last_sent.remove(&pty_id);
+        client.last_used_rows_sent.remove(&pty_id);
         client.preview_next_send_at.remove(&pty_id);
     }
 }
@@ -1510,6 +1524,7 @@ fn subscribe_client_to(client: &mut ClientState, pty_id: u16) {
 fn unsubscribe_client_from(client: &mut ClientState, pty_id: u16) -> bool {
     let removed_sub = client.subscriptions.remove(&pty_id);
     client.last_sent.remove(&pty_id);
+    client.last_used_rows_sent.remove(&pty_id);
     client.preview_next_send_at.remove(&pty_id);
     client.scroll_offsets.remove(&pty_id);
     client.scroll_caches.remove(&pty_id);
@@ -1778,9 +1793,11 @@ impl Session {
         pty.ready_frames.clear();
         pty.driver.resize(rows, cols);
         pty.mark_dirty();
+        pty.last_used_rows_sent = pty.last_used_rows_sent.min(rows);
         for c in self.clients.values_mut() {
             if c.subscriptions.contains(&pty_id) {
                 c.last_sent.remove(&pty_id);
+                c.last_used_rows_sent.remove(&pty_id);
             }
             if c.scroll_caches.remove(&pty_id).is_some() {
                 reset_inflight(c);
@@ -4230,6 +4247,8 @@ async fn tick(state: &AppState) -> TickOutcome {
     let title_interval = Duration::from_secs_f64(1.0 / max_fps as f64);
     let ids: Vec<u16> = sess.ptys.keys().copied().collect();
     let mut clipboard_msgs: Vec<Vec<u8>> = Vec::new();
+    let mut title_msgs: Vec<Vec<u8>> = Vec::new();
+    let mut used_rows_msgs: Vec<Vec<u8>> = Vec::new();
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
@@ -4237,6 +4256,9 @@ async fn tick(state: &AppState) -> TickOutcome {
         if pty.driver.take_title_dirty() {
             pty.mark_dirty();
             pty.title_pending = true;
+        }
+        if pty.driver.take_used_rows_dirty() {
+            pty.mark_dirty();
         }
         for text in pty.driver.take_clipboard_stores() {
             clipboard_msgs.push(msg_s2c_clipboard_content(
@@ -4255,10 +4277,21 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             pty.last_title_send = now;
             pty.title_pending = false;
-            sess.send_to_all(&msg);
+            title_msgs.push(msg);
+        }
+        let used_rows = pty.driver.used_rows();
+        if used_rows != pty.last_used_rows_sent {
+            pty.last_used_rows_sent = used_rows;
+            used_rows_msgs.push(msg_s2c_used_rows(id, used_rows));
         }
     }
     for msg in clipboard_msgs {
+        sess.send_to_all(&msg);
+    }
+    for msg in title_msgs {
+        sess.send_to_all(&msg);
+    }
+    for msg in used_rows_msgs {
         sess.send_to_all(&msg);
     }
 
@@ -4869,6 +4902,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 scroll_offsets: HashMap::new(),
                 scroll_caches: HashMap::new(),
                 last_sent: HashMap::new(),
+                last_used_rows_sent: HashMap::new(),
                 preview_next_send_at: HashMap::new(),
                 rtt_ms: 50.0,
                 min_rtt_ms: 0.0,
@@ -6534,6 +6568,7 @@ mod tests {
             scroll_offsets: HashMap::new(),
             scroll_caches: HashMap::new(),
             last_sent: HashMap::new(),
+            last_used_rows_sent: HashMap::new(),
             preview_next_send_at: HashMap::new(),
             rtt_ms: 50.0,
             min_rtt_ms: 50.0,
