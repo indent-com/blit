@@ -25,6 +25,13 @@ export { createShareTransport } from "./transports/webrtc-share";
 export { MuxTransport, MuxChannel } from "./transports/mux";
 
 export { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
+
+export {
+  EXIT_STATUS_UNKNOWN,
+  exitCodeFromStatus,
+  formatExitStatus,
+} from "./exit-status";
+
 export type {
   BlitConnectionSnapshot,
   BlitDebug,

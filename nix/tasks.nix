@@ -2,6 +2,7 @@
   pkgs,
   version,
   browserWasm,
+  browserWasmNode,
   blit,
   blit-release,
   blit-release-musl ? null,
@@ -42,6 +43,21 @@ let
             fi
             chmod -R u+w "$tmp"
 
+            # Self-initializing Node/Bun build under ./node (see
+            # nix/packages.nix `browserWasmNode`).  Exposed via the
+            # `@blit-sh/browser/node` subpath; the root export stays the
+            # `--target web` build so existing browser consumers are unaffected.
+            mkdir -p "$tmp/node"
+            cp ${browserWasmNode}/blit_browser.js "$tmp/node"/
+            cp ${browserWasmNode}/blit_browser.d.ts "$tmp/node"/
+            cp ${browserWasmNode}/blit_browser_bg.wasm "$tmp/node"/
+            cp ${browserWasmNode}/blit_browser_bg.wasm.d.ts "$tmp/node"/ 2>/dev/null || true
+            if [ -d "${browserWasmNode}/snippets" ]; then
+              cp -r ${browserWasmNode}/snippets "$tmp/node"/snippets
+            fi
+            cp ${browserWasmNode}/package.json "$tmp/node"/package.json
+            chmod -R u+w "$tmp/node"
+
             cat > "$tmp/package.json" <<'PKGJSON'
       {
         "name": "@blit-sh/browser",
@@ -50,7 +66,16 @@ let
         "description": "Low-latency terminal streaming — browser WASM renderer",
         "main": "blit_browser.js",
         "types": "blit_browser.d.ts",
-        "files": ["blit_browser_bg.wasm","blit_browser.js","blit_browser.d.ts","blit_browser_bg.wasm.d.ts","snippets"],
+        "exports": {
+          ".": { "types": "./blit_browser.d.ts", "default": "./blit_browser.js" },
+          "./node": { "types": "./node/blit_browser.d.ts", "default": "./node/blit_browser.js" },
+          "./blit_browser.js": "./blit_browser.js",
+          "./blit_browser_bg.wasm": "./blit_browser_bg.wasm",
+          "./blit_browser_bg.wasm.d.ts": "./blit_browser_bg.wasm.d.ts",
+          "./snippets/*": "./snippets/*",
+          "./package.json": "./package.json"
+        },
+        "files": ["blit_browser_bg.wasm","blit_browser.js","blit_browser.d.ts","blit_browser_bg.wasm.d.ts","snippets","node"],
         "sideEffects": ["./snippets/*"],
         "keywords": ["terminal","tty","wasm","streaming","webgl"],
         "homepage": "https://blit.sh",

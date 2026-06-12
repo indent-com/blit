@@ -145,6 +145,50 @@
         doCheck = false;
       };
 
+      # Self-initializing Node/Bun build of the same crate (wasm-bindgen
+      # \`--target nodejs\`).  Unlike the \`--target web\` build, this one reads its
+      # \`.wasm\` from disk and instantiates synchronously on import, so it works
+      # off-browser with no \`fetch\`/\`init()\` dance.  Published under the
+      # \`@blit-sh/browser/node\` subpath; see nix/tasks.nix \`browser-publish\`.
+      browserWasmNode = rustPlatform.buildRustPackage {
+        pname = "blit-browser-node";
+        inherit version;
+        src = ../.;
+        cargoBuildFlags = [
+          "-p"
+          "blit-browser"
+        ];
+        cargoDeps = browserCargoDeps;
+        nativeBuildInputs = [
+          pkgs.wasm-pack
+          wasmBindgenCli
+          pkgs.binaryen
+        ];
+        buildPhase = ''
+          cd crates/browser
+          HOME=$TMPDIR wasm-pack build --target nodejs --release --out-dir $out
+          # wasm-bindgen's nodejs target emits CommonJS glue (require/__dirname)
+          # but copies the inline JS snippets verbatim as ES modules, so the
+          # generated require() of each snippet throws under Node.  Rewrite the
+          # snippets to CommonJS.  (They are canvas-only helpers, never invoked
+          # in a headless terminal, but must still load.)
+          for f in $out/snippets/blit-browser-*/*.js; do
+            names=$(grep -oE 'export function [A-Za-z0-9_]+' "$f" \
+              | sed 's/export function //' | paste -sd, -)
+            sed -i 's/^export function /function /' "$f"
+            if [ -n "$names" ]; then
+              printf '\nmodule.exports = { %s };\n' "$names" >> "$f"
+            fi
+          done
+          # Mark this subtree as CommonJS so it loads correctly when nested
+          # under the package root's "type":"module".
+          printf '{"type":"commonjs","main":"blit_browser.js","types":"blit_browser.d.ts"}\n' \
+            > $out/package.json
+        '';
+        dontInstall = true;
+        doCheck = false;
+      };
+
       # ------------------------------------------------------------------
       # Release binaries
       #
@@ -399,6 +443,7 @@
           pkgs
           version
           browserWasm
+          browserWasmNode
           blit
           blit-release
           webAppDist

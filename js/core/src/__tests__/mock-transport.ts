@@ -7,6 +7,7 @@ import {
   S2C_CREATED,
   S2C_CREATED_N,
   S2C_CLOSED,
+  S2C_EXITED,
   S2C_HELLO,
   S2C_LIST,
   S2C_QUIT,
@@ -111,6 +112,22 @@ export class MockTransport implements BlitTransport {
 
   pushClosed(ptyId: number) {
     this.push(new Uint8Array([S2C_CLOSED, ptyId & 0xff, (ptyId >> 8) & 0xff]));
+  }
+
+  /** Wire: [0x08][pty_id:2][exit_status:4] (i32 LE). */
+  pushExited(ptyId: number, exitStatus: number) {
+    const msg = new Uint8Array(7);
+    const view = new DataView(msg.buffer);
+    msg[0] = S2C_EXITED;
+    msg[1] = ptyId & 0xff;
+    msg[2] = (ptyId >> 8) & 0xff;
+    view.setInt32(3, exitStatus, true);
+    this.push(msg);
+  }
+
+  /** A legacy-style EXITED frame that omits the exit_status bytes. */
+  pushExitedRaw(ptyId: number) {
+    this.push(new Uint8Array([S2C_EXITED, ptyId & 0xff, (ptyId >> 8) & 0xff]));
   }
 
   pushList(entries: { ptyId: number; tag?: string; command?: string }[]) {

@@ -235,6 +235,69 @@ interface BlitTransport {
 }
 ```
 
+## Server-side: a Node/Bun client over a unix socket
+
+You can also run a `@blit-sh/core` client **server-side** (Node/Bun/Deno) to drive a
+local `blit server` over its unix-domain socket — e.g. to script terminals or run
+headless commands. The non-browser building blocks live under the
+`@blit-sh/core/node` subpath (kept out of the package root so `node:net` and
+runtime globals never leak into browser bundles):
+
+```ts
+import { BlitWorkspace, exitCodeFromStatus, nullLogger } from "@blit-sh/core";
+import { NodeUnixSocketTransport, loadBlitWasm } from "@blit-sh/core/node";
+
+// `loadBlitWasm()` initializes the @blit-sh/browser WASM off-browser: it reads
+// the colocated blit_browser_bg.wasm from disk and feeds it to init(), so you
+// never touch raw wasm bytes. (If you depend on a self-initializing
+// `@blit-sh/browser/node` build it is returned as-is.)
+const wasm = await loadBlitWasm();
+
+const transport = new NodeUnixSocketTransport(process.env.BLIT_SOCK ?? "/tmp/blit.sock");
+const workspace = new BlitWorkspace({
+  wasm,
+  logger: nullLogger, // no-op logger; omit to log lifecycle events to console
+  connections: [{ id: "default", transport }],
+});
+
+const session = await workspace.createSession({
+  connectionId: "default",
+  rows: 24,
+  cols: 80,
+  command: "my-command",
+});
+```
+
+The unix transport speaks blit's framing protocol (4-byte little-endian
+length-prefixed frames) for you — there is no need to re-implement the wire
+format. `BunUnixSocketTransport` and `DenoUnixSocketTransport` are the
+runtime-native equivalents.
+
+### Exit status
+
+When a session's process exits, its `BlitSession.state` becomes `"exited"` and
+`BlitSession.exitStatus` carries the raw status from the server:
+
+- `>= 0` — normal exit; the value is the exit code.
+- `< 0` — terminated by a signal; the value is the negated signal number.
+- `EXIT_STATUS_UNKNOWN` — not yet collected.
+
+`exitCodeFromStatus(status)` maps that to a conventional shell exit code
+(unknown → `1`, signalled → `128 + signal`), and `formatExitStatus(status)`
+renders `"exited(<code>)"` / `"signal(<n>)"`. Both mirror the `blit` CLI.
+
+```ts
+import { exitCodeFromStatus } from "@blit-sh/core";
+
+workspace.subscribe(() => {
+  for (const s of workspace.getSnapshot().sessions) {
+    if (s.state === "exited" && s.exitStatus !== null) {
+      console.log(`${s.id} exited with code`, exitCodeFromStatus(s.exitStatus));
+    }
+  }
+});
+```
+
 ## Your service, our server: `fd-channel` mode
 
 `fd-channel` lets an external process own `blit server`'s lifecycle and control which clients connect via `SCM_RIGHTS` fd passing. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol details and the working examples:

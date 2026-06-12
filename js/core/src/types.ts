@@ -102,6 +102,15 @@ export type BlitSession = {
   usedRows: number;
   command: string | null;
   state: "creating" | "active" | "exited" | "closed";
+  /**
+   * Raw exit status from the server once the process has exited (the
+   * `exit_status` field of `S2C_EXITED`), or `null` while running.
+   *
+   * `>= 0` is the normal exit code, `< 0` is the negated terminating
+   * signal, and {@link EXIT_STATUS_UNKNOWN} means "not yet collected".
+   * Use `exitCodeFromStatus` to map it to a conventional shell exit code.
+   */
+  exitStatus: number | null;
 };
 
 export interface BlitConnectionSnapshot {
