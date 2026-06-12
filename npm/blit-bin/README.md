@@ -45,13 +45,13 @@ import { binaryPath, binaryName, candidatePackages, isMusl } from "blit-bin";
 // or: import { binaryPath } from "blit-bin/resolve";
 ```
 
-| export | description |
-| --- | --- |
-| `default` | absolute path to the `blit` binary (resolved at import) |
-| `binaryPath()` | same path, computed lazily; throws if unavailable |
-| `binaryName()` | `"blit"` or `"blit.exe"` |
-| `candidatePackages()` | platform package names, in resolution order |
-| `isMusl()` | `true` on musl-libc Linux |
+| export                | description                                             |
+| --------------------- | ------------------------------------------------------- |
+| `default`             | absolute path to the `blit` binary (resolved at import) |
+| `binaryPath()`        | same path, computed lazily; throws if unavailable       |
+| `binaryName()`        | `"blit"` or `"blit.exe"`                                |
+| `candidatePackages()` | platform package names, in resolution order             |
+| `isMusl()`            | `true` on musl-libc Linux                               |
 
 ## Platforms
 
