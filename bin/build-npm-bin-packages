@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Repackage release artifacts into npm packages: one data-only package per
-# platform (blit-bin-<os>-<cpu>[-musl]) plus the blit-bin launcher that
+# platform (@blit-sh/bin-<os>-<cpu>[-musl]) plus the @blit-sh/bin launcher that
 # depends on them as optionalDependencies.
 #
 # Usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]
@@ -92,8 +92,8 @@ JSON
 
 Prebuilt \`blit\` binary for $desc.
 
-This is a platform-specific dependency of [\`blit-bin\`](https://www.npmjs.com/package/blit-bin);
-install \`blit-bin\` instead. See <https://blit.sh>.
+This is a platform-specific dependency of [\`@blit-sh/bin\`](https://www.npmjs.com/package/@blit-sh/bin);
+install \`@blit-sh/bin\` instead. See <https://blit.sh>.
 MD
 
   pkg_names+=("$name")
@@ -133,11 +133,11 @@ process_tarball() {
 
   case "$os" in
     linux)
-      write_platform_pkg "blit-bin-linux-$cpu" linux "$cpu" glibc blit "$bin" "Linux $arch (glibc)" ;;
+      write_platform_pkg "@blit-sh/bin-linux-$cpu" linux "$cpu" glibc blit "$bin" "Linux $arch (glibc)" ;;
     linux-musl)
-      write_platform_pkg "blit-bin-linux-$cpu-musl" linux "$cpu" musl blit "$bin" "Linux $arch (musl)" ;;
+      write_platform_pkg "@blit-sh/bin-linux-$cpu-musl" linux "$cpu" musl blit "$bin" "Linux $arch (musl)" ;;
     darwin)
-      write_platform_pkg "blit-bin-darwin-$cpu" darwin "$cpu" "" blit "$bin" "macOS $arch" ;;
+      write_platform_pkg "@blit-sh/bin-darwin-$cpu" darwin "$cpu" "" blit "$bin" "macOS $arch" ;;
     *) echo "error: unknown os '$os' in $f" >&2; exit 1 ;;
   esac
   rm -rf "$tmp"
@@ -163,7 +163,7 @@ process_zip() {
     aarch64) cpu="arm64" ;;
     *) echo "error: unknown arch '$arch' in $f" >&2; exit 1 ;;
   esac
-  write_platform_pkg "blit-bin-win32-$cpu" win32 "$cpu" "" blit.exe "$bin" "Windows $arch"
+  write_platform_pkg "@blit-sh/bin-win32-$cpu" win32 "$cpu" "" blit.exe "$bin" "Windows $arch"
   rm -rf "$tmp"
 }
 
@@ -190,9 +190,9 @@ fi
 # De-duplicate package names (glob fallbacks may match twice).
 mapfile -t pkg_names < <(printf '%s\n' "${pkg_names[@]}" | sort -u)
 
-# --- Launcher package (blit-bin) ---
-launcher_src="$repo_root/npm/blit-bin"
-launcher_out="$out_dir/blit-bin"
+# --- Launcher package (@blit-sh/bin) ---
+launcher_src="$repo_root/npm/bin"
+launcher_out="$out_dir/@blit-sh/bin"
 rm -rf "$launcher_out"
 mkdir -p "$launcher_out/bin"
 for f in index.js index.mjs index.d.ts resolve.js resolve.d.ts README.md; do
@@ -209,14 +209,14 @@ done
 
 cat > "$launcher_out/package.json" <<JSON
 {
-  "name": "blit-bin",
+  "name": "@blit-sh/bin",
   "version": "$version",
   "description": "Installs the prebuilt blit binary for your platform; default export is the binary path.",
   "keywords": ["blit", "terminal", "multiplexer", "wayland", "cli"],
   "homepage": "$HOMEPAGE",
   "license": "$LICENSE",
   "author": "$AUTHOR",
-  "repository": { "type": "git", "url": "$REPO_URL", "directory": "npm/blit-bin" },
+  "repository": { "type": "git", "url": "$REPO_URL", "directory": "npm/bin" },
   "bugs": { "url": "$BUGS_URL" },
   "bin": { "blit": "bin/blit.js" },
   "type": "commonjs",
@@ -241,12 +241,12 @@ cat > "$launcher_out/package.json" <<JSON
   "engines": { "node": ">=18" }
 }
 JSON
-echo "  generated blit-bin launcher (optionalDependencies: ${pkg_names[*]})"
+echo "  generated @blit-sh/bin launcher (optionalDependencies: ${pkg_names[*]})"
 
 # Emit a publish order manifest: platform packages first, launcher last.
 {
   for name in "${pkg_names[@]}"; do echo "$name"; done
-  echo "blit-bin"
+  echo "@blit-sh/bin"
 } > "$out_dir/.publish-order"
 
 echo ""

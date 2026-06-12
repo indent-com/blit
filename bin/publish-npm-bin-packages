@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Publish the generated blit-bin npm packages (platform packages first, then
-# the blit-bin launcher last so optionalDependencies resolve on install).
+# Publish the generated @blit-sh/bin npm packages (platform packages first, then
+# the @blit-sh/bin launcher last so optionalDependencies resolve on install).
 #
 # Usage: publish-npm-bin-packages <packages-dir> [extra npm publish args...]
 #   e.g. publish-npm-bin-packages dist/npm-bin --provenance --access public

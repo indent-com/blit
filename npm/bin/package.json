@@ -1,5 +1,5 @@
 {
-  "name": "blit-bin",
+  "name": "@blit-sh/bin",
   "version": "0.0.0",
   "description": "Installs the prebuilt blit binary for your platform; default export is the binary path.",
   "keywords": [
@@ -15,7 +15,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/indent-com/blit.git",
-    "directory": "npm/blit-bin"
+    "directory": "npm/bin"
   },
   "bugs": {
     "url": "https://github.com/indent-com/blit/issues"
