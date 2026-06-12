@@ -1,13 +1,13 @@
-# blit-bin
+# @blit-sh/bin
 
-The [blit](https://blit.sh) binary, distributed via npm. Installing `blit-bin`
+The [blit](https://blit.sh) binary, distributed via npm. Installing `@blit-sh/bin`
 pulls in exactly one prebuilt package for your platform
-(`blit-bin-<os>-<cpu>[-musl]`) through optional dependencies — nothing else.
+(`@blit-sh/bin-<os>-<cpu>[-musl]`) through optional dependencies — nothing else.
 
 ## CLI
 
 ```sh
-npm i -g blit-bin
+npm i -g @blit-sh/bin
 blit open
 ```
 
@@ -20,7 +20,7 @@ actionable message if the matching prebuilt package was not installed.
 ### ESM
 
 ```js
-import blit from "blit-bin";
+import blit from "@blit-sh/bin";
 import { spawn } from "node:child_process";
 
 spawn(blit, ["open"], { stdio: "inherit" });
@@ -29,7 +29,7 @@ spawn(blit, ["open"], { stdio: "inherit" });
 ### CommonJS
 
 ```js
-const blit = require("blit-bin");
+const blit = require("@blit-sh/bin");
 const { spawn } = require("node:child_process");
 
 spawn(blit, ["open"], { stdio: "inherit" });
@@ -37,12 +37,17 @@ spawn(blit, ["open"], { stdio: "inherit" });
 
 ### Helpers
 
-Lower-level resolution helpers are available on the `blit-bin/resolve` subpath
+Lower-level resolution helpers are available on the `@blit-sh/bin/resolve` subpath
 (and as named exports of the main entry):
 
 ```js
-import { binaryPath, binaryName, candidatePackages, isMusl } from "blit-bin";
-// or: import { binaryPath } from "blit-bin/resolve";
+import {
+  binaryPath,
+  binaryName,
+  candidatePackages,
+  isMusl,
+} from "@blit-sh/bin";
+// or: import { binaryPath } from "@blit-sh/bin/resolve";
 ```
 
 | export                | description                                             |

@@ -16,7 +16,7 @@ const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
 
 if (result.error) {
   process.stderr.write(
-    `blit-bin: failed to launch ${bin}: ${result.error.message}\n`,
+    `@blit-sh/bin: failed to launch ${bin}: ${result.error.message}\n`,
   );
   process.exit(1);
 }

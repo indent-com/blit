@@ -4,7 +4,7 @@
  * is installed.
  *
  * @example
- * import blit from "blit-bin";
+ * import blit from "@blit-sh/bin";
  * import { spawn } from "node:child_process";
  * spawn(blit, ["open"], { stdio: "inherit" });
  */

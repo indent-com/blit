@@ -1,6 +1,6 @@
 "use strict";
 
-// Platform binary resolution for blit-bin. Mirrors the release artifact matrix
+// Platform binary resolution for @blit-sh/bin. Mirrors the release artifact matrix
 // (see bin/build-npm-bin-packages). Kept separate from the public entry points
 // (index.js / index.mjs) so the CLI and both module systems share one copy.
 
@@ -10,10 +10,10 @@ const fs = require("fs");
 function candidatePackages() {
   const platform = process.platform;
   const arch = process.arch;
-  if (platform === "win32") return [`blit-bin-win32-${arch}`];
-  if (platform === "darwin") return [`blit-bin-darwin-${arch}`];
+  if (platform === "win32") return [`@blit-sh/bin-win32-${arch}`];
+  if (platform === "darwin") return [`@blit-sh/bin-darwin-${arch}`];
   if (platform === "linux") {
-    const base = `blit-bin-linux-${arch}`;
+    const base = `@blit-sh/bin-linux-${arch}`;
     // Prefer the libc variant we detect, but fall back to the other.
     return isMusl() ? [`${base}-musl`, base] : [base, `${base}-musl`];
   }
@@ -59,7 +59,7 @@ function binaryPath() {
   }
   throw new Error(
     [
-      `blit-bin: no prebuilt binary found for ${process.platform} ${process.arch}.`,
+      `@blit-sh/bin: no prebuilt binary found for ${process.platform} ${process.arch}.`,
       tried.length ? `Tried optional packages: ${tried.join(", ")}.` : "",
       "Supported: linux x64/arm64 (glibc & musl), darwin arm64, win32 x64.",
       "If your platform is supported, ensure optional dependencies were not",
