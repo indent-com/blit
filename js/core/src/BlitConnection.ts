@@ -8,6 +8,7 @@ import type {
   SessionId,
   TerminalPalette,
 } from "./types";
+import { EXIT_STATUS_UNKNOWN } from "./exit-status";
 import {
   FEATURE_AUDIO,
   FEATURE_COMPOSITOR,
@@ -1257,7 +1258,17 @@ export class BlitConnection {
         const ptyId = bytes[1] | (bytes[2] << 8);
         const sessionId = this.currentSessionIdByPtyId.get(ptyId);
         if (sessionId) {
-          this.updateSession(sessionId, { state: "exited" });
+          // Wire: [0x08][pty_id:2][exit_status:4] (i32 LE). Older servers
+          // may omit the status; default to EXIT_STATUS_UNKNOWN.
+          const exitStatus =
+            bytes.length >= 7
+              ? new DataView(
+                  bytes.buffer,
+                  bytes.byteOffset + 3,
+                  4,
+                ).getInt32(0, true)
+              : EXIT_STATUS_UNKNOWN;
+          this.updateSession(sessionId, { state: "exited", exitStatus });
         }
         return;
       }
@@ -1954,6 +1965,7 @@ export class BlitConnection {
       usedRows: current?.usedRows ?? 0,
       command,
       state,
+      exitStatus: current?.exitStatus ?? null,
     };
     this.currentSessionIdByPtyId.set(ptyId, session.id);
     this.sessionsById.set(session.id, session);

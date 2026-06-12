@@ -17,6 +17,10 @@
       "types": "./src/transports/index.ts",
       "default": "./src/transports/index.ts"
     },
+    "./node": {
+      "types": "./src/node.ts",
+      "default": "./src/node.ts"
+    },
     "./types": {
       "types": "./src/types.ts",
       "default": "./src/types.ts"
@@ -45,6 +49,10 @@
         },
         "types": "./dist/transports/index.d.ts",
         "default": "./dist/transports/index.js"
+      },
+      "./node": {
+        "types": "./dist/node.d.ts",
+        "default": "./dist/node.js"
       },
       "./types": {
         "types": "./dist/types.d.ts",
