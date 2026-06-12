@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# Repackage release artifacts into npm packages: one data-only package per
+# platform (blit-bin-<os>-<cpu>[-musl]) plus the blit-bin launcher that
+# depends on them as optionalDependencies.
+#
+# Usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]
+#
+#   artifacts-dir   directory scanned (recursively) for blit_*.tar.gz and
+#                   blit_*_windows_*.zip release artifacts
+#   out-dir         where generated packages are written
+#   version         optional override; otherwise inferred from filenames
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+in_dir="${1:?usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]}"
+out_dir="${2:?usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]}"
+version_override="${3:-}"
+
+in_dir="$(cd "$in_dir" && pwd)"
+mkdir -p "$out_dir"
+out_dir="$(cd "$out_dir" && pwd)"
+
+HOMEPAGE="https://blit.sh"
+AUTHOR="Indent <oss@indent.com> (https://indent.com)"
+REPO_URL="git+https://github.com/indent-com/blit.git"
+BUGS_URL="https://github.com/indent-com/blit/issues"
+LICENSE="MIT"
+
+extract_zip() {
+  # extract_zip <zip> <dest-dir>
+  local zip="$1" dest="$2"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$zip" -d "$dest"
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xf "$zip" -C "$dest"
+  else
+    echo "error: need 'unzip' or 'bsdtar' to extract $zip" >&2
+    exit 1
+  fi
+}
+
+version=""
+set_version() {
+  local v="$1"
+  if [ -z "$version" ]; then
+    version="$v"
+  elif [ "$version" != "$v" ]; then
+    echo "error: conflicting versions in artifacts: $version vs $v" >&2
+    exit 1
+  fi
+}
+[ -n "$version_override" ] && version="$version_override"
+
+# Track generated platform package names for the launcher manifest.
+pkg_names=()
+
+# write_platform_pkg <pkgName> <nodeOs> <nodeCpu> <libc|''> <binFile> <srcBinary> <descSuffix>
+write_platform_pkg() {
+  local name="$1" os="$2" cpu="$3" libc="$4" binfile="$5" src="$6" desc="$7"
+  local dir="$out_dir/$name"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin"
+  cp "$src" "$dir/bin/$binfile"
+  [ "$binfile" = "blit.exe" ] || chmod 0755 "$dir/bin/$binfile"
+
+  local libc_field=""
+  if [ -n "$libc" ]; then
+    libc_field="\n  \"libc\": [\"$libc\"],"
+  fi
+
+  cat > "$dir/package.json" <<JSON
+{
+  "name": "$name",
+  "version": "$version",
+  "description": "blit binary for $desc",
+  "homepage": "$HOMEPAGE",
+  "license": "$LICENSE",
+  "author": "$AUTHOR",
+  "repository": { "type": "git", "url": "$REPO_URL" },
+  "bugs": { "url": "$BUGS_URL" },
+  "os": ["$os"],
+  "cpu": ["$cpu"],$(printf "$libc_field")
+  "files": ["bin/$binfile", "README.md"],
+  "preferUnplugged": true,
+  "engines": { "node": ">=18" }
+}
+JSON
+
+  cat > "$dir/README.md" <<MD
+# $name
+
+Prebuilt \`blit\` binary for $desc.
+
+This is a platform-specific dependency of [\`blit-bin\`](https://www.npmjs.com/package/blit-bin);
+install \`blit-bin\` instead. See <https://blit.sh>.
+MD
+
+  pkg_names+=("$name")
+  echo "  generated $name ($desc)"
+}
+
+# Split "<os>_<arch>" into os + arch, where arch is a known token that may
+# itself contain an underscore (x86_64).
+split_os_arch() {
+  local s="$1"
+  case "$s" in
+    *_x86_64) split_os="${s%_x86_64}"; split_arch="x86_64" ;;
+    *_aarch64) split_os="${s%_aarch64}"; split_arch="aarch64" ;;
+    *) echo "error: cannot parse os/arch from '$s'" >&2; exit 1 ;;
+  esac
+}
+
+process_tarball() {
+  local f="$1" base os arch v rest
+  base="$(basename "$f" .tar.gz)"           # blit_<ver>_<os>_<arch>
+  rest="${base#blit_}"                       # <ver>_<os>_<arch>
+  v="${rest%%_*}"; rest="${rest#*_}"          # ver, then <os>_<arch>
+  split_os_arch "$rest"; os="$split_os"; arch="$split_arch"
+  set_version "$v"
+
+  local tmp; tmp="$(mktemp -d)"
+  tar -xzf "$f" -C "$tmp"
+  local bin="$tmp/bin/blit"
+  [ -f "$bin" ] || { echo "error: $f has no bin/blit" >&2; exit 1; }
+
+  local cpu
+  case "$arch" in
+    x86_64) cpu="x64" ;;
+    aarch64) cpu="arm64" ;;
+    *) echo "error: unknown arch '$arch' in $f" >&2; exit 1 ;;
+  esac
+
+  case "$os" in
+    linux)
+      write_platform_pkg "blit-bin-linux-$cpu" linux "$cpu" glibc blit "$bin" "Linux $arch (glibc)" ;;
+    linux-musl)
+      write_platform_pkg "blit-bin-linux-$cpu-musl" linux "$cpu" musl blit "$bin" "Linux $arch (musl)" ;;
+    darwin)
+      write_platform_pkg "blit-bin-darwin-$cpu" darwin "$cpu" "" blit "$bin" "macOS $arch" ;;
+    *) echo "error: unknown os '$os' in $f" >&2; exit 1 ;;
+  esac
+  rm -rf "$tmp"
+}
+
+process_zip() {
+  local f="$1" base rest v arch
+  base="$(basename "$f" .zip)"               # blit_<ver>_windows_<arch>
+  rest="${base#blit_}"                       # <ver>_windows_<arch>
+  v="${rest%%_*}"; rest="${rest#*_}"          # ver, then windows_<arch>
+  split_os_arch "$rest"; arch="$split_arch"  # split_os == "windows"
+  set_version "$v"
+
+  local tmp; tmp="$(mktemp -d)"
+  extract_zip "$f" "$tmp"
+  local bin="$tmp/blit.exe"
+  [ -f "$bin" ] || bin="$(find "$tmp" -name blit.exe -print -quit)"
+  [ -n "$bin" ] && [ -f "$bin" ] || { echo "error: $f has no blit.exe" >&2; exit 1; }
+
+  local cpu
+  case "$arch" in
+    x86_64) cpu="x64" ;;
+    aarch64) cpu="arm64" ;;
+    *) echo "error: unknown arch '$arch' in $f" >&2; exit 1 ;;
+  esac
+  write_platform_pkg "blit-bin-win32-$cpu" win32 "$cpu" "" blit.exe "$bin" "Windows $arch"
+  rm -rf "$tmp"
+}
+
+echo "scanning $in_dir for release artifacts..."
+shopt -s nullglob globstar
+for f in "$in_dir"/**/*.tar.gz; do
+  [ -f "$f" ] || continue
+  process_tarball "$f"
+done
+for f in "$in_dir"/**/*_windows_*.zip; do
+  [ -f "$f" ] || continue
+  process_zip "$f"
+done
+
+if [ ${#pkg_names[@]} -eq 0 ]; then
+  echo "error: no blit_*.tar.gz / *_windows_*.zip artifacts found in $in_dir" >&2
+  exit 1
+fi
+if [ -z "$version" ]; then
+  echo "error: could not determine version" >&2
+  exit 1
+fi
+
+# De-duplicate package names (glob fallbacks may match twice).
+mapfile -t pkg_names < <(printf '%s\n' "${pkg_names[@]}" | sort -u)
+
+# --- Launcher package (blit-bin) ---
+launcher_src="$repo_root/npm/blit-bin"
+launcher_out="$out_dir/blit-bin"
+rm -rf "$launcher_out"
+mkdir -p "$launcher_out/bin"
+for f in index.js index.mjs index.d.ts resolve.js resolve.d.ts README.md; do
+  cp "$launcher_src/$f" "$launcher_out/$f"
+done
+cp "$launcher_src/bin/blit.js" "$launcher_out/bin/blit.js"
+
+# Build optionalDependencies JSON object pinned to this version.
+opt_deps=""
+for name in "${pkg_names[@]}"; do
+  [ -n "$opt_deps" ] && opt_deps+=","
+  opt_deps+="\n    \"$name\": \"$version\""
+done
+
+cat > "$launcher_out/package.json" <<JSON
+{
+  "name": "blit-bin",
+  "version": "$version",
+  "description": "Installs the prebuilt blit binary for your platform; default export is the binary path.",
+  "keywords": ["blit", "terminal", "multiplexer", "wayland", "cli"],
+  "homepage": "$HOMEPAGE",
+  "license": "$LICENSE",
+  "author": "$AUTHOR",
+  "repository": { "type": "git", "url": "$REPO_URL", "directory": "npm/blit-bin" },
+  "bugs": { "url": "$BUGS_URL" },
+  "bin": { "blit": "bin/blit.js" },
+  "type": "commonjs",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./resolve": {
+      "types": "./resolve.d.ts",
+      "default": "./resolve.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["bin/blit.js", "index.js", "index.mjs", "index.d.ts", "resolve.js", "resolve.d.ts", "README.md"],
+  "optionalDependencies": {$(printf "$opt_deps")
+  },
+  "engines": { "node": ">=18" }
+}
+JSON
+echo "  generated blit-bin launcher (optionalDependencies: ${pkg_names[*]})"
+
+# Emit a publish order manifest: platform packages first, launcher last.
+{
+  for name in "${pkg_names[@]}"; do echo "$name"; done
+  echo "blit-bin"
+} > "$out_dir/.publish-order"
+
+echo ""
+echo "version: $version"
+echo "packages written to: $out_dir"
+ls -1 "$out_dir"

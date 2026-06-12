@@ -1,0 +1,55 @@
+{
+  "name": "blit-bin",
+  "version": "0.0.0",
+  "description": "Installs the prebuilt blit binary for your platform; default export is the binary path.",
+  "keywords": [
+    "blit",
+    "terminal",
+    "multiplexer",
+    "wayland",
+    "cli"
+  ],
+  "homepage": "https://blit.sh",
+  "license": "MIT",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/indent-com/blit.git",
+    "directory": "npm/blit-bin"
+  },
+  "bugs": {
+    "url": "https://github.com/indent-com/blit/issues"
+  },
+  "bin": {
+    "blit": "bin/blit.js"
+  },
+  "type": "commonjs",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./resolve": {
+      "types": "./resolve.d.ts",
+      "default": "./resolve.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin/blit.js",
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "resolve.js",
+    "resolve.d.ts",
+    "README.md"
+  ],
+  "optionalDependencies": {},
+  "engines": {
+    "node": ">=18"
+  }
+}

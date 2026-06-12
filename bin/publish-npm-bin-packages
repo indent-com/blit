@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Publish the generated blit-bin npm packages (platform packages first, then
+# the blit-bin launcher last so optionalDependencies resolve on install).
+#
+# Usage: publish-npm-bin-packages <packages-dir> [extra npm publish args...]
+#   e.g. publish-npm-bin-packages dist/npm-bin --provenance --access public
+set -euo pipefail
+
+pkgs_dir="${1:?usage: publish-npm-bin-packages <packages-dir> [npm publish args...]}"
+shift || true
+pkgs_dir="$(cd "$pkgs_dir" && pwd)"
+
+order_file="$pkgs_dir/.publish-order"
+if [ ! -f "$order_file" ]; then
+  echo "error: $order_file not found (run build-npm-bin-packages first)" >&2
+  exit 1
+fi
+
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  dir="$pkgs_dir/$name"
+  [ -d "$dir" ] || { echo "error: missing package dir $dir" >&2; exit 1; }
+  echo "=== Publishing $name ==="
+  npm publish "$dir" "$@"
+  echo ""
+done < "$order_file"
+
+echo "done."

@@ -94,6 +94,36 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/publish-npm-packages --provenance --access public
 
+  publish-bin-npm:
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: artifacts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: artifacts
+
+      - name: Build blit-bin npm packages
+        run: ./bin/build-npm-bin-packages artifacts dist/npm-bin "${GITHUB_REF_NAME#v}"
+
+      - name: Publish blit-bin npm packages
+        run: ./bin/publish-npm-bin-packages dist/npm-bin --provenance --access public
+
   update-homebrew:
     needs: [release]
     runs-on: blacksmith-4vcpu-ubuntu-2404
