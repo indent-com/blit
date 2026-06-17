@@ -60,6 +60,11 @@ function isIPadOS(): boolean {
   );
 }
 
+function isAndroid(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /android/i.test(navigator.userAgent);
+}
+
 function effectiveDpr(): number {
   if (typeof window === "undefined") return 1;
   const base = window.devicePixelRatio || 1;
@@ -188,6 +193,10 @@ export class BlitTerminalSurface {
   private _ctrlModifierListeners = new Set<(active: boolean) => void>();
   private _altModifier = false;
   private _altModifierListeners = new Set<(active: boolean) => void>();
+  /** Tracks the composition string already forwarded to the shell on Android,
+   *  so insertCompositionText updates can be streamed letter-by-letter instead
+   *  of waiting for compositionend and dumping the whole word at once. */
+  private _androidCompositionValue = "";
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
@@ -199,6 +208,7 @@ export class BlitTerminalSurface {
 
   // --- event handler refs (for cleanup) ---
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
+  private boundCompositionStart: (() => void) | null = null;
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
   private boundInput: ((e: Event) => void) | null = null;
   private boundScrollListener: (() => void) | null = null;
@@ -1413,6 +1423,21 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Ctrl+Shift+V pastes from the browser clipboard.  Ctrl+V is left as
+      // the terminal's default ^V (quoted-insert) control character.
+      if (
+        e.ctrlKey &&
+        e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        (e.key === "v" || e.key === "V") &&
+        !e.repeat
+      ) {
+        e.preventDefault();
+        void this.pasteFromClipboard();
+        return;
+      }
+
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
       const bytes = keyToBytes(e, appCursor);
@@ -1448,7 +1473,20 @@ export class BlitTerminalSurface {
       return;
     }
 
+    this.boundCompositionStart = () => {
+      this._androidCompositionValue = "";
+    };
+
     this.boundCompositionEnd = (e: CompositionEvent) => {
+      if (isAndroid()) {
+        // On Android we stream insertCompositionText updates letter-by-letter
+        // while the composition is active, so the final word has already been
+        // sent.  Clear the capture buffer so the post-composition input event
+        // (e.g. a space) doesn't duplicate the word.
+        this._androidCompositionValue = "";
+        input.value = "";
+        return;
+      }
       if (e.data && this._sessionId !== null && this.status === "connected") {
         this.sendInput(this._sessionId, encoder.encode(e.data));
       }
@@ -1458,6 +1496,10 @@ export class BlitTerminalSurface {
     this.boundInput = (e: Event) => {
       const inputEvent = e as InputEvent;
       if (inputEvent.isComposing) {
+        if (isAndroid()) {
+          this.handleAndroidCompositionInput(inputEvent);
+          return;
+        }
         if (
           inputEvent.inputType === "deleteContentBackward" &&
           !input.value &&
@@ -1539,6 +1581,7 @@ export class BlitTerminalSurface {
     };
 
     input.addEventListener("keydown", this.boundKeyDown);
+    input.addEventListener("compositionstart", this.boundCompositionStart);
     input.addEventListener("compositionend", this.boundCompositionEnd);
     input.addEventListener("input", this.boundInput);
   }
@@ -1548,12 +1591,73 @@ export class BlitTerminalSurface {
     if (!input) return;
     if (this.boundKeyDown)
       input.removeEventListener("keydown", this.boundKeyDown);
+    if (this.boundCompositionStart)
+      input.removeEventListener("compositionstart", this.boundCompositionStart);
     if (this.boundCompositionEnd)
       input.removeEventListener("compositionend", this.boundCompositionEnd);
     if (this.boundInput) input.removeEventListener("input", this.boundInput);
     this.boundKeyDown = null;
+    this.boundCompositionStart = null;
     this.boundCompositionEnd = null;
     this.boundInput = null;
+  }
+
+  /** Stream Android IME composition updates to the shell one character at a
+   *  time.  Android soft keyboards (Gboard, Samsung) keep the whole word in
+   *  an active composition and only commit it on space/suggestion, which
+   *  makes the terminal feel like it accepts input word-by-word.  By sending
+   *  the delta between consecutive composition values we get letter-by-letter
+   *  behaviour for Latin input while still letting compositionend deliver the
+   *  final result for non-Latin IMEs. */
+  private handleAndroidCompositionInput(inputEvent: InputEvent): void {
+    const input = this.inputEl;
+    if (!input || this._sessionId === null || this.status !== "connected")
+      return;
+
+    const value = input.value;
+    const oldValue = this._androidCompositionValue;
+
+    if (inputEvent.inputType === "deleteContentBackward" && !value) {
+      this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+      this._androidCompositionValue = value;
+      return;
+    }
+
+    if (
+      inputEvent.inputType !== "insertCompositionText" &&
+      inputEvent.inputType !== "insertText"
+    ) {
+      return;
+    }
+
+    if (value.startsWith(oldValue)) {
+      const added = value.slice(oldValue.length);
+      if (added) {
+        this.sendInput(
+          this._sessionId,
+          encoder.encode(added.replace(/\n/g, "\r")),
+        );
+      }
+    } else if (oldValue.startsWith(value)) {
+      const deleted = oldValue.length - value.length;
+      for (let i = 0; i < deleted; i++) {
+        this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+      }
+    } else {
+      // Replacement (autocorrect/suggestion).  Delete what we previously
+      // forwarded and send the new value.
+      for (let i = 0; i < oldValue.length; i++) {
+        this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+      }
+      if (value) {
+        this.sendInput(
+          this._sessionId,
+          encoder.encode(value.replace(/\n/g, "\r")),
+        );
+      }
+    }
+
+    this._androidCompositionValue = value;
   }
 
   // --- Scroll surface ---

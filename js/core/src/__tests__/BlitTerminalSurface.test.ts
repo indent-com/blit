@@ -154,6 +154,192 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
   });
 });
 
+describe("BlitTerminalSurface Ctrl+Shift+V paste shortcut", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      writable: true,
+      value: {
+        writeText: vi.fn().mockResolvedValue(undefined),
+        readText: vi.fn().mockResolvedValue("pasted-text"),
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attachKeyboard(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/compositionend/input listeners.
+    s["setupKeyboard"]();
+    return { s, input };
+  }
+
+  function fireKeyDown(input: HTMLTextAreaElement, init: KeyboardEventInit) {
+    input.dispatchEvent(new KeyboardEvent("keydown", init));
+  }
+
+  it("Ctrl+Shift+V triggers pasteFromClipboard", async () => {
+    const sendInput = vi.fn();
+    const { input } = attachKeyboard(sendInput);
+
+    fireKeyDown(input, {
+      key: "v",
+      code: "KeyV",
+      ctrlKey: true,
+      shiftKey: true,
+      altKey: false,
+      metaKey: false,
+      bubbles: true,
+    });
+
+    expect(navigator.clipboard.readText).toHaveBeenCalled();
+    // pasteFromClipboard is async; wait for it.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    const payload = sendInput.mock.calls[0][1] as Uint8Array;
+    expect(new TextDecoder().decode(payload)).toBe("pasted-text");
+  });
+
+  it("Ctrl+V sends the ^V control character (0x16)", () => {
+    const sendInput = vi.fn();
+    const { input } = attachKeyboard(sendInput);
+
+    fireKeyDown(input, {
+      key: "v",
+      code: "KeyV",
+      ctrlKey: true,
+      shiftKey: false,
+      altKey: false,
+      metaKey: false,
+      bubbles: true,
+    });
+
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    const payload = sendInput.mock.calls[0][1] as Uint8Array;
+    expect(Array.from(payload)).toEqual([0x16]);
+  });
+});
+
+describe("BlitTerminalSurface Android composition", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal("navigator", {
+      userAgent:
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+      platform: "Linux armv8l",
+      maxTouchPoints: 1,
+      clipboard: navigator.clipboard,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function attachAndroid(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/compositionend/input listeners.
+    s["setupKeyboard"]();
+    return { s, input };
+  }
+
+  function fireCompositionInput(
+    input: HTMLTextAreaElement,
+    value: string,
+    inputType: string,
+  ) {
+    input.value = value;
+    const ev = new Event("input") as InputEvent;
+    Object.defineProperty(ev, "inputType", { value: inputType });
+    Object.defineProperty(ev, "isComposing", { value: true });
+    input.dispatchEvent(ev);
+  }
+
+  it("streams insertCompositionText updates letter-by-letter", () => {
+    const sendInput = vi.fn();
+    const { input } = attachAndroid(sendInput);
+
+    input.dispatchEvent(new Event("compositionstart"));
+    fireCompositionInput(input, "h", "insertCompositionText");
+    fireCompositionInput(input, "he", "insertCompositionText");
+    fireCompositionInput(input, "hel", "insertCompositionText");
+    fireCompositionInput(input, "hell", "insertCompositionText");
+    fireCompositionInput(input, "hello", "insertCompositionText");
+    input.dispatchEvent(new CompositionEvent("compositionend", { data: "hello" }));
+
+    const calls = sendInput.mock.calls.map((c) =>
+      new TextDecoder().decode(c[1] as Uint8Array),
+    );
+    expect(calls).toEqual(["h", "e", "l", "l", "o"]);
+  });
+
+  it("sends backspaces when the composition shrinks", () => {
+    const sendInput = vi.fn();
+    const { input } = attachAndroid(sendInput);
+
+    input.dispatchEvent(new Event("compositionstart"));
+    fireCompositionInput(input, "h", "insertCompositionText");
+    fireCompositionInput(input, "he", "insertCompositionText");
+    fireCompositionInput(input, "hel", "insertCompositionText");
+    fireCompositionInput(input, "helo", "insertCompositionText");
+    fireCompositionInput(input, "hel", "insertCompositionText");
+    input.dispatchEvent(new CompositionEvent("compositionend", { data: "hel" }));
+
+    const calls = sendInput.mock.calls.map((c) =>
+      Array.from(c[1] as Uint8Array),
+    );
+    expect(calls).toEqual([[0x68], [0x65], [0x6c], [0x6f], [0x7f]]);
+  });
+
+  it("replaces the composition on autocorrect", () => {
+    const sendInput = vi.fn();
+    const { input } = attachAndroid(sendInput);
+
+    input.dispatchEvent(new Event("compositionstart"));
+    fireCompositionInput(input, "t", "insertCompositionText");
+    fireCompositionInput(input, "te", "insertCompositionText");
+    fireCompositionInput(input, "teh", "insertCompositionText");
+    fireCompositionInput(input, "the", "insertCompositionText");
+    input.dispatchEvent(
+      new CompositionEvent("compositionend", { data: "the" }),
+    );
+
+    const calls = sendInput.mock.calls.map((c) =>
+      Array.from(c[1] as Uint8Array),
+    );
+    // "teh" typed letter-by-letter, then replaced by "the" in one shot.
+    expect(calls).toEqual([
+      [0x74],
+      [0x65],
+      [0x68],
+      [0x7f],
+      [0x7f],
+      [0x7f],
+      [0x74, 0x68, 0x65],
+    ]);
+  });
+});
+
 describe("BlitTerminalSurface iPad autocorrect", () => {
   beforeEach(() => {
     mockCanvasContext();
