@@ -253,7 +253,9 @@ import { NodeUnixSocketTransport, loadBlitWasm } from "@blit-sh/core/node";
 // `@blit-sh/browser/node` build it is returned as-is.)
 const wasm = await loadBlitWasm();
 
-const transport = new NodeUnixSocketTransport(process.env.BLIT_SOCK ?? "/tmp/blit.sock");
+const transport = new NodeUnixSocketTransport(
+  process.env.BLIT_SOCK ?? "/tmp/blit.sock",
+);
 const workspace = new BlitWorkspace({
   wasm,
   logger: nullLogger, // no-op logger; omit to log lifecycle events to console

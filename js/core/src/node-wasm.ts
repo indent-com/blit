@@ -29,9 +29,10 @@ import type { BlitWasmModule } from "./TerminalStore";
  *   with `@blit-sh/browser`.
  */
 export async function loadBlitWasm(wasmPath?: string): Promise<BlitWasmModule> {
-  const mod = (await import("@blit-sh/browser")) as unknown as BlitWasmModule & {
-    default?: unknown;
-  };
+  const mod =
+    (await import("@blit-sh/browser")) as unknown as BlitWasmModule & {
+      default?: unknown;
+    };
 
   // A self-initializing build (`--target nodejs`/`bundler`) has already
   // instantiated the module on import and exposes no `init` default export.
@@ -41,8 +42,12 @@ export async function loadBlitWasm(wasmPath?: string): Promise<BlitWasmModule> {
 
   const location =
     wasmPath ?? import.meta.resolve("@blit-sh/browser/blit_browser_bg.wasm");
-  const path = location.startsWith("file:") ? fileURLToPath(location) : location;
+  const path = location.startsWith("file:")
+    ? fileURLToPath(location)
+    : location;
   const bytes = await readFile(path);
-  await init({ module_or_path: bytes as unknown as Parameters<typeof init>[0] });
+  await init({
+    module_or_path: bytes as unknown as Parameters<typeof init>[0],
+  });
   return mod;
 }
