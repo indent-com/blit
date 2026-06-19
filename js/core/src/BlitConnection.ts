@@ -1262,11 +1262,10 @@ export class BlitConnection {
           // may omit the status; default to EXIT_STATUS_UNKNOWN.
           const exitStatus =
             bytes.length >= 7
-              ? new DataView(
-                  bytes.buffer,
-                  bytes.byteOffset + 3,
-                  4,
-                ).getInt32(0, true)
+              ? new DataView(bytes.buffer, bytes.byteOffset + 3, 4).getInt32(
+                  0,
+                  true,
+                )
               : EXIT_STATUS_UNKNOWN;
           this.updateSession(sessionId, { state: "exited", exitStatus });
         }

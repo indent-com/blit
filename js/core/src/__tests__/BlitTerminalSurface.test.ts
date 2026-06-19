@@ -285,7 +285,9 @@ describe("BlitTerminalSurface Android composition", () => {
     fireCompositionInput(input, "hel", "insertCompositionText");
     fireCompositionInput(input, "hell", "insertCompositionText");
     fireCompositionInput(input, "hello", "insertCompositionText");
-    input.dispatchEvent(new CompositionEvent("compositionend", { data: "hello" }));
+    input.dispatchEvent(
+      new CompositionEvent("compositionend", { data: "hello" }),
+    );
 
     const calls = sendInput.mock.calls.map((c) =>
       new TextDecoder().decode(c[1] as Uint8Array),
@@ -303,7 +305,9 @@ describe("BlitTerminalSurface Android composition", () => {
     fireCompositionInput(input, "hel", "insertCompositionText");
     fireCompositionInput(input, "helo", "insertCompositionText");
     fireCompositionInput(input, "hel", "insertCompositionText");
-    input.dispatchEvent(new CompositionEvent("compositionend", { data: "hel" }));
+    input.dispatchEvent(
+      new CompositionEvent("compositionend", { data: "hel" }),
+    );
 
     const calls = sendInput.mock.calls.map((c) =>
       Array.from(c[1] as Uint8Array),
