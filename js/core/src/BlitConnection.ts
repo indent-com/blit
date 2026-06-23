@@ -504,6 +504,60 @@ export class BlitConnection {
     this.transport.send(buildCloseMessage(session.ptyId));
   }
 
+  /**
+   * Wait for `sessionId` to reach `state === "exited"` or `state === "closed"`
+   * and return the captured `exitStatus`.  Resolves immediately if the session
+   * has already finished.  Resolves with `{ exitStatus: null, timedOut: false }`
+   * if the session is unknown — the caller has nothing else to wait on.
+   *
+   * If `options.timeoutMs` is provided, races the wait against the timeout and
+   * resolves with `{ exitStatus: null, timedOut: true }` if it elapses first.
+   *
+   * Honours {@link EXIT_STATUS_UNKNOWN}: callers that want a conventional
+   * shell exit code should pass the returned `exitStatus` through
+   * {@link exitCodeFromStatus}.
+   */
+  awaitSessionExit(
+    sessionId: SessionId,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<{
+    readonly exitStatus: number | null;
+    readonly timedOut: boolean;
+  }> {
+    const current = this.sessionsById.get(sessionId);
+    if (!current || current.state === "exited" || current.state === "closed") {
+      return Promise.resolve({
+        exitStatus: current?.exitStatus ?? null,
+        timedOut: false,
+      });
+    }
+    return new Promise((resolve) => {
+      let unsubscribe: () => void = () => {};
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (result: {
+        exitStatus: number | null;
+        timedOut: boolean;
+      }): void => {
+        if (timer !== null) clearTimeout(timer);
+        unsubscribe();
+        resolve(result);
+      };
+      if (options?.timeoutMs !== undefined) {
+        timer = setTimeout(
+          () => finish({ exitStatus: null, timedOut: true }),
+          options.timeoutMs,
+        );
+      }
+      unsubscribe = this.subscribe(() => {
+        const session = this.sessionsById.get(sessionId);
+        if (!session) return;
+        if (session.state === "exited" || session.state === "closed") {
+          finish({ exitStatus: session.exitStatus, timedOut: false });
+        }
+      });
+    });
+  }
+
   restartSession(sessionId: SessionId): void {
     const session = this.sessionsById.get(sessionId);
     if (
