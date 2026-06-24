@@ -375,7 +375,7 @@
         postPatch = setupBrowserPkgForDeps + ''
           cd js
         '';
-        hash = "sha256-QJyFd4MRlwpnXcgPPSM2gWFEET2NraI29d2eKb724rg=";
+        hash = "sha256-OdDAEf61IKfbNKowlp4J5VDICuuHntEN/XzsH5wjZw0=";
       };
 
       webAppDist = pkgs.stdenv.mkDerivation {

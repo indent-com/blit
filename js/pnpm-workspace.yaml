@@ -20,6 +20,12 @@ overrides:
   # 7.x line — jsdom@29 imports `undici/lib/handler/wrap-handler.js`,
   # which only exists in undici 7 (the path moved in 8.x).
   undici: "^7.28.0"
+  # CVE-2026-53550: js-yaml <=4.1.1 (4.2.0 is the next patched release).
+  # Pulled in transitively via astro@6.4.8 / @astrojs/internal-helpers.
+  # 5.x dropped the default export, breaking Astro's
+  # `import yaml from 'js-yaml'` — pin to the 4.x line until Astro adopts
+  # the named-only API.
+  "js-yaml": ">=4.2.0 <5"
 
 onlyBuiltDependencies:
   - esbuild
