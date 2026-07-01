@@ -5446,6 +5446,14 @@ fn run_compositor(
         vulkan_renderer.is_some(),
         has_dmabuf,
     );
+    if vulkan_renderer.is_none() {
+        eprintln!(
+            "[compositor] WARNING: no Vulkan renderer — clients can connect but NO frames will be composited (windows will never appear)."
+        );
+        eprintln!(
+            "[compositor] WARNING: install a Vulkan driver; on GPU-less hosts a software driver works (e.g. `apt install mesa-vulkan-drivers` for lavapipe)."
+        );
+    }
 
     // Create globals.
     dh.create_global::<Compositor, WlCompositor, ()>(6, ());
