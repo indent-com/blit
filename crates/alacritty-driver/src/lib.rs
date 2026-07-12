@@ -682,11 +682,16 @@ impl TerminalDriver {
                     line_text.push(zw);
                 }
             }
-            result.push_str(line_text.trim_end());
-
             let is_wrapped = grid_row
                 .last()
                 .is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE));
+            // A soft-wrapped row is full-width: trimming its trailing space would fuse
+            // the word before the wrap onto the next row ("for all" -> "forall").
+            if is_wrapped {
+                result.push_str(&line_text);
+            } else {
+                result.push_str(line_text.trim_end());
+            }
             if line_i < end_i && !is_wrapped {
                 result.push('\n');
             }
@@ -1369,6 +1374,50 @@ mod integration_tests {
         assert_eq!(
             text_to_col[url_char_start], url_col_expected as u16,
             "URL char position {url_char_start} should map to column {url_col_expected}"
+        );
+    }
+
+    /// Regression: when a logical line soft-wraps exactly at a space, snapshotting
+    /// the terminal must not fuse the two words together.
+    ///
+    /// The space that lands in the last column of a WRAPLINE row was being removed by
+    /// `trim_end()` in the text extraction, and because the row is wrapped no `\n` is
+    /// re-inserted, so e.g. "for all" came out as "forall". Observed in blit snapshots
+    /// as run-together words ("thenearest", "acrossrestarts", "andre-enter").
+    #[test]
+    fn wrap_at_space_does_not_fuse_words() {
+        // 10-col terminal. "abcdefghi jkl" fills cols 0-8 with the word, the space at
+        // col 9 (last cell of the wrapped row), then "jkl" continues on the next row.
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        driver.process(b"abcdefghi jkl");
+
+        let frame = driver.snapshot(true, true);
+        assert!(
+            frame.is_wrapped(0),
+            "row 0 should be a soft-wrap continuation"
+        );
+
+        let text = frame.get_all_text();
+        let first_line = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            first_line, "abcdefghi jkl",
+            "wrapped line must preserve the boundary space, got {first_line:?}"
+        );
+    }
+
+    /// Same regression, driven through the driver's own text extraction
+    /// (`get_text_range`, the copy-selection path) rather than the frame snapshot.
+    #[test]
+    fn wrap_at_space_does_not_fuse_words_get_text_range() {
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        driver.process(b"abcdefghi jkl");
+
+        // Bottom of the screen is tail 0; the two used rows are the top of the 24-row
+        // viewport, i.e. tails 23 (word row) and 22 (continuation row).
+        let text = driver.get_text_range(23, 0, 22, 9);
+        assert_eq!(
+            text, "abcdefghi jkl",
+            "wrapped selection must preserve the boundary space, got {text:?}"
         );
     }
 }

@@ -647,8 +647,15 @@ impl FrameState {
                 line.push_str(self.cell_content(row, col));
                 col += 1;
             }
-            result.push_str(line.trim_end());
-            if row < end_row.min(self.rows.saturating_sub(1)) && !self.is_wrapped(row) {
+            let wrapped = self.is_wrapped(row);
+            // A soft-wrapped row is full-width: trimming its trailing space would fuse
+            // the word before the wrap onto the next row ("for all" -> "forall").
+            if wrapped {
+                result.push_str(&line);
+            } else {
+                result.push_str(line.trim_end());
+            }
+            if row < end_row.min(self.rows.saturating_sub(1)) && !wrapped {
                 result.push('\n');
             }
         }
