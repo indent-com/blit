@@ -648,8 +648,7 @@ impl FrameState {
                 col += 1;
             }
             let wrapped = self.is_wrapped(row);
-            // A soft-wrapped row is full-width: trimming its trailing space would fuse
-            // the word before the wrap onto the next row ("for all" -> "forall").
+            // Keep a soft-wrapped row's trailing space: it's the gap between words ("for all", not "forall").
             if wrapped {
                 result.push_str(&line);
             } else {

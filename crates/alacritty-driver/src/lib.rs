@@ -685,8 +685,7 @@ impl TerminalDriver {
             let is_wrapped = grid_row
                 .last()
                 .is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE));
-            // A soft-wrapped row is full-width: trimming its trailing space would fuse
-            // the word before the wrap onto the next row ("for all" -> "forall").
+            // Keep a soft-wrapped row's trailing space: it's the gap between words ("for all", not "forall").
             if is_wrapped {
                 result.push_str(&line_text);
             } else {
@@ -1377,17 +1376,12 @@ mod integration_tests {
         );
     }
 
-    /// Regression: when a logical line soft-wraps exactly at a space, snapshotting
-    /// the terminal must not fuse the two words together.
-    ///
-    /// The space that lands in the last column of a WRAPLINE row was being removed by
-    /// `trim_end()` in the text extraction, and because the row is wrapped no `\n` is
-    /// re-inserted, so e.g. "for all" came out as "forall". Observed in blit snapshots
-    /// as run-together words ("thenearest", "acrossrestarts", "andre-enter").
+    /// Regression: a line soft-wrapping exactly at a space must not fuse the words
+    /// ("for all" -> "forall"); the boundary space in the last WRAPLINE column was
+    /// being trimmed away. Frame-snapshot path (`get_all_text`).
     #[test]
     fn wrap_at_space_does_not_fuse_words() {
-        // 10-col terminal. "abcdefghi jkl" fills cols 0-8 with the word, the space at
-        // col 9 (last cell of the wrapped row), then "jkl" continues on the next row.
+        // Space lands in the last column (9) of the wrapped row; "jkl" continues below.
         let mut driver = TerminalDriver::new(24, 10, 1000);
         driver.process(b"abcdefghi jkl");
 
@@ -1405,15 +1399,13 @@ mod integration_tests {
         );
     }
 
-    /// Same regression, driven through the driver's own text extraction
-    /// (`get_text_range`, the copy-selection path) rather than the frame snapshot.
+    /// Same regression via the driver's `get_text_range` (copy-selection path).
     #[test]
     fn wrap_at_space_does_not_fuse_words_get_text_range() {
         let mut driver = TerminalDriver::new(24, 10, 1000);
         driver.process(b"abcdefghi jkl");
 
-        // Bottom of the screen is tail 0; the two used rows are the top of the 24-row
-        // viewport, i.e. tails 23 (word row) and 22 (continuation row).
+        // tail 0 = bottom row; the two used rows are tails 23 and 22.
         let text = driver.get_text_range(23, 0, 22, 9);
         assert_eq!(
             text, "abcdefghi jkl",
