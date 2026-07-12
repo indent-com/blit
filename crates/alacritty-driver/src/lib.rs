@@ -682,11 +682,15 @@ impl TerminalDriver {
                     line_text.push(zw);
                 }
             }
-            result.push_str(line_text.trim_end());
-
             let is_wrapped = grid_row
                 .last()
                 .is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE));
+            // Keep a soft-wrapped row's trailing space: it's the gap between words ("for all", not "forall").
+            if is_wrapped {
+                result.push_str(&line_text);
+            } else {
+                result.push_str(line_text.trim_end());
+            }
             if line_i < end_i && !is_wrapped {
                 result.push('\n');
             }
@@ -1369,6 +1373,43 @@ mod integration_tests {
         assert_eq!(
             text_to_col[url_char_start], url_col_expected as u16,
             "URL char position {url_char_start} should map to column {url_col_expected}"
+        );
+    }
+
+    /// Regression: a line soft-wrapping exactly at a space must not fuse the words
+    /// ("for all" -> "forall"); the boundary space in the last WRAPLINE column was
+    /// being trimmed away. Frame-snapshot path (`get_all_text`).
+    #[test]
+    fn wrap_at_space_does_not_fuse_words() {
+        // Space lands in the last column (9) of the wrapped row; "jkl" continues below.
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        driver.process(b"abcdefghi jkl");
+
+        let frame = driver.snapshot(true, true);
+        assert!(
+            frame.is_wrapped(0),
+            "row 0 should be a soft-wrap continuation"
+        );
+
+        let text = frame.get_all_text();
+        let first_line = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            first_line, "abcdefghi jkl",
+            "wrapped line must preserve the boundary space, got {first_line:?}"
+        );
+    }
+
+    /// Same regression via the driver's `get_text_range` (copy-selection path).
+    #[test]
+    fn wrap_at_space_does_not_fuse_words_get_text_range() {
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        driver.process(b"abcdefghi jkl");
+
+        // tail 0 = bottom row; the two used rows are tails 23 and 22.
+        let text = driver.get_text_range(23, 0, 22, 9);
+        assert_eq!(
+            text, "abcdefghi jkl",
+            "wrapped selection must preserve the boundary space, got {text:?}"
         );
     }
 }
