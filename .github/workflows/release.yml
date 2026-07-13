@@ -44,19 +44,19 @@ jobs:
     needs: [build-packages, build-windows]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: debs-*
           merge-multiple: true
           path: debs
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: tarballs-*
           merge-multiple: true
           path: tarballs
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-x86_64
           path: windows
@@ -68,7 +68,7 @@ jobs:
           ls -lh windows/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             debs/*.deb
@@ -80,7 +80,7 @@ jobs:
     needs: [release]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/publish-crates
@@ -89,7 +89,7 @@ jobs:
     needs: [release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/publish-npm-packages --provenance --access public
@@ -101,19 +101,22 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: actions/download-artifact@v4
+      # npm >= 11.5 is required for OIDC trusted publishing; Node 22 ships npm 10.
+      - run: npm install -g npm@latest
+
+      - uses: actions/download-artifact@v8
         with:
           pattern: tarballs-*
           merge-multiple: true
           path: artifacts
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-x86_64
           path: artifacts
@@ -129,7 +132,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Update Homebrew tap
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           repository: indent-com/homebrew-tap
@@ -140,21 +143,21 @@ jobs:
     needs: [build-packages, build-windows]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: debs-*
           merge-multiple: true
           path: debs
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: tarballs-*
           merge-multiple: true
           path: tarballs
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-x86_64
           path: windows
@@ -209,7 +212,7 @@ jobs:
           gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
           gpg --batch --yes --armor --clearsign --output dists/stable/InRelease dists/stable/Release
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: repo
 
@@ -217,4 +220,4 @@ jobs:
     needs: [apt-repo]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v5

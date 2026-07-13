@@ -25,7 +25,7 @@ jobs:
             debs: false
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/build-tarballs dist
@@ -39,12 +39,12 @@ jobs:
             cores = 4
       - run: ./bin/build-debs debs
         if: ${{ matrix.debs }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ inputs.upload }}
         with:
           name: tarballs-${{ matrix.label }}
           path: dist/*.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ inputs.upload && matrix.debs }}
         with:
           name: debs-${{ matrix.arch }}
