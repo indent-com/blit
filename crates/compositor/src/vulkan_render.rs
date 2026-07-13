@@ -774,7 +774,14 @@ impl VulkanRenderer {
         // -----------------------------------------------------------
         // BGRA→I420 compute pipeline — planar YUV for software encoders
         // -----------------------------------------------------------
-        eprintln!("[vulkan-render] initialized on {drm_device}");
+        // find_device ignores the DRM node for now, so report the device
+        // Vulkan actually picked rather than the one that was requested.
+        let dev_props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let dev_name = unsafe { std::ffi::CStr::from_ptr(dev_props.device_name.as_ptr()) };
+        eprintln!(
+            "[vulkan-render] initialized: {} (requested {drm_device})",
+            dev_name.to_string_lossy()
+        );
 
         // Query supported DRM format modifiers for each format we accept.
         // Clients (Chromium, mpv, …) will pick from these when allocating
