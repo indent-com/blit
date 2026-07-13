@@ -569,6 +569,10 @@ pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
         max_ptys: 0,
         ping_interval: std::time::Duration::from_secs(10),
         skip_compositor: true,
+        export_sock: std::env::var("BLIT_EXPORT_SOCK")
+            .ok()
+            .map(|v| v == "1")
+            .unwrap_or(false),
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {
@@ -606,6 +610,10 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
         max_ptys: 0,
         ping_interval: std::time::Duration::from_secs(10),
         skip_compositor: true,
+        export_sock: std::env::var("BLIT_EXPORT_SOCK")
+            .ok()
+            .map(|v| v == "1")
+            .unwrap_or(false),
     };
     tokio::spawn(blit_server::run(config));
     for _ in 0..100 {

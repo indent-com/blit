@@ -13,6 +13,7 @@
 | `BLIT_VAAPI_DEVICE`     | `/dev/dri/renderD128`                              | VA-API render node for encoding  |
 | `BLIT_CUDA_DEVICE`      | `0`                                                | CUDA device ordinal (NVENC)      |
 | `BLIT_FD_CHANNEL`       | unset                                              | fd-channel file descriptor       |
+| `BLIT_EXPORT_SOCK`      | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
 | `BLIT_SURFACE_ENCODERS` | see encoder table                                  | Comma-separated encoder priority |
 | `BLIT_SURFACE_QUALITY`  | `medium`                                           | Video quality preset             |
 

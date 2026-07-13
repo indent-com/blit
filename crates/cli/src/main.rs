@@ -360,6 +360,7 @@ async fn async_main() {
             scrollback,
             #[cfg(unix)]
             fd_channel,
+            export_sock,
             verbose,
         } => {
             let ipc_path = socket
@@ -412,6 +413,11 @@ async fn async_main() {
                 max_ptys: 0,
                 ping_interval: std::time::Duration::from_secs(10),
                 skip_compositor: false,
+                export_sock: export_sock
+                    || std::env::var("BLIT_EXPORT_SOCK")
+                        .ok()
+                        .map(|v| v == "1")
+                        .unwrap_or(false),
             };
             blit_server::run(config).await;
         }

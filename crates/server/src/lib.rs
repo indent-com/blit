@@ -69,6 +69,10 @@ pub struct Config {
     pub ping_interval: Duration,
     /// Skip compositor initialization (e.g. for share-only mode).
     pub skip_compositor: bool,
+    /// Export the server's IPC path as `BLIT_SOCK` in spawned terminals so
+    /// `blit` invocations inside them target this server.  Off by default:
+    /// `BLIT_*` is otherwise stripped from child environments.
+    pub export_sock: bool,
 }
 
 trait PtyDriver: Send {

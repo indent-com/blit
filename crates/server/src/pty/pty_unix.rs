@@ -13,6 +13,7 @@ fn build_child_env(
     wayland_display: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
+    blit_sock: Option<&str>,
 ) -> Vec<CString> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
@@ -35,6 +36,12 @@ fn build_child_env(
     };
     set(&mut env, "TERM", "xterm-256color");
     set(&mut env, "COLORTERM", "truecolor");
+    // Opt-in (Config::export_sock): point `blit` invocations inside the
+    // terminal at this server.  Added after the BLIT_* filter above so the
+    // exported value is always the path this server actually listens on.
+    if let Some(sock) = blit_sock {
+        set(&mut env, "BLIT_SOCK", sock);
+    }
     if let Some(wd) = wayland_display {
         let wd_path = std::path::Path::new(wd);
         if let Some(dir) = wd_path.parent() {
@@ -376,7 +383,11 @@ pub fn spawn_pty(
 
     // Build the child's environment before fork() to avoid calling
     // set_var/remove_var after fork in a multi-threaded process (UB per POSIX).
-    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote);
+    let blit_sock = state
+        .config
+        .export_sock
+        .then(|| state.config.ipc_path.as_str());
+    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote, blit_sock);
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -561,7 +572,11 @@ pub fn respawn_child(
     }
 
     // Build the child's environment before fork() (same rationale as spawn_pty).
-    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote);
+    let blit_sock = state
+        .config
+        .export_sock
+        .then(|| state.config.ipc_path.as_str());
+    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote, blit_sock);
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -723,6 +738,7 @@ mod tests {
             Some("/tmp/blit-test/wayland-7"),
             None,
             None,
+            None,
         ));
 
         assert_eq!(
@@ -739,5 +755,22 @@ mod tests {
             Some("wayland"),
         );
         assert!(!env.contains_key("DISPLAY"));
+    }
+
+    #[test]
+    fn child_env_exports_blit_sock_only_when_requested() {
+        let env = child_env_map(build_child_env(None, None, None, None));
+        assert!(!env.contains_key("BLIT_SOCK"));
+
+        let env = child_env_map(build_child_env(
+            None,
+            None,
+            None,
+            Some("/tmp/blit-test.sock"),
+        ));
+        assert_eq!(
+            env.get("BLIT_SOCK").map(String::as_str),
+            Some("/tmp/blit-test.sock")
+        );
     }
 }

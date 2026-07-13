@@ -134,6 +134,11 @@ pub enum Command {
         #[arg(long)]
         fd_channel: Option<i32>,
 
+        /// Export the server socket path as BLIT_SOCK in spawned terminals
+        /// (or set BLIT_EXPORT_SOCK=1)
+        #[arg(long)]
+        export_sock: bool,
+
         /// Enable verbose logging
         #[arg(long, short)]
         verbose: bool,
