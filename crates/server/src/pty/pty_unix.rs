@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Notify, mpsc};
 
 use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
@@ -236,21 +237,51 @@ pub fn close_pty(handle: &PtyHandle) {
 }
 
 pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
+    // Hold the lock across our waitpid so the reap_zombies backstop can't reap
+    // this child (and drop its status) between the table check and the wait.
+    let mut reaped = reaped_statuses().lock().unwrap();
+    if let Some(status) = reaped.remove(&handle.child_pid) {
+        return status;
+    }
     unsafe {
         let mut wstatus: libc::c_int = 0;
         if libc::waitpid(handle.child_pid, &mut wstatus, libc::WNOHANG) > 0 {
-            if libc::WIFEXITED(wstatus) {
-                return libc::WEXITSTATUS(wstatus);
-            } else if libc::WIFSIGNALED(wstatus) {
-                return -(libc::WTERMSIG(wstatus) as i32);
-            }
+            return status_from_wstatus(wstatus);
         }
-        blit_remote::EXIT_STATUS_UNKNOWN
     }
+    blit_remote::EXIT_STATUS_UNKNOWN
 }
 
 pub fn reap_zombies() {
-    unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
+    // Backstop reaper. Record each child's status so its PTY's
+    // collect_exit_status can still report the real code rather than UNKNOWN.
+    let mut reaped = reaped_statuses().lock().unwrap();
+    loop {
+        let mut wstatus: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut wstatus, libc::WNOHANG) };
+        if pid <= 0 {
+            break;
+        }
+        reaped.insert(pid, status_from_wstatus(wstatus));
+    }
+}
+
+/// Statuses reaped by `reap_zombies` before the owning PTY collected them;
+/// drained by `collect_exit_status`, so it stays near-empty in the usual path.
+fn reaped_statuses() -> &'static Mutex<HashMap<libc::pid_t, i32>> {
+    static REAPED: OnceLock<Mutex<HashMap<libc::pid_t, i32>>> = OnceLock::new();
+    REAPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// WEXITSTATUS on normal exit, negated signal if signalled, else UNKNOWN.
+fn status_from_wstatus(wstatus: libc::c_int) -> i32 {
+    if libc::WIFEXITED(wstatus) {
+        libc::WEXITSTATUS(wstatus)
+    } else if libc::WIFSIGNALED(wstatus) {
+        -(libc::WTERMSIG(wstatus) as i32)
+    } else {
+        blit_remote::EXIT_STATUS_UNKNOWN
+    }
 }
 
 pub fn respond_to_queries(handle: &PtyHandle, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
@@ -637,8 +668,44 @@ pub fn respawn_child(
 
 #[cfg(test)]
 mod tests {
-    use super::build_child_env;
+    use super::{PtyHandle, build_child_env, collect_exit_status, reap_zombies};
     use std::collections::HashMap;
+
+    /// Block until `pid` exits but leave it unreaped (`WNOWAIT`), so the reaper
+    /// under test still finds a zombie to consume.
+    fn wait_until_zombie(pid: libc::pid_t) {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(ret, 0, "waitid(WNOWAIT) failed");
+    }
+
+    /// The reap_zombies backstop reaps a PTY child before collect_exit_status
+    /// runs; collect_exit_status must still report the child's real code (42),
+    /// not UNKNOWN (which the client renders as a bogus exit 1).
+    #[test]
+    fn collect_exit_status_survives_backstop_reap() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(42) };
+        }
+
+        wait_until_zombie(pid);
+        reap_zombies();
+
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: pid,
+        };
+        assert_eq!(collect_exit_status(&handle), 42);
+    }
 
     fn child_env_map(env: Vec<std::ffi::CString>) -> HashMap<String, String> {
         env.into_iter()
