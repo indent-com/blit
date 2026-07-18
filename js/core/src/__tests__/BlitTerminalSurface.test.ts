@@ -592,7 +592,9 @@ describe("BlitTerminalSurface iOS backspace repeat", () => {
       fireInput(input, NBSP.repeat(seeded - i), "deleteContentBackward");
     }
 
-    const calls = sendInput.mock.calls.map((c) => Array.from(c[1] as Uint8Array));
+    const calls = sendInput.mock.calls.map((c) =>
+      Array.from(c[1] as Uint8Array),
+    );
     expect(calls).toEqual([[0x7f], [0x7f], [0x7f]]);
     // Buffer is left in place (not emptied) so iOS keeps auto-repeating.
     expect(input.value.length).toBeGreaterThan(0);
@@ -618,9 +620,9 @@ describe("BlitTerminalSurface iOS backspace repeat", () => {
     fireInput(input, seeded + "a", "insertText");
 
     expect(sendInput).toHaveBeenCalledTimes(1);
-    expect(new TextDecoder().decode(sendInput.mock.calls[0][1] as Uint8Array)).toBe(
-      "a",
-    );
+    expect(
+      new TextDecoder().decode(sendInput.mock.calls[0][1] as Uint8Array),
+    ).toBe("a");
     // Field is re-seeded, not emptied.
     expect(input.value.length).toBeGreaterThan(0);
     expect(input.value).toBe(NBSP.repeat(input.value.length));
