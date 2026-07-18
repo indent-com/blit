@@ -582,6 +582,7 @@
           pkgs.cargo-watch
           pkgs.curl
           pkgs.flyctl
+          pkgs.git
           pkgs.libopus
           pkgs.nodejs
           pkgs.pkg-config

@@ -1,4 +1,19 @@
+import {
+  encodeKittyKey,
+  KITTY_SUPPORTED_MASK,
+  type KittyEventType,
+} from "./kitty";
+
 export const encoder = new TextEncoder();
+
+/**
+ * Active kitty keyboard protocol state pulled from the terminal per keystroke.
+ * `flags` is the raw negotiated integer; `eventType` defaults to "press".
+ */
+export interface KittyState {
+  flags: number;
+  eventType?: KittyEventType;
+}
 
 /**
  * Convert a single character to its Ctrl+char byte representation.
@@ -17,13 +32,62 @@ export function ctrlCharToByte(char: string): Uint8Array | null {
 }
 
 /**
+ * macOS "natural text editing" chords, mirroring the default keybinds Ghostty
+ * ships on macOS.  These translate the Cmd/Option editing shortcuts into the
+ * legacy control bytes that readline (bash) and ZLE (zsh) already bind, so they
+ * work at a bare shell prompt with no shell config.
+ *
+ * The caller is responsible for applying these only on macOS and only while the
+ * kitty keyboard protocol is inactive — a kitty-aware app receives the real
+ * combo as CSI-u and does its own line editing.
+ *
+ * Only bare Cmd / bare Option chords match (Shift and the opposite modifier must
+ * be absent), so combos like Cmd+Shift+ArrowLeft fall through to `keyToBytes`.
+ * Returns null when the event is not a recognised editing chord.
+ */
+export function macEditingKeybind(e: KeyboardEvent): Uint8Array | null {
+  // Cmd (super): jump/kill to line edges → Ctrl+U / Ctrl+A / Ctrl+E.
+  if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    switch (e.key) {
+      case "Backspace":
+        return new Uint8Array([0x15]); // Ctrl+U: kill to line start
+      case "ArrowLeft":
+        return new Uint8Array([0x01]); // Ctrl+A: beginning of line
+      case "ArrowRight":
+        return new Uint8Array([0x05]); // Ctrl+E: end of line
+    }
+  }
+  // Option (alt): word-wise editing → Meta-DEL / Meta-b / Meta-f.
+  if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+    switch (e.key) {
+      case "Backspace":
+        return encoder.encode("\x1b\x7f"); // backward-kill-word
+      case "ArrowLeft":
+        return encoder.encode("\x1bb"); // word left
+      case "ArrowRight":
+        return encoder.encode("\x1bf"); // word right
+    }
+  }
+  return null;
+}
+
+/**
  * Encode a keyboard event into the byte sequence expected by the terminal.
  * Returns null if the event should not be forwarded.
  */
 export function keyToBytes(
   e: KeyboardEvent,
   appCursor: boolean,
+  kitty?: KittyState,
 ): Uint8Array | null {
+  // When the kitty keyboard protocol is active, all encoding lives in the
+  // dedicated CSI-u encoder.  flags==0 (after masking) keeps the legacy body
+  // below byte-for-byte identical to what we sent before.
+  const flags = (kitty?.flags ?? 0) & KITTY_SUPPORTED_MASK;
+  if (flags !== 0) {
+    return encodeKittyKey(e, flags, kitty?.eventType ?? "press", appCursor);
+  }
+
   if (e.ctrlKey && !e.altKey && !e.metaKey) {
     // Let Ctrl+Shift+V fall through to the browser so native paste works.
     // On macOS Cmd+V already bypasses this path via the metaKey guard.

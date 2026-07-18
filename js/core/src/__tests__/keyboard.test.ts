@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { keyToBytes } from "../keyboard";
+import { keyToBytes, macEditingKeybind } from "../keyboard";
 
 function makeEvent(
   key: string,
@@ -226,5 +226,108 @@ describe("keyToBytes", () => {
     it("returns null for meta+key", () => {
       expect(keyToBytes(makeEvent("c", { metaKey: true }), false)).toBeNull();
     });
+  });
+
+  describe("kitty delegation", () => {
+    const enc = new TextEncoder();
+
+    it("flags 0 keeps the legacy body byte-identical", () => {
+      // Enter is a CR in legacy mode regardless of the (empty) kitty state.
+      expect(keyToBytes(makeEvent("Enter"), false, { flags: 0 })).toEqual(
+        enc.encode("\r"),
+      );
+    });
+
+    it("delegates Shift+Enter to CSI-u when flags are active", () => {
+      expect(
+        keyToBytes(makeEvent("Enter", { shiftKey: true }), false, { flags: 1 }),
+      ).toEqual(enc.encode("\x1b[13;2u"));
+    });
+
+    it("Cmd+a: null in legacy, CSI-u once kitty is on", () => {
+      expect(keyToBytes(makeEvent("a", { metaKey: true }), false)).toBeNull();
+      expect(
+        keyToBytes(makeEvent("a", { metaKey: true }), false, { flags: 1 }),
+      ).toEqual(enc.encode("\x1b[97;9u"));
+    });
+
+    it("masks unsupported bits: flags 24 ≡ flags 0 (legacy)", () => {
+      expect(keyToBytes(makeEvent("Enter"), false, { flags: 24 })).toEqual(
+        enc.encode("\r"),
+      );
+    });
+
+    it("masks unsupported bits: flags 9 ≡ flags 1", () => {
+      expect(
+        keyToBytes(makeEvent("Enter", { shiftKey: true }), false, { flags: 9 }),
+      ).toEqual(enc.encode("\x1b[13;2u"));
+    });
+
+    it("passes the event type through to the encoder", () => {
+      expect(
+        keyToBytes(makeEvent("ArrowUp"), false, {
+          flags: 3,
+          eventType: "release",
+        }),
+      ).toEqual(enc.encode("\x1b[1;1:3A"));
+    });
+  });
+});
+
+describe("macEditingKeybind", () => {
+  const enc = new TextEncoder();
+
+  it("Cmd chords map to line-edge control bytes", () => {
+    expect(
+      macEditingKeybind(makeEvent("Backspace", { metaKey: true })),
+    ).toEqual(
+      new Uint8Array([0x15]), // Ctrl+U
+    );
+    expect(
+      macEditingKeybind(makeEvent("ArrowLeft", { metaKey: true })),
+    ).toEqual(
+      new Uint8Array([0x01]), // Ctrl+A
+    );
+    expect(
+      macEditingKeybind(makeEvent("ArrowRight", { metaKey: true })),
+    ).toEqual(new Uint8Array([0x05])); // Ctrl+E
+  });
+
+  it("Option chords map to word-wise escape sequences", () => {
+    expect(macEditingKeybind(makeEvent("Backspace", { altKey: true }))).toEqual(
+      enc.encode("\x1b\x7f"),
+    );
+    expect(macEditingKeybind(makeEvent("ArrowLeft", { altKey: true }))).toEqual(
+      enc.encode("\x1bb"),
+    );
+    expect(
+      macEditingKeybind(makeEvent("ArrowRight", { altKey: true })),
+    ).toEqual(enc.encode("\x1bf"));
+  });
+
+  it("requires a bare chord — Shift or the opposite modifier disqualifies", () => {
+    expect(
+      macEditingKeybind(
+        makeEvent("ArrowLeft", { metaKey: true, shiftKey: true }),
+      ),
+    ).toBeNull();
+    expect(
+      macEditingKeybind(
+        makeEvent("Backspace", { metaKey: true, ctrlKey: true }),
+      ),
+    ).toBeNull();
+    expect(
+      macEditingKeybind(
+        makeEvent("ArrowLeft", { metaKey: true, altKey: true }),
+      ),
+    ).toBeNull();
+  });
+
+  it("returns null for unrelated keys and unmodified presses", () => {
+    expect(macEditingKeybind(makeEvent("a", { metaKey: true }))).toBeNull();
+    expect(macEditingKeybind(makeEvent("Backspace"))).toBeNull();
+    expect(
+      macEditingKeybind(makeEvent("ArrowUp", { metaKey: true })),
+    ).toBeNull();
   });
 });

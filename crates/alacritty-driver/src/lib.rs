@@ -13,6 +13,11 @@ use blit_remote::FrameState;
 
 const CELL_SIZE: usize = blit_remote::CELL_SIZE;
 
+// Kitty keyboard protocol flags live in TermMode bits 18-22
+// (DISAMBIGUATE_ESC_CODES .. REPORT_ASSOCIATED_TEXT).  We surface them to the
+// browser as a small integer by shifting the masked bits down to bit 0.
+const KITTY_FLAGS_SHIFT: u32 = 18;
+
 // ── Search scoring constants ────────────────────────────────────────────
 
 const SEARCH_TITLE_BASE: u32 = 1400;
@@ -312,6 +317,10 @@ impl alacritty_terminal::vte::ansi::Timeout for NoSyncTimeout {
 struct BlitEventProxy {
     title: Arc<Mutex<Option<String>>>,
     clipboard_stores: Arc<Mutex<Vec<String>>>,
+    /// Bytes the terminal wants written back to the PTY (query replies such as
+    /// the kitty `CSI ? u` capability response).  The server drains these after
+    /// each `process()` and writes them to the PTY master.
+    pty_writes: Arc<Mutex<Vec<String>>>,
 }
 
 impl BlitEventProxy {
@@ -319,6 +328,7 @@ impl BlitEventProxy {
         Self {
             title: Arc::new(Mutex::new(None)),
             clipboard_stores: Arc::new(Mutex::new(Vec::new())),
+            pty_writes: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn take_title(&self) -> Option<String> {
@@ -326,6 +336,9 @@ impl BlitEventProxy {
     }
     fn take_clipboard_stores(&self) -> Vec<String> {
         std::mem::take(&mut *self.clipboard_stores.lock().unwrap())
+    }
+    fn take_pty_writes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pty_writes.lock().unwrap())
     }
 }
 
@@ -340,6 +353,12 @@ impl EventListener for BlitEventProxy {
             }
             Event::ClipboardStore(_, text) => {
                 self.clipboard_stores.lock().unwrap().push(text);
+            }
+            // The terminal replies to some queries (kitty `CSI ? u`, DSR, etc.)
+            // by asking the host to write bytes back to the PTY.  We used to
+            // drop these; capture them so the server can forward them.
+            Event::PtyWrite(text) => {
+                self.pty_writes.lock().unwrap().push(text);
             }
             _ => {}
         }
@@ -415,6 +434,12 @@ impl TerminalDriver {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let config = Config {
             scrolling_history: scrollback,
+            // Enable the kitty keyboard protocol machinery in the fork: it
+            // early-returns on every push/pop/query unless this is set (the
+            // fork's default is `false`).  With it on, `Term` tracks the
+            // push/pop flag stack in `TermMode` bits 18-22 and emits the
+            // `CSI ? u` capability reply via `Event::PtyWrite`.
+            kitty_keyboard: true,
             ..Config::default()
         };
         let dims = TermDims {
@@ -584,6 +609,19 @@ impl TerminalDriver {
         self.event_proxy.take_clipboard_stores()
     }
 
+    /// Bytes the terminal wants written back to the PTY since the last drain
+    /// (e.g. the kitty `CSI ? u` capability reply).  The server writes these to
+    /// the PTY master after each `process()`.
+    pub fn take_pty_writes(&mut self) -> Vec<String> {
+        self.event_proxy.take_pty_writes()
+    }
+
+    /// Active kitty keyboard protocol flags (bits 18-22 of `TermMode`, shifted
+    /// to bit 0).  0 when the protocol is inactive.
+    pub fn kitty_flags(&self) -> u8 {
+        ((*self.term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> KITTY_FLAGS_SHIFT) as u8
+    }
+
     pub fn synced_output(&self) -> bool {
         self.modes.synced_output
     }
@@ -617,6 +655,7 @@ impl TerminalDriver {
             mode,
         );
         frame.set_scrollback_lines(scrollback_lines.min(u32::MAX as usize) as u32);
+        frame.set_kitty_flags(self.kitty_flags());
         frame
     }
 
@@ -628,6 +667,9 @@ impl TerminalDriver {
 
         let mut frame = self.build_frame(offset, rows as usize, cols as usize, 0, 0, 0);
         frame.set_scrollback_lines(scrollback_lines.min(u32::MAX as usize) as u32);
+        // Keep the real kitty flags while scrolled back — the keyboard mode is
+        // a property of the running app, not of the viewport position.
+        frame.set_kitty_flags(self.kitty_flags());
         frame
     }
 
@@ -1239,6 +1281,28 @@ mod tests {
         let mut driver = TerminalDriver::new(24, 80, 1000);
         driver.resize(40, 120);
         assert_eq!(driver.size(), (40, 120));
+    }
+
+    #[test]
+    fn kitty_keyboard_protocol() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        assert_eq!(driver.kitty_flags(), 0);
+
+        // Push the disambiguate flag (CSI > 1 u).
+        driver.process(b"\x1b[>1u");
+        assert_eq!(driver.kitty_flags(), 1);
+        // The snapshot must carry the live flags too.
+        assert_eq!(driver.snapshot(true, true).kitty_flags(), 1);
+
+        // The capability query echoes the current flags as CSI ? <flags> u and
+        // is exposed as a pty write (drained once).
+        driver.process(b"\x1b[?u");
+        assert_eq!(driver.take_pty_writes(), vec!["\x1b[?1u".to_string()]);
+        assert!(driver.take_pty_writes().is_empty());
+
+        // Pop (CSI < u) restores the empty flag set.
+        driver.process(b"\x1b[<u");
+        assert_eq!(driver.kitty_flags(), 0);
     }
 }
 
