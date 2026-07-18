@@ -126,6 +126,10 @@ function ArcButton(props: {
   onPress: () => void;
   active?: boolean;
   disabled?: boolean;
+  // When set, fire onPress from a real `click` instead of `pointerdown`.
+  // iOS Safari only authorises clipboard reads inside a genuine click/touch
+  // gesture, and preventDefault() on pointerdown suppresses that click.
+  clickToActivate?: boolean;
   onPointerDown?: (e: PointerEvent) => void;
   onPointerMove?: (e: PointerEvent) => void;
   onPointerUp?: (e: PointerEvent) => void;
@@ -153,10 +157,16 @@ function ArcButton(props: {
         type="button"
         disabled={props.disabled}
         onPointerDown={(e) => {
-          e.preventDefault();
+          // Click-activated buttons must let the native click through, so
+          // don't preventDefault (which would cancel it on iOS Safari).
+          if (!props.clickToActivate) e.preventDefault();
           e.stopPropagation();
-          if (props.disabled) return;
+          if (props.disabled || props.clickToActivate) return;
           props.onPointerDown?.(e) ?? props.onPress();
+        }}
+        onClick={() => {
+          if (!props.clickToActivate || props.disabled) return;
+          props.onPress();
         }}
         onPointerMove={props.onPointerMove}
         onPointerUp={props.onPointerUp}
@@ -322,6 +332,8 @@ export default function MobileToolbar(props: {
     const surface = props.surface();
     if (!surface) return;
     void surface.pasteFromClipboard();
+    // Keep the keyboard up: some browsers move focus to the tapped button.
+    surface.focus();
     setIsOpen(false);
   };
 
@@ -403,6 +415,7 @@ export default function MobileToolbar(props: {
             index={6}
             open={isOpen()}
             disabled={!canPaste}
+            clickToActivate
             onPress={handlePaste}
           >
             <span class="text-[10px] font-mono">Paste</span>

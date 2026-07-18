@@ -32,6 +32,10 @@ function ToolbarButton(props: {
   active?: boolean;
   wide?: boolean;
   disabled?: boolean;
+  // When set, fire onPress from a real `click` instead of `pointerdown`.
+  // iOS Safari only authorises clipboard reads inside a genuine click/touch
+  // gesture, and preventDefault() on pointerdown suppresses that click.
+  clickToActivate?: boolean;
   theme: Theme;
   scale: UIScale;
 }) {
@@ -40,9 +44,15 @@ function ToolbarButton(props: {
       type="button"
       disabled={props.disabled}
       onPointerDown={(e) => {
-        e.preventDefault();
+        // Click-activated buttons must let the native click through, so
+        // don't preventDefault (which would cancel it on iOS Safari).
+        if (!props.clickToActivate) e.preventDefault();
         e.stopPropagation();
-        if (props.disabled) return;
+        if (props.disabled || props.clickToActivate) return;
+        props.onPress();
+      }}
+      onClick={() => {
+        if (!props.clickToActivate || props.disabled) return;
         props.onPress();
       }}
       title={props.title}
@@ -192,6 +202,8 @@ export function MobileToolbar(props: {
     const surface = props.surface();
     if (!surface) return;
     void surface.pasteFromClipboard();
+    // Keep the keyboard up: some browsers move focus to the tapped button.
+    surface.focus();
   };
 
   const toggleCtrl = () => {
@@ -274,6 +286,7 @@ export function MobileToolbar(props: {
           title="Paste clipboard"
           onPress={handlePaste}
           disabled={!canPaste}
+          clickToActivate
           wide
           theme={props.theme}
           scale={props.scale}
