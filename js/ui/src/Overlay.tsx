@@ -1,7 +1,13 @@
 import type { JSX } from "solid-js";
 import { Show } from "solid-js";
 import type { TerminalPalette } from "@blit-sh/core";
-import { layout, overlayChromeStyles, themeFor, uiScale } from "./theme";
+import {
+  layout,
+  overlayChromeStyles,
+  scrollbarStyle,
+  themeFor,
+  uiScale,
+} from "./theme";
 import { t } from "./i18n";
 
 export function OverlayBackdrop(props: {
@@ -51,6 +57,7 @@ export function OverlayPanel(props: {
       style={{
         ...layout.panel,
         ...styles().panel,
+        ...scrollbarStyle(themeFor(props.palette)),
         "font-size": `${scale().md}px`,
         ...props.style,
       }}

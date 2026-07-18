@@ -184,6 +184,18 @@ export function themeFor(source: boolean | TerminalPalette): Theme {
   return themeFromPalette(source);
 }
 
+/**
+ * Thin, theme-matched scrollbar for scrollable overlay lists/panels.
+ * Spread into the style of any `overflow: auto` container so it renders a
+ * subtle scrollbar instead of the chunky native one.
+ */
+export function scrollbarStyle(theme: Theme): JSX.CSSProperties {
+  return {
+    "scrollbar-width": "thin",
+    "scrollbar-color": `${theme.border} transparent`,
+  };
+}
+
 export const sidebarWidth = "20em";
 
 /** Centralized z-index scale (increments of 10 for easy insertion). */

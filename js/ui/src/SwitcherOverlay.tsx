@@ -28,6 +28,7 @@ import type {
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 import {
   overlayChromeStyles,
+  scrollbarStyle,
   sessionName,
   sessionPrefix,
   sidebarWidth,
@@ -1860,6 +1861,7 @@ export function SwitcherOverlay(props: {
                 "align-content": "start",
                 gap: `${scale().tightGap}px`,
                 "padding-right": "2px",
+                ...scrollbarStyle(theme()),
               }}
             >
               <For each={sections()}>

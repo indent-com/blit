@@ -1,7 +1,7 @@
 import { createSignal, createEffect, onMount, For } from "solid-js";
 import { PALETTES } from "@blit-sh/core";
 import type { TerminalPalette } from "@blit-sh/core";
-import { themeFor, ui, uiScale } from "./theme";
+import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { t, tp } from "./i18n";
 
@@ -223,6 +223,7 @@ export function PaletteOverlay(props: {
               outline: "none",
               "max-height": "20em",
               overflow: "auto",
+              ...scrollbarStyle(theme),
             }}
           >
             <For each={filtered()}>
