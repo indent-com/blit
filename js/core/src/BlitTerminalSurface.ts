@@ -69,6 +69,30 @@ function isAndroid(): boolean {
   return /android/i.test(navigator.userAgent);
 }
 
+function isIOS(): boolean {
+  if (typeof navigator === "undefined") return false;
+  // iPadOS reports as MacIntel — isIPadOS() covers that via maxTouchPoints.
+  return isIPadOS() || /iPhone|iPod/.test(navigator.platform);
+}
+
+// iOS soft keyboards only auto-repeat Backspace while the focused field still
+// has content to delete.  The hidden capture textarea is otherwise empty, so a
+// held Backspace fires a single deleteContentBackward and stops.  We keep the
+// textarea seeded with this filler run so iOS's own key-repeat streams a
+// deleteContentBackward per repeat; each one forwards a DEL and consumes one
+// filler char.  U+00A0 (NBSP) is a real, deletable character the user will
+// never type, so it is trivial to strip back off the typed-text path.
+const IOS_PAD_CODE = 0x00a0;
+const IOS_PAD = String.fromCharCode(IOS_PAD_CODE).repeat(64);
+
+/** Strip the leading NBSP filler run seeded into the iOS capture textarea,
+ *  leaving only the text the user actually typed/pasted. */
+function stripIosPad(value: string): string {
+  let i = 0;
+  while (i < value.length && value.charCodeAt(i) === IOS_PAD_CODE) i++;
+  return value.slice(i);
+}
+
 function effectiveDpr(): number {
   if (typeof window === "undefined") return 1;
   const base = window.devicePixelRatio || 1;
@@ -201,6 +225,12 @@ export class BlitTerminalSurface {
    *  so insertCompositionText updates can be streamed letter-by-letter instead
    *  of waiting for compositionend and dumping the whole word at once. */
   private _androidCompositionValue = "";
+  /** True when the hidden textarea is kept seeded with filler so iOS soft
+   *  keyboards auto-repeat a held Backspace (see IOS_PAD). */
+  private _iosPad = false;
+  /** Idle timer that tops the iOS filler buffer back up once a Backspace
+   *  repeat burst ends (re-padding mid-burst would cancel iOS's repeat). */
+  private _iosRepadTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
@@ -278,6 +308,47 @@ export class BlitTerminalSurface {
 
   focus(): void {
     this.inputEl?.focus();
+    // Re-seed the iOS Backspace-repeat filler in case the field was cleared.
+    this.seedIosPad();
+  }
+
+  /** Fill the hidden textarea with the NBSP filler buffer and park the cursor
+   *  at the end, so a held Backspace on the iOS soft keyboard keeps having
+   *  content to delete and iOS auto-repeats the deletion.  No-op off iOS. */
+  private seedIosPad(): void {
+    if (!this._iosPad) return;
+    const input = this.inputEl;
+    if (!input) return;
+    if (this._iosRepadTimer !== null) {
+      clearTimeout(this._iosRepadTimer);
+      this._iosRepadTimer = null;
+    }
+    input.value = IOS_PAD;
+    const end = IOS_PAD.length;
+    try {
+      input.setSelectionRange(end, end);
+    } catch {
+      // Some browsers reject setSelectionRange on a detached/hidden field.
+    }
+  }
+
+  /** Top the filler buffer back up once a Backspace repeat burst has gone
+   *  idle.  Re-padding while the burst is live would reset the field and
+   *  cancel iOS's key-repeat, so we wait for a gap between deletions. */
+  private scheduleIosRepad(): void {
+    if (!this._iosPad) return;
+    if (this._iosRepadTimer !== null) clearTimeout(this._iosRepadTimer);
+    this._iosRepadTimer = setTimeout(() => {
+      this._iosRepadTimer = null;
+      this.seedIosPad();
+    }, 400);
+  }
+
+  /** Reset the capture textarea after an input event: re-seed the iOS filler
+   *  buffer, or just empty the field on every other platform. */
+  private resetCaptureField(): void {
+    if (this._iosPad) this.seedIosPad();
+    else if (this.inputEl) this.inputEl.value = "";
   }
 
   /**
@@ -1368,6 +1439,10 @@ export class BlitTerminalSurface {
     const input = this.inputEl;
     if (!input) return;
 
+    // iOS soft keyboards need the capture textarea to stay non-empty for a
+    // held Backspace to auto-repeat.  Read-only surfaces never take input.
+    this._iosPad = !this._readOnly && isIOS();
+
     this.boundKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (this._sessionId === null || this.status !== "connected") return;
@@ -1523,7 +1598,9 @@ export class BlitTerminalSurface {
       if (e.data && this._sessionId !== null && this.status === "connected") {
         this.sendInput(this._sessionId, encoder.encode(e.data));
       }
-      input.value = "";
+      // Re-seed the iOS filler so Backspace-repeat keeps working after a
+      // dictation/accent composition (no-op off iOS → empties the field).
+      this.resetCaptureField();
     };
 
     this.boundInput = (e: Event) => {
@@ -1543,6 +1620,20 @@ export class BlitTerminalSurface {
         }
         return;
       }
+      // iOS soft-keyboard Backspace: the textarea is kept seeded with NBSP
+      // filler (see IOS_PAD) so a held Backspace always has content to delete
+      // and iOS streams a deleteContentBackward per key-repeat.  Forward one
+      // DEL each and leave the now-shorter buffer alone — re-padding here would
+      // reset the field and cancel iOS's repeat.  Top it back up once the burst
+      // goes idle, or immediately if it is about to run dry mid-hold.
+      if (this._iosPad && inputEvent.inputType === "deleteContentBackward") {
+        if (this._sessionId !== null && this.status === "connected") {
+          this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+        }
+        if (input.value.length <= 4) this.seedIosPad();
+        else this.scheduleIosRepad();
+        return;
+      }
       // iPadOS (and desktop spellcheck) ignore autocorrect="off" on this
       // hidden capture textarea and instead deliver autocorrect/suggestion
       // substitutions as an "insertReplacementText" input event.  Each
@@ -1551,49 +1642,52 @@ export class BlitTerminalSurface {
       // duplicate and "correct" terminal input.  Drop it — this is what makes
       // autocorrect-off actually stick on iPad keyboards.
       if (inputEvent.inputType === "insertReplacementText") {
-        input.value = "";
+        this.resetCaptureField();
         return;
       }
+      // On iOS the field carries the filler buffer; strip it so we only act on
+      // what the user actually typed/pasted.
+      const typed = this._iosPad ? stripIosPad(input.value) : input.value;
       // Ctrl modifier: convert the next typed character to Ctrl+char
       if (
         this._ctrlModifier &&
-        input.value &&
+        typed &&
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        const char = input.value[0];
+        const char = typed[0];
         const bytes = ctrlCharToByte(char);
         if (bytes) {
           this.sendInput(this._sessionId, bytes);
         }
         this.setCtrlModifier(false);
-        input.value = "";
+        this.resetCaptureField();
         return;
       }
       // Alt modifier: prefix next typed character with ESC
       if (
         this._altModifier &&
-        input.value &&
+        typed &&
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        const char = input.value[0];
+        const char = typed[0];
         const charCode = char.charCodeAt(0);
         this.sendInput(this._sessionId, new Uint8Array([0x1b, charCode]));
         this.setAltModifier(false);
-        input.value = "";
+        this.resetCaptureField();
         return;
       }
-      if (inputEvent.inputType === "deleteContentBackward" && !input.value) {
+      if (inputEvent.inputType === "deleteContentBackward" && !typed) {
         if (this._sessionId !== null && this.status === "connected") {
           this.sendInput(this._sessionId, new Uint8Array([0x7f]));
         }
       } else if (
-        input.value &&
+        typed &&
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        const payload = encoder.encode(input.value.replace(/\n/g, "\r"));
+        const payload = encoder.encode(typed.replace(/\n/g, "\r"));
         const isPaste = inputEvent.inputType === "insertFromPaste";
         const t = this.terminal;
         if (isPaste && t && t.bracketed_paste()) {
@@ -1610,7 +1704,7 @@ export class BlitTerminalSurface {
           this.sendInput(this._sessionId, payload);
         }
       }
-      input.value = "";
+      this.resetCaptureField();
     };
 
     this.boundPaste = (e: ClipboardEvent) => this.handlePaste(e);
@@ -1620,6 +1714,8 @@ export class BlitTerminalSurface {
     input.addEventListener("compositionend", this.boundCompositionEnd);
     input.addEventListener("input", this.boundInput);
     input.addEventListener("paste", this.boundPaste);
+
+    this.seedIosPad();
   }
 
   private teardownKeyboard(): void {
@@ -1638,6 +1734,10 @@ export class BlitTerminalSurface {
       this._ctrlVFallbackTimer = null;
     }
     this._ctrlVPastePending = false;
+    if (this._iosRepadTimer !== null) {
+      clearTimeout(this._iosRepadTimer);
+      this._iosRepadTimer = null;
+    }
     this.boundKeyDown = null;
     this.boundCompositionStart = null;
     this.boundCompositionEnd = null;

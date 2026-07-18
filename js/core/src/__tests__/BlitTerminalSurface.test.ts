@@ -531,6 +531,102 @@ describe("BlitTerminalSurface iPad autocorrect", () => {
   });
 });
 
+describe("BlitTerminalSurface iOS backspace repeat", () => {
+  const NBSP = String.fromCharCode(0xa0);
+
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal("navigator", {
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      platform: "iPhone",
+      maxTouchPoints: 5,
+      clipboard: navigator.clipboard,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function attachIOS(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/compositionend/input listeners.
+    s["setupKeyboard"]();
+    return { s, input };
+  }
+
+  function fireInput(
+    input: HTMLTextAreaElement,
+    value: string,
+    inputType: string,
+  ) {
+    input.value = value;
+    const ev = new Event("input") as InputEvent;
+    Object.defineProperty(ev, "inputType", { value: inputType });
+    Object.defineProperty(ev, "isComposing", { value: false });
+    input.dispatchEvent(ev);
+  }
+
+  it("seeds the capture textarea with non-empty filler", () => {
+    const { input } = attachIOS(vi.fn());
+    expect(input.value.length).toBeGreaterThan(0);
+    expect(input.value).toBe(NBSP.repeat(input.value.length));
+  });
+
+  it("forwards a DEL for each deleteContentBackward while the buffer holds", () => {
+    const sendInput = vi.fn();
+    const { input } = attachIOS(sendInput);
+    const seeded = input.value.length;
+
+    // iOS deletes one filler char per key-repeat; each fires its own event.
+    for (let i = 1; i <= 3; i++) {
+      fireInput(input, NBSP.repeat(seeded - i), "deleteContentBackward");
+    }
+
+    const calls = sendInput.mock.calls.map((c) => Array.from(c[1] as Uint8Array));
+    expect(calls).toEqual([[0x7f], [0x7f], [0x7f]]);
+    // Buffer is left in place (not emptied) so iOS keeps auto-repeating.
+    expect(input.value.length).toBeGreaterThan(0);
+  });
+
+  it("re-seeds the buffer before it runs dry mid-hold", () => {
+    const sendInput = vi.fn();
+    const { input } = attachIOS(sendInput);
+
+    // Simulate the buffer nearly exhausted; the handler tops it back up.
+    fireInput(input, NBSP.repeat(2), "deleteContentBackward");
+    expect(Array.from(sendInput.mock.calls.at(-1)![1] as Uint8Array)).toEqual([
+      0x7f,
+    ]);
+    expect(input.value.length).toBeGreaterThan(4);
+  });
+
+  it("forwards only the typed character, not the filler", () => {
+    const sendInput = vi.fn();
+    const { input } = attachIOS(sendInput);
+    const seeded = input.value;
+
+    fireInput(input, seeded + "a", "insertText");
+
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1] as Uint8Array)).toBe(
+      "a",
+    );
+    // Field is re-seeded, not emptied.
+    expect(input.value.length).toBeGreaterThan(0);
+    expect(input.value).toBe(NBSP.repeat(input.value.length));
+  });
+});
+
 describe("BlitTerminalSurface DPR detection", () => {
   beforeEach(() => {
     mockCanvasContext();
