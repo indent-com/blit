@@ -1806,6 +1806,10 @@ export function SwitcherOverlay(props: {
                   ? t("switcher.newTerminalPlaceholder")
                   : t("switcher.placeholder")
               }
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
               style={{
                 ...ui.input,
                 flex: 1,
