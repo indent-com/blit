@@ -211,10 +211,13 @@ describe("BlitTerminalSurface Ctrl+Shift+V paste shortcut", () => {
     expect(new TextDecoder().decode(payload)).toBe("pasted-text");
   });
 
-  it("Ctrl+V sends the ^V control character (0x16)", () => {
+  it("Ctrl+V sends the ^V control character (0x16) when no paste follows", async () => {
     const sendInput = vi.fn();
     const { input } = attachKeyboard(sendInput);
 
+    // Ctrl+V now defers ^V so a `paste` event can forward a clipboard image
+    // first.  When no paste event materialises (jsdom dispatches none), the
+    // fallback timer sends the raw ^V so quoted-insert still works.
     fireKeyDown(input, {
       key: "v",
       code: "KeyV",
@@ -226,9 +229,126 @@ describe("BlitTerminalSurface Ctrl+Shift+V paste shortcut", () => {
     });
 
     expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(sendInput).toHaveBeenCalledTimes(1);
     const payload = sendInput.mock.calls[0][1] as Uint8Array;
     expect(Array.from(payload)).toEqual([0x16]);
+  });
+});
+
+describe("BlitTerminalSurface Ctrl+V image paste", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      writable: true,
+      value: {
+        writeText: vi.fn().mockResolvedValue(undefined),
+        readText: vi.fn().mockResolvedValue(""),
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attach(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    const sendClipboard = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — connection exposing a connected transport + clipboard.
+    s["_blitConn"] = { transport: { status: "connected" }, sendClipboard };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/input/paste listeners.
+    s["setupKeyboard"]();
+    return { s, input, sendClipboard };
+  }
+
+  function firePaste(input: HTMLTextAreaElement, file: File | null) {
+    const item: DataTransferItem = {
+      kind: file ? "file" : "string",
+      type: file ? file.type : "text/plain",
+      getAsFile: () => file,
+      getAsString: () => {},
+      webkitGetAsEntry: () => null,
+    } as unknown as DataTransferItem;
+    const clipboardData = {
+      items: file ? ([item] as unknown as DataTransferItemList) : null,
+      getData: () => "",
+    } as unknown as DataTransfer;
+    const ev = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: clipboardData });
+    input.dispatchEvent(ev);
+    return ev;
+  }
+
+  it("forwards a pasted image to the server clipboard then sends ^V", async () => {
+    const sendInput = vi.fn();
+    const { input, sendClipboard } = attach(sendInput);
+
+    // Arm the Ctrl+V deferral, as a real keydown would.
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        ctrlKey: true,
+        bubbles: true,
+      }),
+    );
+
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]); // PNG magic
+    const file = new File([bytes], "clip.png", { type: "image/png" });
+    const ev = firePaste(input, file);
+
+    // The textarea paste is consumed so it doesn't also emit an input event.
+    expect(ev.defaultPrevented).toBe(true);
+    // arrayBuffer() resolves on a microtask; let it settle.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sendClipboard).toHaveBeenCalledTimes(1);
+    expect(sendClipboard.mock.calls[0][0]).toBe("image/png");
+    expect(Array.from(sendClipboard.mock.calls[0][1] as Uint8Array)).toEqual(
+      Array.from(bytes),
+    );
+    // ^V is sent after the image so the app reads a populated clipboard.
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([
+      0x16,
+    ]);
+  });
+
+  it("cancels the fallback ^V once the image paste is handled", async () => {
+    const sendInput = vi.fn();
+    const { input, sendClipboard } = attach(sendInput);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        ctrlKey: true,
+        bubbles: true,
+      }),
+    );
+    const file = new File([new Uint8Array([1, 2, 3])], "clip.png", {
+      type: "image/png",
+    });
+    firePaste(input, file);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    // Let the (now-cancelled) fallback timer window elapse.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Exactly one ^V — the fallback timer must not double-send.
+    expect(sendClipboard).toHaveBeenCalledTimes(1);
+    expect(sendInput).toHaveBeenCalledTimes(1);
   });
 });
 

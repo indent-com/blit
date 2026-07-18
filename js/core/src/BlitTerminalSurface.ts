@@ -8,6 +8,10 @@ import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 
+// The ^V control byte.  Sent for a plain Ctrl+V (quoted-insert in shells, and
+// the paste-trigger TUIs like Claude Code use to read the clipboard).
+const CTRL_V = 0x16;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -211,7 +215,18 @@ export class BlitTerminalSurface {
   private boundCompositionStart: (() => void) | null = null;
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
   private boundInput: ((e: Event) => void) | null = null;
+  private boundPaste: ((e: ClipboardEvent) => void) | null = null;
   private boundScrollListener: (() => void) | null = null;
+
+  // --- Ctrl+V image-paste deferral ---
+  // Ctrl+V is the paste shortcut TUIs like Claude Code read an image from the
+  // clipboard on.  A textarea can't hold an image, so we grab it from the
+  // browser `paste` event and offer it to the server clipboard *before*
+  // letting the app process ^V.  These fields coordinate the keydown (which
+  // arms the deferral) with the paste handler / fallback timer (which sends
+  // the ^V byte once the clipboard has been forwarded).
+  private _ctrlVPastePending = false;
+  private _ctrlVFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private mouseCleanup: (() => void) | null = null;
   private windowResizeHandler: (() => void) | null = null;
 
@@ -1438,6 +1453,24 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Ctrl+V (no Shift): TUIs like Claude Code read an image from the
+      // clipboard when they receive ^V.  A textarea can't surface a pasted
+      // image via the `input` event, so we must let the browser fire a
+      // `paste` event (do NOT preventDefault here), grab any image there, and
+      // offer it to the server clipboard before ^V reaches the app.  The
+      // paste handler / fallback timer sends the ^V byte itself.
+      if (
+        e.ctrlKey &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        (e.key === "v" || e.key === "V") &&
+        !e.repeat
+      ) {
+        this.beginCtrlVPaste();
+        return;
+      }
+
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
       const bytes = keyToBytes(e, appCursor);
@@ -1580,10 +1613,13 @@ export class BlitTerminalSurface {
       input.value = "";
     };
 
+    this.boundPaste = (e: ClipboardEvent) => this.handlePaste(e);
+
     input.addEventListener("keydown", this.boundKeyDown);
     input.addEventListener("compositionstart", this.boundCompositionStart);
     input.addEventListener("compositionend", this.boundCompositionEnd);
     input.addEventListener("input", this.boundInput);
+    input.addEventListener("paste", this.boundPaste);
   }
 
   private teardownKeyboard(): void {
@@ -1596,10 +1632,122 @@ export class BlitTerminalSurface {
     if (this.boundCompositionEnd)
       input.removeEventListener("compositionend", this.boundCompositionEnd);
     if (this.boundInput) input.removeEventListener("input", this.boundInput);
+    if (this.boundPaste) input.removeEventListener("paste", this.boundPaste);
+    if (this._ctrlVFallbackTimer !== null) {
+      clearTimeout(this._ctrlVFallbackTimer);
+      this._ctrlVFallbackTimer = null;
+    }
+    this._ctrlVPastePending = false;
     this.boundKeyDown = null;
     this.boundCompositionStart = null;
     this.boundCompositionEnd = null;
     this.boundInput = null;
+    this.boundPaste = null;
+  }
+
+  // --- Ctrl+V image paste ---------------------------------------------------
+
+  /** Arm the Ctrl+V deferral: don't send ^V yet, wait for the `paste` event
+   *  to forward any clipboard image first.  A fallback timer sends the raw
+   *  ^V if no paste event materialises (empty clipboard, denied permission,
+   *  or a browser that won't fire paste without content) so quoted-insert and
+   *  app paste-triggers still work. */
+  private beginCtrlVPaste(): void {
+    if (this._sessionId === null || this.status !== "connected") return;
+    // A pending press being replaced (autorepeat is filtered by !e.repeat, but
+    // guard anyway): flush the old one as a plain ^V before re-arming.
+    if (this._ctrlVFallbackTimer !== null) {
+      clearTimeout(this._ctrlVFallbackTimer);
+      this._ctrlVFallbackTimer = null;
+    }
+    // Scrolling back and pasting should jump to the live prompt, matching the
+    // keyToBytes input path.
+    if (this.scrollOffset > 0) {
+      this.scrollOffset = 0;
+      this.sendScroll(this._sessionId, 0);
+    }
+    this._ctrlVPastePending = true;
+    this._ctrlVFallbackTimer = setTimeout(() => {
+      this._ctrlVFallbackTimer = null;
+      if (this._ctrlVPastePending) {
+        this._ctrlVPastePending = false;
+        this.sendCtrlV();
+      }
+    }, 0);
+  }
+
+  private sendCtrlV(): void {
+    if (this._readOnly) return;
+    if (this._sessionId === null || this.status !== "connected") return;
+    this.sendInput(this._sessionId, new Uint8Array([CTRL_V]));
+  }
+
+  /** Find the first image entry on a clipboard payload, if any. */
+  private findClipboardImage(dt: DataTransfer | null): DataTransferItem | null {
+    const items = dt?.items;
+    if (!items) return null;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === "file" && it.type.startsWith("image/")) return it;
+    }
+    return null;
+  }
+
+  private handlePaste(e: ClipboardEvent): void {
+    if (this._readOnly) return;
+    if (this._sessionId === null || this.status !== "connected") return;
+
+    // Consume the pending Ctrl+V arm (if this paste came from Ctrl+V) so the
+    // fallback timer doesn't also fire a ^V.
+    const wasCtrlV = this._ctrlVPastePending;
+    this._ctrlVPastePending = false;
+    if (this._ctrlVFallbackTimer !== null) {
+      clearTimeout(this._ctrlVFallbackTimer);
+      this._ctrlVFallbackTimer = null;
+    }
+
+    const imageItem = wasCtrlV
+      ? this.findClipboardImage(e.clipboardData)
+      : null;
+
+    if (imageItem) {
+      // We own this paste: stop the textarea from doing anything with it (it
+      // can't hold an image anyway) and forward the bytes to the server
+      // clipboard, then trigger the app's read with ^V.
+      e.preventDefault();
+      const file = imageItem.getAsFile();
+      const conn = this._blitConn;
+      const sid = this._sessionId;
+      if (!file || !conn) {
+        this.sendCtrlV();
+        return;
+      }
+      const mime = file.type || "image/png";
+      void file
+        .arrayBuffer()
+        .then((buf) => {
+          if (this._sessionId !== sid || this.status !== "connected") return;
+          // Transport messages are ordered, so the clipboard is populated
+          // server-side before the ^V input arrives and the app reads it.
+          conn.sendClipboard(mime, new Uint8Array(buf));
+          this.sendInput(sid, new Uint8Array([CTRL_V]));
+        })
+        .catch(() => {
+          // Reading the blob failed — fall back to a bare ^V so the keypress
+          // isn't swallowed entirely.
+          this.sendCtrlV();
+        });
+      return;
+    }
+
+    if (wasCtrlV) {
+      // Plain Ctrl+V with no image: preserve ^V (quoted-insert / paste-trigger)
+      // and suppress the textarea's own text paste so we don't double-send.
+      e.preventDefault();
+      this.sendCtrlV();
+    }
+    // Otherwise (Cmd+V / Ctrl+Shift+V text paste): leave it to the existing
+    // input(insertFromPaste) path — do not touch the event.
   }
 
   /** Stream Android IME composition updates to the shell one character at a
