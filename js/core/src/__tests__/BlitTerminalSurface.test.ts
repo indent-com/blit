@@ -789,3 +789,249 @@ describe("BlitTerminalSurface native scroll surface", () => {
     expect(el.scrollTop).toBe(1000);
   });
 });
+
+describe("BlitTerminalSurface kitty keyboard protocol", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Minimal Terminal stub exposing just what the keydown path reads. */
+  function mockTerminal(kittyFlags: number) {
+    return {
+      kitty_flags: () => kittyFlags,
+      app_cursor: () => false,
+      echo: () => false,
+      bracketed_paste: () => false,
+      scrollback_lines: () => 0,
+      cursor_row: 0,
+      cursor_col: 0,
+    };
+  }
+
+  function attach(kittyFlags: number) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    const sendInput = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    // @ts-expect-error — install the fake terminal directly.
+    s["terminal"] = mockTerminal(kittyFlags);
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/keyup/blur listeners.
+    s["setupKeyboard"]();
+    return { s, input, sendInput };
+  }
+
+  const dec = new TextDecoder();
+  const sent = (fn: ReturnType<typeof vi.fn>, i: number) =>
+    dec.decode(fn.mock.calls[i][1] as Uint8Array);
+
+  it("forwards Shift+Enter as CSI-u", () => {
+    const { input, sendInput } = attach(1);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        shiftKey: true,
+        bubbles: true,
+      }),
+    );
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(sent(sendInput, 0)).toBe("\x1b[13;2u");
+  });
+
+  it("tags an autorepeat with :2", () => {
+    const { input, sendInput } = attach(3);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowUp",
+        code: "ArrowUp",
+        repeat: true,
+        bubbles: true,
+      }),
+    );
+    expect(sent(sendInput, 0)).toBe("\x1b[1;1:2A");
+  });
+
+  it("emits a release on keyup only when event types are on", () => {
+    // flags 3 → event reporting on: keyup re-emits a release.
+    const withEvents = attach(3);
+    withEvents.input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowUp",
+        code: "ArrowUp",
+        bubbles: true,
+      }),
+    );
+    withEvents.input.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "ArrowUp",
+        code: "ArrowUp",
+        bubbles: true,
+      }),
+    );
+    expect(withEvents.sendInput).toHaveBeenCalledTimes(2);
+    expect(sent(withEvents.sendInput, 1)).toBe("\x1b[1;1:3A");
+
+    // flags 1 → no event reporting: keyup sends nothing.
+    const noEvents = attach(1);
+    noEvents.input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowUp",
+        code: "ArrowUp",
+        bubbles: true,
+      }),
+    );
+    noEvents.input.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "ArrowUp",
+        code: "ArrowUp",
+        bubbles: true,
+      }),
+    );
+    expect(noEvents.sendInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("synthesizes releases for held keys on blur and clears them", () => {
+    const { input, sendInput } = attach(3);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowUp",
+        code: "ArrowUp",
+        bubbles: true,
+      }),
+    );
+    expect(sendInput).toHaveBeenCalledTimes(1);
+
+    input.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+    expect(sendInput).toHaveBeenCalledTimes(2);
+    expect(sent(sendInput, 1)).toBe("\x1b[1;1:3A");
+
+    // A second blur has nothing left to flush.
+    input.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+    expect(sendInput).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not preventDefault Cmd+C / Cmd+V (native copy/paste survives)", () => {
+    const { input, sendInput } = attach(1);
+    for (const key of ["c", "v"]) {
+      const ev = new KeyboardEvent("keydown", {
+        key,
+        code: key === "c" ? "KeyC" : "KeyV",
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      input.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(false);
+    }
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+});
+
+describe("BlitTerminalSurface macOS editing keybinds", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mockTerminal(kittyFlags: number) {
+    return {
+      kitty_flags: () => kittyFlags,
+      app_cursor: () => false,
+      echo: () => false,
+      bracketed_paste: () => false,
+      scrollback_lines: () => 0,
+      cursor_row: 0,
+      cursor_col: 0,
+    };
+  }
+
+  function attach(opts: { macKeybinds: boolean; kittyFlags?: number }) {
+    const s = new BlitTerminalSurface({
+      sessionId: "s1",
+      macKeybinds: opts.macKeybinds,
+    });
+    const sendInput = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    // @ts-expect-error — install the fake terminal directly.
+    s["terminal"] = mockTerminal(opts.kittyFlags ?? 0);
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown listeners.
+    s["setupKeyboard"]();
+    return { s, input, sendInput };
+  }
+
+  const dec = new TextDecoder();
+  const sent = (fn: ReturnType<typeof vi.fn>, i: number) =>
+    dec.decode(fn.mock.calls[i][1] as Uint8Array);
+
+  function press(input: HTMLTextAreaElement, init: KeyboardEventInit) {
+    const ev = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    });
+    input.dispatchEvent(ev);
+    return ev;
+  }
+
+  it("Cmd+Backspace kills to line start (Ctrl+U)", () => {
+    const { input, sendInput } = attach({ macKeybinds: true });
+    const ev = press(input, {
+      key: "Backspace",
+      code: "Backspace",
+      metaKey: true,
+    });
+    expect(ev.defaultPrevented).toBe(true);
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([
+      0x15,
+    ]);
+  });
+
+  it("Option+ArrowLeft moves a word left (Meta-b)", () => {
+    const { input, sendInput } = attach({ macKeybinds: true });
+    press(input, { key: "ArrowLeft", code: "ArrowLeft", altKey: true });
+    expect(sent(sendInput, 0)).toBe("\x1bb");
+  });
+
+  it("yields to the kitty protocol when it is active", () => {
+    // flags 1 → kitty on: Cmd+Backspace forwards as CSI-u, not Ctrl+U.
+    const { input, sendInput } = attach({ macKeybinds: true, kittyFlags: 1 });
+    press(input, { key: "Backspace", code: "Backspace", metaKey: true });
+    expect(sent(sendInput, 0)).toBe("\x1b[127;9u");
+  });
+
+  it("falls through to the legacy byte when disabled", () => {
+    // Without the keybind, Cmd+Backspace is just the legacy DEL (0x7f), not the
+    // kill-to-line-start Ctrl+U (0x15).
+    const { input, sendInput } = attach({ macKeybinds: false });
+    press(input, { key: "Backspace", code: "Backspace", metaKey: true });
+    expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([
+      0x7f,
+    ]);
+  });
+
+  it("still lets Cmd+C reach native copy", () => {
+    const { input, sendInput } = attach({ macKeybinds: true });
+    const ev = press(input, { key: "c", code: "KeyC", metaKey: true });
+    expect(ev.defaultPrevented).toBe(false);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+});

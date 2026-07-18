@@ -762,6 +762,10 @@ impl Terminal {
     pub fn scrollback_lines(&self) -> u32 {
         self.inner.frame().scrollback_lines()
     }
+    /// Active kitty keyboard protocol flags (0 when inactive).
+    pub fn kitty_flags(&self) -> u8 {
+        self.inner.frame().kitty_flags()
+    }
     pub fn cursor_visible(&self) -> bool {
         self.inner.mode() & 1 != 0
     }

@@ -376,6 +376,10 @@ pub struct FrameState {
     line_flags: Vec<u8>,
     /// Total scrollback lines available for this PTY.
     scrollback_lines: u32,
+    /// Active kitty keyboard protocol flags (bits 18-22 of the terminal mode,
+    /// shifted to bit 0).  0 when the protocol is inactive.  Surfaced to the
+    /// browser so `keyToBytes` can emit CSI-u encoding.
+    kitty_flags: u8,
 }
 
 impl FrameState {
@@ -392,6 +396,7 @@ impl FrameState {
             overflow: BTreeMap::new(),
             line_flags: vec![0; rows as usize],
             scrollback_lines: 0,
+            kitty_flags: 0,
         }
     }
 
@@ -469,6 +474,14 @@ impl FrameState {
 
     pub fn set_scrollback_lines(&mut self, lines: u32) {
         self.scrollback_lines = lines;
+    }
+
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_flags
+    }
+
+    pub fn set_kitty_flags(&mut self, flags: u8) {
+        self.kitty_flags = flags;
     }
 
     pub fn is_wrapped(&self, row: u16) -> bool {
@@ -1011,6 +1024,11 @@ impl TerminalState {
                 payload[after_line_flags + 2],
                 payload[after_line_flags + 3],
             ]);
+        }
+        // Trailing kitty keyboard flags (backward-compatible extension).
+        // Guard on length so short payloads from older servers are tolerated.
+        if payload.len() >= after_line_flags + 5 {
+            self.frame.kitty_flags = payload[after_line_flags + 4];
         }
 
         self.frame.cursor_row = new_cursor_row.min(self.frame.rows.saturating_sub(1));
@@ -2543,11 +2561,14 @@ pub fn build_update_msg(
     }
 
     if op_count == 0 {
-        // No cell changes — still emit a frame if cursor/mode/title changed.
+        // No cell changes — still emit a frame if cursor/mode/title/kitty
+        // changed.  A bare kitty push/pop (`CSI > 1 u`) alters no cells, so
+        // without this gate the flag change would never reach the client.
         if !title_changed
             && current.cursor_row == previous.cursor_row
             && current.cursor_col == previous.cursor_col
             && current.mode == previous.mode
+            && current.kitty_flags == previous.kitty_flags
         {
             return None;
         }
@@ -2597,7 +2618,8 @@ pub fn build_update_msg(
             } else {
                 0
             }
-            + 4,
+            + 4
+            + 1,
     );
     payload.extend_from_slice(&current.rows.to_le_bytes());
     payload.extend_from_slice(&current.cols.to_le_bytes());
@@ -2616,6 +2638,9 @@ pub fn build_update_msg(
     }
     // Trailing scrollback count — old clients ignore extra bytes.
     payload.extend_from_slice(&current.scrollback_lines.to_le_bytes());
+    // Trailing kitty keyboard flags — another backward-compatible extension;
+    // old clients stop reading after the scrollback count and ignore it.
+    payload.push(current.kitty_flags);
 
     let compressed = compress_prepend_size(&payload);
     let mut msg = Vec::with_capacity(3 + compressed.len());
@@ -3049,6 +3074,60 @@ mod tests {
         };
         term.feed_compressed(payload);
         assert_eq!(term.title(), "");
+    }
+
+    #[test]
+    fn kitty_flags_change_emits_frame_and_round_trips() {
+        // A bare kitty flag change touches no cells, cursor, mode, or title, so
+        // the diff gate must still force an update.
+        let style = CellStyle::default();
+        let mut prev = FrameState::new(1, 4);
+        prev.write_text(0, 0, "hi", style);
+        let mut next = prev.clone();
+        next.set_kitty_flags(1);
+        let delta = build_update_msg(3, &next, &prev).expect("flags-only change must emit a frame");
+
+        let mut term = TerminalState::new(1, 4);
+        let baseline = build_update_msg(3, &prev, &FrameState::default()).unwrap();
+        let ServerMsg::Update { payload, .. } = parse_server_msg(&baseline).unwrap() else {
+            panic!("expected update");
+        };
+        term.feed_compressed(payload);
+        assert_eq!(term.frame().kitty_flags(), 0);
+
+        let ServerMsg::Update { payload, .. } = parse_server_msg(&delta).unwrap() else {
+            panic!("expected update");
+        };
+        // The frame carries no visible change, only the flag, so the return
+        // bool may be false; the flag itself must land.
+        term.feed_compressed(payload);
+        assert_eq!(term.frame().kitty_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_flags_short_payload_tolerated() {
+        // Simulate an older server that never appended the kitty byte: drop the
+        // trailing byte and confirm the client applies cleanly, leaving flags 0.
+        let style = CellStyle::default();
+        let mut next = FrameState::new(1, 4);
+        next.write_text(0, 0, "hi", style);
+        next.set_kitty_flags(1);
+        let msg = build_update_msg(1, &next, &FrameState::default()).unwrap();
+        let ServerMsg::Update { payload, .. } = parse_server_msg(&msg).unwrap() else {
+            panic!("expected update");
+        };
+        let raw = decompress_size_prepended(payload).unwrap();
+
+        // Full payload → flags applied.
+        let mut full = TerminalState::new(1, 4);
+        full.apply_payload(&raw);
+        assert_eq!(full.frame().kitty_flags(), 1);
+
+        // Truncated payload (kitty byte missing) → tolerated, no panic, flags
+        // left at their default 0.
+        let mut truncated = TerminalState::new(1, 4);
+        truncated.apply_payload(&raw[..raw.len() - 1]);
+        assert_eq!(truncated.frame().kitty_flags(), 0);
     }
 
     #[test]

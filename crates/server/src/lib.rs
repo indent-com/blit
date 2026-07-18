@@ -83,6 +83,7 @@ trait PtyDriver: Send {
     fn search_result(&self, query: &str) -> Option<PtySearchResult>;
     fn take_title_dirty(&mut self) -> bool;
     fn take_clipboard_stores(&mut self) -> Vec<String>;
+    fn take_pty_writes(&mut self) -> Vec<String>;
     fn used_rows(&self) -> u16;
     fn take_used_rows_dirty(&mut self) -> bool;
     fn cursor_position(&self) -> (u16, u16);
@@ -152,6 +153,10 @@ impl PtyDriver for AlacrittyDriver {
 
     fn take_clipboard_stores(&mut self) -> Vec<String> {
         AlacrittyDriver::take_clipboard_stores(self)
+    }
+
+    fn take_pty_writes(&mut self) -> Vec<String> {
+        AlacrittyDriver::take_pty_writes(self)
     }
 
     fn used_rows(&self) -> u16 {
@@ -367,6 +372,16 @@ struct Pty {
     command: Option<String>,
     /// Explicit working directory used to create this PTY.
     cwd: Option<String>,
+}
+
+/// Forward any bytes the terminal wants written back to the PTY (kitty
+/// `CSI ? u` capability reply, etc.).  Called right after `driver.process()`
+/// and before `respond_to_queries` so terminal-generated replies precede our
+/// own DA1/DSR answers.
+fn drain_pty_writes(pty: &mut Pty) {
+    for text in pty.driver.take_pty_writes() {
+        pty::pty_write_handle(&pty.handle, text.as_bytes());
+    }
 }
 
 impl Pty {
@@ -4331,24 +4346,32 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             match input {
                 PtyInput::Data(data) => {
+                    // Process first so the terminal can push/pop kitty modes and
+                    // generate its own replies (the `CSI ? u` capability
+                    // response), then drain those replies to the PTY, and only
+                    // then answer our own DA1/DSR queries.  Kitty probes send
+                    // `CSI ? u` + `CSI c` together; a DA1-first reply reads as
+                    // "no kitty", so the kitty reply must go out first.
+                    pty.driver.process(&data);
+                    drain_pty_writes(pty);
                     pty::respond_to_queries(
                         &pty.handle,
                         &data,
                         pty.driver.size(),
                         pty.driver.cursor_position(),
                     );
-                    pty.driver.process(&data);
                     pty.mark_dirty();
                 }
                 PtyInput::SyncBoundary { before } => {
                     if !before.is_empty() {
+                        pty.driver.process(&before);
+                        drain_pty_writes(pty);
                         pty::respond_to_queries(
                             &pty.handle,
                             &before,
                             pty.driver.size(),
                             pty.driver.cursor_position(),
                         );
-                        pty.driver.process(&before);
                         pty.mark_dirty();
                     }
                     if !pty.driver.synced_output() {
@@ -8351,6 +8374,25 @@ mod tests {
     fn parse_tq_unknown_final_byte_ignored() {
         let results = parse_terminal_queries(b"\x1b[42z", (24, 80), (0, 0));
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_tq_kitty_keyboard_sequences_ignored() {
+        // The kitty keyboard protocol reuses the `u` final byte with `?`, `=`,
+        // `>`, and `<` intermediates.  The terminal driver owns those replies;
+        // parse_terminal_queries must never answer them (or it would race the
+        // driver's `CSI ? u` reply and DA1).
+        for seq in [
+            &b"\x1b[?u"[..],    // capability query
+            &b"\x1b[=1;1u"[..], // set flags
+            &b"\x1b[>1u"[..],   // push flags
+            &b"\x1b[<u"[..],    // pop flags
+        ] {
+            assert!(
+                parse_terminal_queries(seq, (24, 80), (0, 0)).is_empty(),
+                "should ignore {seq:?}",
+            );
+        }
     }
 
     #[test]

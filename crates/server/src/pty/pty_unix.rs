@@ -297,6 +297,12 @@ pub fn respond_to_queries(handle: &PtyHandle, data: &[u8], size: (u16, u16), cur
     }
 }
 
+/// Write raw bytes to the PTY master.  Used to forward terminal-generated
+/// replies (e.g. the kitty `CSI ? u` capability response) back to the child.
+pub fn pty_write_handle(handle: &PtyHandle, data: &[u8]) {
+    pty_write_all(handle.master_fd, data);
+}
+
 pub fn pty_reader(fd: PtyWriteTarget, tx: mpsc::Sender<PtyInput>, notify: Arc<Notify>) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);

@@ -5,12 +5,35 @@ import type { TerminalPalette, ConnectionStatus, SessionId } from "./types";
 import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
 import { measureCell, cssFontFamily, type CellMetrics } from "./measure";
 import type { GlRenderer } from "./gl-renderer";
-import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
+import {
+  keyToBytes,
+  ctrlCharToByte,
+  encoder,
+  macEditingKeybind,
+  type KittyState,
+} from "./keyboard";
+import {
+  encodeKittyKey,
+  KITTY_EVENT_TYPES,
+  KITTY_SUPPORTED_MASK,
+} from "./kitty";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 
 // The ^V control byte.  Sent for a plain Ctrl+V (quoted-insert in shells, and
 // the paste-trigger TUIs like Claude Code use to read the clipboard).
 const CTRL_V = 0x16;
+
+// Snapshot of a keydown, kept per `e.code` while the kitty event-types flag is
+// on so a keyup (or a blur, for keys stuck by Cmd+Tab) can be re-encoded as a
+// release event.
+interface SavedKeyEvent {
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -27,6 +50,12 @@ export interface BlitTerminalSurfaceOptions {
   scrollbarColor?: string;
   scrollbarWidth?: number;
   advanceRatio?: number;
+  /**
+   * Enable the macOS "natural text editing" keybinds (Cmd+Backspace → kill to
+   * line start, Cmd/Option+arrows, etc.).  Defaults to true on macOS.  Only
+   * applied while the kitty keyboard protocol is inactive.
+   */
+  macKeybinds?: boolean;
 }
 
 export interface BlitTerminalSurfaceHandle {
@@ -73,6 +102,14 @@ function isIOS(): boolean {
   if (typeof navigator === "undefined") return false;
   // iPadOS reports as MacIntel — isIPadOS() covers that via maxTouchPoints.
   return isIPadOS() || /iPhone|iPod/.test(navigator.platform);
+}
+
+// Desktop macOS (and iPad with a hardware keyboard, which reports as Mac).  Used
+// to enable the "natural text editing" Cmd/Option keybinds by default; the chord
+// itself requires a physical Cmd/Option key, so this stays inert elsewhere.
+function isMacOS(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Mac/i.test(navigator.platform || navigator.userAgent);
 }
 
 // iOS soft keyboards only auto-repeat Backspace while the focused field still
@@ -143,6 +180,7 @@ export class BlitTerminalSurface {
   private _scrollbarColor: string | undefined;
   private _scrollbarWidth: number;
   private _advanceRatio: number | undefined;
+  private _macKeybinds: boolean;
 
   // --- external collaborators ---
   private _workspace: BlitWorkspace | null = null;
@@ -260,6 +298,14 @@ export class BlitTerminalSurface {
   private mouseCleanup: (() => void) | null = null;
   private windowResizeHandler: (() => void) | null = null;
 
+  // --- Kitty keyboard protocol release tracking ---
+  // While the terminal negotiates event reporting (flag 2), each forwarded
+  // keydown is saved by `e.code` so its keyup — or a blur, which papers over
+  // Cmd+Tab losing the keyup — can be re-emitted as a CSI-u release.
+  private boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
+  private boundBlur: (() => void) | null = null;
+  private kittyPressed = new Map<string, SavedKeyEvent>();
+
   constructor(options: BlitTerminalSurfaceOptions) {
     this._sessionId = options.sessionId;
     this._fontFamily = options.fontFamily ?? DEFAULT_FONT;
@@ -271,6 +317,7 @@ export class BlitTerminalSurface {
     this._scrollbarColor = options.scrollbarColor;
     this._scrollbarWidth = options.scrollbarWidth ?? 4;
     this._advanceRatio = options.advanceRatio;
+    this._macKeybinds = options.macKeybinds ?? isMacOS();
 
     this.dpr = effectiveDpr();
     this.cell = measureCell(
@@ -1546,9 +1593,48 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Cmd+C / Cmd+V must reach the browser's native copy/paste.  Under the
+      // kitty protocol meta combos are otherwise forwarded as CSI-u, which
+      // would swallow them; bail here before the encoder (harmless without
+      // kitty, where these already produce no bytes).
+      if (
+        e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        (e.key === "c" || e.key === "C" || e.key === "v" || e.key === "V")
+      ) {
+        return;
+      }
+
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
-      const bytes = keyToBytes(e, appCursor);
+      const kittyFlags = t
+        ? (t.kitty_flags?.() ?? 0) & KITTY_SUPPORTED_MASK
+        : 0;
+      // macOS "natural text editing" chords (Cmd+Backspace, Cmd/Option+arrows).
+      // Only while kitty is inactive — a kitty-aware app gets the real combo as
+      // CSI-u and edits itself.  Sits after the Cmd+C/V bail above, so native
+      // copy/paste is unaffected.
+      if (this._macKeybinds && kittyFlags === 0) {
+        const edit = macEditingKeybind(e);
+        if (edit) {
+          e.preventDefault();
+          if (this.scrollOffset > 0) {
+            this.scrollOffset = 0;
+            this.sendScroll(this._sessionId!, 0);
+          }
+          this.sendInput(this._sessionId!, edit);
+          return;
+        }
+      }
+      // If the app dropped event reporting while keys were held, forget them.
+      if (!(kittyFlags & KITTY_EVENT_TYPES) && this.kittyPressed.size > 0) {
+        this.kittyPressed.clear();
+      }
+      const kitty: KittyState | undefined = kittyFlags
+        ? { flags: kittyFlags, eventType: e.repeat ? "repeat" : "press" }
+        : undefined;
+      const bytes = keyToBytes(e, appCursor, kitty);
       if (bytes) {
         e.preventDefault();
         if (this.scrollOffset > 0) {
@@ -1573,6 +1659,17 @@ export class BlitTerminalSurface {
           this.predicted = "";
         }
         this.sendInput(this._sessionId!, bytes);
+        // Track the press so its release can be re-emitted (event types only).
+        if (kittyFlags & KITTY_EVENT_TYPES) {
+          this.kittyPressed.set(e.code, {
+            key: e.key,
+            code: e.code,
+            ctrlKey: e.ctrlKey,
+            altKey: e.altKey,
+            metaKey: e.metaKey,
+            shiftKey: e.shiftKey,
+          });
+        }
       }
     };
 
@@ -1709,7 +1806,23 @@ export class BlitTerminalSurface {
 
     this.boundPaste = (e: ClipboardEvent) => this.handlePaste(e);
 
+    // Kitty event reporting: a keyup re-encodes the saved press as a release.
+    this.boundKeyUp = (e: KeyboardEvent) => {
+      if (this._readOnly) return;
+      if (e.isComposing) return;
+      const saved = this.kittyPressed.get(e.code);
+      if (!saved) return;
+      this.kittyPressed.delete(e.code);
+      this.sendKittyRelease(saved);
+    };
+
+    // Losing focus (e.g. Cmd+Tab) swallows keyups, so flush releases for every
+    // still-held key or the app would see them as stuck down.
+    this.boundBlur = () => this.flushKittyReleases();
+
     input.addEventListener("keydown", this.boundKeyDown);
+    input.addEventListener("keyup", this.boundKeyUp);
+    input.addEventListener("blur", this.boundBlur);
     input.addEventListener("compositionstart", this.boundCompositionStart);
     input.addEventListener("compositionend", this.boundCompositionEnd);
     input.addEventListener("input", this.boundInput);
@@ -1718,11 +1831,37 @@ export class BlitTerminalSurface {
     this.seedIosPad();
   }
 
+  /** Re-emit a saved press as a CSI-u release (no-op unless event types are on). */
+  private sendKittyRelease(saved: SavedKeyEvent): void {
+    if (this._sessionId === null || this.status !== "connected") return;
+    const t = this.terminal;
+    const flags = t ? (t.kitty_flags?.() ?? 0) & KITTY_SUPPORTED_MASK : 0;
+    if (!(flags & KITTY_EVENT_TYPES)) return;
+    const appCursor = t ? t.app_cursor() : false;
+    const bytes = encodeKittyKey(
+      saved as unknown as KeyboardEvent,
+      flags,
+      "release",
+      appCursor,
+    );
+    if (bytes) this.sendInput(this._sessionId, bytes);
+  }
+
+  /** Synthesize releases for every tracked key and clear the map. */
+  private flushKittyReleases(): void {
+    if (this.kittyPressed.size === 0) return;
+    const held = Array.from(this.kittyPressed.values());
+    this.kittyPressed.clear();
+    for (const saved of held) this.sendKittyRelease(saved);
+  }
+
   private teardownKeyboard(): void {
     const input = this.inputEl;
     if (!input) return;
     if (this.boundKeyDown)
       input.removeEventListener("keydown", this.boundKeyDown);
+    if (this.boundKeyUp) input.removeEventListener("keyup", this.boundKeyUp);
+    if (this.boundBlur) input.removeEventListener("blur", this.boundBlur);
     if (this.boundCompositionStart)
       input.removeEventListener("compositionstart", this.boundCompositionStart);
     if (this.boundCompositionEnd)
@@ -1739,10 +1878,13 @@ export class BlitTerminalSurface {
       this._iosRepadTimer = null;
     }
     this.boundKeyDown = null;
+    this.boundKeyUp = null;
+    this.boundBlur = null;
     this.boundCompositionStart = null;
     this.boundCompositionEnd = null;
     this.boundInput = null;
     this.boundPaste = null;
+    this.kittyPressed.clear();
   }
 
   // --- Ctrl+V image paste ---------------------------------------------------
@@ -1776,10 +1918,20 @@ export class BlitTerminalSurface {
     }, 0);
   }
 
+  /**
+   * The bytes a Ctrl+V produces: the raw ^V control byte normally, or its
+   * CSI-u form (`\x1b[118;5u`, 'v' + ctrl) when the kitty protocol is active.
+   */
+  private ctrlVBytes(): Uint8Array {
+    const t = this.terminal;
+    const flags = t ? (t.kitty_flags?.() ?? 0) & KITTY_SUPPORTED_MASK : 0;
+    return flags ? encoder.encode("\x1b[118;5u") : new Uint8Array([CTRL_V]);
+  }
+
   private sendCtrlV(): void {
     if (this._readOnly) return;
     if (this._sessionId === null || this.status !== "connected") return;
-    this.sendInput(this._sessionId, new Uint8Array([CTRL_V]));
+    this.sendInput(this._sessionId, this.ctrlVBytes());
   }
 
   /** Find the first image entry on a clipboard payload, if any. */
@@ -1830,7 +1982,7 @@ export class BlitTerminalSurface {
           // Transport messages are ordered, so the clipboard is populated
           // server-side before the ^V input arrives and the app reads it.
           conn.sendClipboard(mime, new Uint8Array(buf));
-          this.sendInput(sid, new Uint8Array([CTRL_V]));
+          this.sendInput(sid, this.ctrlVBytes());
         })
         .catch(() => {
           // Reading the blob failed — fall back to a bare ^V so the keypress
