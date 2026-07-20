@@ -4,6 +4,7 @@ mod generate;
 mod grep;
 mod interactive;
 mod transport;
+mod uplink;
 
 use clap::Parser;
 use cli::{Cli, ClipboardCommand, Command, RemoteCommand, SurfaceCommand, TerminalCommand};
@@ -420,6 +421,12 @@ async fn async_main() {
                         .unwrap_or(false),
             };
             blit_server::run(config).await;
+        }
+        Command::Uplink { url } => {
+            if let Err(e) = uplink::cmd_uplink(url).await {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
         }
         Command::Share { quiet, verbose } => {
             let signal_url = blit_webrtc_forwarder::normalize_hub(&cli.connect.hub);

@@ -408,6 +408,7 @@ pub async fn connect_via_proxy(upstream_uri: &str) -> Result<Transport, String> 
 ///   tcp:host:port              — raw TCP
 ///   socket:/path               — explicit Unix socket / named pipe
 ///   share:passphrase           — WebRTC via hub
+///   uplink:token[?control=url] — upsidedown relay attach
 ///   local                      — local blit-server (auto-start)
 ///   proxy:<upstream-uri>       — explicitly route via blit-proxy
 ///   <name>                     — bare name: looked up in `blit.remotes`
@@ -454,6 +455,23 @@ async fn connect_uri_inner(
             .map_err(|e| format!("cannot connect to {rest}: {e}"))?;
         let _ = s.set_nodelay(true);
         return Ok(Transport::Tcp(s));
+    }
+    if uri.starts_with("uplink:") {
+        if proxy_enabled() {
+            return connect_via_proxy(uri).await;
+        }
+        // Direct resolution via blit-proxy's library (no daemon): bridge the
+        // boxed stream halves onto a duplex pipe for the Transport enum.
+        let (mut upstream_r, mut upstream_w) = blit_proxy::connect_uplink_split(uri).await?;
+        let (local, remote) = tokio::io::duplex(1 << 16);
+        let (mut remote_r, mut remote_w) = tokio::io::split(remote);
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut upstream_r, &mut remote_w).await;
+        });
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut remote_r, &mut upstream_w).await;
+        });
+        return Ok(Transport::Duplex(local));
     }
     if uri.starts_with("ws://") || uri.starts_with("wss://") || uri.starts_with("wt://") {
         if proxy_enabled() {

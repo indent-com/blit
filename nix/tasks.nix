@@ -517,6 +517,24 @@ in
     '';
   };
 
+  deploy-upsidedown = pkgs.writeShellApplication {
+    name = "deploy-upsidedown";
+    runtimeInputs = [
+      pkgs.flyctl
+      pkgs.git
+    ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+      # Build context is the repo root (the Cargo workspace); config and
+      # Dockerfile live under upsidedown/ and are passed explicitly. The
+      # repo-root .dockerignore keeps target/ etc. out of the context.
+      flyctl deploy . \
+        --config upsidedown/fly.toml \
+        --dockerfile upsidedown/Dockerfile "$@"
+    '';
+  };
+
   setup-hub = pkgs.writeShellApplication {
     name = "setup-hub";
     runtimeInputs = [

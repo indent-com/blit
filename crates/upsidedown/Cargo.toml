@@ -1,0 +1,33 @@
+[package]
+name = "blit-upsidedown"
+version = "0.36.0"
+edition.workspace = true
+description = "upsidedown: hosted relay service for blit uplink"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "upsidedown"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+rand = "0.10"
+url = "2"
+ring = "0.17"
+ed25519-dalek = "2"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-acme = { version = "0.14", default-features = false, features = ["ring", "axum", "webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = "0.29"
+web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+async-trait = "0.1"

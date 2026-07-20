@@ -1,0 +1,11 @@
+# Build context is the repo root; keep only what the Rust build needs.
+target
+js
+welcome
+e2e
+docs
+**/node_modules
+**/pkg
+**/dist
+.git
+.github
