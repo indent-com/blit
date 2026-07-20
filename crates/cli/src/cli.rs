@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
         It also exposes every terminal operation as a CLI subcommand for scripts and LLM agents.\n\n\
         Quick start:\n  \
           blit open                 Open the terminal UI in a browser\n  \
-          blit share                Share a terminal via WebRTC\n  \
+          blit share                Share via WebRTC\n  \
           blit terminal start htop  Start a PTY and print its terminal ID\n  \
           blit terminal show 1      Dump current visible terminal text\n  \
           blit learn                Print the full CLI reference\n  \
@@ -99,7 +99,7 @@ pub enum Command {
         port: Option<u16>,
     },
 
-    /// Share a terminal via WebRTC
+    /// Share via WebRTC
     ///
     /// Set BLIT_PASSPHRASE to use a deterministic passphrase (default: random).
     Share {

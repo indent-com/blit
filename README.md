@@ -17,7 +17,7 @@ curl -sf https://install.blit.sh | sh
 blit open # opens a browser
 ```
 
-Share a terminal over WebRTC:
+Share over WebRTC:
 
 ```bash
 blit share # prints a URL anyone can open
