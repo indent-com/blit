@@ -1,6 +1,6 @@
 import { createSignal, createEffect, onMount, Show, For } from "solid-js";
 import type { TerminalPalette } from "@blit-sh/core";
-import { themeFor, ui, uiScale } from "./theme";
+import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { t } from "./i18n";
 
@@ -180,6 +180,7 @@ export function FontOverlay(props: {
                 flex: 1,
                 "min-height": 0,
                 "max-height": "20em",
+                ...scrollbarStyle(theme),
               }}
             >
               <For each={filtered()}>

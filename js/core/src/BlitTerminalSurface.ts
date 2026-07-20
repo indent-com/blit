@@ -8,6 +8,10 @@ import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 
+// The ^V control byte.  Sent for a plain Ctrl+V (quoted-insert in shells, and
+// the paste-trigger TUIs like Claude Code use to read the clipboard).
+const CTRL_V = 0x16;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -63,6 +67,30 @@ function isIPadOS(): boolean {
 function isAndroid(): boolean {
   if (typeof navigator === "undefined") return false;
   return /android/i.test(navigator.userAgent);
+}
+
+function isIOS(): boolean {
+  if (typeof navigator === "undefined") return false;
+  // iPadOS reports as MacIntel — isIPadOS() covers that via maxTouchPoints.
+  return isIPadOS() || /iPhone|iPod/.test(navigator.platform);
+}
+
+// iOS soft keyboards only auto-repeat Backspace while the focused field still
+// has content to delete.  The hidden capture textarea is otherwise empty, so a
+// held Backspace fires a single deleteContentBackward and stops.  We keep the
+// textarea seeded with this filler run so iOS's own key-repeat streams a
+// deleteContentBackward per repeat; each one forwards a DEL and consumes one
+// filler char.  U+00A0 (NBSP) is a real, deletable character the user will
+// never type, so it is trivial to strip back off the typed-text path.
+const IOS_PAD_CODE = 0x00a0;
+const IOS_PAD = String.fromCharCode(IOS_PAD_CODE).repeat(64);
+
+/** Strip the leading NBSP filler run seeded into the iOS capture textarea,
+ *  leaving only the text the user actually typed/pasted. */
+function stripIosPad(value: string): string {
+  let i = 0;
+  while (i < value.length && value.charCodeAt(i) === IOS_PAD_CODE) i++;
+  return value.slice(i);
 }
 
 function effectiveDpr(): number {
@@ -197,6 +225,12 @@ export class BlitTerminalSurface {
    *  so insertCompositionText updates can be streamed letter-by-letter instead
    *  of waiting for compositionend and dumping the whole word at once. */
   private _androidCompositionValue = "";
+  /** True when the hidden textarea is kept seeded with filler so iOS soft
+   *  keyboards auto-repeat a held Backspace (see IOS_PAD). */
+  private _iosPad = false;
+  /** Idle timer that tops the iOS filler buffer back up once a Backspace
+   *  repeat burst ends (re-padding mid-burst would cancel iOS's repeat). */
+  private _iosRepadTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
@@ -211,7 +245,18 @@ export class BlitTerminalSurface {
   private boundCompositionStart: (() => void) | null = null;
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
   private boundInput: ((e: Event) => void) | null = null;
+  private boundPaste: ((e: ClipboardEvent) => void) | null = null;
   private boundScrollListener: (() => void) | null = null;
+
+  // --- Ctrl+V image-paste deferral ---
+  // Ctrl+V is the paste shortcut TUIs like Claude Code read an image from the
+  // clipboard on.  A textarea can't hold an image, so we grab it from the
+  // browser `paste` event and offer it to the server clipboard *before*
+  // letting the app process ^V.  These fields coordinate the keydown (which
+  // arms the deferral) with the paste handler / fallback timer (which sends
+  // the ^V byte once the clipboard has been forwarded).
+  private _ctrlVPastePending = false;
+  private _ctrlVFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private mouseCleanup: (() => void) | null = null;
   private windowResizeHandler: (() => void) | null = null;
 
@@ -263,6 +308,47 @@ export class BlitTerminalSurface {
 
   focus(): void {
     this.inputEl?.focus();
+    // Re-seed the iOS Backspace-repeat filler in case the field was cleared.
+    this.seedIosPad();
+  }
+
+  /** Fill the hidden textarea with the NBSP filler buffer and park the cursor
+   *  at the end, so a held Backspace on the iOS soft keyboard keeps having
+   *  content to delete and iOS auto-repeats the deletion.  No-op off iOS. */
+  private seedIosPad(): void {
+    if (!this._iosPad) return;
+    const input = this.inputEl;
+    if (!input) return;
+    if (this._iosRepadTimer !== null) {
+      clearTimeout(this._iosRepadTimer);
+      this._iosRepadTimer = null;
+    }
+    input.value = IOS_PAD;
+    const end = IOS_PAD.length;
+    try {
+      input.setSelectionRange(end, end);
+    } catch {
+      // Some browsers reject setSelectionRange on a detached/hidden field.
+    }
+  }
+
+  /** Top the filler buffer back up once a Backspace repeat burst has gone
+   *  idle.  Re-padding while the burst is live would reset the field and
+   *  cancel iOS's key-repeat, so we wait for a gap between deletions. */
+  private scheduleIosRepad(): void {
+    if (!this._iosPad) return;
+    if (this._iosRepadTimer !== null) clearTimeout(this._iosRepadTimer);
+    this._iosRepadTimer = setTimeout(() => {
+      this._iosRepadTimer = null;
+      this.seedIosPad();
+    }, 400);
+  }
+
+  /** Reset the capture textarea after an input event: re-seed the iOS filler
+   *  buffer, or just empty the field on every other platform. */
+  private resetCaptureField(): void {
+    if (this._iosPad) this.seedIosPad();
+    else if (this.inputEl) this.inputEl.value = "";
   }
 
   /**
@@ -1353,6 +1439,10 @@ export class BlitTerminalSurface {
     const input = this.inputEl;
     if (!input) return;
 
+    // iOS soft keyboards need the capture textarea to stay non-empty for a
+    // held Backspace to auto-repeat.  Read-only surfaces never take input.
+    this._iosPad = !this._readOnly && isIOS();
+
     this.boundKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (this._sessionId === null || this.status !== "connected") return;
@@ -1438,6 +1528,24 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Ctrl+V (no Shift): TUIs like Claude Code read an image from the
+      // clipboard when they receive ^V.  A textarea can't surface a pasted
+      // image via the `input` event, so we must let the browser fire a
+      // `paste` event (do NOT preventDefault here), grab any image there, and
+      // offer it to the server clipboard before ^V reaches the app.  The
+      // paste handler / fallback timer sends the ^V byte itself.
+      if (
+        e.ctrlKey &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        (e.key === "v" || e.key === "V") &&
+        !e.repeat
+      ) {
+        this.beginCtrlVPaste();
+        return;
+      }
+
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
       const bytes = keyToBytes(e, appCursor);
@@ -1490,7 +1598,9 @@ export class BlitTerminalSurface {
       if (e.data && this._sessionId !== null && this.status === "connected") {
         this.sendInput(this._sessionId, encoder.encode(e.data));
       }
-      input.value = "";
+      // Re-seed the iOS filler so Backspace-repeat keeps working after a
+      // dictation/accent composition (no-op off iOS → empties the field).
+      this.resetCaptureField();
     };
 
     this.boundInput = (e: Event) => {
@@ -1510,6 +1620,20 @@ export class BlitTerminalSurface {
         }
         return;
       }
+      // iOS soft-keyboard Backspace: the textarea is kept seeded with NBSP
+      // filler (see IOS_PAD) so a held Backspace always has content to delete
+      // and iOS streams a deleteContentBackward per key-repeat.  Forward one
+      // DEL each and leave the now-shorter buffer alone — re-padding here would
+      // reset the field and cancel iOS's repeat.  Top it back up once the burst
+      // goes idle, or immediately if it is about to run dry mid-hold.
+      if (this._iosPad && inputEvent.inputType === "deleteContentBackward") {
+        if (this._sessionId !== null && this.status === "connected") {
+          this.sendInput(this._sessionId, new Uint8Array([0x7f]));
+        }
+        if (input.value.length <= 4) this.seedIosPad();
+        else this.scheduleIosRepad();
+        return;
+      }
       // iPadOS (and desktop spellcheck) ignore autocorrect="off" on this
       // hidden capture textarea and instead deliver autocorrect/suggestion
       // substitutions as an "insertReplacementText" input event.  Each
@@ -1518,49 +1642,52 @@ export class BlitTerminalSurface {
       // duplicate and "correct" terminal input.  Drop it — this is what makes
       // autocorrect-off actually stick on iPad keyboards.
       if (inputEvent.inputType === "insertReplacementText") {
-        input.value = "";
+        this.resetCaptureField();
         return;
       }
+      // On iOS the field carries the filler buffer; strip it so we only act on
+      // what the user actually typed/pasted.
+      const typed = this._iosPad ? stripIosPad(input.value) : input.value;
       // Ctrl modifier: convert the next typed character to Ctrl+char
       if (
         this._ctrlModifier &&
-        input.value &&
+        typed &&
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        const char = input.value[0];
+        const char = typed[0];
         const bytes = ctrlCharToByte(char);
         if (bytes) {
           this.sendInput(this._sessionId, bytes);
         }
         this.setCtrlModifier(false);
-        input.value = "";
+        this.resetCaptureField();
         return;
       }
       // Alt modifier: prefix next typed character with ESC
       if (
         this._altModifier &&
-        input.value &&
+        typed &&
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        const char = input.value[0];
+        const char = typed[0];
         const charCode = char.charCodeAt(0);
         this.sendInput(this._sessionId, new Uint8Array([0x1b, charCode]));
         this.setAltModifier(false);
-        input.value = "";
+        this.resetCaptureField();
         return;
       }
-      if (inputEvent.inputType === "deleteContentBackward" && !input.value) {
+      if (inputEvent.inputType === "deleteContentBackward" && !typed) {
         if (this._sessionId !== null && this.status === "connected") {
           this.sendInput(this._sessionId, new Uint8Array([0x7f]));
         }
       } else if (
-        input.value &&
+        typed &&
         this._sessionId !== null &&
         this.status === "connected"
       ) {
-        const payload = encoder.encode(input.value.replace(/\n/g, "\r"));
+        const payload = encoder.encode(typed.replace(/\n/g, "\r"));
         const isPaste = inputEvent.inputType === "insertFromPaste";
         const t = this.terminal;
         if (isPaste && t && t.bracketed_paste()) {
@@ -1577,13 +1704,18 @@ export class BlitTerminalSurface {
           this.sendInput(this._sessionId, payload);
         }
       }
-      input.value = "";
+      this.resetCaptureField();
     };
+
+    this.boundPaste = (e: ClipboardEvent) => this.handlePaste(e);
 
     input.addEventListener("keydown", this.boundKeyDown);
     input.addEventListener("compositionstart", this.boundCompositionStart);
     input.addEventListener("compositionend", this.boundCompositionEnd);
     input.addEventListener("input", this.boundInput);
+    input.addEventListener("paste", this.boundPaste);
+
+    this.seedIosPad();
   }
 
   private teardownKeyboard(): void {
@@ -1596,10 +1728,126 @@ export class BlitTerminalSurface {
     if (this.boundCompositionEnd)
       input.removeEventListener("compositionend", this.boundCompositionEnd);
     if (this.boundInput) input.removeEventListener("input", this.boundInput);
+    if (this.boundPaste) input.removeEventListener("paste", this.boundPaste);
+    if (this._ctrlVFallbackTimer !== null) {
+      clearTimeout(this._ctrlVFallbackTimer);
+      this._ctrlVFallbackTimer = null;
+    }
+    this._ctrlVPastePending = false;
+    if (this._iosRepadTimer !== null) {
+      clearTimeout(this._iosRepadTimer);
+      this._iosRepadTimer = null;
+    }
     this.boundKeyDown = null;
     this.boundCompositionStart = null;
     this.boundCompositionEnd = null;
     this.boundInput = null;
+    this.boundPaste = null;
+  }
+
+  // --- Ctrl+V image paste ---------------------------------------------------
+
+  /** Arm the Ctrl+V deferral: don't send ^V yet, wait for the `paste` event
+   *  to forward any clipboard image first.  A fallback timer sends the raw
+   *  ^V if no paste event materialises (empty clipboard, denied permission,
+   *  or a browser that won't fire paste without content) so quoted-insert and
+   *  app paste-triggers still work. */
+  private beginCtrlVPaste(): void {
+    if (this._sessionId === null || this.status !== "connected") return;
+    // A pending press being replaced (autorepeat is filtered by !e.repeat, but
+    // guard anyway): flush the old one as a plain ^V before re-arming.
+    if (this._ctrlVFallbackTimer !== null) {
+      clearTimeout(this._ctrlVFallbackTimer);
+      this._ctrlVFallbackTimer = null;
+    }
+    // Scrolling back and pasting should jump to the live prompt, matching the
+    // keyToBytes input path.
+    if (this.scrollOffset > 0) {
+      this.scrollOffset = 0;
+      this.sendScroll(this._sessionId, 0);
+    }
+    this._ctrlVPastePending = true;
+    this._ctrlVFallbackTimer = setTimeout(() => {
+      this._ctrlVFallbackTimer = null;
+      if (this._ctrlVPastePending) {
+        this._ctrlVPastePending = false;
+        this.sendCtrlV();
+      }
+    }, 0);
+  }
+
+  private sendCtrlV(): void {
+    if (this._readOnly) return;
+    if (this._sessionId === null || this.status !== "connected") return;
+    this.sendInput(this._sessionId, new Uint8Array([CTRL_V]));
+  }
+
+  /** Find the first image entry on a clipboard payload, if any. */
+  private findClipboardImage(dt: DataTransfer | null): DataTransferItem | null {
+    const items = dt?.items;
+    if (!items) return null;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === "file" && it.type.startsWith("image/")) return it;
+    }
+    return null;
+  }
+
+  private handlePaste(e: ClipboardEvent): void {
+    if (this._readOnly) return;
+    if (this._sessionId === null || this.status !== "connected") return;
+
+    // Consume the pending Ctrl+V arm (if this paste came from Ctrl+V) so the
+    // fallback timer doesn't also fire a ^V.
+    const wasCtrlV = this._ctrlVPastePending;
+    this._ctrlVPastePending = false;
+    if (this._ctrlVFallbackTimer !== null) {
+      clearTimeout(this._ctrlVFallbackTimer);
+      this._ctrlVFallbackTimer = null;
+    }
+
+    const imageItem = wasCtrlV
+      ? this.findClipboardImage(e.clipboardData)
+      : null;
+
+    if (imageItem) {
+      // We own this paste: stop the textarea from doing anything with it (it
+      // can't hold an image anyway) and forward the bytes to the server
+      // clipboard, then trigger the app's read with ^V.
+      e.preventDefault();
+      const file = imageItem.getAsFile();
+      const conn = this._blitConn;
+      const sid = this._sessionId;
+      if (!file || !conn) {
+        this.sendCtrlV();
+        return;
+      }
+      const mime = file.type || "image/png";
+      void file
+        .arrayBuffer()
+        .then((buf) => {
+          if (this._sessionId !== sid || this.status !== "connected") return;
+          // Transport messages are ordered, so the clipboard is populated
+          // server-side before the ^V input arrives and the app reads it.
+          conn.sendClipboard(mime, new Uint8Array(buf));
+          this.sendInput(sid, new Uint8Array([CTRL_V]));
+        })
+        .catch(() => {
+          // Reading the blob failed — fall back to a bare ^V so the keypress
+          // isn't swallowed entirely.
+          this.sendCtrlV();
+        });
+      return;
+    }
+
+    if (wasCtrlV) {
+      // Plain Ctrl+V with no image: preserve ^V (quoted-insert / paste-trigger)
+      // and suppress the textarea's own text paste so we don't double-send.
+      e.preventDefault();
+      this.sendCtrlV();
+    }
+    // Otherwise (Cmd+V / Ctrl+Shift+V text paste): leave it to the existing
+    // input(insertFromPaste) path — do not touch the event.
   }
 
   /** Stream Android IME composition updates to the shell one character at a

@@ -65,6 +65,7 @@ import type { UIScale, Theme } from "./theme";
 import {
   sessionName,
   sessionPrefix,
+  scrollbarStyle,
   themeFor,
   layout,
   ui,
@@ -2154,7 +2155,14 @@ function PreviewPanel(props: {
             {"\u00D7"}
           </button>
         </div>
-        <div style={{ flex: "1 1 0", "min-height": 0, "overflow-y": "auto" }}>
+        <div
+          style={{
+            flex: "1 1 0",
+            "min-height": 0,
+            "overflow-y": "auto",
+            ...scrollbarStyle(props.theme),
+          }}
+        >
           <Index each={props.offScreenSessions}>
             {(s) => (
               <SessionThumbnail

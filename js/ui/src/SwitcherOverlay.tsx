@@ -28,6 +28,7 @@ import type {
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 import {
   overlayChromeStyles,
+  scrollbarStyle,
   sessionName,
   sessionPrefix,
   sidebarWidth,
@@ -1806,6 +1807,10 @@ export function SwitcherOverlay(props: {
                   ? t("switcher.newTerminalPlaceholder")
                   : t("switcher.placeholder")
               }
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
               style={{
                 ...ui.input,
                 flex: 1,
@@ -1856,6 +1861,7 @@ export function SwitcherOverlay(props: {
                 "align-content": "start",
                 gap: `${scale().tightGap}px`,
                 "padding-right": "2px",
+                ...scrollbarStyle(theme()),
               }}
             >
               <For each={sections()}>

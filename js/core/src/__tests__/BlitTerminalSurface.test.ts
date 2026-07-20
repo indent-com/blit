@@ -211,10 +211,13 @@ describe("BlitTerminalSurface Ctrl+Shift+V paste shortcut", () => {
     expect(new TextDecoder().decode(payload)).toBe("pasted-text");
   });
 
-  it("Ctrl+V sends the ^V control character (0x16)", () => {
+  it("Ctrl+V sends the ^V control character (0x16) when no paste follows", async () => {
     const sendInput = vi.fn();
     const { input } = attachKeyboard(sendInput);
 
+    // Ctrl+V now defers ^V so a `paste` event can forward a clipboard image
+    // first.  When no paste event materialises (jsdom dispatches none), the
+    // fallback timer sends the raw ^V so quoted-insert still works.
     fireKeyDown(input, {
       key: "v",
       code: "KeyV",
@@ -226,9 +229,126 @@ describe("BlitTerminalSurface Ctrl+Shift+V paste shortcut", () => {
     });
 
     expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(sendInput).toHaveBeenCalledTimes(1);
     const payload = sendInput.mock.calls[0][1] as Uint8Array;
     expect(Array.from(payload)).toEqual([0x16]);
+  });
+});
+
+describe("BlitTerminalSurface Ctrl+V image paste", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      writable: true,
+      value: {
+        writeText: vi.fn().mockResolvedValue(undefined),
+        readText: vi.fn().mockResolvedValue(""),
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attach(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    const sendClipboard = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — connection exposing a connected transport + clipboard.
+    s["_blitConn"] = { transport: { status: "connected" }, sendClipboard };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/input/paste listeners.
+    s["setupKeyboard"]();
+    return { s, input, sendClipboard };
+  }
+
+  function firePaste(input: HTMLTextAreaElement, file: File | null) {
+    const item: DataTransferItem = {
+      kind: file ? "file" : "string",
+      type: file ? file.type : "text/plain",
+      getAsFile: () => file,
+      getAsString: () => {},
+      webkitGetAsEntry: () => null,
+    } as unknown as DataTransferItem;
+    const clipboardData = {
+      items: file ? ([item] as unknown as DataTransferItemList) : null,
+      getData: () => "",
+    } as unknown as DataTransfer;
+    const ev = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: clipboardData });
+    input.dispatchEvent(ev);
+    return ev;
+  }
+
+  it("forwards a pasted image to the server clipboard then sends ^V", async () => {
+    const sendInput = vi.fn();
+    const { input, sendClipboard } = attach(sendInput);
+
+    // Arm the Ctrl+V deferral, as a real keydown would.
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        ctrlKey: true,
+        bubbles: true,
+      }),
+    );
+
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]); // PNG magic
+    const file = new File([bytes], "clip.png", { type: "image/png" });
+    const ev = firePaste(input, file);
+
+    // The textarea paste is consumed so it doesn't also emit an input event.
+    expect(ev.defaultPrevented).toBe(true);
+    // arrayBuffer() resolves on a microtask; let it settle.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sendClipboard).toHaveBeenCalledTimes(1);
+    expect(sendClipboard.mock.calls[0][0]).toBe("image/png");
+    expect(Array.from(sendClipboard.mock.calls[0][1] as Uint8Array)).toEqual(
+      Array.from(bytes),
+    );
+    // ^V is sent after the image so the app reads a populated clipboard.
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([
+      0x16,
+    ]);
+  });
+
+  it("cancels the fallback ^V once the image paste is handled", async () => {
+    const sendInput = vi.fn();
+    const { input, sendClipboard } = attach(sendInput);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        ctrlKey: true,
+        bubbles: true,
+      }),
+    );
+    const file = new File([new Uint8Array([1, 2, 3])], "clip.png", {
+      type: "image/png",
+    });
+    firePaste(input, file);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    // Let the (now-cancelled) fallback timer window elapse.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Exactly one ^V — the fallback timer must not double-send.
+    expect(sendClipboard).toHaveBeenCalledTimes(1);
+    expect(sendInput).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -408,6 +528,104 @@ describe("BlitTerminalSurface iPad autocorrect", () => {
     fireInput(input, "corrected", "insertReplacementText");
     expect(sendInput).not.toHaveBeenCalled();
     expect(input.value).toBe("");
+  });
+});
+
+describe("BlitTerminalSurface iOS backspace repeat", () => {
+  const NBSP = String.fromCharCode(0xa0);
+
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal("navigator", {
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      platform: "iPhone",
+      maxTouchPoints: 5,
+      clipboard: navigator.clipboard,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function attachIOS(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/compositionend/input listeners.
+    s["setupKeyboard"]();
+    return { s, input };
+  }
+
+  function fireInput(
+    input: HTMLTextAreaElement,
+    value: string,
+    inputType: string,
+  ) {
+    input.value = value;
+    const ev = new Event("input") as InputEvent;
+    Object.defineProperty(ev, "inputType", { value: inputType });
+    Object.defineProperty(ev, "isComposing", { value: false });
+    input.dispatchEvent(ev);
+  }
+
+  it("seeds the capture textarea with non-empty filler", () => {
+    const { input } = attachIOS(vi.fn());
+    expect(input.value.length).toBeGreaterThan(0);
+    expect(input.value).toBe(NBSP.repeat(input.value.length));
+  });
+
+  it("forwards a DEL for each deleteContentBackward while the buffer holds", () => {
+    const sendInput = vi.fn();
+    const { input } = attachIOS(sendInput);
+    const seeded = input.value.length;
+
+    // iOS deletes one filler char per key-repeat; each fires its own event.
+    for (let i = 1; i <= 3; i++) {
+      fireInput(input, NBSP.repeat(seeded - i), "deleteContentBackward");
+    }
+
+    const calls = sendInput.mock.calls.map((c) =>
+      Array.from(c[1] as Uint8Array),
+    );
+    expect(calls).toEqual([[0x7f], [0x7f], [0x7f]]);
+    // Buffer is left in place (not emptied) so iOS keeps auto-repeating.
+    expect(input.value.length).toBeGreaterThan(0);
+  });
+
+  it("re-seeds the buffer before it runs dry mid-hold", () => {
+    const sendInput = vi.fn();
+    const { input } = attachIOS(sendInput);
+
+    // Simulate the buffer nearly exhausted; the handler tops it back up.
+    fireInput(input, NBSP.repeat(2), "deleteContentBackward");
+    expect(Array.from(sendInput.mock.calls.at(-1)![1] as Uint8Array)).toEqual([
+      0x7f,
+    ]);
+    expect(input.value.length).toBeGreaterThan(4);
+  });
+
+  it("forwards only the typed character, not the filler", () => {
+    const sendInput = vi.fn();
+    const { input } = attachIOS(sendInput);
+    const seeded = input.value;
+
+    fireInput(input, seeded + "a", "insertText");
+
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(
+      new TextDecoder().decode(sendInput.mock.calls[0][1] as Uint8Array),
+    ).toBe("a");
+    // Field is re-seeded, not emptied.
+    expect(input.value.length).toBeGreaterThan(0);
+    expect(input.value).toBe(NBSP.repeat(input.value.length));
   });
 });
 

@@ -1,7 +1,7 @@
 import { createSignal, Index, Show } from "solid-js";
 import type { ConnectionStatus, TerminalPalette } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
-import { themeFor, ui, uiScale } from "./theme";
+import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { t } from "./i18n";
 import type { Remote } from "./storage";
 
@@ -280,6 +280,7 @@ export function RemotesOverlay(props: {
               "grid-template-columns": cols(),
               "max-height": "60vh",
               "overflow-y": "auto",
+              ...scrollbarStyle(theme()),
             }}
           >
             <Index each={props.remotes}>
