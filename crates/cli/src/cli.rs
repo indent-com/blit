@@ -72,6 +72,7 @@ pub enum Command {
     ///   blit remote add rabbit ssh:rabbit
     ///   blit remote add prod ssh:alice@prod.example.com
     ///   blit remote add lab share:mysecret
+    ///   blit remote add sandbox uplink:<jwt>
     ///   blit remote list
     ///   blit remote remove rabbit
     ///   blit --on rabbit terminal list
@@ -110,6 +111,14 @@ pub enum Command {
         /// Print detailed connection diagnostics to stderr
         #[arg(long)]
         verbose: bool,
+    },
+
+    /// Expose the local blit server through a relay
+    ///
+    /// Requires BLIT_UPLINK_TOKEN for the control endpoint.
+    Uplink {
+        /// Control endpoint URL (e.g. https://blit.indent.com)
+        url: String,
     },
 
     /// Print the full CLI reference (usage guide for scripts and LLM agents)

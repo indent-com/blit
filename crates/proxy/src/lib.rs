@@ -499,6 +499,10 @@ async fn connect_upstream(uri: &str) -> Result<UpstreamConn, String> {
         return connect_ssh(rest).await;
     }
 
+    if let Some(rest) = uri.strip_prefix("uplink:") {
+        return connect_uplink(rest).await;
+    }
+
     // Extract query parameters from URIs that support them.
     let (base_uri, passphrase, cert_hash) = extract_uri_params(uri);
 
@@ -517,7 +521,7 @@ async fn connect_upstream(uri: &str) -> Result<UpstreamConn, String> {
     }
     Err(format!(
         "unknown upstream URI scheme in '{uri}' \
-         (expected socket:, tcp:, ws://, wss://, wt://, share:, or ssh:)"
+         (expected socket:, tcp:, ws://, wss://, wt://, share:, uplink:, or ssh:)"
     ))
 }
 
@@ -556,6 +560,87 @@ async fn connect_share(rest: &str) -> Result<UpstreamConn, String> {
         reader: Box::new(r),
         writer: Box::new(w),
     })
+}
+
+// ---------------------------------------------------------------------------
+// upsidedown uplink relay (docs/upsidedown.md)
+// ---------------------------------------------------------------------------
+
+/// Default upsidedown control plane for `uplink:` remotes without `?control=`.
+pub const DEFAULT_UPSIDEDOWN_URL: &str = "https://usd.blit.sh";
+
+/// Split `uplink:` URI rest into (token, control_url).
+///
+/// Accepted forms:
+///   `TOKEN`                                — use the default control plane
+///   `TOKEN?control=https://other.example`  — use a specific control plane
+fn parse_uplink_uri(rest: &str) -> (String, String) {
+    let (token_raw, control) = if let Some(q_pos) = rest.find('?') {
+        let token = &rest[..q_pos];
+        let control = rest[q_pos + 1..]
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("control=").map(percent_decode))
+            .unwrap_or_else(|| DEFAULT_UPSIDEDOWN_URL.to_string());
+        (token.to_string(), control)
+    } else {
+        (rest.to_string(), DEFAULT_UPSIDEDOWN_URL.to_string())
+    };
+    (
+        percent_decode(&token_raw),
+        control.trim_end_matches('/').to_string(),
+    )
+}
+
+/// Resolve an `uplink:` remote: ask the upsidedown control plane where the
+/// session's worker is (`GET /attach`, which blocks server-side until the
+/// uplink is connected), then attach over WebSocket with the token as the
+/// auth passphrase.  The token is a credential — never log it.
+async fn connect_uplink(rest: &str) -> Result<UpstreamConn, String> {
+    let (token, control) = parse_uplink_uri(rest);
+    if token.is_empty() {
+        return Err("uplink: remote requires a token".into());
+    }
+    let attach = format!("{control}/attach");
+    let resp = reqwest::Client::new()
+        .get(&attach)
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("{attach}: {e}"))?;
+    match resp.status().as_u16() {
+        200 => {}
+        401 | 403 => return Err(format!("{attach}: token rejected ({})", resp.status())),
+        404 => return Err(format!("{attach}: session has no connected uplink")),
+        s => return Err(format!("{attach}: HTTP {s}")),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("{attach}: bad response: {e}"))?;
+    let ws = body
+        .get("ws")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{attach}: response missing \"ws\""))?;
+    connect_ws(ws, Some(&token)).await
+}
+
+/// Public entry point for direct (non-daemon) `uplink:` connections, used by
+/// blit-cli and blit-gateway when the proxy daemon is disabled.  Accepts the
+/// URI with or without the `uplink:` prefix and returns the connected byte
+/// stream halves.
+pub async fn connect_uplink_split(
+    uri: &str,
+) -> Result<
+    (
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ),
+    String,
+> {
+    let rest = uri.strip_prefix("uplink:").unwrap_or(uri);
+    let conn = connect_uplink(rest).await?;
+    Ok((conn.reader, conn.writer))
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1298,17 @@ pub fn run(verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_uplink_uri_forms() {
+        let (token, control) = parse_uplink_uri("eyJhbGciOi.eyJzaWQi.sig");
+        assert_eq!(token, "eyJhbGciOi.eyJzaWQi.sig");
+        assert_eq!(control, DEFAULT_UPSIDEDOWN_URL);
+
+        let (token, control) = parse_uplink_uri("tok123?control=https://relay.example/");
+        assert_eq!(token, "tok123");
+        assert_eq!(control, "https://relay.example");
+    }
 
     #[test]
     fn proxy_socket_path_default() {

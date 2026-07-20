@@ -1,0 +1,113 @@
+# upsidedown — hosted relay for `blit uplink` (see docs/upsidedown.md).
+#
+# One Fly app, four process groups: a control plane on 443 and three relay
+# workers each owning one external port for both TCP (WebSocket) and UDP
+# (WebTransport/QUIC). Build context is the repo root so the Cargo
+# workspace is available; `dockerfile` is relative to that context.
+
+app = "blit-upsidedown"
+primary_region = "sjc"
+
+[env]
+  UPSIDEDOWN_HOST = "usd.blit.sh"
+  UPSIDEDOWN_ACME_DOMAIN = "usd.blit.sh"
+  UPSIDEDOWN_ACME_CONTACT = "ops@indent.com"
+  UPSIDEDOWN_LISTEN = "0.0.0.0:8443"
+  # Secrets (set via `fly secrets set`): UPSIDEDOWN_PUBLIC_KEYS,
+  # UPSIDEDOWN_SEAL_KEY, REDIS_URL.
+
+[processes]
+  cp = "control-plane"
+  w1 = "worker --name w1 --port 4441"
+  w2 = "worker --name w2 --port 4442"
+  w3 = "worker --name w3 --port 4443"
+
+# One machine per group keeps every port deterministically one worker, and
+# the control plane separate. Never auto-stop: workers hold live sessions
+# and the control plane holds the ACME cert.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["cp", "w1", "w2", "w3"]
+
+# --- Control plane: HTTPS on 443, app-terminated TLS (raw TCP passthrough,
+#     no Fly TLS handler) so it can answer ACME TLS-ALPN-01 itself. ---
+[[services]]
+  processes = ["cp"]
+  protocol = "tcp"
+  internal_port = 8443
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+  [[services.ports]]
+    port = 443
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+# --- Worker 1: WebSocket (TCP) + WebTransport (UDP) on 4441. ---
+[[services]]
+  processes = ["w1"]
+  protocol = "tcp"
+  internal_port = 4441
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+  [[services.ports]]
+    port = 4441
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[services]]
+  processes = ["w1"]
+  protocol = "udp"
+  internal_port = 4441
+  [[services.ports]]
+    port = 4441
+
+# --- Worker 2 on 4442. ---
+[[services]]
+  processes = ["w2"]
+  protocol = "tcp"
+  internal_port = 4442
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+  [[services.ports]]
+    port = 4442
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[services]]
+  processes = ["w2"]
+  protocol = "udp"
+  internal_port = 4442
+  [[services.ports]]
+    port = 4442
+
+# --- Worker 3 on 4443. ---
+[[services]]
+  processes = ["w3"]
+  protocol = "tcp"
+  internal_port = 4443
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+  [[services.ports]]
+    port = 4443
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[services]]
+  processes = ["w3"]
+  protocol = "udp"
+  internal_port = 4443
+  [[services.ports]]
+    port = 4443

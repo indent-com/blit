@@ -1,0 +1,19 @@
+name: Deploy upsidedown
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "upsidedown/**"
+      - "crates/upsidedown/**"
+
+jobs:
+  deploy:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: nix run .#deploy-upsidedown
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

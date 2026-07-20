@@ -39,6 +39,9 @@ enum GatewayConnector {
         host: String,
         socket: Option<String>,
     },
+    /// upsidedown relay attach (`uplink:<jwt>[?control=<url>]`), resolved
+    /// by blit-proxy.  Holds the full URI; the token inside is a credential.
+    Uplink(String),
 }
 
 type BoxedReader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
@@ -149,6 +152,13 @@ impl Config {
                     }
                 }
             }
+            GatewayConnector::Uplink(uri) => {
+                if let Some(proxy) = &self.proxy_sock {
+                    ConnectorSnapshot::Proxied(proxy.clone(), uri.clone())
+                } else {
+                    ConnectorSnapshot::Uplink(uri.clone())
+                }
+            }
             // For proxiable connectors, route through blit-proxy when enabled.
             conn => {
                 if let Some(proxy) = &self.proxy_sock {
@@ -219,6 +229,9 @@ fn uri_to_connector(
             signal_url,
         });
     }
+    if uri.starts_with("uplink:") {
+        return Some(GatewayConnector::Uplink(uri.to_string()));
+    }
     if uri == "local" {
         let path = blit_webserver::config::default_local_socket();
         return Some(GatewayConnector::Ipc(path));
@@ -251,6 +264,8 @@ enum ConnectorSnapshot {
     Tcp(String),
     /// Route through blit-proxy: (proxy_sock_path, upstream_uri).
     Proxied(String, String),
+    /// upsidedown relay attach, resolved in-process via blit-proxy's library.
+    Uplink(String),
     /// WebRTC share session: connect directly to the hub.
     Share {
         passphrase: String,
@@ -284,6 +299,7 @@ impl ConnectorSnapshot {
             ConnectorSnapshot::Proxied(proxy_sock, upstream_uri) => {
                 proxy_connect(proxy_sock, upstream_uri).await
             }
+            ConnectorSnapshot::Uplink(uri) => blit_proxy::connect_uplink_split(uri).await,
             ConnectorSnapshot::Share {
                 passphrase,
                 signal_url,

@@ -139,12 +139,7 @@ type RemoteItem = {
 };
 
 type SwitcherItem =
-  | LayoutItem
-  | SessionItem
-  | PaneItem
-  | ActionItem
-  | SurfaceItem
-  | RemoteItem;
+  LayoutItem | SessionItem | PaneItem | ActionItem | SurfaceItem | RemoteItem;
 type SwitcherSection = {
   title: string;
   items: SwitcherItem[];
