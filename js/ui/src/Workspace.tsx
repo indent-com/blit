@@ -97,7 +97,13 @@ import {
 } from "./bsp/layout";
 
 export type Overlay =
-  "expose" | "palette" | "font" | "help" | "remotes" | "media" | null;
+  | "expose"
+  | "palette"
+  | "font"
+  | "help"
+  | "remotes"
+  | "media"
+  | null;
 
 function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
   const prev = import.meta.hot?.data?.workspace as BlitWorkspace | undefined;
@@ -1141,7 +1147,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn: ((value: string, targetPaneId: string) => void) | null =
     null;
   let clearPaneAssignmentFn: ((paneId: string) => void) | null = null;
