@@ -567,7 +567,7 @@ async fn connect_share(rest: &str) -> Result<UpstreamConn, String> {
 // ---------------------------------------------------------------------------
 
 /// Default upsidedown control plane for `uplink:` remotes without `?control=`.
-pub const DEFAULT_UPSIDEDOWN_URL: &str = "https://usd.blit.sh";
+pub const DEFAULT_UPSIDEDOWN_URL: &str = "https://usd.blit.sh/pool";
 
 /// Split `uplink:` URI rest into (token, control_url).
 ///
