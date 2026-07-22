@@ -21,6 +21,7 @@ const mockSetShowCursor = vi.fn();
 const mockSetOnRender = vi.fn();
 const mockSetAdvanceRatio = vi.fn();
 const mockSetReadOnly = vi.fn();
+const mockSetReadOnlyObjectPosition = vi.fn();
 const mockResendSize = vi.fn();
 const mockFocus = vi.fn();
 
@@ -47,6 +48,7 @@ vi.mock("@blit-sh/core", async () => {
       setOnRender = mockSetOnRender;
       setAdvanceRatio = mockSetAdvanceRatio;
       setReadOnly = mockSetReadOnly;
+      setReadOnlyObjectPosition = mockSetReadOnlyObjectPosition;
       resendSize = mockResendSize;
       focus = mockFocus;
     },
@@ -198,5 +200,21 @@ describe("BlitTerminal", () => {
 
     expect(mockSetFontFamily).toHaveBeenCalledWith("Test Mono");
     expect(mockSetFontSize).toHaveBeenCalledWith(14);
+  });
+
+  it("forwards read-only canvas positioning to surface", () => {
+    const { workspace } = setup();
+
+    render(
+      <BlitWorkspaceProvider workspace={workspace}>
+        <BlitTerminal
+          sessionId={null}
+          readOnly
+          readOnlyObjectPosition="left top"
+        />
+      </BlitWorkspaceProvider>,
+    );
+
+    expect(mockSetReadOnlyObjectPosition).toHaveBeenCalledWith("left top");
   });
 });

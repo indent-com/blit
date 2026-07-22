@@ -24,6 +24,62 @@ function mockCanvasContext(): void {
   });
 }
 
+describe("BlitTerminalSurface read-only canvas layout", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function attachSurface(readOnlyObjectPosition?: string) {
+    const surface = new BlitTerminalSurface({
+      sessionId: null,
+      readOnly: true,
+      readOnlyObjectPosition,
+    });
+    const container = document.createElement("div");
+    surface.attach(container);
+    const canvas = container.querySelector("canvas");
+    if (!(canvas instanceof HTMLCanvasElement)) {
+      throw new Error("Expected Blit terminal canvas");
+    }
+    return { surface, canvas };
+  }
+
+  it("keeps centered positioning by default and accepts an override", () => {
+    const centered = attachSurface();
+    const topLeft = attachSurface("left top");
+
+    expect({
+      default: centered.canvas.style.objectPosition,
+      override: topLeft.canvas.style.objectPosition,
+    }).toEqual({
+      default: "center",
+      override: "left top",
+    });
+
+    centered.surface.dispose();
+    topLeft.surface.dispose();
+  });
+
+  it("updates positioning after attachment", () => {
+    const { surface, canvas } = attachSurface();
+
+    surface.setReadOnlyObjectPosition("right bottom");
+
+    expect(canvas.style.objectPosition).toBe("right bottom");
+    surface.dispose();
+  });
+});
+
 describe("BlitTerminalSurface mobile copy/paste API", () => {
   beforeEach(() => {
     // jsdom doesn't ship a clipboard mock; install one we can spy on.

@@ -22,6 +22,8 @@ export interface BlitTerminalSurfaceOptions {
   fontSize?: number;
   palette?: TerminalPalette;
   readOnly?: boolean;
+  /** CSS object-position for the contained read-only canvas. Default: "center". */
+  readOnlyObjectPosition?: string;
   showCursor?: boolean;
   onRender?: (renderMs: number) => void;
   scrollbarColor?: string;
@@ -138,6 +140,7 @@ export class BlitTerminalSurface {
   private _fontSize: number;
   private _palette: TerminalPalette | undefined;
   private _readOnly: boolean;
+  private _readOnlyObjectPosition: string;
   private _showCursor: boolean;
   private _onRender: ((renderMs: number) => void) | undefined;
   private _scrollbarColor: string | undefined;
@@ -266,6 +269,7 @@ export class BlitTerminalSurface {
     this._fontSize = options.fontSize ?? DEFAULT_FONT_SIZE;
     this._palette = options.palette;
     this._readOnly = options.readOnly ?? false;
+    this._readOnlyObjectPosition = options.readOnlyObjectPosition ?? "center";
     this._showCursor = options.showCursor ?? true;
     this._onRender = options.onRender;
     this._scrollbarColor = options.scrollbarColor;
@@ -543,7 +547,7 @@ export class BlitTerminalSurface {
         width: "100%",
         height: "100%",
         objectFit: "contain",
-        objectPosition: "center",
+        objectPosition: this._readOnlyObjectPosition,
       });
     } else {
       Object.assign(this.glCanvas.style, {
@@ -752,6 +756,15 @@ export class BlitTerminalSurface {
    */
   setReadOnly(readOnly: boolean | undefined): void {
     this._readOnly = readOnly ?? false;
+  }
+
+  setReadOnlyObjectPosition(position: string | undefined): void {
+    const resolved = position ?? "center";
+    if (this._readOnlyObjectPosition === resolved) return;
+    this._readOnlyObjectPosition = resolved;
+    if (this._readOnly && this.glCanvas) {
+      this.glCanvas.style.objectPosition = resolved;
+    }
   }
 
   setShowCursor(show: boolean | undefined): void {

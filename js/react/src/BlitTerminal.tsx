@@ -55,6 +55,7 @@ export function BlitTerminal({
     style,
     palette = ctx.palette,
     readOnly,
+    readOnlyObjectPosition,
     showCursor,
     onRender,
     scrollbarColor,
@@ -73,6 +74,7 @@ export function BlitTerminal({
       fontSize,
       palette,
       readOnly,
+      readOnlyObjectPosition,
       showCursor,
       onRender,
       scrollbarColor,
@@ -141,6 +143,10 @@ export function BlitTerminal({
   useEffect(() => {
     surfaceRef.current?.setReadOnly(readOnly);
   }, [readOnly]);
+
+  useEffect(() => {
+    surfaceRef.current?.setReadOnlyObjectPosition(readOnlyObjectPosition);
+  }, [readOnlyObjectPosition]);
 
   // Re-send dimensions when connection becomes ready.
   const status: ConnectionStatus = connection?.status ?? "disconnected";

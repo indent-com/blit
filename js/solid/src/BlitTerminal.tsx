@@ -18,6 +18,8 @@ export interface BlitTerminalProps {
   style?: JSX.CSSProperties;
   palette?: TerminalPalette;
   readOnly?: boolean;
+  /** CSS object-position for the contained read-only canvas. Default: "center". */
+  readOnlyObjectPosition?: string;
   showCursor?: boolean;
   onRender?: (renderMs: number) => void;
   scrollbarColor?: string;
@@ -52,6 +54,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
       fontSize: props.fontSize ?? ctx.fontSize,
       palette: props.palette ?? ctx.palette,
       readOnly: props.readOnly,
+      readOnlyObjectPosition: props.readOnlyObjectPosition,
       showCursor: props.showCursor,
       onRender: props.onRender,
       scrollbarColor: props.scrollbarColor,
@@ -97,6 +100,9 @@ export function BlitTerminal(props: BlitTerminalProps) {
     surface()?.setAdvanceRatio(props.advanceRatio ?? ctx.advanceRatio),
   );
   createEffect(() => surface()?.setReadOnly(props.readOnly));
+  createEffect(() =>
+    surface()?.setReadOnlyObjectPosition(props.readOnlyObjectPosition),
+  );
 
   // Re-send dimensions when connection becomes ready.
   createEffect(() => {

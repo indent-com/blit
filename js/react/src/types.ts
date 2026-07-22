@@ -21,6 +21,8 @@ export interface BlitTerminalProps {
   palette?: TerminalPalette;
   /** When true, the terminal renders but never sends resize, input, or scroll commands. */
   readOnly?: boolean;
+  /** CSS object-position for the contained read-only canvas. Default: "center". */
+  readOnlyObjectPosition?: string;
   /** When false, the cursor is hidden. Default: true. */
   showCursor?: boolean;
   /** Called after each render frame. Receives the render duration in ms. */
