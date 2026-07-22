@@ -95,22 +95,22 @@ mux forward them unmodified. All integers little-endian; the 16 MiB
 frame limit and [protocol.md](protocol.md) framing apply. Set
 `BLIT_LSP=0` to disable the family (the feature bit is not advertised).
 
-| Direction | Opcode | Name          | Layout                                                                                     |
-| --------- | ------ | ------------- | ------------------------------------------------------------------------------------------ |
-| C2S       | `0x60` | `LSP_OPEN`    | `[nonce:2][flags:1][diag_latency_ms:2][path_len:2][path:N]`                                |
-| C2S       | `0x61` | `LSP_CLOSE`   | `[lsp_id:2]`                                                                               |
-| C2S       | `0x62` | `LSP_ACK`     | `[lsp_id:2][stream:1][update_id:4]`                                                        |
-| C2S       | `0x63` | `LSP_QUERY`   | `[nonce:2][lsp_id:2][kind:1][flags:1][line:4][col:4][path_len:2][path:N][arg_len:2][arg:N]`|
-| C2S       | `0x64` | `LSP_CANCEL`  | `[nonce:2]`                                                                                |
-| C2S       | `0x65` | `LSP_SERVERS` | `[nonce:2]`                                                                                |
-| C2S       | `0x66` | `LSP_STOP`    | `[nonce:2][server_ref:2]`                                                                  |
-| S2C       | `0x60` | `LSP_OPENED`  | `[nonce:2][lsp_id:2][status:1][flags:1][root_len:2][root:N][detail_len:2][detail:N]`       |
-| S2C       | `0x61` | `LSP_STATE`   | `[lsp_id:2][state_id:4][flags:1][records:LZ4]`                                             |
-| S2C       | `0x62` | `LSP_DIAG`    | `[lsp_id:2][update_id:4][flags:1][records:LZ4]`                                            |
-| S2C       | `0x63` | `LSP_QUERY`   | `[nonce:2][status:1][flags:1][records:LZ4]`                                                |
-| S2C       | `0x64` | `LSP_CLOSED`  | `[lsp_id:2][reason:1]`                                                                     |
-| S2C       | `0x65` | `LSP_SERVERS` | `[nonce:2][status:1][flags:1][records:LZ4]`                                                |
-| S2C       | `0x66` | `LSP_STOPPED` | `[nonce:2][status:1]`                                                                      |
+| Direction | Opcode | Name          | Layout                                                                                      |
+| --------- | ------ | ------------- | ------------------------------------------------------------------------------------------- |
+| C2S       | `0x60` | `LSP_OPEN`    | `[nonce:2][flags:1][diag_latency_ms:2][path_len:2][path:N]`                                 |
+| C2S       | `0x61` | `LSP_CLOSE`   | `[lsp_id:2]`                                                                                |
+| C2S       | `0x62` | `LSP_ACK`     | `[lsp_id:2][stream:1][update_id:4]`                                                         |
+| C2S       | `0x63` | `LSP_QUERY`   | `[nonce:2][lsp_id:2][kind:1][flags:1][line:4][col:4][path_len:2][path:N][arg_len:2][arg:N]` |
+| C2S       | `0x64` | `LSP_CANCEL`  | `[nonce:2]`                                                                                 |
+| C2S       | `0x65` | `LSP_SERVERS` | `[nonce:2]`                                                                                 |
+| C2S       | `0x66` | `LSP_STOP`    | `[nonce:2][server_ref:2]`                                                                   |
+| S2C       | `0x60` | `LSP_OPENED`  | `[nonce:2][lsp_id:2][status:1][flags:1][root_len:2][root:N][detail_len:2][detail:N]`        |
+| S2C       | `0x61` | `LSP_STATE`   | `[lsp_id:2][state_id:4][flags:1][records:LZ4]`                                              |
+| S2C       | `0x62` | `LSP_DIAG`    | `[lsp_id:2][update_id:4][flags:1][records:LZ4]`                                             |
+| S2C       | `0x63` | `LSP_QUERY`   | `[nonce:2][status:1][flags:1][records:LZ4]`                                                 |
+| S2C       | `0x64` | `LSP_CLOSED`  | `[lsp_id:2][reason:1]`                                                                      |
+| S2C       | `0x65` | `LSP_SERVERS` | `[nonce:2][status:1][flags:1][records:LZ4]`                                                 |
+| S2C       | `0x66` | `LSP_STOPPED` | `[nonce:2][status:1]`                                                                       |
 
 ### Statuses
 
@@ -392,25 +392,25 @@ Every server→client LSP request terminates in blit:
 `client/registerCapability`/`unregister` into an internal table, epoch
 bumped in `SERVER`; `window/workDoneProgress/create` + `$/progress`
 into phase/percent; `workspace/workspaceFolders` from the root;
-`window/showMessage`* into the `SERVER` msg field and server log;
+`window/showMessage`\* into the `SERVER` msg field and server log;
 `workspace/applyEdit` answered `applied:false` and counted — read-only
 by construction, [git.md](git.md)'s stance.
 
 ## Limits and defaults
 
-| Knob                            | Default        | Env                        |
-| ------------------------------- | -------------- | -------------------------- |
-| Backends per daemon             | 4              | `BLIT_LSP_MAX_SERVERS`     |
-| Attachments per connection      | 16             | `BLIT_LSP_MAX_OPENS`       |
-| Queries in flight per connection| 16             | `BLIT_LSP_MAX_INFLIGHT`    |
-| Open documents per backend      | 128            | `BLIT_LSP_MAX_DOCS`        |
-| Diagnostics settle window       | 500 ms         | `BLIT_LSP_DIAG_LATENCY_MS` |
-| Query timeout                   | 30 s           | `BLIT_LSP_TIMEOUT_MS`      |
-| Initialize timeout              | 60 s           | `BLIT_LSP_INIT_TIMEOUT`    |
-| Idle shutdown                   | 900 s          | `BLIT_LSP_IDLE_SECS`       |
-| Records / bytes per response    | 10 000 / 8 MiB | `BLIT_LSP_ENTRIES_MAX` / `BLIT_LSP_BYTES_MAX` |
-| Restarts per backend            | 3/hour         | `BLIT_LSP_MAX_RESTARTS`    |
-| Spawns per daemon               | 30/minute      | `BLIT_LSP_SPAWN_RATE`      |
+| Knob                             | Default        | Env                                           |
+| -------------------------------- | -------------- | --------------------------------------------- |
+| Backends per daemon              | 4              | `BLIT_LSP_MAX_SERVERS`                        |
+| Attachments per connection       | 16             | `BLIT_LSP_MAX_OPENS`                          |
+| Queries in flight per connection | 16             | `BLIT_LSP_MAX_INFLIGHT`                       |
+| Open documents per backend       | 128            | `BLIT_LSP_MAX_DOCS`                           |
+| Diagnostics settle window        | 500 ms         | `BLIT_LSP_DIAG_LATENCY_MS`                    |
+| Query timeout                    | 30 s           | `BLIT_LSP_TIMEOUT_MS`                         |
+| Initialize timeout               | 60 s           | `BLIT_LSP_INIT_TIMEOUT`                       |
+| Idle shutdown                    | 900 s          | `BLIT_LSP_IDLE_SECS`                          |
+| Records / bytes per response     | 10 000 / 8 MiB | `BLIT_LSP_ENTRIES_MAX` / `BLIT_LSP_BYTES_MAX` |
+| Restarts per backend             | 3/hour         | `BLIT_LSP_MAX_RESTARTS`                       |
+| Spawns per daemon                | 30/minute      | `BLIT_LSP_SPAWN_RATE`                         |
 
 Exhaustion degrades: truncation flags, `WARMING`, `BUDGET`, never a
 hang. RSS is honestly uncappable portably; `MAX_SERVERS=4` plus
@@ -454,15 +454,15 @@ binaries the user already has; nothing touches the compositor.
 
 ## Alternatives
 
-|                        | raw tunnel (byte channels)             | LSP-aware passthrough                    | projection (this)                 |
-| ---------------------- | -------------------------------------- | ---------------------------------------- | --------------------------------- |
-| Wire payload           | raw JSON-RPC                           | LSP JSON in blit frames                  | blit records                      |
-| Client carries         | full LSP client (×2: TS and Rust)      | JSON-RPC + UTF-16 math + URI building    | apply records, ack                |
-| Sharing                | by convention; one raw attach corrupts | id rewriting, capability intersection    | N=1 by construction               |
-| One-shot `lsp diag`    | missed-forever notifications           | cache replay works                       | cache replay, `FULL`              |
-| Positions              | client's problem                       | UTF-16 on the wire                       | UTF-8 bytes, server transcodes    |
-| LSP spec churn lands   | in every client                        | in the wire contract                     | in the server engine              |
-| Non-LSP backend later  | impossible                             | must forge LSP JSON                      | invisible                         |
+|                       | raw tunnel (byte channels)             | LSP-aware passthrough                 | projection (this)              |
+| --------------------- | -------------------------------------- | ------------------------------------- | ------------------------------ |
+| Wire payload          | raw JSON-RPC                           | LSP JSON in blit frames               | blit records                   |
+| Client carries        | full LSP client (×2: TS and Rust)      | JSON-RPC + UTF-16 math + URI building | apply records, ack             |
+| Sharing               | by convention; one raw attach corrupts | id rewriting, capability intersection | N=1 by construction            |
+| One-shot `lsp diag`   | missed-forever notifications           | cache replay works                    | cache replay, `FULL`           |
+| Positions             | client's problem                       | UTF-16 on the wire                    | UTF-8 bytes, server transcodes |
+| LSP spec churn lands  | in every client                        | in the wire contract                  | in the server engine           |
+| Non-LSP backend later | impossible                             | must forge LSP JSON                   | invisible                      |
 
 The tunnel re-runs the documented multiplexer graveyard and breaks the
 single most valuable primitive (diagnostics for a client that was not
