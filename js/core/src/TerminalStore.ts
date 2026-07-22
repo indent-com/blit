@@ -348,7 +348,10 @@ export class TerminalStore {
     if (!this.sharedCanvas) {
       this.sharedCanvas = document.createElement("canvas");
     }
-    this.sharedRenderer = createGlRenderer(this.sharedCanvas, this.textRendering);
+    this.sharedRenderer = createGlRenderer(
+      this.sharedCanvas,
+      this.textRendering,
+    );
     if (!this.sharedRenderer.supported) {
       this.sharedRenderer = createCanvas2dRenderer(
         this.sharedCanvas,
