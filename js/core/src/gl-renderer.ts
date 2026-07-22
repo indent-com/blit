@@ -23,8 +23,11 @@ precision mediump float;
 in vec4 v_color;
 out vec4 fragColor;
 
+// Blend in linear light: decode the sRGB vertex color to linear before the
+// hardware premultiply/blend; the SRGB8 render target re-encodes on store.
+vec3 s2l(vec3 c){ return pow(c, vec3(2.2)); }
 void main() {
-    fragColor = vec4(v_color.rgb * v_color.a, v_color.a);
+    fragColor = vec4(s2l(v_color.rgb) * v_color.a, v_color.a);
 }
 `;
 
@@ -57,13 +60,14 @@ in vec4 v_color;
 uniform sampler2D u_texture;
 out vec4 fragColor;
 
+vec3 s2l(vec3 c){ return pow(c, vec3(2.2)); }
 void main() {
     vec4 tex = texture(u_texture, v_uv);
     float minC = min(tex.r, min(tex.g, tex.b));
     float maxC = max(tex.r, max(tex.g, tex.b));
     float isGray = step(maxC - minC, 0.02);
-    vec3 tinted = v_color.rgb * tex.a;
-    fragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
+    vec3 tinted = s2l(v_color.rgb) * tex.a;
+    fragColor = vec4(mix(s2l(tex.rgb), tinted, isGray), tex.a);
 }
 `;
 
@@ -360,6 +364,51 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   let lastAtlasCanvas: HTMLCanvasElement | null = null;
   let lastAtlasVersion = -1;
 
+  // Linear-light blending target: we draw into an offscreen SRGB8_ALPHA8
+  // texture so the hardware decodes the destination to linear on read, blends
+  // in linear light, and re-encodes to sRGB on store, then blit the raw sRGB
+  // bytes onto the default framebuffer (WebGL2 has no FRAMEBUFFER_SRGB toggle,
+  // so the blit is a plain copy) which the existing drawImage present path
+  // reads back unchanged.
+  const srgbTex = gl.createTexture();
+  const srgbFbo = gl.createFramebuffer();
+  let srgbW = 0;
+  let srgbH = 0;
+
+  function ensureSrgbTarget(w: number, h: number): void {
+    if (!srgbTex || !srgbFbo) return;
+    if (w === srgbW && h === srgbH) return;
+    srgbW = w;
+    srgbH = h;
+    gl!.bindTexture(gl!.TEXTURE_2D, srgbTex);
+    gl!.texImage2D(
+      gl!.TEXTURE_2D,
+      0,
+      gl!.SRGB8_ALPHA8,
+      w,
+      h,
+      0,
+      gl!.RGBA,
+      gl!.UNSIGNED_BYTE,
+      null,
+    );
+    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_MIN_FILTER, gl!.LINEAR);
+    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_MAG_FILTER, gl!.LINEAR);
+    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_WRAP_S, gl!.CLAMP_TO_EDGE);
+    gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_WRAP_T, gl!.CLAMP_TO_EDGE);
+    gl!.bindFramebuffer(gl!.FRAMEBUFFER, srgbFbo);
+    gl!.framebufferTexture2D(
+      gl!.FRAMEBUFFER,
+      gl!.COLOR_ATTACHMENT0,
+      gl!.TEXTURE_2D,
+      srgbTex,
+      0,
+    );
+    gl!.bindFramebuffer(gl!.FRAMEBUFFER, null);
+    // Restore the atlas texture binding the rest of the renderer assumes.
+    gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
+  }
+
   function uploadAtlas(atlasCanvas: HTMLCanvasElement, version: number): void {
     if (atlasCanvas === lastAtlasCanvas && version === lastAtlasVersion) return;
     lastAtlasCanvas = atlasCanvas;
@@ -557,6 +606,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       const h = Math.min(height, maxDim);
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
+      ensureSrgbTarget(canvas.width, canvas.height);
     },
     render(
       bgVerts: Float32Array,
@@ -573,8 +623,15 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       focused = true,
     ) {
       if (gl!.isContextLost()) return;
+      ensureSrgbTarget(canvas.width, canvas.height);
+      gl!.bindFramebuffer(gl!.FRAMEBUFFER, srgbFbo);
       gl!.viewport(0, 0, canvas.width, canvas.height);
-      gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
+      gl!.clearColor(
+        Math.pow(bgColor[0] / 255, 2.2),
+        Math.pow(bgColor[1] / 255, 2.2),
+        Math.pow(bgColor[2] / 255, 2.2),
+        1,
+      );
       gl!.clear(gl!.COLOR_BUFFER_BIT);
       drawColoredTriangles(bgVerts);
       if (atlasCanvas) {
@@ -589,11 +646,30 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
         cell,
         focused,
       );
+      const w = canvas.width;
+      const h = canvas.height;
+      gl!.bindFramebuffer(gl!.READ_FRAMEBUFFER, srgbFbo);
+      gl!.bindFramebuffer(gl!.DRAW_FRAMEBUFFER, null);
+      gl!.blitFramebuffer(
+        0,
+        0,
+        w,
+        h,
+        0,
+        0,
+        w,
+        h,
+        gl!.COLOR_BUFFER_BIT,
+        gl!.NEAREST,
+      );
+      gl!.bindFramebuffer(gl!.FRAMEBUFFER, null);
     },
     dispose() {
       gl!.deleteBuffer(rectBuffer);
       gl!.deleteBuffer(glyphBuffer);
       gl!.deleteTexture(atlasTexture);
+      if (srgbTex) gl!.deleteTexture(srgbTex);
+      if (srgbFbo) gl!.deleteFramebuffer(srgbFbo);
       gl!.deleteProgram(rectProgram);
       gl!.deleteProgram(glyphProgram);
     },

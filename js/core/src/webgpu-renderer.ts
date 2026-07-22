@@ -18,13 +18,16 @@ struct VOut {
   @location(0) color: vec4f,
 }
 
+// Blend in linear light: decode sRGB colors before the hardware premultiply
+// and blend; the sRGB render-target view re-encodes on store.
+fn s2l(c: vec3f) -> vec3f { return pow(c, vec3f(2.2)); }
 @vertex fn vs(v: VIn) -> VOut {
   let clip = (v.pos / u.resolution) * 2.0 - 1.0;
   return VOut(vec4f(clip.x, -clip.y, 0.0, 1.0), v.color);
 }
 
 @fragment fn fs(v: VOut) -> @location(0) vec4f {
-  return vec4f(v.color.rgb * v.color.a, v.color.a);
+  return vec4f(s2l(v.color.rgb) * v.color.a, v.color.a);
 }
 `;
 
@@ -50,13 +53,14 @@ struct VOut {
   return VOut(vec4f(clip.x, -clip.y, 0.0, 1.0), v.uv, v.color);
 }
 
+fn s2l(c: vec3f) -> vec3f { return pow(c, vec3f(2.2)); }
 @fragment fn fs(v: VOut) -> @location(0) vec4f {
   let tex = textureSample(atlasTex, atlasSamp, v.uv);
   let minC = min(tex.r, min(tex.g, tex.b));
   let maxC = max(tex.r, max(tex.g, tex.b));
   let isGray = step(maxC - minC, 0.02);
-  let tinted = v.color.rgb * tex.a;
-  return vec4f(mix(tex.rgb, tinted, isGray), tex.a);
+  let tinted = s2l(v.color.rgb) * tex.a;
+  return mix(vec4f(s2l(tex.rgb), tex.a), vec4f(tinted, tex.a), vec4f(isGray));
 }
 `;
 
@@ -135,10 +139,15 @@ export async function createWebGpuRenderer(
   if (!ctx) return null;
 
   const format = navigator.gpu.getPreferredCanvasFormat();
+  // Blend into an sRGB *view* of the same base texture: the GPU decodes the
+  // stored sRGB destination to linear on read, blends in linear light, and
+  // re-encodes to sRGB on store.
+  const viewFormat = `${format}-srgb` as GPUTextureFormat;
   ctx.configure({
     device,
     format,
     alphaMode: "premultiplied",
+    viewFormats: [viewFormat],
   });
 
   // --- uniform buffer (shared: vec2f resolution, 8 bytes padded to 16) ---
@@ -174,7 +183,7 @@ export async function createWebGpuRenderer(
       module: rectModule,
       targets: [
         {
-          format,
+          format: viewFormat,
           blend: {
             color: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
             alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
@@ -227,7 +236,7 @@ export async function createWebGpuRenderer(
       module: glyphModule,
       targets: [
         {
-          format,
+          format: viewFormat,
           blend: {
             color: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
             alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
@@ -502,13 +511,13 @@ export async function createWebGpuRenderer(
       const pass = enc.beginRenderPass({
         colorAttachments: [
           {
-            view: texture.createView(),
+            view: texture.createView({ format: viewFormat }),
             loadOp: "clear",
             storeOp: "store",
             clearValue: {
-              r: bgColor[0] / 255,
-              g: bgColor[1] / 255,
-              b: bgColor[2] / 255,
+              r: Math.pow(bgColor[0] / 255, 2.2),
+              g: Math.pow(bgColor[1] / 255, 2.2),
+              b: Math.pow(bgColor[2] / 255, 2.2),
               a: 1,
             },
           },
