@@ -1,0 +1,13 @@
+[package]
+name = "blit-fssync"
+version = "0.37.0"
+edition.workspace = true
+description = "Filesystem state sync engine: canonical tree index, per-client diffs, native watch backends"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blit-remote = { workspace = true }
+blake3 = { version = "1", default-features = false }
+notify = "8"

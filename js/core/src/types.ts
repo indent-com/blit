@@ -121,6 +121,9 @@ export interface BlitConnectionSnapshot {
   supportsCopyRange: boolean;
   supportsCompositor: boolean;
   supportsAudio: boolean;
+  supportsFsSync: boolean;
+  /** Server advertises `FEATURE_GIT` (git introspection, docs/git.md). */
+  supportsGit: boolean;
   retryCount: number;
   /** Non-null when the last connection attempt failed with an explicit error message. */
   error: string | null;

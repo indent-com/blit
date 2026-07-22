@@ -13,6 +13,8 @@ import type {
   TransportConfig,
 } from "./types";
 import type { BlitWasmModule } from "./TerminalStore";
+import type { FsSyncHandle, FsSyncOptions } from "./fs";
+import type { GitOpenOptions, GitRepoHandle } from "./git";
 import { WebSocketTransport } from "./transports/websocket";
 import { WebTransportTransport } from "./transports/webtransport";
 import { createShareTransport } from "./transports/webrtc-share";
@@ -192,6 +194,30 @@ export class BlitWorkspace {
   closeSurface(connectionId: ConnectionId, surfaceId: number): void {
     const connection = this.requireConnection(connectionId);
     connection.sendSurfaceClose(surfaceId);
+  }
+
+  /**
+   * Mirror a directory tree from one connection's server (docs/fs-watch.md):
+   * a live map plus per-record callbacks. See `BlitConnection.syncFs`.
+   */
+  async syncFs(
+    connectionId: ConnectionId,
+    path: string,
+    options?: FsSyncOptions,
+  ): Promise<FsSyncHandle> {
+    return this.requireConnection(connectionId).syncFs(path, options);
+  }
+
+  /**
+   * Open a git repository on one connection's server (docs/git.md): live
+   * state plus oid-addressed reads. See `BlitConnection.openRepo`.
+   */
+  async openRepo(
+    connectionId: ConnectionId,
+    path: string,
+    options?: GitOpenOptions,
+  ): Promise<GitRepoHandle> {
+    return this.requireConnection(connectionId).openRepo(path, options);
   }
 
   restartSession(sessionId: SessionId): void {

@@ -1,0 +1,25 @@
+[package]
+name = "blit-git"
+version = "0.37.0"
+edition.workspace = true
+description = "Git introspection engine: repo state streaming, object reads, diffs and patches"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blit-remote = { workspace = true }
+blit-fssync = { workspace = true }
+gix = { version = "0.73", default-features = false, features = [
+    "parallel",
+    "index",
+    "revision",
+    "status",
+    "blob-diff",
+    "dirwalk",
+    "attributes",
+    "worktree-mutation",
+] }
+imara-diff = "0.2"
+encoding_rs = "0.8"
+notify = "8"

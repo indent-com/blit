@@ -79,6 +79,94 @@ import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
+import {
+  FEATURE_FS_SYNC,
+  FS_CLOSED_CONNECTION_LOST,
+  FS_FILE_OK,
+  FS_STATUS_OK,
+  FS_SYNC_CONTENT,
+  FS_SYNC_CROSS_FILESYSTEM,
+  FS_SYNC_RECURSIVE,
+  FS_UPDATE_RESET,
+  FS_UPDATE_SYNC,
+  FsMirror,
+  S2C_FS_CLOSED,
+  S2C_FS_FILE,
+  S2C_FS_SYNCED,
+  S2C_FS_UPDATE,
+  buildFsAckMessage,
+  buildFsFetchMessage,
+  buildFsStopMessage,
+  buildFsSyncMessage,
+  fsDecompress,
+  fsRecords,
+  fsStatusText,
+  fsFileStatusText,
+  parseFsFileMessage,
+  type FsSyncHandle,
+  type FsSyncOptions,
+} from "./fs";
+import {
+  FEATURE_GIT,
+  GIT_CLOSED_CONNECTION_LOST,
+  GIT_OPEN_IGNORED,
+  GIT_OPEN_STATUS,
+  GIT_OPEN_TRACKING,
+  GIT_OPEN_UNTRACKED,
+  GIT_OPEN_WATCH,
+  GIT_PATCH_STRUCTURED,
+  GIT_STATUS_OK,
+  GitStateMirror,
+  type GitLogPage,
+  type GitLogSubscription,
+  type GitLogWatchOptions,
+  type GitOpenOptions,
+  type GitRepoHandle,
+  S2C_GIT_BASE,
+  S2C_GIT_BLOB,
+  S2C_GIT_CLOSED,
+  S2C_GIT_COMMITS,
+  S2C_GIT_DIFF,
+  S2C_GIT_INDEX,
+  S2C_GIT_LOG_PAGE,
+  S2C_GIT_PATCH,
+  S2C_GIT_REPO,
+  S2C_GIT_RESOLVE,
+  S2C_GIT_STATE,
+  S2C_GIT_TREE,
+  gitDiffRecords,
+  gitIndexRecords,
+  gitOidHex,
+  gitPatchRecords,
+  gitStatusText,
+  gitTreeRecords,
+  msgGitAck,
+  msgGitBase,
+  msgGitBlob,
+  msgGitClose,
+  msgGitDiff,
+  msgGitIndex,
+  msgGitLog,
+  msgGitLogAck,
+  msgGitLogUnwatch,
+  msgGitLogWatch,
+  msgGitOpen,
+  msgGitPatch,
+  msgGitResolve,
+  msgGitTree,
+  parseGitBaseResp,
+  parseGitBlobResp,
+  parseGitClosed,
+  parseGitCommits,
+  parseGitDiffResp,
+  parseGitIndexResp,
+  parseGitLogPage,
+  parseGitPatchResp,
+  parseGitRepo,
+  parseGitResolveResp,
+  parseGitState,
+  parseGitTreeResp,
+} from "./git";
 
 const textDecoder = new TextDecoder();
 
@@ -194,10 +282,53 @@ export class BlitConnection {
     number,
     { resolve: (text: string) => void; reject: (error: Error) => void }
   >();
+  private readonly pendingFsSyncs = new Map<
+    number,
+    {
+      resolve: (handle: FsSyncHandle) => void;
+      reject: (error: Error) => void;
+      options: FsSyncOptions;
+    }
+  >();
+  private readonly fsSyncs = new Map<
+    number,
+    { mirror: FsMirror; options: FsSyncOptions }
+  >();
+  private readonly pendingFsFetches = new Map<
+    number,
+    { resolve: (data: Uint8Array) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingGitOpens = new Map<
+    number,
+    {
+      resolve: (handle: GitRepoHandle) => void;
+      reject: (error: Error) => void;
+      options: GitOpenOptions;
+    }
+  >();
+  private readonly gitRepos = new Map<
+    number,
+    { mirror: GitStateMirror; options: GitOpenOptions }
+  >();
+  private readonly pendingGitRequests = new Map<
+    number,
+    {
+      opcode: number;
+      resolve: (msg: Uint8Array) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  /** Live log subscriptions keyed by client-assigned `log_id`. */
+  private readonly gitLogSubs = new Map<
+    number,
+    { repoId: number; onUpdate: (page: GitLogPage) => void }
+  >();
 
   private sessionCounter = 0;
   private nonceCounter = 0;
   private searchCounter = 0;
+  private fsNonceCounter = 0;
+  private gitLogIdCounter = 0;
   private features = 0;
   private disposed = false;
   /** Per-session, per-view size registry for computing minimum resize. */
@@ -296,6 +427,8 @@ export class BlitConnection {
       supportsCopyRange: false,
       supportsCompositor: false,
       supportsAudio: false,
+      supportsFsSync: false,
+      supportsGit: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -374,6 +507,8 @@ export class BlitConnection {
     );
     this.rejectPendingSearches(connectionError("Connection disposed"));
     this.rejectPendingReads(connectionError("Connection disposed"));
+    this.resetFsSyncs(connectionError("Connection disposed"));
+    this.resetGitRepos(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
     this.clearSurfaceSubs();
     this.store.destroy();
@@ -731,6 +866,328 @@ export class BlitConnection {
       this.pendingSearches.set(requestId, { resolve, reject });
       this.transport.send(buildSearchMessage(requestId, query));
     });
+  }
+
+  /**
+   * Mirror a server-side directory tree (docs/fs-watch.md). Resolves once
+   * the server accepts the sync; the handle's `live` map fills as the
+   * staged snapshot streams in and `onSync` fires when it is coherent.
+   * Updates are applied and acknowledged automatically.
+   */
+  async syncFs(
+    path: string,
+    options: FsSyncOptions = {},
+  ): Promise<FsSyncHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot sync while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_FS_SYNC) === 0) {
+      throw connectionError("Server does not support filesystem sync");
+    }
+    let flags = 0;
+    if (options.recursive !== false) flags |= FS_SYNC_RECURSIVE;
+    if (options.content) flags |= FS_SYNC_CONTENT;
+    if (options.crossFilesystem) flags |= FS_SYNC_CROSS_FILESYSTEM;
+    return new Promise<FsSyncHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsSyncs);
+      this.pendingFsSyncs.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        buildFsSyncMessage(
+          nonce,
+          flags,
+          options.latencyMs ?? 0,
+          options.inlineMax ?? 0,
+          path,
+        ),
+      );
+    });
+  }
+
+  private nextFsNonce(pending: ReadonlyMap<number, unknown>): number {
+    let nonce = 0;
+    do {
+      nonce = this.fsNonceCounter = (this.fsNonceCounter + 1) & 0xffff;
+    } while (pending.has(nonce));
+    return nonce;
+  }
+
+  private fsFetch(syncId: number, path: string): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsFetches);
+      this.pendingFsFetches.set(nonce, { resolve, reject });
+      this.transport.send(buildFsFetchMessage(nonce, syncId, path));
+    });
+  }
+
+  /**
+   * Open a repository on the server (docs/git.md). Resolves once the
+   * server accepts; state snapshots (when watching) apply to the handle's
+   * mirror and acknowledge automatically.
+   */
+  async openRepo(
+    path: string,
+    options: GitOpenOptions = {},
+  ): Promise<GitRepoHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open a repo while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_GIT) === 0) {
+      throw connectionError("Server does not support git introspection");
+    }
+    let flags = 0;
+    if (options.watch) flags |= GIT_OPEN_WATCH;
+    if (options.status || options.untracked || options.ignored)
+      flags |= GIT_OPEN_STATUS;
+    if (options.untracked || options.ignored) flags |= GIT_OPEN_UNTRACKED;
+    if (options.ignored) flags |= GIT_OPEN_IGNORED;
+    if (options.tracking) flags |= GIT_OPEN_TRACKING;
+    return new Promise<GitRepoHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingGitOpens);
+      this.pendingGitOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        msgGitOpen(
+          nonce,
+          flags,
+          options.refsLatencyMs ?? 0,
+          options.statusLatencyMs ?? 0,
+          path,
+        ),
+      );
+    });
+  }
+
+  /** One nonce-correlated git request; resolves with the raw response. */
+  private gitRequest(
+    repoId: number,
+    opcode: number,
+    build: (nonce: number) => Uint8Array,
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.gitRepos.has(repoId)) {
+        reject(connectionError("Repo is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingGitRequests);
+      this.pendingGitRequests.set(nonce, { opcode, resolve, reject });
+      this.transport.send(build(nonce));
+    });
+  }
+
+  private makeGitRepoHandle(
+    repoId: number,
+    info: { oidFormat: number; flags: number; workdir: string; gitdir: string },
+    mirror: GitStateMirror,
+  ): GitRepoHandle {
+    // Immutable pulls cache forever by oid (content-addressed).
+    const blobCache = new Map<string, Uint8Array>();
+    const expectOk = (status: number): void => {
+      if (status !== GIT_STATUS_OK) {
+        throw connectionError(`Request failed: ${gitStatusText(status)}`);
+      }
+    };
+    return {
+      repoId,
+      oidFormat: info.oidFormat,
+      repoFlags: info.flags,
+      workdir: info.workdir,
+      gitdir: info.gitdir,
+      state: mirror,
+      log: async (req = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_COMMITS, (nonce) =>
+          msgGitLog({
+            nonce,
+            repoId,
+            flags: req.flags ?? 0,
+            limit: req.limit ?? 0,
+            path: req.path ?? "",
+            tips: req.tips ?? [],
+            hides: req.hides ?? [],
+          }),
+        );
+        const page = parseGitCommits(msg);
+        if (!page) throw connectionError("Malformed commits from server");
+        expectOk(page.status);
+        return page;
+      },
+      tree: async (oid, path = "") => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_TREE, (nonce) =>
+          msgGitTree(nonce, repoId, oid, path),
+        );
+        const parsed = parseGitTreeResp(msg);
+        if (!parsed) throw connectionError("Malformed tree from server");
+        expectOk(parsed[1]);
+        return [...gitTreeRecords(parsed[3])];
+      },
+      blob: async (oid, path = "", maxLen = 0) => {
+        const cacheKey = path === "" ? gitOidHex(oid, info.oidFormat) : null;
+        if (cacheKey !== null) {
+          const cached = blobCache.get(cacheKey);
+          if (cached) return cached;
+        }
+        const msg = await this.gitRequest(repoId, S2C_GIT_BLOB, (nonce) =>
+          msgGitBlob(nonce, repoId, oid, path, maxLen),
+        );
+        const parsed = parseGitBlobResp(msg);
+        if (!parsed) throw connectionError("Malformed blob from server");
+        expectOk(parsed[1]);
+        if (cacheKey !== null) blobCache.set(cacheKey, parsed[3]);
+        return parsed[3];
+      },
+      diff: async (old, newEndpoint, opts = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_DIFF, (nonce) =>
+          msgGitDiff({
+            nonce,
+            repoId,
+            flags: opts.flags ?? 0,
+            old,
+            new: newEndpoint,
+            path: opts.path ?? "",
+          }),
+        );
+        const parsed = parseGitDiffResp(msg);
+        if (!parsed) throw connectionError("Malformed diff from server");
+        expectOk(parsed[1]);
+        return [...gitDiffRecords(parsed[3])];
+      },
+      patch: async (old, newEndpoint, opts = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_PATCH, (nonce) =>
+          msgGitPatch({
+            nonce,
+            repoId,
+            flags: opts.flags ?? 0,
+            context: opts.context ?? 0,
+            old,
+            new: newEndpoint,
+            path: opts.path ?? "",
+            maxLen: opts.maxLen ?? 0,
+          }),
+        );
+        const parsed = parseGitPatchResp(msg);
+        if (!parsed) throw connectionError("Malformed patch from server");
+        expectOk(parsed[1]);
+        const [, , flags, data] = parsed;
+        return {
+          flags,
+          records:
+            flags & GIT_PATCH_STRUCTURED ? [...gitPatchRecords(data)] : [],
+          text: flags & GIT_PATCH_STRUCTURED ? new Uint8Array(0) : data,
+        };
+      },
+      index: async (path = "") => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_INDEX, (nonce) =>
+          msgGitIndex(nonce, repoId, path),
+        );
+        const parsed = parseGitIndexResp(msg);
+        if (!parsed) throw connectionError("Malformed index from server");
+        expectOk(parsed[1]);
+        return [...gitIndexRecords(parsed[3])];
+      },
+      mergeBase: async (oids) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_BASE, (nonce) =>
+          msgGitBase(nonce, repoId, oids),
+        );
+        const parsed = parseGitBaseResp(msg);
+        if (!parsed) throw connectionError("Malformed base from server");
+        expectOk(parsed[1]);
+        return parsed[2];
+      },
+      resolve: async (spec) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_RESOLVE, (nonce) =>
+          msgGitResolve(nonce, repoId, spec),
+        );
+        const parsed = parseGitResolveResp(msg);
+        if (!parsed) throw connectionError("Malformed resolve from server");
+        expectOk(parsed.status);
+        return { tips: parsed.tips, hides: parsed.hides };
+      },
+      watchLog: (spec, opts, onUpdate) =>
+        this.watchGitLog(repoId, spec, opts, onUpdate),
+      close: () => {
+        this.closeGitLogSubs(repoId);
+        if (this.transport.status === "connected") {
+          this.transport.send(msgGitClose(repoId));
+        }
+      },
+    };
+  }
+
+  /** Start a live log subscription; the server pushes pages we auto-ack. */
+  private watchGitLog(
+    repoId: number,
+    spec: string,
+    opts: GitLogWatchOptions,
+    onUpdate: (page: GitLogPage) => void,
+  ): GitLogSubscription {
+    if (!this.gitRepos.has(repoId)) {
+      throw connectionError("Repo is closed");
+    }
+    let logId = 0;
+    do {
+      logId = this.gitLogIdCounter = (this.gitLogIdCounter + 1) & 0xffff;
+    } while (logId === 0 || this.gitLogSubs.has(logId));
+    this.gitLogSubs.set(logId, { repoId, onUpdate });
+    this.transport.send(
+      msgGitLogWatch(logId, repoId, opts.flags ?? 0, opts.limit ?? 0, spec),
+    );
+    return {
+      logId,
+      close: () => {
+        if (!this.gitLogSubs.delete(logId)) return;
+        if (this.transport.status === "connected") {
+          this.transport.send(msgGitLogUnwatch(logId, repoId));
+        }
+      },
+    };
+  }
+
+  /** Drop every log subscription bound to a repo (close or teardown). */
+  private closeGitLogSubs(repoId: number): void {
+    for (const [logId, sub] of this.gitLogSubs) {
+      if (sub.repoId === repoId) this.gitLogSubs.delete(logId);
+    }
+  }
+
+  /** Tear down all git repo state (reconnect or dispose). */
+  private resetGitRepos(error: Error): void {
+    for (const pending of this.pendingGitOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingGitOpens.clear();
+    for (const pending of this.pendingGitRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingGitRequests.clear();
+    this.gitLogSubs.clear();
+    const repos = [...this.gitRepos.values()];
+    this.gitRepos.clear();
+    for (const repo of repos) {
+      repo.options.onClosed?.(GIT_CLOSED_CONNECTION_LOST);
+    }
+  }
+
+  /** Tear down all fs sync state (reconnect or dispose). */
+  private resetFsSyncs(error: Error): void {
+    for (const pending of this.pendingFsSyncs.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsSyncs.clear();
+    for (const pending of this.pendingFsFetches.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsFetches.clear();
+    const syncs = [...this.fsSyncs.values()];
+    this.fsSyncs.clear();
+    for (const sync of syncs) {
+      sync.options.onClosed?.(FS_CLOSED_CONNECTION_LOST);
+    }
   }
 
   private ptyId(sessionId: SessionId): number | undefined {
@@ -1245,6 +1702,8 @@ export class BlitConnection {
         this.surfaceStore.reset();
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
+        this.resetFsSyncs(connectionError("Server is shutting down"));
+        this.resetGitRepos(connectionError("Server is shutting down"));
         // Immediately reconnect so the UI recovers as fast as possible
         // when the server restarts.  Do NOT call transport.close() — that
         // permanently disposes the transport.  transport.reconnect() tears
@@ -1433,11 +1892,17 @@ export class BlitConnection {
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
+          supportsFsSync: (features & FEATURE_FS_SYNC) !== 0,
+          supportsGit: (features & FEATURE_GIT) !== 0,
         };
         this.emit();
         this.surfaceStore.reset();
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
+        // Fs syncs do not survive a server session change: old sync_ids
+        // are meaningless on the new session.
+        this.resetFsSyncs(connectionError("Connection re-established"));
+        this.resetGitRepos(connectionError("Connection re-established"));
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -1618,6 +2083,169 @@ export class BlitConnection {
         }
         return;
       }
+      case S2C_FS_SYNCED: {
+        if (bytes.length < 8) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingFsSyncs.get(nonce);
+        if (!pending) return;
+        this.pendingFsSyncs.delete(nonce);
+        const syncId = bytes[3] | (bytes[4] << 8);
+        const status = bytes[5];
+        const detailLen = bytes[6] | (bytes[7] << 8);
+        const detail = textDecoder.decode(bytes.subarray(8, 8 + detailLen));
+        if (status !== FS_STATUS_OK) {
+          pending.reject(
+            connectionError(`Sync failed: ${fsStatusText(status, detail)}`),
+          );
+          return;
+        }
+        const mirror = new FsMirror();
+        const state = { mirror, options: pending.options };
+        this.fsSyncs.set(syncId, state);
+        pending.resolve({
+          syncId,
+          root: detail,
+          get live() {
+            // The mirror *replaces* its live map when a staged snapshot
+            // swaps in, so the handle must dereference on every access.
+            return mirror.live;
+          },
+          fetch: (path: string) => this.fsFetch(syncId, path),
+          stop: () => {
+            if (this.transport.status === "connected") {
+              this.transport.send(buildFsStopMessage(syncId));
+            }
+          },
+        });
+        return;
+      }
+      case S2C_FS_UPDATE: {
+        if (bytes.length < 8) return;
+        const syncId = bytes[1] | (bytes[2] << 8);
+        const state = this.fsSyncs.get(syncId);
+        if (!state) return;
+        const flags = bytes[7];
+        // Decode a second time only when someone wants per-record events.
+        const records = state.options.onRecord
+          ? fsDecompress(bytes.subarray(8))
+          : null;
+        const updateId = state.mirror.applyUpdate(bytes);
+        if (updateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed FS_UPDATE for sync ${syncId}`,
+          );
+          return;
+        }
+        this.transport.send(buildFsAckMessage(syncId, updateId));
+        if (flags & FS_UPDATE_RESET) state.options.onReset?.();
+        if (records !== null && state.options.onRecord) {
+          for (const record of fsRecords(records)) {
+            state.options.onRecord(record);
+          }
+        }
+        if (flags & FS_UPDATE_SYNC) state.options.onSync?.();
+        state.options.onUpdate?.();
+        return;
+      }
+      case S2C_FS_FILE: {
+        const parsed = parseFsFileMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsFetches.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsFetches.delete(parsed.nonce);
+        if (parsed.status === FS_FILE_OK) {
+          pending.resolve(parsed.data);
+        } else {
+          pending.reject(
+            connectionError(`Fetch failed: ${fsFileStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_CLOSED: {
+        if (bytes.length < 4) return;
+        const syncId = bytes[1] | (bytes[2] << 8);
+        const state = this.fsSyncs.get(syncId);
+        if (!state) return;
+        this.fsSyncs.delete(syncId);
+        state.options.onClosed?.(bytes[3]);
+        return;
+      }
+      case S2C_GIT_REPO: {
+        const info = parseGitRepo(bytes);
+        if (!info) return;
+        const pending = this.pendingGitOpens.get(info.nonce);
+        if (!pending) return;
+        this.pendingGitOpens.delete(info.nonce);
+        if (info.status !== GIT_STATUS_OK) {
+          pending.reject(
+            connectionError(
+              `Open failed: ${gitStatusText(info.status)}${info.workdir ? `: ${info.workdir}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const mirror = new GitStateMirror();
+        this.gitRepos.set(info.repoId, { mirror, options: pending.options });
+        pending.resolve(this.makeGitRepoHandle(info.repoId, info, mirror));
+        return;
+      }
+      case S2C_GIT_STATE: {
+        if (bytes.length < 8) return;
+        const repoId = bytes[1] | (bytes[2] << 8);
+        const repo = this.gitRepos.get(repoId);
+        if (!repo) return;
+        const stateId = repo.mirror.applyState(bytes);
+        if (stateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed GIT_STATE for repo ${repoId}`,
+          );
+          return;
+        }
+        this.transport.send(msgGitAck(repoId, stateId));
+        repo.options.onState?.(repo.mirror, stateId);
+        return;
+      }
+      case S2C_GIT_CLOSED: {
+        const closed = parseGitClosed(bytes);
+        if (!closed) return;
+        const repo = this.gitRepos.get(closed[0]);
+        if (!repo) return;
+        this.gitRepos.delete(closed[0]);
+        this.closeGitLogSubs(closed[0]);
+        repo.options.onClosed?.(closed[1]);
+        return;
+      }
+      case S2C_GIT_LOG_PAGE: {
+        const page = parseGitLogPage(bytes);
+        if (!page) return;
+        const sub = this.gitLogSubs.get(page.logId);
+        if (!sub) return;
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        if (this.transport.status === "connected") {
+          this.transport.send(
+            msgGitLogAck(page.logId, sub.repoId, page.updateId),
+          );
+        }
+        sub.onUpdate(page);
+        return;
+      }
+      case S2C_GIT_COMMITS:
+      case S2C_GIT_TREE:
+      case S2C_GIT_BLOB:
+      case S2C_GIT_DIFF:
+      case S2C_GIT_PATCH:
+      case S2C_GIT_INDEX:
+      case S2C_GIT_BASE:
+      case S2C_GIT_RESOLVE: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingGitRequests.get(nonce);
+        if (!pending || pending.opcode !== bytes[0]) return;
+        this.pendingGitRequests.delete(nonce);
+        pending.resolve(bytes);
+        return;
+      }
       default:
         return;
     }
@@ -1704,6 +2332,10 @@ export class BlitConnection {
       );
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
+      // Fs syncs and git repos do not survive a transport drop; reject
+      // their pending promises promptly rather than leaving them hung.
+      this.resetFsSyncs(connectionError(`Transport ${status}`));
+      this.resetGitRepos(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
       this.hasReceivedList = false;
       // Dismiss all sessions so the UI doesn't show stale terminals from a

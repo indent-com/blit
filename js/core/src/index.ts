@@ -32,6 +32,42 @@ export {
   formatExitStatus,
 } from "./exit-status";
 
+export {
+  FEATURE_FS_SYNC,
+  FS_SYNC_RECURSIVE,
+  FS_SYNC_CONTENT,
+  FS_SYNC_CROSS_FILESYSTEM,
+  FS_STATUS_OK,
+  FS_STATUS_NOT_FOUND,
+  FS_STATUS_PERMISSION_DENIED,
+  FS_STATUS_RESOURCE_LIMIT,
+  FS_STATUS_OTHER,
+  FS_CLOSED_CLIENT_REQUEST,
+  FS_CLOSED_ROOT_GONE,
+  FS_CLOSED_PERMISSION_LOST,
+  FS_CLOSED_BACKEND_FAILED,
+  FS_CLOSED_RESOURCE_LIMIT,
+  FS_CLOSED_CONNECTION_LOST,
+  FS_ENTRY_TYPE_MASK,
+  FS_ENTRY_FILE,
+  FS_ENTRY_DIR,
+  FS_ENTRY_SYMLINK,
+  FS_ENTRY_OTHER,
+  FS_ENTRY_UNREADABLE,
+  FS_ENTRY_NO_CONTENT,
+  FS_ENTRY_UNSTABLE,
+  FsMirror,
+  applyFsDelta,
+} from "./fs";
+export type {
+  FsNode,
+  FsRecord,
+  FsContent,
+  FsSyncOptions,
+  FsSyncHandle,
+} from "./fs";
+export * from "./git";
+
 export type {
   BlitConnectionSnapshot,
   BlitDebug,

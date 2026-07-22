@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 blit-remote = { workspace = true }
+blit-fssync = { workspace = true }
+blit-git = { workspace = true }
 blit-alacritty = { workspace = true }
 blit-compositor = { workspace = true }
 blit-sd-notify = { workspace = true }

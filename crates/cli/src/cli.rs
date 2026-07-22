@@ -62,6 +62,18 @@ pub enum Command {
         command: Option<ClipboardCommand>,
     },
 
+    /// Mirror server filesystem state (docs/fs-watch.md)
+    Fs {
+        #[command(subcommand)]
+        command: FsCommand,
+    },
+
+    /// Inspect git repositories on the server (docs/git.md)
+    Git {
+        #[command(subcommand)]
+        command: GitCommand,
+    },
+
     /// Manage named remotes in blit.remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
@@ -782,6 +794,146 @@ pub enum ClipboardCommand {
 
         /// Text to set (if omitted, reads from stdin)
         text: Option<String>,
+    },
+}
+
+// ── Fs subcommands ───────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum FsCommand {
+    /// Mirror a directory tree from the server, streaming changes
+    ///
+    /// Prints the initial snapshot once it is coherent, then one line per
+    /// change (`+` added, `~` modified, `-` deleted, `>` moved). With
+    /// --json, emits one NDJSON event per record (`upsert`, `delete`,
+    /// `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
+    Sync {
+        /// Path on the server (absolute, or relative to the server's cwd)
+        path: String,
+
+        /// Sync file contents too (hashes always sync)
+        #[arg(long)]
+        content: bool,
+
+        /// Watch only the path and its immediate children
+        #[arg(long)]
+        no_recursive: bool,
+
+        /// Exit after the initial snapshot instead of streaming
+        #[arg(long)]
+        once: bool,
+
+        /// NDJSON event output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Git subcommands ──────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum GitCommand {
+    /// Branch, ahead/behind, stash, and working-tree status
+    Status {
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Keep watching, reprinting whenever the status changes
+        #[arg(long)]
+        watch: bool,
+
+        /// NDJSON output (one state snapshot per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Commit history, newest first
+    ///
+    /// Examples:
+    ///   blit git log                 # HEAD
+    ///   blit git log v1.0            # from a tag
+    ///   blit git log main..feature   # a range
+    ///   blit git log --watch main..HEAD
+    ///   blit git log --follow -- src/main.rs
+    Log {
+        /// Revision or range to log (default: HEAD). A ref, (short) oid,
+        /// HEAD~N, or a range A..B / A...B.
+        rev: Option<String>,
+
+        /// Restrict to commits touching this path (after `--`)
+        #[arg(last = true)]
+        pathspec: Vec<String>,
+
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Maximum commits to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: u16,
+
+        /// Keep the log live, refreshing as its endpoint refs move
+        #[arg(long)]
+        watch: bool,
+
+        /// Follow a single file across renames (needs a path)
+        #[arg(long)]
+        follow: bool,
+
+        /// Follow only the first parent of each merge
+        #[arg(long)]
+        first_parent: bool,
+
+        /// Include the full commit message, not just the subject
+        #[arg(long)]
+        full_message: bool,
+
+        /// Topological order (parents after children) within the page
+        #[arg(long)]
+        topo: bool,
+
+        /// NDJSON output (one commit per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Changed files (unstaged by default), optionally with per-file hunks
+    ///
+    /// Examples:
+    ///   blit git diff                # worktree vs index (unstaged)
+    ///   blit git diff --staged       # index vs HEAD (staged)
+    ///   blit git diff main           # worktree vs a commit
+    ///   blit git diff main dev       # between two commits
+    ///   blit git diff main..dev      # same as: main dev
+    ///   blit git diff main...dev     # since they diverged (merge base)
+    ///   blit git diff HEAD~2 -- src  # limited to a path
+    Diff {
+        /// Revisions to compare: none (worktree vs index), one (that
+        /// revision vs the worktree, or the index with --staged), two
+        /// (between them), or a single A..B / A...B range. Each is a ref,
+        /// (short) oid, or HEAD~N.
+        revs: Vec<String>,
+
+        /// Restrict to this path (after `--`)
+        #[arg(last = true)]
+        pathspec: Vec<String>,
+
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Compare the index to HEAD (staged changes) instead of the worktree
+        #[arg(long)]
+        staged: bool,
+
+        /// Show per-file hunks, not just the changed-file list
+        #[arg(short = 'p', long)]
+        patch: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 

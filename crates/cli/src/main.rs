@@ -1,13 +1,18 @@
 mod agent;
 mod cli;
+mod fs;
 mod generate;
+mod git;
 mod grep;
 mod interactive;
 mod transport;
 mod uplink;
 
 use clap::Parser;
-use cli::{Cli, ClipboardCommand, Command, RemoteCommand, SurfaceCommand, TerminalCommand};
+use cli::{
+    Cli, ClipboardCommand, Command, FsCommand, GitCommand, RemoteCommand, SurfaceCommand,
+    TerminalCommand,
+};
 
 fn main() {
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
@@ -330,6 +335,90 @@ async fn async_main() {
                 ClipboardCommand::Get { mime } => agent::cmd_clipboard_get(transport, &mime).await,
                 ClipboardCommand::Set { mime, text } => {
                     agent::cmd_clipboard_set(transport, &mime, text).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Fs { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match command {
+                FsCommand::Sync {
+                    path,
+                    content,
+                    no_recursive,
+                    once,
+                    json,
+                } => fs::cmd_sync(transport, path, content, no_recursive, once, json).await,
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Git { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match command {
+                GitCommand::Status { repo, watch, json } => {
+                    git::cmd_status(transport, repo, watch, json).await
+                }
+                GitCommand::Log {
+                    rev,
+                    pathspec,
+                    repo,
+                    limit,
+                    watch,
+                    follow,
+                    first_parent,
+                    full_message,
+                    topo,
+                    json,
+                } => {
+                    let opts = git::LogOpts {
+                        rev,
+                        path: pathspec.into_iter().next(),
+                        limit,
+                        watch,
+                        follow,
+                        first_parent,
+                        full_message,
+                        topo,
+                        json,
+                    };
+                    git::cmd_log(transport, repo, opts).await
+                }
+                GitCommand::Diff {
+                    revs,
+                    pathspec,
+                    repo,
+                    staged,
+                    patch,
+                    json,
+                } => {
+                    let opts = git::DiffOpts {
+                        revs,
+                        staged,
+                        patch,
+                        path: pathspec.into_iter().next(),
+                        json,
+                    };
+                    git::cmd_diff(transport, repo, opts).await
                 }
             };
             if let Err(e) = result {
