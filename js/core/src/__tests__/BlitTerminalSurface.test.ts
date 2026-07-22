@@ -78,6 +78,30 @@ describe("BlitTerminalSurface read-only canvas layout", () => {
     expect(canvas.style.objectPosition).toBe("right bottom");
     surface.dispose();
   });
+
+  it("observes container size when read-only resizing is enabled", () => {
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe = observe;
+        disconnect = disconnect;
+      },
+    );
+    const surface = new BlitTerminalSurface({
+      sessionId: null,
+      readOnly: true,
+      readOnlyResize: true,
+    });
+    const container = document.createElement("div");
+
+    surface.attach(container);
+
+    expect(observe).toHaveBeenCalledWith(container);
+    surface.dispose();
+    expect(disconnect).toHaveBeenCalledOnce();
+  });
 });
 
 describe("BlitTerminalSurface mobile copy/paste API", () => {

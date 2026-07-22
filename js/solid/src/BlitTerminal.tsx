@@ -18,6 +18,8 @@ export interface BlitTerminalProps {
   style?: JSX.CSSProperties;
   palette?: TerminalPalette;
   readOnly?: boolean;
+  /** Resize the remote session to this surface while remaining read-only. Default: false. */
+  readOnlyResize?: boolean;
   /** CSS object-position for the contained read-only canvas. Default: "center". */
   readOnlyObjectPosition?: string;
   showCursor?: boolean;
@@ -54,6 +56,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
       fontSize: props.fontSize ?? ctx.fontSize,
       palette: props.palette ?? ctx.palette,
       readOnly: props.readOnly,
+      readOnlyResize: props.readOnlyResize,
       readOnlyObjectPosition: props.readOnlyObjectPosition,
       showCursor: props.showCursor,
       onRender: props.onRender,
@@ -100,6 +103,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
     surface()?.setAdvanceRatio(props.advanceRatio ?? ctx.advanceRatio),
   );
   createEffect(() => surface()?.setReadOnly(props.readOnly));
+  createEffect(() => surface()?.setReadOnlyResize(props.readOnlyResize));
   createEffect(() =>
     surface()?.setReadOnlyObjectPosition(props.readOnlyObjectPosition),
   );
@@ -117,7 +121,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
     if (
       connection?.status === "connected" &&
       props.sessionId !== null &&
-      !props.readOnly
+      (!props.readOnly || props.readOnlyResize)
     ) {
       s?.resendSize();
     }

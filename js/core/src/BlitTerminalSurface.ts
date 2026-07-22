@@ -22,6 +22,8 @@ export interface BlitTerminalSurfaceOptions {
   fontSize?: number;
   palette?: TerminalPalette;
   readOnly?: boolean;
+  /** Resize the remote session to this surface while remaining read-only. Default: false. */
+  readOnlyResize?: boolean;
   /** CSS object-position for the contained read-only canvas. Default: "center". */
   readOnlyObjectPosition?: string;
   showCursor?: boolean;
@@ -140,6 +142,7 @@ export class BlitTerminalSurface {
   private _fontSize: number;
   private _palette: TerminalPalette | undefined;
   private _readOnly: boolean;
+  private _readOnlyResize: boolean;
   private _readOnlyObjectPosition: string;
   private _showCursor: boolean;
   private _onRender: ((renderMs: number) => void) | undefined;
@@ -269,6 +272,7 @@ export class BlitTerminalSurface {
     this._fontSize = options.fontSize ?? DEFAULT_FONT_SIZE;
     this._palette = options.palette;
     this._readOnly = options.readOnly ?? false;
+    this._readOnlyResize = options.readOnlyResize ?? false;
     this._readOnlyObjectPosition = options.readOnlyObjectPosition ?? "center";
     this._showCursor = options.showCursor ?? true;
     this._onRender = options.onRender;
@@ -758,6 +762,18 @@ export class BlitTerminalSurface {
     this._readOnly = readOnly ?? false;
   }
 
+  setReadOnlyResize(resize: boolean | undefined): void {
+    const resolved = resize ?? false;
+    if (this._readOnlyResize === resolved) return;
+    this._readOnlyResize = resolved;
+    if (!this.container || !this._readOnly) return;
+    if (resolved) {
+      this.setupResizeObserver();
+    } else {
+      this.teardownResizeObserver();
+    }
+  }
+
   setReadOnlyObjectPosition(position: string | undefined): void {
     const resolved = position ?? "center";
     if (this._readOnlyObjectPosition === resolved) return;
@@ -976,7 +992,7 @@ export class BlitTerminalSurface {
       this.contentDirty = true;
       this.scheduleRender();
       this.reconcilePrediction();
-      if (this._readOnly) this.syncReadOnlySize(t);
+      if (this._readOnly && !this._readOnlyResize) this.syncReadOnlySize(t);
     });
     // Check for terminal that was created between setup steps.
     const t = conn.getTerminal(sessionId);
@@ -988,7 +1004,7 @@ export class BlitTerminalSurface {
       }
       this.contentDirty = true;
       this.scheduleRender();
-      if (this._readOnly) this.syncReadOnlySize(t);
+      if (this._readOnly && !this._readOnlyResize) this.syncReadOnlySize(t);
     }
   }
 
@@ -1027,7 +1043,7 @@ export class BlitTerminalSurface {
   // --- Resize observer ---
 
   private setupResizeObserver(): void {
-    if (!this.container || this._readOnly) return;
+    if (!this.container || (this._readOnly && !this._readOnlyResize)) return;
 
     if (!this.viewId && this._blitConn) {
       this.viewId = this._blitConn.allocViewId();
@@ -1056,7 +1072,7 @@ export class BlitTerminalSurface {
   private _resizeTimer: ReturnType<typeof setTimeout> | undefined;
 
   private handleResize(immediate?: boolean): void {
-    if (!this.container || this._readOnly) return;
+    if (!this.container || (this._readOnly && !this._readOnlyResize)) return;
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
     const cols = Math.max(1, Math.floor(w / this.cell.w));
@@ -1095,7 +1111,7 @@ export class BlitTerminalSurface {
   resendSize(): void {
     if (
       this._sessionId !== null &&
-      !this._readOnly &&
+      (!this._readOnly || this._readOnlyResize) &&
       this._blitConn &&
       this.viewId &&
       this._rows > 0 &&
