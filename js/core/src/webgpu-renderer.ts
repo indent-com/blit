@@ -1,5 +1,6 @@
 import type { CellMetrics } from "./measure";
 import type { GlRenderer } from "./gl-renderer";
+import type { TextRenderingConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // WGSL shaders
@@ -28,7 +29,9 @@ struct VOut {
 }
 `;
 
-const GLYPH_WGSL = /* wgsl */ `
+function glyphWgsl(gamma: number): string {
+  const cov = gamma === 1 ? "tex.a" : `pow(tex.a, ${gamma.toFixed(6)})`;
+  return /* wgsl */ `
 struct Uniforms { resolution: vec2f }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlasTex: texture_2d<f32>;
@@ -55,10 +58,12 @@ struct VOut {
   let minC = min(tex.r, min(tex.g, tex.b));
   let maxC = max(tex.r, max(tex.g, tex.b));
   let isGray = step(maxC - minC, 0.02);
-  let tinted = v.color.rgb * tex.a;
-  return vec4f(mix(tex.rgb, tinted, isGray), tex.a);
+  let cov = ${cov};
+  let tinted = v.color.rgb * cov;
+  return mix(vec4f(tex.rgb, tex.a), vec4f(tinted, cov), vec4f(isGray));
 }
 `;
+}
 
 // ---------------------------------------------------------------------------
 // WebGPU usage-flag constants (spec-defined, stable across browsers).
@@ -111,6 +116,7 @@ function ensureBuffer(
  */
 export async function createWebGpuRenderer(
   canvas: HTMLCanvasElement,
+  textRendering?: TextRenderingConfig,
 ): Promise<GlRenderer | null> {
   if (typeof navigator === "undefined" || !navigator.gpu) return null;
 
@@ -190,7 +196,8 @@ export async function createWebGpuRenderer(
   });
 
   // --- glyph pipeline ---
-  const glyphModule = device.createShaderModule({ code: GLYPH_WGSL });
+  const gamma = 1 / (1 + Math.max(0, textRendering?.stemDarkening ?? 0));
+  const glyphModule = device.createShaderModule({ code: glyphWgsl(gamma) });
   const glyphBindGroupLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: STAGE_VERTEX, buffer: { type: "uniform" } },

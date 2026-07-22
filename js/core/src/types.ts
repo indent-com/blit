@@ -12,6 +12,19 @@ export interface TerminalPalette {
   ansi: Array<[number, number, number]>;
 }
 
+/**
+ * Optional glyph text-rendering tuning. Defaults reproduce legacy output exactly.
+ */
+export interface TextRenderingConfig {
+  /**
+   * Stem darkening amount, à la macOS font dilation / FreeType stem darkening:
+   * emboldens monochrome glyph coverage to restore weight lost to anti-aliasing.
+   * 0 = off (default, byte-identical to legacy rendering). Typical range 0.2–0.6.
+   * Applied as a coverage gamma: cov' = cov ^ (1 / (1 + stemDarkening)).
+   */
+  stemDarkening?: number;
+}
+
 export interface BlitDebug {
   log(msg: string, ...args: unknown[]): void;
   warn(msg: string, ...args: unknown[]): void;

@@ -7,6 +7,7 @@ import type {
   ConnectionStatus,
   SessionId,
   TerminalPalette,
+  TextRenderingConfig,
 } from "./types";
 import { EXIT_STATUS_UNKNOWN } from "./exit-status";
 import {
@@ -95,6 +96,7 @@ export interface CreateBlitConnectionOptions {
   wasm: BlitWasmModule | Promise<BlitWasmModule>;
   autoConnect?: boolean;
   logger?: import("./BlitWorkspace").BlitLogger;
+  textRendering?: TextRenderingConfig;
 }
 
 export interface CreateSessionOptions {
@@ -243,6 +245,7 @@ export class BlitConnection {
     wasm,
     autoConnect = true,
     logger,
+    textRendering,
   }: CreateBlitConnectionOptions) {
     this.id = id;
     this.transport = transport;
@@ -283,6 +286,7 @@ export class BlitConnection {
         log: (msg) => this._logger.info(`${this.id}: ${msg}`),
       },
       wasm,
+      textRendering,
     );
     this.snapshot = {
       id,

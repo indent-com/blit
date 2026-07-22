@@ -11,6 +11,7 @@ import type {
   ConnectionId,
   SessionId,
   TransportConfig,
+  TextRenderingConfig,
 } from "./types";
 import type { BlitWasmModule } from "./TerminalStore";
 import { WebSocketTransport } from "./transports/websocket";
@@ -23,6 +24,8 @@ export interface AddBlitConnectionOptions extends Omit<
 > {
   transport?: BlitTransport | TransportConfig;
   wasm?: BlitWasmModule | Promise<BlitWasmModule>;
+  /** Per-connection text-rendering config; falls back to the workspace default. */
+  textRendering?: TextRenderingConfig;
 }
 
 /** Logger interface for workspace lifecycle events. */
@@ -49,6 +52,8 @@ export interface CreateBlitWorkspaceOptions {
   wasm: BlitWasmModule | Promise<BlitWasmModule>;
   connections?: AddBlitConnectionOptions[];
   logger?: BlitLogger;
+  /** Workspace-wide default text-rendering config; per-connection value overrides it. */
+  textRendering?: TextRenderingConfig;
 }
 
 export interface CreateWorkspaceSessionOptions {
@@ -75,6 +80,7 @@ export class BlitWorkspace {
   private readonly connectionListeners = new Map<ConnectionId, () => void>();
   private readonly connections = new Map<ConnectionId, BlitConnection>();
   private readonly defaultWasm: BlitWasmModule | Promise<BlitWasmModule>;
+  private readonly defaultTextRendering: TextRenderingConfig | undefined;
   readonly logger: BlitLogger;
 
   private snapshot: BlitWorkspaceSnapshot = {
@@ -84,8 +90,14 @@ export class BlitWorkspace {
     ready: false,
   };
 
-  constructor({ wasm, connections = [], logger }: CreateBlitWorkspaceOptions) {
+  constructor({
+    wasm,
+    connections = [],
+    logger,
+    textRendering,
+  }: CreateBlitWorkspaceOptions) {
     this.defaultWasm = wasm;
+    this.defaultTextRendering = textRendering;
     this.logger = logger ?? consoleLogger;
     for (const connection of connections) {
       this.addConnection(connection);
@@ -112,6 +124,7 @@ export class BlitWorkspace {
       transport,
       wasm: options.wasm ?? this.defaultWasm,
       logger: this.logger,
+      textRendering: options.textRendering ?? this.defaultTextRendering,
     });
     this.connections.set(options.id, connection);
     this.connectionListeners.set(

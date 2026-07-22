@@ -1,6 +1,10 @@
 import type { Terminal } from "@blit-sh/browser";
 import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
-import type { ConnectionStatus, TerminalPalette } from "./types";
+import type {
+  ConnectionStatus,
+  TerminalPalette,
+  TextRenderingConfig,
+} from "./types";
 import {
   buildAckMessage,
   buildClientMetricsMessage,
@@ -34,6 +38,7 @@ export class TerminalStore {
   private subscribed = new Set<number>();
   private desired = new Set<number>();
   private readonly delegate: TerminalStoreDelegate;
+  private textRendering: TextRenderingConfig | undefined;
   private dirtyListeners = new Set<TerminalDirtyListener>();
   private leadPtyId: number | null = null;
   private fontFamily = DEFAULT_FONT;
@@ -71,7 +76,9 @@ export class TerminalStore {
   constructor(
     delegate: TerminalStoreDelegate,
     wasm: BlitWasmModule | Promise<BlitWasmModule>,
+    textRendering?: TextRenderingConfig,
   ) {
+    this.textRendering = textRendering;
     this.delegate = delegate;
     this.startRafProbe();
     this.probeWebGpu();
@@ -98,7 +105,7 @@ export class TerminalStore {
   private probeWebGpu(): void {
     if (typeof navigator === "undefined" || !navigator.gpu) return;
     const canvas = document.createElement("canvas");
-    this.webgpuProbe = createWebGpuRenderer(canvas)
+    this.webgpuProbe = createWebGpuRenderer(canvas, this.textRendering)
       .then((r) => {
         if (this.disposed) {
           r?.dispose();
@@ -341,9 +348,12 @@ export class TerminalStore {
     if (!this.sharedCanvas) {
       this.sharedCanvas = document.createElement("canvas");
     }
-    this.sharedRenderer = createGlRenderer(this.sharedCanvas);
+    this.sharedRenderer = createGlRenderer(this.sharedCanvas, this.textRendering);
     if (!this.sharedRenderer.supported) {
-      this.sharedRenderer = createCanvas2dRenderer(this.sharedCanvas);
+      this.sharedRenderer = createCanvas2dRenderer(
+        this.sharedCanvas,
+        this.textRendering,
+      );
     }
     if (!this.sharedRenderer.supported) return null;
     return {

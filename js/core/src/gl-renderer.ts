@@ -1,4 +1,11 @@
 import type { CellMetrics } from "./measure";
+import type { TextRenderingConfig } from "./types";
+
+/** Coverage gamma from a text-rendering config. 1.0 = no-op. */
+function coverageGamma(cfg?: TextRenderingConfig): number {
+  const k = Math.max(0, cfg?.stemDarkening ?? 0);
+  return 1 / (1 + k);
+}
 
 const MAX_BATCH_VERTS = 65532;
 const GLYPH_FLOATS_PER_VERT = 8;
@@ -46,7 +53,9 @@ void main() {
 }
 `;
 
-const GLYPH_FS = `#version 300 es
+function glyphFs(gamma: number): string {
+  const cov = gamma === 1 ? "tex.a" : `pow(tex.a, ${gamma.toFixed(6)})`;
+  return `#version 300 es
 // Texture coordinates address individual glyphs in a 2K-8K atlas.  Some
 // mobile WebKit/iPad GPUs implement mediump with too little fragment
 // precision for that, which can round samples into transparent padding and
@@ -62,10 +71,12 @@ void main() {
     float minC = min(tex.r, min(tex.g, tex.b));
     float maxC = max(tex.r, max(tex.g, tex.b));
     float isGray = step(maxC - minC, 0.02);
-    vec3 tinted = v_color.rgb * tex.a;
-    fragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
+    float cov = ${cov};
+    vec3 tinted = v_color.rgb * cov;
+    fragColor = mix(vec4(tex.rgb, tex.a), vec4(tinted, cov), isGray);
 }
 `;
+}
 
 function compileShader(
   gl: WebGL2RenderingContext,
@@ -142,7 +153,11 @@ const UNSUPPORTED: GlRenderer = {
  * without GPU).  Reads the same vertex buffers produced by the WASM terminal
  * and paints them with Canvas 2D.
  */
-export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
+export function createCanvas2dRenderer(
+  canvas: HTMLCanvasElement,
+  // Canvas2D fallback keeps legacy coverage; stem darkening is not applied here.
+  _textRendering?: TextRenderingConfig,
+): GlRenderer {
   const ctx = canvas.getContext("2d", { alpha: true });
   if (!ctx) return { ...UNSUPPORTED };
 
@@ -298,7 +313,10 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
   };
 }
 
-export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
+export function createGlRenderer(
+  canvas: HTMLCanvasElement,
+  textRendering?: TextRenderingConfig,
+): GlRenderer {
   const gl = canvas.getContext("webgl2", {
     alpha: true,
     antialias: false,
@@ -315,8 +333,9 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
 
   if (!gl) return { ...UNSUPPORTED };
 
+  const gamma = coverageGamma(textRendering);
   const rectProgram = createProgram(gl, RECT_VS, RECT_FS);
-  const glyphProgram = createProgram(gl, GLYPH_VS, GLYPH_FS);
+  const glyphProgram = createProgram(gl, GLYPH_VS, glyphFs(gamma));
 
   if (!rectProgram || !glyphProgram) {
     return { ...UNSUPPORTED };
