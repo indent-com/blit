@@ -5,13 +5,14 @@ mod generate;
 mod git;
 mod grep;
 mod interactive;
+mod lsp;
 mod transport;
 mod uplink;
 
 use clap::Parser;
 use cli::{
-    Cli, ClipboardCommand, Command, FsCommand, GitCommand, RemoteCommand, SurfaceCommand,
-    TerminalCommand,
+    Cli, ClipboardCommand, Command, FsCommand, GitCommand, LspCommand, RemoteCommand,
+    SurfaceCommand, TerminalCommand,
 };
 
 fn main() {
@@ -424,6 +425,104 @@ async fn async_main() {
             if let Err(e) = result {
                 eprintln!("blit: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Lsp { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    // Exit 2 (error): the 0/1/2 contract reserves 1 for
+                    // "no result", so a connect failure must not look
+                    // like a clean/empty answer.
+                    std::process::exit(2);
+                }
+            };
+            let result = match command {
+                LspCommand::Def { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_DEF,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Refs {
+                    spec,
+                    declaration,
+                    root,
+                    json,
+                } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_REFS,
+                        spec,
+                        String::new(),
+                        declaration,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Hover { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_HOVER,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Symbols {
+                    query,
+                    file,
+                    root,
+                    json,
+                } => lsp::cmd_symbols(transport, root, query, file, json).await,
+                LspCommand::Diagnostics {
+                    path,
+                    watch,
+                    wait,
+                    root,
+                    json,
+                } => lsp::cmd_diagnostics(transport, root, path, watch, wait, json).await,
+                LspCommand::Rename {
+                    spec,
+                    new_name,
+                    root,
+                    json,
+                } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_RENAME,
+                        spec,
+                        new_name,
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Wait { root, timeout } => lsp::cmd_wait(transport, root, timeout).await,
+                LspCommand::List { json } => lsp::cmd_list(transport, json).await,
+                LspCommand::Stop { server_ref } => lsp::cmd_stop(transport, server_ref).await,
+            };
+            match result {
+                // 0 found/clean, 1 no result/diagnostics present, 2 error.
+                Ok(0) => {}
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         Command::Remote { command } => {

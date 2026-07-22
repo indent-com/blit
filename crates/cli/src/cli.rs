@@ -74,6 +74,18 @@ pub enum Command {
         command: GitCommand,
     },
 
+    /// Query language servers on the server (docs/design/lsp.md)
+    ///
+    /// Language servers are discovered by project markers (Cargo.toml,
+    /// go.mod, tsconfig.json, …), spawned lazily, and stay warm across
+    /// invocations. Positions are 1-based PATH:LINE:COL. First calls in
+    /// a fresh workspace may report "warming up" — retry, or run
+    /// `blit lsp wait`.
+    Lsp {
+        #[command(subcommand)]
+        command: LspCommand,
+    },
+
     /// Manage named remotes in blit.remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
@@ -934,6 +946,144 @@ pub enum GitCommand {
         /// NDJSON output
         #[arg(long)]
         json: bool,
+    },
+}
+
+// ── Lsp subcommands ──────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum LspCommand {
+    /// Definition of the symbol at PATH:LINE:COL
+    Def {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one location per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// References to the symbol at PATH:LINE:COL
+    Refs {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Include the declaration itself
+        #[arg(long)]
+        declaration: bool,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one location per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Type and docs of the symbol at PATH:LINE:COL
+    Hover {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search workspace symbols, or outline one file with --file
+    Symbols {
+        /// Fuzzy symbol query (workspace-wide; empty lists everything
+        /// the server returns)
+        query: Option<String>,
+
+        /// Outline this file instead of searching the workspace
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one symbol per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Current diagnostics for the workspace or one path
+    ///
+    /// Exit code 1 when diagnostics exist, 0 when clean.
+    #[command(alias = "diag")]
+    Diagnostics {
+        /// Only diagnostics for this file or directory
+        path: Option<String>,
+
+        /// Keep watching, reprinting as diagnostics change
+        #[arg(long)]
+        watch: bool,
+
+        /// Wait for language servers to finish indexing first
+        #[arg(long)]
+        wait: bool,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one diagnostic per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rename plan for the symbol at PATH:LINE:COL (prints the edits,
+    /// never applies them)
+    Rename {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// The new name
+        new_name: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one edit per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Block until the workspace's language servers are ready
+    Wait {
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+
+    /// List running language servers
+    #[command(alias = "ls")]
+    List {
+        /// NDJSON output (one server per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop a language server by ref (see `blit lsp list`)
+    Stop {
+        /// Server ref from `blit lsp list`
+        server_ref: u16,
     },
 }
 

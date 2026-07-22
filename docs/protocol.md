@@ -147,6 +147,8 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | 4   | `COMPOSITOR`   | Server supports headless Wayland compositor                    |
 | 5   | `AUDIO`        | Server supports audio forwarding (PipeWire capture + Opus)     |
 | 6   | `FS_SYNC`      | Server supports the `FS_*` filesystem sync family              |
+| 7   | `GIT`          | Server supports the `GIT_*` git introspection family           |
+| 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
 
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
 PTY. The trailing command field is a backward-compatible extension; old
@@ -265,6 +267,32 @@ Wire details, record layouts, and semantics:
 `crates/fssync`; codecs and the `FsMirror` reference reducer:
 `crates/remote/src/fs.rs` (Rust) and `js/core/src/fs.ts` (TypeScript,
 surfaced as `syncFs` on `BlitConnection`/`BlitWorkspace`).
+
+## Git introspection
+
+The `GIT_*` family (feature bit 7) opens repositories by path, pushes
+mutable state (HEAD, refs, in-progress operation, status) as
+whole-snapshot `GIT_STATE` messages, and pulls immutable content
+(commits, trees, blobs, diffs, patches) by content address through
+nonce request/response pairs. Wire details:
+[design/git.md](design/git.md); server engine: `crates/git`; codecs and
+the `GitStateMirror` reference reducer: `crates/remote/src/git.rs` and
+`js/core/src/git.ts` (surfaced as `openRepo` on
+`BlitConnection`/`BlitWorkspace`).
+
+## Language intelligence
+
+The `LSP_*` family (feature bit 8) terminates LSP at the server: warm
+language-server backends are daemon-owned and shared, backend
+phase/capabilities are pushed as `LSP_STATE` snapshots, diagnostics as
+per-file replacement sets (`LSP_DIAG`, `FULL` replay on subscribe), and
+definition/references/hover/symbols/rename-as-data are pulled through
+the single `LSP_QUERY` opcode. Positions are 0-based lines with UTF-8
+byte columns; the server transcodes. Wire details:
+[design/lsp.md](design/lsp.md); server engine: `crates/lsp`; codecs and
+the `LspStateMirror`/`LspDiagMirror` reference reducers:
+`crates/remote/src/lsp.rs` and `js/core/src/lsp.ts` (surfaced as
+`openLsp` on `BlitConnection`).
 
 ## Multiplexed WebSocket (`/mux`)
 

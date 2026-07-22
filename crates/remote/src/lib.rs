@@ -11,6 +11,10 @@ pub mod fs;
 /// client-side state mirror reducer.
 pub mod git;
 
+/// Language intelligence (docs/design/lsp.md): opcodes, record codecs,
+/// and the client-side state/diagnostics mirror reducers.
+pub mod lsp;
+
 /// Cap on any single LZ4-decompressed payload, protocol-wide
 /// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
 /// size against it *before* allocating, so a hostile or corrupt length

@@ -5448,6 +5448,220 @@ fn handle_git_message(
     }
 }
 
+/// Per-connection language-intelligence attachments (docs/design/lsp.md).
+/// The `lsp_id`s are connection-scoped like `repo_id`s; the backends
+/// they attach to are daemon-owned and warm inside `blit-lsp`.
+#[derive(Default)]
+struct LspConns {
+    map: HashMap<u16, blit_lsp::Attachment>,
+    next_id: u16,
+    /// Query nonces in flight (per-connection namespace); a duplicate
+    /// is answered `INVALID` without executing, and the size bounds
+    /// pending queries per connection.
+    inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+}
+
+impl LspConns {
+    fn alloc_id(&mut self) -> Option<u16> {
+        for _ in 0..=u16::MAX {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if id != blit_remote::lsp::LSP_ID_INVALID && !self.map.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn max_opens() -> usize {
+        std::env::var("BLIT_LSP_MAX_OPENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    }
+
+    fn max_inflight() -> usize {
+        std::env::var("BLIT_LSP_MAX_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    }
+}
+
+/// The streaming sink for an attachment: every pushed message rides the
+/// connection outbox.
+fn lsp_stream_sink(out: &mpsc::UnboundedSender<Vec<u8>>) -> blit_lsp::Sink {
+    let out = out.clone();
+    std::sync::Arc::new(move |msg| out.send(msg).is_ok())
+}
+
+/// The reply sink for one query: retires the nonce from the in-flight
+/// set when its `S2C_LSP_QUERY` response passes through.
+fn lsp_query_sink(
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    inflight: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    nonce: u16,
+) -> blit_lsp::Sink {
+    let out = out.clone();
+    let inflight = inflight.clone();
+    std::sync::Arc::new(move |msg: Vec<u8>| {
+        if msg.first() == Some(&blit_remote::lsp::S2C_LSP_QUERY)
+            && msg.len() >= 3
+            && u16::from_le_bytes([msg[1], msg[2]]) == nonce
+        {
+            inflight.lock().unwrap().remove(&nonce);
+        }
+        out.send(msg).is_ok()
+    })
+}
+
+fn handle_lsp_message(
+    data: &[u8],
+    conns: &mut LspConns,
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    verbose: bool,
+) {
+    use blit_remote::lsp::*;
+    match data[0] {
+        C2S_LSP_OPEN => {
+            let Some((nonce, flags, diag_latency_ms, path)) = parse_lsp_open(data) else {
+                return;
+            };
+            let refuse = |status: u8, detail: &str| {
+                let _ = out.send(msg_lsp_opened(nonce, LSP_ID_INVALID, status, 0, "", detail));
+            };
+            // Nonce discipline (docs/design/lsp.md: git.md's rules): a
+            // nonce already in flight is a duplicate, answered INVALID
+            // without executing.
+            if conns.inflight.lock().unwrap().contains(&nonce) {
+                refuse(LSP_STATUS_INVALID, "duplicate nonce");
+                return;
+            }
+            const KNOWN: u8 = LSP_OPEN_WATCH | LSP_OPEN_DIAGS;
+            if flags & !KNOWN != 0 {
+                refuse(LSP_STATUS_INVALID, "unknown flags");
+                return;
+            }
+            if conns.map.len() >= LspConns::max_opens() {
+                refuse(LSP_STATUS_BUDGET, "attachment limit reached");
+                return;
+            }
+            let (prepared, root, absent) = match blit_lsp::prepare(path) {
+                Ok(prepared) => prepared,
+                Err((status, detail)) => {
+                    refuse(status, &detail);
+                    return;
+                }
+            };
+            let Some(lsp_id) = conns.alloc_id() else {
+                refuse(LSP_STATUS_BUDGET, "no attachment ids left");
+                return;
+            };
+            if verbose {
+                eprintln!("C2S_LSP_OPEN: lsp_id={lsp_id} path={path} flags={flags:#x}");
+            }
+            // LSP_OPENED must precede the first LSP_STATE; the outbox is
+            // FIFO, so sending before the pacer spawns suffices. On
+            // success `detail` names any matched-but-uninstalled servers
+            // (docs/design/lsp.md), so a client learns what to install.
+            let _ = out.send(msg_lsp_opened(
+                nonce,
+                lsp_id,
+                LSP_STATUS_OK,
+                0,
+                &root,
+                &absent,
+            ));
+            let attachment = prepared.attach(lsp_id, flags, diag_latency_ms, lsp_stream_sink(out));
+            conns.map.insert(lsp_id, attachment);
+        }
+        C2S_LSP_CLOSE => {
+            let Some(lsp_id) = parse_lsp_close(data) else {
+                return;
+            };
+            if conns.map.remove(&lsp_id).is_some() {
+                let _ = out.send(msg_lsp_closed(lsp_id, LSP_CLOSED_CLIENT_REQUEST));
+            }
+        }
+        C2S_LSP_ACK => {
+            let Some((lsp_id, stream, update_id)) = parse_lsp_ack(data) else {
+                return;
+            };
+            if let Some(attachment) = conns.map.get(&lsp_id) {
+                attachment.ack(stream, update_id);
+            }
+        }
+        C2S_LSP_QUERY => {
+            let Some(req) = parse_lsp_query(data) else {
+                return;
+            };
+            let refuse = |status: u8| {
+                let _ = out.send(msg_lsp_query_resp(req.nonce, status, 0, &[]));
+            };
+            let Some(attachment) = conns.map.get(&req.lsp_id) else {
+                refuse(LSP_STATUS_UNKNOWN_ID);
+                return;
+            };
+            {
+                let mut inflight = conns.inflight.lock().unwrap();
+                if inflight.contains(&req.nonce) {
+                    refuse(LSP_STATUS_INVALID);
+                    return;
+                }
+                if inflight.len() >= LspConns::max_inflight() {
+                    refuse(LSP_STATUS_BUDGET);
+                    return;
+                }
+                inflight.insert(req.nonce);
+            }
+            attachment.query(
+                req.nonce,
+                req.kind,
+                req.flags,
+                req.line,
+                req.col,
+                req.path,
+                req.arg,
+                lsp_query_sink(out, &conns.inflight, req.nonce),
+            );
+        }
+        C2S_LSP_CANCEL => {
+            let Some(nonce) = parse_lsp_cancel(data) else {
+                return;
+            };
+            // Advisory, by nonce alone: every attachment forwards; an
+            // unknown nonce is a no-op.
+            for attachment in conns.map.values() {
+                attachment.cancel(nonce);
+            }
+        }
+        C2S_LSP_SERVERS => {
+            let Some(nonce) = parse_lsp_servers(data) else {
+                return;
+            };
+            if conns.inflight.lock().unwrap().contains(&nonce) {
+                let _ = out.send(msg_lsp_servers_resp(nonce, LSP_STATUS_INVALID, 0, &[]));
+                return;
+            }
+            let _ = out.send(blit_lsp::servers_response(nonce));
+        }
+        C2S_LSP_STOP => {
+            let Some((nonce, server_ref)) = parse_lsp_stop(data) else {
+                return;
+            };
+            if conns.inflight.lock().unwrap().contains(&nonce) {
+                let _ = out.send(msg_lsp_stopped(nonce, LSP_STATUS_INVALID));
+                return;
+            }
+            if verbose {
+                eprintln!("C2S_LSP_STOP: server_ref={server_ref}");
+            }
+            let _ = out.send(blit_lsp::stop_response(nonce, server_ref));
+        }
+        _ => {}
+    }
+}
+
 async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     state: AppState,
@@ -5465,6 +5679,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let fs_out = out_tx.clone();
     let mut fs_syncs = FsSyncs::default();
     let mut git_repos = GitRepos::default();
+    let mut lsp_conns = LspConns::default();
+    // BLIT_LSP=0 turns the whole family off: unadvertised and undispatched.
+    let lsp_enabled = !std::env::var("BLIT_LSP").is_ok_and(|v| v == "0");
     #[cfg(target_os = "linux")]
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // On non-Linux, keep the audio sender alive for the lifetime of the
@@ -5673,6 +5890,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_COMPOSITOR
                 | blit_remote::fs::FEATURE_FS_SYNC
                 | blit_remote::git::FEATURE_GIT;
+            // BLIT_LSP=0 disables the family: the bit is simply not
+            // advertised (docs/design/lsp.md), matching the dispatch gate.
+            let features = if lsp_enabled {
+                features | blit_remote::lsp::FEATURE_LSP
+            } else {
+                features
+            };
             #[cfg(target_os = "linux")]
             let mut features = features;
             #[cfg(target_os = "linux")]
@@ -5809,6 +6033,19 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // request threads and state engines, never the session mutex.
         if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_LOG_ACK).contains(&data[0]) {
             handle_git_message(&data, &mut git_repos, &fs_out, config.verbose);
+            continue;
+        }
+
+        // Language intelligence: connection-scoped attachments over
+        // daemon-owned warm backends, never the session mutex. When
+        // BLIT_LSP=0 the family is off — the feature bit is unadvertised
+        // and dispatch is skipped, so no client can spawn a language
+        // server against a disabled server.
+        if (blit_remote::lsp::C2S_LSP_OPEN..=blit_remote::lsp::C2S_LSP_STOP).contains(&data[0]) {
+            if !lsp_enabled {
+                continue;
+            }
+            handle_lsp_message(&data, &mut lsp_conns, &fs_out, config.verbose);
             continue;
         }
 
@@ -9523,5 +9760,89 @@ mod tests {
             client.last_sent.contains_key(&1),
             "last_sent should advance even on disconnect"
         );
+    }
+
+    /// LSP dispatch glue: refusals, unknown ids, and the daemon-wide
+    /// verbs answer synchronously and correctly without any language
+    /// server installed (engine behavior is covered in blit-lsp).
+    #[test]
+    fn lsp_message_flow() {
+        use blit_remote::lsp::*;
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut conns = LspConns::default();
+
+        // A bad path refuses with the sentinel id.
+        handle_lsp_message(
+            &msg_lsp_open(1, 0, 0, "/blit-no-such-path"),
+            &mut conns,
+            &out,
+            false,
+        );
+        let refusal = rx.try_recv().expect("synchronous refusal");
+        let opened = parse_lsp_opened(&refusal).unwrap();
+        assert_eq!(opened.lsp_id, LSP_ID_INVALID);
+        assert_eq!(opened.status, LSP_STATUS_NOT_FOUND);
+
+        // A markerless directory names the problem.
+        let dir = std::env::temp_dir().join(format!("blit-lsp-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        handle_lsp_message(
+            &msg_lsp_open(2, 0, 0, dir.to_str().unwrap()),
+            &mut conns,
+            &out,
+            false,
+        );
+        let refusal = rx.try_recv().expect("synchronous refusal");
+        let opened = parse_lsp_opened(&refusal).unwrap();
+        assert_eq!(opened.lsp_id, LSP_ID_INVALID);
+        assert_eq!(opened.status, LSP_STATUS_NOT_FOUND);
+        assert!(opened.detail.contains("no known project markers"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Unknown flag bits are INVALID.
+        handle_lsp_message(&msg_lsp_open(3, 0x80, 0, "/"), &mut conns, &out, false);
+        let refusal = rx.try_recv().expect("synchronous refusal");
+        assert_eq!(
+            parse_lsp_opened(&refusal).unwrap().status,
+            LSP_STATUS_INVALID
+        );
+
+        // A query against an unknown attachment answers UNKNOWN_ID.
+        let query = msg_lsp_query(&LspQueryRequest {
+            nonce: 9,
+            lsp_id: 42,
+            kind: LSP_QUERY_DEFINITION,
+            flags: 0,
+            line: 0,
+            col: 0,
+            path: "a.rs",
+            arg: "",
+        });
+        handle_lsp_message(&query, &mut conns, &out, false);
+        let resp = rx.try_recv().expect("synchronous refusal");
+        let (nonce, status, _, _) = parse_lsp_query_resp(&resp).unwrap();
+        assert_eq!((nonce, status), (9, LSP_STATUS_UNKNOWN_ID));
+
+        // The daemon-wide verbs answer without any backend running.
+        handle_lsp_message(&msg_lsp_servers(4), &mut conns, &out, false);
+        let resp = rx.try_recv().expect("synchronous LSP_SERVERS");
+        let (nonce, status, _, _) = parse_lsp_servers_resp(&resp).unwrap();
+        assert_eq!((nonce, status), (4, LSP_STATUS_OK));
+
+        handle_lsp_message(&msg_lsp_stop(5, 999), &mut conns, &out, false);
+        let resp = rx.try_recv().expect("synchronous LSP_STOPPED");
+        assert_eq!(parse_lsp_stopped(&resp), Some((5, LSP_STATUS_NOT_FOUND)));
+
+        // ACK and CLOSE on unknown ids are silent no-ops.
+        handle_lsp_message(
+            &msg_lsp_ack(7, LSP_STREAM_STATE, 1),
+            &mut conns,
+            &out,
+            false,
+        );
+        handle_lsp_message(&msg_lsp_close(7), &mut conns, &out, false);
+        assert!(rx.try_recv().is_err());
     }
 }

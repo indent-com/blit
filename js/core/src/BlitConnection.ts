@@ -167,6 +167,43 @@ import {
   parseGitState,
   parseGitTreeResp,
 } from "./git";
+import {
+  FEATURE_LSP,
+  LSP_CLOSED_CONNECTION_LOST,
+  LSP_OPEN_DIAGS,
+  LSP_OPEN_WATCH,
+  LSP_QUERY_DEFINITION,
+  LSP_QUERY_DOC_SYMBOLS,
+  LSP_QUERY_HOVER,
+  LSP_QUERY_REFERENCES,
+  LSP_QUERY_RENAME,
+  LSP_QUERY_WS_SYMBOLS,
+  LSP_REFS_INCLUDE_DECLARATION,
+  LSP_RESP_INCOMPLETE,
+  LSP_RESP_TRUNCATED,
+  LSP_STATUS_OK,
+  LSP_STREAM_DIAG,
+  LSP_STREAM_STATE,
+  LspDiagMirror,
+  LspStateMirror,
+  type LspHandle,
+  type LspOpenOptions,
+  type LspQueryResult,
+  S2C_LSP_CLOSED,
+  S2C_LSP_DIAG,
+  S2C_LSP_OPENED,
+  S2C_LSP_QUERY,
+  S2C_LSP_STATE,
+  lspQueryRecords,
+  lspStatusText,
+  msgLspAck,
+  msgLspClose,
+  msgLspOpen,
+  msgLspQuery,
+  parseLspClosed,
+  parseLspOpened,
+  parseLspQueryResp,
+} from "./lsp";
 
 const textDecoder = new TextDecoder();
 
@@ -322,6 +359,25 @@ export class BlitConnection {
   private readonly gitLogSubs = new Map<
     number,
     { repoId: number; onUpdate: (page: GitLogPage) => void }
+  >();
+  private readonly pendingLspOpens = new Map<
+    number,
+    {
+      resolve: (handle: LspHandle) => void;
+      reject: (error: Error) => void;
+      options: LspOpenOptions;
+    }
+  >();
+  private readonly lspAttachments = new Map<
+    number,
+    { state: LspStateMirror; diags: LspDiagMirror; options: LspOpenOptions }
+  >();
+  private readonly pendingLspRequests = new Map<
+    number,
+    {
+      resolve: (msg: Uint8Array) => void;
+      reject: (error: Error) => void;
+    }
   >();
 
   private sessionCounter = 0;
@@ -509,6 +565,7 @@ export class BlitConnection {
     this.rejectPendingReads(connectionError("Connection disposed"));
     this.resetFsSyncs(connectionError("Connection disposed"));
     this.resetGitRepos(connectionError("Connection disposed"));
+    this.resetLspAttachments(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
     this.clearSurfaceSubs();
     this.store.destroy();
@@ -1173,6 +1230,134 @@ export class BlitConnection {
     }
   }
 
+  /**
+   * Attach to the workspace containing a path (docs/design/lsp.md).
+   * Resolves once the server accepts; state snapshots and diagnostics
+   * (when subscribed) apply to the handle's mirrors and acknowledge
+   * automatically.
+   */
+  async openLsp(
+    path: string,
+    options: LspOpenOptions = {},
+  ): Promise<LspHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open an attachment while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_LSP) === 0) {
+      throw connectionError(
+        "Server does not support language intelligence (upgrade blit on the remote)",
+      );
+    }
+    let flags = 0;
+    if (options.watch || options.diagnostics) flags |= LSP_OPEN_WATCH;
+    if (options.diagnostics) flags |= LSP_OPEN_DIAGS;
+    return new Promise<LspHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingLspOpens);
+      this.pendingLspOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        msgLspOpen(nonce, flags, options.diagLatencyMs ?? 0, path),
+      );
+    });
+  }
+
+  /** One nonce-correlated LSP query; resolves with the raw response. */
+  private lspRequest(
+    lspId: number,
+    build: (nonce: number) => Uint8Array,
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.lspAttachments.has(lspId)) {
+        reject(connectionError("Attachment is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingLspRequests);
+      this.pendingLspRequests.set(nonce, { resolve, reject });
+      this.transport.send(build(nonce));
+    });
+  }
+
+  private makeLspHandle(
+    lspId: number,
+    root: string,
+    state: LspStateMirror,
+    diags: LspDiagMirror,
+  ): LspHandle {
+    // Every query funnels through one shape. Non-OK statuses resolve so
+    // callers can inspect `status` (WARMING is retryable); only
+    // connection loss rejects.
+    const query = async (
+      kind: number,
+      flags: number,
+      line: number,
+      col: number,
+      path: string,
+      arg: string,
+    ): Promise<LspQueryResult> => {
+      const msg = await this.lspRequest(lspId, (nonce) =>
+        msgLspQuery({ nonce, lspId, kind, flags, line, col, path, arg }),
+      );
+      const parsed = parseLspQueryResp(msg);
+      if (!parsed)
+        throw connectionError("Malformed query response from server");
+      const [, status, respFlags, records] = parsed;
+      return {
+        status,
+        truncated: (respFlags & LSP_RESP_TRUNCATED) !== 0,
+        incomplete: (respFlags & LSP_RESP_INCOMPLETE) !== 0,
+        records: [...lspQueryRecords(records)],
+      };
+    };
+    return {
+      lspId,
+      root,
+      state,
+      diags,
+      definition: (path, line, col) =>
+        query(LSP_QUERY_DEFINITION, 0, line, col, path, ""),
+      references: (path, line, col, includeDeclaration = false) =>
+        query(
+          LSP_QUERY_REFERENCES,
+          includeDeclaration ? LSP_REFS_INCLUDE_DECLARATION : 0,
+          line,
+          col,
+          path,
+          "",
+        ),
+      hover: (path, line, col) =>
+        query(LSP_QUERY_HOVER, 0, line, col, path, ""),
+      documentSymbols: (path) =>
+        query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, path, ""),
+      workspaceSymbols: (search) =>
+        query(LSP_QUERY_WS_SYMBOLS, 0, 0, 0, "", search),
+      rename: (path, line, col, newName) =>
+        query(LSP_QUERY_RENAME, 0, line, col, path, newName),
+      close: () => {
+        if (this.transport.status === "connected") {
+          this.transport.send(msgLspClose(lspId));
+        }
+      },
+    };
+  }
+
+  /** Tear down all LSP attachment state (reconnect or dispose). */
+  private resetLspAttachments(error: Error): void {
+    for (const pending of this.pendingLspOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingLspOpens.clear();
+    for (const pending of this.pendingLspRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingLspRequests.clear();
+    const attachments = [...this.lspAttachments.values()];
+    this.lspAttachments.clear();
+    for (const attachment of attachments) {
+      attachment.options.onClosed?.(LSP_CLOSED_CONNECTION_LOST);
+    }
+  }
+
   /** Tear down all fs sync state (reconnect or dispose). */
   private resetFsSyncs(error: Error): void {
     for (const pending of this.pendingFsSyncs.values()) {
@@ -1704,6 +1889,7 @@ export class BlitConnection {
         this.resetSurfaceSubsForReconnect();
         this.resetFsSyncs(connectionError("Server is shutting down"));
         this.resetGitRepos(connectionError("Server is shutting down"));
+        this.resetLspAttachments(connectionError("Server is shutting down"));
         // Immediately reconnect so the UI recovers as fast as possible
         // when the server restarts.  Do NOT call transport.close() — that
         // permanently disposes the transport.  transport.reconnect() tears
@@ -1903,6 +2089,7 @@ export class BlitConnection {
         // are meaningless on the new session.
         this.resetFsSyncs(connectionError("Connection re-established"));
         this.resetGitRepos(connectionError("Connection re-established"));
+        this.resetLspAttachments(connectionError("Connection re-established"));
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -2246,6 +2433,84 @@ export class BlitConnection {
         pending.resolve(bytes);
         return;
       }
+      case S2C_LSP_OPENED: {
+        const opened = parseLspOpened(bytes);
+        if (!opened) return;
+        const pending = this.pendingLspOpens.get(opened.nonce);
+        if (!pending) return;
+        this.pendingLspOpens.delete(opened.nonce);
+        if (opened.status !== LSP_STATUS_OK) {
+          pending.reject(
+            connectionError(
+              `Open failed: ${lspStatusText(opened.status)}${opened.detail ? `: ${opened.detail}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const state = new LspStateMirror();
+        const diags = new LspDiagMirror();
+        this.lspAttachments.set(opened.lspId, {
+          state,
+          diags,
+          options: pending.options,
+        });
+        pending.resolve(
+          this.makeLspHandle(opened.lspId, opened.root, state, diags),
+        );
+        return;
+      }
+      case S2C_LSP_STATE: {
+        if (bytes.length < 8) return;
+        const lspId = bytes[1] | (bytes[2] << 8);
+        const attachment = this.lspAttachments.get(lspId);
+        if (!attachment) return;
+        const stateId = attachment.state.applyState(bytes);
+        if (stateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed LSP_STATE for attachment ${lspId}`,
+          );
+          return;
+        }
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        this.transport.send(msgLspAck(lspId, LSP_STREAM_STATE, stateId));
+        attachment.options.onState?.(attachment.state, stateId);
+        return;
+      }
+      case S2C_LSP_DIAG: {
+        if (bytes.length < 8) return;
+        const lspId = bytes[1] | (bytes[2] << 8);
+        const attachment = this.lspAttachments.get(lspId);
+        if (!attachment) return;
+        const updateId = attachment.diags.applyDiag(bytes);
+        if (updateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed LSP_DIAG for attachment ${lspId}`,
+          );
+          return;
+        }
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        this.transport.send(msgLspAck(lspId, LSP_STREAM_DIAG, updateId));
+        attachment.options.onDiagnostics?.(attachment.diags, updateId);
+        return;
+      }
+      case S2C_LSP_QUERY: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingLspRequests.get(nonce);
+        if (!pending) return;
+        this.pendingLspRequests.delete(nonce);
+        pending.resolve(bytes);
+        return;
+      }
+      case S2C_LSP_CLOSED: {
+        const closed = parseLspClosed(bytes);
+        if (!closed) return;
+        const attachment = this.lspAttachments.get(closed[0]);
+        if (!attachment) return;
+        this.lspAttachments.delete(closed[0]);
+        attachment.options.onClosed?.(closed[1]);
+        return;
+      }
       default:
         return;
     }
@@ -2336,6 +2601,7 @@ export class BlitConnection {
       // their pending promises promptly rather than leaving them hung.
       this.resetFsSyncs(connectionError(`Transport ${status}`));
       this.resetGitRepos(connectionError(`Transport ${status}`));
+      this.resetLspAttachments(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
       this.hasReceivedList = false;
       // Dismiss all sessions so the UI doesn't show stale terminals from a

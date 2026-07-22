@@ -67,6 +67,7 @@ export type {
   FsSyncHandle,
 } from "./fs";
 export * from "./git";
+export * from "./lsp";
 
 export type {
   BlitConnectionSnapshot,

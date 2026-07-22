@@ -829,6 +829,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blit-lsp"
+version = "0.37.0"
+dependencies = [
+ "blake3",
+ "blit-fssync",
+ "blit-remote",
+ "libc",
+ "notify",
+ "serde_json",
+]
+
+[[package]]
 name = "blit-proxy"
 version = "0.37.0"
 dependencies = [
@@ -869,6 +881,7 @@ dependencies = [
  "blit-compositor",
  "blit-fssync",
  "blit-git",
+ "blit-lsp",
  "blit-remote",
  "blit-sd-notify",
  "libc",

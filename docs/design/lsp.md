@@ -1,6 +1,6 @@
 # RFC: Language Intelligence
 
-- **Status:** Draft
+- **Status:** Implemented (`FEATURE_LSP`, protocol feature bit 8)
 - **Date:** 2026-07-23
 - **Companion to:** [fs-watch.md](fs-watch.md), [git.md](git.md)
 
@@ -122,9 +122,9 @@ semantics where they overlap) plus one addition:
              retryable — the same request later will succeed
 ```
 
-`NOT_FOUND`'s detail names what is missing when discovery is the cause
-(`"gopls: not found on PATH"`), so an agent learns what to install
-rather than guessing why a language is silent.
+A matched-but-uninstalled server is named in the successful
+`LSP_OPENED.detail` (`"gopls: not found on PATH"`), so an agent learns
+what to install rather than guessing why a language is silent.
 
 ### Nonces and cancellation
 
@@ -177,10 +177,13 @@ a repo with `Cargo.toml` and `go.mod` gets rust-analyzer and gopls —
 and `lsp_id` names the attachment, not a server: queries route by the
 queried path's language, diagnostics merge across backends (each `DIAG`
 record's `source` attributes it). A language whose marker matched but
-whose binary is absent is simply missing from `LSP_STATE`; querying its
-files answers `NOT_FOUND` with the binary name in detail.
+whose binary is absent is simply missing from `LSP_STATE`; the
+successful `LSP_OPENED.detail` names those absent binaries
+(`"gopls: not found on PATH"`), so a client learns what to install up
+front, and querying such a language's files answers `NOT_FOUND`.
 
-On failure `lsp_id` = `0xFFFF` and `detail` carries a diagnostic.
+On failure `lsp_id` = `0xFFFF` and `detail` carries a diagnostic; on
+success `detail` is the (possibly empty) absent-binary list.
 `LSP_CLOSE` releases the attachment (backends stay warm; § Sessions);
 `LSP_CLOSED` (`reason`: `0` client request, `1` root gone, `2`
 permission lost, `3` backend failure, `4` resource limit) ends it from
@@ -292,6 +295,12 @@ EDIT     0x04: [kind:1][flags:1][hash:16][line:4][col:4]
                version named by hash. Data, never applied — applying
                is the client's business until the mutation RFC.
 ```
+
+Response `flags`: bit 0 `TRUNCATED` (an entries/bytes budget was hit),
+bit 1 `INCOMPLETE` (a `RENAME` `WorkspaceEdit` carried whole-file
+create/rename/delete operations, which v1 does not project — the `EDIT`
+records are the text edits only, so the plan is partial). A client
+must treat an `INCOMPLETE` rename as advisory, not a complete edit set.
 
 Query timeout (`BLIT_LSP_TIMEOUT_MS`) answers `OTHER` with detail — a
 hung backend pins a nonce for seconds, never indefinitely. Queries
@@ -435,10 +444,18 @@ Two implementation traps, named now:
 
 - **Reaping.** The daemon's 5-second `waitpid(-1)` backstop reaps any
   child, which _races_ a supervisor doing its own `wait()` — exit
-  statuses get stolen (`ECHILD`). Restart-with-backoff needs the exit
-  status, so the supervisor must integrate with the PTY layer's
-  reaped-status table rather than use `tokio::process` defaults.
-  Windows needs kill-on-drop job objects — the one platform shim.
+  statuses get stolen (`ECHILD`). The engine `wait()`s (and kills, on
+  timeout) its own child on every path so it usually wins; the backstop
+  was made **selective**, reaping every child to avoid zombies but only
+  _parking_ statuses for PTY-owned pids (`register_pty_pid` in
+  `blit-server`). An LSP child therefore leaves no parked status to
+  collide with a later PTY child that recycles its pid. Windows needs
+  kill-on-drop job objects — the one platform shim.
+- **Non-blocking child I/O.** Stdin writes go through a dedicated writer
+  thread fed by a channel, so a language server that stops draining
+  stdin blocks only that thread — the engine loop keeps expiring
+  queries, honoring `LSP_STOP`, and restarting on the init timeout,
+  which kills the wedged child.
 - **The quirk matrix is the product.** Terminating LSP means every
   server's spec deviation — open-doc-only diagnostics, encoding
   preferences, dynamic-registration timing, nonstandard progress — is
@@ -492,6 +509,41 @@ table (including spawn-rate and restart caps against respawn storms),
 request validation, prompt teardown of attachments on disconnect, idle
 shutdown of backends, and never logging escaped paths or server-supplied
 text as trusted.
+
+## Implementation notes
+
+Landed across `crates/remote/src/lsp.rs` (codecs + the `LspStateMirror`
+/ `LspDiagMirror` reference reducers), `crates/lsp` (discovery,
+supervisor, JSON-RPC client, projection engines, the scripted
+fake-server test harness), `crates/server` (dispatch + refusal tests),
+`crates/cli/src/lsp.rs` (`blit lsp
+def|refs|hover|symbols|diagnostics|rename|wait|list|stop`), and
+`js/core/src/lsp.ts` + `openLsp` on `BlitConnection`, with byte
+fixtures pinned across both codec implementations. Deviations, all
+invisible to the wire contract and upgradable server-side:
+
+- Lazily-located `workspace/symbol` results emit the zero range instead
+  of a `workspaceSymbol/resolve` round trip; rust-analyzer, gopls, and
+  pyright return full locations, so the gap is narrow.
+- Identical concurrent queries are not coalesced onto one upstream
+  request — each gets its own, so cancel refcounting is trivially
+  correct. Coalescing remains an engine optimization for later.
+- `workspace/symbol` routes to the first backend advertising the
+  capability rather than merging results across a workspace's backends.
+- Dynamic `didChangeWatchedFiles` registrations bump the capability
+  epoch but do not narrow the event stream: the engine reports every
+  settled change under the root (servers tolerate extra events; glob
+  filtering is a wire-invisible refinement).
+- Each backend arms its own `notify` watcher; sharing fssync's
+  shared-root watcher (§ Relation to fs and git) is deferred until an
+  `FS_SYNC` on the same root actually coexists — a full fssync
+  reconciler hashes the tree, which a watch-only consumer should not
+  pay for.
+- A `FULL` diagnostics replay is one complete update regardless of the
+  entries budget (fragmentation carries the size); incremental updates
+  chunk under the budget with one in flight.
+- `rss` is sampled when records are built (attachment snapshot or
+  `LSP_SERVERS`), not continuously.
 
 ## Rollout
 
