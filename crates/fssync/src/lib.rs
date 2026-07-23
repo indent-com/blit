@@ -25,11 +25,14 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 use blit_remote::fs::{
-    FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_ENTRY_DIR,
-    FS_ENTRY_FILE, FS_ENTRY_NO_CONTENT, FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK,
-    FS_ENTRY_UNREADABLE, FS_ENTRY_UNSTABLE, FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE,
-    FS_UPDATE_RESET, FS_UPDATE_SYNC, FsContent, FsRecord, append_fs_record, msg_fs_closed,
-    msg_fs_file, msg_fs_update,
+    FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT,
+    FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION,
+    FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_NO_CONTENT,
+    FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_ENTRY_UNREADABLE, FS_ENTRY_UNSTABLE,
+    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS,
+    FS_OP_REMOVE, FS_OP_RENAME, FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_WRITE_DURABLE,
+    FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent, FsRecord,
+    append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
 };
 
 pub mod backend;
@@ -91,11 +94,39 @@ pub enum Hint {
     Rescan,
 }
 
+/// A content write forwarded to the engine (docs/design/fs-write.md).
+/// `path` is the escaped wire path; `flags` are `FS_WRITE_*`.
+#[derive(Clone, Debug)]
+pub struct WriteReq {
+    pub nonce: u16,
+    pub path: String,
+    pub base: u128,
+    pub mode: u32,
+    pub flags: u8,
+    pub content_kind: u8,
+    pub content: Vec<u8>,
+}
+
+/// A metadata op forwarded to the engine. `op` is `FS_OP_*`; `a`/`b` are
+/// escaped wire paths (`b` empty except for `RENAME`).
+#[derive(Clone, Debug)]
+pub struct OpReq {
+    pub nonce: u16,
+    pub op: u8,
+    pub a: String,
+    pub b: String,
+    pub base: u128,
+    pub mode: u32,
+    pub flags: u8,
+}
+
 /// Commands forwarded from the client connection.
 #[derive(Clone, Debug)]
 pub enum Command {
     Ack(u32),
     Fetch { nonce: u16, path: String },
+    Write(WriteReq),
+    Op(OpReq),
     Stop,
 }
 
@@ -175,6 +206,13 @@ pub struct SharedRootHandle {
     /// (root gone, permission lost, resource limit). A closed root is dead
     /// forever; a later `open_root` of the same key must not join it.
     closed: Arc<OnceLock<u8>>,
+    /// Serializes the compare-hash-and-rename critical section of every
+    /// write against this root, across all its per-sync engines (which run
+    /// on separate threads). This is what closes the blit-vs-blit CAS race
+    /// (docs/design/fs-write.md "Conflict model"); the reconciler is not a
+    /// serialization point because writes reply on the per-sync engine's
+    /// own outbox.
+    write_lock: Mutex<()>,
     /// Keeps the native watch alive for the root's lifetime.
     _backend: Mutex<Option<backend::WatchBackend>>,
 }
@@ -281,6 +319,7 @@ fn open_root_inner(key: RootKey, watched: bool) -> Result<Arc<SharedRootHandle>,
         key: key.clone(),
         tx,
         closed: closed.clone(),
+        write_lock: Mutex::new(()),
         _backend: Mutex::new(backend),
     });
     let reconciler_key = key.clone();
@@ -952,6 +991,219 @@ fn racily_clean(mtime_ns: u64) -> bool {
 fn blake3_128(data: &[u8]) -> u128 {
     let hash = blake3::hash(data);
     u128::from_le_bytes(hash.as_bytes()[..16].try_into().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Writes (docs/design/fs-write.md): the path-confinement guard mutations
+// need on top of reads, plus atomic-replace / create-exclusive primitives.
+// Pure platform code — the CAS, hint injection, and echo priming that use
+// these live in the engine (`SyncEngine::exec_write` / `exec_op`).
+// ---------------------------------------------------------------------------
+
+/// Per-write content cap (`BLIT_FS_WRITE_MAX`, default 16 MiB); refused
+/// with `TOO_LARGE`. The decompress guard already bounds inbound bytes at
+/// the 64 MiB protocol cap.
+fn fs_write_max() -> u64 {
+    std::env::var("BLIT_FS_WRITE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16 * 1024 * 1024)
+}
+
+fn write_io_status(e: &io::Error) -> u8 {
+    match e.kind() {
+        io::ErrorKind::NotFound => FS_DONE_NOT_FOUND,
+        io::ErrorKind::PermissionDenied => FS_DONE_PERMISSION,
+        io::ErrorKind::AlreadyExists => FS_DONE_CONFLICT,
+        _ => FS_DONE_OTHER,
+    }
+}
+
+/// How a final-component symlink at the target is treated.
+enum SymlinkPolicy {
+    /// Refuse it (a content write could escape the root through it).
+    Refuse,
+    /// Write through it, but only if its canonical target stays under root.
+    Follow,
+    /// Operate on the link itself (remove/rename move or unlink the link,
+    /// never following it — safe, no escape).
+    Operate,
+}
+
+/// Resolve and confine a write target. Component-validates the wire path
+/// (the traversal fix), then canonicalizes the target's *parent* and
+/// re-confirms it is under the already-canonical `root` — defeating an
+/// in-tree symlink whose target escapes, which `resolve_wire_path` (no
+/// symlink resolution) would miss. The final component is handled per
+/// `policy`. Returns the absolute path to operate on, or an `FS_DONE_*`
+/// status on refusal.
+fn resolve_write_target(root: &Path, wire: &str, policy: SymlinkPolicy) -> Result<PathBuf, u8> {
+    let abs = resolve_wire_path(root, wire).ok_or(FS_DONE_INVALID)?;
+    // The root itself ("") is never a content/op target.
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Err(FS_DONE_INVALID);
+    };
+    let canon_parent = fs::canonicalize(parent).map_err(|e| write_io_status(&e))?;
+    if !canon_parent.starts_with(root) {
+        return Err(FS_DONE_PERMISSION);
+    }
+    let target = canon_parent.join(name);
+    match fs::symlink_metadata(&target) {
+        Ok(md) if md.file_type().is_symlink() => match policy {
+            SymlinkPolicy::Refuse => Err(FS_DONE_PERMISSION),
+            SymlinkPolicy::Operate => Ok(target),
+            SymlinkPolicy::Follow => {
+                let resolved = fs::canonicalize(&target).map_err(|e| write_io_status(&e))?;
+                if resolved.starts_with(root) {
+                    Ok(resolved)
+                } else {
+                    Err(FS_DONE_PERMISSION)
+                }
+            }
+        },
+        _ => Ok(target),
+    }
+}
+
+/// A unique sibling temp path for atomic replace (same directory ⇒ same
+/// filesystem ⇒ atomic `rename`).
+fn temp_sibling(target: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".blit-tmp-{}-{n}", std::process::id()))
+}
+
+/// Set `mode` on an open file (Unix); preserve the replaced file's mode
+/// when `mode` is 0 and a file exists at `at`.
+#[cfg(unix)]
+fn apply_mode(f: &fs::File, at: &Path, mode: u32) {
+    if mode == 0
+        && let Ok(md) = fs::metadata(at)
+    {
+        let _ = f.set_permissions(md.permissions());
+    }
+}
+#[cfg(not(unix))]
+fn apply_mode(_f: &fs::File, _at: &Path, _mode: u32) {}
+
+/// fsync `f` and its parent directory (F_FULLFSYNC on macOS via std's
+/// `sync_all`) so a crash after return cannot lose the write.
+fn fsync_durable(f: &fs::File, target: &Path) -> io::Result<()> {
+    f.sync_all()?;
+    #[cfg(unix)]
+    if let Some(dir) = target.parent()
+        && let Ok(d) = fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    let _ = target;
+    Ok(())
+}
+
+/// Write `bytes` to `target` atomically: a same-directory temp file, then
+/// `rename` over the destination — a reader sees the old bytes or the new,
+/// never a torn write. `mode` 0 preserves the existing file's mode.
+fn write_atomic(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io::Result<()> {
+    use std::io::Write as _;
+    let tmp = temp_sibling(target);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if mode != 0 {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    let mut f = opts.open(&tmp)?;
+    let staged = (|| {
+        f.write_all(bytes)?;
+        apply_mode(&f, target, mode);
+        if durable {
+            f.sync_all()?;
+        }
+        Ok(())
+    })();
+    drop(f);
+    if let Err(e) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if durable
+        && let Ok(d) = fs::File::open(target.parent().unwrap_or_else(|| Path::new(".")))
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Create `target` exclusively (`O_EXCL`): fails `AlreadyExists` if the
+/// path exists, race-free even against an external creator — the
+/// create-exclusive ("New File") precondition.
+fn create_exclusive(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if mode != 0 {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    let mut f = opts.open(target)?;
+    f.write_all(bytes)?;
+    if durable {
+        fsync_durable(&f, target)?;
+    }
+    Ok(())
+}
+
+/// The current on-disk content hash of `path`, or 0 (the "absent"
+/// sentinel) when missing or unreadable. Read under the write lock, so
+/// no other blit writer can interleave; an external writer is the
+/// disclosed, irreducible window.
+fn current_hash(path: &Path) -> u128 {
+    match fs::read(path) {
+        Ok(bytes) => blake3_128(&bytes),
+        Err(_) => 0,
+    }
+}
+
+/// Create `target_parent` and any missing ancestors for `MKPARENTS`,
+/// confined to `root`: the deepest existing ancestor is canonicalized and
+/// re-checked under root, then each missing component is created (never
+/// `create_dir_all`, which would happily descend through an existing
+/// symlink pointing outside the root and create directories there).
+fn create_parents_confined(root: &Path, target_parent: &Path) -> Result<(), u8> {
+    let mut existing = target_parent.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(|n| n.to_os_string()) else {
+            return Err(FS_DONE_INVALID);
+        };
+        tail.push(name);
+        existing = existing.parent().map(Path::to_path_buf).unwrap_or_default();
+        if existing.as_os_str().is_empty() {
+            return Err(FS_DONE_INVALID);
+        }
+    }
+    let mut cur = fs::canonicalize(&existing).map_err(|e| write_io_status(&e))?;
+    if !cur.starts_with(root) {
+        return Err(FS_DONE_PERMISSION);
+    }
+    for name in tail.iter().rev() {
+        cur.push(name);
+        if let Err(e) = fs::create_dir(&cur) {
+            // Tolerate a concurrent creator; anything else is fatal.
+            if !cur.is_dir() {
+                return Err(write_io_status(&e));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,6 +1934,16 @@ impl SyncEngine {
                         return Exit::ClientGone;
                     }
                 }
+                Ok(SyncMsg::Cmd(Command::Write(w))) => {
+                    if !self.handle_write(w) {
+                        return Exit::ClientGone;
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::Op(o))) => {
+                    if !self.handle_op(o) {
+                        return Exit::ClientGone;
+                    }
+                }
                 Ok(SyncMsg::Cmd(Command::Stop)) => return Exit::Stopped,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Exit::ClientGone,
@@ -2036,6 +2298,16 @@ impl SyncEngine {
                         return Err(Exit::ClientGone);
                     }
                 }
+                Ok(SyncMsg::Cmd(Command::Write(w))) => {
+                    if !self.handle_write(w) {
+                        return Err(Exit::ClientGone);
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::Op(o))) => {
+                    if !self.handle_op(o) {
+                        return Err(Exit::ClientGone);
+                    }
+                }
                 Ok(SyncMsg::Cmd(Command::Stop)) => return Err(Exit::Stopped),
                 Ok(SyncMsg::Root(update)) => self.handle_root(update)?,
                 Err(_) => return Err(Exit::ClientGone),
@@ -2070,6 +2342,228 @@ impl SyncEngine {
             },
         };
         (self.outbox)(msg)
+    }
+
+    fn handle_write(&mut self, w: WriteReq) -> bool {
+        let (status, hash, mtime_ns) = self.exec_write(&w);
+        (self.outbox)(msg_fs_done(w.nonce, status, hash, mtime_ns))
+    }
+
+    /// Land a content write under the shared root's write lock: confine the
+    /// path, enforce the CAS precondition against the freshly re-read live
+    /// hash, write atomically (or create-exclusive), then prime the echo.
+    fn exec_write(&mut self, w: &WriteReq) -> (u8, u128, u64) {
+        use blit_remote::fs::FS_WRITE_CONTENT_DELTA;
+        // v1 accepts only full content (0/1); delta is a v2 encoding.
+        if w.content_kind == FS_WRITE_CONTENT_DELTA {
+            return (FS_DONE_INVALID, 0, 0);
+        }
+        if w.content.len() as u64 > fs_write_max() {
+            return (FS_DONE_TOO_LARGE, 0, 0);
+        }
+        if w.flags & FS_WRITE_MKPARENTS != 0
+            && let Some(parent) = resolve_wire_path(&self.root, &w.path)
+                .and_then(|a| a.parent().map(Path::to_path_buf))
+            && let Err(status) = create_parents_confined(&self.root, &parent)
+        {
+            return (status, 0, 0);
+        }
+        let policy = if w.flags & FS_WRITE_FOLLOW_SYMLINK != 0 {
+            SymlinkPolicy::Follow
+        } else {
+            SymlinkPolicy::Refuse
+        };
+        let target = match resolve_write_target(&self.root, &w.path, policy) {
+            Ok(t) => t,
+            Err(status) => return (status, 0, 0),
+        };
+        let durable = w.flags & FS_WRITE_DURABLE != 0;
+        let no_cas = w.flags & FS_WRITE_NO_CAS != 0;
+
+        // Serialize check-and-write against other blit writers of this root.
+        // Clone the Arc so the guard borrows the local, leaving `self` free
+        // for the `&mut self` echo priming below.
+        let shared = self.shared.clone();
+        let _guard = shared.write_lock.lock().unwrap();
+
+        // Never clobber a directory with a file.
+        if fs::symlink_metadata(&target)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return (FS_DONE_WRONG_TYPE, 0, 0);
+        }
+
+        let create_exclusive_mode = !no_cas && w.base == 0;
+        if !no_cas {
+            if w.base == 0 {
+                if target.exists() {
+                    return (FS_DONE_CONFLICT, current_hash(&target), 0);
+                }
+            } else {
+                let cur = current_hash(&target);
+                if cur != w.base {
+                    return (FS_DONE_CONFLICT, cur, 0);
+                }
+            }
+        }
+
+        let hash = blake3_128(&w.content);
+        if create_exclusive_mode {
+            match create_exclusive(&target, &w.content, w.mode, durable) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    return (FS_DONE_CONFLICT, current_hash(&target), 0);
+                }
+                Err(e) => return (write_io_status(&e), 0, 0),
+            }
+        } else if let Err(e) = write_atomic(&target, &w.content, w.mode, durable) {
+            return (write_io_status(&e), 0, 0);
+        }
+
+        let mtime_ns = stat_meta(&target).map(|m| m.mtime_ns).unwrap_or(0);
+        self.prime_echo(&w.path, &target, hash, &w.content, mtime_ns);
+        (FS_DONE_OK, hash, mtime_ns)
+    }
+
+    fn handle_op(&mut self, o: OpReq) -> bool {
+        let (status, hash, mtime_ns) = self.exec_op(&o);
+        (self.outbox)(msg_fs_done(o.nonce, status, hash, mtime_ns))
+    }
+
+    /// Execute a metadata op (mkdir/remove/rename) under the write lock.
+    fn exec_op(&mut self, o: &OpReq) -> (u8, u128, u64) {
+        let _guard = self.shared.write_lock.lock().unwrap();
+        match o.op {
+            FS_OP_MKDIR => {
+                if o.flags & FS_OP_MKPARENTS != 0
+                    && let Some(parent) = resolve_wire_path(&self.root, &o.a)
+                        .and_then(|a| a.parent().map(Path::to_path_buf))
+                    && let Err(status) = create_parents_confined(&self.root, &parent)
+                {
+                    return (status, 0, 0);
+                }
+                let target = match resolve_write_target(&self.root, &o.a, SymlinkPolicy::Operate) {
+                    Ok(t) => t,
+                    Err(status) => return (status, 0, 0),
+                };
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                if o.mode != 0 {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(o.mode);
+                }
+                match builder.create(&target) {
+                    Ok(()) => {}
+                    // Idempotent when the path is already a directory.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        if !target.is_dir() {
+                            return (FS_DONE_CONFLICT, 0, 0);
+                        }
+                    }
+                    Err(e) => return (write_io_status(&e), 0, 0),
+                }
+                let mtime_ns = stat_meta(&target).map(|m| m.mtime_ns).unwrap_or(0);
+                self.hint_change(&target);
+                (FS_DONE_OK, 0, mtime_ns)
+            }
+            FS_OP_REMOVE => {
+                let target = match resolve_write_target(&self.root, &o.a, SymlinkPolicy::Operate) {
+                    Ok(t) => t,
+                    Err(status) => return (status, 0, 0),
+                };
+                let md = match fs::symlink_metadata(&target) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        return (FS_DONE_NOT_FOUND, 0, 0);
+                    }
+                    Err(e) => return (write_io_status(&e), 0, 0),
+                };
+                // Conditional remove is meaningful only for a regular file.
+                if o.flags & FS_OP_NO_CAS == 0 && o.base != 0 {
+                    let cur = current_hash(&target);
+                    if cur != o.base {
+                        return (FS_DONE_CONFLICT, cur, 0);
+                    }
+                }
+                let res = if md.file_type().is_dir() {
+                    fs::remove_dir_all(&target)
+                } else {
+                    // A symlink is unlinked, never followed.
+                    fs::remove_file(&target)
+                };
+                if let Err(e) = res {
+                    return (write_io_status(&e), 0, 0);
+                }
+                self.hint_change(&target);
+                (FS_DONE_OK, 0, 0)
+            }
+            FS_OP_RENAME => {
+                if o.flags & FS_OP_MKPARENTS != 0
+                    && let Some(parent) = resolve_wire_path(&self.root, &o.b)
+                        .and_then(|a| a.parent().map(Path::to_path_buf))
+                    && let Err(status) = create_parents_confined(&self.root, &parent)
+                {
+                    return (status, 0, 0);
+                }
+                let from = match resolve_write_target(&self.root, &o.a, SymlinkPolicy::Operate) {
+                    Ok(t) => t,
+                    Err(status) => return (status, 0, 0),
+                };
+                if fs::symlink_metadata(&from).is_err() {
+                    return (FS_DONE_NOT_FOUND, 0, 0);
+                }
+                let to = match resolve_write_target(&self.root, &o.b, SymlinkPolicy::Operate) {
+                    Ok(t) => t,
+                    Err(status) => return (status, 0, 0),
+                };
+                if let Err(e) = fs::rename(&from, &to) {
+                    return (write_io_status(&e), 0, 0);
+                }
+                self.hint_change(&from);
+                self.hint_change(&to);
+                (FS_DONE_OK, 0, 0)
+            }
+            _ => (FS_DONE_INVALID, 0, 0),
+        }
+    }
+
+    /// Prime the echo of a landed write: cache the bytes by hash, mark this
+    /// client as already holding them (so its own UPSERT echo carries
+    /// metadata, not a copy), teach the reconciler the hash, and inject a
+    /// synchronous dirty hint so the change publishes in one settle window.
+    fn prime_echo(&mut self, wire: &str, abs: &Path, hash: u128, bytes: &[u8], mtime_ns: u64) {
+        blob_store()
+            .lock()
+            .unwrap()
+            .put(hash, Arc::new(bytes.to_vec()));
+        self.held.insert(wire.to_string(), hash);
+        if !racily_clean(mtime_ns)
+            && let Ok(mut meta) = stat_meta(abs)
+        {
+            meta.hash = hash;
+            let _ = self.shared.tx.send(RootMsg::HashLearned {
+                path: wire.to_string(),
+                meta,
+            });
+        }
+        self.hint_change(abs);
+    }
+
+    /// Inject a synchronous dirty hint for a path and its parent so a write
+    /// or op re-enters the mirror in one settle window instead of awaiting
+    /// the native watcher (which also fires and reconciles to a no-op).
+    fn hint_change(&self, abs: &Path) {
+        let _ = self
+            .shared
+            .tx
+            .send(RootMsg::Hint(Hint::Dirty(abs.to_path_buf())));
+        if let Some(parent) = abs.parent() {
+            let _ = self
+                .shared
+                .tx
+                .send(RootMsg::Hint(Hint::Dirty(parent.to_path_buf())));
+        }
     }
 }
 
@@ -2276,6 +2770,177 @@ mod tests {
             }),
         );
         (sent, handle, hint_tx)
+    }
+
+    /// Send a command and block until the `FS_DONE` for `nonce` arrives.
+    fn await_done(
+        handle: &SyncHandle,
+        sent: &Arc<Mutex<Vec<Vec<u8>>>>,
+        nonce: u16,
+        cmd: Command,
+    ) -> (u8, u128, u64) {
+        handle.command(cmd);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for msg in sent.lock().unwrap().iter() {
+                if let Some((n, s, h, m)) = blit_remote::fs::parse_fs_done(msg)
+                    && n == nonce
+                {
+                    return (s, h, m);
+                }
+            }
+            assert!(Instant::now() < deadline, "no FS_DONE for nonce {nonce}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn write_req(nonce: u16, path: &str, base: u128, flags: u8, content: &[u8]) -> Command {
+        Command::Write(WriteReq {
+            nonce,
+            path: path.into(),
+            base,
+            mode: 0,
+            flags,
+            content_kind: 1,
+            content: content.to_vec(),
+        })
+    }
+
+    #[test]
+    fn write_cas_semantics() {
+        // Production always canonicalizes the root (validate_root); the
+        // write guard relies on it.
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        // Create-exclusive (base 0): first ok, second conflicts with the
+        // current disk hash.
+        let (s, hash, _) = await_done(&handle, &sent, 1, write_req(1, "a.txt", 0, 0, b"hello"));
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(hash, blake3_128(b"hello"));
+        let (s, disk, _) = await_done(&handle, &sent, 2, write_req(2, "a.txt", 0, 0, b"x"));
+        assert_eq!(s, FS_DONE_CONFLICT);
+        assert_eq!(disk, hash, "conflict carries the live disk hash");
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hello", "unchanged");
+
+        // CAS overwrite: correct base succeeds, a stale base conflicts.
+        let (s, h2, _) = await_done(&handle, &sent, 3, write_req(3, "a.txt", hash, 0, b"world"));
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(h2, blake3_128(b"world"));
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"world");
+        let (s, _, _) = await_done(&handle, &sent, 4, write_req(4, "a.txt", hash, 0, b"z"));
+        assert_eq!(s, FS_DONE_CONFLICT, "stale base rejected");
+
+        // NO_CAS overwrites unconditionally.
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            5,
+            write_req(5, "a.txt", 0, FS_WRITE_NO_CAS, b"forced"),
+        );
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"forced");
+
+        // MKPARENTS creates the chain.
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            6,
+            write_req(6, "d/e/f.txt", 0, FS_WRITE_MKPARENTS, b"deep"),
+        );
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(fs::read(root.join("d/e/f.txt")).unwrap(), b"deep");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_refuses_traversal() {
+        // Production always canonicalizes the root (validate_root); the
+        // write guard relies on it.
+        let root = temp_dir().canonicalize().unwrap();
+        let sibling = root.parent().unwrap().join("blit-escape-victim.txt");
+        let _ = fs::remove_file(&sibling);
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        // Plain and percent-encoded dot-dot both refuse and write nothing.
+        for (i, p) in ["../blit-escape-victim.txt", "%2E%2E/blit-escape-victim.txt"]
+            .iter()
+            .enumerate()
+        {
+            let (s, _, _) = await_done(
+                &handle,
+                &sent,
+                i as u16 + 1,
+                write_req(i as u16 + 1, p, 0, 0, b"pwn"),
+            );
+            assert_eq!(s, FS_DONE_INVALID, "traversal {p} must be refused");
+        }
+        assert!(!sibling.exists(), "nothing escaped the root");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fs_ops_mkdir_rename_remove() {
+        // Production always canonicalizes the root (validate_root); the
+        // write guard relies on it.
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+        let op = |nonce: u16, op: u8, a: &str, b: &str, base: u128, flags: u8| {
+            Command::Op(OpReq {
+                nonce,
+                op,
+                a: a.into(),
+                b: b.into(),
+                base,
+                mode: 0,
+                flags,
+            })
+        };
+
+        // mkdir
+        let (s, _, _) = await_done(&handle, &sent, 1, op(1, FS_OP_MKDIR, "sub", "", 0, 0));
+        assert_eq!(s, FS_DONE_OK);
+        assert!(root.join("sub").is_dir());
+        // idempotent
+        let (s, _, _) = await_done(&handle, &sent, 2, op(2, FS_OP_MKDIR, "sub", "", 0, 0));
+        assert_eq!(s, FS_DONE_OK);
+
+        // write then rename
+        let (_, _, _) = await_done(&handle, &sent, 3, write_req(3, "sub/x.txt", 0, 0, b"hi"));
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            4,
+            op(4, FS_OP_RENAME, "sub/x.txt", "sub/y.txt", 0, 0),
+        );
+        assert_eq!(s, FS_DONE_OK);
+        assert!(!root.join("sub/x.txt").exists());
+        assert_eq!(fs::read(root.join("sub/y.txt")).unwrap(), b"hi");
+
+        // rename of a missing source is NOT_FOUND
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            5,
+            op(5, FS_OP_RENAME, "sub/gone.txt", "sub/z.txt", 0, 0),
+        );
+        assert_eq!(s, FS_DONE_NOT_FOUND);
+
+        // remove the subtree
+        let (s, _, _) = await_done(&handle, &sent, 6, op(6, FS_OP_REMOVE, "sub", "", 0, 0));
+        assert_eq!(s, FS_DONE_OK);
+        assert!(!root.join("sub").exists());
+        // removing a missing path is NOT_FOUND
+        let (s, _, _) = await_done(&handle, &sent, 7, op(7, FS_OP_REMOVE, "sub", "", 0, 0));
+        assert_eq!(s, FS_DONE_NOT_FOUND);
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Finding: a transiently-unreadable file must not poison the mirror.

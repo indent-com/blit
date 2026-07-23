@@ -17,6 +17,10 @@ pub const C2S_FS_STOP: u8 = 0x41;
 pub const C2S_FS_ACK: u8 = 0x42;
 /// Fetch full content of one file: [0x43][nonce:2][sync_id:2][path_len:2][path:N]
 pub const C2S_FS_FETCH: u8 = 0x43;
+/// Write file content (CAS): [0x44][nonce:2][sync_id:2][flags:1][base:16][mode:4][content_kind:1][path_len:2][path:N][content:LZ4]
+pub const C2S_FS_WRITE: u8 = 0x44;
+/// Metadata op (mkdir/remove/rename): [0x45][nonce:2][sync_id:2][op:1][flags:1][base:16][mode:4][a_len:2][a:N][b_len:2][b:N]
+pub const C2S_FS_OP: u8 = 0x45;
 
 /// Sync accepted or rejected: [0x40][nonce:2][sync_id:2][status:1][detail_len:2][detail:N]
 /// On success detail is the canonical root (UTF-8); on failure a diagnostic.
@@ -27,9 +31,16 @@ pub const S2C_FS_UPDATE: u8 = 0x41;
 pub const S2C_FS_FILE: u8 = 0x42;
 /// Sync terminated: [0x43][sync_id:2][reason:1]
 pub const S2C_FS_CLOSED: u8 = 0x43;
+/// Write/op result: [0x44][nonce:2][status:1][hash:16][mtime_ns:8]
+pub const S2C_FS_DONE: u8 = 0x44;
 
 /// `S2C_HELLO` feature bit: server supports the `FS_*` message family.
 pub const FEATURE_FS_SYNC: u32 = 1 << 6;
+
+/// `S2C_HELLO` feature bit: server supports the write family (`FS_WRITE`,
+/// `FS_OP`). Separately advertised so a deployment can offer read-only
+/// sync without writes (docs/design/fs-write.md "Security").
+pub const FEATURE_FS_WRITE: u32 = 1 << 9;
 
 /// `sync_id` reported by a failed `FS_SYNCED`.
 pub const FS_SYNC_ID_INVALID: u16 = 0xFFFF;
@@ -58,6 +69,63 @@ pub const FS_FILE_OK: u8 = 0;
 pub const FS_FILE_NOT_FOUND: u8 = 1;
 pub const FS_FILE_UNREADABLE: u8 = 2;
 pub const FS_FILE_OTHER: u8 = 3;
+
+// FS_DONE status — the unified git/lsp status table (docs/git.md
+// "Statuses"), NOT FS_SYNCED's grandfathered 0-4, plus one fs addition.
+// Same numeric values as `GIT_STATUS_*` where they overlap.
+pub const FS_DONE_OK: u8 = 0;
+pub const FS_DONE_NOT_FOUND: u8 = 2;
+pub const FS_DONE_WRONG_TYPE: u8 = 3;
+pub const FS_DONE_PERMISSION: u8 = 4;
+pub const FS_DONE_TOO_LARGE: u8 = 5;
+pub const FS_DONE_BUDGET: u8 = 6;
+pub const FS_DONE_INVALID: u8 = 7;
+pub const FS_DONE_OTHER: u8 = 9;
+/// A precondition failed (CAS mismatch, create-exclusive on an existing
+/// path, conditional remove on a changed file). On `CONFLICT`,
+/// `FS_DONE.hash` carries the current on-disk hash so the client rebases
+/// without a round trip. Added in lsp's `10 WARMING` extension style.
+pub const FS_DONE_CONFLICT: u8 = 11;
+
+/// Human-readable name for an `FS_DONE` status code.
+pub fn fs_done_status_text(status: u8) -> &'static str {
+    match status {
+        FS_DONE_OK => "ok",
+        FS_DONE_NOT_FOUND => "not found",
+        FS_DONE_WRONG_TYPE => "wrong type",
+        FS_DONE_PERMISSION => "permission denied",
+        FS_DONE_TOO_LARGE => "too large",
+        FS_DONE_BUDGET => "budget exhausted",
+        FS_DONE_INVALID => "invalid request",
+        FS_DONE_CONFLICT => "conflict",
+        _ => "error",
+    }
+}
+
+// FS_WRITE flags.
+/// Ignore `base`; unconditional overwrite/create ("Save As, replace").
+pub const FS_WRITE_NO_CAS: u8 = 1 << 0;
+/// Create missing parent directories.
+pub const FS_WRITE_MKPARENTS: u8 = 1 << 1;
+/// fsync the file and its parent (F_FULLFSYNC on macOS) before returning.
+pub const FS_WRITE_DURABLE: u8 = 1 << 2;
+/// Write through a final-component symlink whose resolved target stays
+/// under the root; default refuses one.
+pub const FS_WRITE_FOLLOW_SYMLINK: u8 = 1 << 3;
+
+// FS_WRITE content_kind: 0/1 are full bytes (v1); 2 is a reserved
+// delta-against-`base` encoding (v2). A client may always send full.
+pub const FS_WRITE_CONTENT_FULL: u8 = 1;
+pub const FS_WRITE_CONTENT_DELTA: u8 = 2;
+
+// FS_OP op selector.
+pub const FS_OP_MKDIR: u8 = 1;
+pub const FS_OP_REMOVE: u8 = 2;
+pub const FS_OP_RENAME: u8 = 3;
+
+// FS_OP flags (subset of FS_WRITE's, same bit positions).
+pub const FS_OP_NO_CAS: u8 = 1 << 0;
+pub const FS_OP_MKPARENTS: u8 = 1 << 1;
 
 // S2C_FS_CLOSED reasons.
 pub const FS_CLOSED_CLIENT_REQUEST: u8 = 0;
@@ -422,6 +490,166 @@ pub fn parse_fs_file(msg: &[u8]) -> Option<(u16, u8, Vec<u8>)> {
     let status = msg[3];
     let data = decompress_guarded(&msg[4..])?;
     Some((nonce, status, data))
+}
+
+// ---------------------------------------------------------------------------
+// Write family (docs/design/fs-write.md): nonce request/response side-band
+// operations against disk. The write itself echoes nothing — the existing
+// per-client differ re-emits UPSERT/MOVE/DELETE once the reconciler
+// re-indexes the landed change.
+// ---------------------------------------------------------------------------
+
+/// A content write (`C2S_FS_WRITE`). `base` is the CAS precondition: the
+/// current on-disk content hash to match (non-zero), zero for
+/// create-exclusive, ignored under `FS_WRITE_NO_CAS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsWrite {
+    pub nonce: u16,
+    pub sync_id: u16,
+    pub flags: u8,
+    pub base: u128,
+    pub mode: u32,
+    pub content_kind: u8,
+    pub path: String,
+    pub content: Vec<u8>,
+}
+
+pub fn msg_fs_write(w: &FsWrite) -> Vec<u8> {
+    let pb = w.path.as_bytes();
+    let compressed = lz4_flex::compress_prepend_size(&w.content);
+    let mut msg = Vec::with_capacity(29 + pb.len() + compressed.len());
+    msg.push(C2S_FS_WRITE);
+    msg.extend_from_slice(&w.nonce.to_le_bytes());
+    msg.extend_from_slice(&w.sync_id.to_le_bytes());
+    msg.push(w.flags);
+    msg.extend_from_slice(&w.base.to_le_bytes());
+    msg.extend_from_slice(&w.mode.to_le_bytes());
+    msg.push(w.content_kind);
+    msg.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+    msg.extend_from_slice(pb);
+    msg.extend_from_slice(&compressed);
+    msg
+}
+
+/// Parse a `C2S_FS_WRITE`. `None` = malformed, non-UTF-8 path, or content
+/// whose declared decompressed size exceeds the protocol cap.
+pub fn parse_fs_write(msg: &[u8]) -> Option<FsWrite> {
+    // [nonce:2][sync_id:2][flags:1][base:16][mode:4][content_kind:1][path_len:2][path:N][content:LZ4]
+    if msg.len() < 29 || msg[0] != C2S_FS_WRITE {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([msg[1], msg[2]]);
+    let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+    let flags = msg[5];
+    let base = u128::from_le_bytes(msg[6..22].try_into().unwrap());
+    let mode = u32::from_le_bytes(msg[22..26].try_into().unwrap());
+    let content_kind = msg[26];
+    let path_len = u16::from_le_bytes([msg[27], msg[28]]) as usize;
+    let path = std::str::from_utf8(msg.get(29..29 + path_len)?)
+        .ok()?
+        .to_string();
+    let content = decompress_guarded(&msg[29 + path_len..])?;
+    Some(FsWrite {
+        nonce,
+        sync_id,
+        flags,
+        base,
+        mode,
+        content_kind,
+        path,
+        content,
+    })
+}
+
+/// A metadata op (`C2S_FS_OP`): `op` selects mkdir/remove/rename; `a` is
+/// the primary path, `b` the rename destination. `base`/`mode` are used
+/// by only some ops (like `LSP_QUERY`'s `line`/`col`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsOp {
+    pub nonce: u16,
+    pub sync_id: u16,
+    pub op: u8,
+    pub flags: u8,
+    pub base: u128,
+    pub mode: u32,
+    pub a: String,
+    pub b: String,
+}
+
+pub fn msg_fs_op(o: &FsOp) -> Vec<u8> {
+    let ab = o.a.as_bytes();
+    let bb = o.b.as_bytes();
+    let mut msg = Vec::with_capacity(29 + ab.len() + bb.len());
+    msg.push(C2S_FS_OP);
+    msg.extend_from_slice(&o.nonce.to_le_bytes());
+    msg.extend_from_slice(&o.sync_id.to_le_bytes());
+    msg.push(o.op);
+    msg.push(o.flags);
+    msg.extend_from_slice(&o.base.to_le_bytes());
+    msg.extend_from_slice(&o.mode.to_le_bytes());
+    msg.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+    msg.extend_from_slice(ab);
+    msg.extend_from_slice(&(bb.len() as u16).to_le_bytes());
+    msg.extend_from_slice(bb);
+    msg
+}
+
+/// Parse a `C2S_FS_OP`. `None` = malformed or a non-UTF-8 path.
+pub fn parse_fs_op(msg: &[u8]) -> Option<FsOp> {
+    // [nonce:2][sync_id:2][op:1][flags:1][base:16][mode:4][a_len:2][a:N][b_len:2][b:N]
+    if msg.len() < 29 || msg[0] != C2S_FS_OP {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([msg[1], msg[2]]);
+    let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+    let op = msg[5];
+    let flags = msg[6];
+    let base = u128::from_le_bytes(msg[7..23].try_into().unwrap());
+    let mode = u32::from_le_bytes(msg[23..27].try_into().unwrap());
+    let a_len = u16::from_le_bytes([msg[27], msg[28]]) as usize;
+    let a = std::str::from_utf8(msg.get(29..29 + a_len)?)
+        .ok()?
+        .to_string();
+    let b_off = 29 + a_len;
+    let b_len = u16::from_le_bytes([*msg.get(b_off)?, *msg.get(b_off + 1)?]) as usize;
+    let b = std::str::from_utf8(msg.get(b_off + 2..b_off + 2 + b_len)?)
+        .ok()?
+        .to_string();
+    Some(FsOp {
+        nonce,
+        sync_id,
+        op,
+        flags,
+        base,
+        mode,
+        a,
+        b,
+    })
+}
+
+/// Build an `S2C_FS_DONE`. On success `hash`/`mtime_ns` are the post-op
+/// stat; on `CONFLICT`, `hash` is the current on-disk hash.
+pub fn msg_fs_done(nonce: u16, status: u8, hash: u128, mtime_ns: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(28);
+    msg.push(S2C_FS_DONE);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(&hash.to_le_bytes());
+    msg.extend_from_slice(&mtime_ns.to_le_bytes());
+    msg
+}
+
+/// Parse an `S2C_FS_DONE` into `(nonce, status, hash, mtime_ns)`.
+pub fn parse_fs_done(msg: &[u8]) -> Option<(u16, u8, u128, u64)> {
+    // [nonce:2][status:1][hash:16][mtime_ns:8]
+    if msg.len() < 28 || msg[0] != S2C_FS_DONE {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([msg[1], msg[2]]);
+    let status = msg[3];
+    let hash = u128::from_le_bytes(msg[4..20].try_into().unwrap());
+    let mtime_ns = u64::from_le_bytes(msg[20..28].try_into().unwrap());
+    Some((nonce, status, hash, mtime_ns))
 }
 
 /// The complete client obligation: apply updates, read `live`.
@@ -803,6 +1031,76 @@ mod tests {
             parse_fs_file(&msg),
             Some((9, FS_FILE_OK, b"contents".to_vec()))
         );
+    }
+
+    #[test]
+    fn fs_write_roundtrip() {
+        let w = FsWrite {
+            nonce: 7,
+            sync_id: 3,
+            flags: FS_WRITE_MKPARENTS | FS_WRITE_DURABLE,
+            base: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            mode: 0o644,
+            content_kind: FS_WRITE_CONTENT_FULL,
+            path: "dir/50%25.txt".to_string(),
+            content: b"hello world".to_vec(),
+        };
+        assert_eq!(parse_fs_write(&msg_fs_write(&w)), Some(w));
+        // Empty content (create-empty) and zero base (create-exclusive).
+        let w0 = FsWrite {
+            nonce: 1,
+            sync_id: 1,
+            flags: 0,
+            base: 0,
+            mode: 0,
+            content_kind: FS_WRITE_CONTENT_FULL,
+            path: "new.txt".to_string(),
+            content: Vec::new(),
+        };
+        assert_eq!(parse_fs_write(&msg_fs_write(&w0)), Some(w0));
+        // Truncated header and wrong opcode are rejected.
+        assert_eq!(parse_fs_write(&[C2S_FS_WRITE, 0, 0]), None);
+        assert_eq!(parse_fs_write(&msg_fs_file(1, 0, b"x")), None);
+    }
+
+    #[test]
+    fn fs_op_roundtrip() {
+        let rename = FsOp {
+            nonce: 42,
+            sync_id: 9,
+            op: FS_OP_RENAME,
+            flags: FS_OP_MKPARENTS,
+            base: 0,
+            mode: 0,
+            a: "old/name".to_string(),
+            b: "new/name".to_string(),
+        };
+        assert_eq!(parse_fs_op(&msg_fs_op(&rename)), Some(rename));
+        let mkdir = FsOp {
+            nonce: 2,
+            sync_id: 1,
+            op: FS_OP_MKDIR,
+            flags: 0,
+            base: 0,
+            mode: 0o700,
+            a: "sub".to_string(),
+            b: String::new(),
+        };
+        assert_eq!(parse_fs_op(&msg_fs_op(&mkdir)), Some(mkdir));
+        assert_eq!(parse_fs_op(&[C2S_FS_OP, 0],), None);
+    }
+
+    #[test]
+    fn fs_done_roundtrip() {
+        let hash = 0xdead_beef_dead_beef_dead_beef_dead_beefu128;
+        let msg = msg_fs_done(5, FS_DONE_OK, hash, 1_700_000_000_000_000_000);
+        assert_eq!(
+            parse_fs_done(&msg),
+            Some((5, FS_DONE_OK, hash, 1_700_000_000_000_000_000))
+        );
+        // CONFLICT carries the current disk hash.
+        let c = msg_fs_done(6, FS_DONE_CONFLICT, hash, 0);
+        assert_eq!(parse_fs_done(&c), Some((6, FS_DONE_CONFLICT, hash, 0)));
     }
 
     #[test]

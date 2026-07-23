@@ -352,18 +352,59 @@ async fn async_main() {
                     std::process::exit(1);
                 }
             };
-            let result = match command {
+            let result: Result<i32, String> = match command {
                 FsCommand::Sync {
                     path,
                     content,
                     no_recursive,
                     once,
                     json,
-                } => fs::cmd_sync(transport, path, content, no_recursive, once, json).await,
+                } => fs::cmd_sync(transport, path, content, no_recursive, once, json)
+                    .await
+                    .map(|()| 0),
+                FsCommand::Write {
+                    path,
+                    root,
+                    if_hash,
+                    create,
+                    force,
+                    parents,
+                    durable,
+                    mode,
+                    json,
+                } => {
+                    fs::cmd_write(
+                        transport, path, root, if_hash, create, force, parents, durable, mode, json,
+                    )
+                    .await
+                }
+                FsCommand::Mkdir {
+                    path,
+                    root,
+                    parents,
+                    mode,
+                    json,
+                } => fs::cmd_mkdir(transport, path, root, parents, mode, json).await,
+                FsCommand::Rm {
+                    path,
+                    root,
+                    if_hash,
+                    json,
+                } => fs::cmd_rm(transport, path, root, if_hash, json).await,
+                FsCommand::Mv {
+                    from,
+                    to,
+                    root,
+                    parents,
+                    json,
+                } => fs::cmd_mv(transport, from, to, root, parents, json).await,
             };
-            if let Err(e) = result {
-                eprintln!("blit: {e}");
-                std::process::exit(1);
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Git { command } => {

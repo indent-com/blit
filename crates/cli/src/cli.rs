@@ -839,6 +839,109 @@ pub enum FsCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Write a file from stdin, with conflict detection
+    ///
+    /// Content is read from stdin. By default an unconditional overwrite;
+    /// --create fails if the file exists, --if-hash writes only if the
+    /// current content matches. Exit 1 on conflict.
+    Write {
+        /// Path to write, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Write only if the current content hash equals this hex value
+        #[arg(long, conflicts_with_all = ["create", "force"])]
+        if_hash: Option<String>,
+
+        /// Create only if the path does not already exist
+        #[arg(long, conflicts_with_all = ["if_hash", "force"])]
+        create: bool,
+
+        /// Overwrite unconditionally (ignore any precondition)
+        #[arg(long)]
+        force: bool,
+
+        /// Create missing parent directories
+        #[arg(long)]
+        parents: bool,
+
+        /// fsync the file and its parent before returning
+        #[arg(long)]
+        durable: bool,
+
+        /// File mode in octal (e.g. 644); default preserves or umask
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Create a directory
+    Mkdir {
+        /// Path to create, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Create missing parent directories
+        #[arg(long)]
+        parents: bool,
+
+        /// Directory mode in octal (e.g. 700)
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a file or directory subtree
+    Rm {
+        /// Path to remove, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Remove only if the current content hash equals this hex value
+        #[arg(long)]
+        if_hash: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rename or move a file or subtree
+    Mv {
+        /// Source path, relative to --root
+        from: String,
+
+        /// Destination path, relative to --root
+        to: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Create missing parent directories of the destination
+        #[arg(long)]
+        parents: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ── Git subcommands ──────────────────────────────────────────────────────

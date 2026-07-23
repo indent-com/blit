@@ -4796,10 +4796,12 @@ fn handle_fs_message(
     out: &mpsc::UnboundedSender<Vec<u8>>,
     verbose: bool,
 ) {
+    use blit_fssync::{OpReq, WriteReq};
     use blit_remote::fs::{
-        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_STOP, C2S_FS_SYNC, FS_FILE_OTHER, FS_STATUS_OK,
-        FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT, FS_SYNC_CONTENT, FS_SYNC_CROSS_FILESYSTEM,
-        FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, msg_fs_file, msg_fs_synced,
+        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_OP, C2S_FS_STOP, C2S_FS_SYNC, C2S_FS_WRITE,
+        FS_DONE_INVALID, FS_FILE_OTHER, FS_STATUS_OK, FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT,
+        FS_SYNC_CONTENT, FS_SYNC_CROSS_FILESYSTEM, FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE,
+        msg_fs_done, msg_fs_file, msg_fs_synced, parse_fs_op, parse_fs_write,
     };
     match data[0] {
         C2S_FS_SYNC if data.len() >= 12 => {
@@ -4930,6 +4932,61 @@ fn handle_fs_message(
                 }
             }
         }
+        C2S_FS_WRITE => {
+            // The engine replies one FS_DONE; a malformed request or an
+            // unknown sync answers INVALID here (docs/design/fs-write.md).
+            match parse_fs_write(data) {
+                Some(w) => match syncs.map.get(&w.sync_id) {
+                    Some(entry) => {
+                        entry.handle.command(blit_fssync::Command::Write(WriteReq {
+                            nonce: w.nonce,
+                            path: w.path,
+                            base: w.base,
+                            mode: w.mode,
+                            flags: w.flags,
+                            content_kind: w.content_kind,
+                            content: w.content,
+                        }));
+                    }
+                    None => {
+                        let _ = out.send(msg_fs_done(w.nonce, FS_DONE_INVALID, 0, 0));
+                    }
+                },
+                None => {
+                    // Recover the nonce for a best-effort reply if we can.
+                    let nonce = data
+                        .get(1..3)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0);
+                    let _ = out.send(msg_fs_done(nonce, FS_DONE_INVALID, 0, 0));
+                }
+            }
+        }
+        C2S_FS_OP => match parse_fs_op(data) {
+            Some(o) => match syncs.map.get(&o.sync_id) {
+                Some(entry) => {
+                    entry.handle.command(blit_fssync::Command::Op(OpReq {
+                        nonce: o.nonce,
+                        op: o.op,
+                        a: o.a,
+                        b: o.b,
+                        base: o.base,
+                        mode: o.mode,
+                        flags: o.flags,
+                    }));
+                }
+                None => {
+                    let _ = out.send(msg_fs_done(o.nonce, FS_DONE_INVALID, 0, 0));
+                }
+            },
+            None => {
+                let nonce = data
+                    .get(1..3)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .unwrap_or(0);
+                let _ = out.send(msg_fs_done(nonce, FS_DONE_INVALID, 0, 0));
+            }
+        },
         _ => {}
     }
 }
@@ -5682,6 +5739,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut lsp_conns = LspConns::default();
     // BLIT_LSP=0 turns the whole family off: unadvertised and undispatched.
     let lsp_enabled = !std::env::var("BLIT_LSP").is_ok_and(|v| v == "0");
+    // BLIT_FS_WRITE=0 offers read-only sync: the write bit is unadvertised
+    // and FS_WRITE/FS_OP are undispatched (docs/design/fs-write.md
+    // "Security").
+    let fs_write_enabled = !std::env::var("BLIT_FS_WRITE").is_ok_and(|v| v == "0");
     #[cfg(target_os = "linux")]
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // On non-Linux, keep the audio sender alive for the lifetime of the
@@ -5890,13 +5951,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_COMPOSITOR
                 | blit_remote::fs::FEATURE_FS_SYNC
                 | blit_remote::git::FEATURE_GIT;
-            // BLIT_LSP=0 disables the family: the bit is simply not
-            // advertised (docs/design/lsp.md), matching the dispatch gate.
-            let features = if lsp_enabled {
-                features | blit_remote::lsp::FEATURE_LSP
-            } else {
-                features
-            };
+            // BLIT_LSP=0 / BLIT_FS_WRITE=0 disable their families: the bit
+            // is simply not advertised, matching the dispatch gate.
+            let mut features = features;
+            if lsp_enabled {
+                features |= blit_remote::lsp::FEATURE_LSP;
+            }
+            if fs_write_enabled {
+                features |= blit_remote::fs::FEATURE_FS_WRITE;
+            }
             #[cfg(target_os = "linux")]
             let mut features = features;
             #[cfg(target_os = "linux")]
@@ -6024,7 +6087,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | blit_remote::fs::C2S_FS_STOP
                 | blit_remote::fs::C2S_FS_ACK
                 | blit_remote::fs::C2S_FS_FETCH
-        ) {
+        ) || (fs_write_enabled
+            && matches!(
+                data[0],
+                blit_remote::fs::C2S_FS_WRITE | blit_remote::fs::C2S_FS_OP
+            ))
+        {
             handle_fs_message(&data, &mut fs_syncs, &fs_out, config.verbose);
             continue;
         }
