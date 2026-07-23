@@ -550,19 +550,24 @@ fn wire_to_os(component: &str) -> Option<std::ffi::OsString> {
 /// Resolve a wire path (relative, '/'-separated, escaped) against a root.
 /// Rejects traversal — the result always stays under the root.
 pub fn resolve_wire_path(root: &Path, wire: &str) -> Option<PathBuf> {
+    use std::path::Component;
     let mut abs = root.to_path_buf();
     if wire.is_empty() {
         return Some(abs);
     }
     for component in wire.split('/') {
-        if component.is_empty() || component == "." || component == ".." {
-            return None;
-        }
+        // Validate the *decoded* component, not the escaped wire text:
+        // `%2E%2E` decodes to `..` and `%2F` to `/`, so a check on the
+        // escaped form (`component == ".."`) is bypassable and would let
+        // a crafted request climb out of the root. Decode first, then
+        // require exactly one normal path component — rejecting empty,
+        // `.`, `..`, absolute/prefix pieces, and any embedded separator.
         let os = wire_to_os(component)?;
-        if os.is_empty() {
-            return None;
+        let mut parts = Path::new(&os).components();
+        match (parts.next(), parts.next()) {
+            (Some(Component::Normal(part)), None) if part == os.as_os_str() => abs.push(part),
+            _ => return None,
         }
-        abs.push(os);
     }
     Some(abs)
 }
@@ -2150,6 +2155,32 @@ mod tests {
         assert_eq!(
             resolve_wire_path(root, "a/b"),
             Some(root.join("a").join("b"))
+        );
+    }
+
+    /// Traversal must be rejected even when the dot-dot or separator is
+    /// percent-encoded: the `.`/`..`/empty and embedded-`/` checks run
+    /// against the *decoded* component, not the escaped wire text, so a
+    /// crafted `FS_FETCH` cannot climb out of the synced root. (A
+    /// well-behaved peer never sends these — the server escapes `.` as
+    /// `.` and `/` as a separator — but the resolver must not trust the
+    /// client's encoding.)
+    #[test]
+    fn encoded_traversal_rejected() {
+        let root = Path::new("/tmp/root");
+        // %2E%2E decodes to "..".
+        assert!(resolve_wire_path(root, "%2E%2E").is_none());
+        assert!(resolve_wire_path(root, "%2e%2e/etc/passwd").is_none());
+        // %2E decodes to ".".
+        assert!(resolve_wire_path(root, "%2E").is_none());
+        // An embedded encoded separator smuggles two components past a
+        // per-component check.
+        assert!(resolve_wire_path(root, "a%2F..%2Fb").is_none());
+        assert!(resolve_wire_path(root, "a%2Fb").is_none());
+        // A genuine name that merely contains a percent still resolves.
+        assert_eq!(
+            resolve_wire_path(root, "%2525"),
+            Some(root.join("%25"))
         );
     }
 
