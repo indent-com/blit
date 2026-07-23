@@ -57,7 +57,8 @@ pub const S2C_LSP_STATE: u8 = 0x61;
 /// Per-file replacement sets; bit 0 [`LSP_DIAG_FULL`] carries the
 /// complete workspace state (drop everything, then apply).
 pub const S2C_LSP_DIAG: u8 = 0x62;
-/// Query response: [0x63][nonce:2][status:1][flags:1][records:LZ4]
+/// Query response: [0x63][nonce:2][status:1][flags:1][detail_len:2][detail:N][records:LZ4]
+/// `detail` is a human-readable failure reason (empty on success).
 pub const S2C_LSP_QUERY: u8 = 0x63;
 /// Attachment ended server-side: [0x64][lsp_id:2][reason:1]
 pub const S2C_LSP_CLOSED: u8 = 0x64;
@@ -602,26 +603,52 @@ pub fn parse_lsp_diag(msg: &[u8]) -> Option<(u16, u32, u8, Vec<u8>)> {
     Some((lsp_id, update_id, flags, records))
 }
 
-pub fn msg_lsp_query_resp(nonce: u16, status: u8, flags: u8, records: &[u8]) -> Vec<u8> {
+pub fn msg_lsp_query_resp(
+    nonce: u16,
+    status: u8,
+    flags: u8,
+    detail: &str,
+    records: &[u8],
+) -> Vec<u8> {
     let compressed = lz4_flex::compress_prepend_size(records);
-    let mut msg = Vec::with_capacity(5 + compressed.len());
+    let mut msg = Vec::with_capacity(7 + detail.len() + compressed.len());
     msg.push(S2C_LSP_QUERY);
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.push(status);
     msg.push(flags);
+    push_str(&mut msg, detail);
     msg.extend_from_slice(&compressed);
     msg
 }
 
-/// Parse `S2C_LSP_QUERY` into `(nonce, status, flags, records)` with the
-/// records decompressed.
-pub fn parse_lsp_query_resp(msg: &[u8]) -> Option<(u16, u8, u8, Vec<u8>)> {
+/// A decoded `S2C_LSP_QUERY` response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspQueryResp {
+    pub nonce: u16,
+    pub status: u8,
+    pub flags: u8,
+    /// Human-readable failure reason (e.g. the upstream server's own
+    /// error message on `OTHER`); empty on success.
+    pub detail: String,
+    /// Decompressed response records.
+    pub records: Vec<u8>,
+}
+
+/// Parse `S2C_LSP_QUERY` with the records decompressed.
+pub fn parse_lsp_query_resp(msg: &[u8]) -> Option<LspQueryResp> {
     let mut b = body_of(msg, S2C_LSP_QUERY)?;
     let nonce = take_u16(&mut b)?;
     let status = take_u8(&mut b)?;
     let flags = take_u8(&mut b)?;
+    let detail = take_str(&mut b)?.to_string();
     let records = decompress_guarded(b)?;
-    Some((nonce, status, flags, records))
+    Some(LspQueryResp {
+        nonce,
+        status,
+        flags,
+        detail,
+        records,
+    })
 }
 
 pub fn msg_lsp_closed(lsp_id: u16, reason: u8) -> Vec<u8> {
@@ -1479,11 +1506,22 @@ mod tests {
         let msg = msg_lsp_diag(1, 6, LSP_DIAG_FULL, &[]);
         assert_eq!(parse_lsp_diag(&msg), Some((1, 6, LSP_DIAG_FULL, vec![])));
 
-        let msg = msg_lsp_query_resp(3, LSP_STATUS_OK, 0, &[]);
+        let msg = msg_lsp_query_resp(3, LSP_STATUS_OK, 0, "", &[]);
         assert_eq!(
             parse_lsp_query_resp(&msg),
-            Some((3, LSP_STATUS_OK, 0, vec![]))
+            Some(LspQueryResp {
+                nonce: 3,
+                status: LSP_STATUS_OK,
+                flags: 0,
+                detail: String::new(),
+                records: vec![],
+            })
         );
+        // A failure carries the reason.
+        let msg = msg_lsp_query_resp(4, LSP_STATUS_OTHER, 0, "gopls: boom", &[]);
+        let resp = parse_lsp_query_resp(&msg).unwrap();
+        assert_eq!(resp.status, LSP_STATUS_OTHER);
+        assert_eq!(resp.detail, "gopls: boom");
 
         let msg = msg_lsp_closed(1, LSP_CLOSED_BACKEND_FAILED);
         assert_eq!(parse_lsp_closed(&msg), Some((1, LSP_CLOSED_BACKEND_FAILED)));

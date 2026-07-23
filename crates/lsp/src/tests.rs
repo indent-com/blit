@@ -354,7 +354,7 @@ fn query_before_ready_answers_warming() {
     let att = attach(&root, &backend, 0, sink.clone());
     att.query(7, LSP_QUERY_DEFINITION, 0, 0, 0, "a.rs", "", sink);
     let (nonce, status) = wait_for(&rx, |msg| {
-        parse_lsp_query_resp(msg).map(|(n, s, _, _)| (n, s))
+        parse_lsp_query_resp(msg).map(|r| (r.nonce, r.status))
     });
     assert_eq!((nonce, status), (7, LSP_STATUS_WARMING));
 }
@@ -377,8 +377,8 @@ fn definition_transcodes_utf16_to_bytes() {
     att.query(3, LSP_QUERY_DEFINITION, 0, 0, 0, "a.rs", "", sink);
     let (status, records) = wait_for(&rx, |msg| {
         parse_lsp_query_resp(msg)
-            .filter(|(n, ..)| *n == 3)
-            .map(|(_, s, _, r)| (s, r))
+            .filter(|r| r.nonce == 3)
+            .map(|r| (r.status, r.records))
     });
     assert_eq!(status, LSP_STATUS_OK);
     let locations: Vec<_> = lsp_query_records(&records).collect();
@@ -480,8 +480,8 @@ fn rename_returns_edit_plan_and_applyedit_is_refused() {
     att.query(9, LSP_QUERY_RENAME, 0, 1, 3, "a.rs", "renamed", sink);
     let (status, records) = wait_for(&rx, |msg| {
         parse_lsp_query_resp(msg)
-            .filter(|(n, ..)| *n == 9)
-            .map(|(_, s, _, r)| (s, r))
+            .filter(|r| r.nonce == 9)
+            .map(|r| (r.status, r.records))
     });
     assert_eq!(status, LSP_STATUS_OK);
     let edits: Vec<_> = lsp_query_records(&records).collect();
@@ -530,8 +530,8 @@ fn doc_symbols_flatten_with_depth() {
     att.query(5, LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, "a.rs", "", sink);
     let records = wait_for(&rx, |msg| {
         parse_lsp_query_resp(msg)
-            .filter(|(n, ..)| *n == 5)
-            .map(|(_, _, _, r)| r)
+            .filter(|r| r.nonce == 5)
+            .map(|r| r.records)
     });
     let symbols: Vec<_> = lsp_query_records(&records).collect();
     match &symbols[..] {
@@ -620,7 +620,7 @@ fn stop_answers_pending_query() {
     let msg = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("pending query answered on stop");
-    let (nonce, ..) = parse_lsp_query_resp(&msg).unwrap();
+    let nonce = parse_lsp_query_resp(&msg).unwrap().nonce;
     assert_eq!(nonce, 7);
 
     // Once stopped the backend is terminally gone, and further sends are
@@ -665,7 +665,9 @@ fn query_without_capability_is_not_found() {
     ] {
         let (sink, rx) = collector();
         att.query(nonce, kind, 0, 0, 0, path, "", sink);
-        let (n, status) = wait_for(&rx, |m| parse_lsp_query_resp(m).map(|(n, s, _, _)| (n, s)));
+        let (n, status) = wait_for(&rx, |m| {
+            parse_lsp_query_resp(m).map(|r| (r.nonce, r.status))
+        });
         assert_eq!(
             (n, status),
             (nonce, LSP_STATUS_NOT_FOUND),

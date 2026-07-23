@@ -651,12 +651,12 @@ impl Engine {
         let pending = std::mem::take(&mut self.pending);
         for (_, p) in pending {
             if let PendingCtx::Query(q) = p.ctx {
-                respond(&q, LSP_STATUS_OTHER, 0, &[]);
+                respond(&q, LSP_STATUS_OTHER, 0, "", &[]);
             }
         }
         while let Ok(cmd) = self.inbox.try_recv() {
             if let Cmd::Query { sink, nonce, .. } = cmd {
-                let _ = sink(msg_lsp_query_resp(nonce, LSP_STATUS_OTHER, 0, &[]));
+                let _ = sink(msg_lsp_query_resp(nonce, LSP_STATUS_OTHER, 0, "", &[]));
             }
         }
     }
@@ -679,7 +679,7 @@ impl Engine {
         let pending = std::mem::take(&mut self.pending);
         for (_, p) in pending {
             if let PendingCtx::Query(q) = p.ctx {
-                respond(&q, LSP_STATUS_OTHER, 0, &[]);
+                respond(&q, LSP_STATUS_OTHER, 0, "", &[]);
             }
         }
         self.init_id = None;
@@ -1152,19 +1152,19 @@ impl Engine {
         };
         match phase {
             LSP_PHASE_SPAWNING | LSP_PHASE_INITIALIZING => {
-                return respond(&q, LSP_STATUS_WARMING, 0, &[]);
+                return respond(&q, LSP_STATUS_WARMING, 0, "", &[]);
             }
-            LSP_PHASE_FAILED => return respond(&q, LSP_STATUS_OTHER, 0, &[]),
+            LSP_PHASE_FAILED => return respond(&q, LSP_STATUS_OTHER, 0, "", &[]),
             _ => {}
         }
         let (method, params) = match kind {
             LSP_QUERY_WS_SYMBOLS => ("workspace/symbol", json!({ "query": arg })),
             _ => {
                 let Some(path) = &path else {
-                    return respond(&q, blit_remote::lsp::LSP_STATUS_INVALID, 0, &[]);
+                    return respond(&q, blit_remote::lsp::LSP_STATUS_INVALID, 0, "", &[]);
                 };
                 if !self.ensure_open(path) {
-                    return respond(&q, LSP_STATUS_NOT_FOUND, 0, &[]);
+                    return respond(&q, LSP_STATUS_NOT_FOUND, 0, "", &[]);
                 }
                 let (_, txt, _) = &self.open_docs[path];
                 let character = text::col_to_encoding(txt, line, col, self.enc);
@@ -1197,7 +1197,7 @@ impl Engine {
                         "textDocument/rename",
                         json!({ "textDocument": doc, "position": position, "newName": arg }),
                     ),
-                    _ => return respond(&q, blit_remote::lsp::LSP_STATUS_INVALID, 0, &[]),
+                    _ => return respond(&q, blit_remote::lsp::LSP_STATUS_INVALID, 0, "", &[]),
                 }
             }
         };
@@ -1232,11 +1232,19 @@ impl Engine {
                 _ if warming => LSP_STATUS_WARMING,
                 _ => LSP_STATUS_OTHER,
             };
-            return respond(&q, status, 0, &[]);
+            // Carry the server's own message to the client so a failed
+            // query reads as "server X: <reason>", not a bare "error".
+            let detail = if status == LSP_STATUS_OTHER {
+                let msg = error["message"].as_str().unwrap_or("no message");
+                format!("{}: {msg}", self.spec.id)
+            } else {
+                String::new()
+            };
+            return respond(&q, status, 0, &detail, &[]);
         }
         let result = result.unwrap_or(Value::Null);
         if result.is_null() {
-            return respond(&q, LSP_STATUS_NOT_FOUND, 0, &[]);
+            return respond(&q, LSP_STATUS_NOT_FOUND, 0, "", &[]);
         }
         // Borrow the open set in (text, hash) view for translation.
         let open_view: HashMap<PathBuf, (String, LspHash)> = self
@@ -1280,7 +1288,7 @@ impl Engine {
         if sink.incomplete {
             flags |= blit_remote::lsp::LSP_RESP_INCOMPLETE;
         }
-        respond(&q, LSP_STATUS_OK, flags, &buf);
+        respond(&q, LSP_STATUS_OK, flags, "", &buf);
     }
 
     // -- plumbing ---------------------------------------------------------
@@ -1338,7 +1346,7 @@ impl Engine {
                 }
                 PendingCtx::Query(q) => {
                     self.write(rpc::notification("$/cancelRequest", json!({ "id": id })));
-                    respond(&q, LSP_STATUS_OTHER, 0, &[]);
+                    respond(&q, LSP_STATUS_OTHER, 0, "", &[]);
                 }
             }
         }
@@ -1353,9 +1361,9 @@ impl Engine {
 /// implementation). This hook stays for symmetry and future backends.
 fn reap_backstop_status(_pid: u32) {}
 
-fn respond(q: &PendingQuery, status: u8, flags: u8, records: &[u8]) {
+fn respond(q: &PendingQuery, status: u8, flags: u8, detail: &str, records: &[u8]) {
     debug_assert!(status != LSP_STATUS_OK || records.is_empty() || !records.is_empty());
-    let _ = (q.sink)(msg_lsp_query_resp(q.nonce, status, flags, records));
+    let _ = (q.sink)(msg_lsp_query_resp(q.nonce, status, flags, detail, records));
 }
 
 fn token_key(token: &Value) -> Option<String> {

@@ -179,9 +179,15 @@ describe("lsp message roundtrips", () => {
     ).toEqual([1, 6, LSP_DIAG_FULL, new Uint8Array(0)]);
     expect(
       parseLspQueryResp(
-        msgLspQueryResp(3, LSP_STATUS_OK, 0, new Uint8Array(0)),
+        msgLspQueryResp(3, LSP_STATUS_OK, 0, "", new Uint8Array(0)),
       ),
-    ).toEqual([3, LSP_STATUS_OK, 0, new Uint8Array(0)]);
+    ).toEqual([3, LSP_STATUS_OK, 0, "", new Uint8Array(0)]);
+    // A failure carries the reason.
+    expect(
+      parseLspQueryResp(
+        msgLspQueryResp(4, 9, 0, "gopls: boom", new Uint8Array(0)),
+      ),
+    ).toEqual([4, 9, 0, "gopls: boom", new Uint8Array(0)]);
     expect(
       parseLspServersResp(
         msgLspServersResp(4, LSP_STATUS_OK, 0, new Uint8Array(0)),

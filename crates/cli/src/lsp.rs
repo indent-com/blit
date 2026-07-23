@@ -207,7 +207,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
         col: u32,
         path: &str,
         arg: &str,
-    ) -> Result<(u8, u8, Vec<u8>), String> {
+    ) -> Result<(u8, u8, String, Vec<u8>), String> {
         let msg = msg_lsp_query(&LspQueryRequest {
             nonce: REQ_NONCE,
             lsp_id: self.lsp_id,
@@ -226,13 +226,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             if data[0] != S2C_LSP_QUERY {
                 continue;
             }
-            let Some((nonce, status, flags, records)) = parse_lsp_query_resp(&data) else {
+            let Some(resp) = parse_lsp_query_resp(&data) else {
                 return Err("malformed query response from server".into());
             };
-            if nonce != REQ_NONCE {
+            if resp.nonce != REQ_NONCE {
                 continue;
             }
-            return Ok((status, flags, records));
+            return Ok((resp.status, resp.flags, resp.detail, resp.records));
         }
     }
 }
@@ -282,7 +282,11 @@ fn screen(data: &[u8], lsp_id: u16) -> Result<(), String> {
 
 /// Shared refusal handling: `WARMING` gets the retry hint and exit 2;
 /// other non-OK statuses report and exit 2.
-fn check_status(status: u8) -> Result<bool, String> {
+/// `Ok(true)` = proceed, `Ok(false)` = no result (exit 1). `detail`
+/// carries the server's own reason where it has one (e.g. the upstream
+/// error message on a failure), so a failed query reads as the real
+/// cause, not a bare "error".
+fn check_status(status: u8, detail: &str) -> Result<bool, String> {
     match status {
         LSP_STATUS_OK => Ok(true),
         LSP_STATUS_NOT_FOUND => Ok(false),
@@ -290,6 +294,7 @@ fn check_status(status: u8) -> Result<bool, String> {
             "language server warming up — retry, or run `blit lsp wait` ({})",
             lsp_status_text(status)
         )),
+        _ if !detail.is_empty() => Err(format!("query failed: {detail}")),
         _ => Err(format!("query failed: {}", lsp_status_text(status))),
     }
 }
@@ -336,8 +341,8 @@ pub async fn cmd_position(
     } else {
         0
     };
-    let (status, _, records) = session.query(kind, flags, line, col, &path, &arg).await?;
-    if !check_status(status)? {
+    let (status, _, detail, records) = session.query(kind, flags, line, col, &path, &arg).await?;
+    if !check_status(status, &detail)? {
         return Ok(1);
     }
     let mut found = 0;
@@ -425,7 +430,7 @@ pub async fn cmd_symbols(
             eprintln!("no symbols — see running servers with `blit lsp list`");
         }
     };
-    let (status, _, records) = match file {
+    let (status, _, detail, records) = match file {
         Some(file) => {
             session
                 .query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, &client_abs(&file), "")
@@ -444,7 +449,7 @@ pub async fn cmd_symbols(
                 .await?
         }
     };
-    if !check_status(status)? {
+    if !check_status(status, &detail)? {
         hint_empty();
         return Ok(1);
     }

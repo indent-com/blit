@@ -167,7 +167,7 @@ impl Attachment {
         sink: Sink,
     ) {
         let refuse = |status: u8| {
-            let _ = sink(msg_lsp_query_resp(nonce, status, 0, &[]));
+            let _ = sink(msg_lsp_query_resp(nonce, status, 0, "", &[]));
         };
         let want = required_cap(kind);
         // Which backends are candidates for this query: any backend for

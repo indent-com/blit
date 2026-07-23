@@ -1301,9 +1301,10 @@ export class BlitConnection {
       const parsed = parseLspQueryResp(msg);
       if (!parsed)
         throw connectionError("Malformed query response from server");
-      const [, status, respFlags, records] = parsed;
+      const [, status, respFlags, detail, records] = parsed;
       return {
         status,
+        detail,
         truncated: (respFlags & LSP_RESP_TRUNCATED) !== 0,
         incomplete: (respFlags & LSP_RESP_INCOMPLETE) !== 0,
         records: [...lspQueryRecords(records)],

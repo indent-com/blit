@@ -56,7 +56,8 @@ export const S2C_LSP_STATE = 0x61;
  *  Per-file replacement sets; bit 0 {@link LSP_DIAG_FULL} carries the
  *  complete workspace state (drop everything, then apply). */
 export const S2C_LSP_DIAG = 0x62;
-/** Query response: [0x63][nonce:2][status:1][flags:1][records:LZ4] */
+/** Query response: [0x63][nonce:2][status:1][flags:1][detail_len:2][detail:N][records:LZ4].
+ *  `detail` is a human-readable failure reason (empty on success). */
 export const S2C_LSP_QUERY = 0x63;
 /** Attachment ended server-side: [0x64][lsp_id:2][reason:1] */
 export const S2C_LSP_CLOSED = 0x64;
@@ -498,10 +499,20 @@ function parseRecordsResp(
   return [nonce, status, flags, records];
 }
 
+/** Parse `S2C_LSP_QUERY` into `[nonce, status, flags, detail, records]`
+ *  with the records decompressed. */
 export function parseLspQueryResp(
   msg: Uint8Array,
-): [number, number, number, Uint8Array] | null {
-  return parseRecordsResp(msg, S2C_LSP_QUERY);
+): [number, number, number, string, Uint8Array] | null {
+  if (msg.length < 7 || msg[0] !== S2C_LSP_QUERY) return null;
+  const c = new Cursor(msg.subarray(1));
+  const nonce = c.u16();
+  const status = c.u8();
+  const flags = c.u8();
+  const detail = c.str();
+  const records = fsDecompress(c.rest());
+  if (!c.ok || records === null) return null;
+  return [nonce, status, flags, detail, records];
 }
 
 export function parseLspServersResp(
@@ -598,9 +609,19 @@ export function msgLspQueryResp(
   nonce: number,
   status: number,
   flags: number,
+  detail: string,
   records: Uint8Array,
 ): Uint8Array {
-  return msgRecordsResp(S2C_LSP_QUERY, nonce, status, flags, records);
+  const buf: number[] = [S2C_LSP_QUERY];
+  pushU16(buf, nonce);
+  buf.push(status);
+  buf.push(flags);
+  pushStr(buf, detail);
+  const compressed = fsCompressLiteral(records);
+  const msg = new Uint8Array(buf.length + compressed.length);
+  msg.set(buf, 0);
+  msg.set(compressed, buf.length);
+  return msg;
 }
 
 export function msgLspServersResp(
@@ -1024,6 +1045,9 @@ export interface LspOpenOptions {
 export interface LspQueryResult {
   /** An `LSP_STATUS_*` code; inspect before reading records. */
   status: number;
+  /** A human-readable failure reason (e.g. the upstream server's own
+   *  error message on a non-OK status); empty on success. */
+  detail: string;
   /** The entries budget was hit; records present are valid. */
   truncated: boolean;
   /** A `RENAME` plan dropped file operations it cannot project (create /

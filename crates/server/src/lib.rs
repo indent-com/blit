@@ -5596,7 +5596,7 @@ fn handle_lsp_message(
                 return;
             };
             let refuse = |status: u8| {
-                let _ = out.send(msg_lsp_query_resp(req.nonce, status, 0, &[]));
+                let _ = out.send(msg_lsp_query_resp(req.nonce, status, 0, "", &[]));
             };
             let Some(attachment) = conns.map.get(&req.lsp_id) else {
                 refuse(LSP_STATUS_UNKNOWN_ID);
@@ -9822,7 +9822,8 @@ mod tests {
         });
         handle_lsp_message(&query, &mut conns, &out, false);
         let resp = rx.try_recv().expect("synchronous refusal");
-        let (nonce, status, _, _) = parse_lsp_query_resp(&resp).unwrap();
+        let r = parse_lsp_query_resp(&resp).unwrap();
+        let (nonce, status) = (r.nonce, r.status);
         assert_eq!((nonce, status), (9, LSP_STATUS_UNKNOWN_ID));
 
         // The daemon-wide verbs answer without any backend running.
