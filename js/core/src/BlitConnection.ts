@@ -81,12 +81,23 @@ import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
 import {
   FEATURE_FS_SYNC,
+  FEATURE_FS_WRITE,
   FS_CLOSED_CONNECTION_LOST,
+  FS_DONE_CONFLICT,
+  FS_DONE_OK,
   FS_FILE_OK,
+  FS_OP_MKDIR,
+  FS_OP_MKPARENTS,
+  FS_OP_REMOVE,
+  FS_OP_RENAME,
   FS_STATUS_OK,
   FS_SYNC_CONTENT,
   FS_SYNC_CROSS_FILESYSTEM,
   FS_SYNC_RECURSIVE,
+  FS_WRITE_CONTENT_FULL,
+  FS_WRITE_DURABLE,
+  FS_WRITE_MKPARENTS,
+  FS_WRITE_NO_CAS,
   FS_UPDATE_RESET,
   FS_UPDATE_SYNC,
   FsMirror,
@@ -94,17 +105,25 @@ import {
   S2C_FS_FILE,
   S2C_FS_SYNCED,
   S2C_FS_UPDATE,
+  S2C_FS_DONE,
   buildFsAckMessage,
   buildFsFetchMessage,
+  buildFsOpMessage,
   buildFsStopMessage,
   buildFsSyncMessage,
+  buildFsWriteMessage,
   fsDecompress,
+  fsDoneStatusText,
   fsRecords,
   fsStatusText,
   fsFileStatusText,
+  parseFsDoneMessage,
   parseFsFileMessage,
+  FsConflictError,
   type FsSyncHandle,
   type FsSyncOptions,
+  type FsWriteOptions,
+  type FsWriteResult,
 } from "./fs";
 import {
   FEATURE_GIT,
@@ -329,11 +348,27 @@ export class BlitConnection {
   >();
   private readonly fsSyncs = new Map<
     number,
-    { mirror: FsMirror; options: FsSyncOptions }
+    {
+      mirror: FsMirror;
+      options: FsSyncOptions;
+      /** Hash of this client's most recent write per path, for self-echo
+       *  suppression (docs/design/fs-write.md "Echo and attribution"). */
+      lastWritten: Map<string, bigint>;
+    }
   >();
   private readonly pendingFsFetches = new Map<
     number,
     { resolve: (data: Uint8Array) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsWrites = new Map<
+    number,
+    {
+      resolve: (result: FsWriteResult) => void;
+      reject: (error: Error) => void;
+      /** Set on `writeFile`/`mkdir` so a successful reply records the hash
+       *  in the sync's `lastWritten`; unset for remove/rename. */
+      record?: { syncId: number; path: string };
+    }
   >();
   private readonly pendingGitOpens = new Map<
     number,
@@ -982,6 +1017,84 @@ export class BlitConnection {
     });
   }
 
+  private fsWrite(
+    syncId: number,
+    path: string,
+    data: Uint8Array,
+    options: FsWriteOptions,
+  ): Promise<FsWriteResult> {
+    return new Promise<FsWriteResult>((resolve, reject) => {
+      if ((this.features & FEATURE_FS_WRITE) === 0) {
+        reject(connectionError("Server does not support filesystem writes"));
+        return;
+      }
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      let flags = 0;
+      if (options.createParents) flags |= FS_WRITE_MKPARENTS;
+      if (options.durable) flags |= FS_WRITE_DURABLE;
+      // Precondition: create-exclusive (base 0), CAS (base = ifHash), or —
+      // by default or under force — an unconditional overwrite.
+      let base = 0n;
+      if (options.force) {
+        flags |= FS_WRITE_NO_CAS;
+      } else if (options.create) {
+        base = 0n;
+      } else if (options.ifHash !== undefined) {
+        base = options.ifHash;
+      } else {
+        flags |= FS_WRITE_NO_CAS;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsWrites);
+      this.pendingFsWrites.set(nonce, {
+        resolve,
+        reject,
+        record: { syncId, path },
+      });
+      this.transport.send(
+        buildFsWriteMessage({
+          nonce,
+          syncId,
+          flags,
+          base,
+          mode: options.mode ?? 0,
+          contentKind: FS_WRITE_CONTENT_FULL,
+          path,
+          content: data,
+        }),
+      );
+    });
+  }
+
+  private fsOp(
+    syncId: number,
+    op: number,
+    a: string,
+    b: string,
+    base: bigint,
+    mode: number,
+    flags: number,
+    record?: { syncId: number; path: string },
+  ): Promise<FsWriteResult> {
+    return new Promise<FsWriteResult>((resolve, reject) => {
+      if ((this.features & FEATURE_FS_WRITE) === 0) {
+        reject(connectionError("Server does not support filesystem writes"));
+        return;
+      }
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsWrites);
+      this.pendingFsWrites.set(nonce, { resolve, reject, record });
+      this.transport.send(
+        buildFsOpMessage({ nonce, syncId, op, flags, base, mode, a, b }),
+      );
+    });
+  }
+
   /**
    * Open a repository on the server (docs/git.md). Resolves once the
    * server accepts; state snapshots (when watching) apply to the handle's
@@ -1369,6 +1482,10 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingFsFetches.clear();
+    for (const pending of this.pendingFsWrites.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsWrites.clear();
     const syncs = [...this.fsSyncs.values()];
     this.fsSyncs.clear();
     for (const sync of syncs) {
@@ -2288,7 +2405,11 @@ export class BlitConnection {
           return;
         }
         const mirror = new FsMirror();
-        const state = { mirror, options: pending.options };
+        const state = {
+          mirror,
+          options: pending.options,
+          lastWritten: new Map<string, bigint>(),
+        };
         this.fsSyncs.set(syncId, state);
         pending.resolve({
           syncId,
@@ -2299,6 +2420,40 @@ export class BlitConnection {
             return mirror.live;
           },
           fetch: (path: string) => this.fsFetch(syncId, path),
+          writeFile: (path, data, options = {}) =>
+            this.fsWrite(syncId, path, data, options),
+          mkdir: (path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_MKDIR,
+              path,
+              "",
+              0n,
+              options.mode ?? 0,
+              options.createParents ? FS_OP_MKPARENTS : 0,
+              { syncId, path },
+            ),
+          remove: (path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_REMOVE,
+              path,
+              "",
+              options.ifHash ?? 0n,
+              0,
+              0,
+            ).then(() => undefined),
+          rename: (from, to, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_RENAME,
+              from,
+              to,
+              0n,
+              0,
+              options.createParents ? FS_OP_MKPARENTS : 0,
+            ).then(() => undefined),
+          lastWrittenHash: (path: string) => state.lastWritten.get(path),
           stop: () => {
             if (this.transport.status === "connected") {
               this.transport.send(buildFsStopMessage(syncId));
@@ -2346,6 +2501,30 @@ export class BlitConnection {
         } else {
           pending.reject(
             connectionError(`Fetch failed: ${fsFileStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_DONE: {
+        const parsed = parseFsDoneMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsWrites.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsWrites.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          // Record the hash for self-echo suppression: the writer's own
+          // UPSERT echo will carry it, and the model already holds it.
+          if (pending.record) {
+            this.fsSyncs
+              .get(pending.record.syncId)
+              ?.lastWritten.set(pending.record.path, parsed.hash);
+          }
+          pending.resolve({ hash: parsed.hash, mtimeNs: parsed.mtimeNs });
+        } else if (parsed.status === FS_DONE_CONFLICT) {
+          pending.reject(new FsConflictError(parsed.hash));
+        } else {
+          pending.reject(
+            connectionError(`Write failed: ${fsDoneStatusText(parsed.status)}`),
           );
         }
         return;

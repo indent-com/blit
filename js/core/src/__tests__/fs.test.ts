@@ -5,9 +5,15 @@ import type { BlitWasmModule } from "../TerminalStore";
 import { S2C_FRAGMENT, FRAGMENT_FLAG_LAST } from "../types";
 import {
   FEATURE_FS_SYNC,
+  FEATURE_FS_WRITE,
   FS_CLOSED_CONNECTION_LOST,
   FS_CLOSED_ROOT_GONE,
   FS_CONTENT_FULL,
+  FS_DONE_OK,
+  FS_OP_MKDIR,
+  FS_OP_REMOVE,
+  C2S_FS_OP,
+  C2S_FS_WRITE,
   FS_ENTRY_DIR,
   FS_ENTRY_FILE,
   FS_ENTRY_NO_CONTENT,
@@ -22,16 +28,25 @@ import {
   appendFsRecord,
   applyFsDelta,
   buildFsAckMessage,
+  buildFsDoneMessage,
   buildFsFetchMessage,
+  buildFsOpMessage,
   buildFsStopMessage,
   buildFsSyncMessage,
   buildFsUpdateMessage,
+  buildFsWriteMessage,
   fsCompressLiteral,
   fsDecompress,
   fsRecords,
+  parseFsDoneMessage,
   parseFsFileMessage,
   C2S_FS_ACK,
   C2S_FS_SYNC,
+  FS_DONE_CONFLICT,
+  FS_OP_MKPARENTS,
+  FS_OP_RENAME,
+  FS_WRITE_CONTENT_FULL,
+  FS_WRITE_MKPARENTS,
   S2C_FS_CLOSED,
   S2C_FS_FILE,
   S2C_FS_SYNCED,
@@ -180,6 +195,55 @@ describe("fs wire fixtures (cross-checked with Rust)", () => {
     expect(parsed!.nonce).toBe(9);
     expect(parsed!.status).toBe(FS_FILE_OK);
     expect(new TextDecoder().decode(parsed!.data)).toBe("file-content-bytes");
+  });
+
+  it("write-family builders emit the pinned bytes", () => {
+    // Cross-checked with crates/remote/src/fs.rs fs_write_family_byte_fixtures.
+    const base = 0x0f0e0d0c0b0a09080706050403020100n;
+    expect(
+      toHex(
+        buildFsWriteMessage({
+          nonce: 0x0102,
+          syncId: 0x0304,
+          flags: FS_WRITE_MKPARENTS,
+          base,
+          mode: 0o644,
+          contentKind: FS_WRITE_CONTENT_FULL,
+          path: "a/b.txt",
+          content: new TextEncoder().encode("hi"),
+        }),
+      ),
+    ).toBe(
+      "440201040302000102030405060708090a0b0c0d0e0fa4010000010700612f622e74787402000000206869",
+    );
+    expect(
+      toHex(
+        buildFsOpMessage({
+          nonce: 0x0102,
+          syncId: 0x0304,
+          op: FS_OP_RENAME,
+          flags: FS_OP_MKPARENTS,
+          base: 0n,
+          mode: 0,
+          a: "x",
+          b: "y",
+        }),
+      ),
+    ).toBe(
+      "450201040303020000000000000000000000000000000000000000010078010079",
+    );
+    const doneHex = "4402010b000102030405060708090a0b0c0d0e0f8877665544332211";
+    expect(
+      toHex(
+        buildFsDoneMessage(0x0102, FS_DONE_CONFLICT, base, 0x1122334455667788n),
+      ),
+    ).toBe(doneHex);
+    expect(parseFsDoneMessage(fromHex(doneHex))).toEqual({
+      nonce: 0x0102,
+      status: FS_DONE_CONFLICT,
+      hash: base,
+      mtimeNs: 0x1122334455667788n,
+    });
   });
 });
 
@@ -581,6 +645,93 @@ describe("BlitConnection.syncFs", () => {
     transport.pushReady();
     expect(conn.getSnapshot().supportsFsSync).toBe(false);
     await expect(conn.syncFs("/w")).rejects.toThrow(/does not support/);
+    conn.dispose();
+  });
+});
+
+describe("BlitConnection writes", () => {
+  async function writeReadyHandle() {
+    const transport = new MockTransport();
+    const conn = new BlitConnection({
+      id: "test",
+      transport,
+      wasm,
+      autoConnect: false,
+    });
+    transport.pushHello(1, FEATURE_FS_SYNC | FEATURE_FS_WRITE);
+    transport.pushReady();
+    const handlePromise = conn.syncFs("/w");
+    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
+    pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 7, 0, "/w");
+    const handle = await handlePromise;
+    return { conn, transport, handle };
+  }
+
+  it("writeFile resolves with the hash and records lastWrittenHash", async () => {
+    const { conn, transport, handle } = await writeReadyHandle();
+    const p = handle.writeFile("a.txt", new TextEncoder().encode("hi"), {
+      create: true,
+    });
+    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
+    expect(writeMsg).toBeDefined();
+    const nonce = writeMsg[1] | (writeMsg[2] << 8);
+    transport.push(buildFsDoneMessage(nonce, FS_DONE_OK, 0xabcdn, 123n));
+    const res = await p;
+    expect(res.hash).toBe(0xabcdn);
+    expect(res.mtimeNs).toBe(123n);
+    // Recorded for self-echo suppression.
+    expect(handle.lastWrittenHash("a.txt")).toBe(0xabcdn);
+    conn.dispose();
+  });
+
+  it("writeFile rejects with FsConflictError carrying the disk hash", async () => {
+    const { conn, transport, handle } = await writeReadyHandle();
+    const p = handle.writeFile("a.txt", new Uint8Array(), { ifHash: 1n });
+    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
+    const nonce = writeMsg[1] | (writeMsg[2] << 8);
+    transport.push(buildFsDoneMessage(nonce, FS_DONE_CONFLICT, 0x999n, 0n));
+    await expect(p).rejects.toMatchObject({
+      name: "FsConflictError",
+      hash: 0x999n,
+    });
+    // A conflict must not record a lastWrittenHash.
+    expect(handle.lastWrittenHash("a.txt")).toBeUndefined();
+    conn.dispose();
+  });
+
+  it("mkdir/remove/rename emit FS_OP with the right selector and flags", async () => {
+    const { conn, transport, handle } = await writeReadyHandle();
+    void handle.mkdir("d", { createParents: true, mode: 0o700 });
+    void handle.remove("d");
+    void handle.rename("d", "e");
+    const ops = transport.sent.filter((m) => m[0] === C2S_FS_OP);
+    expect(ops.map((m) => m[5])).toEqual([
+      FS_OP_MKDIR,
+      FS_OP_REMOVE,
+      FS_OP_RENAME,
+    ]);
+    // mkdir carried MKPARENTS in its flags byte.
+    expect(ops[0][6] & FS_OP_MKPARENTS).toBe(FS_OP_MKPARENTS);
+    conn.dispose();
+  });
+
+  it("refuses writes without the write feature bit", async () => {
+    const transport = new MockTransport();
+    const conn = new BlitConnection({
+      id: "test",
+      transport,
+      wasm,
+      autoConnect: false,
+    });
+    transport.pushHello(1, FEATURE_FS_SYNC); // sync but not write
+    transport.pushReady();
+    const handlePromise = conn.syncFs("/w");
+    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
+    pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 1, 0, "/w");
+    const handle = await handlePromise;
+    await expect(handle.writeFile("a", new Uint8Array())).rejects.toThrow(
+      /does not support/,
+    );
     conn.dispose();
   });
 });

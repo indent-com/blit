@@ -179,6 +179,181 @@ export function buildFsFetchMessage(
   return msg;
 }
 
+// -- Write family (docs/design/fs-write.md) ---------------------------------
+
+export const C2S_FS_WRITE = 0x44;
+export const C2S_FS_OP = 0x45;
+export const S2C_FS_DONE = 0x44;
+
+/** `S2C_HELLO` bit: the server supports the write family (separately
+ * advertised, so read-only sync can be offered without writes). */
+export const FEATURE_FS_WRITE = 1 << 9;
+
+// FS_DONE status — the unified git/lsp table plus CONFLICT.
+export const FS_DONE_OK = 0;
+export const FS_DONE_NOT_FOUND = 2;
+export const FS_DONE_WRONG_TYPE = 3;
+export const FS_DONE_PERMISSION = 4;
+export const FS_DONE_TOO_LARGE = 5;
+export const FS_DONE_BUDGET = 6;
+export const FS_DONE_INVALID = 7;
+export const FS_DONE_OTHER = 9;
+/** A precondition failed; `FsDone.hash` carries the current on-disk hash. */
+export const FS_DONE_CONFLICT = 11;
+
+/** Human-readable `FS_DONE` status. */
+export function fsDoneStatusText(status: number): string {
+  switch (status) {
+    case FS_DONE_OK:
+      return "ok";
+    case FS_DONE_NOT_FOUND:
+      return "not found";
+    case FS_DONE_WRONG_TYPE:
+      return "wrong type";
+    case FS_DONE_PERMISSION:
+      return "permission denied";
+    case FS_DONE_TOO_LARGE:
+      return "too large";
+    case FS_DONE_BUDGET:
+      return "budget exhausted";
+    case FS_DONE_INVALID:
+      return "invalid request";
+    case FS_DONE_CONFLICT:
+      return "conflict";
+    default:
+      return "error";
+  }
+}
+
+// FS_WRITE flags.
+export const FS_WRITE_NO_CAS = 1 << 0;
+export const FS_WRITE_MKPARENTS = 1 << 1;
+export const FS_WRITE_DURABLE = 1 << 2;
+export const FS_WRITE_FOLLOW_SYMLINK = 1 << 3;
+export const FS_WRITE_CONTENT_FULL = 1;
+export const FS_WRITE_CONTENT_DELTA = 2;
+
+// FS_OP op selector + flags.
+export const FS_OP_MKDIR = 1;
+export const FS_OP_REMOVE = 2;
+export const FS_OP_RENAME = 3;
+export const FS_OP_NO_CAS = 1 << 0;
+export const FS_OP_MKPARENTS = 1 << 1;
+
+const U64_MASK = 0xffffffffffffffffn;
+
+/** Write a 128-bit value as two little-endian u64 (low word first). */
+function setU128(v: DataView, off: number, value: bigint): void {
+  v.setBigUint64(off, value & U64_MASK, true);
+  v.setBigUint64(off + 8, (value >> 64n) & U64_MASK, true);
+}
+
+function getU128(v: DataView, off: number): bigint {
+  return v.getBigUint64(off, true) | (v.getBigUint64(off + 8, true) << 64n);
+}
+
+export interface FsWriteArgs {
+  nonce: number;
+  syncId: number;
+  flags: number;
+  /** CAS precondition hash (0n = create-exclusive; ignored under NO_CAS). */
+  base: bigint;
+  mode: number;
+  contentKind: number;
+  path: string;
+  content: Uint8Array;
+}
+
+export function buildFsWriteMessage(a: FsWriteArgs): Uint8Array {
+  const pathBytes = textEncoder.encode(a.path);
+  const compressed = fsCompressLiteral(a.content);
+  const msg = new Uint8Array(29 + pathBytes.length + compressed.length);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_WRITE;
+  v.setUint16(1, a.nonce, true);
+  v.setUint16(3, a.syncId, true);
+  msg[5] = a.flags;
+  setU128(v, 6, a.base);
+  v.setUint32(22, a.mode, true);
+  msg[26] = a.contentKind;
+  v.setUint16(27, pathBytes.length, true);
+  msg.set(pathBytes, 29);
+  msg.set(compressed, 29 + pathBytes.length);
+  return msg;
+}
+
+export interface FsOpArgs {
+  nonce: number;
+  syncId: number;
+  op: number;
+  flags: number;
+  base: bigint;
+  mode: number;
+  a: string;
+  b: string;
+}
+
+export function buildFsOpMessage(o: FsOpArgs): Uint8Array {
+  const ab = textEncoder.encode(o.a);
+  const bb = textEncoder.encode(o.b);
+  // Fixed part is 31 bytes: opcode + nonce + sync + op + flags + base(16) +
+  // mode(4) + a_len(2) + b_len(2).
+  const msg = new Uint8Array(31 + ab.length + bb.length);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_OP;
+  v.setUint16(1, o.nonce, true);
+  v.setUint16(3, o.syncId, true);
+  msg[5] = o.op;
+  msg[6] = o.flags;
+  setU128(v, 7, o.base);
+  v.setUint32(23, o.mode, true);
+  v.setUint16(27, ab.length, true);
+  msg.set(ab, 29);
+  const bLenOff = 29 + ab.length;
+  v.setUint16(bLenOff, bb.length, true);
+  msg.set(bb, bLenOff + 2);
+  return msg;
+}
+
+export interface FsDone {
+  nonce: number;
+  status: number;
+  /** Post-op content hash on success; current on-disk hash on CONFLICT. */
+  hash: bigint;
+  mtimeNs: bigint;
+}
+
+/** Parse an `S2C_FS_DONE`; null = malformed or wrong opcode. */
+export function parseFsDoneMessage(msg: Uint8Array): FsDone | null {
+  if (msg.length < 28 || msg[0] !== S2C_FS_DONE) {
+    return null;
+  }
+  const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+  return {
+    nonce: v.getUint16(1, true),
+    status: msg[3],
+    hash: getU128(v, 4),
+    mtimeNs: v.getBigUint64(20, true),
+  };
+}
+
+/** Build an `FS_DONE` (tests and mock servers). */
+export function buildFsDoneMessage(
+  nonce: number,
+  status: number,
+  hash: bigint,
+  mtimeNs: bigint,
+): Uint8Array {
+  const msg = new Uint8Array(28);
+  const v = new DataView(msg.buffer);
+  msg[0] = S2C_FS_DONE;
+  v.setUint16(1, nonce, true);
+  msg[3] = status;
+  setU128(v, 4, hash);
+  v.setBigUint64(20, mtimeNs, true);
+  return msg;
+}
+
 // -- LZ4 --------------------------------------------------------------------
 
 /**
@@ -525,6 +700,30 @@ export interface FsSyncOptions {
 }
 
 /** A live sync established by `BlitConnection.syncFs`. */
+/** Options for {@link FsSyncHandle.writeFile}. */
+export interface FsWriteOptions {
+  /** CAS: write only if the current content hash equals this (from
+   *  `live.get(path)?.hash`). Mutually exclusive with `create`/`force`. */
+  ifHash?: bigint;
+  /** Create-exclusive: fail with a conflict if the path already exists. */
+  create?: boolean;
+  /** Overwrite unconditionally, ignoring any precondition. */
+  force?: boolean;
+  /** File mode (e.g. 0o644); omitted/0 preserves the existing mode. */
+  mode?: number;
+  /** Create missing parent directories. */
+  createParents?: boolean;
+  /** fsync the file and its parent before resolving. */
+  durable?: boolean;
+}
+
+/** Result of a successful write/mkdir. */
+export interface FsWriteResult {
+  /** Post-op content hash (0n for a directory). */
+  hash: bigint;
+  mtimeNs: bigint;
+}
+
 export interface FsSyncHandle {
   readonly syncId: number;
   /** Canonical root path on the server. */
@@ -535,8 +734,47 @@ export interface FsSyncHandle {
   readonly live: ReadonlyMap<string, FsNode>;
   /** Pull one file's full content (for `FS_ENTRY_NO_CONTENT` entries). */
   fetch(path: string): Promise<Uint8Array>;
+  /** Write a file (docs/design/fs-write.md). `path` is the wire/mirror-key
+   *  form (as in `live`). Rejects with an {@link FsConflictError} carrying
+   *  the current on-disk hash when a precondition fails. On success the
+   *  returned hash is also recorded as {@link lastWrittenHash} so the
+   *  matching echo can be recognized. */
+  writeFile(
+    path: string,
+    data: Uint8Array,
+    options?: FsWriteOptions,
+  ): Promise<FsWriteResult>;
+  /** Create a directory. */
+  mkdir(
+    path: string,
+    options?: { mode?: number; createParents?: boolean },
+  ): Promise<FsWriteResult>;
+  /** Remove a file or subtree; `ifHash` makes it conditional on a file. */
+  remove(path: string, options?: { ifHash?: bigint }): Promise<void>;
+  /** Rename/move a file or subtree. */
+  rename(
+    from: string,
+    to: string,
+    options?: { createParents?: boolean },
+  ): Promise<void>;
+  /** The hash of the most recent successful `writeFile` at `path`, for
+   *  self-echo suppression: when an incoming UPSERT's `hash` equals this,
+   *  the change is this client's own write and the editor model already
+   *  holds it (never `setValue` your own echo). */
+  lastWrittenHash(path: string): bigint | undefined;
   /** Stop the sync; `onClosed` fires with client-request when the server confirms. */
   stop(): void;
+}
+
+/** Rejection from a write/op whose precondition failed. `hash` is the
+ *  current on-disk content hash — rebase against it and retry. */
+export class FsConflictError extends Error {
+  readonly hash: bigint;
+  constructor(hash: bigint) {
+    super("filesystem write conflict");
+    this.name = "FsConflictError";
+    this.hash = hash;
+  }
 }
 
 // -- Client-side reducer ----------------------------------------------------
