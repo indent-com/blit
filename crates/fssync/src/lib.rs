@@ -1064,24 +1064,45 @@ enum SymlinkPolicy {
     Operate,
 }
 
-/// Resolve and confine a write target. Component-validates the wire path
-/// (the traversal fix), then canonicalizes the target's *parent* and
-/// re-confirms it is under the already-canonical `root` — defeating an
-/// in-tree symlink whose target escapes, which `resolve_wire_path` (no
-/// symlink resolution) would miss. The final component is handled per
-/// `policy`. Returns the absolute path to operate on, or an `FS_DONE_*`
-/// status on refusal.
-fn resolve_write_target(root: &Path, wire: &str, policy: SymlinkPolicy) -> Result<PathBuf, u8> {
-    let abs = resolve_wire_path(root, wire).ok_or(FS_DONE_INVALID)?;
-    // The root itself ("") is never a content/op target.
+/// Why a wire path could not be confined under `root`.
+enum ConfineError {
+    /// Empty or not a single normal-component path.
+    Invalid,
+    /// The parent could not be canonicalized (missing, permission, ...).
+    Io(io::Error),
+    /// The canonical parent lies outside `root`.
+    Escapes,
+}
+
+/// Component-validate `wire` (the traversal fix), then canonicalize the
+/// target's *parent* and re-confirm it is under the already-canonical
+/// `root` — defeating an in-tree symlink whose target escapes, which
+/// `resolve_wire_path` (no symlink resolution) would miss. The final
+/// component is *not* resolved here: callers apply their own symlink
+/// policy (a final-component symlink is read/operated on as the link, never
+/// followed out of root). Returns the confined absolute path.
+fn confine_target(root: &Path, wire: &str) -> Result<PathBuf, ConfineError> {
+    let abs = resolve_wire_path(root, wire).ok_or(ConfineError::Invalid)?;
     let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
-        return Err(FS_DONE_INVALID);
+        return Err(ConfineError::Invalid);
     };
-    let canon_parent = fs::canonicalize(parent).map_err(|e| write_io_status(&e))?;
+    let canon_parent = fs::canonicalize(parent).map_err(ConfineError::Io)?;
     if !canon_parent.starts_with(root) {
-        return Err(FS_DONE_PERMISSION);
+        return Err(ConfineError::Escapes);
     }
-    let target = canon_parent.join(name);
+    Ok(canon_parent.join(name))
+}
+
+/// Resolve and confine a write target via [`confine_target`], then handle a
+/// final-component symlink per `policy`. Returns the absolute path to
+/// operate on, or an `FS_DONE_*` status on refusal.
+fn resolve_write_target(root: &Path, wire: &str, policy: SymlinkPolicy) -> Result<PathBuf, u8> {
+    let target = match confine_target(root, wire) {
+        Ok(t) => t,
+        Err(ConfineError::Invalid) => return Err(FS_DONE_INVALID),
+        Err(ConfineError::Io(e)) => return Err(write_io_status(&e)),
+        Err(ConfineError::Escapes) => return Err(FS_DONE_PERMISSION),
+    };
     match fs::symlink_metadata(&target) {
         Ok(md) if md.file_type().is_symlink() => match policy {
             SymlinkPolicy::Refuse => Err(FS_DONE_PERMISSION),
@@ -1212,14 +1233,38 @@ fn create_exclusive(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io
 /// blit writer can interleave; an external writer is the disclosed,
 /// irreducible window.
 fn current_hash(path: &Path) -> u128 {
-    let bytes = match fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => link_target_bytes(path),
-        _ => fs::read(path),
-    };
-    match bytes {
-        Ok(bytes) => blake3_128(&bytes),
-        Err(_) => 0,
+    match fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => match link_target_bytes(path) {
+            Ok(bytes) => blake3_128(&bytes),
+            Err(_) => 0,
+        },
+        // Stream the existing file through a fixed buffer rather than
+        // fs::read: the on-disk target is unbounded (the CAS request that
+        // triggers this hash is capped, but the file it compares against
+        // is not), so a whole-file read would let a tiny request force an
+        // arbitrarily large allocation.
+        _ => hash_file_streamed(path).unwrap_or(0),
     }
+}
+
+/// BLAKE3-128 of a file's bytes, read through a fixed buffer so peak memory
+/// stays constant regardless of file size. Same value as `blake3_128` over
+/// the full content.
+fn hash_file_streamed(path: &Path) -> io::Result<u128> {
+    use std::io::Read as _;
+    let mut f = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(u128::from_le_bytes(
+        hasher.finalize().as_bytes()[..16].try_into().unwrap(),
+    ))
 }
 
 /// A symlink's target as content bytes: verbatim on Unix, lossy UTF-8
@@ -2032,10 +2077,36 @@ impl SyncEngine {
         match exit {
             Exit::ClientGone => {}
             Exit::Stopped => {
+                self.drain_pending_commands();
                 let _ = (self.outbox)(msg_fs_closed(self.sync_id, FS_CLOSED_CLIENT_REQUEST));
             }
             Exit::Closed(reason) => {
+                self.drain_pending_commands();
                 let _ = (self.outbox)(msg_fs_closed(self.sync_id, reason));
+            }
+        }
+    }
+
+    /// Answer every request still queued when the engine exits so the
+    /// family's one-reply-per-nonce invariant holds on the close path too.
+    /// Client Commands and reconciler RootUpdates share one inbox, so a
+    /// Write/Op/Fetch enqueued behind (or racing) the Closed message would
+    /// otherwise be dropped with its InflightGuard and never answered.
+    /// Requests arriving after the engine's receiver drops instead see
+    /// `SyncHandle::command` return false, and the server answers them.
+    fn drain_pending_commands(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                SyncMsg::Cmd(Command::Write(w)) => {
+                    let _ = (self.outbox)(msg_fs_done(w.nonce, FS_DONE_OTHER, 0, 0));
+                }
+                SyncMsg::Cmd(Command::Op(o)) => {
+                    let _ = (self.outbox)(msg_fs_done(o.nonce, FS_DONE_OTHER, 0, 0));
+                }
+                SyncMsg::Cmd(Command::Fetch { nonce, .. }) => {
+                    let _ = (self.outbox)(msg_fs_file(nonce, blit_remote::fs::FS_FILE_OTHER, &[]));
+                }
+                SyncMsg::Cmd(Command::Ack(_) | Command::Stop) | SyncMsg::Root(_) => {}
             }
         }
     }
@@ -2220,7 +2291,16 @@ impl SyncEngine {
                     // Files and symlinks both carry content — a symlink's
                     // is its target bytes (hash = BLAKE3-128 over them).
                     if matches!(meta.node_type, FS_ENTRY_FILE | FS_ENTRY_SYMLINK) {
-                        if !self.opts.content || meta.size > self.opts.inline_max {
+                        // An inlined file's bytes ride an FS_UPDATE, whose
+                        // decompressed payload a compliant client refuses above
+                        // FS_MAX_DECOMPRESSED — so never inline past that cap
+                        // regardless of the (client-supplied) inline_max, else
+                        // the update is undecodable and the sync wedges.
+                        let inline_cap = self
+                            .opts
+                            .inline_max
+                            .min(blit_remote::fs::FS_MAX_DECOMPRESSED as u64);
+                        if !self.opts.content || meta.size > inline_cap {
                             entry_flags |= FS_ENTRY_NO_CONTENT;
                             self.held.remove(path);
                         } else if *content_changed || meta.hash == 0 {
@@ -2452,31 +2532,58 @@ impl SyncEngine {
     }
 
     fn handle_fetch(&mut self, nonce: u16, wire_path: &str) -> bool {
-        let msg = match resolve_wire_path(&self.root, wire_path) {
-            None => msg_fs_file(nonce, FS_FILE_NOT_FOUND, &[]),
-            // Refuse oversized files before reading a byte: an FS_FILE
-            // whose decompressed payload exceeds the protocol cap could not
-            // be parsed by a compliant client anyway, and reading it would
-            // spike transient memory unbounded (docs/fs-watch.md).
-            Some(abs)
-                if stat_meta(&abs).map(|m| m.size).unwrap_or(0)
-                    > blit_remote::fs::FS_MAX_DECOMPRESSED as u64 =>
-            {
-                msg_fs_file(nonce, blit_remote::fs::FS_FILE_OTHER, &[])
+        // Confine exactly as the write path does: resolve_wire_path alone
+        // validates components but performs no symlink resolution, so an
+        // in-tree symlink in an intermediate component would let fs::read
+        // follow it out of root (arbitrary file read). Canonicalizing the
+        // parent and re-checking starts_with(root) closes that.
+        let msg = match confine_target(&self.root, wire_path) {
+            Err(ConfineError::Invalid) => msg_fs_file(nonce, FS_FILE_NOT_FOUND, &[]),
+            Err(ConfineError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                msg_fs_file(nonce, FS_FILE_NOT_FOUND, &[])
             }
-            Some(abs) => match read_verified(&abs) {
-                ReadOutcome::Stable(data) => msg_fs_file(nonce, FS_FILE_OK, &data),
-                ReadOutcome::Unstable => msg_fs_file(nonce, FS_FILE_UNREADABLE, &[]),
-                ReadOutcome::Unreadable => {
-                    if abs.exists() {
-                        msg_fs_file(nonce, FS_FILE_UNREADABLE, &[])
-                    } else {
-                        msg_fs_file(nonce, FS_FILE_NOT_FOUND, &[])
-                    }
-                }
-            },
+            Err(ConfineError::Io(_)) => msg_fs_file(nonce, FS_FILE_UNREADABLE, &[]),
+            Err(ConfineError::Escapes) => msg_fs_file(nonce, blit_remote::fs::FS_FILE_OTHER, &[]),
+            Ok(abs) => self.fetch_confined(nonce, &abs),
         };
         (self.outbox)(msg)
+    }
+
+    /// Read a confined fetch target. Only regular files and symlinks carry
+    /// fetchable content (a symlink's is its own target bytes, never the
+    /// file it points at); refusing fifos/devices/sockets keeps `fs::read`
+    /// from blocking the engine thread forever on a device node reached
+    /// through the tree.
+    fn fetch_confined(&self, nonce: u16, abs: &Path) -> Vec<u8> {
+        let md = match fs::symlink_metadata(abs) {
+            Ok(md) => md,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return msg_fs_file(nonce, FS_FILE_NOT_FOUND, &[]);
+            }
+            Err(_) => return msg_fs_file(nonce, FS_FILE_UNREADABLE, &[]),
+        };
+        let ft = md.file_type();
+        if !ft.is_file() && !ft.is_symlink() {
+            return msg_fs_file(nonce, blit_remote::fs::FS_FILE_OTHER, &[]);
+        }
+        // Refuse oversized files before reading a byte: an FS_FILE whose
+        // decompressed payload exceeds the protocol cap could not be parsed
+        // by a compliant client anyway, and reading it would spike transient
+        // memory unbounded (docs/fs-watch.md).
+        if ft.is_file() && md.len() > blit_remote::fs::FS_MAX_DECOMPRESSED as u64 {
+            return msg_fs_file(nonce, blit_remote::fs::FS_FILE_OTHER, &[]);
+        }
+        match read_verified(abs) {
+            ReadOutcome::Stable(data) => msg_fs_file(nonce, FS_FILE_OK, &data),
+            ReadOutcome::Unstable => msg_fs_file(nonce, FS_FILE_UNREADABLE, &[]),
+            ReadOutcome::Unreadable => {
+                if abs.exists() {
+                    msg_fs_file(nonce, FS_FILE_UNREADABLE, &[])
+                } else {
+                    msg_fs_file(nonce, FS_FILE_NOT_FOUND, &[])
+                }
+            }
+        }
     }
 
     fn handle_write(&mut self, w: WriteReq) -> bool {
@@ -3161,6 +3268,49 @@ mod tests {
         assert!(!sibling.exists(), "nothing escaped the root");
 
         handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FS_FETCH must confine exactly like the write path: an in-tree symlink
+    /// whose target escapes the root cannot be used to read a file outside
+    /// it (resolve_wire_path alone does no symlink resolution).
+    #[cfg(unix)]
+    #[test]
+    fn fetch_refuses_symlink_escape() {
+        let root = temp_dir().canonicalize().unwrap();
+        // A secret outside the root, plus an in-tree symlink pointing at the
+        // root's parent so `pub/<name>` resolves out of the confinement.
+        let secret = root.parent().unwrap().join("blit-fetch-secret.txt");
+        fs::write(&secret, b"top secret").unwrap();
+        std::os::unix::fs::symlink(root.parent().unwrap(), root.join("pub")).unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        let await_file = |nonce: u16| -> (u8, Vec<u8>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                for msg in sent.lock().unwrap().iter() {
+                    if msg[0] == blit_remote::fs::S2C_FS_FILE
+                        && let Some((n, status, data)) = blit_remote::fs::parse_fs_file(msg)
+                        && n == nonce
+                    {
+                        return (status, data.to_vec());
+                    }
+                }
+                assert!(Instant::now() < deadline, "no FS_FILE for nonce {nonce}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        handle.command(Command::Fetch {
+            nonce: 1,
+            path: "pub/blit-fetch-secret.txt".into(),
+        });
+        let (status, data) = await_file(1);
+        assert_ne!(status, FS_FILE_OK, "escape must be refused");
+        assert!(data.is_empty(), "no bytes leak past the confinement");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_file(&secret);
         let _ = fs::remove_dir_all(&root);
     }
 

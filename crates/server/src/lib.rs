@@ -4901,7 +4901,10 @@ fn handle_fs_message(
                 opts.latency = Duration::from_millis(u64::from(latency_ms).clamp(1, 1000));
             }
             if inline_max != 0 {
-                opts.inline_max = u64::from(inline_max);
+                // Never above the protocol's decompressed cap: an inlined file
+                // rides an FS_UPDATE a client refuses past FS_MAX_DECOMPRESSED.
+                opts.inline_max =
+                    u64::from(inline_max).min(blit_remote::fs::FS_MAX_DECOMPRESSED as u64);
             }
             if verbose {
                 eprintln!(
@@ -4952,10 +4955,17 @@ fn handle_fs_message(
                 .and_then(|b| std::str::from_utf8(b).ok());
             match (path, syncs.map.get(&sync_id)) {
                 (Some(path), Some(entry)) => {
-                    entry.handle.command(blit_fssync::Command::Fetch {
+                    // A false return means the engine already exited on its
+                    // own (root gone, backend failure) but the entry has not
+                    // been reaped yet: answer here so the nonce still gets its
+                    // one FS_FILE reply.
+                    let sent = entry.handle.command(blit_fssync::Command::Fetch {
                         nonce,
                         path: path.to_string(),
                     });
+                    if !sent {
+                        let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
+                    }
                 }
                 _ => {
                     let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
@@ -4980,7 +4990,10 @@ fn handle_fs_message(
                         }
                     };
                     if let Some(entry) = syncs.map.get(&w.sync_id) {
-                        entry.handle.command(blit_fssync::Command::Write(WriteReq {
+                        // A false return means the engine exited on its own
+                        // but was not reaped yet; answer the nonce here (the
+                        // dropped WriteReq releases its in-flight slot).
+                        let sent = entry.handle.command(blit_fssync::Command::Write(WriteReq {
                             nonce: w.nonce,
                             path: w.path,
                             base: w.base,
@@ -4990,6 +5003,9 @@ fn handle_fs_message(
                             content: w.content,
                             inflight: Some(inflight),
                         }));
+                        if !sent {
+                            let _ = out.send(msg_fs_done(w.nonce, FS_DONE_INVALID, 0, 0));
+                        }
                     }
                 }
                 None => {
@@ -5016,7 +5032,10 @@ fn handle_fs_message(
                     }
                 };
                 if let Some(entry) = syncs.map.get(&o.sync_id) {
-                    entry.handle.command(blit_fssync::Command::Op(OpReq {
+                    // A false return means the engine exited on its own but
+                    // was not reaped yet; answer the nonce here (the dropped
+                    // OpReq releases its in-flight slot).
+                    let sent = entry.handle.command(blit_fssync::Command::Op(OpReq {
                         nonce: o.nonce,
                         op: o.op,
                         a: o.a,
@@ -5026,6 +5045,9 @@ fn handle_fs_message(
                         flags: o.flags,
                         inflight: Some(inflight),
                     }));
+                    if !sent {
+                        let _ = out.send(msg_fs_done(o.nonce, FS_DONE_INVALID, 0, 0));
+                    }
                 }
             }
             None => {
@@ -5036,6 +5058,28 @@ fn handle_fs_message(
                 let _ = out.send(msg_fs_done(nonce, FS_DONE_INVALID, 0, 0));
             }
         },
+        // A frame too short to clear the length guards above still carries a
+        // nonce for these read opcodes: recover it and reply, so the request
+        // is not left hanging (mirrors the FS_WRITE/FS_OP recovery).
+        C2S_FS_SYNC => {
+            let nonce = data
+                .get(1..3)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let _ = out.send(msg_fs_synced(
+                nonce,
+                FS_SYNC_ID_INVALID,
+                FS_STATUS_OTHER,
+                "truncated request",
+            ));
+        }
+        C2S_FS_FETCH => {
+            let nonce = data
+                .get(1..3)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
+        }
         _ => {}
     }
 }
@@ -5154,6 +5198,20 @@ fn handle_git_message(
     match data[0] {
         C2S_GIT_OPEN => {
             let Some((nonce, flags, refs_ms, status_ms, path)) = parse_git_open(data) else {
+                // A well-formed nonce with a truncated/non-UTF-8 trailing
+                // field still gets its one reply (as the git read handlers do
+                // via git_nonce), so the client promise resolves.
+                if let Some(nonce) = git_nonce(data) {
+                    let _ = out.send(msg_git_repo(
+                        nonce,
+                        GIT_REPO_ID_INVALID,
+                        GIT_STATUS_INVALID,
+                        0,
+                        0,
+                        "malformed request",
+                        "",
+                    ));
+                }
                 return;
             };
             let refuse = |status: u8, detail: &str| {
@@ -5631,6 +5689,19 @@ fn handle_lsp_message(
     match data[0] {
         C2S_LSP_OPEN => {
             let Some((nonce, flags, diag_latency_ms, path)) = parse_lsp_open(data) else {
+                // A well-formed nonce with a truncated/non-UTF-8 path still
+                // gets its one reply, so the client promise resolves.
+                if let Some(b) = data.get(1..3) {
+                    let nonce = u16::from_le_bytes([b[0], b[1]]);
+                    let _ = out.send(msg_lsp_opened(
+                        nonce,
+                        LSP_ID_INVALID,
+                        LSP_STATUS_INVALID,
+                        0,
+                        "",
+                        "malformed request",
+                    ));
+                }
                 return;
             };
             let refuse = |status: u8, detail: &str| {
@@ -5699,6 +5770,12 @@ fn handle_lsp_message(
         }
         C2S_LSP_QUERY => {
             let Some(req) = parse_lsp_query(data) else {
+                // A well-formed nonce with a truncated/non-UTF-8 tail still
+                // gets its one reply, so the client promise resolves.
+                if let Some(b) = data.get(1..3) {
+                    let nonce = u16::from_le_bytes([b[0], b[1]]);
+                    let _ = out.send(msg_lsp_query_resp(nonce, LSP_STATUS_INVALID, 0, "", &[]));
+                }
                 return;
             };
             let refuse = |status: u8| {

@@ -244,10 +244,13 @@ pub fn close_pty(handle: &PtyHandle) {
 }
 
 pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
-    pty_pids().lock().unwrap().remove(&handle.child_pid);
-    // Hold the lock across our waitpid so the reap_zombies backstop can't reap
-    // this child (and drop its status) between the table check and the wait.
+    // Take reaped_statuses before deregistering, matching reap_zombies'
+    // reaped-then-pty_pids order: the backstop locks reaped first, so holding
+    // it here excludes the backstop across the deregister and our waitpid.
+    // Deregistering first (outside this lock) would let the backstop reap the
+    // child — seeing it absent from pty_pids, it drops the status on the floor.
     let mut reaped = reaped_statuses().lock().unwrap();
+    pty_pids().lock().unwrap().remove(&handle.child_pid);
     if let Some(status) = reaped.remove(&handle.child_pid) {
         return status;
     }
