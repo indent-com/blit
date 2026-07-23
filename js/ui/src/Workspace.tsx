@@ -2394,6 +2394,7 @@ function SessionThumbnail(props: {
         <BlitTerminal
           sessionId={props.session.id}
           readOnly
+          resizable={false}
           showCursor={false}
           style={{ width: "100%", height: "auto" }}
           fontFamily={props.fontFamily}

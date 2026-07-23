@@ -865,6 +865,7 @@ function TabShell(props: {
             fontSize={FONT_SIZE}
             palette={props.palette()}
             readOnly={props.readOnly}
+            resizable={!props.readOnly}
             style={{ width: "100%", height: "100%" }}
             surfaceRef={setTerminalSurface}
           />
@@ -874,7 +875,7 @@ function TabShell(props: {
             connectionId={CONNECTION_ID}
             surfaceId={activeSurfaceId()!}
             focus={!props.readOnly}
-            resizable
+            resizable={!props.readOnly}
             class="block w-full h-full"
           />
         </Show>
