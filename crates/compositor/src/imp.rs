@@ -1282,24 +1282,22 @@ impl Compositor {
     fn set_keyboard_focus(&mut self, new_surface_id: u16) {
         let old_id = self.focused_surface_id;
         if old_id == new_surface_id {
-            // Focus unchanged — still send enter so the client gets the
-            // event (e.g. first toplevel), but skip leave.
-            self.focused_surface_id = new_surface_id;
-            if let Some(root_id) = self.toplevel_surface_ids.get(&new_surface_id)
-                && let Some(wl_surface) = self.surfaces.get(root_id).map(|s| s.wl_surface.clone())
-            {
-                let serial = self.next_serial();
-                for kb in &self.keyboards {
-                    if same_client(kb, &wl_surface) {
-                        kb.enter(serial, &wl_surface, vec![]);
-                    }
-                }
-                for ti in &self.text_inputs {
-                    if same_client(&ti.resource, &wl_surface) {
-                        ti.resource.enter(&wl_surface);
-                    }
-                }
-            }
+            // Focus unchanged: the surface already holds keyboard focus and
+            // received its `wl_keyboard.enter` when focus first moved here
+            // (via the change path below). Do NOT re-send it. A second
+            // `enter` with no intervening `leave` violates the protocol and
+            // crashes a nested compositor whose focus is already set — e.g.
+            // weston's wayland backend takes its "this shouldn't happen"
+            // path and calls `frame_status(output->frame)` unconditionally;
+            // a fullscreen output has no decoration frame, so that is a NULL
+            // deref (SIGSEGV). The browser resends `C2S_SURFACE_FOCUS` for
+            // the already-focused surface on every click/select, so this is
+            // hit constantly.
+            //
+            // Surface-id reuse after a focused surface is destroyed used to
+            // rely on this branch to deliver the first `enter` to the new
+            // owner; that is now handled by resetting `focused_surface_id` to
+            // 0 on destroy, so the reused id arrives here as a real change.
             return;
         }
 
@@ -1595,21 +1593,30 @@ impl Compositor {
         // reconfigure before we re-enter.
         if self.pending_kb_reenter {
             self.pending_kb_reenter = false;
-            let root_ids: Vec<ObjectId> = self.toplevel_surface_ids.values().cloned().collect();
-            for root_id in root_ids {
-                let wl = self.surfaces.get(&root_id).map(|s| s.wl_surface.clone());
-                if let Some(wl) = wl {
-                    let serial = self.next_serial();
-                    for kb in &self.keyboards {
-                        if same_client(kb, &wl) {
-                            kb.leave(serial, &wl);
-                        }
+            // Re-enter only the surface that actually holds keyboard focus.
+            // Re-entering every toplevel would hand phantom focus to
+            // unfocused clients and leave their focus set, so a later real
+            // focus change delivers a second `enter` with no matching
+            // `leave` — the redundant-enter that crashes nested compositors
+            // (see `set_keyboard_focus`). The leave-then-enter pair below is
+            // safe: the `leave` clears the client's focus before the `enter`
+            // re-establishes it.
+            if let Some(root_id) = self
+                .toplevel_surface_ids
+                .get(&self.focused_surface_id)
+                .cloned()
+                && let Some(wl) = self.surfaces.get(&root_id).map(|s| s.wl_surface.clone())
+            {
+                let serial = self.next_serial();
+                for kb in &self.keyboards {
+                    if same_client(kb, &wl) {
+                        kb.leave(serial, &wl);
                     }
-                    let serial = self.next_serial();
-                    for kb in &self.keyboards {
-                        if same_client(kb, &wl) {
-                            kb.enter(serial, &wl, vec![]);
-                        }
+                }
+                let serial = self.next_serial();
+                for kb in &self.keyboards {
+                    if same_client(kb, &wl) {
+                        kb.enter(serial, &wl, vec![]);
                     }
                 }
             }
@@ -2078,6 +2085,13 @@ impl Compositor {
                 }
                 if surf.surface_id > 0 {
                     self.toplevel_surface_ids.remove(&surf.surface_id);
+                    // Clear keyboard focus if it pointed at the dead surface,
+                    // so a reused surface id is treated as a fresh focus
+                    // change (and gets its first `wl_keyboard.enter`) rather
+                    // than a redundant re-enter. See `set_keyboard_focus`.
+                    if self.focused_surface_id == surf.surface_id {
+                        self.focused_surface_id = 0;
+                    }
                     self.last_request_frame_ms.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
