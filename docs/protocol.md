@@ -26,52 +26,54 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 ## Client → Server (C2S)
 
-| Opcode | Name                   | Layout                                                                           |
-| ------ | ---------------------- | -------------------------------------------------------------------------------- |
-| `0x00` | `INPUT`                | `[pty_id:2][data:N]`                                                             |
-| `0x01` | `RESIZE`               | `[pty_id:2][rows:2][cols:2]…` (batch, repeating triplets)                        |
-| `0x02` | `SCROLL`               | `[pty_id:2][offset:4]`                                                           |
-| `0x03` | `ACK`                  | (no payload)                                                                     |
-| `0x04` | `DISPLAY_RATE`         | `[fps:2]`                                                                        |
-| `0x05` | `CLIENT_METRICS`       | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                                       |
-| `0x06` | `MOUSE`                | `[pty_id:2][type:1][button:1][col:2][row:2]`                                     |
-| `0x07` | `RESTART`              | `[pty_id:2]`                                                                     |
-| `0x08` | `PING`                 | _(empty)_ — application-level keepalive                                          |
-| `0x0F` | `QUIT`                 | _(empty)_ — request server shutdown                                              |
-| `0x10` | `CREATE`               | `[rows:2][cols:2][tag_len:2][tag:N]`                                             |
-| `0x11` | `FOCUS`                | `[pty_id:2]`                                                                     |
-| `0x12` | `CLOSE`                | `[pty_id:2]`                                                                     |
-| `0x13` | `SUBSCRIBE`            | `[pty_id:2]`                                                                     |
-| `0x14` | `UNSUBSCRIBE`          | `[pty_id:2]`                                                                     |
-| `0x15` | `SEARCH`               | `[request_id:2][query:N]`                                                        |
-| `0x16` | `CREATE_AT`            | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                               |
-| `0x17` | `CREATE_N`             | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                                    |
-| `0x18` | `CREATE2`              | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]`             |
-| `0x19` | `READ`                 | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                                |
-| `0x1A` | `KILL`                 | `[pty_id:2][signal:4]` — send signal to PTY session leader                       |
-| `0x1B` | `COPY_RANGE`           | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]` |
-| `0x20` | `SURFACE_INPUT`        | `[surface_id:2][keycode:4][pressed:1]`                                           |
-| `0x21` | `SURFACE_POINTER`      | `[surface_id:2][type:1][button:1][x:2][y:2]`                                     |
-| `0x22` | `SURFACE_POINTER_AXIS` | `[surface_id:2][axis:1][value:4]`                                                |
-| `0x23` | `SURFACE_RESIZE`       | `[surface_id:2][width:2][height:2][scale_120:2]`                                 |
-| `0x24` | `SURFACE_FOCUS`        | `[surface_id:2]`                                                                 |
-| `0x25` | `CLIPBOARD_SET`        | `[mime_len:2][mime:N][data_len:4][data:M]`                                       |
-| `0x26` | `SURFACE_LIST`         | _(empty)_ — request list of compositor surfaces                                  |
-| `0x27` | `SURFACE_CAPTURE`      | `[surface_id:2][format:1][quality:1]` — screenshot (0=PNG, 1=AVIF)               |
-| `0x28` | `SURFACE_SUBSCRIBE`    | `[surface_id:2][codec:1][quality:1]`                                             |
-| `0x29` | `SURFACE_UNSUBSCRIBE`  | `[surface_id:2]`                                                                 |
-| `0x2A` | `SURFACE_ACK`          | `[surface_id:2]` — acknowledge receipt of video frame                            |
-| `0x2B` | `SURFACE_CLOSE`        | `[surface_id:2]` — request close of Wayland surface                              |
-| `0x2C` | `CLIPBOARD_LIST`       | (no payload)                                                                     |
-| `0x2D` | `CLIENT_FEATURES`      | `[codec_support:1]` — client capability advertisement                            |
-| `0x2E` | `CLIPBOARD_GET`        | `[mime_len:2][mime:N]`                                                           |
-| `0x2F` | `SURFACE_TEXT`         | `[surface_id:2][text:N]` — composed text input (UTF-8)                           |
-| `0x30` | `AUDIO_SUBSCRIBE`      | `[bitrate_kbps:2]`                                                               |
-| `0x31` | `AUDIO_UNSUBSCRIBE`    | (no payload)                                                                     |
-| `0x40` | `FS_SYNC`              | `[nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N]`             |
-| `0x41` | `FS_STOP`              | `[sync_id:2]`                                                                    |
-| `0x42` | `FS_ACK`               | `[sync_id:2][update_id:4]` — cumulative                                          |
-| `0x43` | `FS_FETCH`             | `[nonce:2][sync_id:2][path_len:2][path:N]`                                       |
+| Opcode | Name                   | Layout                                                                                                                                                               |
+| ------ | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x00` | `INPUT`                | `[pty_id:2][data:N]`                                                                                                                                                 |
+| `0x01` | `RESIZE`               | `[pty_id:2][rows:2][cols:2]…` (batch, repeating triplets)                                                                                                            |
+| `0x02` | `SCROLL`               | `[pty_id:2][offset:4]`                                                                                                                                               |
+| `0x03` | `ACK`                  | (no payload)                                                                                                                                                         |
+| `0x04` | `DISPLAY_RATE`         | `[fps:2]`                                                                                                                                                            |
+| `0x05` | `CLIENT_METRICS`       | `[backlog:2][ack_ahead:2][apply_ms_x10:2]`                                                                                                                           |
+| `0x06` | `MOUSE`                | `[pty_id:2][type:1][button:1][col:2][row:2]`                                                                                                                         |
+| `0x07` | `RESTART`              | `[pty_id:2]`                                                                                                                                                         |
+| `0x08` | `PING`                 | _(empty)_ — application-level keepalive                                                                                                                              |
+| `0x0F` | `QUIT`                 | _(empty)_ — request server shutdown                                                                                                                                  |
+| `0x10` | `CREATE`               | `[rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                                 |
+| `0x11` | `FOCUS`                | `[pty_id:2]`                                                                                                                                                         |
+| `0x12` | `CLOSE`                | `[pty_id:2]`                                                                                                                                                         |
+| `0x13` | `SUBSCRIBE`            | `[pty_id:2]`                                                                                                                                                         |
+| `0x14` | `UNSUBSCRIBE`          | `[pty_id:2]`                                                                                                                                                         |
+| `0x15` | `SEARCH`               | `[request_id:2][query:N]`                                                                                                                                            |
+| `0x16` | `CREATE_AT`            | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                                                                                                                   |
+| `0x17` | `CREATE_N`             | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                        |
+| `0x18` | `CREATE2`              | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]`                                                                                                 |
+| `0x19` | `READ`                 | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                                                                                                                    |
+| `0x1A` | `KILL`                 | `[pty_id:2][signal:4]` — send signal to PTY session leader                                                                                                           |
+| `0x1B` | `COPY_RANGE`           | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]`                                                                                     |
+| `0x20` | `SURFACE_INPUT`        | `[surface_id:2][keycode:4][pressed:1]`                                                                                                                               |
+| `0x21` | `SURFACE_POINTER`      | `[surface_id:2][type:1][button:1][x:2][y:2]`                                                                                                                         |
+| `0x22` | `SURFACE_POINTER_AXIS` | `[surface_id:2][axis:1][value:4]`                                                                                                                                    |
+| `0x23` | `SURFACE_RESIZE`       | `[surface_id:2][width:2][height:2][scale_120:2]`                                                                                                                     |
+| `0x24` | `SURFACE_FOCUS`        | `[surface_id:2]`                                                                                                                                                     |
+| `0x25` | `CLIPBOARD_SET`        | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                                                                           |
+| `0x26` | `SURFACE_LIST`         | _(empty)_ — request list of compositor surfaces                                                                                                                      |
+| `0x27` | `SURFACE_CAPTURE`      | `[surface_id:2][format:1][quality:1]` — screenshot (0=PNG, 1=AVIF)                                                                                                   |
+| `0x28` | `SURFACE_SUBSCRIBE`    | `[surface_id:2][codec:1][quality:1]`                                                                                                                                 |
+| `0x29` | `SURFACE_UNSUBSCRIBE`  | `[surface_id:2]`                                                                                                                                                     |
+| `0x2A` | `SURFACE_ACK`          | `[surface_id:2]` — acknowledge receipt of video frame                                                                                                                |
+| `0x2B` | `SURFACE_CLOSE`        | `[surface_id:2]` — request close of Wayland surface                                                                                                                  |
+| `0x2C` | `CLIPBOARD_LIST`       | (no payload)                                                                                                                                                         |
+| `0x2D` | `CLIENT_FEATURES`      | `[codec_support:1]` — client capability advertisement                                                                                                                |
+| `0x2E` | `CLIPBOARD_GET`        | `[mime_len:2][mime:N]`                                                                                                                                               |
+| `0x2F` | `SURFACE_TEXT`         | `[surface_id:2][text:N]` — composed text input (UTF-8)                                                                                                               |
+| `0x30` | `AUDIO_SUBSCRIBE`      | `[bitrate_kbps:2]`                                                                                                                                                   |
+| `0x31` | `AUDIO_UNSUBSCRIBE`    | (no payload)                                                                                                                                                         |
+| `0x40` | `FS_SYNC`              | `[nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N]`                                                                                                 |
+| `0x41` | `FS_STOP`              | `[sync_id:2]`                                                                                                                                                        |
+| `0x42` | `FS_ACK`               | `[sync_id:2][update_id:4]` — cumulative                                                                                                                              |
+| `0x43` | `FS_FETCH`             | `[nonce:2][sync_id:2][path_len:2][path:N]`                                                                                                                           |
+| `0x44` | `FS_WRITE`             | `[nonce:2][sync_id:2][flags:1][base:16][mode:4][content_kind:1][path_len:2][path:N][content:LZ4]` — CAS content upsert ([design/fs-write.md](design/fs-write.md))    |
+| `0x45` | `FS_OP`                | `[nonce:2][sync_id:2][op:1][flags:1][base:16][mode:4][a_len:2][a:N][b_len:2][b:N]` — mkdir/remove/rename/symlink/hardlink ([design/fs-write.md](design/fs-write.md)) |
 
 **Notes:**
 
@@ -99,40 +101,41 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 
 ## Server → Client (S2C)
 
-| Opcode | Name                | Layout                                                                                                     |
-| ------ | ------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `0x00` | `UPDATE`            | `[pty_id:2][lz4-compressed-frame]`                                                                         |
-| `0x01` | `CREATED`           | `[pty_id:2][tag:N]`                                                                                        |
-| `0x02` | `CLOSED`            | `[pty_id:2]`                                                                                               |
-| `0x03` | `LIST`              | `[count:2][entries…]`                                                                                      |
-| `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                      |
-| `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                 |
-| `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                               |
-| `0x07` | `HELLO`             | `[version:2][features:4]`                                                                                  |
-| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                |
-| `0x09` | `READY`             | (no payload)                                                                                               |
-| `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                     |
-| `0x0B` | `PING`              | _(empty)_ — server keepalive                                                                               |
-| `0x0C` | `QUIT`              | _(empty)_ — server shutting down                                                                           |
-| `0x0D` | `USED_ROWS`         | `[pty_id:2][used_rows:2]`                                                                                  |
-| `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                      |
-| `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                           |
-| `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                   |
-| `0x23` | `SURFACE_TITLE`     | `[surface_id:2][title:N]`                                                                                  |
-| `0x24` | `SURFACE_RESIZED`   | `[surface_id:2][w:2][h:2]`                                                                                 |
-| `0x25` | `CLIPBOARD_CONTENT` | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                 |
-| `0x26` | `SURFACE_LIST`      | `[count:2]` repeated `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]` |
-| `0x27` | `SURFACE_CAPTURE`   | `[surface_id:2][width:4][height:4][image_data:N]` — PNG or AVIF                                            |
-| `0x28` | `SURFACE_APP_ID`    | `[surface_id:2][app_id:N]`                                                                                 |
-| `0x29` | `SURFACE_CURSOR`    | `[surface_id:2][shape_len:1][shape:N]` — CSS cursor keyword                                                |
-| `0x2A` | `SURFACE_ENCODER`   | `[surface_id:2][name][0x00][codec_string]` — encoder display name + WebCodecs codec string, NUL-separated  |
-| `0x2B` | `FRAGMENT`          | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                 |
-| `0x2C` | `CLIPBOARD_LIST`    | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                               |
-| `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                           |
-| `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                   |
-| `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                           |
-| `0x42` | `FS_FILE`           | `[nonce:2][status:1][data:LZ4]`                                                                            |
-| `0x43` | `FS_CLOSED`         | `[sync_id:2][reason:1]`                                                                                    |
+| Opcode | Name                | Layout                                                                                                             |
+| ------ | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `0x00` | `UPDATE`            | `[pty_id:2][lz4-compressed-frame]`                                                                                 |
+| `0x01` | `CREATED`           | `[pty_id:2][tag:N]`                                                                                                |
+| `0x02` | `CLOSED`            | `[pty_id:2]`                                                                                                       |
+| `0x03` | `LIST`              | `[count:2][entries…]`                                                                                              |
+| `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                              |
+| `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                         |
+| `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                                       |
+| `0x07` | `HELLO`             | `[version:2][features:4]`                                                                                          |
+| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                        |
+| `0x09` | `READY`             | (no payload)                                                                                                       |
+| `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                             |
+| `0x0B` | `PING`              | _(empty)_ — server keepalive                                                                                       |
+| `0x0C` | `QUIT`              | _(empty)_ — server shutting down                                                                                   |
+| `0x0D` | `USED_ROWS`         | `[pty_id:2][used_rows:2]`                                                                                          |
+| `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                              |
+| `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                                   |
+| `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                           |
+| `0x23` | `SURFACE_TITLE`     | `[surface_id:2][title:N]`                                                                                          |
+| `0x24` | `SURFACE_RESIZED`   | `[surface_id:2][w:2][h:2]`                                                                                         |
+| `0x25` | `CLIPBOARD_CONTENT` | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                         |
+| `0x26` | `SURFACE_LIST`      | `[count:2]` repeated `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`         |
+| `0x27` | `SURFACE_CAPTURE`   | `[surface_id:2][width:4][height:4][image_data:N]` — PNG or AVIF                                                    |
+| `0x28` | `SURFACE_APP_ID`    | `[surface_id:2][app_id:N]`                                                                                         |
+| `0x29` | `SURFACE_CURSOR`    | `[surface_id:2][shape_len:1][shape:N]` — CSS cursor keyword                                                        |
+| `0x2A` | `SURFACE_ENCODER`   | `[surface_id:2][name][0x00][codec_string]` — encoder display name + WebCodecs codec string, NUL-separated          |
+| `0x2B` | `FRAGMENT`          | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                         |
+| `0x2C` | `CLIPBOARD_LIST`    | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                                       |
+| `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                                   |
+| `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                           |
+| `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                   |
+| `0x42` | `FS_FILE`           | `[nonce:2][status:1][data:LZ4]`                                                                                    |
+| `0x43` | `FS_CLOSED`         | `[sync_id:2][reason:1]`                                                                                            |
+| `0x44` | `FS_DONE`           | `[nonce:2][status:1][hash:16][mtime_ns:8]` — one per `FS_WRITE`/`FS_OP` ([design/fs-write.md](design/fs-write.md)) |
 
 **Notes:**
 
@@ -146,7 +149,7 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | 3   | `COPY_RANGE`   | Server supports range-based text copy                          |
 | 4   | `COMPOSITOR`   | Server supports headless Wayland compositor                    |
 | 5   | `AUDIO`        | Server supports audio forwarding (PipeWire capture + Opus)     |
-| 6   | `FS_SYNC`      | Server supports the `FS_*` filesystem sync family              |
+| 6   | `FS`           | Server supports the `FS_*` filesystem sync family              |
 | 7   | `GIT`          | Server supports the `GIT_*` git introspection family           |
 | 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
 

@@ -262,19 +262,19 @@ invisible by design.
 
 ## Operation set (scope, both directions)
 
-| Op                    | Verdict         | Why                                                                                                                                                                                   |
-| --------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| write (CAS)           | **in**          | the core primitive                                                                                                                                                                    |
-| mkdir (+ mode)        | **in**          | empty folders are real fs-sync entries; explorer "New Folder"; mode for `0700`                                                                                                        |
-| remove (subtree, CAS) | **in**          | explorer delete; mirrors the `DELETE` record; optional `base` = "delete iff unchanged"                                                                                                |
-| rename (subtree)      | **in**          | rename _and_ drag-move are one op; surfaces as a `MOVE` record                                                                                                                        |
-| symlink (create/retarget, CAS) | **in** | dotfile/workspace layouts are symlink-shaped; content = target bytes makes retarget an ordinary CAS (§ Links)                                                                  |
-| hardlink              | **in**          | `link(2)` is one op the client cannot compose from writes; source must be a regular file (§ Links)                                                                                    |
-| create-parents        | **in** (flag)   | drag-move into a fresh path                                                                                                                                                           |
-| delete-to-trash       | **out → shell** | XDG/Recycle/`~/.Trash` semantics diverge; a synced trash dir churns. Compose via rename                                                                                               |
-| copy / duplicate      | **out (v1)**    | the weakest cut; subtree copy can't compose client-side without shipping bytes both ways. Server-side `FS_OP` `COPY` is cheap (it holds the blobs) — trigger: duplicate latency hurts |
-| touch                 | **out**         | create-empty is a zero-byte write with a zero base; mtime-touch has no IDE use                                                                                                        |
-| save-all / txn        | **out**         | N independent nonces, per-file `CONFLICT`, no rollback                                                                                                                                |
+| Op                             | Verdict         | Why                                                                                                                                                                                   |
+| ------------------------------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| write (CAS)                    | **in**          | the core primitive                                                                                                                                                                    |
+| mkdir (+ mode)                 | **in**          | empty folders are real fs-sync entries; explorer "New Folder"; mode for `0700`                                                                                                        |
+| remove (subtree, CAS)          | **in**          | explorer delete; mirrors the `DELETE` record; optional `base` = "delete iff unchanged"                                                                                                |
+| rename (subtree)               | **in**          | rename _and_ drag-move are one op; surfaces as a `MOVE` record                                                                                                                        |
+| symlink (create/retarget, CAS) | **in**          | dotfile/workspace layouts are symlink-shaped; content = target bytes makes retarget an ordinary CAS (§ Links)                                                                         |
+| hardlink                       | **in**          | `link(2)` is one op the client cannot compose from writes; source must be a regular file (§ Links)                                                                                    |
+| create-parents                 | **in** (flag)   | drag-move into a fresh path                                                                                                                                                           |
+| delete-to-trash                | **out → shell** | XDG/Recycle/`~/.Trash` semantics diverge; a synced trash dir churns. Compose via rename                                                                                               |
+| copy / duplicate               | **out (v1)**    | the weakest cut; subtree copy can't compose client-side without shipping bytes both ways. Server-side `FS_OP` `COPY` is cheap (it holds the blobs) — trigger: duplicate latency hurts |
+| touch                          | **out**         | create-empty is a zero-byte write with a zero base; mtime-touch has no IDE use                                                                                                        |
+| save-all / txn                 | **out**         | N independent nonces, per-file `CONFLICT`, no rollback                                                                                                                                |
 
 **Multi-file operations get no wire transaction** — the deliberate
 stance. Save-all, and applying an [lsp.md](lsp.md) rename plan's `EDIT`
