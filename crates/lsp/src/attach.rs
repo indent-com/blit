@@ -330,10 +330,14 @@ impl Pacer {
             return true;
         }
         let backends = self.backends.lock().unwrap().clone();
-        // Current per-backend sequences; a stopped backend bumped its
-        // state_seq on the way out, so its departure triggers a send.
+        // Current per-backend sequences, live backends only — matching
+        // the floor snapshot below. A stopped backend drops out of both
+        // maps, so its departure surfaces once as a floor key with no
+        // seq (the second `unchanged` clause) and then goes quiet
+        // instead of re-triggering a send on every ack.
         let seqs: HashMap<u16, u64> = backends
             .iter()
+            .filter(|b| !b.is_gone())
             .map(|b| (b.server_ref, b.shared.state_seq.load(Ordering::Relaxed)))
             .collect();
         // Nothing to send only if every current backend is at or below

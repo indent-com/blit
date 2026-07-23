@@ -400,11 +400,9 @@ pub fn rename_edits(
                 });
             }
         };
-    if let Some(changes) = result["changes"].as_object() {
-        for (uri, edits) in changes {
-            push_edits(sink, src, uri, edits);
-        }
-    }
+    // `documentChanges` and `changes` are mutually exclusive encodings
+    // of the same edit set; the former supersedes the latter when
+    // present, so never emit from both or every edit is duplicated.
     if let Some(doc_changes) = result["documentChanges"].as_array() {
         for change in doc_changes {
             if let Some(uri) = change["textDocument"]["uri"].as_str() {
@@ -416,6 +414,10 @@ pub fn rename_edits(
                 // partial rename as whole.
                 sink.incomplete = true;
             }
+        }
+    } else if let Some(changes) = result["changes"].as_object() {
+        for (uri, edits) in changes {
+            push_edits(sink, src, uri, edits);
         }
     }
 }

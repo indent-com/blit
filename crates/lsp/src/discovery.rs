@@ -26,7 +26,9 @@ pub enum RootPolicy {
 /// `go.mod`).
 #[derive(Clone, Debug)]
 pub struct MarkerGroup {
-    pub markers: &'static [&'static str],
+    /// Owned so config-derived markers are freed with the table; a
+    /// per-call rebuild must never leak (`table()` runs once per open).
+    pub markers: Vec<String>,
     pub policy: RootPolicy,
 }
 
@@ -64,8 +66,10 @@ fn builtin_table() -> Vec<ServerSpec> {
             init: None,
             settings: None,
         };
-    let group =
-        |markers: &'static [&'static str], policy: RootPolicy| MarkerGroup { markers, policy };
+    let group = |markers: &[&str], policy: RootPolicy| MarkerGroup {
+        markers: markers.iter().map(|s| s.to_string()).collect(),
+        policy,
+    };
     vec![
         entry(
             "rust-analyzer",
@@ -235,12 +239,8 @@ impl Override {
             entry.command = command.clone();
         }
         if let Some(roots) = &self.roots {
-            let leaked: Vec<&'static str> = roots
-                .iter()
-                .map(|s| &*Box::leak(s.clone().into_boxed_str()))
-                .collect();
             entry.groups = vec![MarkerGroup {
-                markers: Box::leak(leaked.into_boxed_slice()),
+                markers: roots.clone(),
                 policy: self.root_policy.unwrap_or(RootPolicy::Nearest),
             }];
         } else if let Some(policy) = self.root_policy {

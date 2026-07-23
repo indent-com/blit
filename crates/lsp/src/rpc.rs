@@ -69,12 +69,26 @@ pub fn error_response(id: &Value, code: i64, message: &str) -> Value {
 /// stream is unrecoverable either way — the engine treats it as child
 /// exit).
 pub fn read_msg(reader: &mut BufReader<Box<dyn Read + Send>>) -> Option<RpcMsg> {
+    // A header line is a handful of ASCII bytes; a broken server that
+    // streams without a newline must not force an unbounded allocation,
+    // the same threat the body's MAX_DECOMPRESSED guard covers below.
+    const MAX_HEADER_LINE: usize = 8 * 1024;
     let mut content_length: Option<usize> = None;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
+        let mut line = Vec::new();
+        let read = (&mut *reader)
+            .take(MAX_HEADER_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .ok()?;
+        if read == 0 {
+            return None; // EOF
+        }
+        // An over-long or unterminated line is a framing error: end the
+        // session rather than accept a partial header.
+        if line.len() > MAX_HEADER_LINE || line.last() != Some(&b'\n') {
             return None;
         }
+        let line = String::from_utf8_lossy(&line);
         let line = line.trim_end();
         if line.is_empty() {
             break;

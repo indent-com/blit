@@ -23,7 +23,7 @@ fn test_spec() -> ServerSpec {
         id: "fake".into(),
         command: vec!["fake".into()],
         groups: vec![MarkerGroup {
-            markers: &["marker"],
+            markers: vec!["marker".into()],
             policy: RootPolicy::Nearest,
         }],
         extensions: vec!["rs".into()],
@@ -402,6 +402,126 @@ fn definition_transcodes_utf16_to_bytes() {
     }
 }
 
+/// blit advertises `definition.linkSupport`, so rust-analyzer and gopls
+/// answer with `LocationLink[]` (`targetUri` + `targetSelectionRange`,
+/// with `targetRange` the fallback) rather than plain `Location[]`. That
+/// is the branch real servers hit, so cover both the selection-range
+/// jump target and the fallback when it is absent.
+#[test]
+fn location_link_uses_selection_range_with_target_fallback() {
+    let root = tmp_root("loclink");
+    // Line 0 is "x"; line 1 is "aé𝄞b" (é = bytes 1..3 in UTF-8).
+    std::fs::write(root.join("a.rs"), "x\naé𝄞b\n").unwrap();
+    let serve = |mut reader: BufReader<Box<dyn Read + Send>>, mut writer: Box<dyn Write + Send>| {
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            match msg {
+                rpc::RpcMsg::Request { id, method, params } => {
+                    let reply = match method.as_str() {
+                        "initialize" => rpc::response(
+                            &id,
+                            json!({ "capabilities": {
+                                "positionEncoding": "utf-16",
+                                "definitionProvider": true,
+                                "referencesProvider": true,
+                            } }),
+                        ),
+                        "shutdown" => rpc::response(&id, Value::Null),
+                        // targetSelectionRange (UTF-16 1..2 = é) is the
+                        // jump target; targetRange spans the whole item.
+                        "textDocument/definition" => {
+                            let uri = params["textDocument"]["uri"].as_str().unwrap().to_string();
+                            rpc::response(
+                                &id,
+                                json!([ {
+                                    "targetUri": uri,
+                                    "targetRange": { "start": { "line": 0, "character": 0 },
+                                                     "end": { "line": 3, "character": 0 } },
+                                    "targetSelectionRange": { "start": { "line": 1, "character": 1 },
+                                                              "end": { "line": 1, "character": 2 } },
+                                } ]),
+                            )
+                        }
+                        // No targetSelectionRange: targetRange (line 0
+                        // "x", UTF-16 0..1) is the jump target.
+                        "textDocument/references" => {
+                            let uri = params["textDocument"]["uri"].as_str().unwrap().to_string();
+                            rpc::response(
+                                &id,
+                                json!([ {
+                                    "targetUri": uri,
+                                    "targetRange": { "start": { "line": 0, "character": 0 },
+                                                     "end": { "line": 0, "character": 1 } },
+                                } ]),
+                            )
+                        }
+                        _ => rpc::error_response(&id, -32601, "unhandled in fake"),
+                    };
+                    let _ = rpc::write_msg(writer.as_mut(), &reply);
+                }
+                rpc::RpcMsg::Notification { method, .. } => {
+                    if method == "exit" {
+                        return;
+                    }
+                }
+                rpc::RpcMsg::Response { .. } => {}
+            }
+        }
+    };
+    let backend = testutil::pipe_backend(test_spec(), root.clone(), test_budgets(), serve);
+    wait_ready(&backend);
+    let att = attach(&root, &backend, 0, dummy_sink());
+
+    // Definition: the selection range transcodes é to bytes 1..3.
+    let (sink, rx) = collector();
+    att.query(3, LSP_QUERY_DEFINITION, 0, 0, 0, "a.rs", "", sink);
+    let records = wait_for(&rx, |msg| {
+        parse_lsp_query_resp(msg)
+            .filter(|r| r.nonce == 3)
+            .map(|r| r.records)
+    });
+    match &lsp_query_records(&records).collect::<Vec<_>>()[..] {
+        [
+            LspQueryRecord::Location {
+                line,
+                col,
+                end_line,
+                end_col,
+                path,
+                ..
+            },
+        ] => {
+            assert_eq!((*line, *col, *end_line, *end_col), (1, 1, 1, 3));
+            assert_eq!(*path, "a.rs");
+        }
+        other => panic!("unexpected definition records: {other:?}"),
+    }
+
+    // References: the targetRange fallback covers "x" = bytes 0..1.
+    let (sink, rx) = collector();
+    att.query(4, LSP_QUERY_REFERENCES, 0, 0, 0, "a.rs", "", sink);
+    let records = wait_for(&rx, |msg| {
+        parse_lsp_query_resp(msg)
+            .filter(|r| r.nonce == 4)
+            .map(|r| r.records)
+    });
+    match &lsp_query_records(&records).collect::<Vec<_>>()[..] {
+        [
+            LspQueryRecord::Location {
+                line,
+                col,
+                end_line,
+                end_col,
+                path,
+                ..
+            },
+        ] => {
+            assert_eq!((*line, *col, *end_line, *end_col), (0, 0, 0, 1));
+            assert_eq!(*path, "a.rs");
+        }
+        other => panic!("unexpected references records: {other:?}"),
+    }
+}
+
 #[test]
 fn diagnostics_full_replay_reaches_late_joiner() {
     let root = tmp_root("diag");
@@ -583,6 +703,87 @@ fn child_exit_restarts_with_backoff() {
     let backend = testutil::pipe_backend(test_spec(), root, test_budgets(), serve);
     wait_ready(&backend);
     assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+}
+
+/// A document opened before a crash must be re-`didOpen`ed once the
+/// backend comes back — even when the *first* respawn also dies during
+/// its handshake, before the open set is ever repopulated. The reopen
+/// list must survive that second respawn, not be clobbered by the
+/// meanwhile-emptied open set.
+#[test]
+fn deferred_didopen_survives_a_respawn_that_dies_in_handshake() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    let root = tmp_root("reopen");
+    std::fs::write(root.join("a.rs"), "fn x() {}\n").unwrap();
+    let uri = crate::text::path_to_uri(&root.join("a.rs"));
+
+    let (open_tx, open_rx) = std::sync::mpsc::channel::<String>();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let serve = move |mut reader: BufReader<Box<dyn Read + Send>>,
+                      mut writer: Box<dyn Write + Send>| {
+        let n = attempts.fetch_add(1, O::SeqCst);
+        // Session 2 dies mid-handshake: it never answers `initialize`,
+        // so it never repopulates the open set.
+        if n == 1 {
+            return;
+        }
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            match msg {
+                rpc::RpcMsg::Request { id, method, .. } => {
+                    match method.as_str() {
+                        "initialize" => {
+                            let _ = rpc::write_msg(
+                                writer.as_mut(),
+                                &rpc::response(
+                                    &id,
+                                    json!({ "capabilities": { "hoverProvider": true } }),
+                                ),
+                            );
+                        }
+                        "shutdown" => {
+                            let _ =
+                                rpc::write_msg(writer.as_mut(), &rpc::response(&id, Value::Null));
+                        }
+                        // Session 1 dies right after the query has opened
+                        // the document, so a.rs is left in the open set.
+                        "textDocument/hover" if n == 0 => return,
+                        _ => {
+                            let _ = rpc::write_msg(
+                                writer.as_mut(),
+                                &rpc::error_response(&id, -32601, "unhandled"),
+                            );
+                        }
+                    }
+                }
+                rpc::RpcMsg::Notification { method, params } => {
+                    // Only the recovered session's replay is observed.
+                    if method == "textDocument/didOpen" && n >= 2 {
+                        let sent = params["textDocument"]["uri"].as_str().unwrap_or_default();
+                        let _ = open_tx.send(sent.to_string());
+                    }
+                    if method == "exit" {
+                        return;
+                    }
+                }
+                rpc::RpcMsg::Response { .. } => {}
+            }
+        }
+    };
+    let backend = testutil::pipe_backend(test_spec(), root.clone(), test_budgets(), serve);
+    wait_ready(&backend);
+
+    // Open a.rs via a query, then let session 1 die.
+    let (sink, _rx) = collector();
+    let att = attach(&root, &backend, 0, sink.clone());
+    att.query(1, LSP_QUERY_HOVER, 0, 0, 0, "a.rs", "", sink);
+
+    // The third session (after the mid-handshake death of the second)
+    // must re-open a.rs from the preserved reopen list.
+    let reopened = open_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a.rs was never re-opened after the double crash");
+    assert_eq!(reopened, uri);
+    drop(att);
 }
 
 /// A queued or in-flight query must always get its one response — even

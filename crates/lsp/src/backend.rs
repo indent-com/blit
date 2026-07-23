@@ -656,6 +656,11 @@ impl Engine {
             }
             reap_backstop_status(pid);
         }
+        // A query whose sender read `gone == false` before the store
+        // above can enqueue after the first drain; answer it here, the
+        // last inbox access before the engine returns and the Receiver
+        // drops, so no nonce is left pending.
+        self.drain_inbox_queries();
     }
 
     /// Answer every in-flight and still-queued query with a terminal
@@ -667,6 +672,12 @@ impl Engine {
                 respond(&q, LSP_STATUS_OTHER, 0, "", &[]);
             }
         }
+        self.drain_inbox_queries();
+    }
+
+    /// Reply a terminal status to every `Cmd::Query` currently queued in
+    /// the inbox, so a query racing shutdown still gets its one response.
+    fn drain_inbox_queries(&mut self) {
         while let Ok(cmd) = self.inbox.try_recv() {
             if let Cmd::Query { sink, nonce, .. } = cmd {
                 let _ = sink(msg_lsp_query_resp(nonce, LSP_STATUS_OTHER, 0, "", &[]));
@@ -717,10 +728,16 @@ impl Engine {
             self.respawn_at = None;
             // The fresh server has no documents open, and LSP forbids
             // notifications before `initialized`. Remember what to
-            // reopen and replay it in on_initialized once READY.
-            self.pending_reopen = self.open_order.iter().cloned().collect();
+            // reopen and replay it in on_initialized once READY. Merge
+            // rather than overwrite: a respawn that dies before
+            // `initialized` never repopulates open_order, so a second
+            // respawn must not clobber the still-unreplayed list.
+            for path in std::mem::take(&mut self.open_order) {
+                if !self.pending_reopen.contains(&path) {
+                    self.pending_reopen.push(path);
+                }
+            }
             self.open_docs.clear();
-            self.open_order.clear();
             self.start_session();
         }
     }
@@ -1495,7 +1512,7 @@ impl Engine {
 fn reap_backstop_status(_pid: u32) {}
 
 fn respond(q: &PendingQuery, status: u8, flags: u8, detail: &str, records: &[u8]) {
-    debug_assert!(status != LSP_STATUS_OK || records.is_empty() || !records.is_empty());
+    debug_assert!(status == LSP_STATUS_OK || records.is_empty());
     let _ = (q.sink)(msg_lsp_query_resp(q.nonce, status, flags, detail, records));
 }
 

@@ -145,7 +145,9 @@ pub(crate) fn reacquire(
     budgets: &Budgets,
 ) -> Option<Arc<Backend>> {
     let spawner = backend::command_spawner(spec, root);
-    get_or_spawn(spec.clone(), root.to_path_buf(), spawner, budgets).ok()
+    get_or_spawn(spec.clone(), root.to_path_buf(), spawner, budgets)
+        .ok()
+        .map(|(backend, _)| backend)
 }
 
 /// Discovery and lazy backend spawn for `path` (docs/design/lsp.md
@@ -179,15 +181,30 @@ pub fn prepare(path: &str) -> Result<(Prepared, String, String), (u8, String)> {
     let budgets = Budgets::default();
     let mut backends = Vec::new();
     let mut specs = Vec::new();
+    // Backends this call newly spawned (not reused): if a later one hits
+    // a budget, roll these back so a partial open never strands idle
+    // servers running with no attachment until the idle sweep reaps them.
+    let mut spawned: Vec<Arc<Backend>> = Vec::new();
     for discovered in found.into_iter().filter(|d| d.on_path) {
         let spawner = backend::command_spawner(&discovered.spec, &discovered.root);
-        backends.push(get_or_spawn(
+        match get_or_spawn(
             discovered.spec.clone(),
             discovered.root.clone(),
             spawner,
             &budgets,
-        )?);
-        specs.push((discovered.spec, discovered.root));
+        ) {
+            Ok((backend, fresh)) => {
+                if fresh {
+                    spawned.push(backend.clone());
+                }
+                backends.push(backend);
+                specs.push((discovered.spec, discovered.root));
+            }
+            Err(e) => {
+                stop_spawned(spawned);
+                return Err(e);
+            }
+        }
     }
     if backends.is_empty() {
         return Err((LSP_STATUS_NOT_FOUND, missing.join(", ")));
@@ -206,13 +223,15 @@ pub fn prepare(path: &str) -> Result<(Prepared, String, String), (u8, String)> {
 }
 
 /// Join a live backend or spawn one, under the server and spawn-rate
-/// budgets. Detail strings name the limit for `LSP_OPENED`.
+/// budgets. The bool is `true` when this call spawned the backend (vs.
+/// reusing a live one), so a caller can roll back its own spawns on a
+/// later failure. Detail strings name the limit for `LSP_OPENED`.
 fn get_or_spawn(
     spec: discovery::ServerSpec,
     root: PathBuf,
     spawner: Spawner,
     budgets: &Budgets,
-) -> Result<Arc<Backend>, (u8, String)> {
+) -> Result<(Arc<Backend>, bool), (u8, String)> {
     let mut reg = registry().lock().unwrap();
     let key = (root.clone(), spec.id.clone());
     if let Some(backend) = reg.backends.get(&key) {
@@ -221,7 +240,7 @@ fn get_or_spawn(
         // Cmd::Attach (TOCTOU): any later sweep sees a recent
         // last_detach and skips it.
         *backend.shared.last_detach.lock().unwrap() = Instant::now();
-        return Ok(backend.clone());
+        return Ok((backend.clone(), false));
     }
     if reg.backends.len() >= budgets.max_servers {
         return Err((
@@ -251,7 +270,21 @@ fn get_or_spawn(
             .spawn(move || sweep(idle))
             .expect("spawn lsp sweeper thread");
     }
-    Ok(backend)
+    Ok((backend, true))
+}
+
+/// Stop and unregister backends a failed `prepare` spawned, so none
+/// lingers attachment-less until the idle sweep.
+fn stop_spawned(spawned: Vec<Arc<Backend>>) {
+    if spawned.is_empty() {
+        return;
+    }
+    let mut reg = registry().lock().unwrap();
+    for backend in spawned {
+        reg.backends
+            .remove(&(backend.root.clone(), backend.id.clone()));
+        backend.send(backend::Cmd::Stop);
+    }
 }
 
 /// Idle shutdown (docs/design/lsp.md "Sessions and discovery"): a
