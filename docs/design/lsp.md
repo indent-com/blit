@@ -107,7 +107,7 @@ frame limit and [protocol.md](protocol.md) framing apply. Set
 | S2C       | `0x60` | `LSP_OPENED`  | `[nonce:2][lsp_id:2][status:1][flags:1][root_len:2][root:N][detail_len:2][detail:N]`        |
 | S2C       | `0x61` | `LSP_STATE`   | `[lsp_id:2][state_id:4][flags:1][records:LZ4]`                                              |
 | S2C       | `0x62` | `LSP_DIAG`    | `[lsp_id:2][update_id:4][flags:1][records:LZ4]`                                             |
-| S2C       | `0x63` | `LSP_QUERY`   | `[nonce:2][status:1][flags:1][records:LZ4]`                                                 |
+| S2C       | `0x63` | `LSP_QUERY`   | `[nonce:2][status:1][flags:1][detail_len:2][detail:N][records:LZ4]`                         |
 | S2C       | `0x64` | `LSP_CLOSED`  | `[lsp_id:2][reason:1]`                                                                      |
 | S2C       | `0x65` | `LSP_SERVERS` | `[nonce:2][status:1][flags:1][records:LZ4]`                                                 |
 | S2C       | `0x66` | `LSP_STOPPED` | `[nonce:2][status:1]`                                                                       |
@@ -315,9 +315,23 @@ create/rename/delete operations, which v1 does not project — the `EDIT`
 records are the text edits only, so the plan is partial). A client
 must treat an `INCOMPLETE` rename as advisory, not a complete edit set.
 
-Query timeout (`BLIT_LSP_TIMEOUT_MS`) answers `OTHER` with detail — a
-hung backend pins a nonce for seconds, never indefinitely. Queries
-before a backend finishes initialize answer `WARMING`.
+The response carries a `detail` string before its records: empty on
+success, and on a genuine upstream failure (`OTHER`) the backing
+server's own error message (`"typescript-language-server: No
+Project"`), so a client shows the real cause rather than a bare
+"error". Query timeout (`BLIT_LSP_TIMEOUT_MS`) answers `OTHER` with
+detail — a hung backend pins a nonce for seconds, never indefinitely.
+Queries before a backend finishes initialize answer `WARMING`.
+
+Some servers (typescript-language-server, pyright, clangd) build no
+project until a document is open and answer `workspace/symbol` with
+"No Project" cold. A `needs_open_doc` discovery-table flag marks them;
+before such a query with an empty open set, the engine opens one
+representative source file — a bounded, ranked walk of the workspace
+that prefers a file under `src`/`lib`/`app` over a root-level config,
+so the server loads the real project rather than an inferred one-file
+project. Capable servers (rust-analyzer, gopls) leave the flag unset
+and never pay the walk.
 
 ### `LSP_SERVERS` / `LSP_STOP`
 
@@ -420,23 +434,23 @@ by construction, [git.md](git.md)'s stance.
 
 ## Limits and defaults
 
-| Knob                             | Default        | Env                                           |
-| -------------------------------- | -------------- | --------------------------------------------- |
-| Backends per daemon              | 4              | `BLIT_LSP_MAX_SERVERS`                        |
-| Attachments per connection       | 16             | `BLIT_LSP_MAX_OPENS`                          |
-| Queries in flight per connection | 16             | `BLIT_LSP_MAX_INFLIGHT`                       |
-| Open documents per backend       | 128            | `BLIT_LSP_MAX_DOCS`                           |
-| Diagnostics settle window        | 500 ms         | `BLIT_LSP_DIAG_LATENCY_MS`                    |
-| Query timeout                    | 30 s           | `BLIT_LSP_TIMEOUT_MS`                         |
-| Initialize timeout               | 60 s           | `BLIT_LSP_INIT_TIMEOUT`                       |
-| Ready quiescence grace           | 1 s            | `BLIT_LSP_READY_GRACE_MS`                     |
-| Idle shutdown                    | 900 s          | `BLIT_LSP_IDLE_SECS`                          |
-| Records / bytes per response     | 10 000 / 8 MiB | `BLIT_LSP_ENTRIES_MAX` / `BLIT_LSP_BYTES_MAX` |
-| Restarts per backend             | 3/hour         | `BLIT_LSP_MAX_RESTARTS`                       |
-| Spawns per daemon                | 30/minute      | `BLIT_LSP_SPAWN_RATE`                         |
+| Knob                             | Default          | Env                                           |
+| -------------------------------- | ---------------- | --------------------------------------------- |
+| Backends per daemon              | 64               | `BLIT_LSP_MAX_SERVERS`                        |
+| Attachments per connection       | 16               | `BLIT_LSP_MAX_OPENS`                          |
+| Queries in flight per connection | 16               | `BLIT_LSP_MAX_INFLIGHT`                       |
+| Open documents per backend       | 128              | `BLIT_LSP_MAX_DOCS`                           |
+| Diagnostics settle window        | 500 ms           | `BLIT_LSP_DIAG_LATENCY_MS`                    |
+| Query timeout                    | 30 s             | `BLIT_LSP_TIMEOUT_MS`                         |
+| Initialize timeout               | 60 s             | `BLIT_LSP_INIT_TIMEOUT`                       |
+| Ready quiescence grace           | 1 s              | `BLIT_LSP_READY_GRACE_MS`                     |
+| Idle shutdown                    | 900 s            | `BLIT_LSP_IDLE_SECS`                          |
+| Records / bytes per response     | 200 000 / 48 MiB | `BLIT_LSP_ENTRIES_MAX` / `BLIT_LSP_BYTES_MAX` |
+| Restarts per backend             | 3/hour           | `BLIT_LSP_MAX_RESTARTS`                       |
+| Spawns per daemon                | 30/minute        | `BLIT_LSP_SPAWN_RATE`                         |
 
 Exhaustion degrades: truncation flags, `WARMING`, `BUDGET`, never a
-hang. RSS is honestly uncappable portably; `MAX_SERVERS=4` plus
+hang. RSS is honestly uncappable portably; the idle sweeper plus
 `lsp list`/`stop` visibility is the real defense on shared boxes —
 rust-analyzer alone can hold multiple GiB.
 

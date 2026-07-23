@@ -54,7 +54,7 @@ pub struct Budgets {
 impl Default for Budgets {
     fn default() -> Self {
         Budgets {
-            max_servers: env_u64("BLIT_LSP_MAX_SERVERS", 4).max(1) as usize,
+            max_servers: env_u64("BLIT_LSP_MAX_SERVERS", 64).max(1) as usize,
             // At least 1: the open set must hold the document a query is
             // about, or ensure_open would open-then-evict it and the
             // query would index a missing key.
@@ -67,8 +67,14 @@ impl Default for Budgets {
             // experimental serverStatus) bypass this heuristic.
             ready_grace: Duration::from_millis(env_u64("BLIT_LSP_READY_GRACE_MS", 1_000)),
             idle: Duration::from_secs(env_u64("BLIT_LSP_IDLE_SECS", 900)),
-            entries_max: env_u64("BLIT_LSP_ENTRIES_MAX", 10_000) as usize,
-            bytes_max: env_u64("BLIT_LSP_BYTES_MAX", 8 * 1024 * 1024) as usize,
+            // Generous per-response caps: a whole-project `workspace/
+            // symbol` dump is a legitimate large result (tens of
+            // thousands of symbols), and both bounds sit safely under
+            // the wire's fragmented `MAX_DECOMPRESSED` (64 MiB). The
+            // byte bound is the real memory guard; entries just stop a
+            // pathological record flood.
+            entries_max: env_u64("BLIT_LSP_ENTRIES_MAX", 200_000) as usize,
+            bytes_max: env_u64("BLIT_LSP_BYTES_MAX", 48 * 1024 * 1024) as usize,
             max_restarts: env_u64("BLIT_LSP_MAX_RESTARTS", 3) as usize,
             spawn_rate_per_min: env_u64("BLIT_LSP_SPAWN_RATE", 30) as usize,
         }

@@ -40,6 +40,13 @@ pub struct ServerSpec {
     pub groups: Vec<MarkerGroup>,
     /// File extensions routed to this server.
     pub extensions: Vec<String>,
+    /// The server answers queries only once it holds an open document
+    /// (typescript-language-server rejects `workspace/symbol` with "No
+    /// Project" cold; pyright/clangd are similar). blit opens one
+    /// representative file before such a query so the server has a
+    /// project. Capable servers (rust-analyzer, gopls) leave this false
+    /// and never pay the workspace walk.
+    pub needs_open_doc: bool,
     /// Verbatim JSON handed to `initializationOptions` (from config).
     pub init: Option<serde_json::Value>,
     /// Verbatim JSON answering `workspace/configuration` (from config).
@@ -53,6 +60,7 @@ fn builtin_table() -> Vec<ServerSpec> {
             command: command.iter().map(|s| s.to_string()).collect(),
             groups,
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
+            needs_open_doc: false,
             init: None,
             settings: None,
         };
@@ -168,6 +176,18 @@ fn builtin_table() -> Vec<ServerSpec> {
             &["md", "markdown"],
         ),
     ]
+    .into_iter()
+    // Open-doc-only servers: their project/index isn't live until a
+    // document is open, so a cold query (notably `workspace/symbol`)
+    // fails without one.
+    .map(|mut spec| {
+        spec.needs_open_doc = matches!(
+            spec.id.as_str(),
+            "typescript-language-server" | "pyright" | "clangd"
+        );
+        spec
+    })
+    .collect()
 }
 
 /// The effective table: built-ins shadowed or extended by `blit.conf`
@@ -186,6 +206,7 @@ pub fn table() -> Vec<ServerSpec> {
                         command: command.clone(),
                         groups: Vec::new(),
                         extensions: Vec::new(),
+                        needs_open_doc: false,
                         init: None,
                         settings: None,
                     };

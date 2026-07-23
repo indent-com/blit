@@ -1022,6 +1022,106 @@ impl Engine {
 
     // -- open set ---------------------------------------------------------
 
+    /// Open one representative source file so an open-doc-only server
+    /// loads the real project. The *choice* of file matters: opening a
+    /// root-level config file (`vitest.config.ts`) makes
+    /// typescript-language-server infer a one-file project and answer
+    /// `workspace/symbol` with only that file's symbols. So a bounded
+    /// walk of the workspace ranks candidates and opens the best — a
+    /// file under a conventional source directory, not a config or test
+    /// file, not sitting at the repo root — which pulls in the whole
+    /// tsconfig project. Capped so a huge monorepo never stalls a query.
+    fn ensure_project_doc(&mut self) {
+        const SKIP: &[&str] = &[
+            "node_modules",
+            ".git",
+            "target",
+            "dist",
+            "build",
+            "out",
+            ".venv",
+            "vendor",
+            ".direnv",
+        ];
+        const SOURCE_DIRS: &[&str] = &["src", "lib", "app", "source", "sources", "packages"];
+        const MAX_VISITED: usize = 8192;
+        // A score that clearly identifies a main-project source file, at
+        // which point the walk can stop early.
+        const GOOD_ENOUGH: i32 = 5;
+
+        // Rank a candidate: prefer files inside a source directory,
+        // penalize config/test/declaration files and files sitting
+        // directly in the workspace root (which are usually configs).
+        let score = |rel: &Path| -> i32 {
+            let mut s = 0;
+            let comps: Vec<String> = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str().map(|x| x.to_ascii_lowercase()))
+                .collect();
+            let depth = comps.len();
+            if comps.iter().any(|c| SOURCE_DIRS.contains(&c.as_str())) {
+                s += 6;
+            }
+            if depth <= 1 {
+                s -= 4; // a bare root-level file, almost always a config
+            }
+            let name = comps.last().map(String::as_str).unwrap_or("");
+            if name.contains(".config.")
+                || name.contains(".test.")
+                || name.contains(".spec.")
+                || name.ends_with(".d.ts")
+            {
+                s -= 3;
+            }
+            s
+        };
+
+        let matches_ext = |path: &Path| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .is_some_and(|e| self.spec.extensions.iter().any(|x| x == &e))
+        };
+
+        let mut best: Option<(i32, PathBuf)> = None;
+        let mut queue = VecDeque::from([self.root.clone()]);
+        let mut visited = 0usize;
+        'walk: while let Some(dir) = queue.pop_front() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut subdirs = Vec::new();
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > MAX_VISITED {
+                    break 'walk;
+                }
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with('.') && !SKIP.contains(&name.as_ref()) {
+                        subdirs.push(path);
+                    }
+                } else if ft.is_file() && matches_ext(&path) {
+                    let rel = path.strip_prefix(&self.root).unwrap_or(&path);
+                    let s = score(rel);
+                    if best.as_ref().is_none_or(|(bs, _)| s > *bs) {
+                        best = Some((s, path.clone()));
+                    }
+                    if s >= GOOD_ENOUGH {
+                        break 'walk;
+                    }
+                }
+            }
+            queue.extend(subdirs);
+        }
+        if let Some((_, path)) = best {
+            self.ensure_open(&path);
+        }
+    }
+
     /// `didOpen` a file (disk bytes) if not already open, LRU-evicting
     /// past the cap. Returns `false` when the file is unreadable.
     fn ensure_open(&mut self, path: &Path) -> bool {
@@ -1158,7 +1258,15 @@ impl Engine {
             _ => {}
         }
         let (method, params) = match kind {
-            LSP_QUERY_WS_SYMBOLS => ("workspace/symbol", json!({ "query": arg })),
+            LSP_QUERY_WS_SYMBOLS => {
+                // Open-doc-only servers (tsserver et al.) have no project
+                // until a document is open, and answer `workspace/symbol`
+                // with "No Project". Open one representative file first.
+                if self.spec.needs_open_doc && self.open_docs.is_empty() {
+                    self.ensure_project_doc();
+                }
+                ("workspace/symbol", json!({ "query": arg }))
+            }
             _ => {
                 let Some(path) = &path else {
                     return respond(&q, blit_remote::lsp::LSP_STATUS_INVALID, 0, "", &[]);

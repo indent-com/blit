@@ -27,6 +27,7 @@ fn test_spec() -> ServerSpec {
             policy: RootPolicy::Nearest,
         }],
         extensions: vec!["rs".into()],
+        needs_open_doc: false,
         init: None,
         settings: Some(json!({ "answer": 42 })),
     }
@@ -678,6 +679,74 @@ fn query_without_capability_is_not_found() {
 
 fn dummy_sink() -> Sink {
     Arc::new(|_| true)
+}
+
+/// A `needs_open_doc` backend (tsserver's "No Project" quirk) must have
+/// a document opened before `workspace/symbol`, or the query fails; blit
+/// opens a representative file from the root first.
+#[test]
+fn ws_symbols_opens_a_project_doc_when_needed() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    let root = tmp_root("wsproj");
+    std::fs::write(root.join("lib.rs"), "fn thing() {}\n").unwrap();
+    let opened = Arc::new(AtomicBool::new(false));
+    let opened2 = opened.clone();
+    let serve = move |mut reader: BufReader<Box<dyn Read + Send>>,
+                      mut writer: Box<dyn Write + Send>| {
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            match msg {
+                rpc::RpcMsg::Request { id, method, .. } => {
+                    let reply = match method.as_str() {
+                        "initialize" => rpc::response(
+                            &id,
+                            json!({ "capabilities": { "workspaceSymbolProvider": true } }),
+                        ),
+                        "shutdown" => rpc::response(&id, Value::Null),
+                        "workspace/symbol" if opened2.load(O::Relaxed) => rpc::response(
+                            &id,
+                            json!([{
+                                "name": "thing", "kind": 12,
+                                "location": { "uri": "file:///x/lib.rs", "range": {
+                                    "start": { "line": 0, "character": 3 },
+                                    "end": { "line": 0, "character": 8 } } }
+                            }]),
+                        ),
+                        // No project until a document is open.
+                        "workspace/symbol" => rpc::error_response(&id, -32000, "No Project"),
+                        _ => rpc::error_response(&id, -32601, "unhandled"),
+                    };
+                    let _ = rpc::write_msg(writer.as_mut(), &reply);
+                }
+                rpc::RpcMsg::Notification { method, .. } => {
+                    if method == "textDocument/didOpen" {
+                        opened2.store(true, O::Relaxed);
+                    }
+                    if method == "exit" {
+                        return;
+                    }
+                }
+                rpc::RpcMsg::Response { .. } => {}
+            }
+        }
+    };
+    let mut spec = test_spec();
+    spec.needs_open_doc = true;
+    let backend = testutil::pipe_backend(spec, root.clone(), test_budgets(), serve);
+    wait_ready(&backend);
+    let (sink, rx) = collector();
+    let att = attach(&root, &backend, 0, sink.clone());
+    att.query(5, LSP_QUERY_WS_SYMBOLS, 0, 0, 0, "", "thing", sink);
+    let records = wait_for(&rx, |m| {
+        parse_lsp_query_resp(m)
+            .filter(|r| r.nonce == 5)
+            .map(|r| r.records)
+    });
+    let syms: Vec<_> = lsp_query_records(&records).collect();
+    assert_eq!(
+        syms.len(),
+        1,
+        "ws-symbols should succeed once a project doc is opened"
+    );
 }
 
 fn wait_ready(backend: &Arc<Backend>) {

@@ -16,10 +16,10 @@ use blit_remote::lsp::{
     FEATURE_LSP, LSP_CLOSED_CLIENT_REQUEST, LSP_DIAG_FULL, LSP_OPEN_DIAGS, LSP_OPEN_WATCH,
     LSP_PHASE_FAILED, LSP_PHASE_INDEXING, LSP_PHASE_INITIALIZING, LSP_PHASE_READY,
     LSP_PHASE_SPAWNING, LSP_PROGRESS_UNKNOWN, LSP_QUERY_DOC_SYMBOLS, LSP_QUERY_REFERENCES,
-    LSP_QUERY_WS_SYMBOLS, LSP_REFS_INCLUDE_DECLARATION, LSP_STATUS_NOT_FOUND, LSP_STATUS_OK,
-    LSP_STATUS_WARMING, LSP_STREAM_DIAG, LSP_STREAM_STATE, LspDiagMirror, LspQueryRecord,
-    LspQueryRequest, LspServersRecord, LspStateMirror, S2C_LSP_CLOSED, S2C_LSP_DIAG,
-    S2C_LSP_OPENED, S2C_LSP_QUERY, S2C_LSP_SERVERS, S2C_LSP_STATE, S2C_LSP_STOPPED,
+    LSP_QUERY_WS_SYMBOLS, LSP_REFS_INCLUDE_DECLARATION, LSP_RESP_TRUNCATED, LSP_STATUS_NOT_FOUND,
+    LSP_STATUS_OK, LSP_STATUS_WARMING, LSP_STREAM_DIAG, LSP_STREAM_STATE, LspDiagMirror,
+    LspQueryRecord, LspQueryRequest, LspServersRecord, LspStateMirror, S2C_LSP_CLOSED,
+    S2C_LSP_DIAG, S2C_LSP_OPENED, S2C_LSP_QUERY, S2C_LSP_SERVERS, S2C_LSP_STATE, S2C_LSP_STOPPED,
     lsp_query_records, lsp_servers_records, lsp_status_text, msg_lsp_ack, msg_lsp_open,
     msg_lsp_query, msg_lsp_servers, msg_lsp_stop, parse_lsp_closed, parse_lsp_diag,
     parse_lsp_opened, parse_lsp_query_resp, parse_lsp_servers_resp, parse_lsp_state,
@@ -341,7 +341,8 @@ pub async fn cmd_position(
     } else {
         0
     };
-    let (status, _, detail, records) = session.query(kind, flags, line, col, &path, &arg).await?;
+    let (status, resp_flags, detail, records) =
+        session.query(kind, flags, line, col, &path, &arg).await?;
     if !check_status(status, &detail)? {
         return Ok(1);
     }
@@ -409,6 +410,11 @@ pub async fn cmd_position(
             LspQueryRecord::Symbol { .. } => {}
         }
     }
+    if resp_flags & LSP_RESP_TRUNCATED != 0 && !json {
+        eprintln!(
+            "… truncated at {found} results (raise BLIT_LSP_ENTRIES_MAX / BLIT_LSP_BYTES_MAX)"
+        );
+    }
     Ok(if found == 0 { 1 } else { 0 })
 }
 
@@ -430,7 +436,7 @@ pub async fn cmd_symbols(
             eprintln!("no symbols — see running servers with `blit lsp list`");
         }
     };
-    let (status, _, detail, records) = match file {
+    let (status, resp_flags, detail, records) = match file {
         Some(file) => {
             session
                 .query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, &client_abs(&file), "")
@@ -493,6 +499,12 @@ pub async fn cmd_symbols(
     if found == 0 {
         hint_empty();
         return Ok(1);
+    }
+    if resp_flags & LSP_RESP_TRUNCATED != 0 && !json {
+        eprintln!(
+            "… truncated at {found} symbols (raise BLIT_LSP_ENTRIES_MAX / \
+             BLIT_LSP_BYTES_MAX, or narrow the query)"
+        );
     }
     Ok(0)
 }
