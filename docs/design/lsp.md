@@ -414,13 +414,27 @@ Dirty-driven admission makes the primary loop work by construction: the
 file an agent just saved is opened and diagnosed without ceremony. What
 remains partial on open-doc-only servers is cold coverage — a file
 never touched in the daemon's lifetime carries no diagnostics, and the
-absence of a `DIAG_FILE` record means unknown, not clean. The engine
-may later fill cold files opportunistically through 3.17
-`workspace/diagnostic` pull where servers implement it — an engine
-enhancement, no wire change. (Cycling the whole workspace through
-didOpen/didClose to force coverage was considered and rejected:
-open-doc-only servers typecheck per open, so it is unbounded thrash on
-large trees.)
+absence of a `DIAG_FILE` record means unknown, not clean.
+
+Whole-project coverage for these servers has no clean LSP answer, and
+that is inherent, not a blit gap. The 3.17 `workspace/diagnostic` pull
+would fill cold files without opening them, and the engine can adopt it
+where a server advertises `diagnosticProvider.workspaceDiagnostics` — but
+the dominant open-doc-only server, typescript-language-server, supports
+neither the workspace nor the document pull, and its maintainer closed
+the workspace-diagnostics POC as architecturally unworkable (a
+full-project tsserver compute "could take minutes and block all other
+functionality"). Cycling the whole tree through didOpen/didClose to
+force coverage is the same thrash from the client side and was rejected
+for the same reason. So whole-project TypeScript diagnostics are the
+build tool's job (`tsc --noEmit`), exactly as in VS Code, whose Problems
+panel shows only open-file tsserver errors by default. pyright is the
+one open-doc-only server that _can_ go whole-project — its
+`diagnosticMode: "workspace"` setting, reachable through blit's
+`lsp.<id>.settings` pass-through — at the documented cost. Servers that
+already diagnose the whole project by construction (rust-analyzer and
+gopls via check-on-save) need none of this; `blit lsp diag` is complete
+for them once ready.
 
 Intelligence therefore reflects **saved state** — exactly what agents
 (who write disk) and every read-only viewer see. When the buffer/editor
