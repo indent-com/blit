@@ -1097,6 +1097,14 @@ struct Compositor {
     display_handle: DisplayHandle,
     surfaces: HashMap<ObjectId, Surface>,
     toplevel_surface_ids: HashMap<u16, ObjectId>,
+    /// Per-toplevel timestamp (`elapsed_ms`) of the last server-driven
+    /// `RequestFrame`. Lets `handle_surface_commit` tell whether the server
+    /// is actively pacing this surface (a viewer is connected): while it is,
+    /// the eager per-commit frame-callback fire is suppressed so it doesn't
+    /// drive a nested compositor (e.g. weston) into an unthrottled repaint
+    /// loop that overruns the server's display-rate pacing. See the fallback
+    /// note in `handle_surface_commit`.
+    last_request_frame_ms: HashMap<u16, u32>,
     next_surface_id: u16,
     shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
@@ -1558,11 +1566,28 @@ impl Compositor {
             held.release();
         }
 
-        // Always fire frame callbacks after processing a commit, so
-        // clients can continue their render loop.  Without this, clients
-        // stall when the server doesn't send RequestFrame (e.g. during
-        // resize or when no subscribers are connected).
-        self.fire_frame_callbacks_for_toplevel(toplevel_sid);
+        // Fire frame callbacks after processing a commit so clients can
+        // continue their render loop — but only as a *fallback*. When a
+        // viewer is connected the server paces this surface via RequestFrame
+        // at the display rate (see server tick loop); that path is then the
+        // sole, throttled driver. Firing again here on every commit would
+        // drive a nested compositor (e.g. weston) into an unthrottled
+        // repaint loop — running much faster than the display and, for
+        // weston, tripping an internal subsurface assertion. So skip the
+        // eager fire while RequestFrame has paced this surface recently, and
+        // fall back to it otherwise (during resize, or when no subscriber is
+        // driving RequestFrame) so the client never stalls. The grace window
+        // is comfortably larger than the server's slowest pacing interval
+        // (250 ms idle blanket), so suppression stays stable while any client
+        // is connected and self-heals within it once pacing stops.
+        const PACING_GRACE_MS: u32 = 500;
+        let paced = self
+            .last_request_frame_ms
+            .get(&toplevel_sid)
+            .is_some_and(|&t| elapsed_ms().wrapping_sub(t) < PACING_GRACE_MS);
+        if !paced {
+            self.fire_frame_callbacks_for_toplevel(toplevel_sid);
+        }
 
         // After an output scale change, re-send keyboard leave/enter on
         // the first commit so clients (especially Firefox) resume input
@@ -2053,6 +2078,7 @@ impl Compositor {
                 }
                 if surf.surface_id > 0 {
                     self.toplevel_surface_ids.remove(&surf.surface_id);
+                    self.last_request_frame_ms.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
                     if let Some(ref mut vk) = self.vulkan_renderer {
@@ -2599,6 +2625,10 @@ impl Compositor {
                 let _ = reply.send(result);
             }
             CompositorCommand::RequestFrame { surface_id } => {
+                // Remember that the server paced this surface, so the eager
+                // per-commit fire in `handle_surface_commit` can stand down
+                // while this (display-rate-throttled) path is driving frames.
+                self.last_request_frame_ms.insert(surface_id, elapsed_ms());
                 self.fire_frame_callbacks_for_toplevel(surface_id);
             }
             CompositorCommand::ReleaseKeys { keycodes } => {
@@ -5504,6 +5534,7 @@ fn run_compositor(
         display_handle: dh,
         surfaces: HashMap::new(),
         toplevel_surface_ids: HashMap::new(),
+        last_request_frame_ms: HashMap::new(),
         next_surface_id: 1,
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),
