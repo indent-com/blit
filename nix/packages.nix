@@ -573,6 +573,7 @@
       devShells.default = pkgs.mkShell {
         buildInputs = [
           rustToolchain
+          pkgs.rust-analyzer
           pkgs.binaryen
           pkgs.bun
           pkgs.cargo-flamegraph
