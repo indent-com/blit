@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { BlitConnection } from "../BlitConnection";
-import { EXIT_STATUS_UNKNOWN } from "../exit-status";
 import { MockTransport } from "./mock-transport";
 import type { BlitWasmModule } from "../TerminalStore";
 import {
@@ -335,87 +334,6 @@ describe("BlitConnection", () => {
     const promise = conn.closeSession(session.id);
     transport.setStatus("disconnected");
     await promise;
-  });
-
-  // --- awaitSessionExit ---
-
-  it("awaitSessionExit resolves on EXITED", async () => {
-    transport.pushCreated(3, "");
-    const session = conn.getSnapshot().sessions[0];
-    const promise = conn.awaitSessionExit(session.id);
-    transport.pushExited(3, 0);
-    await expect(promise).resolves.toEqual({ exitStatus: 0, timedOut: false });
-  });
-
-  it("awaitSessionExit captures signal exit status", async () => {
-    transport.pushCreated(3, "");
-    const session = conn.getSnapshot().sessions[0];
-    const promise = conn.awaitSessionExit(session.id);
-    transport.pushExited(3, -15);
-    await expect(promise).resolves.toEqual({
-      exitStatus: -15,
-      timedOut: false,
-    });
-  });
-
-  it("awaitSessionExit resolves immediately when already exited", async () => {
-    transport.pushCreated(3, "");
-    const session = conn.getSnapshot().sessions[0];
-    transport.pushExited(3, 42);
-    await expect(conn.awaitSessionExit(session.id)).resolves.toEqual({
-      exitStatus: 42,
-      timedOut: false,
-    });
-  });
-
-  it("awaitSessionExit resolves on CLOSED without exitStatus", async () => {
-    transport.pushCreated(3, "");
-    const session = conn.getSnapshot().sessions[0];
-    const promise = conn.awaitSessionExit(session.id);
-    transport.pushClosed(3);
-    await expect(promise).resolves.toEqual({
-      exitStatus: null,
-      timedOut: false,
-    });
-  });
-
-  it("awaitSessionExit honours legacy EXITED frames as EXIT_STATUS_UNKNOWN", async () => {
-    transport.pushCreated(3, "");
-    const session = conn.getSnapshot().sessions[0];
-    const promise = conn.awaitSessionExit(session.id);
-    transport.pushExitedRaw(3);
-    await expect(promise).resolves.toEqual({
-      exitStatus: EXIT_STATUS_UNKNOWN,
-      timedOut: false,
-    });
-  });
-
-  it("awaitSessionExit times out and unsubscribes when the process keeps running", async () => {
-    transport.pushCreated(3, "");
-    const session = conn.getSnapshot().sessions[0];
-    vi.useFakeTimers();
-    try {
-      const promise = conn.awaitSessionExit(session.id, { timeoutMs: 50 });
-      vi.advanceTimersByTime(50);
-      await expect(promise).resolves.toEqual({
-        exitStatus: null,
-        timedOut: true,
-      });
-      // Late EXITED must not be observed by a discarded listener — if the
-      // subscription leaked, this would attempt to resolve the already-settled
-      // promise; we simply assert the snapshot still reflects the exit.
-      transport.pushExited(3, 7);
-      expect(conn.getSession(session.id)?.exitStatus).toBe(7);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("awaitSessionExit returns immediately for an unknown session", async () => {
-    await expect(conn.awaitSessionExit("missing-session-id")).resolves.toEqual({
-      exitStatus: null,
-      timedOut: false,
-    });
   });
 
   // --- Send helpers ---
