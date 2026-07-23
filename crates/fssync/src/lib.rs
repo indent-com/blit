@@ -29,10 +29,10 @@ use blit_remote::fs::{
     FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION,
     FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_NO_CONTENT,
     FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_ENTRY_UNREADABLE, FS_ENTRY_UNSTABLE,
-    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS,
-    FS_OP_REMOVE, FS_OP_RENAME, FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_WRITE_DURABLE,
-    FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent, FsRecord,
-    append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
+    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_HARDLINK, FS_OP_MKDIR,
+    FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK, FS_UPDATE_RESET,
+    FS_UPDATE_SYNC, FS_WRITE_DURABLE, FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS,
+    FsContent, FsRecord, append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
 };
 
 pub mod backend;
@@ -708,7 +708,13 @@ fn stat_meta(path: &Path) -> io::Result<NodeMeta> {
     let (mode, dev_ino) = (0u32, (0u64, 0u64));
     Ok(NodeMeta {
         node_type,
-        size: if ft.is_file() { md.len() } else { 0 },
+        // A symlink's "content" is its target bytes (docs/design/fs-write.md
+        // "Links"), so its size is the target length, as lstat reports it.
+        size: if ft.is_file() || ft.is_symlink() {
+            md.len()
+        } else {
+            0
+        },
         mtime_ns,
         mode,
         hash: 0,
@@ -961,14 +967,20 @@ enum ReadMetaOutcome {
     Unreadable,
 }
 
-/// Read a file with torn-read protection: identity/size/mtime are compared
-/// before and after the read; one retry, then `Unstable`.
+/// Read an entry's content with torn-read protection: identity/size/mtime
+/// are compared before and after the read; one retry, then `Unstable`.
+/// A symlink's content is its target bytes, never the file it points to.
 fn read_verified_meta(path: &Path) -> ReadMetaOutcome {
     for _ in 0..2 {
         let Ok(before) = stat_meta(path) else {
             return ReadMetaOutcome::Unreadable;
         };
-        let Ok(data) = fs::read(path) else {
+        let read = if before.node_type == FS_ENTRY_SYMLINK {
+            link_target_bytes(path)
+        } else {
+            fs::read(path)
+        };
+        let Ok(data) = read else {
             return ReadMetaOutcome::Unreadable;
         };
         match stat_meta(path) {
@@ -1195,14 +1207,54 @@ fn create_exclusive(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io
 }
 
 /// The current on-disk content hash of `path`, or 0 (the "absent"
-/// sentinel) when missing or unreadable. Read under the write lock, so
-/// no other blit writer can interleave; an external writer is the
-/// disclosed, irreducible window.
+/// sentinel) when missing or unreadable. A symlink hashes its target
+/// bytes, matching the read side. Read under the write lock, so no other
+/// blit writer can interleave; an external writer is the disclosed,
+/// irreducible window.
 fn current_hash(path: &Path) -> u128 {
-    match fs::read(path) {
+    let bytes = match fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => link_target_bytes(path),
+        _ => fs::read(path),
+    };
+    match bytes {
         Ok(bytes) => blake3_128(&bytes),
         Err(_) => 0,
     }
+}
+
+/// A symlink's target as content bytes: verbatim on Unix, lossy UTF-8
+/// elsewhere (a client-minted target is UTF-8 and round-trips exactly).
+fn link_target_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let target = fs::read_link(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(target.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    Ok(target.to_string_lossy().into_owned().into_bytes())
+}
+
+/// Create a symlink at `at` whose target is the verbatim string `target`.
+#[cfg(unix)]
+fn symlink_at(target: &str, at: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, at)
+}
+#[cfg(windows)]
+fn symlink_at(target: &str, at: &Path) -> io::Result<()> {
+    // Windows symlinks are typed: pick the directory flavor when the
+    // target resolves to a directory right now, the file flavor otherwise
+    // (including dangling targets).
+    let resolved = at.parent().unwrap_or_else(|| Path::new(".")).join(target);
+    if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir(target, at)
+    } else {
+        std::os::windows::fs::symlink_file(target, at)
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn symlink_at(_target: &str, _at: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// The reconciler's index key for an absolute path under `root`: each
@@ -2165,7 +2217,9 @@ impl SyncEngine {
                     let mut full: Option<Arc<Vec<u8>>> = None;
                     let mut delta: Option<Vec<u8>> = None;
                     let mut skip_record = false;
-                    if meta.node_type == FS_ENTRY_FILE {
+                    // Files and symlinks both carry content — a symlink's
+                    // is its target bytes (hash = BLAKE3-128 over them).
+                    if matches!(meta.node_type, FS_ENTRY_FILE | FS_ENTRY_SYMLINK) {
                         if !self.opts.content || meta.size > self.opts.inline_max {
                             entry_flags |= FS_ENTRY_NO_CONTENT;
                             self.held.remove(path);
@@ -2617,7 +2671,139 @@ impl SyncEngine {
                 self.hint_change(&to);
                 (FS_DONE_OK, 0, 0)
             }
+            FS_OP_SYMLINK | FS_OP_HARDLINK => self.exec_link(o),
             _ => (FS_DONE_INVALID, 0, 0),
+        }
+    }
+
+    /// Create a link at `b`: a symlink whose target is the verbatim string
+    /// `a` (`SYMLINK`), or a hard link to the regular file at `a`
+    /// (`HARDLINK`). `base` CASes on the entry currently at `b` exactly as
+    /// a write's `base` does on its path — zero = create-exclusive,
+    /// non-zero = replace iff the current content hash matches (a symlink
+    /// hashes its target bytes), `NO_CAS` = unconditional. Replacement is
+    /// atomic: the new link lands at a sibling temp path and renames over
+    /// `b`, so a reader sees the old entry or the new, never neither.
+    fn exec_link(&mut self, o: &OpReq) -> (u8, u128, u64) {
+        if o.flags & FS_OP_MKPARENTS != 0
+            && let Some(parent) =
+                resolve_wire_path(&self.root, &o.b).and_then(|b| b.parent().map(Path::to_path_buf))
+            && let Err(status) = create_parents_confined(&self.root, &parent)
+        {
+            return (status, 0, 0);
+        }
+        // A hard-link source is a confined wire path and must be a regular
+        // file (aliasing a symlink or a directory is refused). A symlink
+        // target is a verbatim string stored as given: in-tree relative,
+        // absolute, and dangling targets are all legitimate symlinks — the
+        // read side reports them, never follows (docs/design/fs-watch.md).
+        let src = if o.op == FS_OP_HARDLINK {
+            let src = match resolve_write_target(&self.root, &o.a, SymlinkPolicy::Operate) {
+                Ok(t) => t,
+                Err(status) => return (status, 0, 0),
+            };
+            match fs::symlink_metadata(&src) {
+                Ok(md) if md.file_type().is_file() => {}
+                Ok(_) => return (FS_DONE_WRONG_TYPE, 0, 0),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return (FS_DONE_NOT_FOUND, 0, 0);
+                }
+                Err(e) => return (write_io_status(&e), 0, 0),
+            }
+            Some(src)
+        } else {
+            if o.a.is_empty() {
+                return (FS_DONE_INVALID, 0, 0);
+            }
+            None
+        };
+        let link = match resolve_write_target(&self.root, &o.b, SymlinkPolicy::Operate) {
+            Ok(t) => t,
+            Err(status) => return (status, 0, 0),
+        };
+        let lock = path_write_lock(&link);
+        let _guard = lock.lock().unwrap();
+        // Never clobber a directory with a link (a symlink *to* a directory
+        // at `b` is itself a link entry and may be replaced).
+        if fs::symlink_metadata(&link)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return (FS_DONE_WRONG_TYPE, 0, 0);
+        }
+        let no_cas = o.flags & FS_OP_NO_CAS != 0;
+        let create_exclusive_mode = !no_cas && o.base == 0;
+        if !no_cas {
+            if o.base == 0 {
+                // symlink_metadata, not exists(): a dangling symlink at `b`
+                // is an entry and must fail create-exclusive.
+                if fs::symlink_metadata(&link).is_ok() {
+                    return (FS_DONE_CONFLICT, current_hash(&link), 0);
+                }
+            } else {
+                let cur = current_hash(&link);
+                if cur != o.base {
+                    return (FS_DONE_CONFLICT, cur, 0);
+                }
+            }
+        }
+        let create = |at: &Path| -> io::Result<()> {
+            match &src {
+                Some(src) => fs::hard_link(src, at),
+                None => symlink_at(&o.a, at),
+            }
+        };
+        if create_exclusive_mode {
+            // symlink()/link() fail EEXIST natively, so create-exclusive is
+            // race-free even against an external creator.
+            match create(&link) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    return (FS_DONE_CONFLICT, current_hash(&link), 0);
+                }
+                Err(e) => return (write_io_status(&e), 0, 0),
+            }
+        } else {
+            let tmp = temp_sibling(&link);
+            if let Err(e) = create(&tmp) {
+                return (write_io_status(&e), 0, 0);
+            }
+            if let Err(e) = fs::rename(&tmp, &link) {
+                let _ = fs::remove_file(&tmp);
+                return (write_io_status(&e), 0, 0);
+            }
+        }
+        let mtime_ns = stat_meta(&link).map(|m| m.mtime_ns).unwrap_or(0);
+        let echo_wire = wire_key_for(&self.root, &link).unwrap_or_else(|| o.b.clone());
+        match &src {
+            None => {
+                let hash = blake3_128(o.a.as_bytes());
+                self.prime_echo(&echo_wire, &link, hash, o.a.as_bytes(), mtime_ns);
+                (FS_DONE_OK, hash, mtime_ns)
+            }
+            Some(src) => {
+                // The link's content is the source file's. Hash it for the
+                // echo when the bytes are stable and modestly sized; a huge
+                // or in-flux source just lets the reconciler learn lazily.
+                let small = fs::symlink_metadata(src)
+                    .map(|m| m.len() <= fs_write_max())
+                    .unwrap_or(false);
+                match if small {
+                    read_verified(&link)
+                } else {
+                    ReadOutcome::Unstable
+                } {
+                    ReadOutcome::Stable(data) => {
+                        let hash = blake3_128(&data);
+                        self.prime_echo(&echo_wire, &link, hash, &data, mtime_ns);
+                        (FS_DONE_OK, hash, mtime_ns)
+                    }
+                    _ => {
+                        self.hint_change(&link);
+                        (FS_DONE_OK, 0, mtime_ns)
+                    }
+                }
+            }
         }
     }
 
@@ -3033,6 +3219,169 @@ mod tests {
         // removing a missing path is NOT_FOUND
         let (s, _, _) = await_done(&handle, &sent, 7, op(7, FS_OP_REMOVE, "sub", "", 0, 0));
         assert_eq!(s, FS_DONE_NOT_FOUND);
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Symlink and hard-link ops: create-exclusive, CAS retarget, conflict
+    /// carrying the live target hash, type refusals, and the read side
+    /// treating a symlink's target as its content (mirror and FETCH).
+    #[cfg(unix)]
+    #[test]
+    fn fs_ops_symlink_hardlink() {
+        // Production always canonicalizes the root (validate_root); the
+        // write guard relies on it.
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, hint) = drive_engine(&root);
+        let op = |nonce: u16, op: u8, a: &str, b: &str, base: u128, flags: u8| {
+            Command::Op(OpReq {
+                nonce,
+                op,
+                a: a.into(),
+                b: b.into(),
+                base,
+                mode: 0,
+                flags,
+                inflight: None,
+            })
+        };
+
+        // Create-exclusive symlink; the returned hash covers the target.
+        let (s, h, _) = await_done(&handle, &sent, 1, op(1, FS_OP_SYMLINK, "a.txt", "ln", 0, 0));
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(fs::read_link(root.join("ln")).unwrap(), Path::new("a.txt"));
+        assert_eq!(h, blake3_128(b"a.txt"));
+        // An existing entry conflicts, carrying the live target hash.
+        let (s, disk, _) = await_done(&handle, &sent, 2, op(2, FS_OP_SYMLINK, "other", "ln", 0, 0));
+        assert_eq!(s, FS_DONE_CONFLICT);
+        assert_eq!(disk, h);
+        // CAS retarget: the correct base wins…
+        let (s, h2, _) = await_done(&handle, &sent, 3, op(3, FS_OP_SYMLINK, "b.txt", "ln", h, 0));
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(h2, blake3_128(b"b.txt"));
+        assert_eq!(fs::read_link(root.join("ln")).unwrap(), Path::new("b.txt"));
+        // …and a stale base conflicts.
+        let (s, _, _) = await_done(&handle, &sent, 4, op(4, FS_OP_SYMLINK, "c", "ln", h, 0));
+        assert_eq!(s, FS_DONE_CONFLICT);
+        // NO_CAS replaces unconditionally; a dangling target is legitimate.
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            5,
+            op(5, FS_OP_SYMLINK, "gone/dangling", "ln", 0, FS_OP_NO_CAS),
+        );
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(
+            fs::read_link(root.join("ln")).unwrap(),
+            Path::new("gone/dangling")
+        );
+        // A directory at the link path refuses.
+        fs::create_dir(root.join("d")).unwrap();
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            6,
+            op(6, FS_OP_SYMLINK, "x", "d", 0, FS_OP_NO_CAS),
+        );
+        assert_eq!(s, FS_DONE_WRONG_TYPE);
+
+        // Hard link: same content hash as the source, same inode.
+        let (s, fh, _) = await_done(&handle, &sent, 10, write_req(10, "f.txt", 0, 0, b"hello"));
+        assert_eq!(s, FS_DONE_OK);
+        let (s, lh, _) = await_done(
+            &handle,
+            &sent,
+            11,
+            op(11, FS_OP_HARDLINK, "f.txt", "f2.txt", 0, 0),
+        );
+        assert_eq!(s, FS_DONE_OK);
+        assert_eq!(lh, fh);
+        assert_eq!(fs::read(root.join("f2.txt")).unwrap(), b"hello");
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(root.join("f.txt")).unwrap().ino(),
+                fs::metadata(root.join("f2.txt")).unwrap().ino()
+            );
+        }
+        // Create-exclusive on an existing destination conflicts.
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            12,
+            op(12, FS_OP_HARDLINK, "f.txt", "f2.txt", 0, 0),
+        );
+        assert_eq!(s, FS_DONE_CONFLICT);
+        // The source must be a regular file; a symlink source refuses.
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            13,
+            op(13, FS_OP_HARDLINK, "ln", "ln2", 0, 0),
+        );
+        assert_eq!(s, FS_DONE_WRONG_TYPE);
+        // A missing source is NOT_FOUND.
+        let (s, _, _) = await_done(
+            &handle,
+            &sent,
+            14,
+            op(14, FS_OP_HARDLINK, "nope", "n2", 0, 0),
+        );
+        assert_eq!(s, FS_DONE_NOT_FOUND);
+
+        // The writer's own echo for "ln" is metadata-only (prime_echo marks
+        // it as held), but must still carry the target hash. An externally
+        // created symlink syncs with its target as inline content.
+        std::os::unix::fs::symlink("ext-target", root.join("ext")).unwrap();
+        hint.send(Hint::Dirty(root.join("ext")));
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for msg in sent.lock().unwrap().clone()[seen..].iter() {
+                seen += 1;
+                if msg[0] == blit_remote::fs::S2C_FS_UPDATE {
+                    let id = mirror.apply_update(msg).unwrap();
+                    handle.command(Command::Ack(id));
+                }
+            }
+            if mirror
+                .live
+                .get("ext")
+                .is_some_and(|n| n.content.as_deref() == Some(&b"ext-target"[..]))
+                && mirror.live.contains_key("ln")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "symlink content never synced");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let node = mirror.live.get("ext").unwrap();
+        assert_eq!(node.entry_flags & FS_ENTRY_TYPE_MASK, FS_ENTRY_SYMLINK);
+        assert_eq!(node.hash, blake3_128(b"ext-target"));
+        assert_eq!(node.size, "ext-target".len() as u64);
+        let own = mirror.live.get("ln").unwrap();
+        assert_eq!(own.entry_flags & FS_ENTRY_TYPE_MASK, FS_ENTRY_SYMLINK);
+        assert_eq!(own.hash, blake3_128(b"gone/dangling"));
+        handle.command(Command::Fetch {
+            nonce: 20,
+            path: "ln".into(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        'fetch: loop {
+            for msg in sent.lock().unwrap().iter() {
+                if msg[0] == blit_remote::fs::S2C_FS_FILE
+                    && let Some((20, status, data)) = blit_remote::fs::parse_fs_file(msg)
+                {
+                    assert_eq!(status, FS_FILE_OK);
+                    assert_eq!(data, b"gone/dangling");
+                    break 'fetch;
+                }
+            }
+            assert!(Instant::now() < deadline, "no FS_FILE for the symlink");
+            std::thread::sleep(Duration::from_millis(2));
+        }
 
         handle.command(Command::Stop);
         let _ = fs::remove_dir_all(&root);

@@ -43,8 +43,11 @@ import {
   C2S_FS_SYNC,
   FS_DONE_CONFLICT,
   FS_DONE_PERMISSION,
+  FS_OP_HARDLINK,
   FS_OP_MKPARENTS,
+  FS_OP_NO_CAS,
   FS_OP_RENAME,
+  FS_OP_SYMLINK,
   FS_WRITE_CONTENT_FULL,
   FS_WRITE_MKPARENTS,
   S2C_FS_CLOSED,
@@ -231,6 +234,24 @@ describe("fs wire fixtures (cross-checked with Rust)", () => {
       ),
     ).toBe(
       "450201040303020000000000000000000000000000000000000000010078010079",
+    );
+    // A symlink target is a verbatim string, never a wire path — "../t"
+    // rides the `a` field unescaped and unvalidated.
+    expect(
+      toHex(
+        buildFsOpMessage({
+          nonce: 0x0102,
+          syncId: 0x0304,
+          op: FS_OP_SYMLINK,
+          flags: FS_OP_NO_CAS,
+          base: 0n,
+          mode: 0,
+          a: "../t",
+          b: "l",
+        }),
+      ),
+    ).toBe(
+      "45020104030401000000000000000000000000000000000000000004002e2e2f7401006c",
     );
     const doneHex = "4402010b000102030405060708090a0b0c0d0e0f8877665544332211";
     expect(
@@ -717,6 +738,24 @@ describe("BlitConnection writes", () => {
     ]);
     // mkdir carried MKPARENTS in its flags byte.
     expect(ops[0][6] & FS_OP_MKPARENTS).toBe(FS_OP_MKPARENTS);
+    conn.dispose();
+  });
+
+  it("symlink/hardlink emit FS_OP and record the returned hash", async () => {
+    const { conn, transport, handle } = await writeReadyHandle();
+    const p = handle.symlink("../elsewhere/t", "ln");
+    const q = handle.hardlink("src.txt", "ln2", { force: true });
+    void q.catch(() => {});
+    const ops = transport.sent.filter((m) => m[0] === C2S_FS_OP);
+    expect(ops.map((m) => m[5])).toEqual([FS_OP_SYMLINK, FS_OP_HARDLINK]);
+    // Default is create-exclusive (no NO_CAS); force sets it.
+    expect(ops[0][6] & FS_OP_NO_CAS).toBe(0);
+    expect(ops[1][6] & FS_OP_NO_CAS).toBe(FS_OP_NO_CAS);
+    const nonce = ops[0][1] | (ops[0][2] << 8);
+    transport.push(buildFsDoneMessage(nonce, FS_DONE_OK, 0x77n, 1n));
+    await p;
+    // Recorded for self-echo suppression, keyed by the link path.
+    expect(handle.lastWrittenHash("ln")).toBe(0x77n);
     conn.dispose();
   });
 

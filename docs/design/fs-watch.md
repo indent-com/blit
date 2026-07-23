@@ -159,11 +159,16 @@ MOVE   0x03: [kind:1][from_len:2][from:N][to_len:2][to:M]  # moves subtree
 `UNREADABLE` (exists, content unavailable); bit 3 `NO_CONTENT` (over
 `inline_max`, or `CONTENT` unset); bit 4 `UNSTABLE` (file changed repeatedly
 while being read — content omitted, another upsert follows once it settles).
-`hash` is BLAKE3 truncated to 128 bits, computed over file content (zero for
-non-files): ample collision resistance for content addressing at half the
-per-record cost of a full digest, and BLAKE3 is fast enough that hashing
-changed files is not the bottleneck. `mode` is the Unix mode, synthesized on
-Windows.
+A symlink's content is its **target bytes** (git's model: blob = target),
+so its `size` is the target length and `FS_FETCH` of a symlink returns the
+target, never the file it points at — which is also what makes symlink
+retargeting an ordinary CAS on the write side
+([fs-write.md](fs-write.md) "Links").
+`hash` is BLAKE3 truncated to 128 bits, computed over content — file bytes,
+or a symlink's target bytes (zero for directories and `other`): ample
+collision resistance for content addressing at half the per-record cost of
+a full digest, and BLAKE3 is fast enough that hashing changed files is not
+the bottleneck. `mode` is the Unix mode, synthesized on Windows.
 
 `content_kind`: `0` none, `1` full bytes `[len:4][bytes]`, `2` delta
 `[len:4][ops]` against the last content this client acked for this path —

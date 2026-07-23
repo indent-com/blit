@@ -263,7 +263,8 @@ series), applies LZ4-compressed `UPSERT`/`DELETE`/`MOVE` records to a map,
 and acknowledges cumulatively via `FS_ACK` (byte-window pacing,
 `BLIT_FS_WINDOW`). `FS_FETCH` pulls one file's full content on demand;
 `FS_WRITE`/`FS_OP` write back to disk — content upserts under
-compare-and-swap on the synced content hash, plus mkdir/remove/rename —
+compare-and-swap on the synced content hash, plus
+mkdir/remove/rename/symlink/hardlink —
 each answered by one `FS_DONE`
 ([design/fs-write.md](design/fs-write.md)). The write side shares the
 family's feature bit; `BLIT_FS_WRITE=0` makes a deployment read-only

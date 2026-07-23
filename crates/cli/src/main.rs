@@ -398,6 +398,21 @@ async fn async_main() {
                     parents,
                     json,
                 } => fs::cmd_mv(transport, from, to, root, parents, json).await,
+                FsCommand::Ln {
+                    target,
+                    link,
+                    symlink,
+                    root,
+                    if_hash,
+                    force,
+                    parents,
+                    json,
+                } => {
+                    fs::cmd_ln(
+                        transport, target, link, symlink, root, if_hash, force, parents, json,
+                    )
+                    .await
+                }
             };
             match result {
                 Ok(code) => std::process::exit(code),

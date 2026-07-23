@@ -942,6 +942,41 @@ pub enum FsCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Create a hard link, or a symlink with -s (like ln(1))
+    Ln {
+        /// Existing file path relative to --root; with -s, the verbatim
+        /// symlink target (relative, absolute, or dangling)
+        target: String,
+
+        /// Link path to create, relative to --root
+        link: String,
+
+        /// Create a symlink instead of a hard link
+        #[arg(short = 's', long)]
+        symlink: bool,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Replace only if the current entry's content hash equals this
+        /// hex value (a symlink's hash covers its target bytes)
+        #[arg(long, conflicts_with = "force")]
+        if_hash: Option<String>,
+
+        /// Replace an existing entry unconditionally
+        #[arg(long)]
+        force: bool,
+
+        /// Create missing parent directories of the link
+        #[arg(long)]
+        parents: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ── Git subcommands ──────────────────────────────────────────────────────

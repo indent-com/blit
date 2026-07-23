@@ -85,10 +85,13 @@ import {
   FS_DONE_CONFLICT,
   FS_DONE_OK,
   FS_FILE_OK,
+  FS_OP_HARDLINK,
   FS_OP_MKDIR,
   FS_OP_MKPARENTS,
+  FS_OP_NO_CAS,
   FS_OP_REMOVE,
   FS_OP_RENAME,
+  FS_OP_SYMLINK,
   FS_STATUS_OK,
   FS_SYNC_CONTENT,
   FS_SYNC_CROSS_FILESYSTEM,
@@ -2444,6 +2447,30 @@ export class BlitConnection {
               0,
               options.createParents ? FS_OP_MKPARENTS : 0,
             ).then(() => undefined),
+          symlink: (target, path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_SYMLINK,
+              target,
+              path,
+              options.force ? 0n : (options.ifHash ?? 0n),
+              0,
+              (options.force ? FS_OP_NO_CAS : 0) |
+                (options.createParents ? FS_OP_MKPARENTS : 0),
+              { syncId, path },
+            ),
+          hardlink: (source, path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_HARDLINK,
+              source,
+              path,
+              options.force ? 0n : (options.ifHash ?? 0n),
+              0,
+              (options.force ? FS_OP_NO_CAS : 0) |
+                (options.createParents ? FS_OP_MKPARENTS : 0),
+              { syncId, path },
+            ),
           lastWrittenHash: (path: string) => state.lastWritten.get(path),
           stop: () => {
             if (this.transport.status === "connected") {

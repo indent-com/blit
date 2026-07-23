@@ -236,6 +236,11 @@ export const FS_WRITE_CONTENT_DELTA = 2;
 export const FS_OP_MKDIR = 1;
 export const FS_OP_REMOVE = 2;
 export const FS_OP_RENAME = 3;
+/** Create or retarget a symlink at `b` targeting the verbatim string `a`;
+ * a symlink's content hash is BLAKE3-128 of its target bytes. */
+export const FS_OP_SYMLINK = 4;
+/** Create a hard link at `b` to the regular file at `a`. */
+export const FS_OP_HARDLINK = 5;
 export const FS_OP_NO_CAS = 1 << 0;
 export const FS_OP_MKPARENTS = 1 << 1;
 
@@ -716,6 +721,18 @@ export interface FsWriteOptions {
   durable?: boolean;
 }
 
+/** Options for {@link FsSyncHandle.symlink} / {@link FsSyncHandle.hardlink}. */
+export interface FsLinkOptions {
+  /** Replace only if the current entry's content hash equals this (a
+   *  symlink's hash covers its target bytes: `live.get(path)?.hash`). */
+  ifHash?: bigint;
+  /** Replace unconditionally. Without `ifHash`/`force`, creation is
+   *  exclusive: an existing entry rejects with {@link FsConflictError}. */
+  force?: boolean;
+  /** Create missing parent directories. */
+  createParents?: boolean;
+}
+
 /** Result of a successful write/mkdir. */
 export interface FsWriteResult {
   /** Post-op content hash (0n for a directory). */
@@ -756,6 +773,23 @@ export interface FsSyncHandle {
     to: string,
     options?: { createParents?: boolean },
   ): Promise<void>;
+  /** Create — or, with `ifHash`/`force`, atomically retarget — a symlink
+   *  at `path` pointing at the verbatim string `target` (relative,
+   *  absolute, or dangling; never resolved by the sync). The returned
+   *  hash covers the target bytes and is recorded as
+   *  {@link lastWrittenHash} for self-echo suppression. */
+  symlink(
+    target: string,
+    path: string,
+    options?: FsLinkOptions,
+  ): Promise<FsWriteResult>;
+  /** Create a hard link at `path` to the regular file at `source` (both
+   *  wire paths under the root). */
+  hardlink(
+    source: string,
+    path: string,
+    options?: FsLinkOptions,
+  ): Promise<FsWriteResult>;
   /** The hash of the most recent successful `writeFile` at `path`, for
    *  self-echo suppression: when an incoming UPSERT's `hash` equals this,
    *  the change is this client's own write and the editor model already

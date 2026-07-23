@@ -83,8 +83,9 @@ delta-against-`base` write (v2, mirroring fs-watch's content deltas) —
 a client may always send full, so the encoder is a server-side
 addition later.
 `FS_OP.op`: `1` `MKDIR`(a), `2` `REMOVE`(a, subtree), `3`
-`RENAME`(a → b). `flags` bit 1 `MKPARENTS`, bit 0 `NO_CAS` (for
-`REMOVE`).
+`RENAME`(a → b), `4` `SYMLINK`(a = target string → link at b), `5`
+`HARDLINK`(a = source file → link at b) (§ Links). `flags` bit 1
+`MKPARENTS`, bit 0 `NO_CAS` (for `REMOVE` and the link ops).
 `mode` `0` means "preserve existing, else umask default"
 (`NodeMeta.mode`).
 
@@ -107,10 +108,47 @@ extension style:
 ```
 
 On success `hash`/`mtime_ns` are the post-op stat: the new content hash
-and mtime for `FS_WRITE`; the directory's for `MKDIR`; zero for
-`REMOVE`/`RENAME`. **On `CONFLICT`, `hash` carries the current on-disk
-hash**, so the client rebases (3-way diff, retry) without a round trip —
-the analog of git's "size fields still carry truth" on `TOO_LARGE`.
+and mtime for `FS_WRITE`; the directory's for `MKDIR`; the target-bytes
+hash for `SYMLINK` and the source content hash for `HARDLINK` (both feed
+self-echo suppression, § Echo); zero for `REMOVE`/`RENAME`. **On
+`CONFLICT`, `hash` carries the current on-disk hash**, so the client
+rebases (3-way diff, retry) without a round trip — the analog of git's
+"size fields still carry truth" on `TOO_LARGE`.
+
+### Links
+
+Symlinks follow git's grain: **a symlink's content is its target
+bytes**, its hash BLAKE3-128 over them — landed on the read side too
+([fs-watch.md](fs-watch.md)): symlink `UPSERT`s carry the target as
+inline content, `size` is the target length, and `FS_FETCH` of a
+symlink returns the target bytes, never what it points at. That one
+identity makes the write side free: `SYMLINK`'s `base` CASes on the
+entry at `b` exactly as a write's does on its path — zero =
+create-exclusive (`symlink()` fails `EEXIST` natively, race-free),
+non-zero = retarget iff the current target hashes to `base`, `NO_CAS` =
+unconditional. Retargeting is atomic: the new link lands at a sibling
+temp path and renames over `b`, so a reader sees the old target or the
+new, never neither. The target string `a` is stored **verbatim** —
+relative, absolute, or dangling targets are all legitimate symlinks
+(exactly what `ln -s` accepts), and none of it changes the confinement
+posture: the sync reports links and never follows them, `FS_FETCH`
+returns target bytes, and a content write through a symlink still
+re-confirms the resolved path under the root (§ Path validation). A
+directory at `b` refuses with `WRONG_TYPE`; a symlink at `b` — even one
+pointing at a directory — is an entry like any other and may be
+replaced.
+
+`HARDLINK` requires `a` to be a regular file under the root
+(`WRONG_TYPE` otherwise — aliasing directories is impossible and
+aliasing symlinks is platform-divergent), creates the link at `b` under
+the same `base` discipline, and returns the source's content hash. The
+echo `UPSERT` at `b` is an ordinary file entry: fs-watch disclaims
+hardlink identity, so the mirror sees an independent file with
+identical content. Cross-filesystem sources fail with the mapped I/O
+error (`link(2)` cannot span devices); Windows honors hard links for
+files and may refuse symlink creation without the developer privilege —
+per-platform divergence stays server-side, the wire statuses identical
+(§ Atomicity).
 
 ## Conflict model
 
@@ -230,6 +268,8 @@ invisible by design.
 | mkdir (+ mode)        | **in**          | empty folders are real fs-sync entries; explorer "New Folder"; mode for `0700`                                                                                                        |
 | remove (subtree, CAS) | **in**          | explorer delete; mirrors the `DELETE` record; optional `base` = "delete iff unchanged"                                                                                                |
 | rename (subtree)      | **in**          | rename _and_ drag-move are one op; surfaces as a `MOVE` record                                                                                                                        |
+| symlink (create/retarget, CAS) | **in** | dotfile/workspace layouts are symlink-shaped; content = target bytes makes retarget an ordinary CAS (§ Links)                                                                  |
+| hardlink              | **in**          | `link(2)` is one op the client cannot compose from writes; source must be a regular file (§ Links)                                                                                    |
 | create-parents        | **in** (flag)   | drag-move into a fresh path                                                                                                                                                           |
 | delete-to-trash       | **out → shell** | XDG/Recycle/`~/.Trash` semantics diverge; a synced trash dir churns. Compose via rename                                                                                               |
 | copy / duplicate      | **out (v1)**    | the weakest cut; subtree copy can't compose client-side without shipping bytes both ways. Server-side `FS_OP` `COPY` is cheap (it holds the blobs) — trigger: duplicate latency hurts |
@@ -303,7 +343,15 @@ writeFile(path, data, { ifHash?, mode?, createParents?, durable? })
 mkdir(path, { mode?, createParents? }): Promise<{ hash, mtimeNs }>
 remove(path, { ifHash? }): Promise<void>
 rename(from, to, { createParents? }): Promise<void>
+symlink(target, path, { ifHash?, force?, createParents? })
+  : Promise<{ hash, mtimeNs }>
+hardlink(source, path, { ifHash?, force?, createParents? })
+  : Promise<{ hash, mtimeNs }>
 ```
+
+The link methods default to create-exclusive (the common "New Link"
+case); `ifHash` retargets under CAS, `force` replaces unconditionally —
+inverted from `writeFile`, whose default matches a shell `>` redirect.
 
 **Monaco save flow, end to end:**
 
@@ -318,7 +366,8 @@ rename(from, to, { createParents? }): Promise<void>
 
 The client never hashes. CLI: `blit fs write PATH [--if-hash H |
 --create | --force] [--durable]` from stdin, plus `blit fs mkdir | rm |
-mv`.
+mv` and `blit fs ln [-s] TARGET LINK [--if-hash H | --force]` (like
+`ln(1)`: hard link by default, symlink with `-s`).
 
 ## Forward compatibility: the buffer/collab RFC
 
@@ -365,7 +414,7 @@ its wire — the three contracts that keep that seam open:
    `HashLearned`; CAS against the live re-stat'd hash; retain the
    `SharedRootHandle` in `FsSyncEntry`.
 4. `crates/server`: `Command::Write` / `Command::Op` inline dispatch,
-   e2e; `blit fs write|mkdir|rm|mv`.
+   e2e; `blit fs write|mkdir|rm|mv|ln`.
 5. `js/core`: handle methods and `lastWrittenHash` echo suppression.
 6. Monaco pane (separate `js/ui` work — a new BSP assignment kind and
    component). Ship write + CAS first, mkdir/remove/rename second,

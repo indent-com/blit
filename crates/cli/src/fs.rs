@@ -5,14 +5,14 @@
 
 use crate::transport::{Transport, read_message, write_frame};
 use blit_remote::fs::{
-    FEATURE_FS, FS_CLOSED_BACKEND_FAILED, FS_CLOSED_CLIENT_REQUEST,
-    FS_CLOSED_PERMISSION_LOST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT,
-    FS_DONE_OK, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_OP_MKDIR,
-    FS_OP_MKPARENTS, FS_OP_REMOVE, FS_OP_RENAME, FS_STATUS_OK, FS_SYNC_CONTENT, FS_SYNC_RECURSIVE,
-    FS_UPDATE_SYNC, FS_WRITE_CONTENT_FULL, FS_WRITE_DURABLE, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS,
-    FsMirror, FsOp, FsRecord, FsWrite, S2C_FS_CLOSED, S2C_FS_DONE, S2C_FS_SYNCED, S2C_FS_UPDATE,
-    fs_done_status_text, fs_records, fs_update_records, msg_fs_ack, msg_fs_op, msg_fs_sync,
-    msg_fs_write, parse_fs_done,
+    FEATURE_FS, FS_CLOSED_BACKEND_FAILED, FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_PERMISSION_LOST,
+    FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT, FS_DONE_OK, FS_ENTRY_DIR,
+    FS_ENTRY_FILE, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_OP_HARDLINK, FS_OP_MKDIR,
+    FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK, FS_STATUS_OK,
+    FS_SYNC_CONTENT, FS_SYNC_RECURSIVE, FS_UPDATE_SYNC, FS_WRITE_CONTENT_FULL, FS_WRITE_DURABLE,
+    FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsMirror, FsOp, FsRecord, FsWrite, S2C_FS_CLOSED,
+    S2C_FS_DONE, S2C_FS_SYNCED, S2C_FS_UPDATE, fs_done_status_text, fs_records, fs_update_records,
+    msg_fs_ack, msg_fs_op, msg_fs_sync, msg_fs_write, parse_fs_done,
 };
 use blit_remote::{S2C_HELLO, S2C_QUIT, S2C_READY};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -500,6 +500,8 @@ pub async fn cmd_write(
     report_done(status, hash, mtime, json)
 }
 
+/// Send one FS_OP. `a`/`b` arrive already in wire form: path arguments go
+/// through `escape_wire` at the call site, a symlink target stays verbatim.
 #[allow(clippy::too_many_arguments)]
 async fn run_op(
     transport: Transport,
@@ -522,12 +524,8 @@ async fn run_op(
         flags,
         base,
         mode,
-        a: escape_wire(&a),
-        b: if b.is_empty() {
-            String::new()
-        } else {
-            escape_wire(&b)
-        },
+        a,
+        b,
     };
     if !write_frame(&mut writer, &msg_fs_op(&req)).await {
         return Err("connection closed".into());
@@ -550,7 +548,7 @@ pub async fn cmd_mkdir(
         transport,
         root,
         FS_OP_MKDIR,
-        path,
+        escape_wire(&path),
         String::new(),
         0,
         mode,
@@ -576,7 +574,7 @@ pub async fn cmd_rm(
         transport,
         root,
         FS_OP_REMOVE,
-        path,
+        escape_wire(&path),
         String::new(),
         base,
         0,
@@ -595,5 +593,59 @@ pub async fn cmd_mv(
     json: bool,
 ) -> Result<i32, String> {
     let flags = if parents { FS_OP_MKPARENTS } else { 0 };
-    run_op(transport, root, FS_OP_RENAME, from, to, 0, 0, flags, json).await
+    run_op(
+        transport,
+        root,
+        FS_OP_RENAME,
+        escape_wire(&from),
+        escape_wire(&to),
+        0,
+        0,
+        flags,
+        json,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_ln(
+    transport: Transport,
+    target: String,
+    link: String,
+    symlink: bool,
+    root: String,
+    if_hash: Option<String>,
+    force: bool,
+    parents: bool,
+    json: bool,
+) -> Result<i32, String> {
+    let mut flags = if parents { FS_OP_MKPARENTS } else { 0 };
+    // Default is create-exclusive (base 0); --if-hash retargets under CAS;
+    // --force replaces unconditionally.
+    let base = match &if_hash {
+        Some(h) => parse_hash(h)?,
+        None => 0,
+    };
+    if force {
+        flags |= FS_OP_NO_CAS;
+    }
+    // A symlink target is stored verbatim and may point anywhere, exactly
+    // like ln -s; a hard-link source is a path under --root.
+    let (op, a) = if symlink {
+        (FS_OP_SYMLINK, target)
+    } else {
+        (FS_OP_HARDLINK, escape_wire(&target))
+    };
+    run_op(
+        transport,
+        root,
+        op,
+        a,
+        escape_wire(&link),
+        base,
+        0,
+        flags,
+        json,
+    )
+    .await
 }

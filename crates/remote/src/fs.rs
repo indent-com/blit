@@ -120,6 +120,14 @@ pub const FS_WRITE_CONTENT_DELTA: u8 = 2;
 pub const FS_OP_MKDIR: u8 = 1;
 pub const FS_OP_REMOVE: u8 = 2;
 pub const FS_OP_RENAME: u8 = 3;
+/// Create or retarget a symlink at `b` whose target is the verbatim string
+/// `a` (not a wire path; not confined to the root). `base` CASes on the
+/// current entry at `b` — a symlink's content hash is BLAKE3-128 of its
+/// target bytes (docs/design/fs-write.md "Links").
+pub const FS_OP_SYMLINK: u8 = 4;
+/// Create a hard link at `b` to the regular file at `a` (both wire paths
+/// under the root). `base` CASes on the current entry at `b`.
+pub const FS_OP_HARDLINK: u8 = 5;
 
 // FS_OP flags (subset of FS_WRITE's, same bit positions).
 pub const FS_OP_NO_CAS: u8 = 1 << 0;
@@ -1119,6 +1127,22 @@ mod tests {
         assert_eq!(
             hex(&msg_fs_op(&o)),
             "450201040303020000000000000000000000000000000000000000010078010079"
+        );
+        // A symlink target is a verbatim string, never a wire path — "../t"
+        // rides the `a` field unescaped and unvalidated.
+        let ln = FsOp {
+            nonce: 0x0102,
+            sync_id: 0x0304,
+            op: FS_OP_SYMLINK,
+            flags: FS_OP_NO_CAS,
+            base: 0,
+            mode: 0,
+            a: "../t".into(),
+            b: "l".into(),
+        };
+        assert_eq!(
+            hex(&msg_fs_op(&ln)),
+            "45020104030401000000000000000000000000000000000000000004002e2e2f7401006c"
         );
         assert_eq!(
             hex(&msg_fs_done(
