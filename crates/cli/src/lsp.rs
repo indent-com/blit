@@ -53,8 +53,24 @@ fn parse_spec(spec: &str) -> Result<(String, u32, u32), String> {
 /// filesystem access) makes `blit lsp` work from any directory. An
 /// already-absolute path is returned unchanged.
 fn client_abs(path: &str) -> String {
-    std::path::absolute(path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(path))
+    let abs = std::path::absolute(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    // Collapse `.`/`..` lexically (no filesystem access) so the path is
+    // clean and matches the server's normalized URI — otherwise a
+    // `../main.c` opened as `sub/../main.c` mismatches `main.c` in the
+    // diagnostics stream.
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out.iter()
+        .collect::<std::path::PathBuf>()
         .to_string_lossy()
         .into_owned()
 }
@@ -630,11 +646,24 @@ pub async fn cmd_diagnostics(
         eprintln!("workspace {workdir}");
     }
     let (mut writer, lsp_id, mut rx) = spawn_reader(session);
+    // Resolve the named path against the client cwd (the daemon's cwd is
+    // irrelevant), then express it workspace-relative. The absolute form
+    // opens the right file regardless of where the user stood; the
+    // relative form matches the workspace-relative keys the diagnostics
+    // stream uses (a raw cwd-relative path would miss when the discovered
+    // workspace root differs from the user's cwd — e.g. run from a
+    // subdirectory).
+    let named_abs = path.as_deref().map(client_abs);
+    let filter = named_abs.as_deref().map(|abs| {
+        abs.strip_prefix(&workdir)
+            .map(|r| r.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| abs.to_string())
+    });
     // Naming a file is an open-set admission signal (docs/design/lsp.md
     // "Document truth"): open-doc-only servers (clangd, tsserver,
     // pyright) diagnose only opened documents, so once the backends are
     // ready, nudge the file open with a throwaway outline query.
-    let nudge = path
+    let nudge = named_abs
         .as_deref()
         .filter(|p| Path::new(p).extension().is_some())
         .map(str::to_string);
@@ -653,10 +682,20 @@ pub async fn cmd_diagnostics(
             _ = settle, if got_full && !watch => {
                 let ready = state.servers.values().all(|s| s.phase == LSP_PHASE_READY);
                 if !wait || ready {
-                    let (out, count) = print_diags(&diags, path.as_deref(), json);
+                    let (out, count) = print_diags(&diags, filter.as_deref(), json);
                     print!("{out}");
-                    if count == 0 && diags.files.is_empty() && !json {
-                        eprintln!("{}", empty_diagnostics_reason(&state));
+                    if count == 0 && !json {
+                        match path.as_deref() {
+                            // A file was named: its own set is what
+                            // matters, not the whole workspace.
+                            Some(p) if state.servers.values().any(|s| {
+                                !matches!(s.phase, LSP_PHASE_READY | LSP_PHASE_FAILED)
+                            }) => eprintln!("no diagnostics for {p} yet — still indexing (run `blit lsp wait`)"),
+                            Some(p) => eprintln!(
+                                "no diagnostics for {p} — it is clean, or not under the workspace ({workdir})"
+                            ),
+                            None => eprintln!("{}", empty_diagnostics_reason(&state)),
+                        }
                     }
                     return Ok(if count == 0 { 0 } else { 1 });
                 }
@@ -732,7 +771,7 @@ pub async fn cmd_diagnostics(
                 }
                 quiet_since = tokio::time::Instant::now();
                 if watch {
-                    let (rendered, _) = print_diags(&diags, path.as_deref(), json);
+                    let (rendered, _) = print_diags(&diags, filter.as_deref(), json);
                     if last.as_deref() != Some(rendered.as_str()) {
                         if !json && last.is_some() {
                             println!("—");
