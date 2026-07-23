@@ -477,6 +477,7 @@ function PreviewTerminal(props: {
       <BlitTerminal
         sessionId={props.sessionId}
         readOnly
+        resizable={false}
         showCursor={false}
         style={
           ts()
@@ -1450,13 +1451,12 @@ export function SwitcherOverlay(props: {
           <BlitTerminal
             sessionId={item.sessionId}
             readOnly
+            resizable={false}
             showCursor={false}
             style={{
               width: `${iconSize()}px`,
               height: `${iconSize()}px`,
               "pointer-events": "none",
-              "object-fit": "contain",
-              "object-position": "center",
             }}
           />
         ) : item.type === "surface" ? (

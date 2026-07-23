@@ -22,10 +22,8 @@ export interface BlitTerminalSurfaceOptions {
   fontSize?: number;
   palette?: TerminalPalette;
   readOnly?: boolean;
-  /** Resize the remote session to this surface while remaining read-only. Default: false. */
-  readOnlyResize?: boolean;
-  /** CSS object-position for the contained read-only canvas. Default: "center". */
-  readOnlyObjectPosition?: string;
+  /** Resize the remote session to this surface. Disable for passive previews. Default: true. */
+  resizable?: boolean;
   showCursor?: boolean;
   onRender?: (renderMs: number) => void;
   scrollbarColor?: string;
@@ -142,8 +140,7 @@ export class BlitTerminalSurface {
   private _fontSize: number;
   private _palette: TerminalPalette | undefined;
   private _readOnly: boolean;
-  private _readOnlyResize: boolean;
-  private _readOnlyObjectPosition: string;
+  private _resizable: boolean;
   private _showCursor: boolean;
   private _onRender: ((renderMs: number) => void) | undefined;
   private _scrollbarColor: string | undefined;
@@ -272,8 +269,7 @@ export class BlitTerminalSurface {
     this._fontSize = options.fontSize ?? DEFAULT_FONT_SIZE;
     this._palette = options.palette;
     this._readOnly = options.readOnly ?? false;
-    this._readOnlyResize = options.readOnlyResize ?? false;
-    this._readOnlyObjectPosition = options.readOnlyObjectPosition ?? "center";
+    this._resizable = options.resizable ?? true;
     this._showCursor = options.showCursor ?? true;
     this._onRender = options.onRender;
     this._scrollbarColor = options.scrollbarColor;
@@ -537,6 +533,38 @@ export class BlitTerminalSurface {
     for (const l of this._selectionListeners) l(has);
   }
 
+  private applyCanvasLayout(): void {
+    if (!this.glCanvas) return;
+
+    if (this._resizable) {
+      Object.assign(this.glCanvas.style, {
+        display: "block",
+        width: "",
+        height: "",
+        objectFit: "",
+        objectPosition: "",
+        position: "absolute",
+        top: "0",
+        left: "0",
+        // Pointer/wheel/touch input is handled by `scrollEl` which sits
+        // on top of the canvas — let those events fall through.
+        pointerEvents: "none",
+      });
+    } else {
+      Object.assign(this.glCanvas.style, {
+        display: "block",
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        objectPosition: "center",
+        position: "",
+        top: "",
+        left: "",
+        pointerEvents: "",
+      });
+    }
+  }
+
   /** Attach to a container element. Creates the canvas + textarea inside it. */
   attach(container: HTMLDivElement): void {
     if (this.container === container) return;
@@ -545,25 +573,7 @@ export class BlitTerminalSurface {
 
     // Create canvas
     this.glCanvas = document.createElement("canvas");
-    if (this._readOnly) {
-      Object.assign(this.glCanvas.style, {
-        display: "block",
-        width: "100%",
-        height: "100%",
-        objectFit: "contain",
-        objectPosition: this._readOnlyObjectPosition,
-      });
-    } else {
-      Object.assign(this.glCanvas.style, {
-        display: "block",
-        position: "absolute",
-        top: "0",
-        left: "0",
-        // Pointer/wheel/touch input is handled by `scrollEl` which sits
-        // on top of the canvas — let those events fall through.
-        pointerEvents: "none",
-      });
-    }
+    this.applyCanvasLayout();
     container.appendChild(this.glCanvas);
 
     // Hidden textarea: hosts keyboard focus even in read-only mode so
@@ -753,34 +763,26 @@ export class BlitTerminalSurface {
    * before `attach()`. Changing it while attached will not create/remove the
    * input textarea or toggle keyboard/mouse listeners.
    */
-  /**
-   * Update the read-only flag. Note: this only takes full effect when set
-   * before `attach()`. Changing it while attached will not create/remove the
-   * input textarea or toggle keyboard/mouse listeners.
-   */
   setReadOnly(readOnly: boolean | undefined): void {
     this._readOnly = readOnly ?? false;
   }
 
-  setReadOnlyResize(resize: boolean | undefined): void {
-    const resolved = resize ?? false;
-    if (this._readOnlyResize === resolved) return;
-    this._readOnlyResize = resolved;
-    if (!this.container || !this._readOnly) return;
-    if (resolved) {
-      this.setupResizeObserver();
-    } else {
-      this.teardownResizeObserver();
-    }
-  }
+  setResizable(resizable: boolean | undefined): void {
+    const resolved = resizable ?? true;
+    if (this._resizable === resolved) return;
+    this._resizable = resolved;
+    this.applyCanvasLayout();
+    if (!this.container) return;
 
-  setReadOnlyObjectPosition(position: string | undefined): void {
-    const resolved = position ?? "center";
-    if (this._readOnlyObjectPosition === resolved) return;
-    this._readOnlyObjectPosition = resolved;
-    if (this._readOnly && this.glCanvas) {
-      this.glCanvas.style.objectPosition = resolved;
+    this.teardownResizeObserver();
+    if (resolved) {
+      this.remeasureCells(true);
+      this.setupResizeObserver();
+    } else if (this.terminal) {
+      this.syncTerminalSize(this.terminal);
     }
+    this.contentDirty = true;
+    this.scheduleRender();
   }
 
   setShowCursor(show: boolean | undefined): void {
@@ -870,7 +872,7 @@ export class BlitTerminalSurface {
     this.cell = cell;
 
     const rasterFontSize = this._fontSize * this.dpr;
-    if (!this._readOnly) {
+    if (this._resizable) {
       const t = this.terminal;
       if (t) {
         t.set_cell_size(cell.pw, cell.ph);
@@ -953,7 +955,7 @@ export class BlitTerminalSurface {
       if (t) {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
-        if (!this._readOnly) {
+        if (this._resizable) {
           t.set_cell_size(this.cell.pw, this.cell.ph);
           t.set_font_family(this._fontFamily);
           t.set_font_size(this._fontSize * this.dpr);
@@ -987,12 +989,12 @@ export class BlitTerminalSurface {
       if (this.terminal !== t) {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
-        this.applyMetricsToTerminal(t);
+        if (this._resizable) this.applyMetricsToTerminal(t);
       }
       this.contentDirty = true;
       this.scheduleRender();
       this.reconcilePrediction();
-      if (this._readOnly && !this._readOnlyResize) this.syncReadOnlySize(t);
+      if (!this._resizable) this.syncTerminalSize(t);
     });
     // Check for terminal that was created between setup steps.
     const t = conn.getTerminal(sessionId);
@@ -1000,11 +1002,11 @@ export class BlitTerminalSurface {
       if (this.terminal !== t) {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
-        this.applyMetricsToTerminal(t);
+        if (this._resizable) this.applyMetricsToTerminal(t);
       }
       this.contentDirty = true;
       this.scheduleRender();
-      if (this._readOnly && !this._readOnlyResize) this.syncReadOnlySize(t);
+      if (!this._resizable) this.syncTerminalSize(t);
     }
   }
 
@@ -1030,7 +1032,7 @@ export class BlitTerminalSurface {
     t.invalidate_render_cache();
   }
 
-  private syncReadOnlySize(t: Terminal): void {
+  private syncTerminalSize(t: Terminal): void {
     const tr = t.rows;
     const tc = t.cols;
     if (tr !== this._rows || tc !== this._cols) {
@@ -1043,7 +1045,7 @@ export class BlitTerminalSurface {
   // --- Resize observer ---
 
   private setupResizeObserver(): void {
-    if (!this.container || (this._readOnly && !this._readOnlyResize)) return;
+    if (!this.container || !this._resizable) return;
 
     if (!this.viewId && this._blitConn) {
       this.viewId = this._blitConn.allocViewId();
@@ -1072,7 +1074,7 @@ export class BlitTerminalSurface {
   private _resizeTimer: ReturnType<typeof setTimeout> | undefined;
 
   private handleResize(immediate?: boolean): void {
-    if (!this.container || (this._readOnly && !this._readOnlyResize)) return;
+    if (!this.container || !this._resizable) return;
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
     const cols = Math.max(1, Math.floor(w / this.cell.w));
@@ -1111,7 +1113,7 @@ export class BlitTerminalSurface {
   resendSize(): void {
     if (
       this._sessionId !== null &&
-      (!this._readOnly || this._readOnlyResize) &&
+      this._resizable &&
       this._blitConn &&
       this.viewId &&
       this._rows > 0 &&
@@ -1163,7 +1165,7 @@ export class BlitTerminalSurface {
     const pw = termCols * cell.pw;
     const ph = termRows * cell.ph;
 
-    if (!this._readOnly) {
+    if (this._resizable) {
       const cssW = `${termCols * cell.w}px`;
       const cssH = `${termRows * cell.h}px`;
       const glCanvas = this.glCanvas;

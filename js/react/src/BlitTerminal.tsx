@@ -55,8 +55,7 @@ export function BlitTerminal({
     style,
     palette = ctx.palette,
     readOnly,
-    readOnlyResize,
-    readOnlyObjectPosition,
+    resizable,
     showCursor,
     onRender,
     scrollbarColor,
@@ -75,8 +74,7 @@ export function BlitTerminal({
       fontSize,
       palette,
       readOnly,
-      readOnlyResize,
-      readOnlyObjectPosition,
+      resizable,
       showCursor,
       onRender,
       scrollbarColor,
@@ -147,24 +145,16 @@ export function BlitTerminal({
   }, [readOnly]);
 
   useEffect(() => {
-    surfaceRef.current?.setReadOnlyResize(readOnlyResize);
-  }, [readOnlyResize]);
-
-  useEffect(() => {
-    surfaceRef.current?.setReadOnlyObjectPosition(readOnlyObjectPosition);
-  }, [readOnlyObjectPosition]);
+    surfaceRef.current?.setResizable(resizable);
+  }, [resizable]);
 
   // Re-send dimensions when connection becomes ready.
   const status: ConnectionStatus = connection?.status ?? "disconnected";
   useEffect(() => {
-    if (
-      status === "connected" &&
-      sessionId !== null &&
-      (!readOnly || readOnlyResize)
-    ) {
+    if (status === "connected" && sessionId !== null) {
       surfaceRef.current?.resendSize();
     }
-  }, [status, sessionId, readOnly, readOnlyResize]);
+  }, [status, sessionId]);
 
   // Imperative handle.
   useImperativeHandle(

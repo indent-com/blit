@@ -19,12 +19,10 @@ export interface BlitTerminalProps {
   style?: React.CSSProperties;
   /** Color palette applied to the terminal. */
   palette?: TerminalPalette;
-  /** When true, the terminal renders but never sends input or scroll commands. */
+  /** When true, the terminal renders without sending input or mouse commands. */
   readOnly?: boolean;
-  /** Resize the remote session to this surface while remaining read-only. Default: false. */
-  readOnlyResize?: boolean;
-  /** CSS object-position for the contained read-only canvas. Default: "center". */
-  readOnlyObjectPosition?: string;
+  /** Resize the remote session to this surface. Disable for passive previews. Default: true. */
+  resizable?: boolean;
   /** When false, the cursor is hidden. Default: true. */
   showCursor?: boolean;
   /** Called after each render frame. Receives the render duration in ms. */

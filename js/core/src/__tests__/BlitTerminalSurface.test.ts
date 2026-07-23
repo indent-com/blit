@@ -24,14 +24,26 @@ function mockCanvasContext(): void {
   });
 }
 
-describe("BlitTerminalSurface read-only canvas layout", () => {
+describe("BlitTerminalSurface sizing", () => {
+  const observe = vi.fn();
+  const disconnect = vi.fn();
+
   beforeEach(() => {
+    observe.mockClear();
+    disconnect.mockClear();
     mockCanvasContext();
     vi.stubGlobal(
       "requestAnimationFrame",
       vi.fn(() => 1),
     );
     vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe = observe;
+        disconnect = disconnect;
+      },
+    );
   });
 
   afterEach(() => {
@@ -39,11 +51,12 @@ describe("BlitTerminalSurface read-only canvas layout", () => {
     vi.restoreAllMocks();
   });
 
-  function attachSurface(readOnlyObjectPosition?: string) {
+  function attachSurface(
+    options: { readOnly?: boolean; resizable?: boolean } = {},
+  ) {
     const surface = new BlitTerminalSurface({
       sessionId: null,
-      readOnly: true,
-      readOnlyObjectPosition,
+      ...options,
     });
     const container = document.createElement("div");
     surface.attach(container);
@@ -54,53 +67,126 @@ describe("BlitTerminalSurface read-only canvas layout", () => {
     return { surface, canvas };
   }
 
-  it("keeps centered positioning by default and accepts an override", () => {
-    const centered = attachSurface();
-    const topLeft = attachSurface("left top");
+  it("uses the same resizable layout in read-only and writable modes", () => {
+    const writable = attachSurface();
+    const readOnly = attachSurface({ readOnly: true });
 
     expect({
-      default: centered.canvas.style.objectPosition,
-      override: topLeft.canvas.style.objectPosition,
-    }).toEqual({
-      default: "center",
-      override: "left top",
-    });
-
-    centered.surface.dispose();
-    topLeft.surface.dispose();
-  });
-
-  it("updates positioning after attachment", () => {
-    const { surface, canvas } = attachSurface();
-
-    surface.setReadOnlyObjectPosition("right bottom");
-
-    expect(canvas.style.objectPosition).toBe("right bottom");
-    surface.dispose();
-  });
-
-  it("observes container size when read-only resizing is enabled", () => {
-    const observe = vi.fn();
-    const disconnect = vi.fn();
-    vi.stubGlobal(
-      "ResizeObserver",
-      class {
-        observe = observe;
-        disconnect = disconnect;
+      writable: {
+        objectFit: writable.canvas.style.objectFit,
+        position: writable.canvas.style.position,
+        top: writable.canvas.style.top,
+        left: writable.canvas.style.left,
       },
-    );
-    const surface = new BlitTerminalSurface({
-      sessionId: null,
-      readOnly: true,
-      readOnlyResize: true,
+      readOnly: {
+        objectFit: readOnly.canvas.style.objectFit,
+        position: readOnly.canvas.style.position,
+        top: readOnly.canvas.style.top,
+        left: readOnly.canvas.style.left,
+      },
+    }).toEqual({
+      writable: {
+        objectFit: "",
+        position: "absolute",
+        top: "0px",
+        left: "0px",
+      },
+      readOnly: {
+        objectFit: "",
+        position: "absolute",
+        top: "0px",
+        left: "0px",
+      },
     });
-    const container = document.createElement("div");
+    expect(observe).toHaveBeenCalledTimes(2);
 
-    surface.attach(container);
+    writable.surface.dispose();
+    readOnly.surface.dispose();
+  });
 
-    expect(observe).toHaveBeenCalledWith(container);
-    surface.dispose();
+  it("contains passive surfaces without registering their container size", () => {
+    const writable = attachSurface({ resizable: false });
+    const readOnly = attachSurface({ readOnly: true, resizable: false });
+
+    expect({
+      writable: {
+        width: writable.canvas.style.width,
+        height: writable.canvas.style.height,
+        objectFit: writable.canvas.style.objectFit,
+        objectPosition: writable.canvas.style.objectPosition,
+      },
+      readOnly: {
+        width: readOnly.canvas.style.width,
+        height: readOnly.canvas.style.height,
+        objectFit: readOnly.canvas.style.objectFit,
+        objectPosition: readOnly.canvas.style.objectPosition,
+      },
+    }).toEqual({
+      writable: {
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        objectPosition: "center",
+      },
+      readOnly: {
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        objectPosition: "center",
+      },
+    });
+    expect(observe).not.toHaveBeenCalled();
+
+    writable.surface.dispose();
+    readOnly.surface.dispose();
+  });
+
+  it("reconciles canvas layout and terminal dimensions when resizable changes", () => {
+    const { surface, canvas } = attachSurface({
+      readOnly: true,
+      resizable: false,
+    });
+    // @ts-expect-error — install the terminal dimensions a passive surface follows.
+    surface.terminal = {
+      rows: 40,
+      cols: 120,
+      set_cell_size: vi.fn(),
+      set_font_family: vi.fn(),
+      set_font_size: vi.fn(),
+      invalidate_render_cache: vi.fn(),
+    };
+
+    surface.setResizable(true);
+    expect(canvas.style.position).toBe("absolute");
+    expect(canvas.style.objectFit).toBe("");
+    expect(observe).toHaveBeenCalledOnce();
+
+    surface.setResizable(false);
+    expect(canvas.style.position).toBe("");
+    expect(canvas.style.objectFit).toBe("contain");
+    expect(surface.rows).toBe(40);
+    expect(surface.cols).toBe(120);
     expect(disconnect).toHaveBeenCalledOnce();
+    surface.dispose();
+  });
+
+  it("lets core suppress reconnect resizes for passive surfaces", () => {
+    const setViewSize = vi.fn();
+    const surface = new BlitTerminalSurface({
+      sessionId: "s1",
+      readOnly: true,
+    });
+    // @ts-expect-error — install the minimal connection state used by resendSize.
+    surface._blitConn = { setViewSize };
+    // @ts-expect-error — install an allocated sizing view.
+    surface.viewId = "v1";
+
+    surface.resendSize();
+    expect(setViewSize).toHaveBeenCalledOnce();
+
+    surface.setResizable(false);
+    surface.resendSize();
+    expect(setViewSize).toHaveBeenCalledOnce();
   });
 });
 

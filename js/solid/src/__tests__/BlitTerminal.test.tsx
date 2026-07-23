@@ -21,8 +21,7 @@ const mockSetShowCursor = vi.fn();
 const mockSetOnRender = vi.fn();
 const mockSetAdvanceRatio = vi.fn();
 const mockSetReadOnly = vi.fn();
-const mockSetReadOnlyResize = vi.fn();
-const mockSetReadOnlyObjectPosition = vi.fn();
+const mockSetResizable = vi.fn();
 const mockResendSize = vi.fn();
 const mockFocus = vi.fn();
 
@@ -49,8 +48,7 @@ vi.mock("@blit-sh/core", async () => {
       setOnRender = mockSetOnRender;
       setAdvanceRatio = mockSetAdvanceRatio;
       setReadOnly = mockSetReadOnly;
-      setReadOnlyResize = mockSetReadOnlyResize;
-      setReadOnlyObjectPosition = mockSetReadOnlyObjectPosition;
+      setResizable = mockSetResizable;
       resendSize = mockResendSize;
       focus = mockFocus;
     },
@@ -152,7 +150,7 @@ describe("BlitTerminal", () => {
     expect(mockDispose).toHaveBeenCalledTimes(1);
   });
 
-  it("forwards sessionId changes to surface", () => {
+  it("forwards sessionId and lets core resend read-only dimensions", () => {
     const { transport, workspace } = setup();
 
     transport.pushList([{ ptyId: 7, tag: "test" }]);
@@ -166,6 +164,7 @@ describe("BlitTerminal", () => {
     ));
 
     expect(mockSetSessionId).toHaveBeenCalledWith(sessionId);
+    expect(mockResendSize).toHaveBeenCalled();
   });
 
   it("forwards palette to surface", () => {
@@ -204,21 +203,16 @@ describe("BlitTerminal", () => {
     expect(mockSetFontSize).toHaveBeenCalledWith(14);
   });
 
-  it("forwards read-only layout options to surface", () => {
+  it("forwards sizing independently of read-only mode", () => {
     const { workspace } = setup();
 
     render(() => (
       <BlitWorkspaceProvider workspace={workspace}>
-        <BlitTerminal
-          sessionId={null}
-          readOnly
-          readOnlyObjectPosition="left top"
-          readOnlyResize
-        />
+        <BlitTerminal sessionId={null} readOnly resizable={false} />
       </BlitWorkspaceProvider>
     ));
 
-    expect(mockSetReadOnlyObjectPosition).toHaveBeenCalledWith("left top");
-    expect(mockSetReadOnlyResize).toHaveBeenCalledWith(true);
+    expect(mockSetReadOnly).toHaveBeenCalledWith(true);
+    expect(mockSetResizable).toHaveBeenCalledWith(false);
   });
 });

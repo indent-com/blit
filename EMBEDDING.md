@@ -64,7 +64,7 @@ function TerminalScreen() {
 }
 ```
 
-Read-only terminals preserve the host terminal dimensions and contain the canvas within the embedding element. The contained canvas remains centered by default; pass `readOnlyObjectPosition="left top"` to align it differently. Pass `readOnlyResize` when a read-only surface should instead resize the remote terminal to fill its embedding element, provided the transport permits resize messages.
+Read-only terminals use the same sizing behavior as writable terminals; `readOnly` only disables mutating input. Terminals resize the remote session to their available grid by default. Pass `resizable={false}` for passive previews or read-only transports that must preserve the host dimensions; the canvas is then contained and centered within the embedding element.
 
 ### React API
 

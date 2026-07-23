@@ -18,10 +18,8 @@ export interface BlitTerminalProps {
   style?: JSX.CSSProperties;
   palette?: TerminalPalette;
   readOnly?: boolean;
-  /** Resize the remote session to this surface while remaining read-only. Default: false. */
-  readOnlyResize?: boolean;
-  /** CSS object-position for the contained read-only canvas. Default: "center". */
-  readOnlyObjectPosition?: string;
+  /** Resize the remote session to this surface. Disable for passive previews. Default: true. */
+  resizable?: boolean;
   showCursor?: boolean;
   onRender?: (renderMs: number) => void;
   scrollbarColor?: string;
@@ -56,8 +54,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
       fontSize: props.fontSize ?? ctx.fontSize,
       palette: props.palette ?? ctx.palette,
       readOnly: props.readOnly,
-      readOnlyResize: props.readOnlyResize,
-      readOnlyObjectPosition: props.readOnlyObjectPosition,
+      resizable: props.resizable,
       showCursor: props.showCursor,
       onRender: props.onRender,
       scrollbarColor: props.scrollbarColor,
@@ -103,10 +100,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
     surface()?.setAdvanceRatio(props.advanceRatio ?? ctx.advanceRatio),
   );
   createEffect(() => surface()?.setReadOnly(props.readOnly));
-  createEffect(() => surface()?.setReadOnlyResize(props.readOnlyResize));
-  createEffect(() =>
-    surface()?.setReadOnlyObjectPosition(props.readOnlyObjectPosition),
-  );
+  createEffect(() => surface()?.setResizable(props.resizable));
 
   // Re-send dimensions when connection becomes ready.
   createEffect(() => {
@@ -118,11 +112,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
     const connection = session
       ? (snap.connections.find((c) => c.id === session.connectionId) ?? null)
       : null;
-    if (
-      connection?.status === "connected" &&
-      props.sessionId !== null &&
-      (!props.readOnly || props.readOnlyResize)
-    ) {
+    if (connection?.status === "connected" && props.sessionId !== null) {
       s?.resendSize();
     }
   });
