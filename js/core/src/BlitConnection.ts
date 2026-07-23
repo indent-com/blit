@@ -522,6 +522,7 @@ export class BlitConnection {
       supportsAudio: false,
       supportsFsSync: false,
       supportsGit: false,
+      supportsLsp: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -603,6 +604,7 @@ export class BlitConnection {
     this.resetFsSyncs(connectionError("Connection disposed"));
     this.resetGitRepos(connectionError("Connection disposed"));
     this.resetLspAttachments(connectionError("Connection disposed"));
+    this.resetFragmentReassembly();
     this.resolveAllPendingCloses();
     this.clearSurfaceSubs();
     this.store.destroy();
@@ -1931,6 +1933,13 @@ export class BlitConnection {
     if (emit) this.emit();
   }
 
+  /** Drop any half-received fragment sequence (reconnect or dispose) so it
+   *  cannot bleed into the first fragmented message on the next connection. */
+  private resetFragmentReassembly(): void {
+    this.fragmentChunks = [];
+    this.fragmentBytes = 0;
+  }
+
   private handleMessage = (data: ArrayBuffer): void => {
     const bytes = new Uint8Array(data);
     if (bytes.length === 0) return;
@@ -2002,6 +2011,7 @@ export class BlitConnection {
         this.resetFsSyncs(connectionError("Server is shutting down"));
         this.resetGitRepos(connectionError("Server is shutting down"));
         this.resetLspAttachments(connectionError("Server is shutting down"));
+        this.resetFragmentReassembly();
         // Immediately reconnect so the UI recovers as fast as possible
         // when the server restarts.  Do NOT call transport.close() — that
         // permanently disposes the transport.  transport.reconnect() tears
@@ -2192,6 +2202,7 @@ export class BlitConnection {
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
           supportsFsSync: (features & FEATURE_FS) !== 0,
           supportsGit: (features & FEATURE_GIT) !== 0,
+          supportsLsp: (features & FEATURE_LSP) !== 0,
         };
         this.emit();
         this.surfaceStore.reset();
@@ -2202,6 +2213,7 @@ export class BlitConnection {
         this.resetFsSyncs(connectionError("Connection re-established"));
         this.resetGitRepos(connectionError("Connection re-established"));
         this.resetLspAttachments(connectionError("Connection re-established"));
+        this.resetFragmentReassembly();
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -2800,6 +2812,7 @@ export class BlitConnection {
       this.resetFsSyncs(connectionError(`Transport ${status}`));
       this.resetGitRepos(connectionError(`Transport ${status}`));
       this.resetLspAttachments(connectionError(`Transport ${status}`));
+      this.resetFragmentReassembly();
       this.resolveAllPendingCloses();
       this.hasReceivedList = false;
       // Dismiss all sessions so the UI doesn't show stale terminals from a

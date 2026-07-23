@@ -699,14 +699,22 @@ impl FsMirror {
                     let prev = map.get(path);
                     let content = match content {
                         FsContent::None => {
-                            if entry_flags
-                                & (FS_ENTRY_NO_CONTENT | FS_ENTRY_UNREADABLE | FS_ENTRY_UNSTABLE)
-                                != 0
+                            let entry_type = entry_flags & FS_ENTRY_TYPE_MASK;
+                            let content_bearing =
+                                entry_type == FS_ENTRY_FILE || entry_type == FS_ENTRY_SYMLINK;
+                            if !content_bearing
+                                || entry_flags
+                                    & (FS_ENTRY_NO_CONTENT
+                                        | FS_ENTRY_UNREADABLE
+                                        | FS_ENTRY_UNSTABLE)
+                                    != 0
                             {
                                 None
                             } else {
-                                // Metadata-only upsert keeps previous content.
-                                prev.and_then(|n| n.content.clone())
+                                // Metadata-only upsert keeps previous content only
+                                // when the entry stays the same content-bearing type.
+                                prev.filter(|n| n.entry_flags & FS_ENTRY_TYPE_MASK == entry_type)
+                                    .and_then(|n| n.content.clone())
                             }
                         }
                         FsContent::Full(data) => Some(data.to_vec()),
@@ -812,11 +820,17 @@ pub fn apply_fs_delta(base: &[u8], mut ops: &[u8]) -> Option<Vec<u8>> {
             0x01 => {
                 let offset = leb128(&mut ops)? as usize;
                 let len = leb128(&mut ops)? as usize;
+                if out.len().checked_add(len)? > FS_MAX_DECOMPRESSED {
+                    return None;
+                }
                 out.extend_from_slice(base.get(offset..offset.checked_add(len)?)?);
             }
             0x02 => {
                 let len = leb128(&mut ops)? as usize;
                 if ops.len() < len {
+                    return None;
+                }
+                if out.len().checked_add(len)? > FS_MAX_DECOMPRESSED {
                     return None;
                 }
                 out.extend_from_slice(&ops[..len]);

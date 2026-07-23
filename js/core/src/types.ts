@@ -124,6 +124,8 @@ export interface BlitConnectionSnapshot {
   supportsFsSync: boolean;
   /** Server advertises `FEATURE_GIT` (git introspection, docs/git.md). */
   supportsGit: boolean;
+  /** Server advertises `FEATURE_LSP` (language intelligence, docs/design/lsp.md). */
+  supportsLsp: boolean;
   retryCount: number;
   /** Non-null when the last connection attempt failed with an explicit error message. */
   error: string | null;

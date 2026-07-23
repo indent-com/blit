@@ -12,7 +12,7 @@
  */
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 // -- Opcodes ----------------------------------------------------------------
 
@@ -573,7 +573,13 @@ export function* fsRecords(data: Uint8Array): Generator<FsRecord> {
       if (pos + 2 > bodyEnd) return null;
       const len = view.getUint16(pos, true);
       if (pos + 2 + len > bodyEnd) return null;
-      const s = textDecoder.decode(data.subarray(pos + 2, pos + 2 + len));
+      let s: string;
+      try {
+        s = textDecoder.decode(data.subarray(pos + 2, pos + 2 + len));
+      } catch {
+        // Invalid UTF-8 ends iteration, matching Rust's fatal from_utf8.
+        return null;
+      }
       pos += 2 + len;
       return s;
     };
@@ -865,15 +871,25 @@ export class FsMirror {
           let content: Uint8Array | null;
           const c = record.content;
           if (c.kind === "none") {
+            const entryType = record.entryFlags & FS_ENTRY_TYPE_MASK;
+            const contentBearing =
+              entryType === FS_ENTRY_FILE || entryType === FS_ENTRY_SYMLINK;
+            const sameType =
+              prev !== undefined &&
+              (prev.entryFlags & FS_ENTRY_TYPE_MASK) === entryType;
             content =
+              !contentBearing ||
               (record.entryFlags &
                 (FS_ENTRY_NO_CONTENT |
                   FS_ENTRY_UNREADABLE |
                   FS_ENTRY_UNSTABLE)) !==
-              0
+                0
                 ? null
-                : // Metadata-only upsert keeps previous content.
-                  (prev?.content ?? null);
+                : // Metadata-only upsert keeps previous content only when the
+                  // entry stays the same content-bearing type.
+                  sameType
+                  ? (prev.content ?? null)
+                  : null;
           } else if (c.kind === "full") {
             content = c.data.slice();
           } else {
@@ -956,11 +972,13 @@ export function applyFsDelta(
       const len = leb128();
       if (offset === null || len === null || offset + len > base.length)
         return null;
+      if (total + len > FS_MAX_DECOMPRESSED) return null;
       chunks.push(base.subarray(offset, offset + len));
       total += len;
     } else if (op === 0x02) {
       const len = leb128();
       if (len === null || pos + len > ops.length) return null;
+      if (total + len > FS_MAX_DECOMPRESSED) return null;
       chunks.push(ops.subarray(pos, pos + len));
       pos += len;
       total += len;

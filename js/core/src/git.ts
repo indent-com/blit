@@ -15,7 +15,7 @@
 import { fsCompressLiteral, fsDecompress } from "./fs.js";
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 // -- Opcodes ----------------------------------------------------------------
 
@@ -250,6 +250,7 @@ export function gitOidHex(
 /** Parse a hex oid of either width into wire form; null on malformation. */
 export function gitOidFromHex(hex: string): GitOid | null {
   if (hex.length !== 40 && hex.length !== 64) return null;
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
   const oid = new Uint8Array(32);
   for (let i = 0; i < hex.length / 2; i++) {
     const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);

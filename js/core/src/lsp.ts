@@ -18,7 +18,7 @@
 import { fsCompressLiteral, fsDecompress } from "./fs.js";
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 // -- Opcodes ----------------------------------------------------------------
 
@@ -335,11 +335,20 @@ class Cursor {
     return new Uint8Array(this.bytes(16));
   }
   str(): string {
-    return textDecoder.decode(this.bytes(this.u16()));
+    return this.decode(this.bytes(this.u16()));
   }
   /** A u32-length-prefixed UTF-8 string. */
   text(): string {
-    return textDecoder.decode(this.bytes(this.u32()));
+    return this.decode(this.bytes(this.u32()));
+  }
+  /** Decode UTF-8, poisoning the cursor on invalid input like Rust's from_utf8. */
+  private decode(bytes: Uint8Array): string {
+    try {
+      return textDecoder.decode(bytes);
+    } catch {
+      this.pos = -1;
+      return "";
+    }
   }
   rest(): Uint8Array {
     return this.pos < 0 ? new Uint8Array(0) : this.data.subarray(this.pos);
@@ -768,7 +777,8 @@ function* records<T>(
 ): Generator<T> {
   let rest = data;
   while (rest.length >= 4) {
-    const len = rest[0] | (rest[1] << 8) | (rest[2] << 16) | (rest[3] << 24);
+    const len =
+      (rest[0] | (rest[1] << 8) | (rest[2] << 16)) + rest[3] * 0x1000000;
     if (len === 0 || rest.length < 4 + len) return;
     const body = rest.subarray(4, 4 + len);
     rest = rest.subarray(4 + len);
