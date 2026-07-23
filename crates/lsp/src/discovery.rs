@@ -113,6 +113,60 @@ fn builtin_table() -> Vec<ServerSpec> {
             vec![group(&["Gemfile"], RootPolicy::Nearest)],
             &["rb"],
         ),
+        // nixd evaluates Nix (completion/diagnostics from real values),
+        // the most capable of the Nix servers. A flake is the outermost
+        // root; a plain default.nix/shell.nix project the nearest.
+        entry(
+            "nixd",
+            &["nixd"],
+            vec![
+                group(&["flake.nix"], RootPolicy::Outermost),
+                group(&["default.nix", "shell.nix"], RootPolicy::Nearest),
+            ],
+            &["nix"],
+        ),
+        // Servers for languages without a dedicated project marker root
+        // at the repo (`.git`); their config file, when present, takes
+        // precedence as a nearer root.
+        entry(
+            "bash-language-server",
+            &["bash-language-server", "start"],
+            vec![group(&[".git"], RootPolicy::Nearest)],
+            &["sh", "bash"],
+        ),
+        entry(
+            "lua-language-server",
+            &["lua-language-server"],
+            vec![
+                group(&[".luarc.json", ".luarc.jsonc"], RootPolicy::Nearest),
+                group(&[".git"], RootPolicy::Nearest),
+            ],
+            &["lua"],
+        ),
+        entry(
+            "taplo",
+            &["taplo", "lsp", "stdio"],
+            vec![
+                group(&[".taplo.toml", "taplo.toml"], RootPolicy::Nearest),
+                group(&[".git"], RootPolicy::Nearest),
+            ],
+            &["toml"],
+        ),
+        entry(
+            "yaml-language-server",
+            &["yaml-language-server", "--stdio"],
+            vec![group(&[".git"], RootPolicy::Nearest)],
+            &["yaml", "yml"],
+        ),
+        entry(
+            "marksman",
+            &["marksman", "server"],
+            vec![
+                group(&[".marksman.toml"], RootPolicy::Nearest),
+                group(&[".git"], RootPolicy::Nearest),
+            ],
+            &["md", "markdown"],
+        ),
     ]
 }
 
@@ -357,6 +411,12 @@ pub fn language_id(path: &Path) -> &'static str {
         "m" | "mm" => "objective-c",
         "zig" => "zig",
         "rb" => "ruby",
+        "nix" => "nix",
+        "sh" | "bash" => "shellscript",
+        "lua" => "lua",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" | "markdown" => "markdown",
         _ => "plaintext",
     }
 }
@@ -434,6 +494,49 @@ mod tests {
             server_for_extension(&table, Path::new("y.go")).map(|s| s.id.as_str()),
             Some("gopls")
         );
+        assert_eq!(
+            server_for_extension(&table, Path::new("flake.nix")).map(|s| s.id.as_str()),
+            Some("nixd")
+        );
+        assert_eq!(
+            server_for_extension(&table, Path::new("bin/fmt.sh")).map(|s| s.id.as_str()),
+            Some("bash-language-server")
+        );
+        assert_eq!(
+            server_for_extension(&table, Path::new("Cargo.toml")).map(|s| s.id.as_str()),
+            Some("taplo")
+        );
         assert!(server_for_extension(&table, Path::new("y.txt")).is_none());
+    }
+
+    #[test]
+    fn nixd_flake_is_outermost_git_fallback_for_loose_langs() {
+        let tmp = std::env::temp_dir().join(format!("blit-lsp-disc3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        touch(&tmp.join(".git/HEAD"));
+        touch(&tmp.join("flake.nix"));
+        touch(&tmp.join("sub/shell.nix"));
+        touch(&tmp.join("sub/x.nix"));
+        touch(&tmp.join("sub/deploy.yaml"));
+        let bound = git_root(&tmp.join("sub"));
+
+        let table = builtin_table();
+        // flake.nix wins as the outermost Nix root.
+        let nixd = table.iter().find(|s| s.id == "nixd").unwrap();
+        assert_eq!(
+            resolve_root(nixd, &tmp.join("sub/x.nix"), bound.as_deref()),
+            Some(tmp.clone())
+        );
+        // A marker-less language roots at the git root via the `.git`
+        // fallback group.
+        let yaml = table
+            .iter()
+            .find(|s| s.id == "yaml-language-server")
+            .unwrap();
+        assert_eq!(
+            resolve_root(yaml, &tmp.join("sub/deploy.yaml"), bound.as_deref()),
+            Some(tmp.clone())
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

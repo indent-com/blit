@@ -593,6 +593,16 @@
           pkgs.socat
           pkgs.wasm-bindgen-cli
           pkgs.wasm-pack
+          # Language servers, so `blit lsp` (docs/design/lsp.md) is
+          # dogfoodable across this polyglot repo. rust-analyzer is
+          # above; these cover Nix, shell, TS/JS, TOML, YAML, and
+          # Markdown. blit discovers them on PATH — none is required.
+          pkgs.nixd
+          pkgs.bash-language-server
+          pkgs.taplo
+          pkgs.yaml-language-server
+          pkgs.marksman
+          pkgs.typescript-language-server
         ]
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           pkgs.dbus

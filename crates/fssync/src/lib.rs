@@ -2178,10 +2178,7 @@ mod tests {
         assert!(resolve_wire_path(root, "a%2F..%2Fb").is_none());
         assert!(resolve_wire_path(root, "a%2Fb").is_none());
         // A genuine name that merely contains a percent still resolves.
-        assert_eq!(
-            resolve_wire_path(root, "%2525"),
-            Some(root.join("%25"))
-        );
+        assert_eq!(resolve_wire_path(root, "%2525"), Some(root.join("%25")));
     }
 
     fn meta(node_type: u8, size: u64, mtime: u64, ino: u64) -> NodeMeta {
