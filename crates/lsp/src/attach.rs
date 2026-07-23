@@ -24,8 +24,11 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use blit_remote::lsp::{
-    LSP_DIAG_FULL, LSP_QUERY_WS_SYMBOLS, LSP_STATUS_NOT_FOUND, LSP_STATUS_OTHER, LSP_STREAM_DIAG,
-    LSP_STREAM_STATE, LspDiagRecord, LspStateRecord, append_lsp_diag_record,
+    LSP_CAP_DEFINITION, LSP_CAP_DOC_SYMBOLS, LSP_CAP_HOVER, LSP_CAP_REFERENCES, LSP_CAP_RENAME,
+    LSP_CAP_WS_SYMBOLS, LSP_DIAG_FULL, LSP_PHASE_FAILED, LSP_PHASE_READY, LSP_QUERY_DEFINITION,
+    LSP_QUERY_DOC_SYMBOLS, LSP_QUERY_HOVER, LSP_QUERY_REFERENCES, LSP_QUERY_RENAME,
+    LSP_QUERY_WS_SYMBOLS, LSP_STATUS_NOT_FOUND, LSP_STATUS_OTHER, LSP_STATUS_WARMING,
+    LSP_STREAM_DIAG, LSP_STREAM_STATE, LspDiagRecord, LspStateRecord, append_lsp_diag_record,
     append_lsp_state_record, msg_lsp_diag, msg_lsp_query_resp, msg_lsp_state,
 };
 
@@ -33,6 +36,22 @@ use crate::backend::{Backend, Cmd};
 use crate::discovery::ServerSpec;
 use crate::text;
 use crate::{Budgets, Sink};
+
+/// The capability bit a query kind requires of its backend, so routing
+/// never sends an unsupported request (which would surface as a bare
+/// error). `0` for unknown kinds — no backend advertises it, so the
+/// query answers `NOT_FOUND`.
+fn required_cap(kind: u8) -> u32 {
+    match kind {
+        LSP_QUERY_DEFINITION => LSP_CAP_DEFINITION,
+        LSP_QUERY_REFERENCES => LSP_CAP_REFERENCES,
+        LSP_QUERY_HOVER => LSP_CAP_HOVER,
+        LSP_QUERY_DOC_SYMBOLS => LSP_CAP_DOC_SYMBOLS,
+        LSP_QUERY_WS_SYMBOLS => LSP_CAP_WS_SYMBOLS,
+        LSP_QUERY_RENAME => LSP_CAP_RENAME,
+        _ => 0,
+    }
+}
 
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
 
@@ -150,7 +169,9 @@ impl Attachment {
         let refuse = |status: u8| {
             let _ = sink(msg_lsp_query_resp(nonce, status, 0, &[]));
         };
-        // Pick the routing slot: by workspace-symbol capability, or by
+        let want = required_cap(kind);
+        // Which backends are candidates for this query: any backend for
+        // a workspace-wide symbol search, else the ones registered for
         // the queried file's extension.
         let path = if kind == LSP_QUERY_WS_SYMBOLS {
             None
@@ -160,29 +181,38 @@ impl Attachment {
                 None => return refuse(blit_remote::lsp::LSP_STATUS_INVALID),
             }
         };
-        let mut backends = self.backends.lock().unwrap();
-        let idx = if kind == LSP_QUERY_WS_SYMBOLS {
-            backends
-                .iter()
-                .position(|b| {
-                    b.shared.info.lock().unwrap().caps & blit_remote::lsp::LSP_CAP_WS_SYMBOLS != 0
-                })
-                .or(if backends.is_empty() { None } else { Some(0) })
-        } else {
-            let ext = path
-                .as_ref()
-                .and_then(|p| p.extension())
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase());
-            ext.and_then(|ext| {
-                backends
-                    .iter()
-                    .position(|b| b.extensions.iter().any(|x| x == &ext))
-            })
+        let ext = path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let candidate = |b: &Arc<Backend>| {
+            kind == LSP_QUERY_WS_SYMBOLS
+                || ext
+                    .as_ref()
+                    .is_some_and(|e| b.extensions.iter().any(|x| x == e))
         };
+
+        let mut backends = self.backends.lock().unwrap();
+        // Route only to a backend that both applies to the query and
+        // advertises the capability — never fall back to an incapable
+        // one, or an unsupported request degrades to a bare "error".
+        let idx = backends
+            .iter()
+            .position(|b| candidate(b) && b.caps() & want != 0);
         let Some(idx) = idx else {
+            // No capable backend. If a candidate is still warming, the
+            // capability may simply be unknown yet — say WARMING (retry)
+            // rather than a misleading NOT_FOUND.
+            let warming = backends
+                .iter()
+                .any(|b| candidate(b) && !matches!(b.phase(), LSP_PHASE_READY | LSP_PHASE_FAILED));
             drop(backends);
-            return refuse(LSP_STATUS_NOT_FOUND);
+            return refuse(if warming {
+                LSP_STATUS_WARMING
+            } else {
+                LSP_STATUS_NOT_FOUND
+            });
         };
         // Respawn a stopped backend and update the slot in place, so a
         // later query brings the language server back (spec).

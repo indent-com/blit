@@ -633,6 +633,51 @@ fn stop_answers_pending_query() {
     assert!(!backend.send(crate::backend::Cmd::Stop));
 }
 
+/// A query for a capability the backend does not advertise must answer
+/// NOT_FOUND, never a bare OTHER "error" — routing checks the capability
+/// before dispatching, so an unsupported request is never sent (the
+/// nixd-workspace-symbols case from the field).
+#[test]
+fn query_without_capability_is_not_found() {
+    let root = tmp_root("nocap");
+    std::fs::write(root.join("a.rs"), "fn x() {}\n").unwrap();
+    // A server advertising only hover — no workspace/document symbols,
+    // no definition.
+    let serve = |mut reader: BufReader<Box<dyn Read + Send>>, mut writer: Box<dyn Write + Send>| {
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            if let rpc::RpcMsg::Request { id, method, .. } = msg
+                && method == "initialize"
+            {
+                let _ = rpc::write_msg(
+                    writer.as_mut(),
+                    &rpc::response(&id, json!({ "capabilities": { "hoverProvider": true } })),
+                );
+            }
+        }
+    };
+    let backend = testutil::pipe_backend(test_spec(), root.clone(), test_budgets(), serve);
+    wait_ready(&backend);
+    let att = attach(&root, &backend, 0, dummy_sink());
+
+    for (nonce, kind, path) in [
+        (7, LSP_QUERY_WS_SYMBOLS, ""),
+        (8, LSP_QUERY_DEFINITION, "a.rs"),
+    ] {
+        let (sink, rx) = collector();
+        att.query(nonce, kind, 0, 0, 0, path, "", sink);
+        let (n, status) = wait_for(&rx, |m| parse_lsp_query_resp(m).map(|(n, s, _, _)| (n, s)));
+        assert_eq!(
+            (n, status),
+            (nonce, LSP_STATUS_NOT_FOUND),
+            "kind {kind} must be NOT_FOUND, not error"
+        );
+    }
+}
+
+fn dummy_sink() -> Sink {
+    Arc::new(|_| true)
+}
+
 fn wait_ready(backend: &Arc<Backend>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

@@ -417,10 +417,18 @@ pub async fn cmd_symbols(
 ) -> Result<i32, String> {
     let (reader, writer) = transport.split();
     let (mut session, _) = open_lsp(reader, writer, &client_abs(&root), 0).await?;
+    // Empty symbols are surprising (unlike a grep-style def/refs miss),
+    // and the common cause is that no server providing symbols is
+    // running for this workspace — point the user at `blit lsp list`.
+    let hint_empty = || {
+        if !json {
+            eprintln!("no symbols — see running servers with `blit lsp list`");
+        }
+    };
     let (status, _, records) = match file {
         Some(file) => {
             session
-                .query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, &file, "")
+                .query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, &client_abs(&file), "")
                 .await?
         }
         None => {
@@ -437,6 +445,7 @@ pub async fn cmd_symbols(
         }
     };
     if !check_status(status)? {
+        hint_empty();
         return Ok(1);
     }
     let mut found = 0;
@@ -476,7 +485,11 @@ pub async fn cmd_symbols(
             found += 1;
         }
     }
-    Ok(if found == 0 { 1 } else { 0 })
+    if found == 0 {
+        hint_empty();
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 fn print_diags(mirror: &LspDiagMirror, filter: Option<&str>, json: bool) -> (String, usize) {

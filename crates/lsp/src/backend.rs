@@ -247,6 +247,17 @@ impl Backend {
         self.shared.gone.load(Ordering::Relaxed)
     }
 
+    /// Coarse capability bits (`LSP_CAP_*`) the backend advertised; `0`
+    /// until it finishes `initialize`.
+    pub fn caps(&self) -> u32 {
+        self.shared.info.lock().unwrap().caps
+    }
+
+    /// Current lifecycle phase (`LSP_PHASE_*`).
+    pub fn phase(&self) -> u8 {
+        self.shared.info.lock().unwrap().phase
+    }
+
     /// Best-effort resident set size of the child, in bytes.
     pub fn rss_bytes(&self) -> u64 {
         let pid = self.shared.info.lock().unwrap().pid;
@@ -1203,10 +1214,22 @@ impl Engine {
 
     fn finish_query(&mut self, q: PendingQuery, result: Option<Value>, error: Option<Value>) {
         if let Some(error) = error {
+            // A query dispatched while the backend is still warming up
+            // (many servers accept requests during indexing, then reject
+            // them until the project finishes loading) reports the
+            // retryable WARMING, not a bare OTHER "error" — so a client
+            // retries or runs `blit lsp wait` instead of seeing a
+            // meaningless failure.
+            let phase = self.shared.info.lock().unwrap().phase;
+            let warming = matches!(
+                phase,
+                LSP_PHASE_SPAWNING | LSP_PHASE_INITIALIZING | LSP_PHASE_INDEXING
+            );
             let status = match error["code"].as_i64() {
                 Some(-32800) => LSP_STATUS_CANCELLED, // RequestCancelled
                 Some(-32002) => LSP_STATUS_WARMING,   // ServerNotInitialized
-                Some(-32801) => LSP_STATUS_OTHER,     // ContentModified
+                Some(-32801) => LSP_STATUS_WARMING,   // ContentModified — retryable
+                _ if warming => LSP_STATUS_WARMING,
                 _ => LSP_STATUS_OTHER,
             };
             return respond(&q, status, 0, &[]);
