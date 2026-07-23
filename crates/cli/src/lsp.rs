@@ -555,6 +555,51 @@ fn print_diags(mirror: &LspDiagMirror, filter: Option<&str>, json: bool) -> (Str
     (out, count)
 }
 
+/// Explain an empty diagnostic set from the current server state, so
+/// "nothing" isn't confused with "clean". Three cases: some server is
+/// still warming (the usual cause on a big project — say so and point at
+/// `blit lsp wait`); every server is ready but some diagnose only open
+/// documents (tsserver/pyright/clangd cover only opened/edited files);
+/// or every server is ready and whole-project — the workspace really is
+/// clean.
+fn empty_diagnostics_reason(state: &LspStateMirror) -> String {
+    if state.servers.is_empty() {
+        return "no language servers running for this workspace".into();
+    }
+    let mut warming: Vec<&str> = state
+        .servers
+        .values()
+        .filter(|s| !matches!(s.phase, LSP_PHASE_READY | LSP_PHASE_FAILED))
+        .map(|s| s.id.as_str())
+        .collect();
+    warming.sort_unstable();
+    if !warming.is_empty() {
+        return format!(
+            "no diagnostics yet — still indexing: {} (run `blit lsp wait`, then retry)",
+            warming.join(", ")
+        );
+    }
+    // Every server is ready. Open-doc-only servers only diagnose files
+    // that have been opened; a whole-project server that found nothing
+    // means the workspace is clean.
+    let mut open_doc_only: Vec<&str> = state
+        .servers
+        .values()
+        .filter(|s| matches!(s.id.as_str(), "typescript-language-server" | "pyright" | "clangd"))
+        .map(|s| s.id.as_str())
+        .collect();
+    open_doc_only.sort_unstable();
+    if open_doc_only.is_empty() {
+        "no diagnostics — the workspace is clean".into()
+    } else {
+        format!(
+            "no diagnostics — {} report only files you've opened or edited; \
+             name one (`blit lsp diag PATH`) or edit it to check it",
+            open_doc_only.join(", ")
+        )
+    }
+}
+
 /// `blit lsp diagnostics` — the workspace's current diagnostic state:
 /// print once, `--wait` for backends to settle first, or `--watch` the
 /// stream.
@@ -604,10 +649,7 @@ pub async fn cmd_diagnostics(
                     let (out, count) = print_diags(&diags, path.as_deref(), json);
                     print!("{out}");
                     if count == 0 && diags.files.is_empty() && !json {
-                        eprintln!(
-                            "no diagnostics known — files are diagnosed once queried, \
-                             named here, or changed on disk"
-                        );
+                        eprintln!("{}", empty_diagnostics_reason(&state));
                     }
                     return Ok(if count == 0 { 0 } else { 1 });
                 }
