@@ -6010,8 +6010,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 features |= blit_remote::fs::FEATURE_FS_WRITE;
             }
             #[cfg(target_os = "linux")]
-            let mut features = features;
-            #[cfg(target_os = "linux")]
             {
                 let audio_disabled = std::env::var("BLIT_AUDIO")
                     .map(|v| v == "0")

@@ -701,9 +701,14 @@ describe("BlitConnection writes", () => {
 
   it("mkdir/remove/rename emit FS_OP with the right selector and flags", async () => {
     const { conn, transport, handle } = await writeReadyHandle();
-    void handle.mkdir("d", { createParents: true, mode: 0o700 });
-    void handle.remove("d");
-    void handle.rename("d", "e");
+    // Fire-and-forget: no FS_DONE is mocked, so these stay pending and are
+    // rejected by dispose() below — handle the rejection so it isn't unhandled.
+    const pending = [
+      handle.mkdir("d", { createParents: true, mode: 0o700 }),
+      handle.remove("d"),
+      handle.rename("d", "e"),
+    ];
+    pending.forEach((p) => void p.catch(() => {}));
     const ops = transport.sent.filter((m) => m[0] === C2S_FS_OP);
     expect(ops.map((m) => m[5])).toEqual([
       FS_OP_MKDIR,
