@@ -614,10 +614,11 @@ fn empty_diagnostics_reason(state: &LspStateMirror) -> String {
         "no diagnostics — the workspace is clean".into()
     } else {
         // Passive voice so the phrasing reads right for one server or
-        // several.
+        // several. No "edit it" — blit has no editor; a specific file is
+        // checked by naming it.
         format!(
-            "no diagnostics — with {}, only opened or edited files are diagnosed; \
-             name one with `blit lsp diag PATH`, or edit it",
+            "no diagnostics — {} report only files that are open; \
+             check one with `blit lsp diag PATH`",
             open_doc_only.join(", ")
         )
     }
