@@ -585,16 +585,23 @@ fn empty_diagnostics_reason(state: &LspStateMirror) -> String {
     let mut open_doc_only: Vec<&str> = state
         .servers
         .values()
-        .filter(|s| matches!(s.id.as_str(), "typescript-language-server" | "pyright" | "clangd"))
+        .filter(|s| {
+            matches!(
+                s.id.as_str(),
+                "typescript-language-server" | "pyright" | "clangd"
+            )
+        })
         .map(|s| s.id.as_str())
         .collect();
     open_doc_only.sort_unstable();
     if open_doc_only.is_empty() {
         "no diagnostics — the workspace is clean".into()
     } else {
+        // Passive voice so the phrasing reads right for one server or
+        // several.
         format!(
-            "no diagnostics — {} report only files you've opened or edited; \
-             name one (`blit lsp diag PATH`) or edit it to check it",
+            "no diagnostics — with {}, only opened or edited files are diagnosed; \
+             name one with `blit lsp diag PATH`, or edit it",
             open_doc_only.join(", ")
         )
     }
