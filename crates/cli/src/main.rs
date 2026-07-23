@@ -447,18 +447,22 @@ async fn async_main() {
                     topo,
                     json,
                 } => {
-                    let opts = git::LogOpts {
-                        rev,
-                        path: pathspec.into_iter().next(),
-                        limit,
-                        watch,
-                        follow,
-                        first_parent,
-                        full_message,
-                        topo,
-                        json,
-                    };
-                    git::cmd_log(transport, repo, opts).await
+                    if pathspec.len() > 1 {
+                        Err("only one path filter is supported".to_string())
+                    } else {
+                        let opts = git::LogOpts {
+                            rev,
+                            path: pathspec.into_iter().next(),
+                            limit,
+                            watch,
+                            follow,
+                            first_parent,
+                            full_message,
+                            topo,
+                            json,
+                        };
+                        git::cmd_log(transport, repo, opts).await
+                    }
                 }
                 GitCommand::Diff {
                     revs,
@@ -468,14 +472,18 @@ async fn async_main() {
                     patch,
                     json,
                 } => {
-                    let opts = git::DiffOpts {
-                        revs,
-                        staged,
-                        patch,
-                        path: pathspec.into_iter().next(),
-                        json,
-                    };
-                    git::cmd_diff(transport, repo, opts).await
+                    if pathspec.len() > 1 {
+                        Err("only one path filter is supported".to_string())
+                    } else {
+                        let opts = git::DiffOpts {
+                            revs,
+                            staged,
+                            patch,
+                            path: pathspec.into_iter().next(),
+                            json,
+                        };
+                        git::cmd_diff(transport, repo, opts).await
+                    }
                 }
             };
             if let Err(e) = result {
@@ -657,7 +665,10 @@ async fn async_main() {
                 max_connections: 0,
                 max_ptys: 0,
                 ping_interval: std::time::Duration::from_secs(10),
-                skip_compositor: false,
+                skip_compositor: std::env::var("BLIT_SKIP_COMPOSITOR")
+                    .ok()
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
                 export_sock: export_sock
                     || std::env::var("BLIT_EXPORT_SOCK")
                         .ok()

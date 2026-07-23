@@ -16,14 +16,14 @@ use blit_remote::lsp::{
     FEATURE_LSP, LSP_CLOSED_CLIENT_REQUEST, LSP_DIAG_FULL, LSP_OPEN_DIAGS, LSP_OPEN_WATCH,
     LSP_PHASE_FAILED, LSP_PHASE_INDEXING, LSP_PHASE_INITIALIZING, LSP_PHASE_READY,
     LSP_PHASE_SPAWNING, LSP_PROGRESS_UNKNOWN, LSP_QUERY_DOC_SYMBOLS, LSP_QUERY_REFERENCES,
-    LSP_QUERY_WS_SYMBOLS, LSP_REFS_INCLUDE_DECLARATION, LSP_RESP_TRUNCATED, LSP_STATUS_NOT_FOUND,
-    LSP_STATUS_OK, LSP_STATUS_WARMING, LSP_STREAM_DIAG, LSP_STREAM_STATE, LspDiagMirror,
-    LspQueryRecord, LspQueryRequest, LspServersRecord, LspStateMirror, S2C_LSP_CLOSED,
-    S2C_LSP_DIAG, S2C_LSP_OPENED, S2C_LSP_QUERY, S2C_LSP_SERVERS, S2C_LSP_STATE, S2C_LSP_STOPPED,
-    lsp_query_records, lsp_servers_records, lsp_status_text, msg_lsp_ack, msg_lsp_open,
-    msg_lsp_query, msg_lsp_servers, msg_lsp_stop, parse_lsp_closed, parse_lsp_diag,
-    parse_lsp_opened, parse_lsp_query_resp, parse_lsp_servers_resp, parse_lsp_state,
-    parse_lsp_stopped,
+    LSP_QUERY_RENAME, LSP_QUERY_WS_SYMBOLS, LSP_REFS_INCLUDE_DECLARATION, LSP_RESP_INCOMPLETE,
+    LSP_RESP_TRUNCATED, LSP_STATUS_NOT_FOUND, LSP_STATUS_OK, LSP_STATUS_WARMING, LSP_STREAM_DIAG,
+    LSP_STREAM_STATE, LspDiagMirror, LspQueryRecord, LspQueryRequest, LspServersRecord,
+    LspStateMirror, S2C_LSP_CLOSED, S2C_LSP_DIAG, S2C_LSP_OPENED, S2C_LSP_QUERY, S2C_LSP_SERVERS,
+    S2C_LSP_STATE, S2C_LSP_STOPPED, lsp_query_records, lsp_servers_records, lsp_status_text,
+    msg_lsp_ack, msg_lsp_open, msg_lsp_query, msg_lsp_servers, msg_lsp_stop, parse_lsp_closed,
+    parse_lsp_diag, parse_lsp_opened, parse_lsp_query_resp, parse_lsp_servers_resp,
+    parse_lsp_state, parse_lsp_stopped,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -430,6 +430,18 @@ pub async fn cmd_position(
         eprintln!(
             "… truncated at {found} results (raise BLIT_LSP_ENTRIES_MAX / BLIT_LSP_BYTES_MAX)"
         );
+    }
+    // A RENAME whose WorkspaceEdit carried whole-file create/rename/delete
+    // operations comes back with only the text EDIT records; the plan is
+    // advisory, not a complete edit set (docs/design/lsp.md LSP_QUERY).
+    if kind == LSP_QUERY_RENAME && resp_flags & LSP_RESP_INCOMPLETE != 0 {
+        if json {
+            println!("{}", serde_json::json!({ "type": "incomplete" }));
+        } else {
+            eprintln!(
+                "… rename incomplete: whole-file create/rename/delete operations were dropped; the printed edits alone leave the workspace inconsistent"
+            );
+        }
     }
     Ok(if found == 0 { 1 } else { 0 })
 }

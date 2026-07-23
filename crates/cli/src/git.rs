@@ -34,6 +34,14 @@ fn hex(oid: &GitOid, len: usize) -> String {
         .to_string()
 }
 
+/// Normalize a client path filter to the fs-family wire form the server
+/// decodes (docs/git.md: the GIT_LOG/GIT_DIFF/GIT_PATCH path filter is
+/// escaped "exactly like FS_FETCH"): drop a leading `./` and escape a
+/// literal `%` to `%25`. Matches `escape_wire` in the fs client.
+fn escape_filter(path: &str) -> String {
+    path.trim_start_matches("./").replace('%', "%25")
+}
+
 struct Session<R, W> {
     reader: R,
     writer: W,
@@ -178,12 +186,17 @@ pub async fn cmd_status(
 fn state_json(mirror: &GitStateMirror) -> String {
     let head = mirror.head.as_ref();
     let upstream = head.and_then(|h| mirror.upstreams.get(&h.name));
+    // Counts are only meaningful when COUNTS_VALID is set — an UPSTREAM
+    // record clears it when the ref is GONE (counts forced to zero) or the
+    // ahead/behind walk hit its cap. Emit null then so a consumer cannot
+    // mistake "unknown"/"gone" for "in sync", mirroring render_status.
+    let counts = upstream.filter(|u| u.flags & GIT_UPSTREAM_COUNTS_VALID != 0);
     serde_json::json!({
         "type": "state",
         "head": head.map(|h| h.name.clone()),
         "oid": head.map(|h| hex(&h.oid, 40)),
-        "ahead": upstream.map(|u| u.ahead),
-        "behind": upstream.map(|u| u.behind),
+        "ahead": counts.map(|u| u.ahead),
+        "behind": counts.map(|u| u.behind),
         "stashes": mirror.stashes.len(),
         "status": mirror
             .status
@@ -288,8 +301,10 @@ pub struct DiffOpts {
     pub json: bool,
 }
 
-/// One commit record as pretty text or a rich JSON line.
-fn print_commit(record: &GitCommitRecord, json: bool) {
+/// One commit record as pretty text or a rich JSON line. In text mode
+/// `full_message` prints the body after the subject; JSON always carries
+/// the whole message.
+fn print_commit(record: &GitCommitRecord, json: bool, full_message: bool) {
     let GitCommitRecord::Commit {
         oid,
         tree,
@@ -334,6 +349,11 @@ fn print_commit(record: &GitCommitRecord, json: bool) {
             author_email,
             subject
         );
+        if full_message {
+            for line in message.lines().skip(1) {
+                println!("    {line}");
+            }
+        }
     }
 }
 
@@ -358,7 +378,7 @@ pub async fn cmd_log(transport: Transport, repo: String, opts: LogOpts) -> Resul
         None => (Vec::new(), Vec::new()),
         Some(spec) => resolve_spec(&mut session, spec).await?,
     };
-    let path = opts.path.clone().unwrap_or_default();
+    let path = escape_filter(&opts.path.clone().unwrap_or_default());
 
     if !write_frame(
         &mut session.writer,
@@ -389,7 +409,7 @@ pub async fn cmd_log(transport: Transport, repo: String, opts: LogOpts) -> Resul
             return Err(format!("log failed: {}", git_status_text(page.status)));
         }
         for record in git_commit_records(&page.records) {
-            print_commit(&record, opts.json);
+            print_commit(&record, opts.json, opts.full_message);
         }
         if page.flags & GIT_COMMITS_MORE != 0 && !opts.json {
             eprintln!("… (more; raise -n)");
@@ -540,7 +560,7 @@ async fn watch_log<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             print!("\x1b[2J\x1b[H");
         }
         for record in git_commit_records(&page.records) {
-            print_commit(&record, opts.json);
+            print_commit(&record, opts.json, opts.full_message);
         }
         if page.flags & GIT_COMMITS_MORE != 0 && !opts.json {
             eprintln!("… (more; raise -n)");
@@ -558,7 +578,7 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
     } = opts;
     let (reader, writer) = transport.split();
     let (mut session, _workdir) = open_repo(reader, writer, &repo, 0).await?;
-    let filter = path.unwrap_or_default();
+    let filter = escape_filter(&path.unwrap_or_default());
 
     let commit = |oid| GitEndpoint {
         kind: GIT_ENDPOINT_COMMIT,

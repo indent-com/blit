@@ -84,6 +84,13 @@ pub async fn read_message(
             continue;
         }
         let flags = frame[1];
+        // A complete message can never exceed the protocol-wide decompressed
+        // ceiling, so a fragment stream that grows past it is a buggy or
+        // hostile peer — abort rather than reassemble without bound.
+        if pending.len().saturating_add(frame.len() - 2) > blit_remote::MAX_DECOMPRESSED {
+            pending.clear();
+            return None;
+        }
         pending.extend_from_slice(&frame[2..]);
         if flags & blit_remote::FRAGMENT_FLAG_LAST != 0 {
             return Some(std::mem::take(pending));
@@ -605,6 +612,9 @@ fn spawn_detached_server(socket_path: &str) -> Result<(), String> {
     cmd.arg("server")
         .arg("--socket")
         .arg(socket_path)
+        // One-shot fs/git/lsp use never touches a surface; skip the
+        // compositor/VAAPI bring-up the daemon would otherwise pay for.
+        .env("BLIT_SKIP_COMPOSITOR", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
