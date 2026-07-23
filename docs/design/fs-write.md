@@ -1,6 +1,7 @@
 # RFC: Filesystem Writes
 
-- **Status:** Draft
+- **Status:** Implemented (`FEATURE_FS_WRITE`, protocol feature bit 9) — the
+  disk-write side; the Monaco pane (§ Rollout step 6) is separate `js/ui` work.
 - **Date:** 2026-07-23
 - **Companion to:** [fs-watch.md](fs-watch.md), [git.md](git.md), [lsp.md](lsp.md)
 
@@ -142,9 +143,14 @@ content-hash CAS is self-verifying and costs one 16-byte field.
 
 The **blit-vs-external-writer** window is irreducible: no OS offers an
 atomic compare-hash-and-rename, so an external process writing between
-blit's hash check and blit's rename can be clobbered. Inline dispatch on
-the engine thread closes the blit-vs-blit window entirely; the
-cross-writer window is disclosed, not solved (no design can).
+blit's hash check and blit's rename can be clobbered. The blit-vs-blit
+window is closed by serializing the compare-hash-and-write section on a
+process-global lock keyed by the **canonical target path** — not the
+per-sync engine or the shared root, since two writers can reach the same
+file through different roots (a recursive and a non-recursive sync of the
+same directory, or a root and a nested root), each with its own engine
+thread and `SharedRootHandle`. Distinct files still lock independently.
+The cross-writer window is disclosed, not solved (no design can).
 
 ## Atomicity and durability
 

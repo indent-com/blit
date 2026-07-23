@@ -4767,6 +4767,10 @@ struct FsSyncEntry {
 struct FsSyncs {
     map: HashMap<u16, FsSyncEntry>,
     next_id: u16,
+    /// Nonces of writes/ops in flight on this connection (write-family
+    /// nonce namespace). Membership dedups a duplicate nonce; the count is
+    /// the in-flight cap. Freed by the engine's `InflightGuard` on reply.
+    inflight_writes: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
 }
 
 impl FsSyncs {
@@ -4787,6 +4791,32 @@ impl FsSyncs {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64)
+    }
+
+    fn max_write_inflight() -> usize {
+        std::env::var("BLIT_FS_WRITE_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    }
+
+    /// Reserve a nonce for an in-flight write/op. `Ok(guard)` inserts it and
+    /// returns a guard that frees the slot when dropped; `Err(status)` is
+    /// `INVALID` for a duplicate nonce or `BUDGET` when the cap is reached.
+    fn reserve_write(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_writes.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= Self::max_write_inflight() {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_writes.clone(),
+            nonce,
+        )))
     }
 }
 
@@ -4933,11 +4963,23 @@ fn handle_fs_message(
             }
         }
         C2S_FS_WRITE => {
-            // The engine replies one FS_DONE; a malformed request or an
-            // unknown sync answers INVALID here (docs/design/fs-write.md).
+            // The engine replies one FS_DONE; a malformed request, an unknown
+            // sync, a duplicate nonce, or an over-cap request answers here
+            // (docs/design/fs-write.md).
             match parse_fs_write(data) {
-                Some(w) => match syncs.map.get(&w.sync_id) {
-                    Some(entry) => {
+                Some(w) => {
+                    if !syncs.map.contains_key(&w.sync_id) {
+                        let _ = out.send(msg_fs_done(w.nonce, FS_DONE_INVALID, 0, 0));
+                        return;
+                    }
+                    let inflight = match syncs.reserve_write(w.nonce) {
+                        Ok(guard) => guard,
+                        Err(status) => {
+                            let _ = out.send(msg_fs_done(w.nonce, status, 0, 0));
+                            return;
+                        }
+                    };
+                    if let Some(entry) = syncs.map.get(&w.sync_id) {
                         entry.handle.command(blit_fssync::Command::Write(WriteReq {
                             nonce: w.nonce,
                             path: w.path,
@@ -4946,12 +4988,10 @@ fn handle_fs_message(
                             flags: w.flags,
                             content_kind: w.content_kind,
                             content: w.content,
+                            inflight: Some(inflight),
                         }));
                     }
-                    None => {
-                        let _ = out.send(msg_fs_done(w.nonce, FS_DONE_INVALID, 0, 0));
-                    }
-                },
+                }
                 None => {
                     // Recover the nonce for a best-effort reply if we can.
                     let nonce = data
@@ -4963,8 +5003,19 @@ fn handle_fs_message(
             }
         }
         C2S_FS_OP => match parse_fs_op(data) {
-            Some(o) => match syncs.map.get(&o.sync_id) {
-                Some(entry) => {
+            Some(o) => {
+                if !syncs.map.contains_key(&o.sync_id) {
+                    let _ = out.send(msg_fs_done(o.nonce, FS_DONE_INVALID, 0, 0));
+                    return;
+                }
+                let inflight = match syncs.reserve_write(o.nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(msg_fs_done(o.nonce, status, 0, 0));
+                        return;
+                    }
+                };
+                if let Some(entry) = syncs.map.get(&o.sync_id) {
                     entry.handle.command(blit_fssync::Command::Op(OpReq {
                         nonce: o.nonce,
                         op: o.op,
@@ -4973,12 +5024,10 @@ fn handle_fs_message(
                         base: o.base,
                         mode: o.mode,
                         flags: o.flags,
+                        inflight: Some(inflight),
                     }));
                 }
-                None => {
-                    let _ = out.send(msg_fs_done(o.nonce, FS_DONE_INVALID, 0, 0));
-                }
-            },
+            }
             None => {
                 let nonce = data
                     .get(1..3)

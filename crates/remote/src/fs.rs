@@ -1091,6 +1091,49 @@ mod tests {
     }
 
     #[test]
+    fn fs_write_family_byte_fixtures() {
+        // Pinned bytes, cross-checked with js/core/src/__tests__/fs.test.ts.
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let w = FsWrite {
+            nonce: 0x0102,
+            sync_id: 0x0304,
+            flags: FS_WRITE_MKPARENTS,
+            base: 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100,
+            mode: 0o644,
+            content_kind: FS_WRITE_CONTENT_FULL,
+            path: "a/b.txt".into(),
+            content: b"hi".to_vec(),
+        };
+        assert_eq!(
+            hex(&msg_fs_write(&w)),
+            "440201040302000102030405060708090a0b0c0d0e0fa4010000010700612f622e74787402000000206869"
+        );
+        let o = FsOp {
+            nonce: 0x0102,
+            sync_id: 0x0304,
+            op: FS_OP_RENAME,
+            flags: FS_OP_MKPARENTS,
+            base: 0,
+            mode: 0,
+            a: "x".into(),
+            b: "y".into(),
+        };
+        assert_eq!(
+            hex(&msg_fs_op(&o)),
+            "450201040303020000000000000000000000000000000000000000010078010079"
+        );
+        assert_eq!(
+            hex(&msg_fs_done(
+                0x0102,
+                FS_DONE_CONFLICT,
+                0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100,
+                0x1122_3344_5566_7788
+            )),
+            "4402010b000102030405060708090a0b0c0d0e0f8877665544332211"
+        );
+    }
+
+    #[test]
     fn fs_done_roundtrip() {
         let hash = 0xdead_beef_dead_beef_dead_beef_dead_beefu128;
         let msg = msg_fs_done(5, FS_DONE_OK, hash, 1_700_000_000_000_000_000);

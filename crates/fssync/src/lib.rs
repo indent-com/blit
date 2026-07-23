@@ -94,6 +94,32 @@ pub enum Hint {
     Rescan,
 }
 
+/// Per-connection in-flight write accounting. The server inserts a
+/// request's nonce before dispatch — rejecting a duplicate (`INVALID`) or
+/// an over-cap request (`BUDGET`) — and attaches this guard to the request;
+/// the engine drops it once the request is answered, removing the nonce and
+/// freeing a slot. Bounds the otherwise-unbounded engine channel depth (and
+/// thus resident inbound content) to the in-flight cap.
+#[derive(Debug)]
+pub struct InflightGuard {
+    set: Arc<Mutex<std::collections::HashSet<u16>>>,
+    nonce: u16,
+}
+
+impl InflightGuard {
+    pub fn new(set: Arc<Mutex<std::collections::HashSet<u16>>>, nonce: u16) -> Self {
+        InflightGuard { set, nonce }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.nonce);
+        }
+    }
+}
+
 /// A content write forwarded to the engine (docs/design/fs-write.md).
 /// `path` is the escaped wire path; `flags` are `FS_WRITE_*`.
 #[derive(Clone, Debug)]
@@ -105,6 +131,9 @@ pub struct WriteReq {
     pub flags: u8,
     pub content_kind: u8,
     pub content: Vec<u8>,
+    /// Freed (nonce slot released) when this request is dropped after the
+    /// engine answers it. `None` in tests and embedders without accounting.
+    pub inflight: Option<Arc<InflightGuard>>,
 }
 
 /// A metadata op forwarded to the engine. `op` is `FS_OP_*`; `a`/`b` are
@@ -118,6 +147,7 @@ pub struct OpReq {
     pub base: u128,
     pub mode: u32,
     pub flags: u8,
+    pub inflight: Option<Arc<InflightGuard>>,
 }
 
 /// Commands forwarded from the client connection.
@@ -206,13 +236,6 @@ pub struct SharedRootHandle {
     /// (root gone, permission lost, resource limit). A closed root is dead
     /// forever; a later `open_root` of the same key must not join it.
     closed: Arc<OnceLock<u8>>,
-    /// Serializes the compare-hash-and-rename critical section of every
-    /// write against this root, across all its per-sync engines (which run
-    /// on separate threads). This is what closes the blit-vs-blit CAS race
-    /// (docs/design/fs-write.md "Conflict model"); the reconciler is not a
-    /// serialization point because writes reply on the per-sync engine's
-    /// own outbox.
-    write_lock: Mutex<()>,
     /// Keeps the native watch alive for the root's lifetime.
     _backend: Mutex<Option<backend::WatchBackend>>,
 }
@@ -319,7 +342,6 @@ fn open_root_inner(key: RootKey, watched: bool) -> Result<Arc<SharedRootHandle>,
         key: key.clone(),
         tx,
         closed: closed.clone(),
-        write_lock: Mutex::new(()),
         _backend: Mutex::new(backend),
     });
     let reconciler_key = key.clone();
@@ -1133,9 +1155,7 @@ fn write_atomic(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io::Re
         return Err(e);
     }
     #[cfg(unix)]
-    if durable
-        && let Ok(d) = fs::File::open(target.parent().unwrap_or_else(|| Path::new(".")))
-    {
+    if durable && let Ok(d) = fs::File::open(target.parent().unwrap_or_else(|| Path::new("."))) {
         let _ = d.sync_all();
     }
     Ok(())
@@ -1153,10 +1173,23 @@ fn create_exclusive(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
+    // Open exclusively first: a pre-existing file / concurrent creator
+    // (AlreadyExists) is never touched by the cleanup below.
     let mut f = opts.open(target)?;
-    f.write_all(bytes)?;
-    if durable {
-        fsync_durable(&f, target)?;
+    let staged = (|| {
+        f.write_all(bytes)?;
+        if durable {
+            fsync_durable(&f, target)?;
+        }
+        Ok(())
+    })();
+    drop(f);
+    if let Err(e) = staged {
+        // Restore the "path does not exist" invariant so a retry re-attempts
+        // the create instead of hitting a phantom CONFLICT on the partial
+        // bytes (and leaves nothing for the reconciler to echo).
+        let _ = fs::remove_file(target);
+        return Err(e);
     }
     Ok(())
 }
@@ -1170,6 +1203,40 @@ fn current_hash(path: &Path) -> u128 {
         Ok(bytes) => blake3_128(&bytes),
         Err(_) => 0,
     }
+}
+
+/// The reconciler's index key for an absolute path under `root`: each
+/// component escaped and `/`-joined, exactly as `note_hint` derives it.
+/// Used to key echo priming by the path the change actually lands under
+/// (which differs from the client's wire path for a followed symlink).
+fn wire_key_for(root: &Path, abs: &Path) -> Option<String> {
+    let rel = abs.strip_prefix(root).ok()?;
+    let mut wire = String::new();
+    for comp in rel.components() {
+        wire = join_wire(&wire, &os_to_wire(comp.as_os_str()));
+    }
+    Some(wire)
+}
+
+/// A process-global lock keyed by a canonical filesystem path. The
+/// compare-hash-and-write critical section serializes on the on-disk
+/// *file*, not the `RootKey`: two writers reaching the same file through
+/// different roots (recursive vs not, or a root and a nested root) hold
+/// distinct `SharedRootHandle`s, so a per-root lock could not have closed
+/// their CAS race. Distinct files still lock independently and run in
+/// parallel. The map self-prunes dropped entries, so it stays O(live
+/// writers).
+fn path_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>> =
+        OnceLock::new();
+    let mut map = LOCKS.get_or_init(Default::default).lock().unwrap();
+    if let Some(existing) = map.get(path).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    map.retain(|_, w| w.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    map.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
 }
 
 /// Create `target_parent` and any missing ancestors for `MKPARENTS`,
@@ -1197,10 +1264,24 @@ fn create_parents_confined(root: &Path, target_parent: &Path) -> Result<(), u8> 
     for name in tail.iter().rev() {
         cur.push(name);
         if let Err(e) = fs::create_dir(&cur) {
-            // Tolerate a concurrent creator; anything else is fatal.
-            if !cur.is_dir() {
+            // Tolerate only a REAL concurrently-created directory, never a
+            // symlink: `symlink_metadata` does not follow the link, so a
+            // symlink planted in this slot between the existence walk and
+            // now is rejected instead of silently descended through.
+            let real_dir = fs::symlink_metadata(&cur)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if !real_dir {
                 return Err(write_io_status(&e));
             }
+        }
+        // Re-canonicalize and re-confirm each created component stays under
+        // root before the next `push` descends through it — defense in depth
+        // against a racing in-tree symlink redirecting the tail outside.
+        match fs::canonicalize(&cur) {
+            Ok(c) if c.starts_with(root) => cur = c,
+            Ok(_) => return Err(FS_DONE_PERMISSION),
+            Err(e) => return Err(write_io_status(&e)),
         }
     }
     Ok(())
@@ -2349,9 +2430,10 @@ impl SyncEngine {
         (self.outbox)(msg_fs_done(w.nonce, status, hash, mtime_ns))
     }
 
-    /// Land a content write under the shared root's write lock: confine the
-    /// path, enforce the CAS precondition against the freshly re-read live
-    /// hash, write atomically (or create-exclusive), then prime the echo.
+    /// Land a content write under the target's per-file write lock: confine
+    /// the path, enforce the CAS precondition against the freshly re-read
+    /// live hash, write atomically (or create-exclusive), then prime the
+    /// echo.
     fn exec_write(&mut self, w: &WriteReq) -> (u8, u128, u64) {
         use blit_remote::fs::FS_WRITE_CONTENT_DELTA;
         // v1 accepts only full content (0/1); delta is a v2 encoding.
@@ -2380,11 +2462,12 @@ impl SyncEngine {
         let durable = w.flags & FS_WRITE_DURABLE != 0;
         let no_cas = w.flags & FS_WRITE_NO_CAS != 0;
 
-        // Serialize check-and-write against other blit writers of this root.
-        // Clone the Arc so the guard borrows the local, leaving `self` free
-        // for the `&mut self` echo priming below.
-        let shared = self.shared.clone();
-        let _guard = shared.write_lock.lock().unwrap();
+        // Serialize check-and-write against every other blit writer of this
+        // exact file — including ones reaching it through a different root.
+        // The guard owns its Arc, leaving `self` free for the `&mut self`
+        // echo priming below.
+        let lock = path_write_lock(&target);
+        let _guard = lock.lock().unwrap();
 
         // Never clobber a directory with a file.
         if fs::symlink_metadata(&target)
@@ -2422,7 +2505,11 @@ impl SyncEngine {
         }
 
         let mtime_ns = stat_meta(&target).map(|m| m.mtime_ns).unwrap_or(0);
-        self.prime_echo(&w.path, &target, hash, &w.content, mtime_ns);
+        // Key the echo by the path the write actually landed under — which
+        // is the resolved target, not the client's wire path, when a
+        // symlink was followed. Otherwise the two coincide.
+        let echo_wire = wire_key_for(&self.root, &target).unwrap_or_else(|| w.path.clone());
+        self.prime_echo(&echo_wire, &target, hash, &w.content, mtime_ns);
         (FS_DONE_OK, hash, mtime_ns)
     }
 
@@ -2431,9 +2518,9 @@ impl SyncEngine {
         (self.outbox)(msg_fs_done(o.nonce, status, hash, mtime_ns))
     }
 
-    /// Execute a metadata op (mkdir/remove/rename) under the write lock.
+    /// Execute a metadata op (mkdir/remove/rename), each under the affected
+    /// path's per-file write lock.
     fn exec_op(&mut self, o: &OpReq) -> (u8, u128, u64) {
-        let _guard = self.shared.write_lock.lock().unwrap();
         match o.op {
             FS_OP_MKDIR => {
                 if o.flags & FS_OP_MKPARENTS != 0
@@ -2447,6 +2534,8 @@ impl SyncEngine {
                     Ok(t) => t,
                     Err(status) => return (status, 0, 0),
                 };
+                let lock = path_write_lock(&target);
+                let _guard = lock.lock().unwrap();
                 let mut builder = fs::DirBuilder::new();
                 #[cfg(unix)]
                 if o.mode != 0 {
@@ -2472,6 +2561,8 @@ impl SyncEngine {
                     Ok(t) => t,
                     Err(status) => return (status, 0, 0),
                 };
+                let lock = path_write_lock(&target);
+                let _guard = lock.lock().unwrap();
                 let md = match fs::symlink_metadata(&target) {
                     Ok(m) => m,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -2510,6 +2601,8 @@ impl SyncEngine {
                     Ok(t) => t,
                     Err(status) => return (status, 0, 0),
                 };
+                let lock = path_write_lock(&from);
+                let _guard = lock.lock().unwrap();
                 if fs::symlink_metadata(&from).is_err() {
                     return (FS_DONE_NOT_FOUND, 0, 0);
                 }
@@ -2803,6 +2896,7 @@ mod tests {
             flags,
             content_kind: 1,
             content: content.to_vec(),
+            inflight: None,
         })
     }
 
@@ -2899,6 +2993,7 @@ mod tests {
                 base,
                 mode: 0,
                 flags,
+                inflight: None,
             })
         };
 
