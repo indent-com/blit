@@ -148,7 +148,11 @@ pub(crate) enum Cmd {
         sub: u64,
         nonce: u16,
     },
-    Dirty(Vec<PathBuf>),
+    /// Watcher hints as `(path, was_created)` — the notify event kind
+    /// distinguishes a creation from a modification, which
+    /// `didChangeWatchedFiles` must relay (gopls adds a file to its
+    /// package only on `Created`).
+    Dirty(Vec<(PathBuf, bool)>),
     Rpc(u64, RpcMsg),
     ChildGone(u64),
     Stop,
@@ -349,7 +353,10 @@ struct Engine {
     quiesce_at: Option<Instant>,
     restarts: VecDeque<Instant>,
     respawn_at: Option<Instant>,
-    dirty: HashMap<PathBuf, ()>,
+    /// Dirty paths pending a `didChangeWatchedFiles` flush, each with a
+    /// "was created" hint coalesced across the settle window (a create
+    /// seen in the window wins over a later modify).
+    dirty: HashMap<PathBuf, bool>,
     dirty_deadline: Option<Instant>,
     watcher: Option<notify::RecommendedWatcher>,
 }
@@ -582,15 +589,21 @@ impl Engine {
         let root = self.root.clone();
         let watcher = notify::recommended_watcher(move |event: Result<notify::Event, _>| {
             if let Ok(event) = event {
-                let paths: Vec<PathBuf> = event
+                // notify's kind separates creation from modification;
+                // preserve it so the change event carries the right
+                // FileChangeType. (FSEvents can coalesce a create+write
+                // into one Modify — an unavoidable imprecision on macOS.)
+                let created = matches!(event.kind, notify::EventKind::Create(_));
+                let entries: Vec<(PathBuf, bool)> = event
                     .paths
                     .into_iter()
                     // The `.git` subtree churns constantly and no
                     // language server wants it.
                     .filter(|p| !p.strip_prefix(&root).is_ok_and(|r| r.starts_with(".git")))
+                    .map(|p| (p, created))
                     .collect();
-                if !paths.is_empty() {
-                    let _ = tx.send(Cmd::Dirty(paths));
+                if !entries.is_empty() {
+                    let _ = tx.send(Cmd::Dirty(entries));
                 }
             }
         });
@@ -748,9 +761,11 @@ impl Engine {
                     self.write(rpc::notification("$/cancelRequest", json!({ "id": id })));
                 }
             }
-            Cmd::Dirty(paths) => {
-                for path in paths {
-                    self.dirty.insert(path, ());
+            Cmd::Dirty(entries) => {
+                for (path, created) in entries {
+                    // A create seen anywhere in the window wins; a later
+                    // modify must not downgrade it.
+                    *self.dirty.entry(path).or_insert(false) |= created;
                 }
                 self.dirty_deadline
                     .get_or_insert(Instant::now() + Duration::from_millis(200));
@@ -1182,13 +1197,23 @@ impl Engine {
             return;
         }
         self.dirty_deadline = None;
-        let dirty: Vec<PathBuf> = self.dirty.drain().map(|(p, ())| p).collect();
+        let dirty: Vec<(PathBuf, bool)> = self.dirty.drain().collect();
         let mut events = Vec::with_capacity(dirty.len());
-        for path in dirty {
+        for (path, created) in dirty {
             let exists = path.exists();
+            // LSP FileChangeType: 1 Created, 2 Changed, 3 Deleted. A
+            // gone path is Deleted regardless of the create hint (it was
+            // created and removed within the window).
+            let change_type = if !exists {
+                3
+            } else if created {
+                1
+            } else {
+                2
+            };
             events.push(json!({
                 "uri": text::path_to_uri(&path),
-                "type": if exists { 2 } else { 3 },
+                "type": change_type,
             }));
             if let Some((version, _, _)) = self.open_docs.get(&path) {
                 let version = version + 1;

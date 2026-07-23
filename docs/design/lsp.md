@@ -398,7 +398,12 @@ version corruption is impossible rather than forbidden.
 The engine reuses the fssync shared-root watcher (one native watcher
 per tree, [fs-watch.md](fs-watch.md)) to feed
 `workspace/didChangeWatchedFiles`, honoring dynamic watcher
-registrations. Because several major servers diagnose only open
+registrations. Events carry the notify event kind mapped to the LSP
+`FileChangeType` — `Created`, `Changed`, or `Deleted` — so a server
+that adds a file to its project only on creation (gopls) sees new files
+appear; a gone path is always `Deleted`. (FSEvents can coalesce a
+create-then-write into one modify, an unavoidable macOS imprecision.)
+Because several major servers diagnose only open
 documents (typescript-language-server, pyright, clangd), the engine
 maintains an **open set** from day one, admitted by three signals:
 files recently changed on disk (watcher-dirty), files a subscriber

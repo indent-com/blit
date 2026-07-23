@@ -749,6 +749,76 @@ fn ws_symbols_opens_a_project_doc_when_needed() {
     );
 }
 
+/// `didChangeWatchedFiles` must relay a creation as `Created` (type 1),
+/// a modification as `Changed` (2), and a removal as `Deleted` (3) — not
+/// collapse everything to Changed/Deleted by `exists()` alone, or a
+/// server that adds files only on `Created` (gopls) misses new files.
+#[test]
+fn watched_files_carry_the_change_type() {
+    let root = tmp_root("watched");
+    // Two files that exist before the backend starts, so the real
+    // watcher stays quiet and the injected hints drive the test
+    // deterministically across platforms.
+    std::fs::write(root.join("created.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(root.join("changed.rs"), "fn b() {}\n").unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    let serve = move |mut reader: BufReader<Box<dyn Read + Send>>,
+                      mut writer: Box<dyn Write + Send>| {
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            match msg {
+                rpc::RpcMsg::Request { id, method, .. } => {
+                    let reply = match method.as_str() {
+                        "initialize" => rpc::response(&id, json!({ "capabilities": {} })),
+                        "shutdown" => rpc::response(&id, Value::Null),
+                        _ => rpc::error_response(&id, -32601, "unhandled"),
+                    };
+                    let _ = rpc::write_msg(writer.as_mut(), &reply);
+                }
+                rpc::RpcMsg::Notification { method, params } => {
+                    if method == "workspace/didChangeWatchedFiles" {
+                        let _ = tx.send(params);
+                    }
+                    if method == "exit" {
+                        return;
+                    }
+                }
+                rpc::RpcMsg::Response { .. } => {}
+            }
+        }
+    };
+    let backend = testutil::pipe_backend(test_spec(), root.clone(), test_budgets(), serve);
+    wait_ready(&backend);
+
+    let gone = root.join("gone.rs"); // never created → Deleted
+    backend.send(crate::backend::Cmd::Dirty(vec![
+        (root.join("created.rs"), true),
+        (root.join("changed.rs"), false),
+        (gone, false),
+    ]));
+
+    // Collect changes until all three files are seen.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut types: std::collections::HashMap<String, i64> = Default::default();
+    while types.len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "watched-files event never arrived"
+        );
+        let params = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no didChangeWatchedFiles");
+        for change in params["changes"].as_array().into_iter().flatten() {
+            let uri = change["uri"].as_str().unwrap_or_default();
+            let name = uri.rsplit('/').next().unwrap_or_default().to_string();
+            types.insert(name, change["type"].as_i64().unwrap_or(0));
+        }
+    }
+    assert_eq!(types.get("created.rs"), Some(&1), "creation → Created");
+    assert_eq!(types.get("changed.rs"), Some(&2), "modification → Changed");
+    assert_eq!(types.get("gone.rs"), Some(&3), "missing path → Deleted");
+}
+
 fn wait_ready(backend: &Arc<Backend>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
