@@ -68,6 +68,10 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x2F` | `SURFACE_TEXT`         | `[surface_id:2][text:N]` — composed text input (UTF-8)                           |
 | `0x30` | `AUDIO_SUBSCRIBE`      | `[bitrate_kbps:2]`                                                               |
 | `0x31` | `AUDIO_UNSUBSCRIBE`    | (no payload)                                                                     |
+| `0x40` | `FS_SYNC`              | `[nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N]`             |
+| `0x41` | `FS_STOP`              | `[sync_id:2]`                                                                    |
+| `0x42` | `FS_ACK`               | `[sync_id:2][update_id:4]` — cumulative                                          |
+| `0x43` | `FS_FETCH`             | `[nonce:2][sync_id:2][path_len:2][path:N]`                                       |
 
 **Notes:**
 
@@ -75,6 +79,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 - Bit 0 (`HAS_SRC_PTY`): followed by `[src_pty_id:2]` — create the new PTY in the same working directory as `src_pty_id`.
 - Bit 1 (`HAS_COMMAND`): remaining bytes after tag (and `src_pty_id` if present) are the UTF-8 command string (no length prefix) — spawn this command instead of the default shell.
+- Bit 2 (`HAS_CWD`): followed by `[cwd_len:2][cwd:N]` (before any command bytes) — spawn in this working directory.
 
 `READ` requests text from a PTY's scrollback + viewport:
 
@@ -109,6 +114,7 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                     |
 | `0x0B` | `PING`              | _(empty)_ — server keepalive                                                                               |
 | `0x0C` | `QUIT`              | _(empty)_ — server shutting down                                                                           |
+| `0x0D` | `USED_ROWS`         | `[pty_id:2][used_rows:2]`                                                                                  |
 | `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                      |
 | `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                           |
 | `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                   |
@@ -120,8 +126,13 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | `0x28` | `SURFACE_APP_ID`    | `[surface_id:2][app_id:N]`                                                                                 |
 | `0x29` | `SURFACE_CURSOR`    | `[surface_id:2][shape_len:1][shape:N]` — CSS cursor keyword                                                |
 | `0x2A` | `SURFACE_ENCODER`   | `[surface_id:2][name][0x00][codec_string]` — encoder display name + WebCodecs codec string, NUL-separated  |
+| `0x2B` | `FRAGMENT`          | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                 |
 | `0x2C` | `CLIPBOARD_LIST`    | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                               |
 | `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                           |
+| `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                   |
+| `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                           |
+| `0x42` | `FS_FILE`           | `[nonce:2][status:1][data:LZ4]`                                                                            |
+| `0x43` | `FS_CLOSED`         | `[sync_id:2][reason:1]`                                                                                    |
 
 **Notes:**
 
@@ -135,8 +146,13 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | 3   | `COPY_RANGE`   | Server supports range-based text copy                          |
 | 4   | `COMPOSITOR`   | Server supports headless Wayland compositor                    |
 | 5   | `AUDIO`        | Server supports audio forwarding (PipeWire capture + Opus)     |
+| 6   | `FS_SYNC`      | Server supports the `FS_*` filesystem sync family              |
+| 7   | `GIT`          | Server supports the `GIT_*` git introspection family           |
+| 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
 
-`S2C_LIST` entry layout: `[pty_id:2][cols:2][rows:2][tag_len:2][tag:N]` per PTY.
+`S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
+PTY. The trailing command field is a backward-compatible extension; old
+entries without it parse as an empty command.
 
 `S2C_EXITED` exit status: `WEXITSTATUS` for normal exits (0, 1, …); negative signal number for signal deaths (-9 = SIGKILL); `i32::MIN` when status is unknown.
 
@@ -209,6 +225,81 @@ When `content_len == 7`, the cell's text exceeds 4 bytes. Bytes 8–11 hold an F
 - Bit 10: PTY canonical mode (`tcgetattr ICANON`)
 
 Mode bits are tracked by `ModeTracker` in `blit-alacritty`, which intercepts CSI/DCS sequences from raw PTY output.
+
+## Fragmentation
+
+`S2C_FRAGMENT` (`0x2B`) splits any bulk server message into chunks so small
+frames (audio, keepalives) never sit behind a multi-megabyte write:
+
+```
+[0x2B][flags:1][chunk:N]
+```
+
+Flag bit 0 (`FRAGMENT_FLAG_LAST`) marks the final chunk. Chunks carry the
+original message's bytes verbatim (its opcode arrives in the first chunk);
+the receiver concatenates chunks into one logical message and dispatches it
+normally. Fragments of different messages never interleave — one pending
+reassembly buffer suffices — and only `S2C_AUDIO_FRAME` may appear between
+fragments. The server chunks any payload over 4 KiB; logical messages may
+exceed the 16 MiB frame limit.
+
+## Compressed payloads
+
+Fields documented as `:LZ4` are `lz4_flex::compress_prepend_size` (a 4-byte
+LE uncompressed size, then the LZ4 block). Receivers MUST check the
+declared size against `MAX_DECOMPRESSED` (64 MiB) _before_ allocating, so a
+hostile or corrupt length cannot force a giant allocation. The constant is
+protocol-wide — exported as `MAX_DECOMPRESSED` from `blit-remote` and
+`@blit-sh/core` (the fs family's `FS_MAX_DECOMPRESSED` is the same value) —
+and every family bounds its responses well under it, so a well-behaved
+peer never trips the guard.
+
+## Filesystem sync
+
+The `FS_*` family (feature bit 6) mirrors a server-side directory tree into
+clients as ordered state diffs: a client `FS_SYNC`s a path, receives a staged
+snapshot followed by live updates (`RESET`/`SYNC` flags delimit staged
+series), applies LZ4-compressed `UPSERT`/`DELETE`/`MOVE` records to a map,
+and acknowledges cumulatively via `FS_ACK` (byte-window pacing,
+`BLIT_FS_WINDOW`). `FS_FETCH` pulls one file's full content on demand;
+`FS_WRITE`/`FS_OP` write back to disk — content upserts under
+compare-and-swap on the synced content hash, plus
+mkdir/remove/rename/symlink/hardlink —
+each answered by one `FS_DONE`
+([design/fs-write.md](design/fs-write.md)). The write side shares the
+family's feature bit; `BLIT_FS_WRITE=0` makes a deployment read-only
+(writes answer `PERMISSION`).
+Wire details, record layouts, and semantics:
+[design/fs-watch.md](design/fs-watch.md); server engine:
+`crates/fssync`; codecs and the `FsMirror` reference reducer:
+`crates/remote/src/fs.rs` (Rust) and `js/core/src/fs.ts` (TypeScript,
+surfaced as `syncFs` on `BlitConnection`/`BlitWorkspace`).
+
+## Git introspection
+
+The `GIT_*` family (feature bit 7) opens repositories by path, pushes
+mutable state (HEAD, refs, in-progress operation, status) as
+whole-snapshot `GIT_STATE` messages, and pulls immutable content
+(commits, trees, blobs, diffs, patches) by content address through
+nonce request/response pairs. Wire details:
+[design/git.md](design/git.md); server engine: `crates/git`; codecs and
+the `GitStateMirror` reference reducer: `crates/remote/src/git.rs` and
+`js/core/src/git.ts` (surfaced as `openRepo` on
+`BlitConnection`/`BlitWorkspace`).
+
+## Language intelligence
+
+The `LSP_*` family (feature bit 8) terminates LSP at the server: warm
+language-server backends are daemon-owned and shared, backend
+phase/capabilities are pushed as `LSP_STATE` snapshots, diagnostics as
+per-file replacement sets (`LSP_DIAG`, `FULL` replay on subscribe), and
+definition/references/hover/symbols/rename-as-data are pulled through
+the single `LSP_QUERY` opcode. Positions are 0-based lines with UTF-8
+byte columns; the server transcodes. Wire details:
+[design/lsp.md](design/lsp.md); server engine: `crates/lsp`; codecs and
+the `LspStateMirror`/`LspDiagMirror` reference reducers:
+`crates/remote/src/lsp.rs` and `js/core/src/lsp.ts` (surfaced as
+`openLsp` on `BlitConnection`).
 
 ## Multiplexed WebSocket (`/mux`)
 

@@ -67,6 +67,30 @@ blit remote add prod ssh:alice@prod.co
 blit remote set-default prod
 ```
 
+## Code intelligence
+
+Language servers (rust-analyzer, gopls, clangd, …) are discovered by
+project markers, spawned on the server, and stay warm across
+invocations. Positions are 1-based PATH:LINE:COL; all commands take
+`--root` (default: server cwd) and `--json` (NDJSON).
+
+```bash
+blit lsp wait                        # block until servers finish indexing
+blit lsp diag                        # current diagnostics (exit 1 if any)
+blit lsp diag --wait                 # settle first — use after editing files
+blit lsp def src/main.rs:10:4        # definition of the symbol at 10:4
+blit lsp refs src/main.rs:10:4       # references (--declaration to include it)
+blit lsp hover src/main.rs:10:4      # type and docs
+blit lsp symbols Config              # fuzzy workspace symbol search
+blit lsp symbols --file src/main.rs  # file outline
+blit lsp rename src/main.rs:10:4 nm  # rename plan (prints edits, never applies)
+blit lsp list                        # running servers (ref, phase, memory)
+```
+
+A first call in a fresh workspace may exit 2 with "warming up" — run
+`blit lsp wait` once, then query. The edit loop: change files, then
+`blit lsp diag --wait` to see resulting errors.
+
 ## Clipboard
 
 ```bash

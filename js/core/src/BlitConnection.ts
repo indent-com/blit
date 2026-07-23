@@ -79,6 +79,152 @@ import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
+import {
+  FEATURE_FS,
+  FS_CLOSED_CONNECTION_LOST,
+  FS_DONE_CONFLICT,
+  FS_DONE_OK,
+  FS_FILE_OK,
+  FS_OP_HARDLINK,
+  FS_OP_MKDIR,
+  FS_OP_MKPARENTS,
+  FS_OP_NO_CAS,
+  FS_OP_REMOVE,
+  FS_OP_RENAME,
+  FS_OP_SYMLINK,
+  FS_STATUS_OK,
+  FS_SYNC_CONTENT,
+  FS_SYNC_CROSS_FILESYSTEM,
+  FS_SYNC_RECURSIVE,
+  FS_WRITE_CONTENT_FULL,
+  FS_WRITE_DURABLE,
+  FS_WRITE_MKPARENTS,
+  FS_WRITE_NO_CAS,
+  FS_UPDATE_RESET,
+  FS_UPDATE_SYNC,
+  FsMirror,
+  S2C_FS_CLOSED,
+  S2C_FS_FILE,
+  S2C_FS_SYNCED,
+  S2C_FS_UPDATE,
+  S2C_FS_DONE,
+  buildFsAckMessage,
+  buildFsFetchMessage,
+  buildFsOpMessage,
+  buildFsStopMessage,
+  buildFsSyncMessage,
+  buildFsWriteMessage,
+  fsDecompress,
+  fsDoneStatusText,
+  fsRecords,
+  fsStatusText,
+  fsFileStatusText,
+  parseFsDoneMessage,
+  parseFsFileMessage,
+  FsConflictError,
+  type FsSyncHandle,
+  type FsSyncOptions,
+  type FsWriteOptions,
+  type FsWriteResult,
+} from "./fs";
+import {
+  FEATURE_GIT,
+  GIT_CLOSED_CONNECTION_LOST,
+  GIT_OPEN_IGNORED,
+  GIT_OPEN_STATUS,
+  GIT_OPEN_TRACKING,
+  GIT_OPEN_UNTRACKED,
+  GIT_OPEN_WATCH,
+  GIT_PATCH_STRUCTURED,
+  GIT_STATUS_OK,
+  GitStateMirror,
+  type GitLogPage,
+  type GitLogSubscription,
+  type GitLogWatchOptions,
+  type GitOpenOptions,
+  type GitRepoHandle,
+  S2C_GIT_BASE,
+  S2C_GIT_BLOB,
+  S2C_GIT_CLOSED,
+  S2C_GIT_COMMITS,
+  S2C_GIT_DIFF,
+  S2C_GIT_INDEX,
+  S2C_GIT_LOG_PAGE,
+  S2C_GIT_PATCH,
+  S2C_GIT_REPO,
+  S2C_GIT_RESOLVE,
+  S2C_GIT_STATE,
+  S2C_GIT_TREE,
+  gitDiffRecords,
+  gitIndexRecords,
+  gitOidHex,
+  gitPatchRecords,
+  gitStatusText,
+  gitTreeRecords,
+  msgGitAck,
+  msgGitBase,
+  msgGitBlob,
+  msgGitClose,
+  msgGitDiff,
+  msgGitIndex,
+  msgGitLog,
+  msgGitLogAck,
+  msgGitLogUnwatch,
+  msgGitLogWatch,
+  msgGitOpen,
+  msgGitPatch,
+  msgGitResolve,
+  msgGitTree,
+  parseGitBaseResp,
+  parseGitBlobResp,
+  parseGitClosed,
+  parseGitCommits,
+  parseGitDiffResp,
+  parseGitIndexResp,
+  parseGitLogPage,
+  parseGitPatchResp,
+  parseGitRepo,
+  parseGitResolveResp,
+  parseGitState,
+  parseGitTreeResp,
+} from "./git";
+import {
+  FEATURE_LSP,
+  LSP_CLOSED_CONNECTION_LOST,
+  LSP_OPEN_DIAGS,
+  LSP_OPEN_WATCH,
+  LSP_QUERY_DEFINITION,
+  LSP_QUERY_DOC_SYMBOLS,
+  LSP_QUERY_HOVER,
+  LSP_QUERY_REFERENCES,
+  LSP_QUERY_RENAME,
+  LSP_QUERY_WS_SYMBOLS,
+  LSP_REFS_INCLUDE_DECLARATION,
+  LSP_RESP_INCOMPLETE,
+  LSP_RESP_TRUNCATED,
+  LSP_STATUS_OK,
+  LSP_STREAM_DIAG,
+  LSP_STREAM_STATE,
+  LspDiagMirror,
+  LspStateMirror,
+  type LspHandle,
+  type LspOpenOptions,
+  type LspQueryResult,
+  S2C_LSP_CLOSED,
+  S2C_LSP_DIAG,
+  S2C_LSP_OPENED,
+  S2C_LSP_QUERY,
+  S2C_LSP_STATE,
+  lspQueryRecords,
+  lspStatusText,
+  msgLspAck,
+  msgLspClose,
+  msgLspOpen,
+  msgLspQuery,
+  parseLspClosed,
+  parseLspOpened,
+  parseLspQueryResp,
+} from "./lsp";
 
 const textDecoder = new TextDecoder();
 
@@ -194,10 +340,88 @@ export class BlitConnection {
     number,
     { resolve: (text: string) => void; reject: (error: Error) => void }
   >();
+  private readonly pendingFsSyncs = new Map<
+    number,
+    {
+      resolve: (handle: FsSyncHandle) => void;
+      reject: (error: Error) => void;
+      options: FsSyncOptions;
+    }
+  >();
+  private readonly fsSyncs = new Map<
+    number,
+    {
+      mirror: FsMirror;
+      options: FsSyncOptions;
+      /** Hash of this client's most recent write per path, for self-echo
+       *  suppression (docs/design/fs-write.md "Echo and attribution"). */
+      lastWritten: Map<string, bigint>;
+    }
+  >();
+  private readonly pendingFsFetches = new Map<
+    number,
+    { resolve: (data: Uint8Array) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsWrites = new Map<
+    number,
+    {
+      resolve: (result: FsWriteResult) => void;
+      reject: (error: Error) => void;
+      /** Set on `writeFile`/`mkdir` so a successful reply records the hash
+       *  in the sync's `lastWritten`; unset for remove/rename. */
+      record?: { syncId: number; path: string };
+    }
+  >();
+  private readonly pendingGitOpens = new Map<
+    number,
+    {
+      resolve: (handle: GitRepoHandle) => void;
+      reject: (error: Error) => void;
+      options: GitOpenOptions;
+    }
+  >();
+  private readonly gitRepos = new Map<
+    number,
+    { mirror: GitStateMirror; options: GitOpenOptions }
+  >();
+  private readonly pendingGitRequests = new Map<
+    number,
+    {
+      opcode: number;
+      resolve: (msg: Uint8Array) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  /** Live log subscriptions keyed by client-assigned `log_id`. */
+  private readonly gitLogSubs = new Map<
+    number,
+    { repoId: number; onUpdate: (page: GitLogPage) => void }
+  >();
+  private readonly pendingLspOpens = new Map<
+    number,
+    {
+      resolve: (handle: LspHandle) => void;
+      reject: (error: Error) => void;
+      options: LspOpenOptions;
+    }
+  >();
+  private readonly lspAttachments = new Map<
+    number,
+    { state: LspStateMirror; diags: LspDiagMirror; options: LspOpenOptions }
+  >();
+  private readonly pendingLspRequests = new Map<
+    number,
+    {
+      resolve: (msg: Uint8Array) => void;
+      reject: (error: Error) => void;
+    }
+  >();
 
   private sessionCounter = 0;
   private nonceCounter = 0;
   private searchCounter = 0;
+  private fsNonceCounter = 0;
+  private gitLogIdCounter = 0;
   private features = 0;
   private disposed = false;
   /** Per-session, per-view size registry for computing minimum resize. */
@@ -296,6 +520,8 @@ export class BlitConnection {
       supportsCopyRange: false,
       supportsCompositor: false,
       supportsAudio: false,
+      supportsFsSync: false,
+      supportsGit: false,
       retryCount: 0,
       error: null,
       sessions: [],
@@ -374,6 +600,9 @@ export class BlitConnection {
     );
     this.rejectPendingSearches(connectionError("Connection disposed"));
     this.rejectPendingReads(connectionError("Connection disposed"));
+    this.resetFsSyncs(connectionError("Connection disposed"));
+    this.resetGitRepos(connectionError("Connection disposed"));
+    this.resetLspAttachments(connectionError("Connection disposed"));
     this.resolveAllPendingCloses();
     this.clearSurfaceSubs();
     this.store.destroy();
@@ -731,6 +960,531 @@ export class BlitConnection {
       this.pendingSearches.set(requestId, { resolve, reject });
       this.transport.send(buildSearchMessage(requestId, query));
     });
+  }
+
+  /**
+   * Mirror a server-side directory tree (docs/fs-watch.md). Resolves once
+   * the server accepts the sync; the handle's `live` map fills as the
+   * staged snapshot streams in and `onSync` fires when it is coherent.
+   * Updates are applied and acknowledged automatically.
+   */
+  async syncFs(
+    path: string,
+    options: FsSyncOptions = {},
+  ): Promise<FsSyncHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot sync while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      throw connectionError("Server does not support filesystem sync");
+    }
+    let flags = 0;
+    if (options.recursive !== false) flags |= FS_SYNC_RECURSIVE;
+    if (options.content) flags |= FS_SYNC_CONTENT;
+    if (options.crossFilesystem) flags |= FS_SYNC_CROSS_FILESYSTEM;
+    return new Promise<FsSyncHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsSyncs);
+      this.pendingFsSyncs.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        buildFsSyncMessage(
+          nonce,
+          flags,
+          options.latencyMs ?? 0,
+          options.inlineMax ?? 0,
+          path,
+        ),
+      );
+    });
+  }
+
+  private nextFsNonce(pending: ReadonlyMap<number, unknown>): number {
+    let nonce = 0;
+    do {
+      nonce = this.fsNonceCounter = (this.fsNonceCounter + 1) & 0xffff;
+    } while (pending.has(nonce));
+    return nonce;
+  }
+
+  private fsFetch(syncId: number, path: string): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsFetches);
+      this.pendingFsFetches.set(nonce, { resolve, reject });
+      this.transport.send(buildFsFetchMessage(nonce, syncId, path));
+    });
+  }
+
+  private fsWrite(
+    syncId: number,
+    path: string,
+    data: Uint8Array,
+    options: FsWriteOptions,
+  ): Promise<FsWriteResult> {
+    return new Promise<FsWriteResult>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      let flags = 0;
+      if (options.createParents) flags |= FS_WRITE_MKPARENTS;
+      if (options.durable) flags |= FS_WRITE_DURABLE;
+      // Precondition: create-exclusive (base 0), CAS (base = ifHash), or —
+      // by default or under force — an unconditional overwrite.
+      let base = 0n;
+      if (options.force) {
+        flags |= FS_WRITE_NO_CAS;
+      } else if (options.create) {
+        base = 0n;
+      } else if (options.ifHash !== undefined) {
+        base = options.ifHash;
+      } else {
+        flags |= FS_WRITE_NO_CAS;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsWrites);
+      this.pendingFsWrites.set(nonce, {
+        resolve,
+        reject,
+        record: { syncId, path },
+      });
+      this.transport.send(
+        buildFsWriteMessage({
+          nonce,
+          syncId,
+          flags,
+          base,
+          mode: options.mode ?? 0,
+          contentKind: FS_WRITE_CONTENT_FULL,
+          path,
+          content: data,
+        }),
+      );
+    });
+  }
+
+  private fsOp(
+    syncId: number,
+    op: number,
+    a: string,
+    b: string,
+    base: bigint,
+    mode: number,
+    flags: number,
+    record?: { syncId: number; path: string },
+  ): Promise<FsWriteResult> {
+    return new Promise<FsWriteResult>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsWrites);
+      this.pendingFsWrites.set(nonce, { resolve, reject, record });
+      this.transport.send(
+        buildFsOpMessage({ nonce, syncId, op, flags, base, mode, a, b }),
+      );
+    });
+  }
+
+  /**
+   * Open a repository on the server (docs/git.md). Resolves once the
+   * server accepts; state snapshots (when watching) apply to the handle's
+   * mirror and acknowledge automatically.
+   */
+  async openRepo(
+    path: string,
+    options: GitOpenOptions = {},
+  ): Promise<GitRepoHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open a repo while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_GIT) === 0) {
+      throw connectionError("Server does not support git introspection");
+    }
+    let flags = 0;
+    if (options.watch) flags |= GIT_OPEN_WATCH;
+    if (options.status || options.untracked || options.ignored)
+      flags |= GIT_OPEN_STATUS;
+    if (options.untracked || options.ignored) flags |= GIT_OPEN_UNTRACKED;
+    if (options.ignored) flags |= GIT_OPEN_IGNORED;
+    if (options.tracking) flags |= GIT_OPEN_TRACKING;
+    return new Promise<GitRepoHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingGitOpens);
+      this.pendingGitOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        msgGitOpen(
+          nonce,
+          flags,
+          options.refsLatencyMs ?? 0,
+          options.statusLatencyMs ?? 0,
+          path,
+        ),
+      );
+    });
+  }
+
+  /** One nonce-correlated git request; resolves with the raw response. */
+  private gitRequest(
+    repoId: number,
+    opcode: number,
+    build: (nonce: number) => Uint8Array,
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.gitRepos.has(repoId)) {
+        reject(connectionError("Repo is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingGitRequests);
+      this.pendingGitRequests.set(nonce, { opcode, resolve, reject });
+      this.transport.send(build(nonce));
+    });
+  }
+
+  private makeGitRepoHandle(
+    repoId: number,
+    info: { oidFormat: number; flags: number; workdir: string; gitdir: string },
+    mirror: GitStateMirror,
+  ): GitRepoHandle {
+    // Immutable pulls cache forever by oid (content-addressed).
+    const blobCache = new Map<string, Uint8Array>();
+    const expectOk = (status: number): void => {
+      if (status !== GIT_STATUS_OK) {
+        throw connectionError(`Request failed: ${gitStatusText(status)}`);
+      }
+    };
+    return {
+      repoId,
+      oidFormat: info.oidFormat,
+      repoFlags: info.flags,
+      workdir: info.workdir,
+      gitdir: info.gitdir,
+      state: mirror,
+      log: async (req = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_COMMITS, (nonce) =>
+          msgGitLog({
+            nonce,
+            repoId,
+            flags: req.flags ?? 0,
+            limit: req.limit ?? 0,
+            path: req.path ?? "",
+            tips: req.tips ?? [],
+            hides: req.hides ?? [],
+          }),
+        );
+        const page = parseGitCommits(msg);
+        if (!page) throw connectionError("Malformed commits from server");
+        expectOk(page.status);
+        return page;
+      },
+      tree: async (oid, path = "") => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_TREE, (nonce) =>
+          msgGitTree(nonce, repoId, oid, path),
+        );
+        const parsed = parseGitTreeResp(msg);
+        if (!parsed) throw connectionError("Malformed tree from server");
+        expectOk(parsed[1]);
+        return [...gitTreeRecords(parsed[3])];
+      },
+      blob: async (oid, path = "", maxLen = 0) => {
+        const cacheKey = path === "" ? gitOidHex(oid, info.oidFormat) : null;
+        if (cacheKey !== null) {
+          const cached = blobCache.get(cacheKey);
+          if (cached) return cached;
+        }
+        const msg = await this.gitRequest(repoId, S2C_GIT_BLOB, (nonce) =>
+          msgGitBlob(nonce, repoId, oid, path, maxLen),
+        );
+        const parsed = parseGitBlobResp(msg);
+        if (!parsed) throw connectionError("Malformed blob from server");
+        expectOk(parsed[1]);
+        if (cacheKey !== null) blobCache.set(cacheKey, parsed[3]);
+        return parsed[3];
+      },
+      diff: async (old, newEndpoint, opts = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_DIFF, (nonce) =>
+          msgGitDiff({
+            nonce,
+            repoId,
+            flags: opts.flags ?? 0,
+            old,
+            new: newEndpoint,
+            path: opts.path ?? "",
+          }),
+        );
+        const parsed = parseGitDiffResp(msg);
+        if (!parsed) throw connectionError("Malformed diff from server");
+        expectOk(parsed[1]);
+        return [...gitDiffRecords(parsed[3])];
+      },
+      patch: async (old, newEndpoint, opts = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_PATCH, (nonce) =>
+          msgGitPatch({
+            nonce,
+            repoId,
+            flags: opts.flags ?? 0,
+            context: opts.context ?? 0,
+            old,
+            new: newEndpoint,
+            path: opts.path ?? "",
+            maxLen: opts.maxLen ?? 0,
+          }),
+        );
+        const parsed = parseGitPatchResp(msg);
+        if (!parsed) throw connectionError("Malformed patch from server");
+        expectOk(parsed[1]);
+        const [, , flags, data] = parsed;
+        return {
+          flags,
+          records:
+            flags & GIT_PATCH_STRUCTURED ? [...gitPatchRecords(data)] : [],
+          text: flags & GIT_PATCH_STRUCTURED ? new Uint8Array(0) : data,
+        };
+      },
+      index: async (path = "") => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_INDEX, (nonce) =>
+          msgGitIndex(nonce, repoId, path),
+        );
+        const parsed = parseGitIndexResp(msg);
+        if (!parsed) throw connectionError("Malformed index from server");
+        expectOk(parsed[1]);
+        return [...gitIndexRecords(parsed[3])];
+      },
+      mergeBase: async (oids) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_BASE, (nonce) =>
+          msgGitBase(nonce, repoId, oids),
+        );
+        const parsed = parseGitBaseResp(msg);
+        if (!parsed) throw connectionError("Malformed base from server");
+        expectOk(parsed[1]);
+        return parsed[2];
+      },
+      resolve: async (spec) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_RESOLVE, (nonce) =>
+          msgGitResolve(nonce, repoId, spec),
+        );
+        const parsed = parseGitResolveResp(msg);
+        if (!parsed) throw connectionError("Malformed resolve from server");
+        expectOk(parsed.status);
+        return { tips: parsed.tips, hides: parsed.hides };
+      },
+      watchLog: (spec, opts, onUpdate) =>
+        this.watchGitLog(repoId, spec, opts, onUpdate),
+      close: () => {
+        this.closeGitLogSubs(repoId);
+        if (this.transport.status === "connected") {
+          this.transport.send(msgGitClose(repoId));
+        }
+      },
+    };
+  }
+
+  /** Start a live log subscription; the server pushes pages we auto-ack. */
+  private watchGitLog(
+    repoId: number,
+    spec: string,
+    opts: GitLogWatchOptions,
+    onUpdate: (page: GitLogPage) => void,
+  ): GitLogSubscription {
+    if (!this.gitRepos.has(repoId)) {
+      throw connectionError("Repo is closed");
+    }
+    let logId = 0;
+    do {
+      logId = this.gitLogIdCounter = (this.gitLogIdCounter + 1) & 0xffff;
+    } while (logId === 0 || this.gitLogSubs.has(logId));
+    this.gitLogSubs.set(logId, { repoId, onUpdate });
+    this.transport.send(
+      msgGitLogWatch(logId, repoId, opts.flags ?? 0, opts.limit ?? 0, spec),
+    );
+    return {
+      logId,
+      close: () => {
+        if (!this.gitLogSubs.delete(logId)) return;
+        if (this.transport.status === "connected") {
+          this.transport.send(msgGitLogUnwatch(logId, repoId));
+        }
+      },
+    };
+  }
+
+  /** Drop every log subscription bound to a repo (close or teardown). */
+  private closeGitLogSubs(repoId: number): void {
+    for (const [logId, sub] of this.gitLogSubs) {
+      if (sub.repoId === repoId) this.gitLogSubs.delete(logId);
+    }
+  }
+
+  /** Tear down all git repo state (reconnect or dispose). */
+  private resetGitRepos(error: Error): void {
+    for (const pending of this.pendingGitOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingGitOpens.clear();
+    for (const pending of this.pendingGitRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingGitRequests.clear();
+    this.gitLogSubs.clear();
+    const repos = [...this.gitRepos.values()];
+    this.gitRepos.clear();
+    for (const repo of repos) {
+      repo.options.onClosed?.(GIT_CLOSED_CONNECTION_LOST);
+    }
+  }
+
+  /**
+   * Attach to the workspace containing a path (docs/design/lsp.md).
+   * Resolves once the server accepts; state snapshots and diagnostics
+   * (when subscribed) apply to the handle's mirrors and acknowledge
+   * automatically.
+   */
+  async openLsp(
+    path: string,
+    options: LspOpenOptions = {},
+  ): Promise<LspHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open an attachment while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_LSP) === 0) {
+      throw connectionError(
+        "Server does not support language intelligence (upgrade blit on the remote)",
+      );
+    }
+    let flags = 0;
+    if (options.watch || options.diagnostics) flags |= LSP_OPEN_WATCH;
+    if (options.diagnostics) flags |= LSP_OPEN_DIAGS;
+    return new Promise<LspHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingLspOpens);
+      this.pendingLspOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        msgLspOpen(nonce, flags, options.diagLatencyMs ?? 0, path),
+      );
+    });
+  }
+
+  /** One nonce-correlated LSP query; resolves with the raw response. */
+  private lspRequest(
+    lspId: number,
+    build: (nonce: number) => Uint8Array,
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.lspAttachments.has(lspId)) {
+        reject(connectionError("Attachment is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingLspRequests);
+      this.pendingLspRequests.set(nonce, { resolve, reject });
+      this.transport.send(build(nonce));
+    });
+  }
+
+  private makeLspHandle(
+    lspId: number,
+    root: string,
+    state: LspStateMirror,
+    diags: LspDiagMirror,
+  ): LspHandle {
+    // Every query funnels through one shape. Non-OK statuses resolve so
+    // callers can inspect `status` (WARMING is retryable); only
+    // connection loss rejects.
+    const query = async (
+      kind: number,
+      flags: number,
+      line: number,
+      col: number,
+      path: string,
+      arg: string,
+    ): Promise<LspQueryResult> => {
+      const msg = await this.lspRequest(lspId, (nonce) =>
+        msgLspQuery({ nonce, lspId, kind, flags, line, col, path, arg }),
+      );
+      const parsed = parseLspQueryResp(msg);
+      if (!parsed)
+        throw connectionError("Malformed query response from server");
+      const [, status, respFlags, detail, records] = parsed;
+      return {
+        status,
+        detail,
+        truncated: (respFlags & LSP_RESP_TRUNCATED) !== 0,
+        incomplete: (respFlags & LSP_RESP_INCOMPLETE) !== 0,
+        records: [...lspQueryRecords(records)],
+      };
+    };
+    return {
+      lspId,
+      root,
+      state,
+      diags,
+      definition: (path, line, col) =>
+        query(LSP_QUERY_DEFINITION, 0, line, col, path, ""),
+      references: (path, line, col, includeDeclaration = false) =>
+        query(
+          LSP_QUERY_REFERENCES,
+          includeDeclaration ? LSP_REFS_INCLUDE_DECLARATION : 0,
+          line,
+          col,
+          path,
+          "",
+        ),
+      hover: (path, line, col) =>
+        query(LSP_QUERY_HOVER, 0, line, col, path, ""),
+      documentSymbols: (path) =>
+        query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, path, ""),
+      workspaceSymbols: (search) =>
+        query(LSP_QUERY_WS_SYMBOLS, 0, 0, 0, "", search),
+      rename: (path, line, col, newName) =>
+        query(LSP_QUERY_RENAME, 0, line, col, path, newName),
+      close: () => {
+        if (this.transport.status === "connected") {
+          this.transport.send(msgLspClose(lspId));
+        }
+      },
+    };
+  }
+
+  /** Tear down all LSP attachment state (reconnect or dispose). */
+  private resetLspAttachments(error: Error): void {
+    for (const pending of this.pendingLspOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingLspOpens.clear();
+    for (const pending of this.pendingLspRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingLspRequests.clear();
+    const attachments = [...this.lspAttachments.values()];
+    this.lspAttachments.clear();
+    for (const attachment of attachments) {
+      attachment.options.onClosed?.(LSP_CLOSED_CONNECTION_LOST);
+    }
+  }
+
+  /** Tear down all fs sync state (reconnect or dispose). */
+  private resetFsSyncs(error: Error): void {
+    for (const pending of this.pendingFsSyncs.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsSyncs.clear();
+    for (const pending of this.pendingFsFetches.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsFetches.clear();
+    for (const pending of this.pendingFsWrites.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsWrites.clear();
+    const syncs = [...this.fsSyncs.values()];
+    this.fsSyncs.clear();
+    for (const sync of syncs) {
+      sync.options.onClosed?.(FS_CLOSED_CONNECTION_LOST);
+    }
   }
 
   private ptyId(sessionId: SessionId): number | undefined {
@@ -1245,6 +1999,9 @@ export class BlitConnection {
         this.surfaceStore.reset();
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
+        this.resetFsSyncs(connectionError("Server is shutting down"));
+        this.resetGitRepos(connectionError("Server is shutting down"));
+        this.resetLspAttachments(connectionError("Server is shutting down"));
         // Immediately reconnect so the UI recovers as fast as possible
         // when the server restarts.  Do NOT call transport.close() — that
         // permanently disposes the transport.  transport.reconnect() tears
@@ -1433,11 +2190,18 @@ export class BlitConnection {
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
+          supportsFsSync: (features & FEATURE_FS) !== 0,
+          supportsGit: (features & FEATURE_GIT) !== 0,
         };
         this.emit();
         this.surfaceStore.reset();
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
+        // Fs syncs do not survive a server session change: old sync_ids
+        // are meaningless on the new session.
+        this.resetFsSyncs(connectionError("Connection re-established"));
+        this.resetGitRepos(connectionError("Connection re-established"));
+        this.resetLspAttachments(connectionError("Connection re-established"));
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -1618,6 +2382,333 @@ export class BlitConnection {
         }
         return;
       }
+      case S2C_FS_SYNCED: {
+        if (bytes.length < 8) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingFsSyncs.get(nonce);
+        if (!pending) return;
+        this.pendingFsSyncs.delete(nonce);
+        const syncId = bytes[3] | (bytes[4] << 8);
+        const status = bytes[5];
+        const detailLen = bytes[6] | (bytes[7] << 8);
+        const detail = textDecoder.decode(bytes.subarray(8, 8 + detailLen));
+        if (status !== FS_STATUS_OK) {
+          pending.reject(
+            connectionError(`Sync failed: ${fsStatusText(status, detail)}`),
+          );
+          return;
+        }
+        const mirror = new FsMirror();
+        const state = {
+          mirror,
+          options: pending.options,
+          lastWritten: new Map<string, bigint>(),
+        };
+        this.fsSyncs.set(syncId, state);
+        pending.resolve({
+          syncId,
+          root: detail,
+          get live() {
+            // The mirror *replaces* its live map when a staged snapshot
+            // swaps in, so the handle must dereference on every access.
+            return mirror.live;
+          },
+          fetch: (path: string) => this.fsFetch(syncId, path),
+          writeFile: (path, data, options = {}) =>
+            this.fsWrite(syncId, path, data, options),
+          mkdir: (path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_MKDIR,
+              path,
+              "",
+              0n,
+              options.mode ?? 0,
+              options.createParents ? FS_OP_MKPARENTS : 0,
+              { syncId, path },
+            ),
+          remove: (path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_REMOVE,
+              path,
+              "",
+              options.ifHash ?? 0n,
+              0,
+              0,
+            ).then(() => undefined),
+          rename: (from, to, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_RENAME,
+              from,
+              to,
+              0n,
+              0,
+              options.createParents ? FS_OP_MKPARENTS : 0,
+            ).then(() => undefined),
+          symlink: (target, path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_SYMLINK,
+              target,
+              path,
+              options.force ? 0n : (options.ifHash ?? 0n),
+              0,
+              (options.force ? FS_OP_NO_CAS : 0) |
+                (options.createParents ? FS_OP_MKPARENTS : 0),
+              { syncId, path },
+            ),
+          hardlink: (source, path, options = {}) =>
+            this.fsOp(
+              syncId,
+              FS_OP_HARDLINK,
+              source,
+              path,
+              options.force ? 0n : (options.ifHash ?? 0n),
+              0,
+              (options.force ? FS_OP_NO_CAS : 0) |
+                (options.createParents ? FS_OP_MKPARENTS : 0),
+              { syncId, path },
+            ),
+          lastWrittenHash: (path: string) => state.lastWritten.get(path),
+          stop: () => {
+            if (this.transport.status === "connected") {
+              this.transport.send(buildFsStopMessage(syncId));
+            }
+          },
+        });
+        return;
+      }
+      case S2C_FS_UPDATE: {
+        if (bytes.length < 8) return;
+        const syncId = bytes[1] | (bytes[2] << 8);
+        const state = this.fsSyncs.get(syncId);
+        if (!state) return;
+        const flags = bytes[7];
+        // Decode a second time only when someone wants per-record events.
+        const records = state.options.onRecord
+          ? fsDecompress(bytes.subarray(8))
+          : null;
+        const updateId = state.mirror.applyUpdate(bytes);
+        if (updateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed FS_UPDATE for sync ${syncId}`,
+          );
+          return;
+        }
+        this.transport.send(buildFsAckMessage(syncId, updateId));
+        if (flags & FS_UPDATE_RESET) state.options.onReset?.();
+        if (records !== null && state.options.onRecord) {
+          for (const record of fsRecords(records)) {
+            state.options.onRecord(record);
+          }
+        }
+        if (flags & FS_UPDATE_SYNC) state.options.onSync?.();
+        state.options.onUpdate?.();
+        return;
+      }
+      case S2C_FS_FILE: {
+        const parsed = parseFsFileMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsFetches.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsFetches.delete(parsed.nonce);
+        if (parsed.status === FS_FILE_OK) {
+          pending.resolve(parsed.data);
+        } else {
+          pending.reject(
+            connectionError(`Fetch failed: ${fsFileStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_DONE: {
+        const parsed = parseFsDoneMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsWrites.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsWrites.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          // Record the hash for self-echo suppression: the writer's own
+          // UPSERT echo will carry it, and the model already holds it.
+          if (pending.record) {
+            this.fsSyncs
+              .get(pending.record.syncId)
+              ?.lastWritten.set(pending.record.path, parsed.hash);
+          }
+          pending.resolve({ hash: parsed.hash, mtimeNs: parsed.mtimeNs });
+        } else if (parsed.status === FS_DONE_CONFLICT) {
+          pending.reject(new FsConflictError(parsed.hash));
+        } else {
+          pending.reject(
+            connectionError(`Write failed: ${fsDoneStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_CLOSED: {
+        if (bytes.length < 4) return;
+        const syncId = bytes[1] | (bytes[2] << 8);
+        const state = this.fsSyncs.get(syncId);
+        if (!state) return;
+        this.fsSyncs.delete(syncId);
+        state.options.onClosed?.(bytes[3]);
+        return;
+      }
+      case S2C_GIT_REPO: {
+        const info = parseGitRepo(bytes);
+        if (!info) return;
+        const pending = this.pendingGitOpens.get(info.nonce);
+        if (!pending) return;
+        this.pendingGitOpens.delete(info.nonce);
+        if (info.status !== GIT_STATUS_OK) {
+          pending.reject(
+            connectionError(
+              `Open failed: ${gitStatusText(info.status)}${info.workdir ? `: ${info.workdir}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const mirror = new GitStateMirror();
+        this.gitRepos.set(info.repoId, { mirror, options: pending.options });
+        pending.resolve(this.makeGitRepoHandle(info.repoId, info, mirror));
+        return;
+      }
+      case S2C_GIT_STATE: {
+        if (bytes.length < 8) return;
+        const repoId = bytes[1] | (bytes[2] << 8);
+        const repo = this.gitRepos.get(repoId);
+        if (!repo) return;
+        const stateId = repo.mirror.applyState(bytes);
+        if (stateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed GIT_STATE for repo ${repoId}`,
+          );
+          return;
+        }
+        this.transport.send(msgGitAck(repoId, stateId));
+        repo.options.onState?.(repo.mirror, stateId);
+        return;
+      }
+      case S2C_GIT_CLOSED: {
+        const closed = parseGitClosed(bytes);
+        if (!closed) return;
+        const repo = this.gitRepos.get(closed[0]);
+        if (!repo) return;
+        this.gitRepos.delete(closed[0]);
+        this.closeGitLogSubs(closed[0]);
+        repo.options.onClosed?.(closed[1]);
+        return;
+      }
+      case S2C_GIT_LOG_PAGE: {
+        const page = parseGitLogPage(bytes);
+        if (!page) return;
+        const sub = this.gitLogSubs.get(page.logId);
+        if (!sub) return;
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        if (this.transport.status === "connected") {
+          this.transport.send(
+            msgGitLogAck(page.logId, sub.repoId, page.updateId),
+          );
+        }
+        sub.onUpdate(page);
+        return;
+      }
+      case S2C_GIT_COMMITS:
+      case S2C_GIT_TREE:
+      case S2C_GIT_BLOB:
+      case S2C_GIT_DIFF:
+      case S2C_GIT_PATCH:
+      case S2C_GIT_INDEX:
+      case S2C_GIT_BASE:
+      case S2C_GIT_RESOLVE: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingGitRequests.get(nonce);
+        if (!pending || pending.opcode !== bytes[0]) return;
+        this.pendingGitRequests.delete(nonce);
+        pending.resolve(bytes);
+        return;
+      }
+      case S2C_LSP_OPENED: {
+        const opened = parseLspOpened(bytes);
+        if (!opened) return;
+        const pending = this.pendingLspOpens.get(opened.nonce);
+        if (!pending) return;
+        this.pendingLspOpens.delete(opened.nonce);
+        if (opened.status !== LSP_STATUS_OK) {
+          pending.reject(
+            connectionError(
+              `Open failed: ${lspStatusText(opened.status)}${opened.detail ? `: ${opened.detail}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const state = new LspStateMirror();
+        const diags = new LspDiagMirror();
+        this.lspAttachments.set(opened.lspId, {
+          state,
+          diags,
+          options: pending.options,
+        });
+        pending.resolve(
+          this.makeLspHandle(opened.lspId, opened.root, state, diags),
+        );
+        return;
+      }
+      case S2C_LSP_STATE: {
+        if (bytes.length < 8) return;
+        const lspId = bytes[1] | (bytes[2] << 8);
+        const attachment = this.lspAttachments.get(lspId);
+        if (!attachment) return;
+        const stateId = attachment.state.applyState(bytes);
+        if (stateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed LSP_STATE for attachment ${lspId}`,
+          );
+          return;
+        }
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        this.transport.send(msgLspAck(lspId, LSP_STREAM_STATE, stateId));
+        attachment.options.onState?.(attachment.state, stateId);
+        return;
+      }
+      case S2C_LSP_DIAG: {
+        if (bytes.length < 8) return;
+        const lspId = bytes[1] | (bytes[2] << 8);
+        const attachment = this.lspAttachments.get(lspId);
+        if (!attachment) return;
+        const updateId = attachment.diags.applyDiag(bytes);
+        if (updateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed LSP_DIAG for attachment ${lspId}`,
+          );
+          return;
+        }
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        this.transport.send(msgLspAck(lspId, LSP_STREAM_DIAG, updateId));
+        attachment.options.onDiagnostics?.(attachment.diags, updateId);
+        return;
+      }
+      case S2C_LSP_QUERY: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingLspRequests.get(nonce);
+        if (!pending) return;
+        this.pendingLspRequests.delete(nonce);
+        pending.resolve(bytes);
+        return;
+      }
+      case S2C_LSP_CLOSED: {
+        const closed = parseLspClosed(bytes);
+        if (!closed) return;
+        const attachment = this.lspAttachments.get(closed[0]);
+        if (!attachment) return;
+        this.lspAttachments.delete(closed[0]);
+        attachment.options.onClosed?.(closed[1]);
+        return;
+      }
       default:
         return;
     }
@@ -1704,6 +2795,11 @@ export class BlitConnection {
       );
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
+      // Fs syncs and git repos do not survive a transport drop; reject
+      // their pending promises promptly rather than leaving them hung.
+      this.resetFsSyncs(connectionError(`Transport ${status}`));
+      this.resetGitRepos(connectionError(`Transport ${status}`));
+      this.resetLspAttachments(connectionError(`Transport ${status}`));
       this.resolveAllPendingCloses();
       this.hasReceivedList = false;
       // Dismiss all sessions so the UI doesn't show stale terminals from a

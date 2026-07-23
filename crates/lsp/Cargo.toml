@@ -1,0 +1,18 @@
+[package]
+name = "blit-lsp"
+version = "0.37.0"
+edition.workspace = true
+description = "Language intelligence engine: warm shared language servers projected into blit records"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blit-remote = { workspace = true }
+blit-fssync = { workspace = true }
+blake3 = { version = "1", default-features = false }
+notify = "8"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

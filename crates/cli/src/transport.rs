@@ -554,52 +554,31 @@ pub async fn connect(on: &Option<String>, hub: &str) -> Result<Transport, String
     connect_ipc(&path).await
 }
 
+/// Connect to the local server, spawning it as a **detached process**
+/// if absent. In-process hosting (the old behavior) breaks every
+/// daemon-resident feature for one-shot commands: warm LSP backends
+/// (docs/design/lsp.md "Sessions and discovery"), surviving PTYs — all
+/// died with each short-lived CLI invocation. The spawned `blit server`
+/// outlives us and is shared by later invocations; `blit quit` shuts it
+/// down.
 #[cfg(unix)]
 pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
-    if std::path::Path::new(socket_path).exists() {
-        match tokio::net::UnixStream::connect(socket_path).await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                let _ = std::fs::remove_file(socket_path);
-            }
-        }
+    if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+        return Ok(());
     }
-    let config = blit_server::Config {
-        shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-        shell_flags: std::env::var("BLIT_SHELL_FLAGS").unwrap_or_else(|_| "li".into()),
-        scrollback: std::env::var("BLIT_SCROLLBACK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1_000_000),
-        ipc_path: socket_path.to_string(),
-        surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
-        surface_quality: std::env::var("BLIT_SURFACE_QUALITY")
-            .ok()
-            .and_then(|v| blit_server::SurfaceQuality::parse(&v))
-            .unwrap_or_default(),
-        chroma: blit_server::ChromaSubsampling::from_env(),
-        vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
-            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
-        #[cfg(unix)]
-        fd_channel: None,
-        verbose: false,
-        max_connections: 0,
-        max_ptys: 0,
-        ping_interval: std::time::Duration::from_secs(10),
-        skip_compositor: true,
-        export_sock: std::env::var("BLIT_EXPORT_SOCK")
-            .ok()
-            .map(|v| v == "1")
-            .unwrap_or(false),
-    };
-    tokio::spawn(blit_server::run(config));
+    // A socket file nobody answers on is a leftover from a dead server;
+    // the fresh one must be able to bind.
+    if std::path::Path::new(socket_path).exists() {
+        let _ = std::fs::remove_file(socket_path);
+    }
+    spawn_detached_server(socket_path)?;
     for _ in 0..100 {
-        if std::path::Path::new(socket_path).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Err("server did not create socket in time".into())
+    Err("server did not accept connections in time".into())
 }
 
 #[cfg(windows)]
@@ -607,40 +586,56 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
     if connect_ipc(pipe_path).await.is_ok() {
         return Ok(());
     }
-    let config = blit_server::Config {
-        shell: std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
-        shell_flags: String::new(),
-        scrollback: std::env::var("BLIT_SCROLLBACK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1_000_000),
-        ipc_path: pipe_path.to_string(),
-        surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
-        surface_quality: std::env::var("BLIT_SURFACE_QUALITY")
-            .ok()
-            .and_then(|v| blit_server::SurfaceQuality::parse(&v))
-            .unwrap_or_default(),
-        chroma: blit_server::ChromaSubsampling::from_env(),
-        vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
-            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
-        verbose: false,
-        max_connections: 0,
-        max_ptys: 0,
-        ping_interval: std::time::Duration::from_secs(10),
-        skip_compositor: true,
-        export_sock: std::env::var("BLIT_EXPORT_SOCK")
-            .ok()
-            .map(|v| v == "1")
-            .unwrap_or(false),
-    };
-    tokio::spawn(blit_server::run(config));
+    spawn_detached_server(pipe_path)?;
     for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         if connect_ipc(pipe_path).await.is_ok() {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Err("server did not create pipe in time".into())
+    Err("server did not accept connections in time".into())
+}
+
+/// Spawn `blit server --socket <path>` detached from this process's
+/// session, stdio to the void. Configuration flows through inherited
+/// `BLIT_*`/`SHELL` env vars, which the server command reads itself.
+fn spawn_detached_server(socket_path: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate blit executable: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("server")
+        .arg("--socket")
+        .arg(socket_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New session: no controlling terminal, so the daemon survives
+        // terminal hangup and this CLI's exit.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start blit server: {e}"))?;
+    // Reap in the background so a daemon that exits while a long-lived
+    // client (interactive, share) is still running leaves no zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[cfg(test)]

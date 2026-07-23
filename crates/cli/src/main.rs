@@ -1,13 +1,19 @@
 mod agent;
 mod cli;
+mod fs;
 mod generate;
+mod git;
 mod grep;
 mod interactive;
+mod lsp;
 mod transport;
 mod uplink;
 
 use clap::Parser;
-use cli::{Cli, ClipboardCommand, Command, RemoteCommand, SurfaceCommand, TerminalCommand};
+use cli::{
+    Cli, ClipboardCommand, Command, FsCommand, GitCommand, LspCommand, RemoteCommand,
+    SurfaceCommand, TerminalCommand,
+};
 
 fn main() {
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
@@ -335,6 +341,244 @@ async fn async_main() {
             if let Err(e) = result {
                 eprintln!("blit: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Fs { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result: Result<i32, String> = match command {
+                FsCommand::Sync {
+                    path,
+                    content,
+                    no_recursive,
+                    once,
+                    json,
+                } => fs::cmd_sync(transport, path, content, no_recursive, once, json)
+                    .await
+                    .map(|()| 0),
+                FsCommand::Write {
+                    path,
+                    root,
+                    if_hash,
+                    create,
+                    force,
+                    parents,
+                    durable,
+                    mode,
+                    json,
+                } => {
+                    fs::cmd_write(
+                        transport, path, root, if_hash, create, force, parents, durable, mode, json,
+                    )
+                    .await
+                }
+                FsCommand::Mkdir {
+                    path,
+                    root,
+                    parents,
+                    mode,
+                    json,
+                } => fs::cmd_mkdir(transport, path, root, parents, mode, json).await,
+                FsCommand::Rm {
+                    path,
+                    root,
+                    if_hash,
+                    json,
+                } => fs::cmd_rm(transport, path, root, if_hash, json).await,
+                FsCommand::Mv {
+                    from,
+                    to,
+                    root,
+                    parents,
+                    json,
+                } => fs::cmd_mv(transport, from, to, root, parents, json).await,
+                FsCommand::Ln {
+                    target,
+                    link,
+                    symlink,
+                    root,
+                    if_hash,
+                    force,
+                    parents,
+                    json,
+                } => {
+                    fs::cmd_ln(
+                        transport, target, link, symlink, root, if_hash, force, parents, json,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Git { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match command {
+                GitCommand::Status { repo, watch, json } => {
+                    git::cmd_status(transport, repo, watch, json).await
+                }
+                GitCommand::Log {
+                    rev,
+                    pathspec,
+                    repo,
+                    limit,
+                    watch,
+                    follow,
+                    first_parent,
+                    full_message,
+                    topo,
+                    json,
+                } => {
+                    let opts = git::LogOpts {
+                        rev,
+                        path: pathspec.into_iter().next(),
+                        limit,
+                        watch,
+                        follow,
+                        first_parent,
+                        full_message,
+                        topo,
+                        json,
+                    };
+                    git::cmd_log(transport, repo, opts).await
+                }
+                GitCommand::Diff {
+                    revs,
+                    pathspec,
+                    repo,
+                    staged,
+                    patch,
+                    json,
+                } => {
+                    let opts = git::DiffOpts {
+                        revs,
+                        staged,
+                        patch,
+                        path: pathspec.into_iter().next(),
+                        json,
+                    };
+                    git::cmd_diff(transport, repo, opts).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Lsp { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    // Exit 2 (error): the 0/1/2 contract reserves 1 for
+                    // "no result", so a connect failure must not look
+                    // like a clean/empty answer.
+                    std::process::exit(2);
+                }
+            };
+            let result = match command {
+                LspCommand::Def { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_DEF,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Refs {
+                    spec,
+                    declaration,
+                    root,
+                    json,
+                } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_REFS,
+                        spec,
+                        String::new(),
+                        declaration,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Hover { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_HOVER,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Symbols {
+                    query,
+                    file,
+                    root,
+                    json,
+                } => lsp::cmd_symbols(transport, root, query, file, json).await,
+                LspCommand::Diagnostics {
+                    path,
+                    watch,
+                    wait,
+                    root,
+                    json,
+                } => lsp::cmd_diagnostics(transport, root, path, watch, wait, json).await,
+                LspCommand::Rename {
+                    spec,
+                    new_name,
+                    root,
+                    json,
+                } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_RENAME,
+                        spec,
+                        new_name,
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Wait { root, timeout } => lsp::cmd_wait(transport, root, timeout).await,
+                LspCommand::List { json } => lsp::cmd_list(transport, json).await,
+                LspCommand::Stop { server_ref } => lsp::cmd_stop(transport, server_ref).await,
+            };
+            match result {
+                // 0 found/clean, 1 no result/diagnostics present, 2 error.
+                Ok(0) => {}
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         Command::Remote { command } => {

@@ -73,6 +73,23 @@ in
       description = "Scrollback buffer size in rows per PTY.";
     };
 
+    languageServers = mkOption {
+      type = types.listOf types.package;
+      default = [ ];
+      example = lib.literalExpression "[ pkgs.nixd pkgs.rust-analyzer pkgs.gopls ]";
+      description = ''
+        Language servers to place on the blit server's PATH so
+        <literal>blit lsp</literal> (docs/design/lsp.md) can discover and
+        spawn them. blit ships none; list the servers you want available
+        and their binaries are added to the server process's PATH. blit
+        matches them to files by project marker and extension, keeps them
+        warm across connections, and never downloads anything. Empty by
+        default (the family is advertised but finds no servers). Set
+        <option>BLIT_LSP=0</option> via the environment to disable the
+        family entirely.
+      '';
+    };
+
     audio = {
       enable = mkEnableOption "audio forwarding (PipeWire capture + Opus)";
 
@@ -264,15 +281,19 @@ in
             description = "blit terminal multiplexer for ${user}";
             requires = [ "blit-server@${user}.socket" ];
             # Audio spawns pipewire / wireplumber / dbus-daemon by name,
-            # so they need to be on $PATH.  Use systemd.services.*.path
-            # (which prepends to the default PATH) rather than overriding
-            # $PATH in Environment — that would clobber coreutils and
-            # friends for PTY shells, which inherit the service env.
-            path = lib.optionals cfg.audio.enable [
-              pkgs.pipewire
-              pkgs.wireplumber
-              pkgs.dbus
-            ];
+            # so they need to be on $PATH.  Language servers likewise are
+            # spawned by name and discovered via PATH (docs/design/lsp.md).
+            # Use systemd.services.*.path (which prepends to the default
+            # PATH) rather than overriding $PATH in Environment — that
+            # would clobber coreutils and friends for PTY shells, which
+            # inherit the service env.
+            path =
+              lib.optionals cfg.audio.enable [
+                pkgs.pipewire
+                pkgs.wireplumber
+                pkgs.dbus
+              ]
+              ++ cfg.languageServers;
             serviceConfig = {
               Type = "notify";
               User = user;

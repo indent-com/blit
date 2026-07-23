@@ -4,6 +4,21 @@ import { EXIT_STATUS_UNKNOWN } from "../exit-status";
 import { MockTransport } from "./mock-transport";
 import type { BlitWasmModule } from "../TerminalStore";
 import {
+  C2S_GIT_LOG_ACK,
+  C2S_GIT_LOG_UNWATCH,
+  C2S_GIT_LOG_WATCH,
+  C2S_GIT_OPEN,
+  C2S_GIT_RESOLVE,
+  FEATURE_GIT,
+  GIT_OID_FORMAT_SHA1,
+  GIT_STATUS_OK,
+  S2C_GIT_REPO,
+  type GitLogPage,
+  type GitRepoHandle,
+  msgGitLogPage,
+  msgGitResolveResp,
+} from "../git";
+import {
   C2S_INPUT,
   C2S_RESIZE,
   C2S_SCROLL,
@@ -885,5 +900,97 @@ describe("BlitConnection — advanced scenarios", () => {
     // Should send the remaining view's size (40x120), not a clear
     expect(msg[3] | (msg[4] << 8)).toBe(40);
     expect(msg[5] | (msg[6] << 8)).toBe(120);
+  });
+});
+
+describe("BlitConnection git", () => {
+  const u16 = (b: Uint8Array, at: number) => b[at] | (b[at + 1] << 8);
+  const u32 = (b: Uint8Array, at: number) =>
+    (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16)) + b[at + 3] * 0x1000000;
+  const oid = (fill: number) => new Uint8Array(32).fill(fill, 0, 20);
+
+  // No TS server-side builder for S2C_GIT_REPO; assemble the success reply by
+  // hand: [0x50][nonce:2][repo_id:2][status:1][oid_format:1][flags:1][wd][gd].
+  function gitRepoReply(nonce: number, repoId: number): Uint8Array {
+    const enc = new TextEncoder();
+    const wd = enc.encode("/repo");
+    const gd = enc.encode("/repo/.git");
+    return new Uint8Array([
+      S2C_GIT_REPO,
+      nonce & 0xff,
+      (nonce >> 8) & 0xff,
+      repoId & 0xff,
+      (repoId >> 8) & 0xff,
+      GIT_STATUS_OK,
+      GIT_OID_FORMAT_SHA1,
+      0,
+      wd.length & 0xff,
+      (wd.length >> 8) & 0xff,
+      ...wd,
+      gd.length & 0xff,
+      (gd.length >> 8) & 0xff,
+      ...gd,
+    ]);
+  }
+
+  async function openRepo(): Promise<{
+    conn: BlitConnection;
+    transport: MockTransport;
+    repo: GitRepoHandle;
+  }> {
+    const { conn, transport } = createConnection();
+    transport.pushHello(1, FEATURE_GIT);
+    transport.pushList([]);
+    const promise = conn.openRepo("/repo", {});
+    const open = transport.sent.at(-1)!;
+    expect(open[0]).toBe(C2S_GIT_OPEN);
+    transport.push(gitRepoReply(u16(open, 1), 1));
+    return { conn, transport, repo: await promise };
+  }
+
+  it("resolves a revspec to tips/hides", async () => {
+    const { transport, repo } = await openRepo();
+    const p = repo.resolve("main..dev");
+    const req = transport.sent.at(-1)!;
+    expect(req[0]).toBe(C2S_GIT_RESOLVE);
+    transport.push(
+      msgGitResolveResp(u16(req, 1), GIT_STATUS_OK, [oid(0xcc)], [oid(0xdd)]),
+    );
+    const res = await p;
+    expect(res.tips.map((o) => o[0])).toEqual([0xcc]);
+    expect(res.hides.map((o) => o[0])).toEqual([0xdd]);
+  });
+
+  it("delivers watched log pages, auto-acks, and unwatches on close", async () => {
+    const { transport, repo } = await openRepo();
+    const pages: GitLogPage[] = [];
+    const sub = repo.watchLog("main", {}, (page) => pages.push(page));
+    const watch = transport.sent.at(-1)!;
+    expect(watch[0]).toBe(C2S_GIT_LOG_WATCH);
+    const logId = u16(watch, 1);
+
+    // First pushed page delivers and is acknowledged (update_id at offset 5).
+    transport.push(
+      msgGitLogPage(logId, 1, GIT_STATUS_OK, 0, [], new Uint8Array(0)),
+    );
+    expect(pages).toHaveLength(1);
+    const ack = transport.sent.at(-1)!;
+    expect(ack[0]).toBe(C2S_GIT_LOG_ACK);
+    expect(u16(ack, 1)).toBe(logId);
+    expect(u32(ack, 5)).toBe(1);
+
+    // A later page (the ref moved) delivers again.
+    transport.push(
+      msgGitLogPage(logId, 2, GIT_STATUS_OK, 0, [], new Uint8Array(0)),
+    );
+    expect(pages).toHaveLength(2);
+
+    // Closing unsubscribes and drops any further pages.
+    sub.close();
+    expect(transport.sent.at(-1)![0]).toBe(C2S_GIT_LOG_UNWATCH);
+    transport.push(
+      msgGitLogPage(logId, 3, GIT_STATUS_OK, 0, [], new Uint8Array(0)),
+    );
+    expect(pages).toHaveLength(2);
   });
 });

@@ -62,6 +62,30 @@ pub enum Command {
         command: Option<ClipboardCommand>,
     },
 
+    /// Mirror server filesystem state (docs/fs-watch.md)
+    Fs {
+        #[command(subcommand)]
+        command: FsCommand,
+    },
+
+    /// Inspect git repositories on the server (docs/git.md)
+    Git {
+        #[command(subcommand)]
+        command: GitCommand,
+    },
+
+    /// Query language servers on the server (docs/design/lsp.md)
+    ///
+    /// Language servers are discovered by project markers (Cargo.toml,
+    /// go.mod, tsconfig.json, …), spawned lazily, and stay warm across
+    /// invocations. Positions are 1-based PATH:LINE:COL. First calls in
+    /// a fresh workspace may report "warming up" — retry, or run
+    /// `blit lsp wait`.
+    Lsp {
+        #[command(subcommand)]
+        command: LspCommand,
+    },
+
     /// Manage named remotes in blit.remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
@@ -782,6 +806,422 @@ pub enum ClipboardCommand {
 
         /// Text to set (if omitted, reads from stdin)
         text: Option<String>,
+    },
+}
+
+// ── Fs subcommands ───────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum FsCommand {
+    /// Mirror a directory tree from the server, streaming changes
+    ///
+    /// Prints the initial snapshot once it is coherent, then one line per
+    /// change (`+` added, `~` modified, `-` deleted, `>` moved). With
+    /// --json, emits one NDJSON event per record (`upsert`, `delete`,
+    /// `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
+    Sync {
+        /// Path on the server (absolute, or relative to the server's cwd)
+        path: String,
+
+        /// Sync file contents too (hashes always sync)
+        #[arg(long)]
+        content: bool,
+
+        /// Watch only the path and its immediate children
+        #[arg(long)]
+        no_recursive: bool,
+
+        /// Exit after the initial snapshot instead of streaming
+        #[arg(long)]
+        once: bool,
+
+        /// NDJSON event output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Write a file from stdin, with conflict detection
+    ///
+    /// Content is read from stdin. By default an unconditional overwrite;
+    /// --create fails if the file exists, --if-hash writes only if the
+    /// current content matches. Exit 1 on conflict.
+    Write {
+        /// Path to write, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Write only if the current content hash equals this hex value
+        #[arg(long, conflicts_with_all = ["create", "force"])]
+        if_hash: Option<String>,
+
+        /// Create only if the path does not already exist
+        #[arg(long, conflicts_with_all = ["if_hash", "force"])]
+        create: bool,
+
+        /// Overwrite unconditionally (ignore any precondition)
+        #[arg(long)]
+        force: bool,
+
+        /// Create missing parent directories
+        #[arg(long)]
+        parents: bool,
+
+        /// fsync the file and its parent before returning
+        #[arg(long)]
+        durable: bool,
+
+        /// File mode in octal (e.g. 644); default preserves or umask
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Create a directory
+    Mkdir {
+        /// Path to create, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Create missing parent directories
+        #[arg(long)]
+        parents: bool,
+
+        /// Directory mode in octal (e.g. 700)
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a file or directory subtree
+    Rm {
+        /// Path to remove, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Remove only if the current content hash equals this hex value
+        #[arg(long)]
+        if_hash: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rename or move a file or subtree
+    Mv {
+        /// Source path, relative to --root
+        from: String,
+
+        /// Destination path, relative to --root
+        to: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Create missing parent directories of the destination
+        #[arg(long)]
+        parents: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Create a hard link, or a symlink with -s (like ln(1))
+    Ln {
+        /// Existing file path relative to --root; with -s, the verbatim
+        /// symlink target (relative, absolute, or dangling)
+        target: String,
+
+        /// Link path to create, relative to --root
+        link: String,
+
+        /// Create a symlink instead of a hard link
+        #[arg(short = 's', long)]
+        symlink: bool,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Replace only if the current entry's content hash equals this
+        /// hex value (a symlink's hash covers its target bytes)
+        #[arg(long, conflicts_with = "force")]
+        if_hash: Option<String>,
+
+        /// Replace an existing entry unconditionally
+        #[arg(long)]
+        force: bool,
+
+        /// Create missing parent directories of the link
+        #[arg(long)]
+        parents: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Git subcommands ──────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum GitCommand {
+    /// Branch, ahead/behind, stash, and working-tree status
+    Status {
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Keep watching, reprinting whenever the status changes
+        #[arg(long)]
+        watch: bool,
+
+        /// NDJSON output (one state snapshot per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Commit history, newest first
+    ///
+    /// Examples:
+    ///   blit git log                 # HEAD
+    ///   blit git log v1.0            # from a tag
+    ///   blit git log main..feature   # a range
+    ///   blit git log --watch main..HEAD
+    ///   blit git log --follow -- src/main.rs
+    Log {
+        /// Revision or range to log (default: HEAD). A ref, (short) oid,
+        /// HEAD~N, or a range A..B / A...B.
+        rev: Option<String>,
+
+        /// Restrict to commits touching this path (after `--`)
+        #[arg(last = true)]
+        pathspec: Vec<String>,
+
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Maximum commits to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: u16,
+
+        /// Keep the log live, refreshing as its endpoint refs move
+        #[arg(long)]
+        watch: bool,
+
+        /// Follow a single file across renames (needs a path)
+        #[arg(long)]
+        follow: bool,
+
+        /// Follow only the first parent of each merge
+        #[arg(long)]
+        first_parent: bool,
+
+        /// Include the full commit message, not just the subject
+        #[arg(long)]
+        full_message: bool,
+
+        /// Topological order (parents after children) within the page
+        #[arg(long)]
+        topo: bool,
+
+        /// NDJSON output (one commit per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Changed files (unstaged by default), optionally with per-file hunks
+    ///
+    /// Examples:
+    ///   blit git diff                # worktree vs index (unstaged)
+    ///   blit git diff --staged       # index vs HEAD (staged)
+    ///   blit git diff main           # worktree vs a commit
+    ///   blit git diff main dev       # between two commits
+    ///   blit git diff main..dev      # same as: main dev
+    ///   blit git diff main...dev     # since they diverged (merge base)
+    ///   blit git diff HEAD~2 -- src  # limited to a path
+    Diff {
+        /// Revisions to compare: none (worktree vs index), one (that
+        /// revision vs the worktree, or the index with --staged), two
+        /// (between them), or a single A..B / A...B range. Each is a ref,
+        /// (short) oid, or HEAD~N.
+        revs: Vec<String>,
+
+        /// Restrict to this path (after `--`)
+        #[arg(last = true)]
+        pathspec: Vec<String>,
+
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Compare the index to HEAD (staged changes) instead of the worktree
+        #[arg(long)]
+        staged: bool,
+
+        /// Show per-file hunks, not just the changed-file list
+        #[arg(short = 'p', long)]
+        patch: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Lsp subcommands ──────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum LspCommand {
+    /// Definition of the symbol at PATH:LINE:COL
+    Def {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one location per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// References to the symbol at PATH:LINE:COL
+    Refs {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Include the declaration itself
+        #[arg(long)]
+        declaration: bool,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one location per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Type and docs of the symbol at PATH:LINE:COL
+    Hover {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search workspace symbols, or outline one file with --file
+    Symbols {
+        /// Fuzzy symbol query (workspace-wide; empty lists everything
+        /// the server returns)
+        query: Option<String>,
+
+        /// Outline this file instead of searching the workspace
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one symbol per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Current diagnostics for the workspace or one path
+    ///
+    /// Exit code 1 when diagnostics exist, 0 when clean.
+    #[command(alias = "diag")]
+    Diagnostics {
+        /// Only diagnostics for this file or directory
+        path: Option<String>,
+
+        /// Keep watching, reprinting as diagnostics change
+        #[arg(long)]
+        watch: bool,
+
+        /// Wait for language servers to finish indexing first
+        #[arg(long)]
+        wait: bool,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one diagnostic per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rename plan for the symbol at PATH:LINE:COL (prints the edits,
+    /// never applies them)
+    Rename {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// The new name
+        new_name: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one edit per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Block until the workspace's language servers are ready
+    Wait {
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+
+    /// List running language servers
+    #[command(alias = "ls")]
+    List {
+        /// NDJSON output (one server per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop a language server by ref (see `blit lsp list`)
+    Stop {
+        /// Server ref from `blit lsp list`
+        server_ref: u16,
     },
 }
 

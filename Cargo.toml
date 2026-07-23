@@ -2,6 +2,9 @@
 resolver = "3"
 members = [
     "crates/remote",
+    "crates/fssync",
+    "crates/git",
+    "crates/lsp",
     "crates/alacritty-driver",
     "crates/server",
     "crates/gateway",
@@ -26,6 +29,9 @@ homepage = "https://blit.sh"
 
 [workspace.dependencies]
 blit-remote = { version = "0.37.0", path = "crates/remote" }
+blit-fssync = { version = "0.37.0", path = "crates/fssync" }
+blit-git = { version = "0.37.0", path = "crates/git" }
+blit-lsp = { version = "0.37.0", path = "crates/lsp" }
 blit-alacritty = { version = "0.37.0", path = "crates/alacritty-driver" }
 blit-fonts = { version = "0.37.0", path = "crates/fonts" }
 blit-webserver = { version = "0.37.0", path = "crates/webserver" }

@@ -3,6 +3,24 @@ use std::collections::BTreeMap;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Filesystem state sync (docs/fs-watch.md): opcodes, record
+/// codecs, and the client-side mirror reducer.
+pub mod fs;
+
+/// Git introspection (docs/git.md): opcodes, record codecs, and the
+/// client-side state mirror reducer.
+pub mod git;
+
+/// Language intelligence (docs/design/lsp.md): opcodes, record codecs,
+/// and the client-side state/diagnostics mirror reducers.
+pub mod lsp;
+
+/// Cap on any single LZ4-decompressed payload, protocol-wide
+/// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
+/// size against it *before* allocating, so a hostile or corrupt length
+/// cannot force a giant allocation.
+pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
+
 pub const CELL_SIZE: usize = 12;
 const TITLE_PRESENT: u16 = 1 << 15;
 const OPS_PRESENT: u16 = 1 << 14;
@@ -146,7 +164,7 @@ pub const SURFACE_QUALITY_HIGH: u8 = 3;
 pub const SURFACE_QUALITY_ULTRA: u8 = 4;
 /// Unsubscribe from surface frame updates: [0x29][surface_id:2]
 pub const C2S_SURFACE_UNSUBSCRIBE: u8 = 0x29;
-/// Acknowledge receipt of a surface video frame: [0x2A]
+/// Acknowledge receipt of a surface video frame: [0x2A][surface_id:2]
 pub const C2S_SURFACE_ACK: u8 = 0x2A;
 /// Request close of a Wayland surface (sends xdg_toplevel close event):
 /// [0x2B][surface_id:2]
