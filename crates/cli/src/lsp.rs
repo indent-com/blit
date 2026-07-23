@@ -41,7 +41,22 @@ fn parse_spec(spec: &str) -> Result<(String, u32, u32), String> {
     if path.is_empty() || line == 0 || col == 0 {
         return Err(err());
     }
-    Ok((path.to_string(), line - 1, col - 1))
+    Ok((client_abs(path), line - 1, col - 1))
+}
+
+/// Resolve a path against the **client's** working directory so the
+/// server's cwd is irrelevant. The blit server is a long-lived daemon
+/// whose cwd is wherever it was first auto-started (transport.rs), and
+/// it resolves `LSP_OPEN.path` / query paths against its own cwd — so a
+/// relative `--root .` or `main.rs` from another repo would point at the
+/// daemon's directory, not the user's. Absolutizing here (lexically, no
+/// filesystem access) makes `blit lsp` work from any directory. An
+/// already-absolute path is returned unchanged.
+fn client_abs(path: &str) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn phase_text(phase: u8) -> &'static str {
@@ -315,7 +330,7 @@ pub async fn cmd_position(
 ) -> Result<i32, String> {
     let (path, line, col) = parse_spec(&spec)?;
     let (reader, writer) = transport.split();
-    let (mut session, _) = open_lsp(reader, writer, &root, 0).await?;
+    let (mut session, _) = open_lsp(reader, writer, &client_abs(&root), 0).await?;
     let flags = if kind == LSP_QUERY_REFERENCES && include_declaration {
         LSP_REFS_INCLUDE_DECLARATION
     } else {
@@ -401,7 +416,7 @@ pub async fn cmd_symbols(
     json: bool,
 ) -> Result<i32, String> {
     let (reader, writer) = transport.split();
-    let (mut session, _) = open_lsp(reader, writer, &root, 0).await?;
+    let (mut session, _) = open_lsp(reader, writer, &client_abs(&root), 0).await?;
     let (status, _, records) = match file {
         Some(file) => {
             session
@@ -522,8 +537,13 @@ pub async fn cmd_diagnostics(
     json: bool,
 ) -> Result<i32, String> {
     let (reader, writer) = transport.split();
-    let (session, workdir) =
-        open_lsp(reader, writer, &root, LSP_OPEN_WATCH | LSP_OPEN_DIAGS).await?;
+    let (session, workdir) = open_lsp(
+        reader,
+        writer,
+        &client_abs(&root),
+        LSP_OPEN_WATCH | LSP_OPEN_DIAGS,
+    )
+    .await?;
     if !json {
         eprintln!("workspace {workdir}");
     }
@@ -659,7 +679,7 @@ pub async fn cmd_wait(
     timeout_secs: u64,
 ) -> Result<i32, String> {
     let (reader, writer) = transport.split();
-    let (session, workdir) = open_lsp(reader, writer, &root, LSP_OPEN_WATCH).await?;
+    let (session, workdir) = open_lsp(reader, writer, &client_abs(&root), LSP_OPEN_WATCH).await?;
     eprintln!("workspace {workdir}");
     let (mut writer, lsp_id, mut rx) = spawn_reader(session);
     let mut state = LspStateMirror::new();
@@ -836,18 +856,36 @@ pub use blit_remote::lsp::{
 
 #[cfg(test)]
 mod tests {
-    use super::parse_spec;
+    use super::{client_abs, parse_spec};
+    use std::path::Path;
 
     #[test]
     fn spec_parsing() {
+        // The path is absolutized against the client cwd; line/col
+        // convert to 0-based.
+        let cwd = std::env::current_dir().unwrap();
         assert_eq!(
             parse_spec("src/main.rs:10:4"),
-            Ok(("src/main.rs".into(), 9, 3))
+            Ok((cwd.join("src/main.rs").to_string_lossy().into_owned(), 9, 3))
         );
         // A path with colons still parses right-to-left.
-        assert_eq!(parse_spec("a:b.rs:1:1"), Ok(("a:b.rs".into(), 0, 0)));
+        assert_eq!(
+            parse_spec("a:b.rs:1:1"),
+            Ok((cwd.join("a:b.rs").to_string_lossy().into_owned(), 0, 0))
+        );
+        // An absolute path is passed through unchanged.
+        assert_eq!(parse_spec("/tmp/x.rs:2:3"), Ok(("/tmp/x.rs".into(), 1, 2)));
         assert!(parse_spec("main.rs:10").is_err());
         assert!(parse_spec("main.rs:0:1").is_err());
         assert!(parse_spec(":10:4").is_err());
+    }
+
+    #[test]
+    fn client_abs_absolutizes_relative_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(Path::new(&client_abs(".")).is_absolute());
+        assert_eq!(client_abs("foo/bar"), cwd.join("foo/bar").to_string_lossy());
+        // An absolute path is returned unchanged.
+        assert_eq!(client_abs("/etc/hosts"), "/etc/hosts");
     }
 }

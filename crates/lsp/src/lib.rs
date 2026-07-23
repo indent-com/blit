@@ -43,6 +43,7 @@ pub struct Budgets {
     pub max_docs: usize,
     pub query_timeout: Duration,
     pub init_timeout: Duration,
+    pub ready_grace: Duration,
     pub idle: Duration,
     pub entries_max: usize,
     pub bytes_max: usize,
@@ -60,6 +61,11 @@ impl Default for Budgets {
             max_docs: env_u64("BLIT_LSP_MAX_DOCS", 128).max(1) as usize,
             query_timeout: Duration::from_millis(env_u64("BLIT_LSP_TIMEOUT_MS", 30_000)),
             init_timeout: Duration::from_secs(env_u64("BLIT_LSP_INIT_TIMEOUT", 60)),
+            // How long a session must stay progress-idle after
+            // `initialized` before it is believed READY. Servers that
+            // report quiescence explicitly (rust-analyzer's
+            // experimental serverStatus) bypass this heuristic.
+            ready_grace: Duration::from_millis(env_u64("BLIT_LSP_READY_GRACE_MS", 1_000)),
             idle: Duration::from_secs(env_u64("BLIT_LSP_IDLE_SECS", 900)),
             entries_max: env_u64("BLIT_LSP_ENTRIES_MAX", 10_000) as usize,
             bytes_max: env_u64("BLIT_LSP_BYTES_MAX", 8 * 1024 * 1024) as usize,

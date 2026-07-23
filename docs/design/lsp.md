@@ -216,6 +216,19 @@ SERVER 0x01: [kind:1][server_ref:2][phase:1][progress_pct:1][caps:4]
              ("indexing 42%")
 ```
 
+`ready` means **quiescent**, not merely initialized: servers answer
+`initialize` in milliseconds and start indexing after, with the first
+`$/progress` trailing the handshake — reporting `ready` in that gap
+would let `lsp wait` return into a wall of `WARMING`. A session is
+promoted to `ready` only after it stays progress-idle through a grace
+window (`BLIT_LSP_READY_GRACE_MS`) following `initialized` or the last
+progress `end` — idle alone is not enough, since servers pause between
+warmup stages (rust-analyzer's metadata → crate graph → indexing). A
+server that reports quiescence explicitly overrides the heuristic in
+both directions: blit advertises rust-analyzer's experimental
+`serverStatus` notification, and from its first arrival `quiescent`
+alone decides `ready`/`indexing`, with no grace window.
+
 ### `LSP_DIAG` / `LSP_ACK`
 
 Diagnostics do not satisfy `GIT_STATE`'s smallness precondition (a
@@ -416,6 +429,7 @@ by construction, [git.md](git.md)'s stance.
 | Diagnostics settle window        | 500 ms         | `BLIT_LSP_DIAG_LATENCY_MS`                    |
 | Query timeout                    | 30 s           | `BLIT_LSP_TIMEOUT_MS`                         |
 | Initialize timeout               | 60 s           | `BLIT_LSP_INIT_TIMEOUT`                       |
+| Ready quiescence grace           | 1 s            | `BLIT_LSP_READY_GRACE_MS`                     |
 | Idle shutdown                    | 900 s          | `BLIT_LSP_IDLE_SECS`                          |
 | Records / bytes per response     | 10 000 / 8 MiB | `BLIT_LSP_ENTRIES_MAX` / `BLIT_LSP_BYTES_MAX` |
 | Restarts per backend             | 3/hour         | `BLIT_LSP_MAX_RESTARTS`                       |

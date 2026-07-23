@@ -36,6 +36,8 @@ fn test_budgets() -> Budgets {
     Budgets {
         query_timeout: Duration::from_secs(5),
         init_timeout: Duration::from_secs(5),
+        // Short quiescence grace so wait_ready tests stay fast.
+        ready_grace: Duration::from_millis(80),
         ..Budgets::default()
     }
 }
@@ -230,6 +232,113 @@ fn state_reaches_ready_with_caps() {
             }
         }
     }
+}
+
+/// READY means quiescent, not merely initialized: an active
+/// `$/progress` token holds the phase at INDEXING well past the grace
+/// window, so `blit lsp wait` cannot return mid-warmup.
+#[test]
+fn active_progress_holds_off_ready() {
+    let (_root, backend) = start(
+        "hold",
+        FakeCfg {
+            encoding: "utf-16",
+            after_init: vec![json!({
+                "jsonrpc": "2.0",
+                "method": "$/progress",
+                "params": { "token": "warm", "value": {
+                    "kind": "begin", "title": "indexing", "percentage": 5,
+                } },
+            })],
+            seen: None,
+        },
+    );
+    assert_holds_indexing(&backend);
+}
+
+/// The last progress `end` starts the grace clock; READY follows once
+/// the session stays idle through it.
+#[test]
+fn progress_end_promotes_ready_after_grace() {
+    let progress = |kind: Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": "warm", "value": kind },
+        })
+    };
+    let (_root, backend) = start(
+        "grace",
+        FakeCfg {
+            encoding: "utf-16",
+            after_init: vec![
+                progress(json!({ "kind": "begin", "title": "indexing" })),
+                progress(json!({ "kind": "end" })),
+            ],
+            seen: None,
+        },
+    );
+    wait_ready(&backend);
+}
+
+/// A server that reports quiescence explicitly (rust-analyzer's
+/// experimental serverStatus) overrides the grace heuristic in both
+/// directions: `quiescent:false` pins INDEXING past any idle window…
+#[test]
+fn server_status_nonquiescent_holds_indexing() {
+    let (_root, backend) = start(
+        "status-busy",
+        FakeCfg {
+            encoding: "utf-16",
+            after_init: vec![json!({
+                "jsonrpc": "2.0",
+                "method": "experimental/serverStatus",
+                "params": { "health": "ok", "quiescent": false },
+            })],
+            seen: None,
+        },
+    );
+    assert_holds_indexing(&backend);
+}
+
+/// Wait for the warmup signal to land (phase INDEXING), then outlast
+/// the grace window several times over and check it stuck.
+fn assert_holds_indexing(backend: &Arc<Backend>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "never reached INDEXING");
+        if backend.shared.info.lock().unwrap().phase == LSP_PHASE_INDEXING {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(test_budgets().ready_grace * 6);
+    assert_eq!(
+        backend.shared.info.lock().unwrap().phase,
+        LSP_PHASE_INDEXING
+    );
+}
+
+/// …and `quiescent:true` promotes to READY without waiting out the
+/// grace window.
+#[test]
+fn server_status_quiescent_promotes_ready() {
+    let status = |quiescent: bool| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "experimental/serverStatus",
+            "params": { "health": "ok", "quiescent": quiescent },
+        })
+    };
+    let (_root, backend) = start(
+        "status-ready",
+        FakeCfg {
+            encoding: "utf-16",
+            after_init: vec![status(false), status(true)],
+            seen: None,
+        },
+    );
+    wait_ready(&backend);
 }
 
 #[test]

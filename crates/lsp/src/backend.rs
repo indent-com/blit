@@ -218,7 +218,10 @@ impl Backend {
             open_docs: HashMap::new(),
             open_order: VecDeque::new(),
             enc: PositionEncoding::Utf16,
+            initialized: false,
             progress: HashMap::new(),
+            status_seen: false,
+            quiesce_at: None,
             restarts: VecDeque::new(),
             respawn_at: None,
             dirty: HashMap::new(),
@@ -320,8 +323,19 @@ struct Engine {
     open_docs: HashMap<PathBuf, (i64, String, LspHash)>,
     open_order: VecDeque<PathBuf>,
     enc: PositionEncoding,
+    /// The session finished the `initialize` handshake — notifications
+    /// are legal from here on, independent of the reported phase.
+    initialized: bool,
     /// Active `$/progress` tokens → last percentage.
     progress: HashMap<String, Option<u8>>,
+    /// The session sent `experimental/serverStatus` at least once;
+    /// from then on quiescence is its call, not the progress-idle
+    /// heuristic (docs/design/lsp.md "Sessions and discovery").
+    status_seen: bool,
+    /// When the progress-idle grace window ends and INDEXING may
+    /// become READY. Armed after `initialized` and whenever the last
+    /// progress token ends; disarmed by new progress or serverStatus.
+    quiesce_at: Option<Instant>,
     restarts: VecDeque<Instant>,
     respawn_at: Option<Instant>,
     dirty: HashMap<PathBuf, ()>,
@@ -359,6 +373,7 @@ impl Engine {
             }
             self.expire_pending();
             self.flush_dirty();
+            self.maybe_ready();
             self.maybe_respawn();
         }
         self.shutdown_child();
@@ -368,6 +383,9 @@ impl Engine {
 
     fn start_session(&mut self) {
         self.session_gen += 1;
+        self.initialized = false;
+        self.status_seen = false;
+        self.quiesce_at = None;
         let session_gen = self.session_gen;
         match (self.spawner)() {
             Ok(io) => {
@@ -473,6 +491,10 @@ impl Engine {
                     "rename": {},
                 },
                 "window": { "workDoneProgress": true },
+                // rust-analyzer's quiescence signal
+                // (experimental/serverStatus); explicit readiness
+                // beats the progress-idle grace heuristic.
+                "experimental": { "serverStatusNotification": true },
             },
             "initializationOptions": self.spec.init.clone().unwrap_or(Value::Null),
         });
@@ -503,15 +525,44 @@ impl Engine {
                 json!({ "settings": settings }),
             ));
         }
+        // Not READY yet: most servers (rust-analyzer, gopls) answer
+        // `initialize` in milliseconds and start indexing *after*, with
+        // the first `$/progress` trailing the handshake. Report
+        // INDEXING and let quiescence — a progress-idle grace window,
+        // or serverStatus — promote to READY, so `blit lsp wait` never
+        // returns inside that gap.
+        self.initialized = true;
+        self.quiesce_at = Some(Instant::now() + self.budgets.ready_grace);
         self.set_info(|info| {
             info.caps = caps;
-            info.phase = LSP_PHASE_READY;
+            info.phase = LSP_PHASE_INDEXING;
         });
-        // Now that the session is READY, replay the open set a respawn
+        // Now that the handshake is done, replay the open set a respawn
         // deferred (notifications before `initialized` are illegal).
         for path in std::mem::take(&mut self.pending_reopen) {
             self.ensure_open(&path);
         }
+    }
+
+    /// Promote INDEXING to READY once the progress-idle grace window
+    /// has run out — the quiescence heuristic for servers without an
+    /// explicit signal.
+    fn maybe_ready(&mut self) {
+        let Some(at) = self.quiesce_at else { return };
+        if self.status_seen || !self.progress.is_empty() {
+            self.quiesce_at = None;
+            return;
+        }
+        if Instant::now() < at {
+            return;
+        }
+        self.quiesce_at = None;
+        self.set_info(|info| {
+            if info.phase == LSP_PHASE_INDEXING {
+                info.phase = LSP_PHASE_READY;
+                info.msg.clear();
+            }
+        });
     }
 
     fn start_watcher(&mut self) {
@@ -621,7 +672,10 @@ impl Engine {
             }
         }
         self.init_id = None;
+        self.initialized = false;
         self.progress.clear();
+        self.status_seen = false;
+        self.quiesce_at = None;
         self.set_info(|info| {
             info.phase = LSP_PHASE_FAILED;
             info.pid = None;
@@ -776,6 +830,7 @@ impl Engine {
         match method {
             "textDocument/publishDiagnostics" => self.on_publish_diagnostics(params),
             "$/progress" => self.on_progress(params),
+            "experimental/serverStatus" => self.on_server_status(params),
             "window/showMessage" => {
                 let message = params["message"].as_str().unwrap_or_default().to_string();
                 self.set_info(|info| info.msg = message);
@@ -789,17 +844,23 @@ impl Engine {
             return;
         };
         let value = &params["value"];
+        // Once serverStatus speaks, progress only feeds pct/msg; phase
+        // is the status notification's call.
+        let heuristic = !self.status_seen;
         match value["kind"].as_str() {
             Some("begin") | Some("report") => {
                 let pct = value["percentage"].as_u64().map(|p| p.min(100) as u8);
                 self.progress.insert(token, pct);
+                if heuristic {
+                    self.quiesce_at = None;
+                }
                 let msg = value["title"]
                     .as_str()
                     .or_else(|| value["message"].as_str())
                     .map(str::to_string);
                 let overall = self.overall_progress();
                 self.set_info(|info| {
-                    if info.phase == LSP_PHASE_READY {
+                    if heuristic && info.phase == LSP_PHASE_READY {
                         info.phase = LSP_PHASE_INDEXING;
                     }
                     info.progress_pct = overall;
@@ -810,18 +871,45 @@ impl Engine {
             }
             Some("end") => {
                 self.progress.remove(&token);
-                let idle = self.progress.is_empty();
+                // Progress-idle is necessary but not sufficient:
+                // servers pause between warmup stages (rust-analyzer's
+                // metadata → crate graph → indexing), so READY waits
+                // out the grace window in maybe_ready.
+                if heuristic && self.progress.is_empty() && self.initialized {
+                    self.quiesce_at = Some(Instant::now() + self.budgets.ready_grace);
+                }
                 let overall = self.overall_progress();
                 self.set_info(|info| {
                     info.progress_pct = overall;
-                    if idle && info.phase == LSP_PHASE_INDEXING {
-                        info.phase = LSP_PHASE_READY;
-                        info.msg.clear();
-                    }
                 });
             }
             _ => {}
         }
+    }
+
+    /// rust-analyzer's explicit quiescence signal. Authoritative for
+    /// phase from the first notification on: `quiescent` decides
+    /// READY/INDEXING with no grace window.
+    fn on_server_status(&mut self, params: Value) {
+        self.status_seen = true;
+        self.quiesce_at = None;
+        let quiescent = params["quiescent"].as_bool().unwrap_or(false);
+        let healthy = matches!(params["health"].as_str(), Some("ok") | None);
+        let message = params["message"].as_str().map(str::to_string);
+        self.set_info(|info| {
+            if info.phase == LSP_PHASE_INDEXING || info.phase == LSP_PHASE_READY {
+                info.phase = if quiescent {
+                    LSP_PHASE_READY
+                } else {
+                    LSP_PHASE_INDEXING
+                };
+            }
+            match message {
+                Some(m) => info.msg = m,
+                None if quiescent && healthy => info.msg.clear(),
+                None => {}
+            }
+        });
     }
 
     fn overall_progress(&self) -> u8 {
@@ -974,10 +1062,12 @@ impl Engine {
         if Instant::now() < deadline {
             return;
         }
-        // No notifications before the session is READY — LSP forbids any
-        // (except exit) before `initialized`. Hints keep accumulating in
-        // self.dirty and flush once ready.
-        if self.shared.info.lock().unwrap().phase != LSP_PHASE_READY {
+        // No notifications before the handshake — LSP forbids any
+        // (except exit) before `initialized`. Hints keep accumulating
+        // in self.dirty and flush once the session is up; INDEXING is
+        // fine (a didChange mid-index is legal and keeps the server
+        // current).
+        if !self.initialized {
             return;
         }
         self.dirty_deadline = None;
