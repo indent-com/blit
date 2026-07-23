@@ -369,6 +369,7 @@ fn normalize_ws(bytes: &[u8], mode: u8) -> Vec<u8> {
 
 /// The path→changes walk shared by `GIT_DIFF`, `GIT_PATCH`, and STATUS.
 /// `ws` carries the ignore-whitespace bits (0 = exact).
+#[allow(clippy::too_many_arguments)]
 fn diff_flats(
     repo: &gix::Repository,
     workdir: Option<&std::path::Path>,
@@ -376,6 +377,7 @@ fn diff_flats(
     new: &Flat,
     ws: u8,
     renames: bool,
+    input_cap: u64,
     cancel: &Cancel,
 ) -> Result<Vec<Change>, u8> {
     let mut changes: Vec<Change> = Vec::new();
@@ -389,7 +391,7 @@ fn diff_flats(
             (Some((op, ov)), Some((np, nv))) => {
                 if op == np {
                     if (ov != nv || nv.worktree)
-                        && let Some(st) = modified_status(repo, workdir, op, ov, nv, ws)
+                        && let Some(st) = modified_status(repo, workdir, op, ov, nv, ws, input_cap)
                     {
                         changes.push(Change {
                             path: (*op).clone(),
@@ -455,6 +457,7 @@ fn modified_status(
     old: &Side,
     new: &Side,
     ws: u8,
+    input_cap: u64,
 ) -> Option<u8> {
     let type_change = (old.mode & 0o170000) != (new.mode & 0o170000);
     let content_maybe_differs = new.worktree || old.worktree || old.oid != new.oid;
@@ -469,6 +472,14 @@ fn modified_status(
     // differing oids provably differ — no need to read either blob. Avoids
     // reading full content of every changed file in a commit/index diff.
     if ws == 0 && !old.worktree && !new.worktree {
+        return Some(if type_change { b'T' } else { b'M' });
+    }
+    // Never materialize a side larger than the input cap just to compare it:
+    // an over-cap pair counts as changed without reading content, matching
+    // the binary/patch paths' cap and keeping this pre-loop check bounded.
+    if side_len(repo, workdir, path, old).unwrap_or(0) > input_cap
+        || side_len(repo, workdir, path, new).unwrap_or(0) > input_cap
+    {
         return Some(if type_change { b'T' } else { b'M' });
     }
     // Content check: worktree side re-hashes; whitespace modes compare
@@ -630,6 +641,10 @@ impl RepoHandle {
             (Err(status), _) | (_, Err(status)) => return fail(status),
         };
         let workdir = repo.workdir().map(|p| p.to_path_buf());
+        let input_cap = self
+            .budgets
+            .blob_max
+            .min(blit_remote::MAX_DECOMPRESSED as u64);
         let changes = match diff_flats(
             &repo,
             workdir.as_deref(),
@@ -637,6 +652,7 @@ impl RepoHandle {
             &new_flat,
             ws,
             req.flags & GIT_DIFF_RENAMES != 0,
+            input_cap,
             cancel,
         ) {
             Ok(changes) => changes,
@@ -673,10 +689,6 @@ impl RepoHandle {
             // of either present side (deletions included — the old blob is
             // available). Skipped for submodules (no bytes).
             if !submodule {
-                let input_cap = self
-                    .budgets
-                    .blob_max
-                    .min(blit_remote::MAX_DECOMPRESSED as u64);
                 let side_binary = |path: &[u8], side: &Option<Side>| {
                     side.as_ref().is_some_and(|s| {
                         // An over-cap file counts as binary without reading it.
@@ -813,6 +825,12 @@ impl RepoHandle {
             (Err(status), _) | (_, Err(status)) => return fail(status),
         };
         let workdir = repo.workdir().map(|p| p.to_path_buf());
+        // Input size cap: never materialize a side larger than the blob cap
+        // just to line-diff it — treat it as binary (no rows).
+        let input_cap = self
+            .budgets
+            .blob_max
+            .min(blit_remote::MAX_DECOMPRESSED as u64);
         let changes = match diff_flats(
             &repo,
             workdir.as_deref(),
@@ -820,6 +838,7 @@ impl RepoHandle {
             &new_flat,
             ws,
             req.flags & GIT_DIFF_RENAMES != 0,
+            input_cap,
             cancel,
         ) {
             Ok(changes) => changes,
@@ -858,12 +877,6 @@ impl RepoHandle {
             let (old_path, _new_path) = rename_paths(change);
             let old_read_path = old_path_or(&old_path, change);
             let new_read_path = change_new_path(change);
-            // Input size cap: never materialize a side larger than the blob
-            // cap just to line-diff it — treat it as binary (no rows).
-            let input_cap = self
-                .budgets
-                .blob_max
-                .min(blit_remote::MAX_DECOMPRESSED as u64);
             let over_cap = |path: &[u8], side: &Option<Side>| {
                 side.as_ref().is_some_and(|s| {
                     side_len(&repo, workdir.as_deref(), path, s).unwrap_or(0) > input_cap
@@ -1236,6 +1249,13 @@ fn append_text_patch(
     out.extend_from_slice(format!("--- {a_label}\n+++ {b_label}\n").as_bytes());
     let old_lines = split_lines(old_bytes);
     let new_lines = split_lines(new_bytes);
+    // A final line lacking its newline takes git's "\ No newline at end of
+    // file" marker, so the patch round-trips through `git apply` byte for
+    // byte. `*_last` is a sentinel index no valid line matches when empty.
+    let old_no_nl = old_bytes.last().is_some_and(|&b| b != b'\n');
+    let new_no_nl = new_bytes.last().is_some_and(|&b| b != b'\n');
+    let old_last = old_lines.len().wrapping_sub(1);
+    let new_last = new_lines.len().wrapping_sub(1);
     let changes = line_changes(old_bytes, new_bytes, ws);
     // Group changes whose context windows touch into one @@ hunk, so the
     // emitted hunks never overlap (overlapping hunks are what `git apply`
@@ -1276,10 +1296,13 @@ fn append_text_patch(
             )
             .as_bytes(),
         );
-        let emit = |out: &mut Vec<u8>, prefix: u8, line: &[u8]| {
+        let emit = |out: &mut Vec<u8>, prefix: u8, line: &[u8], no_nl: bool| {
             out.push(prefix);
             out.extend_from_slice(line);
             out.push(b'\n');
+            if no_nl {
+                out.extend_from_slice(b"\\ No newline at end of file\n");
+            }
         };
         // Context lines are identical on both sides, so tracking the old
         // position alone suffices for emission (the new-side counts are in
@@ -1291,20 +1314,30 @@ fn append_text_patch(
             let (a0, a1) = (after.start as usize, after.end as usize);
             // Inner/leading context up to this change.
             while old_pos < b0 {
-                emit(out, b' ', old_lines[old_pos]);
+                emit(
+                    out,
+                    b' ',
+                    old_lines[old_pos],
+                    old_no_nl && old_pos == old_last,
+                );
                 old_pos += 1;
             }
-            for line in &old_lines[b0..b1] {
-                emit(out, b'-', line);
+            for (off, line) in old_lines[b0..b1].iter().copied().enumerate() {
+                emit(out, b'-', line, old_no_nl && b0 + off == old_last);
             }
-            for line in &new_lines[a0..a1] {
-                emit(out, b'+', line);
+            for (off, line) in new_lines[a0..a1].iter().copied().enumerate() {
+                emit(out, b'+', line, new_no_nl && a0 + off == new_last);
             }
             old_pos = b1;
         }
         // Trailing context.
         while old_pos < ctx_end {
-            emit(out, b' ', old_lines[old_pos]);
+            emit(
+                out,
+                b' ',
+                old_lines[old_pos],
+                old_no_nl && old_pos == old_last,
+            );
             old_pos += 1;
         }
         i = j + 1;
@@ -1363,6 +1396,7 @@ pub(crate) fn append_status_records(
         *flags |= GIT_STATE_STATUS_TRUNCATED;
     }
     let workdir = repo.workdir().map(|p| p.to_path_buf());
+    let input_cap = budgets.blob_max.min(blit_remote::MAX_DECOMPRESSED as u64);
     let (Ok(staged), Ok(unstaged)) = (
         diff_flats(
             repo,
@@ -1371,6 +1405,7 @@ pub(crate) fn append_status_records(
             &index_flat,
             0,
             true,
+            input_cap,
             &cancel,
         ),
         diff_flats(
@@ -1380,6 +1415,7 @@ pub(crate) fn append_status_records(
             &worktree_flat,
             0,
             false,
+            input_cap,
             &cancel,
         ),
     ) else {

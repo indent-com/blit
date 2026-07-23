@@ -216,11 +216,14 @@ pub(crate) fn resolve_spec(
         Spec::Range { from, to } => Ok((vec![commit(to)?], vec![commit(from)?])),
         Spec::Merge { theirs, ours } => {
             let (t, o) = (commit(theirs)?, commit(ours)?);
-            let base = bounded_merge_base(repo, t, o, budget, cancel)?;
-            Ok((vec![t, o], base.into_iter().collect()))
+            // `A...B` hides ALL merge bases, so its symmetric difference is
+            // right even in criss-cross histories with more than one base.
+            let bases = bounded_merge_bases(repo, t, o, budget, cancel)?;
+            Ok((vec![t, o], bases))
         }
         Spec::IncludeOnlyParents(a) => Ok((parents(a)?, vec![])),
-        Spec::ExcludeParents(a) => Ok((vec![], parents(a)?)),
+        // `a^!` is `a` with all its parents hidden — reachable set {a}.
+        Spec::ExcludeParents(a) => Ok((vec![commit(a)?], parents(a)?)),
     }
 }
 
@@ -276,6 +279,74 @@ pub(crate) fn bounded_merge_base(
         }
     }
     Ok(None)
+}
+
+/// All merge bases of `a` and `b` — the maximal common ancestors — bounded
+/// and cancellable. Backs `A...B`: hiding the full set makes the symmetric
+/// difference match git when two branches share more than one merge base
+/// (criss-cross merges). Same budget discipline as [`bounded_merge_base`].
+pub(crate) fn bounded_merge_bases(
+    repo: &gix::Repository,
+    a: gix::ObjectId,
+    b: gix::ObjectId,
+    budget: usize,
+    cancel: &Cancel,
+) -> Result<Vec<gix::ObjectId>, u8> {
+    let mut a_anc: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let iter = repo.rev_walk([a]).all().map_err(|_| GIT_STATUS_OTHER)?;
+    for (n, item) in iter.enumerate() {
+        if cancel.is_cancelled() {
+            return Err(GIT_STATUS_CANCELLED);
+        }
+        if n >= budget {
+            return Err(GIT_STATUS_BUDGET);
+        }
+        a_anc.insert(item.map_err(|_| GIT_STATUS_OTHER)?.id);
+    }
+    // Every common ancestor: b's ancestors that a can also reach.
+    let mut common: Vec<gix::ObjectId> = Vec::new();
+    let mut common_set: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let iter = repo.rev_walk([b]).all().map_err(|_| GIT_STATUS_OTHER)?;
+    for (n, item) in iter.enumerate() {
+        if cancel.is_cancelled() {
+            return Err(GIT_STATUS_CANCELLED);
+        }
+        if n >= budget {
+            return Err(GIT_STATUS_BUDGET);
+        }
+        let id = item.map_err(|_| GIT_STATUS_OTHER)?.id;
+        if a_anc.contains(&id) && common_set.insert(id) {
+            common.push(id);
+        }
+    }
+    // Reduce to the maximal elements. A common commit reachable from another
+    // common commit is redundant; every commit on an ancestry path between
+    // two common commits is itself common, so following parents that stay in
+    // the common set reaches every redundant one.
+    let parents_of = |id: gix::ObjectId| -> Result<Vec<gix::ObjectId>, u8> {
+        Ok(repo
+            .find_commit(id)
+            .map_err(|_| GIT_STATUS_OTHER)?
+            .parent_ids()
+            .map(|p| p.detach())
+            .collect())
+    };
+    let mut redundant: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let mut stack: Vec<gix::ObjectId> = common.clone();
+    while let Some(id) = stack.pop() {
+        if cancel.is_cancelled() {
+            return Err(GIT_STATUS_CANCELLED);
+        }
+        for parent in parents_of(id)? {
+            if common_set.contains(&parent) && redundant.insert(parent) {
+                stack.push(parent);
+            }
+        }
+    }
+    Ok(common
+        .into_iter()
+        .filter(|id| !redundant.contains(id))
+        .collect())
 }
 
 /// Walk `hides..tips` into a `(records, frontier, more)` triple — the core

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use blit_git::{Cancel, StateOptions, open};
+use blit_git::{Cancel, RepoHandle, StateOptions, open};
 use blit_remote::git::*;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +59,53 @@ fn fixture() -> PathBuf {
     dir
 }
 
+/// Run git and return its stdout (trimmed of a trailing newline), asserting
+/// success — for oracle comparisons against the real CLI.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .trim_end()
+        .to_string()
+}
+
+/// Drive a state engine to its first snapshot and return that message.
+fn wait_first_state(handle: &RepoHandle, opts: StateOptions) -> Vec<u8> {
+    let sent: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+    let sent2 = sent.clone();
+    let state = handle.start_state(
+        1,
+        opts,
+        Box::new(move |m| {
+            sent2.lock().unwrap().push(m);
+            true
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let msg = loop {
+        if let Some(m) = sent.lock().unwrap().first().cloned() {
+            break m;
+        }
+        assert!(Instant::now() < deadline, "no snapshot arrived");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    state.stop();
+    msg
+}
+
 fn rev(dir: &Path, spec: &str) -> GitOid {
     let out = Command::new("git")
         .current_dir(dir)
@@ -88,9 +135,20 @@ fn open_reports_repo() {
     std::fs::create_dir(&sub).unwrap();
     let (_h2, info2) = open(sub.to_str().unwrap()).expect("open subdir");
     assert_eq!(info2.workdir, info.workdir);
-    // A non-repo fails with WRONG_TYPE.
+    // A non-repo directory is WRONG_TYPE; a missing path NOT_FOUND; an
+    // empty/NUL path OTHER (docs/git.md status table).
     let plain = temp_dir();
-    assert!(open(plain.to_str().unwrap()).is_err());
+    assert_eq!(
+        open(plain.to_str().unwrap()).err().unwrap().0,
+        GIT_STATUS_WRONG_TYPE
+    );
+    let missing = plain.join("does-not-exist");
+    assert_eq!(
+        open(missing.to_str().unwrap()).err().unwrap().0,
+        GIT_STATUS_NOT_FOUND
+    );
+    assert_eq!(open("").err().unwrap().0, GIT_STATUS_OTHER);
+    assert_eq!(open("bad\0path").err().unwrap().0, GIT_STATUS_OTHER);
 }
 
 #[test]
@@ -824,6 +882,13 @@ fn resolve_revspecs() {
     assert_eq!(resolve("HEAD~2"), (GIT_STATUS_OK, vec![c1], vec![]));
     // Range: dev..HEAD → tips=[HEAD], hides=[dev].
     assert_eq!(resolve("dev..HEAD"), (GIT_STATUS_OK, vec![head], vec![dev]));
+    // `^A` exclusion → tips=[], hides=[A].
+    assert_eq!(resolve("^dev"), (GIT_STATUS_OK, vec![], vec![dev]));
+    // `a^!` is the commit itself with its parents hidden: reachable set {a}.
+    let c2 = rev(&dir, "HEAD~1");
+    assert_eq!(resolve("HEAD^!"), (GIT_STATUS_OK, vec![head], vec![c2]));
+    // A non-committish spec (a tree) is WRONG_TYPE.
+    assert_eq!(resolve("HEAD^{tree}").0, GIT_STATUS_WRONG_TYPE);
     // Unknown ref.
     assert_eq!(resolve("nope").0, GIT_STATUS_NOT_FOUND);
 }
@@ -1004,4 +1069,329 @@ fn log_follow_directory_and_unknown_flags() {
     };
     let page = parse_git_commits(&handle.log(&bad_flags, &cancel)).unwrap();
     assert_eq!(page.status, GIT_STATUS_INVALID);
+}
+
+/// Parse "@@ -o,oc +n,nc @@" into (old_count, new_count); a missing count
+/// defaults to 1 as in git's unified-diff format.
+fn hunk_counts(header: &str) -> (usize, usize) {
+    let mut parts = header.split_whitespace();
+    parts.next(); // "@@"
+    let old = parts.next().unwrap().trim_start_matches('-');
+    let new = parts.next().unwrap().trim_start_matches('+');
+    let oc = old.split(',').nth(1).unwrap_or("1").parse().unwrap();
+    let nc = new.split(',').nth(1).unwrap_or("1").parse().unwrap();
+    (oc, nc)
+}
+
+/// A real fork (two branches diverging past a shared base) exercises the
+/// newest-common-ancestor selection that linear ancestry never does:
+/// GIT_BASE, the MERGE_BASE diff endpoint, and `A...B` all report the true
+/// base, which is neither input, and match the real CLI's merge-base.
+#[test]
+fn merge_base_and_symmetric_diff_on_fork() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("shared.txt"), "base\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "base"]);
+    git(&dir, &["branch", "feature"]);
+    // main advances two commits.
+    std::fs::write(dir.join("shared.txt"), "main-1\n").unwrap();
+    git(&dir, &["commit", "-am", "m1"]);
+    std::fs::write(dir.join("shared.txt"), "main-2\n").unwrap();
+    git(&dir, &["commit", "-am", "m2"]);
+    // feature advances two commits on a different file.
+    git(&dir, &["checkout", "feature"]);
+    std::fs::write(dir.join("feat.txt"), "f1\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "f1"]);
+    std::fs::write(dir.join("feat.txt"), "f2\n").unwrap();
+    git(&dir, &["commit", "-am", "f2"]);
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let main_tip = rev(&dir, "main");
+    let feature_tip = rev(&dir, "feature");
+    let base = rev(&dir, "feature~2"); // == main~2, the fork point
+    assert_ne!(base, main_tip);
+    assert_ne!(base, feature_tip);
+    // Cross-check the fork point against the real CLI.
+    let cli_base = rev(&dir, &git_out(&dir, &["merge-base", "main", "feature"]));
+    assert_eq!(cli_base, base);
+
+    // GIT_BASE returns the true fork point.
+    let (_, status, bases) =
+        parse_git_base_resp(&handle.base(1, &[main_tip, feature_tip], &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    assert_eq!(bases, vec![base]);
+
+    // MERGE_BASE diff endpoint reveals the same base.
+    let req = GitDiffRequest {
+        nonce: 2,
+        repo_id: 0,
+        flags: 0,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_MERGE_BASE,
+            oid: main_tip,
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: feature_tip,
+        },
+        path: "",
+    };
+    let (_, status, _, records) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    assert!(matches!(
+        git_diff_records(&records).next().unwrap(),
+        GitDiffRecord::Base { oid } if oid == base
+    ));
+
+    // `A...B` resolves to tips={A,B}, hides=[base].
+    let (_, status, mut tips, hides) =
+        parse_git_resolve_resp(&handle.resolve(3, "feature...main", &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    tips.sort();
+    let mut want = vec![main_tip, feature_tip];
+    want.sort();
+    assert_eq!(tips, want);
+    assert_eq!(hides, vec![base]);
+
+    // MERGE_BASE is only valid on the old side; on the new side it is INVALID.
+    let bad = GitDiffRequest {
+        nonce: 4,
+        repo_id: 0,
+        flags: 0,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: main_tip,
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_MERGE_BASE,
+            oid: feature_tip,
+        },
+        path: "",
+    };
+    let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&bad, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_INVALID);
+}
+
+/// The file-level diff status set matches `git diff --name-status` across a
+/// mixed matrix (modify, delete, add, exact rename) rather than only
+/// hand-enumerated literals.
+#[test]
+fn diff_status_matches_git() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "bbb\n").unwrap();
+    std::fs::write(dir.join("c.txt"), "ccc\n").unwrap();
+    std::fs::write(dir.join("d.txt"), "ddd\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "c1"]);
+    let a = rev(&dir, "HEAD");
+    // Modify a, delete b, rename c->cc (exact), add e, leave d untouched.
+    std::fs::write(dir.join("a.txt"), "a2\n").unwrap();
+    git(&dir, &["rm", "b.txt"]);
+    git(&dir, &["mv", "c.txt", "cc.txt"]);
+    std::fs::write(dir.join("e.txt"), "eee\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "c2"]);
+    let b = rev(&dir, "HEAD");
+
+    // Oracle: git's own name-status with rename detection.
+    let (a_hex, b_hex) = (hex(&a, 40), hex(&b, 40));
+    let raw = git_out(
+        &dir,
+        &["diff", "--name-status", "--find-renames", &a_hex, &b_hex],
+    );
+    let mut expected: Vec<String> = raw
+        .lines()
+        .map(|line| {
+            let mut f = line.split('\t');
+            let st = f.next().unwrap();
+            if st.starts_with('R') {
+                format!("R {} {}", f.next().unwrap(), f.next().unwrap())
+            } else {
+                format!("{} {}", &st[..1], f.next().unwrap())
+            }
+        })
+        .collect();
+    expected.sort();
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let req = GitDiffRequest {
+        nonce: 1,
+        repo_id: 0,
+        flags: GIT_DIFF_RENAMES,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: a,
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: b,
+        },
+        path: "",
+    };
+    let (_, status, _, records) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    let mut got: Vec<String> = git_diff_records(&records)
+        .filter_map(|r| match r {
+            GitDiffRecord::Entry {
+                st,
+                old_path,
+                new_path,
+                ..
+            } => Some(if st == b'R' {
+                format!("R {old_path} {new_path}")
+            } else {
+                format!("{} {new_path}", st as char)
+            }),
+            _ => None,
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, expected);
+}
+
+/// TEXT-mode unified patches round-trip through `git apply`: a non-zero net
+/// delta (pure insert/delete) applies cleanly and its new-side hunk header
+/// reflects the delta, and a file without a trailing newline carries git's
+/// "\ No newline at end of file" marker so it applies too.
+#[test]
+fn patch_text_round_trips_through_git_apply() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    let old_n = "1\n2\n3\n4\n5\n";
+    let old_m = "a\nb"; // no trailing newline
+    std::fs::write(dir.join("n.txt"), old_n).unwrap();
+    std::fs::write(dir.join("m.txt"), old_m).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "seed"]);
+    // Delete a line and insert three (net +2); rewrite the no-newline file's
+    // last line, keeping it newline-free.
+    std::fs::write(dir.join("n.txt"), "1\n2\nX\nY\nZ\n4\n5\n").unwrap();
+    std::fs::write(dir.join("m.txt"), "a\nc").unwrap();
+    git(&dir, &["add", "."]);
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let req = GitPatchRequest {
+        nonce: 1,
+        repo_id: 0,
+        flags: GIT_PATCH_TEXT,
+        context: 3,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: rev(&dir, "HEAD"),
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_INDEX,
+            oid: GIT_OID_NONE,
+        },
+        path: "",
+        max_len: 0,
+    };
+    let (_, status, pflags, data) = parse_git_patch_resp(&handle.patch(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    assert_eq!(pflags & GIT_PATCH_STRUCTURED, 0);
+    let text = String::from_utf8(data.clone()).unwrap();
+    // The no-newline file carries git's marker on both sides of its change.
+    assert!(
+        text.matches("\\ No newline at end of file").count() >= 2,
+        "missing no-newline markers: {text}"
+    );
+    // n.txt's hunk header reflects the +2 net delta (new_count != old_count).
+    let lines: Vec<&str> = text.lines().collect();
+    let n_hunk = lines
+        .iter()
+        .position(|l| *l == "+++ b/n.txt")
+        .and_then(|i| lines[i + 1..].iter().find(|l| l.starts_with("@@")))
+        .expect("n.txt hunk header");
+    assert_eq!(hunk_counts(n_hunk), (5, 7), "header: {n_hunk}");
+
+    // git apply --check accepts the patch against the pre-change content.
+    let apply_dir = temp_dir();
+    git(&apply_dir, &["init"]);
+    std::fs::write(apply_dir.join("n.txt"), old_n).unwrap();
+    std::fs::write(apply_dir.join("m.txt"), old_m).unwrap();
+    std::fs::write(apply_dir.join("patch.diff"), &data).unwrap();
+    git(&apply_dir, &["apply", "--check", "patch.diff"]);
+}
+
+/// HEAD state records for the non-symbolic cases: a detached HEAD carries
+/// the flag, the checked-out oid, and an empty name; an unborn branch
+/// carries the flag, a zero oid, a symbolic name, and an empty-OK log.
+#[test]
+fn detached_and_unborn_head() {
+    // Detached HEAD.
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("f"), "1\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "c1"]);
+    std::fs::write(dir.join("f"), "2\n").unwrap();
+    git(&dir, &["commit", "-am", "c2"]);
+    let c1 = rev(&dir, "HEAD~1");
+    git(&dir, &["checkout", &hex(&c1, 40)]);
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let msg = wait_first_state(
+        &handle,
+        StateOptions {
+            status: true,
+            ..Default::default()
+        },
+    );
+    let mut mirror = GitStateMirror::new();
+    mirror.apply_state(&msg).expect("valid state");
+    let head = mirror.head.as_ref().expect("head record");
+    assert_ne!(head.flags & GIT_HEAD_DETACHED, 0, "detached flag set");
+    assert_eq!(
+        head.oid, c1,
+        "detached HEAD points at the checked-out commit"
+    );
+    assert!(head.name.is_empty(), "detached HEAD has no symbolic name");
+
+    // Unborn branch: a fresh repo with no commits.
+    let empty = temp_dir();
+    git(&empty, &["init", "-b", "main"]);
+    let (handle, _info) = open(empty.to_str().unwrap()).unwrap();
+    let msg = wait_first_state(
+        &handle,
+        StateOptions {
+            status: true,
+            ..Default::default()
+        },
+    );
+    let mut mirror = GitStateMirror::new();
+    mirror.apply_state(&msg).expect("valid state");
+    let head = mirror.head.as_ref().expect("head record");
+    assert_ne!(head.flags & GIT_HEAD_UNBORN, 0, "unborn flag set");
+    assert_eq!(head.oid, GIT_OID_NONE, "unborn HEAD has a zero oid");
+    assert_eq!(
+        head.name, "refs/heads/main",
+        "unborn HEAD keeps its symbolic name"
+    );
+    // The log on an unborn branch is an empty OK page, not an error.
+    let cancel = Cancel::default();
+    let req = GitLogRequest {
+        nonce: 1,
+        repo_id: 0,
+        flags: 0,
+        limit: 0,
+        path: "",
+        tips: vec![],
+        hides: vec![],
+    };
+    let page = parse_git_commits(&handle.log(&req, &cancel)).unwrap();
+    assert_eq!(page.status, GIT_STATUS_OK);
+    assert_eq!(
+        git_commit_records(&page.records)
+            .filter(|r| matches!(r, GitCommitRecord::Commit { .. }))
+            .count(),
+        0
+    );
 }
