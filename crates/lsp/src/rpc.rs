@@ -2,9 +2,9 @@
 //! protocol. Framing only: request correlation and method semantics live
 //! in the engine. Blocking I/O on plain threads, the house engine shape.
 
-use std::io::{BufRead, BufReader, Read};
 #[cfg(test)]
 use std::io::Write;
+use std::io::{BufRead, BufReader, Read};
 
 use serde_json::{Value, json};
 
