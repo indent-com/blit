@@ -1,6 +1,6 @@
 # RFC: Filesystem Writes
 
-- **Status:** Implemented (rides `FEATURE_FS_SYNC`, protocol feature bit 6;
+- **Status:** Implemented (rides `FEATURE_FS`, protocol feature bit 6;
   no new bit) — the disk-write side; the Monaco pane (§ Rollout step 6) is
   separate `js/ui` work.
 - **Date:** 2026-07-23
@@ -35,7 +35,7 @@ explicit trigger for a later RFC (§ Out of scope).
 
 ## Wire
 
-**No new feature bit.** The write family rides `FEATURE_FS_SYNC`
+**No new feature bit.** The write family rides `FEATURE_FS`
 (bit 6): the whole `FS_*` family, reads and writes, ships together, and
 `S2C_HELLO` bits are scarce — 0–8 are taken (fs=6, git=7, lsp=8;
 [protocol.md](../protocol.md)). `BLIT_FS_WRITE=0` still offers read-only
@@ -277,7 +277,7 @@ grant read-only sync to a party not trusted with a shell —
 at dispatch with `FS_DONE` `PERMISSION`, before any parsing or engine
 work. (An earlier draft spent feature bit 9 on advertising this; the
 gate needs only refusal, not advertisement, so the family shares
-`FEATURE_FS_SYNC` and the bit stays free.)
+`FEATURE_FS` and the bit stays free.)
 
 ## Budgets
 

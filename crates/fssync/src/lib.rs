@@ -1,6 +1,6 @@
 //! Filesystem state sync engine (docs/fs-watch.md).
 //!
-//! The server side of `FEATURE_FS_SYNC`, split in two:
+//! The server side of `FEATURE_FS`, split in two:
 //!
 //! - A **shared root** per watched `(path, recursive, cross_filesystem)`,
 //!   refcounted across every sync of that root on every connection: one

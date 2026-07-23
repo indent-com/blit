@@ -33,7 +33,7 @@ export {
 } from "./exit-status";
 
 export {
-  FEATURE_FS_SYNC,
+  FEATURE_FS,
   FS_SYNC_RECURSIVE,
   FS_SYNC_CONTENT,
   FS_SYNC_CROSS_FILESYSTEM,

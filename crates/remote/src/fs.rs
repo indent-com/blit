@@ -38,7 +38,7 @@ pub const S2C_FS_DONE: u8 = 0x44;
 /// reads and writes alike (docs/design/fs-watch.md, docs/design/fs-write.md).
 /// A read-only deployment (`BLIT_FS_WRITE=0`) still advertises this bit and
 /// answers `FS_WRITE`/`FS_OP` with `FS_DONE_PERMISSION`.
-pub const FEATURE_FS_SYNC: u32 = 1 << 6;
+pub const FEATURE_FS: u32 = 1 << 6;
 
 /// `sync_id` reported by a failed `FS_SYNCED`.
 pub const FS_SYNC_ID_INVALID: u16 = 0xFFFF;

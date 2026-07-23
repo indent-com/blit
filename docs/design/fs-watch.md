@@ -1,6 +1,6 @@
 # Filesystem State Sync
 
-- **Status:** Accepted and implemented (`FEATURE_FS_SYNC`, protocol feature bit 6)
+- **Status:** Accepted and implemented (`FEATURE_FS`, protocol feature bit 6)
 - **Date:** 2026-07-21
 
 Chosen over four sibling proposals (since removed from the tree) that
@@ -85,7 +85,7 @@ New `S2C_HELLO` feature bit (mutually exclusive with the other proposals —
 whichever design is adopted takes bit 6):
 
 ```text
-FEATURE_FS_SYNC = 1 << 6
+FEATURE_FS = 1 << 6
 ```
 
 Opcodes occupy the `0x40` block in both directions. Gateway, proxy, and mux
@@ -314,7 +314,7 @@ bytes as trusted text.
 ## Implementation
 
 1. `blit-remote` (`crates/remote/src/fs.rs`): opcodes, record codecs,
-   `FEATURE_FS_SYNC`, and the `FsMirror` reference reducer; TypeScript
+   `FEATURE_FS`, and the `FsMirror` reference reducer; TypeScript
    counterparts in `@blit-sh/core` (`js/core/src/fs.ts`). Both pin the same
    byte fixtures, so codec drift fails on one side or the other.
 2. `blit-fssync` (`crates/fssync`): a **shared root** per

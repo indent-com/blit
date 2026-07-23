@@ -80,7 +80,7 @@ import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
 import {
-  FEATURE_FS_SYNC,
+  FEATURE_FS,
   FS_CLOSED_CONNECTION_LOST,
   FS_DONE_CONFLICT,
   FS_DONE_OK,
@@ -974,7 +974,7 @@ export class BlitConnection {
         `Cannot sync while transport is ${this.transport.status}`,
       );
     }
-    if ((this.features & FEATURE_FS_SYNC) === 0) {
+    if ((this.features & FEATURE_FS) === 0) {
       throw connectionError("Server does not support filesystem sync");
     }
     let flags = 0;
@@ -2187,7 +2187,7 @@ export class BlitConnection {
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
-          supportsFsSync: (features & FEATURE_FS_SYNC) !== 0,
+          supportsFsSync: (features & FEATURE_FS) !== 0,
           supportsGit: (features & FEATURE_GIT) !== 0,
         };
         this.emit();

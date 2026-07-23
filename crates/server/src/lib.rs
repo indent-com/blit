@@ -5790,7 +5790,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let lsp_enabled = !std::env::var("BLIT_LSP").is_ok_and(|v| v == "0");
     // BLIT_FS_WRITE=0 offers read-only sync: FS_WRITE/FS_OP answer
     // FS_DONE_PERMISSION instead of dispatching (docs/design/fs-write.md
-    // "Security"). The family shares FEATURE_FS_SYNC, so there is no
+    // "Security"). The family shares FEATURE_FS, so there is no
     // separate bit to withhold.
     let fs_write_enabled = !std::env::var("BLIT_FS_WRITE").is_ok_and(|v| v == "0");
     #[cfg(target_os = "linux")]
@@ -5999,7 +5999,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
                 | FEATURE_COMPOSITOR
-                | blit_remote::fs::FEATURE_FS_SYNC
+                | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             // BLIT_LSP=0 disables the family: the bit is simply not
             // advertised, matching the dispatch gate.

@@ -38,7 +38,7 @@ export const S2C_FS_CLOSED = 0x43;
  * reads and writes alike. A read-only deployment (`BLIT_FS_WRITE=0` on
  * the server) still advertises this bit and answers writes with
  * `FS_DONE_PERMISSION`. */
-export const FEATURE_FS_SYNC = 1 << 6;
+export const FEATURE_FS = 1 << 6;
 
 /** `sync_id` reported by a failed `FS_SYNCED`. */
 export const FS_SYNC_ID_INVALID = 0xffff;
