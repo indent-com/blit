@@ -261,9 +261,15 @@ clients as ordered state diffs: a client `FS_SYNC`s a path, receives a staged
 snapshot followed by live updates (`RESET`/`SYNC` flags delimit staged
 series), applies LZ4-compressed `UPSERT`/`DELETE`/`MOVE` records to a map,
 and acknowledges cumulatively via `FS_ACK` (byte-window pacing,
-`BLIT_FS_WINDOW`). `FS_FETCH` pulls one file's full content on demand.
+`BLIT_FS_WINDOW`). `FS_FETCH` pulls one file's full content on demand;
+`FS_WRITE`/`FS_OP` write back to disk — content upserts under
+compare-and-swap on the synced content hash, plus mkdir/remove/rename —
+each answered by one `FS_DONE`
+([design/fs-write.md](design/fs-write.md)). The write side shares the
+family's feature bit; `BLIT_FS_WRITE=0` makes a deployment read-only
+(writes answer `PERMISSION`).
 Wire details, record layouts, and semantics:
-[fs-watch.md](fs-watch.md); server engine:
+[design/fs-watch.md](design/fs-watch.md); server engine:
 `crates/fssync`; codecs and the `FsMirror` reference reducer:
 `crates/remote/src/fs.rs` (Rust) and `js/core/src/fs.ts` (TypeScript,
 surfaced as `syncFs` on `BlitConnection`/`BlitWorkspace`).

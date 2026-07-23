@@ -5788,9 +5788,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut lsp_conns = LspConns::default();
     // BLIT_LSP=0 turns the whole family off: unadvertised and undispatched.
     let lsp_enabled = !std::env::var("BLIT_LSP").is_ok_and(|v| v == "0");
-    // BLIT_FS_WRITE=0 offers read-only sync: the write bit is unadvertised
-    // and FS_WRITE/FS_OP are undispatched (docs/design/fs-write.md
-    // "Security").
+    // BLIT_FS_WRITE=0 offers read-only sync: FS_WRITE/FS_OP answer
+    // FS_DONE_PERMISSION instead of dispatching (docs/design/fs-write.md
+    // "Security"). The family shares FEATURE_FS_SYNC, so there is no
+    // separate bit to withhold.
     let fs_write_enabled = !std::env::var("BLIT_FS_WRITE").is_ok_and(|v| v == "0");
     #[cfg(target_os = "linux")]
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -6000,14 +6001,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_COMPOSITOR
                 | blit_remote::fs::FEATURE_FS_SYNC
                 | blit_remote::git::FEATURE_GIT;
-            // BLIT_LSP=0 / BLIT_FS_WRITE=0 disable their families: the bit
-            // is simply not advertised, matching the dispatch gate.
+            // BLIT_LSP=0 disables the family: the bit is simply not
+            // advertised, matching the dispatch gate.
             let mut features = features;
             if lsp_enabled {
                 features |= blit_remote::lsp::FEATURE_LSP;
-            }
-            if fs_write_enabled {
-                features |= blit_remote::fs::FEATURE_FS_WRITE;
             }
             #[cfg(target_os = "linux")]
             {
@@ -6134,13 +6132,31 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | blit_remote::fs::C2S_FS_STOP
                 | blit_remote::fs::C2S_FS_ACK
                 | blit_remote::fs::C2S_FS_FETCH
-        ) || (fs_write_enabled
-            && matches!(
-                data[0],
-                blit_remote::fs::C2S_FS_WRITE | blit_remote::fs::C2S_FS_OP
-            ))
-        {
-            handle_fs_message(&data, &mut fs_syncs, &fs_out, config.verbose);
+                | blit_remote::fs::C2S_FS_WRITE
+                | blit_remote::fs::C2S_FS_OP
+        ) {
+            // A read-only deployment (BLIT_FS_WRITE=0) shares the family's
+            // feature bit, so writes are refused here rather than dropped:
+            // every nonce still gets its one FS_DONE.
+            if !fs_write_enabled
+                && matches!(
+                    data[0],
+                    blit_remote::fs::C2S_FS_WRITE | blit_remote::fs::C2S_FS_OP
+                )
+            {
+                let nonce = data
+                    .get(1..3)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .unwrap_or(0);
+                let _ = fs_out.send(blit_remote::fs::msg_fs_done(
+                    nonce,
+                    blit_remote::fs::FS_DONE_PERMISSION,
+                    0,
+                    0,
+                ));
+            } else {
+                handle_fs_message(&data, &mut fs_syncs, &fs_out, config.verbose);
+            }
             continue;
         }
 

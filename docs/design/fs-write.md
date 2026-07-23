@@ -1,7 +1,8 @@
 # RFC: Filesystem Writes
 
-- **Status:** Implemented (`FEATURE_FS_WRITE`, protocol feature bit 9) — the
-  disk-write side; the Monaco pane (§ Rollout step 6) is separate `js/ui` work.
+- **Status:** Implemented (rides `FEATURE_FS_SYNC`, protocol feature bit 6;
+  no new bit) — the disk-write side; the Monaco pane (§ Rollout step 6) is
+  separate `js/ui` work.
 - **Date:** 2026-07-23
 - **Companion to:** [fs-watch.md](fs-watch.md), [git.md](git.md), [lsp.md](lsp.md)
 
@@ -34,18 +35,15 @@ explicit trigger for a later RFC (§ Out of scope).
 
 ## Wire
 
-New `S2C_HELLO` feature bit, **separately advertised** so a deployment
-can offer read-only sync without writes (§ Security):
-
-```text
-FEATURE_FS_WRITE = 1 << 9
-```
-
-Advertised by default whenever `FS_SYNC` is; `BLIT_FS_WRITE=0` disables
-the family (unadvertised and undispatched), the same shape as
-`BLIT_LSP=0`. A relay or proxy exposing read-only sync to a party not
-trusted with a shell sets `BLIT_FS_WRITE=0`. Bits 0–8 are taken (fs=6,
-git=7, lsp=8; [protocol.md](protocol.md)).
+**No new feature bit.** The write family rides `FEATURE_FS_SYNC`
+(bit 6): the whole `FS_*` family, reads and writes, ships together, and
+`S2C_HELLO` bits are scarce — 0–8 are taken (fs=6, git=7, lsp=8;
+[protocol.md](../protocol.md)). `BLIT_FS_WRITE=0` still offers read-only
+sync (§ Security), but as a **dispatch gate** rather than an
+unadvertised bit: the server answers `FS_WRITE`/`FS_OP` with `FS_DONE`
+`PERMISSION` without executing, so every nonce keeps its one response.
+The conceded cost: a client cannot see read-only-ness in the handshake —
+it learns on the first refused write and grays out editing then.
 Opcodes take the free `0x44`/`0x45` slots in the fs `0x40` block (git
 owns `0x50`). Gateway, proxy, and mux forward them unmodified.
 
@@ -274,9 +272,12 @@ root-scoped API into an arbitrary-path write _structurally_, where the
 shell gates the same power behind the user's own typed commands. Same
 ceiling, higher and un-audited blast radius, plus a new **confinement
 obligation** read-only sync never carried. And a relay or proxy may
-grant read-only sync to a party not trusted with a shell — which is why
-`FEATURE_FS_WRITE` is a **separately advertised bit**, so such a
-deployment offers `FS_SYNC` without `FS_WRITE`.
+grant read-only sync to a party not trusted with a shell —
+`BLIT_FS_WRITE=0` keeps that deployment: `FS_WRITE`/`FS_OP` are refused
+at dispatch with `FS_DONE` `PERMISSION`, before any parsing or engine
+work. (An earlier draft spent feature bit 9 on advertising this; the
+gate needs only refusal, not advertisement, so the family shares
+`FEATURE_FS_SYNC` and the bit stays free.)
 
 ## Budgets
 
@@ -354,8 +355,8 @@ its wire — the three contracts that keep that seam open:
 
 ## Rollout
 
-1. `crates/remote/src/fs.rs`: opcodes, codecs, `FEATURE_FS_WRITE`;
-   TypeScript mirror in `js/core/src/fs.ts`; byte fixtures both sides.
+1. `crates/remote/src/fs.rs`: opcodes, codecs; TypeScript mirror in
+   `js/core/src/fs.ts`; byte fixtures both sides.
 2. **Path-validation prerequisite** — the `resolve_wire_path` decode-
    order fix (done) plus the write-time parent-canonicalize /
    `starts_with(root)` / symlink guard, with the compiled traversal

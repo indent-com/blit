@@ -5,7 +5,6 @@ import type { BlitWasmModule } from "../TerminalStore";
 import { S2C_FRAGMENT, FRAGMENT_FLAG_LAST } from "../types";
 import {
   FEATURE_FS_SYNC,
-  FEATURE_FS_WRITE,
   FS_CLOSED_CONNECTION_LOST,
   FS_CLOSED_ROOT_GONE,
   FS_CONTENT_FULL,
@@ -43,6 +42,7 @@ import {
   C2S_FS_ACK,
   C2S_FS_SYNC,
   FS_DONE_CONFLICT,
+  FS_DONE_PERMISSION,
   FS_OP_MKPARENTS,
   FS_OP_RENAME,
   FS_WRITE_CONTENT_FULL,
@@ -658,7 +658,7 @@ describe("BlitConnection writes", () => {
       wasm,
       autoConnect: false,
     });
-    transport.pushHello(1, FEATURE_FS_SYNC | FEATURE_FS_WRITE);
+    transport.pushHello(1, FEATURE_FS_SYNC);
     transport.pushReady();
     const handlePromise = conn.syncFs("/w");
     const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
@@ -720,23 +720,15 @@ describe("BlitConnection writes", () => {
     conn.dispose();
   });
 
-  it("refuses writes without the write feature bit", async () => {
-    const transport = new MockTransport();
-    const conn = new BlitConnection({
-      id: "test",
-      transport,
-      wasm,
-      autoConnect: false,
-    });
-    transport.pushHello(1, FEATURE_FS_SYNC); // sync but not write
-    transport.pushReady();
-    const handlePromise = conn.syncFs("/w");
-    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
-    pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 1, 0, "/w");
-    const handle = await handlePromise;
-    await expect(handle.writeFile("a", new Uint8Array())).rejects.toThrow(
-      /does not support/,
-    );
+  it("surfaces a read-only server's PERMISSION refusal", async () => {
+    // Writes share FEATURE_FS_SYNC; a BLIT_FS_WRITE=0 server answers each
+    // write with FS_DONE PERMISSION instead of withholding a bit.
+    const { conn, transport, handle } = await writeReadyHandle();
+    const p = handle.writeFile("a", new Uint8Array());
+    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
+    const nonce = writeMsg[1] | (writeMsg[2] << 8);
+    transport.push(buildFsDoneMessage(nonce, FS_DONE_PERMISSION, 0n, 0n));
+    await expect(p).rejects.toThrow(/permission denied/);
     conn.dispose();
   });
 });

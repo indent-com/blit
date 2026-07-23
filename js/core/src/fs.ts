@@ -34,7 +34,10 @@ export const S2C_FS_FILE = 0x42;
 /** Sync terminated: [0x43][sync_id:2][reason:1] */
 export const S2C_FS_CLOSED = 0x43;
 
-/** `S2C_HELLO` feature bit: server supports the `FS_*` message family. */
+/** `S2C_HELLO` feature bit: server supports the `FS_*` message family,
+ * reads and writes alike. A read-only deployment (`BLIT_FS_WRITE=0` on
+ * the server) still advertises this bit and answers writes with
+ * `FS_DONE_PERMISSION`. */
 export const FEATURE_FS_SYNC = 1 << 6;
 
 /** `sync_id` reported by a failed `FS_SYNCED`. */
@@ -184,10 +187,6 @@ export function buildFsFetchMessage(
 export const C2S_FS_WRITE = 0x44;
 export const C2S_FS_OP = 0x45;
 export const S2C_FS_DONE = 0x44;
-
-/** `S2C_HELLO` bit: the server supports the write family (separately
- * advertised, so read-only sync can be offered without writes). */
-export const FEATURE_FS_WRITE = 1 << 9;
 
 // FS_DONE status — the unified git/lsp table plus CONFLICT.
 export const FS_DONE_OK = 0;

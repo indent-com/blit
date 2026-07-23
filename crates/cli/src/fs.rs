@@ -5,7 +5,7 @@
 
 use crate::transport::{Transport, read_message, write_frame};
 use blit_remote::fs::{
-    FEATURE_FS_SYNC, FEATURE_FS_WRITE, FS_CLOSED_BACKEND_FAILED, FS_CLOSED_CLIENT_REQUEST,
+    FEATURE_FS_SYNC, FS_CLOSED_BACKEND_FAILED, FS_CLOSED_CLIENT_REQUEST,
     FS_CLOSED_PERMISSION_LOST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT,
     FS_DONE_OK, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_OP_MKDIR,
     FS_OP_MKPARENTS, FS_OP_REMOVE, FS_OP_RENAME, FS_STATUS_OK, FS_SYNC_CONTENT, FS_SYNC_RECURSIVE,
@@ -336,8 +336,10 @@ fn parse_mode(mode: Option<&str>) -> Result<u32, String> {
     }
 }
 
-/// Handshake, require `FEATURE_FS_WRITE`, and open a (non-recursive,
-/// content-less) sync of `root` to obtain a `sync_id` the write routes to.
+/// Handshake, require `FEATURE_FS_SYNC` (writes share the family's bit;
+/// a read-only remote answers the write itself with "permission denied"),
+/// and open a (non-recursive, content-less) sync of `root` to obtain a
+/// `sync_id` the write routes to.
 async fn open_write_root(
     reader: &mut (impl AsyncRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
@@ -345,11 +347,8 @@ async fn open_write_root(
     root: &str,
 ) -> Result<u16, String> {
     let features = handshake(reader, fragment_buf).await?;
-    if features & FEATURE_FS_WRITE == 0 {
-        return Err(
-            "server does not support filesystem writes (BLIT_FS_WRITE=0 on the remote, or upgrade blit)"
-                .into(),
-        );
+    if features & FEATURE_FS_SYNC == 0 {
+        return Err("server does not support filesystem sync (upgrade blit on the remote)".into());
     }
     if !write_frame(writer, &msg_fs_sync(SYNC_NONCE, 0, 0, 0, root)).await {
         return Err("connection closed".into());

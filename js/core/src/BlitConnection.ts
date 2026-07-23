@@ -81,7 +81,6 @@ import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
 import {
   FEATURE_FS_SYNC,
-  FEATURE_FS_WRITE,
   FS_CLOSED_CONNECTION_LOST,
   FS_DONE_CONFLICT,
   FS_DONE_OK,
@@ -1024,10 +1023,6 @@ export class BlitConnection {
     options: FsWriteOptions,
   ): Promise<FsWriteResult> {
     return new Promise<FsWriteResult>((resolve, reject) => {
-      if ((this.features & FEATURE_FS_WRITE) === 0) {
-        reject(connectionError("Server does not support filesystem writes"));
-        return;
-      }
       if (!this.fsSyncs.has(syncId)) {
         reject(connectionError("Sync is closed"));
         return;
@@ -1079,10 +1074,6 @@ export class BlitConnection {
     record?: { syncId: number; path: string },
   ): Promise<FsWriteResult> {
     return new Promise<FsWriteResult>((resolve, reject) => {
-      if ((this.features & FEATURE_FS_WRITE) === 0) {
-        reject(connectionError("Server does not support filesystem writes"));
-        return;
-      }
       if (!this.fsSyncs.has(syncId)) {
         reject(connectionError("Sync is closed"));
         return;

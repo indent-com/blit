@@ -34,13 +34,11 @@ pub const S2C_FS_CLOSED: u8 = 0x43;
 /// Write/op result: [0x44][nonce:2][status:1][hash:16][mtime_ns:8]
 pub const S2C_FS_DONE: u8 = 0x44;
 
-/// `S2C_HELLO` feature bit: server supports the `FS_*` message family.
+/// `S2C_HELLO` feature bit: server supports the `FS_*` message family,
+/// reads and writes alike (docs/design/fs-watch.md, docs/design/fs-write.md).
+/// A read-only deployment (`BLIT_FS_WRITE=0`) still advertises this bit and
+/// answers `FS_WRITE`/`FS_OP` with `FS_DONE_PERMISSION`.
 pub const FEATURE_FS_SYNC: u32 = 1 << 6;
-
-/// `S2C_HELLO` feature bit: server supports the write family (`FS_WRITE`,
-/// `FS_OP`). Separately advertised so a deployment can offer read-only
-/// sync without writes (docs/design/fs-write.md "Security").
-pub const FEATURE_FS_WRITE: u32 = 1 << 9;
 
 /// `sync_id` reported by a failed `FS_SYNCED`.
 pub const FS_SYNC_ID_INVALID: u16 = 0xFFFF;
