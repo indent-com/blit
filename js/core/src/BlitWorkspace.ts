@@ -58,7 +58,6 @@ export interface CreateWorkspaceSessionOptions {
   tag?: string;
   command?: string;
   cwdFromSessionId?: SessionId;
-  /** Working directory for the new session. Interpreted on the target server. */
   cwd?: string;
 }
 
