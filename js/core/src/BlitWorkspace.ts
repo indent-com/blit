@@ -58,6 +58,8 @@ export interface CreateWorkspaceSessionOptions {
   tag?: string;
   command?: string;
   cwdFromSessionId?: SessionId;
+  /** Working directory for the new session. Interpreted on the target server. */
+  cwd?: string;
 }
 
 export interface ResizeWorkspaceSessionOptions {
@@ -179,6 +181,7 @@ export class BlitWorkspace {
       tag: options.tag,
       command: options.command,
       cwdFromSessionId: options.cwdFromSessionId,
+      cwd: options.cwd,
     });
     return session;
   }
