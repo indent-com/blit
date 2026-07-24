@@ -58,6 +58,7 @@ export interface CreateWorkspaceSessionOptions {
   tag?: string;
   command?: string;
   cwdFromSessionId?: SessionId;
+  cwd?: string;
 }
 
 export interface ResizeWorkspaceSessionOptions {
@@ -179,6 +180,7 @@ export class BlitWorkspace {
       tag: options.tag,
       command: options.command,
       cwdFromSessionId: options.cwdFromSessionId,
+      cwd: options.cwd,
     });
     return session;
   }
