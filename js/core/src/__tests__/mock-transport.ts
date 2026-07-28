@@ -12,6 +12,7 @@ import {
   S2C_LIST,
   S2C_QUIT,
   S2C_READY,
+  S2C_TEXT,
   S2C_TITLE,
   S2C_UPDATE,
 } from "../types";
@@ -155,6 +156,18 @@ export class MockTransport implements BlitTransport {
     msg[1] = ptyId & 0xff;
     msg[2] = (ptyId >> 8) & 0xff;
     msg.set(titleBytes, 3);
+    this.push(msg);
+  }
+
+  pushText(nonce: number, ptyId: number, totalLines: number, text: string) {
+    const textBytes = new TextEncoder().encode(text);
+    const msg = new Uint8Array(13 + textBytes.length);
+    const v = new DataView(msg.buffer);
+    msg[0] = S2C_TEXT;
+    v.setUint16(1, nonce, true);
+    v.setUint16(3, ptyId, true);
+    v.setUint32(5, totalLines, true);
+    msg.set(textBytes, 13);
     this.push(msg);
   }
 

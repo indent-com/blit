@@ -135,6 +135,16 @@ export interface BlitWorkspaceSnapshot {
   ready: boolean;
 }
 
+export interface CopyRangeResult {
+  /** Copied text.  Soft-wrapped rows are joined without a separator. */
+  text: string;
+  /**
+   * Rows the PTY held when the copy ran (scrollback plus screen), so a caller
+   * that asked for a bounded window can tell whether rows were left above it.
+   */
+  totalLines: number;
+}
+
 export interface BlitSearchResult {
   sessionId: SessionId;
   connectionId: ConnectionId;
