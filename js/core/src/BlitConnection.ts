@@ -1614,11 +1614,9 @@ export class BlitConnection {
       case S2C_TEXT: {
         if (bytes.length < 13) return;
         const nonce = bytes[1] | (bytes[2] << 8);
-        const totalLines = new DataView(
-          bytes.buffer,
-          bytes.byteOffset,
-          bytes.byteLength,
-        ).getUint32(5, true);
+        const totalLines =
+          (bytes[5] | (bytes[6] << 8) | (bytes[7] << 16) | (bytes[8] << 24)) >>>
+          0;
         const text = textDecoder.decode(bytes.subarray(13));
         const pending = this.pendingReads.get(nonce);
         if (pending) {
