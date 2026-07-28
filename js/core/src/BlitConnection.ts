@@ -5,6 +5,7 @@ import type {
   BlitTransport,
   ConnectionId,
   ConnectionStatus,
+  CopyRangeResult,
   SessionId,
   TerminalPalette,
 } from "./types";
@@ -192,7 +193,10 @@ export class BlitConnection {
   private readonly pendingSearches = new Map<number, PendingSearch>();
   private readonly pendingReads = new Map<
     number,
-    { resolve: (text: string) => void; reject: (error: Error) => void }
+    {
+      resolve: (result: CopyRangeResult) => void;
+      reject: (error: Error) => void;
+    }
   >();
 
   private sessionCounter = 0;
@@ -452,7 +456,7 @@ export class BlitConnection {
     startCol: number,
     endTail: number,
     endCol: number,
-  ): Promise<string> {
+  ): Promise<CopyRangeResult> {
     if (this.transport.status !== "connected") {
       return Promise.reject(
         connectionError(
@@ -464,7 +468,7 @@ export class BlitConnection {
     if (!session) {
       return Promise.reject(connectionError("Unknown session"));
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<CopyRangeResult>((resolve, reject) => {
       let nonce = 0;
       do {
         nonce = this.nonceCounter = (this.nonceCounter + 1) & 0xffff;
@@ -1610,11 +1614,16 @@ export class BlitConnection {
       case S2C_TEXT: {
         if (bytes.length < 13) return;
         const nonce = bytes[1] | (bytes[2] << 8);
+        const totalLines = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        ).getUint32(5, true);
         const text = textDecoder.decode(bytes.subarray(13));
         const pending = this.pendingReads.get(nonce);
         if (pending) {
           this.pendingReads.delete(nonce);
-          pending.resolve(text);
+          pending.resolve({ text, totalLines });
         }
         return;
       }

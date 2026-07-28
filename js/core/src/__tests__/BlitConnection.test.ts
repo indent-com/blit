@@ -9,6 +9,7 @@ import {
   C2S_SCROLL,
   C2S_FOCUS,
   C2S_CLOSE,
+  C2S_COPY_RANGE,
   C2S_CREATE2,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
@@ -308,6 +309,20 @@ describe("BlitConnection", () => {
     const promise = conn.createSession({ rows: 24, cols: 80 });
     transport.setStatus("disconnected");
     await expect(promise).rejects.toThrow(/disconnected/);
+  });
+
+  // --- copyRange ---
+
+  it("copyRange resolves the copied text with the PTY's line count", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    const promise = conn.copyRange(session.id, 100, 0, 0, 0);
+    const msg = transport.sent.find((m) => m[0] === C2S_COPY_RANGE)!;
+    transport.pushText(msg[1] | (msg[2] << 8), 7, 4242, "one\ntwo");
+    await expect(promise).resolves.toEqual({
+      text: "one\ntwo",
+      totalLines: 4242,
+    });
   });
 
   // --- closeSession ---

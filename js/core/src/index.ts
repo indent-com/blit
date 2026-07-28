@@ -42,6 +42,7 @@ export type {
   BlitSession,
   ConnectionId,
   ConnectionStatus,
+  CopyRangeResult,
   SessionId,
   TerminalPalette,
   TransportConfig,

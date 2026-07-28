@@ -460,13 +460,13 @@ export class BlitTerminalSurface {
       this._blitConn.supportsCopyRange()
     ) {
       try {
-        text = await this._blitConn.copyRange(
+        ({ text } = await this._blitConn.copyRange(
           this._sessionId,
           start.tailOffset,
           start.col,
           end.tailOffset,
           end.col,
-        );
+        ));
       } catch {
         return null;
       }
