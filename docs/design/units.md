@@ -19,7 +19,7 @@ A unit introduces **no new object**. `C2S_RESTART` already respawns an
 exited child in place, reusing the same pty id and the same terminal
 driver, so blit already has a session identity that outlives a
 process. A unit is that identity made declarative: policy attached to
-an existing `Pty` entry, keyed by its existing tag. A client
+an existing `Pty` entry. A client
 subscribes once and follows the unit across restarts, and scrollback
 stays continuous across invocations — the blit-native equivalent of a
 journal. The alternative, a second process model bolted alongside the
@@ -88,7 +88,7 @@ Existing machinery this design reuses rather than reinvents:
   distinguish "old server" from "processed", so every capability here
   is feature-gated, and anything nonce-bearing needs an explicit
   refusal path — the `refuse_lsp_message` pattern at
-  `lib.rs:7411-7422`.
+  `lib.rs:7431-7441`, with the function itself at `lib.rs:6928`.
 - **Flat crate layout** ([../../CONTRIBUTING.md](../../CONTRIBUTING.md)):
   one new `crates/server/src/units.rs`, `mod`'d from the root.
 - **The server is the stateful half**, and everything above the socket
@@ -243,6 +243,20 @@ gets an answer instead of hanging forever. That is a standalone bug,
 worth fixing whether or not units happen.
 
 ## Units
+
+### Identity
+
+A unit's name has to be an identity the server controls, and `Pty.tag`
+is not one: tags are client-chosen and nothing enforces uniqueness, so
+any client could `C2S_CREATE` a session tagged `api` and either
+impersonate a unit or collide with one. So a unit gets an explicit
+`unit: Option<String>` field on `Pty`, set only by the supervisor and
+never settable over the wire, and the tag is left as the cosmetic
+label it is today.
+
+That field is also what makes restart-in-place coherent: the pty id is
+stable across restarts, but it is the `unit` field, not the id, that
+answers "which unit is this". `S2C_UNIT_STATE` carries both.
 
 ### File format
 
@@ -429,6 +443,50 @@ naming the cycle, rather than silently broken by dropping ordering
 edges. That is systemd's behavior, but it is confusing, and there is
 no compatibility obligation here.
 
+### Pipe backing
+
+`Backing=pipe` is the same fork with `pipe2()` on stdin, stdout, and
+stderr instead of the pty slave, and no `setsid`/`TIOCSCTTY`. The
+bytes still feed the alacritty driver, so `S2C_UPDATE`, scrollback,
+search, `C2S_COPY_RANGE`, and browser rendering all work unchanged.
+The difference is entirely on the child's side: no tty, so no job
+control, no SIGWINCH, and tools correctly detect that they are not on
+a terminal.
+
+One interaction with `KillMode=` that is easy to miss: a `pipe` child
+is not a session leader, so `process-group` is meaningless for it
+unless the forked child does an explicit `setpgid(0, 0)`.
+
+### Wire and CLI
+
+A new family in the `0x90` block, gated on `FEATURE_UNITS`, bit 11
+(bits 11 through 31 are free).
+
+| Dir | Opcode | Name           | Layout                                                                                    |
+| --- | ------ | -------------- | ----------------------------------------------------------------------------------------- |
+| C2S | `0x90` | `UNIT_LIST`    | `[nonce:2]`                                                                               |
+| C2S | `0x91` | `UNIT_START`   | `[nonce:2][name:N]`                                                                       |
+| C2S | `0x92` | `UNIT_STOP`    | `[nonce:2][name:N]`                                                                       |
+| C2S | `0x93` | `UNIT_RESTART` | `[nonce:2][name:N]`                                                                       |
+| C2S | `0x94` | `UNIT_RELOAD`  | `[nonce:2]`                                                                               |
+| S2C | `0x90` | `UNIT_LIST`    | `[nonce:2][count:2]` then per unit: name, state, pty id, restart count, last exit, health |
+| S2C | `0x91` | `UNIT_STATE`   | `[name_len:2][name:N][state:1][pty_id:2]` — pushed on every transition                    |
+
+Every request is nonce-bearing, so all of them need the refusal path
+described under Constraints when the family is disabled.
+
+On the CLI, `blit unit list|start|stop|restart|status|cat|reload`,
+following the existing subcommand pattern, and added to
+`crates/cli/src/learn.md` so agents discover it.
+
+### Server restart
+
+Units do not survive a server restart; all unit state is in memory. On
+restart, autostart re-runs them from their files, and clients detect
+the restart through the boot generation in `S2C_HELLO`. This is
+coherent and crash-only, and it is written down here so that nobody
+expects unit state to be durable in the KV store.
+
 ### Worked example
 
 Open a URL in a browser, but only once the server behind that URL
@@ -564,6 +622,55 @@ already `C2S_CREATE` anything — but it is new _persistence_, and it is
 reachable by anyone who can write files through the `fs` family. So
 mirror `blit.remotes`: refuse to load unit files that are group- or
 world-writable, and refuse a world-writable unit directory.
+
+## Known weaknesses
+
+Things this design is currently worse at than it should be, recorded
+so they are decided rather than discovered.
+
+- **systemd's key names carry weaker semantics here.** `Requires=` is
+  start-time only: it does not stop the dependent when the dependency
+  stops, and `Restart=` does not propagate. Likewise `Type=simple`
+  means "active once healthy" rather than systemd's "active
+  immediately". Borrowing the spelling while narrowing the meaning is
+  arguably worse than picking different words, because muscle memory
+  will be wrong silently. Either accept it and document loudly, or
+  split health-gating out under its own key
+  (`ActiveWhenHealthy=`, default yes) so `Type=` keeps its meaning.
+- **Manual state does not survive a restart.** `blit unit stop api`
+  followed by a server restart re-autostarts `api`, contradicting the
+  operator. Everything else here is legitimately crash-only, but
+  "somebody deliberately stopped this" is not derivable from the unit
+  files. The KV store (`docs/design/kv.md`) is redb-backed and already
+  durable, and is the obvious home for enablement and manual-stop
+  state.
+- **`ReadyMatch=` is underspecified.** It has to say _which_ stream it
+  matches — the raw bytes before ANSI interpretation, not the rendered
+  grid, or a redrawing progress bar makes matching nondeterministic —
+  and it needs a bound, so a unit that never becomes ready does not
+  scan unbounded output forever.
+- **`ExecHealthCheck=` children need their own accounting.** They are
+  processes the server spawns that are not sessions, so they need the
+  same timeout and group-kill discipline, and the new SIGCHLD handler
+  must tell them apart from unit children when reaping.
+- **Autostart competes with `max_ptys`.** A cap low enough to be
+  useful can be exhausted before autostart finishes, failing units at
+  boot for a reason that has nothing to do with them. Units should
+  either be exempt from the cap or reserve against it up front.
+- **No `ExecStartPre=` or `ExecStop=`.** Stopping is SIGTERM and
+  nothing else, which is not enough for services that need to be told
+  to drain.
+- **Most of this is Unix-only.** `setsid`/`setpgid`, SIGCHLD, cgroups,
+  `sd_notify`, and `pipe2` all are. Windows gets unit files, restart
+  policy, `Type=simple`/`oneshot`/`match`, and health checks; it does
+  not get group kill, notify readiness, or reactive child death.
+- **This lands policy in the least-covered crate.** `blit-server` is
+  at roughly 36% line coverage, and the established server test
+  pattern only reaches handlers factored as standalone
+  `handle_*_message` functions. The units family should be factored
+  that way from the first commit, and the state machine kept a pure
+  function over `(state, event)` so it is testable without spawning
+  anything.
 
 ## Delivery
 
