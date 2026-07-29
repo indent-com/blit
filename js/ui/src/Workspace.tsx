@@ -1668,10 +1668,10 @@ function WorkspaceScreen(props: {
     else pendingTilePlacement = { assignment, paneId };
   }
 
-  // Send the currently-focused IDE tile to the recoverable background list
-  // (Ctrl+Shift+Q). Handles both the non-BSP focused tile and a tile occupying
-  // the focused BSP pane. Returns true if a tile was backgrounded (so the
-  // keyboard handler knows it consumed the key).
+  // Send the currently-focused IDE or web tile to the recoverable background
+  // list (Ctrl+Shift+Q). Handles both the non-BSP focused tile and a tile
+  // occupying the focused BSP pane. Returns true if a tile was backgrounded
+  // (so the keyboard handler knows it consumed the key).
   function backgroundFocusedTile(): boolean {
     const tile = activeTile();
     if (tile) {
@@ -1682,7 +1682,7 @@ function WorkspaceScreen(props: {
     const paneId = bspFocusedPaneId();
     if (activeLayout() && paneId) {
       const assign = layoutAssignments()?.assignments[paneId] ?? null;
-      if (assign && isTileAssignment(assign)) {
+      if (assign && (isTileAssignment(assign) || isWebAssignment(assign))) {
         pushBackgroundTile(assign);
         clearPaneAssignmentFn?.(paneId);
         return true;
@@ -1694,9 +1694,9 @@ function WorkspaceScreen(props: {
   /**
    * Close the focused tile outright — the Ctrl+Alt+Shift+Q counterpart to
    * {@link backgroundFocusedTile}'s Ctrl+Shift+Q. Same targets (a non-BSP
-   * active tile, or a tile in the focused BSP pane), but the assignment is
-   * dropped instead of parked in the dock, matching what the same chord
-   * does to a terminal or a surface.
+   * active tile, or an IDE/web tile in the focused BSP pane), but the
+   * assignment is dropped instead of parked in the dock, matching what the
+   * same chord does to a terminal or a surface.
    */
   function closeFocusedTile(): boolean {
     if (activeTile()) {
@@ -1706,7 +1706,7 @@ function WorkspaceScreen(props: {
     const paneId = bspFocusedPaneId();
     if (activeLayout() && paneId) {
       const assign = layoutAssignments()?.assignments[paneId] ?? null;
-      if (assign && isTileAssignment(assign)) {
+      if (assign && (isTileAssignment(assign) || isWebAssignment(assign))) {
         clearPaneAssignmentFn?.(paneId);
         return true;
       }

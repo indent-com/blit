@@ -2,6 +2,7 @@
 
 import { createEffect, createSignal, onCleanup, type JSX } from "solid-js";
 import { previewIframeUrl } from "./preview";
+import { forwardWebPaneCloseShortcut } from "./webPaneShortcuts";
 
 export interface WebPaneState {
   /** Where the frame currently is, on the target's own terms (`/dashboard`). */
@@ -176,12 +177,21 @@ export function WebPane(props: WebPaneProps): JSX.Element {
 
   /** The document the listeners below are on, so a reload can take them off
    *  the previous one. */
-  let bound: { doc: Document; claim: () => void } | null = null;
+  let bound: {
+    doc: Document;
+    claim: () => void;
+    forwardWorkspaceShortcut: (event: KeyboardEvent) => void;
+  } | null = null;
 
   const detachFrameListeners = () => {
     if (!bound) return;
     bound.doc.removeEventListener("pointerdown", bound.claim, true);
     bound.doc.removeEventListener("focusin", bound.claim, true);
+    bound.doc.removeEventListener(
+      "keydown",
+      bound.forwardWorkspaceShortcut,
+      true,
+    );
     bound = null;
   };
   // The component's own scope, which is a real owner — so this actually runs.
@@ -193,7 +203,7 @@ export function WebPane(props: WebPaneProps): JSX.Element {
    *
    *  Called from the iframe's `load` event, which is outside any reactive
    *  owner: an `onCleanup` here is never run (Solid says so), so every reload
-   *  of the previewed page left another pair of listeners on a document nobody
+   *  of the previewed page left listeners on a document nobody
    *  would ever detach them from. Removal is explicit instead — the previous
    *  document's on each load, and the last one's on unmount. */
   const attachFrameListeners = () => {
@@ -201,9 +211,17 @@ export function WebPane(props: WebPaneProps): JSX.Element {
     const doc = frame?.contentDocument;
     if (!doc) return;
     const claim = () => props.onFocusRequest?.();
+    // Keyboard events stop at an iframe document; they do not bubble into the
+    // workspace window where createKeyboardShortcuts listens. Relay the
+    // pane removal chords so a focused browser pane behaves like every other
+    // focused tile. Keep this deliberately narrow: previewed apps retain all
+    // of their ordinary keyboard input and shortcuts.
+    const forwardWorkspaceShortcut = (event: KeyboardEvent) =>
+      forwardWebPaneCloseShortcut(event, claim);
     doc.addEventListener("pointerdown", claim, true);
     doc.addEventListener("focusin", claim, true);
-    bound = { doc, claim };
+    doc.addEventListener("keydown", forwardWorkspaceShortcut, true);
+    bound = { doc, claim, forwardWorkspaceShortcut };
     if (doc.body?.dataset.blitPreviewLost === "1") {
       // A binding was lost (worker restart, or a navigation we could not
       // attribute). Re-point once rather than leaving a dead pane.
