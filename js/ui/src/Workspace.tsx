@@ -2243,7 +2243,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn: ((value: string, targetPaneId: string) => void) | null =
     null;
   // A tile to drop into a freshly-created layout, flushed when BSPContainer
