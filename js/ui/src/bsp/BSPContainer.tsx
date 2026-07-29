@@ -1057,13 +1057,33 @@ function BSPPane(props: {
                     "min-height": 0,
                   }}
                 >
-                  <BSPPane
-                    node={split().children[activeTab()].node}
-                    assignments={props.assignments}
-                    focusedPaneId={props.focusedPaneId}
-                    visible={props.visible}
-                    path={[...path(), activeTab()]}
-                  />
+                  {/* Keep every tab body mounted. In particular, a restored web
+                      pane must create its iframe and bind to the preview worker
+                      without waiting for the user to focus its tab. Persistent
+                      bodies also preserve in-frame navigation when switching
+                      between tabs; inactive bodies are only hidden. */}
+                  <For each={split().children}>
+                    {(child, index) => {
+                      const active = () => index() === activeTab();
+                      return (
+                        <div
+                          style={{
+                            position: "absolute",
+                            inset: 0,
+                            display: active() ? "block" : "none",
+                          }}
+                        >
+                          <BSPPane
+                            node={child.node}
+                            assignments={props.assignments}
+                            focusedPaneId={props.focusedPaneId}
+                            visible={props.visible && active()}
+                            path={[...path(), index()]}
+                          />
+                        </div>
+                      );
+                    }}
+                  </For>
                 </div>
               </div>
             );
@@ -1123,6 +1143,9 @@ function LeafPane(props: {
   let autoCreated = false;
 
   createEffect(() => {
+    // Tabs keep their bodies mounted so web panes can materialize eagerly, but
+    // an inactive command leaf should retain the old lazy-start behavior.
+    if (!props.visible) return;
     if (props.sessionId || !props.leaf.command || autoCreated) return;
     if (connection()?.status !== "connected") return;
     autoCreated = true;
