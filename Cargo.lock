@@ -884,6 +884,7 @@ dependencies = [
  "blit-lsp",
  "blit-remote",
  "blit-sd-notify",
+ "getrandom 0.3.4",
  "ignore",
  "libc",
  "memchr",

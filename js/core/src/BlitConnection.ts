@@ -696,6 +696,7 @@ export class BlitConnection {
       supportsLsp: false,
       supportsKv: false,
       retryCount: 0,
+      bootGeneration: null,
       generation: 0,
       error: null,
       sessions: [],
@@ -2898,6 +2899,13 @@ export class BlitConnection {
         const version = bytes[1] | (bytes[2] << 8);
         const features =
           bytes[3] | (bytes[4] << 8) | (bytes[5] << 16) | (bytes[6] << 24);
+        const bootGeneration =
+          bytes.length >= 15
+            ? new DataView(bytes.buffer, bytes.byteOffset + 7, 8).getBigUint64(
+                0,
+                true,
+              )
+            : null;
         if (version > PROTOCOL_VERSION) {
           this.transport.close();
           return;
@@ -2946,6 +2954,7 @@ export class BlitConnection {
           supportsGit: (features & FEATURE_GIT) !== 0,
           supportsLsp: (features & FEATURE_LSP) !== 0,
           supportsKv: (features & FEATURE_KV) !== 0,
+          bootGeneration,
         };
         this.emit();
         this.surfaceStore.reset();

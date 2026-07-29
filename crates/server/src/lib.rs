@@ -2110,6 +2110,8 @@ impl Session {
 
 struct AppStateInner {
     config: Config,
+    /// Opaque identifier shared by every connection to this server process.
+    boot_generation: u64,
     session: Mutex<Session>,
     pty_fds: PtyFds,
     delivery_notify: Arc<Notify>,
@@ -2121,6 +2123,12 @@ struct AppStateInner {
 }
 
 type AppState = Arc<AppStateInner>;
+
+fn new_boot_generation() -> u64 {
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).expect("failed to generate boot generation");
+    u64::from_le_bytes(bytes)
+}
 
 fn nudge_delivery(state: &AppState) {
     state.delivery_notify.notify_one();
@@ -2565,6 +2573,7 @@ fn try_send_update(
 pub async fn run(config: Config) {
     let state: AppState = Arc::new(AppStateInner {
         config,
+        boot_generation: new_boot_generation(),
         session: Mutex::new(Session::new()),
         pty_fds: Arc::new(std::sync::RwLock::new(HashMap::new())),
         delivery_notify: Arc::new(Notify::new()),
@@ -7228,7 +7237,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     features |= FEATURE_AUDIO;
                 }
             }
-            let _ = send_outbox(c, msg_hello(1, features));
+            let _ = send_outbox(c, msg_hello(1, features, state.boot_generation));
         }
         let mut initial_msgs = Vec::with_capacity(2 + sess.ptys.len() * 2);
         // Send surface-created messages BEFORE the PTY list so that

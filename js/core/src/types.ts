@@ -129,6 +129,9 @@ export interface BlitConnectionSnapshot {
   /** Server advertises the KV store family (docs/design/kv.md). */
   supportsKv: boolean;
   retryCount: number;
+  /** Opaque 64-bit identifier for the current server process, or `null` for
+   *  servers predating the extended HELLO. */
+  bootGeneration: bigint | null;
   /** Bumped on every connection reset (transport drop AND server
    *  re-establish), so views holding fs/git handles can re-open them — those
    *  don't survive a reset even when the transport stays up. */

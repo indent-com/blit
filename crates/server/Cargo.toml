@@ -34,6 +34,7 @@ rustls-native-certs = "0.8"
 ignore = "0.4"
 regex = "1"
 memchr = "2"
+getrandom = "0.3"
 redb = "2"
 openh264 = "0.9"
 rav1e = { version = "0.8", default-features = false }
