@@ -1317,6 +1317,7 @@ function LeafPane(props: {
               <div style={{ width: "100%", height: "100%" }}>
                 <BlitTerminal
                   sessionId={props.sessionId}
+                  resizable={props.visible}
                   fontSize={resolveLeafFontSize(props.leaf, ctx.fontSize)}
                   fontFamily={ctx.fontFamily}
                   palette={ctx.palette}

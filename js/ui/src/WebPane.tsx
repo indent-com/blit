@@ -199,7 +199,7 @@ export function WebPane(props: WebPaneProps): JSX.Element {
    *
    *  Called from the iframe's `load` event, which is outside any reactive
    *  owner: an `onCleanup` here is never run (Solid says so), so every reload
-    *  of the previewed page left listeners on a document nobody
+   *  of the previewed page left listeners on a document nobody
    *  would ever detach them from. Removal is explicit instead — the previous
    *  document's on each load, and the last one's on unmount. */
   const attachFrameListeners = () => {
