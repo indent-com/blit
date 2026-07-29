@@ -13,6 +13,14 @@ const FRAGMENT_FLAG_LAST = 1 << 0;
 
 const AUTH_TIMEOUT_MS = 10_000;
 
+// The server sends an application-level ping every 10 seconds. Allow three
+// missed pings plus a little scheduling jitter before declaring the relay dead.
+export const RELAY_INACTIVITY_TIMEOUT_MS = 35_000;
+// A service worker timer can resume before WebSocket messages queued while the
+// browser was suspended. Give one ping interval (plus jitter) for one to arrive.
+export const RELAY_RESUME_GRACE_MS = 15_000;
+const WATCHDOG_LATE_BY_MS = 1_000;
+
 export class RelayUnavailable extends Error {}
 
 /** A live connection to one destination. */
@@ -20,6 +28,10 @@ class DestConnection {
   readonly streams: NetStreams;
   private readonly socket: WebSocket;
   private pending = new Uint8Array(0);
+  private failed = false;
+  private watchdog: ReturnType<typeof setTimeout> | null = null;
+  private watchdogDueAt = 0;
+  private resumeGrace = false;
 
   private constructor(socket: WebSocket) {
     this.socket = socket;
@@ -30,14 +42,17 @@ class DestConnection {
       }
     });
     socket.onmessage = (event) => this.onFrame(event);
-    const fail = () => {
-      this.streams.reset(new Error("relay connection lost"));
-    };
-    socket.onclose = fail;
-    socket.onerror = fail;
+    socket.onclose = () => this.fail(new Error("relay connection lost"));
+    socket.onerror = () => this.fail(new Error("relay connection lost"));
+    this.armWatchdog(RELAY_INACTIVITY_TIMEOUT_MS);
   }
 
   private onFrame(event: MessageEvent): void {
+    if (this.failed) return;
+    // Any server frame proves transport liveness. In particular, the standard
+    // server sends S2C_PING every 10 seconds, which NetStreams safely ignores.
+    this.resumeGrace = false;
+    this.armWatchdog(RELAY_INACTIVITY_TIMEOUT_MS);
     if (typeof event.data === "string") return;
     const bytes = new Uint8Array(event.data as ArrayBuffer);
     if (bytes.length === 0) return;
@@ -57,19 +72,63 @@ class DestConnection {
     this.streams.handleMessage(bytes);
   }
 
+  private armWatchdog(delay: number): void {
+    if (this.failed) return;
+    if (this.watchdog !== null) clearTimeout(this.watchdog);
+    this.watchdogDueAt = Date.now() + delay;
+    this.watchdog = setTimeout(() => {
+      this.watchdog = null;
+      const lateBy = Date.now() - this.watchdogDueAt;
+      if (lateBy >= WATCHDOG_LATE_BY_MS && !this.resumeGrace) {
+        // Background throttling/suspension can delay both this timer and an
+        // already queued ping. A timely second check distinguishes that from a
+        // genuinely half-open socket without keeping it indefinitely.
+        this.resumeGrace = true;
+        this.armWatchdog(RELAY_RESUME_GRACE_MS);
+        return;
+      }
+      this.fail(new Error("relay connection inactive"));
+    }, delay);
+  }
+
+  private fail(err: Error): void {
+    if (this.failed) return;
+    this.failed = true;
+    if (this.watchdog !== null) {
+      clearTimeout(this.watchdog);
+      this.watchdog = null;
+    }
+    this.streams.reset(err);
+    if (
+      this.socket.readyState !== WebSocket.CLOSING &&
+      this.socket.readyState !== WebSocket.CLOSED
+    ) {
+      try {
+        this.socket.close();
+      } catch {
+        // Already gone.
+      }
+    }
+  }
+
   get closed(): boolean {
     return (
+      this.failed ||
       this.socket.readyState === WebSocket.CLOSING ||
       this.socket.readyState === WebSocket.CLOSED
     );
   }
 
   close(): void {
-    try {
-      this.socket.close();
-    } catch {
-      // Already gone.
-    }
+    this.fail(new Error("relay connection closed"));
+  }
+
+  open(host: string, port: number, options: NetOpenOptions): NetStream {
+    // Keep this check adjacent to NetStreams.open: service-worker callbacks do
+    // not interleave synchronous code, so a watchdog cannot fail the socket
+    // between this check and sending NET_OPEN.
+    if (this.closed) throw new Error("relay connection lost");
+    return this.streams.open(host, port, options);
   }
 
   /** Connect, authenticate, and refuse early if the server has no relay — an old server drops `NET_OPEN` silently and every request would hang. */
@@ -169,7 +228,7 @@ export class RelayPool {
     options: NetOpenOptions = {},
   ): Promise<NetStream> {
     const conn = await this.connection(dest);
-    return conn.streams.open(host, port, options);
+    return conn.open(host, port, options);
   }
 
   private async connection(dest: string): Promise<DestConnection> {
