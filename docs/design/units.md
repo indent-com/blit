@@ -15,15 +15,20 @@ check", not merely "after that process exists". The
 model is deliberately systemd's, down to the key names, because that
 expressiveness is well understood and the vocabulary transfers.
 
-A unit introduces **no new object**. `C2S_RESTART` already respawns an
-exited child in place, reusing the same pty id and the same terminal
-driver, so blit already has a session identity that outlives a
-process. A unit is that identity made declarative: policy attached to
-an existing `Pty` entry. A client
-subscribes once and follows the unit across restarts, and scrollback
-stays continuous across invocations — the blit-native equivalent of a
-journal. The alternative, a second process model bolted alongside the
-PTY map, is what this design exists to avoid.
+A unit introduces **no new stream object**. `C2S_RESTART` already
+respawns an exited child in place, reusing the same pty id and the
+same terminal driver, so blit already has a session identity that
+outlives a process. A unit is that identity made declarative, and a
+client subscribes once and follows it across restarts with continuous
+scrollback — the blit-native equivalent of a journal.
+
+It does need a small registry of its own, because a unit exists while
+inactive, blocked, or failed to load, and with `RemainAfterExit=yes`
+after its process is gone — none of which have a PTY. That registry
+points at the current PTY rather than duplicating it, so the PTY
+remains the only terminal object and there is no second process
+model bolted alongside the PTY map. See
+[Identity and generations](#identity-and-generations).
 
 Units sit on three primitives that are worth having on their own, and
 which fix real bugs in today's PTY layer:
@@ -168,52 +173,105 @@ EOF on the pty master and backstopped by `reap_zombies` polling
 `waitpid` every 5 s (`lib.rs:2614-2619`). So the supervisor adds a
 `SignalKind::child()` handler — the same shape as the existing
 SIGTERM/SIGINT handler at `lib.rs:2653-2662`, and `tokio` is already
-built with `features = ["full"]` — and the 5 s poll is **deleted**
-rather than repurposed.
+built with `features = ["full"]`.
 
-That is not just tidiness. EOF-based exit detection has a real hole,
-and it is the hole this whole RFC is about: if a grandchild holds the
-slave open, the session leader can die without any EOF arriving, so
-the PTY never transitions to `exited` and no policy fires. SIGCHLD
-makes leader death observable independently of the fd, which is
-exactly what group kill and deadline escalation need in order to
-confirm their work.
+**The handler must not simply call today's `reap_zombies` more often.**
+That function drains `waitpid(-1, WNOHANG)` in a loop and _discards_
+the status of any pid not in `pty_pids()` (`pty_unix.rs:266-284`).
+That discard is deliberate — a foreign child such as an LSP backend is
+reaped by its own engine — but it means the drain steals statuses from
+anything the server spawns through `Command` and waits on itself. The
+audio pipeline already lives with that race at a 5 s cadence; running
+the drain on every SIGCHLD would widen it sharply, and this RFC then
+adds periodic `ExecHealthCheck=` children directly into its path. That
+is a bug this design would have introduced.
+
+So the signal handler only **wakes the supervisor**, which reaps
+by targeted `waitpid(pid, WNOHANG)` over the pids it owns — PTY
+children plus the helper children of `ExecStartPre=`, `ExecStop=`, and
+`ExecHealthCheck=`, all registered through the existing
+`register_pty_pid`/`pty_pids()` mechanism (`pty_unix.rs:545`,
+`:296-304`) generalized to owned children. **The global
+`waitpid(-1)` drain is deleted rather than rescheduled.** Children the
+server spawns through `Command` keep being reaped by their own owners,
+which is what `std`/`tokio` do anyway, and no status is ever collected
+by a party that did not spawn it.
 
 Windows keeps a poll: it has no SIGCHLD, and `reap_zombies` is already
 a no-op there (`pty/pty_windows.rs:101`).
 
 ### Deadlines and leases
 
-Three ways to bound a session, all resolving to one enforcement path.
+Four independent things can bound a session, and an earlier draft
+claimed they "all resolve to one enforcement path" as though that
+settled the interaction. It does not: with a single deadline field, a
+lease disconnect would clobber an explicit `C2S_DEADLINE`, a reclaim
+would clear a `RuntimeMaxSec` it never set, and a stale disconnect
+could rearm a deadline on a session a newer connection had already
+reclaimed.
 
-- `C2S_DEADLINE [0x1D][pty_id:2][ms:4]` — arm, refresh, or clear
-  (`ms = 0`). Because it is refreshable it doubles as a dead-man
-  switch: re-arm every 30 s and the session dies roughly 30 s after
-  the orchestrator does.
-- `CREATE2_HAS_DEADLINE`, a new flag plus a trailing `[ms:4]` on
-  `C2S_CREATE2`. This closes the create-then-arm window, where an
-  orchestrator dying in the gap leaks exactly the session it was about
-  to protect.
-- **Connection leases.** `C2S_LEASE [0x1E][flags:1][grace_ms:4][lease_id:8]`,
-  answered by `S2C_LEASE [lease_id:8]`. While a connection holds a
-  lease, every session it creates is tagged with that lease. On
-  disconnect each live leased session is given a `grace_ms` deadline
-  rather than being killed outright, so the lease composes with the
-  deadline primitive instead of introducing a second kill path. A
-  reconnecting client presents the same `lease_id` to reclaim its
-  sessions and clear the pending deadlines, so a transient drop costs
-  nothing. This needs one new `Pty` field, `lease: Option<u64>`; there
-  is no owner tracking today.
+So the model is **independent causes with an enforced minimum**:
+
+```text
+effective = min(explicit, lease[current_epoch], runtime_max, stop_escalation)
+```
+
+Each cause is armed and cleared only by itself. One enforcement path,
+several constraints — which is what the original sentence should have
+said.
+
+The causes:
+
+- **`C2S_DEADLINE [0x1D][pty_id:2][ms:4]`** — arm, refresh, or clear
+  the _explicit_ cause (`ms = 0`). Refreshable, so it doubles as a
+  dead-man switch: re-arm every 30 s and the session dies roughly 30 s
+  after the orchestrator does.
+- **`CREATE2_HAS_DEADLINE`**, a flag plus trailing `[ms:4]` on
+  `C2S_CREATE2`. Closes the create-then-arm window in which an
+  orchestrator can die leaking exactly the session it was about to
+  protect.
+- **`RuntimeMaxSec=`** — the unit-file cause.
+- **Stop escalation** — the `TimeoutStopSec` timer between SIGTERM and
+  SIGKILL.
+
+#### Leases
+
+`C2S_LEASE [0x1E][flags:1][grace_ms:4][lease_id:8]` →
+`S2C_LEASE [lease_id:8][epoch:4]`. Sessions created while a connection
+holds a lease are tagged with it. On disconnect each live leased
+session gets a `grace_ms` deadline **in the lease cause only**; a
+reclaim clears that cause and nothing else.
+
+Ownership needs to be explicit, because a bare refreshable id has
+none:
+
+- **The server mints `lease_id`**, unguessably, and the client stores
+  it. A client-chosen `u64` is a namespace anyone on the socket can
+  collide with or guess, and the lease is a kill switch for other
+  people's sessions.
+- **A lease has an `epoch`**, incremented on every successful reclaim.
+  A disconnect only arms the lease deadline if its epoch is still
+  current, so an old connection dying after a newer one reclaimed
+  cannot revoke the newer claim. This is the race that makes reconnect
+  ownership more than bookkeeping.
+- **One holder at a time.** A reclaim by a second connection
+  supersedes the first, which is thereafter epoch-stale; there is no
+  shared ownership and no holder count to get wrong.
+
+#### Escalation and attribution
 
 On expiry: SIGTERM to the group, wait `TimeoutStopSec` (default 5 s —
 systemd's 90 s is wrong for agent workloads), then SIGKILL to the
 group.
 
-For attribution, append `[reason:1]` to `S2C_EXITED`, with
-`0=normal, 1=deadline, 2=lease, 3=gc, 4=unit-stop`. A deadline kill
-currently arrives as `-9`, indistinguishable from a user kill. The
-field is append-only and length-gated, the same trick the boot
-generation used in `S2C_HELLO`.
+Append `[reason:1]` to `S2C_EXITED`
+(`0=normal, 1=deadline, 2=lease, 3=gc, 4=unit-stop`). A deadline kill
+currently arrives as `-9`, indistinguishable from a user kill. When
+several causes expire together the reason is **the cause that produced
+the minimum**, ties broken in the order listed above, so attribution
+is deterministic rather than whichever timer the loop happened to see
+first. The field is append-only and length-gated, the same trick the
+boot generation used in `S2C_HELLO`.
 
 ### GC and `max_ptys`
 
@@ -254,19 +312,68 @@ to bound a pathological config directory.
 
 ## Units
 
-### Identity
+### Identity and generations
 
-A unit's name has to be an identity the server controls, and `Pty.tag`
-is not one: tags are client-chosen and nothing enforces uniqueness, so
-any client could `C2S_CREATE` a session tagged `api` and either
-impersonate a unit or collide with one. So a unit gets an explicit
-`unit: Option<String>` field on `Pty`, set only by the supervisor and
-never settable over the wire, and the tag is left as the cosmetic
-label it is today.
+A unit is **not** only policy attached to a `Pty`. An earlier draft
+said it was, and that was wrong: a unit exists while inactive, while
+blocked on a dependency, while failed to load, and — with
+`RemainAfterExit=yes` — after its process is gone. None of those have
+a PTY. Reload also has to retain definition and runtime state across
+process generations. So there is a small explicit registry:
 
-That field is also what makes restart-in-place coherent: the pty id is
-stable across restarts, but it is the `unit` field, not the id, that
-answers "which unit is this". `S2C_UNIT_STATE` carries both.
+```rust
+struct UnitRuntime {
+    name: UnitName,               // validated, unique, server-owned
+    definition: UnitDefinition,
+    state: UnitState,
+    current: Option<(PtyId, Generation)>,
+    restarts: StartLimiter,
+}
+```
+
+What survives from the original framing is narrower and still true:
+**the PTY remains the only stream object.** The registry points at the
+current PTY; it does not duplicate the terminal, the scrollback, or
+the driver. This is orchestration state, not a second process model.
+
+`Pty.tag` is not identity — tags are client-chosen, optional, and not
+checked for uniqueness at creation (`lib.rs:7777-7817`), so any client
+could `C2S_CREATE` a session tagged `api`. Unit names are validated
+and unique in the registry, and a unit-owned PTY additionally carries
+`unit: Option<UnitName>` set only by the supervisor and never settable
+over the wire. A client PTY whose tag collides with a unit name is
+left completely alone: it is not adopted, not refused, and never
+appears in `S2C_UNIT_LIST`. The tag stays the cosmetic label it is
+today.
+
+#### Generations
+
+Every unit-owned PTY carries a `Generation` that increments on each
+restart, and **every asynchronous event carries `(pty_id, generation)`**.
+
+This is load-bearing once restarts can be triggered by SIGCHLD rather
+than by EOF. In-place respawn is safe today only because it happens
+after the PTY has already reached the EOF/exited path, so there is no
+live reader and no open master. Restarting on leader death removes
+that precondition: the old reader thread can still be alive, old
+descendants can still be writing, and `respawn_child` would open a new
+master and start a second reader against the same pty id. Late output
+or a late EOF from the retired reader would then mutate the new
+generation's state.
+
+So a restart is an ordered sequence, not a call:
+
+1. Record the leader's exit status.
+2. Terminate the remaining old process group (`KillMode=`, then the
+   `TimeoutStopSec` escalation).
+3. Close the old master fd.
+4. Retire the old reader and join it.
+5. Increment the generation.
+6. Spawn the replacement.
+7. Drop any event whose generation is not current.
+
+Step 7 is the cheap backstop that makes the rest safe to get slightly
+wrong.
 
 ### File format
 
@@ -277,9 +384,45 @@ wherever a systemd concept exists.
 
 Going halfway — INI sections with blit-invented key names — would be
 the worst of both, so the rule is: if systemd has the concept, use its
-exact spelling, and `man systemd.service` is the reference. Where
-systemd has no analog, stay in its house style and document the
-deviation.
+exact spelling. Where systemd has no analog, stay in its house style
+and document the deviation.
+
+**Only the vocabulary transfers, not systemd's parser.** Pointing at
+`man systemd.service` as the reference, as an earlier draft did, is
+not implementable: systemd's unit syntax carries specifiers (`%i`,
+`%h`), `ExecStart=` prefixes (`-`, `@`, `+`, `!`), line continuations,
+its own quoting and escaping rules, drop-in merge order, and
+`EnvironmentFile=` expansion. Implementing a subset of that in sixty
+hand-rolled lines while claiming compatibility is how a file format
+that executes code acquires surprising behavior.
+
+So the grammar is small, explicit, and deliberately stricter than
+systemd's:
+
+| Question                 | Answer                                                                                                                                   |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Line forms               | `[Section]`, `Key=Value`, `# comment`, blank. Nothing else.                                                                              |
+| Continuations            | Not supported.                                                                                                                           |
+| Inline comments          | Not supported — `#` only at the start of a line, so values need no escaping.                                                             |
+| Value                    | Everything after the first `=`, trimmed of surrounding whitespace.                                                                       |
+| Quoting / escaping       | None.                                                                                                                                    |
+| `ExecStart=` and friends | `argv` split on unquoted whitespace, `execve`'d directly. **Never `/bin/sh -c`.** No globbing, no expansion, no prefixes.                |
+| Specifiers (`%i`, `%h`)  | Not supported.                                                                                                                           |
+| `Environment=`           | Repeatable, one `NAME=VALUE` each, no expansion. No `EnvironmentFile=`.                                                                  |
+| Repeated scalar keys     | **Error**, not last-wins — a duplicate in a file that executes code is a mistake, not an override.                                       |
+| Repeated list keys       | `Requires=`, `Wants=`, `After=`, `Environment=`, `ExecStartPre=` append.                                                                 |
+| Dependency lists         | Whitespace-separated within one line, and repeatable across lines.                                                                       |
+| Durations                | Bare integers are seconds; `ms`, `s`, `m`, `h` suffixes accepted; `infinity` accepted where a timeout is meaningful; `0` means disabled. |
+| Booleans                 | `yes`/`no` only.                                                                                                                         |
+| Unknown section or key   | **Error.** Not a warning.                                                                                                                |
+| Malformed line           | Error, reported with file and line number.                                                                                               |
+| Duplicate section        | Error.                                                                                                                                   |
+
+Strict beats permissive here in every case: a unit file is executable
+persistence, an error is visible at load, and a silently ignored
+misspelled `Restart=` is a unit that never restarts and nobody
+notices. It also means the grammar can be relaxed later, whereas
+permissive parsing cannot be tightened.
 
 ```ini
 # ~/.config/blit/units/example.unit
@@ -341,21 +484,53 @@ requirement.
 ### State machine
 
 ```
-inactive → activating → active → deactivating → inactive
-                ↓                      ↓
-             failed ←──────────────────┘
+inactive ──start──> activating ──ready+healthy──> active
+   ^                    │                            │
+   │                    │ fail                       │ exit / stop / health fail
+   │                    v                            v
+   └──stop/GC──── failed <──limit──── deactivating ──┘
 ```
 
-`activating → active` is where readiness lands, and where the first
-health check lands too when one is configured. `Restart=` applies on
-the `active → inactive|failed` edge. `StartLimitBurst` over
-`StartLimitIntervalSec` moves a flapping unit to `failed` and stops —
-that is `audio.rs:650`'s burst limiter, generalized. Backoff is
-`RestartSec` doubling with jitter up to `RestartMaxSec`, which is
-`uplink.rs:60-104` generalized.
+The diagram is a summary; the contract is the table. Every transition
+is `(state, event) → (state, actions)`, and the whole thing is a pure
+function (see [Testability](#testability)).
+
+| State          | Event                                           | Next                  | Actions                                              |
+| -------------- | ----------------------------------------------- | --------------------- | ---------------------------------------------------- |
+| `inactive`     | start, deps satisfied                           | `activating`          | spawn generation N, arm `TimeoutStartSec`            |
+| `inactive`     | start, dep failed (`Requires=`)                 | `failed`              | —                                                    |
+| `activating`   | spawn failed                                    | `failed`              | apply `Restart=`                                     |
+| `activating`   | ready probe fired, no health gate               | `active`              | disarm `TimeoutStartSec`, arm `RuntimeMaxSec`        |
+| `activating`   | ready probe fired, health gating                | `activating`          | run probe now                                        |
+| `activating`   | first health probe passed                       | `active`              | disarm `TimeoutStartSec`, arm health interval        |
+| `activating`   | health probe failed                             | `activating`          | retry until `TimeoutStartSec`                        |
+| `activating`   | `TimeoutStartSec` expired                       | `failed`              | stop sequence, apply `Restart=`                      |
+| `activating`   | child exited, `Type=oneshot`, rc=0              | `active`              | if `RemainAfterExit=no` → `inactive`                 |
+| `activating`   | child exited, other                             | `failed`              | apply `Restart=`                                     |
+| `active`       | child exited                                    | `failed` / `inactive` | by `Restart=` and exit status                        |
+| `active`       | health failures ≥ `HealthCheckFailureThreshold` | `failed`              | stop sequence, apply `Restart=`                      |
+| `active`       | watchdog expired                                | `failed`              | stop sequence, apply `Restart=`                      |
+| `active`       | `RuntimeMaxSec` / deadline expired              | `deactivating`        | stop sequence, reason `deadline`                     |
+| `active`       | explicit stop                                   | `deactivating`        | `ExecStop=`, then escalation; record operator intent |
+| `active`       | dependency stopped (`Requires=`)                | `deactivating`        | stop sequence                                        |
+| `deactivating` | stop completed                                  | `inactive`            | retire generation                                    |
+| `deactivating` | `TimeoutStopSec` expired                        | `inactive`            | SIGKILL group, retire generation                     |
+| any            | restart scheduled, backoff elapsed              | `activating`          | spawn generation N+1                                 |
+| any            | start limit exhausted                           | `failed`              | stop scheduling restarts                             |
+| any            | event from stale generation                     | unchanged             | **drop**                                             |
+| any            | definition removed on reload                    | `deactivating`        | stop sequence, drop from registry when `inactive`    |
+
+`Restart=` is evaluated identically wherever it appears in the
+Actions column: `no` never restarts, `on-failure` restarts on a
+non-zero or signalled exit and on any `failed` entry, `always`
+restarts on every exit. Backoff is `RestartSec` doubling with jitter
+up to `RestartMaxSec`; `StartLimitBurst` over `StartLimitIntervalSec`
+exhausts the limiter. That is `audio.rs:650`'s burst limiter and
+`uplink.rs:60-104`'s backoff, generalized.
 
 Restarts respawn in place through `respawn_child`, keeping the pty id
-and the driver. A restarting unit is not a new session.
+and the driver, under the generation discipline above. A restarting
+unit is not a new session.
 
 ### Readiness
 
@@ -442,10 +617,25 @@ spellings is that muscle memory transfers, and silently redefining
   `WatchdogSec` marks the unit failed and applies `Restart=`. It falls
   out for free once the notify listener exists, and blit sets
   `WATCHDOG_USEC` in the child environment exactly as systemd does.
-- **`ExecHealthCheck=`** is spawned every `HealthCheckSec`, killed
-  after `HealthCheckTimeoutSec`, and a non-zero exit fails the unit.
-  Probes never overlap: one still running when the next is due is
-  skipped, not stacked.
+- **`ExecHealthCheck=`** is spawned every `HealthCheckSec` and killed
+  after `HealthCheckTimeoutSec`. Probes never overlap: one still
+  running when the next is due is skipped, not stacked.
+
+  Failure is **thresholded, not immediate**:
+  `HealthCheckFailureThreshold` (default 3) consecutive failures fail
+  the unit, and `HealthCheckSuccessThreshold` (default 1) consecutive
+  successes recover it. Restarting a service because one `curl` lost a
+  race is worse than the problem being solved, and every practical
+  health-checking system landed on consecutive-count thresholds for
+  the same reason.
+
+**`After=` is an initial gate, not a maintained invariant.** It waits
+for the dependency's first `active`, which with health gating means
+its first passing probe. It does not keep the dependent stopped while
+the dependency is unhealthy later, and `Requires=` propagates a
+_stop_, not a health transition. Worth stating plainly because the
+headline — "wait until the server passes its health check" — reads
+like a continuous guarantee and is not one.
 
 #### Helper children
 
@@ -589,10 +779,46 @@ that Windows gets the declarative layer and not the enforcement.
 | Reactive child death (SIGCHLD)           | yes                  | no — keeps a poll                      |
 | `Type=surface`                           | Linux only (Wayland) | no                                     |
 
-Where a capability is unavailable the unit file is still accepted and
-the key is ignored with a warning at load, rather than refusing to
-load: a unit directory shared across machines should not fail wholesale
-on the platform with fewer facilities.
+**An unavailable capability is a load error, not a warning.** An
+earlier draft had unsupported keys ignored so that a unit directory
+shared across machines would not fail wholesale — but that trades a
+loud failure for a silent one, and the silent one is worse in exactly
+the cases that matter. `Type=notify` degrading to `simple` on Windows
+does not merely lose a feature: it breaks the core promise that
+`After=` waits for real readiness, and every dependent then starts
+early, on a platform where nobody is watching. Same for `KillMode=`
+quietly becoming `process`. Portability is achieved by writing
+portable units, not by having the server pretend.
+
+### Live reload
+
+Unit files are watched, so reload semantics need to be part of the
+contract rather than an emergent property of the watcher.
+
+Reload **parses and validates a complete new registry, then swaps it
+atomically**. A file that fails to parse, or an edit that introduces a
+dependency cycle, rejects that file and keeps the last good
+definition for it; the rest of the swap proceeds. An invalid edit
+never partially mutates live policy, and a typo in one unit never
+takes down everything already running.
+
+What a swap does to a running unit:
+
+| Change                                                                                                 | Effect                                                                                                            |
+| ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `ExecStart=`, `Environment=`, `WorkingDirectory=`, `Backing=`, `Type=`, `ReadyMatch=`, `ReadySurface=` | Recorded; applies at the **next start**. A running process is never silently replaced.                            |
+| `Restart=`, `RestartSec=`, `RestartMaxSec=`, `StartLimit*`                                             | Immediate; affects the next restart decision.                                                                     |
+| `HealthCheckSec=`, thresholds, `ExecHealthCheck=`                                                      | Immediate; the interval timer is re-armed.                                                                        |
+| `RuntimeMaxSec=`                                                                                       | Immediate; re-evaluated against the unit's current start time, so shortening it can expire a unit at once.        |
+| `TimeoutStopSec=`, `KillMode=`                                                                         | Immediate; applies to the next stop.                                                                              |
+| `Requires=`, `Wants=`, `After=`                                                                        | Immediate for future starts; does **not** retroactively stop a running unit whose new `Requires=` is unsatisfied. |
+| `[Install] Autostart=`                                                                                 | Immediate; affects the next server start.                                                                         |
+| File removed                                                                                           | Unit is stopped, then dropped from the registry.                                                                  |
+| File added                                                                                             | Loaded; started only if `Autostart=yes`.                                                                          |
+
+`blit unit restart <name>` is how a changed `ExecStart=` is applied,
+which keeps "reload" purely about definitions and leaves process
+lifetime under explicit control.
 
 ### Worked example
 
@@ -724,12 +950,54 @@ re-running dependents on restart is what `PartOf=` would express (see
 
 ## Security
 
-A unit file is arbitrary code executed at every server start. It is
-not a new capability — anyone who can reach the blit socket can
-already `C2S_CREATE` anything — but it is new _persistence_, and it is
-reachable by anyone who can write files through the `fs` family. So
-mirror `blit.remotes`: refuse to load unit files that are group- or
-world-writable, and refuse a world-writable unit directory.
+A unit file is arbitrary code executed at every server start.
+
+An earlier draft proposed mirroring `blit.remotes` — refuse
+group- or world-writable files and directories — and called it done.
+**That control does not address the attacker it names.** A remote
+client writing through the `fs` family writes _as the server's own
+user_, producing a file owned by that user with ordinary `0644`
+permissions in the user's own unit directory. It passes every mode
+check. Mode bits distinguish a different Unix account from this one;
+they say nothing about whether the bytes arrived from the person at
+the keyboard or from a socket.
+
+The distinction that actually matters is that `C2S_CREATE` is
+_ephemeral_ code execution scoped to a connection, while a unit file
+is _durable_ code execution that outlives the connection, the client,
+and the server process, and re-runs at every boot with no one
+attached. Treating those as the same capability because both "run
+code" is how a session-scoped compromise becomes a permanent one.
+
+So they are separated:
+
+- **The unit directories are excluded from the `fs` family.** Reads
+  and writes under `~/.config/blit/units/` and `/etc/blit/units/` are
+  refused, the same way any other path outside a served root is. This
+  is the single control that matters, and it is cheap because the fs
+  family already has path validation to hang it on.
+- **Installing a unit is a separate capability from creating a
+  session.** It is a local operation — `blit unit install` writing
+  through the filesystem directly, not over the wire — so remote
+  access to a blit server never grants durable persistence by
+  default. `C2S_UNIT_START`/`STOP`/`RESTART` remain available over the
+  wire, because starting an _already-installed_ unit is the operator's
+  own policy being exercised, not new code being introduced.
+- **`/etc/blit/units/` autostarts by default; the user directory is
+  gated.** A system directory is administrator-owned by construction.
+  Autostart from `~/.config/blit/units/` requires an explicit server
+  option, so the default posture of a blit server exposed to a network
+  is that nothing on disk starts itself.
+- **Load-time checks remain, as depth rather than as the control:**
+  refuse group- or world-writable files and directories, refuse
+  symlinked unit files, refuse a unit directory whose parent is
+  writable by another user, and resolve and validate the path before
+  opening rather than after.
+
+And documented plainly, because a reader will otherwise assume
+otherwise: **granting the `fs` family write access to a machine where
+unit autostart is enabled for that directory is equivalent to granting
+durable code execution**, and no permission bit mitigates it.
 
 ## Deferred
 
@@ -752,6 +1020,11 @@ missed.
 - **Templated units** (`foo@bar.unit`). No motivating use yet.
 - **Durable unit runtime state.** Restart counts and last-exit are
   deliberately lost on restart; only operator intent is persisted.
+- **`EnvironmentFile=`, specifiers, and `ExecStart=` prefixes.** All
+  are systemd syntax the strict grammar deliberately omits; adding any
+  of them means owning a compatibility surface, not a vocabulary.
+- **Continuous health-based ordering.** `After=` gates on first
+  healthy and does not maintain the invariant afterwards.
 
 ## Testability
 
@@ -793,12 +1066,25 @@ One axis per PR.
 3. **GC.** `exited_at`, the count and time bounds, a real `max_ptys`
    default with `BLIT_MAX_PTYS`, and `S2C_CREATE_FAILED`. Fixes the
    silent-hang bug on its own.
-4. **Units.** Files, the INI parser, autostart, restart policy,
-   readiness, health, dependencies, helper children, `Backing=pipe`,
-   the `0x90` wire family, the reserved KV prefix, and the CLI.
+4. **Unit core.** The registry and generations, the strict INI
+   parser, the state machine, autostart, restart policy, `Requires=`
+   and `After=`, `Type=simple`/`oneshot`/`notify`, start and stop
+   timeouts, helper children, the `0x90` wire family, and the CLI.
+   PTY backing only.
+5. **Unit policy.** Health checks with thresholds and
+   `ActiveWhenHealthy=`, `WatchdogSec=`, `Type=match`,
+   `Type=surface`, `Backing=pipe`, live reload, and the reserved KV
+   prefix for operator intent.
 
 The first three are independently valuable and are the
-incident-shaped fixes. The fourth is the feature, built on primitives
-that have already earned their place. If it needs splitting, the clean
-seam is `Backing=pipe`, which touches only the spawner and is
-orthogonal to everything else.
+incident-shaped fixes; they should land and be exercised before the
+unit layer commits to timer provenance, reconnect ownership, and
+generation handling in production.
+
+4 and 5 were one PR in an earlier draft. Splitting them is the
+review's point that the first implementation should have a smaller
+race surface, applied without dropping anything: everything still
+ships, but the generation and ownership contracts get exercised by a
+PTY-only, probe-free core before health probes, a second spawn path,
+and live reload are layered onto them. `Backing=pipe` remains the
+cleanest internal seam, since it touches only the spawner.
