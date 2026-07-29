@@ -130,13 +130,13 @@ client. That is the fix, and it is intentional.
 the master fd immediately, which detaches the reader thread and leans
 on the kernel hangup; a runaway grandchild holding the slave open
 means no EOF and no `exited` transition. The timed second half of that
-escalation depends on the supervisor tick below, so it lands with it.
+escalation depends on the supervisor loop below, so it lands with it.
 
 **Wire:** append an optional `[flags:1]` to `C2S_KILL`. The arm is
 `data.len() >= 7`, so old clients are unaffected and inherit the new
 default.
 
-### The supervisor tick
+### The supervisor loop
 
 A hung command outliving a disconnected orchestrator is precisely the
 case where today's tick loop stops scheduling. `blanket_frame_interval`
@@ -145,10 +145,42 @@ returns `None` when no client is connected (`lib.rs:2731`), so
 `delivery_notify`. A silent runaway produces no output and is
 therefore never visited on any schedule.
 
-So the 5 s `reap_zombies` task becomes a **1 s supervisor tick**
-holding an `AppState` clone, owning deadlines, leases, restart
-backoff, GC, and health probes. The delivery tick is left alone: it is
-tuned for frame pacing and should not grow policy.
+That is an argument for a second loop, not for polling. The supervisor
+is **fully reactive**, shaped exactly like the delivery loop at
+`lib.rs:2597-2612`: a `tokio::select!` between `supervisor_notify` and
+`sleep_until(next_deadline)`, where `next_deadline` is the minimum
+over every armed timer and `None` means sleep indefinitely. It differs
+from the delivery loop only in what it schedules — policy rather than
+frame pacing — and in never returning `None` merely because no client
+is watching.
+
+Every timer here is a computable instant, so there is nothing to poll
+for: deadline expiry, lease grace, restart backoff, `TimeoutStartSec`,
+`TimeoutStopSec`, the next health probe, watchdog expiry, and
+`exited-linger`. Arming or disarming any of them notifies the loop,
+which recomputes the minimum. An idle server with no armed timers
+wakes zero times, which is the property `lib.rs:4903-4907` is
+protecting for the delivery loop and worth preserving here.
+
+The one genuinely unreactive thing in the server today is child
+death. There is no SIGCHLD handler anywhere; exit is inferred from
+EOF on the pty master and backstopped by `reap_zombies` polling
+`waitpid` every 5 s (`lib.rs:2614-2619`). So the supervisor adds a
+`SignalKind::child()` handler — the same shape as the existing
+SIGTERM/SIGINT handler at `lib.rs:2653-2662`, and `tokio` is already
+built with `features = ["full"]` — and the 5 s poll is **deleted**
+rather than repurposed.
+
+That is not just tidiness. EOF-based exit detection has a real hole,
+and it is the hole this whole RFC is about: if a grandchild holds the
+slave open, the session leader can die without any EOF arriving, so
+the PTY never transitions to `exited` and no policy fires. SIGCHLD
+makes leader death observable independently of the fd, which is
+exactly what group kill and deadline escalation need in order to
+confirm their work.
+
+Windows keeps a poll: it has no SIGCHLD, and `reap_zombies` is already
+a no-op there (`pty/pty_windows.rs:101`).
 
 ### Deadlines and leases
 
@@ -188,7 +220,7 @@ generation used in `S2C_HELLO`.
 There are two distinct leaks.
 
 **Exited slots.** Add `exited_at: Instant` to `Pty` and reap in the
-supervisor tick under two independent bounds: `max-exited`, a count
+supervisor loop under two independent bounds: `max-exited`, a count
 (default 1024, oldest evicted first), and `exited-linger`, a time
 (default off). Eviction runs the same path as `C2S_CLOSE` and
 broadcasts `S2C_CLOSED`, which every client already handles, so no
@@ -540,8 +572,9 @@ One axis per PR.
 1. **Group kill.** `KillMode` as an appended flag byte on `C2S_KILL`,
    and `C2S_CLOSE`'s SIGHUP going to the group. Pure semantics, no new
    state.
-2. **Supervisor tick, deadlines, leases.** The reaper becomes a 1 s
-   state-carrying loop; `C2S_DEADLINE`, `CREATE2_HAS_DEADLINE`,
+2. **Supervisor loop, deadlines, leases.** A reactive loop with a
+   computed `next_deadline`, plus a SIGCHLD handler replacing the 5 s
+   `reap_zombies` poll; `C2S_DEADLINE`, `CREATE2_HAS_DEADLINE`,
    `C2S_LEASE`/`S2C_LEASE`, the `S2C_EXITED` reason byte, and the
    timed half of the `C2S_CLOSE` escalation.
 3. **GC.** `exited_at`, the count and time bounds, a real `max_ptys`
