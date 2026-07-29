@@ -67,6 +67,26 @@ export interface KeyboardShortcutHandlers {
   navigateForward: () => void;
 }
 
+type SurfaceFocusHandlers = Pick<
+  KeyboardShortcutHandlers,
+  "focusedSurfaceId" | "bspFocusedPaneId" | "layoutAssignments"
+>;
+
+/** Whether keyboard input currently belongs to a Wayland surface. */
+export function hasFocusedWaylandSurface(h: SurfaceFocusHandlers): boolean {
+  if (h.focusedSurfaceId() != null) return true;
+  const paneId = h.bspFocusedPaneId();
+  if (!paneId) return false;
+  const assignment = h.layoutAssignments()?.assignments[paneId] ?? null;
+  return isSurfaceAssignment(assignment);
+}
+
+export function shouldHandleNewTerminalShortcut(
+  h: SurfaceFocusHandlers,
+): boolean {
+  return !hasFocusedWaylandSurface(h);
+}
+
 /**
  * Installs global keyboard shortcuts for the workspace.
  * Must be called inside a Solid component (uses onMount/onCleanup).
@@ -114,16 +134,8 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
 
     const shouldHandleRestartEnter = (target: Element | null): boolean => {
       if (h.overlay()) return false;
-      // When a surface is focused, Enter is not special.
-      if (h.focusedSurfaceId() != null) return false;
-
-      // In BSP mode, the focused pane may hold a surface assignment rather
-      // than a session.  Don't intercept Enter in that case either.
-      const fpId = h.bspFocusedPaneId();
-      if (fpId) {
-        const assign = h.layoutAssignments()?.assignments[fpId] ?? null;
-        if (isSurfaceAssignment(assign)) return false;
-      }
+      // When a surface is focused, Enter is application input.
+      if (hasFocusedWaylandSurface(h)) return false;
 
       const fid = h.focusedSessionId();
       const focused = fid ? h.sessions().find((s) => s.id === fid) : null;
@@ -238,11 +250,15 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         return;
       }
       if (mod && !e.shiftKey && e.key === "Enter") {
-        e.preventDefault();
         if (h.overlay()) {
           // Let the overlay handle it.
+          e.preventDefault();
           return;
         }
+        // Wayland applications own their modified Enter chords. In
+        // particular, Ctrl+Enter must not create a terminal behind them.
+        if (!shouldHandleNewTerminalShortcut(h)) return;
+        e.preventDefault();
         if (h.activeLayout() && h.bspFocusedPaneId()) {
           if (h.connectionCount() <= 1) {
             void h.createInPane(h.bspFocusedPaneId()!);
@@ -257,6 +273,7 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         return;
       }
       if (mod && e.shiftKey && e.key === "Enter") {
+        if (!h.overlay() && !shouldHandleNewTerminalShortcut(h)) return;
         e.preventDefault();
         if (h.activeLayout() && h.bspFocusedPaneId()) {
           void h.createInPane(h.bspFocusedPaneId()!);
