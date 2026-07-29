@@ -144,6 +144,33 @@ describe("BlitTerminalSurface sizing", () => {
     readOnly.surface.dispose();
   });
 
+  it("applies local glyph metrics to passive terminals", () => {
+    const { surface } = attachSurface({ readOnly: true, resizable: false });
+    const terminal = {
+      set_cell_size: vi.fn(),
+      set_font_family: vi.fn(),
+      set_font_size: vi.fn(),
+      invalidate_render_cache: vi.fn(),
+    };
+    surface.terminal = terminal as never;
+
+    // A restored off-screen session can be created before any resizable pane.
+    // Its TerminalStore defaults to 1x1 cells, so the passive preview must
+    // install its own render metrics even though it never resizes the PTY.
+    surface["remeasureCells"](true);
+
+    expect(terminal.set_cell_size).toHaveBeenCalledWith(
+      surface["cell"].pw,
+      surface["cell"].ph,
+    );
+    expect(terminal.set_font_family).toHaveBeenCalled();
+    expect(terminal.set_font_size).toHaveBeenCalled();
+    expect(terminal.invalidate_render_cache).toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+
+    surface.dispose();
+  });
+
   it("reconciles canvas layout and terminal dimensions when resizable changes", () => {
     const { surface, canvas } = attachSurface({
       readOnly: true,
