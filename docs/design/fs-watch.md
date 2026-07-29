@@ -218,6 +218,15 @@ backends that resolve to the real path before reporting (macOS FSEvents),
 changes made *inside* a symlinked directory may not produce hints, and only a
 rescan picks them up. Listing and reading are unaffected.
 
+A sync root may arrive raw (as a CLI or user types it) or wire-escaped, and the
+two are not distinguishable by inspection: `FS_SYNCED` echoes
+`escape_path(canonical_root)`, and clients legitimately build further sync roots
+from that echo — where a literal `%` came back as `%25`. `validate_root` tries
+the literal reading first and the decoded one second, so a file genuinely named
+`50%25.txt` still wins over the decoded reading of `50%.txt`. Escaping on the
+way out without decoding on the way in meant such a path could be listed but
+never re-opened, presenting to the client as a file that does not exist.
+
 A symlink's content is its **target bytes** (git's model: blob = target),
 so its `size` is the target length and `FS_FETCH` of a symlink returns the
 target, never the file it points at — which is also what makes symlink

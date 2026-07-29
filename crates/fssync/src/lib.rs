@@ -494,17 +494,36 @@ pub fn validate_root(path: &str) -> Result<PathBuf, (u8, String)> {
     if path.is_empty() || path.contains('\0') {
         return Err((FS_STATUS_OTHER, "invalid path".into()));
     }
-    match fs::canonicalize(path) {
-        Ok(p) => Ok(p),
-        Err(e) => {
-            let status = match e.kind() {
-                io::ErrorKind::NotFound => FS_STATUS_NOT_FOUND,
-                io::ErrorKind::PermissionDenied => FS_STATUS_PERMISSION_DENIED,
-                _ => FS_STATUS_OTHER,
-            };
-            Err((status, e.to_string()))
-        }
+    let err = match fs::canonicalize(path) {
+        Ok(p) => return Ok(p),
+        Err(e) => e,
+    };
+    // A root can arrive in either of two encodings, and they are not
+    // distinguishable by inspection:
+    //
+    //   * raw, as a CLI or a user types it (`/tmp/50%.txt`);
+    //   * wire-escaped, because FS_SYNCED echoes `escape_path(canonical_root)`
+    //     and clients legitimately build further sync roots from that echo
+    //     (js/ui/src/ide/session.ts) — where a literal `%` came back as `%25`.
+    //
+    // Escaping on the way out without decoding on the way in meant any path
+    // containing `%` (or non-UTF-8 bytes) could be listed but never re-opened:
+    // the round trip returned a string that no longer named the file, and the
+    // client reported it as missing. Try the literal reading first so a file
+    // genuinely named `50%25.txt` still wins, then the decoded one.
+    if err.kind() == io::ErrorKind::NotFound
+        && path.contains('%')
+        && let Some(decoded) = wire_to_os(path)
+        && let Ok(p) = fs::canonicalize(&decoded)
+    {
+        return Ok(p);
     }
+    let status = match err.kind() {
+        io::ErrorKind::NotFound => FS_STATUS_NOT_FOUND,
+        io::ErrorKind::PermissionDenied => FS_STATUS_PERMISSION_DENIED,
+        _ => FS_STATUS_OTHER,
+    };
+    Err((status, err.to_string()))
 }
 
 /// Validate and canonicalize an `FS_SYNC_SINGLE` root: the same
@@ -4196,6 +4215,44 @@ mod tests {
     }
 
     /// A SINGLE root's validation: directories answer the invalid-path
+    /// A root whose name contains `%` survives the FS_SYNCED round trip. The
+    /// echo is `escape_path(canonical_root)`, so a literal `%` comes back as
+    /// `%25`; clients build further sync roots from that echo, and without a
+    /// decode on the way in such a path could be listed but never re-opened.
+    /// A file genuinely named `50%25.txt` still takes precedence over the
+    /// decoded reading of `50%.txt`.
+    #[test]
+    fn percent_in_root_survives_the_wire_round_trip() {
+        let dir = temp_dir().canonicalize().unwrap();
+        let literal = dir.join("50%.txt");
+        fs::write(&literal, b"x").unwrap();
+
+        // What the server echoes for this path.
+        let echoed = escape_path(&literal);
+        assert!(echoed.ends_with("50%25.txt"), "echo escapes the percent");
+
+        // Both the raw form a CLI types and the escaped echo must resolve.
+        assert_eq!(
+            validate_root(&literal.to_string_lossy()).unwrap(),
+            literal.canonicalize().unwrap(),
+            "a raw path containing % still works"
+        );
+        assert_eq!(
+            validate_root(&echoed).unwrap(),
+            literal.canonicalize().unwrap(),
+            "the escaped echo resolves back to the same file"
+        );
+
+        // A file actually named `50%25.txt` wins the literal reading.
+        let ambiguous = dir.join("50%25.txt");
+        fs::write(&ambiguous, b"y").unwrap();
+        assert_eq!(
+            validate_root(&echoed).unwrap(),
+            ambiguous.canonicalize().unwrap(),
+            "literal match takes precedence over the decoded one"
+        );
+    }
+
     /// A symlinked directory is enumerated like a real one, flagged
     /// `FS_ENTRY_LINK_DIR` so a client knows it is expandable, and a link that
     /// points back into its own tree stops instead of recursing forever.
