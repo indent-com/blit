@@ -226,16 +226,20 @@ systemd has no analog, stay in its house style and document the
 deviation.
 
 ```ini
-# ~/.config/blit/units/api.unit
+# ~/.config/blit/units/example.unit
 [Unit]
-Description=API server
+Description=Every supported key, for reference
 Requires=postgres
 After=postgres
 
 [Service]
 Type=notify              # simple | oneshot | notify | match | surface
+ReadyMatch=^Listening on # Type=match only
+ReadySurface=chromium    # Type=surface only
+RemainAfterExit=no       # Type=oneshot only
 ExecStart=cargo run -p api
 WorkingDirectory=/home/pierre/src/api
+Environment=RUST_LOG=info
 Backing=pty              # pty | pipe
 
 Restart=on-failure       # no | on-failure | always
@@ -396,28 +400,101 @@ no compatibility obligation here.
 ### Worked example
 
 Open a URL in a browser, but only once the server behind that URL
-actually answers and the browser actually has a window.
+actually answers and the browser is actually driveable. Three units,
+each with a different honest definition of "up".
+
+#### `~/.config/blit/units/api.unit`
 
 ```ini
-# api.unit — active only once /health answers
-[Service]
-Type=notify
-ExecStart=cargo run -p api
-ExecHealthCheck=/usr/bin/curl -fsS localhost:8080/health
-HealthCheckSec=5
-HealthCheckTimeoutSec=2
-TimeoutStartSec=60
-Restart=on-failure
+[Unit]
+Description=API server
 
-# chromium.unit — active once a window exists, not once the process does
+[Service]
+Type=simple
+ExecStart=cargo run -p api
+WorkingDirectory=/home/pierre/src/api
+Environment=RUST_LOG=info
+Environment=PORT=8080
+
+ExecHealthCheck=/usr/bin/curl -fsS --max-time 2 http://localhost:8080/health
+HealthCheckSec=5
+HealthCheckTimeoutSec=3
+
+TimeoutStartSec=180
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=1
+RestartMaxSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=60
+KillMode=process-group
+
+[Install]
+Autostart=yes
+```
+
+`Type=simple` with a health check is the shape most real services
+want, and it is the clearest demonstration of health-gated
+activation: `simple` on its own would call the unit active the
+instant `cargo` is exec'd — before compilation has even started —
+but because `ExecHealthCheck=` is set, `api` does not reach `active`
+until `/health` answers. No separate readiness probe is needed, and
+the program needs no cooperation. `TimeoutStartSec=180` has to cover
+a cold `cargo build`, and `KillMode=process-group` is what stops
+`cargo`'s child compiler and the server binary from surviving a
+restart.
+
+Swap in `Type=notify` if the service calls `sd_notify`, or
+`Type=match` with `ReadyMatch=^Listening on ` if it only prints. Both
+compose with the health check: readiness fires first, the first probe
+gates activation, and thereafter the probe is a liveness signal.
+
+#### `~/.config/blit/units/chromium.unit`
+
+```ini
+[Unit]
+Description=Chromium (Wayland, remote-debugging)
+
 [Service]
 Type=surface
 ReadySurface=chromium
-ExecStart=chromium --ozone-platform=wayland
-Restart=on-failure
+ExecStart=chromium --ozone-platform=wayland --remote-debugging-port=9222 --user-data-dir=/home/pierre/.cache/blit-chromium --no-first-run --no-default-browser-check
+Backing=pipe
 
-# open-url.unit — runs once, after both of the above are genuinely up
+ExecHealthCheck=/usr/bin/curl -fsS --max-time 2 http://localhost:9222/json/version
+HealthCheckSec=10
+HealthCheckTimeoutSec=3
+
+TimeoutStartSec=30
+TimeoutStopSec=10
+Restart=always
+RestartSec=1
+RestartMaxSec=15
+KillMode=process-group
+
+[Install]
+Autostart=yes
+```
+
+Two conditions compose here, and both matter for a browser that is
+going to be driven rather than watched. `Type=surface` says a window
+exists; `ExecHealthCheck=` on the CDP endpoint says it is driveable.
+Either alone is a lie — chromium answers CDP before it paints, and a
+window can exist while the debugger port is not yet listening — so
+`active` means both.
+
+`Backing=pipe` because chromium has no use for a tty, which in turn
+makes `KillMode=process-group` depend on the explicit `setpgid(0, 0)`
+noted above: a pipe-backed child is not a session leader. That
+combination is not incidental. Chromium is the motivating case for
+group kill in the first place — it forks a zygote and a renderer per
+tab, and today's `kill(child_pid)` leaves every one of them running.
+
+#### `~/.config/blit/units/open-url.unit`
+
+```ini
 [Unit]
+Description=Open the API in chromium
 Requires=api chromium
 After=api chromium
 
@@ -425,63 +502,27 @@ After=api chromium
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=<browser-driver> open http://localhost:8080
+TimeoutStartSec=30
+
+[Install]
+Autostart=yes
 ```
 
-Three different definitions of "up" — a `sd_notify` handshake plus a
-passing health probe, a Wayland surface, and a command that exited
-zero — and `open-url` expresses its requirement as `After=api chromium`
-without knowing about any of them. That is the payoff for keeping
-requirement and ordering separate and for letting health participate
-in activation.
+Three different definitions of "up" — a passing HTTP health probe, a
+Wayland surface plus a live CDP endpoint, and a command that exited
+zero — and `open-url` expresses its requirement as
+`After=api chromium` without knowing about any of them. That is the
+payoff for keeping requirement separate from ordering and for letting
+health participate in activation.
 
-If the health check starts failing later, `api` leaves `active` and
-`Restart=` applies; `open-url` is not re-run, because restart
+Note what `Requires=` adds over `After=` here: if `api` never becomes
+healthy within `TimeoutStartSec`, `open-url` fails rather than
+hanging, and it never opens a URL that was never going to load.
+
+If a health check starts failing later, that unit leaves `active` and
+its `Restart=` applies; `open-url` is not re-run, because restart
 propagation is deliberately out of scope for v1 (`PartOf=` is where
 that would go).
-
-### Pipe backing
-
-`Backing=pipe` is the same fork with `pipe2()` on stdin, stdout, and
-stderr instead of the pty slave, and no `setsid`/`TIOCSCTTY`. The
-bytes still feed the alacritty driver, so `S2C_UPDATE`, scrollback,
-search, `C2S_COPY_RANGE`, and browser rendering all work unchanged.
-The difference is entirely on the child's side: no tty, so no job
-control, no SIGWINCH, and tools correctly detect that they are not on
-a terminal.
-
-One interaction with `KillMode=` that is easy to miss: a `pipe` child
-is not a session leader, so `process-group` is meaningless for it
-unless the forked child does an explicit `setpgid(0, 0)`.
-
-### Wire and CLI
-
-A new family in the `0x90` block, gated on `FEATURE_UNITS`, bit 11
-(bits 11 through 31 are free).
-
-| Dir | Opcode | Name           | Layout                                                                                    |
-| --- | ------ | -------------- | ----------------------------------------------------------------------------------------- |
-| C2S | `0x90` | `UNIT_LIST`    | `[nonce:2]`                                                                               |
-| C2S | `0x91` | `UNIT_START`   | `[nonce:2][name:N]`                                                                       |
-| C2S | `0x92` | `UNIT_STOP`    | `[nonce:2][name:N]`                                                                       |
-| C2S | `0x93` | `UNIT_RESTART` | `[nonce:2][name:N]`                                                                       |
-| C2S | `0x94` | `UNIT_RELOAD`  | `[nonce:2]`                                                                               |
-| S2C | `0x90` | `UNIT_LIST`    | `[nonce:2][count:2]` then per unit: name, state, pty id, restart count, last exit, health |
-| S2C | `0x91` | `UNIT_STATE`   | `[name_len:2][name:N][state:1][pty_id:2]` — pushed on every transition                    |
-
-Every request is nonce-bearing, so all of them need the refusal path
-described under Constraints when the family is disabled.
-
-On the CLI, `blit unit list|start|stop|restart|status|cat|reload`,
-following the existing subcommand pattern, and added to
-`crates/cli/src/learn.md` so agents discover it.
-
-### Server restart
-
-Units do not survive a server restart; all unit state is in memory. On
-restart, autostart re-runs them from their files, and clients detect
-the restart through the boot generation in `S2C_HELLO`. This is
-coherent and crash-only, and it is written down here so that nobody
-expects unit state to be durable in the KV store.
 
 ## Security
 
