@@ -1605,6 +1605,7 @@ mod tests {
             let hello = msg_hello(
                 1,
                 FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH,
+                1,
             );
             write_frame(&mut self.writer, &hello).await;
 
