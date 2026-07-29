@@ -242,6 +242,16 @@ only live sessions. The silent `continue` has to go with it: a new
 gets an answer instead of hanging forever. That is a standalone bug,
 worth fixing whether or not units happen.
 
+**Unit sessions do not count against `max_ptys`.** The cap exists to
+bound session creation by clients, which is where the unbounded leak
+lives; unit sessions are bounded by the number of files an operator
+put on disk. Counting them together would mean a cap tight enough to
+be useful could be exhausted during autostart, failing units at boot
+for a reason that has nothing to do with them — and worse,
+nondeterministically, depending on how many clients happened to be
+connected. Units get their own `max-units` instead, which exists only
+to bound a pathological config directory.
+
 ## Units
 
 ### Identity
@@ -283,7 +293,9 @@ Type=notify              # simple | oneshot | notify | match | surface
 ReadyMatch=^Listening on # Type=match only
 ReadySurface=chromium    # Type=surface only
 RemainAfterExit=no       # Type=oneshot only
+ExecStartPre=/usr/bin/mkdir -p /var/run/api
 ExecStart=cargo run -p api
+ExecStop=/usr/bin/api-ctl drain
 WorkingDirectory=/home/pierre/src/api
 Environment=RUST_LOG=info
 Backing=pty              # pty | pipe
@@ -303,6 +315,7 @@ KillMode=process-group
 ExecHealthCheck=/usr/bin/curl -fsS localhost:8080/health
 HealthCheckSec=10
 HealthCheckTimeoutSec=3
+ActiveWhenHealthy=yes    # default when ExecHealthCheck= is set
 
 [Install]
 Autostart=yes
@@ -315,8 +328,8 @@ Four deviations from systemd, each deliberate:
   the heaviest part of systemd's model and buy nothing without a boot
   ordering graph. Presence in the directory plus one boolean is the
   whole enable/disable story.
-- `ExecHealthCheck=`, `HealthCheckSec=`, and
-  `HealthCheckTimeoutSec=` are new: systemd has no health-check
+- `ExecHealthCheck=`, `HealthCheckSec=`, `HealthCheckTimeoutSec=`,
+  and `ActiveWhenHealthy=` are new: systemd has no health-check
   concept at all, only `WatchdogSec`.
 - `Type=match` with `ReadyMatch=` has no systemd analog.
 - `Backing=` and `RestartMaxSec=` are blit-specific.
@@ -367,11 +380,25 @@ and the driver. A restarting unit is not a new session.
   ends up both speaking and understanding `sd_notify(3)`. Unix only;
   Windows falls back to `simple`.
 - `match` — `ReadyMatch=<regex>` against the child's output stream.
-  This is cheap only in blit, because the server is already parsing
+  This is cheap only in blit, because the server is already handling
   every byte of that stream and already depends on `regex`. It is the
   pragmatic probe for the overwhelming majority of programs that will
   never call `sd_notify`, and arguably the most blit-native of the
   three.
+
+  Which stream, precisely, since "output" is ambiguous in a terminal
+  multiplexer: the **raw bytes off the reader thread, before terminal
+  interpretation**, not the rendered grid. Matching the grid would
+  make a redrawing progress bar nondeterministic — a line can be
+  overwritten between two scans and never be observed. The raw stream
+  is split on both `\n` and `\r`, since progress output updates a line
+  with a bare carriage return, and the pattern is applied per segment.
+  A segment is capped (16 KiB) and the accumulator is dropped at each
+  boundary, so a program that never emits a newline cannot grow the
+  buffer without bound. Scanning stops at readiness or
+  `TimeoutStartSec`, whichever comes first, so a unit that never
+  matches costs nothing after its start window.
+
 - `surface` — `ReadySurface=<app_id pattern>`: ready when a matching
   Wayland surface exists in the compositor. For a GUI unit this is the
   only honest definition of started, since a browser process exists
@@ -393,30 +420,58 @@ and the driver. A restarting unit is not a new session.
 
 ### Health
 
-Readiness is a one-shot edge; health is a continuous property. Both
-ship together, and — departing from systemd — **health gates
-activation**: when `ExecHealthCheck=` is set, a unit reaches `active`
-only once its readiness probe has fired _and_ its first health check
-has passed. The whole window is bounded by `TimeoutStartSec`.
+Readiness is a one-shot edge; health is a continuous property.
 
-That one rule is what makes `After=` mean "healthy" without inventing
-a second ordering keyword. systemd cannot express this because it has
-no health concept at all; here it costs nothing, because the probe
-already exists and the state machine already has an `activating`
-state to hold the unit in.
+`Type=` keeps its systemd meaning exactly. Health participates in
+activation through a separate key, `ActiveWhenHealthy=`, which
+**defaults to `yes` whenever `ExecHealthCheck=` is set** and is
+otherwise inert: with it, a unit reaches `active` only once its
+readiness probe has fired _and_ its first health check has passed,
+the whole window bounded by `TimeoutStartSec`. Configure no health
+check and every `Type=` behaves precisely as systemd documents it;
+configure one and it obviously gates, which is the behavior almost
+everyone wants from `After=`. `ActiveWhenHealthy=no` opts back out
+for a probe that is pure monitoring.
+
+Putting this behind its own key rather than folding it into `Type=`
+matters more than it looks: the whole argument for borrowing systemd's
+spellings is that muscle memory transfers, and silently redefining
+`Type=simple` would break exactly that promise.
 
 - **Watchdog.** For `Type=notify`, a missing `WATCHDOG=1` within
   `WatchdogSec` marks the unit failed and applies `Restart=`. It falls
   out for free once the notify listener exists, and blit sets
   `WATCHDOG_USEC` in the child environment exactly as systemd does.
-- **`ExecHealthCheck=`** is spawned every `HealthCheckSec`, killed and
-  counted as a failure after `HealthCheckTimeoutSec`, and a non-zero
-  exit fails the unit. This is the one piece that has the server
-  spawning helper processes on a timer, which today only the audio
-  pipeline does (`audio.rs:345` onward); it reuses that `Command` and
-  `Stdio::piped` path rather than the PTY spawner. Probes never
-  overlap: one still running when the next is due is skipped, not
-  stacked.
+- **`ExecHealthCheck=`** is spawned every `HealthCheckSec`, killed
+  after `HealthCheckTimeoutSec`, and a non-zero exit fails the unit.
+  Probes never overlap: one still running when the next is due is
+  skipped, not stacked.
+
+#### Helper children
+
+`ExecStartPre=`, `ExecStop=`, and `ExecHealthCheck=` are processes the
+server spawns that are **not** sessions, and they need their own
+accounting rather than riding the PTY machinery.
+
+They are spawned through the `Command` and `Stdio::piped` path the
+audio pipeline already uses (`audio.rs:345` onward), not the PTY
+spawner, each with `setpgid(0, 0)` so its own timeout can group-kill
+it — a health probe that shells out must not leave the shell's
+children behind. They are tracked in a `helpers: HashMap<pid, …>`
+separate from `ptys`.
+
+This is a hazard the SIGCHLD handler creates rather than solves: the
+handler sees every child, so it must dispatch on pid. There is already
+a registry for exactly this problem — `register_pty_pid` /
+`pty_pids()` (`pty_unix.rs:545`, `:296-304`) exists so the backstop
+reaper cannot mis-collect a foreign child's status — so helpers get
+the same treatment: PTY pid, helper pid, or unknown-and-discarded.
+
+`ExecStartPre=` runs to completion before `ExecStart=` and a non-zero
+exit fails activation. `ExecStop=` runs before the SIGTERM escalation;
+if it returns zero and the main process is gone, the unit stops
+cleanly, and otherwise the escalation proceeds as normal, so a hung
+`ExecStop=` cannot wedge a stop.
 
 ### Dependencies
 
@@ -424,24 +479,34 @@ systemd's separation of _requirement_ from _ordering_ is kept, because
 collapsing the two is the thing homegrown supervisors reliably get
 wrong.
 
-- `Requires=a` pulls `a` in, and this unit fails if `a` fails to
-  start. No ordering is implied.
-- `Wants=a` pulls `a` in and ignores its outcome.
+- `Requires=a` pulls `a` in; this unit fails if `a` fails to start,
+  **and stops if `a` later stops**. No ordering is implied.
+- `Wants=a` pulls `a` in and ignores its outcome, then and later.
 - `After=a` is ordering only: do not start until `a` reaches `active`.
 
-`active` is doing the real work in that last line. It means ready by
-whichever probe `Type=` selects, and — when `ExecHealthCheck=` is set
+`Requires=` carries systemd's full meaning here, including the
+propagation half, because taking the spelling and quietly dropping
+half its semantics is worse than not borrowing the word. A restart of
+`a` is not a stop: as in systemd, `a` going through
+`active → activating → active` leaves dependents alone, and only a
+transition to `inactive` or `failed` that is not part of a restart
+propagates.
+
+`active` is doing the real work in the `After=` line. It means ready
+by whichever probe `Type=` selects, and — when health gates activation
 — first health check passed. So a single keyword covers "after the
 process exists", "after it says it is ready", "after it has a window",
 "after it answers its health endpoint", and "after that command
 finished", depending only on how the dependency describes itself. The
 dependent unit does not need to know which.
 
-Out of scope for v1: `Before=`, `Conflicts=`, `PartOf=`, `BindsTo=`,
-and restart propagation. Cycles are refused at load with a diagnostic
-naming the cycle, rather than silently broken by dropping ordering
-edges. That is systemd's behavior, but it is confusing, and there is
-no compatibility obligation here.
+Cycles are refused at load with a diagnostic naming the cycle, rather
+than silently broken by dropping ordering edges. That is systemd's
+behavior, but it is confusing, and there is no compatibility
+obligation here. Because unit files live-reload, a cycle introduced by
+an edit rejects **that file** and keeps the last good graph, rather
+than failing the whole set — a typo in one unit must not take down
+everything already running.
 
 ### Pipe backing
 
@@ -481,11 +546,53 @@ following the existing subcommand pattern, and added to
 
 ### Server restart
 
-Units do not survive a server restart; all unit state is in memory. On
-restart, autostart re-runs them from their files, and clients detect
-the restart through the boot generation in `S2C_HELLO`. This is
-coherent and crash-only, and it is written down here so that nobody
-expects unit state to be durable in the KV store.
+Units do not survive a server restart; unit runtime state is in
+memory. On restart, autostart re-runs them from their files, and
+clients detect the restart through the boot generation in
+`S2C_HELLO`. This is coherent and crash-only, and is written down here
+so that nobody expects a running unit's state to be durable.
+
+There is exactly one exception, and it is not runtime state but
+**operator intent**. `blit unit stop api` followed by a server restart
+would otherwise re-autostart `api`, silently contradicting the person
+who stopped it, and no amount of re-reading the unit files can
+recover that decision — it is not in them. So the two facts that
+represent a human decision, "this unit is disabled" and "this unit was
+manually stopped", are persisted; everything else is recomputed.
+
+They go in the KV store (`kv.md`), which is host-local, redb-backed
+and already durable, under a reserved `blit/units/` prefix. That
+implies one small addition to the KV family: **`blit/` becomes a
+server-owned prefix**, rejected for client `KV_PUT` with
+`KV_STATUS_INVALID` and readable like anything else. Without it any
+client could forge operator intent, which is a strictly worse property
+than the one being fixed. The prefix is worth reserving regardless of
+this RFC, since it is the obvious namespace for any future
+server-owned state.
+
+### Support matrix
+
+Most of the primitives are Unix facilities, so the honest summary is
+that Windows gets the declarative layer and not the enforcement.
+
+| Capability                               | Unix                 | Windows                                |
+| ---------------------------------------- | -------------------- | -------------------------------------- |
+| Unit files, autostart, dependencies      | yes                  | yes                                    |
+| `Restart=`, backoff, start limits        | yes                  | yes                                    |
+| `Type=simple` / `oneshot` / `match`      | yes                  | yes                                    |
+| `ExecHealthCheck=`, `ActiveWhenHealthy=` | yes                  | yes                                    |
+| Deadlines, leases, GC                    | yes                  | yes                                    |
+| `Type=notify`, `WatchdogSec=`            | yes                  | no (`sd_notify` is a Unix socket)      |
+| `KillMode=process-group`                 | yes                  | no (falls back to `process`)           |
+| `KillMode=control-group`                 | Linux only           | no                                     |
+| `Backing=pipe`                           | yes                  | yes (no `setsid`/`setpgid` either way) |
+| Reactive child death (SIGCHLD)           | yes                  | no — keeps a poll                      |
+| `Type=surface`                           | Linux only (Wayland) | no                                     |
+
+Where a capability is unavailable the unit file is still accepted and
+the key is ignored with a warning at load, rather than refusing to
+load: a unit directory shared across machines should not fail wholesale
+on the platform with fewer facilities.
 
 ### Worked example
 
@@ -527,8 +634,8 @@ Autostart=yes
 want, and it is the clearest demonstration of health-gated
 activation: `simple` on its own would call the unit active the
 instant `cargo` is exec'd — before compilation has even started —
-but because `ExecHealthCheck=` is set, `api` does not reach `active`
-until `/health` answers. No separate readiness probe is needed, and
+but because `ExecHealthCheck=` is set, `ActiveWhenHealthy=` defaults
+to `yes` and `api` does not reach `active` until `/health` answers. No separate readiness probe is needed, and
 the program needs no cooperation. `TimeoutStartSec=180` has to cover
 a cold `cargo build`, and `KillMode=process-group` is what stops
 `cargo`'s child compiler and the server binary from surviving a
@@ -610,9 +717,10 @@ healthy within `TimeoutStartSec`, `open-url` fails rather than
 hanging, and it never opens a URL that was never going to load.
 
 If a health check starts failing later, that unit leaves `active` and
-its `Restart=` applies; `open-url` is not re-run, because restart
-propagation is deliberately out of scope for v1 (`PartOf=` is where
-that would go).
+its `Restart=` applies. `open-url` is not re-run — `Requires=`
+propagates a _stop_, not a restart, exactly as in systemd, and
+re-running dependents on restart is what `PartOf=` would express (see
+[Deferred](#deferred)).
 
 ## Security
 
@@ -623,54 +731,52 @@ reachable by anyone who can write files through the `fs` family. So
 mirror `blit.remotes`: refuse to load unit files that are group- or
 world-writable, and refuse a world-writable unit directory.
 
-## Known weaknesses
+## Deferred
 
-Things this design is currently worse at than it should be, recorded
-so they are decided rather than discovered.
+Everything here was considered and left out on purpose, rather than
+missed.
 
-- **systemd's key names carry weaker semantics here.** `Requires=` is
-  start-time only: it does not stop the dependent when the dependency
-  stops, and `Restart=` does not propagate. Likewise `Type=simple`
-  means "active once healthy" rather than systemd's "active
-  immediately". Borrowing the spelling while narrowing the meaning is
-  arguably worse than picking different words, because muscle memory
-  will be wrong silently. Either accept it and document loudly, or
-  split health-gating out under its own key
-  (`ActiveWhenHealthy=`, default yes) so `Type=` keeps its meaning.
-- **Manual state does not survive a restart.** `blit unit stop api`
-  followed by a server restart re-autostarts `api`, contradicting the
-  operator. Everything else here is legitimately crash-only, but
-  "somebody deliberately stopped this" is not derivable from the unit
-  files. The KV store (`docs/design/kv.md`) is redb-backed and already
-  durable, and is the obvious home for enablement and manual-stop
-  state.
-- **`ReadyMatch=` is underspecified.** It has to say _which_ stream it
-  matches — the raw bytes before ANSI interpretation, not the rendered
-  grid, or a redrawing progress bar makes matching nondeterministic —
-  and it needs a bound, so a unit that never becomes ready does not
-  scan unbounded output forever.
-- **`ExecHealthCheck=` children need their own accounting.** They are
-  processes the server spawns that are not sessions, so they need the
-  same timeout and group-kill discipline, and the new SIGCHLD handler
-  must tell them apart from unit children when reaping.
-- **Autostart competes with `max_ptys`.** A cap low enough to be
-  useful can be exhausted before autostart finishes, failing units at
-  boot for a reason that has nothing to do with them. Units should
-  either be exempt from the cap or reserve against it up front.
-- **No `ExecStartPre=` or `ExecStop=`.** Stopping is SIGTERM and
-  nothing else, which is not enough for services that need to be told
-  to drain.
-- **Most of this is Unix-only.** `setsid`/`setpgid`, SIGCHLD, cgroups,
-  `sd_notify`, and `pipe2` all are. Windows gets unit files, restart
-  policy, `Type=simple`/`oneshot`/`match`, and health checks; it does
-  not get group kill, notify readiness, or reactive child death.
-- **This lands policy in the least-covered crate.** `blit-server` is
-  at roughly 36% line coverage, and the established server test
-  pattern only reaches handlers factored as standalone
-  `handle_*_message` functions. The units family should be factored
-  that way from the first commit, and the state machine kept a pure
-  function over `(state, event)` so it is testable without spawning
-  anything.
+- **`Before=`, `Conflicts=`, `PartOf=`, `BindsTo=`.** `Requires=`
+  plus `After=` covers the cases this is being built for, and each of
+  the rest adds a propagation edge that has to be reasoned about
+  during live reload. `PartOf=` is the one most likely to be wanted
+  next, for "restart the dependents when I restart".
+- **Precise `Type=surface` attribution.** Matching is by `app_id`, so
+  two units running the same binary cannot be told apart. Fixing it
+  means plumbing `SO_PEERCRED` from the Wayland client socket through
+  to `Surface`, which is real compositor work for a case that may
+  never come up.
+- **Drop-in directories** (`<name>.unit.d/*.conf`). Useful for
+  overriding a system unit from the user directory, but the
+  shadow-by-name rule already covers the common case.
+- **Templated units** (`foo@bar.unit`). No motivating use yet.
+- **Durable unit runtime state.** Restart counts and last-exit are
+  deliberately lost on restart; only operator intent is persisted.
+
+## Testability
+
+Worth stating as a constraint rather than an afterthought, because
+this lands a lot of policy in `blit-server`, which sits at roughly 36%
+line coverage — the least-covered crate that anyone actually tests.
+
+Two rules, both following existing precedent:
+
+- **Factor the wire family as a standalone
+  `handle_unit_message(data, state, out, verbose)`**, the way fs, git,
+  lsp, kv, and net already are. That factoring is exactly why those
+  families are testable today: the server test pattern drives a
+  handler over an `mpsc` outbox and polls for the expected opcode. An
+  arm of the big `match data[0]` inside `handle_client` has no
+  equivalent way to be tested.
+- **Keep the state machine a pure function**,
+  `fn step(state: UnitState, ev: UnitEvent, cfg: &Unit) -> (UnitState, Vec<Action>)`,
+  with actions returned as data — `Spawn`, `Signal`, `ArmTimer`,
+  `Notify` — rather than performed inline. Every interesting property
+  here is then a table test over event sequences: backoff schedules,
+  the start limiter tripping, health gating activation, `Requires=`
+  propagation, deadline escalation ordering. None of it needs to spawn
+  a process, and none of it is timing-dependent, because the clock is
+  an input.
 
 ## Delivery
 
@@ -688,8 +794,8 @@ One axis per PR.
    default with `BLIT_MAX_PTYS`, and `S2C_CREATE_FAILED`. Fixes the
    silent-hang bug on its own.
 4. **Units.** Files, the INI parser, autostart, restart policy,
-   readiness, health, dependencies, `Backing=pipe`, the `0x90` wire
-   family, and the CLI.
+   readiness, health, dependencies, helper children, `Backing=pipe`,
+   the `0x90` wire family, the reserved KV prefix, and the CLI.
 
 The first three are independently valuable and are the
 incident-shaped fixes. The fourth is the feature, built on primitives
