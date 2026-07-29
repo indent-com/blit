@@ -76,7 +76,11 @@ export function WebPane(props: WebPaneProps): JSX.Element {
     let canGoForward = false;
     try {
       const win = frame.contentWindow;
-      if (win) {
+      // Reload briefly points the frame at `about:blank` so assigning the same
+      // preview URL still causes a navigation. Do not publish that transient
+      // document as target state: its pathname is `blank`, which otherwise
+      // makes the status bar render e.g. `http://localhost:7777blank`.
+      if (win && win.location.protocol !== "about:") {
         // Inside the frame the app's own paths are clean, so its location is already the path on the target — except right after bootstrap, when it still carries the /x/ prefix.
         const raw = win.location.pathname + win.location.search;
         path = stripBootstrap(raw);
