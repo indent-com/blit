@@ -2218,8 +2218,7 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn: ((value: string, targetPaneId: string) => void) | null =
     null;
   // A tile to drop into a freshly-created layout, flushed when BSPContainer
@@ -3189,6 +3188,7 @@ function WorkspaceScreen(props: {
                 <For each={backgroundTiles()}>
                   {(assignment, index) => {
                     const d = tileDisplay(assignment);
+                    const web = parseWebAssignment(assignment);
                     return (
                       <div
                         style={{
@@ -3262,8 +3262,9 @@ function WorkspaceScreen(props: {
                         {/* Read-only zoomed-out preview, terminal-thumbnail
                             semantics: click to bring it back to the main
                             view. Only the most recent cards are live — a
-                            mounted preview editor holds an fs sync, and
-                            those are budgeted (LIVE_DOCK_PREVIEWS). */}
+                            mounted preview editor holds an fs sync and a web
+                            preview holds an iframe, so both are budgeted
+                            (LIVE_DOCK_PREVIEWS). */}
                         <Show when={index() < LIVE_DOCK_PREVIEWS}>
                           <div
                             onClick={() => restoreTile(assignment)}
@@ -3288,20 +3289,32 @@ function WorkspaceScreen(props: {
                                 "pointer-events": "none",
                               }}
                             >
-                              <BlitTile
-                                workspace={workspace}
-                                assignment={assignment}
-                                theme={theme()}
-                                palette={palette()}
-                                scale={chromeScale()}
-                                fontFamily={resolvedFontWithFallback()}
-                                fontSize={Math.max(
-                                  7,
-                                  Math.round(fontSize() * 0.6),
+                              <Show
+                                when={web}
+                                fallback={
+                                  <BlitTile
+                                    workspace={workspace}
+                                    assignment={assignment}
+                                    theme={theme()}
+                                    palette={palette()}
+                                    scale={chromeScale()}
+                                    fontFamily={resolvedFontWithFallback()}
+                                    fontSize={Math.max(
+                                      7,
+                                      Math.round(fontSize() * 0.6),
+                                    )}
+                                    onOpenTile={openTile}
+                                    preview
+                                  />
+                                }
+                              >
+                                {(web) => (
+                                  <WebPane
+                                    dest={web().connectionId}
+                                    url={web().url}
+                                  />
                                 )}
-                                onOpenTile={openTile}
-                                preview
-                              />
+                              </Show>
                             </div>
                           </div>
                         </Show>
