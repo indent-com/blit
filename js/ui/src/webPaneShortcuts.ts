@@ -1,4 +1,4 @@
-/** Relay the workspace close chord from a same-origin web-pane iframe. */
+/** Relay workspace pane-removal chords from a same-origin web-pane iframe. */
 export function forwardWebPaneCloseShortcut(
   event: KeyboardEvent,
   claimFocus: () => void,
@@ -6,7 +6,6 @@ export function forwardWebPaneCloseShortcut(
 ): boolean {
   if (
     !event.ctrlKey ||
-    !event.altKey ||
     !event.shiftKey ||
     event.metaKey ||
     (event.key !== "Q" && event.key !== "q" && event.code !== "KeyQ")
@@ -19,7 +18,7 @@ export function forwardWebPaneCloseShortcut(
     key: event.key,
     code: event.code,
     ctrlKey: true,
-    altKey: true,
+    altKey: event.altKey,
     shiftKey: true,
     bubbles: true,
     cancelable: true,

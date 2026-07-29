@@ -38,9 +38,34 @@ describe("forwardWebPaneCloseShortcut", () => {
       altKey: true,
       shiftKey: true,
     });
-    expect(forwardWebPaneCloseShortcut(event, () => {}, new EventTarget())).toBe(
-      true,
-    );
+    expect(
+      forwardWebPaneCloseShortcut(event, () => {}, new EventTarget()),
+    ).toBe(true);
+  });
+
+  it("relays Ctrl+Shift+Q for recoverable pane removal", () => {
+    const source = new KeyboardEvent("keydown", {
+      key: "Q",
+      code: "KeyQ",
+      ctrlKey: true,
+      shiftKey: true,
+      cancelable: true,
+    });
+    const target = new EventTarget();
+    const claimFocus = vi.fn();
+    const listener = vi.fn((raw: Event) => {
+      const event = raw as KeyboardEvent;
+      expect(event.ctrlKey).toBe(true);
+      expect(event.altKey).toBe(false);
+      expect(event.shiftKey).toBe(true);
+      event.preventDefault();
+    });
+    target.addEventListener("keydown", listener);
+
+    expect(forwardWebPaneCloseShortcut(source, claimFocus, target)).toBe(true);
+    expect(claimFocus).toHaveBeenCalledOnce();
+    expect(listener).toHaveBeenCalledOnce();
+    expect(source.defaultPrevented).toBe(true);
   });
 
   it("leaves all other iframe keyboard events alone", () => {
@@ -50,7 +75,6 @@ describe("forwardWebPaneCloseShortcut", () => {
     target.addEventListener("keydown", listener);
 
     for (const init of [
-      { key: "Q", code: "KeyQ", ctrlKey: true, shiftKey: true },
       { key: "Q", code: "KeyQ", ctrlKey: true, altKey: true },
       { key: "P", code: "KeyP", ctrlKey: true, altKey: true, shiftKey: true },
       {
