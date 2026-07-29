@@ -268,6 +268,23 @@ let configUnavailable = false;
 let configEverAuthed = false;
 const pendingWrites = new Map<string, string>();
 
+// Reconnect backoff. A fixed short interval is actively harmful when the
+// server is throttling: every client retrying in lockstep keeps the gateway's
+// global unauthenticated-handshake slots occupied, which makes the throttle
+// refuse still more attempts. Back off, and jitter so clients spread out.
+const CONFIG_RECONNECT_MIN_MS = 2000;
+const CONFIG_RECONNECT_MAX_MS = 30000;
+let configReconnectDelay = CONFIG_RECONNECT_MIN_MS;
+
+function scheduleConfigReconnect(): void {
+  const jitter = 1 + Math.random() * 0.3;
+  setTimeout(connectConfigWs, configReconnectDelay * jitter);
+  configReconnectDelay = Math.min(
+    configReconnectDelay * 2,
+    CONFIG_RECONNECT_MAX_MS,
+  );
+}
+
 export type ConfigWsStatus = "connecting" | "connected" | "unavailable";
 const [configWsStatus, setConfigWsStatus] =
   createSignal<ConfigWsStatus>("connecting");
@@ -310,8 +327,23 @@ export function connectConfigWs(): void {
       window.dispatchEvent(new Event("hashchange"));
       return;
     }
+    if (msg === "busy") {
+      // The gateway's auth throttle refused this handshake without checking
+      // the passphrase — a peer lockout or the concurrent-handshake cap. The
+      // stored credential is still good, so keep it and retry; clearing it
+      // here would drop the user at the login screen for a transient server
+      // condition, and the login attempt would fail for the same reason.
+      configWs = null;
+      configReady = false;
+      ws.onclose = null;
+      ws.close();
+      setConfigWsStatus("connecting");
+      scheduleConfigReconnect();
+      return;
+    }
     if (msg === "ok") {
       configEverAuthed = true;
+      configReconnectDelay = CONFIG_RECONNECT_MIN_MS;
       return;
     }
     if (msg === "ready") {
@@ -358,7 +390,7 @@ export function connectConfigWs(): void {
       return;
     }
     setConfigWsStatus("connecting");
-    setTimeout(connectConfigWs, 2000);
+    scheduleConfigReconnect();
   };
 }
 

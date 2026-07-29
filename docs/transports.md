@@ -93,9 +93,18 @@ sequenceDiagram
         note over B,G: binary blit frames follow
     else rejected
         G->>B: "auth" (text frame)
-        note over B,G: connection closed
+        note over B,G: connection closed, client discards the passphrase
+    else throttled
+        G->>B: "busy" (text frame)
+        note over B,G: connection closed, client keeps the passphrase and retries
     end
 ```
+
+`"busy"` means the auth throttle refused the handshake before looking at the
+passphrase — a peer lockout or the global concurrent-handshake cap. It is
+deliberately distinct from `"auth"`: a client that conflates the two throws
+away a working credential and drops the user at the login screen for what is a
+transient server condition.
 
 After `"ok"`, all subsequent messages are binary WebSocket frames. Each frame is one blit message with no additional length prefix.
 
@@ -140,6 +149,19 @@ Self-signed certificates are auto-generated at startup and rotated every 13 days
 3. Available at the `/config` endpoint for backward compatibility.
 
 The browser constructs `new WebTransport(url, { serverCertificateHashes: [{ algorithm: "sha-256", value: hash }] })`.
+
+A rotation invalidates the hash a long-lived tab captured when it loaded, so
+`MuxTransport.updateWtCertHash` adopts each republished hash and clears the
+QUIC-failed state — a failure against the old certificate says nothing about
+the new one. It deliberately does not reconnect: the hash applies to the next
+connection attempt, so a healthy session is never interrupted to switch
+protocols. Without this a tab open across a rotation fails every subsequent WT
+attempt and silently stays on WebSocket until reloaded.
+
+A failed WebTransport attempt is likewise not permanent. The client falls back
+to WebSocket and re-probes QUIC after a cooldown (`wtReprobeMs`, default 5
+minutes), so a transient UDP problem costs one cooldown rather than
+WebTransport for the lifetime of the page.
 
 ### Stream framing
 
