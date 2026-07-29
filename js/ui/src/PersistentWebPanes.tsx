@@ -13,6 +13,7 @@ import type {
   WebPaneHostRegistrar,
   WebPaneHostRegistration,
 } from "./WebPaneHost";
+import { clipInsetsFor, type ClipInsets } from "./webPaneClipping";
 import { selectWebPaneHost } from "./webPaneHostSelection";
 
 interface RegisteredHost extends WebPaneHostRegistration {
@@ -75,6 +76,22 @@ export function createWebPaneHostRegistry(): WebPaneHostRegistry {
 interface HostPlacement {
   host: RegisteredHost;
   rect: DOMRect;
+  clipInsets: ClipInsets;
+}
+
+function clippingAncestorRects(element: HTMLElement): DOMRect[] {
+  const rects: DOMRect[] = [];
+  for (
+    let ancestor = element.parentElement;
+    ancestor;
+    ancestor = ancestor.parentElement
+  ) {
+    const style = getComputedStyle(ancestor);
+    const clipsX = /^(auto|scroll|hidden|clip)$/.test(style.overflowX);
+    const clipsY = /^(auto|scroll|hidden|clip)$/.test(style.overflowY);
+    if (clipsX || clipsY) rects.push(ancestor.getBoundingClientRect());
+  }
+  return rects;
 }
 
 function placementFor(
@@ -84,7 +101,14 @@ function placementFor(
   void registry.version();
   const visible = registry
     .hosts(assignment)
-    .map((host) => ({ host, rect: host.element.getBoundingClientRect() }))
+    .map((host) => {
+      const rect = host.element.getBoundingClientRect();
+      return {
+        host,
+        rect,
+        clipInsets: clipInsetsFor(rect, clippingAncestorRects(host.element)),
+      };
+    })
     .filter(
       ({ host, rect }) =>
         host.element.isConnected && rect.width > 0 && rect.height > 0,
@@ -161,6 +185,7 @@ export function PersistentWebPanes(props: {
               width: `${current.rect.width}px`,
               height: `${current.rect.height}px`,
               overflow: "hidden",
+              "clip-path": `inset(${current.clipInsets.top}px ${current.clipInsets.right}px ${current.clipInsets.bottom}px ${current.clipInsets.left}px)`,
               "z-index": 5,
               "pointer-events": current.host.interactive ? "auto" : "none",
             };

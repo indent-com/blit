@@ -1568,7 +1568,9 @@ function WorkspaceScreen(props: {
         assignments.add(value);
       }
     }
-    for (const value of backgroundTiles()) {
+    // Keep the dock's live-resource budget intact: older web cards remain
+    // title-only and reload if restored, just like older editor cards.
+    for (const value of backgroundTiles().slice(0, LIVE_DOCK_PREVIEWS)) {
       if (isWebAssignment(value)) assignments.add(value);
     }
     return Array.from(assignments);
