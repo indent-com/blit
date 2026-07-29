@@ -1397,6 +1397,18 @@ async fn run_wt_accept_loop(state: &AppState, server: &mut wt::Server, permanent
     }
 }
 
+/// How long each stage of the WebTransport handshake may take.
+///
+/// Deliberately short. The client opens its stream and writes the passphrase
+/// immediately after `wt.ready` resolves, and abandons the whole attempt after
+/// a few seconds (`wtConnectTimeoutMs` in js/core/src/transports/mux.ts), so a
+/// generous server-side budget buys nothing: it only keeps a slot from
+/// `AUTH_MAX_UNAUTHENTICATED` — a *global* limit — reserved for a client that
+/// has already left. Enough simultaneously-abandoned probes would then make the
+/// throttle answer every other client, including authenticated ones
+/// reconnecting, with `AUTH_BUSY`.
+const WT_AUTH_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Authenticate a WebTransport bidirectional stream.
 ///
 /// Protocol: client sends `[pass_len:2 LE][passphrase]`, server responds
@@ -1407,7 +1419,7 @@ async fn wt_authenticate(
     passphrase: &blit_webserver::config::AuthPassphrase,
     guard: blit_webserver::config::AuthAttemptGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let auth_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let auth_result = tokio::time::timeout(WT_AUTH_STAGE_TIMEOUT, async {
         let mut len_buf = [0u8; 2];
         recv.read_exact(&mut len_buf)
             .await
@@ -1432,16 +1444,21 @@ async fn wt_authenticate(
 
     match auth_result {
         Ok(Ok(true)) => guard.record_success(),
+        // Only a passphrase that was presented and did not match counts
+        // against the peer's failure budget.
         Ok(Ok(false)) => {
             guard.record_failure();
             return Err("authentication failed".into());
         }
+        // The stream died before yielding a passphrase — the client abandoning
+        // its WebTransport probe to fall back to WebSocket lands here, and it
+        // must not push the peer towards a lockout.
         Ok(Err(e)) => {
-            guard.record_failure();
+            drop(guard);
             return Err(e.into());
         }
         Err(_) => {
-            guard.record_failure();
+            drop(guard);
             return Err("authentication timed out".into());
         }
     }
@@ -1468,14 +1485,16 @@ async fn handle_webtransport_session(
     let session = request.ok().await?;
 
     let (mut send, mut recv) =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), session.accept_bi()).await {
+        match tokio::time::timeout(WT_AUTH_STAGE_TIMEOUT, session.accept_bi()).await {
             Ok(Ok(streams)) => streams,
+            // No passphrase was ever offered, so nothing failed to verify —
+            // release the handshake slot without charging the peer.
             Ok(Err(e)) => {
-                auth_guard.record_failure();
+                drop(auth_guard);
                 return Err(e.into());
             }
             Err(_) => {
-                auth_guard.record_failure();
+                drop(auth_guard);
                 session.close(1, b"authentication timed out");
                 return Err("authentication timed out".into());
             }

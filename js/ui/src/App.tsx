@@ -281,9 +281,8 @@ function ConnectedApp(props: {
       ? prev.channelCache
       : new Map();
 
-  // The MuxTransport is created only once the config WS has resolved, so
-  // the WT-vs-WS decision is final at construction time.  Before that,
-  // mux() returns null and no connection is attempted.
+  // The MuxTransport is created only once the config WS has resolved.  Before
+  // that, mux() returns null and no connection is attempted.
   const [mux, setMux] = createSignal<MuxTransport | null>(
     prev && prev.passphrase === props.passphrase ? prev.mux : null,
   );
@@ -292,7 +291,15 @@ function ConnectedApp(props: {
     const status = configWsStatus();
     const hash = certHash();
     if (status === "connecting") return;
-    if (mux()) return; // already created (or reused from HMR)
+    const existing = mux();
+    if (existing) {
+      // The gateway rotates its self-signed WebTransport cert every 13 days
+      // and republishes the hash. A long-lived tab has to adopt it, or every
+      // later QUIC attempt fails validation and the session silently stays on
+      // WebSocket until someone reloads.
+      if (hash) existing.updateWtCertHash(hash, muxWtUrl());
+      return;
+    }
     const m = new MuxTransport(muxWsUrl(), props.passphrase, {
       wtUrl: hash ? muxWtUrl() : undefined,
       wtCertHash: hash,
@@ -300,6 +307,24 @@ function ConnectedApp(props: {
     });
     m.connect();
     setMux(m);
+  });
+
+  // Reconnect triggers the backoff cannot provide. Coming back from sleep or
+  // regaining a network otherwise waits out whatever delay the backoff had
+  // escalated to — up to 10s of a session that looks dead for no reason.
+  // Deliberately in the UI layer: js/core stays free of window/document so it
+  // can be imported by the preview service worker (docs/design/net.md).
+  createEffect(() => {
+    const wake = () => {
+      if (document.visibilityState === "hidden") return;
+      mux()?.connect();
+    };
+    window.addEventListener("online", wake);
+    document.addEventListener("visibilitychange", wake);
+    onCleanup(() => {
+      window.removeEventListener("online", wake);
+      document.removeEventListener("visibilitychange", wake);
+    });
   });
 
   createEffect(() => {
@@ -379,6 +404,7 @@ function AuthApp(props: { onAuth: (pass: string) => void }) {
     setAuthError(null);
     const ws = new WebSocket(configWsUrl());
     let authed = false;
+    let throttled = false;
 
     ws.onopen = () => {
       ws.send(pass);
@@ -390,13 +416,19 @@ function AuthApp(props: { onAuth: (pass: string) => void }) {
         authed = true;
         ws.close();
         props.onAuth(pass);
+      } else if (msg === "busy") {
+        // Throttled before the passphrase was even checked. Saying
+        // "authentication failed" here sends the user hunting for a wrong
+        // credential when the only thing to do is wait.
+        throttled = true;
+        setAuthError(i18n("auth.busy"));
       }
     };
 
     ws.onerror = () => {};
 
     ws.onclose = () => {
-      if (!authed) {
+      if (!authed && !throttled) {
         setAuthError(i18n("auth.failed"));
       }
     };

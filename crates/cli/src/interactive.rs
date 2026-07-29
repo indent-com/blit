@@ -290,7 +290,11 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
             std::process::exit(1);
         });
     let addr = listener.local_addr().unwrap();
-    let url = format!("http://{addr}/#{token}");
+    // `#psk=<url-encoded>` is the fragment form the UI parses (readPassphrase
+    // in js/ui/src/App.tsx); a bare `#<token>` is ignored and leaves the user
+    // typing 32 random characters by hand. `token` is Alphanumeric, so it
+    // needs no percent-escaping.
+    let url = format!("http://{addr}/#psk={token}");
     eprintln!("blit: serving browser UI at {url}");
 
     open_browser(&url);

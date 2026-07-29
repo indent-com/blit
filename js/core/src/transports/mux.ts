@@ -57,6 +57,9 @@ export interface MuxTransportOptions extends BlitTransportOptions {
   wtConnectTimeoutMs?: number;
   /** Timeout waiting for a virtual channel OPEN acknowledgement before retrying. Default: 10000 ms. */
   channelConnectTimeoutMs?: number;
+  /** How long to stay on WebSocket after a WebTransport attempt fails before
+   *  probing QUIC again. Default: 300000 ms (5 min). */
+  wtReprobeMs?: number;
   /** Optional debug logger for connection diagnostics. */
   debug?: BlitDebug;
 }
@@ -86,12 +89,19 @@ export class MuxTransport {
   private readonly initialDelay: number;
   private readonly maxDelay: number;
   private readonly backoff: number;
-  private readonly wtUrl: string | undefined;
-  private readonly wtCertHash: Uint8Array | undefined;
+  private wtUrl: string | undefined;
+  private wtCertHash: Uint8Array | undefined;
   private readonly wtConnectTimeoutMs: number;
   private readonly channelConnectTimeoutMs: number;
-  /** Set to true after the first WT failure so we stop retrying WT. */
+  private readonly wtReprobeMs: number;
+  /** Set after a WT failure to keep us on WebSocket. Cleared by
+   *  `wtReprobeTimer` so a transient QUIC problem — a moment of UDP loss, a
+   *  network that blocks it, a gateway still binding its endpoint — costs one
+   *  cooldown rather than WebTransport for the life of the page. blit sessions
+   *  run for days; a permanent flag turns a one-second event into a
+   *  permanent downgrade. */
   private wtFailed = false;
+  private wtReprobeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly dbg: BlitDebug;
 
   /** All channels keyed by channel ID. */
@@ -134,6 +144,7 @@ export class MuxTransport {
     // recovery path as pressing the Reconnect button, just without user action.
     this.channelConnectTimeoutMs =
       options?.channelConnectTimeoutMs ?? options?.connectTimeoutMs ?? 10_000;
+    this.wtReprobeMs = options?.wtReprobeMs ?? 300_000;
     this.dbg = options?.debug ?? noopDebug;
     if (options?.wtUrl) {
       this.wtUrl = options.wtUrl;
@@ -141,6 +152,49 @@ export class MuxTransport {
     if (options?.wtCertHash) {
       this.wtCertHash = hexToBytes(options.wtCertHash);
     }
+  }
+
+  /**
+   * Adopt a rotated WebTransport certificate hash.
+   *
+   * The gateway regenerates its self-signed cert every 13 days and publishes
+   * the new hash over the config WebSocket. Without this the hash captured at
+   * construction goes stale, every later WT attempt fails cert validation, and
+   * the session is stuck on WebSocket until the page is reloaded.
+   *
+   * Deliberately does not reconnect: tearing down a healthy connection to
+   * switch protocols would interrupt live terminals for no gain. The new hash
+   * is used by the next connection attempt, whenever that happens.
+   */
+  updateWtCertHash(hexHash: string, wtUrl?: string): void {
+    if (this.disposed) return;
+    const next = hexToBytes(hexHash);
+    if (this.wtCertHash && bytesEqual(this.wtCertHash, next)) return;
+    this.dbg.log("adopting rotated WebTransport cert hash");
+    this.wtCertHash = next;
+    if (wtUrl) this.wtUrl = wtUrl;
+    // A failure against the *old* hash says nothing about the new one.
+    this.clearWtFailure();
+  }
+
+  /** Allow WebTransport to be probed again. */
+  private clearWtFailure(): void {
+    this.wtFailed = false;
+    if (this.wtReprobeTimer !== null) {
+      clearTimeout(this.wtReprobeTimer);
+      this.wtReprobeTimer = null;
+    }
+  }
+
+  /** Stay on WebSocket, but only until the cooldown expires. */
+  private markWtFailed(): void {
+    this.wtFailed = true;
+    if (this.wtReprobeTimer !== null || this.disposed) return;
+    this.wtReprobeTimer = setTimeout(() => {
+      this.wtReprobeTimer = null;
+      this.wtFailed = false;
+      this.dbg.log("WebTransport cooldown expired, will probe QUIC again");
+    }, this.wtReprobeMs);
   }
 
   /** Current transport-level status. */
@@ -193,6 +247,10 @@ export class MuxTransport {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.wtReprobeTimer !== null) {
+      clearTimeout(this.wtReprobeTimer);
+      this.wtReprobeTimer = null;
     }
     for (const timer of this.channelReconnectTimers.values()) {
       clearTimeout(timer);
@@ -320,9 +378,16 @@ export class MuxTransport {
         if (e.data === "mux") {
           this.dbg.log("WebSocket authenticated");
           authenticated = true;
+          this.clearAuthRejection();
           this.setStatus("connected");
           this.currentDelay = this.initialDelay;
           this.reopenChannels();
+        } else if (e.data === "busy") {
+          // The server's auth throttle refused the handshake before looking at
+          // the passphrase. Nothing is wrong with the credential, so this is an
+          // ordinary disconnect: back off and retry.
+          this.dbg.warn("WebSocket auth throttled, will retry");
+          socket.close();
         } else if (e.data === "auth") {
           this.dbg.warn("WebSocket auth rejected");
           this._authRejected = true;
@@ -456,7 +521,10 @@ export class MuxTransport {
 
       this.dbg.log("WebTransport connected and authenticated");
       this.wtWriter = writer;
-      this._authRejected = false;
+      // QUIC works here — retire any cooldown so a future failure starts a
+      // fresh one rather than inheriting a stale timer.
+      this.clearWtFailure();
+      this.clearAuthRejection();
       this.currentDelay = this.initialDelay;
       this.setStatus("connected");
       this.reopenChannels();
@@ -479,12 +547,12 @@ export class MuxTransport {
           this.handleDisconnect();
         });
     } catch (err) {
-      // WT failed — mark as failed and fall back to WS.
+      // WT failed — fall back to WS for the cooldown, then probe QUIC again.
       this.dbg.warn(
         "WebTransport failed, falling back to WebSocket: %s",
         err instanceof Error ? err.message : String(err),
       );
-      this.wtFailed = true;
+      this.markWtFailed();
       this.cleanupWt();
       if (this.disposed) return;
       if (this._authRejected) {
@@ -685,6 +753,22 @@ export class MuxTransport {
     buf[2] = MUX_C2S_CLOSE;
     view.setUint16(3, channelId, true);
     this._sendRaw(buf);
+  }
+
+  /**
+   * A successful (re-)authentication retires any earlier rejection. Channels
+   * parked in `error` by a rejection were never queued for re-open — handleDisconnect
+   * returns before touching `pendingReopen` when `_authRejected` is set — so
+   * requeue them here or the transport reconnects with every channel wedged.
+   */
+  private clearAuthRejection(): void {
+    if (!this._authRejected) return;
+    this._authRejected = false;
+    for (const ch of this.channels.values()) {
+      if (ch._internalStatus === "closed") continue;
+      ch._clearAuthRejected();
+      this.pendingReopen.add(ch);
+    }
   }
 
   private reopenChannels(): void {
@@ -898,6 +982,12 @@ export class MuxChannel implements BlitTransport {
   }
 
   /** @internal */
+  _clearAuthRejected(): void {
+    this._authRejected = false;
+    this._lastError = null;
+  }
+
+  /** @internal */
   _deliverMessage(data: ArrayBuffer): void {
     for (const l of this.messageListeners) l(data);
   }
@@ -912,6 +1002,14 @@ function hexToBytes(hex: string): Uint8Array {
     bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   }
   return bytes;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /** Read exactly `n` bytes from a ReadableStreamDefaultReader, buffering

@@ -224,6 +224,13 @@ export class WebSocketTransport implements BlitTransport {
           this.authRejected = false;
           this.lastError = null;
           this.setStatus("connected");
+        } else if (e.data === "busy") {
+          // The server's auth throttle refused the handshake without checking
+          // the passphrase. Retryable, and emphatically not a bad credential.
+          this.authRejected = false;
+          this.lastError = "Server busy, retrying";
+          this.setStatus("disconnected");
+          socket.close();
         } else if (e.data === "auth") {
           this.authRejected = true;
           this.lastError = "Authentication failed";

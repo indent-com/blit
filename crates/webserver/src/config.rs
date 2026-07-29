@@ -110,15 +110,28 @@ impl AuthThrottle {
         let mut inner = self.inner.lock().unwrap();
         inner.prune(now, self.failure_window);
 
+        // Both refusals answer the client with AUTH_BUSY, which is deliberately
+        // indistinguishable from a healthy server to anyone probing. Say why
+        // here so an operator seeing "server busy" in the UI can tell a peer
+        // lockout from saturation without reproducing it.
         if inner.active_unauthenticated >= self.max_unauthenticated {
+            eprintln!(
+                "blit: auth refused for {peer}: {} concurrent unauthenticated handshakes \
+                 (limit {})",
+                inner.active_unauthenticated, self.max_unauthenticated
+            );
             return None;
         }
-        if inner
+        if let Some(until) = inner
             .peers
             .get(&peer)
             .and_then(|state| state.locked_until)
-            .is_some_and(|until| until > now)
+            .filter(|until| *until > now)
         {
+            eprintln!(
+                "blit: auth refused for {peer}: locked out for another {}s",
+                until.duration_since(now).as_secs()
+            );
             return None;
         }
 
@@ -158,6 +171,22 @@ impl AuthThrottle {
             state.failures = 0;
             state.first_failure = now;
             state.locked_until = Some(now + self.lockout);
+            // Only a presented-and-mismatched passphrase reaches here, so this
+            // names a real cause rather than a reconnect that happened to look
+            // like one. Without it a lockout is invisible server-side and shows
+            // up only as a client that cannot log in.
+            eprintln!(
+                "blit: auth lockout for {peer}: {} wrong passphrases within {}s — \
+                 refusing for {}s",
+                self.max_failures,
+                self.failure_window.as_secs(),
+                self.lockout.as_secs()
+            );
+        } else {
+            eprintln!(
+                "blit: wrong passphrase from {peer} ({}/{} before lockout)",
+                state.failures, self.max_failures
+            );
         }
     }
 
@@ -206,10 +235,34 @@ impl Drop for AuthAttemptGuard {
     }
 }
 
+/// Wire response for a passphrase the server rejected. Clients treat it as
+/// "this credential is wrong" and discard it.
+pub const AUTH_REJECTED: &str = "auth";
+
+/// Wire response for an attempt the throttle refused before it could be
+/// checked — a peer lockout or the global concurrent-handshake cap. The
+/// credential was never examined, so clients must keep it and retry rather
+/// than dropping the user at the login screen.
+pub const AUTH_BUSY: &str = "busy";
+
+/// How one authentication attempt ended.
+///
+/// The distinction matters to the throttle: only a passphrase that was
+/// actually presented and did not match may count against a peer's failure
+/// budget. A socket that goes away mid-handshake — a page navigation, a
+/// suspended tab, a client abandoning a probe — is an ordinary reconnect, and
+/// charging it locks out honest users (docs/design/net.md § service worker).
+enum AuthOutcome {
+    Accepted,
+    Rejected,
+    Abandoned,
+}
+
 /// Authenticate a text WebSocket passphrase with timeout, active-connection
-/// limiting, and failed-attempt backoff. Sends "auth" and closes on any
-/// rejected/throttled attempt. When ok_message is present, it is sent after a
-/// successful authentication before returning.
+/// limiting, and failed-attempt backoff. Sends [`AUTH_REJECTED`] and closes on
+/// a wrong passphrase, [`AUTH_BUSY`] when the throttle refused the attempt.
+/// When ok_message is present, it is sent after a successful authentication
+/// before returning.
 pub async fn authenticate_text_ws(
     ws: &mut WebSocket,
     token: &AuthPassphrase,
@@ -218,40 +271,56 @@ pub async fn authenticate_text_ws(
     ok_message: Option<&str>,
 ) -> bool {
     let Some(guard) = throttle.begin(peer.to_string()) else {
-        let _ = ws.send(Message::Text("auth".into())).await;
+        let _ = ws.send(Message::Text(AUTH_BUSY.into())).await;
         let _ = ws.close().await;
         return false;
     };
 
-    let accepted = tokio::time::timeout(AUTH_TIMEOUT, async {
+    let outcome = tokio::time::timeout(AUTH_TIMEOUT, async {
         loop {
             match ws.recv().await {
                 Some(Ok(Message::Text(pass))) => {
-                    break token.verify(pass.trim());
+                    break if token.verify(pass.trim()) {
+                        AuthOutcome::Accepted
+                    } else {
+                        AuthOutcome::Rejected
+                    };
                 }
                 Some(Ok(Message::Ping(d))) => {
                     let _ = ws.send(Message::Pong(d)).await;
                 }
-                _ => break false,
+                _ => break AuthOutcome::Abandoned,
             }
         }
     })
     .await
-    .unwrap_or(false);
+    // A handshake that never produced a passphrase within the window is
+    // abandoned, not failed.
+    .unwrap_or(AuthOutcome::Abandoned);
 
-    if accepted {
-        guard.record_success();
-        if let Some(msg) = ok_message
-            && ws.send(Message::Text(msg.into())).await.is_err()
-        {
-            return false;
+    match outcome {
+        AuthOutcome::Accepted => {
+            guard.record_success();
+            if let Some(msg) = ok_message
+                && ws.send(Message::Text(msg.into())).await.is_err()
+            {
+                return false;
+            }
+            true
         }
-        true
-    } else {
-        guard.record_failure();
-        let _ = ws.send(Message::Text("auth".into())).await;
-        let _ = ws.close().await;
-        false
+        AuthOutcome::Rejected => {
+            guard.record_failure();
+            let _ = ws.send(Message::Text(AUTH_REJECTED.into())).await;
+            let _ = ws.close().await;
+            false
+        }
+        // Dropping the guard releases the handshake slot without touching the
+        // peer's failure count.
+        AuthOutcome::Abandoned => {
+            drop(guard);
+            let _ = ws.close().await;
+            false
+        }
     }
 }
 
@@ -1677,6 +1746,36 @@ mod tests {
         throttle.begin("bad").unwrap().record_failure();
         assert!(throttle.begin("bad").is_none(), "bad peer is locked out");
         assert!(throttle.begin("other").is_some(), "lockout is per peer");
+    }
+
+    /// An abandoned handshake — a page navigation, a suspended tab, a client
+    /// dropping a WebTransport probe to fall back to WebSocket — used to be
+    /// charged as a failed authentication. Enough of them locked out a user who
+    /// never typed a wrong passphrase, and the lockout then answered with the
+    /// same "auth" the UI takes as "discard your stored passphrase".
+    #[test]
+    fn auth_throttle_ignores_handshakes_that_never_presented_a_passphrase() {
+        let throttle =
+            AuthThrottle::with_limits(32, 3, Duration::from_secs(60), Duration::from_secs(60));
+        for _ in 0..10 {
+            drop(throttle.begin("peer").expect("abandoned attempt allowed"));
+        }
+        assert!(
+            throttle.begin("peer").is_some(),
+            "abandoned handshakes must not count towards the failure budget"
+        );
+    }
+
+    #[test]
+    fn auth_throttle_releases_a_slot_exactly_once() {
+        let throttle =
+            AuthThrottle::with_limits(1, 5, Duration::from_secs(60), Duration::from_secs(60));
+        // record_failure() releases, and the subsequent Drop must not release a
+        // second time — a double decrement would let the cap drift upwards.
+        throttle.begin("peer").unwrap().record_failure();
+        let held = throttle.begin("other").expect("slot freed once");
+        assert!(throttle.begin("third").is_none(), "cap still holds at one");
+        drop(held);
     }
 
     // ── blit.roots (RootsState) ──

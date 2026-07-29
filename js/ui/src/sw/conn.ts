@@ -167,6 +167,12 @@ class DestConnection {
       socket.onmessage = (event) => {
         if (typeof event.data === "string") {
           if (event.data === "ok") return;
+          if (event.data === "busy") {
+            finish(
+              new Error("relay busy — too many recent connection attempts"),
+            );
+            return;
+          }
           finish(
             new Error(
               event.data === "auth"

@@ -3,6 +3,8 @@ type Messages = Record<string, string>;
 const en: Messages = {
   "auth.placeholder": "passphrase",
   "auth.failed": "Authentication failed",
+  "auth.busy":
+    "Too many recent connection attempts — wait a minute and try again",
 
   "status.connecting": "Connecting…",
   "status.authenticating": "Authenticating…",
