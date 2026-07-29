@@ -17,7 +17,12 @@ let
     cp ${browserWasm}/blit_browser.js ${browserWasm}/blit_browser.d.ts crates/browser/pkg/
     cp ${browserWasm}/blit_browser_bg.wasm crates/browser/pkg/
     cp ${browserWasm}/blit_browser_bg.wasm.d.ts crates/browser/pkg/ 2>/dev/null || true
-    echo '{"name":"@blit-sh/browser","version":"${version}","main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
+    # An explicit `files` list is required, not cosmetic: crates/browser/pkg
+    # is gitignored, and with no `files` and no .npmignore, npm/pnpm packing
+    # falls back to .gitignore and drops everything but package.json and
+    # main — shipping the package without its .d.ts, which fails the
+    # js/website typecheck on a clean checkout.
+    echo '{"name":"@blit-sh/browser","version":"${version}","files":["blit_browser.js","blit_browser.d.ts","blit_browser_bg.wasm","blit_browser_bg.wasm.d.ts","snippets"],"main":"blit_browser.js","types":"blit_browser.d.ts"}' > crates/browser/pkg/package.json
     if [ -d "${browserWasm}/snippets" ]; then
       for d in ${browserWasm}/snippets/blit-browser-*/; do
         name=$(basename "$d")
@@ -375,8 +380,9 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
-      rm -f js/ui/dist/index.html js/ui/dist/index.html.br
-      cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
+      rm -f js/ui/dist/index.html js/ui/dist/index.html.br js/ui/dist/sw.js js/ui/dist/sw.js.br
+      cp ${webAppDist}/index.html ${webAppDist}/index.html.br \
+        ${webAppDist}/sw.js ${webAppDist}/sw.js.br js/ui/dist/
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
@@ -397,8 +403,9 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
-      rm -f js/ui/dist/index.html js/ui/dist/index.html.br
-      cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
+      rm -f js/ui/dist/index.html js/ui/dist/index.html.br js/ui/dist/sw.js js/ui/dist/sw.js.br
+      cp ${webAppDist}/index.html ${webAppDist}/index.html.br \
+        ${webAppDist}/sw.js ${webAppDist}/sw.js.br js/ui/dist/
 
       outdir="''${1:-coverage-report}"
 
@@ -603,7 +610,8 @@ in
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
-      cp ${webAppDist}/index.html ${webAppDist}/index.html.br js/ui/dist/
+      cp ${webAppDist}/index.html ${webAppDist}/index.html.br \
+        ${webAppDist}/sw.js ${webAppDist}/sw.js.br js/ui/dist/
 
       echo "=== Rust tests ==="
       cargo test --workspace
@@ -616,7 +624,7 @@ in
       (cd js && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm run typecheck)
       echo ""
       echo "=== JS workspace tests ==="
-      (cd js && pnpm --filter @blit-sh/core run test && pnpm --filter @blit-sh/react run test && pnpm --filter @blit-sh/solid run test)
+      (cd js && pnpm --filter @blit-sh/core run test && pnpm --filter @blit-sh/react run test && pnpm --filter @blit-sh/solid run test && pnpm --filter @blit-sh/ui run test)
 
       export BLIT_SERVER="${blit}/bin/blit"
       echo ""

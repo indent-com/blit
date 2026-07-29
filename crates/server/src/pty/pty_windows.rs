@@ -100,10 +100,20 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
 
 pub fn reap_zombies() {}
 
-pub fn respond_to_queries(handle: &PtyHandle, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
-    for resp in crate::parse_terminal_queries(data, size, cursor) {
+/// Answer terminal queries found in `data`; returns the last OSC 7
+/// working-directory report seen in the chunk, if any (docs/protocol.md,
+/// "Working directory tracking").
+pub fn respond_to_queries(
+    handle: &PtyHandle,
+    data: &[u8],
+    size: (u16, u16),
+    cursor: (u16, u16),
+) -> Option<String> {
+    let scan = crate::parse_terminal_queries(data, size, cursor);
+    for resp in scan.responses {
         pty_write_all(PtyWriteTarget(handle.input), resp.as_bytes());
     }
+    scan.osc7_cwd
 }
 
 pub(crate) struct SendHandle(pub(crate) HANDLE);
@@ -349,6 +359,7 @@ pub fn spawn_pty(
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
+        osc7_cwd: None,
     })
 }
 

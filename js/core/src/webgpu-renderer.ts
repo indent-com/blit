@@ -1,5 +1,5 @@
 import type { CellMetrics } from "./measure";
-import type { GlRenderer } from "./gl-renderer";
+import { rgbLuma, type GlRenderer } from "./gl-renderer";
 
 // ---------------------------------------------------------------------------
 // WGSL shaders
@@ -29,10 +29,18 @@ struct VOut {
 `;
 
 const GLYPH_WGSL = /* wgsl */ `
-struct Uniforms { resolution: vec2f }
+struct Uniforms {
+  resolution: vec2f,
+  // Coverage gamma, and the luminance of the default background — see the
+  // WebGL renderer's GLYPH_FS for why the adjustment is background-dependent.
+  gamma: f32,
+  bgLuma: f32,
+}
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlasTex: texture_2d<f32>;
 @group(0) @binding(2) var atlasSamp: sampler;
+
+const LUMA = vec3f(0.2126, 0.7152, 0.0722);
 
 struct VIn {
   @location(0) pos:   vec2f,
@@ -55,8 +63,10 @@ struct VOut {
   let minC = min(tex.r, min(tex.g, tex.b));
   let maxC = max(tex.r, max(tex.g, tex.b));
   let isGray = step(maxC - minC, 0.02);
-  let tinted = v.color.rgb * tex.a;
-  return vec4f(mix(tex.rgb, tinted, isGray), tex.a);
+  let lift = smoothstep(0.0, 0.35, dot(v.color.rgb, LUMA) - u.bgLuma);
+  let a = mix(tex.a, pow(tex.a, mix(1.0, u.gamma, lift)), isGray);
+  let tinted = v.color.rgb * a;
+  return vec4f(mix(tex.rgb, tinted, isGray), a);
 }
 `;
 
@@ -193,7 +203,12 @@ export async function createWebGpuRenderer(
   const glyphModule = device.createShaderModule({ code: GLYPH_WGSL });
   const glyphBindGroupLayout = device.createBindGroupLayout({
     entries: [
-      { binding: 0, visibility: STAGE_VERTEX, buffer: { type: "uniform" } },
+      {
+        binding: 0,
+        // The glyph fragment stage reads the gamma/background terms.
+        visibility: STAGE_VERTEX | STAGE_FRAGMENT,
+        buffer: { type: "uniform" },
+      },
       {
         binding: 1,
         visibility: STAGE_FRAGMENT,
@@ -237,9 +252,12 @@ export async function createWebGpuRenderer(
     },
     primitive: { topology: "triangle-list" },
   });
+  // Nearest, not linear: glyph quads blit their atlas slot 1:1 onto integer
+  // device-pixel boundaries, so filtering can only soften them. Mirrors the
+  // WebGL2 renderer.
   const sampler = device.createSampler({
-    minFilter: "linear",
-    magFilter: "linear",
+    minFilter: "nearest",
+    magFilter: "nearest",
     addressModeU: "clamp-to-edge",
     addressModeV: "clamp-to-edge",
   });
@@ -253,11 +271,14 @@ export async function createWebGpuRenderer(
   let lastAtlasCanvas: HTMLCanvasElement | null = null;
   let lastAtlasVersion = -1;
   let lost = false;
+  let textGamma = 1;
 
   device.lost.then(() => {
     lost = true;
   });
 
+  let logicalW = 0;
+  let logicalH = 0;
   const maxDim = device.limits.maxTextureDimension2D ?? 8192;
 
   // --- atlas upload ---
@@ -421,17 +442,43 @@ export async function createWebGpuRenderer(
     return rects.length > 0 ? new Float32Array(rects) : null;
   }
 
+  let disposed = false;
+
   // --- GlRenderer implementation ---
   return {
-    supported: true,
+    // Same contract as the WebGL2 renderer: once disposed this must read
+    // false so cached holders re-fetch instead of drawing through
+    // destroyed GPU resources.
+    get supported() {
+      return !disposed;
+    },
     backend: "webgpu" as const,
     maxDimension: maxDim,
+
+    setTextGamma(gamma: number) {
+      textGamma = Number.isFinite(gamma) && gamma > 0 ? gamma : 1;
+    },
 
     resize(width: number, height: number) {
       const w = Math.min(width, maxDim);
       const h = Math.min(height, maxDim);
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
+      logicalW = w;
+      logicalH = h;
+      // Grow-only, for the same reason the WebGL2 path is (see
+      // gl-renderer.ts): every pane shares this one canvas and calls
+      // resize() with its own size once per frame, and assigning
+      // canvas.width reallocates and clears the drawing buffer —
+      // measured at ~1ms. Sizing exactly cost that once per pane per
+      // frame whenever two panes differed, which during a window drag is
+      // every pane, every frame.
+      //
+      // The composite blits the top-left logicalW x logicalH sub-rect
+      // (BlitTerminalSurface.doRender), so slack beyond it is never read;
+      // render() confines drawing to that rect with a viewport and
+      // scissor, and the uniform carries the logical size so the
+      // projection is unaffected by the slack.
+      if (canvas.width < w) canvas.width = w;
+      if (canvas.height < h) canvas.height = h;
     },
 
     render(
@@ -450,11 +497,11 @@ export async function createWebGpuRenderer(
     ) {
       if (lost) return;
 
-      // Upload resolution uniform.
+      // Upload resolution + glyph coverage uniforms.
       device.queue.writeBuffer(
         uniformBuf,
         0,
-        new Float32Array([canvas.width, canvas.height]),
+        new Float32Array([logicalW, logicalH, textGamma, rgbLuma(bgColor)]),
       );
 
       // Upload atlas if needed.
@@ -514,6 +561,11 @@ export async function createWebGpuRenderer(
           },
         ],
       });
+      // WebGPU's framebuffer origin is top-left, matching the composite's
+      // sub-rect, so no slack offset is needed — unlike GL, whose viewport
+      // origin is bottom-left.
+      pass.setViewport(0, 0, logicalW, logicalH, 0, 1);
+      pass.setScissorRect(0, 0, logicalW, logicalH);
 
       // Background rects.
       if (bgVerts.length > 0 && rectVB) {
@@ -547,6 +599,7 @@ export async function createWebGpuRenderer(
     },
 
     dispose() {
+      disposed = true;
       rectVB?.destroy();
       glyphVB?.destroy();
       cursorVB?.destroy();

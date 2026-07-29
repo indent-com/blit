@@ -7,7 +7,7 @@ use blit_remote::{
     C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK,
     C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE,
-    C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_SRC_PTY,
     FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
     FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N,
@@ -15,7 +15,7 @@ use blit_remote::{
     S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg,
     msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows,
     msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_resized, msg_surface_title,
+    msg_surface_frame, msg_surface_resized, msg_surface_title, msg_term_cwd_reply,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -32,6 +32,8 @@ mod audio;
 mod audio_pw;
 mod gpu_libs;
 mod ipc;
+mod kv;
+mod net;
 mod nvenc_encode;
 mod pty;
 mod surface_encoder;
@@ -73,6 +75,13 @@ pub struct Config {
     /// `blit` invocations inside them target this server.  Off by default:
     /// `BLIT_*` is otherwise stripped from child environments.
     pub export_sock: bool,
+    /// Permit relayed streams to skip TLS certificate verification
+    /// (`NET_OPEN_INSECURE`). Right for a self-signed dev server on loopback,
+    /// wrong for anything reached across a network.
+    /// `--allow-forward` egress patterns (docs/design/net.md § Target
+    /// policy). Empty = unrestricted, the default.
+    pub allow_forward: Vec<String>,
+    pub allow_forward_insecure: bool,
 }
 
 trait PtyDriver: Send {
@@ -367,6 +376,11 @@ struct Pty {
     command: Option<String>,
     /// Explicit working directory used to create this PTY.
     cwd: Option<String>,
+    /// Working directory last reported by the shell via OSC 7, already
+    /// validated by `parse_osc7_url` (docs/protocol.md, "Working directory
+    /// tracking").  Last write wins; None until shell integration first
+    /// reports (then `C2S_TERM_CWD` falls back to the kernel's view).
+    osc7_cwd: Option<String>,
 }
 
 impl Pty {
@@ -2226,10 +2240,92 @@ fn xterm256_color(idx: u8) -> (u16, u16, u16) {
     let scale = |v: u8| (v as u16) << 8 | v as u16;
     (scale(r8), scale(g8), scale(b8))
 }
-fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> Vec<String> {
+/// Result of scanning a PTY output chunk in `parse_terminal_queries`.
+struct TerminalScan {
+    /// Query responses to write back into the PTY (DA1, DSR, OSC color
+    /// queries, ...).
+    responses: Vec<String>,
+    /// Last valid OSC 7 working-directory report in the chunk
+    /// (docs/protocol.md, "Working directory tracking"): a percent-decoded
+    /// absolute local path of at most `blit_remote::TERM_CWD_MAX` bytes.
+    osc7_cwd: Option<String>,
+}
+
+/// This machine's hostname, for filtering OSC 7 host components.  Cached
+/// because the scan runs on every PTY output chunk.
+fn local_hostname() -> &'static str {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            // Reserve the last byte: gethostname need not NUL-terminate on
+            // truncation.
+            let mut buf = [0u8; 256];
+            if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } == 0 {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+                return String::from_utf8_lossy(&buf[..end]).into_owned();
+            }
+            String::new()
+        }
+        #[cfg(not(unix))]
+        {
+            // No gethostname off unix; COMPUTERNAME covers Windows.  Empty
+            // just narrows accepted OSC 7 hosts to ""/"localhost".
+            std::env::var("COMPUTERNAME").unwrap_or_default()
+        }
+    })
+}
+
+/// Parse an OSC 7 URL (`file://<host><path>`) into a local absolute cwd.
+/// Rejects rather than guesses:
+/// - non-`file://` payloads;
+/// - hosts other than this machine (empty, "localhost", or `local_host`,
+///   ASCII-case-insensitively) — a remote-ssh shell's OSC 7 names the
+///   remote host, and its path is not a local path;
+/// - non-absolute paths (nothing after the host, or no literal `/`);
+/// - malformed percent-escapes, embedded NUL, or invalid UTF-8 after
+///   decoding;
+/// - decoded paths longer than `blit_remote::TERM_CWD_MAX` (longer than
+///   any kernel-accepted cwd; keeps the pushed message bounded).
+fn parse_osc7_url(url: &[u8], local_host: &str) -> Option<String> {
+    let rest = url.strip_prefix(b"file://")?;
+    // The path starts at the first literal '/'; a percent-encoded slash
+    // does not make a path absolute.
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (host, raw_path) = rest.split_at(slash);
+    let host_ok = host.is_empty()
+        || host.eq_ignore_ascii_case(b"localhost")
+        || (!local_host.is_empty() && host.eq_ignore_ascii_case(local_host.as_bytes()));
+    if !host_ok {
+        return None;
+    }
+    // Percent-decode: shell integrations encode non-ASCII and reserved
+    // bytes as %XX (two hex digits).
+    let mut decoded = Vec::with_capacity(raw_path.len());
+    let mut i = 0;
+    while i < raw_path.len() {
+        if raw_path[i] == b'%' {
+            let hex = raw_path.get(i + 1..i + 3)?;
+            let hi = (hex[0] as char).to_digit(16)?;
+            let lo = (hex[1] as char).to_digit(16)?;
+            decoded.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            decoded.push(raw_path[i]);
+            i += 1;
+        }
+    }
+    if decoded.len() > blit_remote::TERM_CWD_MAX || decoded.contains(&0) {
+        return None;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> TerminalScan {
     const DA1_RESPONSE: &[u8] = b"\x1b[?64;1;2;6;9;15;18;21;22c";
 
     let mut results = Vec::new();
+    let mut osc7_cwd = None;
     let mut i = 0;
     while i < data.len() {
         if data[i] != 0x1b || i + 1 >= data.len() {
@@ -2271,6 +2367,15 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
                         let (r, g, b) = xterm256_color(idx);
                         results.push(format!("\x1b]4;{idx};rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\"));
                     }
+                }
+                // OSC 7 — shell integration reports its working directory
+                // as a file:// URL at every prompt (docs/protocol.md,
+                // "Working directory tracking").  Last valid report in the
+                // chunk wins.
+                else if let Some(url) = payload.strip_prefix(b"7;")
+                    && let Some(cwd) = parse_osc7_url(url, local_hostname())
+                {
+                    osc7_cwd = Some(cwd);
                 }
                 i = end + if data[end] == 0x07 { 1 } else { 2 };
                 continue;
@@ -2326,7 +2431,39 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
             results.push(r);
         }
     }
-    results
+    TerminalScan {
+        responses: results,
+        osc7_cwd,
+    }
+}
+
+/// Record an OSC 7 report against a PTY's stored cwd; returns the
+/// `S2C_TERM_CWD_EVENT` to broadcast only when the value changed.  Shells
+/// re-emit OSC 7 at every prompt, so identical repeats must produce no
+/// traffic (docs/protocol.md, "Working directory tracking").
+fn note_osc7_cwd(stored: &mut Option<String>, pty_id: u16, cwd: Option<String>) -> Option<Vec<u8>> {
+    let cwd = cwd?;
+    if stored.as_deref() == Some(cwd.as_str()) {
+        return None;
+    }
+    let msg = blit_remote::msg_term_cwd_event(pty_id, &cwd);
+    *stored = Some(cwd);
+    Some(msg)
+}
+
+/// Working-directory precedence for `C2S_TERM_CWD` (docs/protocol.md,
+/// "Working directory tracking"): prefer the cwd the shell itself reported
+/// via OSC 7 — it is fresher (re-emitted at every prompt by the interactive
+/// shell, not whatever the kernel tracks for the immediate PTY child) and
+/// costs nothing, while the kernel fallback (`pty::pty_cwd`: /proc readlink
+/// on Linux, proc_pidinfo on macOS) is a per-request syscall that only sees
+/// the direct child.  Shells without OSC 7 integration never populate the
+/// report, so the kernel path remains the fallback.
+fn resolve_term_cwd(osc7: Option<&str>, kernel: impl FnOnce() -> Option<String>) -> Option<String> {
+    match osc7 {
+        Some(cwd) => Some(cwd.to_owned()),
+        None => kernel(),
+    }
 }
 
 async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
@@ -2471,6 +2608,14 @@ pub async fn run(config: Config) {
             pty::reap_zombies();
         }
     });
+
+    // Warm the KV store off the serving paths (docs/design/kv.md
+    // § Storage): the load+hash of the whole database happens now, in the
+    // background, instead of inline in the first connection's first KV
+    // message. BLIT_KV=0 disables the family, so nothing to warm.
+    if !std::env::var("BLIT_KV").is_ok_and(|v| v == "0") {
+        kv::warm();
+    }
 
     #[cfg(unix)]
     if let Some(channel_fd) = state.config.fd_channel {
@@ -4317,6 +4462,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .flat_map(|c| c.subscriptions.iter().copied())
         .collect();
     let mut eof_ptys: Vec<u16> = Vec::with_capacity(ids.len());
+    let mut cwd_msgs: Vec<Vec<u8>> = Vec::new();
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
@@ -4331,23 +4477,29 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             match input {
                 PtyInput::Data(data) => {
-                    pty::respond_to_queries(
+                    let osc7 = pty::respond_to_queries(
                         &pty.handle,
                         &data,
                         pty.driver.size(),
                         pty.driver.cursor_position(),
                     );
+                    if let Some(msg) = note_osc7_cwd(&mut pty.osc7_cwd, id, osc7) {
+                        cwd_msgs.push(msg);
+                    }
                     pty.driver.process(&data);
                     pty.mark_dirty();
                 }
                 PtyInput::SyncBoundary { before } => {
                     if !before.is_empty() {
-                        pty::respond_to_queries(
+                        let osc7 = pty::respond_to_queries(
                             &pty.handle,
                             &before,
                             pty.driver.size(),
                             pty.driver.cursor_position(),
                         );
+                        if let Some(msg) = note_osc7_cwd(&mut pty.osc7_cwd, id, osc7) {
+                            cwd_msgs.push(msg);
+                        }
                         pty.driver.process(&before);
                         pty.mark_dirty();
                     }
@@ -4362,6 +4514,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
         }
+    }
+    // Same fan-out as S2C_TITLE / S2C_USED_ROWS above: per-PTY state
+    // events broadcast to every connected client, not just subscribers.
+    for msg in cwd_msgs {
+        sess.send_to_all(&msg);
     }
     // Handle EOF outside the borrow loop.
     drop(sess);
@@ -4747,6 +4904,2057 @@ async fn tick(state: &AppState) -> TickOutcome {
     TickOutcome { next_deadline }
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem state sync (docs/fs-watch.md)
+//
+// FS_* messages are connection-scoped and never touch the session mutex:
+// each sync runs a `blit-fssync` engine on its own thread, delivering
+// serialized updates straight into the client's outbox channel, where the
+// sender loop's S2C_FRAGMENT chunking and audio interleaving apply as for
+// any bulk message.
+// ---------------------------------------------------------------------------
+
+struct FsSyncEntry {
+    /// Dropping the last strong reference stops the engine, which releases
+    /// its share of the root (watcher and reconciler are refcounted across
+    /// syncs). The map entry is the only long-lived strong reference; the
+    /// fetch queue holds `Weak`s, so removal still stops the engine.
+    handle: std::sync::Arc<blit_fssync::SyncHandle>,
+}
+
+/// An `FS_FETCH` waiting for an in-flight slot; the target sync is held
+/// weakly so a queued fetch never keeps a stopped engine alive.
+struct QueuedFetch {
+    nonce: u16,
+    path: String,
+    handle: std::sync::Weak<blit_fssync::SyncHandle>,
+}
+
+/// Caps `FS_FETCH`s in flight per connection, the write-family discipline
+/// (docs/design/fs-watch.md `FS_FETCH`): each fetch can read + LZ4 up to
+/// the 64 MiB protocol cap into the outbox. `FS_FILE` has no busy status
+/// code, so over-cap requests queue (bounded) instead of erroring; a slot
+/// frees when the engine's `FS_FILE` reply passes through the sync's sink.
+#[derive(Default)]
+struct FetchGate {
+    inner: std::sync::Mutex<FetchGateInner>,
+}
+
+#[derive(Default)]
+struct FetchGateInner {
+    inflight: usize,
+    queue: std::collections::VecDeque<QueuedFetch>,
+}
+
+/// `FS_FETCH`es dispatched to engines concurrently, per connection.
+const FS_FETCH_INFLIGHT: usize = 8;
+/// Fetches parked behind the in-flight cap; past this the request answers
+/// `FS_FILE_OTHER` — the family's catch-all — rather than buffering
+/// unboundedly.
+const FS_FETCH_QUEUE_MAX: usize = 256;
+
+/// Release one fetch slot and dispatch queued fetches while slots remain.
+/// A queued fetch whose sync died answers `FS_FILE_OTHER` here, keeping
+/// one reply per nonce.
+fn fetch_finish(gate: &std::sync::Arc<FetchGate>, out: &mpsc::UnboundedSender<Vec<u8>>) {
+    let mut inner = gate.inner.lock().unwrap();
+    inner.inflight = inner.inflight.saturating_sub(1);
+    while inner.inflight < FS_FETCH_INFLIGHT {
+        let Some(q) = inner.queue.pop_front() else {
+            break;
+        };
+        let dispatched = q.handle.upgrade().is_some_and(|handle| {
+            handle.command(blit_fssync::Command::Fetch {
+                nonce: q.nonce,
+                path: q.path.clone(),
+            })
+        });
+        if dispatched {
+            inner.inflight += 1;
+        } else {
+            let _ = out.send(blit_remote::fs::msg_fs_file(
+                q.nonce,
+                blit_remote::fs::FS_FILE_OTHER,
+                &[],
+            ));
+        }
+    }
+}
+
+#[derive(Default)]
+struct FsSyncs {
+    map: HashMap<u16, FsSyncEntry>,
+    next_id: u16,
+    /// Nonces of writes/ops in flight on this connection (write-family
+    /// nonce namespace). Membership dedups a duplicate nonce; the count is
+    /// the in-flight cap. Freed by the engine's `InflightGuard` on reply.
+    inflight_writes: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Nonces of `FS_INDEX` walks in flight — same discipline as
+    /// `inflight_writes`, with its own small cap: an index walk can touch
+    /// hundreds of thousands of entries, so a client only gets a couple at
+    /// a time.
+    inflight_indexes: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Nonces of `FS_SEARCH` walks in flight — the index-walk discipline
+    /// (docs/design/fs-search.md § Budgets): same candidate walk, same
+    /// cap, its own set so search and index nonce spaces stay independent.
+    inflight_searches: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    inflight_greps: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// `FS_FETCH` in-flight cap and overflow queue.
+    fetches: std::sync::Arc<FetchGate>,
+}
+
+impl FsSyncs {
+    fn alloc_id(&mut self) -> Option<u16> {
+        // Monotonic with wrap, skipping live ids and the 0xFFFF sentinel.
+        for _ in 0..=u16::MAX {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if id != blit_remote::fs::FS_SYNC_ID_INVALID && !self.map.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn max_syncs() -> usize {
+        // 128: each sync is one parked engine thread and roots are shared,
+        // so the cap is headroom, not resources — an IDE session's tree
+        // (one sync per expanded dir) plus editors plus dock previews sat
+        // uncomfortably close to 64 (docs/design/fs-watch.md budgets).
+        // Read once: this sits on the per-message path.
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_FS_MAX_SYNCS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128)
+        });
+        *V
+    }
+
+    fn max_write_inflight() -> usize {
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_FS_WRITE_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16)
+        });
+        *V
+    }
+
+    /// Reserve a nonce for an in-flight write/op. `Ok(guard)` inserts it and
+    /// returns a guard that frees the slot when dropped; `Err(status)` is
+    /// `INVALID` for a duplicate nonce or `BUDGET` when the cap is reached.
+    fn reserve_write(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_writes.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= Self::max_write_inflight() {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_writes.clone(),
+            nonce,
+        )))
+    }
+
+    /// Reserve a nonce for an in-flight `FS_INDEX` walk. Same contract as
+    /// [`FsSyncs::reserve_write`]: `INVALID` for a duplicate, `BUDGET` at
+    /// the cap.
+    fn reserve_index(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_indexes.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= 2 {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_indexes.clone(),
+            nonce,
+        )))
+    }
+
+    /// Reserve a nonce for an in-flight `FS_GREP` walk, same cap and
+    /// failure split as [`FsSyncs::reserve_index`].
+    fn reserve_grep(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_greps.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= 2 {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_greps.clone(),
+            nonce,
+        )))
+    }
+
+    /// Reserve a nonce for an in-flight `FS_SEARCH` walk — the index-walk
+    /// cap (docs/design/fs-search.md § Budgets). `FS_SEARCH.status` is the
+    /// grandfathered `FS_SYNCED` table, so both a duplicate nonce and the
+    /// cap answer `Err` and the caller maps it to `RESOURCE_LIMIT`.
+    fn reserve_search(&self, nonce: u16) -> Option<std::sync::Arc<blit_fssync::InflightGuard>> {
+        let mut set = self.inflight_searches.lock().unwrap();
+        if set.contains(&nonce) || set.len() >= 2 {
+            return None;
+        }
+        set.insert(nonce);
+        Some(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_searches.clone(),
+            nonce,
+        )))
+    }
+}
+
+// ── FS_GREP: project-wide content search (docs/design/fs-grep.md) ──────────
+
+/// The only real bound on a grep response: the records buffer must stay
+/// under the protocol's LZ4 decompression cap (`FS_MAX_DECOMPRESSED`,
+/// 64 MiB), with the same headroom `FS_INDEX` leaves. There is deliberately
+/// no match-count budget — a search that says "3 results" when there are
+/// four is worse than a slow one, so the only thing allowed to stop it is
+/// running out of wire.
+const FS_GREP_MAX_RECORD_BYTES: usize = 48 * 1024 * 1024;
+
+/// Records one file may contribute. Not a guessed number: a FILE record
+/// carries its match count in a `u16` (docs/design/fs-grep.md), so past
+/// this the count on the wire would wrap and a client grouping by it would
+/// mis-associate every later match. It also bounds what one dense file
+/// holds in memory before the byte budget below gets a look at it.
+const FS_GREP_MAX_PER_FILE: usize = u16::MAX as usize;
+
+/// Files opened per walk (docs/design/fs-grep.md "Budgets"). Sets
+/// `TRUNCATED`: unlike the binary and size sniffs, a file we declined to
+/// open may well have held matches.
+const FS_GREP_MAX_FILES: usize = 1_000_000;
+
+/// Per-record wire overhead used for budget accounting: length prefix,
+/// kind byte and the four position fields. Deliberately a rough
+/// over-estimate — the budget exists to stop before the wire cap, and
+/// stopping a little early is the safe direction.
+const FS_GREP_RECORD_OVERHEAD: usize = 24;
+
+/// Largest file read. Past this a file is *out of scope* rather than
+/// clipped — the same status as a binary or as `.git`, and so not a
+/// truncation. Sized to hold any hand-written source file.
+const FS_GREP_MAX_FILE: u64 = 64 * 1024 * 1024;
+
+/// Bytes sniffed for NUL before deciding a file is binary.
+const FS_GREP_SNIFF: usize = 8192;
+
+/// Truncate `text` to at most `cap` bytes on a char boundary.
+fn fs_grep_clip_to(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Read a file for searching, or `None` when it is not searchable text.
+///
+/// Sniffs the first [`FS_GREP_SNIFF`] bytes for NUL before reading the
+/// rest, so an unpruned walk meeting a tree full of build artifacts pays
+/// 8 KiB per binary instead of its whole length. Bytes, not `String`: the
+/// search runs on raw bytes, so there is no lossy-UTF-8 copy of every file.
+fn fs_grep_read_text(abs: &std::path::Path, size: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if size > FS_GREP_MAX_FILE {
+        return None;
+    }
+    let mut file = std::fs::File::open(abs).ok()?;
+    let mut buf = vec![0u8; FS_GREP_SNIFF.min(size as usize)];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(filled);
+    if buf.contains(&0) {
+        return None;
+    }
+    file.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Find matches in one file's bytes — one record per *match*, not per
+/// line, so a line containing the query twice yields two results and
+/// clicking either lands on the one you clicked.
+///
+/// Searches the *whole buffer* and maps match offsets back to lines, rather
+/// than running the regex once per line. That is most of the gap to `rg`:
+/// the regex crate's literal prefilters (memchr, Teddy) only get to skip
+/// ahead when handed a large haystack, and feeding them one short line at a
+/// time throws that away along with the per-call overhead.
+fn fs_grep_hits(
+    re: &regex::bytes::Regex,
+    bytes: &[u8],
+    max_per_file: usize,
+    budget: &std::sync::atomic::AtomicUsize,
+) -> (Vec<blit_remote::fs::FsGrepRecord>, bool) {
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    // Record bytes produced but not yet added to the walk-wide budget.
+    // Charging per match would put every walk thread on one cache line,
+    // and charging once per *file* — which is what the walk used to do —
+    // means a pattern matching every byte of a large file builds gigabytes
+    // of records before anything notices. A chunk of slack per thread is
+    // the whole cost of noticing in time.
+    const PUBLISH_CHUNK: usize = 64 * 1024;
+    let mut unpublished = 0usize;
+    // Matches arrive in increasing offset order, so one forward cursor over
+    // the newlines is enough to number them all. It stays on the match's
+    // *first* line, which is where the next match's scan resumes from.
+    let mut line_start = 0usize;
+    let mut line = 0u32;
+    for m in re.find_iter(bytes) {
+        if hits.len() >= max_per_file {
+            truncated = true;
+            break;
+        }
+        // Advance to the line holding this match. Two matches on one line
+        // find no newline between them, which is what gives them the same
+        // line number without special-casing.
+        while let Some(off) = memchr::memchr(b'\n', &bytes[line_start..m.start()]) {
+            line_start += off + 1;
+            line += 1;
+        }
+        // A pattern containing \n matches across lines. Report the range
+        // the way an LSP range would, and carry *every* line it spans so
+        // the client can show the whole match rather than its first line.
+        let mut end_line = line;
+        let mut last_line_start = line_start;
+        for off in memchr::memchr_iter(b'\n', &bytes[m.start()..m.end()]) {
+            end_line += 1;
+            last_line_start = m.start() + off + 1;
+        }
+        let block_end = memchr::memchr(b'\n', &bytes[m.end()..])
+            .map(|o| m.end() + o)
+            .unwrap_or(bytes.len());
+        // The cap is per line spanned, so a multi-line match is not clipped
+        // to the budget of a single one, with an absolute ceiling so a
+        // pathological pattern cannot ship a megabyte.
+        let spanned = (end_line - line) as usize + 1;
+        let cap = blit_remote::fs::FS_GREP_MAX_LINE
+            .saturating_mul(spanned)
+            .min(8192);
+        let text = String::from_utf8_lossy(&bytes[line_start..block_end]);
+        let text = fs_grep_clip_to(&text, cap).to_string();
+        unpublished += text.len() + FS_GREP_RECORD_OVERHEAD;
+        hits.push(blit_remote::fs::FsGrepRecord::Match {
+            line,
+            col: (m.start() - line_start) as u32,
+            end_line,
+            end_col: (m.end() - last_line_start) as u32,
+            text,
+        });
+        if unpublished >= PUBLISH_CHUNK {
+            let total =
+                budget.fetch_add(unpublished, std::sync::atomic::Ordering::Relaxed) + unpublished;
+            unpublished = 0;
+            if total >= FS_GREP_MAX_RECORD_BYTES {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    budget.fetch_add(unpublished, std::sync::atomic::Ordering::Relaxed);
+    (hits, truncated)
+}
+
+/// One file's results, held until both passes are ordered.
+type GrepHit = (String, Vec<blit_remote::fs::FsGrepRecord>);
+
+/// Walk and search one pass in parallel. `skip` excludes paths an earlier
+/// pass already covered. Returns per-file hits, every relative path the
+/// walk yielded, and whether it stopped early.
+fn fs_grep_pass(
+    root: &std::path::Path,
+    re: &regex::bytes::Regex,
+    max_per_file: usize,
+    use_ignores: bool,
+    skip: Option<&std::collections::HashSet<String>>,
+    budget: &std::sync::atomic::AtomicUsize,
+    opened: &std::sync::atomic::AtomicUsize,
+) -> (Vec<GrepHit>, Vec<String>, bool) {
+    use ignore::{WalkBuilder, WalkState};
+    use std::sync::atomic::Ordering;
+
+    let hits: std::sync::Mutex<Vec<GrepHit>> = std::sync::Mutex::new(Vec::new());
+    let seen: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        // `.git` is an object database, not source: nothing a textual query
+        // can usefully match, and on a real repo it dwarfs the tree.
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"));
+    if !use_ignores {
+        builder.standard_filters(false);
+    }
+
+    builder.build_parallel().run(|| {
+        Box::new(|entry| {
+            let Ok(entry) = entry else {
+                return WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return WalkState::Continue;
+            }
+            if budget.load(Ordering::Relaxed) >= FS_GREP_MAX_RECORD_BYTES
+                || opened.fetch_add(1, Ordering::Relaxed) >= FS_GREP_MAX_FILES
+            {
+                stopped.store(true, Ordering::Relaxed);
+                return WalkState::Quit;
+            }
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                return WalkState::Continue;
+            };
+            if rel.as_os_str().is_empty() {
+                return WalkState::Continue;
+            }
+            let rel = rel.to_string_lossy().into_owned();
+            if skip.is_some_and(|s| s.contains(&rel)) {
+                return WalkState::Continue;
+            }
+            if skip.is_none() {
+                seen.lock().unwrap().push(rel.clone());
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let Some(bytes) = fs_grep_read_text(entry.path(), size) else {
+                return WalkState::Continue;
+            };
+            // `fs_grep_hits` charges the budget as it matches, so a file
+            // that matches millions of times stops partway rather than
+            // after the fact.
+            let (found, clipped) = fs_grep_hits(re, &bytes, max_per_file, budget);
+            if clipped {
+                stopped.store(true, Ordering::Relaxed);
+            }
+            if found.is_empty() {
+                return WalkState::Continue;
+            }
+            budget.fetch_add(rel.len() + FS_GREP_RECORD_OVERHEAD, Ordering::Relaxed);
+            hits.lock().unwrap().push((rel, found));
+            WalkState::Continue
+        })
+    });
+
+    (
+        hits.into_inner().unwrap(),
+        seen.into_inner().unwrap(),
+        stopped.into_inner(),
+    )
+}
+
+/// Two-phase content walk: every tracked (non-ignored) file first, then the
+/// ignored ones. Ignore rules rank here rather than filter
+/// (docs/design/fs-grep.md), and running the passes in order is what makes
+/// the ordering fall out of the traversal instead of a sort over everything.
+///
+/// Each pass is `ignore`'s parallel walker, searching on the walk threads.
+/// The tracked pass leaves its standard filters on, so it never descends
+/// into `target/`; the ignored pass turns them off and skips what the first
+/// already covered. Set membership, not a per-path ignore matcher —
+/// `IncrementalIgnore` documents itself as too slow to drive a traversal,
+/// and on a 56 GB tree it was the whole cost.
+///
+/// The bool is `truncated`, and it means exactly one thing: matches existed
+/// that are not in this response. Files skipped as binary or oversized are
+/// *out of scope*, not clipped, so they do not set it — otherwise any tree
+/// with a `target/` in it would report every search as incomplete.
+fn fs_grep_walk(
+    root: &std::path::Path,
+    re: &regex::bytes::Regex,
+    max_matches: usize,
+    max_per_file: usize,
+    no_ignore: bool,
+) -> (Vec<u8>, bool) {
+    let budget = std::sync::atomic::AtomicUsize::new(0);
+    // Per walk, not per pass: the second pass reopens nothing the first
+    // covered, so the two share one allowance.
+    let opened = std::sync::atomic::AtomicUsize::new(0);
+    let (mut tracked, seen, trunc_a) =
+        fs_grep_pass(root, re, max_per_file, true, None, &budget, &opened);
+    // The ignored pass is the expensive half: it is the one that descends
+    // into `target/`. Off by default, so an ordinary search costs the
+    // tracked walk alone.
+    let (mut ignored, trunc_b) = if no_ignore {
+        let tracked_paths: std::collections::HashSet<String> = seen.into_iter().collect();
+        let (hits, _, t) = fs_grep_pass(
+            root,
+            re,
+            max_per_file,
+            false,
+            Some(&tracked_paths),
+            &budget,
+            &opened,
+        );
+        (hits, t)
+    } else {
+        (Vec::new(), false)
+    };
+    let mut truncated = trunc_a || trunc_b;
+
+    tracked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    ignored.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut buf = Vec::new();
+    let mut matched_files = 0usize;
+    'outer: for (is_ignored, files) in [(false, &tracked), (true, &ignored)] {
+        for (rel, found) in files {
+            if max_matches != 0 && matched_files >= max_matches {
+                truncated = true;
+                break 'outer;
+            }
+            matched_files += 1;
+            blit_remote::fs::append_fs_grep_record(
+                &mut buf,
+                &blit_remote::fs::FsGrepRecord::File {
+                    flags: if is_ignored {
+                        blit_remote::fs::FS_GREP_FILE_IGNORED
+                    } else {
+                        0
+                    },
+                    // Exact: FS_GREP_MAX_PER_FILE is this field's own
+                    // ceiling, so the count never wraps.
+                    n: found.len() as u16,
+                    path: rel.clone(),
+                },
+            );
+            for h in found {
+                blit_remote::fs::append_fs_grep_record(&mut buf, h);
+            }
+            if buf.len() >= FS_GREP_MAX_RECORD_BYTES {
+                truncated = true;
+                break 'outer;
+            }
+        }
+    }
+    (buf, truncated)
+}
+
+/// Fuzzy match `needle` (already lowercased chars) against `hay`, whose
+/// lowercased chars the caller supplies in `hay_lc` (a reused buffer — one
+/// walk scores hundreds of thousands of candidates, so the per-candidate
+/// `Vec` allocation is hoisted out); higher is better. Every needle char
+/// must appear in order; contiguity, being in the basename, and a shorter
+/// overall path all score higher. `None` = no match.
+fn fuzzy_score(hay: &str, hay_lc: &[char], needle: &[char]) -> Option<i64> {
+    if needle.is_empty() {
+        return Some(-(hay_lc.len() as i64));
+    }
+    let base_start = match hay.rfind('/') {
+        Some(i) => hay[..i].chars().count() + 1,
+        None => 0,
+    };
+    let mut ni = 0usize;
+    let mut score = 0i64;
+    let mut last: Option<usize> = None;
+    for (i, &hc) in hay_lc.iter().enumerate() {
+        if ni >= needle.len() {
+            break;
+        }
+        if hc == needle[ni] {
+            score += 10;
+            if last == Some(i.wrapping_sub(1)) {
+                score += 15; // contiguous run
+            }
+            if i >= base_start {
+                score += 8; // match lands in the basename
+            }
+            last = Some(i);
+            ni += 1;
+        }
+    }
+    if ni == needle.len() {
+        Some(score - hay_lc.len() as i64)
+    } else {
+        None
+    }
+}
+
+/// Entry budget for index/search walks (`BLIT_FS_INDEX_MAX`), counted over
+/// files the ignore rules let through. Clamped to the protocol's
+/// `FS_INDEX_MAX_COUNT` so a raised env can't emit an unparseable count.
+fn fs_index_max_entries() -> usize {
+    std::env::var("BLIT_FS_INDEX_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400_000)
+        .min(blit_remote::fs::FS_INDEX_MAX_COUNT)
+}
+
+/// Raw-bytes budget for an index payload, kept well under the protocol's
+/// 64 MiB decompression cap (docs/protocol.md).
+const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
+
+/// Recursively list candidate file paths (root-relative, sorted) under
+/// `root`, honoring gitignore rules — walking `.gitignore`d build output
+/// out of search is what keeps the list small enough to ship. `.git`
+/// itself is always pruned; other dotfiles are candidates. Returns the
+/// list plus whether a budget truncated it.
+///
+/// A tree whose *filtered* walk comes back empty (a parent `.gitignore`
+/// with a bare `*` — the dotfiles-repo-at-$HOME pattern — blanks every
+/// non-repo subtree) falls back to an ignore-free walk: an empty index
+/// would otherwise read as "no files here" and never consult the server.
+fn fs_index_walk(root: &std::path::Path, max_entries: usize) -> (Vec<String>, bool) {
+    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true);
+    if paths.is_empty() && !truncated {
+        return fs_index_walk_inner(root, max_entries, false);
+    }
+    (paths, truncated)
+}
+
+fn fs_index_walk_inner(
+    root: &std::path::Path,
+    max_entries: usize,
+    use_ignores: bool,
+) -> (Vec<String>, bool) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    // Yielded-entry budget (directories included), so a directory-heavy
+    // tree stays bounded like the pre-index walk was. Entries the ignore
+    // rules suppress never surface here — that inner I/O is the one cost
+    // this budget cannot see (docs/design/fs-search.md deferred list).
+    let mut work = 0usize;
+    let work_budget = max_entries.saturating_mul(4);
+    let mut truncated = false;
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"));
+    if !use_ignores {
+        builder.standard_filters(false);
+    }
+    for entry in builder.build().flatten() {
+        work += 1;
+        if work > work_budget {
+            truncated = true;
+            break;
+        }
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue; // the root itself, when it is a file
+        }
+        // Truncation is exact: it fires only when a file would be dropped,
+        // never on a trailing directory after the last counted file.
+        if paths.len() >= max_entries || bytes >= FS_INDEX_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        let rel = rel.to_string_lossy().into_owned();
+        bytes += 2 + rel.len();
+        paths.push(rel);
+    }
+    paths.sort_unstable();
+    (paths, truncated)
+}
+
+/// Walk `root` and return up to `limit` file paths (root-relative)
+/// fuzzy-matching `query`, best first. Same candidate set as `FS_INDEX` —
+/// this is the server-side fallback for clients without a local index.
+fn fs_search_walk(root: &str, query: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let needle: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+    let (paths, _) = fs_index_walk(std::path::Path::new(root), fs_index_max_entries());
+    let mut hay_lc: Vec<char> = Vec::new();
+    let mut scored: Vec<(i64, String)> = paths
+        .into_iter()
+        .filter_map(|p| {
+            hay_lc.clear();
+            hay_lc.extend(p.chars().flat_map(|c| c.to_lowercase()));
+            fuzzy_score(&p, &hay_lc, &needle).map(|s| (s, p))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+    scored.truncate(limit);
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+async fn handle_fs_message(
+    data: &[u8],
+    syncs: &mut FsSyncs,
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    verbose: bool,
+) {
+    use blit_fssync::{OpReq, WriteReq};
+    use blit_remote::fs::{
+        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_SEARCH, C2S_FS_STOP,
+        C2S_FS_SYNC, C2S_FS_WRITE, FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER,
+        FS_DONE_PERMISSION, FS_DONE_WRONG_TYPE, FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK,
+        FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT, FS_SYNC_CONTENT, FS_SYNC_CROSS_FILESYSTEM,
+        FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid, msg_fs_done,
+        msg_fs_file, msg_fs_index_result, msg_fs_search_result, msg_fs_synced, parse_fs_index,
+        parse_fs_op, parse_fs_search, parse_fs_write,
+    };
+    match data[0] {
+        C2S_FS_SEARCH => {
+            // Path-based fuzzy file search — no sync. Walk off-thread so the
+            // connection loop never blocks on a large tree, capped like the
+            // index walks it shares a candidate set with
+            // (docs/design/fs-search.md § Budgets).
+            if let Some((nonce, limit, root, query)) = parse_fs_search(data) {
+                let Some(guard) = syncs.reserve_search(nonce) else {
+                    let _ = out.send(msg_fs_search_result(nonce, FS_STATUS_RESOURCE_LIMIT, &[]));
+                    return;
+                };
+                let out = out.clone();
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    let paths = fs_search_walk(&root, &query, limit as usize);
+                    let _ = out.send(msg_fs_search_result(nonce, FS_STATUS_OK, &paths));
+                });
+            }
+        }
+        C2S_FS_GREP => {
+            // Project-wide content search (docs/design/fs-grep.md) — no
+            // sync. Same off-thread shape and in-flight cap as the index
+            // walk it shares a tree with.
+            if let Some((nonce, flags, max_matches, max_per_file, root, query)) =
+                blit_remote::fs::parse_fs_grep(data)
+            {
+                let reply = |status: u8, detail: &str| {
+                    blit_remote::fs::msg_fs_grep_result(nonce, status, 0, detail, &[])
+                };
+                if flags & !blit_remote::fs::FS_GREP_FLAGS_KNOWN != 0 {
+                    let _ = out.send(reply(FS_DONE_INVALID, "unknown flags"));
+                    return;
+                }
+                // An empty pattern matches every line of every file and is
+                // never what anyone meant.
+                if query.is_empty() {
+                    let _ = out.send(reply(FS_DONE_INVALID, "empty query"));
+                    return;
+                }
+                // Literal mode escapes; case-insensitive is the default.
+                // Same semantics as `blit terminal grep`, so the CLI and the
+                // UI agree on what a query means.
+                let mut pattern = if flags & blit_remote::fs::FS_GREP_REGEX != 0 {
+                    query.clone()
+                } else {
+                    regex::escape(&query)
+                };
+                // Applied after escaping, so whole-word composes with
+                // literal mode as well as regex mode.
+                if flags & blit_remote::fs::FS_GREP_WORD != 0 {
+                    pattern = format!(r"\b(?:{pattern})\b");
+                }
+                let re = match regex::bytes::RegexBuilder::new(&pattern)
+                    .case_insensitive(flags & blit_remote::fs::FS_GREP_CASE_SENSITIVE == 0)
+                    .build()
+                {
+                    Ok(re) => re,
+                    // The engine's own message is the only useful thing to
+                    // show someone mid-typing.
+                    Err(err) => {
+                        let _ = out.send(reply(FS_DONE_INVALID, &err.to_string()));
+                        return;
+                    }
+                };
+                let guard = match syncs.reserve_grep(nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(reply(status, ""));
+                        return;
+                    }
+                };
+                // Zero means unlimited on both, and unlimited is the
+                // default: the response is bounded by what the wire can
+                // carry, not by a number someone guessed.
+                let max_matches = max_matches as usize;
+                let max_per_file = if max_per_file == 0 {
+                    FS_GREP_MAX_PER_FILE
+                } else {
+                    (max_per_file as usize).min(FS_GREP_MAX_PER_FILE)
+                };
+                let out = out.clone();
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    let io_status = |err: &std::io::Error| match err.kind() {
+                        std::io::ErrorKind::NotFound => FS_DONE_NOT_FOUND,
+                        std::io::ErrorKind::PermissionDenied => FS_DONE_PERMISSION,
+                        _ => FS_DONE_OTHER,
+                    };
+                    let fail =
+                        |status: u8| blit_remote::fs::msg_fs_grep_result(nonce, status, 0, "", &[]);
+                    let msg = match std::fs::canonicalize(&root) {
+                        Ok(canon) if !canon.is_dir() => fail(FS_DONE_WRONG_TYPE),
+                        // Readability probe, as FS_INDEX does: canonicalize
+                        // succeeds on a mode-000 dir and the walker swallows
+                        // the EACCES, which would read as "no matches here".
+                        Ok(canon) => match std::fs::read_dir(&canon) {
+                            Err(err) => fail(io_status(&err)),
+                            Ok(_) => {
+                                let (records, truncated) = fs_grep_walk(
+                                    &canon,
+                                    &re,
+                                    max_matches,
+                                    max_per_file,
+                                    flags & blit_remote::fs::FS_GREP_NO_IGNORE != 0,
+                                );
+                                let rflags = if truncated {
+                                    blit_remote::fs::FS_GREP_TRUNCATED
+                                } else {
+                                    0
+                                };
+                                blit_remote::fs::msg_fs_grep_result(
+                                    nonce, FS_DONE_OK, rflags, "", &records,
+                                )
+                            }
+                        },
+                        Err(err) => fail(io_status(&err)),
+                    };
+                    let _ = out.send(msg);
+                });
+            }
+        }
+        C2S_FS_INDEX => {
+            // Candidate list for client-side fuzzy search
+            // (docs/design/fs-search.md) — no sync. Walk off-thread, capped
+            // by `reserve_index` so a client can't stack up walks.
+            if let Some((nonce, flags, root)) = parse_fs_index(data) {
+                if flags != 0 {
+                    let _ = out.send(msg_fs_index_result(nonce, FS_DONE_INVALID, 0, &[]));
+                    return;
+                }
+                let guard = match syncs.reserve_index(nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(msg_fs_index_result(nonce, status, 0, &[]));
+                        return;
+                    }
+                };
+                let out = out.clone();
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    let io_status = |err: &std::io::Error| match err.kind() {
+                        std::io::ErrorKind::NotFound => FS_DONE_NOT_FOUND,
+                        std::io::ErrorKind::PermissionDenied => FS_DONE_PERMISSION,
+                        _ => FS_DONE_OTHER,
+                    };
+                    let msg = match std::fs::canonicalize(&root) {
+                        Ok(canon) if !canon.is_dir() => {
+                            msg_fs_index_result(nonce, FS_DONE_WRONG_TYPE, 0, &[])
+                        }
+                        // Probe readability: canonicalize succeeds on a
+                        // mode-000 dir (it only needs parent search perms)
+                        // and the walker swallows the EACCES, which would
+                        // read as an authoritative "no files here".
+                        Ok(canon) => match std::fs::read_dir(&canon) {
+                            Err(err) => msg_fs_index_result(nonce, io_status(&err), 0, &[]),
+                            Ok(_) => {
+                                let (paths, truncated) =
+                                    fs_index_walk(&canon, fs_index_max_entries());
+                                let flags = if truncated { FS_INDEX_TRUNCATED } else { 0 };
+                                msg_fs_index_result(nonce, FS_DONE_OK, flags, &paths)
+                            }
+                        },
+                        Err(err) => msg_fs_index_result(nonce, io_status(&err), 0, &[]),
+                    };
+                    let _ = out.send(msg);
+                });
+            }
+        }
+        C2S_FS_SYNC if data.len() >= 12 => {
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let flags = data[3];
+            let latency_ms = u16::from_le_bytes([data[4], data[5]]);
+            let inline_max = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
+            let path_len = u16::from_le_bytes([data[10], data[11]]) as usize;
+            let refuse = |status: u8, detail: &str| {
+                let _ = out.send(msg_fs_synced(nonce, FS_SYNC_ID_INVALID, status, detail));
+            };
+            let Some(path_bytes) = data.get(12..12 + path_len) else {
+                refuse(FS_STATUS_OTHER, "truncated request");
+                return;
+            };
+            let Ok(path) = std::str::from_utf8(path_bytes) else {
+                refuse(FS_STATUS_OTHER, "path is not UTF-8");
+                return;
+            };
+            const KNOWN: u8 =
+                FS_SYNC_RECURSIVE | FS_SYNC_CONTENT | FS_SYNC_CROSS_FILESYSTEM | FS_SYNC_SINGLE;
+            if flags & !KNOWN != 0 {
+                refuse(FS_STATUS_OTHER, "unknown flags");
+                return;
+            }
+            if !fs_sync_flags_valid(flags) {
+                refuse(FS_STATUS_OTHER, "single sync cannot be recursive");
+                return;
+            }
+            // Reap entries whose engine exited on its own (root gone,
+            // resource limit, backend failure): the client got their
+            // FS_CLOSED but never sent FS_STOP, so their slots would
+            // otherwise leak against the budget until disconnect.
+            syncs.map.retain(|_, entry| !entry.handle.is_done());
+            if syncs.map.len() >= FsSyncs::max_syncs() {
+                refuse(FS_STATUS_RESOURCE_LIMIT, "sync limit reached");
+                return;
+            }
+            let recursive = flags & FS_SYNC_RECURSIVE != 0;
+            let cross_filesystem = flags & FS_SYNC_CROSS_FILESYSTEM != 0;
+            let single = flags & FS_SYNC_SINGLE != 0;
+            // Canonicalize and join (or create) the shared root — one
+            // native watcher and one canonical index per root, shared
+            // across every sync of it — off the runtime: arming a
+            // recursive watcher walks the tree on Linux, seconds on a big
+            // root. The read loop awaits, so this connection's messages
+            // stay strictly ordered (FS_SYNCED before the first
+            // FS_UPDATE, and no later FS_* can observe a half-open sync);
+            // only the worker thread is freed for other connections.
+            let path_owned = path.to_string();
+            let opened = tokio::task::spawn_blocking(move || {
+                if single {
+                    let root = blit_fssync::validate_single_root(&path_owned)?;
+                    let shared = blit_fssync::open_single_root(root.clone())?;
+                    Ok((root, shared))
+                } else {
+                    let root = blit_fssync::validate_root(&path_owned)?;
+                    let shared = blit_fssync::open_root(blit_fssync::RootKey {
+                        path: root.clone(),
+                        recursive,
+                        cross_filesystem,
+                    })?;
+                    Ok((root, shared))
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Err((FS_STATUS_OTHER, "open task failed".to_string())));
+            let (root, shared) = match opened {
+                Ok(opened) => opened,
+                Err((status, detail)) => {
+                    refuse(status, &detail);
+                    return;
+                }
+            };
+            let Some(sync_id) = syncs.alloc_id() else {
+                refuse(FS_STATUS_RESOURCE_LIMIT, "no sync ids left");
+                return;
+            };
+            let mut opts = blit_fssync::SyncOptions {
+                recursive,
+                content: flags & FS_SYNC_CONTENT != 0,
+                cross_filesystem,
+                ..Default::default()
+            };
+            if latency_ms != 0 {
+                opts.latency = Duration::from_millis(u64::from(latency_ms).clamp(1, 1000));
+            }
+            if inline_max != 0 {
+                // Never above the protocol's decompressed cap: an inlined file
+                // rides an FS_UPDATE a client refuses past FS_MAX_DECOMPRESSED.
+                opts.inline_max =
+                    u64::from(inline_max).min(blit_remote::fs::FS_MAX_DECOMPRESSED as u64);
+            }
+            if verbose {
+                eprintln!(
+                    "C2S_FS_SYNC: sync_id={sync_id} root={} recursive={recursive} content={}",
+                    root.display(),
+                    opts.content
+                );
+            }
+            // FS_SYNCED must precede the first FS_UPDATE on the wire; the
+            // outbox is FIFO, so sending before the engine spawns suffices.
+            let _ = out.send(msg_fs_synced(
+                nonce,
+                sync_id,
+                FS_STATUS_OK,
+                &blit_fssync::escape_path(&root),
+            ));
+            // The sink watches for FS_FILE replies to free fetch slots
+            // (and dispatch queued fetches): the engine is the only
+            // producer of them, so every reply pairs with one dispatched
+            // Command::Fetch.
+            let engine_out = out.clone();
+            let gate = syncs.fetches.clone();
+            let gate_out = out.clone();
+            let handle = blit_fssync::start_sync(
+                &shared,
+                sync_id,
+                opts,
+                Box::new(move |msg| {
+                    let is_file_reply = msg.first() == Some(&blit_remote::fs::S2C_FS_FILE);
+                    let sent = engine_out.send(msg).is_ok();
+                    if is_file_reply {
+                        fetch_finish(&gate, &gate_out);
+                    }
+                    sent
+                }),
+            );
+            syncs.map.insert(
+                sync_id,
+                FsSyncEntry {
+                    handle: std::sync::Arc::new(handle),
+                },
+            );
+        }
+        C2S_FS_STOP if data.len() >= 3 => {
+            let sync_id = u16::from_le_bytes([data[1], data[2]]);
+            // The Stop command is queued before the entry (and with it the
+            // channel senders) drops, so the engine still sees it and
+            // answers FS_CLOSED(client request). Unknown ids are a no-op.
+            if let Some(entry) = syncs.map.remove(&sync_id) {
+                entry.handle.command(blit_fssync::Command::Stop);
+            }
+        }
+        C2S_FS_ACK if data.len() >= 7 => {
+            let sync_id = u16::from_le_bytes([data[1], data[2]]);
+            let update_id = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+            if let Some(entry) = syncs.map.get(&sync_id) {
+                entry.handle.command(blit_fssync::Command::Ack(update_id));
+            }
+        }
+        C2S_FS_FETCH if data.len() >= 7 => {
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let sync_id = u16::from_le_bytes([data[3], data[4]]);
+            let path_len = u16::from_le_bytes([data[5], data[6]]) as usize;
+            let path = data
+                .get(7..7 + path_len)
+                .and_then(|b| std::str::from_utf8(b).ok());
+            match (path, syncs.map.get(&sync_id)) {
+                (Some(path), Some(entry)) => {
+                    // In-flight cap (write-family discipline): dispatch when
+                    // a slot is free, queue (bounded) otherwise — FS_FILE has
+                    // no busy status, so over-cap must not error. Queued
+                    // fetches dispatch as replies free slots (`fetch_finish`
+                    // in the sync sink), and a queued fetch whose sync died
+                    // is answered there, keeping one reply per nonce.
+                    let mut gate = syncs.fetches.inner.lock().unwrap();
+                    if gate.inflight < FS_FETCH_INFLIGHT {
+                        gate.inflight += 1;
+                        drop(gate);
+                        // A false return means the engine already exited on
+                        // its own (root gone, backend failure) but the entry
+                        // has not been reaped yet: answer here so the nonce
+                        // still gets its one FS_FILE reply.
+                        let sent = entry.handle.command(blit_fssync::Command::Fetch {
+                            nonce,
+                            path: path.to_string(),
+                        });
+                        if !sent {
+                            let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
+                            fetch_finish(&syncs.fetches, out);
+                        }
+                    } else if gate.queue.len() >= FS_FETCH_QUEUE_MAX {
+                        drop(gate);
+                        let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
+                    } else {
+                        gate.queue.push_back(QueuedFetch {
+                            nonce,
+                            path: path.to_string(),
+                            handle: std::sync::Arc::downgrade(&entry.handle),
+                        });
+                    }
+                }
+                _ => {
+                    let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
+                }
+            }
+        }
+        C2S_FS_WRITE => {
+            // The engine replies one FS_DONE; a malformed request, an unknown
+            // sync, a duplicate nonce, or an over-cap request answers here
+            // (docs/design/fs-write.md).
+            match parse_fs_write(data) {
+                Some(w) => {
+                    if !syncs.map.contains_key(&w.sync_id) {
+                        let _ = out.send(msg_fs_done(w.nonce, FS_DONE_INVALID, 0, 0));
+                        return;
+                    }
+                    let inflight = match syncs.reserve_write(w.nonce) {
+                        Ok(guard) => guard,
+                        Err(status) => {
+                            let _ = out.send(msg_fs_done(w.nonce, status, 0, 0));
+                            return;
+                        }
+                    };
+                    if let Some(entry) = syncs.map.get(&w.sync_id) {
+                        // A false return means the engine exited on its own
+                        // but was not reaped yet; answer the nonce here (the
+                        // dropped WriteReq releases its in-flight slot).
+                        let sent = entry.handle.command(blit_fssync::Command::Write(WriteReq {
+                            nonce: w.nonce,
+                            path: w.path,
+                            base: w.base,
+                            mode: w.mode,
+                            flags: w.flags,
+                            content_kind: w.content_kind,
+                            content: w.content,
+                            inflight: Some(inflight),
+                        }));
+                        if !sent {
+                            let _ = out.send(msg_fs_done(w.nonce, FS_DONE_INVALID, 0, 0));
+                        }
+                    }
+                }
+                None => {
+                    // Recover the nonce for a best-effort reply if we can.
+                    let nonce = data
+                        .get(1..3)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0);
+                    let _ = out.send(msg_fs_done(nonce, FS_DONE_INVALID, 0, 0));
+                }
+            }
+        }
+        C2S_FS_OP => match parse_fs_op(data) {
+            Some(o) => {
+                if !syncs.map.contains_key(&o.sync_id) {
+                    let _ = out.send(msg_fs_done(o.nonce, FS_DONE_INVALID, 0, 0));
+                    return;
+                }
+                let inflight = match syncs.reserve_write(o.nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(msg_fs_done(o.nonce, status, 0, 0));
+                        return;
+                    }
+                };
+                if let Some(entry) = syncs.map.get(&o.sync_id) {
+                    // A false return means the engine exited on its own but
+                    // was not reaped yet; answer the nonce here (the dropped
+                    // OpReq releases its in-flight slot).
+                    let sent = entry.handle.command(blit_fssync::Command::Op(OpReq {
+                        nonce: o.nonce,
+                        op: o.op,
+                        a: o.a,
+                        b: o.b,
+                        base: o.base,
+                        mode: o.mode,
+                        flags: o.flags,
+                        inflight: Some(inflight),
+                    }));
+                    if !sent {
+                        let _ = out.send(msg_fs_done(o.nonce, FS_DONE_INVALID, 0, 0));
+                    }
+                }
+            }
+            None => {
+                let nonce = data
+                    .get(1..3)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .unwrap_or(0);
+                let _ = out.send(msg_fs_done(nonce, FS_DONE_INVALID, 0, 0));
+            }
+        },
+        // A frame too short to clear the length guards above still carries a
+        // nonce for these read opcodes: recover it and reply, so the request
+        // is not left hanging (mirrors the FS_WRITE/FS_OP recovery).
+        C2S_FS_SYNC => {
+            let nonce = data
+                .get(1..3)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let _ = out.send(msg_fs_synced(
+                nonce,
+                FS_SYNC_ID_INVALID,
+                FS_STATUS_OTHER,
+                "truncated request",
+            ));
+        }
+        C2S_FS_FETCH => {
+            let nonce = data
+                .get(1..3)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Git introspection (docs/git.md)
+//
+// GIT_* messages are connection-scoped and never touch the session mutex:
+// each opened repo gets a `blit-git` state engine on its own thread, and
+// object-read requests run on short-lived threads, both delivering wire
+// messages straight into the client's outbox channel.
+// ---------------------------------------------------------------------------
+
+struct GitRepoEntry {
+    handle: blit_git::RepoHandle,
+    /// The state/log-watch engine, started on open (with a watch flag) or
+    /// lazily on the first `GIT_LOG_WATCH`. Dropping it stops the engine.
+    state: Option<blit_git::StateHandle>,
+}
+
+#[derive(Default)]
+struct GitRepos {
+    map: HashMap<u16, GitRepoEntry>,
+    next_id: u16,
+    /// In-flight request cancel flags by nonce (per-connection namespace).
+    cancels: std::sync::Arc<std::sync::Mutex<HashMap<u16, blit_git::Cancel>>>,
+}
+
+impl GitRepos {
+    fn alloc_id(&mut self) -> Option<u16> {
+        for _ in 0..=u16::MAX {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if id != blit_remote::git::GIT_REPO_ID_INVALID && !self.map.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn max_repos() -> usize {
+        // Read once: this sits on the per-message path.
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_GIT_MAX_REPOS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16)
+        });
+        *V
+    }
+
+    fn max_inflight() -> usize {
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_GIT_MAX_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16)
+        });
+        *V
+    }
+
+    /// True while `nonce` is already in flight (docs/git.md: a duplicate is
+    /// answered `INVALID` without executing).
+    fn nonce_in_flight(&self, nonce: u16) -> bool {
+        self.cancels.lock().unwrap().contains_key(&nonce)
+    }
+
+    /// Register a request nonce. `Err(status)` gives the status to answer:
+    /// `INVALID` for a duplicate nonce, `BUDGET` when too many requests are
+    /// already in flight (bounds live request threads per connection).
+    fn begin(&self, nonce: u16) -> Result<blit_git::Cancel, u8> {
+        let mut cancels = self.cancels.lock().unwrap();
+        if cancels.contains_key(&nonce) {
+            return Err(blit_remote::git::GIT_STATUS_INVALID);
+        }
+        if cancels.len() >= Self::max_inflight() {
+            return Err(blit_remote::git::GIT_STATUS_BUDGET);
+        }
+        let cancel = blit_git::Cancel::default();
+        cancels.insert(nonce, cancel.clone());
+        Ok(cancel)
+    }
+}
+
+impl Drop for GitRepos {
+    fn drop(&mut self) {
+        // Connection teardown: flip every in-flight request's cancel so a
+        // disconnected client's walks stop at their next cancellation
+        // point instead of running to completion against a dead outbox.
+        for cancel in self.cancels.lock().unwrap().values() {
+            cancel.cancel();
+        }
+    }
+}
+
+/// Run one request on the blocking pool (bounded per connection by
+/// [`GitRepos::max_inflight`]); the nonce unregisters on completion.
+/// `refuse` builds the response for a rejected (duplicate/at-capacity)
+/// request from the status code.
+fn git_request(
+    repos: &GitRepos,
+    nonce: u16,
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    refuse: impl FnOnce(u8) -> Vec<u8>,
+    run: impl FnOnce(blit_git::Cancel) -> Vec<u8> + Send + 'static,
+) {
+    let cancel = match repos.begin(nonce) {
+        Ok(cancel) => cancel,
+        Err(status) => {
+            let _ = out.send(refuse(status));
+            return;
+        }
+    };
+    let cancels = repos.cancels.clone();
+    let out = out.clone();
+    tokio::task::spawn_blocking(move || {
+        let msg = run(cancel);
+        cancels.lock().unwrap().remove(&nonce);
+        let _ = out.send(msg);
+    });
+}
+
+/// The nonce of a nonce-bearing git request (opcode then `[nonce:2]`).
+fn git_nonce(data: &[u8]) -> Option<u16> {
+    (data.len() >= 3).then(|| u16::from_le_bytes([data[1], data[2]]))
+}
+
+async fn handle_git_message(
+    data: &[u8],
+    repos: &mut GitRepos,
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    verbose: bool,
+) {
+    use blit_remote::git::*;
+    match data[0] {
+        C2S_GIT_OPEN => {
+            let Some((nonce, flags, refs_ms, status_ms, path)) = parse_git_open(data) else {
+                // A well-formed nonce with a truncated/non-UTF-8 trailing
+                // field still gets its one reply (as the git read handlers do
+                // via git_nonce), so the client promise resolves.
+                if let Some(nonce) = git_nonce(data) {
+                    let _ = out.send(msg_git_repo(
+                        nonce,
+                        GIT_REPO_ID_INVALID,
+                        GIT_STATUS_INVALID,
+                        0,
+                        0,
+                        "malformed request",
+                        "",
+                    ));
+                }
+                return;
+            };
+            let refuse = |status: u8, detail: &str| {
+                let _ = out.send(msg_git_repo(
+                    nonce,
+                    GIT_REPO_ID_INVALID,
+                    status,
+                    0,
+                    0,
+                    detail,
+                    "",
+                ));
+            };
+            // GIT_OPEN is nonce-bearing too: a nonce already in flight is a
+            // duplicate (docs/git.md), answered INVALID without executing.
+            if repos.nonce_in_flight(nonce) {
+                refuse(GIT_STATUS_INVALID, "duplicate nonce");
+                return;
+            }
+            const KNOWN: u8 = GIT_OPEN_WATCH
+                | GIT_OPEN_STATUS
+                | GIT_OPEN_UNTRACKED
+                | GIT_OPEN_IGNORED
+                | GIT_OPEN_TRACKING;
+            if flags & !KNOWN != 0 {
+                refuse(GIT_STATUS_INVALID, "unknown flags");
+                return;
+            }
+            if repos.map.len() >= GitRepos::max_repos() {
+                refuse(GIT_STATUS_BUDGET, "repo limit reached");
+                return;
+            }
+            // Repository discovery + open touch the filesystem; run them
+            // off the runtime. The read loop awaits, so this connection's
+            // messages stay ordered (GIT_REPO before the first GIT_STATE,
+            // and no later GIT_* can observe a half-open repo).
+            let path_owned = path.to_string();
+            let opened = tokio::task::spawn_blocking(move || blit_git::open(&path_owned))
+                .await
+                .unwrap_or_else(|_| Err((GIT_STATUS_OTHER, "open task failed".to_string())));
+            let (handle, info) = match opened {
+                Ok(opened) => opened,
+                Err((status, detail)) => {
+                    refuse(status, &detail);
+                    return;
+                }
+            };
+            let Some(repo_id) = repos.alloc_id() else {
+                refuse(GIT_STATUS_BUDGET, "no repo ids left");
+                return;
+            };
+            if verbose {
+                eprintln!("C2S_GIT_OPEN: repo_id={repo_id} path={path} flags={flags:#x}");
+            }
+            // GIT_REPO must precede the first GIT_STATE; the outbox is
+            // FIFO, so sending before the engine spawns suffices.
+            let _ = out.send(msg_git_repo(
+                nonce,
+                repo_id,
+                GIT_STATUS_OK,
+                info.oid_format,
+                info.flags,
+                &info.workdir,
+                &info.gitdir,
+            ));
+            // STATUS and TRACKING imply WATCH; IGNORED implies UNTRACKED
+            // implies STATUS (docs/git.md).
+            let status = flags & (GIT_OPEN_STATUS | GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0;
+            let watch = flags & GIT_OPEN_WATCH != 0 || status || flags & GIT_OPEN_TRACKING != 0;
+            let state = watch.then(|| {
+                let mut opts = blit_git::StateOptions {
+                    status,
+                    untracked: flags & (GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0,
+                    ignored: flags & GIT_OPEN_IGNORED != 0,
+                    tracking: flags & GIT_OPEN_TRACKING != 0,
+                    ..Default::default()
+                };
+                if refs_ms != 0 {
+                    opts.refs_latency = Duration::from_millis(u64::from(refs_ms).clamp(1, 1000));
+                }
+                if status_ms != 0 {
+                    opts.status_latency =
+                        Duration::from_millis(u64::from(status_ms).clamp(1, 10_000));
+                }
+                let engine_out = out.clone();
+                handle.start_state(
+                    repo_id,
+                    opts,
+                    Box::new(move |msg| engine_out.send(msg).is_ok()),
+                )
+            });
+            repos.map.insert(repo_id, GitRepoEntry { handle, state });
+        }
+        C2S_GIT_CLOSE => {
+            let Some(repo_id) = parse_git_close(data) else {
+                return;
+            };
+            if repos.map.remove(&repo_id).is_some() {
+                let _ = out.send(msg_git_closed(repo_id, GIT_CLOSED_CLIENT_REQUEST));
+            }
+        }
+        C2S_GIT_ACK => {
+            let Some((repo_id, state_id)) = parse_git_ack(data) else {
+                return;
+            };
+            if let Some(entry) = repos.map.get(&repo_id)
+                && let Some(state) = &entry.state
+            {
+                state.ack(state_id);
+            }
+        }
+        C2S_GIT_CANCEL => {
+            let Some(nonce) = parse_git_cancel(data) else {
+                return;
+            };
+            if let Some(cancel) = repos.cancels.lock().unwrap().get(&nonce) {
+                cancel.cancel();
+            }
+        }
+        C2S_GIT_LOG => {
+            let Some(req) = parse_git_log(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_commits(n, GIT_STATUS_INVALID, 0, &[], &[]));
+                }
+                return;
+            };
+            let (nonce, entry) = (req.nonce, repos.map.get(&req.repo_id));
+            let Some(entry) = entry else {
+                let _ = out.send(msg_git_commits(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[], &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (
+                req.flags,
+                req.limit,
+                req.path.to_string(),
+                req.tips.clone(),
+                req.hides.clone(),
+            );
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_commits(nonce, status, 0, &[], &[]),
+                move |cancel| {
+                    handle.log(
+                        &GitLogRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            limit: owned.1,
+                            path: &owned.2,
+                            tips: owned.3,
+                            hides: owned.4,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
+        C2S_GIT_TREE => {
+            let Some((nonce, repo_id, oid, path)) = parse_git_tree(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_tree_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let Some(entry) = repos.map.get(&repo_id) else {
+                let _ = out.send(msg_git_tree_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let path = path.to_string();
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_tree_resp(nonce, status, 0, &[]),
+                move |cancel| handle.tree(nonce, &oid, &path, &cancel),
+            );
+        }
+        C2S_GIT_BLOB => {
+            let Some((nonce, repo_id, oid, path, max_len)) = parse_git_blob(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_blob_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let Some(entry) = repos.map.get(&repo_id) else {
+                let _ = out.send(msg_git_blob_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let path = path.to_string();
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_blob_resp(nonce, status, 0, &[]),
+                move |_cancel| handle.blob(nonce, &oid, &path, max_len),
+            );
+        }
+        C2S_GIT_DIFF => {
+            let Some(req) = parse_git_diff(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_diff_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_diff_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (req.flags, req.old, req.new, req.path.to_string());
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_diff_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.diff(
+                        &GitDiffRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            old: owned.1,
+                            new: owned.2,
+                            path: &owned.3,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
+        C2S_GIT_PATCH => {
+            let Some(req) = parse_git_patch(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_patch_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_patch_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (
+                req.flags,
+                req.context,
+                req.old,
+                req.new,
+                req.path.to_string(),
+                req.max_len,
+            );
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_patch_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.patch(
+                        &GitPatchRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            context: owned.1,
+                            old: owned.2,
+                            new: owned.3,
+                            path: &owned.4,
+                            max_len: owned.5,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
+        C2S_GIT_INDEX => {
+            let Some((nonce, repo_id, path)) = parse_git_index(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_index_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let Some(entry) = repos.map.get(&repo_id) else {
+                let _ = out.send(msg_git_index_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let path = path.to_string();
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_index_resp(nonce, status, 0, &[]),
+                move |cancel| handle.index(nonce, &path, &cancel),
+            );
+        }
+        C2S_GIT_BASE => {
+            let Some((nonce, repo_id, oids)) = parse_git_base(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_base_resp(n, GIT_STATUS_INVALID, &[]));
+                }
+                return;
+            };
+            let Some(entry) = repos.map.get(&repo_id) else {
+                let _ = out.send(msg_git_base_resp(nonce, GIT_STATUS_UNKNOWN_ID, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_base_resp(nonce, status, &[]),
+                move |cancel| handle.base(nonce, &oids, &cancel),
+            );
+        }
+        C2S_GIT_RESOLVE => {
+            let Some((nonce, repo_id, spec)) = parse_git_resolve(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_resolve_resp(n, GIT_STATUS_INVALID, &[], &[]));
+                }
+                return;
+            };
+            let Some(entry) = repos.map.get(&repo_id) else {
+                let _ = out.send(msg_git_resolve_resp(nonce, GIT_STATUS_UNKNOWN_ID, &[], &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let spec = spec.to_string();
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_resolve_resp(nonce, status, &[], &[]),
+                move |cancel| handle.resolve(nonce, &spec, &cancel),
+            );
+        }
+        C2S_GIT_LOG_WATCH => {
+            let Some((log_id, repo_id, flags, limit, spec)) = parse_git_log_watch(data) else {
+                return;
+            };
+            let Some(entry) = repos.map.get_mut(&repo_id) else {
+                // No repo → report on the log stream so the client unblocks.
+                let _ = out.send(msg_git_log_page(
+                    log_id,
+                    1,
+                    GIT_STATUS_UNKNOWN_ID,
+                    0,
+                    &[],
+                    &[],
+                ));
+                return;
+            };
+            // Reject undefined flag bits.
+            const KNOWN: u8 = GIT_LOG_FIRST_PARENT
+                | GIT_LOG_TOPO
+                | GIT_LOG_FULL_MESSAGE
+                | GIT_LOG_FOLLOW
+                | GIT_LOG_PATH_OIDS;
+            if flags & !KNOWN != 0 {
+                let _ = out.send(msg_git_log_page(log_id, 1, GIT_STATUS_INVALID, 0, &[], &[]));
+                return;
+            }
+            // Start a log-only engine if the repo was opened without a watch.
+            if entry.state.is_none() {
+                let engine_out = out.clone();
+                let opts = blit_git::StateOptions {
+                    wants_state: false,
+                    ..Default::default()
+                };
+                entry.state = Some(entry.handle.start_state(
+                    repo_id,
+                    opts,
+                    Box::new(move |msg| engine_out.send(msg).is_ok()),
+                ));
+            }
+            if let Some(state) = &entry.state {
+                state.watch_log(log_id, flags, limit, spec.to_string());
+            }
+        }
+        C2S_GIT_LOG_UNWATCH => {
+            let Some((log_id, repo_id)) = parse_git_log_unwatch(data) else {
+                return;
+            };
+            if let Some(entry) = repos.map.get(&repo_id)
+                && let Some(state) = &entry.state
+            {
+                state.unwatch_log(log_id);
+            }
+        }
+        C2S_GIT_LOG_ACK => {
+            let Some((log_id, repo_id, update_id)) = parse_git_log_ack(data) else {
+                return;
+            };
+            if let Some(entry) = repos.map.get(&repo_id)
+                && let Some(state) = &entry.state
+            {
+                state.log_ack(log_id, update_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Per-connection language-intelligence attachments (docs/design/lsp.md).
+/// The `lsp_id`s are connection-scoped like `repo_id`s; the backends
+/// they attach to are daemon-owned and warm inside `blit-lsp`.
+#[derive(Default)]
+struct LspConns {
+    map: HashMap<u16, blit_lsp::Attachment>,
+    next_id: u16,
+    /// Query nonces in flight (per-connection namespace); a duplicate
+    /// is answered `INVALID` without executing, and the size bounds
+    /// pending queries per connection.
+    inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+}
+
+impl LspConns {
+    fn alloc_id(&mut self) -> Option<u16> {
+        for _ in 0..=u16::MAX {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if id != blit_remote::lsp::LSP_ID_INVALID && !self.map.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn max_opens() -> usize {
+        // Read once: this sits on the per-message path.
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_LSP_MAX_OPENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16)
+        });
+        *V
+    }
+
+    fn max_inflight() -> usize {
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_LSP_MAX_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16)
+        });
+        *V
+    }
+}
+
+/// The streaming sink for an attachment: every pushed message rides the
+/// connection outbox.
+fn lsp_stream_sink(out: &mpsc::UnboundedSender<Vec<u8>>) -> blit_lsp::Sink {
+    let out = out.clone();
+    std::sync::Arc::new(move |msg| out.send(msg).is_ok())
+}
+
+/// The reply sink for one query: retires the nonce from the in-flight
+/// set when its `S2C_LSP_QUERY` response passes through.
+fn lsp_query_sink(
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    inflight: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    nonce: u16,
+) -> blit_lsp::Sink {
+    let out = out.clone();
+    let inflight = inflight.clone();
+    std::sync::Arc::new(move |msg: Vec<u8>| {
+        if msg.first() == Some(&blit_remote::lsp::S2C_LSP_QUERY)
+            && msg.len() >= 3
+            && u16::from_le_bytes([msg[1], msg[2]]) == nonce
+        {
+            inflight.lock().unwrap().remove(&nonce);
+        }
+        out.send(msg).is_ok()
+    })
+}
+
+async fn handle_lsp_message(
+    data: &[u8],
+    conns: &mut LspConns,
+    out: &mpsc::UnboundedSender<Vec<u8>>,
+    verbose: bool,
+) {
+    use blit_remote::lsp::*;
+    match data[0] {
+        C2S_LSP_OPEN => {
+            let Some((nonce, flags, diag_latency_ms, path)) = parse_lsp_open(data) else {
+                // A well-formed nonce with a truncated/non-UTF-8 path still
+                // gets its one reply, so the client promise resolves.
+                if let Some(b) = data.get(1..3) {
+                    let nonce = u16::from_le_bytes([b[0], b[1]]);
+                    let _ = out.send(msg_lsp_opened(
+                        nonce,
+                        LSP_ID_INVALID,
+                        LSP_STATUS_INVALID,
+                        0,
+                        "",
+                        "malformed request",
+                    ));
+                }
+                return;
+            };
+            let refuse = |status: u8, detail: &str| {
+                let _ = out.send(msg_lsp_opened(nonce, LSP_ID_INVALID, status, 0, "", detail));
+            };
+            // Nonce discipline (docs/design/lsp.md: git.md's rules): a
+            // nonce already in flight is a duplicate, answered INVALID
+            // without executing.
+            if conns.inflight.lock().unwrap().contains(&nonce) {
+                refuse(LSP_STATUS_INVALID, "duplicate nonce");
+                return;
+            }
+            const KNOWN: u8 = LSP_OPEN_WATCH | LSP_OPEN_DIAGS;
+            if flags & !KNOWN != 0 {
+                refuse(LSP_STATUS_INVALID, "unknown flags");
+                return;
+            }
+            if conns.map.len() >= LspConns::max_opens() {
+                refuse(LSP_STATUS_BUDGET, "attachment limit reached");
+                return;
+            }
+            // Discovery walks and PATH scans (plus a possible backend
+            // spawn) are filesystem work; run them off the runtime. The
+            // read loop awaits, so this connection's messages stay
+            // ordered (LSP_OPENED before the first LSP_STATE, and no
+            // later LSP_* can observe a half-open attachment).
+            let path_owned = path.to_string();
+            let prepared = tokio::task::spawn_blocking(move || blit_lsp::prepare(&path_owned))
+                .await
+                .unwrap_or_else(|_| Err((LSP_STATUS_OTHER, "open task failed".to_string())));
+            let (prepared, root, absent) = match prepared {
+                Ok(prepared) => prepared,
+                Err((status, detail)) => {
+                    refuse(status, &detail);
+                    return;
+                }
+            };
+            let Some(lsp_id) = conns.alloc_id() else {
+                refuse(LSP_STATUS_BUDGET, "no attachment ids left");
+                return;
+            };
+            if verbose {
+                eprintln!("C2S_LSP_OPEN: lsp_id={lsp_id} path={path} flags={flags:#x}");
+            }
+            // LSP_OPENED must precede the first LSP_STATE; the outbox is
+            // FIFO, so sending before the pacer spawns suffices. On
+            // success `detail` names any matched-but-uninstalled servers
+            // (docs/design/lsp.md), so a client learns what to install.
+            let _ = out.send(msg_lsp_opened(
+                nonce,
+                lsp_id,
+                LSP_STATUS_OK,
+                0,
+                &root,
+                &absent,
+            ));
+            let attachment = prepared.attach(lsp_id, flags, diag_latency_ms, lsp_stream_sink(out));
+            conns.map.insert(lsp_id, attachment);
+        }
+        C2S_LSP_CLOSE => {
+            let Some(lsp_id) = parse_lsp_close(data) else {
+                return;
+            };
+            if conns.map.remove(&lsp_id).is_some() {
+                let _ = out.send(msg_lsp_closed(lsp_id, LSP_CLOSED_CLIENT_REQUEST));
+            }
+        }
+        C2S_LSP_ACK => {
+            let Some((lsp_id, stream, update_id)) = parse_lsp_ack(data) else {
+                return;
+            };
+            if let Some(attachment) = conns.map.get(&lsp_id) {
+                attachment.ack(stream, update_id);
+            }
+        }
+        C2S_LSP_QUERY => {
+            let Some(req) = parse_lsp_query(data) else {
+                // A well-formed nonce with a truncated/non-UTF-8 tail still
+                // gets its one reply, so the client promise resolves.
+                if let Some(b) = data.get(1..3) {
+                    let nonce = u16::from_le_bytes([b[0], b[1]]);
+                    let _ = out.send(msg_lsp_query_resp(nonce, LSP_STATUS_INVALID, 0, "", &[]));
+                }
+                return;
+            };
+            let refuse = |status: u8| {
+                let _ = out.send(msg_lsp_query_resp(req.nonce, status, 0, "", &[]));
+            };
+            let Some(attachment) = conns.map.get(&req.lsp_id) else {
+                refuse(LSP_STATUS_UNKNOWN_ID);
+                return;
+            };
+            {
+                let mut inflight = conns.inflight.lock().unwrap();
+                if inflight.contains(&req.nonce) {
+                    refuse(LSP_STATUS_INVALID);
+                    return;
+                }
+                if inflight.len() >= LspConns::max_inflight() {
+                    refuse(LSP_STATUS_BUDGET);
+                    return;
+                }
+                inflight.insert(req.nonce);
+            }
+            attachment.query(
+                req.nonce,
+                req.kind,
+                req.flags,
+                req.line,
+                req.col,
+                req.path,
+                req.arg,
+                lsp_query_sink(out, &conns.inflight, req.nonce),
+            );
+        }
+        C2S_LSP_CANCEL => {
+            let Some(nonce) = parse_lsp_cancel(data) else {
+                return;
+            };
+            // Advisory, by nonce alone: every attachment forwards; an
+            // unknown nonce is a no-op.
+            for attachment in conns.map.values() {
+                attachment.cancel(nonce);
+            }
+        }
+        C2S_LSP_SERVERS => {
+            let Some(nonce) = parse_lsp_servers(data) else {
+                return;
+            };
+            if conns.inflight.lock().unwrap().contains(&nonce) {
+                let _ = out.send(msg_lsp_servers_resp(nonce, LSP_STATUS_INVALID, 0, &[]));
+                return;
+            }
+            let _ = out.send(blit_lsp::servers_response(nonce));
+        }
+        C2S_LSP_STOP => {
+            let Some((nonce, server_ref)) = parse_lsp_stop(data) else {
+                return;
+            };
+            if conns.inflight.lock().unwrap().contains(&nonce) {
+                let _ = out.send(msg_lsp_stopped(nonce, LSP_STATUS_INVALID));
+                return;
+            }
+            if verbose {
+                eprintln!("C2S_LSP_STOP: server_ref={server_ref}");
+            }
+            let _ = out.send(blit_lsp::stop_response(nonce, server_ref));
+        }
+        C2S_LSP_BUFFER => {
+            // Fire-and-forget by design (docs/design/lsp.md
+            // "LSP_BUFFER"): no nonce, so malformed frames and unknown
+            // attachments are dropped, and a RELEASE carrying text is
+            // treated as the release it claims to be.
+            let Some((lsp_id, flags, path, text)) = parse_lsp_buffer(data) else {
+                return;
+            };
+            let Some(attachment) = conns.map.get(&lsp_id) else {
+                return;
+            };
+            let release = flags & LSP_BUFFER_RELEASE != 0;
+            attachment.buffer(path, if release { None } else { Some(text) });
+        }
+        _ => {}
+    }
+}
+
+/// Refuse every nonce-bearing `LSP_*` with `PERMISSION`, the way KV and NET
+/// do when their families are off.
+///
+/// `BLIT_LSP=0` leaves the feature bit unadvertised, but a client that
+/// ignores feature bits — or one that races a mid-session disable — used to
+/// have its request silently dropped, so a promise awaiting the one
+/// guaranteed reply per nonce never resolved. Fire-and-forget opcodes
+/// (`ACK`, `CANCEL`, `BUFFER`) have no reply to give and are dropped, which
+/// is what they get when the family is on and the id is unknown.
+fn refuse_lsp_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
+    use blit_remote::lsp::*;
+    let nonce = data
+        .get(1..3)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    const DETAIL: &str = "lsp disabled";
+    match data[0] {
+        C2S_LSP_OPEN => {
+            let _ = out.send(msg_lsp_opened(
+                nonce,
+                LSP_ID_INVALID,
+                LSP_STATUS_PERMISSION,
+                0,
+                "",
+                DETAIL,
+            ));
+        }
+        C2S_LSP_QUERY => {
+            let _ = out.send(msg_lsp_query_resp(
+                nonce,
+                LSP_STATUS_PERMISSION,
+                0,
+                DETAIL,
+                &[],
+            ));
+        }
+        C2S_LSP_SERVERS => {
+            let _ = out.send(msg_lsp_servers_resp(nonce, LSP_STATUS_PERMISSION, 0, &[]));
+        }
+        C2S_LSP_STOP => {
+            let _ = out.send(msg_lsp_stopped(nonce, LSP_STATUS_PERMISSION));
+        }
+        // LSP_CLOSE names an attachment id, not a nonce, and there is no
+        // attachment to close.
+        _ => {}
+    }
+}
+
 async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     state: AppState,
@@ -4759,6 +6967,32 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Filesystem syncs are connection-scoped; engines write into the same
+    // outbox as everything else and die with this map on disconnect.
+    let fs_out = out_tx.clone();
+    let mut fs_syncs = FsSyncs::default();
+    let mut git_repos = GitRepos::default();
+    let mut lsp_conns = LspConns::default();
+    let mut kv_subs = kv::KvSubs::default();
+    // BLIT_NET=0 turns the relay off: the bit is unadvertised AND every
+    // NET_OPEN is refused with PERMISSION, so a client that ignores
+    // feature bits still gets its one reply.
+    let net_enabled = !std::env::var("BLIT_NET").is_ok_and(|v| v == "0");
+    let net_policy = net::Policy::new(config.allow_forward_insecure, &config.allow_forward);
+    // BLIT_LSP=0 turns the whole family off: the bit is unadvertised AND
+    // every nonce-bearing LSP_* is refused with PERMISSION, as KV and NET
+    // do.
+    let lsp_enabled = !std::env::var("BLIT_LSP").is_ok_and(|v| v == "0");
+    // BLIT_KV=0 disables the store: the bit is unadvertised AND every
+    // nonce-bearing KV_* is refused at dispatch with PERMISSION, so a
+    // client that ignores feature bits still gets its one reply
+    // (docs/design/kv.md "Security posture").
+    let kv_enabled = !std::env::var("BLIT_KV").is_ok_and(|v| v == "0");
+    // BLIT_FS_WRITE=0 offers read-only sync: FS_WRITE/FS_OP answer
+    // FS_DONE_PERMISSION instead of dispatching (docs/design/fs-write.md
+    // "Security"). The family shares FEATURE_FS, so there is no
+    // separate bit to withhold.
+    let fs_write_enabled = !std::env::var("BLIT_FS_WRITE").is_ok_and(|v| v == "0");
     #[cfg(target_os = "linux")]
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // On non-Linux, keep the audio sender alive for the lifetime of the
@@ -4770,6 +7004,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (_audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
     let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
+    // Relayed sockets are connection-scoped: they die with this table on
+    // disconnect, which is what releases forwarded sockets on a dropped
+    // client rather than leaking them. Datagrams read the outbox depth to
+    // decide whether to drop rather than pile on (docs/design/net.md).
+    let mut net_sockets =
+        net::NetSockets::with_outbox(outbox_frame_counter.clone(), outbox_byte_counter.clone());
     let sender_outbox_queued_frames = outbox_frame_counter.clone();
     let sender_outbox_queued_bytes = outbox_byte_counter.clone();
     let sender = tokio::spawn(async move {
@@ -4964,9 +7204,21 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_RESTART
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
-                | FEATURE_COMPOSITOR;
-            #[cfg(target_os = "linux")]
+                | FEATURE_COMPOSITOR
+                | blit_remote::fs::FEATURE_FS
+                | blit_remote::git::FEATURE_GIT;
+            // BLIT_LSP=0 disables the family: the bit is simply not
+            // advertised, matching the dispatch gate.
             let mut features = features;
+            if lsp_enabled {
+                features |= blit_remote::lsp::FEATURE_LSP;
+            }
+            if kv_enabled {
+                features |= blit_remote::kv::FEATURE_KV;
+            }
+            if net_enabled {
+                features |= blit_remote::net::FEATURE_NET;
+            }
             #[cfg(target_os = "linux")]
             {
                 let audio_disabled = std::env::var("BLIT_AUDIO")
@@ -5080,6 +7332,153 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             // Application-level keepalive — no-op.  Its arrival is enough
             // to keep the connection alive (any received data resets
             // transport-level timeouts).
+            continue;
+        }
+
+        // Filesystem sync: connection-scoped, engine-threaded, and
+        // deliberately handled before the session mutex — no fs message
+        // ever needs session state.
+        if matches!(
+            data[0],
+            blit_remote::fs::C2S_FS_SYNC
+                | blit_remote::fs::C2S_FS_STOP
+                | blit_remote::fs::C2S_FS_ACK
+                | blit_remote::fs::C2S_FS_FETCH
+                | blit_remote::fs::C2S_FS_WRITE
+                | blit_remote::fs::C2S_FS_OP
+                | blit_remote::fs::C2S_FS_SEARCH
+                | blit_remote::fs::C2S_FS_INDEX
+                | blit_remote::fs::C2S_FS_GREP
+        ) {
+            // A FROM_PTY sync (docs/ide.md Decision 3) names a source pty
+            // whose live cwd is session state; resolve it here — the sole
+            // place these connection-scoped families touch the session
+            // mutex, and only when the client opts in — then rebase to a
+            // plain path-based sync so the handler stays path-only.
+            let msg: std::borrow::Cow<[u8]> = if data[0] == blit_remote::fs::C2S_FS_SYNC {
+                if let Some(src) = blit_remote::fs::fs_sync_src_pty(&data) {
+                    let cwd = {
+                        let sess = state.session.lock().await;
+                        sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
+                    };
+                    blit_remote::fs::fs_sync_rebase(&data, cwd.as_deref())
+                        .map(std::borrow::Cow::Owned)
+                        .unwrap_or(std::borrow::Cow::Borrowed(&data[..]))
+                } else {
+                    std::borrow::Cow::Borrowed(&data[..])
+                }
+            } else {
+                std::borrow::Cow::Borrowed(&data[..])
+            };
+            // A read-only deployment (BLIT_FS_WRITE=0) shares the family's
+            // feature bit, so writes are refused here rather than dropped:
+            // every nonce still gets its one FS_DONE.
+            if !fs_write_enabled
+                && matches!(
+                    msg[0],
+                    blit_remote::fs::C2S_FS_WRITE | blit_remote::fs::C2S_FS_OP
+                )
+            {
+                let nonce = msg
+                    .get(1..3)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .unwrap_or(0);
+                let _ = fs_out.send(blit_remote::fs::msg_fs_done(
+                    nonce,
+                    blit_remote::fs::FS_DONE_PERMISSION,
+                    0,
+                    0,
+                ));
+            } else {
+                handle_fs_message(&msg, &mut fs_syncs, &fs_out, config.verbose).await;
+            }
+            continue;
+        }
+
+        // Git introspection: same discipline as fs — connection-scoped,
+        // request threads and state engines, never the session mutex.
+        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_LOG_ACK).contains(&data[0]) {
+            // FROM_PTY open (docs/ide.md Decision 3): resolve the source pty's
+            // live cwd (session state) and rebase to a plain path-based open.
+            let msg: std::borrow::Cow<[u8]> = if data[0] == blit_remote::git::C2S_GIT_OPEN {
+                if let Some(src) = blit_remote::git::git_open_src_pty(&data) {
+                    let cwd = {
+                        let sess = state.session.lock().await;
+                        sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
+                    };
+                    blit_remote::git::git_open_rebase(&data, cwd.as_deref())
+                        .map(std::borrow::Cow::Owned)
+                        .unwrap_or(std::borrow::Cow::Borrowed(&data[..]))
+                } else {
+                    std::borrow::Cow::Borrowed(&data[..])
+                }
+            } else {
+                std::borrow::Cow::Borrowed(&data[..])
+            };
+            handle_git_message(&msg, &mut git_repos, &fs_out, config.verbose).await;
+            continue;
+        }
+
+        // Language intelligence: connection-scoped attachments over
+        // daemon-owned warm backends, never the session mutex. When
+        // BLIT_LSP=0 the family is off — the feature bit is unadvertised
+        // AND every nonce-bearing request is refused with PERMISSION, so no
+        // client can spawn a language server against a disabled server and
+        // none is left waiting for a reply that is never coming.
+        if (blit_remote::lsp::C2S_LSP_OPEN..=blit_remote::lsp::C2S_LSP_BUFFER).contains(&data[0]) {
+            if !lsp_enabled {
+                refuse_lsp_message(&data, &fs_out);
+                continue;
+            }
+            // FROM_PTY open (docs/ide.md Decision 3): resolve the source pty's
+            // live cwd (session state) and rebase to a plain path-based open.
+            let msg: std::borrow::Cow<[u8]> = if data[0] == blit_remote::lsp::C2S_LSP_OPEN {
+                if let Some(src) = blit_remote::lsp::lsp_open_src_pty(&data) {
+                    let cwd = {
+                        let sess = state.session.lock().await;
+                        sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
+                    };
+                    blit_remote::lsp::lsp_open_rebase(&data, cwd.as_deref())
+                        .map(std::borrow::Cow::Owned)
+                        .unwrap_or(std::borrow::Cow::Borrowed(&data[..]))
+                } else {
+                    std::borrow::Cow::Borrowed(&data[..])
+                }
+            } else {
+                std::borrow::Cow::Borrowed(&data[..])
+            };
+            handle_lsp_message(&msg, &mut lsp_conns, &fs_out, config.verbose).await;
+            continue;
+        }
+
+        // Server KV store (docs/design/kv.md): connection-scoped
+        // subscriptions over one process-global store, never the session
+        // mutex. BLIT_KV=0 refuses nonce-bearing requests with PERMISSION.
+        if (blit_remote::kv::C2S_KV_OPEN..=blit_remote::kv::C2S_KV_FETCH).contains(&data[0]) {
+            if kv_enabled {
+                kv::handle_kv_message(&data, &mut kv_subs, &fs_out, config.verbose);
+            } else {
+                kv::refuse_kv_message(&data, &fs_out);
+            }
+            continue;
+        }
+
+        // TCP and UDP relay (docs/design/net.md): connection-scoped sockets,
+        // one task per socket, never the session mutex. BLIT_NET=0 refuses
+        // every open with PERMISSION.
+        if blit_remote::net::is_c2s_net(data[0]) {
+            if net_enabled {
+                net::handle_net_message(
+                    &data,
+                    &mut net_sockets,
+                    &fs_out,
+                    &net_policy,
+                    config.verbose,
+                )
+                .await;
+            } else {
+                net::refuse_net_message(&data, &fs_out);
+            }
             continue;
         }
 
@@ -6317,6 +8716,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         pty.driver.reset_modes();
                         pty.exited = false;
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
+                        // The fresh shell hasn't reported OSC 7 yet; keeping
+                        // the dead shell's cwd would shadow the kernel
+                        // fallback in C2S_TERM_CWD with stale data.
+                        pty.osc7_cwd = None;
                         pty.lflag_cache = pty::pty_lflag(&pty.handle);
                         pty.lflag_last = Instant::now();
                         pty.mark_dirty();
@@ -6333,6 +8736,21 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         sess.send_to_all(&msg);
                         need_nudge = true;
                     }
+                }
+            }
+            C2S_TERM_CWD if data.len() >= 5 => {
+                let nonce = u16::from_le_bytes([data[1], data[2]]);
+                let pid = u16::from_le_bytes([data[3], data[4]]);
+                let cwd = sess
+                    .ptys
+                    .get(&pid)
+                    .and_then(|p| {
+                        // Precedence rationale: see `resolve_term_cwd`.
+                        resolve_term_cwd(p.osc7_cwd.as_deref(), || pty::pty_cwd(&p.handle))
+                    })
+                    .unwrap_or_default();
+                if let Some(client) = sess.clients.get(&client_id) {
+                    let _ = send_outbox(client, msg_term_cwd_reply(nonce, &cwd));
                 }
             }
             C2S_READ if data.len() >= 13 => {
@@ -6540,6 +8958,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     }
     sender.abort();
+    // Relayed sockets outlive the read loop only as spawned tasks; drop the
+    // table so every forwarded socket on this connection closes with it.
+    net::shutdown(&mut net_sockets);
     if state.config.verbose {
         eprintln!("client disconnected");
     }
@@ -6548,6 +8969,167 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index walk (docs/design/fs-search.md) prunes `.git`, honors
+    /// `.gitignore`, keeps other dotfiles, sorts, and reports truncation.
+    #[test]
+    fn fs_index_walk_honors_gitignore_and_budget() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("blit_fsindex_{}_{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // A bare `.git` dir marks the tree as a repository, which is what
+        // makes the walker apply `.gitignore`.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join(".hidden"), "h").unwrap();
+        std::fs::write(root.join("sub/b.txt"), "b").unwrap();
+        std::fs::write(root.join("target/junk.txt"), "j").unwrap();
+        std::fs::write(root.join(".git/config"), "c").unwrap();
+
+        let (paths, truncated) = fs_index_walk(&root, 100);
+        assert!(!truncated);
+        assert_eq!(paths, vec![".gitignore", ".hidden", "a.txt", "sub/b.txt"]);
+
+        let (some, truncated) = fs_index_walk(&root, 2);
+        assert!(truncated);
+        assert!(some.len() <= 2);
+
+        // Exactly-at-budget is complete, not truncated: nothing was dropped.
+        let (all, truncated) = fs_index_walk(&root, 4);
+        assert!(!truncated);
+        assert_eq!(all.len(), 4);
+
+        // The search fallback scores over the same candidate set.
+        let hits = fs_search_walk(&root.to_string_lossy(), "btxt", 10);
+        assert_eq!(hits, vec!["sub/b.txt"]);
+
+        // A file root lists nothing (no bogus "" record).
+        let (none, _) = fs_index_walk(&root.join("a.txt"), 100);
+        assert!(none.is_empty());
+
+        // A tree blanked by a glob ignore (`*`, the dotfiles-repo pattern)
+        // falls back to the ignore-free walk instead of reporting empty.
+        let blanked = root.join("blanked");
+        std::fs::create_dir_all(blanked.join(".git")).unwrap();
+        std::fs::write(blanked.join(".gitignore"), "*\n").unwrap();
+        std::fs::write(blanked.join("kept.txt"), "k").unwrap();
+        let (paths, truncated) = fs_index_walk(&blanked, 100);
+        assert!(!truncated);
+        assert_eq!(paths, vec![".gitignore", "kept.txt"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// End-to-end for the `FROM_PTY` open family (docs/ide.md Decision 3):
+    /// spawn a real shell, `cd` it into a fresh directory, then drive the
+    /// exact chain the dispatch layer runs — `pty_cwd` on the live child,
+    /// `*_rebase` onto that cwd, and `validate_root` / `blit_git::open` on
+    /// the effective path — asserting each resolves to the terminal's cwd.
+    #[cfg(unix)]
+    #[test]
+    fn from_pty_resolves_cwd_after_cd_e2e() {
+        use std::process::Command;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        // A fresh directory the child will `cd` into.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("blit_frompty_{}_{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let dir = std::fs::canonicalize(&base).expect("canonicalize temp dir");
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        // A real shell that `cd`s into `dir` then `exec`s a long sleep, so
+        // the process' cwd is `dir` for the test. The pid is stable across
+        // exec, so `pty_cwd` reads `dir` straight from the kernel.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"cd "$0" && exec sleep 60"#)
+            .arg(&dir_str)
+            .spawn()
+            .expect("spawn shell");
+        let pid = child.id() as libc::pid_t;
+
+        // `pty_cwd` reads only `child_pid`; `master_fd` is unused here, and
+        // `PtyHandle` has no `Drop`, so a hand-built handle is side-effect free.
+        let handle = crate::pty::PtyHandle {
+            master_fd: -1,
+            child_pid: pid,
+        };
+
+        // Poll until the cd + exec has landed (bounded so CI never hangs).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cwd = loop {
+            if let Some(cwd) = crate::pty::pty_cwd(&handle)
+                .filter(|c| std::fs::canonicalize(c).ok().as_ref() == Some(&dir))
+            {
+                break cwd;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pty_cwd never resolved to the cd'd directory"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+        };
+        assert_eq!(std::fs::canonicalize(&cwd).unwrap(), dir);
+
+        // fs: the dispatch rebases a FROM_PTY sync onto the resolved cwd,
+        // then `validate_root`s the effective (empty => the cwd) path.
+        let sync = blit_remote::fs::msg_fs_sync_from_pty(
+            1,
+            blit_remote::fs::FS_SYNC_RECURSIVE,
+            0,
+            0,
+            "",
+            1,
+        );
+        let rebased = blit_remote::fs::fs_sync_rebase(&sync, Some(&cwd)).expect("fs rebase");
+        assert_eq!(rebased[3] & blit_remote::fs::FS_SYNC_FROM_PTY, 0);
+        let plen = u16::from_le_bytes([rebased[10], rebased[11]]) as usize;
+        let eff = std::str::from_utf8(&rebased[12..12 + plen]).unwrap();
+        let root = blit_fssync::validate_root(eff).expect("validate_root");
+        assert_eq!(root, dir, "fs sync resolves to the terminal's cwd");
+
+        // git: `cd`-ing into a repo lets a FROM_PTY open discover it from cwd.
+        let git_ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if git_ok {
+            let gopen = blit_remote::git::msg_git_open_from_pty(
+                2,
+                blit_remote::git::GIT_OPEN_WATCH,
+                0,
+                0,
+                "",
+                1,
+            );
+            let greb = blit_remote::git::git_open_rebase(&gopen, Some(&cwd)).expect("git rebase");
+            let (_, gflags, _, _, gpath) = blit_remote::git::parse_git_open(&greb).unwrap();
+            assert_eq!(gflags & blit_remote::git::GIT_OPEN_FROM_PTY, 0);
+            let (_, info) = blit_git::open(gpath).expect("git open at cwd");
+            assert_eq!(
+                std::fs::canonicalize(&info.workdir).unwrap(),
+                dir,
+                "git open resolves the repo at the terminal's cwd"
+            );
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn test_client_with_capacity(
         _capacity: usize,
@@ -6642,6 +9224,825 @@ mod tests {
         let mut frame = FrameState::new(2, 8);
         frame.write_text(0, 0, text, blit_remote::CellStyle::default());
         frame
+    }
+
+    /// Full fs-sync flow through the connection-level handler: SYNC →
+    /// GIT_REPO + first GIT_STATE, object reads, cancel no-op, close.
+    #[tokio::test]
+    async fn git_message_flow() {
+        use blit_remote::git::*;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-git-test-{}", std::process::id()))
+            .canonicalize_or_create();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(dir.join("f.txt"), b"hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "first"]);
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut repos = GitRepos::default();
+        let wait_msg = |rx: &mut mpsc::UnboundedReceiver<Vec<u8>>, opcode: u8| -> Vec<u8> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) if msg[0] == opcode => return msg,
+                    Ok(_) => continue,
+                    Err(_) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "opcode {opcode:#x} never arrived"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        };
+
+        // A bad path refuses with the sentinel repo id.
+        handle_git_message(
+            &msg_git_open(1, 0, 0, 0, "/blit-no-such-path"),
+            &mut repos,
+            &out,
+            false,
+        )
+        .await;
+        let refusal_msg = rx.try_recv().expect("synchronous refusal");
+        let refusal = parse_git_repo(&refusal_msg).unwrap();
+        assert_eq!(refusal.repo_id, GIT_REPO_ID_INVALID);
+
+        // Open with state streaming; GIT_REPO precedes the first GIT_STATE.
+        handle_git_message(
+            &msg_git_open(
+                2,
+                GIT_OPEN_STATUS | GIT_OPEN_UNTRACKED | GIT_OPEN_TRACKING,
+                0,
+                0,
+                dir.to_str().unwrap(),
+            ),
+            &mut repos,
+            &out,
+            false,
+        )
+        .await;
+        let info_msg = rx.try_recv().expect("synchronous GIT_REPO");
+        let info = parse_git_repo(&info_msg).unwrap();
+        assert_eq!(info.status, GIT_STATUS_OK);
+        let repo_id = info.repo_id;
+        let state = wait_msg(&mut rx, S2C_GIT_STATE);
+        let mut mirror = GitStateMirror::new();
+        mirror.apply_state(&state).expect("valid state");
+        assert_eq!(mirror.head.as_ref().unwrap().name, "refs/heads/main");
+        let head_oid = mirror.head.as_ref().unwrap().oid;
+
+        // Log, tree, blob, base round-trips through the dispatcher.
+        handle_git_message(
+            &msg_git_log(10, repo_id, 0, 0, "", &[], &[]),
+            &mut repos,
+            &out,
+            false,
+        )
+        .await;
+        let page = parse_git_commits(&wait_msg(&mut rx, S2C_GIT_COMMITS)).unwrap();
+        assert_eq!(page.status, GIT_STATUS_OK);
+        assert_eq!(git_commit_records(&page.records).count(), 1);
+        handle_git_message(
+            &msg_git_tree(11, repo_id, &head_oid, ""),
+            &mut repos,
+            &out,
+            false,
+        )
+        .await;
+        let (_, status, _, records) =
+            parse_git_tree_resp(&wait_msg(&mut rx, S2C_GIT_TREE)).unwrap();
+        assert_eq!(status, GIT_STATUS_OK);
+        assert_eq!(git_tree_records(&records).count(), 1);
+        handle_git_message(
+            &msg_git_blob(12, repo_id, &head_oid, "f.txt", 0),
+            &mut repos,
+            &out,
+            false,
+        )
+        .await;
+        let (_, status, _, data) = parse_git_blob_resp(&wait_msg(&mut rx, S2C_GIT_BLOB)).unwrap();
+        assert_eq!(status, GIT_STATUS_OK);
+        assert_eq!(data, b"hello\n");
+
+        // Unknown repo id answers UNKNOWN_ID; unknown cancel is a no-op.
+        handle_git_message(
+            &msg_git_tree(13, 999, &head_oid, ""),
+            &mut repos,
+            &out,
+            false,
+        )
+        .await;
+        let (_, status, _, _) = parse_git_tree_resp(&wait_msg(&mut rx, S2C_GIT_TREE)).unwrap();
+        assert_eq!(status, GIT_STATUS_UNKNOWN_ID);
+        handle_git_message(&msg_git_cancel(77), &mut repos, &out, false).await;
+
+        // Close answers GIT_CLOSED(client request) and frees the slot.
+        handle_git_message(&msg_git_close(repo_id), &mut repos, &out, false).await;
+        let (closed_id, reason) = parse_git_closed(&wait_msg(&mut rx, S2C_GIT_CLOSED)).unwrap();
+        assert_eq!((closed_id, reason), (repo_id, GIT_CLOSED_CLIENT_REQUEST));
+        assert!(repos.map.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SYNCED + staged snapshot, live change, FETCH, STOP → CLOSED.
+    #[tokio::test]
+    async fn fs_sync_message_flow() {
+        use blit_remote::fs::{
+            FS_CLOSED_CLIENT_REQUEST, FS_FILE_OK, FS_STATUS_NOT_FOUND, FS_STATUS_OK,
+            FS_SYNC_CONTENT, FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FsMirror, S2C_FS_CLOSED,
+            S2C_FS_FILE, S2C_FS_SYNCED, S2C_FS_UPDATE, msg_fs_ack, msg_fs_fetch, msg_fs_stop,
+            msg_fs_sync, parse_fs_file,
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-fs-test-{}", std::process::id()))
+            .canonicalize_or_create();
+        std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+
+        // Bad path fails with a sentinel sync_id.
+        let missing = dir.join("does-not-exist");
+        handle_fs_message(
+            &msg_fs_sync(1, FS_SYNC_RECURSIVE, 5, 0, &missing.to_string_lossy()),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = rx.try_recv().expect("synchronous refusal");
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), FS_SYNC_ID_INVALID);
+        assert_eq!(msg[5], FS_STATUS_NOT_FOUND);
+
+        // Good path: SYNCED then a RESET…SYNC snapshot.
+        handle_fs_message(
+            &msg_fs_sync(
+                2,
+                FS_SYNC_RECURSIVE | FS_SYNC_CONTENT,
+                5,
+                0,
+                &dir.to_string_lossy(),
+            ),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+        assert_eq!(msg[5], FS_STATUS_OK);
+        assert_ne!(sync_id, FS_SYNC_ID_INVALID);
+
+        let mut mirror = FsMirror::new();
+        while !mirror.live.contains_key("a.txt") {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPDATE {
+                let id = mirror.apply_update(&msg).expect("valid update");
+                handle_fs_message(&msg_fs_ack(sync_id, id), &mut syncs, &out, false).await;
+            }
+        }
+        assert_eq!(mirror.live["a.txt"].content.as_deref(), Some(&b"alpha"[..]));
+
+        // Live change flows without further requests.
+        std::fs::write(dir.join("b.txt"), b"beta").unwrap();
+        while !mirror.live.contains_key("b.txt") {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPDATE {
+                let id = mirror.apply_update(&msg).expect("valid update");
+                handle_fs_message(&msg_fs_ack(sync_id, id), &mut syncs, &out, false).await;
+            }
+        }
+
+        // FETCH round-trips content by path.
+        handle_fs_message(&msg_fs_fetch(7, sync_id, "b.txt"), &mut syncs, &out, false).await;
+        loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_FILE {
+                assert_eq!(parse_fs_file(&msg), Some((7, FS_FILE_OK, b"beta".to_vec())));
+                break;
+            }
+        }
+
+        // STOP yields FS_CLOSED(client request) even though the entry drops.
+        handle_fs_message(&msg_fs_stop(sync_id), &mut syncs, &out, false).await;
+        loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_CLOSED {
+                assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), sync_id);
+                assert_eq!(msg[3], FS_CLOSED_CLIENT_REQUEST);
+                break;
+            }
+        }
+        assert!(syncs.map.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FS_SYNC_SINGLE end-to-end: a real file syncs as the `""` entry, the
+    /// contradictory SINGLE|RECURSIVE combination refuses before any engine
+    /// work, and a directory root answers the engine's refusal
+    /// (docs/design/fs-watch.md "Single-file sync").
+    #[tokio::test]
+    async fn fs_sync_single_flow() {
+        use blit_remote::fs::{
+            FS_CLOSED_CLIENT_REQUEST, FS_STATUS_OK, FS_STATUS_OTHER, FS_SYNC_CONTENT,
+            FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, FsMirror, S2C_FS_CLOSED,
+            S2C_FS_SYNCED, S2C_FS_UPDATE, msg_fs_ack, msg_fs_stop, msg_fs_sync,
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-single-test-{}", std::process::id()))
+            .canonicalize_or_create();
+        let file = dir.join("solo.txt");
+        std::fs::write(&file, b"solo").unwrap();
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+
+        // SINGLE of a real file: SYNCED names the canonical file, then the
+        // snapshot delivers it as the `""` entry.
+        handle_fs_message(
+            &msg_fs_sync(
+                1,
+                FS_SYNC_SINGLE | FS_SYNC_CONTENT,
+                5,
+                0,
+                &file.to_string_lossy(),
+            ),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+        assert_eq!(msg[5], FS_STATUS_OK);
+        assert_ne!(sync_id, FS_SYNC_ID_INVALID);
+        assert_eq!(
+            std::str::from_utf8(&msg[8..]).unwrap(),
+            blit_fssync::escape_path(&file)
+        );
+
+        let mut mirror = FsMirror::new();
+        while !mirror.live.contains_key("") {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPDATE {
+                let id = mirror.apply_update(&msg).expect("valid update");
+                handle_fs_message(&msg_fs_ack(sync_id, id), &mut syncs, &out, false).await;
+            }
+        }
+        assert_eq!(mirror.live[""].content.as_deref(), Some(&b"solo"[..]));
+
+        // Drain the sync so later replies are unambiguous.
+        handle_fs_message(&msg_fs_stop(sync_id), &mut syncs, &out, false).await;
+        loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_CLOSED {
+                assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), sync_id);
+                assert_eq!(msg[3], FS_CLOSED_CLIENT_REQUEST);
+                break;
+            }
+        }
+
+        // SINGLE|RECURSIVE is contradictory: refused synchronously.
+        handle_fs_message(
+            &msg_fs_sync(
+                2,
+                FS_SYNC_SINGLE | FS_SYNC_RECURSIVE,
+                5,
+                0,
+                &file.to_string_lossy(),
+            ),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = rx.try_recv().expect("synchronous refusal");
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), FS_SYNC_ID_INVALID);
+        assert_eq!(msg[5], FS_STATUS_OTHER);
+        assert_eq!(
+            std::str::from_utf8(&msg[8..]).unwrap(),
+            "single sync cannot be recursive"
+        );
+
+        // A directory root answers the engine's refusal.
+        handle_fs_message(
+            &msg_fs_sync(3, FS_SYNC_SINGLE, 5, 0, &dir.to_string_lossy()),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), FS_SYNC_ID_INVALID);
+        assert_eq!(msg[5], FS_STATUS_OTHER);
+        assert!(syncs.map.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FS_FETCH rides a per-connection in-flight cap with a bounded queue
+    /// instead of an error status (docs/design/fs-watch.md `FS_FETCH` has
+    /// no busy code): a burst larger than the cap still answers every
+    /// nonce exactly once, and the queue drains as replies free slots.
+    #[tokio::test]
+    async fn fs_fetch_burst_is_capped_and_fully_answered() {
+        use blit_remote::fs::{
+            FS_FILE_OK, FS_STATUS_OK, FS_SYNC_CONTENT, FS_SYNC_RECURSIVE, S2C_FS_FILE,
+            S2C_FS_SYNCED, msg_fs_fetch, msg_fs_stop, msg_fs_sync, parse_fs_file,
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-fetch-test-{}", std::process::id()))
+            .canonicalize_or_create();
+        std::fs::write(dir.join("a.txt"), b"payload").unwrap();
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+        handle_fs_message(
+            &msg_fs_sync(
+                1,
+                FS_SYNC_RECURSIVE | FS_SYNC_CONTENT,
+                5,
+                0,
+                &dir.to_string_lossy(),
+            ),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        assert_eq!(msg[5], FS_STATUS_OK);
+        let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+
+        let burst = (FS_FETCH_INFLIGHT + 5) as u16;
+        for nonce in 0..burst {
+            handle_fs_message(
+                &msg_fs_fetch(nonce, sync_id, "a.txt"),
+                &mut syncs,
+                &out,
+                false,
+            )
+            .await;
+        }
+        let mut answered = HashSet::new();
+        while answered.len() < burst as usize {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_FILE {
+                let (nonce, status, data) = parse_fs_file(&msg).unwrap();
+                assert_eq!(status, FS_FILE_OK);
+                assert_eq!(data, b"payload");
+                assert!(answered.insert(nonce), "nonce {nonce} answered twice");
+            }
+        }
+        assert!(syncs.fetches.inner.lock().unwrap().queue.is_empty());
+        handle_fs_message(&msg_fs_stop(sync_id), &mut syncs, &out, false).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FS_SEARCH walks are capped like index walks — over-cap (or a
+    /// duplicate in-flight nonce) answers `RESOURCE_LIMIT`, and slots free
+    /// on completion (docs/design/fs-search.md § Budgets).
+    #[tokio::test]
+    async fn fs_search_walks_are_capped() {
+        use blit_remote::fs::{
+            FS_STATUS_OK, FS_STATUS_RESOURCE_LIMIT, msg_fs_search, parse_fs_search_result,
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-search-test-{}", std::process::id()))
+            .canonicalize_or_create();
+        std::fs::write(dir.join("alpha.rs"), b"x").unwrap();
+        let root = dir.to_string_lossy().into_owned();
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+
+        // Two slots; a third reservation — or a duplicate nonce — refuses.
+        let g1 = syncs.reserve_search(1).unwrap();
+        let g2 = syncs.reserve_search(2).unwrap();
+        assert!(syncs.reserve_search(3).is_none());
+        assert!(syncs.reserve_search(1).is_none());
+
+        // At the cap the request answers RESOURCE_LIMIT without walking.
+        handle_fs_message(&msg_fs_search(22, 10, &root, "a"), &mut syncs, &out, false).await;
+        let (nonce, status, paths) = parse_fs_search_result(&recv_blocking(&mut rx)).unwrap();
+        assert_eq!(
+            (nonce, status, paths.len()),
+            (22, FS_STATUS_RESOURCE_LIMIT, 0)
+        );
+
+        // Dropping the guards frees the slots and the search runs.
+        drop(g1);
+        drop(g2);
+        handle_fs_message(&msg_fs_search(9, 10, &root, "alp"), &mut syncs, &out, false).await;
+        let (nonce, status, paths) = parse_fs_search_result(&recv_blocking(&mut rx)).unwrap();
+        assert_eq!((nonce, status), (9, FS_STATUS_OK));
+        assert!(paths.contains(&"alpha.rs".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end grep: literal vs regex, case sensitivity, and the rule
+    /// that `.gitignore` *ranks* rather than filters — ignored hits are
+    /// present, flagged, and sorted after every tracked one.
+    #[tokio::test]
+    async fn fs_grep_matches_and_ranks_ignored_last() {
+        use blit_remote::fs::{
+            FS_DONE_INVALID, FS_DONE_OK, FS_GREP_CASE_SENSITIVE, FS_GREP_FILE_IGNORED,
+            FS_GREP_NO_IGNORE, FS_GREP_REGEX, FsGrepRecord, fs_grep_records, msg_fs_grep,
+            parse_fs_grep_result,
+        };
+
+        let root = std::env::temp_dir()
+            .join(format!("blit-grep-{}", std::process::id()))
+            .canonicalize_or_create();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // A bare .git marks the tree as a repo, which is what makes the
+        // walker apply .gitignore at all.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("src/a.rs"), "let needle = 1;\nnothing\n").unwrap();
+        std::fs::write(root.join("target/gen.rs"), "let needle = 2;\n").unwrap();
+        // Binary files are skipped rather than returning unreadable lines.
+        std::fs::write(root.join("src/blob.bin"), b"needle\0\0binary").unwrap();
+
+        let run = |flags: u8, query: &str| {
+            let root = root.clone();
+            let query = query.to_string();
+            async move {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let mut syncs = FsSyncs::default();
+                let msg = msg_fs_grep(1, flags, 0, 0, root.to_str().unwrap(), &query);
+                handle_fs_message(&msg, &mut syncs, &tx, false).await;
+                let (_, status, _, detail, records) =
+                    parse_fs_grep_result(&recv_blocking(&mut rx)).unwrap();
+                (status, detail, fs_grep_records(&records))
+            }
+        };
+
+        // Ignore rules apply by default: the target/ hit is not searched.
+        let (status, _, recs) = run(0, "NEEDLE").await;
+        assert_eq!(status, FS_DONE_OK);
+        assert!(
+            !recs.iter().any(|r| matches!(
+                r,
+                FsGrepRecord::File { path, .. } if path.starts_with("target/")
+            )),
+            "gitignored files must be skipped unless NO_IGNORE is set"
+        );
+
+        // With NO_IGNORE they come back, ranked last and flagged.
+        let (status, _, recs) = run(FS_GREP_NO_IGNORE, "NEEDLE").await;
+        assert_eq!(status, FS_DONE_OK);
+        let files: Vec<_> = recs
+            .iter()
+            .filter_map(|r| match r {
+                FsGrepRecord::File { path, flags, .. } => Some((path.as_str(), *flags)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            files,
+            vec![("src/a.rs", 0), ("target/gen.rs", FS_GREP_FILE_IGNORED)],
+            "ignored files must be present, flagged, and last"
+        );
+        assert!(
+            !files.iter().any(|(p, _)| p.ends_with(".bin")),
+            "binary files must be skipped"
+        );
+        // The match record carries the line and its byte span.
+        let m = recs
+            .iter()
+            .find_map(|r| match r {
+                FsGrepRecord::Match {
+                    line, col, text, ..
+                } => Some((*line, *col, text.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(m, (0, 4, "let needle = 1;".to_string()));
+
+        // Case-sensitive finds nothing for the wrong case.
+        let (_, _, recs) = run(FS_GREP_CASE_SENSITIVE | FS_GREP_NO_IGNORE, "NEEDLE").await;
+        assert!(recs.is_empty(), "case-sensitive must not match 'needle'");
+
+        // Literal mode escapes regex metacharacters.
+        let (_, _, recs) = run(0, "needle.=").await;
+        assert!(recs.is_empty(), "literal '.' must not match any char");
+        let (_, _, recs) = run(FS_GREP_REGEX | FS_GREP_NO_IGNORE, "needle ?=").await;
+        assert!(!recs.is_empty(), "regex mode must honour metacharacters");
+
+        // A bad regex reports the engine's message rather than failing mute.
+        let (status, detail, _) = run(FS_GREP_REGEX, "needle[").await;
+        assert_eq!(status, FS_DONE_INVALID);
+        assert!(!detail.is_empty(), "a compile error must carry a reason");
+
+        // An empty query is refused before any I/O.
+        let (status, _, _) = run(0, "").await;
+        assert_eq!(status, FS_DONE_INVALID);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file skipped as binary or oversized is *out of scope*, not a
+    /// clipped result — the same status as `.git`. Reporting those as
+    /// truncation made every search of a tree with a `target/` in it claim
+    /// to be incomplete, which is worse than useless: it trains you to
+    /// ignore the one signal that should mean "there is more to find".
+    #[tokio::test]
+    async fn fs_grep_skips_are_not_truncation() {
+        use blit_remote::fs::{
+            FS_DONE_OK, FS_GREP_TRUNCATED, fs_grep_records, msg_fs_grep, parse_fs_grep_result,
+        };
+
+        let root = std::env::temp_dir()
+            .join(format!("blit-grep-trunc-{}", std::process::id()))
+            .canonicalize_or_create();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("hit.txt"), "needle here\n").unwrap();
+        // Binary: sniffed and skipped.
+        std::fs::write(root.join("blob.bin"), b"needle\0\0\0padding").unwrap();
+        // Oversized: stat'd and skipped without reading.
+        let big = vec![b'x'; (FS_GREP_MAX_FILE + 1) as usize];
+        std::fs::write(root.join("huge.txt"), &big).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+        let msg = msg_fs_grep(1, 0, 0, 0, root.to_str().unwrap(), "needle");
+        handle_fs_message(&msg, &mut syncs, &tx, false).await;
+        let (_, status, flags, _, records) = parse_fs_grep_result(&recv_blocking(&mut rx)).unwrap();
+
+        assert_eq!(status, FS_DONE_OK);
+        assert_eq!(
+            flags & FS_GREP_TRUNCATED,
+            0,
+            "skipped binary/oversized files must not report truncation"
+        );
+        // The real hit is still there.
+        assert!(!fs_grep_records(&records).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pattern that matches most of one large file must be clipped by
+    /// the walk's record budget, not collected in full first. The budget
+    /// used to be checked only *between* files, so a dense pattern on a
+    /// single large file built its whole match list — gigabytes, from a
+    /// remotely-supplied pattern — before anything looked at it.
+    #[tokio::test]
+    async fn fs_grep_dense_single_file_stays_within_budget() {
+        use blit_remote::fs::{
+            FS_DONE_OK, FS_GREP_TRUNCATED, FsGrepRecord, fs_grep_records, msg_fs_grep,
+            parse_fs_grep_result,
+        };
+
+        let root = std::env::temp_dir()
+            .join(format!("blit-grep-dense-{}", std::process::id()))
+            .canonicalize_or_create();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // One line per match keeps each record's text short, so the cap
+        // that bites is the count rather than the bytes.
+        let dense = "a\n".repeat(200_000);
+        std::fs::write(root.join("dense.txt"), &dense).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+        let msg = msg_fs_grep(1, 0, 0, 0, root.to_str().unwrap(), "a");
+        handle_fs_message(&msg, &mut syncs, &tx, false).await;
+        let (_, status, flags, _, records) = parse_fs_grep_result(&recv_blocking(&mut rx)).unwrap();
+
+        assert_eq!(status, FS_DONE_OK);
+        assert_ne!(
+            flags & FS_GREP_TRUNCATED,
+            0,
+            "dropping matches that exist must report truncation"
+        );
+        let decoded = fs_grep_records(&records);
+        let matches = decoded
+            .iter()
+            .filter(|r| matches!(r, FsGrepRecord::Match { .. }))
+            .count();
+        assert!(
+            matches <= FS_GREP_MAX_PER_FILE,
+            "{matches} records for one file exceeds the u16 count field"
+        );
+        // And the count on the FILE record is the truth, not a wrapped one.
+        let n = decoded
+            .iter()
+            .find_map(|r| match r {
+                FsGrepRecord::File { n, .. } => Some(*n as usize),
+                _ => None,
+            })
+            .expect("a FILE record");
+        assert_eq!(n, matches, "FILE count must equal the records that follow");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two matches on one line are two results, each carrying its own
+    /// column — otherwise clicking the second hit would take you to the
+    /// first, which is indistinguishable from the click not working.
+    #[tokio::test]
+    async fn fs_grep_reports_every_match_on_a_line() {
+        use blit_remote::fs::{
+            FS_DONE_OK, FsGrepRecord, fs_grep_records, msg_fs_grep, parse_fs_grep_result,
+        };
+
+        let root = std::env::temp_dir()
+            .join(format!("blit-grep-multi-{}", std::process::id()))
+            .canonicalize_or_create();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // "ab" twice on line 0, once on line 2.
+        std::fs::write(root.join("f.txt"), "xx ab yy ab\nnope\nab\n").unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+        let msg = msg_fs_grep(1, 0, 0, 0, root.to_str().unwrap(), "ab");
+        handle_fs_message(&msg, &mut syncs, &tx, false).await;
+        let (_, status, _, _, records) = parse_fs_grep_result(&recv_blocking(&mut rx)).unwrap();
+        assert_eq!(status, FS_DONE_OK);
+
+        let spans: Vec<(u32, u32, u32)> = fs_grep_records(&records)
+            .into_iter()
+            .filter_map(|r| match r {
+                FsGrepRecord::Match {
+                    line, col, end_col, ..
+                } => Some((line, col, end_col)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![(0, 3, 5), (0, 9, 11), (2, 0, 2)],
+            "each match gets its own row and column"
+        );
+        // The file record's count must agree with the rows that follow.
+        let n = fs_grep_records(&records)
+            .into_iter()
+            .find_map(|r| match r {
+                FsGrepRecord::File { n, .. } => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(n as usize, spans.len());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pattern containing `\n` matches across lines. The record must
+    /// report the full range and carry every line it spans — clamping to
+    /// the first line showed a fragment of the thing you searched for.
+    #[tokio::test]
+    async fn fs_grep_multiline_match_carries_every_line() {
+        use blit_remote::fs::{
+            FS_DONE_OK, FS_GREP_REGEX, FsGrepRecord, fs_grep_records, msg_fs_grep,
+            parse_fs_grep_result,
+        };
+
+        let root = std::env::temp_dir()
+            .join(format!("blit-grep-ml-{}", std::process::id()))
+            .canonicalize_or_create();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "pre\nalpha\nbeta\npost\n").unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+        let msg = msg_fs_grep(
+            1,
+            FS_GREP_REGEX,
+            0,
+            0,
+            root.to_str().unwrap(),
+            "alpha\\nbeta",
+        );
+        handle_fs_message(&msg, &mut syncs, &tx, false).await;
+        let (_, status, _, _, records) = parse_fs_grep_result(&recv_blocking(&mut rx)).unwrap();
+        assert_eq!(status, FS_DONE_OK);
+
+        let m = fs_grep_records(&records)
+            .into_iter()
+            .find_map(|r| match r {
+                FsGrepRecord::Match { .. } => Some(r),
+                _ => None,
+            })
+            .expect("a multi-line match");
+        let FsGrepRecord::Match {
+            line,
+            col,
+            end_line,
+            end_col,
+            text,
+        } = m
+        else {
+            unreachable!()
+        };
+        assert_eq!((line, col, end_line, end_col), (1, 0, 2, 4));
+        assert_eq!(text, "alpha\nbeta", "both lines, whole");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whole-word matching wraps the pattern in \b(?:…)\b *after* literal
+    /// escaping, so it composes with both modes — the same order
+    /// `blit terminal grep --word-regexp` uses.
+    #[tokio::test]
+    async fn fs_grep_word_matches_whole_words_only() {
+        use blit_remote::fs::{
+            FS_DONE_OK, FS_GREP_WORD, FsGrepRecord, fs_grep_records, msg_fs_grep,
+            parse_fs_grep_result,
+        };
+
+        let root = std::env::temp_dir()
+            .join(format!("blit-grep-word-{}", std::process::id()))
+            .canonicalize_or_create();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "cat\nconcatenate\nthe cat sat\n").unwrap();
+
+        let run = |flags: u8| {
+            let root = root.clone();
+            async move {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let mut syncs = FsSyncs::default();
+                let msg = msg_fs_grep(1, flags, 0, 0, root.to_str().unwrap(), "cat");
+                handle_fs_message(&msg, &mut syncs, &tx, false).await;
+                let (_, status, _, _, records) =
+                    parse_fs_grep_result(&recv_blocking(&mut rx)).unwrap();
+                assert_eq!(status, FS_DONE_OK);
+                fs_grep_records(&records)
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        FsGrepRecord::Match { line, .. } => Some(line),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // Without the flag, "concatenate" matches too.
+        assert_eq!(run(0).await, vec![0, 1, 2]);
+        // With it, only the standalone words.
+        assert_eq!(run(FS_GREP_WORD).await, vec![0, 2]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn recv_blocking(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => return msg,
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "timed out waiting for message");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    trait CanonicalizeOrCreate {
+        fn canonicalize_or_create(self) -> std::path::PathBuf;
+    }
+
+    impl CanonicalizeOrCreate for std::path::PathBuf {
+        fn canonicalize_or_create(self) -> std::path::PathBuf {
+            std::fs::create_dir_all(&self).unwrap();
+            self.canonicalize().unwrap()
+        }
     }
 
     #[test]
@@ -8291,42 +11692,42 @@ mod tests {
 
     #[test]
     fn parse_tq_da1_bare() {
-        let results = parse_terminal_queries(b"\x1b[c", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[c", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert!(results[0].starts_with("\x1b[?64;"));
     }
 
     #[test]
     fn parse_tq_da1_with_zero_param() {
-        let results = parse_terminal_queries(b"\x1b[0c", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[0c", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert!(results[0].starts_with("\x1b[?64;"));
     }
 
     #[test]
     fn parse_tq_dsr_cursor_position() {
-        let results = parse_terminal_queries(b"\x1b[6n", (24, 80), (5, 10));
+        let results = parse_terminal_queries(b"\x1b[6n", (24, 80), (5, 10)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b[6;11R");
     }
 
     #[test]
     fn parse_tq_dsr_status() {
-        let results = parse_terminal_queries(b"\x1b[5n", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[5n", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b[0n");
     }
 
     #[test]
     fn parse_tq_window_size_cells() {
-        let results = parse_terminal_queries(b"\x1b[18t", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[18t", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b[8;24;80t");
     }
 
     #[test]
     fn parse_tq_window_size_pixels() {
-        let results = parse_terminal_queries(b"\x1b[14t", (30, 100), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[14t", (30, 100), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b[4;480;800t");
     }
@@ -8334,7 +11735,7 @@ mod tests {
     #[test]
     fn parse_tq_multiple_queries() {
         let data = b"\x1b[c\x1b[6n\x1b[5n";
-        let results = parse_terminal_queries(data, (24, 80), (2, 3));
+        let results = parse_terminal_queries(data, (24, 80), (2, 3)).responses;
         assert_eq!(results.len(), 3);
         assert!(results[0].starts_with("\x1b[?64;"));
         assert_eq!(results[1], "\x1b[3;4R");
@@ -8343,31 +11744,31 @@ mod tests {
 
     #[test]
     fn parse_tq_question_mark_sequences_skipped() {
-        let results = parse_terminal_queries(b"\x1b[?1h", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[?1h", (24, 80), (0, 0)).responses;
         assert!(results.is_empty());
     }
 
     #[test]
     fn parse_tq_unknown_final_byte_ignored() {
-        let results = parse_terminal_queries(b"\x1b[42z", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b[42z", (24, 80), (0, 0)).responses;
         assert!(results.is_empty());
     }
 
     #[test]
     fn parse_tq_empty_input() {
-        let results = parse_terminal_queries(b"", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"", (24, 80), (0, 0)).responses;
         assert!(results.is_empty());
     }
 
     #[test]
     fn parse_tq_plain_text_no_csi() {
-        let results = parse_terminal_queries(b"hello world", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"hello world", (24, 80), (0, 0)).responses;
         assert!(results.is_empty());
     }
 
     #[test]
     fn parse_tq_interleaved_with_text() {
-        let results = parse_terminal_queries(b"abc\x1b[cdef\x1b[6n", (24, 80), (1, 2));
+        let results = parse_terminal_queries(b"abc\x1b[cdef\x1b[6n", (24, 80), (1, 2)).responses;
         assert_eq!(results.len(), 2);
     }
 
@@ -8375,35 +11776,35 @@ mod tests {
 
     #[test]
     fn parse_tq_osc11_background_color_bel() {
-        let results = parse_terminal_queries(b"\x1b]11;?\x07", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b]11;?\x07", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b]11;rgb:0000/0000/0000\x1b\\");
     }
 
     #[test]
     fn parse_tq_osc11_background_color_st() {
-        let results = parse_terminal_queries(b"\x1b]11;?\x1b\\", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b]11;?\x1b\\", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b]11;rgb:0000/0000/0000\x1b\\");
     }
 
     #[test]
     fn parse_tq_osc10_foreground_color() {
-        let results = parse_terminal_queries(b"\x1b]10;?\x07", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b]10;?\x07", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
     }
 
     #[test]
     fn parse_tq_osc4_palette_color_0() {
-        let results = parse_terminal_queries(b"\x1b]4;0;?\x07", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b]4;0;?\x07", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b]4;0;rgb:0000/0000/0000\x1b\\");
     }
 
     #[test]
     fn parse_tq_osc4_palette_color_1() {
-        let results = parse_terminal_queries(b"\x1b]4;1;?\x07", (24, 80), (0, 0));
+        let results = parse_terminal_queries(b"\x1b]4;1;?\x07", (24, 80), (0, 0)).responses;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "\x1b]4;1;rgb:8080/0000/0000\x1b\\");
     }
@@ -8411,11 +11812,136 @@ mod tests {
     #[test]
     fn parse_tq_osc_mixed_with_csi() {
         let results =
-            parse_terminal_queries(b"\x1b]11;?\x07\x1b[c\x1b]4;0;?\x07", (24, 80), (0, 0));
+            parse_terminal_queries(b"\x1b]11;?\x07\x1b[c\x1b]4;0;?\x07", (24, 80), (0, 0))
+                .responses;
         assert_eq!(results.len(), 3);
         assert!(results[0].starts_with("\x1b]11;"));
         assert!(results[1].starts_with("\x1b[?64;"));
         assert!(results[2].starts_with("\x1b]4;0;"));
+    }
+
+    // ── OSC 7 working-directory reports ──
+
+    #[test]
+    fn osc7_plain_bel_terminated() {
+        let scan =
+            parse_terminal_queries(b"\x1b]7;file:///home/user/project\x07", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd.as_deref(), Some("/home/user/project"));
+        // A cwd report is not a query — nothing goes back into the PTY.
+        assert!(scan.responses.is_empty());
+    }
+
+    #[test]
+    fn osc7_st_terminated_localhost() {
+        let scan = parse_terminal_queries(b"\x1b]7;file://localhost/tmp\x1b\\", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn osc7_percent_decoded() {
+        let scan =
+            parse_terminal_queries(b"\x1b]7;file:///a%20dir/caf%C3%A9\x07", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd.as_deref(), Some("/a dir/café"));
+    }
+
+    #[test]
+    fn osc7_own_hostname_accepted() {
+        let host = local_hostname();
+        if host.is_empty() {
+            return;
+        }
+        let payload = format!("\x1b]7;file://{host}/srv\x07");
+        let scan = parse_terminal_queries(payload.as_bytes(), (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd.as_deref(), Some("/srv"));
+    }
+
+    #[test]
+    fn osc7_foreign_host_ignored() {
+        // A remote-ssh shell reports the remote host; its path is not local.
+        let scan =
+            parse_terminal_queries(b"\x1b]7;file://elsewhere.example/tmp\x07", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd, None);
+    }
+
+    #[test]
+    fn osc7_non_absolute_rejected() {
+        // No path after the host at all.
+        let scan = parse_terminal_queries(b"\x1b]7;file://localhost\x07", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd, None);
+        // Percent-encoded slash is not a literal path separator.
+        let scan = parse_terminal_queries(b"\x1b]7;file://%2Ftmp\x07", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd, None);
+        // Not a file:// URL.
+        let scan = parse_terminal_queries(b"\x1b]7;http://localhost/x\x07", (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd, None);
+    }
+
+    #[test]
+    fn osc7_malformed_escapes_rejected() {
+        for payload in [
+            &b"\x1b]7;file:///a%GGb\x07"[..],    // non-hex escape
+            &b"\x1b]7;file:///a%2\x07"[..],      // truncated escape
+            &b"\x1b]7;file:///a%00b\x07"[..],    // embedded NUL
+            &b"\x1b]7;file:///a%FF\x07"[..],     // invalid UTF-8 after decode
+            &b"\x1b]7;file:///unterminated"[..], // no BEL/ST terminator
+        ] {
+            let scan = parse_terminal_queries(payload, (24, 80), (0, 0));
+            assert_eq!(scan.osc7_cwd, None, "payload {payload:?}");
+        }
+    }
+
+    #[test]
+    fn osc7_oversize_dropped() {
+        let max = "/".to_owned() + &"a".repeat(blit_remote::TERM_CWD_MAX - 1);
+        let ok = format!("\x1b]7;file://{max}\x07");
+        let scan = parse_terminal_queries(ok.as_bytes(), (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd.as_deref(), Some(max.as_str()));
+
+        let over = format!("\x1b]7;file://{max}a\x07");
+        let scan = parse_terminal_queries(over.as_bytes(), (24, 80), (0, 0));
+        assert_eq!(scan.osc7_cwd, None);
+    }
+
+    #[test]
+    fn osc7_last_report_in_chunk_wins() {
+        let scan = parse_terminal_queries(
+            b"\x1b]7;file:///first\x07output\x1b]7;file:///second\x07",
+            (24, 80),
+            (0, 0),
+        );
+        assert_eq!(scan.osc7_cwd.as_deref(), Some("/second"));
+    }
+
+    #[test]
+    fn osc7_dedupe_same_cwd_one_push() {
+        let mut stored = None;
+        let first = note_osc7_cwd(&mut stored, 3, Some("/tmp".into()));
+        assert_eq!(first, Some(blit_remote::msg_term_cwd_event(3, "/tmp")));
+        // Shells re-emit per prompt: an identical repeat pushes nothing.
+        assert_eq!(note_osc7_cwd(&mut stored, 3, Some("/tmp".into())), None);
+        // A change pushes again (last write wins).
+        assert_eq!(
+            note_osc7_cwd(&mut stored, 3, Some("/var".into())),
+            Some(blit_remote::msg_term_cwd_event(3, "/var"))
+        );
+        // Chunks without a report leave the store untouched.
+        assert_eq!(note_osc7_cwd(&mut stored, 3, None), None);
+        assert_eq!(stored.as_deref(), Some("/var"));
+    }
+
+    #[test]
+    fn poll_prefers_osc7_over_kernel() {
+        let mut kernel_called = false;
+        let cwd = resolve_term_cwd(Some("/from-osc7"), || {
+            kernel_called = true;
+            Some("/from-kernel".into())
+        });
+        assert_eq!(cwd.as_deref(), Some("/from-osc7"));
+        assert!(!kernel_called, "OSC 7 hit must not touch the kernel");
+
+        let cwd = resolve_term_cwd(None, || Some("/from-kernel".into()));
+        assert_eq!(cwd.as_deref(), Some("/from-kernel"));
+        assert_eq!(resolve_term_cwd(None, || None), None);
     }
 
     // ── build_search_results_msg ──
@@ -8544,5 +12070,138 @@ mod tests {
             client.last_sent.contains_key(&1),
             "last_sent should advance even on disconnect"
         );
+    }
+
+    /// With the family disabled, every nonce-bearing LSP request still gets
+    /// its one reply. Dropping them left a client that ignores the feature
+    /// bit — or that raced a mid-session disable — awaiting a promise that
+    /// could never resolve, where KV and NET both answer PERMISSION.
+    #[test]
+    fn disabled_lsp_refuses_every_nonce() {
+        use blit_remote::lsp::*;
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        refuse_lsp_message(&msg_lsp_open(1, 0, 0, "/tmp"), &out);
+        let reply = rx.try_recv().expect("a reply");
+        let opened = parse_lsp_opened(&reply).unwrap();
+        assert_eq!(opened.nonce, 1);
+        assert_eq!(opened.lsp_id, LSP_ID_INVALID);
+        assert_eq!(opened.status, LSP_STATUS_PERMISSION);
+
+        let query = msg_lsp_query(&LspQueryRequest {
+            nonce: 2,
+            lsp_id: 7,
+            kind: LSP_QUERY_DEFINITION,
+            flags: 0,
+            line: 0,
+            col: 0,
+            path: "a.rs",
+            arg: "",
+        });
+        refuse_lsp_message(&query, &out);
+        let resp = parse_lsp_query_resp(&rx.try_recv().expect("a reply")).unwrap();
+        assert_eq!((resp.nonce, resp.status), (2, LSP_STATUS_PERMISSION));
+
+        refuse_lsp_message(&msg_lsp_servers(3), &out);
+        let (nonce, status, ..) = parse_lsp_servers_resp(&rx.try_recv().expect("a reply")).unwrap();
+        assert_eq!((nonce, status), (3, LSP_STATUS_PERMISSION));
+
+        refuse_lsp_message(&msg_lsp_stop(4, 1), &out);
+        let (nonce, status) = parse_lsp_stopped(&rx.try_recv().expect("a reply")).unwrap();
+        assert_eq!((nonce, status), (4, LSP_STATUS_PERMISSION));
+
+        // Fire-and-forget opcodes have no reply to give, disabled or not.
+        refuse_lsp_message(&msg_lsp_ack(1, 0, 1), &out);
+        refuse_lsp_message(&msg_lsp_buffer(1, 0, "a.rs", b"x"), &out);
+        assert!(rx.try_recv().is_err(), "no reply is owed for these");
+    }
+
+    /// LSP dispatch glue: refusals, unknown ids, and the daemon-wide
+    /// verbs answer synchronously and correctly without any language
+    /// server installed (engine behavior is covered in blit-lsp).
+    #[tokio::test]
+    async fn lsp_message_flow() {
+        use blit_remote::lsp::*;
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut conns = LspConns::default();
+
+        // A bad path refuses with the sentinel id.
+        handle_lsp_message(
+            &msg_lsp_open(1, 0, 0, "/blit-no-such-path"),
+            &mut conns,
+            &out,
+            false,
+        )
+        .await;
+        let refusal = rx.try_recv().expect("synchronous refusal");
+        let opened = parse_lsp_opened(&refusal).unwrap();
+        assert_eq!(opened.lsp_id, LSP_ID_INVALID);
+        assert_eq!(opened.status, LSP_STATUS_NOT_FOUND);
+
+        // A markerless directory names the problem.
+        let dir = std::env::temp_dir().join(format!("blit-lsp-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        handle_lsp_message(
+            &msg_lsp_open(2, 0, 0, dir.to_str().unwrap()),
+            &mut conns,
+            &out,
+            false,
+        )
+        .await;
+        let refusal = rx.try_recv().expect("synchronous refusal");
+        let opened = parse_lsp_opened(&refusal).unwrap();
+        assert_eq!(opened.lsp_id, LSP_ID_INVALID);
+        assert_eq!(opened.status, LSP_STATUS_NOT_FOUND);
+        assert!(opened.detail.contains("no known project markers"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Unknown flag bits are INVALID.
+        handle_lsp_message(&msg_lsp_open(3, 0x80, 0, "/"), &mut conns, &out, false).await;
+        let refusal = rx.try_recv().expect("synchronous refusal");
+        assert_eq!(
+            parse_lsp_opened(&refusal).unwrap().status,
+            LSP_STATUS_INVALID
+        );
+
+        // A query against an unknown attachment answers UNKNOWN_ID.
+        let query = msg_lsp_query(&LspQueryRequest {
+            nonce: 9,
+            lsp_id: 42,
+            kind: LSP_QUERY_DEFINITION,
+            flags: 0,
+            line: 0,
+            col: 0,
+            path: "a.rs",
+            arg: "",
+        });
+        handle_lsp_message(&query, &mut conns, &out, false).await;
+        let resp = rx.try_recv().expect("synchronous refusal");
+        let r = parse_lsp_query_resp(&resp).unwrap();
+        let (nonce, status) = (r.nonce, r.status);
+        assert_eq!((nonce, status), (9, LSP_STATUS_UNKNOWN_ID));
+
+        // The daemon-wide verbs answer without any backend running.
+        handle_lsp_message(&msg_lsp_servers(4), &mut conns, &out, false).await;
+        let resp = rx.try_recv().expect("synchronous LSP_SERVERS");
+        let (nonce, status, _, _) = parse_lsp_servers_resp(&resp).unwrap();
+        assert_eq!((nonce, status), (4, LSP_STATUS_OK));
+
+        handle_lsp_message(&msg_lsp_stop(5, 999), &mut conns, &out, false).await;
+        let resp = rx.try_recv().expect("synchronous LSP_STOPPED");
+        assert_eq!(parse_lsp_stopped(&resp), Some((5, LSP_STATUS_NOT_FOUND)));
+
+        // ACK and CLOSE on unknown ids are silent no-ops.
+        handle_lsp_message(
+            &msg_lsp_ack(7, LSP_STREAM_STATE, 1),
+            &mut conns,
+            &out,
+            false,
+        )
+        .await;
+        handle_lsp_message(&msg_lsp_close(7), &mut conns, &out, false).await;
+        assert!(rx.try_recv().is_err());
     }
 }

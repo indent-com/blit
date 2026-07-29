@@ -25,6 +25,9 @@ export interface BlitTerminalProps {
   scrollbarColor?: string;
   scrollbarWidth?: number;
   advanceRatio?: number;
+  /** Coverage gamma for glyph antialiasing: 1 leaves antialiasing untouched,
+   *  above 1 thins light-on-dark text. Default: DEFAULT_TEXT_GAMMA. */
+  textGamma?: number;
   /** Callback to receive the underlying BlitTerminalSurface after mount. */
   surfaceRef?: (surface: BlitTerminalSurface | null) => void;
 }
@@ -60,6 +63,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
       scrollbarColor: props.scrollbarColor,
       scrollbarWidth: props.scrollbarWidth,
       advanceRatio: props.advanceRatio ?? ctx.advanceRatio,
+      textGamma: props.textGamma ?? ctx.textGamma,
     });
 
     s.setWorkspace(workspace);
@@ -99,6 +103,7 @@ export function BlitTerminal(props: BlitTerminalProps) {
   createEffect(() =>
     surface()?.setAdvanceRatio(props.advanceRatio ?? ctx.advanceRatio),
   );
+  createEffect(() => surface()?.setTextGamma(props.textGamma ?? ctx.textGamma));
   createEffect(() => surface()?.setReadOnly(props.readOnly));
   createEffect(() => surface()?.setResizable(props.resizable));
 

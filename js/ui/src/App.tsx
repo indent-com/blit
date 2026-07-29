@@ -2,6 +2,7 @@ import {
   createSignal,
   createEffect,
   createMemo,
+  ErrorBoundary,
   onCleanup,
   Show,
 } from "solid-js";
@@ -154,16 +155,78 @@ export function App(props: { wasm: BlitWasmModule }) {
     setPassphrase(null);
   }
 
+  // Last-resort boundary. Individual tiles contain their own failures
+  // (see BlitTile), but a throw in the shell — the dock, the status bar,
+  // BSPContainer itself — has nothing above it and would leave a blank
+  // page with the reason only in the console. Show it, and offer the one
+  // action that reliably helps.
   return (
-    <Show when={passphrase()} fallback={<AuthApp onAuth={handleAuth} />}>
-      {(pass) => (
-        <ConnectedApp
-          wasm={props.wasm}
-          passphrase={pass()}
-          onAuthError={handleAuthError}
-        />
-      )}
-    </Show>
+    <ErrorBoundary fallback={(err: unknown) => <AppCrash err={err} />}>
+      <Show when={passphrase()} fallback={<AuthApp onAuth={handleAuth} />}>
+        {(pass) => (
+          <ConnectedApp
+            wasm={props.wasm}
+            passphrase={pass()}
+            onAuthError={handleAuthError}
+          />
+        )}
+      </Show>
+    </ErrorBoundary>
+  );
+}
+
+/** The shell failed. Deliberately dependency-free: whatever broke may well
+ *  be the theme or the workspace this would otherwise read from. */
+function AppCrash(props: { err: unknown }) {
+  const message = () =>
+    props.err instanceof Error
+      ? `${props.err.name}: ${props.err.message}\n\n${props.err.stack ?? ""}`
+      : String(props.err);
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: "0",
+        display: "flex",
+        "flex-direction": "column",
+        gap: "12px",
+        padding: "24px",
+        overflow: "auto",
+        background: "#1a1a1a",
+        color: "#e0e0e0",
+        "font-family": "ui-monospace, monospace",
+        "font-size": "13px",
+      }}
+    >
+      <b style={{ color: "#f66" }}>blit hit an unexpected error</b>
+      <div>Reloading usually recovers; your terminals keep running.</div>
+      <div>
+        <button
+          onClick={() => location.reload()}
+          style={{
+            padding: "4px 10px",
+            background: "#2a2a2a",
+            color: "#e0e0e0",
+            border: "1px solid rgba(255,255,255,0.15)",
+            "border-radius": "3px",
+            cursor: "pointer",
+            font: "inherit",
+          }}
+        >
+          Reload
+        </button>
+      </div>
+      <pre
+        style={{
+          "white-space": "pre-wrap",
+          "word-break": "break-word",
+          color: "rgba(255,255,255,0.5)",
+          margin: "0",
+        }}
+      >
+        {message()}
+      </pre>
+    </div>
   );
 }
 

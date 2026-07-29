@@ -440,13 +440,13 @@ pub fn parse_remotes_str(contents: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Parse `blit.remotes` content including disabled entries.
-/// Format: `name = uri` for enabled; `# name = uri` (with optional whitespace
-/// after `#`) for disabled. Other `#` lines and blank lines are ignored.
-/// Duplicate names: last wins (same as blit.conf).
-pub fn parse_remotes_full(contents: &str) -> Vec<RemoteEntry> {
+/// Parse `name = value` lines shared by `blit.remotes` and `blit.roots`.
+/// Format: `name = value` for enabled; `# name = value` (optional whitespace
+/// after `#`) for disabled. Blank lines and other `#` lines are ignored.
+/// Duplicate names: last wins; first-seen order is preserved.
+fn parse_kv_entries(contents: &str) -> Vec<(String, String, bool)> {
     let mut order: Vec<String> = Vec::new();
-    let mut map: HashMap<String, RemoteEntry> = HashMap::new();
+    let mut map: HashMap<String, (String, String, bool)> = HashMap::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -461,23 +461,34 @@ pub fn parse_remotes_full(contents: &str) -> Vec<RemoteEntry> {
             continue;
         };
         let name = k.trim().to_string();
-        let uri = v.trim().to_string();
-        if name.is_empty() || uri.is_empty() {
+        let value = v.trim().to_string();
+        // A name with internal whitespace can't round-trip through the
+        // space-delimited `*-add`/`*-reorder` wire verbs, so never
+        // materialize one (applies to both blit.remotes and blit.roots).
+        if name.is_empty() || name.contains(char::is_whitespace) || value.is_empty() {
             continue;
         }
         if !map.contains_key(&name) {
             order.push(name.clone());
         }
-        map.insert(
-            name.clone(),
-            RemoteEntry {
-                name,
-                uri,
-                disabled,
-            },
-        );
+        map.insert(name.clone(), (name, value, disabled));
     }
     order.into_iter().map(|k| map.remove(&k).unwrap()).collect()
+}
+
+/// Parse `blit.remotes` content including disabled entries.
+/// Format: `name = uri` for enabled; `# name = uri` (with optional whitespace
+/// after `#`) for disabled. Other `#` lines and blank lines are ignored.
+/// Duplicate names: last wins (same as blit.conf).
+pub fn parse_remotes_full(contents: &str) -> Vec<RemoteEntry> {
+    parse_kv_entries(contents)
+        .into_iter()
+        .map(|(name, uri, disabled)| RemoteEntry {
+            name,
+            uri,
+            disabled,
+        })
+        .collect()
 }
 
 fn serialize_remotes(entries: &[RemoteEntry]) -> String {
@@ -636,6 +647,13 @@ struct RemotesInner {
     /// Cached current contents (raw file text, normalized).
     contents: RwLock<String>,
     tx: broadcast::Sender<String>,
+
+    /// False in ephemeral mode: `set` broadcasts but never touches disk.
+    /// Without this, "no file I/O" was only true until the first write —
+    /// which let a `blit open` session's temporary destination list
+    /// overwrite the user's real config, and let the unit tests clobber
+    /// `~/.config/blit/` on every `cargo test`.
+    persist: bool,
 }
 
 impl RemotesState {
@@ -645,6 +663,7 @@ impl RemotesState {
         let inner = Arc::new(RemotesInner {
             contents: RwLock::new(serialize_remotes(&read_remotes_full())),
             tx,
+            persist: true,
         });
         let watcher_inner = inner.clone();
         spawn_file_watcher(remotes_path(), "remotes", move || {
@@ -666,6 +685,7 @@ impl RemotesState {
             inner: Arc::new(RemotesInner {
                 contents: RwLock::new(initial),
                 tx,
+                persist: false,
             }),
         }
     }
@@ -677,7 +697,9 @@ impl RemotesState {
 
     /// Overwrite `blit.remotes` with `entries` and broadcast the change.
     pub fn set(&self, entries: &[RemoteEntry]) {
-        write_remotes(entries);
+        if self.inner.persist {
+            write_remotes(entries);
+        }
         let text = serialize_remotes(entries);
         *self.inner.contents.write().unwrap() = text.clone();
         let _ = self.inner.tx.send(text);
@@ -698,6 +720,247 @@ impl RemotesState {
 }
 
 impl Default for RemotesState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RootsState — live-reloading blit.roots (IDE workspace roots)
+// ---------------------------------------------------------------------------
+
+/// A single entry in `blit.roots`: a named workspace root the IDE can browse.
+/// `value` is an opaque `remote:path` spec (e.g. `local:/home/me/app`); the
+/// server stores and serves it verbatim, the client parses the remote/path.
+/// `disabled` entries are persisted as `# name = value` and hidden from the
+/// picker but preserved for re-enabling. Unlike `blit.remotes`, the file is
+/// never auto-provisioned — an absent file just means no declared roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootEntry {
+    pub name: String,
+    pub value: String,
+    pub disabled: bool,
+}
+
+pub fn roots_path() -> PathBuf {
+    if let Ok(p) = std::env::var("BLIT_ROOTS") {
+        return PathBuf::from(p);
+    }
+    blit_config_dir().join("blit.roots")
+}
+
+/// Parse `blit.roots` content including disabled entries.
+pub fn parse_roots_full(contents: &str) -> Vec<RootEntry> {
+    parse_kv_entries(contents)
+        .into_iter()
+        .map(|(name, value, disabled)| RootEntry {
+            name,
+            value,
+            disabled,
+        })
+        .collect()
+}
+
+/// Read `blit.roots` including disabled entries; empty if the file is absent.
+pub fn read_roots_full() -> Vec<RootEntry> {
+    match std::fs::read_to_string(roots_path()) {
+        Ok(c) => parse_roots_full(&c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => {
+            eprintln!("blit: could not read {}: {e}", roots_path().display());
+            vec![]
+        }
+    }
+}
+
+fn serialize_roots(entries: &[RootEntry]) -> String {
+    let mut out = String::new();
+    for e in entries {
+        if e.disabled {
+            out.push_str("# ");
+        }
+        out.push_str(&e.name);
+        out.push_str(" = ");
+        out.push_str(&e.value);
+        out.push('\n');
+    }
+    out
+}
+
+/// Write `blit.roots` atomically with mode 0o600.
+pub fn write_roots(entries: &[RootEntry]) {
+    let path = roots_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    write_secret_file(&path, &serialize_roots(entries));
+}
+
+/// Atomically read-modify-write `blit.roots` under an exclusive flock.
+pub fn modify_roots(f: impl FnOnce(&mut Vec<RootEntry>)) {
+    let _lock = lock_config_dir();
+    let mut entries = read_roots_full();
+    f(&mut entries);
+    write_roots(&entries);
+}
+
+/// One `blit.forwards` entry: a name and a port-forward spec
+/// (docs/design/net.md § A named list). Same shape as [`RootEntry`], and for
+/// the same reason: `blit.conf` is a flat key→value map and cannot hold an
+/// ordered list, so a list of named things gets its own file. `disabled`
+/// entries are persisted as `# name = spec` and skipped by
+/// `blit forward --all` but preserved for re-enabling. Never
+/// auto-provisioned — an absent file means no declared forwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardEntry {
+    pub name: String,
+    pub spec: String,
+    pub disabled: bool,
+}
+
+pub fn forwards_path() -> PathBuf {
+    if let Ok(p) = std::env::var("BLIT_FORWARDS") {
+        return PathBuf::from(p);
+    }
+    blit_config_dir().join("blit.forwards")
+}
+
+/// Parse `blit.forwards` content including disabled entries.
+pub fn parse_forwards_full(contents: &str) -> Vec<ForwardEntry> {
+    parse_kv_entries(contents)
+        .into_iter()
+        .map(|(name, spec, disabled)| ForwardEntry {
+            name,
+            spec,
+            disabled,
+        })
+        .collect()
+}
+
+/// Read `blit.forwards` including disabled entries; empty if absent.
+pub fn read_forwards_full() -> Vec<ForwardEntry> {
+    match std::fs::read_to_string(forwards_path()) {
+        Ok(c) => parse_forwards_full(&c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => {
+            eprintln!("blit: could not read {}: {e}", forwards_path().display());
+            vec![]
+        }
+    }
+}
+
+fn serialize_forwards(entries: &[ForwardEntry]) -> String {
+    let mut out = String::new();
+    for e in entries {
+        if e.disabled {
+            out.push_str("# ");
+        }
+        out.push_str(&e.name);
+        out.push_str(" = ");
+        out.push_str(&e.spec);
+        out.push('\n');
+    }
+    out
+}
+
+/// Write `blit.forwards` atomically with mode 0o600.
+pub fn write_forwards(entries: &[ForwardEntry]) {
+    let path = forwards_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    write_secret_file(&path, &serialize_forwards(entries));
+}
+
+/// Atomically read-modify-write `blit.forwards` under an exclusive flock.
+pub fn modify_forwards(f: impl FnOnce(&mut Vec<ForwardEntry>)) {
+    let _lock = lock_config_dir();
+    let mut entries = read_forwards_full();
+    f(&mut entries);
+    write_forwards(&entries);
+}
+
+/// Manages `blit.roots` exactly as [`RemotesState`] manages `blit.remotes`:
+/// reads/writes the file, watches for external changes, and broadcasts the
+/// raw serialized contents to all subscribers. The config WebSocket handler
+/// prefixes the broadcast with `"roots:"`.
+#[derive(Clone)]
+pub struct RootsState {
+    inner: Arc<RootsInner>,
+}
+
+struct RootsInner {
+    contents: RwLock<String>,
+    tx: broadcast::Sender<String>,
+
+    /// False in ephemeral mode: `set` broadcasts but never touches disk.
+    /// Without this, "no file I/O" was only true until the first write —
+    /// which let a `blit open` session's temporary destination list
+    /// overwrite the user's real config, and let the unit tests clobber
+    /// `~/.config/blit/` on every `cargo test`.
+    persist: bool,
+}
+
+impl RootsState {
+    /// Full persistent mode: reads `blit.roots`, watches it for changes.
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(64);
+        let inner = Arc::new(RootsInner {
+            contents: RwLock::new(serialize_roots(&read_roots_full())),
+            tx,
+            persist: true,
+        });
+        let watcher_inner = inner.clone();
+        spawn_file_watcher(roots_path(), "roots", move || {
+            let text = std::fs::read_to_string(roots_path()).unwrap_or_default();
+            *watcher_inner.contents.write().unwrap() = text.clone();
+            let _ = watcher_inner.tx.send(text);
+        });
+        Self { inner }
+    }
+
+    /// Ephemeral mode: starts with the given text, no file I/O, no watcher.
+    pub fn ephemeral(initial: String) -> Self {
+        let (tx, _) = broadcast::channel(64);
+        Self {
+            inner: Arc::new(RootsInner {
+                contents: RwLock::new(initial),
+                tx,
+                persist: false,
+            }),
+        }
+    }
+
+    /// Returns the current serialized roots contents.
+    pub fn get(&self) -> String {
+        self.inner.contents.read().unwrap().clone()
+    }
+
+    /// Overwrite `blit.roots` with `entries` and broadcast the change.
+    pub fn set(&self, entries: &[RootEntry]) {
+        if self.inner.persist {
+            write_roots(entries);
+        }
+        let text = serialize_roots(entries);
+        *self.inner.contents.write().unwrap() = text.clone();
+        let _ = self.inner.tx.send(text);
+    }
+
+    /// Atomically read-modify-write `blit.roots` under an exclusive flock,
+    /// then update the in-memory cache and broadcast.
+    pub fn modify(&self, f: impl FnOnce(&mut Vec<RootEntry>)) {
+        let _lock = lock_config_dir();
+        let mut entries = parse_roots_full(&self.get());
+        f(&mut entries);
+        self.set(&entries);
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.inner.tx.subscribe()
+    }
+}
+
+impl Default for RootsState {
     fn default() -> Self {
         Self::new()
     }
@@ -728,11 +991,15 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 ///      `blit.remotes`).  `<text>` is the raw `blit.remotes` file contents:
 ///      `name = uri` lines for enabled remotes, `# name = uri` lines for
 ///      disabled ones.  Empty string if the file does not exist.
-///   3. Zero or more `"key=value"` messages — current browser settings.
-///   4. `"ready"` — end of initial burst; live updates follow.
+///   3. `"roots:<text>"` — the raw `blit.roots` file contents in the same
+///      `name = value` format (`value` is an opaque `remote:path` spec).
+///      Empty string when there are no declared roots.
+///   4. Zero or more `"key=value"` messages — current browser settings.
+///   5. `"ready"` — end of initial burst; live updates follow.
 ///
 /// After `"ready"`, the server pushes:
 ///   - `"remotes:<text>"` when `blit.remotes` changes.
+///   - `"roots:<text>"` when `blit.roots` changes.
 ///   - `"key=value"` when `blit.conf` changes.
 ///
 /// The client may send:
@@ -752,12 +1019,17 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 ///   - `"remotes-reorder name1 name2 …"` — reorder remotes to match the
 ///     supplied name sequence; any names not listed are appended at the end
 ///     in their original relative order.  Disabled state is preserved.
+///   - `"roots-add name value"` / `"roots-remove name"` /
+///     `"roots-toggle name"` / `"roots-reorder name1 name2 …"` — the exact
+///     analogues for `blit.roots`.  `value` is an opaque `remote:path` spec.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_config_ws(
     mut ws: WebSocket,
     token: &AuthPassphrase,
     config: &ConfigState,
     remotes: Option<&RemotesState>,
     remotes_transform: Option<fn(&str) -> String>,
+    roots: Option<&RootsState>,
     extra_init: &[String],
     auth: AuthContext<'_>,
 ) {
@@ -767,6 +1039,7 @@ pub async fn handle_config_ws(
 
     // Subscribe before reading the snapshot so we can't miss a concurrent write.
     let mut remotes_rx = remotes.map(|r| r.subscribe());
+    let mut roots_rx = roots.map(|r| r.subscribe());
 
     // Send the current remotes snapshot (even if empty — client can rely on
     // always receiving this message after "ok").
@@ -776,6 +1049,16 @@ pub async fn handle_config_ws(
         .unwrap_or(remotes_text);
     if ws
         .send(Message::Text(format!("remotes:{remotes_text}").into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // Send the current roots snapshot (always, even if empty).
+    let roots_text = roots.map(|r| r.get()).unwrap_or_default();
+    if ws
+        .send(Message::Text(format!("roots:{roots_text}").into()))
         .await
         .is_err()
     {
@@ -914,6 +1197,90 @@ pub async fn handle_config_ws(
                                     });
                                 }
                             }
+                        } else if let Some(rest) = text.strip_prefix("roots-add ") {
+                            // "roots-add <name> <value>" — value is an opaque
+                            // remote:path spec (remainder after the first space).
+                            if let Some((raw_name, raw_value)) = rest.split_once(' ') {
+                                let name = raw_name.trim().replace(['\n', '\r'], "");
+                                let value = raw_value.trim().replace(['\n', '\r'], "");
+                                // Reject '=' and a leading '#' (the disabled
+                                // marker): a '#'-prefixed name would serialize
+                                // as an enabled line that reparses as disabled.
+                                if !name.is_empty()
+                                    && !name.contains('=')
+                                    && !name.starts_with('#')
+                                    && !value.is_empty()
+                                    && let Some(r) = roots
+                                {
+                                    r.modify(|entries| {
+                                        if let Some(pos) =
+                                            entries.iter().position(|e| e.name == name)
+                                        {
+                                            entries[pos].value = value;
+                                            entries[pos].disabled = false;
+                                        } else {
+                                            entries.push(RootEntry {
+                                                name,
+                                                value,
+                                                disabled: false,
+                                            });
+                                        }
+                                    });
+                                }
+                            }
+                        } else if let Some(name) = text.strip_prefix("roots-remove ") {
+                            let name = name.trim().replace(['\n', '\r'], "");
+                            if !name.is_empty()
+                                && let Some(r) = roots
+                            {
+                                r.modify(|entries| {
+                                    entries.retain(|e| e.name != name);
+                                });
+                            }
+                        } else if let Some(name) = text.strip_prefix("roots-toggle ") {
+                            let name = name.trim().replace(['\n', '\r'], "");
+                            if !name.is_empty()
+                                && let Some(r) = roots
+                            {
+                                r.modify(|entries| {
+                                    if let Some(pos) =
+                                        entries.iter().position(|e| e.name == name)
+                                    {
+                                        entries[pos].disabled = !entries[pos].disabled;
+                                    }
+                                });
+                            }
+                        } else if let Some(rest) = text.strip_prefix("roots-reorder ") {
+                            // "roots-reorder name1 name2 …" — reorder to match the
+                            // sequence; unlisted entries are appended at the end.
+                            if let Some(r) = roots {
+                                let desired: Vec<String> = rest
+                                    .split_whitespace()
+                                    .map(|s| s.replace(['\n', '\r'], ""))
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                if !desired.is_empty() {
+                                    r.modify(|entries| {
+                                        let by_name: std::collections::HashMap<String, RootEntry> =
+                                            entries
+                                                .iter()
+                                                .map(|e| (e.name.clone(), e.clone()))
+                                                .collect();
+                                        let mut reordered: Vec<RootEntry> = desired
+                                            .iter()
+                                            .filter_map(|n| by_name.get(n).cloned())
+                                            .collect();
+                                        let desired_set: std::collections::HashSet<&str> =
+                                            desired.iter().map(|s| s.as_str()).collect();
+                                        for e in entries.iter() {
+                                            if !desired_set.contains(e.name.as_str()) {
+                                                reordered.push(e.clone());
+                                            }
+                                        }
+                                        *entries = reordered;
+                                    });
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -965,6 +1332,36 @@ pub async fn handle_config_ws(
                             {
                                 break;
                             }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            roots_update = async {
+                match roots_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match roots_update {
+                    Ok(text) => {
+                        if ws
+                            .send(Message::Text(format!("roots:{text}").into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed some updates — send the current snapshot.
+                        if let Some(r) = roots
+                            && ws
+                                .send(Message::Text(format!("roots:{}", r.get()).into()))
+                                .await
+                                .is_err()
+                        {
+                            break;
                         }
                     }
                     Err(_) => break,
@@ -1280,5 +1677,74 @@ mod tests {
         throttle.begin("bad").unwrap().record_failure();
         assert!(throttle.begin("bad").is_none(), "bad peer is locked out");
         assert!(throttle.begin("other").is_some(), "lockout is per peer");
+    }
+
+    // ── blit.roots (RootsState) ──
+
+    #[test]
+    fn roots_parse_and_round_trip_disabled() {
+        let initial = "app = local:/home/me/app\n# prod = server:/srv/app\n";
+        let entries = parse_roots_full(initial);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "app");
+        assert_eq!(entries[0].value, "local:/home/me/app");
+        assert!(!entries[0].disabled);
+        assert_eq!(entries[1].name, "prod");
+        assert!(entries[1].disabled);
+        let serialized = serialize_roots(&entries);
+        assert_eq!(parse_roots_full(&serialized), entries);
+        assert!(serialized.contains("# prod = server:/srv/app"));
+    }
+
+    #[test]
+    fn roots_add_new_and_update_existing() {
+        let state = RootsState::ephemeral(String::new());
+        // Add new.
+        state.modify(|entries| {
+            entries.push(RootEntry {
+                name: "app".into(),
+                value: "local:/a".into(),
+                disabled: false,
+            });
+        });
+        // Update existing (WS add semantics: retarget + re-enable).
+        state.modify(|entries| {
+            let name = "app".to_string();
+            if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                entries[pos].value = "local:/b".into();
+                entries[pos].disabled = false;
+            } else {
+                entries.push(RootEntry {
+                    name,
+                    value: "local:/b".into(),
+                    disabled: false,
+                });
+            }
+        });
+        let entries = parse_roots_full(&state.get());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "local:/b");
+    }
+
+    #[test]
+    fn roots_toggle_and_remove() {
+        let state = RootsState::ephemeral("app = local:/a\nlib = local:/b\n".into());
+        state.modify(|entries| {
+            if let Some(pos) = entries.iter().position(|e| e.name == "app") {
+                entries[pos].disabled = !entries[pos].disabled;
+            }
+        });
+        state.modify(|entries| entries.retain(|e| e.name != "lib"));
+        let entries = parse_roots_full(&state.get());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "app");
+        assert!(entries[0].disabled);
+    }
+
+    #[test]
+    fn roots_empty_when_absent() {
+        // An absent file must not auto-provision (unlike blit.remotes).
+        let state = RootsState::ephemeral(String::new());
+        assert!(parse_roots_full(&state.get()).is_empty());
     }
 }

@@ -1,13 +1,22 @@
 mod agent;
+mod attach;
 mod cli;
+mod forward;
+mod fs;
 mod generate;
+mod git;
 mod grep;
 mod interactive;
+mod kv;
+mod lsp;
 mod transport;
 mod uplink;
 
 use clap::Parser;
-use cli::{Cli, ClipboardCommand, Command, RemoteCommand, SurfaceCommand, TerminalCommand};
+use cli::{
+    Cli, ClipboardCommand, Command, FsCommand, GitCommand, KvCommand, LspCommand, RemoteCommand,
+    SurfaceCommand, TerminalCommand,
+};
 
 fn main() {
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
@@ -140,6 +149,13 @@ async fn async_main() {
                     agent::cmd_kill(transport, id, &signal).await
                 }
                 TerminalCommand::Close { id } => agent::cmd_close(transport, id).await,
+                TerminalCommand::Attach { id } => match attach::cmd_attach(transport, id).await {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => Err(e),
+                },
+                TerminalCommand::Resize { id, cols, rows } => {
+                    agent::cmd_resize(transport, id, cols, rows).await
+                }
                 TerminalCommand::Grep {
                     pattern,
                     ids,
@@ -301,6 +317,13 @@ async fn async_main() {
                     agent::cmd_click(transport, id, x, y, &button).await
                 }
                 SurfaceCommand::Key { id, key } => agent::cmd_key(transport, id, &key).await,
+                SurfaceCommand::Scroll {
+                    id,
+                    amount,
+                    horizontal,
+                } => agent::cmd_scroll(transport, id, amount, horizontal).await,
+                SurfaceCommand::Focus { id } => agent::cmd_focus_surface(transport, id).await,
+                SurfaceCommand::Text { id, text } => agent::cmd_text(transport, id, &text).await,
                 SurfaceCommand::Type { id, text } => agent::cmd_type(transport, id, &text).await,
                 SurfaceCommand::Record {
                     id,
@@ -337,6 +360,369 @@ async fn async_main() {
                 std::process::exit(1);
             }
         }
+        Command::Fs { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result: Result<i32, String> = match command {
+                FsCommand::Sync {
+                    path,
+                    content,
+                    no_recursive,
+                    once,
+                    json,
+                } => fs::cmd_sync(transport, path, content, no_recursive, once, json)
+                    .await
+                    .map(|()| 0),
+                FsCommand::Write {
+                    path,
+                    root,
+                    if_hash,
+                    create,
+                    force,
+                    parents,
+                    durable,
+                    mode,
+                    json,
+                } => {
+                    fs::cmd_write(
+                        transport, path, root, if_hash, create, force, parents, durable, mode, json,
+                    )
+                    .await
+                }
+                FsCommand::Mkdir {
+                    path,
+                    root,
+                    parents,
+                    mode,
+                    json,
+                } => fs::cmd_mkdir(transport, path, root, parents, mode, json).await,
+                FsCommand::Rm {
+                    path,
+                    root,
+                    if_hash,
+                    json,
+                } => fs::cmd_rm(transport, path, root, if_hash, json).await,
+                FsCommand::Mv {
+                    from,
+                    to,
+                    root,
+                    parents,
+                    json,
+                } => fs::cmd_mv(transport, from, to, root, parents, json).await,
+                FsCommand::Ln {
+                    target,
+                    link,
+                    symlink,
+                    root,
+                    if_hash,
+                    force,
+                    parents,
+                    json,
+                } => {
+                    fs::cmd_ln(
+                        transport, target, link, symlink, root, if_hash, force, parents, json,
+                    )
+                    .await
+                }
+                FsCommand::Grep {
+                    pattern,
+                    root,
+                    regex,
+                    case_sensitive,
+                    word,
+                    no_ignore,
+                    max_matches,
+                    files_with_matches,
+                    json,
+                } => {
+                    fs::cmd_grep(
+                        transport,
+                        pattern,
+                        root,
+                        regex,
+                        case_sensitive,
+                        word,
+                        no_ignore,
+                        max_matches,
+                        files_with_matches,
+                        json,
+                    )
+                    .await
+                }
+                FsCommand::Cat { path, root } => fs::cmd_cat(transport, path, root).await,
+                FsCommand::Find {
+                    query,
+                    root,
+                    limit,
+                    json,
+                } => fs::cmd_find(transport, query, root, limit, json).await,
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Git { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match command {
+                GitCommand::Status { repo, watch, json } => {
+                    git::cmd_status(transport, repo, watch, json).await
+                }
+                GitCommand::Log {
+                    rev,
+                    pathspec,
+                    repo,
+                    limit,
+                    watch,
+                    follow,
+                    first_parent,
+                    full_message,
+                    topo,
+                    json,
+                } => {
+                    if pathspec.len() > 1 {
+                        Err("only one path filter is supported".to_string())
+                    } else {
+                        let opts = git::LogOpts {
+                            rev,
+                            path: pathspec.into_iter().next(),
+                            limit,
+                            watch,
+                            follow,
+                            first_parent,
+                            full_message,
+                            topo,
+                            json,
+                        };
+                        git::cmd_log(transport, repo, opts).await
+                    }
+                }
+                GitCommand::Diff {
+                    revs,
+                    pathspec,
+                    repo,
+                    staged,
+                    patch,
+                    json,
+                } => {
+                    if pathspec.len() > 1 {
+                        Err("only one path filter is supported".to_string())
+                    } else {
+                        let opts = git::DiffOpts {
+                            revs,
+                            staged,
+                            patch,
+                            path: pathspec.into_iter().next(),
+                            json,
+                        };
+                        git::cmd_diff(transport, repo, opts).await
+                    }
+                }
+                GitCommand::Show {
+                    spec,
+                    repo,
+                    max_len,
+                } => git::cmd_show(transport, repo, spec, max_len).await,
+                GitCommand::LsTree { spec, repo, json } => {
+                    git::cmd_ls_tree(transport, repo, spec, json).await
+                }
+                GitCommand::LsFiles { path, repo, json } => {
+                    git::cmd_ls_files(transport, repo, path, json).await
+                }
+                GitCommand::MergeBase { revs, repo, json } => {
+                    // The only git command with a meaningful non-zero exit
+                    // (1 = unrelated histories), so it exits directly
+                    // rather than flattening to this block's Ok(()).
+                    match git::cmd_merge_base(transport, repo, revs, json).await {
+                        Ok(code) => std::process::exit(code),
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Kv { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result: Result<i32, String> = match command {
+                KvCommand::Get { key } => kv::cmd_get(transport, key).await,
+                KvCommand::Put {
+                    key,
+                    value,
+                    if_hash,
+                    force,
+                    durable,
+                    json,
+                } => kv::cmd_put(transport, key, value, false, if_hash, force, durable, json).await,
+                KvCommand::Rm {
+                    key,
+                    if_hash,
+                    force,
+                    durable,
+                    json,
+                } => kv::cmd_put(transport, key, None, true, if_hash, force, durable, json).await,
+                KvCommand::Ls {
+                    prefix,
+                    watch,
+                    values,
+                    json,
+                } => kv::cmd_ls(transport, prefix, watch, values, json).await,
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Lsp { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    // Exit 2 (error): the 0/1/2 contract reserves 1 for
+                    // "no result", so a connect failure must not look
+                    // like a clean/empty answer.
+                    std::process::exit(2);
+                }
+            };
+            let result = match command {
+                LspCommand::Def { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_DEF,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Refs {
+                    spec,
+                    declaration,
+                    root,
+                    json,
+                } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_REFS,
+                        spec,
+                        String::new(),
+                        declaration,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Hover { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_HOVER,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Complete { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_COMPLETE,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Signature { spec, root, json } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_SIGNATURE,
+                        spec,
+                        String::new(),
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Symbols {
+                    query,
+                    file,
+                    root,
+                    json,
+                } => lsp::cmd_symbols(transport, root, query, file, json).await,
+                LspCommand::Diagnostics {
+                    path,
+                    watch,
+                    wait,
+                    root,
+                    json,
+                } => lsp::cmd_diagnostics(transport, root, path, watch, wait, json).await,
+                LspCommand::Rename {
+                    spec,
+                    new_name,
+                    root,
+                    json,
+                } => {
+                    lsp::cmd_position(
+                        transport,
+                        root,
+                        lsp::KIND_RENAME,
+                        spec,
+                        new_name,
+                        false,
+                        json,
+                    )
+                    .await
+                }
+                LspCommand::Wait { root, timeout } => lsp::cmd_wait(transport, root, timeout).await,
+                LspCommand::List { json } => lsp::cmd_list(transport, json).await,
+                LspCommand::Stop { server_ref } => lsp::cmd_stop(transport, server_ref).await,
+            };
+            match result {
+                // 0 found/clean, 1 no result/diagnostics present, 2 error.
+                Ok(0) => {}
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Command::Remote { command } => {
             let cmd = command.unwrap_or(RemoteCommand::List { reveal: false });
             cmd_remote(cmd);
@@ -362,6 +748,8 @@ async fn async_main() {
             #[cfg(unix)]
             fd_channel,
             export_sock,
+            allow_forward,
+            allow_forward_insecure,
             verbose,
         } => {
             let ipc_path = socket
@@ -413,12 +801,17 @@ async fn async_main() {
                 max_connections: 0,
                 max_ptys: 0,
                 ping_interval: std::time::Duration::from_secs(10),
-                skip_compositor: false,
+                skip_compositor: std::env::var("BLIT_SKIP_COMPOSITOR")
+                    .ok()
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
                 export_sock: export_sock
                     || std::env::var("BLIT_EXPORT_SOCK")
                         .ok()
                         .map(|v| v == "1")
                         .unwrap_or(false),
+                allow_forward,
+                allow_forward_insecure,
             };
             blit_server::run(config).await;
         }
@@ -517,6 +910,55 @@ async fn async_main() {
         }
         Command::Gateway => {
             blit_gateway::run().await;
+        }
+        Command::Forward {
+            specs,
+            all,
+            alpn,
+            insecure,
+        } => {
+            // The management verbs share the positional slot with specs: no
+            // spec can be a bare word (they all carry colons), so the first
+            // argument is unambiguous.
+            let verb = specs.first().map(String::as_str).unwrap_or("");
+            let rest = specs.get(1..).unwrap_or(&[]);
+            let result: Result<i32, String> = match verb {
+                "add" => match rest {
+                    [name, spec] => forward::cmd_add(name, spec),
+                    _ => Err("usage: blit forward add NAME SPEC".into()),
+                },
+                "list" | "ls" => forward::cmd_list(),
+                "rm" | "remove" => match rest {
+                    [name] => forward::cmd_rm(name),
+                    _ => Err("usage: blit forward rm NAME".into()),
+                },
+                "toggle" => match rest {
+                    [name] => forward::cmd_toggle(name),
+                    _ => Err("usage: blit forward toggle NAME".into()),
+                },
+                _ => match forward::resolve_specs(&specs, all) {
+                    // Connect only once there is something to forward, and
+                    // only after every spec has parsed.
+                    Ok(resolved) => {
+                        let conn = &cli.connect;
+                        match transport::connect(&conn.on, &conn.hub).await {
+                            Ok(transport) => {
+                                let tls = forward::TlsOpts { alpn, insecure };
+                                forward::cmd_forward(transport, resolved, tls).await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Command::Learn => {
             print!("{}", include_str!("learn.md"));

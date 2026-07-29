@@ -69,8 +69,13 @@ async fn connect_ipc(path: &str) -> Result<IpcStream, String> {
 }
 
 const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
+/// The preview service worker (docs/design/net.md § Client: service worker).
+/// A separate asset because a worker cannot be inlined into the single-file
+/// app bundle: it needs its own URL and a JavaScript MIME type.
+const SW_JS_BR: &[u8] = include_bytes!("../../../js/ui/dist/sw.js.br");
 
 static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML_BR));
+static SW_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(SW_JS_BR));
 
 type DestMap = std::collections::HashMap<String, GatewayConnector>;
 
@@ -82,6 +87,9 @@ struct Config {
     /// Live-reloading `blit.remotes` file — the persistent source of truth
     /// for the remote list.  The file watcher drives `destinations` updates.
     remotes: blit_webserver::config::RemotesState,
+    /// Live-reloading `blit.roots` file — the IDE workspace roots served to
+    /// browsers over `/config`. Does not affect routing.
+    roots: blit_webserver::config::RootsState,
     cors_origin: Option<String>,
     wt_cert_hash: std::sync::RwLock<Option<String>>,
     config_state: blit_webserver::config::ConfigState,
@@ -448,6 +456,7 @@ pub async fn run() {
         std::collections::HashMap::new();
 
     let remotes = blit_webserver::config::RemotesState::new();
+    let roots = blit_webserver::config::RootsState::new();
     let initial_remotes = blit_webserver::config::parse_remotes_str(&remotes.get());
     for (name, uri) in &initial_remotes {
         if let Some(connector) = uri_to_connector(uri, &ssh_pool, &hub_url, webrtc_enabled) {
@@ -489,6 +498,7 @@ pub async fn run() {
         passphrase,
         destinations: std::sync::RwLock::new(destinations),
         remotes,
+        roots,
         cors_origin,
         wt_cert_hash: std::sync::RwLock::new(None),
         config_state,
@@ -706,6 +716,24 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         return resp;
     }
 
+    // The preview service worker and the path it claims (docs/design/net.md
+    // § Client: service worker). Both are checked before the WebSocket
+    // upgrade and the SPA fallback: `/x/…` reaching the fallback would render
+    // the blit UI inside a preview frame, which is unreadable as a failure.
+    {
+        let inm = request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .map(|v| v.as_bytes());
+        let ae = request
+            .headers()
+            .get(axum::http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        if let Some(resp) = blit_webserver::try_ui_route(&path, SW_JS_BR, &SW_ETAG, inm, ae) {
+            return resp;
+        }
+    }
+
     let is_ws = request
         .headers()
         .get("upgrade")
@@ -728,6 +756,7 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
                     &state.config_state,
                     Some(&state.remotes),
                     transform,
+                    Some(&state.roots),
                     &extra_init,
                     blit_webserver::config::AuthContext {
                         throttle: &state.auth_throttle,
@@ -1704,6 +1733,7 @@ mod tests {
             passphrase: blit_webserver::config::AuthPassphrase::plaintext("test"),
             destinations: std::sync::RwLock::new(destinations),
             remotes: blit_webserver::config::RemotesState::ephemeral(String::new()),
+            roots: blit_webserver::config::RootsState::ephemeral(String::new()),
             cors_origin,
             wt_cert_hash: std::sync::RwLock::new(None),
             config_state: blit_webserver::config::ConfigState::new(),

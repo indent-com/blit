@@ -121,7 +121,18 @@ export interface BlitConnectionSnapshot {
   supportsCopyRange: boolean;
   supportsCompositor: boolean;
   supportsAudio: boolean;
+  supportsFsSync: boolean;
+  /** Server advertises `FEATURE_GIT` (git introspection, docs/git.md). */
+  supportsGit: boolean;
+  /** Server advertises `FEATURE_LSP` (language intelligence, docs/design/lsp.md). */
+  supportsLsp: boolean;
+  /** Server advertises the KV store family (docs/design/kv.md). */
+  supportsKv: boolean;
   retryCount: number;
+  /** Bumped on every connection reset (transport drop AND server
+   *  re-establish), so views holding fs/git handles can re-open them — those
+   *  don't survive a reset even when the transport stays up. */
+  generation: number;
   /** Non-null when the last connection attempt failed with an explicit error message. */
   error: string | null;
   sessions: readonly BlitSession[];
@@ -174,6 +185,25 @@ export type TransportConfig =
 export const DEFAULT_FONT = "ui-monospace, monospace";
 export const DEFAULT_FONT_SIZE = 13;
 
+/**
+ * Coverage gamma for glyph antialiasing (1 = untouched, higher = thinner
+ * light-on-dark text).
+ *
+ * Glyph coverage is blended into an sRGB-encoded framebuffer, which overstates
+ * partial coverage and makes light-on-dark stems read bolder than the font
+ * intends. Apple platforms are where that lands hardest — the system's own
+ * text rendering is the reference users compare against, and it thins stems
+ * the same way — so they get a correction by default and everyone else opts
+ * in. Same reasoning, and roughly the same value, as kitty's
+ * `text_gamma_adjustment`.
+ */
+export const DEFAULT_TEXT_GAMMA = isApplePlatform() ? 1.4 : 1;
+
+function isApplePlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+}
+
 /** Wire protocol constants: client-to-server message types. */
 export const C2S_INPUT = 0x00;
 /** Desired viewport size(s): repeated [pty_id:2][rows:2][cols:2] entries. `0x0` clears one. */
@@ -195,6 +225,7 @@ export const C2S_CREATE_N = 0x17;
 export const C2S_CREATE2 = 0x18;
 export const C2S_KILL = 0x1a;
 export const C2S_COPY_RANGE = 0x1b;
+export const C2S_TERM_CWD = 0x1c;
 export const CREATE2_HAS_SRC_PTY = 1 << 0;
 export const CREATE2_HAS_COMMAND = 1 << 1;
 export const CREATE2_HAS_CWD = 1 << 2;
@@ -205,6 +236,11 @@ export const S2C_CREATED = 0x01;
 export const S2C_CLOSED = 0x02;
 export const S2C_LIST = 0x03;
 export const S2C_TITLE = 0x04;
+export const S2C_TERM_CWD = 0x0e;
+/** Unsolicited push when a pty's OSC 7-reported cwd changes
+ *  (docs/protocol.md `TERM_CWD_EVENT`): [pty_id:2][cwd:N], no length
+ *  prefix — the S2C_TITLE convention. */
+export const S2C_TERM_CWD_EVENT = 0x0f;
 export const S2C_SEARCH_RESULTS = 0x05;
 export const S2C_CREATED_N = 0x06;
 export const S2C_HELLO = 0x07;

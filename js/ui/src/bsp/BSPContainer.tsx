@@ -2,9 +2,8 @@ import {
   createSignal,
   createEffect,
   createMemo,
-  createContext,
-  useContext,
   onCleanup,
+  batch,
   Show,
   For,
   Index,
@@ -30,45 +29,26 @@ import {
   reconcileAssignments,
   saveActiveLayout,
   surfaceAssignment,
+  isContentAssignment,
   isSurfaceAssignment,
+  isWebAssignment,
   parseSurfaceAssignment,
+  parseWebAssignment,
+  isTileAssignment,
+  parseTileAssignment,
 } from "./layout";
+import { BlitTile } from "../ide/BlitTile";
+import { WebPane, type WebPaneHandle } from "../WebPane";
+import { isTileDrag, tileDragAssignment } from "../ide/tileDrag";
+import { resolveTab, isPtyRef } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
+import { BSPTreeContext, useBSPTree, type BSPTreeCtx } from "./treeContext";
 import type { Theme } from "../theme";
 import { themeFor, ui, uiScale } from "../theme";
 import { t, tp } from "../i18n";
 
-/** Props that stay constant through the BSPPane recursion tree.  Hoisted
- *  into context so each level only passes the values that actually change. */
-interface BSPTreeCtx {
-  connectionId: string;
-  connectionLabels?: Map<string, string>;
-  multiPane: boolean;
-  onFocusPane: (paneId: string) => void;
-  onCreateInPane?: (
-    paneId: string,
-    command?: string,
-    connectionId?: string,
-  ) => void;
-  onSwitcher?: () => void;
-  onHelp?: () => void;
-  onResize: (
-    split: BSPSplit,
-    indexA: number,
-    indexB: number,
-    fraction: number,
-  ) => void;
-  palette: TerminalPalette;
-  fontFamily: string;
-  fontSize: number;
-  tabMemory: Record<string, number>;
-  onRender?: (renderMs?: number) => void;
-}
-
-const BSPTreeContext = createContext<BSPTreeCtx>();
-function useBSPTree(): BSPTreeCtx {
-  return useContext(BSPTreeContext)!;
-}
+// The tree context lives in ./treeContext so its identity survives hot
+// reloads of this module (see that file).
 
 function resolveLeafFontSize(leaf: BSPLeaf, baseFontSize: number): number {
   const raw = leaf.fontSize;
@@ -96,6 +76,39 @@ function sameAssignments(left: BSPAssignments, right: BSPAssignments): boolean {
     if (left.assignments[key] !== right.assignments[key]) return false;
   }
   return true;
+}
+
+/** Resolve a pane id (child-index path, `enumeratePanes` scheme) to the index
+ *  path of its leaf, or null when it doesn't name a leaf. */
+function leafPath(node: BSPNode, paneId: string): number[] | null {
+  if (node.type === "leaf") return paneId === "0" ? [] : null;
+  const path = paneId.split(".").map(Number);
+  if (path.some((n) => !Number.isInteger(n))) return null;
+  let cur: BSPNode = node;
+  for (const idx of path) {
+    if (cur.type !== "split" || !cur.children[idx]) return null;
+    cur = cur.children[idx].node;
+  }
+  return cur.type === "leaf" ? path : null;
+}
+
+/** Return a copy of `node` with the subtree at `path` replaced. */
+function replaceNodeAtPath(
+  node: BSPNode,
+  path: readonly number[],
+  replacement: BSPNode,
+): BSPNode {
+  if (path.length === 0) return replacement;
+  if (node.type !== "split") return node;
+  const [head, ...rest] = path;
+  return {
+    ...node,
+    children: node.children.map((child, i) =>
+      i === head
+        ? { ...child, node: replaceNodeAtPath(child.node, rest, replacement) }
+        : child,
+    ),
+  };
 }
 
 export function BSPContainer(props: {
@@ -133,9 +146,18 @@ export function BSPContainer(props: {
     fn: (sessionId: SessionId, targetPaneId: string) => void,
   ) => void;
   onMoveToPane?: (fn: (value: string, targetPaneId: string) => void) => void;
+  /** Called with a function that splits a pane, placing `value` in a new
+   *  pane beside the target's current occupant (which is preserved). */
+  onSplitPane?: (fn: (value: string, targetPaneId: string) => void) => void;
   onClearPaneAssignment?: (fn: (paneId: string) => void) => void;
   onFocusedPaneChange?: (paneId: string | null) => void;
   onRender?: (renderMs?: number) => void;
+  /** Open an IDE tile from within a tile (commit view → editor). */
+  onOpenTile?: (assignment: string) => void;
+  /** A web pane publishing its navigation handle, for the status bar. */
+  onWebPaneHandle?: (paneId: string, handle: WebPaneHandle) => void;
+  /** Drop a dragged IDE tile assignment into a specific pane. */
+  onDropTile?: (assignment: string, paneId: string) => void;
 }) {
   const workspace = createBlitWorkspace();
   const workspaceState = createBlitWorkspaceState(workspace);
@@ -196,6 +218,9 @@ export function BSPContainer(props: {
 
   let lastDsl = props.layout.dsl;
   let lastLayout = props.layout;
+  // Monotonic tag source for leaves created by splitPane (must be unique in
+  // the tree so the serialized DSL round-trips).
+  let splitTagCounter = 0;
 
   // React to external layout changes.
   createEffect(() => {
@@ -212,7 +237,10 @@ export function BSPContainer(props: {
     for (const pane of currentPanes) {
       const v = prev[pane.id];
       if (v == null) continue;
-      if (isSurfaceAssignment(v)) {
+      if (isSurfaceAssignment(v) || isTileAssignment(v)) {
+        // Surfaces and IDE tiles (editor/diff) are not sessions — carry them
+        // forward positionally so they survive a layout change (the drop the
+        // carry-forward would otherwise cause; docs/ide-plan.md F4).
         carried.push(v);
       } else if (live.has(v) && !seenSessions.has(v)) {
         seenSessions.add(v);
@@ -253,17 +281,41 @@ export function BSPContainer(props: {
   // list).  Once all referenced connections are ready, any remaining
   // unmatched terminal entries are given up on and pendingHash is cleared so
   // normal reconciliation takes over.
+  // Tab refs ("t:<conn>:<id>" with a non-digit id) resolve asynchronously
+  // against the server's tabs/ registry (docs/design/kv.md) — one kvFetch
+  // per pane, fired once the connection advertises the kv capability (at
+  // S2C_HELLO; sessions aren't needed, so this beats terminal resolution).
+  const tabFetchesInFlight = new Set<string>();
+  function applyResolvedTab(paneId: string, assignment: string | null) {
+    if (!pendingHash || !(paneId in pendingHash)) return;
+    delete pendingHash[paneId];
+    if (assignment) {
+      setLayoutState((prev) => ({
+        assignments: { ...prev.assignments, [paneId]: assignment },
+      }));
+    }
+    // Unresolvable (deleted tab, no kv): the pane degrades to empty and
+    // reconciliation fills it once resolvingHash flips false.
+    if (Object.keys(pendingHash).length === 0) {
+      pendingHash = null;
+      setResolvingHash(false);
+    }
+  }
+
   createEffect(() => {
     if (!pendingHash) return;
     const live = liveSessions();
     const snap = workspaceState();
-    // Collect connection IDs referenced by pending *terminal* entries.
+    // Collect connection IDs referenced by pending *terminal* entries (tab
+    // refs resolve on their own path and must not join the ready-sweep).
     const referencedConnIds = new Set<string>();
     for (const ref of Object.values(pendingHash)) {
       if (!ref.startsWith("t:")) continue;
       const body = ref.slice(2); // "connectionId:ptyId"
       const lastColon = body.lastIndexOf(":");
-      if (lastColon > 0) referencedConnIds.add(body.slice(0, lastColon));
+      if (lastColon <= 0) continue;
+      if (!isPtyRef(body.slice(lastColon + 1))) continue;
+      referencedConnIds.add(body.slice(0, lastColon));
     }
 
     const resolved: Record<string, string> = {};
@@ -281,12 +333,34 @@ export function BSPContainer(props: {
         continue;
       }
       if (ref.startsWith("t:")) {
-        // Terminal: "t:connectionId:ptyId" → session ID
         const body = ref.slice(2);
         const lastColon = body.lastIndexOf(":");
         if (lastColon <= 0) continue;
         const connId = body.slice(0, lastColon);
-        const ptyId = parseInt(body.slice(lastColon + 1), 10);
+        const seg = body.slice(lastColon + 1);
+        if (!isPtyRef(seg)) {
+          // Tab ref: fetch the assignment from tabs/<id> exactly once.
+          const c = snap.connections.find((c) => c.id === connId);
+          if (c && c.supportsKv && !tabFetchesInFlight.has(paneId)) {
+            tabFetchesInFlight.add(paneId);
+            resolveTab(workspace, connId, seg)
+              .then((assignment) => {
+                tabFetchesInFlight.delete(paneId);
+                applyResolvedTab(paneId, assignment);
+              })
+              .catch(() => {
+                // Transient (re-establish mid-flight): re-arm; the effect
+                // refires on the next snapshot change and retries.
+                tabFetchesInFlight.delete(paneId);
+              });
+          } else if (c && c.ready && !c.supportsKv) {
+            // Ready without the kv store: the ref can never resolve.
+            applyResolvedTab(paneId, null);
+          }
+          continue;
+        }
+        // Terminal: "t:connectionId:ptyId" → session ID
+        const ptyId = parseInt(seg, 10);
         const session = live.find(
           (s) => s.connectionId === connId && s.ptyId === ptyId,
         );
@@ -333,6 +407,8 @@ export function BSPContainer(props: {
         const body = ref.slice(2);
         const lastColon = body.lastIndexOf(":");
         if (lastColon <= 0) continue;
+        // Never sweep a tab ref — its kvFetch may be mid-flight.
+        if (!isPtyRef(body.slice(lastColon + 1))) continue;
         const connId = body.slice(0, lastColon);
         if (readyConnIds.has(connId)) {
           delete pendingHash[paneId];
@@ -438,7 +514,7 @@ export function BSPContainer(props: {
   const assignedInPaneOrder = createMemo(() =>
     paneIds()
       .map((paneId) => layoutState().assignments[paneId])
-      .filter((v): v is SessionId => v != null && !isSurfaceAssignment(v)),
+      .filter((v): v is SessionId => v != null && !isContentAssignment(v)),
   );
 
   // focusedPaneId is the single source of truth for which pane is active.
@@ -463,7 +539,7 @@ export function BSPContainer(props: {
     const fpId = focusedPaneId();
     if (!fpId) return null;
     const value = layoutState().assignments[fpId] ?? null;
-    return value && !isSurfaceAssignment(value) ? value : null;
+    return value && !isContentAssignment(value) ? value : null;
   });
 
   // Keep focusedPaneId valid when panes change.
@@ -502,17 +578,32 @@ export function BSPContainer(props: {
   });
 
   function moveToPane(value: string, targetPaneId: string) {
-    setLayoutState((prev) => {
-      if (prev.assignments[targetPaneId] === value) return prev;
-      return {
-        ...prev,
-        assignments: {
-          ...prev.assignments,
-          [targetPaneId]: value,
-        },
-      };
+    // Guard against a stale pane id (e.g. a caller still holding a pane path
+    // from a previous layout): writing the tile to a non-existent pane would
+    // silently render nothing. Fall back to the focused pane, then the first.
+    const valid = paneIds();
+    let pane = targetPaneId;
+    if (!valid.includes(pane)) {
+      const fp = focusedPaneId();
+      pane = fp && valid.includes(fp) ? fp : (valid[0] ?? targetPaneId);
+    }
+    // Batched (like splitPane): unbatched, the assignment write flushes
+    // first and the still-focused OLD pane's focus effect re-asserts DOM
+    // focus into its terminal before the focus moves — stealing the caret
+    // on every cross-pane open (Explorer click, dock restore).
+    batch(() => {
+      setLayoutState((prev) => {
+        if (prev.assignments[pane] === value) return prev;
+        return {
+          ...prev,
+          assignments: {
+            ...prev.assignments,
+            [pane]: value,
+          },
+        };
+      });
+      setFocusedPaneId(pane);
     });
-    setFocusedPaneId(targetPaneId);
   }
 
   function moveSessionToPane(sessionId: SessionId, targetPaneId: string) {
@@ -524,6 +615,60 @@ export function BSPContainer(props: {
   });
   createEffect(() => {
     props.onMoveToPane?.(moveToPane);
+  });
+
+  // Split the target pane in two, keeping its current occupant in the first
+  // child and placing `value` in a new second child (so opening a tile never
+  // evicts the terminal). Inserting a split at a leaf's path only changes that
+  // leaf's own pane id (siblings keep their index paths), so the only
+  // assignment that must be rekeyed is the target's — from `targetPaneId` to
+  // `<path>.0`; the new pane `<path>.1` gets `value`.
+  function splitPane(value: string, targetPaneId: string) {
+    const cur = root();
+    const path = leafPath(cur, targetPaneId);
+    if (path === null) {
+      // Can't locate the pane in the tree — fall back to a plain replace.
+      moveToPane(value, targetPaneId);
+      return;
+    }
+    let oldLeaf: BSPNode = cur;
+    for (const idx of path) {
+      oldLeaf = (oldLeaf as BSPSplit).children[idx].node;
+    }
+    const newLeaf: BSPLeaf = { type: "leaf", tag: `ide${++splitTagCounter}` };
+    const split: BSPSplit = {
+      type: "split",
+      direction: "horizontal",
+      children: [
+        { node: oldLeaf, weight: 1 },
+        { node: newLeaf, weight: 1 },
+      ],
+    };
+    const newRoot = replaceNodeAtPath(cur, path, split);
+    const oldNewId = [...path, 0].join(".");
+    const newId = [...path, 1].join(".");
+    // Batch: the target pane's id changes during the split, so root and
+    // assignments must flush in one reactive cycle. Otherwise the intermediate
+    // state (rekeyed assignment, stale panes) transiently hides the sibling
+    // terminal and flip-flops focus (delegated event handlers aren't batched).
+    batch(() => {
+      setLayoutState((prev) => {
+        const assignments = { ...prev.assignments };
+        const occupant = assignments[targetPaneId];
+        if (oldNewId !== targetPaneId) {
+          delete assignments[targetPaneId];
+          if (occupant != null) assignments[oldNewId] = occupant;
+        }
+        assignments[newId] = value;
+        return { ...prev, assignments };
+      });
+      updateRoot(newRoot);
+      setFocusedPaneId(newId);
+    });
+  }
+
+  createEffect(() => {
+    props.onSplitPane?.(splitPane);
   });
 
   function clearPaneAssignment(paneId: string) {
@@ -574,6 +719,10 @@ export function BSPContainer(props: {
             : null;
       if (!bracket) return;
       e.preventDefault();
+      // Stop the event outright: a focused editor would otherwise also
+      // treat Ctrl-[ / Ctrl-] as indent (CodeMirror's Mod-[ on
+      // non-mac), and a focused terminal would forward Ctrl-[ as ESC.
+      e.stopPropagation();
       const idx = fpId ? ids.indexOf(fpId) : -1;
       const delta = bracket === "]" ? 1 : -1;
       const next = (idx + delta + ids.length) % ids.length;
@@ -710,6 +859,15 @@ export function BSPContainer(props: {
     tabMemory,
     get onRender() {
       return props.onRender;
+    },
+    get onWebPaneHandle() {
+      return props.onWebPaneHandle;
+    },
+    get onOpenTile() {
+      return props.onOpenTile;
+    },
+    get onDropTile() {
+      return props.onDropTile;
     },
   };
   return (
@@ -932,7 +1090,11 @@ function LeafPane(props: {
 
   const surfaceParsed = () => parseSurfaceAssignment(props.sessionId);
   const isSurface = () => surfaceParsed() != null;
+  const tileParsed = () => parseTileAssignment(props.sessionId);
+  const webParsed = () => parseWebAssignment(props.sessionId);
   const surfaceId = () => surfaceParsed()?.surfaceId ?? null;
+  // Highlighted while a tile drag hovers this pane (a valid drop target).
+  const [tileDragOver, setTileDragOver] = createSignal(false);
   const surfaceConnectionId = () =>
     surfaceParsed()?.connectionId ?? ctx.connectionId;
 
@@ -967,32 +1129,46 @@ function LeafPane(props: {
     ctx.onCreateInPane?.(props.paneId, props.leaf.command);
   });
 
+  // Per-pane memos (default equality): the raw props read through the shared
+  // assignments object, whose identity changes on ANY pane's reassignment —
+  // without the memo, every pane's focus effect re-runs on every layout
+  // mutation and the focused pane re-asserts DOM focus it never lost.
+  const paneSession = createMemo(() => props.sessionId);
+  const paneVisible = createMemo(() => props.visible);
   createEffect(() => {
     // Track these dependencies
     const focused = props.isFocused;
-    const _sid = props.sessionId;
-    const _vis = props.visible;
+    const _sid = paneSession();
+    const _vis = paneVisible();
     if (focused && paneContainer) {
-      // Focus the pane container's focusable child.
-      // Bare "canvas" is excluded — the terminal canvas has no tabindex so
-      // focus() is a no-op.  Surface canvases have tabindex and are matched
-      // by the [tabindex] selector.
-      const sel = "[tabindex], input, textarea";
-      const focusable = paneContainer.querySelector<HTMLElement>(sel);
+      // Focus the pane container's focusable child. An editable CodeMirror
+      // content div comes FIRST: a comma-list querySelector returns the
+      // first match in *document* order, and an editor tile has [tabindex]
+      // elements (the scroller) before `.cm-content` — focusing those
+      // leaves the editor without keyboard focus or a visible cursor.
+      // Read-only CM contents (diff views) are contenteditable=false and
+      // unfocusable, so they fall through to the [tabindex] pass (the
+      // diff root). Bare "canvas" is excluded — the terminal canvas has
+      // no tabindex so focus() is a no-op; surface canvases have tabindex.
+      const pick = (): HTMLElement | null =>
+        paneContainer.querySelector<HTMLElement>(
+          '.cm-content[contenteditable="true"]',
+        ) ??
+        paneContainer.querySelector<HTMLElement>("[tabindex], input, textarea");
+      const focusable = pick();
       if (focusable) {
         focusable.focus();
       } else {
         // BlitTerminal attaches its canvas in onMount which runs after
         // this effect.  Retry once the current reactive flush completes.
-        queueMicrotask(() => {
-          paneContainer.querySelector<HTMLElement>(sel)?.focus();
-        });
+        queueMicrotask(() => pick()?.focus());
       }
     }
   });
 
   return (
     <div
+      ref={paneContainer}
       data-blit-bsp-pane-id={props.paneId}
       data-blit-bsp-focused={props.isFocused ? "true" : undefined}
       style={{
@@ -1007,12 +1183,176 @@ function LeafPane(props: {
       }}
       onPointerDown={() => ctx.onFocusPane(props.paneId)}
       onFocusIn={() => ctx.onFocusPane(props.paneId)}
+      onDragOver={(e) => {
+        if (!ctx.onDropTile || !isTileDrag(e)) return;
+        e.preventDefault(); // allow the drop
+        e.dataTransfer!.dropEffect = "copy";
+        if (!tileDragOver()) setTileDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        // Ignore leaves into child elements; only clear when truly leaving.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setTileDragOver(false);
+      }}
+      onDrop={(e) => {
+        const assignment = tileDragAssignment(e);
+        setTileDragOver(false);
+        if (assignment && ctx.onDropTile) {
+          e.preventDefault();
+          ctx.onDropTile(assignment, props.paneId);
+        }
+      }}
     >
-      <Show
-        when={isSurface()}
-        fallback={
+      <Show when={tileDragOver()}>
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            "z-index": 5,
+            "pointer-events": "none",
+            background: `color-mix(in srgb, ${theme().accent} 14%, transparent)`,
+            border: `2px solid ${theme().accent}`,
+            "box-sizing": "border-box",
+          }}
+        />
+      </Show>
+      {/* IDE tile (editor/diff/commit) overlays the pane; its value is mutually
+          exclusive with sessions and surfaces (docs/ide-plan.md PR-6). Rendered
+          via the shared BlitTile so BSP panes and the non-BSP focused-tile view
+          never drift. */}
+      <Show when={tileParsed()}>
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            overflow: "hidden",
+            "background-color": theme().bg,
+          }}
+        >
+          <BlitTile
+            workspace={workspace}
+            assignment={props.sessionId!}
+            theme={theme()}
+            palette={ctx.palette}
+            scale={scale()}
+            fontFamily={ctx.fontFamily}
+            fontSize={ctx.fontSize}
+            onOpenTile={(a) => ctx.onOpenTile?.(a)}
+          />
+        </div>
+      </Show>
+      <Show when={webParsed()}>
+        {(web) => (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              overflow: "hidden",
+              "background-color": theme().bg,
+            }}
+          >
+            <WebPane
+              dest={web().connectionId}
+              url={web().url}
+              focus={props.isFocused}
+              onHandle={(handle) => ctx.onWebPaneHandle?.(props.paneId, handle)}
+              // A click lands inside the frame, so the pane's own
+              // onPointerDown never fires and the pane would never take
+              // focus — leaving the status bar showing another pane.
+              onFocusRequest={() => ctx.onFocusPane(props.paneId)}
+            />
+          </div>
+        )}
+      </Show>
+      {/* Terminal / surface / empty layer. Gated on !tileParsed(): a tile is
+          mutually exclusive with sessions and surfaces, and because EmptyPane
+          is position:relative and follows the tile overlay in the DOM it would
+          otherwise paint *over* the tile (showing "New terminal / Menu / Help"
+          instead of the editor/diff/commit). */}
+      <Show when={!tileParsed() && !webParsed()}>
+        <Show
+          when={isSurface()}
+          fallback={
+            <Show
+              when={props.sessionId && session()}
+              fallback={
+                <EmptyPane
+                  paneId={props.paneId}
+                  label={props.leaf.tag || null}
+                  isFocused={props.isFocused}
+                  theme={theme()}
+                  palette={ctx.palette}
+                  fontSize={ctx.fontSize}
+                  connectionId={ctx.connectionId}
+                  connectionLabels={ctx.connectionLabels}
+                  onCreateInPane={ctx.onCreateInPane}
+                  onSwitcher={ctx.onSwitcher}
+                  onHelp={ctx.onHelp}
+                />
+              }
+            >
+              <div style={{ width: "100%", height: "100%" }}>
+                <BlitTerminal
+                  sessionId={props.sessionId}
+                  fontSize={resolveLeafFontSize(props.leaf, ctx.fontSize)}
+                  fontFamily={ctx.fontFamily}
+                  palette={ctx.palette}
+                  style={{ width: "100%", height: "100%" }}
+                  showCursor={props.isFocused}
+                  onRender={ctx.onRender}
+                />
+              </div>
+              <Show when={session()?.state === "exited"}>
+                <div
+                  style={{
+                    position: "absolute",
+                    bottom: "8px",
+                    left: "50%",
+                    transform: "translateX(-50%)",
+                    background: theme().solidPanelBg,
+                    border: `1px solid ${theme().border}`,
+                    padding: `${scale().controlY}px ${scale().controlX}px`,
+                    "font-size": `${scale().sm}px`,
+                    display: "flex",
+                    "align-items": "center",
+                    gap: `${scale().gap}px`,
+                  }}
+                >
+                  <mark
+                    style={{
+                      ...ui.badge,
+                      "background-color": "rgba(255,100,100,0.3)",
+                    }}
+                  >
+                    {t("bsp.exited")}
+                  </mark>
+                  <Show when={connection()?.supportsRestart}>
+                    <button
+                      onClick={() => workspace.restartSession(props.sessionId!)}
+                      style={{ ...ui.btn, "font-size": `${scale().sm}px` }}
+                    >
+                      {t("bsp.restart")} <kbd style={ui.kbd}>Enter</kbd>
+                    </button>
+                  </Show>
+                  <button
+                    onClick={() =>
+                      void workspace.closeSession(props.sessionId!)
+                    }
+                    style={{
+                      ...ui.btn,
+                      "font-size": `${scale().sm}px`,
+                      opacity: 0.5,
+                    }}
+                  >
+                    {t("bsp.close")} <kbd style={ui.kbd}>Esc</kbd>
+                  </button>
+                </div>
+              </Show>
+            </Show>
+          }
+        >
           <Show
-            when={props.sessionId && session()}
+            when={surfaceConnPresent()}
             fallback={
               <EmptyPane
                 paneId={props.paneId}
@@ -1029,91 +1369,16 @@ function LeafPane(props: {
               />
             }
           >
-            <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
-              <BlitTerminal
-                sessionId={props.sessionId}
-                fontSize={resolveLeafFontSize(props.leaf, ctx.fontSize)}
-                fontFamily={ctx.fontFamily}
-                palette={ctx.palette}
+            <div style={{ width: "100%", height: "100%" }}>
+              <BlitSurfaceView
+                connectionId={surfaceConnectionId()}
+                surfaceId={surfaceId()!}
+                focus={props.isFocused}
+                resizable
                 style={{ width: "100%", height: "100%" }}
-                showCursor={props.isFocused}
-                onRender={ctx.onRender}
               />
             </div>
-            <Show when={session()?.state === "exited"}>
-              <div
-                style={{
-                  position: "absolute",
-                  bottom: "8px",
-                  left: "50%",
-                  transform: "translateX(-50%)",
-                  background: theme().solidPanelBg,
-                  border: `1px solid ${theme().border}`,
-                  padding: `${scale().controlY}px ${scale().controlX}px`,
-                  "font-size": `${scale().sm}px`,
-                  display: "flex",
-                  "align-items": "center",
-                  gap: `${scale().gap}px`,
-                }}
-              >
-                <mark
-                  style={{
-                    ...ui.badge,
-                    "background-color": "rgba(255,100,100,0.3)",
-                  }}
-                >
-                  {t("bsp.exited")}
-                </mark>
-                <Show when={connection()?.supportsRestart}>
-                  <button
-                    onClick={() => workspace.restartSession(props.sessionId!)}
-                    style={{ ...ui.btn, "font-size": `${scale().sm}px` }}
-                  >
-                    {t("bsp.restart")} <kbd style={ui.kbd}>Enter</kbd>
-                  </button>
-                </Show>
-                <button
-                  onClick={() => void workspace.closeSession(props.sessionId!)}
-                  style={{
-                    ...ui.btn,
-                    "font-size": `${scale().sm}px`,
-                    opacity: 0.5,
-                  }}
-                >
-                  {t("bsp.close")} <kbd style={ui.kbd}>Esc</kbd>
-                </button>
-              </div>
-            </Show>
           </Show>
-        }
-      >
-        <Show
-          when={surfaceConnPresent()}
-          fallback={
-            <EmptyPane
-              paneId={props.paneId}
-              label={props.leaf.tag || null}
-              isFocused={props.isFocused}
-              theme={theme()}
-              palette={ctx.palette}
-              fontSize={ctx.fontSize}
-              connectionId={ctx.connectionId}
-              connectionLabels={ctx.connectionLabels}
-              onCreateInPane={ctx.onCreateInPane}
-              onSwitcher={ctx.onSwitcher}
-              onHelp={ctx.onHelp}
-            />
-          }
-        >
-          <div ref={paneContainer} style={{ width: "100%", height: "100%" }}>
-            <BlitSurfaceView
-              connectionId={surfaceConnectionId()}
-              surfaceId={surfaceId()!}
-              focus={props.isFocused}
-              resizable
-              style={{ width: "100%", height: "100%" }}
-            />
-          </div>
         </Show>
       </Show>
     </div>

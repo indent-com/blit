@@ -55,15 +55,28 @@ precision highp float;
 in vec2 v_uv;
 in vec4 v_color;
 uniform sampler2D u_texture;
+// Coverage gamma, and the luminance of the default background. See
+// applyTextGamma() below for why the adjustment is background-dependent.
+uniform float u_gamma;
+uniform float u_bgLuma;
 out vec4 fragColor;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 void main() {
     vec4 tex = texture(u_texture, v_uv);
     float minC = min(tex.r, min(tex.g, tex.b));
     float maxC = max(tex.r, max(tex.g, tex.b));
     float isGray = step(maxC - minC, 0.02);
-    vec3 tinted = v_color.rgb * tex.a;
-    fragColor = vec4(mix(tex.rgb, tinted, isGray), tex.a);
+    // Blending coverage straight into an sRGB-encoded framebuffer overstates
+    // partial coverage, so light-on-dark stems read bolder than the font
+    // intends.  Bend the coverage curve to compensate, ramped in by how much
+    // lighter than the background the glyph is — a dark glyph on a light
+    // background has the opposite error and must be left alone.
+    float lift = smoothstep(0.0, 0.35, dot(v_color.rgb, LUMA) - u_bgLuma);
+    float a = mix(tex.a, pow(tex.a, mix(1.0, u_gamma, lift)), isGray);
+    vec3 tinted = v_color.rgb * a;
+    fragColor = vec4(mix(tex.rgb, tinted, isGray), a);
 }
 `;
 
@@ -103,10 +116,19 @@ function createProgram(
 
 export type RendererBackend = "webgpu" | "webgl2" | "canvas2d";
 
+/** Relative luminance of an 0-255 RGB triple, in the same (sRGB-encoded)
+ *  space the glyph shader compares foreground colours in. */
+export function rgbLuma(rgb: [number, number, number]): number {
+  return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+}
+
 export interface GlRenderer {
   supported: boolean;
   backend?: RendererBackend;
   maxDimension: number;
+  /** Coverage gamma for glyph antialiasing. 1 leaves coverage untouched;
+   *  above 1 thins light-on-dark text. See GLYPH_FS. */
+  setTextGamma(gamma: number): void;
   resize(width: number, height: number): void;
   render(
     bgVerts: Float32Array,
@@ -128,6 +150,7 @@ export interface GlRenderer {
 const UNSUPPORTED: GlRenderer = {
   supported: false,
   maxDimension: 0,
+  setTextGamma() {},
   resize() {},
   render() {},
   dispose() {},
@@ -145,6 +168,10 @@ const UNSUPPORTED: GlRenderer = {
 export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
   const ctx = canvas.getContext("2d", { alpha: true });
   if (!ctx) return { ...UNSUPPORTED };
+
+  // The size this pane asked for; the canvas itself may be larger.
+  let c2dW = 0;
+  let c2dH = 0;
 
   // Reusable scratch canvas for glyph tinting.
   const tmp = document.createElement("canvas");
@@ -261,9 +288,18 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
     supported: true,
     backend: "canvas2d" as const,
     maxDimension: 32767,
+    // Canvas 2D composites glyphs with drawImage, which offers no hook for
+    // reshaping coverage — the fallback renders at gamma 1 whatever is asked.
+    setTextGamma() {},
     resize(width: number, height: number) {
-      if (canvas.width !== width) canvas.width = width;
-      if (canvas.height !== height) canvas.height = height;
+      c2dW = width;
+      c2dH = height;
+      // Grow-only, as in the WebGL2 path below: every pane shares this one
+      // canvas and resizes it once per frame, and assigning canvas.width
+      // reallocates and clears the bitmap. The composite reads only the
+      // top-left c2dW x c2dH sub-rect, so slack is invisible.
+      if (canvas.width < width) canvas.width = width;
+      if (canvas.height < height) canvas.height = height;
     },
     render(
       bgVerts,
@@ -279,9 +315,11 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
       bgColor,
       focused = true,
     ) {
-      ctx!.clearRect(0, 0, canvas.width, canvas.height);
+      // Confined to the logical rect: clearing the whole grown bitmap
+      // would cost every other pane's area too.
+      ctx!.clearRect(0, 0, c2dW, c2dH);
       ctx!.fillStyle = `rgb(${bgColor[0]},${bgColor[1]},${bgColor[2]})`;
-      ctx!.fillRect(0, 0, canvas.width, canvas.height);
+      ctx!.fillRect(0, 0, c2dW, c2dH);
       drawBgRects(bgVerts);
       if (atlasCanvas) drawGlyphs(glyphVerts, atlasCanvas);
       renderCursor(
@@ -335,8 +373,20 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   const glyphColorLoc = gl.getAttribLocation(glyphProgram, "a_color");
   const glyphResLoc = gl.getUniformLocation(glyphProgram, "u_resolution");
   const glyphTexLoc = gl.getUniformLocation(glyphProgram, "u_texture");
+  const glyphGammaLoc = gl.getUniformLocation(glyphProgram, "u_gamma");
+  const glyphBgLumaLoc = gl.getUniformLocation(glyphProgram, "u_bgLuma");
+
+  let textGamma = 1;
 
   const maxDim = (gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number) || 4096;
+
+  // The size the *current* pane is drawing at. The canvas backing store is
+  // grow-only (see resize), so it is usually larger; everything that used
+  // to read canvas.width/height for projection or viewport reads these
+  // instead, or content would be scaled to the grown store.
+  let logicalW = 0;
+  let logicalH = 0;
+  let disposed = false;
 
   canvas.addEventListener("webglcontextlost", (e) => {
     e.preventDefault();
@@ -352,8 +402,14 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
   gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // Glyph quads blit their atlas slot 1:1 — same size in device pixels, both
+  // corners on integer boundaries (see the WASM push_glyph_vert) — so every
+  // sample lands dead centre on a texel and NEAREST is exact. LINEAR is only
+  // *nearly* exact: UVs are computed at texel edges from an up-to-8K atlas, so
+  // any rounding in that division bleeds a neighbouring texel in and softens
+  // the glyph. Nothing here ever samples at a non-integer scale.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
@@ -383,7 +439,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     gl!.bindBuffer(gl!.ARRAY_BUFFER, rectBuffer);
     gl!.enableVertexAttribArray(rectPosLoc);
     gl!.enableVertexAttribArray(rectColorLoc);
-    gl!.uniform2f(rectResLoc, canvas.width, canvas.height);
+    gl!.uniform2f(rectResLoc, logicalW, logicalH);
     for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
       const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
       const slice = data.subarray(
@@ -520,6 +576,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     data: Float32Array,
     atlasCanvas: HTMLCanvasElement,
     atlasVersion: number,
+    bgLuma: number,
   ): void {
     if (!data.length || !atlasCanvas) return;
     uploadAtlas(atlasCanvas, atlasVersion);
@@ -530,7 +587,9 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
     gl!.enableVertexAttribArray(glyphPosLoc);
     gl!.enableVertexAttribArray(glyphUvLoc);
     gl!.enableVertexAttribArray(glyphColorLoc);
-    gl!.uniform2f(glyphResLoc, canvas.width, canvas.height);
+    gl!.uniform2f(glyphResLoc, logicalW, logicalH);
+    gl!.uniform1f(glyphGammaLoc, textGamma);
+    gl!.uniform1f(glyphBgLumaLoc, bgLuma);
     gl!.activeTexture(gl!.TEXTURE0);
     gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
     gl!.uniform1i(glyphTexLoc, 0);
@@ -549,14 +608,38 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   }
 
   return {
-    supported: true,
+    // A disposed renderer must stop reporting itself as usable: callers
+    // cache the shared renderer and only re-fetch when this goes false
+    // (see BlitTerminalSurface.doRender). The async WebGPU probe disposes
+    // whatever was already in place and swaps itself in, so without this
+    // a surface keeps drawing through deleted GL objects — "bindTexture:
+    // attempt to use a deleted object", and a pane that never paints.
+    get supported() {
+      return !disposed;
+    },
     backend: "webgl2" as const,
     maxDimension: maxDim,
+    setTextGamma(gamma: number) {
+      textGamma = Number.isFinite(gamma) && gamma > 0 ? gamma : 1;
+    },
     resize(width: number, height: number) {
       const w = Math.min(width, maxDim);
       const h = Math.min(height, maxDim);
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
+      logicalW = w;
+      logicalH = h;
+      // Grow-only. Every pane shares this one canvas and calls resize()
+      // with its own size once per frame, and assigning canvas.width
+      // reallocates and clears the drawing buffer — measured at ~1ms a
+      // time. Sizing exactly therefore cost that once per pane per frame
+      // whenever two panes differed in size, which during a window drag
+      // is every pane, every frame.
+      //
+      // The composite blits the top-left logicalW x logicalH sub-rect
+      // (see BlitTerminalSurface.doRender), so slack beyond it is never
+      // read and a larger backing store is invisible. render() below
+      // confines drawing to that rect via the viewport.
+      if (canvas.width < w) canvas.width = w;
+      if (canvas.height < h) canvas.height = h;
     },
     render(
       bgVerts: Float32Array,
@@ -573,12 +656,24 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       focused = true,
     ) {
       if (gl!.isContextLost()) return;
-      gl!.viewport(0, 0, canvas.width, canvas.height);
+      // The shaders flip Y, so content is laid out from the top-left;
+      // GL's viewport origin is the bottom-left, hence the slack offset.
+      // Scissor to the same rect so the clear only pays for the region
+      // this pane actually uses, not the whole grown canvas.
+      const vpY = canvas.height - logicalH;
+      gl!.viewport(0, vpY, logicalW, logicalH);
+      gl!.enable(gl!.SCISSOR_TEST);
+      gl!.scissor(0, vpY, logicalW, logicalH);
       gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
       gl!.clear(gl!.COLOR_BUFFER_BIT);
       drawColoredTriangles(bgVerts);
       if (atlasCanvas) {
-        uploadAndDrawGlyphs(glyphVerts, atlasCanvas, atlasVersion);
+        uploadAndDrawGlyphs(
+          glyphVerts,
+          atlasCanvas,
+          atlasVersion,
+          rgbLuma(bgColor),
+        );
       }
       renderCursor(
         cursorVisible,
@@ -591,6 +686,7 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
       );
     },
     dispose() {
+      disposed = true;
       gl!.deleteBuffer(rectBuffer);
       gl!.deleteBuffer(glyphBuffer);
       gl!.deleteTexture(atlasTexture);

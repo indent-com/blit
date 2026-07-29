@@ -19,7 +19,7 @@ const MAX_BUFFER_FRAMES = 25; // 500 ms
  * Adaptive jitter buffer: the worklet starts at MIN_BUFFER_SAMPLES, grows
  * by one 20 ms frame on the leading edge of each underrun event, and
  * shrinks back one frame at a time after DECAY_STABLE_SAMPLES of
- * underrun-free playback.  No hard upper bound — the DRIFT_JUMP_MS skip
+ * underrun-free playback.  No hard upper bound — the worklet's skip
  * path reclaims excess latency if the buffer ever runs away.  Hysteresis
  * is provided by the MIN floor: once bufferTarget hits it, shrinking
  * stops.  Floor is three frames (60 ms) to absorb two back-to-back late
@@ -67,15 +67,6 @@ const DRIFT_FULL_CORRECTION_MS = 300;
 
 /** Maximum rate offset from 1.0 in either direction. */
 const MAX_RATE_OFFSET = 0.02; // ±2%
-
-/**
- * Drift threshold for a hard jump (ms).  When audio is *ahead* of video by
- * more than this, the worklet skips forward (drops old samples) to close the
- * gap without a full flush.  When audio is *behind* by more than this, we
- * just reset sync and let rate steering or new frames catch up — flushing
- * would discard the only audio we have, making the gap worse.
- */
-const DRIFT_JUMP_MS = 500;
 
 /** Minimum number of audio frames received before we start sync adjustment. */
 const SYNC_WARMUP_FRAMES = 10;
@@ -200,8 +191,8 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
       } else {
         this.buffer.push(e.data);
         this.buffered += e.data.length / 2; // half = per-channel sample count
-        // No hard buffer cap: the DRIFT_JUMP_MS skip path (main thread)
-        // reclaims excess latency if something pathological accumulates.
+        // No hard buffer cap: the "skip" message path reclaims excess
+        // latency if something pathological accumulates.
       }
     };
   }
@@ -424,8 +415,6 @@ export class AudioPlayer {
   // aligned within the ppm-level clock skew of the sample-rate
   // converters, which is imperceptible for sub-hour sessions.
 
-  /** Last consumed-sample position reported by the worklet. */
-  private samplesConsumed = 0;
   /** Number of audio frames received (for warmup). */
   private framesReceived = 0;
   /** Current playback rate sent to the worklet. */
@@ -698,7 +687,6 @@ export class AudioPlayer {
   // -- Internal: rate servo -------------------------------------------------
 
   private resetSync(): void {
-    this.samplesConsumed = 0;
     this.framesReceived = 0;
     this.currentRate = 1.0;
     this.smoothedRate = 1.0;
@@ -738,9 +726,8 @@ export class AudioPlayer {
    * the adaptive target and nudges the worklet's playback rate within
    * ±5 % to push the buffer back toward target.
    */
-  private onWorkletPosition(consumed: number): void {
+  private onWorkletPosition(): void {
     const now = Date.now();
-    this.samplesConsumed = consumed;
     this.lastWorkletReportAt = now;
 
     // Don't adjust during warmup — not enough samples to stabilise.
@@ -1041,7 +1028,7 @@ export class AudioPlayer {
           if (typeof d.buffered === "number") {
             this.lastBufferedSamples = d.buffered;
           }
-          this.onWorkletPosition(d.value);
+          this.onWorkletPosition();
         } else if (d.type === "event") {
           if (typeof d.target === "number") {
             this.currentBufferTarget = d.target;

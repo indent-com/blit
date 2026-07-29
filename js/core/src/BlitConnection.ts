@@ -42,6 +42,8 @@ import {
   S2C_QUIT,
   S2C_TEXT,
   S2C_TITLE,
+  S2C_TERM_CWD,
+  S2C_TERM_CWD_EVENT,
   S2C_UPDATE,
   S2C_USED_ROWS,
   C2S_PING,
@@ -58,6 +60,9 @@ import {
   buildResizeBatchMessage,
   buildResizeMessage,
   buildKillMessage,
+  buildTermCwdMessage,
+  parseTermCwdReply,
+  parseTermCwdEvent,
   buildRestartMessage,
   buildScrollMessage,
   buildSearchMessage,
@@ -80,6 +85,204 @@ import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import { detectCodecSupport } from "./BlitSurfaceCanvas";
+import {
+  FEATURE_FS,
+  FS_CLOSED_CLIENT_REQUEST,
+  FS_CLOSED_CONNECTION_LOST,
+  FS_DONE_CONFLICT,
+  FS_DONE_INVALID,
+  FS_DONE_OK,
+  FS_FILE_OK,
+  FS_OP_HARDLINK,
+  FS_OP_MKDIR,
+  FS_OP_MKPARENTS,
+  FS_OP_NO_CAS,
+  FS_OP_REMOVE,
+  FS_OP_RENAME,
+  FS_OP_SYMLINK,
+  FS_STATUS_OK,
+  FS_SYNC_CONTENT,
+  FS_SYNC_CROSS_FILESYSTEM,
+  FS_SYNC_RECURSIVE,
+  FS_SYNC_SINGLE,
+  FS_WRITE_CONTENT_DELTA,
+  FS_WRITE_CONTENT_FULL,
+  FS_WRITE_DURABLE,
+  FS_WRITE_MKPARENTS,
+  FS_WRITE_NO_CAS,
+  FS_UPDATE_RESET,
+  FS_UPDATE_SYNC,
+  FsMirror,
+  FS_INDEX_TRUNCATED,
+  S2C_FS_CLOSED,
+  S2C_FS_FILE,
+  S2C_FS_INDEX,
+  S2C_FS_SEARCH,
+  S2C_FS_SYNCED,
+  S2C_FS_UPDATE,
+  S2C_FS_DONE,
+  buildFsAckMessage,
+  buildFsFetchMessage,
+  buildFsIndexMessage,
+  buildFsSearchMessage,
+  buildFsOpMessage,
+  buildFsStopMessage,
+  buildFsSyncMessage,
+  buildFsWriteMessage,
+  parseFsIndexResult,
+  buildFsGrepMessage,
+  parseFsGrepResult,
+  S2C_FS_GREP,
+  FS_GREP_TRUNCATED,
+  parseFsSearchResult,
+  fsDoneStatusText,
+  fsFileStatusText,
+  parseFsDoneMessage,
+  parseFsFileMessage,
+  encodeFsDelta,
+  FsConflictError,
+  FsOpenError,
+  type FsFileIndex,
+  type FsGrepResult,
+  type FsGrepOptions,
+  type FsNode,
+  type FsRecord,
+  type FsSyncHandle,
+  type FsSyncOptions,
+  type FsWriteOptions,
+  type FsWriteResult,
+} from "./fs";
+import {
+  FEATURE_GIT,
+  GIT_CLOSED_CONNECTION_LOST,
+  GIT_OPEN_IGNORED,
+  GIT_OPEN_STATUS,
+  GIT_OPEN_TRACKING,
+  GIT_OPEN_UNTRACKED,
+  GIT_OPEN_WATCH,
+  GIT_PATCH_STRUCTURED,
+  GIT_STATUS_OK,
+  GitStateMirror,
+  type GitLogPage,
+  type GitLogSubscription,
+  type GitLogWatchOptions,
+  type GitOpenOptions,
+  type GitRepoHandle,
+  S2C_GIT_BASE,
+  S2C_GIT_BLOB,
+  S2C_GIT_CLOSED,
+  S2C_GIT_COMMITS,
+  S2C_GIT_DIFF,
+  S2C_GIT_INDEX,
+  S2C_GIT_LOG_PAGE,
+  S2C_GIT_PATCH,
+  S2C_GIT_REPO,
+  S2C_GIT_RESOLVE,
+  S2C_GIT_STATE,
+  S2C_GIT_TREE,
+  gitDiffRecords,
+  gitIndexRecords,
+  gitOidHex,
+  gitPatchRecords,
+  gitStatusText,
+  gitTreeRecords,
+  msgGitAck,
+  msgGitBase,
+  msgGitBlob,
+  msgGitClose,
+  msgGitDiff,
+  msgGitIndex,
+  msgGitLog,
+  msgGitLogAck,
+  msgGitLogUnwatch,
+  msgGitLogWatch,
+  msgGitOpen,
+  msgGitPatch,
+  msgGitResolve,
+  msgGitTree,
+  parseGitBaseResp,
+  parseGitBlobResp,
+  parseGitClosed,
+  parseGitCommits,
+  parseGitDiffResp,
+  parseGitIndexResp,
+  parseGitLogPage,
+  parseGitPatchResp,
+  parseGitRepo,
+  parseGitResolveResp,
+  parseGitTreeResp,
+} from "./git";
+import {
+  FEATURE_LSP,
+  LSP_BUFFER_RELEASE,
+  LSP_CLOSED_CONNECTION_LOST,
+  LSP_OPEN_DIAGS,
+  LSP_OPEN_WATCH,
+  LSP_QUERY_COMPLETION,
+  LSP_QUERY_DEFINITION,
+  LSP_QUERY_DOC_SYMBOLS,
+  LSP_QUERY_HOVER,
+  LSP_QUERY_REFERENCES,
+  LSP_QUERY_RENAME,
+  LSP_QUERY_SIGNATURE,
+  LSP_QUERY_WS_SYMBOLS,
+  LSP_REFS_INCLUDE_DECLARATION,
+  LSP_RESP_INCOMPLETE,
+  LSP_RESP_TRUNCATED,
+  LSP_STATUS_OK,
+  LSP_STREAM_DIAG,
+  LSP_STREAM_STATE,
+  LspDiagMirror,
+  LspStateMirror,
+  type LspHandle,
+  type LspOpenOptions,
+  type LspQueryResult,
+  S2C_LSP_CLOSED,
+  S2C_LSP_DIAG,
+  S2C_LSP_OPENED,
+  S2C_LSP_QUERY,
+  S2C_LSP_STATE,
+  lspQueryRecords,
+  lspStatusText,
+  msgLspAck,
+  msgLspBuffer,
+  msgLspClose,
+  msgLspOpen,
+  msgLspQuery,
+  parseLspClosed,
+  parseLspOpened,
+  parseLspQueryResp,
+} from "./lsp";
+import {
+  FEATURE_KV,
+  KV_PUT_DELETE,
+  KV_PUT_DURABLE,
+  KV_PUT_NO_CAS,
+  KV_STATUS_CONFLICT,
+  KV_STATUS_NOT_FOUND,
+  KV_STATUS_OK,
+  KvMirror,
+  S2C_KV_CLOSED,
+  S2C_KV_DONE,
+  S2C_KV_OPENED,
+  S2C_KV_UPDATE,
+  S2C_KV_VALUE,
+  buildKvAckMessage,
+  buildKvFetchMessage,
+  buildKvOpenMessage,
+  buildKvPutMessage,
+  buildKvStopMessage,
+  kvClosedText,
+  kvStatusText,
+  parseKvDoneMessage,
+  parseKvOpenedMessage,
+  parseKvValueMessage,
+  type KvFetchResult,
+  type KvPutOptions,
+  type KvWatchHandle,
+  type KvWatchOptions,
+} from "./kv";
+import { Notifier } from "./reactive";
 
 const textDecoder = new TextDecoder();
 
@@ -137,6 +340,57 @@ type ParsedList = {
   entries: ListEntry[];
   complete: boolean;
 };
+
+/** One `syncFs` caller on a shared wire sync: its callbacks + reactive
+ *  surface. Wire-identical opens share one sync (docs/fs-watch.md), so
+ *  callbacks fan out per consumer while the mirror is shared. */
+type FsSyncConsumer = {
+  options: FsSyncOptions;
+  notifier: Notifier;
+};
+
+/** One wire sync, shared by every consumer whose open was wire-identical. */
+type FsSyncShare = {
+  /** Coalescing key: flags + latency + inline cap + src pty + path. */
+  key: string;
+  syncId: number;
+  root: string;
+  mirror: FsMirror;
+  /** True once any `SYNC` has been seen — the live map is coherent. */
+  synced: boolean;
+  /** Hash of this client's most recent write per path, for self-echo
+   *  suppression (docs/design/fs-write.md "Echo and attribution").
+   *  Entries are dropped once the matching echo upsert is observed. */
+  lastWritten: Map<string, bigint>;
+  consumers: Set<FsSyncConsumer>;
+};
+
+/** An unanswered `C2S_FS_SYNC` and every caller waiting on it. */
+type PendingFsSync = {
+  key: string;
+  waiters: Array<{
+    resolve: (handle: FsSyncHandle) => void;
+    reject: (error: Error) => void;
+    options: FsSyncOptions;
+  }>;
+};
+
+/** Synthesize the upsert a joiner would have received for a mirrored node. */
+function fsNodeUpsert(path: string, node: FsNode): FsRecord {
+  return {
+    kind: "upsert",
+    path,
+    entryFlags: node.entryFlags,
+    size: node.size,
+    mtimeNs: node.mtimeNs,
+    mode: node.mode,
+    hash: node.hash,
+    content:
+      node.content !== null
+        ? { kind: "full", data: node.content }
+        : { kind: "none" },
+  };
+}
 
 function connectionError(message: string): Error {
   return new Error(message);
@@ -198,10 +452,147 @@ export class BlitConnection {
       reject: (error: Error) => void;
     }
   >();
+  /** Unanswered `C2S_FS_SYNC`s by nonce; `pendingFsSyncsByKey` indexes the
+   *  same entries so wire-identical opens coalesce while in flight. */
+  private readonly pendingFsSyncs = new Map<number, PendingFsSync>();
+  private readonly pendingFsSyncsByKey = new Map<string, PendingFsSync>();
+  /** Live syncs by server `sync_id`; `fsSyncsByKey` indexes the same
+   *  shares for coalescing until their last consumer stops. */
+  private readonly fsSyncs = new Map<number, FsSyncShare>();
+  private readonly fsSyncsByKey = new Map<string, FsSyncShare>();
+  private readonly pendingFsFetches = new Map<
+    number,
+    { resolve: (data: Uint8Array) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsSearches = new Map<
+    number,
+    { resolve: (paths: string[]) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsIndexes = new Map<
+    number,
+    { resolve: (index: FsFileIndex) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsGreps = new Map<
+    number,
+    { resolve: (result: FsGrepResult) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingCwds = new Map<
+    number,
+    { resolve: (cwd: string) => void; reject: (error: Error) => void }
+  >();
+  private cwdNonceCounter = 0;
+  /** Latest server-pushed cwd per session (`S2C_TERM_CWD_EVENT`); cleared
+   *  on reset/HELLO — pushes do not survive a server session change. */
+  private readonly termCwds = new Map<SessionId, string>();
+  private readonly termCwdListeners = new Set<
+    (sessionId: SessionId, cwd: string) => void
+  >();
+  private readonly pendingFsWrites = new Map<
+    number,
+    {
+      resolve: (result: FsWriteResult) => void;
+      reject: (error: Error) => void;
+      /** Set on `writeFile`/`mkdir` so a successful reply records the hash
+       *  in the sync's `lastWritten`; unset for remove/rename. */
+      record?: { syncId: number; path: string };
+      /** Set on a delta write: an `FS_DONE` INVALID re-sends it as a full
+       *  write instead of rejecting (a pre-delta server's refusal). */
+      onInvalid?: () => void;
+    }
+  >();
+  private readonly pendingKvOpens = new Map<
+    number,
+    {
+      resolve: (handle: KvWatchHandle) => void;
+      reject: (error: Error) => void;
+      options: KvWatchOptions;
+    }
+  >();
+  private readonly kvWatches = new Map<
+    number,
+    { mirror: KvMirror; options: KvWatchOptions }
+  >();
+  private readonly pendingKvPuts = new Map<
+    number,
+    {
+      resolve: (result: { hash: bigint; mtimeNs: bigint }) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingKvFetches = new Map<
+    number,
+    {
+      resolve: (result: KvFetchResult | null) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingGitOpens = new Map<
+    number,
+    {
+      resolve: (handle: GitRepoHandle) => void;
+      reject: (error: Error) => void;
+      options: GitOpenOptions;
+    }
+  >();
+  private readonly gitRepos = new Map<
+    number,
+    { mirror: GitStateMirror; options: GitOpenOptions; notifier: Notifier }
+  >();
+  /** Connection-wide blob cache: oid-addressed content is immutable
+   *  (docs/design/git.md "GIT_BLOB"), so entries outlive repo handles and
+   *  reconnects. Promises coalesce concurrent fetches of one oid; Map
+   *  order is the LRU order for the byte budget. */
+  private readonly gitBlobCache = new Map<
+    string,
+    { promise: Promise<Uint8Array>; bytes: number; settled: boolean }
+  >();
+  private gitBlobCacheBytes = 0;
+  /** Byte budget for {@link gitBlobCache}; tests shrink it to exercise
+   *  eviction without moving real megabytes. */
+  private gitBlobCacheBudget = 64 * 1024 * 1024;
+  private readonly pendingGitRequests = new Map<
+    number,
+    {
+      opcode: number;
+      resolve: (msg: Uint8Array) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  /** Live log subscriptions keyed by client-assigned `log_id`. */
+  private readonly gitLogSubs = new Map<
+    number,
+    { repoId: number; onUpdate: (page: GitLogPage) => void }
+  >();
+  private readonly pendingLspOpens = new Map<
+    number,
+    {
+      resolve: (handle: LspHandle) => void;
+      reject: (error: Error) => void;
+      options: LspOpenOptions;
+    }
+  >();
+  private readonly lspAttachments = new Map<
+    number,
+    {
+      state: LspStateMirror;
+      diags: LspDiagMirror;
+      options: LspOpenOptions;
+      notifier: Notifier;
+    }
+  >();
+  private readonly pendingLspRequests = new Map<
+    number,
+    {
+      resolve: (msg: Uint8Array) => void;
+      reject: (error: Error) => void;
+    }
+  >();
 
   private sessionCounter = 0;
   private nonceCounter = 0;
   private searchCounter = 0;
+  private fsNonceCounter = 0;
+  private gitLogIdCounter = 0;
   private features = 0;
   private disposed = false;
   /** Per-session, per-view size registry for computing minimum resize. */
@@ -210,9 +601,9 @@ export class BlitConnection {
     Map<string, { rows: number; cols: number }>
   >();
   private viewIdCounter = 0;
-  private hasConnected = false;
   private hasReceivedList = false;
   private retryCount = 0;
+  private generation = 0;
   private lastError: string | null = null;
 
   /** Default video quality for new surface subscriptions (0 = server default). */
@@ -300,15 +691,16 @@ export class BlitConnection {
       supportsCopyRange: false,
       supportsCompositor: false,
       supportsAudio: false,
+      supportsFsSync: false,
+      supportsGit: false,
+      supportsLsp: false,
+      supportsKv: false,
       retryCount: 0,
+      generation: 0,
       error: null,
       sessions: [],
       focusedSessionId: null,
     };
-
-    if (transport.status === "connected") {
-      this.hasConnected = true;
-    }
 
     this.transport.addEventListener("message", this.handleMessage);
     this.transport.addEventListener("statuschange", this.handleStatusChange);
@@ -378,6 +770,12 @@ export class BlitConnection {
     );
     this.rejectPendingSearches(connectionError("Connection disposed"));
     this.rejectPendingReads(connectionError("Connection disposed"));
+    this.resetFsSyncs(connectionError("Connection disposed"));
+    this.resetGitRepos(connectionError("Connection disposed"));
+    this.resetLspAttachments(connectionError("Connection disposed"));
+    this.resetKv(connectionError("Connection disposed"));
+    this.resetFragmentReassembly();
+    this.termCwds.clear();
     this.resolveAllPendingCloses();
     this.clearSurfaceSubs();
     this.store.destroy();
@@ -737,6 +1135,1108 @@ export class BlitConnection {
     });
   }
 
+  /**
+   * Mirror a server-side directory tree (docs/fs-watch.md). Resolves once
+   * the server accepts the sync; the handle's `live` map fills as the
+   * staged snapshot streams in and `onSync` fires when it is coherent.
+   * Updates are applied and acknowledged automatically.
+   *
+   * Wire-identical opens (same path and options) share one server sync:
+   * each caller gets its own handle and callbacks, and the wire stop goes
+   * out when the last handle stops. A caller joining an established sync
+   * has its snapshot replayed from the mirror (`onReset`/`onRecord`/
+   * `onSync`) on a later task, so per-record consumers stay coherent.
+   */
+  async syncFs(
+    path: string,
+    options: FsSyncOptions = {},
+  ): Promise<FsSyncHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot sync while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      throw connectionError("Server does not support filesystem sync");
+    }
+    if (options.single && options.recursive) {
+      throw connectionError(
+        "A single-file sync cannot be recursive (docs/design/fs-watch.md)",
+      );
+    }
+    let flags = 0;
+    // `single` and the recursive default are exclusive: a single-file
+    // root has nothing to recurse into, and the server rejects the
+    // flag combination. The bit rides `flags`, so the coalescing key
+    // below separates single and directory opens automatically.
+    if (options.single) flags |= FS_SYNC_SINGLE;
+    else if (options.recursive !== false) flags |= FS_SYNC_RECURSIVE;
+    if (options.content) flags |= FS_SYNC_CONTENT;
+    if (options.crossFilesystem) flags |= FS_SYNC_CROSS_FILESYSTEM;
+    const srcPtyId = options.fromSessionId
+      ? this.sessionsById.get(options.fromSessionId)?.ptyId
+      : undefined;
+    const latencyMs = options.latencyMs ?? 0;
+    const inlineMax = options.inlineMax ?? 0;
+    const key = `${flags}:${latencyMs}:${inlineMax}:${srcPtyId ?? ""}:${path}`;
+    const share = this.fsSyncsByKey.get(key);
+    if (share) {
+      return this.joinFsShare(share, options);
+    }
+    const pending = this.pendingFsSyncsByKey.get(key);
+    if (pending) {
+      return new Promise<FsSyncHandle>((resolve, reject) => {
+        pending.waiters.push({ resolve, reject, options });
+      });
+    }
+    return new Promise<FsSyncHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsSyncs);
+      const entry: PendingFsSync = {
+        key,
+        waiters: [{ resolve, reject, options }],
+      };
+      this.pendingFsSyncs.set(nonce, entry);
+      this.pendingFsSyncsByKey.set(key, entry);
+      this.transport.send(
+        buildFsSyncMessage(nonce, flags, latencyMs, inlineMax, path, srcPtyId),
+      );
+    });
+  }
+
+  /** Attach a consumer to an established share, replaying the snapshot it
+   *  missed. The replay is deferred to a macrotask so the caller holds the
+   *  handle (its `await` continuation runs) before any callback fires; the
+   *  mirror is re-read at replay time, so updates landing in between stay
+   *  coherent — the replay is always a valid restage of what preceded it. */
+  private joinFsShare(
+    share: FsSyncShare,
+    options: FsSyncOptions,
+  ): FsSyncHandle {
+    const consumer: FsSyncConsumer = { options, notifier: new Notifier() };
+    share.consumers.add(consumer);
+    const handle = this.makeFsSyncHandle(share, consumer);
+    setTimeout(() => {
+      if (!share.consumers.has(consumer)) return; // stopped or closed already
+      const staged = share.mirror.staged;
+      if (staged !== null) {
+        // Mid-restage: replay the staging map — it equals the records the
+        // other consumers saw since RESET — and let the wire SYNC land.
+        options.onReset?.();
+        if (options.onRecord) {
+          for (const [p, node] of staged) {
+            options.onRecord(fsNodeUpsert(p, node));
+          }
+        }
+      } else if (share.synced) {
+        // Coherent: replay the live map as the restage the joiner missed.
+        options.onReset?.();
+        if (options.onRecord) {
+          for (const [p, node] of share.mirror.live) {
+            options.onRecord(fsNodeUpsert(p, node));
+          }
+        }
+        options.onSync?.();
+        // Revision before onUpdate, matching the wire path: revision-keyed
+        // caches re-read inside onUpdate must observe the bump.
+        consumer.notifier.emit();
+        options.onUpdate?.();
+      }
+      // Neither: the initial snapshot has not started; the wire
+      // RESET…SYNC reaches this consumer like any other.
+    }, 0);
+    return handle;
+  }
+
+  private makeFsSyncHandle(
+    share: FsSyncShare,
+    consumer: FsSyncConsumer,
+  ): FsSyncHandle {
+    const { syncId, mirror } = share;
+    const notifier = consumer.notifier;
+    return {
+      syncId,
+      root: share.root,
+      subscribe: notifier.subscribe,
+      get revision() {
+        return notifier.revision;
+      },
+      get live() {
+        // The mirror *replaces* its live map when a staged snapshot
+        // swaps in, so the handle must dereference on every access.
+        return mirror.live;
+      },
+      fetch: (path: string) => this.fsFetch(syncId, path),
+      writeFile: (path, data, options = {}) =>
+        this.fsWrite(syncId, path, data, options),
+      mkdir: (path, options = {}) =>
+        this.fsOp(
+          syncId,
+          FS_OP_MKDIR,
+          path,
+          "",
+          0n,
+          options.mode ?? 0,
+          options.createParents ? FS_OP_MKPARENTS : 0,
+          { syncId, path },
+        ),
+      remove: (path, options = {}) =>
+        this.fsOp(
+          syncId,
+          FS_OP_REMOVE,
+          path,
+          "",
+          options.ifHash ?? 0n,
+          0,
+          0,
+        ).then(() => undefined),
+      rename: (from, to, options = {}) =>
+        this.fsOp(
+          syncId,
+          FS_OP_RENAME,
+          from,
+          to,
+          0n,
+          0,
+          options.createParents ? FS_OP_MKPARENTS : 0,
+        ).then(() => undefined),
+      symlink: (target, path, options = {}) =>
+        this.fsOp(
+          syncId,
+          FS_OP_SYMLINK,
+          target,
+          path,
+          options.force ? 0n : (options.ifHash ?? 0n),
+          0,
+          (options.force ? FS_OP_NO_CAS : 0) |
+            (options.createParents ? FS_OP_MKPARENTS : 0),
+          { syncId, path },
+        ),
+      hardlink: (source, path, options = {}) =>
+        this.fsOp(
+          syncId,
+          FS_OP_HARDLINK,
+          source,
+          path,
+          options.force ? 0n : (options.ifHash ?? 0n),
+          0,
+          (options.force ? FS_OP_NO_CAS : 0) |
+            (options.createParents ? FS_OP_MKPARENTS : 0),
+          { syncId, path },
+        ),
+      lastWrittenHash: (path: string) => share.lastWritten.get(path),
+      stop: () => this.releaseFsConsumer(share, consumer),
+    };
+  }
+
+  /** Detach one consumer; the last one releases the wire sync. */
+  private releaseFsConsumer(
+    share: FsSyncShare,
+    consumer: FsSyncConsumer,
+  ): void {
+    if (!share.consumers.has(consumer)) return;
+    if (share.consumers.size > 1) {
+      share.consumers.delete(consumer);
+      // Confirm this consumer's close asynchronously, standing in for the
+      // server confirmation the surviving consumers will keep absorbing.
+      queueMicrotask(() => {
+        consumer.options.onClosed?.(FS_CLOSED_CLIENT_REQUEST);
+        consumer.notifier.emit();
+      });
+      return;
+    }
+    // Last consumer: release the wire sync. Unindex the key first so a
+    // new open starts fresh instead of joining a dying sync; FS_CLOSED
+    // (or the connection teardown) fires the remaining onClosed.
+    if (this.fsSyncsByKey.get(share.key) === share) {
+      this.fsSyncsByKey.delete(share.key);
+    }
+    if (this.transport.status === "connected") {
+      this.transport.send(buildFsStopMessage(share.syncId));
+    }
+  }
+
+  private nextFsNonce(pending: ReadonlyMap<number, unknown>): number {
+    let nonce = 0;
+    do {
+      nonce = this.fsNonceCounter = (this.fsNonceCounter + 1) & 0xffff;
+    } while (pending.has(nonce));
+    return nonce;
+  }
+
+  private fsFetch(syncId: number, path: string): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsFetches);
+      this.pendingFsFetches.set(nonce, { resolve, reject });
+      this.transport.send(buildFsFetchMessage(nonce, syncId, path));
+    });
+  }
+
+  /** Resolve a session's live working directory (server reads the pty's cwd).
+   *  Resolves "" when the session/pty is gone or the cwd can't be read. */
+  sessionCwd(sessionId: SessionId): Promise<string> {
+    if (this.transport.status !== "connected") return Promise.resolve("");
+    const session = this.sessionsById.get(sessionId);
+    if (!session) return Promise.resolve("");
+    // Servers predating TERM_CWD never answer, so pendings only leave this
+    // map on a connection reset — cap them like pendingFsIndexes. "" is
+    // the documented can't-read result.
+    if (this.pendingCwds.size >= 8) return Promise.resolve("");
+    return new Promise<string>((resolve, reject) => {
+      let nonce = 0;
+      do {
+        nonce = this.cwdNonceCounter = (this.cwdNonceCounter + 1) & 0xffff;
+      } while (this.pendingCwds.has(nonce));
+      this.pendingCwds.set(nonce, { resolve, reject });
+      this.transport.send(buildTermCwdMessage(nonce, session.ptyId));
+    });
+  }
+
+  /** Subscribe to server-pushed cwd changes (`S2C_TERM_CWD_EVENT`,
+   *  docs/protocol.md): the server watches OSC 7 reports, so consumers
+   *  can suppress `sessionCwd` polling while pushes flow. Returns an
+   *  unsubscribe function. */
+  onTermCwd(listener: (sessionId: SessionId, cwd: string) => void): () => void {
+    this.termCwdListeners.add(listener);
+    return () => {
+      this.termCwdListeners.delete(listener);
+    };
+  }
+
+  /** The most recent server-pushed cwd for a session, or null when none
+   *  has arrived since the session (or server connection) was
+   *  established. The `sessionCwd()` poll is independent of pushes. */
+  lastPushedCwd(sessionId: SessionId): string | null {
+    return this.termCwds.get(sessionId) ?? null;
+  }
+
+  /** Fuzzy file search under `root`; resolves with up to `limit` root-relative
+   *  paths, best match first. No sync — a one-shot server-side walk. */
+  searchFiles(root: string, query: string, limit = 50): Promise<string[]> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(
+          `Cannot search while transport is ${this.transport.status}`,
+        ),
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      return Promise.reject(
+        connectionError("Server does not support file search"),
+      );
+    }
+    return new Promise<string[]>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsSearches);
+      this.pendingFsSearches.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildFsSearchMessage(nonce, Math.min(limit, 0xffff), root, query),
+      );
+    });
+  }
+
+  /** Fetch the candidate file list under `root` for client-side fuzzy
+   *  search (docs/design/fs-search.md): root-relative paths, sorted,
+   *  gitignore-filtered. `truncated` means a budget clipped the list, so
+   *  callers should keep `searchFiles` for this root. Servers predating
+   *  `FS_INDEX` never answer — the promise just stays pending until the
+   *  connection resets, so callers should race it against a fallback. */
+  indexFiles(root: string): Promise<FsFileIndex> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(
+          `Cannot index files while transport is ${this.transport.status}`,
+        ),
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      return Promise.reject(
+        connectionError("Server does not support file indexing"),
+      );
+    }
+    // A pre-FS_INDEX server never answers, so pendings can only leave this
+    // map on a connection reset — cap them so a polling caller can't grow
+    // the map without bound (every other fs pending is guaranteed a reply).
+    if (this.pendingFsIndexes.size >= 8) {
+      return Promise.reject(
+        connectionError("Too many file index requests in flight"),
+      );
+    }
+    return new Promise<FsFileIndex>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsIndexes);
+      this.pendingFsIndexes.set(nonce, { resolve, reject });
+      this.transport.send(buildFsIndexMessage(nonce, root));
+    });
+  }
+
+  /** Content search under `root` (docs/design/fs-grep.md). Resolves with
+   *  hits grouped by file — tracked files first, then gitignored ones,
+   *  which are ranked rather than excluded. No sync: a one-shot
+   *  server-side walk.
+   *
+   *  Rejects on a non-OK status, carrying the server's own message where
+   *  it has one — an uncompilable regex reports the engine's wording,
+   *  which is the useful thing to show someone mid-typing. Like
+   *  `indexFiles`, a server predating `FS_GREP` drops the opcode and never
+   *  answers, so the in-flight cap keeps a repeating caller bounded. */
+  grep(
+    root: string,
+    query: string,
+    opts: FsGrepOptions = {},
+  ): Promise<FsGrepResult> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(
+          `Cannot search while transport is ${this.transport.status}`,
+        ),
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      return Promise.reject(
+        connectionError("Server does not support content search"),
+      );
+    }
+    if (this.pendingFsGreps.size >= 8) {
+      return Promise.reject(
+        connectionError("Too many content searches in flight"),
+      );
+    }
+    return new Promise<FsGrepResult>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsGreps);
+      this.pendingFsGreps.set(nonce, { resolve, reject });
+      this.transport.send(buildFsGrepMessage(nonce, root, query, opts));
+    });
+  }
+
+  // -- Server KV store (docs/design/kv.md) ----------------------------------
+
+  private kvGuard(): Error | null {
+    if (this.transport.status !== "connected") {
+      return connectionError(
+        `Cannot use kv while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_KV) === 0) {
+      return connectionError("Server does not support the kv store");
+    }
+    return null;
+  }
+
+  /** CAS put: `ifHash` → compare-and-swap, `create` → create-exclusive,
+   *  neither → unconditional. Conflicts reject with {@link FsConflictError}
+   *  whose `hash` is the current value hash (rebase and retry). */
+  kvPut(
+    key: string,
+    value: Uint8Array,
+    options: KvPutOptions = {},
+  ): Promise<{ hash: bigint; mtimeNs: bigint }> {
+    const err = this.kvGuard();
+    if (err) return Promise.reject(err);
+    let flags = 0;
+    let base = 0n;
+    if (options.ifHash !== undefined) {
+      base = options.ifHash;
+    } else if (!options.create) {
+      flags |= KV_PUT_NO_CAS;
+    }
+    if (options.durable) flags |= KV_PUT_DURABLE;
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingKvPuts);
+      this.pendingKvPuts.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildKvPutMessage({ nonce, flags, base, key, value }),
+      );
+    });
+  }
+
+  /** Delete a key: `ifHash` → delete-iff-unchanged, absent → unconditional
+   *  (idempotent on a missing key). */
+  kvDelete(key: string, options: { ifHash?: bigint } = {}): Promise<void> {
+    const err = this.kvGuard();
+    if (err) return Promise.reject(err);
+    let flags = KV_PUT_DELETE;
+    let base = 0n;
+    if (options.ifHash !== undefined) base = options.ifHash;
+    else flags |= KV_PUT_NO_CAS;
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingKvPuts);
+      this.pendingKvPuts.set(nonce, {
+        resolve: () => resolve(),
+        reject,
+      });
+      this.transport.send(
+        buildKvPutMessage({
+          nonce,
+          flags,
+          base,
+          key,
+          value: new Uint8Array(0),
+        }),
+      );
+    });
+  }
+
+  /** Fetch one value; null when the key is absent. */
+  kvFetch(key: string): Promise<KvFetchResult | null> {
+    const err = this.kvGuard();
+    if (err) return Promise.reject(err);
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingKvFetches);
+      this.pendingKvFetches.set(nonce, { resolve, reject });
+      this.transport.send(buildKvFetchMessage(nonce, key));
+    });
+  }
+
+  /** Subscribe to a literal byte prefix (empty = whole store). The handle's
+   *  mirror fills from the snapshot and tracks live changes; updates are
+   *  acknowledged automatically. Subscriptions do not survive re-establish —
+   *  `onClosed` fires and the caller re-`watchKv`s (the fs-family rule). */
+  watchKv(
+    prefix: string,
+    options: KvWatchOptions = {},
+  ): Promise<KvWatchHandle> {
+    const err = this.kvGuard();
+    if (err) return Promise.reject(err);
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingKvOpens);
+      this.pendingKvOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        buildKvOpenMessage(nonce, 0, options.inlineMax ?? 0, prefix),
+      );
+    });
+  }
+
+  /** Reject pending kv requests and close watches (disconnect or
+   *  re-establish; nothing kv survives either). */
+  private resetKv(error: Error): void {
+    for (const pending of this.pendingKvOpens.values()) pending.reject(error);
+    this.pendingKvOpens.clear();
+    for (const pending of this.pendingKvPuts.values()) pending.reject(error);
+    this.pendingKvPuts.clear();
+    for (const pending of this.pendingKvFetches.values()) pending.reject(error);
+    this.pendingKvFetches.clear();
+    const watches = [...this.kvWatches.values()];
+    this.kvWatches.clear();
+    for (const watch of watches) watch.options.onClosed?.(error);
+  }
+
+  private fsWrite(
+    syncId: number,
+    path: string,
+    data: Uint8Array,
+    options: FsWriteOptions,
+  ): Promise<FsWriteResult> {
+    return new Promise<FsWriteResult>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      let flags = 0;
+      if (options.createParents) flags |= FS_WRITE_MKPARENTS;
+      if (options.durable) flags |= FS_WRITE_DURABLE;
+      // Precondition: create-exclusive (base 0), CAS (base = ifHash), or —
+      // by default or under force — an unconditional overwrite.
+      let base = 0n;
+      if (options.force) {
+        flags |= FS_WRITE_NO_CAS;
+      } else if (options.create) {
+        base = 0n;
+      } else if (options.ifHash !== undefined) {
+        base = options.ifHash;
+      } else {
+        flags |= FS_WRITE_NO_CAS;
+      }
+      // A delta applies against the exact bytes the CAS precondition
+      // names (docs/design/fs-write.md content_kind 2), so it demands a
+      // real nonzero-hash anchor: no `force`, no create-exclusive, no
+      // unconditional write.
+      if (
+        options.deltaBase !== undefined &&
+        (options.force || options.ifHash === undefined || options.ifHash === 0n)
+      ) {
+        reject(
+          connectionError(
+            "deltaBase requires a nonzero ifHash precondition (without force)",
+          ),
+        );
+        return;
+      }
+      const send = (
+        contentKind: number,
+        content: Uint8Array,
+        onInvalid?: () => void,
+      ): void => {
+        const nonce = this.nextFsNonce(this.pendingFsWrites);
+        this.pendingFsWrites.set(nonce, {
+          resolve,
+          reject,
+          record: { syncId, path },
+          onInvalid,
+        });
+        // Delta ops and full bytes ride the same LZ4 path: the builder
+        // compresses `content` regardless of kind.
+        this.transport.send(
+          buildFsWriteMessage({
+            nonce,
+            syncId,
+            flags,
+            base,
+            mode: options.mode ?? 0,
+            contentKind,
+            path,
+            content,
+          }),
+        );
+      };
+      if (options.deltaBase !== undefined) {
+        const ops = encodeFsDelta(options.deltaBase, data);
+        // The server's own worthwhile heuristic (crates/fssync/src/lib.rs):
+        // send the delta only when clearly smaller than the full content.
+        if (ops.length * 8 < data.length * 7) {
+          // A pre-delta server answers INVALID for content_kind 2: retry
+          // once as a full write with the same precondition, surfacing
+          // only the retry's outcome. (CONFLICT is a real CAS failure
+          // and never retries.)
+          send(FS_WRITE_CONTENT_DELTA, ops, () =>
+            send(FS_WRITE_CONTENT_FULL, data),
+          );
+          return;
+        }
+      }
+      send(FS_WRITE_CONTENT_FULL, data);
+    });
+  }
+
+  private fsOp(
+    syncId: number,
+    op: number,
+    a: string,
+    b: string,
+    base: bigint,
+    mode: number,
+    flags: number,
+    record?: { syncId: number; path: string },
+  ): Promise<FsWriteResult> {
+    return new Promise<FsWriteResult>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingFsWrites);
+      this.pendingFsWrites.set(nonce, { resolve, reject, record });
+      this.transport.send(
+        buildFsOpMessage({ nonce, syncId, op, flags, base, mode, a, b }),
+      );
+    });
+  }
+
+  /**
+   * Open a repository on the server (docs/git.md). Resolves once the
+   * server accepts; state snapshots (when watching) apply to the handle's
+   * mirror and acknowledge automatically.
+   */
+  async openRepo(
+    path: string,
+    options: GitOpenOptions = {},
+  ): Promise<GitRepoHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open a repo while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_GIT) === 0) {
+      throw connectionError("Server does not support git introspection");
+    }
+    let flags = 0;
+    if (options.watch) flags |= GIT_OPEN_WATCH;
+    if (options.status || options.untracked || options.ignored)
+      flags |= GIT_OPEN_STATUS;
+    if (options.untracked || options.ignored) flags |= GIT_OPEN_UNTRACKED;
+    if (options.ignored) flags |= GIT_OPEN_IGNORED;
+    if (options.tracking) flags |= GIT_OPEN_TRACKING;
+    const srcPtyId = options.fromSessionId
+      ? this.sessionsById.get(options.fromSessionId)?.ptyId
+      : undefined;
+    return new Promise<GitRepoHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingGitOpens);
+      this.pendingGitOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        msgGitOpen(
+          nonce,
+          flags,
+          options.refsLatencyMs ?? 0,
+          options.statusLatencyMs ?? 0,
+          path,
+          srcPtyId,
+        ),
+      );
+    });
+  }
+
+  /** One nonce-correlated git request; resolves with the raw response. */
+  private gitRequest(
+    repoId: number,
+    opcode: number,
+    build: (nonce: number) => Uint8Array,
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.gitRepos.has(repoId)) {
+        reject(connectionError("Repo is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingGitRequests);
+      this.pendingGitRequests.set(nonce, { opcode, resolve, reject });
+      this.transport.send(build(nonce));
+    });
+  }
+
+  /** Serve one oid's bytes from the connection-wide cache, coalescing
+   *  concurrent fetches; a hit refreshes LRU recency. */
+  private cachedGitBlob(
+    cacheKey: string,
+    fetch: () => Promise<Uint8Array>,
+  ): Promise<Uint8Array> {
+    const hit = this.gitBlobCache.get(cacheKey);
+    if (hit) {
+      this.gitBlobCache.delete(cacheKey);
+      this.gitBlobCache.set(cacheKey, hit);
+      return hit.promise;
+    }
+    const entry = { promise: fetch(), bytes: 0, settled: false };
+    this.gitBlobCache.set(cacheKey, entry);
+    entry.promise.then(
+      (data) => {
+        entry.settled = true;
+        if (this.gitBlobCache.get(cacheKey) !== entry) return;
+        entry.bytes = data.byteLength;
+        this.gitBlobCacheBytes += entry.bytes;
+        this.evictGitBlobs();
+      },
+      () => {
+        // Failures are not cached.
+        if (this.gitBlobCache.get(cacheKey) === entry) {
+          this.gitBlobCache.delete(cacheKey);
+        }
+      },
+    );
+    return entry.promise;
+  }
+
+  /** Drop least-recently-used settled blobs until back under budget. */
+  private evictGitBlobs(): void {
+    if (this.gitBlobCacheBytes <= this.gitBlobCacheBudget) return;
+    for (const [key, entry] of this.gitBlobCache) {
+      if (!entry.settled) continue; // in-flight entries keep coalescing
+      this.gitBlobCache.delete(key);
+      this.gitBlobCacheBytes -= entry.bytes;
+      if (this.gitBlobCacheBytes <= this.gitBlobCacheBudget) return;
+    }
+  }
+
+  private makeGitRepoHandle(
+    repoId: number,
+    info: { oidFormat: number; flags: number; workdir: string; gitdir: string },
+    mirror: GitStateMirror,
+    notifier: Notifier,
+  ): GitRepoHandle {
+    const expectOk = (status: number): void => {
+      if (status !== GIT_STATUS_OK) {
+        throw connectionError(`Request failed: ${gitStatusText(status)}`);
+      }
+    };
+    return {
+      repoId,
+      oidFormat: info.oidFormat,
+      repoFlags: info.flags,
+      workdir: info.workdir,
+      gitdir: info.gitdir,
+      state: mirror,
+      subscribe: notifier.subscribe,
+      get revision() {
+        return notifier.revision;
+      },
+      log: async (req = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_COMMITS, (nonce) =>
+          msgGitLog({
+            nonce,
+            repoId,
+            flags: req.flags ?? 0,
+            limit: req.limit ?? 0,
+            path: req.path ?? "",
+            tips: req.tips ?? [],
+            hides: req.hides ?? [],
+          }),
+        );
+        const page = parseGitCommits(msg);
+        if (!page) throw connectionError("Malformed commits from server");
+        expectOk(page.status);
+        return page;
+      },
+      tree: async (oid, path = "") => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_TREE, (nonce) =>
+          msgGitTree(nonce, repoId, oid, path),
+        );
+        const parsed = parseGitTreeResp(msg);
+        if (!parsed) throw connectionError("Malformed tree from server");
+        expectOk(parsed[1]);
+        return [...gitTreeRecords(parsed[3])];
+      },
+      blob: (oid, path = "", maxLen = 0) => {
+        const fetchBlob = async (): Promise<Uint8Array> => {
+          const msg = await this.gitRequest(repoId, S2C_GIT_BLOB, (nonce) =>
+            msgGitBlob(nonce, repoId, oid, path, maxLen),
+          );
+          const parsed = parseGitBlobResp(msg);
+          if (!parsed) throw connectionError("Malformed blob from server");
+          expectOk(parsed[1]);
+          return parsed[3];
+        };
+        // Only a direct oid pull is content-addressed; a `path` resolves
+        // through whatever object the oid names, so it bypasses the cache.
+        if (path !== "") return fetchBlob();
+        return this.cachedGitBlob(gitOidHex(oid, info.oidFormat), fetchBlob);
+      },
+      diff: async (old, newEndpoint, opts = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_DIFF, (nonce) =>
+          msgGitDiff({
+            nonce,
+            repoId,
+            flags: opts.flags ?? 0,
+            old,
+            new: newEndpoint,
+            path: opts.path ?? "",
+          }),
+        );
+        const parsed = parseGitDiffResp(msg);
+        if (!parsed) throw connectionError("Malformed diff from server");
+        expectOk(parsed[1]);
+        return [...gitDiffRecords(parsed[3])];
+      },
+      patch: async (old, newEndpoint, opts = {}) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_PATCH, (nonce) =>
+          msgGitPatch({
+            nonce,
+            repoId,
+            flags: opts.flags ?? 0,
+            context: opts.context ?? 0,
+            old,
+            new: newEndpoint,
+            path: opts.path ?? "",
+            maxLen: opts.maxLen ?? 0,
+          }),
+        );
+        const parsed = parseGitPatchResp(msg);
+        if (!parsed) throw connectionError("Malformed patch from server");
+        expectOk(parsed[1]);
+        const [, , flags, data] = parsed;
+        return {
+          flags,
+          records:
+            flags & GIT_PATCH_STRUCTURED ? [...gitPatchRecords(data)] : [],
+          text: flags & GIT_PATCH_STRUCTURED ? new Uint8Array(0) : data,
+        };
+      },
+      index: async (path = "") => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_INDEX, (nonce) =>
+          msgGitIndex(nonce, repoId, path),
+        );
+        const parsed = parseGitIndexResp(msg);
+        if (!parsed) throw connectionError("Malformed index from server");
+        expectOk(parsed[1]);
+        return [...gitIndexRecords(parsed[3])];
+      },
+      mergeBase: async (oids) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_BASE, (nonce) =>
+          msgGitBase(nonce, repoId, oids),
+        );
+        const parsed = parseGitBaseResp(msg);
+        if (!parsed) throw connectionError("Malformed base from server");
+        expectOk(parsed[1]);
+        return parsed[2];
+      },
+      resolve: async (spec) => {
+        const msg = await this.gitRequest(repoId, S2C_GIT_RESOLVE, (nonce) =>
+          msgGitResolve(nonce, repoId, spec),
+        );
+        const parsed = parseGitResolveResp(msg);
+        if (!parsed) throw connectionError("Malformed resolve from server");
+        expectOk(parsed.status);
+        return { tips: parsed.tips, hides: parsed.hides };
+      },
+      watchLog: (spec, opts, onUpdate) =>
+        this.watchGitLog(repoId, spec, opts, onUpdate),
+      close: () => {
+        this.closeGitLogSubs(repoId);
+        if (this.transport.status === "connected") {
+          this.transport.send(msgGitClose(repoId));
+        }
+      },
+    };
+  }
+
+  /** Start a live log subscription; the server pushes pages we auto-ack. */
+  private watchGitLog(
+    repoId: number,
+    spec: string,
+    opts: GitLogWatchOptions,
+    onUpdate: (page: GitLogPage) => void,
+  ): GitLogSubscription {
+    if (!this.gitRepos.has(repoId)) {
+      throw connectionError("Repo is closed");
+    }
+    let logId = 0;
+    do {
+      logId = this.gitLogIdCounter = (this.gitLogIdCounter + 1) & 0xffff;
+    } while (logId === 0 || this.gitLogSubs.has(logId));
+    this.gitLogSubs.set(logId, { repoId, onUpdate });
+    this.transport.send(
+      msgGitLogWatch(logId, repoId, opts.flags ?? 0, opts.limit ?? 0, spec),
+    );
+    return {
+      logId,
+      close: () => {
+        if (!this.gitLogSubs.delete(logId)) return;
+        if (this.transport.status === "connected") {
+          this.transport.send(msgGitLogUnwatch(logId, repoId));
+        }
+      },
+    };
+  }
+
+  /** Drop every log subscription bound to a repo (close or teardown). */
+  private closeGitLogSubs(repoId: number): void {
+    for (const [logId, sub] of this.gitLogSubs) {
+      if (sub.repoId === repoId) this.gitLogSubs.delete(logId);
+    }
+  }
+
+  /** Tear down all git repo state (reconnect or dispose). */
+  private resetGitRepos(error: Error): void {
+    for (const pending of this.pendingGitOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingGitOpens.clear();
+    for (const pending of this.pendingGitRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingGitRequests.clear();
+    this.gitLogSubs.clear();
+    const repos = [...this.gitRepos.values()];
+    this.gitRepos.clear();
+    for (const repo of repos) {
+      repo.options.onClosed?.(GIT_CLOSED_CONNECTION_LOST);
+      repo.notifier.emit();
+    }
+  }
+
+  /**
+   * Attach to the workspace containing a path (docs/design/lsp.md).
+   * Resolves once the server accepts; state snapshots and diagnostics
+   * (when subscribed) apply to the handle's mirrors and acknowledge
+   * automatically.
+   */
+  async openLsp(
+    path: string,
+    options: LspOpenOptions = {},
+  ): Promise<LspHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open an attachment while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_LSP) === 0) {
+      throw connectionError(
+        "Server does not support language intelligence (upgrade blit on the remote)",
+      );
+    }
+    let flags = 0;
+    if (options.watch || options.diagnostics) flags |= LSP_OPEN_WATCH;
+    if (options.diagnostics) flags |= LSP_OPEN_DIAGS;
+    const srcPtyId = options.fromSessionId
+      ? this.sessionsById.get(options.fromSessionId)?.ptyId
+      : undefined;
+    return new Promise<LspHandle>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingLspOpens);
+      this.pendingLspOpens.set(nonce, { resolve, reject, options });
+      this.transport.send(
+        msgLspOpen(nonce, flags, options.diagLatencyMs ?? 0, path, srcPtyId),
+      );
+    });
+  }
+
+  /** One nonce-correlated LSP query; resolves with the raw response. */
+  private lspRequest(
+    lspId: number,
+    build: (nonce: number) => Uint8Array,
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      if (!this.lspAttachments.has(lspId)) {
+        reject(connectionError("Attachment is closed"));
+        return;
+      }
+      const nonce = this.nextFsNonce(this.pendingLspRequests);
+      this.pendingLspRequests.set(nonce, { resolve, reject });
+      this.transport.send(build(nonce));
+    });
+  }
+
+  private makeLspHandle(
+    lspId: number,
+    root: string,
+    state: LspStateMirror,
+    diags: LspDiagMirror,
+    notifier: Notifier,
+  ): LspHandle {
+    // Every query funnels through one shape. Non-OK statuses resolve so
+    // callers can inspect `status` (WARMING is retryable); only
+    // connection loss rejects.
+    const query = async (
+      kind: number,
+      flags: number,
+      line: number,
+      col: number,
+      path: string,
+      arg: string,
+    ): Promise<LspQueryResult> => {
+      const msg = await this.lspRequest(lspId, (nonce) =>
+        msgLspQuery({ nonce, lspId, kind, flags, line, col, path, arg }),
+      );
+      const parsed = parseLspQueryResp(msg);
+      if (!parsed)
+        throw connectionError("Malformed query response from server");
+      const [, status, respFlags, detail, records] = parsed;
+      return {
+        status,
+        detail,
+        truncated: (respFlags & LSP_RESP_TRUNCATED) !== 0,
+        incomplete: (respFlags & LSP_RESP_INCOMPLETE) !== 0,
+        records: [...lspQueryRecords(records)],
+      };
+    };
+    return {
+      lspId,
+      root,
+      state,
+      diags,
+      subscribe: notifier.subscribe,
+      get revision() {
+        return notifier.revision;
+      },
+      definition: (path, line, col) =>
+        query(LSP_QUERY_DEFINITION, 0, line, col, path, ""),
+      references: (path, line, col, includeDeclaration = false) =>
+        query(
+          LSP_QUERY_REFERENCES,
+          includeDeclaration ? LSP_REFS_INCLUDE_DECLARATION : 0,
+          line,
+          col,
+          path,
+          "",
+        ),
+      hover: (path, line, col) =>
+        query(LSP_QUERY_HOVER, 0, line, col, path, ""),
+      documentSymbols: (path) =>
+        query(LSP_QUERY_DOC_SYMBOLS, 0, 0, 0, path, ""),
+      workspaceSymbols: (search) =>
+        query(LSP_QUERY_WS_SYMBOLS, 0, 0, 0, "", search),
+      rename: (path, line, col, newName) =>
+        query(LSP_QUERY_RENAME, 0, line, col, path, newName),
+      completion: (path, line, col) =>
+        query(LSP_QUERY_COMPLETION, 0, line, col, path, ""),
+      signatureHelp: (path, line, col) =>
+        query(LSP_QUERY_SIGNATURE, 0, line, col, path, ""),
+      // Fire-and-forget overlay writes (docs/design/lsp.md
+      // "LSP_BUFFER"): transport ordering, not acknowledgment, is what
+      // queries rely on, so these send-and-return like input.
+      buffer: (path, text) => {
+        if (
+          this.transport.status === "connected" &&
+          this.lspAttachments.has(lspId)
+        ) {
+          this.transport.send(msgLspBuffer(lspId, 0, path, text));
+        }
+      },
+      releaseBuffer: (path) => {
+        if (
+          this.transport.status === "connected" &&
+          this.lspAttachments.has(lspId)
+        ) {
+          this.transport.send(
+            msgLspBuffer(lspId, LSP_BUFFER_RELEASE, path, new Uint8Array()),
+          );
+        }
+      },
+      close: () => {
+        if (this.transport.status === "connected") {
+          this.transport.send(msgLspClose(lspId));
+        }
+      },
+    };
+  }
+
+  /** Tear down all LSP attachment state (reconnect or dispose). */
+  private resetLspAttachments(error: Error): void {
+    for (const pending of this.pendingLspOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingLspOpens.clear();
+    for (const pending of this.pendingLspRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingLspRequests.clear();
+    const attachments = [...this.lspAttachments.values()];
+    this.lspAttachments.clear();
+    for (const attachment of attachments) {
+      attachment.options.onClosed?.(LSP_CLOSED_CONNECTION_LOST);
+      attachment.notifier.emit();
+    }
+  }
+
+  /** Tear down all fs sync state (reconnect or dispose). */
+  private resetFsSyncs(error: Error): void {
+    for (const pending of this.pendingFsSyncs.values()) {
+      for (const waiter of pending.waiters) waiter.reject(error);
+    }
+    this.pendingFsSyncs.clear();
+    this.pendingFsSyncsByKey.clear();
+    for (const pending of this.pendingFsFetches.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsFetches.clear();
+    for (const pending of this.pendingFsSearches.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsSearches.clear();
+    for (const pending of this.pendingFsGreps.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsGreps.clear();
+    for (const pending of this.pendingFsIndexes.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsIndexes.clear();
+    for (const pending of this.pendingCwds.values()) {
+      pending.reject(error);
+    }
+    this.pendingCwds.clear();
+    for (const pending of this.pendingFsWrites.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsWrites.clear();
+    const shares = [...this.fsSyncs.values()];
+    this.fsSyncs.clear();
+    this.fsSyncsByKey.clear();
+    for (const share of shares) {
+      for (const consumer of share.consumers) {
+        consumer.options.onClosed?.(FS_CLOSED_CONNECTION_LOST);
+        consumer.notifier.emit();
+      }
+      share.consumers.clear();
+    }
+  }
+
   private ptyId(sessionId: SessionId): number | undefined {
     return this.sessionsById.get(sessionId)?.ptyId;
   }
@@ -940,20 +2440,6 @@ export class BlitConnection {
   // subscribe/unsubscribe lifecycle for that id.
   /** Active surface subscriptions keyed by surface id. */
   private surfaceSubs = new Map<number, SurfaceSub>();
-
-  /**
-   * True once {@link detectCodecSupport} has resolved and
-   * {@link sendClientFeatures} has informed the server which video codecs
-   * this client can decode.
-   *
-   * Surface subscribes are sent immediately (with codec_support=0 =
-   * "accept anything") so the server can start encoding the first frame
-   * without waiting for the async codec probe.  Once the probe resolves
-   * we send C2S_CLIENT_FEATURES and re-subscribe any active surfaces so
-   * the server can switch to the optimal encoder.  This eliminates a
-   * round-trip from the time-to-first-frame on remote connections.
-   */
-  private _codecFeaturesSent = false;
 
   /** Grace window before a refCount=0 subscription's wire UNSUB fires.
    *  Chosen to comfortably cover typical Solid re-render ordering where
@@ -1181,6 +2667,13 @@ export class BlitConnection {
     if (emit) this.emit();
   }
 
+  /** Drop any half-received fragment sequence (reconnect or dispose) so it
+   *  cannot bleed into the first fragmented message on the next connection. */
+  private resetFragmentReassembly(): void {
+    this.fragmentChunks = [];
+    this.fragmentBytes = 0;
+  }
+
   private handleMessage = (data: ArrayBuffer): void => {
     const bytes = new Uint8Array(data);
     if (bytes.length === 0) return;
@@ -1237,6 +2730,8 @@ export class BlitConnection {
         this.hasReceivedList = false;
         this.snapshot = {
           ...this.snapshot,
+          // Reset generation: fs/git/lsp are torn down below.
+          generation: ++this.generation,
           status:
             this.transport.status === "connected"
               ? "authenticating"
@@ -1249,6 +2744,12 @@ export class BlitConnection {
         this.surfaceStore.reset();
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
+        this.resetFsSyncs(connectionError("Server is shutting down"));
+        this.resetGitRepos(connectionError("Server is shutting down"));
+        this.resetLspAttachments(connectionError("Server is shutting down"));
+        this.resetKv(connectionError("Server is shutting down"));
+        this.resetFragmentReassembly();
+        this.termCwds.clear();
         // Immediately reconnect so the UI recovers as fast as possible
         // when the server restarts.  Do NOT call transport.close() — that
         // permanently disposes the transport.  transport.reconnect() tears
@@ -1423,6 +2924,10 @@ export class BlitConnection {
         }
         this.snapshot = {
           ...this.snapshot,
+          // Bump generation: a re-establish resets fs/git/lsp below even while
+          // the transport stays "connected", so handle-holding views must
+          // re-open (they can't tell from status alone).
+          generation: ++this.generation,
           // The upstream server is responsive, but terminals are not known
           // until S2C_LIST arrives. Keep the user-visible state at
           // "authenticating" here so a remote does not appear connected
@@ -1437,11 +2942,24 @@ export class BlitConnection {
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
+          supportsFsSync: (features & FEATURE_FS) !== 0,
+          supportsGit: (features & FEATURE_GIT) !== 0,
+          supportsLsp: (features & FEATURE_LSP) !== 0,
+          supportsKv: (features & FEATURE_KV) !== 0,
         };
         this.emit();
         this.surfaceStore.reset();
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
+        // Fs syncs do not survive a server session change: old sync_ids
+        // are meaningless on the new session.
+        this.resetFsSyncs(connectionError("Connection re-established"));
+        this.resetGitRepos(connectionError("Connection re-established"));
+        this.resetLspAttachments(connectionError("Connection re-established"));
+        this.resetKv(connectionError("Connection re-established"));
+        this.resetFragmentReassembly();
+        // Pushed cwds belong to the old server session's ptys.
+        this.termCwds.clear();
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -1625,6 +3143,514 @@ export class BlitConnection {
         }
         return;
       }
+      case S2C_FS_SYNCED: {
+        if (bytes.length < 8) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingFsSyncs.get(nonce);
+        if (!pending) return;
+        this.pendingFsSyncs.delete(nonce);
+        if (this.pendingFsSyncsByKey.get(pending.key) === pending) {
+          this.pendingFsSyncsByKey.delete(pending.key);
+        }
+        const syncId = bytes[3] | (bytes[4] << 8);
+        const status = bytes[5];
+        const detailLen = bytes[6] | (bytes[7] << 8);
+        const detail = textDecoder.decode(bytes.subarray(8, 8 + detailLen));
+        if (status !== FS_STATUS_OK) {
+          // FsOpenError carries the wire status/detail so callers can
+          // pick a fallback — e.g. a `single` open refused by an older
+          // server (any status other than not-found/permission) falls
+          // back to a directory sync.
+          const error = new FsOpenError(status, detail);
+          for (const waiter of pending.waiters) waiter.reject(error);
+          return;
+        }
+        const share: FsSyncShare = {
+          key: pending.key,
+          syncId,
+          root: detail,
+          mirror: new FsMirror(),
+          synced: false,
+          lastWritten: new Map<string, bigint>(),
+          consumers: new Set<FsSyncConsumer>(),
+        };
+        this.fsSyncs.set(syncId, share);
+        this.fsSyncsByKey.set(pending.key, share);
+        for (const waiter of pending.waiters) {
+          const consumer: FsSyncConsumer = {
+            options: waiter.options,
+            notifier: new Notifier(),
+          };
+          share.consumers.add(consumer);
+          waiter.resolve(this.makeFsSyncHandle(share, consumer));
+        }
+        return;
+      }
+      case S2C_FS_UPDATE: {
+        if (bytes.length < 8) return;
+        const syncId = bytes[1] | (bytes[2] << 8);
+        const share = this.fsSyncs.get(syncId);
+        if (!share) return;
+        const flags = bytes[7];
+        // One decompress + decode serves the mirror, the per-record
+        // callbacks, and the echo bookkeeping; skip collection entirely
+        // when nobody needs the records.
+        let wantRecords = share.lastWritten.size > 0;
+        if (!wantRecords) {
+          for (const consumer of share.consumers) {
+            if (consumer.options.onRecord) {
+              wantRecords = true;
+              break;
+            }
+          }
+        }
+        const records: FsRecord[] | undefined = wantRecords ? [] : undefined;
+        const applied = share.mirror.apply(bytes, records);
+        if (applied === null) {
+          this._logger.warn(
+            `${this.id}: malformed FS_UPDATE for sync ${syncId}`,
+          );
+          return;
+        }
+        this.transport.send(buildFsAckMessage(syncId, applied.updateId));
+        if (flags & FS_UPDATE_SYNC) share.synced = true;
+        if (flags & FS_UPDATE_RESET) {
+          for (const consumer of share.consumers) consumer.options.onReset?.();
+        }
+        if (records) {
+          for (const consumer of share.consumers) {
+            const onRecord = consumer.options.onRecord;
+            if (!onRecord) continue;
+            for (const record of records) onRecord(record);
+          }
+        }
+        if (flags & FS_UPDATE_SYNC) {
+          for (const consumer of share.consumers) consumer.options.onSync?.();
+        }
+        // Staged records leave `live` untouched; only wake subscribers
+        // when it actually changed (direct apply or the SYNC swap). The
+        // revision must be bumped before onUpdate runs: a signal write
+        // inside onUpdate re-runs consumer memos synchronously, and any
+        // cache keyed on `handle.revision` must see the new revision then,
+        // not the pre-update one.
+        if (applied.liveChanged) {
+          for (const consumer of share.consumers) {
+            consumer.notifier.emit();
+            consumer.options.onUpdate?.();
+          }
+        }
+        // Every callback above has had its shot at self-echo suppression;
+        // consume matched entries so the map cannot grow without bound.
+        if (records && share.lastWritten.size > 0) {
+          for (const record of records) {
+            if (
+              record.kind === "upsert" &&
+              share.lastWritten.get(record.path) === record.hash
+            ) {
+              share.lastWritten.delete(record.path);
+            }
+          }
+        }
+        return;
+      }
+      case S2C_FS_FILE: {
+        const parsed = parseFsFileMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsFetches.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsFetches.delete(parsed.nonce);
+        if (parsed.status === FS_FILE_OK) {
+          pending.resolve(parsed.data);
+        } else {
+          pending.reject(
+            connectionError(`Fetch failed: ${fsFileStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_SEARCH: {
+        const parsed = parseFsSearchResult(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsSearches.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsSearches.delete(parsed.nonce);
+        pending.resolve(parsed.paths);
+        return;
+      }
+      case S2C_FS_GREP: {
+        const parsed = parseFsGrepResult(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsGreps.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsGreps.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          pending.resolve({
+            files: parsed.files,
+            truncated: (parsed.flags & FS_GREP_TRUNCATED) !== 0,
+          });
+        } else {
+          pending.reject(
+            connectionError(
+              parsed.detail ||
+                `Content search failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
+      case S2C_FS_INDEX: {
+        const parsed = parseFsIndexResult(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsIndexes.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsIndexes.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          pending.resolve({
+            paths: parsed.paths,
+            truncated: (parsed.flags & FS_INDEX_TRUNCATED) !== 0,
+          });
+        } else {
+          pending.reject(
+            connectionError(
+              `File index failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
+      case S2C_TERM_CWD: {
+        const parsed = parseTermCwdReply(bytes);
+        if (!parsed) return;
+        const pending = this.pendingCwds.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingCwds.delete(parsed.nonce);
+        pending.resolve(parsed.cwd);
+        return;
+      }
+      case S2C_TERM_CWD_EVENT: {
+        const parsed = parseTermCwdEvent(bytes);
+        if (!parsed) return;
+        const sessionId = this.currentSessionIdByPtyId.get(parsed.ptyId);
+        if (!sessionId) return; // unknown pty: ignore
+        this.termCwds.set(sessionId, parsed.cwd);
+        for (const listener of this.termCwdListeners) {
+          listener(sessionId, parsed.cwd);
+        }
+        return;
+      }
+      case S2C_FS_DONE: {
+        const parsed = parseFsDoneMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsWrites.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsWrites.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          // Record the hash for self-echo suppression: the writer's own
+          // UPSERT echo will carry it, and the model already holds it.
+          if (pending.record) {
+            this.fsSyncs
+              .get(pending.record.syncId)
+              ?.lastWritten.set(pending.record.path, parsed.hash);
+          }
+          pending.resolve({ hash: parsed.hash, mtimeNs: parsed.mtimeNs });
+        } else if (parsed.status === FS_DONE_CONFLICT) {
+          pending.reject(new FsConflictError(parsed.hash));
+        } else if (parsed.status === FS_DONE_INVALID && pending.onInvalid) {
+          // A delta write refused by a pre-delta server: re-send once as
+          // a full write; the promise settles with the retry's outcome.
+          pending.onInvalid();
+        } else {
+          pending.reject(
+            connectionError(`Write failed: ${fsDoneStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_CLOSED: {
+        if (bytes.length < 4) return;
+        const syncId = bytes[1] | (bytes[2] << 8);
+        const share = this.fsSyncs.get(syncId);
+        if (!share) return;
+        this.fsSyncs.delete(syncId);
+        if (this.fsSyncsByKey.get(share.key) === share) {
+          this.fsSyncsByKey.delete(share.key);
+        }
+        for (const consumer of share.consumers) {
+          consumer.options.onClosed?.(bytes[3]);
+          consumer.notifier.emit();
+        }
+        share.consumers.clear();
+        return;
+      }
+      case S2C_KV_OPENED: {
+        const parsed = parseKvOpenedMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingKvOpens.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingKvOpens.delete(parsed.nonce);
+        if (parsed.status !== KV_STATUS_OK) {
+          pending.reject(
+            connectionError(`Watch failed: ${kvStatusText(parsed.status)}`),
+          );
+          return;
+        }
+        const mirror = new KvMirror();
+        this.kvWatches.set(parsed.kvId, { mirror, options: pending.options });
+        const kvId = parsed.kvId;
+        pending.resolve({
+          kvId,
+          mirror,
+          close: () => {
+            if (this.kvWatches.delete(kvId)) {
+              if (this.transport.status === "connected") {
+                this.transport.send(buildKvStopMessage(kvId));
+              }
+            }
+          },
+        });
+        return;
+      }
+      case S2C_KV_UPDATE: {
+        if (bytes.length < 8) return;
+        const kvId = bytes[1] | (bytes[2] << 8);
+        const watch = this.kvWatches.get(kvId);
+        if (!watch) return;
+        const updateId = watch.mirror.applyUpdate(bytes);
+        if (updateId === null) {
+          this._logger.warn(`${this.id}: malformed KV_UPDATE for ${kvId}`);
+          return;
+        }
+        // Acks are load-bearing: they advance the server's retention
+        // floor, and a subscription whose queued-unacked bytes breach
+        // `BLIT_KV_UNACKED_MAX` is dropped with `KV_CLOSED` reason
+        // RESOURCE_LIMIT (docs/design/kv.md "Retention").
+        this.transport.send(buildKvAckMessage(kvId, updateId));
+        watch.options.onUpdate?.(watch.mirror);
+        return;
+      }
+      case S2C_KV_DONE: {
+        const parsed = parseKvDoneMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingKvPuts.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingKvPuts.delete(parsed.nonce);
+        if (parsed.status === KV_STATUS_OK) {
+          pending.resolve({ hash: parsed.hash, mtimeNs: parsed.mtimeNs });
+        } else if (parsed.status === KV_STATUS_CONFLICT) {
+          // The same conflict shape as fs writes: `hash` carries the
+          // current value hash so the caller rebases without a round trip.
+          pending.reject(new FsConflictError(parsed.hash));
+        } else {
+          pending.reject(
+            connectionError(`Put failed: ${kvStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_KV_VALUE: {
+        const parsed = parseKvValueMessage(bytes);
+        if (!parsed) return;
+        const pending = this.pendingKvFetches.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingKvFetches.delete(parsed.nonce);
+        if (parsed.status === KV_STATUS_OK) {
+          pending.resolve({ hash: parsed.hash, value: parsed.data });
+        } else if (parsed.status === KV_STATUS_NOT_FOUND) {
+          pending.resolve(null);
+        } else {
+          pending.reject(
+            connectionError(`Fetch failed: ${kvStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_KV_CLOSED: {
+        // [0x74][kv_id:2][reason:1] — the subscription is gone server-side.
+        // Removing the watch first means the handle's future close() finds
+        // nothing to delete and sends no KV_STOP for the dead id; the
+        // mirror is dead and recovery is the caller re-`watchKv`ing (the
+        // fresh snapshot is the recovery, docs/design/kv.md "Retention").
+        if (bytes.length < 4) return;
+        const kvId = bytes[1] | (bytes[2] << 8);
+        const watch = this.kvWatches.get(kvId);
+        if (!watch) return;
+        this.kvWatches.delete(kvId);
+        watch.options.onClosed?.(
+          connectionError(`Watch closed: ${kvClosedText(bytes[3])}`),
+        );
+        return;
+      }
+      case S2C_GIT_REPO: {
+        const info = parseGitRepo(bytes);
+        if (!info) return;
+        const pending = this.pendingGitOpens.get(info.nonce);
+        if (!pending) return;
+        this.pendingGitOpens.delete(info.nonce);
+        if (info.status !== GIT_STATUS_OK) {
+          pending.reject(
+            connectionError(
+              `Open failed: ${gitStatusText(info.status)}${info.workdir ? `: ${info.workdir}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const mirror = new GitStateMirror();
+        const notifier = new Notifier();
+        this.gitRepos.set(info.repoId, {
+          mirror,
+          options: pending.options,
+          notifier,
+        });
+        pending.resolve(
+          this.makeGitRepoHandle(info.repoId, info, mirror, notifier),
+        );
+        return;
+      }
+      case S2C_GIT_STATE: {
+        if (bytes.length < 8) return;
+        const repoId = bytes[1] | (bytes[2] << 8);
+        const repo = this.gitRepos.get(repoId);
+        if (!repo) return;
+        const stateId = repo.mirror.applyState(bytes);
+        if (stateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed GIT_STATE for repo ${repoId}`,
+          );
+          return;
+        }
+        this.transport.send(msgGitAck(repoId, stateId));
+        // Revision before the callback: revision-keyed caches re-read
+        // inside it must observe the bump (same invariant as fs updates).
+        repo.notifier.emit();
+        repo.options.onState?.(repo.mirror, stateId);
+        return;
+      }
+      case S2C_GIT_CLOSED: {
+        const closed = parseGitClosed(bytes);
+        if (!closed) return;
+        const repo = this.gitRepos.get(closed[0]);
+        if (!repo) return;
+        this.gitRepos.delete(closed[0]);
+        this.closeGitLogSubs(closed[0]);
+        repo.options.onClosed?.(closed[1]);
+        repo.notifier.emit();
+        return;
+      }
+      case S2C_GIT_LOG_PAGE: {
+        const page = parseGitLogPage(bytes);
+        if (!page) return;
+        const sub = this.gitLogSubs.get(page.logId);
+        if (!sub) return;
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        if (this.transport.status === "connected") {
+          this.transport.send(
+            msgGitLogAck(page.logId, sub.repoId, page.updateId),
+          );
+        }
+        sub.onUpdate(page);
+        return;
+      }
+      case S2C_GIT_COMMITS:
+      case S2C_GIT_TREE:
+      case S2C_GIT_BLOB:
+      case S2C_GIT_DIFF:
+      case S2C_GIT_PATCH:
+      case S2C_GIT_INDEX:
+      case S2C_GIT_BASE:
+      case S2C_GIT_RESOLVE: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingGitRequests.get(nonce);
+        if (!pending || pending.opcode !== bytes[0]) return;
+        this.pendingGitRequests.delete(nonce);
+        pending.resolve(bytes);
+        return;
+      }
+      case S2C_LSP_OPENED: {
+        const opened = parseLspOpened(bytes);
+        if (!opened) return;
+        const pending = this.pendingLspOpens.get(opened.nonce);
+        if (!pending) return;
+        this.pendingLspOpens.delete(opened.nonce);
+        if (opened.status !== LSP_STATUS_OK) {
+          pending.reject(
+            connectionError(
+              `Open failed: ${lspStatusText(opened.status)}${opened.detail ? `: ${opened.detail}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const state = new LspStateMirror();
+        const diags = new LspDiagMirror();
+        const notifier = new Notifier();
+        this.lspAttachments.set(opened.lspId, {
+          state,
+          diags,
+          options: pending.options,
+          notifier,
+        });
+        pending.resolve(
+          this.makeLspHandle(opened.lspId, opened.root, state, diags, notifier),
+        );
+        return;
+      }
+      case S2C_LSP_STATE: {
+        if (bytes.length < 8) return;
+        const lspId = bytes[1] | (bytes[2] << 8);
+        const attachment = this.lspAttachments.get(lspId);
+        if (!attachment) return;
+        const stateId = attachment.state.applyState(bytes);
+        if (stateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed LSP_STATE for attachment ${lspId}`,
+          );
+          return;
+        }
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        this.transport.send(msgLspAck(lspId, LSP_STREAM_STATE, stateId));
+        // Revision before the callback (same invariant as fs updates).
+        attachment.notifier.emit();
+        attachment.options.onState?.(attachment.state, stateId);
+        return;
+      }
+      case S2C_LSP_DIAG: {
+        if (bytes.length < 8) return;
+        const lspId = bytes[1] | (bytes[2] << 8);
+        const attachment = this.lspAttachments.get(lspId);
+        if (!attachment) return;
+        const updateId = attachment.diags.applyDiag(bytes);
+        if (updateId === null) {
+          this._logger.warn(
+            `${this.id}: malformed LSP_DIAG for attachment ${lspId}`,
+          );
+          return;
+        }
+        // Acknowledge before delivering: pacing must not wait on the callback.
+        this.transport.send(msgLspAck(lspId, LSP_STREAM_DIAG, updateId));
+        // Revision before the callback (same invariant as fs updates).
+        attachment.notifier.emit();
+        attachment.options.onDiagnostics?.(attachment.diags, updateId);
+        return;
+      }
+      case S2C_LSP_QUERY: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingLspRequests.get(nonce);
+        if (!pending) return;
+        this.pendingLspRequests.delete(nonce);
+        pending.resolve(bytes);
+        return;
+      }
+      case S2C_LSP_CLOSED: {
+        const closed = parseLspClosed(bytes);
+        if (!closed) return;
+        const attachment = this.lspAttachments.get(closed[0]);
+        if (!attachment) return;
+        this.lspAttachments.delete(closed[0]);
+        attachment.options.onClosed?.(closed[1]);
+        attachment.notifier.emit();
+        return;
+      }
       default:
         return;
     }
@@ -1641,11 +3667,9 @@ export class BlitConnection {
     const authRejected = status === "error" && this.transport.authRejected;
 
     if (status === "connected") {
-      this.hasConnected = true;
       this.hasReceivedList = false;
       this.retryCount = 0;
       this.lastError = null;
-      this._codecFeaturesSent = false;
       // Start application-level keepalive.
       if (this.pingTimer === null && this.pingIntervalMs > 0) {
         this.pingTimer = setInterval(() => {
@@ -1661,7 +3685,6 @@ export class BlitConnection {
       // surfaces so the server can switch to the optimal encoder.
       detectCodecSupport().then((mask) => {
         this.sendClientFeatures(mask);
-        this._codecFeaturesSent = true;
         this.resubscribeWithCodecSupport();
       });
     } else if (
@@ -1711,6 +3734,14 @@ export class BlitConnection {
       );
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
+      // Fs syncs and git repos do not survive a transport drop; reject
+      // their pending promises promptly rather than leaving them hung.
+      this.resetFsSyncs(connectionError(`Transport ${status}`));
+      this.resetGitRepos(connectionError(`Transport ${status}`));
+      this.resetLspAttachments(connectionError(`Transport ${status}`));
+      this.resetKv(connectionError(`Transport ${status}`));
+      this.resetFragmentReassembly();
+      this.termCwds.clear();
       this.resolveAllPendingCloses();
       this.hasReceivedList = false;
       // Dismiss all sessions so the UI doesn't show stale terminals from a
@@ -2089,6 +4120,7 @@ export class BlitConnection {
     if (this.currentSessionIdByPtyId.get(session.ptyId) === sessionId) {
       this.currentSessionIdByPtyId.delete(session.ptyId);
     }
+    this.termCwds.delete(sessionId);
     this.store.freeTerminal(session.ptyId);
 
     const focusedWasClosed = this.snapshot.focusedSessionId === sessionId;

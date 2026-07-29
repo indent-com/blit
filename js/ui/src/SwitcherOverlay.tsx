@@ -13,6 +13,7 @@ import {
   BlitSurfaceView,
   createBlitWorkspace,
 } from "@blit-sh/solid";
+import { symbolKindTag } from "./ide/symbolKinds";
 import {
   SEARCH_SOURCE_SCROLLBACK,
   SEARCH_SOURCE_TITLE,
@@ -44,9 +45,10 @@ import {
   type BSPAssignments,
   type BSPLayout,
 } from "./bsp/layout";
+import { tileDisplay } from "./ide/tileDisplay";
 import { t, tp } from "./i18n";
 import { readStoredPassphrase } from "./passphrase-storage";
-import { getInstallPrompt, clearInstallPrompt } from "./main";
+import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
 
 const SOURCE_LABEL: Record<number, string> = {
   [SEARCH_SOURCE_TITLE]: t("switcher.sourceTitle"),
@@ -102,7 +104,8 @@ type ActionItem = {
     | "change-font"
     | "change-palette"
     | "change-layout"
-    | "change-remotes";
+    | "change-remotes"
+    | "open-web";
   connectionId?: string;
 };
 
@@ -138,13 +141,56 @@ type RemoteItem = {
   status: import("@blit-sh/core").ConnectionStatus | null;
 };
 
+type TileItem = {
+  type: "tile";
+  key: string;
+  title: string;
+  subtitle: string;
+  /** The tile assignment to restore (editor:/diff:/commit:). */
+  assignment: string;
+  tileKind: "editor" | "diff" | "commit" | "web";
+};
+
+type FileItem = {
+  type: "file";
+  key: string;
+  title: string;
+  subtitle: string;
+  /** Root-relative path to open in the editor. */
+  relPath: string;
+};
+
+/** One `#query` hit: an LSP workspace symbol, as the backend reported it. */
+export type SwitcherSymbolHit = {
+  name: string;
+  /** LSP SymbolKind value. */
+  symKind: number;
+  /** Workspace-relative path (the LSP root's, not the fs root's). */
+  path: string;
+  /** 0-based line. */
+  line: number;
+  /** UTF-8 byte column. */
+  col: number;
+};
+
+type SymbolItem = {
+  type: "symbol";
+  key: string;
+  title: string;
+  subtitle: string;
+  hit: SwitcherSymbolHit;
+};
+
 type SwitcherItem =
   | LayoutItem
   | SessionItem
   | PaneItem
   | ActionItem
   | SurfaceItem
-  | RemoteItem;
+  | RemoteItem
+  | TileItem
+  | FileItem
+  | SymbolItem;
 type SwitcherSection = {
   title: string;
   items: SwitcherItem[];
@@ -191,6 +237,56 @@ function PaneGlyph(props: { empty: boolean; fg: string; dimFg: string }) {
       >
         <path d="M12 8v8" stroke={props.fg} />
         <path d="M8 12h8" stroke={props.fg} />
+      </Show>
+    </svg>
+  );
+}
+
+function TileGlyph(props: {
+  kind: "editor" | "diff" | "commit" | "preview" | "web";
+  fg: string;
+  dimFg: string;
+}) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="24"
+      height="24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <Show when={props.kind === "web"}>
+        {/* globe */}
+        <circle cx="12" cy="12" r="7.5" stroke={props.dimFg} />
+        <path d="M4.5 12h15" stroke={props.fg} />
+        <path
+          d="M12 4.5c3 3 3 12 0 15M12 4.5c-3 3-3 12 0 15"
+          stroke={props.fg}
+        />
+      </Show>
+      <Show when={props.kind === "editor"}>
+        {/* document with text lines */}
+        <path d="M7 4.5h7l3.5 3.5v11.5H7z" stroke={props.dimFg} />
+        <path d="M13.5 4.5v4h4" stroke={props.dimFg} />
+        <path d="M9.5 12h6M9.5 15h6" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "diff"}>
+        {/* two side-by-side columns */}
+        <rect x="4.5" y="4.5" width="15" height="15" stroke={props.dimFg} />
+        <path d="M12 4.5v15" stroke={props.dimFg} />
+        <path d="M6.5 9h3M6.5 12h3" stroke={props.fg} />
+        <path d="M14.5 12h3M14.5 15h3" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "commit"}>
+        {/* commit node on a branch line */}
+        <path d="M12 4.5v4M12 15.5v4" stroke={props.dimFg} />
+        <circle cx="12" cy="12" r="3.5" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "preview"}>
+        {/* framed picture: a rendered file rather than its source */}
+        <rect x="4.5" y="5.5" width="15" height="13" stroke={props.dimFg} />
+        <circle cx="9" cy="10" r="1.5" stroke={props.fg} />
+        <path d="M5.5 16.5l4-4 3.5 3.5 2.5-2.5 3 3" stroke={props.fg} />
       </Show>
     </svg>
   );
@@ -334,6 +430,22 @@ function ActionGlyph(props: {
             <path d="M7 7h10l-1 12H8L7 7z" stroke={props.dimFg} />
             <path d="M5 7h14" stroke={props.fg} />
             <path d="M10 5h4" stroke={props.fg} />
+          </svg>
+        );
+      case "open-web":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            stroke-width="1.5"
+          >
+            <circle cx="12" cy="12" r="8" stroke={props.fg} />
+            <path
+              d="M4 12h16M12 4c3 3 3 13 0 16M12 4c-3 3-3 13 0 16"
+              stroke={props.fg}
+            />
           </svg>
         );
       case "change-remotes":
@@ -578,6 +690,8 @@ export function SwitcherOverlay(props: {
   layoutAssignments?: BSPAssignments | null;
   onApplyLayout?: (layout: BSPLayout) => void;
   onRemoveLayout?: (dsl: string) => void;
+  /** Open the web-pane picker. */
+  onOpenWeb?: () => void;
   onClearLayout?: () => void;
   onSelectPane?: (
     paneId: string,
@@ -610,6 +724,30 @@ export function SwitcherOverlay(props: {
     connectionId: string,
     targetPaneId: string,
   ) => void;
+  /** Backgrounded IDE tiles (editor/diff/commit), most-recent first. */
+  backgroundTiles?: readonly string[];
+  /** Restore a backgrounded tile (re-open it in the main view / focused pane). */
+  onRestoreTile?: (assignment: string) => void;
+  /** Synchronous "@query" search over the locally cached file index
+   *  (ide/fileIndex.ts) — per-keystroke, no round trip. Null while the
+   *  index hasn't arrived (old server, still fetching) — the list just
+   *  shows empty until it lands. */
+  fileSearchLocal?: (query: string) => string[] | null;
+  /** Kick the index fetch without scoring anything — called on mount so
+   *  the list is usually in hand by the first "@" keystroke. */
+  fileSearchWarm?: () => void;
+  /** Open a file (root-relative path) from an "@" match in the editor. */
+  onOpenFile?: (relPath: string) => void;
+  /** Async "#query" search over the workspace's LSP symbols. Unlike the
+   *  file index this is a real round trip per query, so the caller sees a
+   *  debounced, cancellable call — resolve to [] for "nothing to say"
+   *  (no attachment, still warming, backend can't answer). */
+  symbolSearch?: (query: string) => Promise<SwitcherSymbolHit[]>;
+  /** Attach the language server without asking anything of it, so the
+   *  first "#" keystroke isn't also waiting on a spawn. */
+  symbolSearchWarm?: () => void;
+  /** Open a "#" match: reveal its line in an editor tile. */
+  onOpenSymbol?: (hit: SwitcherSymbolHit) => void;
   defaultRemote?: string | null;
 }) {
   const workspace = createBlitWorkspace();
@@ -669,6 +807,65 @@ export function SwitcherOverlay(props: {
 
   const isCommand = () => query().startsWith(">");
   const commandText = () => (isCommand() ? query().slice(1).trim() : "");
+  // "@query" → fuzzy file search of the active session's root.
+  const isFileSearch = () => query().startsWith("@");
+  const fileQuery = () => (isFileSearch() ? query().slice(1).trim() : "");
+  const [fileResults, setFileResults] = createSignal<string[]>([]);
+  // Warm the local index cache so the list is usually in hand by the
+  // first "@" keystroke.
+  onMount(() => props.fileSearchWarm?.());
+  createEffect(() => {
+    if (!isFileSearch()) {
+      setFileResults([]);
+      return;
+    }
+    // Synchronous, per keystroke. Re-runs on its own when the index fetch
+    // lands (the lookup reads a version signal).
+    setFileResults(props.fileSearchLocal?.(fileQuery()) ?? []);
+  });
+  // "#query" → LSP workspace symbols. Unlike "@", there is no local index
+  // to score against: every query is a round trip to the language server.
+  // Hence the debounce (typing a name shouldn't be one request per letter)
+  // and the cancelled flag — Solid re-runs this effect on each keystroke
+  // and disposes the previous run, so a slow answer can't overwrite a
+  // newer one.
+  const isSymbolSearch = () => query().startsWith("#");
+  const symbolQuery = () => (isSymbolSearch() ? query().slice(1).trim() : "");
+  const [symbolResults, setSymbolResults] = createSignal<SwitcherSymbolHit[]>(
+    [],
+  );
+  const [symbolPending, setSymbolPending] = createSignal(false);
+  onMount(() => props.symbolSearchWarm?.());
+  createEffect(() => {
+    if (!isSymbolSearch() || !props.symbolSearch) {
+      setSymbolResults([]);
+      setSymbolPending(false);
+      return;
+    }
+    const q = symbolQuery();
+    const search = props.symbolSearch;
+    let cancelled = false;
+    setSymbolPending(true);
+    const timer = setTimeout(() => {
+      search(q)
+        .then((hits) => {
+          if (!cancelled) {
+            setSymbolResults(hits);
+            setSymbolPending(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSymbolResults([]);
+            setSymbolPending(false);
+          }
+        });
+    }, 120);
+    onCleanup(() => {
+      cancelled = true;
+      clearTimeout(timer);
+    });
+  });
   const inlineCmd = () =>
     !isCommand() && query().includes(">")
       ? query()
@@ -990,7 +1187,64 @@ export function SwitcherOverlay(props: {
       }));
   });
 
+  const backgroundMatches = createMemo<TileItem[]>(() => {
+    const needle = searchPart().toLowerCase();
+    const items: TileItem[] = [];
+    for (const assignment of props.backgroundTiles ?? []) {
+      const d = tileDisplay(assignment);
+      if (
+        needle &&
+        !d.title.toLowerCase().includes(needle) &&
+        !d.subtitle.toLowerCase().includes(needle)
+      ) {
+        continue;
+      }
+      items.push({
+        type: "tile",
+        key: `tile:${assignment}`,
+        title: d.title,
+        subtitle: d.subtitle,
+        assignment,
+        tileKind: d.kind,
+      });
+    }
+    return items;
+  });
+
   const sections = createMemo<SwitcherSection[]>(() => {
+    if (isFileSearch()) {
+      const items: FileItem[] = fileResults().map((relPath) => {
+        const slash = relPath.lastIndexOf("/");
+        return {
+          type: "file",
+          key: `file:${relPath}`,
+          title: slash === -1 ? relPath : relPath.slice(slash + 1),
+          subtitle: slash === -1 ? "" : relPath.slice(0, slash),
+          relPath,
+        };
+      });
+      return [{ title: t("switcher.sectionFiles"), items }];
+    }
+    if (isSymbolSearch()) {
+      const items: SymbolItem[] = symbolResults().map((hit) => ({
+        type: "symbol",
+        // Name alone is not unique — the same symbol name recurs across
+        // files and even within one — and a duplicate key would point
+        // selection and scroll-into-view at the wrong row.
+        key: `symbol:${hit.path}:${hit.line}:${hit.col}:${hit.name}`,
+        title: hit.name,
+        subtitle: `${symbolKindTag(hit.symKind)} · ${hit.path}:${hit.line + 1}`,
+        hit,
+      }));
+      return [
+        {
+          title: symbolPending()
+            ? t("switcher.sectionSymbolsPending")
+            : t("switcher.sectionSymbols"),
+          items,
+        },
+      ];
+    }
     if (newTerminalMode()) {
       const q = searchPart().toLowerCase();
       const items: RemoteItem[] = [];
@@ -1064,6 +1318,12 @@ export function SwitcherOverlay(props: {
     }));
     if (!layoutMode() && paneMatches().length > 0) {
       next.push({ title: t("switcher.sectionPanes"), items: paneMatches() });
+    }
+    if (!layoutMode() && backgroundMatches().length > 0) {
+      next.push({
+        title: t("switcher.sectionBackground"),
+        items: backgroundMatches(),
+      });
     }
     if (!layoutMode() && sessionMatches().length > 0) {
       if (props.multiConnection && props.connectionLabels) {
@@ -1169,6 +1429,15 @@ export function SwitcherOverlay(props: {
         title: t("switcher.newTerminal"),
         subtitle: t("switcher.createInCwd"),
         action: "new-terminal",
+      });
+    }
+    if (props.onOpenWeb) {
+      actions.push({
+        type: "action",
+        key: "action:open-web",
+        title: "New web pane",
+        subtitle: "Open a URL the server can reach",
+        action: "open-web",
       });
     }
     // Offer "Share URL" when a passphrase is stored locally.
@@ -1382,7 +1651,10 @@ export function SwitcherOverlay(props: {
       !isCommand() &&
       sel != null &&
       sel.type !== "action" &&
-      sel.type !== "remote"
+      sel.type !== "remote" &&
+      sel.type !== "tile" &&
+      sel.type !== "file" &&
+      sel.type !== "symbol"
     );
   };
   // Narrow viewport: hide preview sidebar, shrink thumbnails.
@@ -1494,6 +1766,14 @@ export function SwitcherOverlay(props: {
             dimFg={theme().dimFg}
             accent={theme().accent}
           />
+        ) : item.type === "tile" ? (
+          <TileGlyph
+            kind={(item as TileItem).tileKind}
+            fg={theme().fg}
+            dimFg={theme().dimFg}
+          />
+        ) : item.type === "file" || item.type === "symbol" ? (
+          <TileGlyph kind="editor" fg={theme().fg} dimFg={theme().dimFg} />
         ) : (
           <ActionGlyph
             action={item.action}
@@ -1558,6 +1838,20 @@ export function SwitcherOverlay(props: {
       }
       return;
     }
+    if (item.type === "tile") {
+      props.onRestoreTile?.(item.assignment);
+      return;
+    }
+    if (item.type === "file") {
+      props.onOpenFile?.(item.relPath);
+      props.onClose();
+      return;
+    }
+    if (item.type === "symbol") {
+      props.onOpenSymbol?.(item.hit);
+      props.onClose();
+      return;
+    }
     if (item.action === "install-app") {
       const prompt = getInstallPrompt();
       if (prompt) {
@@ -1612,6 +1906,10 @@ export function SwitcherOverlay(props: {
     }
     if (item.action === "change-remotes") {
       props.onChangeRemotes?.();
+      return;
+    }
+    if (item.action === "open-web") {
+      props.onOpenWeb?.();
       return;
     }
     if (item.action === "clear-local-storage") {
@@ -1708,8 +2006,18 @@ export function SwitcherOverlay(props: {
       return;
     }
     if (event.key === "Tab" && selectedItem()) {
+      // Tab completes to "<target>>", the run-a-command-there form. That
+      // only means something for a destination — a terminal, pane, surface
+      // or remote. For a file or a symbol there is nothing to run, and
+      // rewriting the query to a bare basename would silently drop the
+      // "@"/"#" and land you in pane search with no way back to the hit
+      // you had selected.
+      const sel = selectedItem()!;
+      if (sel.type === "file" || sel.type === "symbol" || sel.type === "tile") {
+        return;
+      }
       event.preventDefault();
-      setQuery(selectedItem()!.title + ">");
+      setQuery(sel.title + ">");
       return;
     }
     if (
@@ -2266,7 +2574,6 @@ export function SwitcherOverlay(props: {
                                     "font-size": `${fsSm()}px`,
                                     padding: `${scale().controlY}px ${scale().controlX}px`,
                                     "font-family": "inherit",
-                                    "line-height": "1",
                                     "align-self": "center",
                                   }}
                                 >
@@ -2460,7 +2767,6 @@ export function SwitcherOverlay(props: {
                         "font-size": `${fsMd()}px`,
                         padding: `${scale().controlY}px`,
                         "font-family": "inherit",
-                        "line-height": "1",
                       }}
                     >
                       {"\u00d7"}

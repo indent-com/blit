@@ -18,5 +18,22 @@ export {
   surfaceAssignment,
   isSurfaceAssignment,
   parseSurfaceAssignment,
+  editorAssignment,
+  previewAssignment,
+  diffAssignment,
+  parseDiffArg,
+  commitAssignment,
+  isTileAssignment,
+  parseTileAssignment,
+  webAssignment,
+  isWebAssignment,
+  parseWebAssignment,
+  isContentAssignment,
 } from "./layout";
-export type { BSPLayout, BSPPane, BSPAssignments } from "./layout";
+export type {
+  BSPLayout,
+  BSPPane,
+  BSPAssignments,
+  TileAssignment,
+  DiffSide,
+} from "./layout";

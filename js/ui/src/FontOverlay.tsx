@@ -7,17 +7,19 @@ import { t } from "./i18n";
 export function FontOverlay(props: {
   currentFamily: string;
   currentSize: number;
+  currentGamma: number;
   serverFonts: string[];
   palette: TerminalPalette;
   fontSize: number;
-  onSelect: (font: string, size: number) => void;
-  onPreview: (font: string, size: number) => void;
+  onSelect: (font: string, size: number, gamma: number) => void;
+  onPreview: (font: string, size: number, gamma: number) => void;
   onClose: () => void;
 }) {
   const theme = themeFor(props.palette);
   const scale = uiScale(props.fontSize);
   const originalFamily = props.currentFamily;
   const originalSize = props.currentSize;
+  const originalGamma = props.currentGamma;
   const initialFamily = originalFamily.trim();
   const initialFamilyLower = initialFamily.toLowerCase();
   const initialIdx = () =>
@@ -28,6 +30,7 @@ export function FontOverlay(props: {
   const [query, setQuery] = createSignal(initialFamily);
   const [filterQuery, setFilterQuery] = createSignal("");
   const [size, setSize] = createSignal(props.currentSize);
+  const [gamma, setGamma] = createSignal(props.currentGamma);
   const [selectedIdx, setSelectedIdx] = createSignal(initialIdx());
   const [hoverIdx, setHoverIdx] = createSignal(-1);
 
@@ -46,12 +49,21 @@ export function FontOverlay(props: {
   };
 
   const dismiss = () => {
-    props.onPreview(originalFamily, originalSize);
+    props.onPreview(originalFamily, originalSize, originalGamma);
     props.onClose();
   };
 
   const previewFont = (family: string) => {
-    props.onPreview(family, size());
+    props.onPreview(family, size(), gamma());
+  };
+
+  /** The family the form would apply right now: the highlighted list entry,
+   *  else whatever has been typed, else what we opened with. */
+  const pendingFamily = () => {
+    const f = filtered();
+    const idx = selectedIdx();
+    if (idx >= 0 && idx < f.length) return f[idx];
+    return trimmedQuery() || originalFamily;
   };
 
   const selectFont = (idx: number) => {
@@ -136,13 +148,7 @@ export function FontOverlay(props: {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            const f = filtered();
-            const idx = selectedIdx();
-            const family =
-              idx >= 0 && idx < f.length
-                ? f[idx]
-                : trimmedQuery() || originalFamily;
-            props.onSelect(family, size());
+            props.onSelect(pendingFamily(), size(), gamma());
           }}
           style={{
             display: "flex",
@@ -251,6 +257,52 @@ export function FontOverlay(props: {
                 "text-align": "center",
               }}
             />
+          </div>
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: `${scale.gap}px`,
+              "flex-shrink": 0,
+            }}
+          >
+            <label
+              style={{
+                "font-size": `${scale.md}px`,
+                opacity: 0.7,
+                "flex-shrink": 0,
+              }}
+              title={t("font.thinningHint")}
+            >
+              {t("font.thinningLabel")}
+            </label>
+            <input
+              name="blit-text-gamma"
+              type="range"
+              min={0.5}
+              max={2.5}
+              step={0.05}
+              value={gamma()}
+              onInput={(e) => {
+                const g = Number(e.currentTarget.value);
+                setGamma(g);
+                // Live: the whole point of this control is comparing the
+                // rendered result, not a number.
+                props.onPreview(pendingFamily(), size(), g);
+              }}
+              style={{ flex: 1 }}
+            />
+            <output
+              style={{
+                "font-size": `${scale.sm}px`,
+                opacity: 0.7,
+                width: "3em",
+                "text-align": "center",
+                "flex-shrink": 0,
+              }}
+            >
+              {gamma().toFixed(2)}
+            </output>
           </div>
           <button
             type="submit"

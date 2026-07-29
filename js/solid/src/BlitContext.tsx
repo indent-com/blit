@@ -7,6 +7,7 @@ export interface BlitContextValue {
   fontFamily?: string;
   fontSize?: number;
   advanceRatio?: number;
+  textGamma?: number;
 }
 
 const BlitContext = createContext<BlitContextValue>({});
@@ -37,6 +38,9 @@ export function BlitWorkspaceProvider(props: BlitProviderProps) {
         },
         get advanceRatio() {
           return props.advanceRatio;
+        },
+        get textGamma() {
+          return props.textGamma;
         },
       }}
     >

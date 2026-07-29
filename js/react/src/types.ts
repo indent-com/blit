@@ -33,6 +33,9 @@ export interface BlitTerminalProps {
   scrollbarWidth?: number;
   /** Font advance-width / units-per-em ratio from font tables for native-accurate cell width. */
   advanceRatio?: number;
+  /** Coverage gamma for glyph antialiasing: 1 leaves antialiasing untouched,
+   *  above 1 thins light-on-dark text. Default: DEFAULT_TEXT_GAMMA. */
+  textGamma?: number;
   /** Callback to receive the underlying BlitTerminalSurface after mount. */
   surfaceRef?: (surface: BlitTerminalSurface | null) => void;
 }

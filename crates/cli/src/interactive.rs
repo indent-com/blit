@@ -23,6 +23,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 const WEB_INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br");
+/// The preview service worker, served by this server as well as the gateway's
+/// (docs/design/net.md § Client: service worker). Without a route for it the
+/// SPA fallback answered `/sw.js` with `index.html`, so registration failed on
+/// the MIME type — every load logged it, and web previews never worked here at
+/// all, because the worker they run on never came up.
+const WEB_SW_JS_BR: &[u8] = include_bytes!("../../../js/ui/dist/sw.js.br");
 
 #[derive(Clone)]
 enum BrowserConnector {
@@ -140,6 +146,8 @@ struct BrowserState {
     destinations: std::sync::RwLock<std::collections::HashMap<String, DestinationInfo>>,
     config: blit_webserver::config::ConfigState,
     remotes: blit_webserver::config::RemotesState,
+    /// Live-reloading `blit.roots` served to the browser over `/config`.
+    roots: blit_webserver::config::RootsState,
     /// Hub URL for converting `share:` remotes entries to connectors.
     hub: String,
     /// Shared SSH connection pool.
@@ -167,6 +175,8 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
     // Use persistent RemotesState backed by ~/.config/blit/blit.remotes.
     // This watches the file for external changes and broadcasts updates.
     let remotes = blit_webserver::config::RemotesState::new();
+    // Persistent roots, backed by ~/.config/blit/blit.roots.
+    let roots = blit_webserver::config::RootsState::new();
 
     // Ensure local blit-server is running.
     let local_path = transport::default_local_socket();
@@ -196,6 +206,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
         destinations: std::sync::RwLock::new(destinations),
         config: blit_webserver::config::ConfigState::new(),
         remotes,
+        roots,
         hub: hub.to_string(),
         ssh_pool,
         shutdown: shutdown.clone(),
@@ -235,6 +246,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
 
     let html_etag: &'static str =
         Box::leak(blit_webserver::html_etag(WEB_INDEX_HTML_BR).into_boxed_str());
+    let sw_etag: &'static str = Box::leak(blit_webserver::html_etag(WEB_SW_JS_BR).into_boxed_str());
 
     let app = axum::Router::new()
         .route(
@@ -251,6 +263,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                                     &state.config,
                                     Some(&state.remotes),
                                     None,
+                                    Some(&state.roots),
                                     &[],
                                     blit_webserver::config::AuthContext {
                                         throttle: &state.auth_throttle,
@@ -266,7 +279,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
             ),
         )
         .fallback(get(move |state, request| {
-            browser_root_handler(state, request, html_etag)
+            browser_root_handler(state, request, html_etag, sw_etag)
         }))
         .with_state(state);
 
@@ -321,11 +334,26 @@ async fn browser_root_handler(
     axum::extract::State(state): axum::extract::State<Arc<BrowserState>>,
     request: axum::extract::Request,
     etag: &'static str,
+    sw_etag: &'static str,
 ) -> Response {
     let path = request.uri().path().to_string();
 
     if let Some(resp) = blit_webserver::try_font_route(&path, None) {
         return resp;
+    }
+
+    {
+        let inm = request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .map(|v| v.as_bytes());
+        let ae = request
+            .headers()
+            .get(axum::http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        if let Some(resp) = blit_webserver::try_ui_route(&path, WEB_SW_JS_BR, sw_etag, inm, ae) {
+            return resp;
+        }
     }
 
     let is_ws = request

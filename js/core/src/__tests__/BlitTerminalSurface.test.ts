@@ -108,29 +108,32 @@ describe("BlitTerminalSurface sizing", () => {
     const writable = attachSurface({ resizable: false });
     const readOnly = attachSurface({ readOnly: true, resizable: false });
 
+    // A passive surface is *clamped*, not stretched: `width: 100%` scaled the
+    // grid to the container instead of letting it keep its own cell size, so
+    // the bound is now a maximum.
     expect({
       writable: {
-        width: writable.canvas.style.width,
-        height: writable.canvas.style.height,
+        maxWidth: writable.canvas.style.maxWidth,
+        maxHeight: writable.canvas.style.maxHeight,
         objectFit: writable.canvas.style.objectFit,
         objectPosition: writable.canvas.style.objectPosition,
       },
       readOnly: {
-        width: readOnly.canvas.style.width,
-        height: readOnly.canvas.style.height,
+        maxWidth: readOnly.canvas.style.maxWidth,
+        maxHeight: readOnly.canvas.style.maxHeight,
         objectFit: readOnly.canvas.style.objectFit,
         objectPosition: readOnly.canvas.style.objectPosition,
       },
     }).toEqual({
       writable: {
-        width: "100%",
-        height: "100%",
+        maxWidth: "100%",
+        maxHeight: "100%",
         objectFit: "contain",
         objectPosition: "center",
       },
       readOnly: {
-        width: "100%",
-        height: "100%",
+        maxWidth: "100%",
+        maxHeight: "100%",
         objectFit: "contain",
         objectPosition: "center",
       },

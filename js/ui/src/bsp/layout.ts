@@ -1,8 +1,12 @@
-import type { SessionId } from "@blit-sh/core";
 import { parseDSL } from "@blit-sh/core/bsp";
 import type { BSPLayout } from "@blit-sh/core/bsp";
 
-export type { BSPLayout, BSPPane, BSPAssignments } from "@blit-sh/core/bsp";
+export type {
+  BSPLayout,
+  BSPPane,
+  BSPAssignments,
+  TileAssignment,
+} from "@blit-sh/core/bsp";
 export {
   enumeratePanes,
   assignSessionsToPanes,
@@ -10,10 +14,20 @@ export {
   reconcileAssignments,
   adjustWeights,
   layoutFromDSL,
+  leafCount,
   PRESETS,
   surfaceAssignment,
   isSurfaceAssignment,
   parseSurfaceAssignment,
+  editorAssignment,
+  diffAssignment,
+  parseDiffArg,
+  isTileAssignment,
+  parseTileAssignment,
+  webAssignment,
+  isWebAssignment,
+  parseWebAssignment,
+  isContentAssignment,
 } from "@blit-sh/core/bsp";
 
 import { readStorage, writeStorage } from "../storage";
@@ -45,19 +59,36 @@ function layoutFromDSLString(dsl: string, name?: string): BSPLayout | null {
   }
 }
 
-export function loadActiveLayout(): BSPLayout | null {
+/** The layout named by the URL hash's `l=` param, or null. Never consults
+ *  localStorage — the hashchange handler must not resurrect a stored
+ *  layout the current hash doesn't carry. */
+export function loadLayoutFromHash(): BSPLayout | null {
   const hash = parseHash();
-  if (hash.l) {
-    // Format: "name:dsl" when name differs from dsl, otherwise just "dsl".
-    const colonIdx = hash.l.indexOf(":");
-    if (colonIdx > 0) {
-      const name = hash.l.slice(0, colonIdx);
-      const dsl = hash.l.slice(colonIdx + 1);
-      const layout = layoutFromDSLString(dsl, name);
-      if (layout) return layout;
-    }
-    const layout = layoutFromDSLString(hash.l);
+  if (!hash.l) return null;
+  // Format: "name:dsl" when name differs from dsl, otherwise just "dsl".
+  const colonIdx = hash.l.indexOf(":");
+  if (colonIdx > 0) {
+    const name = hash.l.slice(0, colonIdx);
+    const dsl = hash.l.slice(colonIdx + 1);
+    const layout = layoutFromDSLString(dsl, name);
     if (layout) return layout;
+  }
+  return layoutFromDSLString(hash.l);
+}
+
+export function loadActiveLayout(): BSPLayout | null {
+  const fromHash = loadLayoutFromHash();
+  if (fromHash) return fromHash;
+
+  // A hash that carries app state but no `l=` is an explicit "no layout" —
+  // the app strips `l` when the layout is cleared. Falling back to the
+  // stored layout here resurrected it on every remount (page load, PWA
+  // relaunch, and each dev-server HMR remount) and on every hashchange:
+  // the "screen suddenly splits" bug. The stored layout only seeds a
+  // genuinely fresh entry (empty hash or connect-only params).
+  const hash = parseHash();
+  for (const key of ["t", "s", "a", "p", "tile"]) {
+    if (hash[key] !== undefined) return null;
   }
 
   try {
@@ -76,15 +107,25 @@ export function loadFocusedPaneFromHash(): string | null {
 }
 
 /**
+ * The non-BSP "focused tile" persisted in the hash as `tile=<encoded>`.
+ * parseHash already URL-decodes, so this returns the raw assignment string
+ * (editor:/diff:/commit:) or null. The caller validates with isTileAssignment.
+ */
+export function loadFocusedTileFromHash(): string | null {
+  return parseHash().tile || null;
+}
+
+/**
  * Parse BSP pane assignments from the URL hash.
  *
- * New format (t:/s: prefixed):
- *   a=0:t:hound:28,1.0:s:hound:42
- *     → { "0": "t:hound:28", "1.0": "s:hound:42" }
+ *   a=0:t:hound:28,1.0:s:hound:42,2:t:hound:0k3vq8za
+ *     → { "0": "t:hound:28", "1.0": "s:hound:42", "2": "t:hound:0k3vq8za" }
  *
- * Legacy format (no prefix — treated as terminal):
- *   a=0:hound:28,1:local:3
- *     → { "0": "t:hound:28", "1": "t:local:3" }
+ * A `t:` segment that is all digits is a terminal ptyId; anything else is a
+ * server-side tab id (docs/design/kv.md — tab ids are never all-digits).
+ * `s:` is a compositor surface. `w:` is a web pane, written for legibility and
+ * read as a `t:` tab ref — both resolve through the KV tab registry. The
+ * resolver classifies; this just splits.
  */
 export function loadAssignmentsFromHash(): Record<string, string> | null {
   const a = parseHash().a;
@@ -95,12 +136,13 @@ export function loadAssignmentsFromHash(): Record<string, string> | null {
     if (colon <= 0) continue;
     const paneId = pair.slice(0, colon);
     const rest = pair.slice(colon + 1);
-    if (rest.startsWith("t:") || rest.startsWith("s:")) {
-      // New format: "t:connectionId:ptyId" or "s:connectionId:surfaceId"
+    if (rest.startsWith("w:")) {
+      // A web pane is a tab like any other (tabs/<id> in KV); `w:` exists only
+      // so a hash reads legibly. Normalize to the tab form so there is exactly
+      // one resolution path.
+      result[paneId] = `t:${rest.slice(2)}`;
+    } else if (rest.startsWith("t:") || rest.startsWith("s:")) {
       result[paneId] = rest;
-    } else {
-      // Legacy format: "connectionId:ptyId" — treat as terminal
-      result[paneId] = `t:${rest}`;
     }
   }
   return Object.keys(result).length > 0 ? result : null;

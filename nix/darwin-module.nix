@@ -38,6 +38,22 @@ in
       description = "Scrollback buffer size in rows per PTY.";
     };
 
+    languageServers = mkOption {
+      type = types.listOf types.package;
+      default = [ ];
+      example = lib.literalExpression "[ pkgs.nixd pkgs.rust-analyzer pkgs.gopls ]";
+      description = ''
+        Language servers to place on the blit server's PATH so
+        <literal>blit lsp</literal> (docs/design/lsp.md) can discover and
+        spawn them. blit ships none; list the servers you want available
+        and their binaries are prepended to the server process's PATH.
+        blit matches them to files by project marker and extension, keeps
+        them warm across connections, and never downloads anything. Empty
+        by default. Set <option>BLIT_LSP=0</option> via the environment to
+        disable the family entirely.
+      '';
+    };
+
     audio = {
       enable = mkEnableOption "audio forwarding (Linux only — no-op on Darwin)";
 
@@ -201,7 +217,16 @@ in
           ProgramArguments = [
             "/bin/sh"
             "-lc"
-            ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; exec ${cfg.package}/bin/blit server''
+            # Language servers on PATH so `blit lsp` can discover them
+            # (docs/design/lsp.md); prepended so a user-installed server
+            # does not shadow the pinned one.
+            (
+              ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; ''
+              + lib.optionalString (
+                cfg.languageServers != [ ]
+              ) ''export PATH="${lib.makeBinPath cfg.languageServers}:$PATH"; ''
+              + ''exec ${cfg.package}/bin/blit server''
+            )
           ];
           EnvironmentVariables = {
             BLIT_SCROLLBACK = toString cfg.scrollback;

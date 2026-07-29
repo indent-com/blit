@@ -3,6 +3,32 @@ use std::collections::BTreeMap;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Filesystem state sync (docs/fs-watch.md): opcodes, record
+/// codecs, and the client-side mirror reducer.
+pub mod fs;
+
+/// Git introspection (docs/git.md): opcodes, record codecs, and the
+/// client-side state mirror reducer.
+pub mod git;
+
+/// Language intelligence (docs/design/lsp.md): opcodes, record codecs,
+/// and the client-side state/diagnostics mirror reducers.
+pub mod lsp;
+
+/// Server KV store (docs/design/kv.md): opcodes, record codecs, and the
+/// client-side mirror reducer.
+pub mod kv;
+
+/// TCP and UDP relay (docs/design/net.md): opcodes, flags, and the
+/// message builders both ends share.
+pub mod net;
+
+/// Cap on any single LZ4-decompressed payload, protocol-wide
+/// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
+/// size against it *before* allocating, so a hostile or corrupt length
+/// cannot force a giant allocation.
+pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
+
 pub const CELL_SIZE: usize = 12;
 const TITLE_PRESENT: u16 = 1 << 15;
 const OPS_PRESENT: u16 = 1 << 14;
@@ -82,6 +108,8 @@ pub const C2S_COPY_RANGE: u8 = 0x1B;
 /// Send a signal to a PTY's session leader: [0x1A][pty_id:2][signal:4]
 /// signal is a raw libc signal number (e.g. SIGTERM=15, SIGKILL=9).
 pub const C2S_KILL: u8 = 0x1A;
+/// Request a PTY's live working directory: [0x1C][nonce:2][pty_id:2]
+pub const C2S_TERM_CWD: u8 = 0x1C;
 
 /// Keyboard input for a Wayland surface: [0x20][surface_id:2][data:N]
 /// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
@@ -146,7 +174,7 @@ pub const SURFACE_QUALITY_HIGH: u8 = 3;
 pub const SURFACE_QUALITY_ULTRA: u8 = 4;
 /// Unsubscribe from surface frame updates: [0x29][surface_id:2]
 pub const C2S_SURFACE_UNSUBSCRIBE: u8 = 0x29;
-/// Acknowledge receipt of a surface video frame: [0x2A]
+/// Acknowledge receipt of a surface video frame: [0x2A][surface_id:2]
 pub const C2S_SURFACE_ACK: u8 = 0x2A;
 /// Request close of a Wayland surface (sends xdg_toplevel close event):
 /// [0x2B][surface_id:2]
@@ -206,6 +234,26 @@ pub const S2C_QUIT: u8 = 0x0C;
 /// `used_rows` is the highest visible row reached since the last terminal
 /// reset/clear-like sequence, capped to the current PTY height.
 pub const S2C_USED_ROWS: u8 = 0x0D;
+/// Reply to `C2S_TERM_CWD`: [0x0E][nonce:2][cwd_len:2][cwd:N]. Empty = unknown.
+/// The server answers with the shell's own OSC 7 report when it has seen
+/// one, and falls back to asking the kernel about the PTY child otherwise
+/// (docs/protocol.md, "Working directory tracking").
+pub const S2C_TERM_CWD: u8 = 0x0E;
+/// Unsolicited working-directory push: [0x0F][pty_id:2][cwd:N].
+/// `cwd` is the remainder of the message (no length prefix, like S2C_TITLE):
+/// an absolute UTF-8 path of at most [`TERM_CWD_MAX`] bytes.
+/// Broadcast to every connected client when the cwd reported by shell
+/// integration (OSC 7) changes; identical per-prompt re-reports are not
+/// re-sent.  Shells without OSC 7 integration never trigger this — clients
+/// keep the `C2S_TERM_CWD` poll as the fallback
+/// (docs/protocol.md, "Working directory tracking").
+pub const S2C_TERM_CWD_EVENT: u8 = 0x0F;
+/// Upper bound on the `cwd` path in `S2C_TERM_CWD_EVENT` (and on the
+/// server-side OSC 7 store feeding `S2C_TERM_CWD`).  4096 is Linux's
+/// PATH_MAX — no kernel-accepted cwd is longer (macOS caps at 1024) —
+/// and it sits well under the u16 length the family's `cwd_len:2`
+/// framing already imposes.  Oversize OSC 7 reports are dropped.
+pub const TERM_CWD_MAX: usize = 4096;
 /// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
 /// nonce: echoed from C2S_READ request
 /// total_lines: total available lines (scrollback + viewport rows)
@@ -2158,6 +2206,74 @@ pub fn msg_read(nonce: u16, pty_id: u16, offset: u32, limit: u32, flags: u8) -> 
     msg
 }
 
+/// Build a `C2S_TERM_CWD`.
+pub fn msg_term_cwd(nonce: u16, pty_id: u16) -> Vec<u8> {
+    let mut m = Vec::with_capacity(5);
+    m.push(C2S_TERM_CWD);
+    m.extend_from_slice(&nonce.to_le_bytes());
+    m.extend_from_slice(&pty_id.to_le_bytes());
+    m
+}
+
+/// Parse a `C2S_TERM_CWD` → `(nonce, pty_id)`.
+pub fn parse_term_cwd(data: &[u8]) -> Option<(u16, u16)> {
+    if data.first().copied() != Some(C2S_TERM_CWD) || data.len() < 5 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([data[1], data[2]]),
+        u16::from_le_bytes([data[3], data[4]]),
+    ))
+}
+
+/// Build an `S2C_TERM_CWD` reply (empty `cwd` = unavailable).
+pub fn msg_term_cwd_reply(nonce: u16, cwd: &str) -> Vec<u8> {
+    let cb = cwd.as_bytes();
+    let mut m = Vec::with_capacity(5 + cb.len());
+    m.push(S2C_TERM_CWD);
+    m.extend_from_slice(&nonce.to_le_bytes());
+    m.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+    m.extend_from_slice(cb);
+    m
+}
+
+/// Parse an `S2C_TERM_CWD` reply → `(nonce, cwd)`.
+pub fn parse_term_cwd_reply(data: &[u8]) -> Option<(u16, String)> {
+    if data.first().copied() != Some(S2C_TERM_CWD) || data.len() < 5 {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([data[1], data[2]]);
+    let len = u16::from_le_bytes([data[3], data[4]]) as usize;
+    if data.len() < 5 + len {
+        return None;
+    }
+    Some((
+        nonce,
+        String::from_utf8_lossy(&data[5..5 + len]).into_owned(),
+    ))
+}
+
+/// Build an `S2C_TERM_CWD_EVENT` push (unsolicited cwd change).
+pub fn msg_term_cwd_event(pty_id: u16, cwd: &str) -> Vec<u8> {
+    let cb = cwd.as_bytes();
+    let mut m = Vec::with_capacity(3 + cb.len());
+    m.push(S2C_TERM_CWD_EVENT);
+    m.extend_from_slice(&pty_id.to_le_bytes());
+    m.extend_from_slice(cb);
+    m
+}
+
+/// Parse an `S2C_TERM_CWD_EVENT` → `(pty_id, cwd)`.
+pub fn parse_term_cwd_event(data: &[u8]) -> Option<(u16, String)> {
+    if data.first().copied() != Some(S2C_TERM_CWD_EVENT) || data.len() < 3 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([data[1], data[2]]),
+        String::from_utf8_lossy(&data[3..]).into_owned(),
+    ))
+}
+
 pub fn msg_copy_range(
     nonce: u16,
     pty_id: u16,
@@ -2345,6 +2461,22 @@ pub fn msg_surface_focus(surface_id: u16) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3);
     msg.push(C2S_SURFACE_FOCUS);
     msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg
+}
+
+/// Build a `C2S_SURFACE_TEXT`: [0x2F][surface_id:2][text:N].
+///
+/// Unlike `SURFACE_INPUT`, which carries evdev keycodes, this hands the
+/// server UTF-8 and lets it choose how to deliver it — synthesised
+/// US-QWERTY keys for ASCII, `zwp_text_input_v3` commit_string for
+/// anything else. It is the only way to type a character the client
+/// cannot map to a keycode.
+pub fn msg_surface_text(surface_id: u16, text: &str) -> Vec<u8> {
+    let tb = text.as_bytes();
+    let mut msg = Vec::with_capacity(3 + tb.len());
+    msg.push(C2S_SURFACE_TEXT);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(tb);
     msg
 }
 
@@ -2996,6 +3128,38 @@ fn push_wrapped_word(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn term_cwd_roundtrip() {
+        let req = msg_term_cwd(12, 42);
+        assert_eq!(parse_term_cwd(&req), Some((12, 42)));
+        let reply = msg_term_cwd_reply(12, "/home/user/src/linux");
+        assert_eq!(
+            parse_term_cwd_reply(&reply),
+            Some((12, "/home/user/src/linux".to_string()))
+        );
+        // Empty cwd (unavailable) round-trips too.
+        assert_eq!(
+            parse_term_cwd_reply(&msg_term_cwd_reply(1, "")),
+            Some((1, String::new()))
+        );
+    }
+
+    #[test]
+    fn term_cwd_event_roundtrip() {
+        let msg = msg_term_cwd_event(0x1234, "/home/user/src/linux");
+        // Wire layout: [opcode][pty_id:2 LE][cwd bytes, no length prefix].
+        assert_eq!(msg[0], S2C_TERM_CWD_EVENT);
+        assert_eq!(&msg[1..3], &[0x34, 0x12]);
+        assert_eq!(&msg[3..], b"/home/user/src/linux");
+        assert_eq!(
+            parse_term_cwd_event(&msg),
+            Some((0x1234, "/home/user/src/linux".to_string()))
+        );
+        // Too short / wrong opcode.
+        assert_eq!(parse_term_cwd_event(&[S2C_TERM_CWD_EVENT, 0]), None);
+        assert_eq!(parse_term_cwd_event(&msg_term_cwd(1, 2)), None);
+    }
 
     #[test]
     fn update_round_trip_preserves_title_and_cells() {

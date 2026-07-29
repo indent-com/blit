@@ -5,12 +5,13 @@ use blit_remote::{
     CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264,
     EXIT_STATUS_UNKNOWN, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO,
     S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
-    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
+    S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
     SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
     msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
     msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
-    msg_surface_close, msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext,
-    parse_server_msg,
+    msg_surface_close, msg_surface_focus, msg_surface_pointer_axis, msg_surface_resize,
+    msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text, msg_term_cwd,
+    parse_server_msg, parse_term_cwd_reply,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -30,6 +31,8 @@ pub(crate) struct AgentConn {
     pub(crate) ptys: Vec<PtyInfo>,
     pub(crate) titles: HashMap<u16, String>,
     pub(crate) exited: HashMap<u16, i32>,
+    /// HELLO feature bits — gates requests older servers don't answer.
+    pub(crate) features: u32,
     /// Reassembly buffer for `S2C_FRAGMENT` messages from the server.
     fragment_buf: Vec<u8>,
 }
@@ -41,6 +44,7 @@ impl AgentConn {
         let mut ptys = Vec::new();
         let mut titles = HashMap::new();
         let mut exited = HashMap::new();
+        let mut features = 0u32;
         let mut fragment_buf: Vec<u8> = Vec::new();
 
         loop {
@@ -59,7 +63,12 @@ impl AgentConn {
             match data[0] {
                 S2C_READY => break,
                 S2C_QUIT => return Err("server is shutting down".to_string()),
-                S2C_HELLO | S2C_PING => {}
+                S2C_HELLO => {
+                    if let Some(ServerMsg::Hello { features: f, .. }) = parse_server_msg(&data) {
+                        features = f;
+                    }
+                }
+                S2C_PING => {}
                 S2C_LIST => {
                     if let Some(ServerMsg::List { entries }) = parse_server_msg(&data) {
                         ptys = entries
@@ -98,6 +107,7 @@ impl AgentConn {
             ptys,
             titles,
             exited,
+            features,
             fragment_buf,
         })
     }
@@ -162,18 +172,44 @@ impl AgentConn {
 }
 
 pub async fn cmd_list(transport: Transport) -> Result<(), String> {
-    let conn = AgentConn::connect(transport).await?;
+    let mut conn = AgentConn::connect(transport).await?;
 
-    println!("ID\tTAG\tTITLE\tCOMMAND\tSTATUS");
+    // One TERM_CWD round trip per pty, all requested up front (nonce =
+    // pty id). Cheap server-side: an OSC 7 report is a stored string, the
+    // fallback one kernel query. Gated on the fs-era HELLO bit —
+    // C2S_TERM_CWD shipped alongside FEATURE_FS, so older servers are
+    // skipped instead of stalling the listing to the reply deadline;
+    // their rows print an empty CWD.
+    let mut cwds: HashMap<u16, String> = HashMap::new();
+    if conn.features & blit_remote::fs::FEATURE_FS != 0 && !conn.ptys.is_empty() {
+        let ids: Vec<u16> = conn.ptys.iter().map(|p| p.id).collect();
+        for &id in &ids {
+            conn.send(&msg_term_cwd(id, id)).await?;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        while cwds.len() < ids.len() {
+            let Ok(data) = conn.recv_deadline(deadline).await else {
+                break;
+            };
+            if data.first().copied() == Some(S2C_TERM_CWD)
+                && let Some((nonce, cwd)) = parse_term_cwd_reply(&data)
+            {
+                cwds.insert(nonce, cwd);
+            }
+        }
+    }
+
+    println!("ID\tTAG\tTITLE\tCOMMAND\tCWD\tSTATUS");
     for pty in &conn.ptys {
         let title = conn.titles.get(&pty.id).map(|s| s.as_str()).unwrap_or("");
+        let cwd = cwds.get(&pty.id).map(|s| s.as_str()).unwrap_or("");
         let status = match conn.exited.get(&pty.id) {
             None => "running".to_string(),
             Some(&s) => format_exit_status(s),
         };
         println!(
-            "{}\t{}\t{}\t{}\t{}",
-            pty.id, pty.tag, title, pty.command, status
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            pty.id, pty.tag, title, pty.command, cwd, status
         );
     }
     // Read-only command — nothing was written so there is nothing to drain.
@@ -410,6 +446,24 @@ pub async fn cmd_quit(transport: Transport) -> Result<(), String> {
     Ok(())
 }
 
+/// Set a pty's viewport size and exit.
+///
+/// The size is a *request*, not a command: the server reconciles the
+/// desired sizes of every attached viewer, so a browser holding the same
+/// terminal larger keeps the grid larger. There is no reply to wait for —
+/// `S2C_SIZE` only arrives for a grid that actually changed — so this
+/// flushes and returns once the frame is written.
+pub async fn cmd_resize(transport: Transport, id: u16, cols: u16, rows: u16) -> Result<(), String> {
+    if cols == 0 || rows == 0 {
+        return Err("cols and rows must be greater than zero".into());
+    }
+    let mut conn = AgentConn::connect(transport).await?;
+    if !conn.has_pty(id) {
+        return Err(format!("pty {id} not found"));
+    }
+    conn.send(&msg_resize(id, rows, cols)).await
+}
+
 pub async fn cmd_close(transport: Transport, id: u16) -> Result<(), String> {
     let mut conn = AgentConn::connect(transport).await?;
 
@@ -504,7 +558,7 @@ fn format_exit_status(status: i32) -> String {
     }
 }
 
-fn exit_code_from_status(status: i32) -> i32 {
+pub(crate) fn exit_code_from_status(status: i32) -> i32 {
     if status == EXIT_STATUS_UNKNOWN {
         1
     } else if status >= 0 {
@@ -1062,6 +1116,50 @@ pub async fn cmd_click(
         msg.extend_from_slice(&y.to_le_bytes());
         conn.send(&msg).await?;
     }
+    conn.finish().await;
+    Ok(())
+}
+
+/// Scroll a surface. `axis` 0 is vertical, 1 horizontal; the wire carries
+/// hundredths, so a "line" is roughly 10 units of wheel travel.
+pub async fn cmd_scroll(
+    transport: Transport,
+    id: u16,
+    amount: f64,
+    horizontal: bool,
+) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    let value = (amount * 100.0).round();
+    if !value.is_finite() || value.abs() > f64::from(i32::MAX) {
+        return Err("scroll amount out of range".into());
+    }
+    conn.send(&msg_surface_pointer_axis(
+        id,
+        u8::from(horizontal),
+        value as i32,
+    ))
+    .await?;
+    conn.finish().await;
+    Ok(())
+}
+
+/// Give a surface keyboard and pointer focus.
+pub async fn cmd_focus_surface(transport: Transport, id: u16) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_surface_focus(id)).await?;
+    conn.finish().await;
+    Ok(())
+}
+
+/// Commit literal UTF-8 to a surface.
+///
+/// Distinct from `type`, which parses `{Return}` and synthesises evdev
+/// keycodes: that route can only reach characters the client can map to a
+/// US-QWERTY key, so anything non-ASCII was unreachable. This hands the
+/// server the text and lets it use `zwp_text_input_v3` where it can.
+pub async fn cmd_text(transport: Transport, id: u16, text: &str) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_surface_text(id, text)).await?;
     conn.finish().await;
     Ok(())
 }
