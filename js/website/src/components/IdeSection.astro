@@ -1,0 +1,252 @@
+---
+// Terminal-native IDE section: the left-dock + tiles UI that ships in the
+// web app. The mock mirrors the real chrome: Files tree with live git
+// status, an editor with LSP completion, the commit DAG with ref pills.
+
+const treeRows = [
+  { pad: 0, glyph: "▾", name: "crates", flag: "M", cls: "text-[#d29922]" },
+  { pad: 1, glyph: "▸", name: "git", flag: "", cls: "" },
+  { pad: 1, glyph: "▾", name: "remote", flag: "M", cls: "text-[#d29922]" },
+  { pad: 2, glyph: "", name: "fs.rs", flag: "M", cls: "text-[#d29922]" },
+  { pad: 2, glyph: "", name: "lsp.rs", flag: "", cls: "" },
+  { pad: 0, glyph: "▾", name: "docs", flag: "", cls: "" },
+  { pad: 1, glyph: "", name: "fs-search.md", flag: "A", cls: "text-[var(--green)]" },
+  { pad: 0, glyph: "▸", name: "js", flag: "M", cls: "text-[#d29922]" },
+];
+
+const codeLines = [
+  `<span class="text-[var(--hl-kw)]">let</span> <span class="text-[var(--hl-kw)]">mut</span> tokens = spec.split_whitespace();`,
+  `<span class="text-[var(--hl-kw)]">let</span> first = tokens.next().unwrap_or(spec);`,
+  `<span class="text-[var(--hl-kw)]">let</span> (tips, hides) = <span class="text-[var(--hl-fn)]">resolve_one</span>(repo, first)?;`,
+  `<span class="text-[var(--hl-kw)]">for</span> token <span class="text-[var(--hl-kw)]">in</span> tokens.ne<span class="blit-cursor"></span>`,
+];
+
+const completions = [
+  { label: "next()", kind: "fn", selected: true },
+  { label: "next_back()", kind: "fn", selected: false },
+  { label: "nth(n)", kind: "fn", selected: false },
+];
+
+const features = [
+  {
+    title: "Files, live",
+    body: "A tree that follows your terminal's cwd, streams git status per entry, and does create / rename / move / delete in place.",
+  },
+  {
+    title: "Language servers, server-side",
+    body: "Completion with snippet tab stops, signature help, hover types and docs, go-to-definition, references, document outline, and diagnostics on unsaved buffers. rust-analyzer &amp; friends run next to the code, not in your browser.",
+  },
+  {
+    title: "Rename across files",
+    body: "F2 applies the server's whole edit plan, not just the open buffer — every file it touches is written compare-and-swap, and any that refused is named rather than silently skipped.",
+  },
+  {
+    title: "Search: names and contents",
+    body: "<code class=\"font-mono text-[12px] text-[var(--fg)]\">@</code> scores a shipped file index locally, with no round trip per keystroke. A separate pane greps <em>contents</em> across the repo — literal or regex, case, whole word — server-side, so only hits cross the wire.",
+  },
+  {
+    title: "Ignore rules that rank",
+    body: "Content search respects <code class=\"font-mono text-[12px] text-[var(--fg)]\">.gitignore</code> by default, which is what keeps it fast on a tree full of build output. Turn that off and ignored files are still searched — ranked last and dimmed, not hidden.",
+  },
+  {
+    title: "Problems, and a key to walk them",
+    body: "Diagnostics land in the gutter, in a panel, and on F8 / Shift+F8 to step through them. Find and replace in a file is ours too: regex, case, whole word, live match count.",
+  },
+  {
+    title: "The whole commit graph",
+    body: "The full DAG with branch and tag pills. Log any revspec — <code class=\"font-mono text-[12px] text-[var(--fg)]\">v0.38..main hotfix</code> — and it sticks per worktree.",
+  },
+  {
+    title: "Diffs at every stage",
+    body: "HEAD, staged, unstaged, or everything; side-by-side or unified, syntax highlighted. Click a diff line to land in the editor.",
+  },
+  {
+    title: "Tiles, not tabs",
+    body: "Panes split like a tiling window manager and layouts live in the URL. Editors, diffs, and terminals are all just tiles.",
+  },
+];
+---
+
+<section id="ide" class="border-b border-[var(--border)]">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div class="max-w-2xl">
+      <div
+        class="flex items-center gap-2 font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+      >
+        <span>Terminal-native IDE</span>
+        <span
+          class="rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2 py-0.5 text-[9px] tracking-wider"
+          >New</span
+        >
+      </div>
+      <h2
+        class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+      >
+        An IDE that lives where your terminals do.
+      </h2>
+      <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+        Files, editors, diffs, and the commit graph — in the same tiled
+        workspace as your terminals, over the same wire. Open it on an SSH
+        remote or a share link: the server runs the language servers, walks
+        the repo, and streams state; the browser stays a thin client.
+      </p>
+    </div>
+
+    <!-- IDE mock -->
+    <div class="relative mt-12" data-theme="dark">
+      <div
+        aria-hidden="true"
+        class="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] opacity-60 blur-2xl"
+        style="background: radial-gradient(46rem 16rem at 50% 40%, var(--accent-glow), transparent 70%);"
+      >
+      </div>
+      <div
+        class="overflow-hidden rounded-xl border border-[#21262d] bg-[#0a0d12] shadow-2xl shadow-[color:var(--accent-glow)]"
+      >
+        <!-- chrome -->
+        <div
+          class="flex items-center gap-3 border-b border-[#21262d] bg-[#11161d] px-3 py-2"
+        >
+          <div class="flex items-center gap-1.5">
+            <span class="h-2.5 w-2.5 rounded-full bg-[#ff5f57]"></span>
+            <span class="h-2.5 w-2.5 rounded-full bg-[#febc2e]"></span>
+            <span class="h-2.5 w-2.5 rounded-full bg-[#28c840]"></span>
+          </div>
+          <div
+            class="flex flex-1 items-center justify-center font-mono text-[11px] text-[var(--dim)]"
+          >
+            blit.sh/s#rf6e… — crates/git/src/requests.rs
+          </div>
+          <span
+            class="font-mono text-[10px] uppercase tracking-wider text-[var(--green)]"
+            >● live</span
+          >
+        </div>
+        <div class="grid grid-cols-[13rem_minmax(0,1fr)] max-md:grid-cols-1">
+          <!-- left dock -->
+          <div
+            class="border-r border-[#21262d] bg-[#0d1117] font-mono text-[11.5px] leading-[1.7] max-md:hidden"
+          >
+            <div
+              class="border-b border-[#21262d] px-3 py-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]"
+            >
+              Files · fs
+            </div>
+            <div class="px-3 py-2 text-[var(--fg)]">
+              {
+                treeRows.map((r) => (
+                  <div class="flex items-center justify-between">
+                    <span style={`padding-left:${r.pad * 0.9}rem`}>
+                      <span class="text-[var(--dim)]">{r.glyph}</span>{" "}
+                      {r.name}
+                    </span>
+                    <span class:list={["text-[10px]", r.cls]}>{r.flag}</span>
+                  </div>
+                ))
+              }
+            </div>
+            <div
+              class="border-y border-[#21262d] px-3 py-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]"
+            >
+              Commit log · HEAD~4..HEAD
+            </div>
+            <div class="px-3 py-2 text-[var(--dim)]">
+              <div class="flex items-center gap-1.5">
+                <span class="text-[var(--accent)]">●</span>
+                <span
+                  class="rounded border border-[var(--accent)]/50 bg-[var(--accent-soft)] px-1 text-[9px] font-bold text-[var(--accent)]"
+                  >fs</span
+                >
+                <span class="truncate">6057b8f survive the sync cap</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <span class="text-[var(--accent)]">│</span>
+                <span class="truncate">4fb3a8f stop resurrecting a…</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <span class="text-[var(--accent)]">●</span>
+                <span
+                  class="rounded border border-[#d29922]/50 bg-[#d29922]/10 px-1 text-[9px] font-bold text-[#d29922]"
+                  >v0.38.1</span
+                >
+                <span class="truncate">c08273a release</span>
+              </div>
+            </div>
+          </div>
+          <!-- editor -->
+          <div class="relative bg-[var(--code-bg)]">
+            <div
+              class="flex items-center gap-3 border-b border-[#21262d] bg-[#11161d] px-4 py-1.5 font-mono text-[11px]"
+            >
+              <span class="text-[var(--fg)]">requests.rs</span>
+              <span class="text-[var(--accent)]">Edit</span>
+              <span class="text-[var(--dim)]">Staged</span>
+              <span class="text-[var(--dim)]">Unstaged</span>
+              <span class="text-[var(--dim)]">All</span>
+              <span class="ml-auto flex items-center gap-3 text-[var(--dim)]">
+                <span>Def</span><span>Refs</span><span>Rename</span><span
+                  >Outline</span
+                ><span>Save</span>
+              </span>
+            </div>
+            <pre
+              class="m-0 overflow-x-auto px-4 py-3.5 font-mono text-[12.5px] leading-relaxed text-[var(--code-fg)]"><code>{codeLines.map((l) => (<span class="block" set:html={l} />))}</code></pre>
+            <!-- completion popup -->
+            <div
+              class="absolute left-[13.5rem] top-[7.6rem] overflow-hidden rounded-md border border-[#30363d] bg-[#161b22] font-mono text-[11.5px] shadow-xl max-sm:left-[6rem]"
+            >
+              {
+                completions.map((c) => (
+                  <div
+                    class:list={[
+                      "flex items-center justify-between gap-6 px-2.5 py-1",
+                      c.selected
+                        ? "bg-[var(--accent-soft)] text-[var(--bright)]"
+                        : "text-[var(--dim)]",
+                    ]}
+                  >
+                    <span>{c.label}</span>
+                    <span class="text-[9px] uppercase text-[var(--accent-2)]">
+                      {c.kind}
+                    </span>
+                  </div>
+                ))
+              }
+            </div>
+            <div class="h-16"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- feature grid -->
+    <div class="mt-12 grid grid-cols-1 gap-x-10 gap-y-8 sm:grid-cols-2 lg:grid-cols-3">
+      {
+        features.map(({ title, body }) => (
+          <div>
+            <h3 class="font-sans text-[15px] font-bold text-[var(--bright)]">
+              {title}
+            </h3>
+            <p
+              class="mt-1.5 text-[13.5px] leading-relaxed text-[var(--dim)]"
+              set:html={body}
+            />
+          </div>
+        ))
+      }
+    </div>
+
+    <p class="mt-10 max-w-2xl text-[13.5px] leading-relaxed text-[var(--dim)]">
+      Everything above is a message family on blit's wire protocol — the same
+      one terminals use. No sidecar daemons, no per-language extensions to
+      install in the browser.
+      <a
+        href="https://github.com/indent-com/blit/tree/main/docs/design"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-[var(--accent)] no-underline hover:underline"
+        >Read the protocol RFCs →</a
+      >
+    </p>
+  </div>
+</section>

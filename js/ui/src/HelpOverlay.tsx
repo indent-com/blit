@@ -14,7 +14,15 @@ export function HelpOverlay(props: {
 }) {
   const theme = themeFor(props.palette);
   const scale = uiScale(props.fontSize);
-  const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  const mod = isMac ? "Cmd" : "Ctrl";
+  // CodeMirror binds different chords per platform for these two.
+  const fold = isMac ? "Cmd+Alt+[ / ]" : "Ctrl+Shift+[ / ]";
+  const undoRedo = isMac
+    ? "Cmd+Z / Cmd+Shift+Z"
+    : "Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z";
+  // Sections are hand-dealt between the two columns to keep their
+  // heights close; re-deal when a section grows.
   const left: Section[] = [
     {
       title: t("help.keyboard"),
@@ -27,15 +35,31 @@ export function HelpOverlay(props: {
         ["Alt+Shift+[ / ]", t("help.prevNextTerminal")],
         ["Ctrl+[ / ]", t("help.prevNextPane")],
         ["Ctrl+Shift+V", t("help.paste")],
+        ["Ctrl+Shift+E", t("help.dockExplorer")],
+        ["Ctrl+Shift+F", t("help.projectSearch")],
+        ["Ctrl+Shift+L", t("help.dockLog")],
+        ["Ctrl+Shift+P", t("help.dockProblems")],
+        ["Ctrl+Shift+B", t("help.previewPanel")],
+        ["Ctrl+Shift+K", t("help.workspaceRoots")],
+        ["Ctrl+Shift+O", "Open a URL as a web pane"],
         ["Ctrl+Shift+`", t("help.debugPanel")],
         ["Ctrl+Shift+A", t("help.resetAudio")],
-        ["Ctrl+Shift+B", t("help.previewPanel")],
         ["Ctrl+?", t("help.thisHelp")],
         ["Escape", t("help.closeOverlay")],
       ],
     },
-  ];
-  const right: Section[] = [
+    {
+      // The Cmd+K field is a mode switcher, not just a filter — the
+      // prefixes are invisible unless something says so.
+      title: t("help.searchModes"),
+      items: [
+        ["name", t("help.modePlain")],
+        [">command", t("help.modeCommand")],
+        ["target>command", t("help.modeTargetCommand")],
+        ["@file", t("help.modeFile")],
+        ["#symbol", t("help.modeSymbol")],
+      ],
+    },
     {
       title: t("help.scrollback"),
       items: [
@@ -43,6 +67,48 @@ export function HelpOverlay(props: {
         ["Shift+PageUp / PageDown", t("help.pageUpDown")],
         ["Shift+Home / End", t("help.topBottom")],
         ["Any key", t("help.exitScrollback")],
+      ],
+    },
+  ];
+  const right: Section[] = [
+    {
+      title: t("help.editor"),
+      items: [
+        [`F12 / ${mod}+Click`, t("help.goToDef")],
+        ["Shift+F12", t("help.findRefs")],
+        [t("help.hoverPointer"), t("help.hover")],
+        ["F2", t("help.rename")],
+        [`${mod}+Shift+O`, t("help.outline")],
+        ["F8 / Shift+F8", t("help.nextDiagnostic")],
+        [`${mod}+Shift+M`, t("help.listDiagnostics")],
+        ["Ctrl+Alt+← / →", t("help.navBackForward")],
+        ["Ctrl+Space", t("help.completion")],
+        ["Tab / Enter", t("help.acceptCompletion")],
+        ["( / ,", t("help.signatureHelp")],
+      ],
+    },
+    {
+      title: t("help.editing"),
+      items: [
+        [`${mod}+S`, t("help.saveFile")],
+        [undoRedo, t("help.undoRedo")],
+        [`${mod}+/`, t("help.toggleComment")],
+        ["Alt+↑ / ↓", t("help.moveLine")],
+        ["Shift+Alt+↑ / ↓", t("help.copyLine")],
+        ["Alt+Z", t("help.softWrap")],
+        [fold, t("help.fold")],
+        ["Alt+Click", t("help.addCursor")],
+        ["Alt+Shift+drag", t("help.columnSelect")],
+      ],
+    },
+    {
+      title: t("help.find"),
+      items: [
+        [`${mod}+F`, t("help.findInFile")],
+        [`F3 / Shift+F3`, t("help.findNextPrev")],
+        [`${mod}+D`, t("help.selectNextOccurrence")],
+        [`${mod}+Shift+L`, t("help.selectAllOccurrences")],
+        [`${mod}+Alt+G`, t("help.gotoLine")],
       ],
     },
     {

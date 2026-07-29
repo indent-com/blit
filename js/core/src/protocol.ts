@@ -5,6 +5,9 @@ import {
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_KILL,
+  C2S_TERM_CWD,
+  S2C_TERM_CWD,
+  S2C_TERM_CWD_EVENT,
   C2S_MOUSE,
   C2S_RESTART,
   C2S_RESIZE,
@@ -284,6 +287,53 @@ export function buildKillMessage(ptyId: number, signal: number): Uint8Array {
   const view = new DataView(msg.buffer);
   view.setInt32(3, signal, true);
   return msg;
+}
+
+/** [0x1C][nonce:2][pty_id:2] — request a pty's live cwd. */
+export function buildTermCwdMessage(nonce: number, ptyId: number): Uint8Array {
+  const msg = new Uint8Array(5);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_TERM_CWD;
+  v.setUint16(1, nonce, true);
+  v.setUint16(3, ptyId, true);
+  return msg;
+}
+
+/** [0x0E][nonce:2][cwd_len:2][cwd:N] → { nonce, cwd } (empty cwd = unknown). */
+export function parseTermCwdReply(
+  data: Uint8Array,
+): { nonce: number; cwd: string } | null {
+  if (data.length < 5 || data[0] !== S2C_TERM_CWD) return null;
+  const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const nonce = v.getUint16(1, true);
+  const len = v.getUint16(3, true);
+  if (data.length < 5 + len) return null;
+  return { nonce, cwd: new TextDecoder().decode(data.subarray(5, 5 + len)) };
+}
+
+/** The server-enforced cap on a pushed cwd (docs/protocol.md
+ *  `TERM_CWD_MAX`), mirrored so a hostile frame cannot mint an
+ *  unbounded string. */
+const TERM_CWD_MAX = 4096;
+
+/** [0x0F][pty_id:2][cwd:N] → { ptyId, cwd } — unsolicited push when the
+ *  OSC 7-reported cwd changes (docs/protocol.md `TERM_CWD_EVENT`). `cwd`
+ *  is the remainder of the message, no length prefix (the S2C_TITLE
+ *  convention): a non-empty UTF-8 absolute path of at most 4096 bytes.
+ *  Null = malformed. */
+export function parseTermCwdEvent(
+  data: Uint8Array,
+): { ptyId: number; cwd: string } | null {
+  if (data.length < 4 || data[0] !== S2C_TERM_CWD_EVENT) return null;
+  const cwdBytes = data.subarray(3);
+  if (cwdBytes.length > TERM_CWD_MAX) return null;
+  let cwd: string;
+  try {
+    cwd = new TextDecoder("utf-8", { fatal: true }).decode(cwdBytes);
+  } catch {
+    return null;
+  }
+  return { ptyId: data[1] | (data[2] << 8), cwd };
 }
 
 export function buildCopyRangeMessage(

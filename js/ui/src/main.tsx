@@ -64,35 +64,38 @@ const MASKABLE_SVG =
   const blob = new Blob([JSON.stringify(manifest)], {
     type: "application/json",
   });
-  const link = document.createElement("link");
+  // Idempotent for the same reason the mount below is: appending a second
+  // manifest link would leave the document with two.
+  const link =
+    document.head.querySelector<HTMLLinkElement>('link[rel="manifest"]') ??
+    document.head.appendChild(document.createElement("link"));
   link.rel = "manifest";
   link.href = URL.createObjectURL(blob);
-  document.head.appendChild(link);
-}
-
-// Capture the install prompt so the Cmd+K overlay can offer "Install App".
-// The browser fires beforeinstallprompt only when the manifest is valid and
-// the app isn't already installed.
-interface BeforeInstallPromptEvent extends Event {
-  prompt(): Promise<void>;
-}
-let deferredInstallPrompt: BeforeInstallPromptEvent | null = null;
-window.addEventListener("beforeinstallprompt", (e) => {
-  e.preventDefault();
-  deferredInstallPrompt = e as BeforeInstallPromptEvent;
-});
-window.addEventListener("appinstalled", () => {
-  deferredInstallPrompt = null;
-});
-export function getInstallPrompt(): BeforeInstallPromptEvent | null {
-  return deferredInstallPrompt;
-}
-export function clearInstallPrompt(): void {
-  deferredInstallPrompt = null;
 }
 
 connectConfigWs();
 
 initWasm().then((wasm) => {
-  render(() => <App wasm={wasm} />, document.getElementById("root")!);
+  // Mount idempotently. `render()` appends and never clears, so a second
+  // execution of this module body would leave two whole app trees in
+  // `#root` — two docks, two BSP containers fighting over the same
+  // workspace's visible sessions, and a document twice the viewport tall.
+  // Nothing should re-execute the entry (see installPrompt.ts on why the
+  // entry must stay importer-free), but the guard is cheap and the failure
+  // mode is not.
+  (import.meta.hot?.data?.dispose as (() => void) | undefined)?.();
+  // Not `getElementById("root")!` — that assertion turned a missing mount
+  // point into "Uncaught (in promise) Error: The `element` passed to
+  // render(...) doesn't exist", which names the symptom and not the cause.
+  // The usual cause is a document that is not index.html (a stray dev
+  // entry, a stale tab), so say that.
+  const root = document.getElementById("root");
+  if (!root) {
+    throw new Error(
+      "blit: no #root element in this document — index.html is the only " +
+        "page that hosts the app; a stale or hand-written entry will not work",
+    );
+  }
+  const dispose = render(() => <App wasm={wasm} />, root);
+  if (import.meta.hot) import.meta.hot.data.dispose = dispose;
 });

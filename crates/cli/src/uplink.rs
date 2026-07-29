@@ -77,7 +77,8 @@ async fn run_loop(
         }
 
         // Try relays in (shuffled) order; a session that was actually
-        // established ends with a fresh control-plane query, per the RFC.
+        // established ends with a fresh control-plane query, per
+        // docs/uplink.md.
         let mut established = false;
         for relay in &pool {
             match run_session(relay, &current).await {
@@ -325,9 +326,9 @@ async fn bridge(mut send: wt::SendStream, mut recv: wt::RecvStream) {
     tokio::join!(down, up);
 }
 
-/// Build a WebTransport client with the RFC's liveness settings (10s
-/// keepalive, 30s idle timeout) and either system-root or pinned TLS
-/// verification.  `wt::ClientBuilder` doesn't expose the quinn transport
+/// Build a WebTransport client with the liveness settings from
+/// docs/uplink.md (10s keepalive, 30s idle timeout) and either
+/// system-root or pinned TLS verification.  `wt::ClientBuilder` doesn't expose the quinn transport
 /// config, so this mirrors its setup by hand.
 fn build_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());

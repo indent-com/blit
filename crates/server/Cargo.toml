@@ -13,11 +13,28 @@ path = "src/lib.rs"
 
 [dependencies]
 blit-remote = { workspace = true }
+blit-fssync = { workspace = true }
+blit-git = { workspace = true }
+blit-lsp = { workspace = true }
 blit-alacritty = { workspace = true }
 blit-compositor = { workspace = true }
 blit-sd-notify = { workspace = true }
 tokio = { version = "1", features = ["full"] }
+# Opt-in TLS termination for relayed streams (docs/design/net.md § TLS
+# termination). Same versions the cli, webrtc-forwarder and upsidedown
+# crates already pin, so nothing new enters the workspace.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+] }
+rustls-native-certs = "0.8"
+ignore = "0.4"
+regex = "1"
 memchr = "2"
+redb = "2"
 openh264 = "0.9"
 rav1e = { version = "0.8", default-features = false }
 ravif = { version = "0.13", default-features = false }

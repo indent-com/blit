@@ -34,6 +34,13 @@
         height: 100%;
         overflow: hidden;
         overscroll-behavior: none;
+        /* Single spacing everywhere by default. blit is a terminal first:
+           code panes, lists and chrome should all sit on the same tight
+           rhythm, and the browser's ~1.2 default was quietly adding
+           leading to everything that never set its own. Prose opts back
+           out explicitly (the commit message header, diagnostic text,
+           switcher subtitles). */
+        line-height: 1;
         -webkit-tap-highlight-color: transparent;
       }
       #root {

@@ -1,5 +1,5 @@
 import { createSignal, onCleanup } from "solid-js";
-import { PALETTES, DEFAULT_FONT } from "@blit-sh/core";
+import { PALETTES, DEFAULT_FONT, DEFAULT_TEXT_GAMMA } from "@blit-sh/core";
 import type { TerminalPalette } from "@blit-sh/core";
 import {
   readStoredPassphrase,
@@ -109,22 +109,126 @@ export function retargetRemote(name: string, newUri: string): void {
   addRemote(name, newUri);
 }
 
+// ---------------------------------------------------------------------------
+// Roots — live list of named IDE workspace roots from the config WebSocket.
+// A root's on-disk value is an opaque `remote:path` spec; we parse it into a
+// (remote, path) pair for the UI. An empty `remote` means the default target.
+// ---------------------------------------------------------------------------
+
+export interface Root {
+  name: string;
+  /** Declared remote name, or "" for the default target. */
+  remote: string;
+  /** Absolute path on that remote. */
+  path: string;
+  /** True for `# name = value` lines: kept on disk but hidden from the picker. */
+  disabled: boolean;
+}
+
+/** Split a `remote:path` value. The remote is the segment before the first
+ *  `:` when it contains no `/` (so absolute paths like `/a:b` stay whole). */
+function splitRootValue(value: string): { remote: string; path: string } {
+  const c = value.indexOf(":");
+  // A remote prefix is the segment before the first ':' only when it has no
+  // '/' AND the remainder is an absolute path — so "remote:/abs" splits but
+  // "/local:x" and "a:b:c" (default target) stay whole and round-trip.
+  if (
+    c > 0 &&
+    !value.slice(0, c).includes("/") &&
+    value.slice(c + 1).startsWith("/")
+  ) {
+    return { remote: value.slice(0, c), path: value.slice(c + 1) };
+  }
+  return { remote: "", path: value };
+}
+
+function joinRootValue(remote: string, path: string): string {
+  return remote ? `${remote}:${path}` : path;
+}
+
+/** Parse a raw blit.roots text (same `name = value` format as remotes). */
+export function parseRootsText(text: string): Root[] {
+  const result: Root[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let body = trimmed;
+    let disabled = false;
+    if (body.startsWith("#")) {
+      body = body.slice(1).trimStart();
+      disabled = true;
+    }
+    const eq = body.indexOf("=");
+    if (eq <= 0) continue;
+    const name = body.slice(0, eq).trim();
+    const value = body.slice(eq + 1).trim();
+    if (!name || !value) continue;
+    const { remote, path } = splitRootValue(value);
+    result.push({ name, remote, path, disabled });
+  }
+  return result;
+}
+
+const [roots, setRootsSignal] = createSignal<Root[]>([]);
+
+/** Reactive accessor — returns the current list of declared workspace roots. */
+export function useRoots(): () => Root[] {
+  return roots;
+}
+
+/** Add or retarget a root. `remote` may be "" for the default target. */
+export function addRoot(name: string, remote: string, path: string): void {
+  if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
+  configWs.send(`roots-add ${name} ${joinRootValue(remote, path)}`);
+}
+
+/** Remove a root by name. */
+export function removeRoot(name: string): void {
+  if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
+  configWs.send(`roots-remove ${name}`);
+}
+
+/** Toggle a root's enabled/disabled state. */
+export function toggleRoot(name: string): void {
+  if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
+  configWs.send(`roots-toggle ${name}`);
+}
+
+/** Reorder roots to match the supplied name sequence. */
+export function reorderRoots(names: string[]): void {
+  if (!configWs || configWs.readyState !== WebSocket.OPEN) return;
+  configWs.send(`roots-reorder ${names.join(" ")}`);
+}
+
 export const HOST_KEY = "blit.host";
 export const PALETTE_KEY = "blit.palette";
 export const FONT_KEY = "blit.fontFamily";
 export const FONT_SIZE_KEY = "blit.fontSize";
-export const FONT_SMOOTHING_KEY = "blit.fontSmoothing";
+/** Glyph antialiasing coverage gamma — see DEFAULT_TEXT_GAMMA. */
+export const TEXT_GAMMA_KEY = "blit.textGamma";
 export const TARGET_KEY = "blit.target";
 export const AUDIO_BITRATE_KEY = "blit.audioBitrate";
 export const AUDIO_MUTED_KEY = "blit.audioMuted";
 export const VIDEO_QUALITY_KEY = "blit.videoQuality";
 export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
+// Panel widths are UI-local (not synced to blit.conf), so they stay out of
+// PERSISTED_KEYS below and round-trip through localStorage only.
+export const LEFT_DOCK_WIDTH_KEY = "blit.leftDockWidth";
+export const PREVIEW_PANEL_WIDTH_KEY = "blit.previewPanelWidth";
+/** Whether the IDE dock is open ("1"/"0"). */
+export const LEFT_DOCK_OPEN_KEY = "blit.leftDockOpen";
+/** Comma-separated list of collapsed dock sections. */
+export const LEFT_COLLAPSED_KEY = "blit.leftCollapsed";
+/** Editor soft-wrap ("1"/"0"). Persisted like the font settings — it is a
+ *  reading preference, not per-machine chrome geometry. */
+export const EDITOR_WRAP_KEY = "blit.editorWrap";
 
 const PERSISTED_KEYS = new Set([
   PALETTE_KEY,
   FONT_KEY,
   FONT_SIZE_KEY,
-  FONT_SMOOTHING_KEY,
+  TEXT_GAMMA_KEY,
+  EDITOR_WRAP_KEY,
   "blit.layouts",
   TARGET_KEY,
   AUDIO_BITRATE_KEY,
@@ -223,6 +327,10 @@ export function connectConfigWs(): void {
     }
     if (msg.startsWith("remotes:")) {
       setRemotesSignal(parseRemotesText(msg.slice("remotes:".length)));
+      return;
+    }
+    if (msg.startsWith("roots:")) {
+      setRootsSignal(parseRootsText(msg.slice("roots:".length)));
       return;
     }
     if (msg.startsWith("wt=")) {
@@ -351,6 +459,19 @@ export function preferredFontSize(): number {
   return 13;
 }
 
+/** Preferred glyph coverage gamma. See DEFAULT_TEXT_GAMMA. */
+export function preferredTextGamma(): number {
+  const q = new URLSearchParams(location.search).get("textGamma");
+  const raw = q ?? readStorage(TEXT_GAMMA_KEY);
+  if (raw) {
+    const n = Number(raw);
+    // Past ~2.5 the thinning eats stems outright, so refuse to render
+    // unreadably; below 1 it fattens, which is a legitimate light-theme want.
+    if (Number.isFinite(n) && n >= 0.5 && n <= 2.5) return n;
+  }
+  return DEFAULT_TEXT_GAMMA;
+}
+
 export function preferredFont(): string {
   const q = new URLSearchParams(location.search).get("font");
   if (q?.trim()) return q.trim();
@@ -393,4 +514,39 @@ export function preferredSurfaceStreaming(): boolean {
   const s = readStorage(SURFACE_STREAMING_KEY);
   if (s === "0") return false;
   return true;
+}
+
+function preferredWidth(key: string, fallback: number): number {
+  const n = parseInt(readStorage(key) ?? "", 10);
+  return Number.isFinite(n) && n >= 160 ? n : fallback;
+}
+
+export function preferredLeftDockWidth(): number {
+  return preferredWidth(LEFT_DOCK_WIDTH_KEY, 260);
+}
+
+export function preferredPreviewPanelWidth(): number {
+  return preferredWidth(PREVIEW_PANEL_WIDTH_KEY, 160);
+}
+
+/** Whether the IDE dock was left open. */
+export function preferredLeftDockOpen(): boolean {
+  return readStorage(LEFT_DOCK_OPEN_KEY) === "1";
+}
+
+type LeftSection = "explorer" | "log" | "problems";
+
+/** The set of collapsed dock sections, persisted as a comma list. Absent
+ *  (first run) collapses Commit Log + Problems so Files (with its folded-in
+ *  changes) shows on its own. */
+export function preferredCollapsedSections(): LeftSection[] {
+  const raw = readStorage(LEFT_COLLAPSED_KEY);
+  if (raw == null) return ["log", "problems"];
+  // An id missing here is silently dropped on every reload, so the
+  // section would come back expanded forever.
+  const valid = new Set(["explorer", "log", "problems"]);
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((p): p is LeftSection => valid.has(p));
 }

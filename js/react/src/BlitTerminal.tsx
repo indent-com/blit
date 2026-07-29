@@ -61,6 +61,7 @@ export function BlitTerminal({
     scrollbarColor,
     scrollbarWidth,
     advanceRatio = ctx.advanceRatio,
+    textGamma = ctx.textGamma,
   } = props;
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -80,6 +81,7 @@ export function BlitTerminal({
       scrollbarColor,
       scrollbarWidth,
       advanceRatio,
+      textGamma,
     });
     surfaceRef.current = surface;
     props.surfaceRef?.(surface);
@@ -139,6 +141,10 @@ export function BlitTerminal({
   useEffect(() => {
     surfaceRef.current?.setAdvanceRatio(advanceRatio);
   }, [advanceRatio]);
+
+  useEffect(() => {
+    surfaceRef.current?.setTextGamma(textGamma);
+  }, [textGamma]);
 
   useEffect(() => {
     surfaceRef.current?.setReadOnly(readOnly);

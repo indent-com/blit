@@ -43,6 +43,18 @@ pathlib.Path('js/ui/dist/index.html.br').write_bytes(brotli.compress(html))
 " 2>/dev/null || cp js/ui/dist/index.html js/ui/dist/index.html.br
 fi
 
+# Same for the preview service worker, which the gateway also embeds.
+if [ ! -f js/ui/dist/sw.js.br ]; then
+    echo "=== Creating stub js/ui/dist/sw.js.br ==="
+    mkdir -p js/ui/dist
+    echo '/* stub */' > js/ui/dist/sw.js
+    python3 -c "
+import brotli, pathlib
+js = pathlib.Path('js/ui/dist/sw.js').read_bytes()
+pathlib.Path('js/ui/dist/sw.js.br').write_bytes(brotli.compress(js))
+" 2>/dev/null || cp js/ui/dist/sw.js js/ui/dist/sw.js.br
+fi
+
 echo "=== Building blit CLI ==="
 # Use the same profiling binary that bin/dev/process-compose builds, rather
 # than downloading a release via install.blit.sh — the installer's cleanup

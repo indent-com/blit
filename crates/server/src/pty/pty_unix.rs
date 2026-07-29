@@ -244,9 +244,13 @@ pub fn close_pty(handle: &PtyHandle) {
 }
 
 pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
-    // Hold the lock across our waitpid so the reap_zombies backstop can't reap
-    // this child (and drop its status) between the table check and the wait.
+    // Take reaped_statuses before deregistering, matching reap_zombies'
+    // reaped-then-pty_pids order: the backstop locks reaped first, so holding
+    // it here excludes the backstop across the deregister and our waitpid.
+    // Deregistering first (outside this lock) would let the backstop reap the
+    // child — seeing it absent from pty_pids, it drops the status on the floor.
     let mut reaped = reaped_statuses().lock().unwrap();
+    pty_pids().lock().unwrap().remove(&handle.child_pid);
     if let Some(status) = reaped.remove(&handle.child_pid) {
         return status;
     }
@@ -260,16 +264,22 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
 }
 
 pub fn reap_zombies() {
-    // Backstop reaper. Record each child's status so its PTY's
-    // collect_exit_status can still report the real code rather than UNKNOWN.
+    // Backstop reaper. Reap every exited child so none becomes a
+    // zombie, but only *park* statuses for PTY-owned pids: a foreign
+    // child (e.g. a blit-lsp language server, reaped by its own engine
+    // on every path) must not leave a stale entry that a later PTY
+    // child recycling its pid would collect.
     let mut reaped = reaped_statuses().lock().unwrap();
+    let owned = pty_pids().lock().unwrap();
     loop {
         let mut wstatus: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut wstatus, libc::WNOHANG) };
         if pid <= 0 {
             break;
         }
-        reaped.insert(pid, status_from_wstatus(wstatus));
+        if owned.contains(&pid) {
+            reaped.insert(pid, status_from_wstatus(wstatus));
+        }
     }
 }
 
@@ -278,6 +288,19 @@ pub fn reap_zombies() {
 fn reaped_statuses() -> &'static Mutex<HashMap<libc::pid_t, i32>> {
     static REAPED: OnceLock<Mutex<HashMap<libc::pid_t, i32>>> = OnceLock::new();
     REAPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Live PTY child pids, so the backstop parks statuses only for
+/// children this module owns. A PTY registers on spawn and deregisters
+/// when its exit status is collected.
+fn pty_pids() -> &'static Mutex<std::collections::HashSet<libc::pid_t>> {
+    static PIDS: OnceLock<Mutex<std::collections::HashSet<libc::pid_t>>> = OnceLock::new();
+    PIDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Register a pid as a live PTY child (backstop-parkable).
+pub(crate) fn register_pty_pid(pid: libc::pid_t) {
+    pty_pids().lock().unwrap().insert(pid);
 }
 
 /// WEXITSTATUS on normal exit, negated signal if signalled, else UNKNOWN.
@@ -291,10 +314,20 @@ fn status_from_wstatus(wstatus: libc::c_int) -> i32 {
     }
 }
 
-pub fn respond_to_queries(handle: &PtyHandle, data: &[u8], size: (u16, u16), cursor: (u16, u16)) {
-    for resp in crate::parse_terminal_queries(data, size, cursor) {
+/// Answer terminal queries found in `data`; returns the last OSC 7
+/// working-directory report seen in the chunk, if any (docs/protocol.md,
+/// "Working directory tracking").
+pub fn respond_to_queries(
+    handle: &PtyHandle,
+    data: &[u8],
+    size: (u16, u16),
+    cursor: (u16, u16),
+) -> Option<String> {
+    let scan = crate::parse_terminal_queries(data, size, cursor);
+    for resp in scan.responses {
         pty_write_all(handle.master_fd, resp.as_bytes());
     }
+    scan.osc7_cwd
 }
 
 pub fn pty_reader(fd: PtyWriteTarget, tx: mpsc::Sender<PtyInput>, notify: Arc<Notify>) {
@@ -509,6 +542,7 @@ pub fn spawn_pty(
         master_fd: master,
         child_pid: pid,
     };
+    register_pty_pid(pid);
     let lflag_cache = pty_lflag(&handle);
 
     Some(crate::Pty {
@@ -528,6 +562,7 @@ pub fn spawn_pty(
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
+        osc7_cwd: None,
     })
 }
 
@@ -678,6 +713,7 @@ pub fn respawn_child(
         master_fd: master,
         child_pid: pid,
     };
+    register_pty_pid(pid);
     Some((handle, reader_handle, byte_rx))
 }
 
@@ -712,6 +748,8 @@ mod tests {
             unsafe { libc::_exit(42) };
         }
 
+        // The backstop parks statuses only for registered PTY children.
+        super::register_pty_pid(pid);
         wait_until_zombie(pid);
         reap_zombies();
 

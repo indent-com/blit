@@ -1,0 +1,205 @@
+/** One authenticated blit connection per destination, owned by the service worker (docs/design/net.md § Where the connection lives). */
+
+import {
+  FEATURE_NET,
+  NetStreams,
+  type NetOpenOptions,
+  type NetStream,
+} from "@blit-sh/core";
+// Imported, never redeclared: a hand-copied opcode is a bug that presents as a connection that hangs until it times out, with nothing on the wire to blame.
+import { S2C_FRAGMENT, S2C_HELLO, S2C_READY } from "@blit-sh/core/types";
+
+const FRAGMENT_FLAG_LAST = 1 << 0;
+
+const AUTH_TIMEOUT_MS = 10_000;
+
+export class RelayUnavailable extends Error {}
+
+/** A live connection to one destination. */
+class DestConnection {
+  readonly streams: NetStreams;
+  private readonly socket: WebSocket;
+  private pending = new Uint8Array(0);
+
+  private constructor(socket: WebSocket) {
+    this.socket = socket;
+    this.streams = new NetStreams((msg) => {
+      // A view into a larger buffer would send the whole buffer; copy so the frame is exactly the message.
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(new Uint8Array(msg).buffer as ArrayBuffer);
+      }
+    });
+    socket.onmessage = (event) => this.onFrame(event);
+    const fail = () => {
+      this.streams.reset(new Error("relay connection lost"));
+    };
+    socket.onclose = fail;
+    socket.onerror = fail;
+  }
+
+  private onFrame(event: MessageEvent): void {
+    if (typeof event.data === "string") return;
+    const bytes = new Uint8Array(event.data as ArrayBuffer);
+    if (bytes.length === 0) return;
+    if (bytes[0] === S2C_FRAGMENT) {
+      if (bytes.length < 2) return;
+      const merged = new Uint8Array(this.pending.length + bytes.length - 2);
+      merged.set(this.pending, 0);
+      merged.set(bytes.subarray(2), this.pending.length);
+      this.pending = merged;
+      if (bytes[1] & FRAGMENT_FLAG_LAST) {
+        const message = this.pending;
+        this.pending = new Uint8Array(0);
+        this.streams.handleMessage(message);
+      }
+      return;
+    }
+    this.streams.handleMessage(bytes);
+  }
+
+  get closed(): boolean {
+    return (
+      this.socket.readyState === WebSocket.CLOSING ||
+      this.socket.readyState === WebSocket.CLOSED
+    );
+  }
+
+  close(): void {
+    try {
+      this.socket.close();
+    } catch {
+      // Already gone.
+    }
+  }
+
+  /** Connect, authenticate, and refuse early if the server has no relay — an old server drops `NET_OPEN` silently and every request would hang. */
+  static connect(url: string, passphrase: string): Promise<DestConnection> {
+    return new Promise((resolve, reject) => {
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(url);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      socket.binaryType = "arraybuffer";
+      let settled = false;
+      let features = 0;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.close();
+        reject(new Error("timed out connecting to the relay"));
+      }, AUTH_TIMEOUT_MS);
+      const finish = (err: Error | null, conn?: DestConnection) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) {
+          socket.close();
+          reject(err);
+        } else {
+          resolve(conn!);
+        }
+      };
+      socket.onopen = () => socket.send(passphrase);
+      socket.onerror = () => finish(new Error("relay connection failed"));
+      socket.onclose = () => finish(new Error("relay closed the connection"));
+      socket.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          if (event.data === "ok") return;
+          finish(
+            new Error(
+              event.data === "auth"
+                ? "authentication failed"
+                : event.data.replace(/^error:/, ""),
+            ),
+          );
+          return;
+        }
+        const bytes = new Uint8Array(event.data as ArrayBuffer);
+        if (bytes.length === 0) return;
+        if (bytes[0] === S2C_HELLO && bytes.length >= 7) {
+          features =
+            bytes[3] | (bytes[4] << 8) | (bytes[5] << 16) | (bytes[6] << 24);
+          return;
+        }
+        if (bytes[0] === S2C_READY) {
+          if ((features & FEATURE_NET) === 0) {
+            finish(
+              new RelayUnavailable(
+                "this blit server has no relay — upgrade it to preview web apps",
+              ),
+            );
+            return;
+          }
+          // Hand the socket over: from here the DestConnection owns its handlers, and everything is a NET message.
+          finish(null, new DestConnection(socket));
+        }
+      };
+    });
+  }
+}
+
+/** Connections by destination, opened on demand and dropped when they die. */
+export class RelayPool {
+  private passphrase: string | null = null;
+  private readonly conns = new Map<string, Promise<DestConnection>>();
+
+  setPassphrase(passphrase: string): void {
+    if (passphrase && passphrase !== this.passphrase) {
+      this.passphrase = passphrase;
+      // A changed credential invalidates every socket authenticated with the old one.
+      for (const [, conn] of this.conns) {
+        conn.then((c) => c.close()).catch(() => {});
+      }
+      this.conns.clear();
+    }
+  }
+
+  get authenticated(): boolean {
+    return this.passphrase !== null;
+  }
+
+  /** Open a relayed socket to `host:port` on `dest`. */
+  async open(
+    dest: string,
+    host: string,
+    port: number,
+    options: NetOpenOptions = {},
+  ): Promise<NetStream> {
+    const conn = await this.connection(dest);
+    return conn.streams.open(host, port, options);
+  }
+
+  private async connection(dest: string): Promise<DestConnection> {
+    const existing = this.conns.get(dest);
+    if (existing) {
+      try {
+        const conn = await existing;
+        if (!conn.closed) return conn;
+      } catch {
+        // Fall through and retry once; a stale rejection must not be sticky.
+      }
+      this.conns.delete(dest);
+    }
+    if (!this.passphrase) {
+      throw new Error("no passphrase yet — open the blit UI in a tab");
+    }
+    const url = destUrl(dest);
+    const attempt = DestConnection.connect(url, this.passphrase);
+    this.conns.set(dest, attempt);
+    try {
+      return await attempt;
+    } catch (err) {
+      this.conns.delete(dest);
+      throw err;
+    }
+  }
+}
+
+/** The gateway's per-destination WebSocket path (`/d/{name}`). */
+function destUrl(dest: string): string {
+  const proto = self.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${self.location.host}/d/${encodeURIComponent(dest)}`;
+}

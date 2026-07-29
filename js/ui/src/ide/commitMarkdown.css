@@ -1,0 +1,133 @@
+.blit-commit-markdown {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.blit-commit-markdown > :first-child,
+.blit-commit-markdown > :first-child > :first-child {
+  margin-top: 0;
+}
+
+.blit-commit-markdown > :last-child,
+.blit-commit-markdown > :last-child > :last-child {
+  margin-bottom: 0;
+}
+
+.blit-commit-markdown--subject {
+  font-weight: 700;
+}
+
+.blit-commit-markdown--subject :where(p, h1, h2, h3, h4, h5, h6) {
+  margin: 0;
+  font: inherit;
+}
+
+.blit-commit-markdown--body {
+  margin-top: 0.4em;
+}
+
+.blit-commit-markdown--body :where(p, ul, ol, blockquote, pre, table, hr) {
+  margin: 0 0 0.75em;
+}
+
+.blit-commit-markdown--body :where(h1, h2, h3, h4, h5, h6) {
+  margin: 1em 0 0.4em;
+  line-height: 1.2;
+}
+
+.blit-commit-markdown--body h1 {
+  font-size: 1.35em;
+}
+
+.blit-commit-markdown--body h2 {
+  font-size: 1.25em;
+}
+
+.blit-commit-markdown--body h3 {
+  font-size: 1.15em;
+}
+
+.blit-commit-markdown--body :where(h4, h5, h6) {
+  font-size: 1em;
+}
+
+.blit-commit-markdown :where(ul, ol) {
+  padding-left: 2em;
+}
+
+.blit-commit-markdown li + li {
+  margin-top: 0.2em;
+}
+
+.blit-commit-markdown blockquote {
+  padding-left: 0.8em;
+  border-left: 3px solid currentColor;
+  opacity: 0.8;
+}
+
+.blit-commit-markdown code {
+  padding: 0.08em 0.3em;
+  border: 1px solid rgb(127 127 127 / 25%);
+  border-radius: 3px;
+  background: rgb(127 127 127 / 12%);
+  font: inherit;
+}
+
+.blit-commit-markdown pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.7em;
+  border: 1px solid rgb(127 127 127 / 25%);
+  border-radius: 4px;
+  background: rgb(127 127 127 / 12%);
+  white-space: pre;
+  word-break: normal;
+}
+
+.blit-commit-markdown pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.blit-commit-markdown a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.blit-commit-markdown img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.blit-commit-markdown hr {
+  border: 0;
+  border-top: 1px solid currentColor;
+  opacity: 0.35;
+}
+
+.blit-commit-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.blit-commit-markdown :where(th, td) {
+  padding: 0.3em 0.5em;
+  border: 1px solid rgb(127 127 127 / 35%);
+  text-align: left;
+}
+
+/* A markdown *preview* renders links as inert spans (ide/BlitPreview): a
+   relative link would resolve against the app's own origin, and a preview
+   is a viewer. Style them so they still read as links, without the
+   affordance of something clickable. */
+.blit-md-link {
+  color: var(--blit-md-link, inherit);
+  border-bottom: 1px dotted currentColor;
+  opacity: 0.85;
+  cursor: default;
+}

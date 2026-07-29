@@ -62,6 +62,39 @@ pub enum Command {
         command: Option<ClipboardCommand>,
     },
 
+    /// Mirror server filesystem state (docs/fs-watch.md)
+    Fs {
+        #[command(subcommand)]
+        command: FsCommand,
+    },
+
+    /// Inspect git repositories on the server (docs/git.md)
+    Git {
+        #[command(subcommand)]
+        command: GitCommand,
+    },
+
+    /// Read and write the server's key/value store (docs/design/kv.md)
+    ///
+    /// A prefix-watchable store the server already keeps for the web app's
+    /// settings; it doubles as host-local scratch space for scripts.
+    Kv {
+        #[command(subcommand)]
+        command: KvCommand,
+    },
+
+    /// Query language servers on the server (docs/design/lsp.md)
+    ///
+    /// Language servers are discovered by project markers (Cargo.toml,
+    /// go.mod, tsconfig.json, …), spawned lazily, and stay warm across
+    /// invocations. Positions are 1-based PATH:LINE:COL. First calls in
+    /// a fresh workspace may report "warming up" — retry, or run
+    /// `blit lsp wait`.
+    Lsp {
+        #[command(subcommand)]
+        command: LspCommand,
+    },
+
     /// Manage named remotes in blit.remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
@@ -121,6 +154,46 @@ pub enum Command {
         url: String,
     },
 
+    /// Forward local ports to the server's network (TCP and UDP)
+    ///
+    /// Specs are `[kind/][bind:]port:host:hostport`, where kind is tcp
+    /// (default) or udp, bind defaults to 127.0.0.1, and a local port of 0
+    /// picks a free one. Every spec rides one connection; all listeners bind
+    /// before any serves, so a bind failure leaves nothing running.
+    ///
+    /// Forwards end with the process — the listening socket is local, so
+    /// there is nothing to reattach to.
+    ///
+    /// Examples:
+    ///   blit forward 8080:localhost:3000
+    ///   blit forward 8080:localhost:3000 5432:db.internal:5432
+    ///   blit forward udp/5353:resolver.internal:53
+    ///   blit forward tls/8443:api.internal:443   # server terminates TLS
+    ///   blit forward --all                    # every enabled blit.forwards entry
+    ///   blit forward add web 8080:localhost:3000
+    ///   blit forward list
+    #[command(alias = "f")]
+    Forward {
+        /// Forward specs, or a named entry's management subcommand
+        #[arg(value_name = "SPEC")]
+        specs: Vec<String>,
+
+        /// Start every enabled entry in ~/.config/blit/blit.forwards
+        #[arg(long)]
+        all: bool,
+
+        /// ALPN protocols to offer on tls/ forwards, in preference order
+        /// (e.g. --alpn h2,http/1.1). Omitted offers no ALPN, which is not
+        /// the same as offering http/1.1.
+        #[arg(long, value_delimiter = ',')]
+        alpn: Vec<String>,
+
+        /// Skip certificate verification on tls/ forwards. The server must
+        /// also permit it (blit server --allow-forward-insecure).
+        #[arg(long)]
+        insecure: bool,
+    },
+
     /// Print the full CLI reference (usage guide for scripts and LLM agents)
     Learn,
 
@@ -147,6 +220,20 @@ pub enum Command {
         /// (or set BLIT_EXPORT_SOCK=1)
         #[arg(long)]
         export_sock: bool,
+
+        /// Restrict what the TCP/UDP relay may reach: host[:ports], where
+        /// host is a name, a *.suffix glob, an address, a CIDR block, or *,
+        /// and ports is a comma-separated list of n or n-m. Repeatable (or
+        /// set BLIT_ALLOW_FORWARD to a comma-separated list). Unrestricted
+        /// when absent; loopback is always permitted.
+        #[arg(long, value_name = "PATTERN")]
+        allow_forward: Vec<String>,
+
+        /// Permit relayed TLS streams to skip certificate verification (or set
+        /// BLIT_ALLOW_FORWARD_INSECURE=1). Right for a self-signed dev server
+        /// on loopback, wrong for anything reached across a network.
+        #[arg(long)]
+        allow_forward_insecure: bool,
 
         /// Enable verbose logging
         #[arg(long, short)]
@@ -215,7 +302,7 @@ pub enum Command {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum TerminalCommand {
-    /// List all terminals (TSV: ID, TAG, TITLE, STATUS)
+    /// List all terminals (TSV: ID, TAG, TITLE, COMMAND, CWD, STATUS)
     #[command(alias = "ls")]
     List,
 
@@ -628,6 +715,32 @@ pub enum TerminalCommand {
         id: u16,
     },
 
+    /// Attach this terminal to a remote one (Ctrl-] detaches)
+    ///
+    /// Puts the local tty in raw mode, forwards keystrokes, and repaints
+    /// the remote grid. Needs a real terminal on stdin. Exits with the
+    /// remote program's status if it finishes while attached.
+    Attach {
+        /// Terminal ID
+        id: u16,
+    },
+
+    /// Set a terminal's viewport size
+    ///
+    /// The size is a client *request*: the server reconciles the desired
+    /// sizes of every attached viewer, so another connected client can
+    /// hold the grid larger than this.
+    Resize {
+        /// Terminal ID
+        id: u16,
+
+        /// Columns
+        cols: u16,
+
+        /// Rows
+        rows: u16,
+    },
+
     /// Record timestamped terminal output
     ///
     /// Writes a compact binary format (BLITREC) with microsecond timestamps.
@@ -722,6 +835,41 @@ pub enum SurfaceCommand {
         key: String,
     },
 
+    /// Scroll a surface
+    ///
+    /// AMOUNT is in wheel units; positive scrolls down (or right with
+    /// --horizontal). Fractions are allowed — the wire carries hundredths.
+    Scroll {
+        /// Surface ID
+        id: u16,
+
+        /// Wheel units; positive = down/right
+        amount: f64,
+
+        /// Scroll horizontally instead of vertically
+        #[arg(long)]
+        horizontal: bool,
+    },
+
+    /// Give a surface keyboard and pointer focus
+    Focus {
+        /// Surface ID
+        id: u16,
+    },
+
+    /// Commit literal UTF-8 text to a surface
+    ///
+    /// Unlike `type`, this sends the text itself rather than synthesised
+    /// US-QWERTY keystrokes, so non-ASCII characters actually arrive. It
+    /// has no {braces} syntax — use `key` for special keys.
+    Text {
+        /// Surface ID
+        id: u16,
+
+        /// Text to commit
+        text: String,
+    },
+
     /// Type text into a surface (xdotool-style: {Return}, {ctrl+a} for special keys)
     Type {
         /// Surface ID
@@ -782,6 +930,690 @@ pub enum ClipboardCommand {
 
         /// Text to set (if omitted, reads from stdin)
         text: Option<String>,
+    },
+}
+
+// ── Fs subcommands ───────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum FsCommand {
+    /// Mirror a directory tree from the server, streaming changes
+    ///
+    /// Prints the initial snapshot once it is coherent, then one line per
+    /// change (`+` added, `~` modified, `-` deleted, `>` moved). With
+    /// --json, emits one NDJSON event per record (`upsert`, `delete`,
+    /// `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
+    Sync {
+        /// Path on the server (absolute, or relative to the server's cwd)
+        path: String,
+
+        /// Sync file contents too (hashes always sync)
+        #[arg(long)]
+        content: bool,
+
+        /// Watch only the path and its immediate children
+        #[arg(long)]
+        no_recursive: bool,
+
+        /// Exit after the initial snapshot instead of streaming
+        #[arg(long)]
+        once: bool,
+
+        /// NDJSON event output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Write a file from stdin, with conflict detection
+    ///
+    /// Content is read from stdin. By default an unconditional overwrite;
+    /// --create fails if the file exists, --if-hash writes only if the
+    /// current content matches. Exit 1 on conflict.
+    Write {
+        /// Path to write, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Write only if the current content hash equals this hex value
+        #[arg(long, conflicts_with_all = ["create", "force"])]
+        if_hash: Option<String>,
+
+        /// Create only if the path does not already exist
+        #[arg(long, conflicts_with_all = ["if_hash", "force"])]
+        create: bool,
+
+        /// Overwrite unconditionally (ignore any precondition)
+        #[arg(long)]
+        force: bool,
+
+        /// Create missing parent directories
+        #[arg(long)]
+        parents: bool,
+
+        /// fsync the file and its parent before returning
+        #[arg(long)]
+        durable: bool,
+
+        /// File mode in octal (e.g. 644); default preserves or umask
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Create a directory
+    Mkdir {
+        /// Path to create, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Create missing parent directories
+        #[arg(long)]
+        parents: bool,
+
+        /// Directory mode in octal (e.g. 700)
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a file or directory subtree
+    Rm {
+        /// Path to remove, relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Remove only if the current content hash equals this hex value
+        #[arg(long)]
+        if_hash: Option<String>,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rename or move a file or subtree
+    Mv {
+        /// Source path, relative to --root
+        from: String,
+
+        /// Destination path, relative to --root
+        to: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Create missing parent directories of the destination
+        #[arg(long)]
+        parents: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Create a hard link, or a symlink with -s (like ln(1))
+    Ln {
+        /// Existing file path relative to --root; with -s, the verbatim
+        /// symlink target (relative, absolute, or dangling)
+        target: String,
+
+        /// Link path to create, relative to --root
+        link: String,
+
+        /// Create a symlink instead of a hard link
+        #[arg(short = 's', long)]
+        symlink: bool,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Replace only if the current entry's content hash equals this
+        /// hex value (a symlink's hash covers its target bytes)
+        #[arg(long, conflicts_with = "force")]
+        if_hash: Option<String>,
+
+        /// Replace an existing entry unconditionally
+        #[arg(long)]
+        force: bool,
+
+        /// Create missing parent directories of the link
+        #[arg(long)]
+        parents: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search file contents across a tree (docs/design/fs-grep.md)
+    ///
+    /// Examples:
+    ///   blit fs grep needle                    # literal, case-insensitive
+    ///   blit fs grep -e 'fn \\w+' --root crates # regex
+    ///   blit fs grep -sw Config                # case-sensitive whole word
+    ///   blit fs grep --no-ignore TODO          # include gitignored files
+    ///   blit fs grep -l needle                 # matching paths only
+    ///
+    /// Prints PATH:LINE:TEXT, like grep(1). Exits 1 when nothing matched.
+    Grep {
+        /// Pattern: a literal string, or a regex with -e
+        pattern: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Treat the pattern as a regular expression
+        #[arg(short = 'e', long)]
+        regex: bool,
+
+        /// Match case exactly (the default is case-insensitive)
+        #[arg(short = 's', long)]
+        case_sensitive: bool,
+
+        /// Match whole words only
+        #[arg(short = 'w', long)]
+        word: bool,
+
+        /// Search gitignored files too; they rank after tracked ones.
+        /// Much slower on a tree with build output.
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Stop after this many matching files (0 = server default)
+        #[arg(short = 'm', long, default_value_t = 0)]
+        max_matches: u16,
+
+        /// Print only the paths that contain a match
+        #[arg(short = 'l', long)]
+        files_with_matches: bool,
+
+        /// NDJSON output, one object per match
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print a file's contents to stdout (bytes, unmodified)
+    Cat {
+        /// File path relative to --root
+        path: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+    },
+
+    /// Fuzzy-find files by path (docs/design/fs-search.md)
+    ///
+    /// Scores a subsequence match over each root-relative path, best
+    /// first. Exits 1 when nothing matched.
+    Find {
+        /// Query to match against paths
+        query: String,
+
+        /// Root directory on the server (relative to the client's cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Maximum number of paths to return
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: u16,
+
+        /// NDJSON output, one object per path
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Git subcommands ──────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum GitCommand {
+    /// Branch, ahead/behind, stash, and working-tree status
+    Status {
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Keep watching, reprinting whenever the status changes
+        #[arg(long)]
+        watch: bool,
+
+        /// NDJSON output (one state snapshot per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Commit history, newest first
+    ///
+    /// Examples:
+    ///   blit git log                 # HEAD
+    ///   blit git log v1.0            # from a tag
+    ///   blit git log main..feature   # a range
+    ///   blit git log --watch main..HEAD
+    ///   blit git log --follow -- src/main.rs
+    Log {
+        /// Revision or range to log (default: HEAD). A ref, (short) oid,
+        /// HEAD~N, or a range A..B / A...B.
+        rev: Option<String>,
+
+        /// Restrict to commits touching this path (after `--`)
+        #[arg(last = true)]
+        pathspec: Vec<String>,
+
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Maximum commits to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: u16,
+
+        /// Keep the log live, refreshing as its endpoint refs move
+        #[arg(long)]
+        watch: bool,
+
+        /// Follow a single file across renames (needs a path)
+        #[arg(long)]
+        follow: bool,
+
+        /// Follow only the first parent of each merge
+        #[arg(long)]
+        first_parent: bool,
+
+        /// Include the full commit message, not just the subject
+        #[arg(long)]
+        full_message: bool,
+
+        /// Topological order (parents after children) within the page
+        #[arg(long)]
+        topo: bool,
+
+        /// NDJSON output (one commit per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Changed files (unstaged by default), optionally with per-file hunks
+    ///
+    /// Examples:
+    ///   blit git diff                # worktree vs index (unstaged)
+    ///   blit git diff --staged       # index vs HEAD (staged)
+    ///   blit git diff main           # worktree vs a commit
+    ///   blit git diff main dev       # between two commits
+    ///   blit git diff main..dev      # same as: main dev
+    ///   blit git diff main...dev     # since they diverged (merge base)
+    ///   blit git diff HEAD~2 -- src  # limited to a path
+    Diff {
+        /// Revisions to compare: none (worktree vs index), one (that
+        /// revision vs the worktree, or the index with --staged), two
+        /// (between them), or a single A..B / A...B range. Each is a ref,
+        /// (short) oid, or HEAD~N.
+        revs: Vec<String>,
+
+        /// Restrict to this path (after `--`)
+        #[arg(last = true)]
+        pathspec: Vec<String>,
+
+        /// Repository location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Compare the index to HEAD (staged changes) instead of the worktree
+        #[arg(long)]
+        staged: bool,
+
+        /// Show per-file hunks, not just the changed-file list
+        #[arg(short = 'p', long)]
+        patch: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print an object's bytes (like `git cat-file` / `git show`)
+    ///
+    /// Examples:
+    ///   blit git show HEAD:src/main.rs   # a file at a revision
+    ///   blit git show v1.0:Cargo.toml
+    ///   blit git show HEAD               # the commit object itself
+    Show {
+        /// REV[:PATH]. Omit PATH for the commit object; omit REV
+        /// (`:path`) for HEAD.
+        spec: String,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Stop after this many bytes
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_len: u32,
+    },
+
+    /// List one tree level (like `git ls-tree`)
+    ///
+    /// TSV: MODE TYPE OID<TAB>NAME. Not recursive — pass a path to
+    /// descend.
+    LsTree {
+        /// REV[:PATH]; omit PATH for the root tree
+        spec: String,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List the index (like `git ls-files --stage`)
+    ///
+    /// TSV: MODE STAGE OID<TAB>PATH. Conflicted paths appear once per
+    /// stage (1 = base, 2 = ours, 3 = theirs).
+    LsFiles {
+        /// Restrict to this path prefix
+        #[arg(default_value = "")]
+        path: String,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Best common ancestors of two or more revisions
+    ///
+    /// Exits 1 when the histories are unrelated, as git does.
+    MergeBase {
+        /// Two or more revisions
+        #[arg(required = true, num_args = 2..)]
+        revs: Vec<String>,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Kv subcommands ───────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum KvCommand {
+    /// Print one value's bytes to stdout
+    ///
+    /// Exits 1 when the key is absent — that is an empty answer, not an
+    /// error, so `if blit kv get k >/dev/null; then` reads naturally.
+    Get {
+        /// Key
+        key: String,
+    },
+
+    /// Set one value, from an argument or stdin
+    ///
+    /// Compare-and-swap by default: pass --if-hash to require the current
+    /// value, or --force to overwrite unconditionally. Exit 1 on conflict.
+    Put {
+        /// Key
+        key: String,
+
+        /// Value; omit to read it from stdin
+        value: Option<String>,
+
+        /// Write only if the current value's hash equals this hex value
+        #[arg(long, conflicts_with = "force")]
+        if_hash: Option<String>,
+
+        /// Overwrite unconditionally
+        #[arg(long)]
+        force: bool,
+
+        /// Wait for the write to reach disk before answering
+        #[arg(long)]
+        durable: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete one key
+    Rm {
+        /// Key
+        key: String,
+
+        /// Delete only if the current value's hash equals this hex value
+        #[arg(long, conflicts_with = "force")]
+        if_hash: Option<String>,
+
+        /// Delete unconditionally
+        #[arg(long)]
+        force: bool,
+
+        /// Wait for the delete to reach disk before answering
+        #[arg(long)]
+        durable: bool,
+
+        /// JSON result output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List the keys under a prefix (TSV: KEY, SIZE)
+    Ls {
+        /// Key prefix; omit for the whole store
+        #[arg(default_value = "")]
+        prefix: String,
+
+        /// Keep streaming changes after the first snapshot
+        #[arg(long)]
+        watch: bool,
+
+        /// Include values (TSV gains a third column)
+        #[arg(long)]
+        values: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Lsp subcommands ──────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum LspCommand {
+    /// Definition of the symbol at PATH:LINE:COL
+    Def {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one location per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// References to the symbol at PATH:LINE:COL
+    Refs {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Include the declaration itself
+        #[arg(long)]
+        declaration: bool,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one location per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Type and docs of the symbol at PATH:LINE:COL
+    Hover {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Completions at PATH:LINE:COL (TSV: LABEL, KIND, DETAIL)
+    ///
+    /// What a language server offers for the identifier being typed
+    /// there. `cut -f1` gives a plain label list.
+    Complete {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Signature help at PATH:LINE:COL
+    ///
+    /// Prints the signature, underlines the active parameter, then any
+    /// documentation.
+    Signature {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search workspace symbols, or outline one file with --file
+    Symbols {
+        /// Fuzzy symbol query (workspace-wide; empty lists everything
+        /// the server returns)
+        query: Option<String>,
+
+        /// Outline this file instead of searching the workspace
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one symbol per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Current diagnostics for the workspace or one path
+    ///
+    /// Exit code 1 when diagnostics exist, 0 when clean.
+    #[command(alias = "diag")]
+    Diagnostics {
+        /// Only diagnostics for this file or directory
+        path: Option<String>,
+
+        /// Keep watching, reprinting as diagnostics change
+        #[arg(long)]
+        watch: bool,
+
+        /// Wait for language servers to finish indexing first
+        #[arg(long)]
+        wait: bool,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one diagnostic per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rename plan for the symbol at PATH:LINE:COL (prints the edits,
+    /// never applies them)
+    Rename {
+        /// Position, 1-based (e.g. src/main.rs:10:4)
+        spec: String,
+
+        /// The new name
+        new_name: String,
+
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// NDJSON output (one edit per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Block until the workspace's language servers are ready
+    Wait {
+        /// Workspace location on the server (default: server cwd)
+        #[arg(long, default_value = ".")]
+        root: String,
+
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+
+    /// List running language servers
+    #[command(alias = "ls")]
+    List {
+        /// NDJSON output (one server per line)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop a language server by ref (see `blit lsp list`)
+    Stop {
+        /// Server ref from `blit lsp list`
+        server_ref: u16,
     },
 }
 

@@ -40,6 +40,9 @@ export interface KeyboardShortcutHandlers {
   cancelOverlay: () => void;
   toggleDebug: () => void;
   togglePreviewPanel: () => void;
+  toggleLeftPanel: (panel: "explorer" | "log" | "problems") => void;
+  /** Show/hide the project-search top pane. */
+  toggleSearch: () => void;
   createAndFocus: () => Promise<void>;
   createInPane: (paneId: string) => Promise<void>;
   openNewTerminalPicker: (paneId?: string) => void;
@@ -49,8 +52,19 @@ export interface KeyboardShortcutHandlers {
   focusBySession: (sessionId: SessionId) => void;
   /** Clear the assignment for the focused BSP pane (remove term without closing) */
   clearFocusedPaneAssignment: () => void;
+  /**
+   * Send the focused IDE tile (non-BSP focused tile, or a tile occupying the
+   * focused BSP pane) to the recoverable background list. Returns true if a
+   * tile was backgrounded (so the caller stops handling the key).
+   */
+  backgroundFocusedTile: () => boolean;
+  /** Close the focused IDE tile outright (no dock parking). */
+  closeFocusedTile: () => boolean;
   /** Reset the audio pipeline on all connections to recover from stalled audio */
   resetAudio: () => void;
+  /** Navigate the focused tile pane's history back / forward (like a browser). */
+  navigateBack: () => void;
+  navigateForward: () => void;
 }
 
 /**
@@ -140,13 +154,21 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       h.handleRestartOrClose();
       return true;
     };
+    const isMacLike = /Mac|iPhone|iPad/.test(navigator.platform);
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
 
       if (mod && !e.shiftKey && e.key === "k") {
-        e.preventDefault();
-        h.toggleOverlay("expose");
-        return;
+        // On a Mac keyboard, Ctrl+K in a focused terminal is the shell's
+        // kill-line — only Cmd+K opens the switcher there. (Elsewhere
+        // Ctrl+K is the app's only binding, so it keeps winning.)
+        const ctrlOnlyInTerminal =
+          isMacLike && !e.metaKey && isTerminalInput(eventElement(e.target));
+        if (!ctrlOnlyInTerminal) {
+          e.preventDefault();
+          h.toggleOverlay("expose");
+          return;
+        }
       }
       if (e.ctrlKey && e.shiftKey && (e.key === "?" || e.code === "Slash")) {
         e.preventDefault();
@@ -161,6 +183,52 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       if (e.ctrlKey && e.shiftKey && e.key === "B") {
         e.preventDefault();
         h.togglePreviewPanel();
+        return;
+      }
+      // Ctrl+Shift+E/L/P: reveal a left-dock section. (Changes is folded into
+      // Files, so its former Ctrl+Shift+G is retired.)
+      if (e.ctrlKey && e.shiftKey && e.key === "E") {
+        e.preventDefault();
+        h.toggleLeftPanel("explorer");
+        return;
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === "F") {
+        e.preventDefault();
+        h.toggleSearch();
+        return;
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === "L") {
+        e.preventDefault();
+        h.toggleLeftPanel("log");
+        return;
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+        e.preventDefault();
+        h.toggleLeftPanel("problems");
+        return;
+      }
+      // Ctrl+Alt+←/→: navigate the focused tile pane's history (back/forward).
+      if (e.ctrlKey && e.altKey && !e.shiftKey && e.key === "ArrowLeft") {
+        e.preventDefault();
+        h.navigateBack();
+        return;
+      }
+      if (e.ctrlKey && e.altKey && !e.shiftKey && e.key === "ArrowRight") {
+        e.preventDefault();
+        h.navigateForward();
+        return;
+      }
+      // Ctrl+Shift+O: open a URL as a web pane. (Chrome binds this to its
+      // bookmark manager on Windows/Linux; it is one line to change here.)
+      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "O") {
+        e.preventDefault();
+        h.toggleOverlay("web");
+        return;
+      }
+      // Ctrl+Shift+K: manage workspace roots.
+      if (e.ctrlKey && e.shiftKey && e.key === "K") {
+        e.preventDefault();
+        h.toggleOverlay("roots");
         return;
       }
       // Ctrl+Shift+A: reset audio pipeline (recover from stalled audio).
@@ -213,6 +281,12 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         (e.key === "Q" || e.key === "q" || e.code === "KeyQ")
       ) {
         if (h.overlay()) return;
+        // IDE tile first: a non-BSP focused tile, or a tile in the focused BSP
+        // pane, goes to the recoverable background list (Cmd+K to restore).
+        if (h.backgroundFocusedTile()) {
+          e.preventDefault();
+          return;
+        }
         // Non-BSP surface focus: unfocus the surface (return to terminal view).
         if (h.focusedSurfaceId() != null) {
           e.preventDefault();
@@ -244,6 +318,10 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       ) {
         if (h.overlay()) return;
         e.preventDefault();
+        // IDE tile first, same precedence as Ctrl+Shift+Q above — otherwise
+        // the chord fell through to the focused *session* and closed a
+        // terminal out from under an editor that had focus.
+        if (h.closeFocusedTile()) return;
         // Non-BSP surface focus.
         const sid = h.focusedSurfaceId();
         const sConnId = h.focusedSurfaceConnId();

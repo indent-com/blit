@@ -64,6 +64,173 @@ export function parseSurfaceAssignment(
   return Number.isFinite(n) ? { connectionId, surfaceId: n } : null;
 }
 
+// IDE tiles (docs/ide-plan.md PR-6/7): non-session, non-surface pane content
+// — a CodeMirror editor or a git diff — dispatched by assignment shape like
+// surfaces. The argument is a filesystem path, so it may contain ":" and "/":
+// the parser splits only the leading "<kind>:<conn>:" and keeps the rest
+// verbatim (unlike the surface parser's lastIndexOf, which would corrupt it).
+const EDITOR_PREFIX = "editor:";
+const DIFF_PREFIX = "diff:";
+const COMMIT_PREFIX = "commit:";
+const PREVIEW_PREFIX = "preview:";
+
+/** BSP assignment for an editor tile: "editor:<connectionId>:<path>". */
+export function editorAssignment(connectionId: string, path: string): string {
+  return `${EDITOR_PREFIX}${connectionId}:${path}`;
+}
+
+/** BSP assignment for a rendered preview of a file:
+ *  "preview:<connectionId>:<path>". Same shape as an editor tile — it is
+ *  the same file, shown rendered instead of as source, and the view
+ *  switcher flips between them. */
+export function previewAssignment(connectionId: string, path: string): string {
+  return `${PREVIEW_PREFIX}${connectionId}:${path}`;
+}
+
+/** BSP assignment for a git diff tile: "diff:<connectionId>:<path>" for the
+ *  unstaged (INDEX×WORKTREE) diff, or ":staged:<path>" for the staged
+ *  (HEAD×INDEX) diff. `path` is absolute (starts with "/"), so the "staged:"
+ *  marker is unambiguous. */
+/** Which endpoints a diff tile compares.
+ *  - "unstaged":  INDEX×WORKTREE (tracked, unstaged edits)
+ *  - "staged":    HEAD×INDEX (git diff --cached)
+ *  - "untracked": INDEX×WORKTREE + untracked walk (a new file, shown added)
+ *  - "worktree":  HEAD×WORKTREE (all changes since HEAD, staged + unstaged) */
+export type DiffSide = "unstaged" | "staged" | "untracked" | "worktree";
+
+export function diffAssignment(
+  connectionId: string,
+  path: string,
+  side: DiffSide = "unstaged",
+): string {
+  const prefix = side === "unstaged" ? "" : `${side}:`;
+  return `${DIFF_PREFIX}${connectionId}:${prefix}${path}`;
+}
+
+/** Decode a diff tile's arg into { side, staged, path }. `staged` is kept as a
+ *  convenience alias for `side === "staged"`. */
+export function parseDiffArg(arg: string): {
+  side: DiffSide;
+  staged: boolean;
+  path: string;
+} {
+  for (const side of ["staged", "untracked", "worktree"] as const) {
+    const prefix = `${side}:`;
+    if (arg.startsWith(prefix)) {
+      return {
+        side,
+        staged: side === "staged",
+        path: arg.slice(prefix.length),
+      };
+    }
+  }
+  return { side: "unstaged", staged: false, path: arg };
+}
+
+/** BSP assignment for a commit tile: "commit:<connectionId>:<oid>:<repoPath>".
+ *  `oid` is hex (no ":"), so the first ":" of the arg splits oid from repo. */
+export function commitAssignment(
+  connectionId: string,
+  oid: string,
+  repoPath: string,
+): string {
+  return `${COMMIT_PREFIX}${connectionId}:${oid}:${repoPath}`;
+}
+
+/** True when the assignment is an editor/diff/commit tile (not a session). */
+export function isTileAssignment(value: string | null): boolean {
+  return (
+    value != null &&
+    (value.startsWith(EDITOR_PREFIX) ||
+      value.startsWith(DIFF_PREFIX) ||
+      value.startsWith(COMMIT_PREFIX) ||
+      value.startsWith(PREVIEW_PREFIX))
+  );
+}
+
+/** True when the assignment names pane content rather than a terminal session
+ *  — a surface, an IDE tile, or a web pane. Anything that answers true here
+ *  must be kept out of session assignment and focus bookkeeping. */
+export function isContentAssignment(value: string | null): boolean {
+  return (
+    isSurfaceAssignment(value) ||
+    isTileAssignment(value) ||
+    isWebAssignment(value)
+  );
+}
+
+export interface TileAssignment {
+  kind: "editor" | "diff" | "commit" | "preview";
+  connectionId: string;
+  /** Verbatim argument (a path, or "<oid>:<repoPath>" for commit). */
+  arg: string;
+}
+
+/** Parse an editor/diff/commit tile assignment, or null. */
+export function parseTileAssignment(
+  value: string | null,
+): TileAssignment | null {
+  let kind: TileAssignment["kind"];
+  let prefix: string;
+  if (value != null && value.startsWith(EDITOR_PREFIX)) {
+    kind = "editor";
+    prefix = EDITOR_PREFIX;
+  } else if (value != null && value.startsWith(DIFF_PREFIX)) {
+    kind = "diff";
+    prefix = DIFF_PREFIX;
+  } else if (value != null && value.startsWith(COMMIT_PREFIX)) {
+    kind = "commit";
+    prefix = COMMIT_PREFIX;
+  } else if (value != null && value.startsWith(PREVIEW_PREFIX)) {
+    kind = "preview";
+    prefix = PREVIEW_PREFIX;
+  } else {
+    return null;
+  }
+  const rest = value.slice(prefix.length);
+  const colon = rest.indexOf(":");
+  if (colon <= 0) return null;
+  return {
+    kind,
+    connectionId: rest.slice(0, colon),
+    arg: rest.slice(colon + 1),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Web pane assignment helpers
+// ---------------------------------------------------------------------------
+
+// A web pane is an iframe onto something the server can reach — a dev server,
+// an internal dashboard — served through the preview service worker
+// (docs/design/net.md). Same dispatch-by-assignment-shape as surfaces and IDE
+// tiles. The argument is a URL, so it contains ":" and "/" and the parser
+// splits only the leading "web:<conn>:" and keeps the rest verbatim.
+const WEB_PREFIX = "web:";
+
+/** BSP assignment for a web pane: "web:<connectionId>:<url>". */
+export function webAssignment(connectionId: string, url: string): string {
+  return `${WEB_PREFIX}${connectionId}:${url}`;
+}
+
+/** Check whether a BSP assignment value represents a web pane. */
+export function isWebAssignment(value: string | null): boolean {
+  return value != null && value.startsWith(WEB_PREFIX);
+}
+
+/** Parse a web pane assignment into its connection and URL, or null. */
+export function parseWebAssignment(
+  value: string | null,
+): { connectionId: string; url: string } | null {
+  if (value == null || !value.startsWith(WEB_PREFIX)) return null;
+  const rest = value.slice(WEB_PREFIX.length);
+  const colon = rest.indexOf(":");
+  if (colon <= 0) return null;
+  const url = rest.slice(colon + 1);
+  if (!url) return null;
+  return { connectionId: rest.slice(0, colon), url };
+}
+
 export function enumeratePanes(
   node: BSPNode,
   path: readonly number[] = [],

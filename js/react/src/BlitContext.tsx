@@ -8,6 +8,7 @@ export interface BlitContextValue {
   fontFamily?: string;
   fontSize?: number;
   advanceRatio?: number;
+  textGamma?: number;
 }
 
 const BlitContext = createContext<BlitContextValue>({});
@@ -27,10 +28,18 @@ export function BlitWorkspaceProvider({
   fontFamily,
   fontSize,
   advanceRatio,
+  textGamma,
 }: BlitProviderProps) {
   const value = useMemo(
-    () => ({ workspace, palette, fontFamily, fontSize, advanceRatio }),
-    [workspace, palette, fontFamily, fontSize, advanceRatio],
+    () => ({
+      workspace,
+      palette,
+      fontFamily,
+      fontSize,
+      advanceRatio,
+      textGamma,
+    }),
+    [workspace, palette, fontFamily, fontSize, advanceRatio, textGamma],
   );
   return <BlitContext.Provider value={value}>{children}</BlitContext.Provider>;
 }

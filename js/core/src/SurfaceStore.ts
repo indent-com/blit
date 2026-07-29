@@ -2,7 +2,6 @@ import type { BlitSurface, ConnectionId } from "./types";
 import {
   SURFACE_FRAME_FLAG_KEYFRAME,
   SURFACE_FRAME_CODEC_MASK,
-  SURFACE_FRAME_CODEC_H264,
   SURFACE_FRAME_CODEC_AV1,
 } from "./types";
 

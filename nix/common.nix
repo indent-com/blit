@@ -43,7 +43,7 @@ let
         (craneLib.filterCargoSources path type)
         || pkgs.lib.hasSuffix ".html" path
         || pkgs.lib.hasSuffix ".html.br" path
-        || builtins.baseNameOf path == "learn.md"
+        || baseNameOf path == "learn.md"
         || pkgs.lib.hasInfix "/js/ui/dist/" path
         || pkgs.lib.hasSuffix ".xkb" path
         || pkgs.lib.hasSuffix ".spv" path;
@@ -125,7 +125,7 @@ let
   staticLibopus =
     if pkgs.stdenv.hostPlatform.isAarch64 then
       pkgsStaticLLVM.libopus.overrideAttrs (old: {
-        mesonFlags = builtins.map (
+        mesonFlags = map (
           f:
           if f == "-Dintrinsics=enabled" then
             "-Dintrinsics=disabled"

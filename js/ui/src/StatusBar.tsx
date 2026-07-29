@@ -1,4 +1,6 @@
-import { Show, For, type JSX, createSignal, createEffect } from "solid-js";
+import { WebPaneNav } from "./WebPaneNav";
+import type { WebPaneHandle } from "./WebPane";
+import { Show, For, type JSX } from "solid-js";
 import { onMount, onCleanup } from "solid-js";
 import type {
   BlitSession,
@@ -20,8 +22,17 @@ import {
   uiScale,
   z,
 } from "./theme";
-import type { Theme } from "./theme";
+import type { Theme, UIScale } from "./theme";
 import { t, tp } from "./i18n";
+import {
+  activeEditor,
+  type CommitController,
+  type DiffController,
+  type EditorController,
+  type PreviewController,
+} from "./ide/activeEditor";
+import { lineWrap, toggleLineWrap } from "./ide/editorPrefs";
+import { FileViewSwitcher } from "./ide/FileViewSwitcher";
 
 type SurfaceDebugInfo = {
   surfaceId: number;
@@ -60,7 +71,15 @@ function rgba([r, g, b]: [number, number, number], alpha: number): string {
 export function StatusBar(props: {
   sessions: readonly BlitSession[];
   surfaceCount: number;
+  /** Editor/diff/commit tiles on screen. */
+  tileCount: number;
+  /** Web panes on screen. */
+  webCount: number;
   focusedSession: BlitSession | null;
+  /** Live cwd of the focused terminal, when it is known to be that
+   *  terminal's (the poll keeps its last reading when a pty can't
+   *  answer). */
+  focusedCwd?: string | null;
   focusedSurface: BlitSurface | null;
   connectionLabels?: Map<string, string>;
   connections: readonly BlitConnectionSnapshot[];
@@ -70,11 +89,22 @@ export function StatusBar(props: {
   metrics: Metrics;
   palette: TerminalPalette;
   fontSize: number;
+  fontFamily: string;
   fontLoading: boolean;
   debug: boolean;
   toggleDebug: () => void;
   previewPanelOpen: boolean;
   onPreviewPanel: () => void;
+  leftDockOpen: boolean;
+  onToggleLeftDock: () => void;
+  onRoots: () => void;
+  /** Navigation for the focused web pane, or null when none is focused. */
+  webPane: {
+    handle: WebPaneHandle;
+    url: string;
+    /** Point the focused pane at a different origin. */
+    retarget: (url: string) => void;
+  } | null;
   debugStats: DebugStats;
   timeline: RenderSample[];
   net: NetSample[];
@@ -137,48 +167,163 @@ export function StatusBar(props: {
             {tp("statusbar.surfaces", { count: props.surfaceCount })}
           </span>
         </Show>
+        <Show when={props.tileCount > 0}>
+          <span>
+            {"\u00B7"}
+            {tp("statusbar.tiles", { count: props.tileCount })}
+          </span>
+        </Show>
+        <Show when={props.webCount > 0}>
+          <span>
+            {"\u00B7"}
+            {tp("statusbar.webPanes", { count: props.webCount })}
+          </span>
+        </Show>
       </button>
       <span
         style={{
           flex: 1,
+          "min-width": 0,
+          display: "flex",
+          "align-items": "center",
+          gap: `${scale().tightGap}px`,
           overflow: "hidden",
           "text-overflow": "ellipsis",
           "white-space": "nowrap",
         }}
       >
         <Show
-          when={props.focusedSession}
+          when={props.webPane}
           fallback={
-            <Show when={props.focusedSurface}>
-              {(surface) => {
+            <Show
+              when={activeEditor()}
+              keyed
+              fallback={
+                <Show
+                  when={props.focusedSession}
+                  fallback={
+                    <Show when={props.focusedSurface}>
+                      {(surface) => {
+                        const label = () =>
+                          props.connectionLabels?.get(surface().connectionId) ??
+                          null;
+                        const prefix = () => surfacePrefix(surface(), label());
+                        return (
+                          <>
+                            <span style={{ opacity: 0.5 }}>{prefix()}</span>
+                            {" \u203A "}
+                            {surfaceName(surface())}
+                          </>
+                        );
+                      }}
+                    </Show>
+                  }
+                >
+                  {(session) => {
+                    const label = () =>
+                      props.connectionLabels?.get(session().connectionId) ??
+                      null;
+                    const prefix = () => sessionPrefix(session(), label());
+                    return (
+                      <>
+                        <span style={{ opacity: 0.5 }}>{prefix()}</span>
+                        {" \u203A "}
+                        <span style={{ "flex-shrink": 0 }}>
+                          {sessionName(session())}
+                        </span>
+                        {/* The cwd is the first thing to give up when the bar
+                        runs out of room, and it truncates from the left:
+                        the tail of a path identifies it, the leading
+                        /Users/... does not. */}
+                        <Show when={props.focusedCwd}>
+                          {(cwd) => (
+                            <span
+                              title={cwd()}
+                              style={{
+                                "min-width": 0,
+                                overflow: "hidden",
+                                "white-space": "nowrap",
+                                direction: "rtl",
+                                "text-overflow": "ellipsis",
+                                opacity: 0.5,
+                              }}
+                            >
+                              {/* Isolated so the RTL truncation above cannot
+                              reorder the path's own punctuation. */}
+                              <bdi>{cwd()}</bdi>
+                            </span>
+                          )}
+                        </Show>
+                      </>
+                    );
+                  }}
+                </Show>
+              }
+            >
+              {(ed) => {
                 const label = () =>
-                  props.connectionLabels?.get(surface().connectionId) ?? null;
-                const prefix = () => surfacePrefix(surface(), label());
-                return (
-                  <>
-                    <span style={{ opacity: 0.5 }}>{prefix()}</span>
-                    {" \u203A "}
-                    {surfaceName(surface())}
-                  </>
+                  props.connectionLabels?.get(ed.connectionId) ?? null;
+                return ed.kind === "diff" ? (
+                  <DiffIdentity
+                    d={ed}
+                    label={label()}
+                    theme={theme()}
+                    scale={scale()}
+                    fontFamily={props.fontFamily}
+                    fontSize={props.fontSize}
+                  />
+                ) : ed.kind === "commit" ? (
+                  <CommitIdentity c={ed} label={label()} theme={theme()} />
+                ) : ed.kind === "preview" ? (
+                  <PreviewIdentity
+                    p={ed}
+                    label={label()}
+                    theme={theme()}
+                    fontFamily={props.fontFamily}
+                    fontSize={props.fontSize}
+                  />
+                ) : (
+                  <EditorIdentity
+                    ed={ed}
+                    label={label()}
+                    theme={theme()}
+                    scale={scale()}
+                    fontFamily={props.fontFamily}
+                    fontSize={props.fontSize}
+                  />
                 );
               }}
             </Show>
           }
         >
-          {(session) => {
-            const label = () =>
-              props.connectionLabels?.get(session().connectionId) ?? null;
-            const prefix = () => sessionPrefix(session(), label());
-            return (
-              <>
-                <span style={{ opacity: 0.5 }}>{prefix()}</span>
-                {" \u203A "}
-                {sessionName(session())}
-              </>
-            );
-          }}
+          {(web) => (
+            <WebPaneNav
+              handle={web().handle}
+              url={web().url}
+              onRetarget={web().retarget}
+              fontSize={props.fontSize}
+            />
+          )}
         </Show>
       </span>
+      <Show when={activeEditor()} keyed>
+        {(ed) =>
+          ed.kind === "diff" ? (
+            <DiffActions d={ed} scale={scale()} theme={theme()} />
+          ) : ed.kind === "commit" ? (
+            <ViewModeButton
+              viewMode={ed.viewMode}
+              toggle={ed.toggleViewMode}
+              scale={scale()}
+            />
+          ) : ed.kind === "preview" ? (
+            // Nothing to act on: no save, no diff mode, no LSP.
+            <></>
+          ) : (
+            <EditorActions ed={ed} scale={scale()} theme={theme()} />
+          )
+        }
+      </Show>
       <Show when={props.audioAvailable || props.hasSurfaces}>
         <button
           onClick={props.onMedia}
@@ -188,7 +333,7 @@ export function StatusBar(props: {
           }}
           title="Media settings"
         >
-          {"\u{1F3AC}"}
+          {"\u266A"}
         </button>
       </Show>
       <button
@@ -196,7 +341,24 @@ export function StatusBar(props: {
         style={{ ...buttonStyle(), opacity: props.debug ? 1 : 0.3 }}
         title={t("statusbar.debugStats")}
       >
-        {"\u{1F41B}"}
+        {"\u25C6"}
+      </button>
+      <button
+        onClick={props.onToggleLeftDock}
+        style={{
+          ...buttonStyle(),
+          opacity: props.leftDockOpen ? 1 : 0.3,
+        }}
+        title="Toggle IDE dock (Ctrl+Shift+E)"
+      >
+        {"\u25E7"}
+      </button>
+      <button
+        onClick={props.onRoots}
+        style={{ ...buttonStyle(), opacity: 0.7 }}
+        title="Workspace roots (Ctrl+Shift+K)"
+      >
+        {"\u2302"}
       </button>
       <button
         onClick={props.onPreviewPanel}
@@ -206,7 +368,7 @@ export function StatusBar(props: {
         }}
         title={t("statusbar.previewPanel")}
       >
-        {"\u25EB"}
+        {"\u25E8"}
       </button>
       <button
         onClick={props.onPalette}
@@ -332,6 +494,359 @@ export function StatusBar(props: {
           net={props.net}
           focusedSurfaceId={props.focusedSurface?.surfaceId ?? null}
         />
+      </Show>
+    </>
+  );
+}
+
+/** Focused diff's identity: filename + the view switcher (or a plain
+ *  comparison label when the tile cannot switch views). */
+function DiffIdentity(props: {
+  d: DiffController;
+  label: string | null;
+  theme: Theme;
+  scale: UIScale;
+  fontFamily: string;
+  fontSize: number;
+}) {
+  return (
+    <>
+      <PathIdentity
+        connectionId={props.d.connectionId}
+        label={props.label}
+        path={props.d.path}
+        theme={props.theme}
+      />
+      <Show
+        when={props.d.onOpenTile}
+        fallback={
+          <span style={{ color: props.theme.dimFg, "flex-shrink": 0 }}>
+            ◇ {props.d.sideLabel}
+          </span>
+        }
+      >
+        {(open) => (
+          <FileViewSwitcher
+            current={props.d.side}
+            connectionId={props.d.connectionId}
+            path={props.d.path}
+            onOpenTile={open()}
+            theme={props.theme}
+            fontFamily={props.fontFamily}
+            fontSize={props.fontSize}
+          />
+        )}
+      </Show>
+    </>
+  );
+}
+
+/**
+ * A tile's full location: `remote › /abs/path`, directory dimmed and
+ * basename bold.
+ *
+ * Truncates from the left — the tail of a path identifies it, the leading
+ * `/Users/...` does not — via an RTL block whose content is `bdi`-isolated
+ * so the path's own text still reads left to right.
+ */
+function PathIdentity(props: {
+  connectionId: string;
+  label: string | null;
+  path: string;
+  theme: Theme;
+}) {
+  const cut = () => {
+    const i = props.path.lastIndexOf("/");
+    return i < 0
+      ? { dir: "", base: props.path }
+      : { dir: props.path.slice(0, i + 1), base: props.path.slice(i + 1) };
+  };
+  return (
+    <>
+      <span style={{ opacity: 0.5, "flex-shrink": 0 }}>
+        {props.label ?? props.connectionId}
+      </span>
+      {" › "}
+      <span
+        title={props.path}
+        style={{
+          "min-width": 0,
+          overflow: "hidden",
+          "white-space": "nowrap",
+          direction: "rtl",
+          "text-overflow": "ellipsis",
+        }}
+      >
+        <bdi>
+          <span style={{ opacity: 0.6 }}>{cut().dir}</span>
+          <b style={{ color: props.theme.fg }}>{cut().base}</b>
+        </bdi>
+      </span>
+    </>
+  );
+}
+
+/** Focused commit's identity: repo location, abbreviated oid, subject. */
+function CommitIdentity(props: {
+  c: CommitController;
+  label: string | null;
+  theme: Theme;
+}) {
+  return (
+    <>
+      <PathIdentity
+        connectionId={props.c.connectionId}
+        label={props.label}
+        path={props.c.repoPath}
+        theme={props.theme}
+      />
+      <b style={{ color: props.theme.warning, "flex-shrink": 0 }}>
+        {props.c.short}
+      </b>
+      <span
+        style={{
+          overflow: "hidden",
+          "text-overflow": "ellipsis",
+          "white-space": "nowrap",
+        }}
+      >
+        {props.c.subject}
+      </span>
+    </>
+  );
+}
+
+/** The unified ⇄ side-by-side toggle, shared by diff and commit tiles. */
+function ViewModeButton(props: {
+  viewMode: () => "unified" | "split";
+  toggle: () => void;
+  scale: UIScale;
+}) {
+  return (
+    <button
+      style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
+      onClick={() => props.toggle()}
+      title={
+        props.viewMode() === "unified"
+          ? "Switch to side-by-side"
+          : "Switch to unified"
+      }
+    >
+      {props.viewMode() === "unified" ? "⊟ Unified" : "⊠ Split"}
+    </button>
+  );
+}
+
+/** Focused diff's actions: the unified ⇄ side-by-side toggle. */
+function DiffActions(props: {
+  d: DiffController;
+  scale: UIScale;
+  theme: Theme;
+}) {
+  return (
+    <ViewModeButton
+      viewMode={props.d.viewMode}
+      toggle={props.d.toggleViewMode}
+      scale={props.scale}
+    />
+  );
+}
+
+/** Focused editor's identity in the status bar: filename, view switcher, and
+ *  dirty / conflict / lsp state. Reads the controller's accessors reactively. */
+/** A preview's identity: the path and the view switcher, nothing else.
+ *  There is no dirty flag or banner because a preview cannot be edited. */
+function PreviewIdentity(props: {
+  p: PreviewController;
+  label: string | null;
+  theme: Theme;
+  fontFamily: string;
+  fontSize: number;
+}) {
+  return (
+    <>
+      <PathIdentity
+        connectionId={props.p.connectionId}
+        label={props.label}
+        path={props.p.path}
+        theme={props.theme}
+      />
+      <Show when={props.p.onOpenTile}>
+        {(open) => (
+          <FileViewSwitcher
+            current="preview"
+            connectionId={props.p.connectionId}
+            path={props.p.path}
+            onOpenTile={open()}
+            theme={props.theme}
+            fontFamily={props.fontFamily}
+            fontSize={props.fontSize}
+          />
+        )}
+      </Show>
+    </>
+  );
+}
+
+function EditorIdentity(props: {
+  ed: EditorController;
+  label: string | null;
+  theme: Theme;
+  scale: UIScale;
+  fontFamily: string;
+  fontSize: number;
+}) {
+  return (
+    <>
+      <PathIdentity
+        connectionId={props.ed.connectionId}
+        label={props.label}
+        path={props.ed.path}
+        theme={props.theme}
+      />
+      <Show when={props.ed.onOpenTile}>
+        {(open) => (
+          <FileViewSwitcher
+            current="editor"
+            connectionId={props.ed.connectionId}
+            path={props.ed.path}
+            onOpenTile={open()}
+            theme={props.theme}
+            fontFamily={props.fontFamily}
+            fontSize={props.fontSize}
+          />
+        )}
+      </Show>
+      <Show when={props.ed.dirty()}>
+        <span
+          style={{ color: props.theme.warning, "flex-shrink": 0 }}
+          title="unsaved"
+        >
+          ●
+        </span>
+      </Show>
+      <Show when={props.ed.banner()}>
+        {(b) => (
+          <span
+            style={{
+              "flex-shrink": 0,
+              color:
+                b().tone === "err"
+                  ? props.theme.errorText
+                  : props.theme.warning,
+            }}
+          >
+            {b().text}
+          </span>
+        )}
+      </Show>
+      <Show when={props.ed.lspMsg()}>
+        <span style={{ color: props.theme.dimFg, "flex-shrink": 0 }}>
+          {props.ed.lspMsg()}
+        </span>
+      </Show>
+    </>
+  );
+}
+
+/** Focused editor's action buttons in the status bar. */
+function EditorActions(props: {
+  ed: EditorController;
+  scale: UIScale;
+  theme: Theme;
+}) {
+  const btn = (): JSX.CSSProperties => ({
+    ...ui.btn,
+    "font-size": `${props.scale.md}px`,
+  });
+  // Keep the editor focused when a button is clicked: the mousedown would
+  // otherwise blur the editor, which autosaves — turning Discard into a no-op
+  // (it would revert to what autosave just wrote) and dropping the cursor Def/
+  // Refs act on.
+  const noBlur = (e: MouseEvent) => e.preventDefault();
+  return (
+    <>
+      <Show when={props.ed.lspAvailable()}>
+        <button
+          style={btn()}
+          onMouseDown={noBlur}
+          onClick={() => props.ed.goToDefinition()}
+          title="Go to definition (F12 or ⌘-click)"
+        >
+          Def
+        </button>
+        <button
+          style={btn()}
+          onMouseDown={noBlur}
+          onClick={() => props.ed.findReferences()}
+          title="Find references (⇧F12)"
+        >
+          Refs
+        </button>
+        <button
+          style={btn()}
+          onMouseDown={noBlur}
+          onClick={() => props.ed.showOutline()}
+          title="Document outline (⌘⇧O)"
+        >
+          Outline
+        </button>
+      </Show>
+      <button
+        style={{ ...btn(), opacity: lineWrap() ? 1 : 0.5 }}
+        onMouseDown={noBlur}
+        onClick={() => toggleLineWrap()}
+        title={lineWrap() ? "Soft wrap on (⌥Z)" : "Soft wrap off (⌥Z)"}
+      >
+        ⏎
+      </button>
+      <Show when={props.ed.lspAvailable()}>
+        <Show when={!props.ed.readOnly()}>
+          <button
+            style={btn()}
+            onMouseDown={noBlur}
+            onClick={() => props.ed.renameSymbol()}
+            title="Rename symbol (F2)"
+          >
+            Rename
+          </button>
+        </Show>
+      </Show>
+      <Show when={props.ed.conflicted()}>
+        <button
+          style={btn()}
+          onMouseDown={noBlur}
+          onClick={() => props.ed.reload()}
+        >
+          Reload
+        </button>
+        <button
+          style={btn()}
+          onMouseDown={noBlur}
+          onClick={() => props.ed.overwrite()}
+        >
+          Overwrite
+        </button>
+      </Show>
+      <Show when={!props.ed.readOnly()}>
+        <Show when={props.ed.dirty() && !props.ed.conflicted()}>
+          <button
+            style={btn()}
+            onMouseDown={noBlur}
+            onClick={() => props.ed.discard()}
+            title="Discard changes (revert to saved)"
+          >
+            Discard
+          </button>
+        </Show>
+        <button
+          style={{ ...btn(), opacity: props.ed.dirty() ? 1 : 0.5 }}
+          onMouseDown={noBlur}
+          onClick={() => props.ed.save()}
+          title="Save (⌘S)"
+        >
+          Save
+        </button>
       </Show>
     </>
   );

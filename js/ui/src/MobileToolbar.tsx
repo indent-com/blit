@@ -76,7 +76,6 @@ function ToolbarButton(props: {
         "-webkit-user-select": "none",
         "touch-action": "manipulation",
         "white-space": "nowrap",
-        "line-height": 1,
         transition: "background 0.1s, color 0.1s, opacity 0.1s",
       }}
     >
@@ -146,7 +145,6 @@ function ArrowButton(props: {
         "user-select": "none",
         "-webkit-user-select": "none",
         "touch-action": "manipulation",
-        "line-height": 1,
       }}
     >
       {props.label}

@@ -57,6 +57,7 @@ export class TerminalStore {
   private webgpuCanvas: HTMLCanvasElement | null = null;
   private displayFps = 0;
   private rafHandle = 0;
+  private visibilityHandler: (() => void) | null = null;
   private rafPrev = 0;
   private rafSamples: number[] = [];
   private pendingAppliedFrames = 0;
@@ -74,6 +75,7 @@ export class TerminalStore {
   ) {
     this.delegate = delegate;
     this.startRafProbe();
+    this.armRafProbe();
     this.probeWebGpu();
 
     if (wasm instanceof Promise) {
@@ -587,6 +589,15 @@ export class TerminalStore {
               this.displayFps = fps;
               this.sendDisplayFps();
             }
+            // Established, so stop. This loop used to reschedule itself
+            // forever to keep re-measuring a number that changes only when
+            // the display does, which kept a rAF callback running every
+            // frame for the life of the page — visible in a profile as
+            // hundreds of ms of animation-frame work, and it denies the
+            // browser any idle frame to coalesce style invalidation into.
+            // `armRafProbe` re-measures when the display plausibly changed.
+            this.stopRafProbe();
+            return;
           }
         }
       }
@@ -594,6 +605,24 @@ export class TerminalStore {
       this.rafHandle = requestAnimationFrame(measure);
     };
     this.rafHandle = requestAnimationFrame(measure);
+  }
+
+  /**
+   * Re-measure the display rate when it may have changed: returning to a
+   * visible tab, which is also when a window has plausibly been dragged to
+   * a monitor with a different refresh rate. Cheap — the probe stops again
+   * after ~20 frames.
+   */
+  private armRafProbe(): void {
+    if (typeof document === "undefined") return;
+    this.visibilityHandler = () => {
+      if (document.visibilityState === "visible") {
+        this.rafPrev = 0;
+        this.rafSamples = [];
+        this.startRafProbe();
+      }
+    };
+    document.addEventListener("visibilitychange", this.visibilityHandler);
   }
 
   private stopRafProbe(): void {
@@ -613,6 +642,10 @@ export class TerminalStore {
   destroy(): void {
     this.disposed = true;
     this.stopRafProbe();
+    if (this.visibilityHandler) {
+      document.removeEventListener("visibilitychange", this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
     this.stopMetricsHeartbeat();
     for (const t of this.terminals.values()) t.free();
     this.terminals.clear();

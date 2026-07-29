@@ -24,6 +24,11 @@ processes:
       echo '<html><body>stub</body></html>' > js/ui/dist/index.html;
       python3 -c "import brotli, pathlib; pathlib.Path('js/ui/dist/index.html.br').write_bytes(brotli.compress(pathlib.Path('js/ui/dist/index.html').read_bytes()))" 2>/dev/null || cp js/ui/dist/index.html js/ui/dist/index.html.br;
       fi;
+      if [ ! -f js/ui/dist/sw.js.br ]; then
+      mkdir -p js/ui/dist;
+      echo '/* stub */' > js/ui/dist/sw.js;
+      python3 -c "import brotli, pathlib; pathlib.Path('js/ui/dist/sw.js.br').write_bytes(brotli.compress(pathlib.Path('js/ui/dist/sw.js').read_bytes()))" 2>/dev/null || cp js/ui/dist/sw.js js/ui/dist/sw.js.br;
+      fi;
       exec cargo build -p blit-cli --profile profiling
 
   browser-wasm:

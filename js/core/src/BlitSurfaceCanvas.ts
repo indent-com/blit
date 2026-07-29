@@ -362,8 +362,6 @@ export class BlitSurfaceCanvas {
    *  the canvas for normal typing; the textarea only receives focus when
    *  an IME composition session is active. */
   private textInput: HTMLTextAreaElement | null = null;
-  /** True while an IME composition session is active (focus is on textarea). */
-  private _isComposing = false;
   /** Non-zero when a Meta→Ctrl translation is in flight (stores the Meta
    *  evdev keycode that was swapped so the release can be translated back). */
   private _metaToCtrl = 0;
@@ -876,7 +874,6 @@ export class BlitSurfaceCanvas {
     // Detect IME composition start on the canvas and redirect focus
     // to the textarea so the browser's IME UI can work.
     this.boundCompositionStart = () => {
-      this._isComposing = true;
       if (this.textInput) this.textInput.focus();
     };
     canvas.addEventListener("compositionstart", this.boundCompositionStart);
@@ -1253,7 +1250,6 @@ export class BlitSurfaceCanvas {
     // compositionend handler sends the result and returns focus here.
     if (pressed && (e.key === "Dead" || e.isComposing)) {
       if (this.textInput) {
-        this._isComposing = true;
         this.textInput.focus();
       }
       return;
@@ -1504,7 +1500,6 @@ export class BlitSurfaceCanvas {
   /** Handle IME composition end — send the composed text and return
    *  focus to the canvas. */
   private handleCompositionEnd(e: CompositionEvent): void {
-    this._isComposing = false;
     const ta = this.textInput;
     if (!ta) return;
     if (e.data) {

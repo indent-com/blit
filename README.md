@@ -43,6 +43,23 @@ are stored in `~/.config/blit/blit.remotes` (mode 0600). `blit open` reads this
 file and shows all remotes in the browser's Remotes dialog (Cmd+K). SSH remotes
 are auto-installed on first connection.
 
+Forward ports to whatever the server can reach — `ssh -L` over any blit
+transport, plus UDP:
+
+```bash
+blit forward 8080:localhost:3000                # local 8080 → server's :3000
+blit forward 8080:localhost:3000 5432:db:5432    # a list, over one connection
+blit forward udp/5353:resolver.internal:53       # UDP too
+blit forward add web 8080:localhost:3000         # remember it
+blit forward --all                               # start every saved forward
+```
+
+Listeners bind to loopback unless you name a bind address. The relay reaches
+whatever the server reaches; restrict it with
+`blit server --allow-forward 'host[:ports]'`. Saved forwards live in
+`~/.config/blit/blit.forwards` (mode 0600). See
+[docs/design/net.md](docs/design/net.md).
+
 Control terminals programmatically:
 
 ```bash

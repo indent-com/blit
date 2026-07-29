@@ -51,10 +51,20 @@ blit terminal list            # show all terminals
 blit terminal close "$ID"     # tear down a terminal
 blit terminal kill "$ID" TERM # signal the process, keep the terminal
 blit terminal restart "$ID"   # re-run an exited terminal
+blit terminal resize "$ID" 200 50  # set the viewport (cols rows)
+blit terminal attach "$ID"    # drive it from here; Ctrl-] detaches
 blit quit                     # shut down the server
 ```
 
 Terminals persist until closed or the daemon exits. Clean up when done.
+
+`attach` needs a real tty on stdin and repaints the remote grid in the
+alternate screen, so your scrollback survives. It exits with the remote
+program's status if that program finishes while you are attached.
+
+`type` synthesises US-QWERTY keystrokes and understands `{Return}`;
+`text` sends the characters themselves, which is the only way to reach
+anything non-ASCII.
 
 ## Remotes
 
@@ -66,6 +76,171 @@ blit --on prod terminal list               # named remote
 blit remote add prod ssh:alice@prod.co
 blit remote set-default prod
 ```
+
+## Files
+
+All paths are relative to `--root` (default: the client's cwd, resolved
+against _your_ cwd, not the daemon's). `--json` emits NDJSON.
+
+```bash
+blit fs cat src/main.rs                  # print a file (bytes, unmodified)
+blit fs find main.rs                     # fuzzy-find by path, best first
+blit fs grep needle                      # search contents, PATH:LINE:TEXT
+blit fs grep -e 'fn \w+' --root crates   # regex
+blit fs grep -sw Config                  # case-sensitive, whole word
+blit fs grep -l needle                   # matching paths only
+blit fs grep --no-ignore TODO            # include gitignored files
+blit fs sync . --json                    # mirror a tree, stream changes
+```
+
+`fs grep` is case-insensitive literal by default and honours `.gitignore`,
+which is what keeps it fast on a tree with build output — `--no-ignore`
+searches ignored files too and ranks them last. It exits 1 when nothing
+matched, like grep(1), so `if blit fs grep -l TODO; then …` works.
+
+Writes are compare-and-swap by default, so a concurrent change is a
+conflict rather than a silent clobber (exit 1):
+
+```bash
+echo hi | blit fs write notes.txt              # unconditional overwrite
+echo hi | blit fs write notes.txt --create     # fail if it exists
+echo hi | blit fs write notes.txt --if-hash H  # only if unchanged
+blit fs mkdir -p a/b        # create a directory
+blit fs mv old new          # rename or move
+blit fs rm -r dir           # remove a subtree
+blit fs ln -s target link   # symlink (omit -s for a hard link)
+```
+
+## Git
+
+Read-only introspection of repositories on the server. `--repo` picks the
+worktree (default: cwd); `--json` emits NDJSON.
+
+```bash
+blit git status                     # branch, ahead/behind, stash, worktree
+blit git status --watch             # stream changes
+blit git log                        # history, newest first
+blit git log v1.0                   # from a tag
+blit git log main..feature          # a range
+blit git log --follow -- src/main.rs
+blit git diff                       # unstaged
+blit git diff --staged              # staged
+blit git diff main dev              # between two commits
+blit git diff HEAD~2 -p -- src      # with hunks, limited to a path
+blit git show HEAD:src/main.rs      # a file's bytes at a revision
+blit git show HEAD                  # the commit object itself
+blit git ls-tree HEAD                # one tree level (MODE TYPE OID<TAB>NAME)
+blit git ls-tree HEAD:src            # descend by passing a path
+blit git merge-base main feature     # best common ancestors (exit 1 if unrelated)
+blit git ls-files                    # the index (MODE STAGE OID<TAB>PATH)
+blit git ls-files src                # limited to a path prefix
+```
+
+## Code intelligence
+
+Language servers (rust-analyzer, gopls, clangd, …) are discovered by
+project markers, spawned on the server, and stay warm across
+invocations. Positions are 1-based PATH:LINE:COL; all commands take
+`--root` (default: server cwd) and `--json` (NDJSON).
+
+```bash
+blit lsp wait                        # block until servers finish indexing
+blit lsp diag                        # current diagnostics (exit 1 if any)
+blit lsp diag --wait                 # settle first — use after editing files
+blit lsp def src/main.rs:10:4        # definition of the symbol at 10:4
+blit lsp refs src/main.rs:10:4       # references (--declaration to include it)
+blit lsp hover src/main.rs:10:4      # type and docs
+blit lsp complete src/main.rs:10:4   # completions (TSV: LABEL, KIND, DETAIL)
+blit lsp signature src/main.rs:10:4  # signature, active parameter underlined
+blit lsp symbols Config              # fuzzy workspace symbol search
+blit lsp symbols --file src/main.rs  # file outline
+blit lsp rename src/main.rs:10:4 nm  # rename plan (prints edits, never applies)
+blit lsp list                        # running servers (ref, phase, memory)
+```
+
+A first call in a fresh workspace may exit 2 with "warming up" — run
+`blit lsp wait` once, then query. The edit loop: change files, then
+`blit lsp diag --wait` to see resulting errors.
+
+## Key/value store
+
+A prefix-watchable store on the server — the web app's settings live here,
+and it doubles as host-local scratch space for scripts.
+
+```bash
+blit kv put build/status ok        # set from an argument
+cat report.json | blit kv put ci/report   # or from stdin
+blit kv get build/status           # value bytes to stdout (exit 1 if absent)
+blit kv ls build/                  # keys under a prefix (TSV: KEY, SIZE)
+blit kv ls build/ --values         # include values
+blit kv ls build/ --watch          # stream changes as they happen
+blit kv rm build/status            # delete
+```
+
+Writes are compare-and-swap when you ask: `--if-hash H` writes only if the
+current value still hashes to H, exiting 1 on conflict. Without it a put is
+an unconditional overwrite. `--durable` waits for disk.
+
+## Web panes
+
+In the browser UI, `Cmd+K` → **Web pane** opens a URL the server can reach as a
+tiling pane. The empty-pane entry doubles as a location bar: `[remote>][command]`
+takes a URL wherever it takes a command, so `localhost:3000` or
+`prod>localhost:3000` opens a pane instead of a terminal (a scheme or a port is
+what marks it as a location; a bare word stays a command). Locations are
+remembered per server in its KV store, and the focused pane takes over the
+status bar with back/forward/reload and its title.
+
+## Port forwarding
+
+Forward local ports to whatever the server can reach — `ssh -L` over any blit
+transport, plus UDP. Specs are `[kind/][bind:]port:host:hostport`, where kind
+is `tcp` (default) or `udp`.
+
+```bash
+blit forward 8080:localhost:3000               # local 8080 → server's :3000
+blit forward 8080:localhost:3000 5432:db:5432   # a list, one connection
+blit forward udp/5353:resolver.internal:53      # a UDP flow per local source
+blit forward tls/8443:api.internal:443          # server terminates TLS
+blit forward 0:db.internal:5432                 # port 0: pick one, print it
+blit --on prod forward 5432:db.internal:5432    # through a named remote
+```
+
+Listeners bind to **127.0.0.1** unless a bind address is given: the local
+socket has no passphrase in front of it, so binding a wildcard address would
+hand the relay to anyone who can reach the machine. Every spec binds before
+any starts serving, so a failed bind leaves nothing running.
+
+Forwards end with the process — the listening socket is local, so there is
+nothing to reattach to. Keep a set of them in `~/.config/blit/blit.forwards`:
+
+```bash
+blit forward add web 8080:localhost:3000   # add or update an entry
+blit forward list                           # every entry, disabled ones marked
+blit forward toggle web                     # disable without removing
+blit forward rm web
+blit forward --all                          # start every enabled entry
+```
+
+A `tls/` forward takes plaintext locally and speaks TLS to the target, so
+`curl http://localhost:8443/` reaches an `https://` service without a
+certificate anywhere on your side. `--alpn h2,http/1.1` offers ALPN (omitted
+offers none, which is not the same as offering http/1.1) and the negotiated
+protocol is printed once. `--insecure` skips certificate verification, and the
+server must permit it too (`blit server --allow-forward-insecure`) — a client
+asking is not enough. Plain `tcp/` forwards stay opaque: TLS the local client
+speaks passes straight through, end to end.
+
+By default the relay reaches whatever the server reaches. To restrict it, give
+`blit server --allow-forward 'host[:ports]'` (a name, a `*.suffix` glob, an
+address, a CIDR block, or `*`; repeatable, or `BLIT_ALLOW_FORWARD`) — one
+pattern makes it an allowlist, loopback still permitted. `BLIT_NET=0` turns
+forwarding off entirely.
+
+UDP note: blit's wire is reliable and ordered, so relayed datagrams get
+retransmission and head-of-line blocking they did not ask for. Fine for
+DNS-shaped request/response traffic; poor for anything running its own
+congestion control, such as QUIC.
 
 ## Clipboard
 
@@ -101,6 +276,10 @@ blit surface click 1 100 50 --button right          # right-click
 blit surface key 1 Return                           # key press
 blit surface key 1 ctrl+shift+c                     # modifier combo
 blit surface type 1 "hello{Return}"                 # type text ({braces} for special keys)
+blit surface text 1 "café — naïve"                  # commit literal UTF-8 (non-ASCII works)
+blit surface scroll 1 3                             # scroll down 3 wheel units
+blit surface scroll 1 -2 --horizontal               # scroll left
+blit surface focus 1                                # give it keyboard/pointer focus
 blit surface record 1 --output video.h264           # record until Ctrl+C
 blit surface record 1 --duration 10 --output v.h264 # record 10 seconds
 blit surface record 1 --frames 30 --output v.h264   # record 30 frames

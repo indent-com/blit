@@ -13,6 +13,21 @@ import type {
   TransportConfig,
 } from "./types";
 import type { BlitWasmModule } from "./TerminalStore";
+import type {
+  FsFileIndex,
+  FsGrepOptions,
+  FsGrepResult,
+  FsSyncHandle,
+  FsSyncOptions,
+} from "./fs";
+import type { GitOpenOptions, GitRepoHandle } from "./git";
+import type {
+  KvFetchResult,
+  KvPutOptions,
+  KvWatchHandle,
+  KvWatchOptions,
+} from "./kv";
+import type { LspHandle, LspOpenOptions } from "./lsp";
 import { WebSocketTransport } from "./transports/websocket";
 import { WebTransportTransport } from "./transports/webtransport";
 import { createShareTransport } from "./transports/webrtc-share";
@@ -74,6 +89,10 @@ function workspaceError(message: string): Error {
 export class BlitWorkspace {
   private readonly listeners = new Set<() => void>();
   private readonly connectionListeners = new Map<ConnectionId, () => void>();
+  private readonly termCwdListeners = new Set<
+    (sessionId: SessionId, cwd: string) => void
+  >();
+  private readonly termCwdUnsubs = new Map<ConnectionId, () => void>();
   private readonly connections = new Map<ConnectionId, BlitConnection>();
   private readonly defaultWasm: BlitWasmModule | Promise<BlitWasmModule>;
   readonly logger: BlitLogger;
@@ -119,6 +138,12 @@ export class BlitWorkspace {
       options.id,
       connection.subscribe(() => this.recomputeSnapshot()),
     );
+    this.termCwdUnsubs.set(
+      options.id,
+      connection.onTermCwd((sessionId, cwd) => {
+        for (const listener of this.termCwdListeners) listener(sessionId, cwd);
+      }),
+    );
     this.recomputeSnapshot();
     return connection;
   }
@@ -129,6 +154,8 @@ export class BlitWorkspace {
 
     this.connectionListeners.get(connectionId)?.();
     this.connectionListeners.delete(connectionId);
+    this.termCwdUnsubs.get(connectionId)?.();
+    this.termCwdUnsubs.delete(connectionId);
     this.connections.delete(connectionId);
     connection.close();
     connection.dispose();
@@ -194,6 +221,145 @@ export class BlitWorkspace {
   closeSurface(connectionId: ConnectionId, surfaceId: number): void {
     const connection = this.requireConnection(connectionId);
     connection.sendSurfaceClose(surfaceId);
+  }
+
+  /**
+   * Mirror a directory tree from one connection's server (docs/fs-watch.md):
+   * a live map plus per-record callbacks. See `BlitConnection.syncFs`.
+   */
+  async syncFs(
+    connectionId: ConnectionId,
+    path: string,
+    options?: FsSyncOptions,
+  ): Promise<FsSyncHandle> {
+    return this.requireConnection(connectionId).syncFs(path, options);
+  }
+
+  /**
+   * Open a git repository on one connection's server (docs/git.md): live
+   * state plus oid-addressed reads. See `BlitConnection.openRepo`.
+   */
+  async openRepo(
+    connectionId: ConnectionId,
+    path: string,
+    options?: GitOpenOptions,
+  ): Promise<GitRepoHandle> {
+    return this.requireConnection(connectionId).openRepo(path, options);
+  }
+
+  /** Fuzzy file search under `root` on one connection; up to `limit` matches,
+   *  best first. See `BlitConnection.searchFiles`. */
+  async searchFiles(
+    connectionId: ConnectionId,
+    root: string,
+    query: string,
+    limit?: number,
+  ): Promise<string[]> {
+    return this.requireConnection(connectionId).searchFiles(root, query, limit);
+  }
+
+  /** Candidate file list under `root` on one connection, for client-side
+   *  fuzzy search. See `BlitConnection.indexFiles`. */
+  async indexFiles(
+    connectionId: ConnectionId,
+    root: string,
+  ): Promise<FsFileIndex> {
+    return this.requireConnection(connectionId).indexFiles(root);
+  }
+
+  /** Content search under `root` on one connection, hits grouped by file
+   *  (tracked first, gitignored last). See `BlitConnection.grep`. */
+  async grep(
+    connectionId: ConnectionId,
+    root: string,
+    query: string,
+    opts?: FsGrepOptions,
+  ): Promise<FsGrepResult> {
+    return this.requireConnection(connectionId).grep(root, query, opts);
+  }
+
+  /** A session's live working directory (server reads the pty's cwd). "" when
+   *  unavailable. See `BlitConnection.sessionCwd`. */
+  async sessionCwd(
+    connectionId: ConnectionId,
+    sessionId: SessionId,
+  ): Promise<string> {
+    return this.requireConnection(connectionId).sessionCwd(sessionId);
+  }
+
+  /** Subscribe to server-pushed cwd changes across every connection
+   *  (`S2C_TERM_CWD_EVENT`, docs/protocol.md): consumers can suppress
+   *  `sessionCwd` polling while pushes flow. Returns an unsubscribe
+   *  function. */
+  onTermCwd(listener: (sessionId: SessionId, cwd: string) => void): () => void {
+    this.termCwdListeners.add(listener);
+    return () => {
+      this.termCwdListeners.delete(listener);
+    };
+  }
+
+  /** The most recent server-pushed cwd for a session, or null when none
+   *  has arrived since (re)connect. See `BlitConnection.lastPushedCwd`. */
+  lastPushedCwd(sessionId: SessionId): string | null {
+    const session = this.getSession(sessionId);
+    if (!session) return null;
+    return (
+      this.connections.get(session.connectionId)?.lastPushedCwd(sessionId) ??
+      null
+    );
+  }
+
+  /**
+   * Attach language intelligence on one connection's server (docs/lsp.md):
+   * live server state + diagnostics plus point-in-time queries. See
+   * `BlitConnection.openLsp`.
+   */
+  async openLsp(
+    connectionId: ConnectionId,
+    path: string,
+    options?: LspOpenOptions,
+  ): Promise<LspHandle> {
+    return this.requireConnection(connectionId).openLsp(path, options);
+  }
+
+  /** CAS put into one connection's server KV store (docs/design/kv.md).
+   *  See `BlitConnection.kvPut`. */
+  async kvPut(
+    connectionId: ConnectionId,
+    key: string,
+    value: Uint8Array,
+    options?: KvPutOptions,
+  ): Promise<{ hash: bigint; mtimeNs: bigint }> {
+    return this.requireConnection(connectionId).kvPut(key, value, options);
+  }
+
+  /** Delete a key from one connection's server KV store.
+   *  See `BlitConnection.kvDelete`. */
+  async kvDelete(
+    connectionId: ConnectionId,
+    key: string,
+    options?: { ifHash?: bigint },
+  ): Promise<void> {
+    return this.requireConnection(connectionId).kvDelete(key, options);
+  }
+
+  /** Fetch one value from one connection's server KV store; null when
+   *  absent. See `BlitConnection.kvFetch`. */
+  async kvFetch(
+    connectionId: ConnectionId,
+    key: string,
+  ): Promise<KvFetchResult | null> {
+    return this.requireConnection(connectionId).kvFetch(key);
+  }
+
+  /** Watch a literal byte prefix of one connection's server KV store.
+   *  See `BlitConnection.watchKv`. */
+  async watchKv(
+    connectionId: ConnectionId,
+    prefix: string,
+    options?: KvWatchOptions,
+  ): Promise<KvWatchHandle> {
+    return this.requireConnection(connectionId).watchKv(prefix, options);
   }
 
   restartSession(sessionId: SessionId): void {

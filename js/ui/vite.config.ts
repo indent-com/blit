@@ -1,4 +1,5 @@
 import { defineConfig, type Plugin } from "vite";
+import { lezer } from "@lezer/generator/rollup";
 import solid from "vite-plugin-solid";
 import { viteSingleFile } from "vite-plugin-singlefile";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
@@ -14,10 +15,18 @@ const snippetsDir = resolve(__dirname, "../../crates/browser/pkg/snippets");
 const isDev =
   process.env.NODE_ENV !== "production" && !process.argv.includes("build");
 
+/** Dev-only path of the service worker entry, mirroring SW_DEV_ENTRY in
+ *  src/preview.ts. */
+const SW_DEV_ENTRY = "/src/sw/index.ts";
+
 export default defineConfig({
   base: "/",
   plugins: [
     solid(),
+    // Compiles src/ide/nix/syntax.grammar to a Lezer parser at build time.
+    // The grammar is vendored (and patched — see its header) because the
+    // only published Nix grammar mis-parses formatted Nix.
+    lezer(),
     // Only inline everything into a single HTML file for production builds.
     !isDev && viteSingleFile(),
     {
@@ -51,6 +60,22 @@ export default bin.buffer;
             if (existsSync(candidate)) return candidate;
           }
         }
+      },
+    },
+    // Dev: serve the preview service worker from source. The dev server has
+    // no /sw.js route — its SPA fallback answers with index.html, and a worker
+    // served as text/html is refused outright. Vite transforms the TS entry to
+    // a real module; the header is what lets a script under /src claim the
+    // whole origin as its scope.
+    isDev && {
+      name: "blit-sw-dev",
+      configureServer(server) {
+        server.middlewares.use((req, res, next) => {
+          if (req.url && req.url.startsWith(SW_DEV_ENTRY)) {
+            res.setHeader("Service-Worker-Allowed", "/");
+          }
+          next();
+        });
       },
     },
     // Dev: proxy blit WS connections to the gateway.

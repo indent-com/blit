@@ -12,6 +12,10 @@ const items = [
     title: "Hardware encoding",
     body: "NVENC requires the proprietary NVIDIA driver. VA-API needs Intel/AMD with libva. Falls back to software at any time.",
   },
+  {
+    title: "IDE scope",
+    body: "Edit, navigate, search, diff, commit — no debugger, no test runner, and rename is the only refactoring. Indentation is inferred from the file; there is no .editorconfig reader yet.",
+  },
 ];
 ---
 
@@ -36,7 +40,7 @@ const items = [
         </p>
       </div>
 
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {
           items.map(({ title, body }) => (
             <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] p-4">

@@ -2,7 +2,8 @@ import type { Terminal } from "@blit-sh/browser";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
 import type { TerminalPalette, ConnectionStatus, SessionId } from "./types";
-import { DEFAULT_FONT, DEFAULT_FONT_SIZE } from "./types";
+import { DEFAULT_FONT, DEFAULT_FONT_SIZE, DEFAULT_TEXT_GAMMA } from "./types";
+import { cancelFrame, scheduleFrame } from "./frameScheduler";
 import { measureCell, cssFontFamily, type CellMetrics } from "./measure";
 import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
@@ -29,6 +30,8 @@ export interface BlitTerminalSurfaceOptions {
   scrollbarColor?: string;
   scrollbarWidth?: number;
   advanceRatio?: number;
+  /** Coverage gamma for glyph antialiasing. See DEFAULT_TEXT_GAMMA. */
+  textGamma?: number;
 }
 
 export interface BlitTerminalSurfaceHandle {
@@ -95,12 +98,28 @@ function stripIosPad(value: string): string {
   return value.slice(i);
 }
 
+/** The zoom levels Safari's View ▸ Zoom ladder can actually be set to. */
+const SAFARI_ZOOM_STEPS = [
+  0.5, 0.75, 0.85, 1, 1.15, 1.25, 1.5, 1.75, 2, 2.5, 3,
+];
+
 function effectiveDpr(): number {
   if (typeof window === "undefined") return 1;
   const base = window.devicePixelRatio || 1;
   if (isSafari() && !isIPadOS() && window.outerWidth && window.innerWidth) {
-    const zoom = window.outerWidth / window.innerWidth;
-    if (zoom > 0.25 && zoom < 8) return Math.round(base * zoom * 100) / 100;
+    // Desktop Safari does not fold page zoom into devicePixelRatio, so zoom has
+    // to be inferred, and outerWidth/innerWidth is the only signal on offer.
+    // But that ratio is not purely zoom: anything that eats viewport width
+    // without shrinking the window — a sidebar, above all — inflates it
+    // identically, and an over-estimated DPR means an oversized backing store
+    // that the browser then resamples down, blurring every glyph. So only
+    // believe a ratio that lands on a zoom level Safari can be set to, and
+    // read the rest as "no zoom, just furniture".
+    const ratio = window.outerWidth / window.innerWidth;
+    const zoom = SAFARI_ZOOM_STEPS.find(
+      (step) => Math.abs(ratio - step) <= step * 0.015,
+    );
+    if (zoom !== undefined) return Math.round(base * zoom * 100) / 100;
   }
   return base;
 }
@@ -146,6 +165,7 @@ export class BlitTerminalSurface {
   private _scrollbarColor: string | undefined;
   private _scrollbarWidth: number;
   private _advanceRatio: number | undefined;
+  private _textGamma: number;
 
   // --- external collaborators ---
   private _workspace: BlitWorkspace | null = null;
@@ -165,6 +185,14 @@ export class BlitTerminalSurface {
    *  scrollOffset → scrollTop sync, so the scroll listener doesn't feed
    *  the change back. */
   private suppressScrollSync = false;
+  /** scrollEl's client height, refreshed from the ResizeObserver and the
+   *  scroll listener — both of which run after layout, so the measurement
+   *  costs nothing. Never read inside the render loop (see
+   *  syncScrollSurface). */
+  private scrollViewH = 0;
+  /** The last scrollTop we assigned, so the render loop can tell whether a
+   *  write is needed without reading the element back. */
+  private lastScrollTop = 0;
 
   // --- mutable state ---
   private viewId: string | null = null;
@@ -183,7 +211,23 @@ export class BlitTerminalSurface {
   private lastWasmBuffer: ArrayBuffer | null = null;
   private raf = 0;
   private renderScheduled = false;
+  /** Correction computed by `measureSnap`, awaiting `applySnap`. */
+  private pendingSnap: [number, number] | null = null;
+  /** Last known canvas box, reused by mouse handlers. Null means "re-read
+   *  on next use". Mouse events fire many times per frame, and reading the
+   *  box in each one forced a style recalc + layout every time — a profile
+   *  of pointer movement put ~9% of the whole recording in Recalculate
+   *  style, blamed on `mouseToCell`. */
+  private canvasRect: DOMRect | null = null;
+  /** Last value written to the canvas's cursor, so a mousemove that
+   *  changes nothing does not dirty style. Writing the same value still
+   *  invalidates it, which is what made the read above expensive. */
+  private lastCursor = "";
   private dpr: number;
+  /** Sub-pixel correction currently applied to the canvas, in CSS px.
+   *  See snapToDevicePixels. */
+  private snapX = 0;
+  private snapY = 0;
 
   private scrollOffset = 0;
   private scrollFade = 0;
@@ -205,7 +249,6 @@ export class BlitTerminalSurface {
 
   private selStart: SelPos | null = null;
   private selEnd: SelPos | null = null;
-  private selecting = false;
   private _selectionListeners = new Set<(hasSelection: boolean) => void>();
   private hoveredUrl: {
     row: number;
@@ -218,7 +261,6 @@ export class BlitTerminalSurface {
   private predictedFromRow = 0;
   private predictedFromCol = 0;
 
-  private wasmReady = false;
   private disposed = false;
   private _ctrlModifier = false;
   private _ctrlModifierListeners = new Set<(active: boolean) => void>();
@@ -237,10 +279,12 @@ export class BlitTerminalSurface {
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
-  private readyUnsub: (() => void) | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private dprMq: MediaQueryList | null = null;
   private dprCheckHandler: (() => void) | null = null;
+  /** Re-snaps the canvas when layout moves it, not only when a frame renders
+   *  (see setupDeviceSnapping). */
+  private snapScrollHandler: (() => void) | null = null;
   private fontsHandler: (() => void) | null = null;
 
   // --- event handler refs (for cleanup) ---
@@ -261,7 +305,6 @@ export class BlitTerminalSurface {
   private _ctrlVPastePending = false;
   private _ctrlVFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private mouseCleanup: (() => void) | null = null;
-  private windowResizeHandler: (() => void) | null = null;
 
   constructor(options: BlitTerminalSurfaceOptions) {
     this._sessionId = options.sessionId;
@@ -275,6 +318,7 @@ export class BlitTerminalSurface {
     this._scrollbarColor = options.scrollbarColor;
     this._scrollbarWidth = options.scrollbarWidth ?? 4;
     this._advanceRatio = options.advanceRatio;
+    this._textGamma = options.textGamma ?? DEFAULT_TEXT_GAMMA;
 
     this.dpr = effectiveDpr();
     this.cell = measureCell(
@@ -536,11 +580,14 @@ export class BlitTerminalSurface {
   private applyCanvasLayout(): void {
     if (!this.glCanvas) return;
 
+    // Both branches leave width/height to doRender, which sizes the element to
+    // exactly the backing store's device pixels every frame.
     if (this._resizable) {
       Object.assign(this.glCanvas.style, {
         display: "block",
-        width: "",
-        height: "",
+        maxWidth: "",
+        maxHeight: "",
+        margin: "",
         objectFit: "",
         objectPosition: "",
         position: "absolute",
@@ -553,16 +600,28 @@ export class BlitTerminalSurface {
     } else {
       Object.assign(this.glCanvas.style, {
         display: "block",
-        width: "100%",
-        height: "100%",
+        // Clamp rather than stretch. `width: 100%` scaled the grid to whatever
+        // box it was handed, which magnifies — and blurs — a preview whose
+        // grid is smaller than its pane. With max-* the natural 1:1 size wins
+        // whenever it fits, and only a grid too big for the box gets scaled
+        // down (object-fit keeps that proportional).
+        maxWidth: "100%",
+        maxHeight: "100%",
+        margin: "auto",
         objectFit: "contain",
         objectPosition: "center",
+        // Stays in flow: preview cards size their own height off this canvas,
+        // and an absolutely positioned one collapses them to nothing.
         position: "",
         top: "",
         left: "",
         pointerEvents: "",
       });
     }
+    // The box moves, so any sub-pixel correction against the old one is stale.
+    this.snapX = 0;
+    this.snapY = 0;
+    this.glCanvas.style.transform = "";
   }
 
   /** Attach to a container element. Creates the canvas + textarea inside it. */
@@ -650,6 +709,7 @@ export class BlitTerminalSurface {
     }
 
     this.setupDprDetection();
+    this.setupDeviceSnapping();
     this.setupCursorBlink();
     this.setupRenderer();
     this.setupCellMeasure();
@@ -675,6 +735,7 @@ export class BlitTerminalSurface {
     this.teardownCellMeasure();
     this.teardownRenderer();
     this.teardownCursorBlink();
+    this.teardownDeviceSnapping();
     this.teardownDprDetection();
 
     if (this.glCanvas && this.container?.contains(this.glCanvas)) {
@@ -715,7 +776,6 @@ export class BlitTerminalSurface {
     this._blitConn = conn;
     if (this.container) {
       this.setupRenderer();
-      this.setupWasmReady();
       this.setupTerminal();
       this.setupDirtyListener();
       this.setupResizeObserver();
@@ -803,17 +863,41 @@ export class BlitTerminalSurface {
     this.remeasureCells(true);
   }
 
+  setTextGamma(gamma: number | undefined): void {
+    const resolved = gamma ?? DEFAULT_TEXT_GAMMA;
+    if (this._textGamma === resolved) return;
+    this._textGamma = resolved;
+    // Purely a shader term — no atlas or geometry change, just repaint.
+    this.scheduleRender();
+  }
+
   // =========================================================================
   // Private setup/teardown methods
   // =========================================================================
 
   private scheduleRender(): void {
-    if (this.renderScheduled || this.disposed) return;
-    this.renderScheduled = true;
-    this.raf = requestAnimationFrame(() => {
-      this.renderScheduled = false;
-      this.doRender();
-    });
+    if (this.disposed) return;
+    // One frame for every surface, staged reads-then-writes — see
+    // ./frameScheduler. Per-surface rAFs meant pane N's layout read was
+    // forced by pane N-1's writes.
+    scheduleFrame(this);
+  }
+
+  /** Frame phase 1. Reads layout; writes nothing. */
+  measureFrame(): void {
+    if (this.disposed) return;
+    this.measureSnap();
+  }
+
+  /** Frame phase 2. Writes and paints; reads no layout. */
+  paintFrame(): void {
+    if (this.disposed) return;
+    this.applySnap();
+    this.doRender();
+    // doRender sizes the canvas, so whatever the measure phase cached is
+    // stale now. Dropping it here means the next mouse event re-reads
+    // once, rather than every event re-reading.
+    this.invalidateCanvasBox();
   }
 
   // --- DPR detection ---
@@ -821,7 +905,14 @@ export class BlitTerminalSurface {
   private setupDprDetection(): void {
     this.dprCheckHandler = () => {
       const next = effectiveDpr();
-      if (next !== this.dpr) {
+      // Hysteresis. On Safari `effectiveDpr` infers zoom from
+      // outerWidth/innerWidth, whose ratio drifts continuously while a
+      // window is dragged (the chrome is a fixed pixel offset). An exact
+      // inequality therefore fires most frames of a resize, and each one
+      // costs a full remeasure: a throwaway canvas + measureText, then
+      // invalidate_render_cache — the glyph atlas rebuilt, per pane, per
+      // frame. Only a real zoom step clears this threshold.
+      if (Math.abs(next - this.dpr) > 0.05) {
         this.dpr = next;
         this.remeasureCells(true);
       }
@@ -833,6 +924,39 @@ export class BlitTerminalSurface {
       this.dprMq.addEventListener("change", this.dprCheckHandler);
     }
     window.addEventListener("resize", this.dprCheckHandler);
+  }
+
+  /**
+   * Keep the canvas on the device-pixel grid when layout moves it without a
+   * frame to piggyback on.
+   *
+   * {@link snapToDevicePixels} runs inside `doRender`, which is enough while
+   * frames arrive but not otherwise: a pane whose origin moves for a reason of
+   * its own — chrome above it changing height, a dock opening — keeps its stale
+   * correction until the server happens to send an update, and until then every
+   * glyph is resampled off-grid.
+   *
+   * Deliberately no ResizeObserver of its own. A resizable surface already has
+   * one (`setupResizeObserver`) and the snap hangs off that; a passive surface
+   * must not register its container size at all, which a second observer would
+   * do. Scroll covers movement that changes no box.
+   */
+  private setupDeviceSnapping(): void {
+    this.snapScrollHandler = () => {
+      // Scrolling an ancestor moves the box without resizing it.
+      this.invalidateCanvasBox();
+      this.snapToDevicePixels();
+    };
+    // Capture: an ancestor scrolling moves this canvas without any event of
+    // its own reaching it.
+    window.addEventListener("scroll", this.snapScrollHandler, true);
+  }
+
+  private teardownDeviceSnapping(): void {
+    if (this.snapScrollHandler) {
+      window.removeEventListener("scroll", this.snapScrollHandler, true);
+      this.snapScrollHandler = null;
+    }
   }
 
   private teardownDprDetection(): void {
@@ -926,21 +1050,6 @@ export class BlitTerminalSurface {
     this.renderer = null;
   }
 
-  // --- WASM ready ---
-
-  private setupWasmReady(): void {
-    this.readyUnsub?.();
-    this.readyUnsub = null;
-    if (!this._blitConn) {
-      this.wasmReady = false;
-      return;
-    }
-    this.readyUnsub = this._blitConn.onReady(() => {
-      this.wasmReady = true;
-    });
-    if (this._blitConn.isReady()) this.wasmReady = true;
-  }
-
   // --- Terminal lifecycle ---
 
   private setupTerminal(): void {
@@ -948,7 +1057,6 @@ export class BlitTerminalSurface {
       this.terminal = null;
       return;
     }
-    this.setupWasmReady();
     if (this._sessionId !== null) {
       this._blitConn.retain(this._sessionId);
       const t = this._blitConn.getTerminal(this._sessionId);
@@ -973,8 +1081,6 @@ export class BlitTerminalSurface {
     if (this._sessionId !== null && this._blitConn) {
       this._blitConn.release(this._sessionId);
     }
-    this.readyUnsub?.();
-    this.readyUnsub = null;
   }
 
   // --- Dirty listener ---
@@ -1051,10 +1157,24 @@ export class BlitTerminalSurface {
       this.viewId = this._blitConn.allocViewId();
     }
 
-    this.windowResizeHandler = () => this.handleResize();
-    this.resizeObserver = new ResizeObserver(() => this.handleResize());
+    // The ResizeObserver already fires for a window resize — the pane's
+    // box changes with it — so a second `window` listener only doubled
+    // the work per frame, per pane.
+    this.resizeObserver = new ResizeObserver(() => {
+      // Refresh the cached scroll geometry here rather than in the render
+      // loop: an observer callback runs after layout, so these reads are
+      // already-computed values instead of a forced reflow.
+      if (this.scrollEl) {
+        this.scrollViewH = this.scrollEl.clientHeight;
+        this.lastScrollTop = this.scrollEl.scrollTop;
+      }
+      this.invalidateCanvasBox();
+      // Snap before the size round-trip: the new box is already on screen, and
+      // waiting for the server's grid would leave it off-grid until then.
+      this.snapToDevicePixels();
+      this.handleResize();
+    });
     this.resizeObserver.observe(this.container);
-    window.addEventListener("resize", this.windowResizeHandler);
     this.handleResize(true /* immediate */);
   }
 
@@ -1062,16 +1182,17 @@ export class BlitTerminalSurface {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     clearTimeout(this._resizeTimer);
-    if (this.windowResizeHandler) {
-      window.removeEventListener("resize", this.windowResizeHandler);
-      this.windowResizeHandler = null;
-    }
     if (this._sessionId !== null && this._blitConn && this.viewId) {
       this._blitConn.removeView(this._sessionId, this.viewId);
     }
   }
 
   private _resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  private _lastViewSizeAt = 0;
+  /** Wire rate limit for size changes. Low enough that a drag stays
+   *  roughly live, high enough not to flood the server with intermediate
+   *  sizes (each one can cost an encoder rebuild for h264-software). */
+  private static readonly RESIZE_THROTTLE_MS = 80;
 
   private handleResize(immediate?: boolean): void {
     if (!this.container || !this._resizable) return;
@@ -1083,28 +1204,63 @@ export class BlitTerminalSurface {
     if (sizeChanged) {
       this._rows = rows;
       this._cols = cols;
-      // Debounce the server notification to avoid flooding the server
-      // with intermediate sizes during drag-resize, which causes
-      // expensive encoder recreation cycles for h264-software.
-      // Render locally is immediate; only the network message is delayed.
+      // The grid is server-owned: the wasm terminal's cols/rows are
+      // read-only, so nothing on screen reflows until setViewSize has
+      // round-tripped and the server streams the new grid back. A purely
+      // trailing debounce therefore does not "delay the network message
+      // while rendering locally" — it freezes the pane's contents for the
+      // whole drag, because every frame's clearTimeout restarts it.
+      //
+      // Leading edge + throttle instead: the first change of a drag goes
+      // out at once and further ones at most every RESIZE_THROTTLE_MS,
+      // with a trailing timer so the final size always lands.
       if (this._sessionId !== null && this._blitConn && this.viewId) {
-        if (immediate) {
-          this._blitConn.setViewSize(this._sessionId, this.viewId, rows, cols);
+        const send = () => {
+          if (this._sessionId === null || !this._blitConn || !this.viewId)
+            return;
+          this._lastViewSizeAt = performance.now();
+          this._blitConn.setViewSize(
+            this._sessionId,
+            this.viewId,
+            this._rows,
+            this._cols,
+          );
+        };
+        clearTimeout(this._resizeTimer);
+        const since = performance.now() - this._lastViewSizeAt;
+        if (immediate || since >= BlitTerminalSurface.RESIZE_THROTTLE_MS) {
+          send();
         } else {
-          clearTimeout(this._resizeTimer);
-          this._resizeTimer = setTimeout(() => {
-            if (this._sessionId !== null && this._blitConn && this.viewId) {
-              this._blitConn.setViewSize(
-                this._sessionId,
-                this.viewId,
-                rows,
-                cols,
-              );
-            }
-          }, 150);
+          // Read _rows/_cols at fire time, not now: a later frame in the
+          // same window updates them and this timer should carry the
+          // newest size, not the one that scheduled it.
+          this._resizeTimer = setTimeout(
+            send,
+            BlitTerminalSurface.RESIZE_THROTTLE_MS - since,
+          );
         }
       }
     }
+    // Changing the pane's height changes `clientHeight`, and the browser
+    // re-clamps `scrollTop` to the new range — a synthetic scroll event the
+    // listener would otherwise read as the user scrolling, derive a new
+    // offset from, and send to the server. Opening a pane above a terminal
+    // must not move its scrollback.
+    //
+    // Only the flag is set here. The render loop already calls
+    // `syncScrollSurface` every frame, so doing it synchronously as well
+    // added a forced layout read *and* two style writes per pane per
+    // resize event — the interleaving that makes a window drag crawl.
+    // Two frames of suppression because the clamp lands after layout,
+    // by which point the scheduled render has re-derived the DOM from
+    // `scrollOffset`, which is the value we actually trust.
+    this.suppressScrollSync = true;
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        this.suppressScrollSync = false;
+      }),
+    );
+
     this.contentDirty = true;
     this.scheduleRender();
   }
@@ -1136,7 +1292,114 @@ export class BlitTerminalSurface {
 
   private teardownRenderLoop(): void {
     cancelAnimationFrame(this.raf);
+    cancelFrame(this);
     this.renderScheduled = false;
+  }
+
+  /**
+   * Cancel the canvas's fractional device-pixel offset.
+   *
+   * Everything about the backing store is device-pixel exact — cell metrics
+   * snap to whole device pixels (measureCell), glyph quads land on integer
+   * boundaries, the composite blit is 1:1. None of that survives if the
+   * element itself is painted at a fractional offset, which is the normal
+   * outcome of laying panes out with flex weights: the compositor resamples
+   * the whole canvas and every glyph in it softens at once.
+   *
+   * So measure where the box actually lands and translate by the remainder.
+   * The correction is always under one device pixel, and it is applied via
+   * `transform` precisely because transforms do not perturb layout — nothing
+   * reflows, and the sibling scroll/input overlays stay put.
+   */
+  /**
+   * Read half of device-pixel snapping: work out the correction, write
+   * nothing. Safe only while layout is clean — the frame scheduler's
+   * measure phase, a ResizeObserver callback, or a scroll callback.
+   */
+  private measureSnap(): void {
+    const canvas = this.glCanvas;
+    if (!canvas) {
+      this.pendingSnap = null;
+      return;
+    }
+    const dpr = this.dpr;
+    // At dpr 1 a correction is always ±0.5 CSS px, and a fractional transform
+    // is worse than the problem: it promotes the canvas to its own composited
+    // layer and Chrome rasterizes the bitmap *through* the translate,
+    // resampling every pixel. Left alone, paint-time snapping puts a
+    // fractionally-positioned canvas on the grid crisply. Above dpr 1 the
+    // correction is a sub-CSS-pixel nudge that lands on a real device pixel,
+    // which is worth the layer.
+    //
+    // Decided before the rect read, not after: the answer at dpr <= 1 is
+    // always "no correction", so reading the box first would be a layout
+    // read that could only confirm what we already knew.
+    if (dpr <= 1) {
+      this.pendingSnap = [0, 0];
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    // The measure phase is the one place a read is already paid for, so
+    // the mouse handlers' cache is refreshed from it.
+    this.canvasRect = rect;
+    if (rect.width === 0 || rect.height === 0) {
+      this.pendingSnap = null;
+      return;
+    }
+    // getBoundingClientRect reports the *transformed* box, so back out the
+    // correction already in place or it would compound frame over frame.
+    const left = (rect.left - this.snapX) * dpr;
+    const top = (rect.top - this.snapY) * dpr;
+    this.pendingSnap = [
+      (Math.round(left) - left) / dpr,
+      (Math.round(top) - top) / dpr,
+    ];
+  }
+
+  /** The canvas box, re-read only when something may have moved it. */
+  private canvasBox(): DOMRect | null {
+    const canvas = this.glCanvas;
+    if (!canvas) return null;
+    if (!this.canvasRect) this.canvasRect = canvas.getBoundingClientRect();
+    return this.canvasRect;
+  }
+
+  /** Forget the cached box. Call whenever layout may have shifted it. */
+  private invalidateCanvasBox(): void {
+    this.canvasRect = null;
+  }
+
+  /** Set the canvas cursor, skipping a redundant write. */
+  private setCursor(target: HTMLElement, value: string): void {
+    if (this.lastCursor === value) return;
+    this.lastCursor = value;
+    this.setCursor(target, value);
+  }
+
+  /** Write half: apply whatever `measureSnap` worked out. */
+  private applySnap(): void {
+    const canvas = this.glCanvas;
+    const snap = this.pendingSnap;
+    this.pendingSnap = null;
+    if (!canvas || !snap) return;
+    const [dx, dy] = snap;
+    if (dx === this.snapX && dy === this.snapY) return;
+    this.snapX = dx;
+    this.snapY = dy;
+    canvas.style.transform =
+      dx === 0 && dy === 0 ? "" : `translate(${dx}px, ${dy}px)`;
+  }
+
+  /**
+   * Both halves back to back. Only for callers that already run after
+   * layout — a ResizeObserver or scroll callback — where the read is a
+   * cached value rather than a forced reflow. The render path must use the
+   * split halves instead, or it reintroduces exactly the cross-pane
+   * read-after-write this was built to remove.
+   */
+  private snapToDevicePixels(): void {
+    this.measureSnap();
+    this.applySnap();
   }
 
   private doRender(): void {
@@ -1165,14 +1428,20 @@ export class BlitTerminalSurface {
     const pw = termCols * cell.pw;
     const ph = termRows * cell.ph;
 
-    if (this._resizable) {
-      const cssW = `${termCols * cell.w}px`;
-      const cssH = `${termRows * cell.h}px`;
-      const glCanvas = this.glCanvas;
-      if (glCanvas) {
-        if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
-        if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
-      }
+    // Size the element to exactly the backing store's device pixels. In
+    // resizable panes that is the whole story; non-resizable ones additionally
+    // clamp with max-width/max-height (see applyCanvasLayout) so an oversized
+    // grid still scales down to fit, but one that already fits is left at 1:1
+    // instead of being magnified.
+    const cssW = `${termCols * cell.w}px`;
+    // Non-resizable surfaces leave the height to the canvas's intrinsic aspect
+    // ratio, so that clamping the width scales the grid instead of squashing
+    // it and letterboxing the difference.
+    const cssH = this._resizable ? `${termRows * cell.h}px` : "auto";
+    const glCanvas = this.glCanvas;
+    if (glCanvas) {
+      if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
+      if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
     }
 
     const mem = conn.wasmMemory();
@@ -1214,6 +1483,9 @@ export class BlitTerminalSurface {
       t.glyph_verts_len(),
     );
     renderer.resize(pw, ph);
+    // The renderer is shared between panes, so this is per-frame state, not
+    // setup — a pane must not inherit its neighbour's gamma.
+    renderer.setTextGamma(this._textGamma);
     const predictedLen = this.predicted.length;
     let effectiveCursorCol = t.cursor_col;
     let effectiveCursorRow = t.cursor_row;
@@ -1962,10 +2234,26 @@ export class BlitTerminalSurface {
       if (!t) return;
       const maxLines = t.scrollback_lines();
       const cellH = Math.max(1, this.cell.h);
-      // scrollTop=max → offset 0 (newest); scrollTop=0 → offset maxLines.
-      const maxScrollTop = maxLines * cellH;
-      const fromTop = maxScrollTop - el.scrollTop;
-      const next = Math.max(0, Math.min(maxLines, Math.round(fromTop / cellH)));
+      // Anchor on the distance to the *bottom*, measured from real DOM
+      // geometry rather than recomputed as `maxLines * cellH`. The two
+      // agree only while the spacer matches the current `clientHeight`;
+      // between a pane resizing and the next render they do not, and the
+      // recomputed form silently mapped a stale scrollTop onto the wrong
+      // line. scrollTop=max → offset 0 (newest); scrollTop=0 → maxLines.
+      // Falls back to the model when the element has no layout yet (before
+      // the first frame, and under jsdom), where the measurement is 0 and
+      // would read as "at the bottom".
+      // A scroll callback also runs after layout, so refresh the cache from
+      // real geometry while it is free.
+      this.scrollViewH = el.clientHeight;
+      this.lastScrollTop = el.scrollTop;
+      const measured = el.scrollHeight - el.clientHeight;
+      const maxScrollTop = measured > 0 ? measured : maxLines * cellH;
+      const fromBottom = maxScrollTop - el.scrollTop;
+      const next = Math.max(
+        0,
+        Math.min(maxLines, Math.round(fromBottom / cellH)),
+      );
       if (next === this.scrollOffset) return;
       this.scrollOffset = next;
       if (this._sessionId !== null && this.status === "connected") {
@@ -1975,6 +2263,9 @@ export class BlitTerminalSurface {
       this.scheduleRender();
     };
     el.addEventListener("scroll", this.boundScrollListener, { passive: true });
+    // Seed the cache: the first sync cannot measure it itself.
+    this.scrollViewH = el.clientHeight;
+    this.lastScrollTop = el.scrollTop;
     this.syncScrollSurface(/* preserveOffset */ false);
   }
 
@@ -2003,14 +2294,30 @@ export class BlitTerminalSurface {
     // content to viewport + scrollback range so the maximum reachable
     // scrollTop is exactly (scrollback_lines * cellH), matching the mapping
     // above and allowing offset 0 to land at native bottom.
-    const desired = `${el.clientHeight + lines * cellH}px`;
+    // The cached height, not `el.clientHeight`. This runs inside the render
+    // loop, *after* the canvas style writes above, so reading layout here
+    // forced a synchronous full-document reflow — once per pane, every
+    // frame. During a window drag that was the dominant cost of resizing
+    // (a profile put ~69% of the time in Layout with almost no JS
+    // self-time, which is the signature of forced reflow rather than slow
+    // script). The ResizeObserver and scroll callbacks both run after
+    // layout, so measuring there is free.
+    // Falls back to a real read only when nothing has cached a measurement
+    // yet — before the first observer callback, and under jsdom. That is a
+    // one-off; the steady state never reads layout here, which is the whole
+    // point.
+    const viewH = this.scrollViewH > 0 ? this.scrollViewH : el.clientHeight;
+    const desired = `${viewH + lines * cellH}px`;
     if (spacer.style.height !== desired) spacer.style.height = desired;
     // Clamp scrollOffset to the (possibly shrunken) range first.
     if (preserveOffset) {
       this.scrollOffset = Math.max(0, Math.min(lines, this.scrollOffset));
     }
     const targetTop = (lines - this.scrollOffset) * cellH;
-    if (Math.abs(el.scrollTop - targetTop) > 0.5) {
+    // Compared against what we last wrote rather than read back from the
+    // element, for the same reason: a read here is a forced reflow.
+    if (Math.abs(this.lastScrollTop - targetTop) > 0.5) {
+      this.lastScrollTop = targetTop;
       this.suppressScrollSync = true;
       el.scrollTop = targetTop;
       // The scroll event is async; clear the flag in the next frame.
@@ -2044,7 +2351,8 @@ export class BlitTerminalSurface {
     let lastHoverUrl: string | null = null;
 
     const mouseToCell = (e: MouseEvent) => {
-      const rect = canvas.getBoundingClientRect();
+      const rect = this.canvasBox();
+      if (!rect) return { row: 0, col: 0 };
       return {
         row: Math.min(
           Math.max(Math.floor((e.clientY - rect.top) / this.cell.h), 0),
@@ -2281,7 +2589,7 @@ export class BlitTerminalSurface {
         const geo = this.scrollbarGeo;
         const y = canvasYFromEvent(e);
         this.scrollDragging = true;
-        target.style.cursor = "grabbing";
+        this.setCursor(target, "grabbing");
         if (y >= geo.barY && y <= geo.barY + geo.barH) {
           this.scrollDragOffset = y - geo.barY;
         } else {
@@ -2299,7 +2607,6 @@ export class BlitTerminalSurface {
         e.preventDefault();
         clearSelection();
         selecting = true;
-        this.selecting = true;
         const cell = mouseToCell(e);
         const sel = cellToSel(cell);
         const detail = Math.min(e.detail, 3) as 1 | 2 | 3;
@@ -2383,7 +2690,7 @@ export class BlitTerminalSurface {
     const handleMouseUp = (e: MouseEvent) => {
       if (this.scrollDragging) {
         this.scrollDragging = false;
-        target.style.cursor = "text";
+        this.setCursor(target, "text");
         this.scheduleRender();
         return;
       }
@@ -2395,7 +2702,6 @@ export class BlitTerminalSurface {
       if (selecting) {
         stopAutoScroll();
         selecting = false;
-        this.selecting = false;
         if (selGranularity === 1) this.selEnd = cellToSel(mouseToCell(e));
         this.scheduleRender();
         if (
@@ -2442,18 +2748,18 @@ export class BlitTerminalSurface {
 
     const handleHoverMove = (e: MouseEvent) => {
       if (this.scrollDragging) {
-        target.style.cursor = "grabbing";
+        this.setCursor(target, "grabbing");
         return;
       }
       if (this.scrollbarGeo && isNearScrollbar(e)) {
-        target.style.cursor = "default";
+        this.setCursor(target, "default");
         return;
       }
       if (selecting) {
         if (this.hoveredUrl) {
           this.hoveredUrl = null;
           this.scheduleRender();
-          target.style.cursor = "text";
+          this.setCursor(target, "text");
           lastHoverUrl = null;
         }
         return;
@@ -2463,7 +2769,7 @@ export class BlitTerminalSurface {
       const url = hit?.url ?? null;
       if (url !== lastHoverUrl) {
         lastHoverUrl = url;
-        target.style.cursor = hit ? "pointer" : "text";
+        this.setCursor(target, hit ? "pointer" : "text");
         this.hoveredUrl = hit
           ? {
               row: cell.row,
@@ -2492,7 +2798,6 @@ export class BlitTerminalSurface {
       if (selecting) {
         stopAutoScroll();
         selecting = false;
-        this.selecting = false;
         clearSelection();
       }
     };
