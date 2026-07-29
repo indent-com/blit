@@ -134,7 +134,12 @@ import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
 import { BSPContainer, EmptyPane } from "./bsp/BSPContainer";
 import { WebOverlay } from "./WebOverlay";
-import { WebPane, type WebPaneHandle } from "./WebPane";
+import type { WebPaneHandle } from "./WebPane";
+import { WebPaneHost } from "./WebPaneHost";
+import {
+  PersistentWebPanes,
+  createWebPaneHostRegistry,
+} from "./PersistentWebPanes";
 import { WebPaneNav } from "./WebPaneNav";
 import {
   ensurePreviewWorker,
@@ -1547,10 +1552,27 @@ function WorkspaceScreen(props: {
   // is switchable in the picker, since a URL means different things per remote.
   const [webDest, setWebDest] = createSignal<string | null>(null);
   const webDestId = () => webDest() ?? activeConnectionId();
-  // Navigation handles by pane, published by each WebPane for the status bar.
+  // WebPane instances live in one persistent overlay and publish handles by
+  // assignment, so moving a frame between a pane and the dock keeps the same
+  // browsing context and navigation history.
+  const webPaneHosts = createWebPaneHostRegistry();
   const [webHandles, setWebHandles] = createSignal<
     Record<string, WebPaneHandle>
   >({});
+  const persistentWebAssignments = createMemo(() => {
+    const assignments = new Set<string>();
+    const active = activeTile();
+    if (active && isWebAssignment(active)) assignments.add(active);
+    for (const value of Object.values(layoutAssignments()?.assignments ?? {})) {
+      if (typeof value === "string" && isWebAssignment(value)) {
+        assignments.add(value);
+      }
+    }
+    for (const value of backgroundTiles()) {
+      if (isWebAssignment(value)) assignments.add(value);
+    }
+    return Array.from(assignments);
+  });
 
   /** Remembered locations live in the *server's* KV store, so each remote
    *  keeps its own set (docs/design/kv.md). `workspace.kv*` is per-connection,
@@ -1609,8 +1631,9 @@ function WorkspaceScreen(props: {
       : activeTile();
     const parsed = parseWebAssignment(assign);
     if (!parsed) return null;
+    if (!assign) return null;
     const paneId = inBsp() ? (bspFocusedPaneId() ?? "") : NAV_NONBSP;
-    const handle = webHandles()[paneId];
+    const handle = webHandles()[assign];
     if (!handle) return null;
     return {
       handle,
@@ -2788,6 +2811,16 @@ function WorkspaceScreen(props: {
             : {}),
         }}
       >
+        <PersistentWebPanes
+          assignments={persistentWebAssignments()}
+          registry={webPaneHosts}
+          onHandle={(assignment, handle) =>
+            setWebHandles((previous) => ({
+              ...previous,
+              [assignment]: handle,
+            }))
+          }
+        />
         <section
           style={{
             ...layout.termContainer,
@@ -3057,16 +3090,11 @@ function WorkspaceScreen(props: {
                           position: "relative",
                         }}
                       >
-                        <WebPane
-                          dest={web().connectionId}
-                          url={web().url}
-                          focus
-                          onHandle={(handle) =>
-                            setWebHandles((prev) => ({
-                              ...prev,
-                              [NAV_NONBSP]: handle,
-                            }))
-                          }
+                        <WebPaneHost
+                          assignment={activeTile()!}
+                          hostId={NAV_NONBSP}
+                          register={webPaneHosts.register}
+                          focused
                         />
                         <button
                           onClick={() => setActiveTile(null)}
@@ -3129,9 +3157,7 @@ function WorkspaceScreen(props: {
                     }}
                     onFocusedPaneChange={setBspFocusedPaneId}
                     onOpenTile={openTile}
-                    onWebPaneHandle={(paneId, handle) =>
-                      setWebHandles((prev) => ({ ...prev, [paneId]: handle }))
-                    }
+                    registerWebPaneHost={webPaneHosts.register}
                     onDropTile={dropTileIntoPane}
                     onCreateInPane={(paneId, command, connectionId) => {
                       if (
@@ -3308,10 +3334,12 @@ function WorkspaceScreen(props: {
                                   />
                                 }
                               >
-                                {(web) => (
-                                  <WebPane
-                                    dest={web().connectionId}
-                                    url={web().url}
+                                {(_) => (
+                                  <WebPaneHost
+                                    assignment={assignment}
+                                    hostId={`dock:${assignment}`}
+                                    register={webPaneHosts.register}
+                                    interactive={false}
                                   />
                                 )}
                               </Show>

@@ -1,4 +1,4 @@
-import type { WebPaneHandle } from "../WebPane";
+import type { WebPaneHostRegistrar } from "../WebPaneHost";
 /**
  * The BSP tree's shared context, deliberately in its own module.
  *
@@ -44,8 +44,8 @@ export interface BSPTreeCtx {
   onOpenTile?: (assignment: string) => void;
   /** Drop a dragged IDE tile assignment into a specific pane. */
   onDropTile?: (assignment: string, paneId: string) => void;
-  /** A web pane publishing its navigation handle, for the status bar. */
-  onWebPaneHandle?: (paneId: string, handle: WebPaneHandle) => void;
+  /** Register the visual host for a Workspace-owned persistent web pane. */
+  registerWebPaneHost?: WebPaneHostRegistrar;
 }
 
 export const BSPTreeContext = createContext<BSPTreeCtx>();
