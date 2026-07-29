@@ -996,19 +996,20 @@ export class BlitTerminalSurface {
     this.cell = cell;
 
     const rasterFontSize = this._fontSize * this.dpr;
-    if (this._resizable) {
-      const t = this.terminal;
-      if (t) {
-        t.set_cell_size(cell.pw, cell.ph);
-        t.set_font_family(this._fontFamily);
-        t.set_font_size(rasterFontSize);
-        if (shouldInvalidate) t.invalidate_render_cache();
-      }
-      if (this._blitConn) {
-        this._blitConn.setCellSize(cell.pw, cell.ph);
-        this._blitConn.setFontFamily(this._fontFamily);
-        this._blitConn.setFontSize(rasterFontSize);
-      }
+    const t = this.terminal;
+    if (t) {
+      // Glyph metrics are local rendering state, not a remote resize request.
+      // Passive previews still need them: after a reload they may be the first
+      // surface for a terminal created with TerminalStore's 1x1 defaults.
+      t.set_cell_size(cell.pw, cell.ph);
+      t.set_font_family(this._fontFamily);
+      t.set_font_size(rasterFontSize);
+      if (shouldInvalidate) t.invalidate_render_cache();
+    }
+    if (this._resizable && this._blitConn) {
+      this._blitConn.setCellSize(cell.pw, cell.ph);
+      this._blitConn.setFontFamily(this._fontFamily);
+      this._blitConn.setFontSize(rasterFontSize);
     }
     if (shouldInvalidate) {
       this.contentDirty = true;
@@ -1063,11 +1064,7 @@ export class BlitTerminalSurface {
       if (t) {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
-        if (this._resizable) {
-          t.set_cell_size(this.cell.pw, this.cell.ph);
-          t.set_font_family(this._fontFamily);
-          t.set_font_size(this._fontSize * this.dpr);
-        }
+        this.applyMetricsToTerminal(t);
         this.contentDirty = true;
         this.scheduleRender();
       }
@@ -1095,7 +1092,7 @@ export class BlitTerminalSurface {
       if (this.terminal !== t) {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
-        if (this._resizable) this.applyMetricsToTerminal(t);
+        this.applyMetricsToTerminal(t);
       }
       this.contentDirty = true;
       this.scheduleRender();
@@ -1108,7 +1105,7 @@ export class BlitTerminalSurface {
       if (this.terminal !== t) {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
-        if (this._resizable) this.applyMetricsToTerminal(t);
+        this.applyMetricsToTerminal(t);
       }
       this.contentDirty = true;
       this.scheduleRender();
