@@ -38,7 +38,7 @@ import {
   parseTileAssignment,
 } from "./layout";
 import { BlitTile } from "../ide/BlitTile";
-import { WebPane, type WebPaneHandle } from "../WebPane";
+import { WebPaneHost, type WebPaneHostRegistrar } from "../WebPaneHost";
 import { isTileDrag, tileDragAssignment } from "../ide/tileDrag";
 import { resolveTab, isPtyRef } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
@@ -154,8 +154,8 @@ export function BSPContainer(props: {
   onRender?: (renderMs?: number) => void;
   /** Open an IDE tile from within a tile (commit view → editor). */
   onOpenTile?: (assignment: string) => void;
-  /** A web pane publishing its navigation handle, for the status bar. */
-  onWebPaneHandle?: (paneId: string, handle: WebPaneHandle) => void;
+  /** Register visual hosts for Workspace-owned persistent web panes. */
+  registerWebPaneHost?: WebPaneHostRegistrar;
   /** Drop a dragged IDE tile assignment into a specific pane. */
   onDropTile?: (assignment: string, paneId: string) => void;
 }) {
@@ -860,8 +860,8 @@ export function BSPContainer(props: {
     get onRender() {
       return props.onRender;
     },
-    get onWebPaneHandle() {
-      return props.onWebPaneHandle;
+    get registerWebPaneHost() {
+      return props.registerWebPaneHost;
     },
     get onOpenTile() {
       return props.onOpenTile;
@@ -1265,7 +1265,7 @@ function LeafPane(props: {
         </div>
       </Show>
       <Show when={webParsed()}>
-        {(web) => (
+        {(_) => (
           <div
             style={{
               position: "absolute",
@@ -1274,14 +1274,11 @@ function LeafPane(props: {
               "background-color": theme().bg,
             }}
           >
-            <WebPane
-              dest={web().connectionId}
-              url={web().url}
-              focus={props.isFocused}
-              onHandle={(handle) => ctx.onWebPaneHandle?.(props.paneId, handle)}
-              // A click lands inside the frame, so the pane's own
-              // onPointerDown never fires and the pane would never take
-              // focus — leaving the status bar showing another pane.
+            <WebPaneHost
+              assignment={props.sessionId!}
+              hostId={`bsp:${props.paneId}`}
+              register={ctx.registerWebPaneHost!}
+              focused={props.isFocused}
               onFocusRequest={() => ctx.onFocusPane(props.paneId)}
             />
           </div>
