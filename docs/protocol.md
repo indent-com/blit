@@ -113,7 +113,7 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                              |
 | `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                         |
 | `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                                       |
-| `0x07` | `HELLO`             | `[version:2][features:4]`                                                                                          |
+| `0x07` | `HELLO`             | `[version:2][features:4][boot_generation:8]`                                                                       |
 | `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                        |
 | `0x09` | `READY`             | (no payload)                                                                                                       |
 | `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                             |
@@ -146,7 +146,7 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 
 **Notes:**
 
-`S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `features` is a 4-byte bitmask:
+`S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. Legacy servers omit this field. `features` is a 4-byte bitmask:
 
 | Bit | Name           | Meaning                                                        |
 | --- | -------------- | -------------------------------------------------------------- |
@@ -189,7 +189,7 @@ Each `(client, surface)` pair runs at most one server-side encoder, at the compo
 On connect, the server immediately sends:
 
 ```
-S2C_HELLO       (version + feature bits)
+S2C_HELLO       (version + feature bits + boot generation)
 S2C_LIST        (all existing PTYs)
 S2C_TITLE       (one per PTY, if title is set)
 S2C_EXITED      (one per exited-but-retained PTY)

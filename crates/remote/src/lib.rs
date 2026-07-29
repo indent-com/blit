@@ -1465,6 +1465,7 @@ pub enum ServerMsg<'a> {
     Hello {
         version: u16,
         features: u32,
+        boot_generation: Option<u64>,
     },
     Update {
         pty_id: u16,
@@ -1594,7 +1595,15 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             }
             let version = u16::from_le_bytes([data[1], data[2]]);
             let features = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
-            Some(ServerMsg::Hello { version, features })
+            // The boot generation was appended to HELLO without changing the
+            // protocol version, so continue to accept HELLOs from older servers.
+            let boot_generation = (data.len() >= 15)
+                .then(|| u64::from_le_bytes(data[7..15].try_into().expect("checked HELLO length")));
+            Some(ServerMsg::Hello {
+                version,
+                features,
+                boot_generation,
+            })
         }
         S2C_UPDATE => {
             if data.len() < 3 {
@@ -1960,11 +1969,12 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
     }
 }
 
-pub fn msg_hello(version: u16, features: u32) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(7);
+pub fn msg_hello(version: u16, features: u32, boot_generation: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(15);
     msg.push(S2C_HELLO);
     msg.extend_from_slice(&version.to_le_bytes());
     msg.extend_from_slice(&features.to_le_bytes());
+    msg.extend_from_slice(&boot_generation.to_le_bytes());
     msg
 }
 
@@ -3128,6 +3138,29 @@ fn push_wrapped_word(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_roundtrip_with_boot_generation() {
+        let msg = msg_hello(1, 0x1234_5678, 0xfedc_ba98_7654_3210);
+        assert_eq!(msg.len(), 15);
+        assert_eq!(&msg[7..], &0xfedc_ba98_7654_3210_u64.to_le_bytes());
+        assert!(matches!(
+            parse_server_msg(&msg),
+            Some(ServerMsg::Hello {
+                version: 1,
+                features: 0x1234_5678,
+                boot_generation: Some(0xfedc_ba98_7654_3210),
+            })
+        ));
+
+        assert!(matches!(
+            parse_server_msg(&msg[..7]),
+            Some(ServerMsg::Hello {
+                boot_generation: None,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn term_cwd_roundtrip() {

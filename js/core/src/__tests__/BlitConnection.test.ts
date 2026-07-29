@@ -593,6 +593,16 @@ describe("BlitConnection", () => {
     expect(conn.getSnapshot().ready).toBe(false);
   });
 
+  it("exposes the server boot generation from hello", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE, 0x1234_5678_9abc_def0n);
+    expect(conn.getSnapshot().bootGeneration).toBe(0x1234_5678_9abc_def0n);
+  });
+
+  it("accepts legacy hello without a boot generation", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    expect(conn.getSnapshot().bootGeneration).toBeNull();
+  });
+
   it("supportsRestart reflects FEATURE_RESTART", () => {
     transport.pushHello(1, FEATURE_RESTART);
     expect(conn.getSnapshot().supportsRestart).toBe(true);
