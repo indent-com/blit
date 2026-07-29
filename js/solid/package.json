@@ -1,6 +1,6 @@
 {
   "name": "@blit-sh/solid",
-  "version": "0.39.0",
+  "version": "0.40.0",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
