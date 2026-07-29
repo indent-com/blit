@@ -160,6 +160,28 @@ describe("WebSocketTransport", () => {
     transport.close();
   });
 
+  // "busy" means the server's auth throttle refused the handshake without
+  // examining the passphrase. Conflating it with "auth" makes a transient
+  // lockout look like a bad credential, which wedges the transport and (in the
+  // UI) discards a passphrase that was never wrong.
+  it("treats a throttled handshake as retryable, not an auth rejection", () => {
+    const transport = new WebSocketTransport("ws://host", "pass", {
+      reconnectDelay: 500,
+    });
+    transport.connect();
+    const ws = latestSocket();
+    ws.simulateOpen();
+    ws.simulateMessage("busy");
+
+    expect(transport.authRejected).toBe(false);
+    expect(transport.lastError).toBe("Server busy, retrying");
+
+    const instancesBefore = MockWebSocket.instances.length;
+    vi.advanceTimersByTime(500);
+    expect(MockWebSocket.instances.length).toBe(instancesBefore + 1);
+    transport.close();
+  });
+
   it("transitions to error on server error and retries", () => {
     const transport = new WebSocketTransport("ws://host", "pass", {
       reconnectDelay: 500,

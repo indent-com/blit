@@ -222,7 +222,18 @@ export class WebTransportTransport implements BlitTransport {
 
       // Read 1-byte auth response: 1 = ok, 0 = rejected
       const { data: authResp, remainder } = await readExactBuffered(reader, 1);
-      if (!authResp || authResp[0] !== 1) {
+      if (!authResp) {
+        // EOF before any verdict — the stream broke mid-handshake. Treating it
+        // as a rejection would wedge the transport for a credential the server
+        // never examined, so retry instead. The `wt.closed` handler below is
+        // not installed yet, so schedule the retry here.
+        this.cleanup();
+        this.lastError = "Connection closed during authentication";
+        this.setStatus("disconnected");
+        this.scheduleReconnect();
+        return;
+      }
+      if (authResp[0] !== 1) {
         this.authRejected = true;
         this.lastError = "Authentication failed";
         this.setStatus("error");
