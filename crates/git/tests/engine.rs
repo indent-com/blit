@@ -728,6 +728,58 @@ fn same_second_same_size_rewrite_is_detected() {
     );
 }
 
+/// The same case one step worse: a same-size rewrite whose mtime is
+/// byte-identical to the one the index recorded, which is what a write
+/// landing in the same coarse-clock tick as the `git add` produces. Stat
+/// equality proves nothing inside the index's own mtime, so the content
+/// must be read — git's racy-index rule.
+#[test]
+fn rewrite_with_the_indexed_mtime_is_detected() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    let file = dir.join("r.txt");
+    std::fs::write(&file, "aaaa\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "seed"]);
+    // What `git add` recorded for r.txt, straight from the file it stat'd.
+    let indexed = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::fs::write(&file, "bbbb\n").unwrap();
+    // Replay the tick collision. One tick means one timestamp for all of
+    // it: the rewrite carries the mtime the index recorded, and the index
+    // itself was written in that same tick.
+    let stamp = std::fs::FileTimes::new().set_modified(indexed);
+    for path in [&file, &dir.join(".git/index")] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(stamp)
+            .unwrap();
+    }
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let req = GitDiffRequest {
+        nonce: 1,
+        repo_id: 0,
+        flags: 0,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_INDEX,
+            oid: GIT_OID_NONE,
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_WORKTREE,
+            oid: GIT_OID_NONE,
+        },
+        path: "",
+    };
+    let (_, _, _, records) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+    assert!(
+        git_diff_records(&records).any(|r| matches!(r, GitDiffRecord::Entry { st: b'M', .. })),
+        "rewrite inside the index's own mtime missed"
+    );
+}
+
 #[test]
 fn index_entries_and_rename() {
     let dir = fixture();

@@ -719,7 +719,7 @@ impl Engine {
         // under objects/; those events carry no HEAD/ref/status meaning,
         // so drop them before they reach the engine thread.
         let objects = [self.gitdir.join("objects"), self.common.join("objects")];
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let watcher = blit_fssync::backend::watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = &res else {
                 return;
             };
