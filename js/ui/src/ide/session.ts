@@ -231,6 +231,10 @@ export interface IdeSession {
   /** Idempotently attach a language server for this root. */
   ensureLsp(): void;
   lspHandle: Accessor<LspHandle | null>;
+  /** The remote has no language intelligence, so nothing will ever attach —
+   *  from the negotiated features, not from a failed attach, since the attach
+   *  is lazy. False while the transport is down. */
+  noLsp: Accessor<boolean>;
   /** Bumps on every lsp state/diagnostics push. */
   lspVersion: Accessor<number>;
 
@@ -289,6 +293,9 @@ function buildSession(
   );
   const gitReady = createMemo(() =>
     isConnReady(wsSnap(), connectionId, "supportsGit"),
+  );
+  const lspReady = createMemo(() =>
+    isConnReady(wsSnap(), connectionId, "supportsLsp"),
   );
   const connGen = createMemo(() => connGeneration(wsSnap(), connectionId));
 
@@ -966,6 +973,11 @@ function buildSession(
   // ── lsp: attached on demand (Problems / editor squiggles) ──────────────
   const [lspHandle, setLspHandle] = createSignal<LspHandle | null>(null);
   const [lspVersion, setLspVersion] = createSignal(0);
+  // The remote cannot do language intelligence at all (old blit, or BLIT_LSP=0,
+  // which unadvertises the feature). Read off the negotiated features rather
+  // than a failed attach: the attach is lazy, so a panel that folds itself away
+  // on this would otherwise have to open first to learn it should not have.
+  const noLsp = createMemo(() => fsReady() && !lspReady());
   // Requested once a consumer needs it; the gated effect below opens it when
   // the connection is ready and re-opens after a reset (a plain one-shot open
   // would be lost forever if it fired while the transport was still connecting).
@@ -978,7 +990,7 @@ function buildSession(
     if (!lspWanted()) return;
     connGen(); // re-open after a connection reset
     lspRetry(); // re-attempt after a transient (reset-clobbered) open
-    if (!fsReady()) return; // wait for the transport (fs is the base feature)
+    if (!lspReady()) return; // no transport yet, or no language support at all
     let localDisposed = false;
     let unsub: (() => void) | null = null;
     workspace
@@ -1050,6 +1062,7 @@ function buildSession(
     logLoaded,
     ensureLsp,
     lspHandle,
+    noLsp,
     lspVersion,
     // Both return "" when the root is unknown, so callers can decline to open
     // rather than mint a tile whose path can never resolve.

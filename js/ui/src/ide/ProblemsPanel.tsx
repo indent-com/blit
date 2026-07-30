@@ -211,18 +211,28 @@ export function ProblemsPanel(props: {
             }}
           >
             <Show when={props.session} fallback="No root selected.">
-              <Show when={props.session!.lspHandle()} fallback="Opening…">
-                <Show
-                  when={!anyBackend()}
-                  fallback={
-                    // Sticky "No problems.": only blank while a backend is
-                    // *sustained*-loading (debounced). A brief re-index blip no
-                    // longer flips this on and off every second. If the reindex
-                    // surfaces a problem it streams into `total()` and shows.
-                    showLoading() ? "" : "No problems."
-                  }
-                >
-                  No language server for this project.
+              {/* The dock folds this section away on a remote with no language
+                  intelligence; this is what it says when opened anyway. Without
+                  it the panel sat on "Opening…" for an attach that can never
+                  happen. */}
+              <Show
+                when={!props.session!.noLsp()}
+                fallback="No language support on this remote."
+              >
+                <Show when={props.session!.lspHandle()} fallback="Opening…">
+                  <Show
+                    when={!anyBackend()}
+                    fallback={
+                      // Sticky "No problems.": only blank while a backend is
+                      // *sustained*-loading (debounced). A brief re-index blip
+                      // no longer flips this on and off every second. If the
+                      // reindex surfaces a problem it streams into `total()`
+                      // and shows.
+                      showLoading() ? "" : "No problems."
+                    }
+                  >
+                    No language server for this project.
+                  </Show>
                 </Show>
               </Show>
             </Show>

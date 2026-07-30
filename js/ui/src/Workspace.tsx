@@ -663,13 +663,16 @@ function WorkspaceScreen(props: {
   });
   const activeSession = useIdeSession(workspace, ideDescriptor);
 
-  // Sections with nothing to show for this root. The commit log over a
-  // directory that is not a repository (or a remote with no git at all) folds
-  // away, rather than sitting open on a message — the space belongs to the
-  // panels that do apply. It unfolds by itself when a repo appears.
+  // Sections with nothing to show for this root: a commit log over a directory
+  // that is not a repository (or a remote with no git at all), problems from a
+  // remote that cannot run a language server. They fold away rather than
+  // sitting open on a message — the space belongs to the panels that do apply —
+  // and unfold by themselves once they have something to say.
   const inapplicableSections = createMemo<ReadonlySet<LeftPanel>>(() => {
     const set = new Set<LeftPanel>();
-    if (activeSession()?.noRepo()) set.add("log");
+    const s = activeSession();
+    if (s?.noRepo()) set.add("log");
+    if (s?.noLsp()) set.add("problems");
     return set;
   });
   // An override lapses once its section applies again.
