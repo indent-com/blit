@@ -856,6 +856,13 @@ export function ExplorerPanel(props: {
                   <For each={list()}>
                     {(row) => {
                       const isDir = isDirLike(row.type, row.flags);
+                      // Expansion follows symlinks; moving into one does not.
+                      // A drop on a symlinked directory would rename *through*
+                      // the link — the destination resolves under both the link
+                      // and its real path, and fails EXDEV across devices. That
+                      // is its own change; keep it to real directories, which is
+                      // also what `createUnder` gates on.
+                      const isMoveTarget = row.type === FS_ENTRY_DIR;
                       const isLink = row.type === FS_ENTRY_SYMLINK;
                       const unreadable =
                         (row.flags & FS_ENTRY_UNREADABLE) !== 0;
@@ -877,7 +884,7 @@ export function ExplorerPanel(props: {
                                 opacity: unreadable ? 0.5 : 1,
                                 "font-style": isLink ? "italic" : "normal",
                                 background:
-                                  dropTarget() === row.relPath && isDir
+                                  dropTarget() === row.relPath && isMoveTarget
                                     ? `color-mix(in srgb, ${props.theme.accent} 30%, transparent)`
                                     : isActive()
                                       ? `color-mix(in srgb, ${props.theme.accent} 22%, transparent)`
@@ -908,7 +915,9 @@ export function ExplorerPanel(props: {
                                 }
                               }}
                               onContextMenu={(e) => openMenu(e, row)}
-                              draggable={row.type === FS_ENTRY_FILE || isDir}
+                              draggable={
+                                row.type === FS_ENTRY_FILE || isMoveTarget
+                              }
                               onDragStart={(e) => {
                                 const s = props.session;
                                 if (!s) return;
@@ -927,14 +936,17 @@ export function ExplorerPanel(props: {
                                 });
                               }}
                               onDragOver={(e) => {
-                                if (isDir) acceptMove(e, row.relPath);
+                                if (isMoveTarget) acceptMove(e, row.relPath);
                               }}
                               onDragLeave={() => {
-                                if (isDir && dropTarget() === row.relPath)
+                                if (
+                                  isMoveTarget &&
+                                  dropTarget() === row.relPath
+                                )
                                   setDropTarget(null);
                               }}
                               onDrop={(e) => {
-                                if (isDir) performMove(e, row.relPath);
+                                if (isMoveTarget) performMove(e, row.relPath);
                               }}
                               title={
                                 unreadable
