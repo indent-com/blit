@@ -2308,6 +2308,19 @@ impl Reconciler {
         }
     }
 
+    /// The device the sync root lives on, which bounds cross-filesystem
+    /// descent.
+    ///
+    /// Reconcile paths must pass this rather than `None`: `scan_children`
+    /// re-anchors a `None` bound to whatever device it is handed, and for a
+    /// symlink that is the *target's* device — silently lifting the guard for
+    /// the whole foreign subtree. The reconcile pre-check cannot catch it
+    /// either, because a symlink's own `dev_ino` comes from `lstat` and so
+    /// reports the device the link itself lives on, not its target's.
+    fn root_device(&self) -> Option<u64> {
+        self.canonical.get("").map(|m| m.dev_ino.0)
+    }
+
     /// Verify one hinted path against the canonical index.
     fn reconcile(&mut self, rel: &str) -> Result<(), u8> {
         if self.single {
@@ -2373,7 +2386,8 @@ impl Reconciler {
                     // watch registration and this scan produce duplicate
                     // hints, which reconcile to no-ops.
                     let mut sub = Index::new();
-                    match self.scan_into(&mut sub, &abs, rel, self.opts.recursive, None) {
+                    let bound = self.root_device();
+                    match self.scan_into(&mut sub, &abs, rel, self.opts.recursive, bound) {
                         Ok(()) => {}
                         Err(e) if e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO) => {
                             return Err(FS_CLOSED_RESOURCE_LIMIT);
@@ -2468,9 +2482,10 @@ impl Reconciler {
         for k in gone {
             self.index_remove(&k);
         }
+        let bound = self.root_device();
         for (abs, rel) in new_dirs {
             let mut sub = Index::new();
-            match self.scan_into(&mut sub, &abs, &rel, self.opts.recursive, None) {
+            match self.scan_into(&mut sub, &abs, &rel, self.opts.recursive, bound) {
                 Ok(()) => {}
                 Err(e) if e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO) => {
                     return Err(FS_CLOSED_RESOURCE_LIMIT);
@@ -4215,6 +4230,80 @@ mod tests {
     }
 
     /// A SINGLE root's validation: directories answer the invalid-path
+    /// With `cross_filesystem` off (the default), a symlink to a directory on
+    /// another mount is reported but never descended — on the initial scan and,
+    /// the case that actually regressed, on an incremental reconcile.
+    ///
+    /// The reconcile pre-check cannot catch this one: a symlink's `dev_ino`
+    /// comes from `lstat`, so it reports the device the *link* lives on (the
+    /// root's), sailing past the guard that stops real foreign-device
+    /// directories. `scan_into` was then called with `root_dev: None`, which
+    /// re-anchored the bound to the target's device and indexed the whole
+    /// cross-device subtree.
+    ///
+    /// Uses /dev/shm as the second filesystem; skipped when it is absent, not
+    /// writable, or happens to share a device with the temp dir.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cross_device_symlink_is_not_descended_on_reconcile() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = temp_dir().canonicalize().unwrap();
+        let Ok(shm) = std::path::Path::new("/dev/shm").canonicalize() else {
+            return;
+        };
+        let foreign = shm.join(format!("blit-xdev-{}", std::process::id()));
+        if fs::create_dir_all(foreign.join("inner")).is_err() {
+            return;
+        }
+        // Guard the premise: without two devices this proves nothing.
+        let (Ok(a), Ok(b)) = (fs::metadata(&dir), fs::metadata(&foreign)) else {
+            let _ = fs::remove_dir_all(&foreign);
+            return;
+        };
+        if a.dev() == b.dev() {
+            let _ = fs::remove_dir_all(&foreign);
+            return;
+        }
+        fs::write(foreign.join("inner/secret.txt"), b"elsewhere").unwrap();
+        fs::write(dir.join("local.txt"), b"here").unwrap();
+
+        // cross_filesystem defaults to false in test_key.
+        let (sent, handle, hint) = drive_engine(&dir);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("local.txt")
+        });
+
+        // Create the link *after* the first snapshot, so the hint takes the
+        // "new (or type-changed) directory" branch — the trigger.
+        std::os::unix::fs::symlink(&foreign, dir.join("far")).unwrap();
+        hint.send(Hint::Dirty(dir.join("far")));
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "link entry", |m| {
+            m.live.contains_key("far")
+        });
+
+        // The link is reported — it is the boundary, like a mount point — but
+        // nothing beyond it is indexed. Snapshot the verdict, then tear down
+        // *before* asserting: /dev/shm is RAM, and a failing assert would
+        // otherwise leave the fixture behind.
+        let leaked: Vec<String> = mirror
+            .live
+            .keys()
+            .filter(|k| k.starts_with("far/"))
+            .cloned()
+            .collect();
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&foreign);
+
+        assert!(
+            leaked.is_empty(),
+            "cross_filesystem is off: a symlink to another device must not be \
+             descended, found {leaked:?}"
+        );
+    }
+
     /// A root whose name contains `%` survives the FS_SYNCED round trip. The
     /// echo is `escape_path(canonical_root)`, so a literal `%` comes back as
     /// `%25`; clients build further sync roots from that echo, and without a
