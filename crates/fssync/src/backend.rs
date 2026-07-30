@@ -6,7 +6,7 @@
 //! verifies everything against the filesystem before emitting.
 
 use crate::{Hint, HintSender};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 
 /// Keeps the native watch alive; dropping it unwatches.
@@ -39,34 +39,53 @@ pub fn is_read_only_event(kind: &notify::EventKind) -> bool {
     )
 }
 
+/// Build the platform watcher every blit watch goes through.
+///
+/// Identical to `notify::recommended_watcher` but for one setting:
+/// `Config::default()` turns symlink following *on*, and notify's inotify
+/// backend re-`WalkDir`s a subtree on every `IN_CREATE`/`IN_MOVED_TO` that
+/// carries `ISDIR` (notify 8.2 `src/inotify.rs`). A recursive watch on a
+/// worktree that contains a pnpm `node_modules` — where every package is a
+/// symlink into `.pnpm/`, so the same real directories are reachable under
+/// many paths — or a `.direnv` linking into the nix store therefore walks a
+/// tree several times its real size, and re-walks it per directory created
+/// anywhere inside. Measured on this repo: 9.7k real directories, 92k when
+/// following, and four such event loops pinned four cores indefinitely.
+///
+/// Following is also wrong on the merits here: neither the status engine nor
+/// the sync engine reports on paths outside the root it was handed, so the
+/// walk only ever costs work whose results are discarded.
+pub fn watcher<F: notify::EventHandler>(handler: F) -> notify::Result<RecommendedWatcher> {
+    RecommendedWatcher::new(handler, Config::default().with_follow_symlinks(false))
+}
+
 /// Arm a native watch on `root` feeding `hints`. Must be called *before*
 /// the engine's initial enumeration so nothing slips between scan and arm.
 pub fn watch(root: &Path, recursive: bool, hints: HintSender) -> notify::Result<WatchBackend> {
-    let mut watcher =
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-            Ok(event) => {
-                if event.need_rescan() {
-                    hints.send(Hint::Rescan);
-                    return;
-                }
-                if is_read_only_event(&event.kind) {
-                    return;
-                }
-                for path in event.paths {
-                    hints.send(Hint::Dirty(path));
-                }
-            }
-            Err(_) => {
+    let mut backend = watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(event) => {
+            if event.need_rescan() {
                 hints.send(Hint::Rescan);
+                return;
             }
-        })?;
+            if is_read_only_event(&event.kind) {
+                return;
+            }
+            for path in event.paths {
+                hints.send(Hint::Dirty(path));
+            }
+        }
+        Err(_) => {
+            hints.send(Hint::Rescan);
+        }
+    })?;
     let mode = if recursive {
         RecursiveMode::Recursive
     } else {
         RecursiveMode::NonRecursive
     };
-    watcher.watch(root, mode)?;
-    Ok(WatchBackend { _watcher: watcher })
+    backend.watch(root, mode)?;
+    Ok(WatchBackend { _watcher: backend })
 }
 
 #[cfg(test)]
