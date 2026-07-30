@@ -44,9 +44,10 @@ struct Side {
 type Flat = BTreeMap<Vec<u8>, Side>;
 
 /// A file's on-disk identity at the moment its content was proven equal
-/// to an index blob. Size and full-precision mtime carry the same
-/// correctness bar as [`stat_matches`]; inode and device (unix) also
-/// catch rename-over rewrites that preserve both.
+/// to an index blob. Size and full-precision mtime as in [`stat_matches`],
+/// minus its racy-index guard — this signature is anchored to a read this
+/// process performed rather than to the index file's mtime; inode and
+/// device (unix) also catch rename-over rewrites that preserve both.
 #[derive(Clone, Copy, PartialEq)]
 struct DiskSig {
     size: u64,
@@ -223,6 +224,7 @@ fn flatten(
             let workdir = repo.workdir().ok_or(GIT_STATUS_INVALID)?.to_path_buf();
             // Tracked files: the index projected onto the disk.
             let index = repo.index_or_empty().map_err(|_| GIT_STATUS_OTHER)?;
+            let index_mtime = file_mtime(index.path());
             for entry in index_filter_range(&index, filter) {
                 if cancel.is_cancelled() {
                     return Err(GIT_STATUS_CANCELLED);
@@ -246,7 +248,7 @@ fn flatten(
                 // Index stat first; then the engine's own stat cache — a
                 // stat unchanged since its content last hashed equal to
                 // this same blob is clean without a read.
-                let unchanged = stat_matches(entry, &md)
+                let unchanged = stat_matches(entry, &md, index_mtime)
                     || stats.is_some_and(|cache| {
                         cache.get(path.as_ref() as &[u8]).is_some_and(|sig| {
                             sig.oid == entry.id && Some(sig.disk) == DiskSig::of(&md)
@@ -279,11 +281,38 @@ fn under_filter(path: &[u8], filter: &[u8]) -> bool {
         || (path.len() > filter.len() && path.starts_with(filter) && path[filter.len()] == b'/')
 }
 
-/// Conservative index-stat match: size plus full-precision mtime. Seconds
-/// alone would call a same-second rewrite clean (the racy-git problem);
-/// nanoseconds catch it on every filesystem that records them. A false
-/// mismatch only costs a content hash, never a wrong answer.
-fn stat_matches(entry: &gix::index::Entry, md: &std::fs::Metadata) -> bool {
+/// A file's mtime as (seconds, nanoseconds) since the epoch, or None if it
+/// cannot be read.
+fn file_mtime(path: &std::path::Path) -> Option<(i64, u32)> {
+    use std::time::UNIX_EPOCH;
+    let d = std::fs::metadata(path)
+        .and_then(|md| md.modified())
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?;
+    Some((d.as_secs() as i64, d.subsec_nanos()))
+}
+
+/// Conservative index-stat match: size plus full-precision mtime, and only
+/// for an entry the index is entitled to call clean at all.
+///
+/// Nanoseconds alone are not enough. Linux stamps mtimes from the coarse
+/// clock, which only advances once per timer tick, so a file written twice
+/// within one tick carries a byte-identical mtime both times — and a
+/// same-size rewrite between the `git add` that recorded the stat and the
+/// index write that followed it is then indistinguishable from no write at
+/// all. That is the racy-git problem, and git's answer (`is_racy_stat`,
+/// read-cache.c) is to distrust any entry whose recorded mtime is not
+/// strictly older than the index file's own mtime: within that window the
+/// stat proves nothing and the content must be read. `index_mtime` is that
+/// timestamp; None (unreadable index) distrusts everything.
+///
+/// A false mismatch only costs a content hash, never a wrong answer.
+fn stat_matches(
+    entry: &gix::index::Entry,
+    md: &std::fs::Metadata,
+    index_mtime: Option<(i64, u32)>,
+) -> bool {
     use std::time::UNIX_EPOCH;
     if u64::from(entry.stat.size) != md.len() {
         return false;
@@ -295,8 +324,11 @@ fn stat_matches(entry: &gix::index::Entry, md: &std::fs::Metadata) -> bool {
     else {
         return false;
     };
-    i64::from(entry.stat.mtime.secs) == disk.as_secs() as i64
-        && entry.stat.mtime.nsecs == disk.subsec_nanos()
+    let disk = (disk.as_secs() as i64, disk.subsec_nanos());
+    if (i64::from(entry.stat.mtime.secs), entry.stat.mtime.nsecs) != disk {
+        return false;
+    }
+    index_mtime.is_some_and(|index_mtime| index_mtime > disk)
 }
 
 fn worktree_mode(md: &std::fs::Metadata, _index_mode: u32) -> u32 {
