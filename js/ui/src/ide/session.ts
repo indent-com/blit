@@ -57,6 +57,7 @@ import {
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import { isConnReady, connGeneration, isTransientConnError } from "./reactive";
 import { currentSessionForPty } from "./followTerminal";
+import { settledWithoutRepo } from "./gitPresence";
 
 /** Ceiling on consecutive transient open-retries — see the per-session
  *  counters. Generous: a real reconnect needs one. */
@@ -197,10 +198,12 @@ export interface IdeSession {
    *  terminal is gone, …) or the server closed the watch. `null` while the
    *  repo is opening or open — the two states panels must not conflate. */
   gitError: Accessor<string | null>;
-  /** There is no repo here and none is coming: the open failed, the server
-   *  closed the watch, or the remote has no git support. False while one is
-   *  still opening (or could be, once the transport is back), so panels that
-   *  only make sense over a repository can fold away without flapping. */
+  /** There is no repo here and none is coming: the open settled as a failure,
+   *  or the remote has no git support. False while one is still opening (or
+   *  could be, once the transport is back), so panels that only make sense
+   *  over a repository can fold away without flapping — and false once a repo
+   *  *has* opened here, because a watch that then dies is a failure to report
+   *  rather than an absent repository (see [`settledWithoutRepo`]). */
   noRepo: Accessor<boolean>;
   /** The repo's worktree root, discovered when git first opens and kept across
    *  connection resets (unlike gitHandle, which drops to null on a reset). Use
@@ -653,12 +656,20 @@ function buildSession(
   // Without it every git panel has to guess, and the commit log's guess was
   // "loading" — forever, for a page no one is coming to send.
   const [gitError, setGitError] = createSignal<string | null>(null);
-  // Settled emptiness: an open that failed for good, or a remote whose server
-  // has no git at all (the open effect never runs, so there is no error to
-  // read either). Deliberately false while the transport is down — the repo
-  // that comes back is not news, and folding panels on a blip is.
-  const noRepo = createMemo(
-    () => !gitHandle() && (gitError() !== null || (fsReady() && !gitReady())),
+  // Whether a repo has ever opened for this root. Distinguishes "there is no
+  // repository" from "the one we had just died", which look identical from
+  // gitHandle and gitError alone — see `settledWithoutRepo`. Cleared only by an
+  // open that settles as a failure, so a reconnect window keeps the answer the
+  // last settled open gave.
+  const [hadRepo, setHadRepo] = createSignal(false);
+  const noRepo = createMemo(() =>
+    settledWithoutRepo({
+      hasHandle: gitHandle() !== null,
+      hadRepo: hadRepo(),
+      gitError: gitError(),
+      fsReady: fsReady(),
+      gitReady: gitReady(),
+    }),
   );
   // Commit log with frontier pagination: a live head page (watchLog, updates
   // as refs move) plus statically fetched older pages appended on demand.
@@ -799,6 +810,10 @@ function buildSession(
         // git-backed panel would sit on a dead repo — the commit log showing
         // "Loading…" for a page that can never arrive. A connection loss is
         // not terminal; connGen re-opens.
+        //
+        // `hadRepo` stays set here on purpose: this is a repository that died,
+        // not one that was never there, so the sections stay open to say so
+        // instead of folding away over the commits still on screen.
         onClosed: (reason: number) => {
           setGitVersion((v) => v + 1);
           if (reason === GIT_CLOSED_CONNECTION_LOST || disposed) return;
@@ -813,6 +828,7 @@ function buildSession(
         }
         gitRetries = 0;
         setGitError(null);
+        setHadRepo(true);
         setGitHandle(h);
         // Reveal the repo root so a tile-anchored fs tree can re-root at it.
         setGitWorkdir(h.workdir);
@@ -830,6 +846,10 @@ function buildSession(
           setGitRetry((n) => n + 1);
         else {
           setGitError(e instanceof Error ? e.message : String(e));
+          // This root has no repo, whatever an earlier generation opened here
+          // (a follow-terminal dock re-resolves its root at every open, so the
+          // cwd may have moved out of the worktree). The sections may fold.
+          setHadRepo(false);
           setGitSettled(true);
         }
       });

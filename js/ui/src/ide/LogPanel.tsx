@@ -492,6 +492,21 @@ export function LogPanel(props: {
               {props.session?.logSpecError()}
             </div>
           </Show>
+          {/* A watch the server closed leaves the rows below standing, and
+              nothing else would say they had stopped moving: the empty state
+              only renders when there are none. Says it once, here, rather than
+              folding the section over commits the user is reading. */}
+          <Show when={commits().length > 0 && props.session?.gitError()}>
+            <div
+              style={{
+                "font-size": `${props.scale.xs}px`,
+                color: props.theme.errorText,
+                padding: "2px 2px 0",
+              }}
+            >
+              {props.session?.gitError()}
+            </div>
+          </Show>
         </div>
       </Show>
       {/* The dock folds this section away when there is no repo, so the
