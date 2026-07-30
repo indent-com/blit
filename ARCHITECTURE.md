@@ -8,6 +8,7 @@ Detailed references:
 - [docs/transports.md](docs/transports.md) — all transport options, topology diagrams, deployment patterns
 - [docs/server.md](docs/server.md) — PTY lifecycle, compositor, frame pacing, server control
 - [docs/frontend.md](docs/frontend.md) — WASM runtime, WebGL renderer, glyph atlas, input handling
+- [docs/design/](docs/design/README.md) — per-subsystem design RFCs (filesystem, git, LSP, KV, net)
 
 ---
 
