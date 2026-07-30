@@ -1018,4 +1018,20 @@ describe("BlitConnection git", () => {
     );
     expect(pages).toHaveLength(2);
   });
+
+  // A FROM_PTY open whose source session cannot be resolved used to fall back
+  // to a plain path-based open: with the follow-terminal `path: ""` that is
+  // `blit_git::open("")` — refused as "invalid path", leaving the dock's
+  // commit log on "Loading…" for good. Refuse it here instead, so the caller
+  // sees a real error rather than a silently rebased root.
+  it("refuses a FROM_PTY open whose source session is unknown", async () => {
+    const { conn, transport } = createConnection();
+    transport.pushHello(1, FEATURE_GIT);
+    transport.pushList([{ ptyId: 1, tag: "a" }]);
+    const before = transport.sent.length;
+    await expect(
+      conn.openRepo("", { watch: true, fromSessionId: "test:404" }),
+    ).rejects.toThrow(/source terminal/i);
+    expect(transport.sent.slice(before)).toHaveLength(0);
+  });
 });

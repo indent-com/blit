@@ -17,6 +17,7 @@ import {
   createMemo,
   createEffect,
   onCleanup,
+  untrack,
   type Accessor,
 } from "solid-js";
 import type {
@@ -42,6 +43,11 @@ import {
   GIT_LOG_TOPO,
   GIT_COMMITS_MORE,
   GIT_STATUS_OK,
+  GIT_CLOSED_CLIENT_REQUEST,
+  GIT_CLOSED_CONNECTION_LOST,
+  GIT_CLOSED_PERMISSION_LOST,
+  GIT_CLOSED_REPO_GONE,
+  GIT_CLOSED_RESOURCE_LIMIT,
 } from "@blit-sh/core";
 import {
   editorAssignment,
@@ -50,6 +56,7 @@ import {
 } from "@blit-sh/core/bsp";
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import { isConnReady, connGeneration, isTransientConnError } from "./reactive";
+import { currentSessionForPty } from "./followTerminal";
 
 /** Ceiling on consecutive transient open-retries — see the per-session
  *  counters. Generous: a real reconnect needs one. */
@@ -61,6 +68,22 @@ const MAX_OPEN_RETRIES = 20;
 export function isSyncLimitError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return /resource limit/i.test(msg);
+}
+
+/** A `GIT_CLOSED` reason, for the panels that have to explain it. */
+function gitClosedText(reason: number): string {
+  switch (reason) {
+    case GIT_CLOSED_CLIENT_REQUEST:
+      return "closed by this client";
+    case GIT_CLOSED_REPO_GONE:
+      return "the repository went away";
+    case GIT_CLOSED_PERMISSION_LOST:
+      return "permission lost";
+    case GIT_CLOSED_RESOURCE_LIMIT:
+      return "the server ran out of file watches";
+    default:
+      return "the server's repository watch failed";
+  }
 }
 
 // Shared tree-expansion state: two sessions that resolve to the SAME file tree
@@ -114,6 +137,11 @@ export interface IdeSessionDescriptor {
   connectionId: ConnectionId;
   path: string;
   fromSessionId?: SessionId;
+  /** The pty behind `fromSessionId`. Follow-terminal sessions are keyed by pty
+   *  and stay warm across reconnects, which mint new SessionIds and prune the
+   *  superseded ones — so the pty, not the id, is what the opens follow (see
+   *  ./followTerminal). */
+  fromPtyId?: number;
   /** Tile-anchored roots: once git discovers the enclosing repo, re-root the fs
    *  tree at the repo workdir so the explorer shows the whole project rather
    *  than the file's directory. Falls back to `path` when not in a repo. */
@@ -165,6 +193,10 @@ export interface IdeSession {
   /** Live git state (status/head/upstreams/stashes); `null` until watched. */
   gitState: Accessor<GitStateMirror | null>;
   gitHandle: Accessor<GitRepoHandle | null>;
+  /** Why this root has no repo: the open failed (not a repository, the source
+   *  terminal is gone, …) or the server closed the watch. `null` while the
+   *  repo is opening or open — the two states panels must not conflate. */
+  gitError: Accessor<string | null>;
   /** The repo's worktree root, discovered when git first opens and kept across
    *  connection resets (unlike gitHandle, which drops to null on a reset). Use
    *  this to build commit tiles so clicking a commit still works while git is
@@ -238,7 +270,6 @@ function buildSession(
   desc: IdeSessionDescriptor,
 ): IdeSession {
   const { connectionId } = desc;
-  const fromSessionId = desc.fromSessionId;
 
   // Gate every open (fs/git/lsp) on the connection being ready, and re-open
   // after a reset. A session can be built before its transport is connected —
@@ -255,6 +286,23 @@ function buildSession(
     isConnReady(wsSnap(), connectionId, "supportsGit"),
   );
   const connGen = createMemo(() => connGeneration(wsSnap(), connectionId));
+
+  // The source of a follow-terminal open (the server resolves the root from
+  // that pty's live cwd), resolved fresh at every open: SessionIds are minted
+  // per connection generation, and this session outlives generations — it is
+  // keyed by pty and kept warm across reconnects (see ./followTerminal).
+  // Untracked: the session list churns on every title/row update, and reading
+  // it reactively would tear the handles down and re-open them for nothing.
+  const fromSessionId = (): SessionId | undefined => {
+    const id = desc.fromSessionId;
+    if (!id || desc.fromPtyId === undefined) return id;
+    return currentSessionForPty(
+      untrack(wsSnap).sessions,
+      connectionId,
+      desc.fromPtyId,
+      id,
+    );
+  };
 
   // Retry counters. A re-establish resets fs/git/lsp *after* re-emitting the
   // snapshot (BlitConnection S2C_HELLO: emit() then resetFsSyncs/resetGitRepos),
@@ -366,7 +414,10 @@ function buildSession(
     let localDisposed = false;
     let limitTimer: ReturnType<typeof setTimeout> | null = null;
     workspace
-      .syncFs(connectionId, rootAt, { ...rootOpts, fromSessionId })
+      .syncFs(connectionId, rootAt, {
+        ...rootOpts,
+        fromSessionId: fromSessionId(),
+      })
       .then((h) => {
         if (disposed || localDisposed) {
           h.stop();
@@ -586,6 +637,10 @@ function buildSession(
   // ── git: watch status + branch + a head commit-log page ────────────────
   const [gitHandle, setGitHandle] = createSignal<GitRepoHandle | null>(null);
   const [gitVersion, setGitVersion] = createSignal(0);
+  // Why there is no repo, when that is a failure rather than "still opening".
+  // Without it every git panel has to guess, and the commit log's guess was
+  // "loading" — forever, for a page no one is coming to send.
+  const [gitError, setGitError] = createSignal<string | null>(null);
   // Commit log with frontier pagination: a live head page (watchLog, updates
   // as refs move) plus statically fetched older pages appended on demand.
   const LOG_PAGE = 1000;
@@ -717,10 +772,20 @@ function buildSession(
         // watch keeps subsequent updates incremental.
         untracked: true,
         tracking: true,
-        fromSessionId,
+        fromSessionId: fromSessionId(),
         onState: () => setGitVersion((v) => v + 1),
-        // Reflect a close/connection-loss in the reactive graph too.
-        onClosed: () => setGitVersion((v) => v + 1),
+        // Reflect a close/connection-loss in the reactive graph too. A
+        // server-side close (the watch hit a resource limit, the repo went
+        // away) is terminal for this handle: drop it and say why, or every
+        // git-backed panel would sit on a dead repo — the commit log showing
+        // "Loading…" for a page that can never arrive. A connection loss is
+        // not terminal; connGen re-opens.
+        onClosed: (reason: number) => {
+          setGitVersion((v) => v + 1);
+          if (reason === GIT_CLOSED_CONNECTION_LOST || disposed) return;
+          setGitHandle(null);
+          setGitError(`Repository watch closed: ${gitClosedText(reason)}`);
+        },
       })
       .then((h) => {
         if (disposed || localDisposed) {
@@ -728,6 +793,7 @@ function buildSession(
           return;
         }
         gitRetries = 0;
+        setGitError(null);
         setGitHandle(h);
         // Reveal the repo root so a tile-anchored fs tree can re-root at it.
         setGitWorkdir(h.workdir);
@@ -739,10 +805,14 @@ function buildSession(
         // preferRepoRoot tree still learns the repo workdir instead of
         // mis-rooting at the file's directory. A genuine failure (not a repo),
         // or too many transient retries, settles — letting the fs tree fall
-        // back to the descriptor path.
+        // back to the descriptor path, and telling the git panels why they
+        // have no repo instead of leaving them to look like they are loading.
         if (isTransientConnError(e) && gitRetries++ < MAX_OPEN_RETRIES)
           setGitRetry((n) => n + 1);
-        else setGitSettled(true);
+        else {
+          setGitError(e instanceof Error ? e.message : String(e));
+          setGitSettled(true);
+        }
       });
     onCleanup(() => {
       localDisposed = true;
@@ -900,7 +970,10 @@ function buildSession(
     let localDisposed = false;
     let unsub: (() => void) | null = null;
     workspace
-      .openLsp(connectionId, desc.path, { diagnostics: true, fromSessionId })
+      .openLsp(connectionId, desc.path, {
+        diagnostics: true,
+        fromSessionId: fromSessionId(),
+      })
       .then((h) => {
         if (disposed || localDisposed) {
           h.close();
@@ -953,6 +1026,7 @@ function buildSession(
     expandTo,
     gitState,
     gitHandle,
+    gitError,
     repoWorkdir: gitWorkdir,
     commits,
     hasMoreLog,

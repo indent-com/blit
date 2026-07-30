@@ -639,6 +639,9 @@ function WorkspaceScreen(props: {
         connectionId: a.session.connectionId,
         path: "",
         fromSessionId: a.session.id,
+        // Keyed by pty, so the session survives reconnects that replace every
+        // SessionId — the pty is what its opens keep following.
+        fromPtyId: a.session.ptyId,
       };
     }
     // Tile-anchored: the fs sync starts at the file's directory (or the

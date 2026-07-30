@@ -74,6 +74,7 @@ export function LogPanel(props: {
   onOpenTile: (assignment: string) => void;
 }) {
   const commits = () => props.session?.commits() ?? [];
+  const gitError = () => props.session?.gitError() ?? null;
 
   // Tick so relative timestamps advance on their own. Coarse (the rendered
   // strings are minute-grained soon after a commit lands) and paused while
@@ -493,14 +494,16 @@ export function LogPanel(props: {
             style={{
               padding: `${props.scale.panelPadding}px`,
               "font-size": `${props.scale.sm}px`,
-              color: props.theme.dimFg,
+              // A failed repo is an error, not a slow load — say so, and in
+              // the error colour, rather than spinning on "Loading…" for a
+              // page the server will never send.
+              color: gitError() ? props.theme.errorText : props.theme.dimFg,
             }}
           >
             {!props.session
               ? "No root selected."
-              : props.session.logLoaded()
-                ? "No commits."
-                : "Loading…"}
+              : (gitError() ??
+                (props.session.logLoaded() ? "No commits." : "Loading…"))}
           </div>
         }
       >
