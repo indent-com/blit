@@ -74,7 +74,14 @@ export function LogPanel(props: {
   onOpenTile: (assignment: string) => void;
 }) {
   const commits = () => props.session?.commits() ?? [];
-  const gitError = () => props.session?.gitError() ?? null;
+  const emptyText = (): string => {
+    const s = props.session;
+    if (!s) return "No root selected.";
+    const failure = s.gitError();
+    if (failure) return failure;
+    if (s.noRepo()) return "No repository here.";
+    return s.logLoaded() ? "No commits." : "Loading…";
+  };
 
   // Tick so relative timestamps advance on their own. Coarse (the rendered
   // strings are minute-grained soon after a commit lands) and paused while
@@ -487,6 +494,10 @@ export function LogPanel(props: {
           </Show>
         </div>
       </Show>
+      {/* The dock folds this section away when there is no repo, so the
+          fallback below is what you get for opening it anyway: the reason,
+          stated once, dimmed like every other empty state. "Loading…" is only
+          ever said while a page is genuinely on its way. */}
       <Show
         when={commits().length > 0}
         fallback={
@@ -494,16 +505,10 @@ export function LogPanel(props: {
             style={{
               padding: `${props.scale.panelPadding}px`,
               "font-size": `${props.scale.sm}px`,
-              // A failed repo is an error, not a slow load — say so, and in
-              // the error colour, rather than spinning on "Loading…" for a
-              // page the server will never send.
-              color: gitError() ? props.theme.errorText : props.theme.dimFg,
+              color: props.theme.dimFg,
             }}
           >
-            {!props.session
-              ? "No root selected."
-              : (gitError() ??
-                (props.session.logLoaded() ? "No commits." : "Loading…"))}
+            {emptyText()}
           </div>
         }
       >

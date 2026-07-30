@@ -197,6 +197,11 @@ export interface IdeSession {
    *  terminal is gone, …) or the server closed the watch. `null` while the
    *  repo is opening or open — the two states panels must not conflate. */
   gitError: Accessor<string | null>;
+  /** There is no repo here and none is coming: the open failed, the server
+   *  closed the watch, or the remote has no git support. False while one is
+   *  still opening (or could be, once the transport is back), so panels that
+   *  only make sense over a repository can fold away without flapping. */
+  noRepo: Accessor<boolean>;
   /** The repo's worktree root, discovered when git first opens and kept across
    *  connection resets (unlike gitHandle, which drops to null on a reset). Use
    *  this to build commit tiles so clicking a commit still works while git is
@@ -641,6 +646,13 @@ function buildSession(
   // Without it every git panel has to guess, and the commit log's guess was
   // "loading" — forever, for a page no one is coming to send.
   const [gitError, setGitError] = createSignal<string | null>(null);
+  // Settled emptiness: an open that failed for good, or a remote whose server
+  // has no git at all (the open effect never runs, so there is no error to
+  // read either). Deliberately false while the transport is down — the repo
+  // that comes back is not news, and folding panels on a blip is.
+  const noRepo = createMemo(
+    () => !gitHandle() && (gitError() !== null || (fsReady() && !gitReady())),
+  );
   // Commit log with frontier pagination: a live head page (watchLog, updates
   // as refs move) plus statically fetched older pages appended on demand.
   const LOG_PAGE = 1000;
@@ -1027,6 +1039,7 @@ function buildSession(
     gitState,
     gitHandle,
     gitError,
+    noRepo,
     repoWorkdir: gitWorkdir,
     commits,
     hasMoreLog,
