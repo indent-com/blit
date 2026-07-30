@@ -17,6 +17,7 @@ import type {
 } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
+import { createDragReorder, reorderTo } from "./dragReorder";
 import { DirectoryPicker } from "./DirectoryPicker";
 import type { Root, Remote } from "./storage";
 
@@ -66,8 +67,6 @@ export function RootsOverlay(props: {
     nameRef?.focus();
   }
 
-  const [dropGap, setDropGap] = createSignal<number | null>(null);
-  let dragSourceIndex: number | null = null;
   let nameRef!: HTMLInputElement;
 
   const enabledRemotes = () => props.remotes.filter((r) => !r.disabled);
@@ -87,42 +86,6 @@ export function RootsOverlay(props: {
     props.onAdd(n, remote().trim(), p);
     resetForm();
     nameRef?.focus();
-  }
-
-  function handleDragStart(e: DragEvent, index: number) {
-    dragSourceIndex = index;
-    if (e.dataTransfer) {
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", String(index));
-    }
-  }
-
-  function handleDragOver(e: DragEvent, index: number) {
-    e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const midY = rect.top + rect.height / 2;
-    setDropGap(e.clientY < midY ? index : index + 1);
-  }
-
-  function handleDrop(e: DragEvent) {
-    e.preventDefault();
-    const gap = dropGap();
-    setDropGap(null);
-    if (dragSourceIndex === null || gap === null) return;
-    let insertAt = gap;
-    if (insertAt > dragSourceIndex) insertAt--;
-    if (insertAt === dragSourceIndex) return;
-    const names = props.roots.map((r) => r.name);
-    const [moved] = names.splice(dragSourceIndex, 1);
-    names.splice(insertAt, 0, moved);
-    props.onReorder(names);
-    dragSourceIndex = null;
-  }
-
-  function handleDragEnd() {
-    dragSourceIndex = null;
-    setDropGap(null);
   }
 
   const inputStyle = () => ({
@@ -152,6 +115,21 @@ export function RootsOverlay(props: {
   // handshake is incomplete. Undefined status ⇒ local-only, allow.
   const mutationsBlocked = () =>
     props.gatewayStatus !== undefined && props.gatewayStatus !== "connected";
+
+  // Reordering runs on pointer events, not HTML5 drag-and-drop, so the drag
+  // handle works under touch as well as a mouse.
+  const drag = createDragReorder({
+    count: () => props.roots.length,
+    disabled: mutationsBlocked,
+    onDrop: (from, gap) => {
+      const names = reorderTo(
+        props.roots.map((r) => r.name),
+        from,
+        gap,
+      );
+      if (names) props.onReorder(names);
+    },
+  });
 
   // Columns: drag, name, remote:path, edit, toggle, remove.
   const cols = () => "auto auto 1fr auto auto auto";
@@ -209,17 +187,7 @@ export function RootsOverlay(props: {
         >
           <div
             role="list"
-            onDragOver={(e) => {
-              e.preventDefault();
-              if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-            }}
-            onDrop={handleDrop}
-            onDragLeave={(e) => {
-              const related = e.relatedTarget as Node | null;
-              if (!related || !e.currentTarget.contains(related)) {
-                setDropGap(null);
-              }
-            }}
+            ref={drag.containerRef}
             style={{
               display: "grid",
               "grid-template-columns": cols(),
@@ -231,33 +199,26 @@ export function RootsOverlay(props: {
             <Index each={props.roots}>
               {(root, index) => {
                 const disabled = () => root().disabled;
-                const rowOpacity = () => (dragSourceIndex === index ? 0.5 : 1);
-                const isActiveGap = (gap: number) =>
-                  dragSourceIndex !== null &&
-                  gap !== dragSourceIndex &&
-                  gap !== dragSourceIndex + 1;
+                const rowOpacity = () =>
+                  drag.sourceIndex() === index ? 0.5 : 1;
                 const showGapBefore = () => {
-                  const gap = dropGap();
-                  return gap !== null && gap === index && isActiveGap(gap);
+                  const gap = drag.dropGap();
+                  return gap === index && drag.wouldMove(gap);
                 };
                 const showGapAfter = () => {
-                  const gap = dropGap();
+                  const gap = drag.dropGap();
                   return (
-                    gap !== null &&
                     gap === index + 1 &&
                     index === props.roots.length - 1 &&
-                    isActiveGap(gap)
+                    drag.wouldMove(gap)
                   );
                 };
 
                 return (
                   <div
                     role="listitem"
-                    draggable={!mutationsBlocked()}
-                    onDragStart={(e) => handleDragStart(e, index)}
-                    onDragOver={(e) => handleDragOver(e, index)}
-                    onDrop={handleDrop}
-                    onDragEnd={handleDragEnd}
+                    ref={drag.rowRef(index)}
+                    onPointerDown={(e) => drag.onRowPointerDown(e, index)}
                     style={{
                       display: "grid",
                       "grid-template-columns": "subgrid",
@@ -281,16 +242,25 @@ export function RootsOverlay(props: {
                     {/* Drag handle */}
                     <div
                       title="Drag to reorder"
+                      aria-label="Drag to reorder"
+                      onPointerDown={(e) => drag.onHandlePointerDown(e, index)}
                       style={{
                         display: "flex",
                         "align-items": "center",
                         "align-self": "stretch",
                         "justify-content": "center",
-                        padding: `0 ${scale().controlX}px`,
-                        cursor: mutationsBlocked() ? "not-allowed" : "grab",
+                        padding: `0 ${scale().controlX + 4}px`,
+                        cursor: mutationsBlocked()
+                          ? "not-allowed"
+                          : drag.sourceIndex() === index
+                            ? "grabbing"
+                            : "grab",
                         color: theme().dimFg,
                         "font-size": `${scale().md}px`,
                         "user-select": "none",
+                        // Claim the gesture from the container's touch
+                        // panning, so a finger on the handle reorders.
+                        "touch-action": "none",
                         "border-right": `1px solid ${theme().subtleBorder}`,
                         opacity: mutationsBlocked() ? 0.4 : 1,
                       }}

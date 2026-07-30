@@ -2,6 +2,7 @@ import { createSignal, Index, Show } from "solid-js";
 import type { ConnectionStatus, TerminalPalette } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
+import { createDragReorder, reorderTo } from "./dragReorder";
 import { t } from "./i18n";
 import type { Remote } from "./storage";
 
@@ -43,10 +44,6 @@ export function RemotesOverlay(props: {
   const [uri, setUri] = createSignal("");
   const [revealed, setRevealed] = createSignal<Set<string>>(new Set());
 
-  /** Insertion gap: 0 = before first row, 1 = between row 0 and 1, etc. */
-  const [dropGap, setDropGap] = createSignal<number | null>(null);
-  let dragSourceIndex: number | null = null;
-
   let nameRef!: HTMLInputElement;
 
   function toggleReveal(remoteName: string) {
@@ -67,51 +64,6 @@ export function RemotesOverlay(props: {
     setName("");
     setUri("");
     nameRef?.focus();
-  }
-
-  function handleDragStart(e: DragEvent, index: number) {
-    dragSourceIndex = index;
-    if (e.dataTransfer) {
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", String(index));
-    }
-  }
-
-  function handleDragOver(e: DragEvent, index: number) {
-    e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    const target = e.currentTarget as HTMLElement;
-    const rect = target.getBoundingClientRect();
-    const midY = rect.top + rect.height / 2;
-    // Top half → insert before this row (gap = index), bottom half → after (gap = index + 1)
-    setDropGap(e.clientY < midY ? index : index + 1);
-  }
-
-  function handleDragLeave(_e: DragEvent) {
-    // No-op: dragOver on sibling rows will update the gap, and
-    // handleDragEnd / handleDrop reset state when the drag finishes.
-    // Clearing here would cause flicker when crossing between rows.
-  }
-
-  function handleDrop(e: DragEvent) {
-    e.preventDefault();
-    const gap = dropGap();
-    setDropGap(null);
-    if (dragSourceIndex === null || gap === null) return;
-    // Convert gap index to the target index in the post-removal array
-    let insertAt = gap;
-    if (insertAt > dragSourceIndex) insertAt--;
-    if (insertAt === dragSourceIndex) return;
-    const names = props.remotes.map((r) => r.name);
-    const [moved] = names.splice(dragSourceIndex, 1);
-    names.splice(insertAt, 0, moved);
-    props.onReorder(names);
-    dragSourceIndex = null;
-  }
-
-  function handleDragEnd() {
-    dragSourceIndex = null;
-    setDropGap(null);
   }
 
   const inputStyle = () => ({
@@ -145,6 +97,21 @@ export function RemotesOverlay(props: {
   // (no config WS wired up), allow mutations — local-only callers.
   const mutationsBlocked = () =>
     props.gatewayStatus !== undefined && props.gatewayStatus !== "connected";
+
+  // Reordering runs on pointer events, not HTML5 drag-and-drop, so the drag
+  // handle works under touch as well as a mouse.
+  const drag = createDragReorder({
+    count: () => props.remotes.length,
+    disabled: () => !!props.readOnly || mutationsBlocked(),
+    onDrop: (from, gap) => {
+      const names = reorderTo(
+        props.remotes.map((r) => r.name),
+        from,
+        gap,
+      );
+      if (names) props.onReorder(names);
+    },
+  });
 
   // Only include the reveal/hide column if any remote is a share URI.
   // Columns: drag, name, uri, default, [reveal], reconnect, toggle, remove.
@@ -260,21 +227,7 @@ export function RemotesOverlay(props: {
         >
           <div
             role="list"
-            onDragOver={(e) => {
-              // Allow the list container itself to be a drop target so
-              // the cursor doesn't flicker when passing over insertion
-              // indicators or row gaps.
-              e.preventDefault();
-              if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-            }}
-            onDrop={handleDrop}
-            onDragLeave={(e) => {
-              // Clear insertion indicator when the cursor leaves the list entirely.
-              const related = e.relatedTarget as Node | null;
-              if (!related || !e.currentTarget.contains(related)) {
-                setDropGap(null);
-              }
-            }}
+            ref={drag.containerRef}
             style={{
               display: "grid",
               "grid-template-columns": cols(),
@@ -308,35 +261,26 @@ export function RemotesOverlay(props: {
                     : theme().dimFg;
                 };
 
-                const rowOpacity = () => (dragSourceIndex === index ? 0.5 : 1);
-                /** Whether the drop would actually move the item (not a no-op). */
-                const isActiveGap = (gap: number) =>
-                  dragSourceIndex !== null &&
-                  gap !== dragSourceIndex &&
-                  gap !== dragSourceIndex + 1;
+                const rowOpacity = () =>
+                  drag.sourceIndex() === index ? 0.5 : 1;
                 const showGapBefore = () => {
-                  const gap = dropGap();
-                  return gap !== null && gap === index && isActiveGap(gap);
+                  const gap = drag.dropGap();
+                  return gap === index && drag.wouldMove(gap);
                 };
                 const showGapAfter = () => {
-                  const gap = dropGap();
+                  const gap = drag.dropGap();
                   return (
-                    gap !== null &&
                     gap === index + 1 &&
                     index === props.remotes.length - 1 &&
-                    isActiveGap(gap)
+                    drag.wouldMove(gap)
                   );
                 };
 
                 return (
                   <div
                     role="listitem"
-                    draggable={!props.readOnly && !mutationsBlocked()}
-                    onDragStart={(e) => handleDragStart(e, index)}
-                    onDragOver={(e) => handleDragOver(e, index)}
-                    onDragLeave={handleDragLeave}
-                    onDrop={handleDrop}
-                    onDragEnd={handleDragEnd}
+                    ref={drag.rowRef(index)}
+                    onPointerDown={(e) => drag.onRowPointerDown(e, index)}
                     style={{
                       display: "grid",
                       "grid-template-columns": "subgrid",
@@ -361,16 +305,27 @@ export function RemotesOverlay(props: {
                     <Show when={!props.readOnly}>
                       <div
                         title={t("remotes.dragHandle")}
+                        aria-label={t("remotes.dragHandle")}
+                        onPointerDown={(e) =>
+                          drag.onHandlePointerDown(e, index)
+                        }
                         style={{
                           display: "flex",
                           "align-items": "center",
                           "align-self": "stretch",
                           "justify-content": "center",
-                          padding: `0 ${scale().controlX}px`,
-                          cursor: mutationsBlocked() ? "not-allowed" : "grab",
+                          padding: `0 ${scale().controlX + 4}px`,
+                          cursor: mutationsBlocked()
+                            ? "not-allowed"
+                            : drag.sourceIndex() === index
+                              ? "grabbing"
+                              : "grab",
                           color: theme().dimFg,
                           "font-size": `${scale().md}px`,
                           "user-select": "none",
+                          // Claim the gesture from the container's touch
+                          // panning, so a finger on the handle reorders.
+                          "touch-action": "none",
                           "border-right": `1px solid ${theme().subtleBorder}`,
                           opacity: mutationsBlocked() ? 0.4 : 1,
                         }}
