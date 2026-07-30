@@ -35,6 +35,8 @@ import type {
 import {
   FS_ENTRY_TYPE_MASK,
   FS_ENTRY_DIR,
+  FS_ENTRY_SYMLINK,
+  FS_ENTRY_LINK_DIR,
   gitCommitRecords,
   gitOidHex,
   GIT_LOG_TOPO,
@@ -216,6 +218,17 @@ export interface IdeSession {
 
 function typeOf(node: FsNode): number {
   return node.entryFlags & FS_ENTRY_TYPE_MASK;
+}
+
+/** A row the tree can descend: a real directory, or a symlink whose target is
+ *  one. The sync enumerates both (crates/fssync `NodeMeta::enumerable_dir`), so
+ *  gating expansion on `FS_ENTRY_DIR` alone renders a symlinked directory as a
+ *  leaf whose children exist but can never be reached. */
+export function isDirLike(type: number, flags: number): boolean {
+  return (
+    type === FS_ENTRY_DIR ||
+    (type === FS_ENTRY_SYMLINK && (flags & FS_ENTRY_LINK_DIR) !== 0)
+  );
 }
 
 /** Build one IdeSession. Runs inside its own reactive root (see the registry
@@ -479,8 +492,8 @@ function buildSession(
       });
     }
     out.sort((a, b) => {
-      const ad = a.type === FS_ENTRY_DIR ? 0 : 1;
-      const bd = b.type === FS_ENTRY_DIR ? 0 : 1;
+      const ad = isDirLike(a.type, a.flags) ? 0 : 1;
+      const bd = isDirLike(b.type, b.flags) ? 0 : 1;
       return ad !== bd ? ad - bd : a.name.localeCompare(b.name);
     });
     childListCache.set(handle, { rev: handle.revision, children: out });
@@ -528,7 +541,7 @@ function buildSession(
                 };
           nextCache.set(relPath, row);
           out.push(row);
-          if (e.type === FS_ENTRY_DIR && isExpanded) {
+          if (isDirLike(e.type, e.flags) && isExpanded) {
             walk(relPath, childHandles.get(relPath), depth + 1);
           }
         }
@@ -558,7 +571,8 @@ function buildSession(
     if (!rows) return;
     const wanted = new Set<string>();
     for (const row of rows) {
-      if (row.type === FS_ENTRY_DIR && row.expanded) wanted.add(row.relPath);
+      if (isDirLike(row.type, row.flags) && row.expanded)
+        wanted.add(row.relPath);
     }
     for (const relDir of [...childHandles.keys()]) {
       if (!wanted.has(relDir)) {
@@ -915,9 +929,16 @@ function buildSession(
     });
   });
 
+  // `rootPath` is only known from the FS_SYNCED echo, so it is null before the
+  // root sync lands and again after a reset clears it — while previously
+  // rendered rows stay clickable. Falling back to the bare relPath used to send
+  // a *relative* path to the server, which resolves against the server's own
+  // cwd rather than the synced tree: on a remote that is some unrelated
+  // directory, and the editor reported the file as simply "not found". An empty
+  // string is refused by the caller instead, which can say so.
   const abs = (relPath: string): string => {
     const r = rootPath();
-    return r ? `${r}/${relPath}` : relPath;
+    return r ? `${r}/${relPath}` : "";
   };
 
   return {
@@ -943,9 +964,16 @@ function buildSession(
     ensureLsp,
     lspHandle,
     lspVersion,
-    fileAssignment: (relPath) => editorAssignment(connectionId, abs(relPath)),
-    diffAssignment: (relPath, side) =>
-      diffAssignment(connectionId, abs(relPath), side),
+    // Both return "" when the root is unknown, so callers can decline to open
+    // rather than mint a tile whose path can never resolve.
+    fileAssignment: (relPath) => {
+      const a = abs(relPath);
+      return a ? editorAssignment(connectionId, a) : "";
+    },
+    diffAssignment: (relPath, side) => {
+      const a = abs(relPath);
+      return a ? diffAssignment(connectionId, a, side) : "";
+    },
     grep: async (query, opts) => {
       const r = rootPath();
       if (!r) return { files: [], truncated: false };

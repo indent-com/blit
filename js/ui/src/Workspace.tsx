@@ -3460,7 +3460,10 @@ function WorkspaceScreen(props: {
               }}
               onOpenFile={(relPath) => {
                 const s = activeSession();
-                if (s) openTile(s.fileAssignment(relPath));
+                if (!s) return;
+                // "" when the session has no synced root yet.
+                const a = s.fileAssignment(relPath);
+                if (a) openTile(a);
               }}
               symbolSearchWarm={() => activeSession()?.ensureLsp()}
               symbolSearch={async (q) => {

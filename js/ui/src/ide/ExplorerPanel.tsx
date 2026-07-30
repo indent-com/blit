@@ -39,6 +39,7 @@ import { diffAssignment, type DiffSide } from "@blit-sh/core/bsp";
 import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import type { IdeSession, IdeTreeRow } from "./session";
+import { isDirLike } from "./session";
 import {
   addFsMoveDrag,
   fsMovePayload,
@@ -223,7 +224,11 @@ export function ExplorerPanel(props: {
     } else {
       const rel = joinRel(ed.parentRel, name);
       s.createFile(rel)
-        .then(() => props.onOpenTile(s.fileAssignment(rel)))
+        .then(() => {
+          // "" if the root sync reset while the create was in flight.
+          const a = s.fileAssignment(rel);
+          if (a) props.onOpenTile(a);
+        })
         .catch(flashOpError);
     }
   };
@@ -555,7 +560,7 @@ export function ExplorerPanel(props: {
   // A collapsed directory's rolled-up status summary (hidden once expanded,
   // where the child rows carry their own flags).
   const dirSummary = (row: IdeTreeRow): Badge | null => {
-    if (row.type !== FS_ENTRY_DIR || row.expanded) return null;
+    if (!isDirLike(row.type, row.flags) || row.expanded) return null;
     const set = gitStatus().dirLetters.get(absOf(row));
     if (!set || set.size === 0) return null;
     const order = ["U", "D", "A", "R", "C", "M", "?"];
@@ -567,7 +572,7 @@ export function ExplorerPanel(props: {
 
   // A file's two porcelain columns {x: staged, y: worktree}, or null if clean.
   const fileFlags = (row: IdeTreeRow): { x: string; y: string } | null => {
-    if (row.type === FS_ENTRY_DIR) return null;
+    if (isDirLike(row.type, row.flags)) return null;
     return gitStatus().fileMap.get(absOf(row)) ?? null;
   };
 
@@ -850,7 +855,14 @@ export function ExplorerPanel(props: {
                   <Show when={createAtRoot()}>{editRow(0, "")}</Show>
                   <For each={list()}>
                     {(row) => {
-                      const isDir = row.type === FS_ENTRY_DIR;
+                      const isDir = isDirLike(row.type, row.flags);
+                      // Expansion follows symlinks; moving into one does not.
+                      // A drop on a symlinked directory would rename *through*
+                      // the link — the destination resolves under both the link
+                      // and its real path, and fails EXDEV across devices. That
+                      // is its own change; keep it to real directories, which is
+                      // also what `createUnder` gates on.
+                      const isMoveTarget = row.type === FS_ENTRY_DIR;
                       const isLink = row.type === FS_ENTRY_SYMLINK;
                       const unreadable =
                         (row.flags & FS_ENTRY_UNREADABLE) !== 0;
@@ -872,7 +884,7 @@ export function ExplorerPanel(props: {
                                 opacity: unreadable ? 0.5 : 1,
                                 "font-style": isLink ? "italic" : "normal",
                                 background:
-                                  dropTarget() === row.relPath && isDir
+                                  dropTarget() === row.relPath && isMoveTarget
                                     ? `color-mix(in srgb, ${props.theme.accent} 30%, transparent)`
                                     : isActive()
                                       ? `color-mix(in srgb, ${props.theme.accent} 22%, transparent)`
@@ -887,13 +899,25 @@ export function ExplorerPanel(props: {
                                 const s = props.session;
                                 if (!s) return;
                                 if (isDir) s.toggleDir(row.relPath);
-                                else if (row.type === FS_ENTRY_FILE)
-                                  props.onOpenTile(
-                                    s.fileAssignment(row.relPath),
-                                  );
+                                // A symlink to a file opens like the file it
+                                // points at: the editor's single-file sync
+                                // canonicalizes the root, so it loads the
+                                // target's real bytes.
+                                else if (
+                                  row.type === FS_ENTRY_FILE ||
+                                  row.type === FS_ENTRY_SYMLINK
+                                ) {
+                                  // Empty when the session has no synced root
+                                  // yet; opening then would mint a tile with no
+                                  // path that can never resolve.
+                                  const a = s.fileAssignment(row.relPath);
+                                  if (a) props.onOpenTile(a);
+                                }
                               }}
                               onContextMenu={(e) => openMenu(e, row)}
-                              draggable={row.type === FS_ENTRY_FILE || isDir}
+                              draggable={
+                                row.type === FS_ENTRY_FILE || isMoveTarget
+                              }
                               onDragStart={(e) => {
                                 const s = props.session;
                                 if (!s) return;
@@ -912,14 +936,17 @@ export function ExplorerPanel(props: {
                                 });
                               }}
                               onDragOver={(e) => {
-                                if (isDir) acceptMove(e, row.relPath);
+                                if (isMoveTarget) acceptMove(e, row.relPath);
                               }}
                               onDragLeave={() => {
-                                if (isDir && dropTarget() === row.relPath)
+                                if (
+                                  isMoveTarget &&
+                                  dropTarget() === row.relPath
+                                )
                                   setDropTarget(null);
                               }}
                               onDrop={(e) => {
-                                if (isDir) performMove(e, row.relPath);
+                                if (isMoveTarget) performMove(e, row.relPath);
                               }}
                               title={
                                 unreadable
@@ -999,9 +1026,11 @@ export function ExplorerPanel(props: {
                                               : f().y !== " "
                                                 ? "unstaged"
                                                 : "staged";
-                                          props.onOpenTile(
-                                            s.diffAssignment(row.relPath, side),
+                                          const a = s.diffAssignment(
+                                            row.relPath,
+                                            side,
                                           );
+                                          if (a) props.onOpenTile(a);
                                         }}
                                       >
                                         <span

@@ -1586,6 +1586,15 @@ export function BlitEditor(props: {
       setError(null);
       return;
     }
+    if (!props.path) {
+      // The opener could not resolve an absolute path — its session had no
+      // synced root (session.ts `abs`). The tile's path is fixed at creation,
+      // so this cannot recover; say what is wrong rather than blaming the file
+      // or spinning on "loading" forever. Openers avoid creating such a tile.
+      setStatus("error");
+      setError("No path — the file tree had no synced root when this opened");
+      return;
+    }
     let disposed = false;
     let opened: FsSyncHandle | null = null;
     let limitTimer: ReturnType<typeof setTimeout> | null = null;

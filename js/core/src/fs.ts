@@ -145,6 +145,11 @@ export const FS_ENTRY_NO_CONTENT = 1 << 3;
 /** File changed repeatedly while being read; content omitted, another
  *  upsert follows once it settles. */
 export const FS_ENTRY_UNSTABLE = 1 << 4;
+/** Set on an `FS_ENTRY_SYMLINK` whose target is a directory, which the sync
+ *  enumerates like any other. The type alone cannot distinguish a link to a
+ *  directory from one to a file, so this is what tells a tree the entry is
+ *  expandable. */
+export const FS_ENTRY_LINK_DIR = 1 << 5;
 
 // UPSERT content kinds.
 export const FS_CONTENT_NONE = 0;

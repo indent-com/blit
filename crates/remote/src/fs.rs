@@ -259,6 +259,11 @@ pub const FS_ENTRY_NO_CONTENT: u8 = 1 << 3;
 /// File changed repeatedly while being read; content omitted, another
 /// upsert follows once it settles.
 pub const FS_ENTRY_UNSTABLE: u8 = 1 << 4;
+/// Set on an `FS_ENTRY_SYMLINK` whose target is a directory, which the sync
+/// enumerates like any other. Clients need it to know the entry is expandable:
+/// the type alone cannot distinguish a link to a directory from one to a file,
+/// and a non-recursive sync has no children listed yet to infer it from.
+pub const FS_ENTRY_LINK_DIR: u8 = 1 << 5;
 
 // UPSERT content kinds.
 pub const FS_CONTENT_NONE: u8 = 0;

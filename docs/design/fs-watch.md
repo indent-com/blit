@@ -199,7 +199,34 @@ MOVE   0x03: [kind:1][from_len:2][from:N][to_len:2][to:M]  # moves subtree
 `entry_flags` bits 0–1: type (0 file, 1 dir, 2 symlink, 3 other); bit 2
 `UNREADABLE` (exists, content unavailable); bit 3 `NO_CONTENT` (over
 `inline_max`, or `CONTENT` unset); bit 4 `UNSTABLE` (file changed repeatedly
-while being read — content omitted, another upsert follows once it settles).
+while being read — content omitted, another upsert follows once it settles);
+bit 5 `LINK_DIR` (a symlink whose target is a directory).
+
+A symlinked directory is **enumerated like a real one**, under the link's own
+path, so a file browser can descend it — the alternative is a dead end: an
+entry with children that can never be listed. `LINK_DIR` is what tells a
+client the entry is expandable, since the type alone cannot distinguish a link
+to a directory from one to a file, and a non-recursive sync has no children
+listed yet to infer it from. Traversal is bounded by the `(dev, ino)` identity
+of every directory on the descent path: a link whose target is already an
+ancestor is reported but not descended, so a self-referential tree terminates
+without a redundant copy of the subtree. A link with no usable identity (a
+platform that exposes no inode) is reported and not descended.
+
+Note the watch asymmetry: the sync registers on the link's own path, so on
+backends that resolve to the real path before reporting (macOS FSEvents),
+changes made _inside_ a symlinked directory may not produce hints, and only a
+rescan picks them up. Listing and reading are unaffected.
+
+A sync root may arrive raw (as a CLI or user types it) or wire-escaped, and the
+two are not distinguishable by inspection: `FS_SYNCED` echoes
+`escape_path(canonical_root)`, and clients legitimately build further sync roots
+from that echo — where a literal `%` came back as `%25`. `validate_root` tries
+the literal reading first and the decoded one second, so a file genuinely named
+`50%25.txt` still wins over the decoded reading of `50%.txt`. Escaping on the
+way out without decoding on the way in meant such a path could be listed but
+never re-opened, presenting to the client as a file that does not exist.
+
 A symlink's content is its **target bytes** (git's model: blob = target),
 so its `size` is the target length and `FS_FETCH` of a symlink returns the
 target, never the file it points at — which is also what makes symlink

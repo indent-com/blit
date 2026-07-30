@@ -27,12 +27,13 @@ use std::{fs, io};
 use blit_remote::fs::{
     FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT,
     FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION,
-    FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_NO_CONTENT,
-    FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_ENTRY_UNREADABLE, FS_ENTRY_UNSTABLE,
-    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_HARDLINK, FS_OP_MKDIR,
-    FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK, FS_UPDATE_RESET,
-    FS_UPDATE_SYNC, FS_WRITE_DURABLE, FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS,
-    FsContent, FsRecord, append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
+    FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_LINK_DIR,
+    FS_ENTRY_NO_CONTENT, FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_ENTRY_UNREADABLE,
+    FS_ENTRY_UNSTABLE, FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_HARDLINK,
+    FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK,
+    FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_WRITE_DURABLE, FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS,
+    FS_WRITE_NO_CAS, FsContent, FsRecord, append_fs_record, msg_fs_closed, msg_fs_done,
+    msg_fs_file, msg_fs_update,
 };
 
 pub mod backend;
@@ -493,17 +494,36 @@ pub fn validate_root(path: &str) -> Result<PathBuf, (u8, String)> {
     if path.is_empty() || path.contains('\0') {
         return Err((FS_STATUS_OTHER, "invalid path".into()));
     }
-    match fs::canonicalize(path) {
-        Ok(p) => Ok(p),
-        Err(e) => {
-            let status = match e.kind() {
-                io::ErrorKind::NotFound => FS_STATUS_NOT_FOUND,
-                io::ErrorKind::PermissionDenied => FS_STATUS_PERMISSION_DENIED,
-                _ => FS_STATUS_OTHER,
-            };
-            Err((status, e.to_string()))
-        }
+    let err = match fs::canonicalize(path) {
+        Ok(p) => return Ok(p),
+        Err(e) => e,
+    };
+    // A root can arrive in either of two encodings, and they are not
+    // distinguishable by inspection:
+    //
+    //   * raw, as a CLI or a user types it (`/tmp/50%.txt`);
+    //   * wire-escaped, because FS_SYNCED echoes `escape_path(canonical_root)`
+    //     and clients legitimately build further sync roots from that echo
+    //     (js/ui/src/ide/session.ts) — where a literal `%` came back as `%25`.
+    //
+    // Escaping on the way out without decoding on the way in meant any path
+    // containing `%` (or non-UTF-8 bytes) could be listed but never re-opened:
+    // the round trip returned a string that no longer named the file, and the
+    // client reported it as missing. Try the literal reading first so a file
+    // genuinely named `50%25.txt` still wins, then the decoded one.
+    if err.kind() == io::ErrorKind::NotFound
+        && path.contains('%')
+        && let Some(decoded) = wire_to_os(path)
+        && let Ok(p) = fs::canonicalize(&decoded)
+    {
+        return Ok(p);
     }
+    let status = match err.kind() {
+        io::ErrorKind::NotFound => FS_STATUS_NOT_FOUND,
+        io::ErrorKind::PermissionDenied => FS_STATUS_PERMISSION_DENIED,
+        _ => FS_STATUS_OTHER,
+    };
+    Err((status, err.to_string()))
 }
 
 /// Validate and canonicalize an `FS_SYNC_SINGLE` root: the same
@@ -761,9 +781,22 @@ pub struct NodeMeta {
     pub hash: u128,
     /// File identity used for move detection; (0, 0) when unavailable.
     pub dev_ino: (u64, u64),
+    /// Set when `node_type` is `FS_ENTRY_SYMLINK` and the target is a
+    /// directory. Captured at stat time so the send path and the descent gates
+    /// don't each have to re-resolve the link.
+    pub link_dir: bool,
 }
 
 impl NodeMeta {
+    /// True when this node's children belong in the index: a real directory, or
+    /// a symlink resolving to one. The file browser descends both, so every
+    /// gate deciding "should I enumerate this?" must use this rather than
+    /// testing `FS_ENTRY_DIR` alone — otherwise a symlinked directory is a dead
+    /// end, reporting children it can never list.
+    fn enumerable_dir(&self) -> bool {
+        self.node_type == FS_ENTRY_DIR || (self.node_type == FS_ENTRY_SYMLINK && self.link_dir)
+    }
+
     fn same_identity(&self, other: &NodeMeta) -> bool {
         self.node_type == other.node_type && self.dev_ino != (0, 0) && self.dev_ino == other.dev_ino
     }
@@ -783,6 +816,21 @@ impl NodeMeta {
             && self.mtime_ns == other.mtime_ns
             && self.mode == other.mode
             && self.dev_ino == other.dev_ino
+    }
+}
+
+/// `(dev, ino)` of an already-stat'd node, or `(0, 0)` where the platform does
+/// not expose one — which callers must treat as "identity unknown".
+fn target_identity(md: &fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (md.dev(), md.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        (0, 0)
     }
 }
 
@@ -813,6 +861,9 @@ fn stat_meta(path: &Path) -> io::Result<NodeMeta> {
     let (mode, dev_ino) = (0u32, (0u64, 0u64));
     Ok(NodeMeta {
         node_type,
+        // One extra stat, and only for links: resolving the target is the only
+        // way to know whether this entry is enumerable.
+        link_dir: ft.is_symlink() && fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false),
         // A symlink's "content" is its target bytes (docs/design/fs-write.md
         // "Links"), so its size is the target length, as lstat reports it.
         size: if ft.is_file() || ft.is_symlink() {
@@ -2110,16 +2161,79 @@ impl Reconciler {
         recurse: bool,
         root_dev: Option<u64>,
     ) -> io::Result<()> {
+        let mut ancestors = Vec::new();
+        self.scan_into_inner(index, abs, rel, recurse, root_dev, &mut ancestors)
+    }
+
+    /// `ancestors` holds the `(dev, ino)` identity of every directory on the
+    /// current descent path, which is what makes following symlinks safe: a
+    /// link whose target is already an ancestor is a cycle and is reported
+    /// without being descended. Identity comes from the stat already performed,
+    /// so this costs nothing extra for the common case.
+    fn scan_into_inner(
+        &mut self,
+        index: &mut Index,
+        abs: &Path,
+        rel: &str,
+        recurse: bool,
+        root_dev: Option<u64>,
+        ancestors: &mut Vec<(u64, u64)>,
+    ) -> io::Result<()> {
         let meta = stat_meta(abs)?;
         if index.len() >= self.opts.max_entries {
             return Err(io::Error::from_raw_os_error(RESOURCE_LIMIT_ERRNO));
         }
-        let is_dir = meta.node_type == FS_ENTRY_DIR;
+        let node_type = meta.node_type;
+        let link_dir = meta.link_dir;
+        let self_id = meta.dev_ino;
         let dev = meta.dev_ino.0;
         index.insert(rel.to_string(), meta);
-        if !is_dir {
+
+        // A symlink to a directory is still reported as FS_ENTRY_SYMLINK — its
+        // content stays the target bytes (docs/design/fs-watch.md "Links") —
+        // but it is enumerated so the file browser can descend it. Without
+        // this a symlinked directory is a dead end: an entry with children
+        // that can never be listed.
+        let (descend_id, dev) = if node_type == FS_ENTRY_SYMLINK {
+            if !link_dir {
+                return Ok(()); // dangling, or a link to a file
+            }
+            let Ok(target) = fs::metadata(abs) else {
+                return Ok(());
+            };
+            let id = target_identity(&target);
+            if id == (0, 0) {
+                // No usable identity means no way to detect a cycle. Report the
+                // link, but do not risk descending forever.
+                return Ok(());
+            }
+            if ancestors.contains(&id) {
+                return Ok(()); // the link points back up its own path
+            }
+            (id, id.0)
+        } else if node_type == FS_ENTRY_DIR {
+            (self_id, dev)
+        } else {
             return Ok(());
-        }
+        };
+
+        ancestors.push(descend_id);
+        let result = self.scan_children(index, abs, rel, recurse, root_dev, dev, ancestors);
+        ancestors.pop();
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_children(
+        &mut self,
+        index: &mut Index,
+        abs: &Path,
+        rel: &str,
+        recurse: bool,
+        root_dev: Option<u64>,
+        dev: u64,
+        ancestors: &mut Vec<(u64, u64)>,
+    ) -> io::Result<()> {
         let root_dev = root_dev.or(Some(dev));
         if !self.opts.cross_filesystem && Some(dev) != root_dev {
             return Ok(()); // report the mount point, don't descend
@@ -2138,8 +2252,14 @@ impl Reconciler {
             let child_abs = entry.path();
             // Non-recursive syncs index immediate children only.
             let child_recurse = self.opts.recursive;
-            if let Err(e) = self.scan_into(index, &child_abs, &child_rel, child_recurse, root_dev)
-                && e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO)
+            if let Err(e) = self.scan_into_inner(
+                index,
+                &child_abs,
+                &child_rel,
+                child_recurse,
+                root_dev,
+                ancestors,
+            ) && e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO)
             {
                 return Err(e);
             }
@@ -2188,6 +2308,19 @@ impl Reconciler {
         }
     }
 
+    /// The device the sync root lives on, which bounds cross-filesystem
+    /// descent.
+    ///
+    /// Reconcile paths must pass this rather than `None`: `scan_children`
+    /// re-anchors a `None` bound to whatever device it is handed, and for a
+    /// symlink that is the *target's* device — silently lifting the guard for
+    /// the whole foreign subtree. The reconcile pre-check cannot catch it
+    /// either, because a symlink's own `dev_ino` comes from `lstat` and so
+    /// reports the device the link itself lives on, not its target's.
+    fn root_device(&self) -> Option<u64> {
+        self.canonical.get("").map(|m| m.dev_ino.0)
+    }
+
     /// Verify one hinted path against the canonical index.
     fn reconcile(&mut self, rel: &str) -> Result<(), u8> {
         if self.single {
@@ -2233,9 +2366,9 @@ impl Reconciler {
                 let was_dir = self
                     .canonical
                     .get(rel)
-                    .map(|m| m.node_type == FS_ENTRY_DIR)
+                    .map(|m| m.enumerable_dir())
                     .unwrap_or(false);
-                let is_dir = meta.node_type == FS_ENTRY_DIR;
+                let is_dir = meta.enumerable_dir();
                 let preserved_hash = self
                     .canonical
                     .get(rel)
@@ -2253,7 +2386,8 @@ impl Reconciler {
                     // watch registration and this scan produce duplicate
                     // hints, which reconcile to no-ops.
                     let mut sub = Index::new();
-                    match self.scan_into(&mut sub, &abs, rel, self.opts.recursive, None) {
+                    let bound = self.root_device();
+                    match self.scan_into(&mut sub, &abs, rel, self.opts.recursive, bound) {
                         Ok(()) => {}
                         Err(e) if e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO) => {
                             return Err(FS_CLOSED_RESOURCE_LIMIT);
@@ -2301,11 +2435,11 @@ impl Reconciler {
             let name = os_to_wire(&entry.file_name());
             let child_rel = join_wire(rel, &name);
             if let Ok(meta) = stat_meta(&entry.path()) {
-                let newly_dir = meta.node_type == FS_ENTRY_DIR
+                let newly_dir = meta.enumerable_dir()
                     && self
                         .canonical
                         .get(&child_rel)
-                        .map(|m| m.node_type != FS_ENTRY_DIR)
+                        .map(|m| !m.enumerable_dir())
                         .unwrap_or(true);
                 let preserved = self
                     .canonical
@@ -2348,9 +2482,10 @@ impl Reconciler {
         for k in gone {
             self.index_remove(&k);
         }
+        let bound = self.root_device();
         for (abs, rel) in new_dirs {
             let mut sub = Index::new();
-            match self.scan_into(&mut sub, &abs, &rel, self.opts.recursive, None) {
+            match self.scan_into(&mut sub, &abs, &rel, self.opts.recursive, bound) {
                 Ok(()) => {}
                 Err(e) if e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO) => {
                     return Err(FS_CLOSED_RESOURCE_LIMIT);
@@ -2811,6 +2946,9 @@ impl SyncEngine {
         let prior_failures = self.retry.remove(path).map(|e| e.failures).unwrap_or(0);
         let was_retry = prior_failures > 0;
         let mut entry_flags = meta.node_type & FS_ENTRY_TYPE_MASK;
+        if meta.link_dir {
+            entry_flags |= FS_ENTRY_LINK_DIR;
+        }
         let mut hash = meta.hash;
         let mut full: Option<Arc<Vec<u8>>> = None;
         let mut delta: Option<Vec<u8>> = None;
@@ -3757,6 +3895,7 @@ mod tests {
             mode: 0o644,
             hash: 0,
             dev_ino: (1, ino),
+            link_dir: false,
         }
     }
 
@@ -4091,6 +4230,186 @@ mod tests {
     }
 
     /// A SINGLE root's validation: directories answer the invalid-path
+    /// With `cross_filesystem` off (the default), a symlink to a directory on
+    /// another mount is reported but never descended — on the initial scan and,
+    /// the case that actually regressed, on an incremental reconcile.
+    ///
+    /// The reconcile pre-check cannot catch this one: a symlink's `dev_ino`
+    /// comes from `lstat`, so it reports the device the *link* lives on (the
+    /// root's), sailing past the guard that stops real foreign-device
+    /// directories. `scan_into` was then called with `root_dev: None`, which
+    /// re-anchored the bound to the target's device and indexed the whole
+    /// cross-device subtree.
+    ///
+    /// Uses /dev/shm as the second filesystem; skipped when it is absent, not
+    /// writable, or happens to share a device with the temp dir.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cross_device_symlink_is_not_descended_on_reconcile() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = temp_dir().canonicalize().unwrap();
+        let Ok(shm) = std::path::Path::new("/dev/shm").canonicalize() else {
+            return;
+        };
+        let foreign = shm.join(format!("blit-xdev-{}", std::process::id()));
+        if fs::create_dir_all(foreign.join("inner")).is_err() {
+            return;
+        }
+        // Guard the premise: without two devices this proves nothing.
+        let (Ok(a), Ok(b)) = (fs::metadata(&dir), fs::metadata(&foreign)) else {
+            let _ = fs::remove_dir_all(&foreign);
+            return;
+        };
+        if a.dev() == b.dev() {
+            let _ = fs::remove_dir_all(&foreign);
+            return;
+        }
+        fs::write(foreign.join("inner/secret.txt"), b"elsewhere").unwrap();
+        fs::write(dir.join("local.txt"), b"here").unwrap();
+
+        // cross_filesystem defaults to false in test_key.
+        let (sent, handle, hint) = drive_engine(&dir);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("local.txt")
+        });
+
+        // Create the link *after* the first snapshot, so the hint takes the
+        // "new (or type-changed) directory" branch — the trigger.
+        std::os::unix::fs::symlink(&foreign, dir.join("far")).unwrap();
+        hint.send(Hint::Dirty(dir.join("far")));
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "link entry", |m| {
+            m.live.contains_key("far")
+        });
+
+        // The link is reported — it is the boundary, like a mount point — but
+        // nothing beyond it is indexed. Snapshot the verdict, then tear down
+        // *before* asserting: /dev/shm is RAM, and a failing assert would
+        // otherwise leave the fixture behind.
+        let leaked: Vec<String> = mirror
+            .live
+            .keys()
+            .filter(|k| k.starts_with("far/"))
+            .cloned()
+            .collect();
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&foreign);
+
+        assert!(
+            leaked.is_empty(),
+            "cross_filesystem is off: a symlink to another device must not be \
+             descended, found {leaked:?}"
+        );
+    }
+
+    /// A root whose name contains `%` survives the FS_SYNCED round trip. The
+    /// echo is `escape_path(canonical_root)`, so a literal `%` comes back as
+    /// `%25`; clients build further sync roots from that echo, and without a
+    /// decode on the way in such a path could be listed but never re-opened.
+    /// A file genuinely named `50%25.txt` still takes precedence over the
+    /// decoded reading of `50%.txt`.
+    #[test]
+    fn percent_in_root_survives_the_wire_round_trip() {
+        let dir = temp_dir().canonicalize().unwrap();
+        let literal = dir.join("50%.txt");
+        fs::write(&literal, b"x").unwrap();
+
+        // What the server echoes for this path.
+        let echoed = escape_path(&literal);
+        assert!(echoed.ends_with("50%25.txt"), "echo escapes the percent");
+
+        // Both the raw form a CLI types and the escaped echo must resolve.
+        assert_eq!(
+            validate_root(&literal.to_string_lossy()).unwrap(),
+            literal.canonicalize().unwrap(),
+            "a raw path containing % still works"
+        );
+        assert_eq!(
+            validate_root(&echoed).unwrap(),
+            literal.canonicalize().unwrap(),
+            "the escaped echo resolves back to the same file"
+        );
+
+        // A file actually named `50%25.txt` wins the literal reading.
+        let ambiguous = dir.join("50%25.txt");
+        fs::write(&ambiguous, b"y").unwrap();
+        assert_eq!(
+            validate_root(&echoed).unwrap(),
+            ambiguous.canonicalize().unwrap(),
+            "literal match takes precedence over the decoded one"
+        );
+    }
+
+    /// A symlinked directory is enumerated like a real one, flagged
+    /// `FS_ENTRY_LINK_DIR` so a client knows it is expandable, and a link that
+    /// points back into its own tree stops instead of recursing forever.
+    /// Previously the scan reported the link as a childless entry, which made
+    /// the file browser a dead end at every symlinked directory.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_are_traversed_and_cycle_safe() {
+        let dir = temp_dir().canonicalize().unwrap();
+        // real/inner/deep.txt, plus link -> real, and a cycle real/loop -> real
+        fs::create_dir_all(dir.join("real/inner")).unwrap();
+        fs::write(dir.join("real/inner/deep.txt"), b"payload").unwrap();
+        fs::write(dir.join("real/top.txt"), b"top").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("real/loop")).unwrap();
+        // A link to a file, and a dangling one: neither is enumerable.
+        std::os::unix::fs::symlink(dir.join("real/top.txt"), dir.join("tolink")).unwrap();
+        std::os::unix::fs::symlink(dir.join("nope"), dir.join("dangling")).unwrap();
+
+        let (sent, handle, _hint) = drive_engine(&dir);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(
+            &sent,
+            &handle,
+            &mut mirror,
+            &mut seen,
+            "link subtree",
+            |m| m.live.contains_key("link/inner/deep.txt"),
+        );
+
+        // The link is reported as a symlink, but flagged as enumerable.
+        let link = &mirror.live["link"];
+        assert_eq!(link.entry_flags & FS_ENTRY_TYPE_MASK, FS_ENTRY_SYMLINK);
+        assert_ne!(
+            link.entry_flags & FS_ENTRY_LINK_DIR,
+            0,
+            "a symlinked directory must advertise that it can be expanded"
+        );
+        // Its contents are reachable through the link's own path.
+        assert!(mirror.live.contains_key("link/top.txt"));
+        assert_eq!(
+            mirror.live["link/inner/deep.txt"].content.as_deref(),
+            Some(&b"payload"[..])
+        );
+
+        // A link to a file is not enumerable, and neither is a dangling one.
+        assert_eq!(mirror.live["tolink"].entry_flags & FS_ENTRY_LINK_DIR, 0);
+        assert_eq!(mirror.live["dangling"].entry_flags & FS_ENTRY_LINK_DIR, 0);
+
+        // `real/loop` points at its own ancestor, so it is reported but never
+        // descended — no redundant copy of the subtree, no recursion.
+        assert!(mirror.live.contains_key("real/loop"));
+        assert!(
+            !mirror.live.keys().any(|k| k.starts_with("real/loop/")),
+            "a link to an ancestor must not be descended: {:?}",
+            mirror.live.keys().collect::<Vec<_>>()
+        );
+        // The same link reached through `link` is equally bounded.
+        assert!(mirror.live.contains_key("link/loop"));
+        assert!(
+            !mirror.live.keys().any(|k| k.starts_with("link/loop/")),
+            "cycle detection must hold through a symlinked path too: {:?}",
+            mirror.live.keys().collect::<Vec<_>>()
+        );
+        handle.command(Command::Stop);
+    }
+
     /// error, files canonicalize, missing paths keep their status.
     #[test]
     fn single_root_validation() {

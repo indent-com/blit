@@ -67,6 +67,7 @@ export {
   FS_ENTRY_UNREADABLE,
   FS_ENTRY_NO_CONTENT,
   FS_ENTRY_UNSTABLE,
+  FS_ENTRY_LINK_DIR,
   FsMirror,
   applyFsDelta,
   fsCompress,
