@@ -52,9 +52,22 @@ pub fn is_read_only_event(kind: &notify::EventKind) -> bool {
 /// anywhere inside. Measured on this repo: 9.7k real directories, 92k when
 /// following, and four such event loops pinned four cores indefinitely.
 ///
-/// Following is also wrong on the merits here: neither the status engine nor
-/// the sync engine reports on paths outside the root it was handed, so the
-/// walk only ever costs work whose results are discarded.
+/// Cost is not the whole argument, because not following also changes *what*
+/// is covered. A recursive sync enumerates a symlinked directory under the
+/// link's own path (`docs/design/fs-watch.md` § Links), and notify's walk
+/// yields a symlink as a symlink when it is not following, so `filter_dir`
+/// drops it and no descriptor covers those aliased paths: an edit under one
+/// is hinted at the target's real path — which the sync sees only when that
+/// target is itself inside the root — and never at the alias.
+///
+/// Following did not reliably cover them either. `inotify_add_watch` returns
+/// the *same* descriptor for an inode already watched, and notify keys its
+/// descriptor→path map on that descriptor, so arming both a pnpm alias and
+/// its real path left whichever the walk reached last reporting for both, and
+/// unwatching either dropped both. The choice is therefore between one stable
+/// rule and an arming-order lottery that could strand the real path, not
+/// between coverage and none. The status engine never reported on the aliases
+/// at all: it asks git, which follows the index.
 pub fn watcher<F: notify::EventHandler>(handler: F) -> notify::Result<RecommendedWatcher> {
     RecommendedWatcher::new(handler, Config::default().with_follow_symlinks(false))
 }
@@ -123,5 +136,59 @@ mod tests {
         ] {
             assert!(!is_read_only_event(&kind), "{kind:?} may report a change");
         }
+    }
+
+    /// A watched tree reachable under two names — `real/` and a symlink to it —
+    /// must report changes under the *real* one.
+    ///
+    /// This is the property [`watcher`] buys, and it is a positive assertion
+    /// rather than a wait on a negative: `inotify_add_watch` hands back the
+    /// same descriptor for an inode already watched, and notify keys its
+    /// descriptor→path map on that descriptor, so with following on, arming
+    /// the link overwrote the mapping for the real directory and a write to
+    /// `real/inner/x` was delivered as `link/inner/x`. The real path — the one
+    /// git reports and every non-aliased sync entry lives under — then got no
+    /// hint at all. Reverting to `Config::default()` here fails this test with
+    /// exactly that swap, whenever the walk reaches the link second.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changes_are_reported_under_the_real_path_not_a_symlinked_alias() {
+        use crate::{Hint, RootMsg};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("blit-watch-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        // `watch` arms synchronously, so nothing can slip in before the write.
+        let _backend = watch(&dir, true, HintSender { tx }).unwrap();
+        std::fs::write(dir.join("real/inner/w.txt"), b"x").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        let hit = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break None;
+            }
+            match rx.recv_timeout(left) {
+                Ok(RootMsg::Hint(Hint::Dirty(p))) if p.ends_with("real/inner/w.txt") => {
+                    break Some(p);
+                }
+                Ok(RootMsg::Hint(hint)) => seen.push(format!("{hint:?}")),
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            hit.is_some(),
+            "no hint under real/inner/; got {seen:?} — an alias reported instead means \
+             the watch is following symlinks again"
+        );
     }
 }

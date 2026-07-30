@@ -213,10 +213,17 @@ ancestor is reported but not descended, so a self-referential tree terminates
 without a redundant copy of the subtree. A link with no usable identity (a
 platform that exposes no inode) is reported and not descended.
 
-Note the watch asymmetry: the sync registers on the link's own path, so on
-backends that resolve to the real path before reporting (macOS FSEvents),
-changes made _inside_ a symlinked directory may not produce hints, and only a
-rescan picks them up. Listing and reading are unaffected.
+Note the watch asymmetry: enumeration goes through the link, the watch does
+not. The recursive native watch does not follow symlinks (`backend::watcher`,
+which explains why), and macOS FSEvents resolves to the real path before
+reporting, so on every platform a change made _inside_ a symlinked directory
+is hinted at the **target's real path** — which a sync sees only when that
+target is itself inside its root — and never at the aliased path. An entry
+below a symlinked directory therefore holds what the last enumeration saw
+until a rescan; listing and reading are unaffected, and the real path stays
+live. Closing the gap means mapping resolved paths back to every alias that
+reaches them, which is a larger change than either of the ones that exposed
+it.
 
 A sync root may arrive raw (as a CLI or user types it) or wire-escaped, and the
 two are not distinguishable by inspection: `FS_SYNCED` echoes
