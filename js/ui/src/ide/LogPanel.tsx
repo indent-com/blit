@@ -74,6 +74,14 @@ export function LogPanel(props: {
   onOpenTile: (assignment: string) => void;
 }) {
   const commits = () => props.session?.commits() ?? [];
+  const emptyText = (): string => {
+    const s = props.session;
+    if (!s) return "No root selected.";
+    const failure = s.gitError();
+    if (failure) return failure;
+    if (s.noRepo()) return "No repository here.";
+    return s.logLoaded() ? "No commits." : "Loading…";
+  };
 
   // Tick so relative timestamps advance on their own. Coarse (the rendered
   // strings are minute-grained soon after a commit lands) and paused while
@@ -484,8 +492,27 @@ export function LogPanel(props: {
               {props.session?.logSpecError()}
             </div>
           </Show>
+          {/* A watch the server closed leaves the rows below standing, and
+              nothing else would say they had stopped moving: the empty state
+              only renders when there are none. Says it once, here, rather than
+              folding the section over commits the user is reading. */}
+          <Show when={commits().length > 0 && props.session?.gitError()}>
+            <div
+              style={{
+                "font-size": `${props.scale.xs}px`,
+                color: props.theme.errorText,
+                padding: "2px 2px 0",
+              }}
+            >
+              {props.session?.gitError()}
+            </div>
+          </Show>
         </div>
       </Show>
+      {/* The dock folds this section away when there is no repo, so the
+          fallback below is what you get for opening it anyway: the reason,
+          stated once, dimmed like every other empty state. "Loading…" is only
+          ever said while a page is genuinely on its way. */}
       <Show
         when={commits().length > 0}
         fallback={
@@ -496,11 +523,7 @@ export function LogPanel(props: {
               color: props.theme.dimFg,
             }}
           >
-            {!props.session
-              ? "No root selected."
-              : props.session.logLoaded()
-                ? "No commits."
-                : "Loading…"}
+            {emptyText()}
           </div>
         }
       >

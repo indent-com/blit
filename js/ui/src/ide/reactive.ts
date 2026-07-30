@@ -37,7 +37,7 @@ const MAX_OPEN_RETRIES = 20;
 export function isConnReady(
   snapshot: BlitWorkspaceSnapshot,
   connectionId: string,
-  capability: "supportsFsSync" | "supportsGit",
+  capability: "supportsFsSync" | "supportsGit" | "supportsLsp",
 ): boolean {
   const c = snapshot.connections.find((x) => x.id === connectionId);
   return (

@@ -97,6 +97,7 @@ import {
 import { t } from "./i18n";
 import { StatusBar } from "./StatusBar";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
+import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
 import { ExplorerPanel } from "./ide/ExplorerPanel";
 import { LogPanel } from "./ide/LogPanel";
 import { SearchPanel } from "./ide/SearchPanel";
@@ -478,6 +479,12 @@ function WorkspaceScreen(props: {
   const [collapsedSections, setCollapsedSections] = createSignal<
     Set<LeftPanel>
   >(new Set(preferredCollapsedSections() as LeftPanel[]));
+  // Sections auto-folded because they don't apply here, which the user asked
+  // to see anyway. Not persisted: it is an override of a fold this root
+  // caused, not a preference about the dock.
+  const [foldOverrides, setFoldOverrides] = createSignal<
+    ReadonlySet<LeftPanel>
+  >(new Set());
   const [sectionWeights, setSectionWeights] = createSignal<
     Record<LeftPanel, number>
   >({ explorer: 1, log: 1, problems: 1 });
@@ -639,6 +646,9 @@ function WorkspaceScreen(props: {
         connectionId: a.session.connectionId,
         path: "",
         fromSessionId: a.session.id,
+        // Keyed by pty, so the session survives reconnects that replace every
+        // SessionId — the pty is what its opens keep following.
+        fromPtyId: a.session.ptyId,
       };
     }
     // Tile-anchored: the fs sync starts at the file's directory (or the
@@ -652,6 +662,34 @@ function WorkspaceScreen(props: {
     };
   });
   const activeSession = useIdeSession(workspace, ideDescriptor);
+
+  // Sections with nothing to show for this root: a commit log over a directory
+  // that is not a repository (or a remote with no git at all), problems from a
+  // remote that cannot run a language server. They fold away rather than
+  // sitting open on a message — the space belongs to the panels that do apply —
+  // and unfold by themselves once they have something to say.
+  const inapplicableSections = createMemo<ReadonlySet<LeftPanel>>(() => {
+    const set = new Set<LeftPanel>();
+    const s = activeSession();
+    if (s?.noRepo()) set.add("log");
+    if (s?.noLsp()) set.add("problems");
+    return set;
+  });
+  // An override lapses once its section applies again.
+  createEffect(() => {
+    const inapplicable = inapplicableSections();
+    setFoldOverrides((cur) => {
+      const next = liveOverrides(cur, inapplicable);
+      return next.size === cur.size ? cur : next;
+    });
+  });
+  const collapsedForDock = createMemo(() =>
+    foldedSections(
+      collapsedSections(),
+      inapplicableSections(),
+      foldOverrides(),
+    ),
+  );
 
   // --- Mobile touch detection & virtual keyboard tracking ---
   const [isMobileTouch, setIsMobileTouch] = createSignal(false);
@@ -1272,13 +1310,20 @@ function WorkspaceScreen(props: {
     writeStorage(LEFT_DOCK_OPEN_KEY, next ? "1" : "0");
   }
   function toggleSectionCollapse(panel: LeftPanel) {
-    setCollapsedSections((cur) => {
-      const next = new Set(cur);
-      if (next.has(panel)) next.delete(panel);
-      else next.add(panel);
-      persistCollapsed(next);
-      return next;
-    });
+    const cur = collapsedSections();
+    const next = toggleSection(
+      panel,
+      cur,
+      inapplicableSections(),
+      foldOverrides(),
+    );
+    setFoldOverrides(next.overridden);
+    // A toggle moves exactly one panel, so an unchanged size means this click
+    // went to the override instead of the preference.
+    if (next.userCollapsed.size !== cur.size) {
+      setCollapsedSections(next.userCollapsed);
+      persistCollapsed(next.userCollapsed);
+    }
   }
   // Keyboard entry point: open the dock and reveal a section.
   function focusSection(panel: LeftPanel) {
@@ -2833,7 +2878,7 @@ function WorkspaceScreen(props: {
         >
           <Show when={leftDockOpen()}>
             <LeftDock
-              collapsed={collapsedSections()}
+              collapsed={collapsedForDock()}
               weights={sectionWeights()}
               header={rootPickerHeader()}
               theme={theme()}

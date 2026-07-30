@@ -17,6 +17,7 @@ import {
   createMemo,
   createEffect,
   onCleanup,
+  untrack,
   type Accessor,
 } from "solid-js";
 import type {
@@ -42,6 +43,11 @@ import {
   GIT_LOG_TOPO,
   GIT_COMMITS_MORE,
   GIT_STATUS_OK,
+  GIT_CLOSED_CLIENT_REQUEST,
+  GIT_CLOSED_CONNECTION_LOST,
+  GIT_CLOSED_PERMISSION_LOST,
+  GIT_CLOSED_REPO_GONE,
+  GIT_CLOSED_RESOURCE_LIMIT,
 } from "@blit-sh/core";
 import {
   editorAssignment,
@@ -50,6 +56,8 @@ import {
 } from "@blit-sh/core/bsp";
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import { isConnReady, connGeneration, isTransientConnError } from "./reactive";
+import { currentSessionForPty } from "./followTerminal";
+import { settledWithoutRepo } from "./gitPresence";
 
 /** Ceiling on consecutive transient open-retries — see the per-session
  *  counters. Generous: a real reconnect needs one. */
@@ -61,6 +69,22 @@ const MAX_OPEN_RETRIES = 20;
 export function isSyncLimitError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return /resource limit/i.test(msg);
+}
+
+/** A `GIT_CLOSED` reason, for the panels that have to explain it. */
+function gitClosedText(reason: number): string {
+  switch (reason) {
+    case GIT_CLOSED_CLIENT_REQUEST:
+      return "closed by this client";
+    case GIT_CLOSED_REPO_GONE:
+      return "the repository went away";
+    case GIT_CLOSED_PERMISSION_LOST:
+      return "permission lost";
+    case GIT_CLOSED_RESOURCE_LIMIT:
+      return "the server ran out of file watches";
+    default:
+      return "the server's repository watch failed";
+  }
 }
 
 // Shared tree-expansion state: two sessions that resolve to the SAME file tree
@@ -114,6 +138,11 @@ export interface IdeSessionDescriptor {
   connectionId: ConnectionId;
   path: string;
   fromSessionId?: SessionId;
+  /** The pty behind `fromSessionId`. Follow-terminal sessions are keyed by pty
+   *  and stay warm across reconnects, which mint new SessionIds and prune the
+   *  superseded ones — so the pty, not the id, is what the opens follow (see
+   *  ./followTerminal). */
+  fromPtyId?: number;
   /** Tile-anchored roots: once git discovers the enclosing repo, re-root the fs
    *  tree at the repo workdir so the explorer shows the whole project rather
    *  than the file's directory. Falls back to `path` when not in a repo. */
@@ -165,6 +194,17 @@ export interface IdeSession {
   /** Live git state (status/head/upstreams/stashes); `null` until watched. */
   gitState: Accessor<GitStateMirror | null>;
   gitHandle: Accessor<GitRepoHandle | null>;
+  /** Why this root has no repo: the open failed (not a repository, the source
+   *  terminal is gone, …) or the server closed the watch. `null` while the
+   *  repo is opening or open — the two states panels must not conflate. */
+  gitError: Accessor<string | null>;
+  /** There is no repo here and none is coming: the open settled as a failure,
+   *  or the remote has no git support. False while one is still opening (or
+   *  could be, once the transport is back), so panels that only make sense
+   *  over a repository can fold away without flapping — and false once a repo
+   *  *has* opened here, because a watch that then dies is a failure to report
+   *  rather than an absent repository (see [`settledWithoutRepo`]). */
+  noRepo: Accessor<boolean>;
   /** The repo's worktree root, discovered when git first opens and kept across
    *  connection resets (unlike gitHandle, which drops to null on a reset). Use
    *  this to build commit tiles so clicking a commit still works while git is
@@ -194,6 +234,10 @@ export interface IdeSession {
   /** Idempotently attach a language server for this root. */
   ensureLsp(): void;
   lspHandle: Accessor<LspHandle | null>;
+  /** The remote has no language intelligence, so nothing will ever attach —
+   *  from the negotiated features, not from a failed attach, since the attach
+   *  is lazy. False while the transport is down. */
+  noLsp: Accessor<boolean>;
   /** Bumps on every lsp state/diagnostics push. */
   lspVersion: Accessor<number>;
 
@@ -238,7 +282,6 @@ function buildSession(
   desc: IdeSessionDescriptor,
 ): IdeSession {
   const { connectionId } = desc;
-  const fromSessionId = desc.fromSessionId;
 
   // Gate every open (fs/git/lsp) on the connection being ready, and re-open
   // after a reset. A session can be built before its transport is connected —
@@ -254,7 +297,27 @@ function buildSession(
   const gitReady = createMemo(() =>
     isConnReady(wsSnap(), connectionId, "supportsGit"),
   );
+  const lspReady = createMemo(() =>
+    isConnReady(wsSnap(), connectionId, "supportsLsp"),
+  );
   const connGen = createMemo(() => connGeneration(wsSnap(), connectionId));
+
+  // The source of a follow-terminal open (the server resolves the root from
+  // that pty's live cwd), resolved fresh at every open: SessionIds are minted
+  // per connection generation, and this session outlives generations — it is
+  // keyed by pty and kept warm across reconnects (see ./followTerminal).
+  // Untracked: the session list churns on every title/row update, and reading
+  // it reactively would tear the handles down and re-open them for nothing.
+  const fromSessionId = (): SessionId | undefined => {
+    const id = desc.fromSessionId;
+    if (!id || desc.fromPtyId === undefined) return id;
+    return currentSessionForPty(
+      untrack(wsSnap).sessions,
+      connectionId,
+      desc.fromPtyId,
+      id,
+    );
+  };
 
   // Retry counters. A re-establish resets fs/git/lsp *after* re-emitting the
   // snapshot (BlitConnection S2C_HELLO: emit() then resetFsSyncs/resetGitRepos),
@@ -366,7 +429,10 @@ function buildSession(
     let localDisposed = false;
     let limitTimer: ReturnType<typeof setTimeout> | null = null;
     workspace
-      .syncFs(connectionId, rootAt, { ...rootOpts, fromSessionId })
+      .syncFs(connectionId, rootAt, {
+        ...rootOpts,
+        fromSessionId: fromSessionId(),
+      })
       .then((h) => {
         if (disposed || localDisposed) {
           h.stop();
@@ -586,6 +652,25 @@ function buildSession(
   // ── git: watch status + branch + a head commit-log page ────────────────
   const [gitHandle, setGitHandle] = createSignal<GitRepoHandle | null>(null);
   const [gitVersion, setGitVersion] = createSignal(0);
+  // Why there is no repo, when that is a failure rather than "still opening".
+  // Without it every git panel has to guess, and the commit log's guess was
+  // "loading" — forever, for a page no one is coming to send.
+  const [gitError, setGitError] = createSignal<string | null>(null);
+  // Whether a repo has ever opened for this root. Distinguishes "there is no
+  // repository" from "the one we had just died", which look identical from
+  // gitHandle and gitError alone — see `settledWithoutRepo`. Cleared only by an
+  // open that settles as a failure, so a reconnect window keeps the answer the
+  // last settled open gave.
+  const [hadRepo, setHadRepo] = createSignal(false);
+  const noRepo = createMemo(() =>
+    settledWithoutRepo({
+      hasHandle: gitHandle() !== null,
+      hadRepo: hadRepo(),
+      gitError: gitError(),
+      fsReady: fsReady(),
+      gitReady: gitReady(),
+    }),
+  );
   // Commit log with frontier pagination: a live head page (watchLog, updates
   // as refs move) plus statically fetched older pages appended on demand.
   const LOG_PAGE = 1000;
@@ -717,10 +802,24 @@ function buildSession(
         // watch keeps subsequent updates incremental.
         untracked: true,
         tracking: true,
-        fromSessionId,
+        fromSessionId: fromSessionId(),
         onState: () => setGitVersion((v) => v + 1),
-        // Reflect a close/connection-loss in the reactive graph too.
-        onClosed: () => setGitVersion((v) => v + 1),
+        // Reflect a close/connection-loss in the reactive graph too. A
+        // server-side close (the watch hit a resource limit, the repo went
+        // away) is terminal for this handle: drop it and say why, or every
+        // git-backed panel would sit on a dead repo — the commit log showing
+        // "Loading…" for a page that can never arrive. A connection loss is
+        // not terminal; connGen re-opens.
+        //
+        // `hadRepo` stays set here on purpose: this is a repository that died,
+        // not one that was never there, so the sections stay open to say so
+        // instead of folding away over the commits still on screen.
+        onClosed: (reason: number) => {
+          setGitVersion((v) => v + 1);
+          if (reason === GIT_CLOSED_CONNECTION_LOST || disposed) return;
+          setGitHandle(null);
+          setGitError(`Repository watch closed: ${gitClosedText(reason)}`);
+        },
       })
       .then((h) => {
         if (disposed || localDisposed) {
@@ -728,6 +827,8 @@ function buildSession(
           return;
         }
         gitRetries = 0;
+        setGitError(null);
+        setHadRepo(true);
         setGitHandle(h);
         // Reveal the repo root so a tile-anchored fs tree can re-root at it.
         setGitWorkdir(h.workdir);
@@ -739,10 +840,18 @@ function buildSession(
         // preferRepoRoot tree still learns the repo workdir instead of
         // mis-rooting at the file's directory. A genuine failure (not a repo),
         // or too many transient retries, settles — letting the fs tree fall
-        // back to the descriptor path.
+        // back to the descriptor path, and telling the git panels why they
+        // have no repo instead of leaving them to look like they are loading.
         if (isTransientConnError(e) && gitRetries++ < MAX_OPEN_RETRIES)
           setGitRetry((n) => n + 1);
-        else setGitSettled(true);
+        else {
+          setGitError(e instanceof Error ? e.message : String(e));
+          // This root has no repo, whatever an earlier generation opened here
+          // (a follow-terminal dock re-resolves its root at every open, so the
+          // cwd may have moved out of the worktree). The sections may fold.
+          setHadRepo(false);
+          setGitSettled(true);
+        }
       });
     onCleanup(() => {
       localDisposed = true;
@@ -884,6 +993,11 @@ function buildSession(
   // ── lsp: attached on demand (Problems / editor squiggles) ──────────────
   const [lspHandle, setLspHandle] = createSignal<LspHandle | null>(null);
   const [lspVersion, setLspVersion] = createSignal(0);
+  // The remote cannot do language intelligence at all (old blit, or BLIT_LSP=0,
+  // which unadvertises the feature). Read off the negotiated features rather
+  // than a failed attach: the attach is lazy, so a panel that folds itself away
+  // on this would otherwise have to open first to learn it should not have.
+  const noLsp = createMemo(() => fsReady() && !lspReady());
   // Requested once a consumer needs it; the gated effect below opens it when
   // the connection is ready and re-opens after a reset (a plain one-shot open
   // would be lost forever if it fired while the transport was still connecting).
@@ -896,11 +1010,14 @@ function buildSession(
     if (!lspWanted()) return;
     connGen(); // re-open after a connection reset
     lspRetry(); // re-attempt after a transient (reset-clobbered) open
-    if (!fsReady()) return; // wait for the transport (fs is the base feature)
+    if (!lspReady()) return; // no transport yet, or no language support at all
     let localDisposed = false;
     let unsub: (() => void) | null = null;
     workspace
-      .openLsp(connectionId, desc.path, { diagnostics: true, fromSessionId })
+      .openLsp(connectionId, desc.path, {
+        diagnostics: true,
+        fromSessionId: fromSessionId(),
+      })
       .then((h) => {
         if (disposed || localDisposed) {
           h.close();
@@ -953,6 +1070,8 @@ function buildSession(
     expandTo,
     gitState,
     gitHandle,
+    gitError,
+    noRepo,
     repoWorkdir: gitWorkdir,
     commits,
     hasMoreLog,
@@ -963,6 +1082,7 @@ function buildSession(
     logLoaded,
     ensureLsp,
     lspHandle,
+    noLsp,
     lspVersion,
     // Both return "" when the root is unknown, so callers can decline to open
     // rather than mint a tile whose path can never resolve.

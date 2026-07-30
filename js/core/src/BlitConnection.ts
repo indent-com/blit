@@ -1174,9 +1174,7 @@ export class BlitConnection {
     else if (options.recursive !== false) flags |= FS_SYNC_RECURSIVE;
     if (options.content) flags |= FS_SYNC_CONTENT;
     if (options.crossFilesystem) flags |= FS_SYNC_CROSS_FILESYSTEM;
-    const srcPtyId = options.fromSessionId
-      ? this.sessionsById.get(options.fromSessionId)?.ptyId
-      : undefined;
+    const srcPtyId = this.srcPtyForOpen(options.fromSessionId);
     const latencyMs = options.latencyMs ?? 0;
     const inlineMax = options.inlineMax ?? 0;
     const key = `${flags}:${latencyMs}:${inlineMax}:${srcPtyId ?? ""}:${path}`;
@@ -1757,9 +1755,7 @@ export class BlitConnection {
     if (options.untracked || options.ignored) flags |= GIT_OPEN_UNTRACKED;
     if (options.ignored) flags |= GIT_OPEN_IGNORED;
     if (options.tracking) flags |= GIT_OPEN_TRACKING;
-    const srcPtyId = options.fromSessionId
-      ? this.sessionsById.get(options.fromSessionId)?.ptyId
-      : undefined;
+    const srcPtyId = this.srcPtyForOpen(options.fromSessionId);
     return new Promise<GitRepoHandle>((resolve, reject) => {
       const nonce = this.nextFsNonce(this.pendingGitOpens);
       this.pendingGitOpens.set(nonce, { resolve, reject, options });
@@ -2055,9 +2051,7 @@ export class BlitConnection {
     let flags = 0;
     if (options.watch || options.diagnostics) flags |= LSP_OPEN_WATCH;
     if (options.diagnostics) flags |= LSP_OPEN_DIAGS;
-    const srcPtyId = options.fromSessionId
-      ? this.sessionsById.get(options.fromSessionId)?.ptyId
-      : undefined;
+    const srcPtyId = this.srcPtyForOpen(options.fromSessionId);
     return new Promise<LspHandle>((resolve, reject) => {
       const nonce = this.nextFsNonce(this.pendingLspOpens);
       this.pendingLspOpens.set(nonce, { resolve, reject, options });
@@ -2240,6 +2234,30 @@ export class BlitConnection {
 
   private ptyId(sessionId: SessionId): number | undefined {
     return this.sessionsById.get(sessionId)?.ptyId;
+  }
+
+  /**
+   * The pty a `fromSessionId` open resolves its root from (fs/git/lsp
+   * FROM_PTY, docs/ide.md Decision 3), or `undefined` for a plain
+   * path-based open.
+   *
+   * A caller that asked to follow a terminal must never silently get a
+   * path-based open instead: those opens carry a *pty-relative* path (the
+   * dock's follow-terminal root is `""`), so dropping FROM_PTY rebases them
+   * onto the server's own cwd — and for git, `open("")` is refused outright,
+   * which left the commit log loading forever. SessionIds are minted fresh on
+   * every re-establish and superseded ones are pruned, so an unresolvable id
+   * means the caller is holding one from a past generation: fail loudly.
+   */
+  private srcPtyForOpen(sessionId: SessionId | undefined): number | undefined {
+    if (!sessionId) return undefined;
+    const ptyId = this.ptyId(sessionId);
+    if (ptyId === undefined) {
+      throw connectionError(
+        `Source terminal is gone: session ${sessionId} is no longer known`,
+      );
+    }
+    return ptyId;
   }
 
   getTerminal(sessionId: SessionId) {
