@@ -215,7 +215,7 @@ platform that exposes no inode) is reported and not descended.
 
 Note the watch asymmetry: the sync registers on the link's own path, so on
 backends that resolve to the real path before reporting (macOS FSEvents),
-changes made *inside* a symlinked directory may not produce hints, and only a
+changes made _inside_ a symlinked directory may not produce hints, and only a
 rescan picks them up. Listing and reading are unaffected.
 
 A sync root may arrive raw (as a CLI or user types it) or wire-escaped, and the
