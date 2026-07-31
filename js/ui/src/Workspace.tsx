@@ -4143,6 +4143,10 @@ function PreviewPanel(props: {
 
   return (
     <div
+      // Named the way a BSP pane is (`data-blit-bsp-pane-id`): a parked card is
+      // draggable, and so is every explorer row and commit, so "the parked
+      // cards" is only expressible as a subtree.
+      data-blit-preview-panel=""
       style={{
         width: `${props.width}px`,
         "flex-shrink": 0,
