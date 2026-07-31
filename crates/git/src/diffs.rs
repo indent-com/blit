@@ -469,13 +469,18 @@ impl Change {
 /// Read one side's bytes: blob by oid, or the worktree file. A worktree
 /// symlink yields its target path (git's symlink blob content), never the
 /// pointed-at file's bytes.
+///
+/// A worktree side reads from disk even when it carries an oid: that oid is
+/// the hash `modified_status` computed for the file it read, and nothing
+/// writes it to the object database, so the odb has the blob only when the
+/// same content happens to be staged or committed.
 fn side_bytes(
     repo: &gix::Repository,
     workdir: Option<&std::path::Path>,
     path: &[u8],
     side: &Side,
 ) -> Option<Vec<u8>> {
-    if !side.oid.is_null() {
+    if !side.worktree && !side.oid.is_null() {
         // detach() moves the decoded buffer out — no copy.
         return repo.find_object(side.oid).ok().map(|o| o.detach().data);
     }
@@ -501,7 +506,7 @@ fn side_is_binary(
     input_cap: u64,
     memo: &mut std::collections::HashMap<gix::ObjectId, bool>,
 ) -> bool {
-    if !side.oid.is_null() {
+    if !side.worktree && !side.oid.is_null() {
         if let Some(&binary) = memo.get(&side.oid) {
             return binary;
         }
@@ -556,7 +561,7 @@ fn side_len(
     path: &[u8],
     side: &Side,
 ) -> Option<u64> {
-    if !side.oid.is_null() {
+    if !side.worktree && !side.oid.is_null() {
         return repo.find_header(side.oid).ok().map(|h| h.size());
     }
     let abs = workdir?.join(gix::path::from_byte_slice(path));
