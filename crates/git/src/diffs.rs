@@ -1625,6 +1625,12 @@ impl RepoHandle {
                 (old_bytes, new_bytes, binary)
             };
             if text_mode {
+                // A file's text is appended whole or not at all: a patch cut
+                // mid-file is not a patch. Overshooting the budget is
+                // therefore rolled back rather than kept, so a change set
+                // that outgrows it truncates at the last whole file the way
+                // structured mode stops at the last whole record.
+                let mark = text.len();
                 append_text_patch(
                     &mut text,
                     &old_path,
@@ -1636,6 +1642,16 @@ impl RepoHandle {
                     context,
                     ws,
                 );
+                // `mark > 0` is "something is already in this response": a
+                // single file too big for the budget still fails with
+                // TOO_LARGE below, or a resumed request would ask for it
+                // forever.
+                if text.len() > budget && mark > 0 {
+                    text.truncate(mark);
+                    resp_flags |= GIT_PATCH_TRUNCATED;
+                    cursor = last_whole.take().map(|key| (key, 0));
+                    break;
+                }
             } else {
                 let mut file_flags = 0;
                 if binary && !filtered {
@@ -1696,11 +1712,12 @@ impl RepoHandle {
         }
         let payload = if text_mode { text } else { records };
         // Unified text is the one shape that cannot be windowed mid-file: a
-        // patch cut between a hunk header and its rows is not a patch. A
-        // single file whose text alone exceeds the budget is therefore still
-        // TOO_LARGE, which is a status rather than a truncation, so the
-        // "TRUNCATED carries a CURSOR" rule is untouched. Structured mode
-        // never refuses: it stops at the budget and says where. The stop is a
+        // patch cut between a hunk header and its rows is not a patch. Reaching
+        // here over budget therefore means the very first file of the response
+        // is alone too big to describe — every later overflow rolled back and
+        // truncated — and that is a status rather than a truncation, so the
+        // "TRUNCATED carries a CURSOR" rule is untouched. Structured mode never
+        // refuses: it stops at the budget and says where. The stop is a
         // threshold rather than a ceiling — the record that crosses it is
         // already written, and one row is bounded by the wire's own field
         // clip — so a payload can exceed `max_len` by that one record.

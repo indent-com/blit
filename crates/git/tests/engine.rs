@@ -4361,3 +4361,84 @@ fn collapse_patch_oids(line: &str) -> String {
         None => line.to_string(),
     }
 }
+
+/// `TEXT` mode's budget is a file boundary, not a wall: appending a file that
+/// crosses it rolls that file back and reports `TRUNCATED`, so a change set
+/// larger than `max_len` still renders. Only a single file too big to describe
+/// on its own is `TOO_LARGE` (docs/design/git.md "GIT_PATCH").
+#[test]
+fn text_patch_truncates_at_a_file_boundary() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    let body = |tag: &str| {
+        (0..40)
+            .map(|n| format!("{tag} line {n}\n"))
+            .collect::<String>()
+    };
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.join(name), body("old")).unwrap();
+    }
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "seed"]);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.join(name), body("new")).unwrap();
+    }
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let page = |max_len: u32, after: &str| {
+        let req = GitPatchRequest {
+            nonce: 1,
+            repo_id: 0,
+            flags: GIT_PATCH_TEXT,
+            context: 3,
+            rename: 0,
+            old: GitEndpoint {
+                kind: GIT_ENDPOINT_COMMIT,
+                oid: rev(&dir, "HEAD"),
+            },
+            new: GitEndpoint {
+                kind: GIT_ENDPOINT_WORKTREE,
+                oid: GIT_OID_NONE,
+            },
+            path: "",
+            max_len,
+            after,
+            after_pos: 0,
+        };
+        let (_, status, flags, data) = parse_git_patch_resp(&handle.patch(&req, &cancel)).unwrap();
+        (
+            status,
+            flags,
+            String::from_utf8(data).expect("patch text is UTF-8"),
+        )
+    };
+
+    let whole = page(0, "").2;
+    let one_file = whole
+        .find("diff --git a/b.txt")
+        .expect("three file sections");
+    // A budget between one and two files: the first must arrive whole.
+    let (status, flags, first) = page((one_file + 8) as u32, "");
+    assert_eq!(status, GIT_STATUS_OK, "a page-sized change set refused");
+    assert_ne!(flags & GIT_PATCH_TRUNCATED, 0, "partial page not reported");
+    assert_eq!(
+        first.matches("diff --git ").count(),
+        1,
+        "the file that crossed the budget was kept:\n{first}"
+    );
+    assert!(first.starts_with("diff --git a/a.txt"), "{first}");
+    assert!(
+        first.len() <= one_file + 8,
+        "over budget after rolling back:\n{first}"
+    );
+
+    // Resuming from the last path delivered makes progress, per the TEXT-mode
+    // contract (no CURSOR record to hand back).
+    let (status, _, second) = page((one_file + 8) as u32, "a.txt");
+    assert_eq!(status, GIT_STATUS_OK);
+    assert!(second.starts_with("diff --git a/b.txt"), "{second}");
+
+    // One file alone over the budget is the case that has nowhere to cut.
+    assert_eq!(page(64, "").0, GIT_STATUS_TOO_LARGE);
+}
