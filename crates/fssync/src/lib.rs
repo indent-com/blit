@@ -853,14 +853,31 @@ impl NodeMeta {
             || self.dev_ino != prev.dev_ino
     }
 
-    /// Equality for diffing: everything except `hash`, which is a lazily
-    /// learned annotation — a hash fill-in alone must not produce records.
+    /// Equality for diffing: everything the client can see, except `hash`,
+    /// which is a lazily learned annotation — a hash fill-in alone must not
+    /// produce records.
+    ///
+    /// "Everything the client can see" includes the two flags that are not
+    /// properties of the inode: `filtered` and `link_dir` both ride out in
+    /// `entry_flags`, so a diff that ignored them could drop the only record
+    /// that would have carried a flag flip. That is not hypothetical — it
+    /// deadlocked `a_directory_reports_that_it_hid_children` on CI (#124).
+    /// A newly excluded child normally bumps its parent directory's mtime,
+    /// so the flip travelled as a side effect of a stat change; when the
+    /// two writes landed in the same filesystem timestamp tick, mtime
+    /// matched, the entry compared equal, and no record was emitted. The
+    /// hint path suppresses further nudges once the canonical entry is
+    /// `filtered` (one re-list per transition), so nothing retried and the
+    /// client never learned. Comparing the flags is what makes the publish
+    /// depend on the flag itself rather than on a coincidence of timestamps.
     fn visible_eq(&self, other: &NodeMeta) -> bool {
         self.node_type == other.node_type
             && self.size == other.size
             && self.mtime_ns == other.mtime_ns
             && self.mode == other.mode
             && self.dev_ino == other.dev_ino
+            && self.filtered == other.filtered
+            && self.link_dir == other.link_dir
     }
 }
 
@@ -4173,6 +4190,53 @@ mod tests {
             dev_ino: (1, ino),
             link_dir: false,
             filtered: false,
+        }
+    }
+
+    /// A flag flip with an otherwise identical stat still produces a record.
+    ///
+    /// `filtered` and `link_dir` are the two wire-visible bits that are not
+    /// properties of the inode, so nothing about a fresh stat implies them.
+    /// In the field the flip usually rides along with a stat change — the
+    /// excluded child that set `filtered` also bumped its parent's mtime —
+    /// which is why a diff that ignored the flags looked correct until two
+    /// writes shared one timestamp tick. That is the CI deadlock in #124:
+    /// no record, and the hint path stops nudging once the canonical entry
+    /// is `filtered`, so the client never hears about it. Asserting on the
+    /// mechanism keeps this deterministic instead of timestamp-dependent.
+    #[test]
+    fn diff_reports_a_flag_flip_under_an_unchanged_stat() {
+        for (label, flip) in [
+            (
+                "filtered",
+                (|m: &mut NodeMeta| m.filtered = true) as fn(&mut NodeMeta),
+            ),
+            ("link_dir", |m: &mut NodeMeta| m.link_dir = true),
+        ] {
+            let mut prev = Index::new();
+            prev.insert("".into(), meta(FS_ENTRY_DIR, 0, 0, 1));
+            prev.insert("d".into(), meta(FS_ENTRY_DIR, 0, 0, 2));
+            let mut curr = prev.clone();
+            flip(curr.get_mut("d").unwrap());
+
+            let changed = std::collections::BTreeSet::from(["d".to_string()]);
+            for (how, ops) in [
+                ("diff", diff(&prev, &curr)),
+                ("diff_changed", diff_changed(&prev, &curr, &changed)),
+            ] {
+                let [
+                    DiffOp::Upsert {
+                        path,
+                        content_changed,
+                    },
+                ] = &ops[..]
+                else {
+                    panic!("{label} via {how}: expected one Upsert, got {ops:?}");
+                };
+                assert_eq!(path, "d", "{label} via {how}");
+                // A flag is metadata: the client re-reads flags, not bytes.
+                assert!(!content_changed, "{label} via {how} asked for content");
+            }
         }
     }
 

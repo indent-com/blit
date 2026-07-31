@@ -79,6 +79,10 @@ export interface ConnectionSpec {
   id: string;
   label: string;
   transport: BlitTransport;
+  /** The connection is read-only (an `.ro` share): the server refuses
+   *  writes, so its terminals render without input affordances rather
+   *  than swallowing keystrokes silently. */
+  readOnly?: boolean;
 }
 
 const DEFAULT_HUB_URL = "wss://hub.blit.sh";

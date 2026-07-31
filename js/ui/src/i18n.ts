@@ -269,6 +269,7 @@ const en: Messages = {
   "bsp.restart": "Restart",
   "bsp.close": "Close",
   "bsp.commandPlaceholder": "[remote>][command]",
+  "bsp.commandPlaceholderNoRemotes": "[command]",
 };
 
 const es: Messages = {
@@ -429,6 +430,7 @@ const es: Messages = {
   "bsp.restart": "Reiniciar",
   "bsp.close": "Cerrar",
   "bsp.commandPlaceholder": "[remoto>][comando]",
+  "bsp.commandPlaceholderNoRemotes": "[comando]",
 };
 
 const fr: Messages = {
@@ -582,6 +584,7 @@ const fr: Messages = {
   "bsp.restart": "Redémarrer",
   "bsp.close": "Fermer",
   "bsp.commandPlaceholder": "[cible>][commande]",
+  "bsp.commandPlaceholderNoRemotes": "[commande]",
 };
 
 const de: Messages = {
@@ -736,6 +739,7 @@ const de: Messages = {
   "bsp.restart": "Neustart",
   "bsp.close": "Schließen",
   "bsp.commandPlaceholder": "[Ziel>][Befehl]",
+  "bsp.commandPlaceholderNoRemotes": "[Befehl]",
 };
 
 const ja: Messages = {
@@ -887,6 +891,7 @@ const ja: Messages = {
   "bsp.restart": "再起動",
   "bsp.close": "閉じる",
   "bsp.commandPlaceholder": "[リモート>][コマンド]",
+  "bsp.commandPlaceholderNoRemotes": "[コマンド]",
 };
 
 const zh: Messages = {
@@ -1037,6 +1042,7 @@ const zh: Messages = {
   "bsp.restart": "重新启动",
   "bsp.close": "关闭",
   "bsp.commandPlaceholder": "[远程>][命令]",
+  "bsp.commandPlaceholderNoRemotes": "[命令]",
 };
 
 const locales: Record<string, Messages> = { en, es, fr, de, ja, zh };

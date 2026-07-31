@@ -45,6 +45,10 @@ export interface BSPTreeCtx {
   fontSize: number;
   tabMemory: Record<string, number>;
   onRender?: (renderMs?: number) => void;
+  /** Whether a session's connection is read-only (an `.ro` share): its
+   *  terminals render without input affordances instead of silently
+   *  swallowing keystrokes the server will refuse. */
+  isSessionReadOnly?: (sessionId: string) => boolean;
   /** Open an IDE tile from within a tile (commit view → editor). */
   onOpenTile?: (assignment: string) => void;
   /** Drop a dragged IDE tile assignment into a specific pane. */

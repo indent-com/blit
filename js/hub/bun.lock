@@ -5,11 +5,11 @@
     "": {
       "name": "blit-rendezvous",
       "dependencies": {
-        "ioredis": "latest",
-        "tweetnacl": "latest",
+        "ioredis": "^5.10.1",
+        "tweetnacl": "^1.0.3",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "^1.3.14",
       },
     },
   },

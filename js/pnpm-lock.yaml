@@ -227,6 +227,9 @@ importers:
       '@blit-sh/solid':
         specifier: workspace:*
         version: link:../solid
+      '@blit-sh/ui':
+        specifier: workspace:*
+        version: link:../ui
       astro:
         specifier: ^6.4.6
         version: 6.4.8(@types/node@25.8.0)(jiti@2.7.0)(rollup@4.60.4)(supports-color@7.2.0)(yaml@2.9.0)
@@ -243,6 +246,9 @@ importers:
       '@blit-sh/browser':
         specifier: file:../../crates/browser/pkg
         version: blit-browser@file:../crates/browser/pkg
+      '@lezer/generator':
+        specifier: ^1.8.0
+        version: 1.8.0
       '@tailwindcss/vite':
         specifier: ^4.3.0
         version: 4.3.0(vite@8.0.16(@types/node@25.8.0)(esbuild@0.28.1)(jiti@2.7.0)(yaml@2.9.0))

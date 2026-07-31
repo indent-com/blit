@@ -133,6 +133,7 @@ import { PaletteOverlay } from "./PaletteOverlay";
 import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
+import { shellCapabilities } from "./shellCapabilities";
 import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
 import { BSPContainer, EmptyPane } from "./bsp/BSPContainer";
@@ -280,6 +281,23 @@ function WorkspaceScreen(props: {
   const defaultConnectionId = createMemo(
     () => props.connectionSpecs()[0]?.id ?? "main",
   );
+
+  // Read-only connections (an `.ro` share): their terminals render without
+  // input affordances instead of swallowing keystrokes the server refuses.
+  const readOnlyConnections = createMemo(
+    () =>
+      new Set(
+        props
+          .connectionSpecs()
+          .filter((c) => c.readOnly)
+          .map((c) => c.id),
+      ),
+  );
+  const isSessionReadOnly = (sessionId: string): boolean => {
+    if (readOnlyConnections().size === 0) return false;
+    const s = wsState().sessions.find((x) => x.id === sessionId);
+    return !!s && readOnlyConnections().has(s.connectionId);
+  };
 
   const focusedSession = () => {
     const snap = wsState();
@@ -950,6 +968,9 @@ function WorkspaceScreen(props: {
   let serverFontsRequest: Promise<void> | null = null;
 
   function loadServerFonts(): void {
+    // The listing is a blit-server HTTP route; embedded on a static origin
+    // it is a guaranteed 404, and the local font stack is the answer.
+    if (!shellCapabilities().serverRoutes) return;
     if (serverFontsLoaded || serverFontsRequest) return;
 
     serverFontsRequest = fetch(`${basePath}fonts`)
@@ -2124,7 +2145,12 @@ function WorkspaceScreen(props: {
     }
     // Only auto-open when there are configured remotes — a single local
     // connection is near-instant and doesn't need a status dialog.
-    if (phase === "pending" && overlay() === null && remotes().length > 0) {
+    if (
+      phase === "pending" &&
+      overlay() === null &&
+      remotes().length > 0 &&
+      shellCapabilities().remotes
+    ) {
       setRemotesAutoOpen("open");
       setOverlay("remotes");
     }
@@ -3199,6 +3225,7 @@ function WorkspaceScreen(props: {
                                   <>
                                     <BlitTerminal
                                       sessionId={fid()}
+                                      readOnly={isSessionReadOnly(fid())}
                                       onRender={countFrame}
                                       style={{ width: "100%", height: "100%" }}
                                       fontFamily={resolvedFontWithFallback()}
@@ -3367,6 +3394,7 @@ function WorkspaceScreen(props: {
                     layout={al()}
                     onLayoutChange={setActiveLayout}
                     connectionId={activeConnectionId()}
+                    isSessionReadOnly={isSessionReadOnly}
                     connectionLabels={connectionLabels()}
                     palette={palette()}
                     fontFamily={resolvedFontWithFallback()}
@@ -3677,7 +3705,11 @@ function WorkspaceScreen(props: {
               presetLayouts={PRESETS}
               onChangeFont={() => toggleOverlay("font")}
               onChangePalette={() => toggleOverlay("palette")}
-              onChangeRemotes={() => toggleOverlay("remotes")}
+              onChangeRemotes={
+                shellCapabilities().remotes
+                  ? () => toggleOverlay("remotes")
+                  : undefined
+              }
               onOpenWeb={() => toggleOverlay("web")}
               defaultRemote={defaultRemote()}
               remotes={remotes()}
@@ -3805,7 +3837,7 @@ function WorkspaceScreen(props: {
             />
           )}
         </Show>
-        <Show when={overlay() === "remotes"}>
+        <Show when={overlay() === "remotes" && shellCapabilities().remotes}>
           {(_) => (
             <RemotesOverlay
               remotes={remotes()}
@@ -3982,7 +4014,11 @@ function WorkspaceScreen(props: {
             connections={allConnections()}
             gatewayStatus={configWsStatus()}
             status={connectionStatus()}
-            onRemotes={() => toggleOverlay("remotes")}
+            onRemotes={
+              shellCapabilities().remotes
+                ? () => toggleOverlay("remotes")
+                : undefined
+            }
             metrics={metrics()}
             palette={palette()}
             fontSize={fontSize()}

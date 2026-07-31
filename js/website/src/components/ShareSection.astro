@@ -1,0 +1,62 @@
+---
+// Act II — share. The collaboration story: a URL is the whole ceremony.
+---
+
+<section id="share" class="border-b border-[var(--border)] bg-[var(--bg-soft)]/50">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div
+      class="grid grid-cols-1 gap-10 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] lg:items-center lg:gap-14"
+    >
+      <div>
+        <div
+          class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+        >
+          Share
+        </div>
+        <h2
+          class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+        >
+          Hand a teammate a URL.
+        </h2>
+        <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
+          <code class="text-[var(--code-fg)]">blit share</code> prints two links:
+          one that types, one that watches. WebRTC punches through NATs — no SSH
+          keys, no port forwarding, no account. The person on the other end gets
+          the same workspace you saw above, in whatever browser they have.
+        </p>
+        <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
+          For machines you return to, name them once.
+          <code class="text-[var(--code-fg)]">blit remote add prod ssh:alice@prod.co</code>
+          — blit installs itself on the remote at first connection and every
+          terminal there survives yours closing.
+        </p>
+        <p class="mt-5 border-t border-[var(--border)] pt-4 text-[13px] leading-relaxed text-[var(--dim)]">
+          Building your own front end? The same client ships as MIT-licensed
+          packages — <code class="text-[var(--code-fg)]">@blit-sh/core</code> and
+          Solid components — so a terminal in <em>your</em> product is an
+          import, not a project.
+        </p>
+      </div>
+
+      <div
+        class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--code-bg)] shadow-lg"
+        data-theme="dark"
+      >
+        <div
+          class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+        >
+          Share & connect
+        </div>
+        <pre
+          class="m-0 overflow-x-auto px-4 py-4 font-mono text-[13px] leading-relaxed text-[var(--code-fg)]"><code><span class="text-[var(--green)] select-none">$</span> blit share
+Terminals at <span class="text-[var(--accent)] underline">https://blit.sh/s#psk=rf6e…</span>
+Read-only:   <span class="text-[var(--accent)] underline">https://blit.sh/s#psk=EMPs…</span>
+
+<span class="text-[var(--green)] select-none">$</span> blit remote add prod ssh:alice@prod.co
+<span class="text-[var(--green)] select-none">$</span> blit --on prod terminal list
+<span class="text-[var(--dim)]">2  build (running)</span>
+<span class="text-[var(--dim)]">3  shell (idle)</span></code></pre>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,6 +1,6 @@
 ---
 import Layout from "../layouts/Layout.astro";
-import TerminalDemo from "../components/terminal/TerminalDemo.tsx";
+import SharePage from "../components/SharePage.tsx";
 ---
 
 <Layout
@@ -8,5 +8,5 @@ import TerminalDemo from "../components/terminal/TerminalDemo.tsx";
   description="Low-latency terminal streaming. Share your terminal via WebRTC."
   bodyClass="bg-[var(--bg)] text-[var(--fg)] antialiased h-dvh overflow-hidden"
 >
-  <TerminalDemo client:only="solid-js" />
+  <SharePage client:only="solid-js" />
 </Layout>
