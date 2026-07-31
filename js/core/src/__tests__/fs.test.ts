@@ -829,6 +829,10 @@ function pushSynced(
   transport.push(msg);
 }
 
+/** Run pending timers: consumer callbacks held back until the opener holds
+ *  its handle are released on a task of their own. */
+const flushTimers = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 describe("BlitConnection.syncFs", () => {
   it("full flow: sync, snapshot, records, ack, fetch, close", async () => {
     const { conn, transport } = fsReadyConnection();
@@ -850,6 +854,9 @@ describe("BlitConnection.syncFs", () => {
     const nonce = syncMsg[1] | (syncMsg[2] << 8);
     pushSynced(transport, nonce, 5, 0, "/watched");
     const handle = await handlePromise;
+    // The open's callbacks are held until the opener holds its handle;
+    // let that task run so the pushes below deliver inline.
+    await flushTimers();
     expect(handle.syncId).toBe(5);
     expect(handle.root).toBe("/watched");
 
@@ -942,6 +949,7 @@ describe("BlitConnection.syncFs", () => {
     const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
     pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 9, 0, "/w");
     const handle = await handlePromise;
+    await flushTimers();
     let notified = 0;
     handle.subscribe(() => notified++);
     const rev0 = handle.revision;
@@ -999,6 +1007,7 @@ describe("BlitConnection.syncFs", () => {
     const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
     pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 2, 0, "/w");
     await handlePromise;
+    await flushTimers();
     transport.pushHello(1, FEATURE_FS);
     expect(closedReason).toBe(FS_CLOSED_CONNECTION_LOST);
     conn.dispose();
@@ -1020,9 +1029,167 @@ describe("BlitConnection.syncFs", () => {
   });
 });
 
-describe("BlitConnection.syncFs coalescing", () => {
-  const flushTimers = () => new Promise((resolve) => setTimeout(resolve, 0));
+describe("BlitConnection.syncFs open contract", () => {
+  // A single-file sync is one record, so the server's accept echo and the
+  // coherent snapshot go out back to back and reach the client in one
+  // chunk; every batched transport (webtransport, mux, unix) dispatches a
+  // chunk's frames in one synchronous loop, so nothing flushes microtasks
+  // in between.
+  function pushAcceptAndSnapshotInOneChunk(
+    transport: MockTransport,
+    syncId: number,
+    root: string,
+    records: Uint8Array,
+  ) {
+    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
+    pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), syncId, 0, root);
+    transport.push(
+      buildFsUpdateMessage(
+        syncId,
+        1,
+        FS_UPDATE_RESET | FS_UPDATE_SYNC,
+        records,
+      ),
+    );
+  }
 
+  it("holds a fresh open's callbacks until the opener holds its handle", async () => {
+    const { conn, transport } = fsReadyConnection();
+    // The editor's open pattern (js/ui/src/ide/BlitEditor.tsx): the handle
+    // is stored by the promise continuation, and onSync — "the snapshot is
+    // coherent" — is where a still-absent file is declared missing.
+    let opened: FsSyncHandle | null = null;
+    let verdict: string | null = null;
+    const opening = conn
+      .syncFs("/w/.envrc", {
+        content: true,
+        single: true,
+        onSync: () => {
+          verdict = opened?.live.get("") ? "loaded" : "not-found";
+        },
+      })
+      .then((h) => {
+        opened = h;
+      });
+    pushAcceptAndSnapshotInOneChunk(
+      transport,
+      5,
+      "/w/.envrc",
+      upsertRecords("", "export FOO=1"),
+    );
+    await opening;
+    await flushTimers();
+    expect(verdict).toBe("loaded");
+    conn.dispose();
+  });
+
+  it("holds a joiner's callbacks until it holds its handle", async () => {
+    const { conn, transport } = fsReadyConnection();
+    const p1 = conn.syncFs("/w", { content: true });
+    pushAcceptAndSnapshotInOneChunk(
+      transport,
+      6,
+      "/w",
+      upsertRecords("a", "one"),
+    );
+    await p1;
+    await flushTimers();
+
+    // A joiner resolves off the mirror with no round trip, so its window is
+    // narrower — but a frame handled before its continuation runs (an open
+    // from inside another consumer's callback) hits the same trap.
+    let opened: FsSyncHandle | null = null;
+    let sawHandle: boolean | null = null;
+    let syncs = 0;
+    const seen: string[] = [];
+    const joining = conn
+      .syncFs("/w", {
+        content: true,
+        onSync: () => {
+          syncs++;
+          sawHandle ??= opened !== null;
+        },
+        onRecord: (r) => {
+          if (r.kind === "upsert") seen.push(r.path);
+        },
+      })
+      .then((h) => {
+        opened = h;
+      });
+    transport.push(
+      buildFsUpdateMessage(6, 2, FS_UPDATE_SYNC, upsertRecords("b", "two")),
+    );
+    await joining;
+    await flushTimers();
+    // One coherence signal, delivered with the handle in hand, and the
+    // replay covers the update that landed while the joiner was opening.
+    expect(sawHandle).toBe(true);
+    expect(syncs).toBe(1);
+    expect(seen.sort()).toEqual(["a", "b"]);
+    conn.dispose();
+  });
+
+  it("releases a close held behind the snapshot, in order", async () => {
+    const { conn, transport } = fsReadyConnection();
+    const events: string[] = [];
+    let opened: FsSyncHandle | null = null;
+    const opening = conn
+      .syncFs("/w", {
+        content: true,
+        onSync: () => events.push(opened ? "sync" : "sync-without-handle"),
+        onClosed: (r) => events.push(`closed:${r}`),
+      })
+      .then((h) => {
+        opened = h;
+      });
+    pushAcceptAndSnapshotInOneChunk(
+      transport,
+      7,
+      "/w",
+      upsertRecords("a", "one"),
+    );
+    // A close riding the same chunk: not reproducible from the mirror, so it
+    // is always delivered — behind the snapshot it followed on the wire.
+    transport.push(new Uint8Array([S2C_FS_CLOSED, 7, 0, FS_CLOSED_ROOT_GONE]));
+    await opening;
+    await flushTimers();
+    expect(events).toEqual(["sync", `closed:${FS_CLOSED_ROOT_GONE}`]);
+    conn.dispose();
+  });
+
+  it("gives a consumer that stopped before the handoff only its close", async () => {
+    const { conn, transport } = fsReadyConnection();
+    const first: string[] = [];
+    const second: string[] = [];
+    const p1 = conn.syncFs("/w", {
+      content: true,
+      onSync: () => first.push("sync"),
+      onClosed: (r) => first.push(`closed:${r}`),
+    });
+    const p2 = conn.syncFs("/w", {
+      content: true,
+      onSync: () => second.push("sync"),
+      onClosed: (r) => second.push(`closed:${r}`),
+    });
+    pushAcceptAndSnapshotInOneChunk(
+      transport,
+      8,
+      "/w",
+      upsertRecords("a", "one"),
+    );
+    const h1 = await p1;
+    await p2;
+    h1.stop();
+    await flushTimers();
+    // Nothing it never saw is owed to a stopped consumer; the survivor's
+    // snapshot is untouched.
+    expect(first).toEqual([`closed:${FS_CLOSED_CLIENT_REQUEST}`]);
+    expect(second).toEqual(["sync"]);
+    conn.dispose();
+  });
+});
+
+describe("BlitConnection.syncFs coalescing", () => {
   it("shares one wire sync between wire-identical opens", async () => {
     const { conn, transport } = fsReadyConnection();
     let closed1: number | null = null;
@@ -1042,6 +1209,7 @@ describe("BlitConnection.syncFs coalescing", () => {
     pushSynced(transport, syncMsgs[0][1] | (syncMsgs[0][2] << 8), 5, 0, "/w");
     const h1 = await p1;
     const h2 = await p2;
+    await flushTimers();
     expect(h1.syncId).toBe(5);
     expect(h2.syncId).toBe(5);
 
@@ -1214,6 +1382,7 @@ describe("BlitConnection writes", () => {
     const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
     pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 7, 0, "/w");
     const handle = await handlePromise;
+    await flushTimers();
     return { conn, transport, handle };
   }
 
@@ -1299,6 +1468,7 @@ describe("BlitConnection writes", () => {
     const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
     pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 7, 0, "/w");
     handle = await handlePromise;
+    await flushTimers();
 
     const writePromise = handle.writeFile(
       "a.txt",

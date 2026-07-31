@@ -378,7 +378,16 @@ type ParsedList = {
 type FsSyncConsumer = {
   options: FsSyncOptions;
   notifier: Notifier;
+  /** Callbacks held back until this consumer's opener holds its handle
+   *  (`dispatchFs`); null once they run inline. */
+  held: HeldFsCallback[] | null;
 };
+
+/** A consumer callback waiting for its opener. `mirrored` marks the ones a
+ *  restage of the mirror reproduces (RESET / records / SYNC / onUpdate), so
+ *  a replay — or a consumer that stopped meanwhile — can drop them; a close
+ *  notification is never reproducible and always runs. */
+type HeldFsCallback = { deliver: () => void; mirrored: boolean };
 
 /** One wire sync, shared by every consumer whose open was wire-identical. */
 type FsSyncShare = {
@@ -1180,11 +1189,19 @@ export class BlitConnection {
    * staged snapshot streams in and `onSync` fires when it is coherent.
    * Updates are applied and acknowledged automatically.
    *
+   * No callback of this open runs before the opener holds its handle: the
+   * accept echo and the first snapshot can arrive in one transport chunk,
+   * and a chunk's frames are dispatched in one synchronous loop, so the
+   * callbacks of a not-yet-handed-off consumer are held and released on a
+   * task of their own (`dispatchFs`). Only the mirror and the wire acks
+   * advance synchronously.
+   *
    * Wire-identical opens (same path and options) share one server sync:
    * each caller gets its own handle and callbacks, and the wire stop goes
    * out when the last handle stops. A caller joining an established sync
    * has its snapshot replayed from the mirror (`onReset`/`onRecord`/
-   * `onSync`) on a later task, so per-record consumers stay coherent.
+   * `onSync`) on that same later task, so per-record consumers stay
+   * coherent.
    */
   async syncFs(
     path: string,
@@ -1271,47 +1288,97 @@ export class BlitConnection {
   }
 
   /** Attach a consumer to an established share, replaying the snapshot it
-   *  missed. The replay is deferred to a macrotask so the caller holds the
-   *  handle (its `await` continuation runs) before any callback fires; the
-   *  mirror is re-read at replay time, so updates landing in between stay
-   *  coherent — the replay is always a valid restage of what preceded it. */
+   *  missed. Like a fresh open, its callbacks are held until the caller
+   *  holds the handle (`dispatchFs`); the replay runs on that same task and
+   *  re-reads the mirror, so it subsumes — and therefore drops — whatever
+   *  the wire delivered in between. The replay is always a valid restage of
+   *  everything that preceded it. */
   private joinFsShare(
     share: FsSyncShare,
     options: FsSyncOptions,
   ): FsSyncHandle {
-    const consumer: FsSyncConsumer = { options, notifier: new Notifier() };
+    const consumer: FsSyncConsumer = {
+      options,
+      notifier: new Notifier(),
+      held: [],
+    };
     share.consumers.add(consumer);
     const handle = this.makeFsSyncHandle(share, consumer);
     setTimeout(() => {
-      if (!share.consumers.has(consumer)) return; // stopped or closed already
-      const staged = share.mirror.staged;
-      if (staged !== null) {
-        // Mid-restage: replay the staging map — it equals the records the
-        // other consumers saw since RESET — and let the wire SYNC land.
-        options.onReset?.();
-        if (options.onRecord) {
-          for (const [p, node] of staged) {
-            options.onRecord(fsNodeUpsert(p, node));
+      // Stopped or closed already: only the close notification is owed.
+      if (share.consumers.has(consumer)) {
+        this.dropHeldFsRecords(consumer);
+        const staged = share.mirror.staged;
+        if (staged !== null) {
+          // Mid-restage: replay the staging map — it equals the records the
+          // other consumers saw since RESET — and let the wire SYNC land.
+          options.onReset?.();
+          if (options.onRecord) {
+            for (const [p, node] of staged) {
+              options.onRecord(fsNodeUpsert(p, node));
+            }
           }
-        }
-      } else if (share.synced) {
-        // Coherent: replay the live map as the restage the joiner missed.
-        options.onReset?.();
-        if (options.onRecord) {
-          for (const [p, node] of share.mirror.live) {
-            options.onRecord(fsNodeUpsert(p, node));
+        } else if (share.synced) {
+          // Coherent: replay the live map as the restage the joiner missed.
+          options.onReset?.();
+          if (options.onRecord) {
+            for (const [p, node] of share.mirror.live) {
+              options.onRecord(fsNodeUpsert(p, node));
+            }
           }
+          options.onSync?.();
+          // Revision before onUpdate, matching the wire path: revision-keyed
+          // caches re-read inside onUpdate must observe the bump.
+          consumer.notifier.emit();
+          options.onUpdate?.();
         }
-        options.onSync?.();
-        // Revision before onUpdate, matching the wire path: revision-keyed
-        // caches re-read inside onUpdate must observe the bump.
-        consumer.notifier.emit();
-        options.onUpdate?.();
+        // Neither: the initial snapshot has not started; the wire
+        // RESET…SYNC reaches this consumer like any other.
       }
-      // Neither: the initial snapshot has not started; the wire
-      // RESET…SYNC reaches this consumer like any other.
+      this.releaseHeldFs(consumer);
     }, 0);
     return handle;
+  }
+
+  /** Deliver one consumer callback, honoring the open contract: nothing
+   *  fires before that consumer's opener holds its handle. The opener's
+   *  promise continuation and the frames of one transport chunk are not
+   *  interleaved — a chunk is dispatched in a single synchronous loop
+   *  (webtransport / mux / unix), so an `FS_UPDATE` riding the same chunk
+   *  as the `FS_SYNCED` that resolves the open is handled first. Held
+   *  callbacks keep their order and are released together. */
+  private dispatchFs(
+    consumer: FsSyncConsumer,
+    deliver: () => void,
+    mirrored = true,
+  ): void {
+    if (consumer.held) consumer.held.push({ deliver, mirrored });
+    else deliver();
+  }
+
+  /** Release a consumer's held callbacks, in order. Callbacks appended
+   *  while draining (a callback that stops the handle) stay in order; the
+   *  gate opens only once the queue has run dry. */
+  private releaseHeldFs(consumer: FsSyncConsumer): void {
+    const held = consumer.held;
+    if (!held) return;
+    for (let i = 0; i < held.length; i++) held[i].deliver();
+    consumer.held = null;
+  }
+
+  /** Drop the held callbacks a mirror restage reproduces, keeping the close
+   *  notifications. Used when the replay that supersedes them is about to
+   *  run, and when the consumer is going away. */
+  private dropHeldFsRecords(consumer: FsSyncConsumer): void {
+    const held = consumer.held;
+    if (!held) return;
+    // In place: the array being drained is the queue itself, so a drop from
+    // inside a callback still takes effect on the rest of the drain.
+    let kept = 0;
+    for (const callback of held) {
+      if (!callback.mirrored) held[kept++] = callback;
+    }
+    held.length = kept;
   }
 
   private makeFsSyncHandle(
@@ -1403,11 +1470,19 @@ export class BlitConnection {
     if (!share.consumers.has(consumer)) return;
     if (share.consumers.size > 1) {
       share.consumers.delete(consumer);
-      // Confirm this consumer's close asynchronously, standing in for the
-      // server confirmation the surviving consumers will keep absorbing.
+      // Nothing this consumer never saw is owed to it any more, but its
+      // close still is: stand in for the server confirmation the surviving
+      // consumers will keep absorbing.
+      this.dropHeldFsRecords(consumer);
       queueMicrotask(() => {
-        consumer.options.onClosed?.(FS_CLOSED_CLIENT_REQUEST);
-        consumer.notifier.emit();
+        this.dispatchFs(
+          consumer,
+          () => {
+            consumer.options.onClosed?.(FS_CLOSED_CLIENT_REQUEST);
+            consumer.notifier.emit();
+          },
+          false,
+        );
       });
       return;
     }
@@ -2523,8 +2598,14 @@ export class BlitConnection {
     this.fsSyncsByKey.clear();
     for (const share of shares) {
       for (const consumer of share.consumers) {
-        consumer.options.onClosed?.(FS_CLOSED_CONNECTION_LOST);
-        consumer.notifier.emit();
+        this.dispatchFs(
+          consumer,
+          () => {
+            consumer.options.onClosed?.(FS_CLOSED_CONNECTION_LOST);
+            consumer.notifier.emit();
+          },
+          false,
+        );
       }
       share.consumers.clear();
     }
@@ -3498,9 +3579,16 @@ export class BlitConnection {
           const consumer: FsSyncConsumer = {
             options: waiter.options,
             notifier: new Notifier(),
+            // Held until the opener's continuation has run — a snapshot
+            // riding this very chunk is handled before it (`dispatchFs`).
+            held: [],
           };
           share.consumers.add(consumer);
           waiter.resolve(this.makeFsSyncHandle(share, consumer));
+          // A task, not a microtask: the opener sits behind an await chain
+          // of unknown length (BlitWorkspace.syncFs adds hops of its own),
+          // and only a task is guaranteed to run after all of it.
+          setTimeout(() => this.releaseHeldFs(consumer), 0);
         }
         return;
       }
@@ -3533,17 +3621,27 @@ export class BlitConnection {
         this.transport.send(buildFsAckMessage(syncId, applied.updateId));
         if (flags & FS_UPDATE_SYNC) share.synced = true;
         if (flags & FS_UPDATE_RESET) {
-          for (const consumer of share.consumers) consumer.options.onReset?.();
+          for (const consumer of share.consumers) {
+            const onReset = consumer.options.onReset;
+            if (onReset) this.dispatchFs(consumer, onReset);
+          }
         }
         if (records) {
           for (const consumer of share.consumers) {
             const onRecord = consumer.options.onRecord;
             if (!onRecord) continue;
-            for (const record of records) onRecord(record);
+            // One dispatch per update, not per record: a snapshot's worth of
+            // records would otherwise be a closure each while held.
+            this.dispatchFs(consumer, () => {
+              for (const record of records) onRecord(record);
+            });
           }
         }
         if (flags & FS_UPDATE_SYNC) {
-          for (const consumer of share.consumers) consumer.options.onSync?.();
+          for (const consumer of share.consumers) {
+            const onSync = consumer.options.onSync;
+            if (onSync) this.dispatchFs(consumer, onSync);
+          }
         }
         // Staged records leave `live` untouched; only wake subscribers
         // when it actually changed (direct apply or the SYNC swap). The
@@ -3553,12 +3651,17 @@ export class BlitConnection {
         // not the pre-update one.
         if (applied.liveChanged) {
           for (const consumer of share.consumers) {
-            consumer.notifier.emit();
-            consumer.options.onUpdate?.();
+            this.dispatchFs(consumer, () => {
+              consumer.notifier.emit();
+              consumer.options.onUpdate?.();
+            });
           }
         }
         // Every callback above has had its shot at self-echo suppression;
-        // consume matched entries so the map cannot grow without bound.
+        // consume matched entries so the map cannot grow without bound. A
+        // consumer still waiting for its handle sees this echo as external,
+        // which is what it is: the write was some other consumer's, made
+        // before this one could hold a handle to write with.
         if (records && share.lastWritten.size > 0) {
           for (const record of records) {
             if (
@@ -3693,9 +3796,16 @@ export class BlitConnection {
         if (this.fsSyncsByKey.get(share.key) === share) {
           this.fsSyncsByKey.delete(share.key);
         }
+        const reason = bytes[3];
         for (const consumer of share.consumers) {
-          consumer.options.onClosed?.(bytes[3]);
-          consumer.notifier.emit();
+          this.dispatchFs(
+            consumer,
+            () => {
+              consumer.options.onClosed?.(reason);
+              consumer.notifier.emit();
+            },
+            false,
+          );
         }
         share.consumers.clear();
         return;

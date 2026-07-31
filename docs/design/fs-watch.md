@@ -577,4 +577,12 @@ bytes as trusted text.
 [--exclude PATTERN]… [--once] [--json]` (`crates/cli/src/fs.rs`), and
    `syncFs(path, { ignore, excludeGit, exclude })` on `BlitConnection` /
    `BlitWorkspace` in `@blit-sh/core` returning a live map plus per-record
-   callbacks, with automatic acknowledgment and fetch-on-demand.
+   callbacks, with automatic acknowledgment and fetch-on-demand. No callback
+   of an open runs before its opener holds the handle: a transport hands a
+   whole received chunk to the client in one synchronous loop, so the
+   `FS_SYNCED` that resolves the open and a following `FS_UPDATE` are handled
+   back to back with no microtask flush in between — and a single-file sync
+   makes that the normal case, since its snapshot is one record and the
+   server emits accept and snapshot together. The mirror and the acks still
+   advance on the frame; only the callbacks are held, and they are released
+   in order on a task of their own — the same task a joiner's replay uses.
