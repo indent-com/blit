@@ -120,6 +120,9 @@ export const GIT_STATUS_CANCELLED = 8;
 export const GIT_STATUS_OTHER = 9;
 /** A precondition failed. Shares docs/design/fs-write.md's code. */
 export const GIT_STATUS_CONFLICT = 11;
+/** A MERGE_BASE endpoint over histories with no common ancestor: the
+ *  request is well-formed, the repository has no such base. */
+export const GIT_STATUS_NO_MERGE_BASE = 12;
 
 // C2S_GIT_OPEN flags (u16). STATUS and TRACKING imply WATCH; UNTRACKED
 // implies STATUS; IGNORED implies UNTRACKED.
@@ -1953,6 +1956,8 @@ export function gitStatusText(status: number): string {
       return "backend error";
     case GIT_STATUS_CONFLICT:
       return "conflict";
+    case GIT_STATUS_NO_MERGE_BASE:
+      return "no merge base";
     default:
       // Total on purpose: a log must not conflate "the backend failed"
       // with "this build does not know that code".

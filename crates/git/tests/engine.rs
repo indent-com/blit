@@ -1654,6 +1654,36 @@ fn merge_base_and_symmetric_diff_on_fork() {
     };
     let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&bad, &cancel)).unwrap();
     assert_eq!(status, GIT_STATUS_INVALID);
+
+    // Both operands peel, so an annotated tag names its commit; a blob is
+    // WRONG_TYPE and an absent oid NOT_FOUND, not "backend error".
+    git(&dir, &["tag", "-a", "v1", "-m", "v1", "main"]);
+    let cases = [
+        (rev(&dir, "v1"), GIT_STATUS_OK),
+        (rev(&dir, "main:shared.txt"), GIT_STATUS_WRONG_TYPE),
+        (GIT_OID_NONE, GIT_STATUS_NOT_FOUND),
+    ];
+    assert_ne!(cases[0].0, main_tip, "annotated tag has its own oid");
+    for (nonce, (oid, want)) in cases.iter().enumerate() {
+        let req = GitDiffRequest {
+            nonce: 5 + nonce as u16,
+            repo_id: 0,
+            flags: 0,
+            rename: 0,
+            old: GitEndpoint {
+                kind: GIT_ENDPOINT_MERGE_BASE,
+                oid: *oid,
+            },
+            new: GitEndpoint {
+                kind: GIT_ENDPOINT_COMMIT,
+                oid: feature_tip,
+            },
+            path: "",
+            after: "",
+        };
+        let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+        assert_eq!(status, *want, "MERGE_BASE over {}", hex(oid, 8));
+    }
 }
 
 /// The review view of a branch still being worked on: MERGE_BASE against
@@ -1879,7 +1909,9 @@ fn criss_cross_merge_bases() {
 }
 
 /// Disjoint histories (orphan branch): `GIT_BASE` answers OK with zero
-/// bases and `A...B` resolves with no hides.
+/// bases, `A...B` resolves with no hides, and a MERGE_BASE diff endpoint
+/// reports `NO_MERGE_BASE` — a fact about the repository, not `INVALID`,
+/// which would tell a correct client it built the request wrong.
 #[test]
 fn disjoint_histories_have_no_base() {
     let dir = temp_dir();
@@ -1908,6 +1940,64 @@ fn disjoint_histories_have_no_base() {
     want.sort();
     assert_eq!(tips, want);
     assert!(hides.is_empty(), "nothing to hide without a base");
+
+    // The same fact through a diff, on both an oid-bearing new side and the
+    // worktree, and on GIT_PATCH — every one of them a distinct status a
+    // client can render, not a bare "invalid request".
+    for (nonce, new) in [
+        (
+            3,
+            GitEndpoint {
+                kind: GIT_ENDPOINT_COMMIT,
+                oid: other_tip,
+            },
+        ),
+        (
+            4,
+            GitEndpoint {
+                kind: GIT_ENDPOINT_WORKTREE,
+                oid: GIT_OID_NONE,
+            },
+        ),
+    ] {
+        let req = GitDiffRequest {
+            nonce,
+            repo_id: 0,
+            flags: 0,
+            rename: 0,
+            old: GitEndpoint {
+                kind: GIT_ENDPOINT_MERGE_BASE,
+                oid: main_tip,
+            },
+            new,
+            path: "",
+            after: "",
+        };
+        let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+        assert_eq!(status, GIT_STATUS_NO_MERGE_BASE, "new kind {}", new.kind);
+    }
+    let req = GitPatchRequest {
+        nonce: 5,
+        repo_id: 0,
+        flags: 0,
+        context: 3,
+        rename: 0,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_MERGE_BASE,
+            oid: main_tip,
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_WORKTREE,
+            oid: GIT_OID_NONE,
+        },
+        path: "",
+        max_len: 0,
+        after: "",
+        after_pos: 0,
+    };
+    let (_, status, _, _) = parse_git_patch_resp(&handle.patch(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_NO_MERGE_BASE);
+    assert_eq!(git_status_text(GIT_STATUS_NO_MERGE_BASE), "no merge base");
 }
 
 /// The file-level diff status set matches `git diff --name-status` across a

@@ -22,9 +22,10 @@ use blit_remote::git::{
     GIT_PATCH_IGNORE_SPACE_CHANGE, GIT_PATCH_IGNORED, GIT_PATCH_NO_SPANS, GIT_PATCH_RAW,
     GIT_PATCH_RENAMES, GIT_PATCH_STRUCTURED, GIT_PATCH_TEXT, GIT_PATCH_TRUNCATED,
     GIT_PATCH_UNTRACKED, GIT_RENAME_MAX, GIT_STATE_STATUS_TRUNCATED, GIT_STATUS_CANCELLED,
-    GIT_STATUS_ENTRY_CONFLICTED, GIT_STATUS_INVALID, GIT_STATUS_NOT_FOUND, GIT_STATUS_OK,
-    GIT_STATUS_OTHER, GIT_STATUS_TOO_LARGE, GitDiffRecord, GitDiffRequest, GitEndpoint,
-    GitIndexRecord, GitIndexRequest, GitOid, GitPatchRecord, GitPatchRequest, GitStateRecord,
+    GIT_STATUS_ENTRY_CONFLICTED, GIT_STATUS_INVALID, GIT_STATUS_NO_MERGE_BASE,
+    GIT_STATUS_NOT_FOUND, GIT_STATUS_OK, GIT_STATUS_OTHER, GIT_STATUS_TOO_LARGE,
+    GIT_STATUS_WRONG_TYPE, GitDiffRecord, GitDiffRequest, GitEndpoint, GitIndexRecord,
+    GitIndexRequest, GitOid, GitPatchRecord, GitPatchRequest, GitStateRecord,
     append_git_diff_record, append_git_index_record, append_git_patch_record,
     append_git_state_record, msg_git_diff_resp, msg_git_index_resp, msg_git_patch_resp,
 };
@@ -1167,6 +1168,20 @@ fn resolve_endpoints(
     if old.kind != GIT_ENDPOINT_MERGE_BASE {
         return Ok((*old, *new, None));
     }
+    // Both operands are peeled to commits, the way a revision spec is
+    // (`requests::resolve_one`): the merge-base walk takes commits, so an
+    // annotated tag used to reach it and come back "backend error" — a
+    // request naming a tag is neither malformed nor a server fault.
+    let peel = |oid: &GitOid| -> Result<gix::ObjectId, u8> {
+        if is_zero_oid(oid) {
+            return Err(GIT_STATUS_NOT_FOUND);
+        }
+        repo.find_object(oid_from_wire(repo, oid))
+            .map_err(|_| GIT_STATUS_NOT_FOUND)?
+            .peel_to_kind(gix::object::Kind::Commit)
+            .map(|object| object.id)
+            .map_err(|_| GIT_STATUS_WRONG_TYPE)
+    };
     // The new side names the topic to fork from. INDEX and WORKTREE carry no
     // oid, but the work they hold is committed onto HEAD, so HEAD is the
     // topic — that is what makes "everything since the fork, committed or
@@ -1174,15 +1189,15 @@ fn resolve_endpoints(
     // HEAD names no commit at all: NOT_FOUND, so a client can degrade to
     // another view instead of reading it as a request it built wrong.
     let b = match new.kind {
-        GIT_ENDPOINT_COMMIT => oid_from_wire(repo, &new.oid),
+        GIT_ENDPOINT_COMMIT => peel(&new.oid)?,
         GIT_ENDPOINT_INDEX | GIT_ENDPOINT_WORKTREE => {
             repo.head_id().map_err(|_| GIT_STATUS_NOT_FOUND)?.detach()
         }
         _ => return Err(GIT_STATUS_INVALID),
     };
-    let a = oid_from_wire(repo, &old.oid);
+    let a = peel(&old.oid)?;
     let base = crate::requests::bounded_merge_base(repo, memo, a, b, budget, cancel)?
-        .ok_or(GIT_STATUS_INVALID)?;
+        .ok_or(GIT_STATUS_NO_MERGE_BASE)?;
     let base_bytes = oid_bytes(base.as_ref());
     Ok((
         GitEndpoint {

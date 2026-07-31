@@ -185,6 +185,10 @@ One table for every `status` byte in the family:
               message's detail field where it has one
 11 CONFLICT    a precondition failed (a lock was held, or the repository
               moved under a request)
+12 NO_MERGE_BASE
+              a MERGE_BASE endpoint over histories with no common
+              ancestor: the request is well-formed, the repository has
+              no such base
 ```
 
 Codes 0–4 coincide with `FS_SYNCED`'s where the semantics overlap, so a
@@ -195,10 +199,13 @@ reused rather than given a synonym.
 `OTHER` means _only_ "unclassified backend failure" — anything with a
 classifiable cause (an invalid path, a wrong object type) returns the
 specific code, because a consumer's whole reason for reading the status
-byte is to tell a recoverable condition from a real error. The
-human-readable mapping is total on both sides: `OTHER` and an
-unrecognized code render differently, so a log never conflates "the
-backend failed" with "this build does not know that code".
+byte is to tell a recoverable condition from a real error. `INVALID` is
+held to the same rule from the other side: it means the request itself is
+wrong, so a condition of the repository — disjoint histories, an unborn
+HEAD — gets its own code rather than telling a correct client it made a
+malformed request. The human-readable mapping is total on both sides:
+`OTHER` and an unrecognized code render differently, so a log never
+conflates "the backend failed" with "this build does not know that code".
 
 ### Nonces and cancellation
 
@@ -677,12 +684,15 @@ trailing whitespace is ignored — git's `-b`), bit 4 `IGNORE_ALL_SPACE`
 entries whose changes vanish under the normalization are omitted and `st`
 reflects the normalized comparison; oids still name the true blobs.
 `path` filters to a subtree. `status` as `GIT_TREE` plus `INVALID`
-(e.g. INDEX/WORKTREE on a bare repo, MERGE_BASE on the new side, against
-an EMPTY or TREE new side or over non-commits, no common ancestor) and
-`NOT_FOUND` when an unborn HEAD stands in for an oid-less new side: that
-request is well-formed, the repository simply holds no commit to take the
-base against, and a client should degrade to another view rather than
-read it as a request it built wrong. Response `flags`: bit 0 `TRUNCATED`.
+(e.g. INDEX/WORKTREE on a bare repo, MERGE_BASE on the new side or
+against an EMPTY or TREE new side), `NO_MERGE_BASE` (the histories share
+no ancestor), `WRONG_TYPE` (a MERGE_BASE operand that does not peel to a
+commit) and `NOT_FOUND` (an absent oid, or an unborn HEAD standing in for
+an oid-less new side: that request is well-formed, the repository simply
+holds no commit to take the base against, so a client can degrade to
+another view rather than read it as a request it built wrong). A
+MERGE_BASE operand peels like a revision spec, so an annotated tag names
+its commit. Response `flags`: bit 0 `TRUNCATED`.
 
 ```text
 DIFF_ENTRY 0x03: [kind:1][st:1][similarity:1][dflags:1]
