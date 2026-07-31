@@ -16,6 +16,7 @@ import { createSignal, onMount, Show } from "solid-js";
 import type { BlitWasmModule } from "@blit-sh/core";
 import { mountBlitWorkspace, shareTransport } from "@blit-sh/ui/embed";
 import { initWasm } from "../lib/wasm";
+import { MONO_CATALOG, MONO_STACK } from "../lib/fonts";
 import {
   isEncrypted,
   encryptPassphrase,
@@ -189,6 +190,14 @@ export default function SharePage() {
               ref={(el) => {
                 mountBlitWorkspace(el, {
                   wasm: wasm()!,
+                  // The site's face, already self-hosted by the layout, so
+                  // the shared terminal matches the page it opened from
+                  // instead of falling back to the platform's monospace.
+                  fontFamily: MONO_STACK,
+                  // The picker's whole menu: this origin serves no
+                  // `font/<family>` route, so a typed name would load
+                  // nothing and read as a broken control.
+                  fonts: MONO_CATALOG,
                   connections: [
                     {
                       id: "share",

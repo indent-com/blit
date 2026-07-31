@@ -20,6 +20,10 @@
   "devDependencies": {
     "@astrojs/check": "^0.9.9",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "@fontsource/fira-code": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/source-code-pro": "^5.3.0",
     "@lezer/generator": "^1.8.0",
     "@tailwindcss/vite": "^4.3.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",

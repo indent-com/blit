@@ -19,12 +19,7 @@ import {
   createBlitWorkspaceState,
   createBlitWorkspaceConnection,
 } from "@blit-sh/solid";
-import {
-  BlitWorkspace,
-  PALETTES,
-  DEFAULT_FONT,
-  LSP_STATUS_OK,
-} from "@blit-sh/core";
+import { BlitWorkspace, PALETTES, LSP_STATUS_OK } from "@blit-sh/core";
 import type {
   BlitTransport,
   BlitSession,
@@ -53,6 +48,7 @@ import {
   writeStorage,
   useConfigValue,
   preferredPalette,
+  defaultFont,
   preferredFont,
   preferredFontSize,
   preferredTextGamma,
@@ -98,6 +94,7 @@ import { t } from "./i18n";
 import { StatusBar } from "./StatusBar";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
+import { fontCatalog } from "./fontCatalog";
 import { ExplorerPanel } from "./ide/ExplorerPanel";
 import { LogPanel } from "./ide/LogPanel";
 import { SearchPanel } from "./ide/SearchPanel";
@@ -711,7 +708,11 @@ function WorkspaceScreen(props: {
   const inapplicableSections = createMemo<ReadonlySet<LeftPanel>>(() => {
     const set = new Set<LeftPanel>();
     const s = activeSession();
-    if (s?.noRepo()) set.add("log");
+    // No session at all — nothing picked yet, or a share still connecting —
+    // is as empty as a root without a repository, and folds the same way.
+    // Now that the log's fold comes from here rather than from a seeded
+    // preference, this case has to be named or the log sits open on nothing.
+    if (!s || s.noRepo()) set.add("log");
     if (s?.noLsp()) set.add("problems");
     return set;
   });
@@ -1001,7 +1002,7 @@ function WorkspaceScreen(props: {
 
   const { resolvedFont, fontLoading, advanceRatio } = createFontLoader(
     font,
-    DEFAULT_FONT,
+    defaultFont(),
   );
   const [activeLayout, setActiveLayout] = createSignal<BSPLayout | null>(
     loadActiveLayout(),
@@ -2065,7 +2066,8 @@ function WorkspaceScreen(props: {
 
   const resolvedFontWithFallback = () => {
     const rf = resolvedFont();
-    return rf === DEFAULT_FONT ? rf : `${rf}, ${DEFAULT_FONT}`;
+    const base = defaultFont();
+    return rf === base ? rf : `${rf}, ${base}`;
   };
 
   onMount(loadServerFonts);
@@ -2349,7 +2351,7 @@ function WorkspaceScreen(props: {
   }
 
   function changeFont(family: string, size: number, gamma: number) {
-    const value = family.trim() || DEFAULT_FONT;
+    const value = family.trim() || defaultFont();
     setFont(value);
     setFontSize(size);
     setTextGamma(gamma);
@@ -3816,6 +3818,7 @@ function WorkspaceScreen(props: {
               currentSize={fontSize()}
               currentGamma={textGamma()}
               serverFonts={serverFonts()}
+              fontChoices={fontCatalog()}
               palette={palette()}
               fontSize={fontSize()}
               onSelect={changeFont}

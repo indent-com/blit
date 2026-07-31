@@ -16,11 +16,14 @@ import { render } from "solid-js/web";
 import { createShareTransport } from "@blit-sh/core";
 import type { BlitDebug, BlitTransport, BlitWasmModule } from "@blit-sh/core";
 import { Workspace } from "./Workspace";
+import { setDefaultFont } from "./storage";
+import { setFontCatalog } from "./fontCatalog";
 import { setShellCapabilities } from "./shellCapabilities";
 import type { ConnectionSpec } from "./App";
 import type { ShellCapabilities } from "./shellCapabilities";
+import type { FontChoice } from "./fontCatalog";
 
-export type { ConnectionSpec };
+export type { ConnectionSpec, FontChoice };
 
 export interface EmbedOptions {
   wasm: BlitWasmModule;
@@ -31,6 +34,15 @@ export interface EmbedOptions {
    *  connection list) and no preview service worker (there is no sw.js at
    *  the host's origin). */
   capabilities?: Partial<ShellCapabilities>;
+  /** Monospace stack to default to, for a host that ships its own webfont
+   *  and wants the workspace on the same face as the page around it. The
+   *  visitor's own choice still wins; this replaces the platform fallback
+   *  the app-served client is right to use. */
+  fontFamily?: string;
+  /** Faces bundled into the host page, offered as the font picker's whole
+   *  menu. Without these the picker searches families the page cannot fetch
+   *  and accepts names it cannot honour. */
+  fonts?: readonly FontChoice[];
   /** A transport authenticated once and then refused — a revoked share
    *  passphrase, an expired link. The host owns the surrounding page, so it
    *  owns the apology. */
@@ -57,6 +69,8 @@ export function mountBlitWorkspace(
     serverRoutes: false,
     ...opts.capabilities,
   });
+  if (opts.fontFamily) setDefaultFont(opts.fontFamily);
+  if (opts.fonts) setFontCatalog(opts.fonts);
   root.style.lineHeight = "1";
   root.style.boxSizing = "border-box";
   root.style.overflow = "hidden";

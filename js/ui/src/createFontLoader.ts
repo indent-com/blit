@@ -1,5 +1,6 @@
 import { createSignal, createEffect, onCleanup } from "solid-js";
 import { basePath } from "./storage";
+import { shellCapabilities } from "./shellCapabilities";
 
 const CSS_GENERIC = new Set([
   "serif",
@@ -73,12 +74,17 @@ export function createFontLoader(
 
     const load = async () => {
       let ratio: number | undefined;
+      // A blit server serves the face and its metrics; a static host does
+      // not, and asking produces a pair of 404s per family. Where the font
+      // came with the page (an embedder's own @font-face) it is already
+      // declared, so `document.fonts.load` below is the whole job.
+      const served = shellCapabilities().serverRoutes;
       for (const family of families) {
         if (cancelled || version !== requestVersion) return;
 
         const loadSpec = `16px "${family}"`;
         const id = fontStyleId(family);
-        if (!document.getElementById(id)) {
+        if (served && !document.getElementById(id)) {
           try {
             const response = await fetch(
               `${basePath}font/${encodeURIComponent(family)}`,
@@ -96,7 +102,7 @@ export function createFontLoader(
           } catch {}
         }
 
-        if (ratio == null) {
+        if (served && ratio == null) {
           try {
             const metricsResp = await fetch(
               `${basePath}font-metrics/${encodeURIComponent(family)}`,

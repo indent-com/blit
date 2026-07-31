@@ -504,12 +504,38 @@ export function preferredTextGamma(): number {
   return DEFAULT_TEXT_GAMMA;
 }
 
+/**
+ * The stack to use when the visitor has expressed no font preference.
+ *
+ * `DEFAULT_FONT` is deliberately `ui-monospace, monospace`: the app is
+ * served by a blit server that ships no webfont, so the right answer there
+ * is whatever the platform calls its terminal face. A host that *does* ship
+ * one — blit.sh self-hosts JetBrains Mono for the whole site — wants the
+ * embedded workspace on the same face as the page around it, and saying so
+ * from the host beats hardcoding a webfont into a client that usually has
+ * no way to fetch it.
+ *
+ * Page-level like the shell capabilities, and for the same reason: it
+ * describes the document, not a component instance, and is set once before
+ * mount. A stored or `?font=` choice still wins over it — this replaces the
+ * fallback, not the preference.
+ */
+let pageDefaultFont = DEFAULT_FONT;
+
+export function setDefaultFont(family: string): void {
+  pageDefaultFont = family.trim() || DEFAULT_FONT;
+}
+
+export function defaultFont(): string {
+  return pageDefaultFont;
+}
+
 export function preferredFont(): string {
   const q = new URLSearchParams(location.search).get("font");
   if (q?.trim()) return q.trim();
   const s = readStorage(FONT_KEY);
   if (s?.trim()) return s.trim();
-  return DEFAULT_FONT;
+  return pageDefaultFont;
 }
 
 /** Preferred audio muted state. Defaults to true (browser autoplay policy). */
@@ -575,12 +601,20 @@ export function preferredLeftDockOpen(): boolean {
 
 type LeftSection = "explorer" | "log" | "problems";
 
-/** The set of collapsed dock sections, persisted as a comma list. Absent
- *  (first run) collapses Commit Log + Problems so Files (with its folded-in
- *  changes) shows on its own. */
+/**
+ * The set of collapsed dock sections, persisted as a comma list.
+ *
+ * Absent (first run) collapses Problems, so Files — with its folded-in
+ * changes — shows on its own. Commit Log is deliberately *not* in that list
+ * even though it starts folded in practice: it folds because the root is not
+ * a repository (`noRepo`, see dockSections), and that is a different
+ * statement. A user collapse is a preference and outranks the auto-unfold, so
+ * seeding one here left the log folded on entering a repo — permanently, for
+ * anyone who never thought to click a header they had never seen open.
+ */
 export function preferredCollapsedSections(): LeftSection[] {
   const raw = readStorage(LEFT_COLLAPSED_KEY);
-  if (raw == null) return ["log", "problems"];
+  if (raw == null) return ["problems"];
   // An id missing here is silently dropped on every reload, so the
   // section would come back expanded forever.
   const valid = new Set(["explorer", "log", "problems"]);

@@ -3,12 +3,17 @@ import type { TerminalPalette } from "@blit-sh/core";
 import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { t } from "./i18n";
+import type { FontChoice } from "./fontCatalog";
 
 export function FontOverlay(props: {
   currentFamily: string;
   currentSize: number;
   currentGamma: number;
   serverFonts: string[];
+  /** Faces a host bundled into the page (see fontCatalog). When present these
+   *  are the only choices, and the family box is gone: on a host with no
+   *  `font/<family>` route, a typed name loads nothing. */
+  fontChoices?: readonly FontChoice[];
   palette: TerminalPalette;
   fontSize: number;
   onSelect: (font: string, size: number, gamma: number) => void;
@@ -22,10 +27,16 @@ export function FontOverlay(props: {
   const originalGamma = props.currentGamma;
   const initialFamily = originalFamily.trim();
   const initialFamilyLower = initialFamily.toLowerCase();
+  /** Choices come from the host, or from the server's installed families —
+   *  where the family is its own label. */
+  const catalog = () => props.fontChoices ?? [];
+  const curated = () => catalog().length > 0;
+  const choices = (): readonly FontChoice[] =>
+    curated()
+      ? catalog()
+      : props.serverFonts.map((f) => ({ label: f, stack: f }));
   const initialIdx = () =>
-    props.serverFonts.findIndex(
-      (font) => font.toLowerCase() === initialFamilyLower,
-    );
+    choices().findIndex((c) => c.stack.toLowerCase() === initialFamilyLower);
 
   const [query, setQuery] = createSignal(initialFamily);
   const [filterQuery, setFilterQuery] = createSignal("");
@@ -42,10 +53,10 @@ export function FontOverlay(props: {
   const showAllFonts = () => trimmedFilter().length === 0;
   const lowerFilter = () => trimmedFilter().toLowerCase();
 
-  const filtered = () => {
-    if (showAllFonts()) return props.serverFonts;
+  const filtered = (): readonly FontChoice[] => {
+    if (curated() || showAllFonts()) return choices();
     const q = lowerFilter();
-    return props.serverFonts.filter((f) => f.toLowerCase().includes(q));
+    return choices().filter((c) => c.label.toLowerCase().includes(q));
   };
 
   const dismiss = () => {
@@ -62,8 +73,9 @@ export function FontOverlay(props: {
   const pendingFamily = () => {
     const f = filtered();
     const idx = selectedIdx();
-    if (idx >= 0 && idx < f.length) return f[idx];
-    return trimmedQuery() || originalFamily;
+    if (idx >= 0 && idx < f.length) return f[idx].stack;
+    // Curated hosts have no text box to fall back to.
+    return (!curated() && trimmedQuery()) || originalFamily;
   };
 
   const selectFont = (idx: number) => {
@@ -71,8 +83,8 @@ export function FontOverlay(props: {
     setSelectedIdx(idx);
     setHoverIdx(-1);
     if (idx >= 0 && idx < f.length) {
-      setQuery(f[idx]);
-      previewFont(f[idx]);
+      setQuery(f[idx].label);
+      previewFont(f[idx].stack);
     }
   };
 
@@ -88,6 +100,15 @@ export function FontOverlay(props: {
         e.preventDefault();
         selectFont(Math.max(idx - 1, 0));
         break;
+      case "Enter":
+        // Curated: the list holds the focus, and a list has no implicit form
+        // submit the way the family box does — so Enter would do nothing at
+        // all on the one control the picker has left.
+        if (curated()) {
+          e.preventDefault();
+          props.onSelect(pendingFamily(), size(), gamma());
+        }
+        break;
       case "Escape":
         e.preventDefault();
         dismiss();
@@ -96,8 +117,13 @@ export function FontOverlay(props: {
   };
 
   onMount(() => {
-    inputRef?.focus();
-    inputRef?.select();
+    // Curated: the list is the whole control, so it takes the focus the
+    // search box would have had, and arrow keys work on open.
+    if (curated()) listRef?.focus();
+    else {
+      inputRef?.focus();
+      inputRef?.select();
+    }
   });
 
   // Scroll selected item into view
@@ -111,6 +137,7 @@ export function FontOverlay(props: {
 
   // Reset selection when query changes from typing (not from selectFont)
   createEffect(() => {
+    if (curated()) return;
     if (showAllFonts()) {
       setSelectedIdx(initialIdx());
     } else {
@@ -158,27 +185,31 @@ export function FontOverlay(props: {
             "min-height": 0,
           }}
         >
-          <input
-            ref={inputRef!}
-            name="blit-font-search"
-            type="text"
-            value={query()}
-            onInput={(e) => {
-              const v = e.currentTarget.value;
-              setQuery(v);
-              setFilterQuery(v);
-            }}
-            onKeyDown={handleKeyDown}
-            placeholder={t("font.placeholder")}
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck={false}
-            style={inputStyle()}
-          />
+          <Show when={!curated()}>
+            <input
+              ref={inputRef!}
+              name="blit-font-search"
+              type="text"
+              value={query()}
+              onInput={(e) => {
+                const v = e.currentTarget.value;
+                setQuery(v);
+                setFilterQuery(v);
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder={t("font.placeholder")}
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
+              style={inputStyle()}
+            />
+          </Show>
           <Show when={filtered().length > 0}>
             <ul
               ref={listRef!}
+              tabindex={curated() ? 0 : undefined}
+              onKeyDown={curated() ? handleKeyDown : undefined}
               style={{
                 margin: 0,
                 padding: 0,
@@ -208,7 +239,7 @@ export function FontOverlay(props: {
                     onMouseEnter={() => setHoverIdx(i())}
                     onMouseLeave={() => setHoverIdx(-1)}
                   >
-                    {f}
+                    {f.label}
                   </li>
                 )}
               </For>

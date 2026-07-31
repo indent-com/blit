@@ -20,14 +20,12 @@ const snippetsDir = resolve(__dirname, "../../crates/browser/pkg/snippets");
 export default defineConfig({
   integrations: [solidJs()],
   fonts: [
-    {
-      provider: fontProviders.fontsource(),
-      name: "Fira Code",
-      cssVariable: "--font-mono",
-      weights: [400, 700],
-      styles: ["normal"],
-      fallbacks: ["ui-monospace", "monospace"],
-    },
+    // Only the sans face goes through the pipeline. The monospace faces are
+    // self-hosted by hand in src/styles/global.css, because this pipeline
+    // renames what it subsets — `JetBrains Mono-a4588de4…`, rehashed per
+    // build — and the terminal's font setting is a family string that gets
+    // persisted. A mangled name there is unreadable in the picker and stops
+    // matching anything the next deploy ships.
     {
       provider: fontProviders.fontsource(),
       name: "Inter",

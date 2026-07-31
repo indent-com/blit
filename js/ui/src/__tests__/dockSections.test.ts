@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { LeftPanel } from "../LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "../dockSections";
+import { preferredCollapsedSections } from "../storage";
 
 const set = (...panels: LeftPanel[]) => new Set<LeftPanel>(panels);
 const none = new Set<LeftPanel>();
@@ -65,5 +66,43 @@ describe("liveOverrides", () => {
     // own, and the next root without one must fold it afresh.
     expect(liveOverrides(set("log"), none)).toEqual(none);
     expect(liveOverrides(set("log"), set("log"))).toEqual(set("log"));
+  });
+});
+
+/**
+ * Entering a repository has to open the commit log, and leaving one has to
+ * close it. Both fall out of `noRepo` driving the fold — but only as long as
+ * nothing seeds a *user collapse* for the log, because a preference outranks
+ * the auto-unfold by design. The first-run default used to do exactly that,
+ * which left the log shut on entering a repo for good.
+ */
+describe("commit log follows the repository", () => {
+  afterEach(() => localStorage.clear());
+
+  const firstRun = () => new Set(preferredCollapsedSections() as LeftPanel[]);
+
+  it("does not pre-collapse the log on first run", () => {
+    expect(firstRun().has("log")).toBe(false);
+  });
+
+  it("folds outside a repository and opens inside one", () => {
+    const outside = foldedSections(firstRun(), set("log"), none);
+    expect(outside.has("log")).toBe(true);
+    const inside = foldedSections(firstRun(), none, none);
+    expect(inside.has("log")).toBe(false);
+  });
+
+  it("still honours an explicit collapse made inside a repository", () => {
+    // Collapsing an applicable section records a preference...
+    const { userCollapsed } = toggleSection("log", firstRun(), none, none);
+    expect(userCollapsed.has("log")).toBe(true);
+    // ...which survives the next repo, unlike an auto-fold.
+    expect(foldedSections(userCollapsed, none, none).has("log")).toBe(true);
+  });
+
+  it("keeps Problems folded on first run", () => {
+    // It has an auto-fold of its own, but no LSP is the common case and the
+    // panel is noise before one attaches.
+    expect(firstRun().has("problems")).toBe(true);
   });
 });

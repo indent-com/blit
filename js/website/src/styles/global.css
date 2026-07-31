@@ -1,6 +1,30 @@
 @import "tailwindcss";
 
+/* The monospace faces, self-hosted under their real family names.
+ *
+ * Latin 400/700 only: that is what a terminal draws, and the picker on /s
+ * offers these four (see src/lib/fonts.ts). Declaring a face costs one rule;
+ * the woff2 behind it is fetched when something actually uses it.
+ *
+ * Deliberately not Astro's font pipeline, which is what `--font-sans` uses:
+ * it renames the family it subsets, per build. That is invisible for page text
+ * but not for a terminal, whose font is a family string the user picks and the
+ * app persists — see the comment in astro.config.ts. */
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-700.css";
+@import "@fontsource/fira-code/latin-400.css";
+@import "@fontsource/fira-code/latin-700.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-700.css";
+@import "@fontsource/source-code-pro/latin-400.css";
+@import "@fontsource/source-code-pro/latin-700.css";
+
 @theme inline {
   --font-sans: var(--font-sans);
-  --font-mono: var(--font-mono);
+}
+
+@theme {
+  /* Kept in step with MONO_STACK in src/lib/fonts.ts, which is what the
+   * terminal measures cells against — a canvas cannot read a CSS variable. */
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }

@@ -19,9 +19,10 @@ import type { BlitWasmModule } from "@blit-sh/core";
 import { BlitTerminal, BlitWorkspaceProvider } from "@blit-sh/solid";
 import { initWasm } from "../lib/wasm";
 import { parseBlitrec, ReplayTransport } from "../lib/replay";
+import { monoLoadSpec, MONO_STACK } from "../lib/fonts";
 
 const DARK = PALETTES.find((p) => p.id === "github-dark")!;
-const FONT = "Fira Code, ui-monospace, monospace";
+const FONT = MONO_STACK;
 const FONT_SIZE = 12.5;
 const PTY = 1;
 const COLS = 80;
@@ -58,7 +59,7 @@ export default function HeroWorkspace() {
   onMount(async () => {
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
     try {
-      await document.fonts?.load(`${FONT_SIZE}px "Fira Code"`);
+      await document.fonts?.load(monoLoadSpec(FONT_SIZE));
     } catch {
       // Fallback metrics are fine; the tile just letterboxes a little.
     }
