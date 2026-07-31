@@ -686,11 +686,13 @@ reflects the normalized comparison; oids still name the true blobs.
 `path` filters to a subtree. `status` as `GIT_TREE` plus `INVALID`
 (e.g. INDEX/WORKTREE on a bare repo, MERGE_BASE on the new side or
 against an EMPTY or TREE new side), `NO_MERGE_BASE` (the histories share
-no ancestor) and `NOT_FOUND` (an unborn HEAD standing in for an oid-less
-new side: that request is well-formed, the repository simply holds no
-commit to take the base against, so a client can degrade to another view
-rather than read it as a request it built wrong). Response `flags`: bit 0
-`TRUNCATED`.
+no ancestor), `WRONG_TYPE` (a MERGE_BASE operand that does not peel to a
+commit) and `NOT_FOUND` (an absent oid, or an unborn HEAD standing in for
+an oid-less new side: that request is well-formed, the repository simply
+holds no commit to take the base against, so a client can degrade to
+another view rather than read it as a request it built wrong). A
+MERGE_BASE operand peels like a revision spec, so an annotated tag names
+its commit. Response `flags`: bit 0 `TRUNCATED`.
 
 ```text
 DIFF_ENTRY 0x03: [kind:1][st:1][similarity:1][dflags:1]

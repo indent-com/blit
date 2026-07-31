@@ -1654,6 +1654,36 @@ fn merge_base_and_symmetric_diff_on_fork() {
     };
     let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&bad, &cancel)).unwrap();
     assert_eq!(status, GIT_STATUS_INVALID);
+
+    // Both operands peel, so an annotated tag names its commit; a blob is
+    // WRONG_TYPE and an absent oid NOT_FOUND, not "backend error".
+    git(&dir, &["tag", "-a", "v1", "-m", "v1", "main"]);
+    let cases = [
+        (rev(&dir, "v1"), GIT_STATUS_OK),
+        (rev(&dir, "main:shared.txt"), GIT_STATUS_WRONG_TYPE),
+        (GIT_OID_NONE, GIT_STATUS_NOT_FOUND),
+    ];
+    assert_ne!(cases[0].0, main_tip, "annotated tag has its own oid");
+    for (nonce, (oid, want)) in cases.iter().enumerate() {
+        let req = GitDiffRequest {
+            nonce: 5 + nonce as u16,
+            repo_id: 0,
+            flags: 0,
+            rename: 0,
+            old: GitEndpoint {
+                kind: GIT_ENDPOINT_MERGE_BASE,
+                oid: *oid,
+            },
+            new: GitEndpoint {
+                kind: GIT_ENDPOINT_COMMIT,
+                oid: feature_tip,
+            },
+            path: "",
+            after: "",
+        };
+        let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+        assert_eq!(status, *want, "MERGE_BASE over {}", hex(oid, 8));
+    }
 }
 
 /// The review view of a branch still being worked on: MERGE_BASE against
