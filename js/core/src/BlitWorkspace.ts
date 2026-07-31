@@ -20,7 +20,12 @@ import type {
   FsSyncHandle,
   FsSyncOptions,
 } from "./fs";
-import type { GitOpenOptions, GitRepoHandle } from "./git";
+import type {
+  GitDiscoverOptions,
+  GitFoundRepo,
+  GitOpenOptions,
+  GitRepoHandle,
+} from "./git";
 import type {
   KvFetchResult,
   KvPutOptions,
@@ -245,6 +250,21 @@ export class BlitWorkspace {
     options?: GitOpenOptions,
   ): Promise<GitRepoHandle> {
     return this.requireConnection(connectionId).openRepo(path, options);
+  }
+
+  /**
+   * Repositories under `path` on one connection's server — "what is checked
+   * out here" in one call, rather than a ladder of candidate paths probed
+   * with an `FS_SYNC` per level. Allocates no repo id, so it costs nothing
+   * against the per-connection repo budget. See
+   * `BlitConnection.discoverRepos`.
+   */
+  async discoverRepos(
+    connectionId: ConnectionId,
+    path: string,
+    options?: GitDiscoverOptions,
+  ): Promise<GitFoundRepo[]> {
+    return this.requireConnection(connectionId).discoverRepos(path, options);
   }
 
   /** Fuzzy file search under `root` on one connection; up to `limit` matches,

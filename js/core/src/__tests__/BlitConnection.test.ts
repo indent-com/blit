@@ -603,6 +603,16 @@ describe("BlitConnection", () => {
     expect(conn.getSnapshot().bootGeneration).toBeNull();
   });
 
+  it("exposes the server version from hello", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE, 1n, "0.40.1");
+    expect(conn.getSnapshot().serverVersion).toBe("0.40.1");
+  });
+
+  it("leaves the server version null for servers that omit it", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE, 1n);
+    expect(conn.getSnapshot().serverVersion).toBeNull();
+  });
+
   it("supportsRestart reflects FEATURE_RESTART", () => {
     transport.pushHello(1, FEATURE_RESTART);
     expect(conn.getSnapshot().supportsRestart).toBe(true);

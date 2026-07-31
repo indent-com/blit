@@ -27,6 +27,7 @@ import type {
   TerminalPalette,
 } from "@blit-sh/core";
 import {
+  measureCell,
   GIT_ENDPOINT_INDEX,
   GIT_ENDPOINT_WORKTREE,
   GIT_ENDPOINT_COMMIT,
@@ -454,18 +455,30 @@ export function BlitDiff(props: {
     runPatch(h);
   });
 
-  const mix = (color: string, pct: number) =>
-    `color-mix(in srgb, ${color} ${pct}%, transparent)`;
-  const addBg = () => mix(props.theme.success, 14);
-  const delBg = () => mix(props.theme.error, 14);
-  const addSpan = () => mix(props.theme.success, 32);
-  const delSpan = () => mix(props.theme.error, 32);
+  // Row tints and the change-span tints on top of them are OPAQUE, mixed
+  // against what they sit on rather than left translucent. An inline
+  // background covers the font's content box, which is taller than a
+  // line-height-1 row, so vertically adjacent spans overlap — with
+  // translucent colours that overlap paints twice and draws a dark band
+  // across every row boundary. Composited to the same values up front, the
+  // overlap is invisible and one edit reads as one block.
+  const over = (color: string, pct: number, base: string) =>
+    `color-mix(in srgb, ${color} ${pct}%, ${base})`;
+  const addBg = () => over(props.theme.success, 14, props.theme.bg);
+  const delBg = () => over(props.theme.error, 14, props.theme.bg);
+  const addSpan = () => over(props.theme.success, 32, addBg());
+  const delSpan = () => over(props.theme.error, 32, delBg());
 
-  // Line-height 1: a row is exactly one em tall, matching the editor. This
-  // only holds because the patch renders at `props.fontSize` too (see the
-  // root below) — deriving the row height from the editor's em while
-  // setting a smaller font-size puts the difference back as leading.
-  const rowH = () => `${Math.round(props.fontSize)}px`;
+  // A diff row is exactly one terminal cell tall, measured the way the
+  // terminal measures it: ascent + descent, snapped to device pixels
+  // (js/core/src/measure.ts). Rounding the font size instead made the row
+  // shorter than the glyphs it holds, and everything followed from that —
+  // spacing that did not match a terminal beside it, change-span
+  // backgrounds (which cover the font's content box, not the line box)
+  // overlapping their neighbours, and the next row's background painting
+  // over the tail of a descender, so the bottom of a `g` went missing.
+  const cell = createMemo(() => measureCell(props.fontFamily, props.fontSize));
+  const rowH = () => `${cell().h}px`;
   const numCol: JSX.CSSProperties = {
     width: "38px",
     "flex-shrink": 0,
@@ -583,6 +596,7 @@ export function BlitDiff(props: {
                         style={{
                           display: "flex",
                           "min-height": rowH(),
+                          "line-height": rowH(),
                           background: bg,
                         }}
                       >
@@ -629,6 +643,9 @@ export function BlitDiff(props: {
                 {(r) => {
                   if (r.kind === "file") return null;
                   if (r.kind === "base") return null;
+                  // A truncated patch ends with a cursor naming where it
+                  // stopped; it is a resume point, not a row to draw.
+                  if (r.kind === "cursor") return null;
                   if (r.kind === "gap") {
                     return (
                       <div
@@ -661,6 +678,7 @@ export function BlitDiff(props: {
                       style={{
                         display: "flex",
                         "min-height": rowH(),
+                        "line-height": rowH(),
                       }}
                     >
                       <div

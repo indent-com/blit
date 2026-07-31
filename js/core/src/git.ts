@@ -21,69 +21,88 @@ const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 // -- Opcodes ----------------------------------------------------------------
 
-/** Open a repo: [0x50][nonce:2][flags:1][refs_latency_ms:2][status_latency_ms:2][path_len:2][path:N] */
-export const C2S_GIT_OPEN = 0x50;
-/** Close a repo: [0x51][repo_id:2] */
-export const C2S_GIT_CLOSE = 0x51;
-/** Acknowledge a state snapshot: [0x52][repo_id:2][state_id:4] */
-export const C2S_GIT_ACK = 0x52;
-/** Walk commits: [0x53][nonce:2][repo_id:2][flags:1][limit:2][path_len:2][path:N][n_tips:2][tips][n_hides:2][hides] */
-export const C2S_GIT_LOG = 0x53;
-/** List one tree level: [0x54][nonce:2][repo_id:2][oid:32][path_len:2][path:N] */
-export const C2S_GIT_TREE = 0x54;
-/** Fetch object bytes: [0x55][nonce:2][repo_id:2][oid:32][path_len:2][path:N][max_len:4] */
-export const C2S_GIT_BLOB = 0x55;
-/** File-level diff: [0x56][nonce:2][repo_id:2][flags:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N] */
-export const C2S_GIT_DIFF = 0x56;
-/** Patch rows or text: [0x57][nonce:2][repo_id:2][flags:1][context:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][max_len:4] */
-export const C2S_GIT_PATCH = 0x57;
-/** Enumerate the index: [0x58][nonce:2][repo_id:2][path_len:2][path:N] */
-export const C2S_GIT_INDEX = 0x58;
-/** Cancel an in-flight request: [0x59][nonce:2] */
-export const C2S_GIT_CANCEL = 0x59;
-/** Merge base: [0x5A][nonce:2][repo_id:2][n_oids:1][oids:32·N] */
-export const C2S_GIT_BASE = 0x5a;
-/** Resolve a revision spec to commit oids: [0x5B][nonce:2][repo_id:2][spec_len:2][spec:N].
+/** Open a repo: [0xA0][nonce:2][flags:2][refs_latency_ms:2][status_latency_ms:2][src_pty_id:2][parent_repo_id:2][n_prefixes:2][(len:2, prefix:N)·N][path_len:2][path:N] */
+export const C2S_GIT_OPEN = 0xa0;
+/** Close a repo: [0xA1][repo_id:2] */
+export const C2S_GIT_CLOSE = 0xa1;
+/** Acknowledge a state snapshot: [0xA2][repo_id:2][state_id:4] */
+export const C2S_GIT_ACK = 0xa2;
+/** Walk commits: [0xA7][nonce:2][repo_id:2][flags:1][limit:2][path_len:2][path:N][n_tips:2][tips][n_hides:2][hides] */
+export const C2S_GIT_LOG = 0xa7;
+/** List one tree level: [0xAB][nonce:2][repo_id:2][flags:1][oid:32][path_len:2][path:N][after_len:2][after:N] */
+export const C2S_GIT_TREE = 0xab;
+/** Object bytes, windowed: [0xAC][nonce:2][repo_id:2][flags:1][oid:32][path_len:2][path:N][offset:8][max_len:4] */
+export const C2S_GIT_BLOB = 0xac;
+/** File-level diff: [0xAD][nonce:2][repo_id:2][flags:1][rename:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][after_len:2][after:N] */
+export const C2S_GIT_DIFF = 0xad;
+/** Patch rows or text: [0xAE][nonce:2][repo_id:2][flags:2][context:1][rename:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][max_len:4][after_len:2][after:N][after_pos:8] */
+export const C2S_GIT_PATCH = 0xae;
+/** Enumerate the index: [0xAF][nonce:2][repo_id:2][flags:1][path_len:2][path:N][after_len:2][after:N] */
+export const C2S_GIT_INDEX = 0xaf;
+/** Cancel an in-flight request: [0xA3][nonce:2] */
+export const C2S_GIT_CANCEL = 0xa3;
+/** Merge base: [0xB0][nonce:2][repo_id:2][n_oids:1][oids:32·N] */
+export const C2S_GIT_BASE = 0xb0;
+/** Resolve a revision spec to commit oids: [0xA6][nonce:2][repo_id:2][spec_len:2][spec:N].
  *  `spec` is any git revision expression — a ref, (short) oid, `HEAD~3`, or
  *  a range `A..B` / `A...B`. The reply gives `tips`/`hides` for {@link msgGitLog}. */
-export const C2S_GIT_RESOLVE = 0x5b;
-/** Subscribe to a live log: [0x5C][log_id:2][repo_id:2][flags:1][limit:2][spec_len:2][spec:N].
+export const C2S_GIT_RESOLVE = 0xa6;
+/** Subscribe to a live log: [0xA8][log_id:2][repo_id:2][flags:1][limit:2][spec_len:2][spec:N].
  *  The server resolves `spec` and pushes a `GIT_LOG_PAGE`, re-emitting when
  *  the resolved endpoints move. `log_id` is client-assigned (unique per
  *  connection); `flags` are the `GIT_LOG_*` bits. */
-export const C2S_GIT_LOG_WATCH = 0x5c;
-/** End a log subscription: [0x5D][log_id:2][repo_id:2] */
-export const C2S_GIT_LOG_UNWATCH = 0x5d;
-/** Acknowledge a log page (coalescing pacing): [0x5E][log_id:2][repo_id:2][update_id:4] */
-export const C2S_GIT_LOG_ACK = 0x5e;
+export const C2S_GIT_LOG_WATCH = 0xa8;
+/** End a log subscription: [0xA9][log_id:2][repo_id:2] */
+export const C2S_GIT_LOG_UNWATCH = 0xa9;
+/** Acknowledge a log page (coalescing pacing): [0xAA][log_id:2][repo_id:2][update_id:4] */
+export const C2S_GIT_LOG_ACK = 0xaa;
 
-/** Open reply: [0x50][nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir][gitdir_len:2][gitdir] */
-export const S2C_GIT_REPO = 0x50;
-/** Whole-state snapshot: [0x51][repo_id:2][state_id:4][flags:1][records:LZ4] */
-export const S2C_GIT_STATE = 0x51;
-/** Repo terminated: [0x52][repo_id:2][reason:1] */
-export const S2C_GIT_CLOSED = 0x52;
-/** Log page: [0x53][nonce:2][status:1][flags:1][n_frontier:2][frontier][records:LZ4] */
-export const S2C_GIT_COMMITS = 0x53;
-/** Tree listing: [0x54][nonce:2][status:1][flags:1][records:LZ4] */
-export const S2C_GIT_TREE = 0x54;
-/** Blob bytes: [0x55][nonce:2][status:1][size:8][data:LZ4] */
-export const S2C_GIT_BLOB = 0x55;
-/** Diff entries: [0x56][nonce:2][status:1][flags:1][records:LZ4] */
-export const S2C_GIT_DIFF = 0x56;
-/** Patch rows/text: [0x57][nonce:2][status:1][flags:1][data:LZ4] */
-export const S2C_GIT_PATCH = 0x57;
-/** Index entries: [0x58][nonce:2][status:1][flags:1][records:LZ4] */
-export const S2C_GIT_INDEX = 0x58;
-/** Merge bases: [0x5A][nonce:2][status:1][n_bases:1][bases:32·N] */
-export const S2C_GIT_BASE = 0x5a;
-/** Resolve reply: [0x5B][nonce:2][status:1][n_tips:2][tips:32·N][n_hides:2][hides:32·N] */
-export const S2C_GIT_RESOLVE = 0x5b;
-/** Live log page: [0x5C][log_id:2][update_id:4][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4].
+/** Open reply: [0xA0][nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir][gitdir_len:2][gitdir] */
+export const S2C_GIT_REPO = 0xa0;
+/** Whole-state snapshot: [0xA4][repo_id:2][state_id:4][flags:1][records:LZ4] */
+export const S2C_GIT_STATE = 0xa4;
+/** Repo terminated: [0xA5][repo_id:2][reason:1] */
+export const S2C_GIT_CLOSED = 0xa5;
+/** Log page: [0xA7][nonce:2][status:1][flags:1][n_frontier:2][frontier][records:LZ4] */
+export const S2C_GIT_COMMITS = 0xa7;
+/** Tree listing: [0xAB][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_TREE = 0xab;
+/** Blob bytes: [0xAC][nonce:2][status:1][size:8][data:LZ4] */
+export const S2C_GIT_BLOB = 0xac;
+/** Diff entries: [0xAD][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_DIFF = 0xad;
+/** Patch rows/text: [0xAE][nonce:2][status:1][flags:1][data:LZ4] */
+export const S2C_GIT_PATCH = 0xae;
+/** Index entries: [0xAF][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_INDEX = 0xaf;
+/** Merge bases: [0xB0][nonce:2][status:1][n_bases:1][bases:32·N] */
+export const S2C_GIT_BASE = 0xb0;
+/** Resolve reply: [0xA6][nonce:2][status:1][n_tips:2][tips:32·N][n_hides:2][hides:32·N] */
+export const S2C_GIT_RESOLVE = 0xa6;
+/** Live log page: [0xA8][log_id:2][update_id:4][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4].
  *  Same records as `GIT_COMMITS`; re-sent (coalesced, acked) when the
  *  subscription's resolved endpoints move. `flags` bit 0 `MORE` marks a
  *  truncated head page — pull older history with `GIT_LOG` from `frontier`. */
-export const S2C_GIT_LOG_PAGE = 0x5c;
+export const S2C_GIT_LOG_PAGE = 0xa8;
+
+/** Enumerate repositories under a path: [0xB1][nonce:2][flags:1][depth:1][path_len:2][path:N][after_len:2][after:N].
+ *  Allocates no repo ids — an enumeration, not an open. */
+export const C2S_GIT_DISCOVER = 0xb1;
+/** Line attribution: [0xB2][nonce:2][repo_id:2][flags:1][oid:32][start_line:4][line_count:4][path_len:2][path:N][after_len:2][after:N] */
+export const C2S_GIT_BLAME = 0xb2;
+/** Reflog traversal: [0xB3][nonce:2][repo_id:2][flags:1][limit:2][ref_len:2][ref:N][after_len:2][after:N]. `ref` empty = HEAD. */
+export const C2S_GIT_REFLOG = 0xb3;
+/** Fetch from a remote: [0xB4][nonce:2][repo_id:2][flags:1][timeout_ms:4][remote_len:2][remote:N][n_refspecs:2][(len:2, refspec:N)·N] */
+export const C2S_GIT_FETCH = 0xb4;
+
+/** Discovery reply: [0xB1][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_DISCOVER = 0xb1;
+/** Blame reply: [0xB2][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_BLAME = 0xb2;
+/** Reflog reply: [0xB3][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_REFLOG = 0xb3;
+/** Fetch reply: [0xB4][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_FETCH = 0xb4;
 
 /** `S2C_HELLO` feature bit: server supports the `GIT_*` message family. */
 export const FEATURE_GIT = 1 << 7;
@@ -99,21 +118,23 @@ export const GIT_STATUS_BUDGET = 6;
 export const GIT_STATUS_INVALID = 7;
 export const GIT_STATUS_CANCELLED = 8;
 export const GIT_STATUS_OTHER = 9;
+/** A precondition failed. Shares docs/design/fs-write.md's code. */
+export const GIT_STATUS_CONFLICT = 11;
 
-// C2S_GIT_OPEN flags. STATUS and TRACKING imply WATCH; UNTRACKED implies
-// STATUS; IGNORED implies UNTRACKED.
+// C2S_GIT_OPEN flags (u16). STATUS and TRACKING imply WATCH; UNTRACKED
+// implies STATUS; IGNORED implies UNTRACKED.
 export const GIT_OPEN_WATCH = 1 << 0;
 export const GIT_OPEN_STATUS = 1 << 1;
 export const GIT_OPEN_UNTRACKED = 1 << 2;
 export const GIT_OPEN_IGNORED = 1 << 3;
 export const GIT_OPEN_TRACKING = 1 << 4;
-/** Resolve the repo's discovery path from a pty's live cwd: a trailing
- *  `[src_pty_id:2]` names a pty and the server joins `path` onto its cwd
- *  before `.git` discovery (docs/ide.md Decision 3). */
-export const GIT_OPEN_FROM_PTY = 1 << 5;
+/** One `STATE_REMOTE` record per configured remote; implies `WATCH`. */
+export const GIT_OPEN_REMOTES = 1 << 5;
 
 /** `repo_id` reported by a failed `GIT_REPO`. */
 export const GIT_REPO_ID_INVALID = 0xffff;
+/** `GIT_OPEN.src_pty_id` / `parent_repo_id`: no such context. */
+export const GIT_OPEN_NO_CONTEXT = 0xffff;
 
 export const GIT_OID_FORMAT_SHA1 = 0;
 export const GIT_OID_FORMAT_SHA256 = 1;
@@ -123,6 +144,11 @@ export const GIT_REPO_BARE = 1 << 0;
 export const GIT_REPO_SHALLOW = 1 << 1;
 export const GIT_REPO_SPARSE = 1 << 2;
 export const GIT_REPO_LINKED = 1 << 3;
+/** Reserved for a mutation family; clear in this build. */
+export const GIT_REPO_WRITABLE = 1 << 4;
+/** `GIT_FETCH` will be attempted for this repo: fetch is enabled and a
+ *  `git` binary was found. Answered per repository, not per connection. */
+export const GIT_REPO_FETCHABLE = 1 << 5;
 
 // S2C_GIT_CLOSED reasons.
 export const GIT_CLOSED_CLIENT_REQUEST = 0;
@@ -137,6 +163,11 @@ export const GIT_CLOSED_CONNECTION_LOST = -1;
 // S2C_GIT_STATE flags.
 export const GIT_STATE_REFS_TRUNCATED = 1 << 0;
 export const GIT_STATE_STATUS_TRUNCATED = 1 << 1;
+/** More records for this `state_id` follow. {@link GitStateMirror}
+ *  accumulates them and installs the map on the chunk with this clear, so a
+ *  consumer never observes a half-built snapshot; only the final chunk is
+ *  acknowledged. */
+export const GIT_STATE_PARTIAL = 1 << 2;
 
 // C2S_GIT_LOG flags.
 export const GIT_LOG_FIRST_PARENT = 1 << 0;
@@ -148,16 +179,43 @@ export const GIT_LOG_PATH_OIDS = 1 << 4;
 // S2C_GIT_COMMITS flags.
 export const GIT_COMMITS_MORE = 1 << 0;
 
-// C2S_GIT_DIFF / C2S_GIT_PATCH request flags (shared bits 0-4).
+// C2S_GIT_BLOB request flags.
+/** Deliver the whole object or answer `TOO_LARGE`. Without it a request is
+ *  a window: what fits from `offset`, with `size` still the true object
+ *  size, so a viewer can render the head of a file too large to ship. */
+export const GIT_BLOB_WHOLE = 1 << 0;
+
+// C2S_GIT_DIFF request flags; C2S_GIT_PATCH shares bits 0-5.
 export const GIT_DIFF_RENAMES = 1 << 0;
 export const GIT_DIFF_UNTRACKED = 1 << 1;
 export const GIT_DIFF_IGNORED = 1 << 2;
 export const GIT_DIFF_IGNORE_SPACE_CHANGE = 1 << 3;
 export const GIT_DIFF_IGNORE_ALL_SPACE = 1 << 4;
-// C2S_GIT_PATCH-only request flags.
-export const GIT_PATCH_TEXT = 1 << 5;
-export const GIT_PATCH_CHAR_SPANS = 1 << 6;
-export const GIT_PATCH_NO_SPANS = 1 << 7;
+/** Compare on-disk bytes as they are: skip the `text`/`eol` normalization
+ *  the worktree side gets from the path's gitattributes. */
+export const GIT_DIFF_RAW = 1 << 5;
+
+// C2S_GIT_PATCH request flags: a u16 whose low six bits are exactly
+// GIT_DIFF's, so one shared prefix rather than two numberings.
+export const GIT_PATCH_RENAMES = GIT_DIFF_RENAMES;
+export const GIT_PATCH_UNTRACKED = GIT_DIFF_UNTRACKED;
+export const GIT_PATCH_IGNORED = GIT_DIFF_IGNORED;
+export const GIT_PATCH_IGNORE_SPACE_CHANGE = GIT_DIFF_IGNORE_SPACE_CHANGE;
+export const GIT_PATCH_IGNORE_ALL_SPACE = GIT_DIFF_IGNORE_ALL_SPACE;
+export const GIT_PATCH_RAW = GIT_DIFF_RAW;
+export const GIT_PATCH_TEXT = 1 << 6;
+export const GIT_PATCH_CHAR_SPANS = 1 << 7;
+export const GIT_PATCH_NO_SPANS = 1 << 8;
+/** With `TEXT`, emit binary content as git's `GIT binary patch` block
+ *  instead of the `Binary files … differ` sentence — git's `--binary`, and
+ *  asked for as git asks for it: a 40 MiB PNG is not what a review surface
+ *  wants by default, but it is the difference between a patch `git apply`
+ *  can replay and one it refuses. */
+export const GIT_PATCH_BINARY = 1 << 9;
+
+/** The similarity threshold a `rename` byte may carry: 0 is the exact-oid
+ *  join, 1-100 a percentage, above that `INVALID`. */
+export const GIT_RENAME_MAX = 100;
 
 // Response flags.
 export const GIT_TREE_TRUNCATED = 1 << 0;
@@ -165,6 +223,32 @@ export const GIT_DIFF_TRUNCATED = 1 << 0;
 export const GIT_INDEX_TRUNCATED = 1 << 0;
 export const GIT_PATCH_STRUCTURED = 1 << 0;
 export const GIT_PATCH_TRUNCATED = 1 << 1;
+/** Similarity rename detection was skipped: the candidate set exceeded the
+ *  server's limit, so the response fell back to the exact-oid join. */
+export const GIT_DIFF_RENAME_LIMIT = 1 << 1;
+export const GIT_DISCOVER_TRUNCATED = 1 << 0;
+export const GIT_BLAME_TRUNCATED = 1 << 0;
+export const GIT_REFLOG_TRUNCATED = 1 << 0;
+
+// C2S_GIT_DISCOVER request flags.
+/** Descend into a repository once one is found (off by default). */
+export const GIT_DISCOVER_NESTED = 1 << 0;
+export const GIT_DISCOVER_BARE = 1 << 1;
+
+// C2S_GIT_BLAME request flags.
+export const GIT_BLAME_FOLLOW_RENAMES = 1 << 0;
+export const GIT_BLAME_FOLLOW_COPIES = 1 << 1;
+
+// C2S_GIT_REFLOG request flags.
+/** Oldest entry first; the default is newest-first, like `git reflog`. */
+export const GIT_REFLOG_OLDEST_FIRST = 1 << 0;
+
+// C2S_GIT_FETCH request flags.
+export const GIT_FETCH_PRUNE = 1 << 0;
+export const GIT_FETCH_NO_TAGS = 1 << 1;
+/** Anchor each fetched tip under `refs/blit/fetch/<remote>/<n>` so a
+ *  concurrent `gc` cannot prune it before the client diffs it. */
+export const GIT_FETCH_ANCHOR = 1 << 2;
 
 // Diff endpoints.
 export const GIT_ENDPOINT_EMPTY = 0;
@@ -182,6 +266,12 @@ export const GIT_STATE_RECORD_OP = 0x03;
 export const GIT_STATE_RECORD_STATUS = 0x04;
 export const GIT_STATE_RECORD_UPSTREAM = 0x05;
 export const GIT_STATE_RECORD_STASH = 0x06;
+export const GIT_STATE_RECORD_REMOTE = 0x07;
+/** Reserved family-wide in every records payload: where a budget-truncated
+ *  response stopped. `TRUNCATED` with no `CURSOR` means unresumable. */
+export const GIT_RECORD_CURSOR = 0x7f;
+/** The remote whose HEAD the checked-out branch tracks. */
+export const GIT_REMOTE_DEFAULT = 1 << 0;
 
 export const GIT_HEAD_DETACHED = 1 << 0;
 export const GIT_HEAD_UNBORN = 1 << 1;
@@ -212,6 +302,11 @@ export const GIT_DIFF_RECORD_ENTRY = 0x03;
 export const GIT_DIFF_RECORD_BASE = 0x04;
 export const GIT_DIFF_ENTRY_BINARY = 1 << 0;
 export const GIT_DIFF_ENTRY_SUBMODULE = 1 << 1;
+/** The path's gitattributes name a `filter` driver, so the object bytes
+ *  and the worktree bytes are not comparable (an LFS pointer against the
+ *  asset it stands for). No rows follow: render "filtered file changed"
+ *  rather than a wrong whole-file rewrite. */
+export const GIT_DIFF_ENTRY_FILTERED = 1 << 2;
 
 // GIT_PATCH record kinds.
 export const GIT_PATCH_RECORD_FILE = 0x01;
@@ -219,11 +314,27 @@ export const GIT_PATCH_RECORD_ROW = 0x02;
 export const GIT_PATCH_RECORD_GAP = 0x03;
 export const GIT_PATCH_RECORD_BASE = 0x04;
 export const GIT_PATCH_FILE_BINARY = 1 << 0;
+/** Filtered file: no rows follow (see {@link GIT_DIFF_ENTRY_FILTERED}). */
+export const GIT_PATCH_FILE_FILTERED = 1 << 1;
 
 // GIT_INDEX record kind.
 export const GIT_INDEX_RECORD_ENTRY = 0x04;
 export const GIT_INDEX_INTENT_TO_ADD = 1 << 0;
 export const GIT_INDEX_SKIP_WORKTREE = 1 << 1;
+
+// 0xB1-0xB4 record kinds and flags.
+export const GIT_DISCOVER_RECORD_REPO = 0x01;
+export const GIT_BLAME_RECORD_RANGE = 0x01;
+export const GIT_REFLOG_RECORD_ENTRY = 0x01;
+export const GIT_FETCH_RECORD_REF = 0x01;
+export const GIT_FOUND_BARE = 1 << 0;
+export const GIT_FOUND_LINKED = 1 << 1;
+export const GIT_FOUND_SUBMODULE = 1 << 2;
+export const GIT_FETCH_REF_FORCED = 1 << 0;
+export const GIT_FETCH_REF_PRUNED = 1 << 1;
+export const GIT_FETCH_REF_NEW = 1 << 2;
+/** An existing tag was moved (git's `t`, distinct from its `+`). */
+export const GIT_FETCH_REF_TAG_UPDATE = 1 << 3;
 
 // -- Oids -------------------------------------------------------------------
 
@@ -287,6 +398,12 @@ function pushI64(buf: number[], value: bigint): void {
     buf.push(Number(v & 0xffn));
     v >>= 8n;
   }
+}
+
+/** A u64 from a JS number: values past 2^53 are not representable, which
+ *  is far beyond any offset or row count this protocol carries. */
+function pushU64(buf: number[], value: number): void {
+  pushI64(buf, BigInt(Math.max(0, Math.trunc(value))));
 }
 
 function pushStr(buf: number[], text: string): void {
@@ -367,22 +484,38 @@ export interface GitEndpoint {
   oid: GitOid;
 }
 
-export function msgGitOpen(
-  nonce: number,
-  flags: number,
-  refsLatencyMs: number,
-  statusLatencyMs: number,
-  path: string,
-  srcPtyId?: number,
-): Uint8Array {
-  const hasSrc = srcPtyId != null;
+/** A `C2S_GIT_OPEN`. Both context ids are plain fields with a
+ *  {@link GIT_OPEN_NO_CONTEXT} sentinel rather than flag-gated tails, so
+ *  the message has one shape however it is used. */
+export interface GitOpenRequest {
+  nonce: number;
+  /** `GIT_OPEN_*` bits (u16). */
+  flags: number;
+  /** Per-open settle windows; 0 = the server default. */
+  refsLatencyMs?: number;
+  statusLatencyMs?: number;
+  /** A pty whose live cwd `path` is joined onto before discovery. */
+  srcPtyId?: number;
+  /** A parent repo: `path` is then a submodule path relative to its
+   *  worktree, and the server resolves the submodule's own gitdir. */
+  parentRepoId?: number;
+  /** Ref prefixes to watch; empty watches every ref. */
+  refPrefixes?: string[];
+  path: string;
+}
+
+export function msgGitOpen(req: GitOpenRequest): Uint8Array {
   const buf: number[] = [C2S_GIT_OPEN];
-  pushU16(buf, nonce);
-  buf.push(hasSrc ? flags | GIT_OPEN_FROM_PTY : flags);
-  pushU16(buf, refsLatencyMs);
-  pushU16(buf, statusLatencyMs);
-  pushStr(buf, path);
-  if (hasSrc) pushU16(buf, srcPtyId);
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.flags);
+  pushU16(buf, req.refsLatencyMs ?? 0);
+  pushU16(buf, req.statusLatencyMs ?? 0);
+  pushU16(buf, req.srcPtyId ?? GIT_OPEN_NO_CONTEXT);
+  pushU16(buf, req.parentRepoId ?? GIT_OPEN_NO_CONTEXT);
+  const prefixes = req.refPrefixes ?? [];
+  pushU16(buf, prefixes.length);
+  for (const prefix of prefixes) pushStr(buf, prefix);
+  pushStr(buf, req.path);
   return new Uint8Array(buf);
 }
 
@@ -425,33 +558,51 @@ export function msgGitLog(req: GitLogRequest): Uint8Array {
   return new Uint8Array(buf);
 }
 
-export function msgGitTree(
-  nonce: number,
-  repoId: number,
-  oid: GitOid,
-  path: string,
-): Uint8Array {
+export interface GitTreeRequest {
+  nonce: number;
+  repoId: number;
+  /** Reserved; a set bit is `INVALID`. */
+  flags?: number;
+  oid: GitOid;
+  path: string;
+  /** "" = from the beginning; else a `CURSOR` record's path. */
+  after?: string;
+}
+
+export function msgGitTree(req: GitTreeRequest): Uint8Array {
   const buf: number[] = [C2S_GIT_TREE];
-  pushU16(buf, nonce);
-  pushU16(buf, repoId);
-  pushOid(buf, oid);
-  pushStr(buf, path);
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushOid(buf, req.oid);
+  pushStr(buf, req.path);
+  pushStr(buf, req.after ?? "");
   return new Uint8Array(buf);
 }
 
-export function msgGitBlob(
-  nonce: number,
-  repoId: number,
-  oid: GitOid,
-  path: string,
-  maxLen: number,
-): Uint8Array {
+export interface GitBlobRequest {
+  nonce: number;
+  repoId: number;
+  /** {@link GIT_BLOB_WHOLE} refuses rather than windowing. */
+  flags?: number;
+  oid: GitOid;
+  path: string;
+  /** First byte to return. Past the end is `INVALID`; exactly the end is
+   *  `OK` with no data. */
+  offset?: number;
+  /** 0 = the server default cap. */
+  maxLen: number;
+}
+
+export function msgGitBlob(req: GitBlobRequest): Uint8Array {
   const buf: number[] = [C2S_GIT_BLOB];
-  pushU16(buf, nonce);
-  pushU16(buf, repoId);
-  pushOid(buf, oid);
-  pushStr(buf, path);
-  pushU32(buf, maxLen);
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushOid(buf, req.oid);
+  pushStr(buf, req.path);
+  pushU64(buf, req.offset ?? 0);
+  pushU32(buf, req.maxLen);
   return new Uint8Array(buf);
 }
 
@@ -459,10 +610,15 @@ export interface GitDiffRequest {
   nonce: number;
   repoId: number;
   flags: number;
+  /** Rename similarity threshold: 0 = the exact-oid join, 1-100 a
+   *  percentage (git's own default is 50), above that `INVALID`. */
+  rename?: number;
   old: GitEndpoint;
   new: GitEndpoint;
   /** Subtree filter (escaped wire path); "" = everything. */
   path: string;
+  /** "" = from the beginning; else a `CURSOR` record's path. */
+  after?: string;
 }
 
 export function msgGitDiff(req: GitDiffRequest): Uint8Array {
@@ -470,11 +626,13 @@ export function msgGitDiff(req: GitDiffRequest): Uint8Array {
   pushU16(buf, req.nonce);
   pushU16(buf, req.repoId);
   buf.push(req.flags);
+  buf.push(req.rename ?? 0);
   buf.push(req.old.kind);
   pushOid(buf, req.old.oid);
   buf.push(req.new.kind);
   pushOid(buf, req.new.oid);
   pushStr(buf, req.path);
+  pushStr(buf, req.after ?? "");
   return new Uint8Array(buf);
 }
 
@@ -483,32 +641,148 @@ export interface GitPatchRequest extends GitDiffRequest {
   context: number;
   /** Response size cap; 0 = server default. */
   maxLen: number;
+  /** Rows already delivered for {@link GitDiffRequest.after}, so a file
+   *  larger than the byte budget resumes mid-hunk instead of restarting. */
+  afterPos?: number;
 }
 
 export function msgGitPatch(req: GitPatchRequest): Uint8Array {
   const buf: number[] = [C2S_GIT_PATCH];
   pushU16(buf, req.nonce);
   pushU16(buf, req.repoId);
-  buf.push(req.flags);
+  pushU16(buf, req.flags);
   buf.push(req.context);
+  buf.push(req.rename ?? 0);
   buf.push(req.old.kind);
   pushOid(buf, req.old.oid);
   buf.push(req.new.kind);
   pushOid(buf, req.new.oid);
   pushStr(buf, req.path);
   pushU32(buf, req.maxLen);
+  pushStr(buf, req.after ?? "");
+  pushU64(buf, req.afterPos ?? 0);
   return new Uint8Array(buf);
 }
 
-export function msgGitIndex(
-  nonce: number,
-  repoId: number,
-  path: string,
-): Uint8Array {
+export interface GitIndexRequest {
+  nonce: number;
+  repoId: number;
+  /** Reserved; a set bit is `INVALID`. */
+  flags?: number;
+  /** Path prefix; "" = every entry. */
+  path: string;
+  /** "" = from the beginning; else a `CURSOR` record's path. */
+  after?: string;
+}
+
+export function msgGitIndex(req: GitIndexRequest): Uint8Array {
   const buf: number[] = [C2S_GIT_INDEX];
-  pushU16(buf, nonce);
-  pushU16(buf, repoId);
-  pushStr(buf, path);
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushStr(buf, req.path);
+  pushStr(buf, req.after ?? "");
+  return new Uint8Array(buf);
+}
+
+export interface GitDiscoverRequest {
+  nonce: number;
+  /** `GIT_DISCOVER_*` bits. */
+  flags?: number;
+  /** 0 = the server default, clamped to the server maximum. */
+  depth?: number;
+  /** Plain UTF-8, like {@link GitOpenRequest.path}. */
+  path: string;
+  after?: string;
+}
+
+export function msgGitDiscover(req: GitDiscoverRequest): Uint8Array {
+  const buf: number[] = [C2S_GIT_DISCOVER];
+  pushU16(buf, req.nonce);
+  buf.push(req.flags ?? 0);
+  buf.push(req.depth ?? 0);
+  pushStr(buf, req.path);
+  pushStr(buf, req.after ?? "");
+  return new Uint8Array(buf);
+}
+
+export interface GitBlameRequest {
+  nonce: number;
+  repoId: number;
+  /** `GIT_BLAME_*` bits. */
+  flags?: number;
+  /** The commit to blame from; the zero oid means HEAD. The worktree is
+   *  not blameable. */
+  oid: GitOid;
+  /** 1-based; 0 is treated as 1. Also how a truncated blame resumes:
+   *  re-issue with `startLine` one past the `CURSOR`'s `pos`. */
+  startLine?: number;
+  /** 0 = to end of file, subject to the server's line budget. */
+  lineCount?: number;
+  path: string;
+}
+
+export function msgGitBlame(req: GitBlameRequest): Uint8Array {
+  const buf: number[] = [C2S_GIT_BLAME];
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushOid(buf, req.oid);
+  pushU32(buf, req.startLine ?? 0);
+  pushU32(buf, req.lineCount ?? 0);
+  pushStr(buf, req.path);
+  return new Uint8Array(buf);
+}
+
+export interface GitReflogRequest {
+  nonce: number;
+  repoId: number;
+  /** `GIT_REFLOG_*` bits. */
+  flags?: number;
+  /** 0 = the server default, clamped to the entry budget. */
+  limit?: number;
+  /** "" = `HEAD`. */
+  refName?: string;
+  /** Entries already delivered from the end `OLDEST_FIRST` selects, so a
+   *  reflog longer than `limit` pages: re-issue with the `CURSOR`'s
+   *  `pos`. */
+  afterPos?: number;
+}
+
+export function msgGitReflog(req: GitReflogRequest): Uint8Array {
+  const buf: number[] = [C2S_GIT_REFLOG];
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushU16(buf, req.limit ?? 0);
+  pushU64(buf, req.afterPos ?? 0);
+  pushStr(buf, req.refName ?? "");
+  return new Uint8Array(buf);
+}
+
+export interface GitFetchRequest {
+  nonce: number;
+  repoId: number;
+  /** `GIT_FETCH_*` bits. */
+  flags?: number;
+  /** 0 = the server default, clamped to the server maximum. */
+  timeoutMs?: number;
+  /** "" = the branch's configured remote, else `origin`. */
+  remote?: string;
+  /** Empty = the remote's configured refspecs. */
+  refspecs?: string[];
+}
+
+export function msgGitFetch(req: GitFetchRequest): Uint8Array {
+  const buf: number[] = [C2S_GIT_FETCH];
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushU32(buf, req.timeoutMs ?? 0);
+  pushStr(buf, req.remote ?? "");
+  const refspecs = req.refspecs ?? [];
+  pushU16(buf, refspecs.length);
+  for (const spec of refspecs) pushStr(buf, spec);
   return new Uint8Array(buf);
 }
 
@@ -676,6 +950,30 @@ export function parseGitDiffResp(
   return parseRecordsResp(msg, S2C_GIT_DIFF);
 }
 
+export function parseGitDiscoverResp(
+  msg: Uint8Array,
+): [number, number, number, Uint8Array] | null {
+  return parseRecordsResp(msg, S2C_GIT_DISCOVER);
+}
+
+export function parseGitBlameResp(
+  msg: Uint8Array,
+): [number, number, number, Uint8Array] | null {
+  return parseRecordsResp(msg, S2C_GIT_BLAME);
+}
+
+export function parseGitReflogResp(
+  msg: Uint8Array,
+): [number, number, number, Uint8Array] | null {
+  return parseRecordsResp(msg, S2C_GIT_REFLOG);
+}
+
+export function parseGitFetchResp(
+  msg: Uint8Array,
+): [number, number, number, Uint8Array] | null {
+  return parseRecordsResp(msg, S2C_GIT_FETCH);
+}
+
 export function parseGitPatchResp(
   msg: Uint8Array,
 ): [number, number, number, Uint8Array] | null {
@@ -833,13 +1131,27 @@ export function msgGitLogPage(
 
 export type GitStateRecord =
   | { kind: "head"; flags: number; oid: GitOid; name: string }
-  | { kind: "ref"; flags: number; oid: GitOid; peeled: GitOid; name: string }
+  | {
+      kind: "ref";
+      flags: number;
+      oid: GitOid;
+      peeled: GitOid;
+      name: string;
+      /** The symbolic target's ref name with {@link GIT_REF_SYMBOLIC},
+       *  else "". This is what names the default branch instead of
+       *  guessing `main` then `master`. */
+      target: string;
+    }
   | { kind: "op"; op: number; oid: GitOid; detail: string }
   | {
       kind: "status";
       staged: number;
       unstaged: number;
       flags: number;
+      /** The worktree content's hash when the status walk read the file,
+       *  else zero. A write that leaves the letters alone still moves
+       *  this, so the snapshot is not suppressed as a duplicate. */
+      oid: GitOid;
       oldPath: string;
       path: string;
     }
@@ -858,7 +1170,20 @@ export type GitStateRecord =
       time: bigint;
       tz: number;
       msg: string;
+    }
+  | {
+      kind: "remote";
+      flags: number;
+      name: string;
+      /** As configured, userinfo included. */
+      fetchUrl: string;
+      /** "" when it equals {@link fetchUrl}. */
+      pushUrl: string;
     };
+
+/** Where a budget-truncated response stopped; re-issue the same request
+ *  with these as `after`/`afterPos`. Reserved family-wide. */
+export type GitCursorRecord = { kind: "cursor"; after: string; pos: bigint };
 
 export type GitCommitRecord =
   | {
@@ -879,13 +1204,15 @@ export type GitCommitRecord =
     }
   | { kind: "pathAt"; otype: number; mode: number; oid: GitOid; path: string };
 
-export type GitTreeRecord = {
-  kind: "entry";
-  otype: number;
-  mode: number;
-  oid: GitOid;
-  name: string;
-};
+export type GitTreeRecord =
+  | {
+      kind: "entry";
+      otype: number;
+      mode: number;
+      oid: GitOid;
+      name: string;
+    }
+  | GitCursorRecord;
 
 export type GitDiffRecord =
   | {
@@ -901,10 +1228,22 @@ export type GitDiffRecord =
       oldPath: string;
       newPath: string;
     }
+  | GitCursorRecord
   | { kind: "base"; oid: GitOid };
 
 export type GitPatchRecord =
-  | { kind: "file"; flags: number; oldPath: string; newPath: string }
+  | {
+      kind: "file";
+      /** ASCII porcelain letter, the {@link GitDiffRecord} alphabet — a
+       *  binary or empty added file emits no rows and still says whether
+       *  it was added, deleted or modified. */
+      st: number;
+      similarity: number;
+      flags: number;
+      /** The old path whenever there is an old side, not only renames. */
+      oldPath: string;
+      newPath: string;
+    }
   | {
       kind: "row";
       /** 1-based; 0 = side absent (pure addition/deletion). */
@@ -917,17 +1256,66 @@ export type GitPatchRecord =
       newSpans: Array<[number, number]>;
     }
   | { kind: "gap"; oldLine: number; newLine: number }
-  | { kind: "base"; oid: GitOid };
+  | { kind: "base"; oid: GitOid }
+  | GitCursorRecord;
 
-export type GitIndexRecord = {
-  kind: "entry";
-  stage: number;
-  iflags: number;
-  mode: number;
-  size: number;
-  mtimeNs: bigint;
-  oid: GitOid;
-  path: string;
+export type GitIndexRecord =
+  | {
+      kind: "entry";
+      stage: number;
+      iflags: number;
+      mode: number;
+      size: number;
+      mtimeNs: bigint;
+      oid: GitOid;
+      path: string;
+    }
+  | GitCursorRecord;
+
+/** One repository found by {@link msgGitDiscover}, deduped by gitdir. */
+export type GitDiscoverRecord =
+  | { kind: "repo"; flags: number; workdir: string; gitdir: string }
+  | GitCursorRecord;
+
+/** One contiguous attributed range. Author and message are deliberately
+ *  absent: resolve the distinct `commit` oids with one `GIT_LOG`, or find
+ *  them already in an oid-keyed cache. */
+export type GitBlameRecord =
+  | {
+      kind: "range";
+      flags: number;
+      commit: GitOid;
+      startLine: number;
+      lineCount: number;
+      origStart: number;
+      /** "" unless the range came from a different path. */
+      origPath: string;
+    }
+  | GitCursorRecord;
+
+export type GitReflogRecord =
+  | {
+      kind: "entry";
+      flags: number;
+      old: GitOid;
+      new: GitOid;
+      time: bigint;
+      tz: number;
+      msg: string;
+    }
+  | GitCursorRecord;
+
+/** What the remote answered for one ref. A remote can refuse one refspec
+ *  of several and still exit zero, so `status` per ref is how "did I
+ *  actually get these commits" is answered. */
+export type GitFetchRecord = {
+  kind: "ref";
+  flags: number;
+  status: number;
+  old: GitOid;
+  new: GitOid;
+  name: string;
+  detail: string;
 };
 
 /**
@@ -971,6 +1359,7 @@ export function gitStateRecords(data: Uint8Array): Generator<GitStateRecord> {
           oid: c.oid(),
           peeled: c.oid(),
           name: c.str(),
+          target: c.str(),
         } as const;
       case GIT_STATE_RECORD_OP:
         return {
@@ -985,6 +1374,7 @@ export function gitStateRecords(data: Uint8Array): Generator<GitStateRecord> {
           staged: c.u8(),
           unstaged: c.u8(),
           flags: c.u8(),
+          oid: c.oid(),
           oldPath: c.str(),
           path: c.str(),
         } as const;
@@ -1006,10 +1396,23 @@ export function gitStateRecords(data: Uint8Array): Generator<GitStateRecord> {
           tz: (c.u16() << 16) >> 16,
           msg: c.str(),
         } as const;
+      case GIT_STATE_RECORD_REMOTE:
+        return {
+          kind: "remote",
+          flags: c.u8(),
+          name: c.str(),
+          fetchUrl: c.str(),
+          pushUrl: c.str(),
+        } as const;
       default:
         return null;
     }
   });
+}
+
+/** The family-wide `CURSOR`, decoded the same way everywhere. */
+function cursor(c: Cursor): GitCursorRecord {
+  return { kind: "cursor", after: c.str(), pos: c.i64() };
 }
 
 export function gitCommitRecords(data: Uint8Array): Generator<GitCommitRecord> {
@@ -1064,6 +1467,7 @@ export function gitCommitRecords(data: Uint8Array): Generator<GitCommitRecord> {
 
 export function gitTreeRecords(data: Uint8Array): Generator<GitTreeRecord> {
   return records(data, (kind, c) => {
+    if (kind === GIT_RECORD_CURSOR) return cursor(c);
     if (kind !== GIT_TREE_RECORD_ENTRY) return null;
     return {
       kind: "entry",
@@ -1093,6 +1497,8 @@ export function gitDiffRecords(data: Uint8Array): Generator<GitDiffRecord> {
         } as const;
       case GIT_DIFF_RECORD_BASE:
         return { kind: "base", oid: c.oid() } as const;
+      case GIT_RECORD_CURSOR:
+        return cursor(c);
       default:
         return null;
     }
@@ -1105,6 +1511,8 @@ export function gitPatchRecords(data: Uint8Array): Generator<GitPatchRecord> {
       case GIT_PATCH_RECORD_FILE:
         return {
           kind: "file",
+          st: c.u8(),
+          similarity: c.u8(),
           flags: c.u8(),
           oldPath: c.str(),
           newPath: c.str(),
@@ -1134,6 +1542,8 @@ export function gitPatchRecords(data: Uint8Array): Generator<GitPatchRecord> {
         return { kind: "gap", oldLine: c.u32(), newLine: c.u32() } as const;
       case GIT_PATCH_RECORD_BASE:
         return { kind: "base", oid: c.oid() } as const;
+      case GIT_RECORD_CURSOR:
+        return cursor(c);
       default:
         return null;
     }
@@ -1142,6 +1552,7 @@ export function gitPatchRecords(data: Uint8Array): Generator<GitPatchRecord> {
 
 export function gitIndexRecords(data: Uint8Array): Generator<GitIndexRecord> {
   return records(data, (kind, c) => {
+    if (kind === GIT_RECORD_CURSOR) return cursor(c);
     if (kind !== GIT_INDEX_RECORD_ENTRY) return null;
     return {
       kind: "entry",
@@ -1152,6 +1563,68 @@ export function gitIndexRecords(data: Uint8Array): Generator<GitIndexRecord> {
       mtimeNs: c.u64(),
       oid: c.oid(),
       path: c.str(),
+    } as const;
+  });
+}
+
+export function gitDiscoverRecords(
+  data: Uint8Array,
+): Generator<GitDiscoverRecord> {
+  return records(data, (kind, c) => {
+    if (kind === GIT_RECORD_CURSOR) return cursor(c);
+    if (kind !== GIT_DISCOVER_RECORD_REPO) return null;
+    return {
+      kind: "repo",
+      flags: c.u8(),
+      workdir: c.str(),
+      gitdir: c.str(),
+    } as const;
+  });
+}
+
+export function gitBlameRecords(data: Uint8Array): Generator<GitBlameRecord> {
+  return records(data, (kind, c) => {
+    if (kind === GIT_RECORD_CURSOR) return cursor(c);
+    if (kind !== GIT_BLAME_RECORD_RANGE) return null;
+    return {
+      kind: "range",
+      flags: c.u8(),
+      commit: c.oid(),
+      startLine: c.u32(),
+      lineCount: c.u32(),
+      origStart: c.u32(),
+      origPath: c.str(),
+    } as const;
+  });
+}
+
+export function gitReflogRecords(data: Uint8Array): Generator<GitReflogRecord> {
+  return records(data, (kind, c) => {
+    if (kind === GIT_RECORD_CURSOR) return cursor(c);
+    if (kind !== GIT_REFLOG_RECORD_ENTRY) return null;
+    return {
+      kind: "entry",
+      flags: c.u8(),
+      old: c.oid(),
+      new: c.oid(),
+      time: c.i64(),
+      tz: (c.u16() << 16) >> 16,
+      msg: c.str(),
+    } as const;
+  });
+}
+
+export function gitFetchRecords(data: Uint8Array): Generator<GitFetchRecord> {
+  return records(data, (kind, c) => {
+    if (kind !== GIT_FETCH_RECORD_REF) return null;
+    return {
+      kind: "ref",
+      flags: c.u8(),
+      status: c.u8(),
+      old: c.oid(),
+      new: c.oid(),
+      name: c.str(),
+      detail: c.str(),
     } as const;
   });
 }
@@ -1174,6 +1647,7 @@ export function appendGitStateRecord(
       pushOid(buf, record.oid);
       pushOid(buf, record.peeled);
       pushStr(buf, record.name);
+      pushStr(buf, record.target);
       break;
     case "op":
       buf.push(GIT_STATE_RECORD_OP, record.op);
@@ -1187,6 +1661,7 @@ export function appendGitStateRecord(
         record.unstaged,
         record.flags,
       );
+      pushOid(buf, record.oid);
       pushStr(buf, record.oldPath);
       pushStr(buf, record.path);
       break;
@@ -1205,6 +1680,12 @@ export function appendGitStateRecord(
       pushU16(buf, record.tz & 0xffff);
       pushStr(buf, record.msg);
       break;
+    case "remote":
+      buf.push(GIT_STATE_RECORD_REMOTE, record.flags);
+      pushStr(buf, record.name);
+      pushStr(buf, record.fetchUrl);
+      pushStr(buf, record.pushUrl);
+      break;
   }
   const len = buf.length - start - 4;
   buf[start] = len & 0xff;
@@ -1214,6 +1695,38 @@ export function appendGitStateRecord(
 }
 
 // -- Connection-level API shapes --------------------------------------------
+
+/** One repository found by {@link BlitConnection.discoverRepos}. */
+export interface GitFoundRepo {
+  /** Worktree root; empty for a bare repository. */
+  workdir: string;
+  /** Canonical git directory — the identity the server dedupes on, and the
+   *  one `GIT_REPO` reports for an open of this repository. */
+  gitdir: string;
+  bare: boolean;
+  /** A linked worktree (`git worktree add`). */
+  linked: boolean;
+  submodule: boolean;
+}
+
+export interface GitDiscoverOptions {
+  /** Directory levels to descend; 0 = the server default (4), clamped. */
+  depth?: number;
+  /** Descend *into* a repository once one is found. Off by default, so a
+   *  tree full of vendored checkouts costs nothing. */
+  nested?: boolean;
+  /** Report bare repositories too. */
+  bare?: boolean;
+  /** Each page as it lands, for a caller rendering progressively. The
+   *  promise still resolves with every repository found. */
+  onPage?: (repos: GitFoundRepo[]) => void;
+  /** Bound on pages followed (default 64), for a walk over a tree being
+   *  written to underneath it. */
+  maxPages?: number;
+  /** Abort the walk; the promise rejects with a cancelled
+   *  {@link GitStatusError}. */
+  signal?: AbortSignal;
+}
 
 export interface GitOpenOptions {
   /** Stream `GIT_STATE` snapshots (implied by status/tracking). */
@@ -1226,6 +1739,15 @@ export interface GitOpenOptions {
   ignored?: boolean;
   /** Include per-branch upstream ahead/behind records. */
   tracking?: boolean;
+  /** Include one `STATE_REMOTE` record per configured remote. */
+  remotes?: boolean;
+  /** Open a submodule of this already-open repo: `path` is then relative
+   *  to its worktree and the server resolves the submodule's own gitdir,
+   *  so a client never has to guess where `.gitmodules` put it. */
+  parentRepoId?: number;
+  /** Ref prefixes to watch; empty watches every ref. A UI that renders
+   *  branches and never tags stops paying for tags at every settle. */
+  refPrefixes?: string[];
   /** Ref settle window in ms; 0 = server default (50). */
   refsLatencyMs?: number;
   /** Status settle window in ms; 0 = server default (500). */
@@ -1256,30 +1778,100 @@ export interface GitRepoHandle extends ReactiveStore {
   /** One page of `hides..tips`; continue with `frontier` as `tips`. */
   log(
     req?: Partial<Omit<GitLogRequest, "nonce" | "repoId">>,
+    opts?: GitRequestOptions,
   ): Promise<GitCommitsPage>;
-  /** One tree level; oid may be a commit/tag (peeled server-side). */
-  tree(oid: GitOid, path?: string): Promise<GitTreeRecord[]>;
-  /** Raw object bytes, cached by oid (immutable, cache-forever). */
-  blob(oid: GitOid, path?: string, maxLen?: number): Promise<Uint8Array>;
+  /** One tree level; oid may be a commit/tag (peeled server-side).
+   *  A truncated listing ends with a `cursor` record — pass its `after`
+   *  to continue. */
+  tree(
+    oid: GitOid,
+    path?: string,
+    opts?: GitRequestOptions & { after?: string },
+  ): Promise<GitTreeRecord[]>;
+  /** Object bytes, cached by oid (immutable, cache-forever).
+   *  A read is a window: `offset` plus `maxLen`, with the whole object
+   *  only when {@link GIT_BLOB_WHOLE} is set in `flags`. */
+  blob(
+    oid: GitOid,
+    path?: string,
+    maxLen?: number,
+    opts?: GitRequestOptions & { offset?: number; flags?: number },
+  ): Promise<Uint8Array>;
   /** File-level diff records between two endpoints. */
   diff(
     old: GitEndpoint,
     newEndpoint: GitEndpoint,
-    opts?: { flags?: number; path?: string },
+    opts?: GitRequestOptions & {
+      flags?: number;
+      path?: string;
+      /** Rename similarity threshold; 0 = the exact-oid join. */
+      rename?: number;
+      after?: string;
+    },
   ): Promise<GitDiffRecord[]>;
   /** Patch rows (default) or unified text (`GIT_PATCH_TEXT`). */
   patch(
     old: GitEndpoint,
     newEndpoint: GitEndpoint,
-    opts?: { flags?: number; context?: number; path?: string; maxLen?: number },
+    opts?: GitRequestOptions & {
+      flags?: number;
+      context?: number;
+      path?: string;
+      maxLen?: number;
+      rename?: number;
+      after?: string;
+      afterPos?: number;
+    },
   ): Promise<{ flags: number; records: GitPatchRecord[]; text: Uint8Array }>;
   /** Index entries under a path prefix. */
-  index(path?: string): Promise<GitIndexRecord[]>;
+  index(
+    path?: string,
+    opts?: GitRequestOptions & { after?: string },
+  ): Promise<GitIndexRecord[]>;
   /** Merge base of two or more commits; empty = disjoint histories. */
-  mergeBase(oids: GitOid[]): Promise<GitOid[]>;
+  mergeBase(oids: GitOid[], opts?: GitRequestOptions): Promise<GitOid[]>;
   /** Resolve a revision spec (ref, oid, `HEAD~3`, `A..B`, `A...B`) to the
    *  `tips`/`hides` a {@link log} or {@link watchLog} walks between. */
-  resolve(spec: string): Promise<{ tips: GitOid[]; hides: GitOid[] }>;
+  resolve(
+    spec: string,
+    opts?: GitRequestOptions,
+  ): Promise<{ tips: GitOid[]; hides: GitOid[] }>;
+  /** Line attribution. Author and message are deliberately absent: resolve
+   *  the returned commit oids with one {@link log}, or find them already in
+   *  the oid-keyed cache. A blame the line budget cut short ends with a
+   *  `cursor` record — continue with `startLine` one past its `pos`. */
+  blame(
+    path: string,
+    opts?: GitRequestOptions & {
+      oid?: GitOid;
+      startLine?: number;
+      lineCount?: number;
+      flags?: number;
+    },
+  ): Promise<GitBlameRecord[]>;
+  /** Reflog entries for a ref ("" = HEAD), newest-first by default. The
+   *  only way to name an oid no longer reachable from any ref. A reflog
+   *  longer than `limit` ends with a `cursor` record — continue with
+   *  `afterPos` set to its `pos`. */
+  reflog(
+    refName?: string,
+    opts?: GitRequestOptions & {
+      flags?: number;
+      limit?: number;
+      afterPos?: number;
+    },
+  ): Promise<GitReflogRecord[]>;
+  /** Fetch from a remote, reporting per-ref what happened — so "did I
+   *  actually get these commits" is answerable from the reply rather than
+   *  from an exit code that lies. */
+  fetch(
+    opts?: GitRequestOptions & {
+      remote?: string;
+      refspecs?: string[];
+      flags?: number;
+      timeoutMs?: number;
+    },
+  ): Promise<GitFetchRecord[]>;
   /** Subscribe to a server-pushed log of `spec`. `onUpdate` fires with the
    *  first page and again whenever the resolved endpoints move (a named ref
    *  changes). Pages are acknowledged automatically. `close()` unsubscribes. */
@@ -1290,6 +1882,14 @@ export interface GitRepoHandle extends ReactiveStore {
   ): GitLogSubscription;
   /** Close the repo; `onClosed` fires when the server confirms. */
   close(): void;
+}
+
+/** Options every git request accepts. */
+export interface GitRequestOptions {
+  /** Abort the request. The promise rejects immediately with a
+   *  {@link GitStatusError} whose `cancelled` is true, and `GIT_CANCEL`
+   *  goes to the server. */
+  signal?: AbortSignal;
 }
 
 export interface GitLogWatchOptions {
@@ -1305,6 +1905,23 @@ export interface GitLogSubscription {
   readonly logId: number;
   /** Unsubscribe; sends `GIT_LOG_UNWATCH` and stops delivering pages. */
   close(): void;
+}
+
+/**
+ * Whether a `STATE_REF` name is a gitdir **pseudo-ref** — `MERGE_HEAD`,
+ * `ORIG_HEAD`, `CHERRY_PICK_HEAD`, `REBASE_HEAD`, `REVERT_HEAD`, and the
+ * `MERGE_HEAD#2…` an octopus adds — rather than a real ref.
+ *
+ * They share the ref stream (an in-progress operation is repository state
+ * like any other) but they are not refs: git resolves them from the gitdir,
+ * they disappear when the operation ends, and none of them is something a
+ * client can check out. The distinction is the missing `refs/` prefix, and
+ * it is here so that a consumer inverting `state.refs` into an oid → names
+ * decoration map has one call to make rather than a rule to rediscover —
+ * without it `ORIG_HEAD` renders as though it were a branch.
+ */
+export function isGitPseudoRef(name: string): boolean {
+  return !name.startsWith("refs/");
 }
 
 /** Human-readable unified-status text. */
@@ -1326,8 +1943,51 @@ export function gitStatusText(status: number): string {
       return "invalid request";
     case GIT_STATUS_CANCELLED:
       return "cancelled";
+    case GIT_STATUS_OTHER:
+      return "backend error";
+    case GIT_STATUS_CONFLICT:
+      return "conflict";
     default:
-      return "error";
+      // Total on purpose: a log must not conflate "the backend failed"
+      // with "this build does not know that code".
+      return `unknown status ${status}`;
+  }
+}
+
+/**
+ * A rejected git request, carrying the status byte the wire already had.
+ *
+ * Without it the only test available to a consumer is
+ * `error.message.includes("not found")`, and a false positive there turns
+ * a recoverable transport blip into a hard failure — which is why a
+ * consumer that wanted to treat `NOT_FOUND` as "fetch it" and anything
+ * else as a real error wrote that code and then reverted it.
+ *
+ * `message` keeps the human-readable form, so existing string matching
+ * still works; `status` is the supported test.
+ */
+export class GitStatusError extends Error {
+  /** A `GIT_STATUS_*` code. */
+  readonly status: number;
+  /** `GIT_REPO`'s diagnostic, else "". */
+  readonly detail: string;
+  /** Which request failed — "open", "log", "diff", … */
+  readonly op: string;
+
+  constructor(op: string, status: number, detail = "") {
+    super(
+      `${op} failed: ${gitStatusText(status)}${detail ? `: ${detail}` : ""}`,
+    );
+    this.name = "GitStatusError";
+    this.status = status;
+    this.detail = detail;
+    this.op = op;
+  }
+
+  /** True when the request ended because the caller aborted it, rather
+   *  than because it failed — indistinguishable before this class. */
+  get cancelled(): boolean {
+    return this.status === GIT_STATUS_CANCELLED;
   }
 }
 
@@ -1344,6 +2004,17 @@ export interface GitRefState {
   flags: number;
   oid: GitOid;
   peeled: GitOid;
+  /** The symbolic target's ref name with {@link GIT_REF_SYMBOLIC}, else
+   *  "". How a client names the default branch instead of guessing. */
+  target: string;
+}
+
+export interface GitRemoteState {
+  flags: number;
+  /** As configured, userinfo included. */
+  fetchUrl: string;
+  /** "" when it equals {@link fetchUrl}. */
+  pushUrl: string;
 }
 
 export interface GitUpstreamState {
@@ -1357,6 +2028,10 @@ export interface GitStatusEntry {
   staged: number;
   unstaged: number;
   flags: number;
+  /** The worktree content's hash when the status walk read the file, else
+   *  zero. A write that leaves the letters alone still moves this, so the
+   *  snapshot is not suppressed as a duplicate (indent-com/blit#120). */
+  oid: GitOid;
   oldPath: string;
   path: string;
 }
@@ -1386,20 +2061,57 @@ export class GitStateMirror {
   status: GitStatusEntry[] = [];
   upstreams = new Map<string, GitUpstreamState>();
   stashes: GitStashEntry[] = [];
+  /** Keyed by remote name; populated with the `REMOTES` open flag. */
+  remotes = new Map<string, GitRemoteState>();
   flags = 0;
+  /** Records buffered from `PARTIAL` chunks of the snapshot in flight. */
+  #pending: Uint8Array[] = [];
+  #pendingStateId = -1;
 
-  /** Apply one `S2C_GIT_STATE` message; returns the `state_id` to ack,
-   *  or null when malformed. */
+  /**
+   * Apply one `S2C_GIT_STATE` message.
+   *
+   * Returns the `state_id` to acknowledge, or null when the snapshot is
+   * not yet complete (a `PARTIAL` chunk was buffered) or the message was
+   * malformed. In both of those cases there is nothing to acknowledge and
+   * nothing new to render, so one null covers them.
+   */
   applyState(msg: Uint8Array): number | null {
     const parsed = parseGitState(msg);
-    if (parsed === null) return null;
-    const [, stateId, flags, recordBytes] = parsed;
+    if (parsed === null) {
+      this.#pending = [];
+      return null;
+    }
+    const [, stateId, flags, chunk] = parsed;
+    // A chunk for a different snapshot supersedes whatever was buffered:
+    // the server only moves forward, so a stale partial is dead.
+    if (stateId !== this.#pendingStateId) {
+      this.#pending = [];
+      this.#pendingStateId = stateId;
+    }
+    if ((flags & GIT_STATE_PARTIAL) !== 0) {
+      this.#pending.push(chunk);
+      return null;
+    }
+    let recordBytes = chunk;
+    if (this.#pending.length > 0) {
+      const parts = [...this.#pending, chunk];
+      const total = parts.reduce((n, part) => n + part.length, 0);
+      recordBytes = new Uint8Array(total);
+      let at = 0;
+      for (const part of parts) {
+        recordBytes.set(part, at);
+        at += part.length;
+      }
+      this.#pending = [];
+    }
     this.head = null;
     this.refs = new Map();
     this.op = null;
     this.status = [];
     this.upstreams = new Map();
     this.stashes = [];
+    this.remotes = new Map();
     this.flags = flags;
     for (const record of gitStateRecords(recordBytes)) {
       switch (record.kind) {
@@ -1415,6 +2127,7 @@ export class GitStateMirror {
             flags: record.flags,
             oid: record.oid,
             peeled: record.peeled,
+            target: record.target,
           });
           break;
         case "op":
@@ -1425,6 +2138,7 @@ export class GitStateMirror {
             staged: record.staged,
             unstaged: record.unstaged,
             flags: record.flags,
+            oid: record.oid,
             oldPath: record.oldPath,
             path: record.path,
           });
@@ -1444,6 +2158,13 @@ export class GitStateMirror {
             time: record.time,
             tz: record.tz,
             message: record.msg,
+          });
+          break;
+        case "remote":
+          this.remotes.set(record.name, {
+            flags: record.flags,
+            fetchUrl: record.fetchUrl,
+            pushUrl: record.pushUrl,
           });
           break;
       }

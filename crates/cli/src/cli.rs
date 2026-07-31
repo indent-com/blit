@@ -960,6 +960,26 @@ pub enum FsCommand {
         #[arg(long)]
         no_recursive: bool,
 
+        /// Honor .gitignore, $GIT_DIR/info/exclude and core.excludesFile
+        #[arg(long)]
+        gitignore: bool,
+
+        /// Honor .ignore files (ripgrep's convention)
+        #[arg(long)]
+        dot_ignore: bool,
+
+        /// Shorthand for --gitignore --dot-ignore --exclude-git
+        #[arg(long)]
+        ignore: bool,
+
+        /// Skip .git directories and gitfiles
+        #[arg(long)]
+        exclude_git: bool,
+
+        /// Skip paths matching a gitignore-syntax pattern (repeatable)
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+
         /// Exit after the initial snapshot instead of streaming
         #[arg(long)]
         once: bool,
@@ -1289,6 +1309,11 @@ pub enum GitCommand {
         #[arg(short = 'p', long)]
         patch: bool,
 
+        /// With -p, include binary content as a GIT binary patch block, so
+        /// `git apply --binary` can replay it (git's --binary)
+        #[arg(long)]
+        binary: bool,
+
         /// NDJSON output
         #[arg(long)]
         json: bool,
@@ -1360,6 +1385,128 @@ pub enum GitCommand {
         /// Repository path on the server
         #[arg(long, default_value = ".")]
         repo: String,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Who last touched each line (like `git blame`)
+    ///
+    /// Prints `OID LINE) TEXT`-less attribution: one row per contiguous
+    /// range, since the ranges are what the server computes. Resolve the
+    /// oids with `blit git log` if you want authors.
+    Blame {
+        /// File to blame
+        path: String,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Revision to blame from (default: HEAD)
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// First line (1-based); with --lines, the start of the range
+        #[arg(long)]
+        start: Option<u32>,
+
+        /// How many lines to attribute — a viewport blame is cheap, a
+        /// whole large file is not
+        #[arg(long)]
+        lines: Option<u32>,
+
+        /// Follow renames (git's -M)
+        #[arg(short = 'M', long)]
+        follow: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// A ref's reflog (like `git reflog`)
+    ///
+    /// The only way to name an oid no longer reachable from any ref — an
+    /// amended or reset-away commit that `log` cannot reach.
+    Reflog {
+        /// Ref to read (default: HEAD)
+        #[arg(default_value = "")]
+        ref_name: String,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Maximum entries to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: u16,
+
+        /// Oldest first (default is newest first, like git)
+        #[arg(long)]
+        reverse: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Find repositories under a path
+    ///
+    /// TSV: WORKDIR<TAB>GITDIR. Deduped by gitdir, so several paths
+    /// resolving to one repository report once.
+    Discover {
+        /// Directory to search (default: server cwd)
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// How deep to descend
+        #[arg(long, default_value_t = 4)]
+        depth: u8,
+
+        /// Descend into repositories after finding one
+        #[arg(long)]
+        nested: bool,
+
+        /// Report bare repositories too
+        #[arg(long)]
+        bare: bool,
+
+        /// NDJSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Fetch from a remote, reporting per-ref what happened
+    ///
+    /// Runs the server's own `git fetch`, so its credential helpers and
+    /// config apply. Exits 1 if any ref was refused — unlike `git fetch`,
+    /// which can exit 0 having refused one refspec of several.
+    Fetch {
+        /// Remote name (default: origin)
+        #[arg(default_value = "")]
+        remote: String,
+
+        /// Refspecs to fetch (default: the remote's configured ones)
+        refspecs: Vec<String>,
+
+        /// Repository path on the server
+        #[arg(long, default_value = ".")]
+        repo: String,
+
+        /// Delete remote-tracking refs the remote no longer has
+        #[arg(long)]
+        prune: bool,
+
+        /// Anchor fetched tips under refs/blit/fetch/ so a concurrent gc
+        /// cannot prune them
+        #[arg(long)]
+        anchor: bool,
+
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 120)]
+        timeout: u32,
 
         /// NDJSON output
         #[arg(long)]

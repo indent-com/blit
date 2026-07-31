@@ -14,15 +14,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use blit_remote::git::{
-    GIT_OID_FORMAT_SHA1, GIT_OID_FORMAT_SHA256, GIT_REPO_BARE, GIT_REPO_LINKED, GIT_REPO_SHALLOW,
-    GIT_REPO_SPARSE, GIT_STATUS_NOT_FOUND, GIT_STATUS_OTHER, GIT_STATUS_PERMISSION,
-    GIT_STATUS_WRONG_TYPE, GitOid,
+    GIT_OID_FORMAT_SHA1, GIT_OID_FORMAT_SHA256, GIT_REPO_BARE, GIT_REPO_FETCHABLE, GIT_REPO_LINKED,
+    GIT_REPO_SHALLOW, GIT_REPO_SPARSE, GIT_STATUS_NOT_FOUND, GIT_STATUS_OTHER,
+    GIT_STATUS_PERMISSION, GIT_STATUS_WRONG_TYPE, GitOid,
 };
 
 mod diffs;
+mod reads;
 mod requests;
 mod state;
 
+pub use reads::{DiscoverLimits, discover, discover_within, open_submodule};
 pub use state::{StateHandle, StateOptions};
 #[doc(hidden)]
 pub use state::{debug_engine_refs, debug_status_recomputes};
@@ -57,6 +59,15 @@ pub struct Budgets {
     /// partial view. A big worktree holds far more entries than final status
     /// records, so this is generous and independent of `entries_max`.
     pub untracked_scan_max: usize,
+    /// Unmatched add/delete candidate pairs the similarity rename pass
+    /// will consider before falling back to the exact-oid join and
+    /// reporting `RENAME_LIMIT`. git's own guard, under its own name
+    /// (`diff.renameLimit`), because the pass is quadratic.
+    pub rename_limit: usize,
+    /// Lines one `GIT_BLAME` response attributes before it truncates with a
+    /// `CURSOR`. Blaming a viewport is cheap and blaming a 200 000-line file
+    /// is not, so this bounds a response rather than the answer.
+    pub blame_lines_max: u32,
     /// Concurrent `GIT_LOG_WATCH` subscriptions per repo. `log_id` is
     /// client-assigned (a u16), so the engine's subscription map is keyed by
     /// untrusted input; this bounds it. A handful of watched logs covers any
@@ -75,9 +86,19 @@ impl Default for Budgets {
             walk_max: env_u64("BLIT_GIT_WALK_MAX", 100_000) as usize,
             bytes_max: env_u64("BLIT_GIT_BYTES_MAX", 8 * 1024 * 1024) as usize,
             untracked_scan_max: env_u64("BLIT_GIT_UNTRACKED_SCAN_MAX", 1_000_000) as usize,
+            rename_limit: env_u64("BLIT_GIT_RENAME_LIMIT", 1_000) as usize,
+            blame_lines_max: env_u64("BLIT_GIT_BLAME_LINES_MAX", 50_000).max(1) as u32,
             max_log_subs: env_u64("BLIT_GIT_MAX_LOG_SUBS", 64) as usize,
         }
     }
+}
+
+pub(crate) fn env_u64_pub(name: &str, default: u64) -> u64 {
+    env_u64(name, default)
+}
+
+pub(crate) fn env_usize(name: &str, default: usize) -> usize {
+    env_u64(name, default as u64) as usize
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -239,6 +260,12 @@ pub fn open(path: &str) -> Result<(RepoHandle, RepoInfo), (u8, String)> {
         .unwrap_or(false)
     {
         flags |= GIT_REPO_SPARSE;
+    }
+    // Capability, answered per repository rather than per connection: a
+    // box without `git` or with BLIT_GIT_FETCH=0 cannot fetch this repo
+    // or any other, and a client should learn that at open.
+    if crate::reads::fetch_available() {
+        flags |= GIT_REPO_FETCHABLE;
     }
     let info = RepoInfo {
         oid_format,

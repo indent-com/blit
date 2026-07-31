@@ -3,13 +3,14 @@
 //! repository, and returns the complete response message.
 
 use blit_remote::git::{
-    GIT_COMMIT_LOSSY_ENCODING, GIT_COMMITS_MORE, GIT_LOG_FIRST_PARENT, GIT_LOG_FOLLOW,
-    GIT_LOG_FULL_MESSAGE, GIT_LOG_PATH_OIDS, GIT_LOG_TOPO, GIT_OID_NONE, GIT_OTYPE_BLOB,
-    GIT_OTYPE_COMMIT, GIT_OTYPE_TREE, GIT_STATUS_BUDGET, GIT_STATUS_CANCELLED, GIT_STATUS_INVALID,
-    GIT_STATUS_NOT_FOUND, GIT_STATUS_OK, GIT_STATUS_OTHER, GIT_STATUS_TOO_LARGE,
-    GIT_STATUS_WRONG_TYPE, GIT_TREE_TRUNCATED, GitCommitRecord, GitLogRequest, GitOid,
-    GitTreeRecord, append_git_commit_record, append_git_tree_record, msg_git_base_resp,
-    msg_git_blob_resp, msg_git_commits, msg_git_resolve_resp, msg_git_tree_resp,
+    GIT_BLOB_WHOLE, GIT_COMMIT_LOSSY_ENCODING, GIT_COMMITS_MORE, GIT_LOG_FIRST_PARENT,
+    GIT_LOG_FOLLOW, GIT_LOG_FULL_MESSAGE, GIT_LOG_PATH_OIDS, GIT_LOG_TOPO, GIT_OID_NONE,
+    GIT_OTYPE_BLOB, GIT_OTYPE_COMMIT, GIT_OTYPE_TREE, GIT_STATUS_BUDGET, GIT_STATUS_CANCELLED,
+    GIT_STATUS_INVALID, GIT_STATUS_NOT_FOUND, GIT_STATUS_OK, GIT_STATUS_OTHER,
+    GIT_STATUS_TOO_LARGE, GIT_STATUS_WRONG_TYPE, GIT_TREE_TRUNCATED, GitBlobRequest,
+    GitCommitRecord, GitLogRequest, GitOid, GitTreeRecord, GitTreeRequest,
+    append_git_commit_record, append_git_tree_record, msg_git_base_resp, msg_git_blob_resp,
+    msg_git_commits, msg_git_resolve_resp, msg_git_tree_resp,
 };
 
 use crate::{Budgets, Cancel, RepoHandle, commit_text, is_zero_oid, oid_bytes, oid_from_wire};
@@ -80,28 +81,61 @@ impl RepoHandle {
     }
 
     /// `GIT_TREE`: one level of a tree, oid peeled and `path` descended.
-    pub fn tree(&self, nonce: u16, oid: &GitOid, path: &str, cancel: &Cancel) -> Vec<u8> {
+    pub fn tree(&self, req: &GitTreeRequest<'_>, cancel: &Cancel) -> Vec<u8> {
+        let nonce = req.nonce;
         let repo = self.local();
         let fail = |status: u8| msg_git_tree_resp(nonce, status, 0, &[]);
-        let tree = match resolve_tree(&repo, oid, path) {
+        if req.flags != 0 {
+            return fail(GIT_STATUS_INVALID);
+        }
+        let tree = match resolve_tree(&repo, &req.oid, req.path) {
             Ok(tree) => tree,
             Err(status) => return fail(status),
         };
+        // Resuming a truncated listing: tree entries are already in git's
+        // own order, which the cursor makes normative.
+        let after = match crate::unescape_wire(req.after) {
+            Some(bytes) => bytes,
+            None => return fail(GIT_STATUS_OTHER),
+        };
         let mut records = Vec::new();
         let mut flags = 0u8;
-        for (count, entry) in tree.iter().enumerate() {
+        let mut count = 0usize;
+        let mut last = Vec::new();
+        for entry in tree.iter() {
             if cancel.is_cancelled() {
                 return fail(GIT_STATUS_CANCELLED);
             }
             let Ok(entry) = entry else {
                 return fail(GIT_STATUS_OTHER);
             };
+            let filename = entry.filename();
+            let mode = entry.mode();
+            // The cursor is compared in the order the entries arrive in,
+            // which is git's: a subtree sorts as if its name ended in `/`.
+            // Comparing raw names instead disagrees with that order wherever
+            // a blob and a subtree share a prefix — `lib.rs` sorts before
+            // `lib` in a tree (`.` is 0x2e, `/` is 0x2f) but after it
+            // bytewise — and a page boundary landing between them silently
+            // dropped the subtree from the listing.
+            let key = git_order_key(filename.as_ref(), mode);
+            if !after.is_empty() && key <= after {
+                continue;
+            }
             if count >= self.budgets.entries_max || records.len() >= self.budgets.bytes_max {
                 flags |= GIT_TREE_TRUNCATED;
+                append_git_tree_record(
+                    &mut records,
+                    &GitTreeRecord::Cursor {
+                        after: &crate::escape_bstr(&last),
+                        pos: 0,
+                    },
+                );
                 break;
             }
-            let mode = entry.mode();
-            let name = crate::escape_bstr(entry.filename());
+            count += 1;
+            last = key;
+            let name = crate::escape_bstr(filename);
             append_git_tree_record(
                 &mut records,
                 &GitTreeRecord::Entry {
@@ -115,10 +149,21 @@ impl RepoHandle {
         msg_git_tree_resp(nonce, GIT_STATUS_OK, flags, &records)
     }
 
-    /// `GIT_BLOB`: raw object bytes, size-capped, cache-forever.
-    pub fn blob(&self, nonce: u16, oid: &GitOid, path: &str, max_len: u32) -> Vec<u8> {
+    /// `GIT_BLOB`: object bytes from `offset`, size-capped, cache-forever.
+    ///
+    /// A window is the default: a viewer that would happily render the head
+    /// of a 20 MiB generated file gets it, where the whole-object-only read
+    /// gave it nothing at all. `WHOLE` asks for the old behavior — the
+    /// entire object or `TOO_LARGE` — for a caller that must hash or parse
+    /// the file and gains nothing from a prefix.
+    pub fn blob(&self, req: &GitBlobRequest<'_>) -> Vec<u8> {
+        let nonce = req.nonce;
+        let (oid, path, max_len) = (&req.oid, req.path, req.max_len);
         let repo = self.local();
         let fail = |status: u8, size: u64| msg_git_blob_resp(nonce, status, size, &[]);
+        if req.flags & !GIT_BLOB_WHOLE != 0 {
+            return fail(GIT_STATUS_INVALID, 0);
+        }
         let blob_id = if path.is_empty() {
             oid_from_wire(&repo, oid)
         } else {
@@ -143,11 +188,24 @@ impl RepoHandle {
             u64::from(max_len).min(self.budgets.blob_max)
         }
         .min(blit_remote::MAX_DECOMPRESSED as u64);
-        if size > cap {
+        // `size` is always the true object size, so a client always knows
+        // how much of the object it is holding.
+        if req.offset > size {
+            return fail(GIT_STATUS_INVALID, size);
+        }
+        // Without WHOLE there is no refusal: the client gets what fits from
+        // `offset` and walks, comparing `offset + data.len()` against `size`
+        // to know when it is done.
+        if req.flags & GIT_BLOB_WHOLE != 0 && size > cap {
             return fail(GIT_STATUS_TOO_LARGE, size);
         }
         match repo.find_object(blob_id) {
-            Ok(obj) => msg_git_blob_resp(nonce, GIT_STATUS_OK, size, &obj.data),
+            Ok(obj) => {
+                let start = req.offset as usize;
+                let end = start.saturating_add(cap as usize).min(obj.data.len());
+                let window = obj.data.get(start..end).unwrap_or(&[]);
+                msg_git_blob_resp(nonce, GIT_STATUS_OK, size, window)
+            }
             Err(_) => fail(GIT_STATUS_NOT_FOUND, 0),
         }
     }
@@ -871,6 +929,19 @@ fn append_commit(
         },
     );
     true
+}
+
+/// An entry's sort key in git's canonical tree order: the name, with `/`
+/// appended for a subtree. Git orders a tree as if every directory name
+/// ended in a slash, and the `GIT_TREE` cursor is compared in that order —
+/// so the cursor carries the key, not the bare name, and a boundary between
+/// `lib` and `lib.rs` resumes correctly in either arrangement.
+fn git_order_key(filename: &[u8], mode: gix::object::tree::EntryMode) -> Vec<u8> {
+    let mut key = filename.to_vec();
+    if mode.is_tree() {
+        key.push(b'/');
+    }
+    key
 }
 
 pub(crate) fn otype_of_mode(mode: u32) -> u8 {

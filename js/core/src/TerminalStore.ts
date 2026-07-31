@@ -46,10 +46,8 @@ export class TerminalStore {
   private disposed = false;
   private ready = false;
   private readyListeners = new Set<() => void>();
-  private frozenPtys = new Set<number>();
   /** Incremented every time any terminal's cell metrics are set, so renderers can detect stale state. */
   metricsGeneration = 0;
-  private frozenBuffers = new Map<number, Uint8Array[]>();
   private sharedRenderer: GlRenderer | null = null;
   private sharedCanvas: HTMLCanvasElement | null = null;
   private webgpuProbe: Promise<void> | null = null;
@@ -84,6 +82,12 @@ export class TerminalStore {
           if (this.disposed) return;
           this.mod = mod;
           this.ready = true;
+          // Replay whatever arrived while the module was loading, then repaint:
+          // `BlitTerminalSurface.doRender` drops a frame outright while
+          // `wasmMemory()` is null and never retries, so surfaces that asked
+          // for a frame during the load window are still showing nothing.
+          this.drainQueuedFrames();
+          this.notifyAllDirty();
           for (const l of this.readyListeners) l();
         })
         .catch((err) => {
@@ -100,7 +104,9 @@ export class TerminalStore {
   private probeWebGpu(): void {
     if (typeof navigator === "undefined" || !navigator.gpu) return;
     const canvas = document.createElement("canvas");
-    this.webgpuProbe = createWebGpuRenderer(canvas)
+    this.webgpuProbe = createWebGpuRenderer(canvas, () =>
+      this.handleWebGpuLost(),
+    )
       .then((r) => {
         if (this.disposed) {
           r?.dispose();
@@ -115,6 +121,13 @@ export class TerminalStore {
             this.sharedRenderer.dispose();
             this.sharedRenderer = r;
             this.sharedCanvas = canvas;
+            // Surfaces cache the renderer and only re-fetch once `supported`
+            // goes false (see gl-renderer), so the swap is picked up on a
+            // surface's *next* render — and nothing here was scheduling one.
+            // An idle pane therefore kept displaying its last pre-swap
+            // composite until output arrived or the cursor blink fired 530ms
+            // later, and a read-only surface (no blink) kept it for good.
+            this.notifyAllDirty();
           }
         }
       })
@@ -234,21 +247,21 @@ export class TerminalStore {
 
   handleUpdate(ptyId: number, payload: Uint8Array): void {
     this.pendingAcks++;
-    // Buffer frames for frozen PTYs (e.g. during selection).
-    if (this.frozenPtys.has(ptyId)) {
-      let buf = this.frozenBuffers.get(ptyId);
-      if (!buf) {
-        buf = [];
-        this.frozenBuffers.set(ptyId, buf);
-      }
-      buf.push(new Uint8Array(payload));
+
+    // No WASM yet: queue, don't drop. Frames are deltas against the state the
+    // server believes we hold (see the ops encoder in crates/remote), and it
+    // never resends — so a discarded frame desyncs the grid until the next
+    // re-subscribe. On a cold load the discarded one is typically the full
+    // frame that follows subscribe, which is what leaves a pane blank or
+    // half-painted with cells that no later update ever corrects.
+    if (!this.mod) {
+      this.queueFrame(ptyId, payload);
       return;
     }
 
     const applyStart = this.nowMs();
     let terminal = this.terminals.get(ptyId);
     if (!terminal) {
-      if (!this.mod) return;
       terminal = this.createTerminal();
       this.terminals.set(ptyId, terminal);
       const stale = this.staleTerminals.get(ptyId);
@@ -318,6 +331,53 @@ export class TerminalStore {
     return canvas;
   }
 
+  /**
+   * Throw away the shared renderer after a GPU context or device loss, so the
+   * next {@link getSharedRenderer} builds a replacement.
+   *
+   * The canvas goes with it, and that is the point: a canvas keeps the context
+   * it was first given for life. A canvas whose WebGL2 context was lost hands
+   * back that same dead context from `getContext("webgl2")`, and a canvas
+   * configured for WebGPU refuses `getContext("webgl2")` altogether — which
+   * would have taken the WebGL2 *and* Canvas2D fallbacks down with it and left
+   * `getSharedRenderer` returning null forever. Only a fresh element rebinds.
+   *
+   * Repainting is part of the recovery: rendering is event-driven, so without
+   * this an idle pane would sit blank until its next output.
+   */
+  private discardSharedRenderer(): void {
+    if (this.disposed) return;
+    const dead = this.sharedRenderer;
+    if (!dead) return;
+    if (dead === this.webgpuRenderer) {
+      // Don't let getSharedRenderer promote the dead device straight back in.
+      this.webgpuRenderer = null;
+      this.webgpuCanvas = null;
+    }
+    this.sharedRenderer = null;
+    this.sharedCanvas = null;
+    dead.dispose();
+    // If the GPU is gone for good the rebuild lands on Canvas2D, which has no
+    // context to lose — so this converges instead of looping.
+    this.notifyAllDirty();
+  }
+
+  /**
+   * The WebGPU device died. Drop it as a candidate so
+   * {@link getSharedRenderer} can't promote it back, and rebuild only if it was
+   * the renderer actually in use — a device lost before the probe promoted it
+   * should cost a healthy WebGL2 fallback nothing.
+   */
+  private handleWebGpuLost(): void {
+    if (this.disposed) return;
+    const wasShared =
+      this.sharedRenderer !== null &&
+      this.sharedRenderer === this.webgpuRenderer;
+    this.webgpuRenderer = null;
+    this.webgpuCanvas = null;
+    if (wasShared) this.discardSharedRenderer();
+  }
+
   /** Get a shared renderer for all surfaces. Prefers WebGPU (async probe),
    *  falls back to WebGL2, then Canvas 2D. */
   getSharedRenderer(): {
@@ -343,7 +403,9 @@ export class TerminalStore {
     if (!this.sharedCanvas) {
       this.sharedCanvas = document.createElement("canvas");
     }
-    this.sharedRenderer = createGlRenderer(this.sharedCanvas);
+    this.sharedRenderer = createGlRenderer(this.sharedCanvas, () =>
+      this.discardSharedRenderer(),
+    );
     if (!this.sharedRenderer.supported) {
       this.sharedRenderer = createCanvas2dRenderer(this.sharedCanvas);
     }
@@ -354,27 +416,76 @@ export class TerminalStore {
     };
   }
 
+  /** Upper bound on frames held per PTY while the WASM module loads. Well
+   *  above what a sub-second module fetch can accumulate; the cap only exists
+   *  so a module that never resolves can't grow the queue without limit. */
+  private static readonly MAX_QUEUED_FRAMES = 512;
+
   /**
-   * Drain queued compressed frames for a PTY into the WASM terminal.
-   * Called at the start of the rAF callback so decode + render happen
-   * in one JS turn, avoiding budget fragmentation.
-   * Returns true if any frames were applied.
+   * Hold a frame that can't be decoded yet.
+   *
+   * On overflow the queue is dropped and the PTY re-subscribed rather than
+   * replayed: a gap in a delta stream is unrecoverable, but a fresh subscribe
+   * makes the server encode against an empty basis and send a full frame.
    */
-  drainPending(ptyId: number): boolean {
-    const q = this.pendingFrames.get(ptyId);
-    if (!q || q.length === 0) return false;
-    const t = this.terminals.get(ptyId);
-    if (!t) {
-      q.length = 0;
-      return false;
+  private queueFrame(ptyId: number, payload: Uint8Array): void {
+    let queue = this.pendingFrames.get(ptyId);
+    if (!queue) {
+      queue = [];
+      this.pendingFrames.set(ptyId, queue);
     }
+    if (queue.length >= TerminalStore.MAX_QUEUED_FRAMES) {
+      console.warn(
+        `blit: dropping ${queue.length} queued frames for pty ${ptyId} — re-subscribing`,
+      );
+      this.pendingFrames.delete(ptyId);
+      if (this.subscribed.has(ptyId)) {
+        this.subscribed.delete(ptyId);
+        this.syncSubscriptions();
+      }
+      return;
+    }
+    queue.push(new Uint8Array(payload));
+  }
+
+  /**
+   * Apply everything queued by {@link queueFrame}, in arrival order, creating
+   * the terminals the frames belong to. Callers repaint afterwards.
+   */
+  private drainQueuedFrames(): void {
+    if (!this.mod || this.pendingFrames.size === 0) return;
     const applyStart = this.nowMs();
-    for (const payload of q) {
-      t.feed_compressed(payload);
+    for (const [ptyId, queue] of this.pendingFrames) {
+      if (queue.length === 0) continue;
+      let terminal = this.terminals.get(ptyId);
+      if (!terminal) {
+        terminal = this.createTerminal();
+        this.terminals.set(ptyId, terminal);
+        const stale = this.staleTerminals.get(ptyId);
+        if (stale) {
+          this.staleTerminals.delete(ptyId);
+          stale.free();
+        }
+      }
+      for (const payload of queue) terminal.feed_compressed(payload);
     }
-    q.length = 0;
+    this.pendingFrames.clear();
     this.noteAppliedFrame(this.nowMs() - applyStart);
-    return true;
+  }
+
+  /**
+   * Force every surface to re-prepare and repaint.
+   *
+   * The dirty listeners are the existing "this terminal's content changed"
+   * path, and a surface's callback already sets `contentDirty` and schedules a
+   * frame. That is exactly what a late WASM load or a renderer swap needs even
+   * though no cell changed — and reusing it beats a second notification
+   * mechanism that would have to stay in step with the first.
+   */
+  private notifyAllDirty(): void {
+    for (const ptyId of this.terminals.keys()) {
+      for (const listener of this.dirtyListeners) listener(ptyId);
+    }
   }
 
   /** Mark the latest applied terminal state as painted to the screen. */
@@ -402,7 +513,6 @@ export class TerminalStore {
     terminals: number;
     staleTerminals: number;
     subscribed: number;
-    frozenPtys: number;
     pendingFrameQueues: number;
     totalPendingFrames: number;
   } {
@@ -420,7 +530,6 @@ export class TerminalStore {
       terminals: this.terminals.size,
       staleTerminals: this.staleTerminals.size,
       subscribed: this.subscribed.size,
-      frozenPtys: this.frozenPtys.size,
       pendingFrameQueues: this.pendingFrames.size,
       totalPendingFrames: totalPending,
     };
@@ -447,37 +556,6 @@ export class TerminalStore {
 
   getCellSize(): { pw: number; ph: number } {
     return { pw: this.cellPw, ph: this.cellPh };
-  }
-
-  /** Freeze a PTY: buffer incoming frames instead of applying them. */
-  freeze(ptyId: number): void {
-    this.frozenPtys.add(ptyId);
-  }
-
-  isFrozen(ptyId: number): boolean {
-    return this.frozenPtys.has(ptyId);
-  }
-
-  /** Thaw a PTY: apply all buffered frames and resume normal updates. */
-  thaw(ptyId: number): void {
-    this.frozenPtys.delete(ptyId);
-    const buf = this.frozenBuffers.get(ptyId);
-    if (buf && buf.length > 0) {
-      this.frozenBuffers.delete(ptyId);
-      let t = this.terminals.get(ptyId);
-      if (!t && this.mod) {
-        t = this.createTerminal();
-        this.terminals.set(ptyId, t);
-      }
-      if (t) {
-        for (const frame of buf) {
-          t.feed_compressed(frame);
-        }
-        for (const l of this.dirtyListeners) l(ptyId);
-      }
-    } else {
-      this.frozenBuffers.delete(ptyId);
-    }
   }
 
   setDesiredSubscriptions(ptyIds: Set<number>): void {

@@ -374,11 +374,30 @@ async fn async_main() {
                     path,
                     content,
                     no_recursive,
+                    gitignore,
+                    dot_ignore,
+                    ignore,
+                    exclude_git,
+                    exclude,
                     once,
                     json,
-                } => fs::cmd_sync(transport, path, content, no_recursive, once, json)
-                    .await
-                    .map(|()| 0),
+                } => fs::cmd_sync(
+                    transport,
+                    path,
+                    fs::SyncArgs {
+                        content,
+                        no_recursive,
+                        gitignore,
+                        dot_ignore,
+                        ignore,
+                        exclude_git,
+                        exclude,
+                        once,
+                        json,
+                    },
+                )
+                .await
+                .map(|()| 0),
                 FsCommand::Write {
                     path,
                     root,
@@ -519,6 +538,7 @@ async fn async_main() {
                     repo,
                     staged,
                     patch,
+                    binary,
                     json,
                 } => {
                     if pathspec.len() > 1 {
@@ -528,6 +548,7 @@ async fn async_main() {
                             revs,
                             staged,
                             patch,
+                            binary,
                             path: pathspec.into_iter().next(),
                             json,
                         };
@@ -544,6 +565,50 @@ async fn async_main() {
                 }
                 GitCommand::LsFiles { path, repo, json } => {
                     git::cmd_ls_files(transport, repo, path, json).await
+                }
+                GitCommand::Blame {
+                    path,
+                    repo,
+                    rev,
+                    start,
+                    lines,
+                    follow,
+                    json,
+                } => git::cmd_blame(transport, repo, path, rev, start, lines, follow, json).await,
+                GitCommand::Reflog {
+                    ref_name,
+                    repo,
+                    limit,
+                    reverse,
+                    json,
+                } => git::cmd_reflog(transport, repo, ref_name, limit, reverse, json).await,
+                GitCommand::Discover {
+                    path,
+                    depth,
+                    nested,
+                    bare,
+                    json,
+                } => git::cmd_discover(transport, path, depth, nested, bare, json).await,
+                GitCommand::Fetch {
+                    remote,
+                    refspecs,
+                    repo,
+                    prune,
+                    anchor,
+                    timeout,
+                    json,
+                } => {
+                    // Exits non-zero when a ref was refused: `git fetch`
+                    // can exit 0 having refused one refspec of several,
+                    // which is the trap this avoids.
+                    match git::cmd_fetch(
+                        transport, repo, remote, refspecs, prune, anchor, timeout, json,
+                    )
+                    .await
+                    {
+                        Ok(code) => std::process::exit(code),
+                        Err(e) => Err(e),
+                    }
                 }
                 GitCommand::MergeBase { revs, repo, json } => {
                     // The only git command with a meaningful non-zero exit

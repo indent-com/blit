@@ -10,4 +10,5 @@ homepage.workspace = true
 [dependencies]
 blit-remote = { workspace = true }
 blake3 = { version = "1", default-features = false }
+ignore = "0.4"
 notify = "8"

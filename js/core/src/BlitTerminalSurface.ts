@@ -1464,8 +1464,10 @@ export class BlitTerminalSurface {
       }
     }
 
+    let preparedOps = false;
     if (this.contentDirty) {
       this.contentDirty = false;
+      preparedOps = true;
       t.prepare_render_ops();
     }
 
@@ -1539,17 +1541,28 @@ export class BlitTerminalSurface {
     }
 
     // WebGPU presents asynchronously, so `drawImage(webgpuCanvas)` above reads
-    // the *previously* presented frame, not the one just submitted. While the
-    // size is stable this is an imperceptible one-frame content lag that the
-    // next render heals. But on a resize the stale frame is the wrong size,
-    // and because rendering is event-driven it stops once the resize settles —
-    // leaving that wrong-size frame composited forever as whole-screen trails.
-    // Schedule one catch-up render so the new-size frame, now presented, gets
-    // re-composited. WebGL2 doesn't need this (preserveDrawingBuffer gives a
-    // synchronous same-frame readback).
+    // the *previously* presented frame, not the one just submitted. Rendering
+    // is event-driven, so "the next render heals it" is only true if there is
+    // a next render — and the last frame of a burst of output is exactly the
+    // one with nothing behind it. Until the cursor blink fires (530ms, and
+    // never on a read-only surface) the whole pane sits a frame behind.
+    //
+    // So catch up after any frame that changed what is on screen: new content
+    // (`preparedOps`) or a new size. A resize is the worse of the two — the
+    // stale frame is the wrong size, composited as whole-screen trails — but
+    // both leave the pane stale for as long as the surface stays idle.
+    //
+    // This cannot loop: the catch-up render prepares nothing and changes no
+    // size, so it schedules no third frame. Nor does it double the work while
+    // output streams — `scheduleFrame` coalesces into a Set, so the catch-up
+    // merges with the next content render if one lands in the same frame. The
+    // extra frame is only ever paid on the way to idle.
+    //
+    // WebGL2 needs none of this: preserveDrawingBuffer gives a synchronous
+    // same-frame readback.
     if (
       shared?.renderer.backend === "webgpu" &&
-      (pw !== this.lastRenderedPw || ph !== this.lastRenderedPh)
+      (preparedOps || pw !== this.lastRenderedPw || ph !== this.lastRenderedPh)
     ) {
       this.scheduleRender();
     }
@@ -2175,6 +2188,29 @@ export class BlitTerminalSurface {
       inputEvent.inputType !== "insertCompositionText" &&
       inputEvent.inputType !== "insertText"
     ) {
+      return;
+    }
+
+    // The toolbar's one-shot Ctrl/Alt, on this path too. Android keyboards
+    // keep the word in an active composition, so a letter typed after
+    // tapping Ctrl arrives here and never reaches the keydown or plain
+    // `input` branches that apply the modifier — Ctrl+C came out as a
+    // literal "c". The composition is abandoned rather than continued: the
+    // control byte is not text the IME can go on editing.
+    if (
+      (this._ctrlModifier || this._altModifier) &&
+      value.startsWith(oldValue) &&
+      value.length > oldValue.length
+    ) {
+      const char = value.slice(oldValue.length)[0];
+      const bytes = this._ctrlModifier
+        ? ctrlCharToByte(char)
+        : new Uint8Array([0x1b, char.charCodeAt(0)]);
+      if (bytes) this.sendInput(this._sessionId, bytes);
+      this.setCtrlModifier(false);
+      this.setAltModifier(false);
+      this._androidCompositionValue = "";
+      this.resetCaptureField();
       return;
     }
 

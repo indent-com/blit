@@ -92,16 +92,16 @@ Opcodes occupy the `0x40` block in both directions. Gateway, proxy, and mux
 forward them unmodified. All integers little-endian; 16 MiB frame limit and
 [protocol.md](protocol.md) framing apply.
 
-| Direction | Opcode | Name        | Layout                                                               |
-| --------- | ------ | ----------- | -------------------------------------------------------------------- |
-| C2S       | `0x40` | `FS_SYNC`   | `[nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N]` |
-| C2S       | `0x41` | `FS_STOP`   | `[sync_id:2]`                                                        |
-| C2S       | `0x42` | `FS_ACK`    | `[sync_id:2][update_id:4]`                                           |
-| C2S       | `0x43` | `FS_FETCH`  | `[nonce:2][sync_id:2][path_len:2][path:N]`                           |
-| S2C       | `0x40` | `FS_SYNCED` | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`             |
-| S2C       | `0x41` | `FS_UPDATE` | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                     |
-| S2C       | `0x42` | `FS_FILE`   | `[nonce:2][status:1][data:LZ4]`                                      |
-| S2C       | `0x43` | `FS_CLOSED` | `[sync_id:2][reason:1]`                                              |
+| Direction | Opcode | Name        | Layout                                                                                            |
+| --------- | ------ | ----------- | ------------------------------------------------------------------------------------------------- |
+| C2S       | `0x40` | `FS_SYNC`   | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` (+ optional trailers, below) |
+| C2S       | `0x41` | `FS_STOP`   | `[sync_id:2]`                                                                                     |
+| C2S       | `0x42` | `FS_ACK`    | `[sync_id:2][update_id:4]`                                                                        |
+| C2S       | `0x43` | `FS_FETCH`  | `[nonce:2][sync_id:2][path_len:2][path:N]`                                                        |
+| S2C       | `0x40` | `FS_SYNCED` | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                          |
+| S2C       | `0x41` | `FS_UPDATE` | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                  |
+| S2C       | `0x42` | `FS_FILE`   | `[nonce:2][status:1][data:LZ4]`                                                                   |
+| S2C       | `0x43` | `FS_CLOSED` | `[sync_id:2][reason:1]`                                                                           |
 
 ### `FS_SYNC`
 
@@ -109,15 +109,17 @@ forward them unmodified. All integers little-endian; 16 MiB frame limit and
 bit 2 `CROSS_FILESYSTEM` (descend into mount points), bit 3 `SINGLE` (the
 root is a single file, § Single-file sync), bit 4 `FROM_PTY` (resolve the
 sync's base directory from a pty's live cwd; [ide.md](../ide.md)
-Decision 3). Bit 5 is reserved for `EXCLUDE_GIT` (lands with
-`FEATURE_GIT`, see [git.md](git.md): any entry whose final component is
-exactly `.git` — directory or gitfile — is omitted from enumeration,
-watching, hashing, and all records; paths beneath it do not exist for
-this sync. A pure name filter: fs sync never reads git data).
+Decision 3), bits 5–8 `EXCLUDE_GIT` / `GITIGNORE` / `EXCLUDE` / `DOTIGNORE`
+(§ Ignoring).
 Symlinks are reported, never followed. `latency_ms` is the batching/settle window (0 → server default
 20 ms, clamped to 1–1000). `inline_max` caps per-file inline content (0 →
 server default 16 MiB); larger files sync metadata + hash only, bytes on
 demand via `FS_FETCH`.
+
+Two optional trailers follow `path`, each announced by its flag, in this
+order: `[exclude_len:2][exclude:M]` when `EXCLUDE` is set, then
+`[src_pty_id:2]` when `FROM_PTY` is set. A parser skips the first to reach
+the second; a message with neither flag is exactly the original layout.
 
 `path` is UTF-8, absolute or relative to the server's working directory,
 and must exist — a directory (the tree to mirror) or, under `SINGLE`, a
@@ -169,6 +171,128 @@ coexist without joining (a `SINGLE` sync never arms a whole-directory
 content read of siblings). Budgets are unchanged: a `SINGLE` root costs
 one non-recursive watch descriptor on the parent and a one-entry index.
 
+### Ignoring
+
+Without exclusion, "watch this repository" costs the whole checkout —
+`node_modules/**`, `target/**`, and `.git/**` included, which on a real
+monorepo is 204k entries against a 1 M ceiling that _closes_ the sync
+rather than truncating it. Four flags narrow what a sync indexes, and
+they compose:
+
+- Bit 5 `EXCLUDE_GIT`: any entry whose final component is exactly `.git`
+  — directory or gitfile — is excluded. A pure name filter; fs sync never
+  reads git data for it.
+- Bit 6 `GITIGNORE`: honor `.gitignore` in and above the root — from the
+  enclosing worktree top down to each directory scanned — plus the
+  governing repository's `$GIT_DIR/info/exclude`, the user's
+  `core.excludesFile`, and its `core.ignorecase` (git folds case when that
+  is set, and a mirror that did not would exclude a different set of paths
+  than the repository it mirrors).
+- Bit 8 `DOTIGNORE`: honor `.ignore`, ripgrep's convention, the same way.
+  Separate from `GITIGNORE` because the two answer different questions —
+  a project uses `.ignore` to hide things from tooling without telling git
+  to stop tracking them — and because `.ignore` brings none of git's
+  repository-wide sources with it. `FS_INDEX` and `FS_GREP` apply both
+  together; a sync picks.
+- Bit 7 `EXCLUDE`: the `[exclude_len:2][exclude:M]` trailer, gitignore
+  syntax with one pattern per `\n`, anchored at the sync root. Blank lines
+  and `#` comments are dropped; at most 4096 patterns. A list with no
+  negation in it commutes, so it is sorted and deduplicated — two clients
+  that asked for the same thing in a different order then share one root
+  rather than building two identical indexes. A list containing `!` keeps
+  the order it was written in, since gitignore is last-match-wins.
+
+Precedence is git's, with the client on top: client patterns first (so
+`!keep` re-includes what the ignore files hide), then the deepest ignore
+file, outward to the worktree top, then `info/exclude` and the global
+file. A match on an ancestor _directory_ excludes everything below it, so
+— as in git — no negation resurrects a file under an excluded directory.
+`.git` is a name filter that outranks all of it.
+
+**Repository boundaries are respected.** An exclude stack belongs to one
+repository, so a nested repository inside the root starts a fresh one: the
+outer repo's `.gitignore`s and `info/exclude` do not reach inside it, its
+own `info/exclude` does, and `core.excludesFile` — which every repository
+inherits — stays at the bottom. Symmetrically, a root that is itself a
+repository top inherits nothing from a repository it happens to sit
+inside; only a root that is a plain subdirectory of a worktree picks up
+the ignore files above it. Client patterns are the exception, by design:
+they are the _sync's_ filter rather than a repository's, and apply
+throughout.
+
+None of the flags is on by default: a sync narrows only when asked, and an
+unfiltered sync builds no matcher and pays nothing per entry.
+
+**Excluded is not the same as absent, to a client.** An excluded path
+simply is not in the mirror, so nothing distinguishes a directory that is
+empty from one whose contents the rules hide. `FS_ENTRY_FILTERED` on the
+_directory_ is that signal, and it is what lets a file tree render "some
+items hidden" rather than a folder that looks wrong. It is computed by
+enumeration, which makes it prompt in one direction only: the first
+excluded child costs one re-listing of its directory, while the last one
+disappearing clears the flag at that directory's next enumeration.
+Chasing the clear would mean re-listing on every excluded-file event —
+the cost exclusion exists to avoid — so a client may briefly see the flag
+on a directory that no longer hides anything.
+
+**Exclusion is not a view.** An excluded path is never stated, indexed,
+hashed, counted against the entry budget, or recorded — and its hints are
+dropped before the settle tick, so git plumbing writing inside `.git/` no
+longer wakes a reconciler that has nothing to say about it.
+
+It does not cost watch descriptors either. A recursive inotify watch is
+one descriptor per directory whether or not the sync mirrors it, so a
+filtered root instead arms **one non-recursive watch per indexed
+directory**, driven by the reconciler as it enumerates: it arms exactly
+what it indexes and never reaches the excluded subtrees. The
+arm-before-scan contract holds one level down — a directory is armed
+before it is listed, so an entry created in the gap is either listed by
+the read or reported by the watch, never neither — and a directory
+leaving the index takes its watch with it (a full rescan, which reports no
+removals, sweeps the armed set against the new index instead). Failing to
+arm because the process is out of descriptors closes the sync with reason
+`4`, since the alternative is a subtree that silently stops updating.
+
+This is inotify-only, and only for a root that excludes something.
+FSEvents covers a tree with one stream and `ReadDirectoryChangesW` with
+one handle, where per-directory arming would cost _more_ objects rather
+than fewer; an unfiltered root keeps the single recursive watch on every
+platform. Symlinked directories are enumerated but not armed, exactly as
+the recursive watch never followed them (§ Links). Measured on a
+2023-directory tree with 2000 of them excluded: 2023 watches before, 22
+after.
+
+**Edits to the rules are ordinary changes.** A write to any ignore source
+invalidates the compiled matcher and forces a full re-enumeration, so a
+new `.gitignore` line arrives as DELETEs of what it now covers and a
+removed one as UPSERTs of what it uncovers. Source edits are checked
+before the filter — `$GIT_DIR/info/exclude` lives inside the directory
+`EXCLUDE_GIT` excludes, and the other order would drop the hint that its
+own rules moved.
+
+Only sources that can actually change a verdict count. An ignore file
+inside an already-excluded directory is never read, because the directory
+is never descended, so writing one is not a rules change and costs
+nothing — without that, `npm install` writing a `.gitignore` into every
+package under `node_modules` would rescan the root thousands of times and
+the exclusion would cost more than it saves. An `info/exclude` follows its
+_worktree_ rather than its own directory, which `EXCLUDE_GIT` always
+excludes: the root's own always counts, a nested repository's counts while
+that repository is indexed.
+
+**Sharing** follows the existing rule with the exclusion set as part of the
+key: two syncs excluding the same things share one watcher, reconciler,
+and index, and two excluding different things do not — they index
+different trees, exactly as a recursive and a non-recursive sync of one
+path do. Since exclusion narrows enumeration and `SINGLE` enumerates
+nothing, the three flags are rejected in combination with it (status `4`)
+rather than silently doing nothing.
+
+A server predating these flags refuses any request that sets one with
+"unknown flags" — which is why the pattern list is flag-announced rather
+than merely appended: a silently dropped filter would mirror the whole
+tree, the precise failure the flags exist to prevent.
+
 ### `FS_UPDATE`
 
 `flags`: bit 0 `RESET` — begin a staged snapshot: create an empty staging map
@@ -200,7 +324,8 @@ MOVE   0x03: [kind:1][from_len:2][from:N][to_len:2][to:M]  # moves subtree
 `UNREADABLE` (exists, content unavailable); bit 3 `NO_CONTENT` (over
 `inline_max`, or `CONTENT` unset); bit 4 `UNSTABLE` (file changed repeatedly
 while being read — content omitted, another upsert follows once it settles);
-bit 5 `LINK_DIR` (a symlink whose target is a directory).
+bit 5 `LINK_DIR` (a symlink whose target is a directory); bit 6 `FILTERED`
+(a directory whose enumeration skipped an excluded child, § Ignoring).
 
 A symlinked directory is **enumerated like a real one**, under the link's own
 path, so a file browser can descend it — the alternative is a dead end: an
@@ -382,6 +507,7 @@ the existing scheduler and `S2C_FRAGMENT` fairness.
 | Snapshot retention / client | 32 MiB  | `BLIT_FS_RETAIN_MAX`\* |
 | Syncs per connection        | 128     | `BLIT_FS_MAX_SYNCS`    |
 | Indexed entries per root    | 1 M     | `BLIT_FS_MAX_ENTRIES`  |
+| Exclude patterns per sync   | 4096    | —                      |
 | Unacked bytes per sync      | 1 MiB   | `BLIT_FS_WINDOW`       |
 
 \* Not needed in the implemented architecture: a sync engine holds at most
@@ -430,7 +556,7 @@ bytes as trusted text.
    counterparts in `@blit-sh/core` (`js/core/src/fs.ts`). Both pin the same
    byte fixtures, so codec drift fails on one side or the other.
 2. `blit-fssync` (`crates/fssync`): a **shared root** per
-   `(path, recursive, cross_filesystem, single)`, refcounted across every
+   `(path, recursive, cross_filesystem, single, exclusion)`, refcounted across every
    sync on every connection — one native watcher and one hint-driven reconciler
    owning the canonical index and publishing immutable snapshots — plus a
    **per-sync engine** holding only client state: shadow snapshot, held
@@ -447,7 +573,8 @@ bytes as trusted text.
 3. Native backends via the `notify` crate (inotify / FSEvents /
    `ReadDirectoryChangesW`), demoted to dirty hints; semantics tests are
    backend-independent by construction — same suite, three CI targets.
-4. Clients: `blit fs sync <path> [--content] [--once] [--json]`
-   (`crates/cli/src/fs.rs`), and `syncFs(path)` on `BlitConnection` /
+4. Clients: `blit fs sync <path> [--content] [--ignore] [--exclude-git]
+[--exclude PATTERN]… [--once] [--json]` (`crates/cli/src/fs.rs`), and
+   `syncFs(path, { ignore, excludeGit, exclude })` on `BlitConnection` /
    `BlitWorkspace` in `@blit-sh/core` returning a live map plus per-record
    callbacks, with automatic acknowledgment and fetch-on-demand.

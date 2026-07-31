@@ -1466,6 +1466,9 @@ pub enum ServerMsg<'a> {
         version: u16,
         features: u32,
         boot_generation: Option<u64>,
+        /// The server's crate version (e.g. `"0.40.1"`).  `None` from servers
+        /// that predate the field.
+        server_version: Option<&'a str>,
     },
     Update {
         pty_id: u16,
@@ -1599,10 +1602,21 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             // protocol version, so continue to accept HELLOs from older servers.
             let boot_generation = (data.len() >= 15)
                 .then(|| u64::from_le_bytes(data[7..15].try_into().expect("checked HELLO length")));
+            // The server's crate version came later still, same deal: a
+            // length-prefixed string appended after the boot generation.
+            let server_version = (data.len() >= 17)
+                .then(|| {
+                    let len = u16::from_le_bytes([data[15], data[16]]) as usize;
+                    data.get(17..17 + len)
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .filter(|v| !v.is_empty())
+                })
+                .flatten();
             Some(ServerMsg::Hello {
                 version,
                 features,
                 boot_generation,
+                server_version,
             })
         }
         S2C_UPDATE => {
@@ -1969,12 +1983,21 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
     }
 }
 
-pub fn msg_hello(version: u16, features: u32, boot_generation: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(15);
+pub fn msg_hello(
+    version: u16,
+    features: u32,
+    boot_generation: u64,
+    server_version: &str,
+) -> Vec<u8> {
+    let ver_bytes = server_version.as_bytes();
+    let ver_len = ver_bytes.len().min(u16::MAX as usize);
+    let mut msg = Vec::with_capacity(17 + ver_len);
     msg.push(S2C_HELLO);
     msg.extend_from_slice(&version.to_le_bytes());
     msg.extend_from_slice(&features.to_le_bytes());
     msg.extend_from_slice(&boot_generation.to_le_bytes());
+    msg.extend_from_slice(&(ver_len as u16).to_le_bytes());
+    msg.extend_from_slice(&ver_bytes[..ver_len]);
     msg
 }
 
@@ -3141,22 +3164,42 @@ mod tests {
 
     #[test]
     fn hello_roundtrip_with_boot_generation() {
-        let msg = msg_hello(1, 0x1234_5678, 0xfedc_ba98_7654_3210);
-        assert_eq!(msg.len(), 15);
-        assert_eq!(&msg[7..], &0xfedc_ba98_7654_3210_u64.to_le_bytes());
+        let msg = msg_hello(1, 0x1234_5678, 0xfedc_ba98_7654_3210, "0.40.1");
+        assert_eq!(msg.len(), 17 + 6);
+        assert_eq!(&msg[7..15], &0xfedc_ba98_7654_3210_u64.to_le_bytes());
         assert!(matches!(
             parse_server_msg(&msg),
             Some(ServerMsg::Hello {
                 version: 1,
                 features: 0x1234_5678,
                 boot_generation: Some(0xfedc_ba98_7654_3210),
+                server_version: Some("0.40.1"),
             })
         ));
 
+        // Servers that predate either trailing field still parse.
+        assert!(matches!(
+            parse_server_msg(&msg[..15]),
+            Some(ServerMsg::Hello {
+                boot_generation: Some(0xfedc_ba98_7654_3210),
+                server_version: None,
+                ..
+            })
+        ));
         assert!(matches!(
             parse_server_msg(&msg[..7]),
             Some(ServerMsg::Hello {
                 boot_generation: None,
+                server_version: None,
+                ..
+            })
+        ));
+
+        // A truncated version string is ignored rather than fatal.
+        assert!(matches!(
+            parse_server_msg(&msg[..20]),
+            Some(ServerMsg::Hello {
+                server_version: None,
                 ..
             })
         ));

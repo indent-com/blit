@@ -26,6 +26,7 @@ import type {
 import {
   gitOidFromHex,
   gitOidHex,
+  measureCell,
   GIT_ENDPOINT_COMMIT,
   GIT_ENDPOINT_EMPTY,
   GIT_LOG_FULL_MESSAGE,
@@ -44,6 +45,13 @@ import {
 } from "./reactive";
 import { collectRefPills, RefPills } from "./refPills";
 import { acquireRepo } from "./repoRegistry";
+import {
+  commitCacheKey,
+  getCachedCommit,
+  putCachedCommit,
+  type CommitInfo,
+  type FileDiff,
+} from "./commitCache";
 import { langForFile } from "./languages";
 import { CommitMarkdown } from "./CommitMarkdown";
 import { buildDiffHighlighter, lineColors } from "./diff-highlight";
@@ -57,27 +65,6 @@ import {
 } from "./activeEditor";
 
 const dec = new TextDecoder();
-
-interface CommitInfo {
-  short: string;
-  message: string;
-  author: string;
-  email: string;
-  /** Author time (git log's convention for the header line). */
-  time: bigint;
-  committer: string;
-  committerEmail: string;
-  committerTime: bigint;
-  /** Full hex oids of this commit's parents — two or more for a merge,
-   *  none for a root commit. Each opens as its own commit tile. */
-  parents: string[];
-}
-
-interface FileDiff {
-  newPath: string;
-  oldPath: string;
-  rows: GitPatchRecord[];
-}
 
 export function BlitCommit(props: {
   workspace: BlitWorkspace;
@@ -189,13 +176,25 @@ export function BlitCommit(props: {
   createEffect(() => {
     const h = repo.handle();
     if (!h) return;
-    setFiles(null); // a re-acquired handle refetches; show loading again
-    setExpandedFiles(new Set<number>());
     const oid = gitOidFromHex(props.oid);
     if (!oid) {
       setError("Invalid commit id");
       return;
     }
+    // A commit's message and patch are immutable, so a tile that has already
+    // loaded them renders from the cache. This is what makes moving a commit
+    // to the dock and back free: the view is rebuilt, but nothing is asked of
+    // the server a second time.
+    const key = commitCacheKey(props.connectionId, props.repoPath, props.oid);
+    const cached = getCachedCommit(key);
+    if (cached) {
+      setCommit(cached.commit);
+      setFiles(cached.files);
+      setError(null);
+      return;
+    }
+    setFiles(null); // a re-acquired handle refetches; show loading again
+    setExpandedFiles(new Set<number>());
     h.log({ tips: [oid], limit: 1, flags: GIT_LOG_FULL_MESSAGE })
       .then(async (page) => {
         const rec = [...gitCommitRecords(page.records)].find(
@@ -205,7 +204,7 @@ export function BlitCommit(props: {
           setError("Commit not found");
           return;
         }
-        setCommit({
+        const info: CommitInfo = {
           short: props.oid.slice(0, 10),
           message: rec.message,
           author: rec.authorName,
@@ -215,7 +214,8 @@ export function BlitCommit(props: {
           committerEmail: rec.committerEmail,
           committerTime: rec.committerTime,
           parents: rec.parents.map((p) => gitOidHex(p, h.oidFormat)),
-        });
+        };
+        setCommit(info);
         const parent = rec.parents[0];
         const oldEp = parent
           ? { kind: GIT_ENDPOINT_COMMIT, oid: parent }
@@ -232,6 +232,7 @@ export function BlitCommit(props: {
           }
         }
         setFiles(out);
+        putCachedCommit(key, { commit: info, files: out });
       })
       .catch((e: unknown) => {
         // A reset mid-request re-acquires the repo and refetches; showing
@@ -241,18 +242,30 @@ export function BlitCommit(props: {
       });
   });
 
-  const mix = (color: string, pct: number) =>
-    `color-mix(in srgb, ${color} ${pct}%, transparent)`;
-  const addBg = () => mix(props.theme.success, 14);
-  const delBg = () => mix(props.theme.error, 14);
-  const addSpan = () => mix(props.theme.success, 32);
-  const delSpan = () => mix(props.theme.error, 32);
+  // Row tints and the change-span tints on top of them are OPAQUE, mixed
+  // against what they sit on rather than left translucent. An inline
+  // background covers the font's content box, which is taller than a
+  // line-height-1 row, so vertically adjacent spans overlap — with
+  // translucent colours that overlap paints twice and draws a dark band
+  // across every row boundary. Composited to the same values up front, the
+  // overlap is invisible and one edit reads as one block.
+  const over = (color: string, pct: number, base: string) =>
+    `color-mix(in srgb, ${color} ${pct}%, ${base})`;
+  const addBg = () => over(props.theme.success, 14, props.theme.bg);
+  const delBg = () => over(props.theme.error, 14, props.theme.bg);
+  const addSpan = () => over(props.theme.success, 32, addBg());
+  const delSpan = () => over(props.theme.error, 32, delBg());
 
-  // Line-height 1: a row is exactly one em tall, matching the editor. This
-  // only holds because the patch renders at `props.fontSize` too (see the
-  // root below) — deriving the row height from the editor's em while
-  // setting a smaller font-size puts the difference back as leading.
-  const rowH = () => `${Math.round(props.fontSize)}px`;
+  // A patch row is exactly one terminal cell tall, measured the way the
+  // terminal measures it: ascent + descent, snapped to device pixels
+  // (js/core/src/measure.ts). Rounding the font size instead made the row
+  // shorter than the glyphs it holds, and everything followed from that —
+  // spacing that did not match a terminal beside it, change-span
+  // backgrounds (which cover the font's content box, not the line box)
+  // overlapping their neighbours, and the next row's background painting
+  // over the tail of a descender, so the bottom of a `g` went missing.
+  const cell = createMemo(() => measureCell(props.fontFamily, props.fontSize));
+  const rowH = () => `${cell().h}px`;
   const numCol: JSX.CSSProperties = {
     width: "40px",
     "flex-shrink": 0,
@@ -372,6 +385,14 @@ export function BlitCommit(props: {
                 <div
                   style={{
                     display: "flex",
+                    // Wrap *between* the items. Without this the row is one
+                    // unwrapped flex line and every item shrinks to its
+                    // min-content width, so a narrow pane turns the header
+                    // into a rank of one-word-wide columns each wrapping
+                    // inside itself. The atoms below then refuse to break at
+                    // all — an oid or a timestamp split across two lines is
+                    // not a shorter oid, it is an unreadable one.
+                    "flex-wrap": "wrap",
                     gap: `${props.scale.tightGap}px`,
                     "align-items": "baseline",
                     "margin-top": "2px",
@@ -382,7 +403,12 @@ export function BlitCommit(props: {
                     color: props.theme.dimFg,
                   }}
                 >
-                  <span style={{ color: props.theme.warning }}>
+                  <span
+                    style={{
+                      color: props.theme.warning,
+                      "white-space": "nowrap",
+                    }}
+                  >
                     {c().short}
                   </span>
                   <RefPills
@@ -390,9 +416,13 @@ export function BlitCommit(props: {
                     theme={props.theme}
                     scale={props.scale}
                     max={6}
+                    wrap
                   />
+                  {/* A name is prose and may wrap; it just may not be
+                      squeezed to one word per line, which `min-width: 0`
+                      here would reintroduce. */}
                   <span>{c().author}</span>
-                  <span>
+                  <span style={{ "white-space": "nowrap" }}>
                     {new Date(Number(c().time) * 1000).toLocaleString()}
                   </span>
                   <Show
@@ -407,9 +437,11 @@ export function BlitCommit(props: {
                       {c().committer !== c().author
                         ? ` by ${c().committer}`
                         : ""}{" "}
-                      {new Date(
-                        Number(c().committerTime) * 1000,
-                      ).toLocaleString()}
+                      <span style={{ "white-space": "nowrap" }}>
+                        {new Date(
+                          Number(c().committerTime) * 1000,
+                        ).toLocaleString()}
+                      </span>
                     </span>
                   </Show>
                 </div>
@@ -445,6 +477,9 @@ export function BlitCommit(props: {
                           cursor: "pointer",
                           "text-decoration": "underline",
                           "text-underline-offset": "2px",
+                          // `^2 a1b2c3d4e5` is one token: broken across two
+                          // lines it reads as two different parents.
+                          "white-space": "nowrap",
                         }}
                         onClick={() => openCommit(p)}
                         onKeyDown={(e) => {
@@ -571,7 +606,11 @@ export function BlitCommit(props: {
                             : lineColors(newStr, lang, highlighter());
                         return (
                           <div
-                            style={{ display: "flex", "min-height": rowH() }}
+                            style={{
+                              display: "flex",
+                              "min-height": rowH(),
+                              "line-height": rowH(),
+                            }}
                           >
                             <div
                               style={{
@@ -652,6 +691,7 @@ export function BlitCommit(props: {
                           style={{
                             display: "flex",
                             "min-height": rowH(),
+                            "line-height": rowH(),
                           }}
                         >
                           <div

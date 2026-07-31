@@ -172,6 +172,7 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
   // The size this pane asked for; the canvas itself may be larger.
   let c2dW = 0;
   let c2dH = 0;
+  let disposed = false;
 
   // Reusable scratch canvas for glyph tinting.
   const tmp = document.createElement("canvas");
@@ -285,7 +286,15 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
   }
 
   return {
-    supported: true,
+    // Same contract as the WebGL2 path below: a disposed renderer must stop
+    // reporting itself usable, because that is the only signal a surface has
+    // that its cached renderer was swapped out from under it. A plain `true`
+    // here meant a surface holding this fallback never noticed the WebGPU
+    // probe replacing it — it kept drawing into this orphaned 2D canvas while
+    // compositing from WebGPU's, so the pane stayed blank for good.
+    get supported() {
+      return !disposed;
+    },
     backend: "canvas2d" as const,
     maxDimension: 32767,
     // Canvas 2D composites glyphs with drawImage, which offers no hook for
@@ -332,11 +341,18 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
         focused,
       );
     },
-    dispose() {},
+    dispose() {
+      disposed = true;
+    },
   };
 }
 
-export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
+export function createGlRenderer(
+  canvas: HTMLCanvasElement,
+  /** Called once if the drawing context is lost. The renderer is unusable from
+   *  that point on — see the `webglcontextlost` handler below. */
+  onLost?: () => void,
+): GlRenderer {
   const gl = canvas.getContext("webgl2", {
     alpha: true,
     antialias: false,
@@ -387,13 +403,23 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   let logicalW = 0;
   let logicalH = 0;
   let disposed = false;
+  let contextLost = false;
 
-  canvas.addEventListener("webglcontextlost", (e) => {
-    e.preventDefault();
-    console.warn("blit: WebGL context lost");
-  });
-  canvas.addEventListener("webglcontextrestored", () => {
-    console.warn("blit: WebGL context restored");
+  // A lost context invalidates every program, buffer, VAO and texture created
+  // through it. Deliberately no `preventDefault()` and no `webglcontextrestored`
+  // handler: preventDefault's only effect is to ask for a restore, and a
+  // restored context arrives empty — all of the above would have to be rebuilt
+  // on it. Both handlers used to just log, which meant every draw after a loss
+  // went through deleted objects and the pane never painted again.
+  //
+  // Reporting `supported: false` (below) makes cached holders re-fetch, and
+  // `onLost` lets the owner build a replacement on a fresh canvas — which is
+  // the only reliable move, since this canvas is bound to the dead context for
+  // good.
+  canvas.addEventListener("webglcontextlost", () => {
+    contextLost = true;
+    console.warn("blit: WebGL context lost — rebuilding renderer");
+    onLost?.();
   });
 
   gl.disable(gl.DEPTH_TEST);
@@ -608,14 +634,15 @@ export function createGlRenderer(canvas: HTMLCanvasElement): GlRenderer {
   }
 
   return {
-    // A disposed renderer must stop reporting itself as usable: callers
-    // cache the shared renderer and only re-fetch when this goes false
-    // (see BlitTerminalSurface.doRender). The async WebGPU probe disposes
-    // whatever was already in place and swaps itself in, so without this
-    // a surface keeps drawing through deleted GL objects — "bindTexture:
-    // attempt to use a deleted object", and a pane that never paints.
+    // A disposed or context-lost renderer must stop reporting itself as
+    // usable: callers cache the shared renderer and only re-fetch when this
+    // goes false (see BlitTerminalSurface.doRender). The async WebGPU probe
+    // disposes whatever was already in place and swaps itself in, so without
+    // this a surface keeps drawing through deleted GL objects — "bindTexture:
+    // attempt to use a deleted object", and a pane that never paints. A lost
+    // context has the same effect for the same reason.
     get supported() {
-      return !disposed;
+      return !disposed && !contextLost;
     },
     backend: "webgl2" as const,
     maxDimension: maxDim,

@@ -1606,6 +1606,7 @@ mod tests {
                 1,
                 FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH,
                 1,
+                "0.0.0-test",
             );
             write_frame(&mut self.writer, &hello).await;
 

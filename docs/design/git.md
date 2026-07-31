@@ -1,8 +1,8 @@
 # RFC: Git Introspection
 
 - **Status:** Accepted, implemented
-- **Date:** 2026-07-21
-- **Companion to:** [fs-watch.md](fs-watch.md)
+- **Date:** 2026-07-21, revised 2026-07-30 (second pass)
+- **Companion to:** [fs-watch.md](fs-watch.md), [fs-write.md](fs-write.md)
 
 ## Summary
 
@@ -24,6 +24,28 @@ The design splits along Git's own grain:
 
 A ref snapshot is a few KiB; the object store is unbounded. Pushing the
 first and pulling the second is the only split that bounds both directions.
+
+**Second pass.** The first version shipped and a consumer built on it (the
+Review panel in `indent-com/neo#3248`), which surfaced one recurring
+failure: the server knew something and the wire did not carry it. A
+bounded response could not say where it stopped, a rejection could not say
+why, a rename that was not byte-identical read as delete + add, and a
+binary file's patch record could not say whether it was added or deleted.
+Pass one bounded the wire and got that right; what it under-delivered was
+**legibility**. The sharpened rule, which the rest of this document
+follows:
+
+> Every bounded response says where it stopped, and every stopping point
+> is resumable. Every rejection carries its code. Nothing the server
+> computed is dropped between the engine and the consumer.
+
+That pass reshaped message layouts in place rather than appending
+compatibility tails: `FEATURE_GIT` remains the family's only feature bit,
+and the handshake's `PROTOCOL_VERSION` is how a mismatched peer is turned
+away. blit ships server, codecs, and clients from one version number, and
+SSH remotes auto-install on first connection, so skew is bounded by
+construction; where it is not, a refused handshake beats a diff whose
+records are shifted by two bytes.
 
 Two conveniences ride on that split. The server _resolves_ revision
 expressions — `main`, `v1.0^`, `HEAD~3`, ranges like `dev..HEAD` — to the
@@ -54,15 +76,37 @@ updates live as either endpoint advances.
 
 ## Non-goals
 
-- Mutation: staging, committing, checkout, branching, push. Read-only by
-  design; a mutation family would be a separate RFC.
-- Remote operations (fetch/push/ls-remote) and credentials.
-- Blame and reflog traversal (natural later additions to the same opcode
-  block; the record framing leaves room).
-- Submodule recursion: submodules appear as entries with their commit oid;
-  clients open them as separate repositories.
-- Hook execution, config access, filter/smudge application: blobs are raw
-  object bytes; worktree diffs use worktree bytes as they are on disk.
+Each of these is refused for a reason, not merely unlisted. Where the
+second pass took one on, it says so.
+
+- **Mutation**: staging, committing, checkout, branching. Still out; the
+  shape a mutation family would take is sketched under
+  [Mutation](#mutation-proposed), which is the one part of this document
+  that is a proposal rather than a contract.
+- **Push and `ls-remote`.** Fetch is in (see [`GIT_FETCH`](#git_fetch)) —
+  it was the one remote operation whose absence pushed real work back on
+  every consumer, in the form of `git fetch` in a PTY with its exit codes
+  screen-scraped off the terminal grid. Push and `ls-remote` are genuinely
+  lower value for a read-oriented client.
+- **Credentials.** blit stores, parses, and transmits no secret. A fetch
+  runs the box's own `git`, which picks up whatever `credential.helper`
+  the box's config names — the same thing the PTY workaround relied on.
+  Remote URLs go out as configured; see Security.
+- **Filter/smudge execution.** Running a `filter.<driver>.clean` program
+  means spawning an arbitrary configured binary as a side effect of a
+  read, and the read side is deliberately a pure function of the object
+  store and the worktree. The two sides of a filtered path are instead
+  _flagged_ incomparable (`FILTERED`), which removes the actively
+  misleading whole-file rewrite without crossing that line. `text`/`eol`
+  normalization, which needs no external program, is applied.
+- **Hook execution** and general config access. Two specific config
+  values are exposed because nothing else can answer the questions they
+  answer: remote names/URLs (`STATE_REMOTE`) and a symbolic ref's target
+  (`STATE_REF.target`). Neither is a key/value surface.
+- **Submodule recursion.** Submodules are still separate repositories —
+  but a client no longer has to guess where one lives:
+  `GIT_OPEN.parent_repo_id` names it by `(parent, path)` and the server
+  resolves the gitdir.
 
 ## Protocol
 
@@ -72,40 +116,55 @@ New `S2C_HELLO` feature bit:
 FEATURE_GIT = 1 << 7
 ```
 
-Opcodes occupy the `0x50` block in both directions; request/response pairs
+Opcodes occupy the `0xA0` block in both directions; request/response pairs
 share the opcode value. Gateway, proxy, and mux forward them unmodified.
 All integers little-endian; the 16 MiB frame limit and
 [protocol.md](protocol.md) framing apply.
 
-| Direction | Opcode | Name              | Layout                                                                                                            |
-| --------- | ------ | ----------------- | ----------------------------------------------------------------------------------------------------------------- |
-| C2S       | `0x50` | `GIT_OPEN`        | `[nonce:2][flags:1][refs_latency_ms:2][status_latency_ms:2][path_len:2][path:N]`                                  |
-| C2S       | `0x51` | `GIT_CLOSE`       | `[repo_id:2]`                                                                                                     |
-| C2S       | `0x52` | `GIT_ACK`         | `[repo_id:2][state_id:4]`                                                                                         |
-| C2S       | `0x53` | `GIT_LOG`         | `[nonce:2][repo_id:2][flags:1][limit:2][path_len:2][path:N][n_tips:2][tips:32·N][n_hides:2][hides:32·N]`          |
-| C2S       | `0x54` | `GIT_TREE`        | `[nonce:2][repo_id:2][oid:32][path_len:2][path:N]`                                                                |
-| C2S       | `0x55` | `GIT_BLOB`        | `[nonce:2][repo_id:2][oid:32][path_len:2][path:N][max_len:4]`                                                     |
-| C2S       | `0x56` | `GIT_DIFF`        | `[nonce:2][repo_id:2][flags:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N]`                       |
-| C2S       | `0x57` | `GIT_PATCH`       | `[nonce:2][repo_id:2][flags:1][context:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][max_len:4]` |
-| C2S       | `0x58` | `GIT_INDEX`       | `[nonce:2][repo_id:2][path_len:2][path:N]`                                                                        |
-| C2S       | `0x59` | `GIT_CANCEL`      | `[nonce:2]`                                                                                                       |
-| C2S       | `0x5A` | `GIT_BASE`        | `[nonce:2][repo_id:2][n_oids:1][oids:32·N]`                                                                       |
-| C2S       | `0x5B` | `GIT_RESOLVE`     | `[nonce:2][repo_id:2][spec_len:2][spec:N]`                                                                        |
-| C2S       | `0x5C` | `GIT_LOG_WATCH`   | `[log_id:2][repo_id:2][flags:1][limit:2][spec_len:2][spec:N]`                                                     |
-| C2S       | `0x5D` | `GIT_LOG_UNWATCH` | `[log_id:2][repo_id:2]`                                                                                           |
-| C2S       | `0x5E` | `GIT_LOG_ACK`     | `[log_id:2][repo_id:2][update_id:4]`                                                                              |
-| S2C       | `0x50` | `GIT_REPO`        | `[nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir:N][gitdir_len:2][gitdir:N]`         |
-| S2C       | `0x51` | `GIT_STATE`       | `[repo_id:2][state_id:4][flags:1][records:LZ4]`                                                                   |
-| S2C       | `0x52` | `GIT_CLOSED`      | `[repo_id:2][reason:1]`                                                                                           |
-| S2C       | `0x53` | `GIT_COMMITS`     | `[nonce:2][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]`                                          |
-| S2C       | `0x54` | `GIT_TREE`        | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                       |
-| S2C       | `0x55` | `GIT_BLOB`        | `[nonce:2][status:1][size:8][data:LZ4]`                                                                           |
-| S2C       | `0x56` | `GIT_DIFF`        | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                       |
-| S2C       | `0x57` | `GIT_PATCH`       | `[nonce:2][status:1][flags:1][data:LZ4]`                                                                          |
-| S2C       | `0x58` | `GIT_INDEX`       | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                       |
-| S2C       | `0x5A` | `GIT_BASE`        | `[nonce:2][status:1][n_bases:1][bases:32·N]`                                                                      |
-| S2C       | `0x5B` | `GIT_RESOLVE`     | `[nonce:2][status:1][n_tips:2][tips:32·N][n_hides:2][hides:32·N]`                                                 |
-| S2C       | `0x5C` | `GIT_LOG_PAGE`    | `[log_id:2][update_id:4][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]`                            |
+| Direction | Opcode | Name              | Layout                                                                                                                                                         |
+| --------- | ------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C2S       | `0xA0` | `GIT_OPEN`        | `[nonce:2][flags:2][refs_latency_ms:2][status_latency_ms:2][src_pty_id:2][parent_repo_id:2][n_prefixes:2][(prefix_len:2, prefix:N)·N][path_len:2][path:N]`     |
+| C2S       | `0xA1` | `GIT_CLOSE`       | `[repo_id:2]`                                                                                                                                                  |
+| C2S       | `0xA2` | `GIT_ACK`         | `[repo_id:2][state_id:4]`                                                                                                                                      |
+| C2S       | `0xA7` | `GIT_LOG`         | `[nonce:2][repo_id:2][flags:1][limit:2][path_len:2][path:N][n_tips:2][tips:32·N][n_hides:2][hides:32·N]`                                                       |
+| C2S       | `0xAB` | `GIT_TREE`        | `[nonce:2][repo_id:2][flags:1][oid:32][path_len:2][path:N][after_len:2][after:N]`                                                                              |
+| C2S       | `0xAC` | `GIT_BLOB`        | `[nonce:2][repo_id:2][flags:1][oid:32][path_len:2][path:N][offset:8][max_len:4]`                                                                               |
+| C2S       | `0xAD` | `GIT_DIFF`        | `[nonce:2][repo_id:2][flags:1][rename:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][after_len:2][after:N]`                                    |
+| C2S       | `0xAE` | `GIT_PATCH`       | `[nonce:2][repo_id:2][flags:2][context:1][rename:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][max_len:4][after_len:2][after:N][after_pos:8]` |
+| C2S       | `0xAF` | `GIT_INDEX`       | `[nonce:2][repo_id:2][flags:1][path_len:2][path:N][after_len:2][after:N]`                                                                                      |
+| C2S       | `0xA3` | `GIT_CANCEL`      | `[nonce:2]`                                                                                                                                                    |
+| C2S       | `0xB0` | `GIT_BASE`        | `[nonce:2][repo_id:2][n_oids:1][oids:32·N]`                                                                                                                    |
+| C2S       | `0xA6` | `GIT_RESOLVE`     | `[nonce:2][repo_id:2][spec_len:2][spec:N]`                                                                                                                     |
+| C2S       | `0xA8` | `GIT_LOG_WATCH`   | `[log_id:2][repo_id:2][flags:1][limit:2][spec_len:2][spec:N]`                                                                                                  |
+| C2S       | `0xA9` | `GIT_LOG_UNWATCH` | `[log_id:2][repo_id:2]`                                                                                                                                        |
+| C2S       | `0xAA` | `GIT_LOG_ACK`     | `[log_id:2][repo_id:2][update_id:4]`                                                                                                                           |
+| C2S       | `0xB1` | `GIT_DISCOVER`    | `[nonce:2][flags:1][depth:1][path_len:2][path:N][after_len:2][after:N]`                                                                                        |
+| C2S       | `0xB2` | `GIT_BLAME`       | `[nonce:2][repo_id:2][flags:1][oid:32][start_line:4][line_count:4][path_len:2][path:N]`                                                                        |
+| C2S       | `0xB3` | `GIT_REFLOG`      | `[nonce:2][repo_id:2][flags:1][limit:2][after_pos:8][ref_len:2][ref:N]`                                                                                        |
+| C2S       | `0xB4` | `GIT_FETCH`       | `[nonce:2][repo_id:2][flags:1][timeout_ms:4][remote_len:2][remote:N][n_refspecs:2][(len:2, refspec:N)·N]`                                                      |
+| S2C       | `0xA0` | `GIT_REPO`        | `[nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir:N][gitdir_len:2][gitdir:N]`                                                      |
+| S2C       | `0xA4` | `GIT_STATE`       | `[repo_id:2][state_id:4][flags:1][records:LZ4]`                                                                                                                |
+| S2C       | `0xA5` | `GIT_CLOSED`      | `[repo_id:2][reason:1]`                                                                                                                                        |
+| S2C       | `0xA7` | `GIT_COMMITS`     | `[nonce:2][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]`                                                                                       |
+| S2C       | `0xAB` | `GIT_TREE`        | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xAC` | `GIT_BLOB`        | `[nonce:2][status:1][size:8][data:LZ4]`                                                                                                                        |
+| S2C       | `0xAD` | `GIT_DIFF`        | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xAE` | `GIT_PATCH`       | `[nonce:2][status:1][flags:1][data:LZ4]`                                                                                                                       |
+| S2C       | `0xAF` | `GIT_INDEX`       | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xB0` | `GIT_BASE`        | `[nonce:2][status:1][n_bases:1][bases:32·N]`                                                                                                                   |
+| S2C       | `0xA6` | `GIT_RESOLVE`     | `[nonce:2][status:1][n_tips:2][tips:32·N][n_hides:2][hides:32·N]`                                                                                              |
+| S2C       | `0xA8` | `GIT_LOG_PAGE`    | `[log_id:2][update_id:4][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]`                                                                         |
+| S2C       | `0xB1` | `GIT_DISCOVER`    | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xB2` | `GIT_BLAME`       | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xB3` | `GIT_REFLOG`      | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xB4` | `GIT_FETCH`       | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+
+One contiguous block, `0xA0`–`0xB4`, grouped by role — lifecycle, pushed
+state, revision and log, object reads, then the repository-wide
+operations — with `0xB5`–`0xBF` reserved for what comes next. The family
+was renumbered out of `0x50` when the second pass broke the wire anyway:
+there was no reason to carry a split allocation forward, and the freed
+block is available to a future family.
 
 ### Statuses
 
@@ -122,11 +181,24 @@ One table for every `status` byte in the family:
 6 BUDGET       a budget was exhausted with no way to paginate or truncate
 7 INVALID      malformed request (unknown flags, bad endpoint combination)
 8 CANCELLED    ended by GIT_CANCEL
-9 OTHER        diagnostic in the message's detail field where it has one
+9 OTHER        an unclassified backend failure, diagnostic in the
+              message's detail field where it has one
+11 CONFLICT    a precondition failed (a lock was held, or the repository
+              moved under a request)
 ```
 
 Codes 0–4 coincide with `FS_SYNCED`'s where the semantics overlap, so a
-client's error mapping is one table, not one per message.
+client's error mapping is one table, not one per message. `10` is lsp's
+`WARMING`; `11` is the code [fs-write.md](fs-write.md) already assigned,
+reused rather than given a synonym.
+
+`OTHER` means _only_ "unclassified backend failure" — anything with a
+classifiable cause (an invalid path, a wrong object type) returns the
+specific code, because a consumer's whole reason for reading the status
+byte is to tell a recoverable condition from a real error. The
+human-readable mapping is total on both sides: `OTHER` and an
+unrecognized code render differently, so a log never conflates "the
+backend failed" with "this build does not know that code".
 
 ### Nonces and cancellation
 
@@ -179,6 +251,49 @@ raw bytes escapes past 64 KiB. A wrapped prefix does not corrupt one field,
 it desynchronizes every field after it in the response — a visibly
 shortened name costs one unhelpful row instead.
 
+### Continuation
+
+Six responses can be cut short by a budget, and all six say where they
+stopped. One record, reserved family-wide, carries the resume point:
+
+```text
+CURSOR 0x7F: [kind:1][after_len:2][after:N][pos:8]
+             emitted last when a budget cut the response short. `after`
+             is the escaped path of the last emitted item; `pos` is a
+             position within it (rows delivered, for GIT_PATCH; 0
+             elsewhere).
+```
+
+`GIT_TREE`, `GIT_INDEX`, `GIT_DIFF` and `GIT_PATCH` take a matching
+`after` (and, for `GIT_PATCH`, `after_pos`): re-issue the same request
+with the cursor's values and receive the remainder. Empty means "from the
+beginning", so each message has one parse shape. The `*_TRUNCATED`
+response flags keep their meaning and gain a companion rule:
+**`TRUNCATED` with no `CURSOR` record means the response is genuinely
+unresumable**, which after this pass is only the pathological state case
+below.
+
+Continuation is **stateless**, exactly as `GIT_LOG`'s frontier is — the
+server holds nothing between requests. That requires a deterministic total
+order, so one is now normative: tree and index entries in git's own path
+order, diff and patch entries by new path, falling back to the old path
+for deletions. For `GIT_TREE` that order is git's tree order literally,
+which sorts a subtree as if its name ended in `/` — so a subtree's cursor
+`after` carries the trailing slash. It has to: `lib.rs` precedes `lib/` in
+a tree and follows `lib` bytewise, and a cursor compared on bare names
+drops or repeats one of them wherever a page breaks between the two. Unlike a commit walk, a tree/index/worktree enumeration is
+not immutable, so a continuation can straddle a change; the contract is
+[fs-watch.md](fs-watch.md)'s — per-item coherent, whole-response
+best-effort. For COMMIT × COMMIT diffs, which are immutable, continuation
+is exact.
+
+A per-request budget override was considered instead and declined. A
+client-settable ceiling the server clamps is the clamp with extra steps:
+it does not let a client get a whole 40 MiB patch, it only lets one client
+consume more of a shared box before hitting the same wall, and it makes
+per-request memory a function of untrusted input. The env knobs stay
+operator-facing.
+
 **Records** inside every `records:LZ4` payload use the
 [fs-watch.md](fs-watch.md) framing: `[record_len:4][kind:1][…]`, unknown
 kinds skipped via `record_len`, malformed records end the payload. Record
@@ -191,11 +306,44 @@ guard can never be what a well-behaved response trips.
 
 ### `GIT_OPEN` / `GIT_REPO`
 
-`flags`: bit 0 `WATCH` (stream `GIT_STATE`), bit 1 `STATUS` (include
-index/worktree status records in state; implies `WATCH`), bit 2 `UNTRACKED`
-(status includes untracked files), bit 3 `IGNORED` (status includes ignored
-files; implies `UNTRACKED`), bit 4 `TRACKING` (include per-branch upstream
-records in state; implies `WATCH`).
+`flags` (`u16`): bit 0 `WATCH` (stream `GIT_STATE`), bit 1 `STATUS`
+(include index/worktree status records in state; implies `WATCH`), bit 2
+`UNTRACKED` (status includes untracked files), bit 3 `IGNORED` (status
+includes ignored files; implies `UNTRACKED`), bit 4 `TRACKING` (include
+per-branch upstream records in state; implies `WATCH`), bit 5 `REMOTES`
+(include one `STATE_REMOTE` record per configured remote; implies
+`WATCH`). Bits 6–15 are reserved and a set bit is `INVALID`.
+
+`src_pty_id` and `parent_repo_id` are plain fields with an `0xFFFF`
+"none" sentinel rather than flag-gated tails, so the message has one parse
+shape however it is used:
+
+- `src_pty_id` names a pty whose live cwd `path` is joined onto before
+  discovery ([ide.md](../ide.md) Decision 3).
+- `parent_repo_id` makes `path` a **submodule path relative to that
+  repo's worktree**: the server resolves the submodule's own gitdir and
+  worktree (a `.git` file, `.git/modules/<name>`, or a relocated
+  worktree) and opens it. `WRONG_TYPE` when the path is not a submodule
+  of that parent, `NOT_FOUND` when it is not initialized _or_ initialized
+  with no checkout yet (an empty directory — discovery from it would walk
+  up and find the parent, which reads as "not a submodule" when the
+  honest answer is "not checked out"), and `INVALID` when the path leaves
+  the parent's worktree. That last one is checked after resolution, not
+  just lexically: refusing `..` and absolute paths says nothing about a
+  symlink inside the worktree pointing anywhere on the box. Either way
+  the answer is one a UI needs, and one that guess-and-open reports as an
+  indistinguishable failure. With the diff entry already carrying the
+  old and new commit oids, a submodule bump becomes "here are the 12
+  commits that came in" (`GIT_LOG old..new` on the child) instead of two
+  hex strings.
+
+Setting both is `INVALID`.
+
+`ref_prefixes` bounds what the state stream watches: empty means every
+ref, `refs/heads/` means branches only. A UI that renders branches and
+never renders tags stops paying for tags at every settle — on a large
+monorepo the difference between a 3 KiB snapshot and a 4 MiB one,
+recomputed on every ref move.
 
 `refs_latency_ms` and `status_latency_ms` are per-open settle windows
 (`0` → server defaults 50 / 500 ms, clamped to 1–1000 / 1–10000); the env
@@ -214,7 +362,13 @@ found from it), `PERMISSION`, `BUDGET` (repo limit reached), `INVALID`,
 diagnostic. On success `workdir` is the canonical worktree root (empty for
 bare) and `gitdir` the canonical git directory, both escaped.
 `GIT_REPO.flags`: bit 0 `BARE`, bit 1 `SHALLOW`, bit 2 `SPARSE`
-(sparse-checkout active), bit 3 `LINKED` (linked worktree).
+(sparse-checkout active), bit 3 `LINKED` (linked worktree), bit 4
+`WRITABLE`, bit 5 `FETCHABLE`. The last two answer capability **per
+repository** rather than per connection, which is strictly more accurate —
+a checkout can be read-only, or a box can have no `git` binary for
+`GIT_FETCH` to run — and costs two bits of a byte that had four free.
+`WRITABLE` is clear in this build (no mutation family); `FETCHABLE` is
+clear when `BLIT_GIT_FETCH=0` or `git` is absent.
 
 `repo_id` scopes every other message. `GIT_CLOSE` releases it;
 `GIT_CLOSED` (`reason`: `0` client request, `1` repository gone, `2`
@@ -233,7 +387,23 @@ Pacing is coalescing: at most one snapshot is in flight; the client acks
 `state_id`, and the server then sends the _latest_ state if it changed
 while unacked. A slow client skips intermediate states and never falls
 behind. `flags`: bit 0 `REFS_TRUNCATED`, bit 1 `STATUS_TRUNCATED` (entry
-budget hit; counts still accurate up to the cap).
+budget hit; counts still accurate up to the cap), bit 2 `PARTIAL`.
+
+A snapshot too large for one message spans several `GIT_STATE` messages
+sharing one `state_id`, each but the last carrying `PARTIAL`. The client
+accumulates and replaces its map on the final chunk, so "complete
+snapshot, replace the map" still holds and it never observes a half-built
+state; only the final chunk is acked, so the one-in-flight pacing is
+unchanged.
+
+Records are emitted **most load-bearing first**, so a budget sheds what
+nobody decorates with: HEAD and the operation, then HEAD's branch and its
+upstream, then `refs/remotes/*/HEAD`, then branches, then remote branches,
+then upstream/stash/remote records, then tags, then status. A repository
+with 200 000 tags truncates its tags and keeps its branches. This matters
+more than the chunking: a dropped `refs/remotes/origin/HEAD` reads as
+"this branch has no base", which is silently wrong rather than visibly
+partial, and ordering is what makes that unreachable.
 
 Records:
 
@@ -241,7 +411,13 @@ Records:
 HEAD   0x01: [kind:1][flags:1][oid:32][name_len:2][name:N]
              flags: bit 0 DETACHED, bit 1 UNBORN; name = symbolic target
 STATE_REF 0x02: [kind:1][flags:1][oid:32][peeled:32][name_len:2][name:N]
+             [target_len:2][target:N]
              flags: bit 0 PEELED_VALID (annotated tag), bit 1 SYMBOLIC.
+             target = the symbolic target's full ref name when SYMBOLIC,
+             else empty. This is what turns refs/remotes/origin/HEAD from
+             an oid into "the default branch is <this>", replacing a
+             client-side HEAD → main → master ladder that gives a
+             repository with any other default branch no answer at all.
              Besides refs/*, an in-progress operation streams its gitdir
              pseudo-refs — MERGE_HEAD (one record per line; octopus
              extras named MERGE_HEAD#2…), CHERRY_PICK_HEAD, REVERT_HEAD,
@@ -252,11 +428,13 @@ OP     0x03: [kind:1][op:1][oid:32][detail_len:2][detail:N]
              oid = the operation head (first MERGE_HEAD line for an
              octopus); detail = "step/total" for rebases, else "";
              absent record = no operation
-STATUS 0x04: [kind:1][staged:1][unstaged:1][flags:1]
+STATUS 0x04: [kind:1][staged:1][unstaged:1][flags:1][oid:32]
              [old_len:2][old_path:N][path_len:2][path:N]
              staged/unstaged: ASCII ' ' A M D R T U, '?' untracked,
              '!' ignored (porcelain letters); flags: bit 0 CONFLICTED;
-             old_path non-empty only for renames
+             old_path non-empty only for renames.
+             oid is the worktree content's hash when the status walk read
+             the file, else zero — see below
 UPSTREAM 0x05: [kind:1][flags:1][ahead:4][behind:4]
              [name_len:2][name:N][upstream_len:2][upstream:N]
              one per local branch with a configured upstream; name joins
@@ -267,7 +445,47 @@ STASH  0x06: [kind:1][index:2][oid:32][time:8 i64 s][tz:2 i16 min]
              [msg_len:2][msg:N]
              index is the N of stash@{N}, oid the stash commit, msg the
              reflog message under the family's text rules
+STATE_REMOTE 0x07: [kind:1][flags:1][name_len:2][name:N]
+             [fetch_len:2][fetch_url:N][push_len:2][push_url:N]
+             one per configured remote, with the REMOTES open flag;
+             flags bit 0 DEFAULT; push_url empty when it equals fetch_url.
+             URLs go out as configured, userinfo included — the caller
+             already has a shell and can read .git/config, so stripping
+             it would cost them the ability to reproduce the remote and
+             buy nothing. Three named fields, no key/value access, no
+             writes: enough to answer "is this checkout the repository
+             this pull request belongs to" without parsing owner/name out
+             of the worktree path and hoping the clone followed a
+             convention.
 ```
+
+**Pseudo-refs share the `STATE_REF` stream, and that is a migration
+hazard.** Before this pass every key in a client's ref map began with
+`refs/`; now `MERGE_HEAD`, `ORIG_HEAD` and their siblings appear there
+too, while an operation is live. A consumer that inverts the map into
+oid → names to decorate a log will render `ORIG_HEAD` as though it were a
+branch unless it filters. They are not given a synthetic `refs/` prefix
+precisely because they are not refs — git resolves them from the gitdir,
+they vanish when the operation ends, and a prefix would make them
+indistinguishable from a branch a client could check out. The rule is the
+whole test: **a name with no `refs/` prefix is a pseudo-ref**, which the
+TypeScript client exports as `isGitPseudoRef` so no consumer has to
+re-derive it.
+
+**Why `STATUS` carries an oid.** The engine drops a snapshot byte-identical
+to the last one it sent — the stream's contract is "latest state", and a
+repeated snapshot carries none. Without the oid that suppression swallowed
+a real event: writing a file that is already `M` and stays `M` changes the
+worktree and not the record, so no frame went out, no `state_id` moved, and
+a consumer diffing the worktree had nothing to key a refetch on. That is
+exactly what an agent editing one file over and over does. The status walk
+has already read the file to decide the letter, so hashing what is in hand
+costs nothing and makes the existing dedupe do the right thing with no new
+concept. Zero when the walk short-circuited without reading (an over-cap
+file, two content-addressed sides), which is also when there is nothing new
+to say. The same hash lands on `DIFF_ENTRY.new_oid`, so a worktree-side oid
+is real whenever the content was read rather than only when the index
+happened to know it.
 
 `STATUS` records appear only with the `STATUS` open flag; `UPSTREAM` only
 with `TRACKING`. `main ↑2 ↓3` — the most-rendered piece of git chrome —
@@ -372,7 +590,9 @@ survive reconnects — re-issue `GIT_LOG_WATCH` after re-`GIT_OPEN`.
 descends from it. Lists one level — clients walk by issuing further
 requests (entries carry the child oids) or skip levels with `path`.
 `status`: `UNKNOWN_ID`, `NOT_FOUND`, `WRONG_TYPE`, `OTHER`. Response
-`flags`: bit 0 `TRUNCATED` (entry budget).
+`flags`: bit 0 `TRUNCATED` (entry budget), paired with a `CURSOR` record;
+`after` continues the listing. Request `flags` is reserved and a set bit
+is `INVALID`.
 
 ```text
 TREE_ENTRY 0x02: [kind:1][otype:1][mode:4][oid:32][name_len:2][name:N]
@@ -385,11 +605,26 @@ TREE_ENTRY 0x02: [kind:1][otype:1][mode:4][oid:32][name_len:2][name:N]
 The pull for object content. `oid` names a blob directly, or a
 commit/tag/tree resolved through `path`. The effective cap is
 `min(max_len, BLIT_GIT_BLOB_MAX, MAX_DECOMPRESSED)`, with `max_len` `0`
-meaning the server default — the numbers can never disagree. `status`:
-`UNKNOWN_ID`, `NOT_FOUND`, `WRONG_TYPE`, `TOO_LARGE` (`size` is always
-the true object size, so the client knows what it declined), `OTHER`.
-`data` is raw object bytes, LZ4, fragmented as needed. Content-addressed
-⇒ cache forever, never refetch.
+meaning the server default — the numbers can never disagree.
+
+**A read is a window, not all-or-nothing.** The server returns bytes
+`[offset, offset + cap)` and `size` is always the true object size, so a
+client walks a large object and knows it is done when
+`offset + data.len() == size`. `offset > size` is `INVALID`;
+`offset == size` is `OK` with no data. `(oid, offset, len)` is as
+content-addressed as `oid` was, so the client cache generalizes with no
+invalidation story.
+
+`flags` bit 0 `WHOLE` asks for the old behavior explicitly — the entire
+object or `TOO_LARGE` with the true size. That case is real: a caller that
+must hash or parse a whole file gains nothing from a prefix and should not
+pay for one. But it is a request the caller makes, not a default imposed
+on the viewer that would happily render the first 500 lines of a 20 MiB
+generated file and used to get nothing at all.
+
+`status`: `UNKNOWN_ID`, `NOT_FOUND`, `WRONG_TYPE`, `INVALID`,
+`TOO_LARGE` (only under `WHOLE`), `OTHER`. `data` is raw object bytes,
+LZ4, fragmented as needed.
 
 ### `GIT_DIFF`
 
@@ -411,6 +646,20 @@ With a MERGE_BASE endpoint the response opens with a `BASE` record naming
 the chosen base (what `git merge-base` would pick), so per-file follow-ups
 become oid-addressed and cacheable forever by `(base, topic, path)`.
 
+**Rename detection** is `RENAMES` plus a `rename` similarity threshold:
+`0` is the exact-oid join (byte-identical moves only, reported at
+similarity 100), `1..=100` a percentage — git's own default is 50 — and
+anything above is `INVALID`, on `GIT_PATCH` exactly as on `GIT_DIFF` —
+the two share the field, so they share the rejection rather than one of
+them quietly falling back to the exact-oid join. Threshold 0 finds nothing in a real pull
+request, because a rename with one character changed reads as delete +
+add; scoring is what makes the flag mean something. It runs after the
+exact join, over the unmatched add/delete candidates only, and is bounded
+by `BLIT_GIT_RENAME_LIMIT` (git's `diff.renameLimit`, same default);
+past the limit the response falls back to the exact join and sets
+response `flags` bit 1 `RENAME_LIMIT`, so a client can say "rename
+detection skipped" rather than showing pairs it cannot explain.
+
 `flags`: bit 0 `RENAMES` (rename/copy detection), bit 1 `UNTRACKED`
 (worktree endpoint reports untracked files as additions), bit 2 `IGNORED`,
 bit 3 `IGNORE_SPACE_CHANGE` (runs of whitespace compare equal and
@@ -427,11 +676,28 @@ DIFF_ENTRY 0x03: [kind:1][st:1][similarity:1][dflags:1]
                  [old_mode:4][new_mode:4][old_oid:32][new_oid:32]
                  [old_len:2][old_path:N][new_len:2][new_path:N]
                  st: ASCII A M D R C T U; similarity 0-100 (renames/copies)
-                 dflags: bit 0 BINARY, bit 1 SUBMODULE
+                 dflags: bit 0 BINARY, bit 1 SUBMODULE, bit 2 FILTERED
 BASE       0x04: [kind:1][oid:32]
                  first record when a MERGE_BASE endpoint was used: the
                  base the server chose
 ```
+
+**Attributes.** The worktree side is normalized per the path's `text`/`eol`
+gitattributes before comparison, so a CRLF checkout of an LF-normalized
+object is not reported as every line changed. `RAW` (`flags` bit 5) opts
+out, for a caller that genuinely wants on-disk bytes compared as they are.
+Normalization is the default rather than opt-in because the un-normalized
+answer is wrong, and a flag everyone is expected to set is a default with
+extra steps.
+
+A path whose attributes name a `filter` driver is a different case: with
+`filter=lfs` the object store holds a ~130-byte pointer and the worktree
+holds the asset, so the two sides are not comparable at all and every
+LFS-tracked file would read as a total rewrite whether or not the user
+touched it. blit does not run the filter — that would mean spawning a
+configured program as a side effect of a read — it sets `FILTERED` and
+emits no rows, the way a binary file behaves, so a client renders
+"filtered file changed" instead of a wrong 4000-line diff.
 
 Worktree-side oids are zero unless the file's hash was already known (from
 the index). Worktree reads use the torn-read discipline of
@@ -448,14 +714,39 @@ from `INVALID` for bad endpoints). File-level records first (`GIT_DIFF`),
 hunks on demand keeps the common case (status pane) cheap and the
 expensive case (full patch) explicit.
 
-Request `flags` shares bits 0–4 with `GIT_DIFF` (including the
-ignore-whitespace bits) and adds: bit 5 `TEXT` — return a classic unified
-diff (UTF-8, escaped paths in headers) as raw `data`, for consumers that
-feed `git apply` or archive patches; bit 6 `CHAR_SPANS` — character-
-granularity spans instead of the default word granularity; bit 7
-`NO_SPANS` — skip intraline refinement entirely, for whole-line
-renderers. Response `flags`: bit 0 `STRUCTURED` (`data` is records, the
+Request `flags` is a `u16` whose low six bits are **exactly** `GIT_DIFF`'s
+(including the ignore-whitespace bits and `RAW`), so there is one shared
+prefix rather than two overlapping numberings, and adds: bit 6 `TEXT` —
+return a classic unified diff (UTF-8, escaped paths in headers) as raw
+`data`, for consumers that feed `git apply` or archive patches; bit 7
+`CHAR_SPANS` — character-granularity spans instead of the default word
+granularity; bit 8 `NO_SPANS` — skip intraline refinement entirely, for
+whole-line renderers; bit 9 `BINARY` — git's `--binary`, emitting binary
+content as a `GIT binary patch` block instead of the `Binary files … differ`
+sentence. `rename` is `GIT_DIFF`'s similarity threshold.
+Response `flags`: bit 0 `STRUCTURED` (`data` is records, the
 default), bit 1 `TRUNCATED`.
+
+Continuation is per **row**, not per file, which is what makes a diff with
+one enormous file finishable: the `CURSOR` names the file the budget
+stopped inside and `pos` counts the row and gap records of it already
+delivered, and the next request re-emits that file's `PATCH_FILE` header —
+so a page always says which file its rows belong to — and continues from
+`after_pos`. A cut _between_ files is the same record with `pos` `0`,
+meaning "past this file entirely"; `pos` is therefore not monotone across
+pages, and a client resumes by echoing the pair rather than by comparing
+it. The budget is a stopping threshold rather than a hard ceiling: the
+record that crosses it has been written, so a response can exceed
+`max_len` by one row.
+
+**`TEXT` mode truncates only at a file boundary**, and carries no `CURSOR`:
+a unified diff cut between a hunk header and its rows is not a patch, and
+the payload is text with nowhere to put a record. `TRUNCATED` there means
+"re-issue with `after` set to the last `+++` path you were given", which
+the client is already holding. A single file whose unified text alone
+exceeds the budget is `TOO_LARGE` — a status, not a truncation, so the
+"`TRUNCATED` carries a `CURSOR`" rule stands. Structured mode never
+refuses for size.
 
 **The default response is structured**: aligned row records, so clients
 render side-by-side or inline with a loop, never a unified-diff parser. A
@@ -464,9 +755,18 @@ ranges within each side that differ (intraline refinement of modified
 pairs). A context row has no spans:
 
 ```text
-PATCH_FILE 0x01: [kind:1][flags:1]
+PATCH_FILE 0x01: [kind:1][st:1][similarity:1][flags:1]
                  [old_len:2][old_path:N][new_len:2][new_path:N]
-                 begins a file section; flags: bit 0 BINARY (no rows)
+                 begins a file section. st/similarity mirror DIFF_ENTRY
+                 field for field — one status alphabet and one field
+                 order across both views — because a binary or empty
+                 added file emits no rows at all and would otherwise be
+                 unable to say whether it was added, deleted or
+                 modified, which is the one thing text mode could
+                 express that records could not. old_path carries the
+                 old path whenever there is an old side, not only for
+                 renames; st disambiguates.
+                 flags: bit 0 BINARY, bit 1 FILTERED (both: no rows)
 PATCH_ROW  0x02: [kind:1][old_line:4][new_line:4]
                  [old_text_len:4][old_text:N][new_text_len:4][new_text:N]
                  [n_old_spans:2][spans:(start:4,len:4)·N]
@@ -515,23 +815,325 @@ comes best-first (what `git merge-base` would print first); `n_bases` `0`
 with `OK` means disjoint histories. The answer is immutable per oid set,
 so it caches forever like every other pull.
 
+### `GIT_PATCH_TEXT` output
+
+Text mode emits **git's own patch format**, not a subset, so a parser
+written against `git diff` works unchanged:
+
+```text
+diff --git a/<old> b/<new>
+[old mode <m>] [new mode <m>]        mode changed, content also changed
+[deleted file mode <m>]              st == D
+[new file mode <m>]                  st == A
+[similarity index <n>%]              st == R or C
+[rename from <old>] [rename to <new>]
+[copy from <old>] [copy to <new>]
+index <old_oid>..<new_oid>[ <mode>]
+--- a/<old> | /dev/null
++++ b/<new> | /dev/null
+@@ hunks, with "\ No newline at end of file" where needed
+```
+
+A binary file reads `Binary files a/<old> and b/<new> differ`, git's exact
+sentence. A pure rename with no content change is a well-formed git rename
+patch rather than a lone `diff --git` line.
+
+A pure mode change emits the `diff --git` line and the two mode lines and
+stops, as git does — there is no content to describe. Hunk ranges follow
+git's spelling exactly: a zero-length side starts at `0`, a one-line side
+omits its count (`-1`, not `-1,1`), and the closing `@@` carries the
+section heading xdiff's default picks (the nearest preceding line starting
+with an alphabetic character, `_`, or `$`).
+
+Two deliberate deviations remain, documented rather than discovered — a
+third, binary content, is closed below:
+
+- **`index` carries full-length oids**, not `core.abbrev` abbreviations.
+  A unique short oid costs an object-database probe per side per file, and
+  every consumer of an `index` line either ignores it or wants the full
+  oid. `git apply` accepts either. (The mode suffix follows git's rule: on
+  the `index` line only when unchanged, since an add or delete already
+  stated it.)
+- **`similarity index` reports blit's score**, not git's, because the
+  rename scorer is blit's own (see Implementation notes).
+- ~~**Binary content is not emitted**~~ — closed. `BINARY` (git's
+  `--binary`) emits git's `GIT binary patch` block, and without it the
+  response carries `Binary files … differ`, which is `git diff`'s own
+  behaviour without the flag. Both bodies go out, forward and reverse, as
+  `emit_binary_diff` writes them — the second is what `git apply -R`
+  replays, and a block with only the first is not the format. Literals
+  only, never deltas: `git apply` reads both, and producing a delta means
+  carrying git's delta encoder for bytes on the wire rather than
+  correctness. Verified by _applying_, not by matching bytes:
+  `git apply --binary` and `git apply --binary -R` against the pre-change
+  tree, with the results compared byte for byte
+  (`binary_patch_applies_with_git_apply`). The block does come out
+  identical to `git diff --binary`'s today, deflate stream included, but
+  what is promised is that git accepts it — two zlib implementations at
+  the same level may compress the same bytes differently and both be
+  right.
+
+Verification is differential, not an assertion of intent
+(`text_patch_matches_git_diff`): a fixture repository covering add /
+delete / modify / rename-with-edit / mode change / binary /
+no-trailing-newline is diffed with the system `git` and compared line for
+line, with only those deviations normalized away. It was worth
+writing — it caught four format differences the eye had passed over,
+including the hunk-range spelling and the section heading.
+
+### `GIT_DISCOVER`
+
+"What repositories are under this path", so a client stops probing a
+ladder of candidate paths and walking directories itself with a
+non-recursive `FS_SYNC` per level — an fs sync per directory level, on a
+family whose purpose is watching, purely to enumerate names.
+
+```text
+REPO_FOUND 0x01: [kind:1][flags:1][workdir_len:2][workdir:N]
+                 [gitdir_len:2][gitdir:N]
+                 flags: bit 0 BARE, bit 1 LINKED, bit 2 SUBMODULE
+```
+
+`depth` `0` → the default (4), clamped to `BLIT_GIT_DISCOVER_DEPTH_MAX`.
+Request `flags`: bit 0 `NESTED` (descend into a repository once one is
+found — off by default, so a tree full of vendored checkouts costs
+nothing), bit 1 `BARE`. Results dedupe by canonical gitdir, which is the
+identity `GIT_REPO` reports and the one that survives several paths
+resolving to one repository. Bounded by `BLIT_GIT_DISCOVER_MAX` results
+and `BLIT_GIT_DISCOVER_SCAN_MAX` scanned entries, with a `CURSOR` for the
+remainder.
+
+Because the walk is stateless, a resume replays it to reach the cursor —
+and while it is replaying, neither budget is charged. Both bound the _new_
+work a request does, or a page counted from the start of the walk would
+stop at the same repository on every call and the cursor would never move.
+
+The replay also needs the walk to be reproducible, so **sibling
+directories are visited in path order**: `read_dir` guarantees no ordering
+at all, and a page that reached the cursor's repository at a different
+point would skip or repeat its neighbours. That is the same requirement the
+Continuation section makes normative, met the way a filesystem walk can
+meet it. What it cannot promise is a tree that changes between pages —
+per-item coherent, whole-response best-effort, as everywhere else.
+
+**It allocates no repo ids**: an enumeration, not an open, so it cannot
+exhaust the per-connection repo budget. Discovery is a filesystem walk and
+inherits the fs family's authority unchanged — it finds nothing the caller
+could not have found with `FS_SYNC` and a loop — and does not follow
+symlinks out of the tree.
+
+### `GIT_BLAME`
+
+Line attribution, the question a review surface asks right after "what
+changed". Client-side blame is not viable: it means a blob plus a diff per
+commit per file, which is the round-trip pattern this family exists to
+avoid, and it exhausts `entries_max` long before producing an answer.
+
+```text
+BLAME_RANGE 0x01: [kind:1][flags:1][commit:32]
+                  [start_line:4][line_count:4][orig_start:4]
+                  [orig_path_len:2][orig_path:N]
+                  one per contiguous attributed range; orig_path empty
+                  unless the range came from a different path
+```
+
+`oid` names the commit to blame from (zero = HEAD; the worktree is not
+blameable — `INVALID`). `line_count` `0` means to end of file. Request
+`flags`: bit 0 `FOLLOW_RENAMES` (git's `-M`), bit 1 `FOLLOW_COPIES`
+(`-C`, materially more expensive, off by default).
+
+**Author and message are deliberately absent.** The response carries
+commit oids; the client resolves the distinct set with one `GIT_LOG`, or
+finds them already in its oid-keyed cache. That keeps a viewport blame to
+a few hundred bytes and keeps the "oid-addressed, cache forever"
+discipline intact — the same reason `PATH_AT` carries an oid and not a
+blob. Line ranges are the budget story: blaming a viewport is cheap,
+blaming a 20 000-line file is not, so `line_count` scopes the walk,
+`BLIT_GIT_BLAME_LINES_MAX` caps it, and `CURSOR` resumes it.
+
+The requested range is **clamped to the file** rather than refused: a
+viewport that reaches the last line, and `line_count` `0` from an offset,
+are the ordinary cases, and gix rejects an inclusive range longer than the
+file instead of clamping — so the file's length is read first. A
+`start_line` past the end is `OK` with no records. `TRUNCATED` describes
+the answer, not the request: it is set when the cap stopped the walk short
+of the lines asked for, and the `CURSOR`'s `pos` is the last line
+attributed. Blame resumes through `start_line` — one past that `pos` —
+rather than through an `after` of its own, since the request already has a
+field that says where to begin.
+
+### `GIT_REFLOG`
+
+```text
+REFLOG_ENTRY 0x01: [kind:1][flags:1][old:32][new:32]
+                   [time:8 i64 s][tz:2 i16 min][msg_len:2][msg:N]
+```
+
+`ref` empty means `HEAD`. `flags` bit 0 `OLDEST_FIRST` (default
+newest-first, matching `git reflog`). Entry signatures are omitted: the
+message carries the operation, which is what a caller reads. A ref that
+exists but has never moved answers `OK` with no entries; only a ref that
+does not exist is `NOT_FOUND` — the ref is resolved before the reflog is
+read, because the reader itself cannot tell the two apart. That is `git
+reflog show`'s own split: empty and exit zero for a tag, fatal for a name
+it cannot resolve.
+
+A reflog has no path to name a resume point with, so its continuation is
+positional: `after_pos` is the number of entries already delivered from
+whichever end `OLDEST_FIRST` selected, and a page cut short by `limit`
+ends with a `CURSOR` whose `pos` is what to pass next. The file is
+append-only, so the position is stable in the direction that matters;
+entries landing between pages fall under the family's per-item-coherent,
+whole-response-best-effort contract.
+
+Two things this makes possible that nothing else does. An agent working in
+a sandbox checkout for a session switches branches, resets, rebases and
+amends; "what did this session do to the repository" is only answerable
+from `HEAD`'s reflog, and the alternative is `git reflog` in a PTY with
+the terminal grid scraped — that tax, for a purely local read. And it is
+the only way to name an oid no longer reachable from any ref: `resolve`
+cannot see an amended-away commit and `log` cannot reach it, but the
+reflog has it, and once named the object works normally everywhere else.
+
+### `GIT_FETCH`
+
+The one remote operation on the wire. Without it a client cannot see a
+pull request from a fork, a retarget, or a force-push, because blit only
+sees objects already in the local store — so the workaround is `git fetch`
+in a PTY, and it costs: exit codes that lie (a remote can refuse one
+refspec of several and still exit zero), a two-step refspec fallback,
+`GIT_TERMINAL_PROMPT=0` or a hang at a username prompt, fetched objects
+anchored by hand so an unlucky `gc` cannot prune them, failure diagnosis
+by reading git's last output line off the terminal grid, and a session, a
+shell, a `PATH`, and a terminal-UI filter that has to know to hide it.
+
+```text
+FETCH_REF 0x01: [kind:1][flags:1][status:1][old:32][new:32]
+                [name_len:2][name:N][detail_len:2][detail:N]
+                flags: bit 0 FORCED, bit 1 PRUNED, bit 2 NEW,
+                bit 3 TAG_UPDATE
+```
+
+git's flag alphabet is covered in full — ` ` fast-forward, `=` up to date,
+`+` forced, `-` pruned, `*` new, `t` tag update, `!` rejected — because a
+letter this parser does not handle is a ref the reply never mentions, which
+is the failure the response exists to prevent. `t` keeps its own bit rather
+than folding into `FORCED`: git distinguishes the two, and "the tag you
+pinned now points elsewhere" is a different sentence from "this branch was
+rewritten".
+
+Request `flags`: bit 0 `PRUNE`, bit 1 `NO_TAGS`, bit 2 `ANCHOR` (write
+each fetched tip under `refs/blit/fetch/<remote>/<n>` so a concurrent `gc`
+cannot prune it before the client diffs it). `timeout_ms` `0` → the
+default, clamped. One fetch per repo at a time; a second answers
+`CONFLICT`. `GIT_CANCEL` applies. `PERMISSION` when `BLIT_GIT_FETCH=0` or
+the open cleared `FETCHABLE`.
+
+The reply's shape is the point: **"did I actually get these commits" is
+answerable from it** — per-refspec status plus resulting oids — instead of
+needing a `resolve` per commit afterwards to re-establish a truth the exit
+code obscured.
+
+**Implementation: a subprocess, not an in-process TLS stack.** This is the
+one place the family contradicts its own "never shell out" stance, so the
+reasoning is explicit. That stance is about _reads_: a spawn is real
+overhead against a 2 ms tree listing, and porcelain parsing is fragile
+against a format meant for humans. Neither transfers. A fetch is a network
+operation measured in seconds, so a 2 ms spawn is noise, and
+`git fetch --porcelain --atomic` emits a stable machine format
+(`<flag> <old> <new> <ref>`) that is not porcelain-for-humans at all.
+Against that, `gix` with `blocking-network-client` links a full TLS stack
+into every blit binary — including the static musl build — for a feature
+most deployments never use, and reimplements the parts of git's
+configuration that make fetches work in practice: `url.<base>.insteadOf`,
+`http.proxy`, `credential.helper` chains, `core.sshCommand`, per-host SSH
+config, corporate CA bundles. Divergence there is invisible until a user's
+fetch fails in a way their `git` does not.
+
+So the server runs `git fetch --porcelain --atomic --no-write-fetch-head`
+as a plain subprocess — no PTY, no shell, argv only — in the repo's
+directory with the environment pinned (`GIT_TERMINAL_PROMPT=0`,
+`GIT_ASKPASS`/`SSH_ASKPASS` disabled, `GIT_CONFIG_PARAMETERS` empty,
+`stdin` closed), parses the porcelain lines into `FETCH_REF` records, and
+reports git's stderr tail as `detail` on failure. A timeout kills the
+process group. If `git` is not on `PATH`, `FETCHABLE` is clear on every
+open and the opcode answers `OTHER`.
+
+This keeps the credential boundary where it belongs: blit never stores,
+parses, or transmits a secret; the fetch picks up whatever
+`credential.helper` the box's config names, which is what the PTY
+workaround already relied on. The difference is that the result comes back
+structured instead of scraped.
+
+## Mutation (proposed)
+
+The one part of this document that is a proposal rather than a contract.
+Everything read-side is first-class, so a review surface can show a
+reviewer exactly what changed and act on none of it: stage a hunk, discard
+a file, commit what is staged, each leaves the family for `git` in a PTY —
+shell quoting, screen-scraping, a visible terminal — for operations that
+are purely local and touch no network and no credential. It also splits
+the mental model: state arrives on a watched stream, but a change the
+client makes lands invisibly until the watcher notices.
+
+Sketch, deliberately narrow. In: stage / unstage / discard by path;
+commit; branch create, switch, delete — one opcode discriminated by an
+`op` byte, following `LSP_QUERY`'s precedent. Out: push, rebase / merge /
+cherry-pick as server-side operations, hooks, and hunk-level staging in a
+first cut.
+
+The interesting questions are ordering and observability, not the git
+calls:
+
+- **Serialization.** Mutations run on the repo's state engine thread, so
+  two cannot interleave and none can race the snapshot describing it;
+  reads stay on the stateless pool and stay concurrent.
+- **Observability.** The reply carries the `state_id` it produced — the
+  engine re-snapshots immediately rather than waiting out the settle
+  window — so a client awaits the snapshot it was promised instead of
+  guessing when the watcher will notice.
+- **Preconditions.** A CAS on `state_id`, mirroring
+  [fs-write.md](fs-write.md): `0` is unconditional, otherwise the mutation
+  applies only if the current `state_id` matches, else `CONFLICT` with the
+  current id, so the client rebases without a round trip.
+- **In-flight reads.** Oid-addressed reads are unaffected; a read against
+  `INDEX`/`WORKTREE` would carry the `state_id` it was computed at so a
+  client can discard a diff of a tree that no longer exists.
+- **Hooks** are never run, and the reply would say so rather than staying
+  quiet — silently skipping a `pre-commit` hook the repository defines is
+  exactly the quiet wrongness this pass is trying to remove.
+
 ## Limits and defaults
 
-| Knob                            | Default        | Env                          |
-| ------------------------------- | -------------- | ---------------------------- |
-| Open repos per connection       | 16             | `BLIT_GIT_MAX_REPOS`         |
-| Log subscriptions per repo      | 64             | `BLIT_GIT_MAX_LOG_SUBS`      |
-| Ref settle window               | 50 ms          | `BLIT_GIT_REFS_LATENCY_MS`   |
-| Status settle window            | 500 ms         | `BLIT_GIT_STATUS_LATENCY_MS` |
-| Blob / patch size cap           | 16 MiB         | `BLIT_GIT_BLOB_MAX`          |
-| Commits per `GIT_LOG`           | 256 (max 4096) | `BLIT_GIT_LOG_MAX`           |
-| Records per response            | 10 000         | `BLIT_GIT_ENTRIES_MAX`       |
-| Commits visited per walk        | 100 000        | `BLIT_GIT_WALK_MAX`          |
-| Uncompressed bytes per response | 8 MiB          | `BLIT_GIT_BYTES_MAX`         |
+| Knob                            | Default        | Env                           |
+| ------------------------------- | -------------- | ----------------------------- |
+| Open repos per connection       | 16             | `BLIT_GIT_MAX_REPOS`          |
+| Log subscriptions per repo      | 64             | `BLIT_GIT_MAX_LOG_SUBS`       |
+| Ref settle window               | 50 ms          | `BLIT_GIT_REFS_LATENCY_MS`    |
+| Status settle window            | 500 ms         | `BLIT_GIT_STATUS_LATENCY_MS`  |
+| Blob / patch size cap           | 16 MiB         | `BLIT_GIT_BLOB_MAX`           |
+| Commits per `GIT_LOG`           | 256 (max 4096) | `BLIT_GIT_LOG_MAX`            |
+| Records per response            | 10 000         | `BLIT_GIT_ENTRIES_MAX`        |
+| Commits visited per walk        | 100 000        | `BLIT_GIT_WALK_MAX`           |
+| Uncompressed bytes per response | 8 MiB          | `BLIT_GIT_BYTES_MAX`          |
+| Rename candidate pairs          | 1 000          | `BLIT_GIT_RENAME_LIMIT`       |
+| Blame lines per request         | 50 000         | `BLIT_GIT_BLAME_LINES_MAX`    |
+| Discovery depth (max)           | 4 (16)         | `BLIT_GIT_DISCOVER_DEPTH_MAX` |
+| Discovery results               | 256            | `BLIT_GIT_DISCOVER_MAX`       |
+| Discovery entries scanned       | 100 000        | `BLIT_GIT_DISCOVER_SCAN_MAX`  |
+| Fetch timeout                   | 120 s          | `BLIT_GIT_FETCH_TIMEOUT_MS`   |
+| Fetch enabled                   | on             | `BLIT_GIT_FETCH=0`            |
 
-Budget exhaustion degrades, never surprises: `GIT_LOG` paginates
-(`MORE` + frontier), enumerations truncate (`TRUNCATED`), sized pulls
-refuse with the true size (`TOO_LARGE`), and unpaginatable walks
+`BLIT_GIT_MAX_REPOS` is **per connection**: `GitRepos` is constructed per
+connection and the cap is checked against that map, so a leaky client
+starves only itself. (Only the env read is process-wide, which is a
+caching detail.) Repo _handles_ dedupe by canonical gitdir across opens,
+so N opens of one repository cost N ids but one engine.
+
+Budget exhaustion degrades, never surprises — and, since the second pass,
+always continues: `GIT_LOG` paginates (`MORE` + frontier), enumerations
+truncate with a `CURSOR` naming where they stopped, sized pulls window
+(or refuse with the true size under `WHOLE`), and unpaginatable walks
 (`GIT_BASE`, `UPSTREAM` counting) answer `BUDGET` or clear
 `COUNTS_VALID`. Only repo-level failures close the repo (`GIT_CLOSED`
 reason `4`). Two settle windows because ref moves are cheap to re-read
@@ -592,14 +1194,40 @@ churn. It is a pure name filter — fs sync still never reads git data.
 
 ## Security
 
-Read-only by construction: no message mutates the repository, touches
-remotes, runs hooks, or reads credentials. Discovery honors standard Git
-layout only; the authority model is [fs-watch.md](fs-watch.md)'s — the
-server already hands clients a shell, so this adds denial-of-service
-surface, not privilege, and the mitigations are the budget table,
-request validation (unknown flags/kinds, NULs, oversized paths, bad oids
-rejected), prompt teardown on disconnect, and never logging escaped names
-as trusted text.
+Read-only by construction with one named exception (`GIT_FETCH`): no other
+message mutates the repository, runs a program, or reaches the network.
+Discovery honors standard Git layout only; the authority model is
+[fs-watch.md](fs-watch.md)'s — the server already hands clients a shell,
+so this adds denial-of-service surface, not privilege, and the mitigations
+are the budget table, request validation (unknown flags/kinds, NULs,
+oversized paths, bad oids rejected), prompt teardown on disconnect, and
+never logging escaped names as trusted text.
+
+Four specifics worth naming:
+
+- **Remote URLs are emitted as configured**, userinfo included. This is
+  deliberate and follows the family's authority model rather than
+  defecting from it: the server already hands this caller a shell, so a
+  value they can `cat .git/config` for is not a secret the wire is
+  keeping, and stripping it would only stop them reproducing the remote.
+  The place to be careful is server-side logging, which the rule below
+  already covers.
+- **Cursors are untrusted paths.** `after` goes through the same
+  validation as every other request path — escaping, NUL rejection, length
+  caps, traversal refusal — because a resume token that is really a path
+  is a path. It carries no server state, so a forged cursor can at worst
+  name a different valid starting point.
+- **Discovery** reveals only what `FS_SYNC` plus a loop already reveals,
+  bounded by depth, result, and scan caps, and does not follow symlinks
+  out of the tree.
+- **Fetch** reaches the network and may execute a credential helper — the
+  one the box's git config already names, run by a subprocess that is
+  exactly the `git fetch` the user's own shell would run, with prompting
+  disabled so a missing credential fails reportably instead of hanging.
+  Operators who do not want server-initiated egress set
+  `BLIT_GIT_FETCH=0`, which clears `FETCHABLE` on every open and refuses
+  the opcode. `ANCHOR` writes refs under `refs/blit/fetch/`, a namespace
+  no other tool uses; nothing else in the repository is modified.
 
 ## Implementation notes
 
@@ -616,10 +1244,24 @@ range — with `--staged`, a `-- <path>` filter, and `-p/--patch` for unified
 hunks), and `js/core/src/git.ts` + `openRepo` on
 `BlitConnection`/`BlitWorkspace` (whose handle adds `resolve` and
 `watchLog`), with byte fixtures pinned across both codec implementations.
+**Second-pass status.** Implemented across `crates/remote` (codecs and
+fixtures), `crates/git` (engine, plus `reads.rs` for the repository-wide
+operations), `crates/server` (dispatch), and `js/core` (codec, mirror,
+and the `GitRepoHandle` surface), with byte fixtures pinned identically on
+both sides.
+
+Still outstanding: a CLI surface for the second-pass reads
+(`blit git blame|reflog|discover|fetch`), and the mutation family below,
+which remains a proposal.
+
 Deviations, all invisible to the wire contract and upgradable server-side:
 
-- Rename/copy detection is an exact-oid join reported at similarity 100;
-  content-similarity scoring can land later.
+- Rename similarity is blit's own scorer — weighted hashed-line overlap,
+  git's `2·common/(a+b)` shape — rather than
+  `gix_diff::rewrites::Tracker`. The tracker consumes gix tree-diff
+  changes, and this pipeline diffs flattened `path → Side` maps so a
+  single code path can span index and worktree endpoints that no tree
+  diff sees. Copy detection (`C`) is not implemented; only renames.
 - `GIT_LOG`'s path filter compares the entry against the first parent
   only, and `FOLLOW` adopts the parent-side name of an identical blob —
   exact-rename following, not similarity-based.

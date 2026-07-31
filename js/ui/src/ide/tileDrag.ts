@@ -1,11 +1,17 @@
 /**
- * Drag-and-drop of IDE tile assignments.
+ * Drag-and-drop of BSP pane assignments.
  *
  * Any element that opens a tile on click (an explorer file, a changed file, a
  * problem, a commit, a reference) can also be *dragged* onto a BSP pane to open
  * there instead of the default target. Sources call {@link startTileDrag} with
  * the same assignment they'd pass to `onOpenTile`; pane drop zones read it with
  * {@link tileDragAssignment} and route it to that specific pane.
+ *
+ * The payload is a pane assignment, not strictly an IDE tile: the preview
+ * panel's parked cards drag terminals (a bare session id) and surfaces the
+ * same way, since a pane assignment holds any of them and BSPContainer's
+ * moveToPane is agnostic. Hence the deliberately dumb payload — one opaque
+ * string, interpreted only where it lands.
  */
 
 /** Custom MIME so we only accept our own tile drags (not arbitrary text). */

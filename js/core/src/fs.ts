@@ -19,7 +19,9 @@ const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 // -- Opcodes ----------------------------------------------------------------
 
-/** Start a sync: [0x40][nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N] */
+/** Start a sync: [0x40][nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]
+ *  then, with `FS_SYNC_EXCLUDE`, [exclude_len:2][exclude:M]; then, with
+ *  `FS_SYNC_FROM_PTY`, [src_pty_id:2]. */
 export const C2S_FS_SYNC = 0x40;
 /** Stop a sync: [0x41][sync_id:2] */
 export const C2S_FS_STOP = 0x41;
@@ -56,8 +58,28 @@ export const FS_SYNC_CROSS_FILESYSTEM = 1 << 2;
 export const FS_SYNC_SINGLE = 1 << 3;
 /** Resolve the sync's base directory from a pty's live cwd: a trailing
  *  `[src_pty_id:2]` names a pty and the server joins `path` onto its cwd
- *  (docs/ide.md Decision 3). */
+ *  (docs/ide.md Decision 3). It comes last, after any `EXCLUDE` field. */
 export const FS_SYNC_FROM_PTY = 1 << 4;
+/** Omit every entry whose final component is exactly `.git` — directory or
+ *  gitfile — from enumeration, hashing, hints, and records. A pure name
+ *  filter: no git data is read (docs/design/fs-watch.md "Ignoring"). */
+export const FS_SYNC_EXCLUDE_GIT = 1 << 5;
+/** Honor `.gitignore` in and above the root, plus the governing
+ *  repository's `$GIT_DIR/info/exclude`, the user's `core.excludesFile`,
+ *  and its `core.ignorecase`. */
+export const FS_SYNC_GITIGNORE = 1 << 6;
+/** A trailing `[exclude_len:2][exclude:M]` carries client patterns —
+ *  gitignore syntax, one per line, anchored at the sync root and applied
+ *  above every other rule, so `!keep` re-includes. The flag is what makes
+ *  the field parseable, and what makes a server too old to filter refuse
+ *  the sync instead of silently mirroring the whole tree. */
+export const FS_SYNC_EXCLUDE = 1 << 7;
+/** Honor `.ignore` in and above the root — ripgrep's convention, which a
+ *  project uses to hide things from tooling without telling git to stop
+ *  tracking them. Separate from `GITIGNORE` because the two answer
+ *  different questions, and `.ignore` brings none of git's
+ *  repository-wide sources with it. */
+export const FS_SYNC_DOTIGNORE = 1 << 8;
 
 // S2C_FS_UPDATE flags.
 /** Begin a staged snapshot: apply this and subsequent records to an empty
@@ -150,6 +172,17 @@ export const FS_ENTRY_UNSTABLE = 1 << 4;
  *  directory from one to a file, so this is what tells a tree the entry is
  *  expandable. */
 export const FS_ENTRY_LINK_DIR = 1 << 5;
+/** Set on a directory whose enumeration skipped at least one child the
+ *  sync's exclusion rules cover. Excluded paths are absent rather than
+ *  marked, so without this a client cannot tell an empty directory from a
+ *  filtered one — a file tree needs it to say "some items hidden".
+ *
+ *  Prompt when it goes up, lazy when it comes down: the first excluded
+ *  child costs one re-listing of its directory, while the last one
+ *  disappearing clears the flag only at that directory's next
+ *  enumeration. So a tree may briefly show "hidden items" on a directory
+ *  that no longer has any. */
+export const FS_ENTRY_FILTERED = 1 << 6;
 
 // UPSERT content kinds.
 export const FS_CONTENT_NONE = 0;
@@ -158,6 +191,9 @@ export const FS_CONTENT_DELTA = 2;
 
 // -- Message builders (client to server) ------------------------------------
 
+/** Fixed part of `C2S_FS_SYNC`, up to and including `path_len`. */
+export const FS_SYNC_HEADER = 13;
+
 export function buildFsSyncMessage(
   nonce: number,
   flags: number,
@@ -165,19 +201,37 @@ export function buildFsSyncMessage(
   inlineMax: number,
   path: string,
   srcPtyId?: number,
+  /** Gitignore-syntax patterns, one per line. Empty omits the field. */
+  exclude?: string,
 ): Uint8Array {
   const pathBytes = textEncoder.encode(path);
+  const excludeBytes = textEncoder.encode(exclude ?? "");
+  const hasExclude = excludeBytes.length > 0;
   const hasSrc = srcPtyId != null;
-  const msg = new Uint8Array(12 + pathBytes.length + (hasSrc ? 2 : 0));
+  const excludeLen = hasExclude ? 2 + excludeBytes.length : 0;
+  const msg = new Uint8Array(
+    FS_SYNC_HEADER + pathBytes.length + excludeLen + (hasSrc ? 2 : 0),
+  );
   const v = new DataView(msg.buffer);
   msg[0] = C2S_FS_SYNC;
   v.setUint16(1, nonce, true);
-  msg[3] = hasSrc ? flags | FS_SYNC_FROM_PTY : flags;
-  v.setUint16(4, latencyMs, true);
-  v.setUint32(6, inlineMax, true);
-  v.setUint16(10, pathBytes.length, true);
-  msg.set(pathBytes, 12);
-  if (hasSrc) v.setUint16(12 + pathBytes.length, srcPtyId, true);
+  v.setUint16(
+    3,
+    (hasSrc ? flags | FS_SYNC_FROM_PTY : flags) |
+      (hasExclude ? FS_SYNC_EXCLUDE : 0),
+    true,
+  );
+  v.setUint16(5, latencyMs, true);
+  v.setUint32(7, inlineMax, true);
+  v.setUint16(11, pathBytes.length, true);
+  msg.set(pathBytes, FS_SYNC_HEADER);
+  let off = FS_SYNC_HEADER + pathBytes.length;
+  if (hasExclude) {
+    v.setUint16(off, excludeBytes.length, true);
+    msg.set(excludeBytes, off + 2);
+    off += excludeLen;
+  }
+  if (hasSrc) v.setUint16(off, srcPtyId, true);
   return msg;
 }
 
@@ -1149,6 +1203,28 @@ export interface FsSyncOptions {
   content?: boolean;
   /** Descend into mount points. */
   crossFilesystem?: boolean;
+  /** Shorthand for `gitignore`, `dotIgnore` and `excludeGit` together —
+   *  what "ignore what the repo ignores" usually means. Off by default,
+   *  so a sync only narrows when asked; on a checkout it is the
+   *  difference between mirroring the work tree and mirroring
+   *  `node_modules` and `.git` too. */
+  ignore?: boolean;
+  /** Honor `.gitignore` in and above the root, plus the governing
+   *  repository's `$GIT_DIR/info/exclude`, the user's `core.excludesFile`,
+   *  and its `core.ignorecase`. */
+  gitignore?: boolean;
+  /** Honor `.ignore` files (ripgrep's convention), which bring none of
+   *  git's repository-wide sources with them. */
+  dotIgnore?: boolean;
+  /** Omit `.git` directories and gitfiles. A pure name filter — no git
+   *  data is read — and usually what you want alongside `ignore`, since
+   *  `.git` is not in anyone's `.gitignore`. */
+  excludeGit?: boolean;
+  /** Extra gitignore-syntax patterns, anchored at the sync root and
+   *  applied above every other rule, so `"!keep"` re-includes something
+   *  the ignore files hide. Excluded paths are never enumerated, hashed,
+   *  or counted against the server's entry budget. */
+  exclude?: string[];
   /** Batching/settle window in ms; 0 = server default (20). */
   latencyMs?: number;
   /** Per-file inline content cap in bytes; 0 = server default (16 MiB). */

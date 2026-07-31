@@ -435,6 +435,15 @@ is not a goal but falls out free.
 4. `js/ui`: `ide/serverState.ts` — buffer parking on the autosave
    triggers + mount-time restore (`editor/buf/`), then open-markers +
    cross-client dock landing (`editor/open/`).
+
+   _Shipped on `tabs/` instead_ (`ide/openTabs.ts`): the tab registry
+   already records every opened tab — diffs, commits and web panes
+   included, not just editor files — keyed by a deterministic id, so
+   the dock is derived by watching that prefix and subtracting what the
+   client currently displays. `editor/open/` remains the right home for
+   per-file cursor/scroll metadata; it is no longer needed to answer
+   "what is open".
+
 5. `js/ui`: roots on KV — `roots` key read/watch/CAS mutations in
    `storage.ts`, gateway seed-and-fallback (§ Second consumer).
 6. `blit kv` CLI.

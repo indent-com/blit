@@ -134,7 +134,20 @@ blit git ls-tree HEAD:src            # descend by passing a path
 blit git merge-base main feature     # best common ancestors (exit 1 if unrelated)
 blit git ls-files                    # the index (MODE STAGE OID<TAB>PATH)
 blit git ls-files src                # limited to a path prefix
+blit git blame src/main.rs           # one row per attributed range
+blit git blame src/main.rs --start 40 --lines 20   # just a viewport
+blit git reflog                      # HEAD's reflog, newest first
+blit git reflog refs/heads/main -n 5
+blit git discover /workspace         # repositories under a path
+blit git fetch origin                # per-ref outcomes; exit 1 if any refused
+blit git fetch origin refs/pull/12/head --anchor
 ```
+
+`blame` prints commit oids, not authors — resolve them with `git log` when
+you need names, which keeps a viewport blame small. `fetch` runs the
+server's own `git`, so its credential helpers and config apply, and it
+exits non-zero when any ref was refused (plain `git fetch` can exit 0
+having refused one refspec of several).
 
 ## Code intelligence
 

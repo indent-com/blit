@@ -121,6 +121,9 @@ function ensureBuffer(
  */
 export async function createWebGpuRenderer(
   canvas: HTMLCanvasElement,
+  /** Called once if the GPU device is lost. The renderer is unusable from that
+   *  point on — see the `device.lost` handler below. */
+  onLost?: () => void,
 ): Promise<GlRenderer | null> {
   if (typeof navigator === "undefined" || !navigator.gpu) return null;
 
@@ -273,8 +276,16 @@ export async function createWebGpuRenderer(
   let lost = false;
   let textGamma = 1;
 
-  device.lost.then(() => {
+  // A lost device takes every buffer, texture and pipeline created from it with
+  // it, and nothing can be recreated on the same device — WebGPU requires a new
+  // one. Reporting `supported: false` (below) makes cached holders re-fetch,
+  // and `onLost` lets the owner build the replacement.
+  device.lost.then((info) => {
     lost = true;
+    console.warn(
+      `blit: WebGPU device lost (${info.reason || "unknown"}) — rebuilding renderer`,
+    );
+    onLost?.();
   });
 
   let logicalW = 0;
@@ -446,11 +457,13 @@ export async function createWebGpuRenderer(
 
   // --- GlRenderer implementation ---
   return {
-    // Same contract as the WebGL2 renderer: once disposed this must read
-    // false so cached holders re-fetch instead of drawing through
-    // destroyed GPU resources.
+    // Same contract as the WebGL2 renderer: once disposed — or once the device
+    // is lost — this must read false so cached holders re-fetch instead of
+    // drawing through destroyed GPU resources. `lost` used to only short-
+    // circuit render(), which left the store handing out a dead renderer for
+    // the rest of the page's life: every pane blank, permanently.
     get supported() {
-      return !disposed;
+      return !disposed && !lost;
     },
     backend: "webgpu" as const,
     maxDimension: maxDim,

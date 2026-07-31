@@ -96,7 +96,7 @@ function toHex(bytes: Uint8Array): string {
  * (see the matching `wire_fixtures` test there). Both implementations pin
  * the same bytes, so any codec drift fails on one side or the other.
  */
-const FIXTURE_SYNC = "400201031900000001000d002f746d702f7761746368206d65";
+const FIXTURE_SYNC = "40020103001900000001000d002f746d702f7761746368206d65";
 const FIXTURE_STOP = "410201";
 const FIXTURE_ACK = "42020104030201";
 const FIXTURE_FETCH = "43030002010b007375622f2546462e62696e";
@@ -168,7 +168,18 @@ describe("fs wire fixtures (cross-checked with Rust)", () => {
     // FROM_PTY sync (docs/ide.md Decision 3): flag bit set + trailing src pty.
     expect(
       toHex(buildFsSyncMessage(7, FS_SYNC_RECURSIVE, 0, 0, "sub", 42)),
-    ).toBe("4007001100000000000003007375622a00");
+    ).toBe("400700110000000000000003007375622a00");
+    // Both optional trailers, in field order: EXCLUDE then FROM_PTY
+    // (docs/design/fs-watch.md "Ignoring").
+    expect(
+      toHex(
+        buildFsSyncMessage(7, FS_SYNC_RECURSIVE, 0, 0, "sub", 42, "target"),
+      ),
+    ).toBe("4007009100000000000000030073756206007461726765742a00");
+    // No patterns leaves the message exactly as it was before the field.
+    expect(
+      toHex(buildFsSyncMessage(7, FS_SYNC_RECURSIVE, 0, 0, "sub", 42, "")),
+    ).toBe("400700110000000000000003007375622a00");
   });
 
   it("record encoder emits the pinned bytes", () => {

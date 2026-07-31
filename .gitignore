@@ -1,3 +1,6 @@
+**/.DS_Store
+.DS_Store
+.env.local
 .vite/
 /.blit-dev.sock
 /.direnv/
@@ -11,5 +14,3 @@
 coverage/
 dist/
 node_modules/
-.DS_Store
-**/.DS_Store

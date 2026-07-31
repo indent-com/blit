@@ -58,7 +58,6 @@ type DebugStats = {
   terminals: number;
   staleTerminals: number;
   subscribed: number;
-  frozenPtys: number;
   pendingFrameQueues: number;
   totalPendingFrames: number;
   surfaces?: SurfaceDebugInfo[];
@@ -901,7 +900,6 @@ function DebugPanel(props: {
       terminals: 0,
       staleTerminals: 0,
       subscribed: 0,
-      frozenPtys: 0,
       pendingFrameQueues: 0,
       totalPendingFrames: 0,
     };
@@ -1037,7 +1035,7 @@ function DebugPanel(props: {
         />
         <Row
           label="Terminals"
-          value={`${stats().terminals} live, ${stats().staleTerminals} stale, ${stats().frozenPtys} frozen`}
+          value={`${stats().terminals} live, ${stats().staleTerminals} stale`}
         />
         <Show when={(stats().surfaces?.length ?? 0) > 0}>
           <For each={stats().surfaces}>
