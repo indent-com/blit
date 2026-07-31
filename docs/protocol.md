@@ -69,7 +69,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x2F` | `SURFACE_TEXT`         | `[surface_id:2][text:N]` — composed text input (UTF-8)                                                                                                               |
 | `0x30` | `AUDIO_SUBSCRIBE`      | `[bitrate_kbps:2]`                                                                                                                                                   |
 | `0x31` | `AUDIO_UNSUBSCRIBE`    | (no payload)                                                                                                                                                         |
-| `0x40` | `FS_SYNC`              | `[nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N]`                                                                                                 |
+| `0x40` | `FS_SYNC`              | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`                    |
 | `0x41` | `FS_STOP`              | `[sync_id:2]`                                                                                                                                                        |
 | `0x42` | `FS_ACK`               | `[sync_id:2][update_id:4]` — cumulative                                                                                                                              |
 | `0x43` | `FS_FETCH`             | `[nonce:2][sync_id:2][path_len:2][path:N]`                                                                                                                           |
@@ -113,7 +113,7 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 | `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                              |
 | `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                         |
 | `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                                       |
-| `0x07` | `HELLO`             | `[version:2][features:4][boot_generation:8]`                                                                       |
+| `0x07` | `HELLO`             | `[version:2][features:4][boot_generation:8][server_version_len:2][server_version:N]`                               |
 | `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                        |
 | `0x09` | `READY`             | (no payload)                                                                                                       |
 | `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                             |
@@ -146,7 +146,7 @@ Both bytes are optional — a 3-byte message uses connection/server defaults. Re
 
 **Notes:**
 
-`S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. Legacy servers omit this field. `features` is a 4-byte bitmask:
+`S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. `server_version` is the server's release string (its crate version, e.g. `0.40.1`) — informational only: feature negotiation always goes through the feature bits, never a version comparison. Both trailing fields were appended without a protocol bump, so legacy servers omit them and clients must treat a short `HELLO` as valid. `features` is a 4-byte bitmask:
 
 | Bit | Name           | Meaning                                                        |
 | --- | -------------- | -------------------------------------------------------------- |
@@ -189,7 +189,7 @@ Each `(client, surface)` pair runs at most one server-side encoder, at the compo
 On connect, the server immediately sends:
 
 ```
-S2C_HELLO       (version + feature bits + boot generation)
+S2C_HELLO       (protocol version + feature bits + boot generation + server release)
 S2C_LIST        (all existing PTYs)
 S2C_TITLE       (one per PTY, if title is set)
 S2C_EXITED      (one per exited-but-retained PTY)
@@ -305,7 +305,10 @@ nonce request/response pairs. Wire details:
 [design/git.md](design/git.md); server engine: `crates/git`; codecs and
 the `GitStateMirror` reference reducer: `crates/remote/src/git.rs` and
 `js/core/src/git.ts` (surfaced as `openRepo` on
-`BlitConnection`/`BlitWorkspace`).
+`BlitConnection`/`BlitWorkspace`). Bounded responses carry a `CURSOR`
+record naming where they stopped, so every enumeration is resumable;
+discovery, blame, reflog and fetch occupy a second opcode block at
+`0x90`.
 
 ## Language intelligence
 

@@ -12,7 +12,7 @@ import type { Extension } from "@codemirror/state";
 import { tags as t } from "@lezer/highlight";
 // Aliased: `t` in this module is already @lezer/highlight's tag set.
 import { t as tr } from "../i18n";
-import { type TerminalPalette } from "@blit-sh/core";
+import { measureCell, type TerminalPalette } from "@blit-sh/core";
 import type { Theme } from "../theme";
 import { uiScale } from "../theme";
 
@@ -43,13 +43,18 @@ export function cmTheme(
   const cyan = at(14, theme.accent);
   const comment = theme.dimFg;
 
-  // The one deliberate restatement of the global `line-height: 1`
-  // (js/ui/index.html). Every other copy was removed as redundant, but
-  // CodeMirror's virtual scrolling *measures* the rendered line height to
-  // size its viewport, so the editor pins its own text metrics next to the
-  // font family and size it already sets here rather than depending on a
-  // reset it does not own.
-  const lineHeight = "1";
+  // One terminal cell per line, measured the way the terminal measures it:
+  // ascent + descent, snapped to device pixels (js/core/src/measure.ts).
+  // Every code surface derives its line box from that one function — the
+  // terminal's canvas grid, a diff or commit row, and this editor — so a
+  // file, a patch and a shell stacked in three panes line up, and no glyph
+  // is taller than the line that holds it.
+  //
+  // It stays pinned here rather than inherited from the global reset
+  // (js/ui/index.html): CodeMirror's virtual scrolling *measures* the
+  // rendered line height to size its viewport, so the editor states its own
+  // text metrics next to the font family and size it already sets.
+  const lineHeight = `${measureCell(fontFamily, fontSize).h}px`;
 
   const view = EditorView.theme(
     {

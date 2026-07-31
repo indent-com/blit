@@ -78,7 +78,10 @@ export function withConn(
   return isTileAssignment(full) || isWebAssignment(full) ? full : null;
 }
 
-const tabKey = (id: string): string => `tabs/${id}`;
+/** Key namespace for the registry; also the prefix `openTabs.ts` watches. */
+export const TAB_PREFIX = "tabs/";
+
+const tabKey = (id: string): string => `${TAB_PREFIX}${id}`;
 
 /** Fire-and-forget registration; idempotent (deterministic id ⇒ same value). */
 export function registerTab(

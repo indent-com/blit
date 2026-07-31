@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use blit_remote::git::{
     GIT_CLOSED_BACKEND_FAILED, GIT_CLOSED_RESOURCE_LIMIT, GIT_HEAD_DETACHED, GIT_HEAD_UNBORN,
     GIT_OID_NONE, GIT_OP_BISECT, GIT_OP_CHERRY_PICK, GIT_OP_MERGE, GIT_OP_REBASE, GIT_OP_REVERT,
-    GIT_REF_PEELED_VALID, GIT_REF_SYMBOLIC, GIT_STATE_RECORD_STATUS, GIT_STATE_REFS_TRUNCATED,
+    GIT_REF_PEELED_VALID, GIT_REF_SYMBOLIC, GIT_REMOTE_DEFAULT, GIT_STATE_PARTIAL,
+    GIT_STATE_RECORD_REF, GIT_STATE_RECORD_STATUS, GIT_STATE_REFS_TRUNCATED,
     GIT_STATE_STATUS_TRUNCATED, GIT_STATUS_OK, GIT_UPSTREAM_COUNTS_VALID, GIT_UPSTREAM_GONE,
     GitStateRecord, append_git_state_record, msg_git_closed, msg_git_state,
 };
@@ -50,6 +51,10 @@ pub struct StateOptions {
     pub untracked: bool,
     pub ignored: bool,
     pub tracking: bool,
+    /// Emit one `STATE_REMOTE` record per configured remote.
+    pub remotes: bool,
+    /// Ref prefixes to watch; empty watches every ref.
+    pub ref_prefixes: Vec<String>,
     pub refs_latency: Duration,
     pub status_latency: Duration,
 }
@@ -62,6 +67,8 @@ impl Default for StateOptions {
             untracked: false,
             ignored: false,
             tracking: false,
+            remotes: false,
+            ref_prefixes: Vec::new(),
             refs_latency: crate::env_latency("BLIT_GIT_REFS_LATENCY_MS", 50, 1000),
             status_latency: crate::env_latency("BLIT_GIT_STATUS_LATENCY_MS", 500, 10_000),
         }
@@ -316,12 +323,16 @@ struct Subscriber {
 
 /// The union of subscriber demands: what the shared computation must
 /// cover so every subscriber's filtered view is complete.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 struct Demand {
     status: bool,
     untracked: bool,
     ignored: bool,
     tracking: bool,
+    remotes: bool,
+    /// Union of subscriber prefix filters; empty means every ref, and an
+    /// empty list from any subscriber widens the union to all.
+    ref_prefixes: Vec<String>,
 }
 
 /// One computed snapshot, cut at the superset demand and assembled per
@@ -332,6 +343,8 @@ struct Parts {
     refs_truncated: bool,
     /// UPSTREAM records; present when any subscriber wants TRACKING.
     tracking: Option<Vec<u8>>,
+    /// STATE_REMOTE records; present when any subscriber wants REMOTES.
+    remotes: Option<Vec<u8>>,
     /// STATUS records at the superset untracked/ignored demand, plus the
     /// truncation flag.
     status: Option<(Vec<u8>, bool)>,
@@ -1038,12 +1051,27 @@ impl Engine {
     /// The union of live subscriber demands.
     fn demand(&self) -> Demand {
         let mut demand = Demand::default();
+        let mut wants_all_refs = false;
         for sub in self.subs.values().filter(|s| s.opts.wants_state && !s.gone) {
             demand.status |= sub.opts.status;
             demand.untracked |= sub.opts.untracked;
             demand.ignored |= sub.opts.ignored;
             demand.tracking |= sub.opts.tracking;
+            demand.remotes |= sub.opts.remotes;
+            if sub.opts.ref_prefixes.is_empty() {
+                wants_all_refs = true;
+            } else {
+                for prefix in &sub.opts.ref_prefixes {
+                    if !demand.ref_prefixes.contains(prefix) {
+                        demand.ref_prefixes.push(prefix.clone());
+                    }
+                }
+            }
         }
+        if wants_all_refs {
+            demand.ref_prefixes.clear();
+        }
+        demand.ref_prefixes.sort();
         demand
     }
 
@@ -1058,7 +1086,7 @@ impl Engine {
             return;
         }
         let demand = self.demand();
-        if self.parts.as_ref().map(|p| p.demand) != Some(demand) {
+        if self.parts.as_ref().map(|p| &p.demand) != Some(&demand) {
             self.parts = None;
         }
         let parts = match self.parts.take() {
@@ -1083,8 +1111,26 @@ impl Engine {
             }
             let state_id = sub.next_state_id;
             sub.next_state_id = sub.next_state_id.wrapping_add(1);
-            if !(sub.outbox)(msg_git_state(sub.repo_id, state_id, flags, &records)) {
-                sub.gone = true;
+            // A snapshot past the per-message byte budget goes out as
+            // several messages sharing one state_id, every one but the
+            // last carrying PARTIAL. The client accumulates and installs
+            // the map on the final chunk, so "complete snapshot, replace
+            // the map" still holds, and only that chunk is acked — the
+            // one-in-flight pacing is unchanged.
+            let mut sent_ok = true;
+            for (chunk, more) in chunk_records(&records, self.repo.budgets.bytes_max) {
+                let chunk_flags = if more {
+                    flags | GIT_STATE_PARTIAL
+                } else {
+                    flags
+                };
+                if !(sub.outbox)(msg_git_state(sub.repo_id, state_id, chunk_flags, chunk)) {
+                    sub.gone = true;
+                    sent_ok = false;
+                    break;
+                }
+            }
+            if !sent_ok {
                 continue;
             }
             sub.unacked = Some(state_id);
@@ -1104,10 +1150,16 @@ impl Engine {
         head_record(repo, &mut base);
         let mut branches: Vec<String> = Vec::new();
         let entries_max = self.repo.budgets.entries_max;
-        let refs_truncated = !refs_records(repo, entries_max, &mut base, &mut branches);
+        let prefixes = demand.ref_prefixes.clone();
+        let refs_truncated = !refs_records(repo, entries_max, &prefixes, &mut base, &mut branches);
         op_record(repo, &mut base);
         special_ref_records(repo, &mut base);
         stash_records(repo, entries_max, &mut base);
+        let remotes = demand.remotes.then(|| {
+            let mut records = Vec::new();
+            remote_records(repo, &mut records);
+            records
+        });
         let tracking = demand.tracking.then(|| {
             let mut records = Vec::new();
             upstream_records(
@@ -1119,10 +1171,11 @@ impl Engine {
             );
             records
         });
-        let status = demand.status.then(|| {
+        let want_status = demand.status;
+        let status = want_status.then(|| {
             status_segment(
                 repo,
-                demand,
+                &demand,
                 &self.repo.budgets,
                 &mut self.status_dirty,
                 &mut self.status_memo,
@@ -1134,6 +1187,7 @@ impl Engine {
             base,
             refs_truncated,
             tracking,
+            remotes,
             status,
             demand,
         }
@@ -1272,11 +1326,26 @@ fn assemble(parts: &Parts, opts: &StateOptions) -> (u8, Vec<u8>) {
     if parts.refs_truncated {
         flags |= GIT_STATE_REFS_TRUNCATED;
     }
-    let mut records = parts.base.clone();
+    // The base was cut at the union of prefix demands; an open that asked
+    // for less gets the difference filtered out here, the same way STATUS
+    // narrows below.
+    let mut records =
+        if opts.ref_prefixes.is_empty() || opts.ref_prefixes == parts.demand.ref_prefixes {
+            parts.base.clone()
+        } else {
+            let mut narrowed = Vec::with_capacity(parts.base.len());
+            filter_refs(&parts.base, &opts.ref_prefixes, &mut narrowed);
+            narrowed
+        };
     if opts.tracking
         && let Some(tracking) = &parts.tracking
     {
         records.extend_from_slice(tracking);
+    }
+    if opts.remotes
+        && let Some(remotes) = &parts.remotes
+    {
+        records.extend_from_slice(remotes);
     }
     if opts.status
         && let Some((status, truncated)) = &parts.status
@@ -1297,6 +1366,86 @@ fn assemble(parts: &Parts, opts: &StateOptions) -> (u8, Vec<u8>) {
 /// letter beside a filtered worktree letter survives with the worktree
 /// side blanked (the delete-then-recreate case); a record left with two
 /// blanks disappears entirely.
+/// Split a records buffer on record boundaries into pieces no larger than
+/// `budget`, yielding `(chunk, more_follows)`. A single record larger than
+/// the budget is its own chunk rather than being split — record framing is
+/// what makes the payload parseable, and half a record parses as nothing.
+///
+/// Always yields at least one chunk, so an empty snapshot is still one
+/// message with `PARTIAL` clear.
+fn chunk_records(records: &[u8], budget: usize) -> Vec<(&[u8], bool)> {
+    if records.len() <= budget || budget == 0 {
+        return vec![(records, false)];
+    }
+    let mut bounds = Vec::new();
+    let mut at = 0usize;
+    let mut start = 0usize;
+    while at + 4 <= records.len() {
+        let len = u32::from_le_bytes(records[at..at + 4].try_into().expect("4 bytes")) as usize;
+        let end = match at.checked_add(4).and_then(|n| n.checked_add(len)) {
+            Some(end) if end <= records.len() => end,
+            // Malformed framing: the rest is unparseable anyway, so it
+            // rides out in one piece and the decoder stops where it stops.
+            _ => break,
+        };
+        if end - start > budget && at > start {
+            bounds.push((start, at));
+            start = at;
+        }
+        at = end;
+    }
+    bounds.push((start, records.len()));
+    let last = bounds.len() - 1;
+    bounds
+        .into_iter()
+        .enumerate()
+        .map(|(i, (a, b))| (&records[a..b], i != last))
+        .collect()
+}
+
+/// Copy records, keeping only `STATE_REF`s whose name matches one of
+/// `prefixes`. Non-ref records pass through untouched — HEAD, the
+/// operation, stash and remote records are not what a prefix filter is
+/// about. Pseudo-refs (`MERGE_HEAD` and friends) carry no `refs/` prefix
+/// and are always kept: they describe the operation in progress, which a
+/// client asking for `refs/heads/` still needs.
+fn filter_refs(records: &[u8], prefixes: &[String], out: &mut Vec<u8>) {
+    let mut data = records;
+    while data.len() >= 4 {
+        let len = u32::from_le_bytes(data[0..4].try_into().expect("4 bytes")) as usize;
+        if len == 0 || data.len() < 4 + len {
+            break;
+        }
+        let frame = &data[..4 + len];
+        data = &data[4 + len..];
+        if frame[4] != GIT_STATE_RECORD_REF {
+            out.extend_from_slice(frame);
+            continue;
+        }
+        // STATE_REF body: [flags:1][oid:32][peeled:32][name_len:2][name:N]
+        let name_at = 4 + 1 + 1 + 32 + 32;
+        let Some(name_len) = frame
+            .get(name_at..name_at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        else {
+            out.extend_from_slice(frame);
+            continue;
+        };
+        let Some(name) = frame
+            .get(name_at + 2..name_at + 2 + name_len)
+            .and_then(|b| std::str::from_utf8(b).ok())
+        else {
+            out.extend_from_slice(frame);
+            continue;
+        };
+        let keep =
+            !name.starts_with("refs/") || prefixes.iter().any(|p| name.starts_with(p.as_str()));
+        if keep {
+            out.extend_from_slice(frame);
+        }
+    }
+}
+
 fn filter_status(records: &[u8], untracked: bool, ignored: bool, out: &mut Vec<u8>) {
     if untracked && ignored {
         out.extend_from_slice(records);
@@ -1339,7 +1488,7 @@ fn filter_status(records: &[u8], untracked: bool, ignored: bool, out: &mut Vec<u
 /// records verbatim. A demand change past what the memo holds recomputes.
 fn status_segment(
     repo: &gix::Repository,
-    demand: Demand,
+    demand: &Demand,
     budgets: &Budgets,
     dirty: &mut bool,
     memo: &mut Option<StatusMemo>,
@@ -1431,10 +1580,39 @@ fn head_record(repo: &gix::Repository, records: &mut Vec<u8>) {
     );
 }
 
-/// All refs; returns false when the entry budget truncated the set.
+/// How load-bearing a ref is, lowest first. A budget must shed what nobody
+/// decorates with: dropping `refs/remotes/origin/HEAD` reads as "this
+/// branch has no base", which is silently wrong, while dropping the
+/// 200 000th tag is visibly partial and harmless (docs/design/git.md
+/// "GIT_STATE / GIT_ACK").
+fn ref_tier(name: &str, head_branch: Option<&str>, upstream: Option<&str>) -> u8 {
+    if Some(name) == head_branch {
+        return 0;
+    }
+    if Some(name) == upstream {
+        return 1;
+    }
+    if name.starts_with("refs/remotes/") && name.ends_with("/HEAD") {
+        return 2;
+    }
+    if name.starts_with("refs/heads/") {
+        return 3;
+    }
+    if name.starts_with("refs/remotes/") {
+        return 4;
+    }
+    if name.starts_with("refs/tags/") {
+        return 6;
+    }
+    5
+}
+
+/// All refs, most load-bearing first, optionally filtered to `prefixes`;
+/// returns false when the entry budget truncated the set.
 fn refs_records(
     repo: &gix::Repository,
     entries_max: usize,
+    prefixes: &[String],
     records: &mut Vec<u8>,
     branches: &mut Vec<String>,
 ) -> bool {
@@ -1444,17 +1622,35 @@ fn refs_records(
     let Ok(iter) = platform.all() else {
         return true;
     };
-    for (count, reference) in iter.flatten().enumerate() {
-        if count >= entries_max {
-            return false;
-        }
+    // HEAD's branch and its upstream lead the ordering, so resolve them
+    // before the walk.
+    let head_branch = repo
+        .head_name()
+        .ok()
+        .flatten()
+        .map(|n| crate::escape_bstr(n.as_bstr()));
+    let upstream = head_branch.as_deref().and_then(|branch| {
+        let short = branch.strip_prefix("refs/heads/")?;
+        upstream_ref_name(repo, short)
+    });
+
+    // Collected, then ordered, then emitted: the cap has to fall on the
+    // least important refs, which is not knowable one entry at a time.
+    let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut overflow = false;
+    for reference in iter.flatten() {
         let name = crate::escape_bstr(reference.name().as_bstr());
         let mut ref_flags = 0u8;
         let mut reference = reference;
+        // The symbolic target's name was previously bound and dropped here.
+        // It is the only thing that turns `refs/remotes/origin/HEAD` from an
+        // oid into "the default branch is <this>", so it goes on the wire.
+        let mut target = String::new();
         let oid = match reference.target() {
             gix::refs::TargetRef::Object(id) => oid_bytes(id),
-            gix::refs::TargetRef::Symbolic(_) => {
+            gix::refs::TargetRef::Symbolic(name) => {
                 ref_flags |= GIT_REF_SYMBOLIC;
+                target = crate::escape_bstr(name.as_bstr());
                 reference
                     .peel_to_id_in_place()
                     .map(|id| oid_bytes(id.as_ref()))
@@ -1475,17 +1671,100 @@ fn refs_records(
         if let Some(branch) = name.strip_prefix("refs/heads/") {
             branches.push(branch.to_string());
         }
+        // An empty prefix list watches every ref; otherwise a UI that
+        // renders branches stops paying for tags at every settle.
+        if !prefixes.is_empty() && !prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            continue;
+        }
+        let mut encoded = Vec::new();
         append_git_state_record(
-            records,
+            &mut encoded,
             &GitStateRecord::Ref {
                 flags: ref_flags,
                 oid,
                 peeled,
                 name: &name,
+                target: &target,
+            },
+        );
+        // A pathological repository must not be collected whole just to
+        // sort it: past a generous multiple of the cap, stop taking tags
+        // (the only unbounded tier in practice) and mark truncation.
+        if collected.len() >= entries_max.saturating_mul(4) {
+            overflow = true;
+            break;
+        }
+        collected.push((
+            ref_tier(&name, head_branch.as_deref(), upstream.as_deref()),
+            encoded,
+        ));
+    }
+    collected.sort_by_key(|(tier, _)| *tier);
+    let truncated = overflow || collected.len() > entries_max;
+    for (_, encoded) in collected.into_iter().take(entries_max) {
+        records.extend_from_slice(&encoded);
+    }
+    !truncated
+}
+
+/// The full ref name a local branch tracks, from config — the same
+/// mapping `UPSTREAM` records are derived from, never exposed raw.
+fn upstream_ref_name(repo: &gix::Repository, branch: &str) -> Option<String> {
+    let config = repo.config_snapshot();
+    let remote = config.string(format!("branch.{branch}.remote").as_str())?;
+    let merge = config.string(format!("branch.{branch}.merge").as_str())?;
+    let merge = merge.to_string();
+    let short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+    Some(format!("refs/remotes/{remote}/{short}"))
+}
+
+/// One `STATE_REMOTE` per configured remote.
+///
+/// URLs go out as configured, userinfo included. The authority model is
+/// the fs family's: the server already hands this caller a shell, so a
+/// value they can `cat .git/config` for is not a secret this message is
+/// keeping. Stripping it would cost the client the ability to reproduce
+/// the remote and buy nothing.
+fn remote_records(repo: &gix::Repository, records: &mut Vec<u8>) {
+    let default = repo
+        .head_name()
+        .ok()
+        .flatten()
+        .and_then(|n| {
+            let name = crate::escape_bstr(n.as_bstr());
+            let branch = name.strip_prefix("refs/heads/")?.to_string();
+            repo.config_snapshot()
+                .string(format!("branch.{branch}.remote").as_str())
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_default();
+    for name in repo.remote_names() {
+        let name = name.to_string();
+        let Ok(remote) = repo.find_remote(name.as_str()) else {
+            continue;
+        };
+        let url = |dir| {
+            remote
+                .url(dir)
+                .map(|u| u.to_bstring().to_string())
+                .unwrap_or_default()
+        };
+        let fetch_url = url(gix::remote::Direction::Fetch);
+        let push_url = url(gix::remote::Direction::Push);
+        append_git_state_record(
+            records,
+            &GitStateRecord::Remote {
+                flags: if name == default {
+                    GIT_REMOTE_DEFAULT
+                } else {
+                    0
+                },
+                name: &name,
+                fetch_url: &fetch_url,
+                push_url: if push_url == fetch_url { "" } else { &push_url },
             },
         );
     }
-    true
 }
 
 fn op_record(repo: &gix::Repository, records: &mut Vec<u8>) {
@@ -1554,6 +1833,7 @@ fn special_ref_records(repo: &gix::Repository, records: &mut Vec<u8>) {
                 oid,
                 peeled: GIT_OID_NONE,
                 name,
+                target: "",
             },
         );
     };

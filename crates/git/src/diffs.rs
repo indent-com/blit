@@ -12,16 +12,19 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use blit_remote::git::{
-    GIT_DIFF_ENTRY_BINARY, GIT_DIFF_ENTRY_SUBMODULE, GIT_DIFF_IGNORE_ALL_SPACE,
-    GIT_DIFF_IGNORE_SPACE_CHANGE, GIT_DIFF_IGNORED, GIT_DIFF_RENAMES, GIT_DIFF_TRUNCATED,
-    GIT_DIFF_UNTRACKED, GIT_ENDPOINT_COMMIT, GIT_ENDPOINT_EMPTY, GIT_ENDPOINT_INDEX,
-    GIT_ENDPOINT_MERGE_BASE, GIT_ENDPOINT_TREE, GIT_ENDPOINT_WORKTREE, GIT_INDEX_INTENT_TO_ADD,
-    GIT_INDEX_SKIP_WORKTREE, GIT_INDEX_TRUNCATED, GIT_OID_NONE, GIT_PATCH_CHAR_SPANS,
-    GIT_PATCH_FILE_BINARY, GIT_PATCH_NO_SPANS, GIT_PATCH_STRUCTURED, GIT_PATCH_TEXT,
-    GIT_PATCH_TRUNCATED, GIT_STATE_STATUS_TRUNCATED, GIT_STATUS_CANCELLED,
+    GIT_DIFF_ENTRY_BINARY, GIT_DIFF_ENTRY_FILTERED, GIT_DIFF_ENTRY_SUBMODULE,
+    GIT_DIFF_IGNORE_ALL_SPACE, GIT_DIFF_IGNORE_SPACE_CHANGE, GIT_DIFF_IGNORED, GIT_DIFF_RAW,
+    GIT_DIFF_RENAME_LIMIT, GIT_DIFF_RENAMES, GIT_DIFF_TRUNCATED, GIT_DIFF_UNTRACKED,
+    GIT_ENDPOINT_COMMIT, GIT_ENDPOINT_EMPTY, GIT_ENDPOINT_INDEX, GIT_ENDPOINT_MERGE_BASE,
+    GIT_ENDPOINT_TREE, GIT_ENDPOINT_WORKTREE, GIT_INDEX_INTENT_TO_ADD, GIT_INDEX_SKIP_WORKTREE,
+    GIT_INDEX_TRUNCATED, GIT_OID_NONE, GIT_PATCH_BINARY, GIT_PATCH_CHAR_SPANS,
+    GIT_PATCH_FILE_BINARY, GIT_PATCH_FILE_FILTERED, GIT_PATCH_IGNORE_ALL_SPACE,
+    GIT_PATCH_IGNORE_SPACE_CHANGE, GIT_PATCH_IGNORED, GIT_PATCH_NO_SPANS, GIT_PATCH_RAW,
+    GIT_PATCH_RENAMES, GIT_PATCH_STRUCTURED, GIT_PATCH_TEXT, GIT_PATCH_TRUNCATED,
+    GIT_PATCH_UNTRACKED, GIT_RENAME_MAX, GIT_STATE_STATUS_TRUNCATED, GIT_STATUS_CANCELLED,
     GIT_STATUS_ENTRY_CONFLICTED, GIT_STATUS_INVALID, GIT_STATUS_NOT_FOUND, GIT_STATUS_OK,
     GIT_STATUS_OTHER, GIT_STATUS_TOO_LARGE, GitDiffRecord, GitDiffRequest, GitEndpoint,
-    GitIndexRecord, GitOid, GitPatchRecord, GitPatchRequest, GitStateRecord,
+    GitIndexRecord, GitIndexRequest, GitOid, GitPatchRecord, GitPatchRequest, GitStateRecord,
     append_git_diff_record, append_git_index_record, append_git_patch_record,
     append_git_state_record, msg_git_diff_resp, msg_git_index_resp, msg_git_patch_resp,
 };
@@ -446,6 +449,21 @@ struct Change {
     st: u8,
     old: Option<Side>,
     new: Option<Side>,
+    /// 0-100, meaningful for `R`: 100 from the exact-oid join, else the
+    /// measured content similarity.
+    similarity: u8,
+}
+
+impl Change {
+    fn new(path: Vec<u8>, st: u8, old: Option<Side>, new: Option<Side>) -> Change {
+        Change {
+            path,
+            st,
+            old,
+            new,
+            similarity: 0,
+        }
+    }
 }
 
 /// Read one side's bytes: blob by oid, or the worktree file. A worktree
@@ -585,6 +603,13 @@ fn normalize_ws(bytes: &[u8], mode: u8) -> Vec<u8> {
 /// `ws` carries the ignore-whitespace bits (0 = exact). `stats` is the
 /// status pipeline's stat cache, fed by proven content equalities.
 #[allow(clippy::too_many_arguments)]
+/// What `diff_flats` produced, plus whether rename scoring was skipped.
+struct Changes {
+    changes: Vec<Change>,
+    rename_limit_hit: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn diff_flats(
     repo: &gix::Repository,
     workdir: Option<&std::path::Path>,
@@ -592,10 +617,15 @@ fn diff_flats(
     new: &Flat,
     ws: u8,
     renames: bool,
+    // `rename_threshold` 0 = exact-oid join only; 1..=100 scores content.
+    rename_threshold: u8,
+    rename_limit: usize,
     input_cap: u64,
     cancel: &Cancel,
     mut stats: Option<&mut StatCache>,
-) -> Result<Vec<Change>, u8> {
+    // Per-path gitattributes, or None for a raw comparison.
+    mut attrs: Option<&mut Attrs<'_>>,
+) -> Result<Changes, u8> {
     let mut changes: Vec<Change> = Vec::new();
     let mut old_iter = old.iter().peekable();
     let mut new_iter = new.iter().peekable();
@@ -606,6 +636,11 @@ fn diff_flats(
         match (old_iter.peek(), new_iter.peek()) {
             (Some((op, ov)), Some((np, nv))) => {
                 if op == np {
+                    let mut hashed = None;
+                    let normalize_crlf = nv.worktree
+                        && attrs
+                            .as_deref_mut()
+                            .is_some_and(|attrs| attrs.normalizes_eol(op));
                     if (ov != nv || nv.worktree)
                         && let Some(st) = modified_status(
                             repo,
@@ -616,60 +651,62 @@ fn diff_flats(
                             ws,
                             input_cap,
                             stats.as_deref_mut(),
+                            &mut hashed,
+                            normalize_crlf,
                         )
                     {
-                        changes.push(Change {
-                            path: (*op).clone(),
+                        // A worktree side whose content was read is no
+                        // longer unhashed: carrying the oid makes both
+                        // DIFF_ENTRY.new_oid and STATUS.oid real.
+                        let mut new_side = (*nv).clone();
+                        if let Some(oid) = hashed {
+                            new_side.oid = oid;
+                        }
+                        changes.push(Change::new(
+                            (*op).clone(),
                             st,
-                            old: Some((*ov).clone()),
-                            new: Some((*nv).clone()),
-                        });
+                            Some((*ov).clone()),
+                            Some(new_side),
+                        ));
                     }
                     old_iter.next();
                     new_iter.next();
                 } else if op < np {
-                    changes.push(Change {
-                        path: (*op).clone(),
-                        st: b'D',
-                        old: Some((*ov).clone()),
-                        new: None,
-                    });
+                    changes.push(Change::new((*op).clone(), b'D', Some((*ov).clone()), None));
                     old_iter.next();
                 } else {
-                    changes.push(Change {
-                        path: (*np).clone(),
-                        st: b'A',
-                        old: None,
-                        new: Some((*nv).clone()),
-                    });
+                    changes.push(Change::new((*np).clone(), b'A', None, Some((*nv).clone())));
                     new_iter.next();
                 }
             }
             (Some((op, ov)), None) => {
-                changes.push(Change {
-                    path: (*op).clone(),
-                    st: b'D',
-                    old: Some((*ov).clone()),
-                    new: None,
-                });
+                changes.push(Change::new((*op).clone(), b'D', Some((*ov).clone()), None));
                 old_iter.next();
             }
             (None, Some((np, nv))) => {
-                changes.push(Change {
-                    path: (*np).clone(),
-                    st: b'A',
-                    old: None,
-                    new: Some((*nv).clone()),
-                });
+                changes.push(Change::new((*np).clone(), b'A', None, Some((*nv).clone())));
                 new_iter.next();
             }
             (None, None) => break,
         }
     }
-    if renames {
-        join_renames(&mut changes);
-    }
-    Ok(changes)
+    let rename_limit_hit = if renames {
+        join_renames_scored(
+            repo,
+            workdir,
+            &mut changes,
+            rename_threshold,
+            rename_limit,
+            input_cap,
+            cancel,
+        )
+    } else {
+        false
+    };
+    Ok(Changes {
+        changes,
+        rename_limit_hit,
+    })
 }
 
 /// Decide whether a same-path pair actually differs (hashing worktree
@@ -689,6 +726,14 @@ fn modified_status(
     ws: u8,
     input_cap: u64,
     stats: Option<&mut StatCache>,
+    // Set to the worktree content hash when this call read the file, so a
+    // caller gets the oid for free rather than reading the bytes twice
+    // (docs/design/git.md STATUS `oid`).
+    hashed: &mut Option<gix::ObjectId>,
+    // True when the path's text/eol attributes say the object store holds
+    // LF: the worktree side is normalized before comparing, so a CRLF
+    // checkout is not reported as every line changed.
+    normalize_crlf: bool,
 ) -> Option<u8> {
     let type_change = (old.mode & 0o170000) != (new.mode & 0o170000);
     let content_maybe_differs = new.worktree || old.worktree || old.oid != new.oid;
@@ -728,7 +773,13 @@ fn modified_status(
     // Content check: worktree side re-hashes; whitespace modes compare
     // normalized bytes.
     let old_bytes = side_bytes(repo, workdir, path, old);
-    let new_bytes = side_bytes(repo, workdir, path, new);
+    let new_bytes = side_bytes(repo, workdir, path, new).map(|bytes| {
+        if normalize_crlf && new.worktree {
+            normalize_eol(&bytes)
+        } else {
+            bytes
+        }
+    });
     match (old_bytes, new_bytes) {
         (Some(a), Some(b)) => {
             let equal = if ws == 0 {
@@ -755,10 +806,168 @@ fn modified_status(
                     None
                 }
             } else {
+                if new.worktree {
+                    *hashed = Some(
+                        gix::objs::compute_hash(repo.object_hash(), gix::object::Kind::Blob, &b)
+                            .unwrap_or_else(|_| repo.object_hash().null()),
+                    );
+                }
                 Some(if type_change { b'T' } else { b'M' })
             }
         }
         _ => Some(b'M'),
+    }
+}
+
+/// Rename joining, in two passes: the cheap exact-oid join always, then —
+/// when the request named a similarity threshold — content scoring over
+/// what is left. Returns true when the candidate set exceeded `limit` and
+/// the similarity pass was skipped, which the response reports as
+/// `RENAME_LIMIT` rather than quietly showing delete+add pairs.
+///
+/// This is blit's own scorer rather than `gix_diff::rewrites::Tracker`:
+/// the tracker consumes gix tree-diff changes, and this pipeline diffs
+/// flattened `(path -> Side)` maps so it can span index and worktree
+/// endpoints that no tree diff sees.
+fn join_renames_scored(
+    repo: &gix::Repository,
+    workdir: Option<&std::path::Path>,
+    changes: &mut Vec<Change>,
+    threshold: u8,
+    limit: usize,
+    input_cap: u64,
+    cancel: &Cancel,
+) -> bool {
+    join_renames(changes);
+    // Only 0 opts out. 100 is a percentage like any other — the strictest
+    // one, matching a pair whose content scores identical without the blobs
+    // being byte-identical (a mode change, or an eol normalization that
+    // makes the two sides equal), which the exact-oid join above cannot see.
+    if threshold == 0 {
+        return false;
+    }
+    let deletes: Vec<usize> = (0..changes.len())
+        .filter(|&i| changes[i].st == b'D')
+        .collect();
+    let adds: Vec<usize> = (0..changes.len())
+        .filter(|&i| changes[i].st == b'A')
+        .collect();
+    if deletes.is_empty() || adds.is_empty() {
+        return false;
+    }
+    // git's own guard (diff.renameLimit): the pass is quadratic in the
+    // unmatched candidate set, so past the limit fall back to the exact
+    // join and say so.
+    if deletes.len().saturating_mul(adds.len()) > limit {
+        return true;
+    }
+
+    // Hash each candidate's lines once. A side we cannot read, or one over
+    // the input cap, simply has no signature and never matches.
+    let signature = |idx: usize, side: &Option<Side>, path: &[u8]| -> Option<LineSig> {
+        let side = side.as_ref()?;
+        let _ = idx;
+        if side_len(repo, workdir, path, side).unwrap_or(0) > input_cap {
+            return None;
+        }
+        let bytes = side_bytes(repo, workdir, path, side)?;
+        if looks_binary(&bytes) {
+            return None;
+        }
+        Some(LineSig::of(&bytes))
+    };
+    let del_sigs: Vec<Option<LineSig>> = deletes
+        .iter()
+        .map(|&i| {
+            let path = changes[i].path.clone();
+            signature(i, &changes[i].old, &path)
+        })
+        .collect();
+
+    let mut consumed = vec![false; deletes.len()];
+    let mut any_joined = false;
+    for &add_idx in &adds {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let path = changes[add_idx].path.clone();
+        let Some(add_sig) = signature(add_idx, &changes[add_idx].new, &path) else {
+            continue;
+        };
+        let mut best: Option<(usize, u8)> = None;
+        for (slot, _) in deletes.iter().enumerate() {
+            if consumed[slot] {
+                continue;
+            }
+            let Some(del_sig) = &del_sigs[slot] else {
+                continue;
+            };
+            let score = del_sig.similarity(&add_sig);
+            if score >= threshold && best.is_none_or(|(_, b)| score > b) {
+                best = Some((slot, score));
+            }
+        }
+        let Some((slot, score)) = best else { continue };
+        consumed[slot] = true;
+        let del_idx = deletes[slot];
+        let old_path = changes[del_idx].path.clone();
+        let old_side = changes[del_idx].old.clone();
+        let mut both = old_path;
+        both.push(0);
+        both.extend_from_slice(&changes[add_idx].path);
+        let change = &mut changes[add_idx];
+        change.st = b'R';
+        change.old = old_side;
+        change.path = both;
+        change.similarity = score;
+        changes[del_idx].st = 0;
+        any_joined = true;
+    }
+    if any_joined {
+        changes.retain(|change| change.st != 0);
+    }
+    false
+}
+
+/// A file's content reduced to hashed lines, weighted by line length, for
+/// similarity scoring. Byte weighting rather than line counting so a file
+/// of many short lines does not outweigh the content that actually moved.
+struct LineSig {
+    lines: std::collections::HashMap<u64, u64>,
+    total: u64,
+}
+
+impl LineSig {
+    fn of(bytes: &[u8]) -> LineSig {
+        use std::hash::{Hash, Hasher};
+        let mut lines: std::collections::HashMap<u64, u64> = Default::default();
+        let mut total = 0u64;
+        for line in bytes.split_inclusive(|&b| b == b'\n') {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            line.hash(&mut hasher);
+            let weight = line.len() as u64;
+            *lines.entry(hasher.finish()).or_default() += weight;
+            total += weight;
+        }
+        LineSig { lines, total }
+    }
+
+    /// Percentage of shared content: `2 * common / (a + b)`, git's own
+    /// shape, so a threshold of 50 means what it means in `git diff -M50%`.
+    fn similarity(&self, other: &LineSig) -> u8 {
+        if self.total == 0 && other.total == 0 {
+            return 100;
+        }
+        let denom = self.total + other.total;
+        if denom == 0 {
+            return 0;
+        }
+        let common: u64 = self
+            .lines
+            .iter()
+            .map(|(hash, weight)| other.lines.get(hash).copied().unwrap_or(0).min(*weight))
+            .sum();
+        ((2 * common * 100) / denom).min(100) as u8
     }
 }
 
@@ -799,6 +1008,7 @@ fn join_renames(changes: &mut Vec<Change>) {
             change.st = b'R';
             change.old = old_side;
             change.path = both;
+            change.similarity = 100;
             changes[del_idx].st = 0;
             any_joined = true;
         }
@@ -806,6 +1016,122 @@ fn join_renames(changes: &mut Vec<Change>) {
     if any_joined {
         changes.retain(|change| change.st != 0);
     }
+}
+
+/// The total order a cursor resumes against: new path, falling back to the
+/// old path for a deletion. Deterministic ordering is what makes `after`
+/// stateless — the server holds nothing between requests.
+fn sort_key(change: &Change) -> Vec<u8> {
+    let (old, new) = rename_paths(change);
+    if new.is_empty() { old } else { new }
+}
+
+/// Per-path gitattributes, for deciding whether the two sides of a diff are
+/// even comparable.
+///
+/// With `filter=lfs` the object store holds a ~130-byte pointer and the
+/// worktree holds the asset, so a worktree diff reads every LFS-tracked
+/// file as a total rewrite whether or not the user touched it. We do not
+/// run the filter — that would mean spawning a configured program as a
+/// side effect of a read — we detect it and say so, and emit no rows, the
+/// way a binary file behaves.
+///
+/// Absent when the repository has no index or the stack cannot be
+/// configured, in which case nothing is flagged.
+struct Attrs<'r> {
+    stack: gix::AttributeStack<'r>,
+    outcome: gix::attrs::search::Outcome,
+}
+
+impl<'r> Attrs<'r> {
+    fn new(repo: &'r gix::Repository) -> Option<Attrs<'r>> {
+        let index = repo.index_or_empty().ok()?;
+        let stack = repo
+            .attributes_only(
+                &index,
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            )
+            .ok()?;
+        let mut outcome = gix::attrs::search::Outcome::default();
+        outcome.initialize_with_selection(&Default::default(), ["filter", "text", "eol"]);
+        Some(Attrs { stack, outcome })
+    }
+
+    /// The path's `filter`, `text` and `eol` attributes, each present
+    /// only when set to something.
+    fn lookup(&mut self, path: &[u8]) -> Option<[Option<gix::attrs::StateRef<'_>>; 3]> {
+        let Ok(platform) = self.stack.at_entry(gix::bstr::BStr::new(path), None) else {
+            return None;
+        };
+        self.outcome.reset();
+        if !platform.matching_attributes(&mut self.outcome) {
+            return None;
+        }
+        let mut found = [None, None, None];
+        for m in self.outcome.iter_selected() {
+            let slot = match m.assignment.name.as_str() {
+                "filter" => 0,
+                "text" => 1,
+                "eol" => 2,
+                _ => continue,
+            };
+            if !matches!(m.assignment.state, gix::attrs::StateRef::Unspecified) {
+                found[slot] = Some(m.assignment.state);
+            }
+        }
+        Some(found)
+    }
+
+    fn is_filtered(&mut self, path: &[u8]) -> bool {
+        self.lookup(path).is_some_and(|found| found[0].is_some())
+    }
+
+    /// Whether the worktree side should be LF-normalized before comparing:
+    /// `text` set (or `text=auto`), or `eol=lf`/`eol=crlf`. Without this
+    /// a CRLF checkout of an LF-normalized object reads as every line
+    /// changed — a file the user did not touch, shown as a rewrite.
+    fn normalizes_eol(&mut self, path: &[u8]) -> bool {
+        let Some(found) = self.lookup(path) else {
+            return false;
+        };
+        if found[0].is_some() {
+            return false; // a filter driver owns the conversion
+        }
+        let set = |state: Option<gix::attrs::StateRef<'_>>| match state {
+            Some(gix::attrs::StateRef::Set) => true,
+            Some(gix::attrs::StateRef::Value(v)) => v.as_bstr() != "false",
+            _ => false,
+        };
+        set(found[1]) || set(found[2])
+    }
+}
+
+/// Collapse CRLF to LF. Applied to the worktree side only, and only for a
+/// path whose attributes say the object store holds LF — the object side
+/// is already normalized, so touching it would undo the comparison.
+fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The old path a `PATCH_FILE` record reports: whatever the old side was
+/// called, whenever there is an old side — not rename-only, since `st`
+/// already disambiguates and a consumer wants the path either way.
+fn record_old_path(change: &Change) -> Vec<u8> {
+    if change.old.is_none() {
+        return Vec::new();
+    }
+    let (old, new) = rename_paths(change);
+    if old.is_empty() { new } else { old }
 }
 
 /// Split a rename's NUL-joined path back into (old, new).
@@ -862,8 +1188,9 @@ impl RepoHandle {
             | GIT_DIFF_UNTRACKED
             | GIT_DIFF_IGNORED
             | GIT_DIFF_IGNORE_SPACE_CHANGE
-            | GIT_DIFF_IGNORE_ALL_SPACE;
-        if req.flags & !KNOWN_DIFF_FLAGS != 0 {
+            | GIT_DIFF_IGNORE_ALL_SPACE
+            | GIT_DIFF_RAW;
+        if req.flags & !KNOWN_DIFF_FLAGS != 0 || req.rename > GIT_RENAME_MAX {
             return fail(GIT_STATUS_INVALID);
         }
         let filter = match crate::unescape_wire(req.path) {
@@ -908,19 +1235,37 @@ impl RepoHandle {
             .budgets
             .blob_max
             .min(blit_remote::MAX_DECOMPRESSED as u64);
-        let changes = match diff_flats(
+        let mut attrs = (req.flags & GIT_DIFF_RAW == 0)
+            .then(|| Attrs::new(&repo))
+            .flatten();
+        let outcome = match diff_flats(
             &repo,
             workdir.as_deref(),
             &old_flat,
             &new_flat,
             ws,
             req.flags & GIT_DIFF_RENAMES != 0,
+            req.rename,
+            self.budgets.rename_limit,
             input_cap,
             cancel,
             None,
+            attrs.as_mut(),
         ) {
-            Ok(changes) => changes,
+            Ok(outcome) => outcome,
             Err(status) => return fail(status),
+        };
+        let Changes {
+            mut changes,
+            rename_limit_hit,
+        } = outcome;
+        // A cursor is only meaningful over a deterministic order, so the
+        // walk order stops being incidental here (docs/design/git.md
+        // "Continuation").
+        changes.sort_by_key(sort_key);
+        let after = match crate::unescape_wire(req.after) {
+            Some(bytes) => bytes,
+            None => return fail(GIT_STATUS_OTHER),
         };
 
         let mut records = Vec::new();
@@ -929,15 +1274,33 @@ impl RepoHandle {
         } else {
             0
         };
+        if rename_limit_hit {
+            flags |= GIT_DIFF_RENAME_LIMIT;
+        }
         if let Some(oid) = base {
             append_git_diff_record(&mut records, &GitDiffRecord::Base { oid });
         }
         let mut binary_memo: std::collections::HashMap<gix::ObjectId, bool> = Default::default();
+        let mut emitted = 0usize;
+        let mut last_key: Vec<u8> = Vec::new();
+        let changes: Vec<&Change> = changes
+            .iter()
+            .filter(|c| after.is_empty() || sort_key(c) > after)
+            .collect();
         for (count, change) in changes.iter().enumerate() {
             if count >= self.budgets.entries_max || records.len() >= self.budgets.bytes_max {
                 flags |= GIT_DIFF_TRUNCATED;
+                append_git_diff_record(
+                    &mut records,
+                    &GitDiffRecord::Cursor {
+                        after: &crate::escape_bstr(&last_key),
+                        pos: 0,
+                    },
+                );
                 break;
             }
+            emitted += 1;
+            last_key = sort_key(change);
             let (old_path, new_path) = rename_paths(change);
             let old_side = change.old.clone();
             let new_side = change.new.clone();
@@ -972,11 +1335,20 @@ impl RepoHandle {
                     dflags |= GIT_DIFF_ENTRY_BINARY;
                 }
             }
+            // A filtered path's two sides are not comparable, so say so
+            // rather than reporting a whole-file rewrite the user cannot
+            // explain.
+            if !submodule
+                && let Some(attrs) = attrs.as_mut()
+                && attrs.is_filtered(&new_path)
+            {
+                dflags |= GIT_DIFF_ENTRY_FILTERED;
+            }
             append_git_diff_record(
                 &mut records,
                 &GitDiffRecord::Entry {
                     st: change.st,
-                    similarity: if change.st == b'R' { 100 } else { 0 },
+                    similarity: change.similarity,
                     dflags,
                     old_mode: old_side.as_ref().map(|s| s.mode).unwrap_or(0),
                     new_mode: new_side.as_ref().map(|s| s.mode).unwrap_or(0),
@@ -993,14 +1365,19 @@ impl RepoHandle {
                 },
             );
         }
+        let _ = emitted;
         msg_git_diff_resp(req.nonce, GIT_STATUS_OK, flags, &records)
     }
 
     /// `GIT_INDEX`: enumerate index entries under a prefix.
-    pub fn index(&self, nonce: u16, path: &str, cancel: &Cancel) -> Vec<u8> {
+    pub fn index(&self, req: &GitIndexRequest<'_>, cancel: &Cancel) -> Vec<u8> {
+        let nonce = req.nonce;
         let repo = self.local();
         let fail = |status: u8| msg_git_index_resp(nonce, status, 0, &[]);
-        let filter = match crate::unescape_wire(path) {
+        if req.flags != 0 {
+            return fail(GIT_STATUS_INVALID);
+        }
+        let filter = match crate::unescape_wire(req.path) {
             Some(bytes) => bytes,
             None => return fail(GIT_STATUS_OTHER),
         };
@@ -1063,6 +1440,24 @@ impl RepoHandle {
     pub fn patch(&self, req: &GitPatchRequest<'_>, cancel: &Cancel) -> Vec<u8> {
         let repo = self.local();
         let fail = |status: u8| msg_git_patch_resp(req.nonce, status, 0, &[]);
+        // The same rejections `GIT_DIFF` makes, since the low bits are the
+        // same flags and `rename` is the same field: an out-of-range
+        // threshold is INVALID rather than a silent fall back to the
+        // exact-oid join, and an undefined flag bit is refused instead of
+        // ignored (docs/design/git.md).
+        const KNOWN_PATCH_FLAGS: u16 = GIT_PATCH_RENAMES
+            | GIT_PATCH_UNTRACKED
+            | GIT_PATCH_IGNORED
+            | GIT_PATCH_IGNORE_SPACE_CHANGE
+            | GIT_PATCH_IGNORE_ALL_SPACE
+            | GIT_PATCH_RAW
+            | GIT_PATCH_TEXT
+            | GIT_PATCH_CHAR_SPANS
+            | GIT_PATCH_NO_SPANS
+            | GIT_PATCH_BINARY;
+        if req.flags & !KNOWN_PATCH_FLAGS != 0 || req.rename > GIT_RENAME_MAX {
+            return fail(GIT_STATUS_INVALID);
+        }
         let filter = match crate::unescape_wire(req.path) {
             Some(bytes) => bytes,
             None => return fail(GIT_STATUS_OTHER),
@@ -1078,15 +1473,15 @@ impl RepoHandle {
             Ok(resolved) => resolved,
             Err(status) => return fail(status),
         };
-        let ws = req.flags & (GIT_DIFF_IGNORE_SPACE_CHANGE | GIT_DIFF_IGNORE_ALL_SPACE);
+        let ws = (req.flags & (GIT_PATCH_IGNORE_SPACE_CHANGE | GIT_PATCH_IGNORE_ALL_SPACE)) as u8;
         let truncated = std::cell::Cell::new(false);
         let sides = [&old_ep, &new_ep].map(|endpoint| {
             flatten(
                 &repo,
                 endpoint,
                 &filter,
-                req.flags & GIT_DIFF_UNTRACKED != 0,
-                req.flags & GIT_DIFF_IGNORED != 0,
+                req.flags & GIT_PATCH_UNTRACKED != 0,
+                req.flags & GIT_PATCH_IGNORED != 0,
                 &self.budgets,
                 cancel,
                 &truncated,
@@ -1105,21 +1500,41 @@ impl RepoHandle {
             .budgets
             .blob_max
             .min(blit_remote::MAX_DECOMPRESSED as u64);
-        let changes = match diff_flats(
+        let mut attrs = (req.flags & GIT_PATCH_RAW == 0)
+            .then(|| Attrs::new(&repo))
+            .flatten();
+        let outcome = match diff_flats(
             &repo,
             workdir.as_deref(),
             &old_flat,
             &new_flat,
             ws,
-            req.flags & GIT_DIFF_RENAMES != 0,
+            req.flags & GIT_PATCH_RENAMES != 0,
+            req.rename,
+            self.budgets.rename_limit,
             input_cap,
             cancel,
             None,
+            attrs.as_mut(),
         ) {
-            Ok(changes) => changes,
+            Ok(outcome) => outcome,
             Err(status) => return fail(status),
         };
-
+        let mut changes = outcome.changes;
+        changes.sort_by_key(sort_key);
+        let after = match crate::unescape_wire(req.after) {
+            Some(bytes) => bytes,
+            None => return fail(GIT_STATUS_OTHER),
+        };
+        // Resuming: skip whole files already delivered. The file named by
+        // `after` is re-entered at `after_pos` rows so a file larger than
+        // the byte budget makes progress instead of restarting.
+        let resume_rows = req.after_pos;
+        let changes: Vec<Change> = changes
+            .into_iter()
+            .filter(|c| after.is_empty() || sort_key(c) >= after)
+            .skip_while(|c| !after.is_empty() && resume_rows == 0 && sort_key(c) == after)
+            .collect();
         let context = if req.context == 0 {
             3
         } else {
@@ -1140,15 +1555,29 @@ impl RepoHandle {
         if !text_mode && let Some(oid) = base {
             append_git_patch_record(&mut records, &GitPatchRecord::Base { oid });
         }
-        for change in &changes {
+        let budget = max_len.min(self.budgets.bytes_max);
+        // Where a cut response resumes: the last file delivered whole, or the
+        // file the row budget stopped inside plus the rows of it delivered.
+        let mut cursor: Option<(Vec<u8>, u64)> = None;
+        let mut last_whole: Option<Vec<u8>> = None;
+        for (n, change) in changes.iter().enumerate() {
             if cancel.is_cancelled() {
                 return fail(GIT_STATUS_CANCELLED);
             }
             let out_len = if text_mode { text.len() } else { records.len() };
-            if out_len >= max_len || out_len >= self.budgets.bytes_max {
+            if out_len >= budget {
                 resp_flags |= GIT_PATCH_TRUNCATED;
+                cursor = last_whole.take().map(|key| (key, 0));
                 break;
             }
+            // Rows of the boundary file the client already has. Only the
+            // first change can be that file — the filter above dropped
+            // everything before it.
+            let skip = if n == 0 && !after.is_empty() && sort_key(change) == after {
+                resume_rows
+            } else {
+                0
+            };
             let (old_path, _new_path) = rename_paths(change);
             let old_read_path = old_path_or(&old_path, change);
             let new_read_path = change_new_path(change);
@@ -1157,8 +1586,12 @@ impl RepoHandle {
                     side_len(&repo, workdir.as_deref(), path, s).unwrap_or(0) > input_cap
                 })
             };
-            let too_large =
-                over_cap(&old_read_path, &change.old) || over_cap(&new_read_path, &change.new);
+            let filtered = attrs
+                .as_mut()
+                .is_some_and(|attrs| attrs.is_filtered(&new_read_path));
+            let too_large = filtered
+                || over_cap(&old_read_path, &change.old)
+                || over_cap(&new_read_path, &change.new);
             let (old_bytes, new_bytes, binary) = if too_large {
                 (Vec::new(), Vec::new(), true)
             } else {
@@ -1167,29 +1600,60 @@ impl RepoHandle {
                     .as_ref()
                     .and_then(|side| side_bytes(&repo, workdir.as_deref(), &old_read_path, side))
                     .unwrap_or_default();
-                let new_bytes = change
+                let mut new_bytes = change
                     .new
                     .as_ref()
                     .and_then(|side| side_bytes(&repo, workdir.as_deref(), &new_read_path, side))
                     .unwrap_or_default();
+                // The worktree side is normalized per the path's
+                // text/eol attributes, so a CRLF checkout of an
+                // LF-normalized object is not reported as every line
+                // changed. RAW opts out.
+                if change.new.as_ref().is_some_and(|side| side.worktree)
+                    && attrs
+                        .as_mut()
+                        .is_some_and(|attrs| attrs.normalizes_eol(&new_read_path))
+                {
+                    new_bytes = normalize_eol(&new_bytes);
+                }
                 let binary = looks_binary(&old_bytes) || looks_binary(&new_bytes);
                 (old_bytes, new_bytes, binary)
             };
             if text_mode {
                 append_text_patch(
-                    &mut text, &old_path, change, binary, &old_bytes, &new_bytes, context, ws,
+                    &mut text,
+                    &old_path,
+                    change,
+                    binary,
+                    req.flags & GIT_PATCH_BINARY != 0,
+                    &old_bytes,
+                    &new_bytes,
+                    context,
+                    ws,
                 );
             } else {
+                let mut file_flags = 0;
+                if binary && !filtered {
+                    file_flags |= GIT_PATCH_FILE_BINARY;
+                }
+                if filtered {
+                    file_flags |= GIT_PATCH_FILE_FILTERED;
+                }
                 append_git_patch_record(
                     &mut records,
                     &GitPatchRecord::File {
-                        flags: if binary { GIT_PATCH_FILE_BINARY } else { 0 },
-                        old_path: &crate::escape_bstr(&old_path),
+                        // The DIFF_ENTRY alphabet, so a binary or empty
+                        // added file — which emits no rows at all — still
+                        // says whether it was added, deleted or modified.
+                        st: change.st,
+                        similarity: change.similarity,
+                        flags: file_flags,
+                        old_path: &crate::escape_bstr(&record_old_path(change)),
                         new_path: &crate::escape_bstr(&change_new_path(change)),
                     },
                 );
                 if !binary {
-                    append_rows(
+                    let (pos, cut) = append_rows(
                         &mut records,
                         &old_bytes,
                         &new_bytes,
@@ -1197,12 +1661,45 @@ impl RepoHandle {
                         ws,
                         req.flags & GIT_PATCH_CHAR_SPANS != 0,
                         req.flags & GIT_PATCH_NO_SPANS != 0,
+                        skip,
+                        budget,
                     );
+                    if cut {
+                        // Stopped inside this file: the cursor names it and
+                        // the rows of it delivered, so the next request
+                        // re-emits its FILE record and continues the rows.
+                        resp_flags |= GIT_PATCH_TRUNCATED;
+                        cursor = Some((sort_key(change), pos));
+                        break;
+                    }
                 }
             }
+            last_whole = Some(sort_key(change));
+        }
+        // Text mode's payload is a patch, not a record stream, so it has
+        // nowhere to put a CURSOR record: there, `TRUNCATED` means "resume
+        // from the last `+++` path you were given", which the client has in
+        // front of it. Structured mode says it exactly.
+        if !text_mode && let Some((key, pos)) = cursor {
+            append_git_patch_record(
+                &mut records,
+                &GitPatchRecord::Cursor {
+                    after: &crate::escape_bstr(&key),
+                    pos,
+                },
+            );
         }
         let payload = if text_mode { text } else { records };
-        if payload.len() > max_len {
+        // Unified text is the one shape that cannot be windowed mid-file: a
+        // patch cut between a hunk header and its rows is not a patch. A
+        // single file whose text alone exceeds the budget is therefore still
+        // TOO_LARGE, which is a status rather than a truncation, so the
+        // "TRUNCATED carries a CURSOR" rule is untouched. Structured mode
+        // never refuses: it stops at the budget and says where. The stop is a
+        // threshold rather than a ceiling — the record that crosses it is
+        // already written, and one row is bounded by the wire's own field
+        // clip — so a payload can exceed `max_len` by that one record.
+        if text_mode && payload.len() > budget {
             return fail(GIT_STATUS_TOO_LARGE);
         }
         msg_git_patch_resp(req.nonce, GIT_STATUS_OK, resp_flags, &payload)
@@ -1253,7 +1750,46 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
-/// Emit PATCH_ROW/PATCH_GAP records for one file.
+/// A file's row stream, windowed: the first `skip` records are counted and
+/// dropped, and emission stops once `records` reaches `budget`.
+///
+/// The stream for a given pair of blobs is deterministic, so a position in
+/// it is a resume point: `GIT_PATCH` hands back the count as the `CURSOR`'s
+/// `pos` and the next request replays the file and skips that many. Without
+/// this a file whose rows outgrow the byte budget could only be restarted
+/// from row 0, forever.
+struct RowWindow<'a> {
+    records: &'a mut Vec<u8>,
+    skip: u64,
+    /// Records of this file accounted for so far — skipped plus emitted.
+    pos: u64,
+    budget: usize,
+    stopped: bool,
+}
+
+impl RowWindow<'_> {
+    fn push(&mut self, write: impl FnOnce(&mut Vec<u8>)) {
+        if self.stopped {
+            return;
+        }
+        if self.pos < self.skip {
+            self.pos += 1;
+            return;
+        }
+        if self.records.len() >= self.budget {
+            self.stopped = true;
+            return;
+        }
+        self.pos += 1;
+        write(self.records);
+    }
+}
+
+/// Emit PATCH_ROW/PATCH_GAP records for one file, resuming after `skip`
+/// records and stopping at `budget` bytes. Returns the number of records of
+/// this file now accounted for (the `CURSOR` `pos`) and whether the budget
+/// cut it short.
+#[allow(clippy::too_many_arguments)]
 fn append_rows(
     records: &mut Vec<u8>,
     old_bytes: &[u8],
@@ -1262,27 +1798,36 @@ fn append_rows(
     ws: u8,
     char_spans: bool,
     no_spans: bool,
-) {
+    skip: u64,
+    budget: usize,
+) -> (u64, bool) {
     let old_lines = split_lines(old_bytes);
     let new_lines = split_lines(new_bytes);
     let changes = line_changes(old_bytes, new_bytes, ws);
     let mut old_pos = 0usize; // next unemitted old line
     let mut new_pos = 0usize;
     let mut emitted_any = false;
+    let mut window = RowWindow {
+        records,
+        skip,
+        pos: 0,
+        budget,
+        stopped: false,
+    };
     for (idx, (before, after)) in changes.iter().enumerate() {
+        if window.stopped {
+            break;
+        }
         let (b0, b1) = (before.start as usize, before.end as usize);
         let (a0, a1) = (after.start as usize, after.end as usize);
         // Context gap before this hunk.
         let ctx_start = b0.saturating_sub(context);
         if ctx_start > old_pos {
             if emitted_any || old_pos > 0 {
-                append_git_patch_record(
-                    records,
-                    &GitPatchRecord::Gap {
-                        old_line: (old_pos + 1) as u32,
-                        new_line: (new_pos + 1) as u32,
-                    },
-                );
+                let (old_line, new_line) = ((old_pos + 1) as u32, (new_pos + 1) as u32);
+                window.push(|records| {
+                    append_git_patch_record(records, &GitPatchRecord::Gap { old_line, new_line });
+                });
             }
             new_pos += ctx_start - old_pos;
             old_pos = ctx_start;
@@ -1292,33 +1837,42 @@ fn append_rows(
         }
         // Leading context rows.
         while old_pos < b0 {
-            append_row(records, &old_lines, &new_lines, old_pos, new_pos, &[], &[]);
+            let (o, n) = (old_pos, new_pos);
+            window.push(|records| append_row(records, &old_lines, &new_lines, o, n, &[], &[]));
             old_pos += 1;
             new_pos += 1;
         }
         // Changed block: pair rows up, then one-sided remainders.
         let pairs = (b1 - b0).min(a1 - a0);
         for i in 0..pairs {
+            // Spans are the expensive part, so they are computed only for a
+            // row that is actually going out.
+            if window.stopped || window.pos < window.skip {
+                window.push(|_| {});
+                continue;
+            }
             let (old_spans, new_spans) = if no_spans {
                 (Vec::new(), Vec::new())
             } else {
                 intraline_spans(old_lines[b0 + i], new_lines[a0 + i], char_spans, ws)
             };
-            append_row(
-                records,
-                &old_lines,
-                &new_lines,
-                b0 + i,
-                a0 + i,
-                &old_spans,
-                &new_spans,
-            );
+            window.push(|records| {
+                append_row(
+                    records,
+                    &old_lines,
+                    &new_lines,
+                    b0 + i,
+                    a0 + i,
+                    &old_spans,
+                    &new_spans,
+                );
+            });
         }
         for i in (b0 + pairs)..b1 {
-            append_one_sided(records, Some((&old_lines, i)), None);
+            window.push(|records| append_one_sided(records, Some((&old_lines, i)), None));
         }
         for i in (a0 + pairs)..a1 {
-            append_one_sided(records, None, Some((&new_lines, i)));
+            window.push(|records| append_one_sided(records, None, Some((&new_lines, i))));
         }
         old_pos = b1;
         new_pos = a1;
@@ -1331,12 +1885,14 @@ fn append_rows(
             .unwrap_or(old_lines.len());
         let ctx_end = (b1 + context).min(old_lines.len()).min(next_b0);
         while old_pos < ctx_end && new_pos < new_lines.len() {
-            append_row(records, &old_lines, &new_lines, old_pos, new_pos, &[], &[]);
+            let (o, n) = (old_pos, new_pos);
+            window.push(|records| append_row(records, &old_lines, &new_lines, o, n, &[], &[]));
             old_pos += 1;
             new_pos += 1;
         }
         emitted_any = true;
     }
+    (window.pos, window.stopped)
 }
 
 fn append_row(
@@ -1492,6 +2048,7 @@ fn append_text_patch(
     old_path: &[u8],
     change: &Change,
     binary: bool,
+    want_binary: bool,
     old_bytes: &[u8],
     new_bytes: &[u8],
     context: usize,
@@ -1503,25 +2060,90 @@ fn append_text_patch(
     } else {
         old_path.to_vec()
     };
+    let a_name = crate::escape_bstr(&old_name);
+    let b_name = crate::escape_bstr(&new_path);
+    out.extend_from_slice(format!("diff --git a/{a_name} b/{b_name}\n").as_bytes());
+
+    // git's own header set, in git's order. The subset this used to emit
+    // meant a parser written against `git diff` could not see a rename or a
+    // mode change at all (docs/design/git.md "GIT_PATCH_TEXT output").
+    let old_mode = change.old.as_ref().map(|s| s.mode);
+    let new_mode = change.new.as_ref().map(|s| s.mode);
+    match (old_mode, new_mode) {
+        (Some(old), Some(new)) if old != new => {
+            out.extend_from_slice(format!("old mode {old:06o}\nnew mode {new:06o}\n").as_bytes());
+        }
+        (Some(old), None) => {
+            out.extend_from_slice(format!("deleted file mode {old:06o}\n").as_bytes());
+        }
+        (None, Some(new)) => {
+            out.extend_from_slice(format!("new file mode {new:06o}\n").as_bytes());
+        }
+        _ => {}
+    }
+    if change.st == b'R' || change.st == b'C' {
+        let verb = if change.st == b'R' { "rename" } else { "copy" };
+        out.extend_from_slice(
+            format!(
+                "similarity index {}%\n{verb} from {a_name}\n{verb} to {b_name}\n",
+                change.similarity
+            )
+            .as_bytes(),
+        );
+    }
+    // A pure mode change has no content to describe: git emits the
+    // `diff --git` line and the two mode lines, and stops.
+    let content_unchanged =
+        change.st == b'T' || (old_bytes == new_bytes && change.st != b'R' && change.st != b'C');
+    if content_unchanged && old_mode != new_mode && change.old.is_some() && change.new.is_some() {
+        return;
+    }
+    // Full-length oids rather than a core.abbrev abbreviation: a unique
+    // short oid costs an object-database probe per side per file, and
+    // `git apply` accepts either (documented deviation).
+    let oid_hex = |side: &Option<Side>| {
+        side.as_ref()
+            .map(|s| s.oid.to_hex().to_string())
+            .unwrap_or_else(|| "0".repeat(40))
+    };
+    // The mode rides the `index` line only when it is unchanged; an add or
+    // delete already stated it on its own line, and git does not repeat it.
+    let index_mode = match (old_mode, new_mode) {
+        (Some(old), Some(new)) if old == new => format!(" {old:06o}"),
+        _ => String::new(),
+    };
     out.extend_from_slice(
         format!(
-            "diff --git a/{} b/{}\n",
-            crate::escape_bstr(&old_name),
-            crate::escape_bstr(&new_path)
+            "index {}..{}{index_mode}\n",
+            oid_hex(&change.old),
+            oid_hex(&change.new)
         )
         .as_bytes(),
     );
+
     if binary {
-        out.extend_from_slice(b"Binary files differ\n");
+        // `BINARY` is git's `--binary`: with it the content goes out as a
+        // `GIT binary patch` block, so the patch is one `git apply --binary`
+        // can replay; without it, git's exact sentence, which is also what
+        // `git diff` alone produces. A file too large to read, or one an
+        // unrun filter stands in front of, has no content to emit either
+        // way and keeps the sentence.
+        if want_binary && !(old_bytes.is_empty() && new_bytes.is_empty()) {
+            append_binary_patch(out, old_bytes, new_bytes);
+        } else {
+            out.extend_from_slice(
+                format!("Binary files a/{a_name} and b/{b_name} differ\n").as_bytes(),
+            );
+        }
         return;
     }
     let a_label = if change.old.is_some() {
-        format!("a/{}", crate::escape_bstr(&old_name))
+        format!("a/{a_name}")
     } else {
         "/dev/null".to_string()
     };
     let b_label = if change.new.is_some() {
-        format!("b/{}", crate::escape_bstr(&new_path))
+        format!("b/{b_name}")
     } else {
         "/dev/null".to_string()
     };
@@ -1565,13 +2187,39 @@ fn append_text_patch(
             .map(|(b, a)| (a.end - a.start) as isize - (b.end - b.start) as isize)
             .sum();
         let new_count = (old_count as isize + net) as usize;
+        // git's own range spelling: a zero-length side starts at 0, and a
+        // one-line side omits the count entirely (`-1` not `-1,1`).
+        let range = |start: usize, count: usize| {
+            let first = if count == 0 { 0 } else { start + 1 };
+            if count == 1 {
+                format!("{first}")
+            } else {
+                format!("{first},{count}")
+            }
+        };
+        // The section heading git appends after the closing `@@`: the last
+        // line before the hunk that looks like the start of a definition.
+        // xdiff's built-in default with no configured `xfuncname` — a line
+        // whose first character is alphabetic, `_` or `$`.
+        let heading = old_lines[..ctx_start]
+            .iter()
+            .rev()
+            .find(|line| {
+                line.first()
+                    .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+            })
+            .map(|line| {
+                let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+                String::from_utf8_lossy(trimmed).trim_end().to_string()
+            })
+            .filter(|h| !h.is_empty())
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
         out.extend_from_slice(
             format!(
-                "@@ -{},{} +{},{} @@\n",
-                ctx_start + 1,
-                old_count,
-                new_start + 1,
-                new_count,
+                "@@ -{} +{} @@{heading}\n",
+                range(ctx_start, old_count),
+                range(new_start, new_count),
             )
             .as_bytes(),
         );
@@ -1717,8 +2365,11 @@ pub(crate) fn append_status_records(
             &index_flat,
             0,
             true,
+            100,
+            0,
             input_cap,
             &cancel,
+            None,
             None,
         ),
         diff_flats(
@@ -1728,9 +2379,12 @@ pub(crate) fn append_status_records(
             &worktree_flat,
             0,
             false,
+            0,
+            0,
             input_cap,
             &cancel,
             Some(stats),
+            None,
         ),
     ) else {
         return;
@@ -1754,15 +2408,17 @@ pub(crate) fn append_status_records(
         staged: u8,
         unstaged: u8,
         old_path: Vec<u8>,
+        /// Worktree content hash when the unstaged walk read the file.
+        oid: GitOid,
     }
     let mut cells: BTreeMap<Vec<u8>, Cell> = BTreeMap::new();
-    for change in &staged {
+    for change in &staged.changes {
         let (old_path, new_path) = rename_paths(change);
         let cell = cells.entry(new_path).or_default();
         cell.staged = change.st;
         cell.old_path = old_path;
     }
-    for change in &unstaged {
+    for change in &unstaged.changes {
         let (_, new_path) = rename_paths(change);
         let untracked_entry = change.st == b'A'
             && change
@@ -1789,6 +2445,14 @@ pub(crate) fn append_status_records(
             cell.unstaged = letter;
         } else {
             cell.unstaged = change.st;
+        }
+        // The unstaged walk hashed what it read, so a write that leaves
+        // the letters alone still moves this and the snapshot goes out
+        // (docs/design/git.md STATUS `oid`).
+        if let Some(side) = &change.new
+            && !side.oid.is_null()
+        {
+            cell.oid = oid_bytes(side.oid.as_ref());
         }
     }
     for path in &conflicted {
@@ -1817,9 +2481,72 @@ pub(crate) fn append_status_records(
                     cell.unstaged
                 },
                 flags: entry_flags,
+                oid: cell.oid,
                 old_path: &crate::escape_bstr(&cell.old_path),
                 path: &crate::escape_bstr(path),
             },
         );
     }
+}
+
+/// git's base85 alphabet (`base85.c`), in git's order. Not the Ascii85 or
+/// Z85 alphabet — a patch encoded with either is not a patch git can read.
+const BASE85: &[u8; 85] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+/// Encode `data` the way git's `encode_85` does: four bytes at a time,
+/// big-endian, into five characters, zero-padding a short final group.
+fn encode_base85(data: &[u8], out: &mut Vec<u8>) {
+    for chunk in data.chunks(4) {
+        let mut acc: u32 = 0;
+        for (i, byte) in chunk.iter().enumerate() {
+            acc |= u32::from(*byte) << (24 - 8 * i);
+        }
+        let mut digits = [0u8; 5];
+        for slot in digits.iter_mut().rev() {
+            *slot = BASE85[(acc % 85) as usize];
+            acc /= 85;
+        }
+        out.extend_from_slice(&digits);
+    }
+}
+
+/// One `literal <size>` body: the deflated bytes in git's line format —
+/// a length letter (`A`–`Z` for 1–26 bytes, `a`–`z` for 27–52) then base85
+/// of up to 52 deflated bytes — terminated by a blank line.
+///
+/// `size` is the *inflated* length, which is what `git apply` allocates
+/// from; the lines carry the deflated stream.
+fn append_binary_body(out: &mut Vec<u8>, content: &[u8]) {
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write as _;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    // Writing to a Vec cannot fail, and neither can finishing it.
+    let deflated = encoder
+        .write_all(content)
+        .and_then(|()| encoder.finish())
+        .unwrap_or_default();
+    out.extend_from_slice(format!("literal {}\n", content.len()).as_bytes());
+    for chunk in deflated.chunks(52) {
+        let n = chunk.len() as u8;
+        out.push(if n <= 26 { b'A' + n - 1 } else { b'a' + n - 27 });
+        encode_base85(chunk, out);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+}
+
+/// git's `GIT binary patch` block: the forward body, then the reverse one,
+/// exactly as `emit_binary_diff` writes them — the second is what
+/// `git apply -R` replays, and a block with only the first is not the
+/// format.
+///
+/// Only literals are emitted, never deltas. A delta is smaller for a small
+/// edit to a large file, and `git apply` reads both; producing one means
+/// carrying git's delta encoder, which buys bytes on the wire and nothing
+/// in correctness.
+fn append_binary_patch(out: &mut Vec<u8>, old_bytes: &[u8], new_bytes: &[u8]) {
+    out.extend_from_slice(b"GIT binary patch\n");
+    append_binary_body(out, new_bytes);
+    append_binary_body(out, old_bytes);
 }

@@ -171,14 +171,33 @@ export class MockTransport implements BlitTransport {
     this.push(msg);
   }
 
-  pushHello(version: number, features: number, bootGeneration?: bigint) {
-    const msg = new Uint8Array(bootGeneration === undefined ? 7 : 15);
+  pushHello(
+    version: number,
+    features: number,
+    bootGeneration?: bigint,
+    serverVersion?: string,
+  ) {
+    const verBytes =
+      serverVersion === undefined
+        ? null
+        : new TextEncoder().encode(serverVersion);
+    const len =
+      bootGeneration === undefined
+        ? 7
+        : verBytes === null
+          ? 15
+          : 17 + verBytes.length;
+    const msg = new Uint8Array(len);
     const view = new DataView(msg.buffer);
     msg[0] = S2C_HELLO;
     view.setUint16(1, version, true);
     view.setUint32(3, features, true);
     if (bootGeneration !== undefined) {
       view.setBigUint64(7, bootGeneration, true);
+    }
+    if (verBytes !== null) {
+      view.setUint16(15, verBytes.length, true);
+      msg.set(verBytes, 17);
     }
     this.push(msg);
   }

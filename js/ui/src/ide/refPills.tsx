@@ -90,6 +90,11 @@ export function RefPills(props: {
   scale: UIScale;
   /** Show at most this many pills, then a +N spillover (default 3). */
   max?: number;
+  /** Let the pills wrap onto further lines, each keeping its whole ref name,
+   *  for a header that has vertical room. The default packs them on one line
+   *  and clips, which is what a log row needs — there the rails after them
+   *  have to stay put and every row is one line tall. */
+  wrap?: boolean;
 }) {
   const max = () => props.max ?? 3;
   const color = (kind: RefPill["kind"]): string =>
@@ -108,8 +113,9 @@ export function RefPills(props: {
         // clip, never their neighbors.
         "flex-shrink": 1,
         "min-width": 0,
-        overflow: "hidden",
+        overflow: props.wrap ? "visible" : "hidden",
         display: "flex",
+        "flex-wrap": props.wrap ? "wrap" : "nowrap",
         gap: "3px",
         "align-items": "center",
       }}
@@ -127,9 +133,19 @@ export function RefPills(props: {
               border: `1px solid color-mix(in srgb, ${color(pill.kind)} 45%, transparent)`,
               background: `color-mix(in srgb, ${color(pill.kind)} ${pill.kind === "head" ? 28 : 12}%, transparent)`,
               "font-weight": pill.kind === "head" ? 700 : 400,
-              "max-width": "12em",
-              overflow: "hidden",
-              "text-overflow": "ellipsis",
+              // A ref name is one token: `origin/design/git-second-pass`
+              // broken across two lines inside its own pill reads as two
+              // refs. In `wrap` mode it keeps its full width and the row
+              // wraps around it; packed on one line it is bounded and
+              // clipped by the container, with the full name on `title`.
+              "white-space": "nowrap",
+              ...(props.wrap
+                ? {}
+                : {
+                    "max-width": "12em",
+                    overflow: "hidden",
+                    "text-overflow": "ellipsis",
+                  }),
             }}
           >
             {pill.label}

@@ -14,81 +14,107 @@ use std::collections::BTreeMap;
 /// `S2C_HELLO` feature bit: server supports the `GIT_*` message family.
 pub const FEATURE_GIT: u32 = 1 << 7;
 
+// Opcodes: one contiguous block, `0xA0`-`0xB4`, grouped by role —
+// lifecycle, pushed state, revision and log, object reads, then the
+// repository-wide operations. Request and response share a value where
+// they pair. `0xB5`-`0xBF` are reserved for the family's next additions.
+
 // C2S opcodes.
 
-/// Open (discover) a repository: [0x50][nonce:2][flags:1][refs_latency_ms:2][status_latency_ms:2][path_len:2][path:N]
+/// Open (discover) a repository: [0xA0][nonce:2][flags:1][refs_latency_ms:2][status_latency_ms:2][path_len:2][path:N]
 /// `path` is plain UTF-8 (client-chosen filesystem location, like `FS_SYNC`).
-pub const C2S_GIT_OPEN: u8 = 0x50;
-/// Release a repo id: [0x51][repo_id:2]
-pub const C2S_GIT_CLOSE: u8 = 0x51;
-/// Acknowledge a state snapshot: [0x52][repo_id:2][state_id:4]
-pub const C2S_GIT_ACK: u8 = 0x52;
-/// Walk `hides..tips`: [0x53][nonce:2][repo_id:2][flags:1][limit:2][path_len:2][path:N][n_tips:2][tips:32·N][n_hides:2][hides:32·N]
-pub const C2S_GIT_LOG: u8 = 0x53;
-/// List one tree level: [0x54][nonce:2][repo_id:2][oid:32][path_len:2][path:N]
-pub const C2S_GIT_TREE: u8 = 0x54;
-/// Fetch object bytes: [0x55][nonce:2][repo_id:2][oid:32][path_len:2][path:N][max_len:4]
-pub const C2S_GIT_BLOB: u8 = 0x55;
-/// File-level diff between two endpoints: [0x56][nonce:2][repo_id:2][flags:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N]
-pub const C2S_GIT_DIFF: u8 = 0x56;
-/// Render-ready patch rows: [0x57][nonce:2][repo_id:2][flags:1][context:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][max_len:4]
-pub const C2S_GIT_PATCH: u8 = 0x57;
-/// Enumerate index entries: [0x58][nonce:2][repo_id:2][path_len:2][path:N]
-pub const C2S_GIT_INDEX: u8 = 0x58;
-/// Advisory cancel of an in-flight request: [0x59][nonce:2]
-pub const C2S_GIT_CANCEL: u8 = 0x59;
-/// Merge bases of an oid set: [0x5A][nonce:2][repo_id:2][n_oids:1][oids:32·N]
-pub const C2S_GIT_BASE: u8 = 0x5A;
-/// Resolve a revision spec to commit oids: [0x5B][nonce:2][repo_id:2][spec_len:2][spec:N]
+pub const C2S_GIT_OPEN: u8 = 0xA0;
+/// Release a repo id: [0xA1][repo_id:2]
+pub const C2S_GIT_CLOSE: u8 = 0xA1;
+/// Acknowledge a state snapshot: [0xA2][repo_id:2][state_id:4]
+pub const C2S_GIT_ACK: u8 = 0xA2;
+/// Walk `hides..tips`: [0xA7][nonce:2][repo_id:2][flags:1][limit:2][path_len:2][path:N][n_tips:2][tips:32·N][n_hides:2][hides:32·N]
+pub const C2S_GIT_LOG: u8 = 0xA7;
+/// List one tree level: [0xAB][nonce:2][repo_id:2][oid:32][path_len:2][path:N]
+pub const C2S_GIT_TREE: u8 = 0xAB;
+/// Fetch object bytes: [0xAC][nonce:2][repo_id:2][oid:32][path_len:2][path:N][max_len:4]
+pub const C2S_GIT_BLOB: u8 = 0xAC;
+/// File-level diff between two endpoints: [0xAD][nonce:2][repo_id:2][flags:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N]
+pub const C2S_GIT_DIFF: u8 = 0xAD;
+/// Render-ready patch rows: [0xAE][nonce:2][repo_id:2][flags:1][context:1][old_kind:1][old:32][new_kind:1][new:32][path_len:2][path:N][max_len:4]
+pub const C2S_GIT_PATCH: u8 = 0xAE;
+/// Enumerate index entries: [0xAF][nonce:2][repo_id:2][path_len:2][path:N]
+pub const C2S_GIT_INDEX: u8 = 0xAF;
+/// Advisory cancel of an in-flight request: [0xA3][nonce:2]
+pub const C2S_GIT_CANCEL: u8 = 0xA3;
+/// Merge bases of an oid set: [0xB0][nonce:2][repo_id:2][n_oids:1][oids:32·N]
+pub const C2S_GIT_BASE: u8 = 0xB0;
+/// Resolve a revision spec to commit oids: [0xA6][nonce:2][repo_id:2][spec_len:2][spec:N]
 /// `spec` is any git revision expression — a ref name, (short) oid,
 /// `HEAD~3`, or a range `A..B` / `A...B`. The response gives `tips`/`hides`
 /// ready to feed [`msg_git_log`].
-pub const C2S_GIT_RESOLVE: u8 = 0x5B;
-/// Subscribe to a live log of a spec: [0x5C][log_id:2][repo_id:2][flags:1][limit:2][spec_len:2][spec:N]
+pub const C2S_GIT_RESOLVE: u8 = 0xA6;
+/// Subscribe to a live log of a spec: [0xA8][log_id:2][repo_id:2][flags:1][limit:2][spec_len:2][spec:N]
 /// The server resolves `spec` and pushes a `GIT_LOG_PAGE`, re-emitting
 /// whenever the resolved endpoints move (a ref the spec names changes).
 /// `log_id` is a client-assigned subscription id (unique per connection).
 /// `flags` are the same `GIT_LOG_*` bits.
-pub const C2S_GIT_LOG_WATCH: u8 = 0x5C;
-/// End a log subscription: [0x5D][log_id:2][repo_id:2]
-pub const C2S_GIT_LOG_UNWATCH: u8 = 0x5D;
-/// Acknowledge a log page (coalescing pacing): [0x5E][log_id:2][repo_id:2][update_id:4]
-pub const C2S_GIT_LOG_ACK: u8 = 0x5E;
+pub const C2S_GIT_LOG_WATCH: u8 = 0xA8;
+/// End a log subscription: [0xA9][log_id:2][repo_id:2]
+pub const C2S_GIT_LOG_UNWATCH: u8 = 0xA9;
+/// Acknowledge a log page (coalescing pacing): [0xAA][log_id:2][repo_id:2][update_id:4]
+pub const C2S_GIT_LOG_ACK: u8 = 0xAA;
+
+/// Enumerate repositories under a path: [0xB1][nonce:2][flags:1][depth:1][path_len:2][path:N][after_len:2][after:N]
+/// A bounded downward search. Allocates no repo ids — it answers "what is
+/// here", not "give me a handle".
+pub const C2S_GIT_DISCOVER: u8 = 0xB1;
+/// Line attribution: [0xB2][nonce:2][repo_id:2][flags:1][oid:32][start_line:4][line_count:4][path_len:2][path:N][after_len:2][after:N]
+pub const C2S_GIT_BLAME: u8 = 0xB2;
+/// Reflog traversal: [0xB3][nonce:2][repo_id:2][flags:1][limit:2][ref_len:2][ref:N][after_len:2][after:N]
+/// `ref` empty = HEAD.
+pub const C2S_GIT_REFLOG: u8 = 0xB3;
+/// Fetch from a remote: [0xB4][nonce:2][repo_id:2][flags:1][timeout_ms:4][remote_len:2][remote:N][n_refspecs:2][(len:2, refspec:N)·N]
+pub const C2S_GIT_FETCH: u8 = 0xB4;
 
 // S2C opcodes.
 
-/// Open outcome: [0x50][nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir:N][gitdir_len:2][gitdir:N]
+/// Open outcome: [0xA0][nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir:N][gitdir_len:2][gitdir:N]
 /// On failure `repo_id` = [`GIT_REPO_ID_INVALID`] and `workdir` carries a
 /// diagnostic; on success both paths are canonical, escaped.
-pub const S2C_GIT_REPO: u8 = 0x50;
-/// Whole-state snapshot: [0x51][repo_id:2][state_id:4][flags:1][records:LZ4]
-pub const S2C_GIT_STATE: u8 = 0x51;
-/// Repo ended server-side: [0x52][repo_id:2][reason:1]
-pub const S2C_GIT_CLOSED: u8 = 0x52;
-/// Log response: [0x53][nonce:2][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]
-pub const S2C_GIT_COMMITS: u8 = 0x53;
-/// Tree response: [0x54][nonce:2][status:1][flags:1][records:LZ4]
-pub const S2C_GIT_TREE: u8 = 0x54;
-/// Blob response: [0x55][nonce:2][status:1][size:8][data:LZ4]
+pub const S2C_GIT_REPO: u8 = 0xA0;
+/// Whole-state snapshot: [0xA4][repo_id:2][state_id:4][flags:1][records:LZ4]
+pub const S2C_GIT_STATE: u8 = 0xA4;
+/// Repo ended server-side: [0xA5][repo_id:2][reason:1]
+pub const S2C_GIT_CLOSED: u8 = 0xA5;
+/// Log response: [0xA7][nonce:2][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]
+pub const S2C_GIT_COMMITS: u8 = 0xA7;
+/// Tree response: [0xAB][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_TREE: u8 = 0xAB;
+/// Blob response: [0xAC][nonce:2][status:1][size:8][data:LZ4]
 /// `size` is always the true object size, even on `TOO_LARGE`.
-pub const S2C_GIT_BLOB: u8 = 0x55;
-/// Diff response: [0x56][nonce:2][status:1][flags:1][records:LZ4]
-pub const S2C_GIT_DIFF: u8 = 0x56;
-/// Patch response: [0x57][nonce:2][status:1][flags:1][data:LZ4]
+pub const S2C_GIT_BLOB: u8 = 0xAC;
+/// Diff response: [0xAD][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_DIFF: u8 = 0xAD;
+/// Patch response: [0xAE][nonce:2][status:1][flags:1][data:LZ4]
 /// `data` is records when `STRUCTURED`, else a classic unified diff.
-pub const S2C_GIT_PATCH: u8 = 0x57;
-/// Index response: [0x58][nonce:2][status:1][flags:1][records:LZ4]
-pub const S2C_GIT_INDEX: u8 = 0x58;
-/// Merge-base response: [0x5A][nonce:2][status:1][n_bases:1][bases:32·N]
-pub const S2C_GIT_BASE: u8 = 0x5A;
-/// Resolve response: [0x5B][nonce:2][status:1][n_tips:2][tips:32·N][n_hides:2][hides:32·N]
-pub const S2C_GIT_RESOLVE: u8 = 0x5B;
-/// Live log page: [0x5C][log_id:2][update_id:4][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]
+pub const S2C_GIT_PATCH: u8 = 0xAE;
+/// Index response: [0xAF][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_INDEX: u8 = 0xAF;
+/// Merge-base response: [0xB0][nonce:2][status:1][n_bases:1][bases:32·N]
+pub const S2C_GIT_BASE: u8 = 0xB0;
+/// Resolve response: [0xA6][nonce:2][status:1][n_tips:2][tips:32·N][n_hides:2][hides:32·N]
+pub const S2C_GIT_RESOLVE: u8 = 0xA6;
+/// Live log page: [0xA8][log_id:2][update_id:4][status:1][flags:1][n_frontier:2][frontier:32·N][records:LZ4]
 /// Same records as `GIT_COMMITS`; re-sent (coalesced, acked) when the
 /// subscription's resolved endpoints move. `flags` bit 0 `MORE` marks a
 /// truncated head page — pull older history statelessly with `GIT_LOG`
 /// from `frontier`.
-pub const S2C_GIT_LOG_PAGE: u8 = 0x5C;
+pub const S2C_GIT_LOG_PAGE: u8 = 0xA8;
+
+/// Discovery response: [0xB1][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_DISCOVER: u8 = 0xB1;
+/// Blame response: [0xB2][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_BLAME: u8 = 0xB2;
+/// Reflog response: [0xB3][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_REFLOG: u8 = 0xB3;
+/// Fetch response: [0xB4][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_FETCH: u8 = 0xB4;
 
 // Unified status table: every `status` byte in the family (docs/git.md
 // "Statuses"). Codes 0-4 coincide with `FS_SYNCED`'s where semantics overlap.
@@ -110,8 +136,14 @@ pub const GIT_STATUS_INVALID: u8 = 7;
 pub const GIT_STATUS_CANCELLED: u8 = 8;
 /// Diagnostic in the message's detail field where it has one.
 pub const GIT_STATUS_OTHER: u8 = 9;
+/// A precondition failed (a lock was held, or the repository moved under a
+/// request). Shares docs/design/fs-write.md's code rather than minting a
+/// synonym, so a client's status mapping stays one table.
+pub const GIT_STATUS_CONFLICT: u8 = 11;
 
-/// Human-readable name for a `GIT_STATUS_*` code.
+/// Human-readable name for a `GIT_STATUS_*` code. Total: `OTHER` and an
+/// unrecognized code are distinct, so a consumer that logs this text can
+/// tell "the backend failed" from "this build does not know that code".
 pub fn git_status_text(status: u8) -> &'static str {
     match status {
         GIT_STATUS_OK => "ok",
@@ -123,28 +155,40 @@ pub fn git_status_text(status: u8) -> &'static str {
         GIT_STATUS_BUDGET => "budget exhausted",
         GIT_STATUS_INVALID => "invalid request",
         GIT_STATUS_CANCELLED => "cancelled",
-        _ => "error",
+        GIT_STATUS_OTHER => "backend error",
+        GIT_STATUS_CONFLICT => "conflict",
+        _ => "unknown status",
     }
 }
 
-// C2S_GIT_OPEN flags.
+// C2S_GIT_OPEN flags (u16: the byte was full, and `src_pty_id` /
+// `parent_repo_id` are plain fields now rather than flag-gated tails).
 /// Stream `GIT_STATE`.
-pub const GIT_OPEN_WATCH: u8 = 1 << 0;
+pub const GIT_OPEN_WATCH: u16 = 1 << 0;
 /// Include index/worktree status records in state; implies `WATCH`.
-pub const GIT_OPEN_STATUS: u8 = 1 << 1;
+pub const GIT_OPEN_STATUS: u16 = 1 << 1;
 /// Status includes untracked files.
-pub const GIT_OPEN_UNTRACKED: u8 = 1 << 2;
+pub const GIT_OPEN_UNTRACKED: u16 = 1 << 2;
 /// Status includes ignored files; implies `UNTRACKED`.
-pub const GIT_OPEN_IGNORED: u8 = 1 << 3;
+pub const GIT_OPEN_IGNORED: u16 = 1 << 3;
 /// Include per-branch upstream records in state; implies `WATCH`.
-pub const GIT_OPEN_TRACKING: u8 = 1 << 4;
-/// Resolve the repo's discovery path from a pty's live cwd: a trailing
-/// `[src_pty_id:2]` names a pty and the server joins `path` onto its cwd
-/// before upward `.git` discovery (docs/ide.md Decision 3).
-pub const GIT_OPEN_FROM_PTY: u8 = 1 << 5;
+pub const GIT_OPEN_TRACKING: u16 = 1 << 4;
+/// Include one `STATE_REMOTE` record per configured remote; implies
+/// `WATCH`. URLs go out as configured.
+pub const GIT_OPEN_REMOTES: u16 = 1 << 5;
+/// Every flag this build understands; anything else is `INVALID`.
+pub const GIT_OPEN_KNOWN: u16 = GIT_OPEN_WATCH
+    | GIT_OPEN_STATUS
+    | GIT_OPEN_UNTRACKED
+    | GIT_OPEN_IGNORED
+    | GIT_OPEN_TRACKING
+    | GIT_OPEN_REMOTES;
 
-/// `repo_id` reported by a failed `GIT_REPO`.
+/// `repo_id` reported by a failed `GIT_REPO`, and the "no context" sentinel
+/// for `GIT_OPEN`'s `src_pty_id` / `parent_repo_id`.
 pub const GIT_REPO_ID_INVALID: u16 = 0xFFFF;
+/// `GIT_OPEN.src_pty_id` / `parent_repo_id`: no such context.
+pub const GIT_OPEN_NO_CONTEXT: u16 = 0xFFFF;
 
 // S2C_GIT_REPO oid_format: the repository hash width; oids on the wire are
 // always 32 bytes, zero-padded past it.
@@ -160,6 +204,14 @@ pub const GIT_REPO_SHALLOW: u8 = 1 << 1;
 pub const GIT_REPO_SPARSE: u8 = 1 << 2;
 /// Linked worktree.
 pub const GIT_REPO_LINKED: u8 = 1 << 3;
+/// Reserved for the mutation family (docs/design/git.md "Mutation"); clear
+/// in this build, and clear whenever `BLIT_GIT_WRITE=0`.
+pub const GIT_REPO_WRITABLE: u8 = 1 << 4;
+/// `GIT_FETCH` will be attempted for this repo: fetch is enabled
+/// (`BLIT_GIT_FETCH`) and a `git` binary was found. Capability is answered
+/// per repository rather than per connection because it can differ per
+/// repository.
+pub const GIT_REPO_FETCHABLE: u8 = 1 << 5;
 
 // S2C_GIT_CLOSED reasons.
 pub const GIT_CLOSED_CLIENT_REQUEST: u8 = 0;
@@ -171,6 +223,12 @@ pub const GIT_CLOSED_RESOURCE_LIMIT: u8 = 4;
 // S2C_GIT_STATE flags: entry budget hit; counts accurate up to the cap.
 pub const GIT_STATE_REFS_TRUNCATED: u8 = 1 << 0;
 pub const GIT_STATE_STATUS_TRUNCATED: u8 = 1 << 1;
+/// More records for this `state_id` follow. A snapshot past the per-message
+/// byte budget spans several `GIT_STATE` messages sharing one `state_id`;
+/// the client accumulates and replaces its map on the chunk with this bit
+/// clear, so it never observes a half-built snapshot. Only the final chunk
+/// is acked, so the one-in-flight pacing is unchanged.
+pub const GIT_STATE_PARTIAL: u8 = 1 << 2;
 
 // C2S_GIT_LOG flags.
 pub const GIT_LOG_FIRST_PARENT: u8 = 1 << 0;
@@ -187,8 +245,16 @@ pub const GIT_LOG_PATH_OIDS: u8 = 1 << 4;
 /// Partial page; continue with `tips = frontier` and the same `hides`.
 pub const GIT_COMMITS_MORE: u8 = 1 << 0;
 
-// C2S_GIT_DIFF request flags; C2S_GIT_PATCH shares bits 0-4.
-/// Rename/copy detection.
+// C2S_GIT_BLOB request flags.
+/// Deliver the whole object or answer `TOO_LARGE`. Without it a request is
+/// a window: the server returns what fits from `offset` and `size` still
+/// carries the true object size, so a viewer can render the head of a file
+/// too large to ship whole.
+pub const GIT_BLOB_WHOLE: u8 = 1 << 0;
+
+// C2S_GIT_DIFF request flags; C2S_GIT_PATCH shares bits 0-5.
+/// Rename/copy detection. The `rename` byte carries the similarity
+/// threshold; this bit alone means the exact-oid join (threshold 100).
 pub const GIT_DIFF_RENAMES: u8 = 1 << 0;
 /// Worktree endpoint reports untracked files as additions.
 pub const GIT_DIFF_UNTRACKED: u8 = 1 << 1;
@@ -197,23 +263,78 @@ pub const GIT_DIFF_IGNORED: u8 = 1 << 2;
 pub const GIT_DIFF_IGNORE_SPACE_CHANGE: u8 = 1 << 3;
 /// Whitespace ignored entirely (git `-w`).
 pub const GIT_DIFF_IGNORE_ALL_SPACE: u8 = 1 << 4;
+/// Compare on-disk bytes as they are: skip the `text`/`eol` normalization
+/// the worktree side gets by default from the path's gitattributes.
+pub const GIT_DIFF_RAW: u8 = 1 << 5;
 
-// C2S_GIT_PATCH-only request flags.
+// C2S_GIT_PATCH request flags: a u16 whose low six bits are exactly
+// `GIT_DIFF`'s, so one shared prefix rather than two numberings.
+pub const GIT_PATCH_RENAMES: u16 = GIT_DIFF_RENAMES as u16;
+pub const GIT_PATCH_UNTRACKED: u16 = GIT_DIFF_UNTRACKED as u16;
+pub const GIT_PATCH_IGNORED: u16 = GIT_DIFF_IGNORED as u16;
+pub const GIT_PATCH_IGNORE_SPACE_CHANGE: u16 = GIT_DIFF_IGNORE_SPACE_CHANGE as u16;
+pub const GIT_PATCH_IGNORE_ALL_SPACE: u16 = GIT_DIFF_IGNORE_ALL_SPACE as u16;
+pub const GIT_PATCH_RAW: u16 = GIT_DIFF_RAW as u16;
 /// Classic unified diff as raw `data` instead of records.
-pub const GIT_PATCH_TEXT: u8 = 1 << 5;
+pub const GIT_PATCH_TEXT: u16 = 1 << 6;
 /// Character-granularity spans instead of the default word granularity.
-pub const GIT_PATCH_CHAR_SPANS: u8 = 1 << 6;
+pub const GIT_PATCH_CHAR_SPANS: u16 = 1 << 7;
 /// Skip intraline refinement entirely, for whole-line renderers.
-pub const GIT_PATCH_NO_SPANS: u8 = 1 << 7;
+pub const GIT_PATCH_NO_SPANS: u16 = 1 << 8;
+/// With `TEXT`, emit binary content as git's `GIT binary patch` block
+/// instead of the `Binary files … differ` sentence — git's `--binary`,
+/// under git's own rule that it is asked for rather than assumed. A patch
+/// carrying a 40 MiB PNG is not what a review surface wants by default,
+/// and it is the difference between a patch `git apply` can replay and one
+/// it refuses.
+pub const GIT_PATCH_BINARY: u16 = 1 << 9;
+
+/// The similarity threshold a `rename` byte may carry: `0` is the exact-oid
+/// join, `1..=100` a percentage, anything above is `INVALID`.
+pub const GIT_RENAME_MAX: u8 = 100;
 
 // Response flags: S2C_GIT_TREE / S2C_GIT_DIFF / S2C_GIT_INDEX bit 0 is the
 // entry-budget truncation marker; S2C_GIT_PATCH uses bit 0 for payload form.
+// A truncated response carries a trailing `CURSOR` record unless it is
+// genuinely unresumable.
 pub const GIT_TREE_TRUNCATED: u8 = 1 << 0;
 pub const GIT_DIFF_TRUNCATED: u8 = 1 << 0;
+/// Similarity rename detection was skipped: the unmatched add/delete
+/// candidate set exceeded `BLIT_GIT_RENAME_LIMIT`, so the response fell
+/// back to the exact-oid join. Renders as "rename detection skipped"
+/// instead of unexplained delete+add pairs.
+pub const GIT_DIFF_RENAME_LIMIT: u8 = 1 << 1;
 pub const GIT_INDEX_TRUNCATED: u8 = 1 << 0;
 /// `data` is records (the default); clear = classic unified diff text.
 pub const GIT_PATCH_STRUCTURED: u8 = 1 << 0;
 pub const GIT_PATCH_TRUNCATED: u8 = 1 << 1;
+pub const GIT_DISCOVER_TRUNCATED: u8 = 1 << 0;
+pub const GIT_BLAME_TRUNCATED: u8 = 1 << 0;
+pub const GIT_REFLOG_TRUNCATED: u8 = 1 << 0;
+
+// C2S_GIT_DISCOVER request flags.
+/// Descend into a repository once one is found (off by default, so a tree
+/// of vendored checkouts costs nothing).
+pub const GIT_DISCOVER_NESTED: u8 = 1 << 0;
+/// Report bare repositories too.
+pub const GIT_DISCOVER_BARE: u8 = 1 << 1;
+
+// C2S_GIT_BLAME request flags.
+/// Follow renames (git's `-M`).
+pub const GIT_BLAME_FOLLOW_RENAMES: u8 = 1 << 0;
+/// Follow copies (git's `-C`); materially more expensive.
+pub const GIT_BLAME_FOLLOW_COPIES: u8 = 1 << 1;
+
+// C2S_GIT_REFLOG request flags.
+/// Oldest entry first; default is newest-first, matching `git reflog`.
+pub const GIT_REFLOG_OLDEST_FIRST: u8 = 1 << 0;
+
+// C2S_GIT_FETCH request flags.
+pub const GIT_FETCH_PRUNE: u8 = 1 << 0;
+pub const GIT_FETCH_NO_TAGS: u8 = 1 << 1;
+/// Anchor every fetched tip under `refs/blit/fetch/<remote>/<n>` so a
+/// concurrent `gc` cannot prune it before the client diffs it.
+pub const GIT_FETCH_ANCHOR: u8 = 1 << 2;
 
 // Diff/patch endpoint kinds (docs/git.md "GIT_DIFF").
 pub const GIT_ENDPOINT_EMPTY: u8 = 0;
@@ -224,6 +345,11 @@ pub const GIT_ENDPOINT_WORKTREE: u8 = 4;
 /// Old side only: the server substitutes `merge-base(oid, new)`.
 pub const GIT_ENDPOINT_MERGE_BASE: u8 = 5;
 
+/// Reserved family-wide in every records payload: the continuation point of
+/// a response a budget cut short. `TRUNCATED` set with no `CURSOR` record
+/// means the response is genuinely unresumable.
+pub const GIT_RECORD_CURSOR: u8 = 0x7F;
+
 // Record kinds inside GIT_STATE.
 pub const GIT_STATE_RECORD_HEAD: u8 = 0x01;
 pub const GIT_STATE_RECORD_REF: u8 = 0x02;
@@ -231,6 +357,11 @@ pub const GIT_STATE_RECORD_OP: u8 = 0x03;
 pub const GIT_STATE_RECORD_STATUS: u8 = 0x04;
 pub const GIT_STATE_RECORD_UPSTREAM: u8 = 0x05;
 pub const GIT_STATE_RECORD_STASH: u8 = 0x06;
+pub const GIT_STATE_RECORD_REMOTE: u8 = 0x07;
+
+// STATE_REMOTE record flags.
+/// The remote whose `HEAD` the checkout's default branch tracks.
+pub const GIT_REMOTE_DEFAULT: u8 = 1 << 0;
 
 // HEAD record flags.
 pub const GIT_HEAD_DETACHED: u8 = 1 << 0;
@@ -281,6 +412,11 @@ pub const GIT_DIFF_RECORD_BASE: u8 = 0x04;
 // DIFF_ENTRY dflags.
 pub const GIT_DIFF_ENTRY_BINARY: u8 = 1 << 0;
 pub const GIT_DIFF_ENTRY_SUBMODULE: u8 = 1 << 1;
+/// The path's gitattributes name a `filter` driver, so the object bytes and
+/// the worktree bytes are not comparable (an LFS pointer against the asset
+/// it stands for). No rows are emitted: a client renders "filtered file
+/// changed" rather than a wrong whole-file rewrite.
+pub const GIT_DIFF_ENTRY_FILTERED: u8 = 1 << 2;
 
 // Record kinds inside the GIT_PATCH response (structured form).
 pub const GIT_PATCH_RECORD_FILE: u8 = 0x01;
@@ -291,9 +427,32 @@ pub const GIT_PATCH_RECORD_BASE: u8 = 0x04;
 // PATCH_FILE flags.
 /// Binary file: no rows follow.
 pub const GIT_PATCH_FILE_BINARY: u8 = 1 << 0;
+/// Filtered file: no rows follow (see `GIT_DIFF_ENTRY_FILTERED`).
+pub const GIT_PATCH_FILE_FILTERED: u8 = 1 << 1;
 
 // Record kind inside the GIT_INDEX response.
 pub const GIT_INDEX_RECORD_ENTRY: u8 = 0x04;
+
+// Record kinds inside the 0x90-block responses.
+pub const GIT_DISCOVER_RECORD_REPO: u8 = 0x01;
+pub const GIT_BLAME_RECORD_RANGE: u8 = 0x01;
+pub const GIT_REFLOG_RECORD_ENTRY: u8 = 0x01;
+pub const GIT_FETCH_RECORD_REF: u8 = 0x01;
+
+// REPO_FOUND record flags.
+pub const GIT_FOUND_BARE: u8 = 1 << 0;
+pub const GIT_FOUND_LINKED: u8 = 1 << 1;
+pub const GIT_FOUND_SUBMODULE: u8 = 1 << 2;
+
+// FETCH_REF record flags.
+pub const GIT_FETCH_REF_FORCED: u8 = 1 << 0;
+pub const GIT_FETCH_REF_PRUNED: u8 = 1 << 1;
+pub const GIT_FETCH_REF_NEW: u8 = 1 << 2;
+/// An existing tag was moved (git's `t` flag, distinct from its `+`). Its own
+/// bit rather than folded into `FORCED`, because git distinguishes the two and
+/// a client showing "the tag you pinned now points elsewhere" wants the
+/// distinction.
+pub const GIT_FETCH_REF_TAG_UPDATE: u8 = 1 << 3;
 
 // INDEX_ENTRY iflags.
 pub const GIT_INDEX_INTENT_TO_ADD: u8 = 1 << 0;
@@ -477,90 +636,118 @@ fn body_of(msg: &[u8], opcode: u8) -> Option<&[u8]> {
 // C2S message builders and parsers
 // ---------------------------------------------------------------------------
 
-pub fn msg_git_open(
-    nonce: u16,
-    flags: u8,
-    refs_latency_ms: u16,
-    status_latency_ms: u16,
-    path: &str,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(10 + path.len());
+/// A decoded `C2S_GIT_OPEN`.
+///
+/// Both context ids are plain fields with a [`GIT_OPEN_NO_CONTEXT`]
+/// sentinel rather than flag-gated tails, so the message has one parse
+/// shape however it is used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitOpenRequest<'a> {
+    pub nonce: u16,
+    pub flags: u16,
+    /// Per-open settle windows; `0` = the server default.
+    pub refs_latency_ms: u16,
+    pub status_latency_ms: u16,
+    /// `GIT_OPEN_NO_CONTEXT` = none. Otherwise the server joins `path` onto
+    /// that pty's live cwd before upward discovery (docs/ide.md Decision 3).
+    pub src_pty_id: u16,
+    /// `GIT_OPEN_NO_CONTEXT` = none. Otherwise `path` is a submodule path
+    /// relative to that repo's worktree and the server resolves the
+    /// submodule's own gitdir and worktree — a client never has to guess
+    /// where `.gitmodules` put it.
+    pub parent_repo_id: u16,
+    /// Ref prefixes to watch; empty = every ref. A UI that renders branches
+    /// and not tags stops paying for tags at every settle.
+    pub ref_prefixes: Vec<&'a str>,
+    /// Plain UTF-8: a filesystem location the client chose (or, with
+    /// `parent_repo_id`, a repo-relative submodule path).
+    pub path: &'a str,
+}
+
+impl GitOpenRequest<'_> {
+    /// The common case: a plain path with no context and no prefix filter.
+    pub fn new(nonce: u16, flags: u16, path: &str) -> GitOpenRequest<'_> {
+        GitOpenRequest {
+            nonce,
+            flags,
+            refs_latency_ms: 0,
+            status_latency_ms: 0,
+            src_pty_id: GIT_OPEN_NO_CONTEXT,
+            parent_repo_id: GIT_OPEN_NO_CONTEXT,
+            ref_prefixes: Vec::new(),
+            path,
+        }
+    }
+}
+
+pub fn msg_git_open(req: &GitOpenRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(17 + req.path.len());
     msg.push(C2S_GIT_OPEN);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.push(flags);
-    msg.extend_from_slice(&refs_latency_ms.to_le_bytes());
-    msg.extend_from_slice(&status_latency_ms.to_le_bytes());
-    push_str(&mut msg, path);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.flags.to_le_bytes());
+    msg.extend_from_slice(&req.refs_latency_ms.to_le_bytes());
+    msg.extend_from_slice(&req.status_latency_ms.to_le_bytes());
+    msg.extend_from_slice(&req.src_pty_id.to_le_bytes());
+    msg.extend_from_slice(&req.parent_repo_id.to_le_bytes());
+    msg.extend_from_slice(&(req.ref_prefixes.len() as u16).to_le_bytes());
+    for prefix in &req.ref_prefixes {
+        push_str(&mut msg, prefix);
+    }
+    push_str(&mut msg, req.path);
     msg
 }
 
-/// Build a `C2S_GIT_OPEN` whose discovery path the server resolves from a
-/// pty's live cwd: sets `GIT_OPEN_FROM_PTY` and appends `[src_pty_id:2]`
-/// after the path (docs/ide.md Decision 3).
-pub fn msg_git_open_from_pty(
-    nonce: u16,
-    flags: u8,
-    refs_latency_ms: u16,
-    status_latency_ms: u16,
-    path: &str,
-    src_pty_id: u16,
-) -> Vec<u8> {
-    let mut msg = msg_git_open(
+pub fn parse_git_open(msg: &[u8]) -> Option<GitOpenRequest<'_>> {
+    let mut b = body_of(msg, C2S_GIT_OPEN)?;
+    let nonce = take_u16(&mut b)?;
+    let flags = take_u16(&mut b)?;
+    let refs_latency_ms = take_u16(&mut b)?;
+    let status_latency_ms = take_u16(&mut b)?;
+    let src_pty_id = take_u16(&mut b)?;
+    let parent_repo_id = take_u16(&mut b)?;
+    let n_prefixes = take_u16(&mut b)? as usize;
+    let mut ref_prefixes = Vec::with_capacity(n_prefixes.min(64));
+    for _ in 0..n_prefixes {
+        ref_prefixes.push(take_str(&mut b)?);
+    }
+    let path = take_str(&mut b)?;
+    Some(GitOpenRequest {
         nonce,
-        flags | GIT_OPEN_FROM_PTY,
+        flags,
         refs_latency_ms,
         status_latency_ms,
+        src_pty_id,
+        parent_repo_id,
+        ref_prefixes,
         path,
-    );
-    msg.extend_from_slice(&src_pty_id.to_le_bytes());
-    msg
+    })
 }
 
-/// Extract the trailing `src_pty_id` from a `FROM_PTY` `C2S_GIT_OPEN`.
-pub fn git_open_src_pty(msg: &[u8]) -> Option<u16> {
-    if msg.first().copied() != Some(C2S_GIT_OPEN) || msg.len() < 10 {
-        return None;
-    }
-    if msg[3] & GIT_OPEN_FROM_PTY == 0 {
-        return None;
-    }
-    let path_len = u16::from_le_bytes([msg[8], msg[9]]) as usize;
-    let off = 10usize.checked_add(path_len)?;
-    let b = msg.get(off..off + 2)?;
-    Some(u16::from_le_bytes([b[0], b[1]]))
-}
-
-/// Rebase a `FROM_PTY` `C2S_GIT_OPEN` onto a resolved `cwd` (join `cwd`/`path`,
-/// clear `FROM_PTY`), producing a plain path-based open the handler consumes
-/// unchanged. `cwd` `None` (source pty gone) keeps `path` verbatim.
+/// Rebase a pty-relative `C2S_GIT_OPEN` onto a resolved `cwd`: join
+/// `cwd`/`path` and clear `src_pty_id`, producing the plain path-based open
+/// the handler consumes. `cwd` `None` (source pty gone) keeps `path`
+/// verbatim.
 pub fn git_open_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
-    git_open_src_pty(msg)?;
-    let (nonce, flags, refs_ms, status_ms, path) = parse_git_open(msg)?;
+    let req = parse_git_open(msg)?;
+    if req.src_pty_id == GIT_OPEN_NO_CONTEXT {
+        return None;
+    }
     let joined = cwd.map(|dir| {
         std::path::Path::new(dir)
-            .join(path)
+            .join(req.path)
             .to_string_lossy()
             .into_owned()
     });
-    let eff = joined.as_deref().unwrap_or(path);
-    Some(msg_git_open(
-        nonce,
-        flags & !GIT_OPEN_FROM_PTY,
-        refs_ms,
-        status_ms,
-        eff,
-    ))
-}
-
-/// Parse `C2S_GIT_OPEN` into `(nonce, flags, refs_latency_ms, status_latency_ms, path)`.
-pub fn parse_git_open(msg: &[u8]) -> Option<(u16, u8, u16, u16, &str)> {
-    let mut b = body_of(msg, C2S_GIT_OPEN)?;
-    let nonce = take_u16(&mut b)?;
-    let flags = take_u8(&mut b)?;
-    let refs_latency_ms = take_u16(&mut b)?;
-    let status_latency_ms = take_u16(&mut b)?;
-    let path = take_str(&mut b)?;
-    Some((nonce, flags, refs_latency_ms, status_latency_ms, path))
+    Some(msg_git_open(&GitOpenRequest {
+        nonce: req.nonce,
+        flags: req.flags,
+        refs_latency_ms: req.refs_latency_ms,
+        status_latency_ms: req.status_latency_ms,
+        src_pty_id: GIT_OPEN_NO_CONTEXT,
+        parent_repo_id: req.parent_repo_id,
+        ref_prefixes: req.ref_prefixes,
+        path: joined.as_deref().unwrap_or(req.path),
+    }))
 }
 
 pub fn msg_git_close(repo_id: u16) -> Vec<u8> {
@@ -651,46 +838,96 @@ pub fn parse_git_log(msg: &[u8]) -> Option<GitLogRequest<'_>> {
     })
 }
 
-pub fn msg_git_tree(nonce: u16, repo_id: u16, oid: &GitOid, path: &str) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(39 + path.len());
+/// A decoded `C2S_GIT_TREE`. `after` empty = from the beginning; set it to
+/// a `CURSOR` record's path to continue a truncated listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitTreeRequest<'a> {
+    pub nonce: u16,
+    pub repo_id: u16,
+    /// Reserved; a set bit is `INVALID`.
+    pub flags: u8,
+    pub oid: GitOid,
+    pub path: &'a str,
+    pub after: &'a str,
+}
+
+pub fn msg_git_tree(req: &GitTreeRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(42 + req.path.len() + req.after.len());
     msg.push(C2S_GIT_TREE);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&repo_id.to_le_bytes());
-    msg.extend_from_slice(oid);
-    push_str(&mut msg, path);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.extend_from_slice(&req.oid);
+    push_str(&mut msg, req.path);
+    push_str(&mut msg, req.after);
     msg
 }
 
-/// Parse `C2S_GIT_TREE` into `(nonce, repo_id, oid, path)`.
-pub fn parse_git_tree(msg: &[u8]) -> Option<(u16, u16, GitOid, &str)> {
+pub fn parse_git_tree(msg: &[u8]) -> Option<GitTreeRequest<'_>> {
     let mut b = body_of(msg, C2S_GIT_TREE)?;
     let nonce = take_u16(&mut b)?;
     let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
     let oid = take_oid(&mut b)?;
     let path = take_str(&mut b)?;
-    Some((nonce, repo_id, oid, path))
+    let after = take_str(&mut b)?;
+    Some(GitTreeRequest {
+        nonce,
+        repo_id,
+        flags,
+        oid,
+        path,
+        after,
+    })
 }
 
-pub fn msg_git_blob(nonce: u16, repo_id: u16, oid: &GitOid, path: &str, max_len: u32) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(43 + path.len());
+/// A decoded `C2S_GIT_BLOB`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitBlobRequest<'a> {
+    pub nonce: u16,
+    pub repo_id: u16,
+    /// `GIT_BLOB_WHOLE` refuses rather than windowing.
+    pub flags: u8,
+    pub oid: GitOid,
+    pub path: &'a str,
+    /// First byte to return. Past the end is `INVALID`; exactly the end is
+    /// `OK` with no data.
+    pub offset: u64,
+    /// `0` = the server default cap.
+    pub max_len: u32,
+}
+
+pub fn msg_git_blob(req: &GitBlobRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(52 + req.path.len());
     msg.push(C2S_GIT_BLOB);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&repo_id.to_le_bytes());
-    msg.extend_from_slice(oid);
-    push_str(&mut msg, path);
-    msg.extend_from_slice(&max_len.to_le_bytes());
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.extend_from_slice(&req.oid);
+    push_str(&mut msg, req.path);
+    msg.extend_from_slice(&req.offset.to_le_bytes());
+    msg.extend_from_slice(&req.max_len.to_le_bytes());
     msg
 }
 
-/// Parse `C2S_GIT_BLOB` into `(nonce, repo_id, oid, path, max_len)`.
-pub fn parse_git_blob(msg: &[u8]) -> Option<(u16, u16, GitOid, &str, u32)> {
+pub fn parse_git_blob(msg: &[u8]) -> Option<GitBlobRequest<'_>> {
     let mut b = body_of(msg, C2S_GIT_BLOB)?;
     let nonce = take_u16(&mut b)?;
     let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
     let oid = take_oid(&mut b)?;
     let path = take_str(&mut b)?;
+    let offset = take_u64(&mut b)?;
     let max_len = take_u32(&mut b)?;
-    Some((nonce, repo_id, oid, path, max_len))
+    Some(GitBlobRequest {
+        nonce,
+        repo_id,
+        flags,
+        oid,
+        path,
+        offset,
+        max_len,
+    })
 }
 
 /// A decoded `C2S_GIT_DIFF` request.
@@ -699,28 +936,28 @@ pub struct GitDiffRequest<'a> {
     pub nonce: u16,
     pub repo_id: u16,
     pub flags: u8,
+    /// Rename similarity threshold: `0` = the exact-oid join, `1..=100` a
+    /// percentage (git's own default is 50), above that `INVALID`.
+    pub rename: u8,
     pub old: GitEndpoint,
     pub new: GitEndpoint,
     /// Empty = whole tree; escaped form.
     pub path: &'a str,
+    /// Empty = from the beginning; else a `CURSOR` record's path.
+    pub after: &'a str,
 }
 
-pub fn msg_git_diff(
-    nonce: u16,
-    repo_id: u16,
-    flags: u8,
-    old: GitEndpoint,
-    new: GitEndpoint,
-    path: &str,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(74 + path.len());
+pub fn msg_git_diff(req: &GitDiffRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(77 + req.path.len() + req.after.len());
     msg.push(C2S_GIT_DIFF);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&repo_id.to_le_bytes());
-    msg.push(flags);
-    push_endpoint(&mut msg, old);
-    push_endpoint(&mut msg, new);
-    push_str(&mut msg, path);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.push(req.rename);
+    push_endpoint(&mut msg, req.old);
+    push_endpoint(&mut msg, req.new);
+    push_str(&mut msg, req.path);
+    push_str(&mut msg, req.after);
     msg
 }
 
@@ -729,16 +966,20 @@ pub fn parse_git_diff(msg: &[u8]) -> Option<GitDiffRequest<'_>> {
     let nonce = take_u16(&mut b)?;
     let repo_id = take_u16(&mut b)?;
     let flags = take_u8(&mut b)?;
+    let rename = take_u8(&mut b)?;
     let old = take_endpoint(&mut b)?;
     let new = take_endpoint(&mut b)?;
     let path = take_str(&mut b)?;
+    let after = take_str(&mut b)?;
     Some(GitDiffRequest {
         nonce,
         repo_id,
         flags,
+        rename,
         old,
         new,
         path,
+        after,
     })
 }
 
@@ -747,37 +988,38 @@ pub fn parse_git_diff(msg: &[u8]) -> Option<GitDiffRequest<'_>> {
 pub struct GitPatchRequest<'a> {
     pub nonce: u16,
     pub repo_id: u16,
-    pub flags: u8,
+    /// Low six bits are `GIT_DIFF`'s; `TEXT`/`CHAR_SPANS`/`NO_SPANS` follow.
+    pub flags: u16,
     /// Context lines; `0` = server default (3).
     pub context: u8,
+    /// Rename similarity threshold, as `GIT_DIFF`.
+    pub rename: u8,
     pub old: GitEndpoint,
     pub new: GitEndpoint,
     /// Non-empty = one file's patch; empty = the whole diff.
     pub path: &'a str,
     pub max_len: u32,
+    /// Empty = from the beginning; else a `CURSOR` record's path.
+    pub after: &'a str,
+    /// Rows already delivered for `after`, so a file larger than the byte
+    /// budget resumes mid-hunk instead of restarting forever.
+    pub after_pos: u64,
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors the wire layout field-for-field
-pub fn msg_git_patch(
-    nonce: u16,
-    repo_id: u16,
-    flags: u8,
-    context: u8,
-    old: GitEndpoint,
-    new: GitEndpoint,
-    path: &str,
-    max_len: u32,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(79 + path.len());
+pub fn msg_git_patch(req: &GitPatchRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(90 + req.path.len() + req.after.len());
     msg.push(C2S_GIT_PATCH);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&repo_id.to_le_bytes());
-    msg.push(flags);
-    msg.push(context);
-    push_endpoint(&mut msg, old);
-    push_endpoint(&mut msg, new);
-    push_str(&mut msg, path);
-    msg.extend_from_slice(&max_len.to_le_bytes());
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.extend_from_slice(&req.flags.to_le_bytes());
+    msg.push(req.context);
+    msg.push(req.rename);
+    push_endpoint(&mut msg, req.old);
+    push_endpoint(&mut msg, req.new);
+    push_str(&mut msg, req.path);
+    msg.extend_from_slice(&req.max_len.to_le_bytes());
+    push_str(&mut msg, req.after);
+    msg.extend_from_slice(&req.after_pos.to_le_bytes());
     msg
 }
 
@@ -785,40 +1027,66 @@ pub fn parse_git_patch(msg: &[u8]) -> Option<GitPatchRequest<'_>> {
     let mut b = body_of(msg, C2S_GIT_PATCH)?;
     let nonce = take_u16(&mut b)?;
     let repo_id = take_u16(&mut b)?;
-    let flags = take_u8(&mut b)?;
+    let flags = take_u16(&mut b)?;
     let context = take_u8(&mut b)?;
+    let rename = take_u8(&mut b)?;
     let old = take_endpoint(&mut b)?;
     let new = take_endpoint(&mut b)?;
     let path = take_str(&mut b)?;
     let max_len = take_u32(&mut b)?;
+    let after = take_str(&mut b)?;
+    let after_pos = take_u64(&mut b)?;
     Some(GitPatchRequest {
         nonce,
         repo_id,
         flags,
         context,
+        rename,
         old,
         new,
         path,
         max_len,
+        after,
+        after_pos,
     })
 }
 
-pub fn msg_git_index(nonce: u16, repo_id: u16, path: &str) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(7 + path.len());
+/// A decoded `C2S_GIT_INDEX`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitIndexRequest<'a> {
+    pub nonce: u16,
+    pub repo_id: u16,
+    /// Reserved; a set bit is `INVALID`.
+    pub flags: u8,
+    pub path: &'a str,
+    pub after: &'a str,
+}
+
+pub fn msg_git_index(req: &GitIndexRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(10 + req.path.len() + req.after.len());
     msg.push(C2S_GIT_INDEX);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&repo_id.to_le_bytes());
-    push_str(&mut msg, path);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    push_str(&mut msg, req.path);
+    push_str(&mut msg, req.after);
     msg
 }
 
-/// Parse `C2S_GIT_INDEX` into `(nonce, repo_id, path)`.
-pub fn parse_git_index(msg: &[u8]) -> Option<(u16, u16, &str)> {
+pub fn parse_git_index(msg: &[u8]) -> Option<GitIndexRequest<'_>> {
     let mut b = body_of(msg, C2S_GIT_INDEX)?;
     let nonce = take_u16(&mut b)?;
     let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
     let path = take_str(&mut b)?;
-    Some((nonce, repo_id, path))
+    let after = take_str(&mut b)?;
+    Some(GitIndexRequest {
+        nonce,
+        repo_id,
+        flags,
+        path,
+        after,
+    })
 }
 
 pub fn msg_git_cancel(nonce: u16) -> Vec<u8> {
@@ -925,6 +1193,195 @@ pub fn parse_git_log_ack(msg: &[u8]) -> Option<(u16, u16, u32)> {
     let repo_id = take_u16(&mut b)?;
     let update_id = take_u32(&mut b)?;
     Some((log_id, repo_id, update_id))
+}
+
+/// A decoded `C2S_GIT_DISCOVER`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDiscoverRequest<'a> {
+    pub nonce: u16,
+    pub flags: u8,
+    /// `0` = the server default; clamped to the server maximum.
+    pub depth: u8,
+    /// Plain UTF-8, like `GIT_OPEN`: a filesystem location the client chose.
+    pub path: &'a str,
+    pub after: &'a str,
+}
+
+pub fn msg_git_discover(req: &GitDiscoverRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(9 + req.path.len() + req.after.len());
+    msg.push(C2S_GIT_DISCOVER);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.push(req.flags);
+    msg.push(req.depth);
+    push_str(&mut msg, req.path);
+    push_str(&mut msg, req.after);
+    msg
+}
+
+pub fn parse_git_discover(msg: &[u8]) -> Option<GitDiscoverRequest<'_>> {
+    let mut b = body_of(msg, C2S_GIT_DISCOVER)?;
+    let nonce = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
+    let depth = take_u8(&mut b)?;
+    let path = take_str(&mut b)?;
+    let after = take_str(&mut b)?;
+    Some(GitDiscoverRequest {
+        nonce,
+        flags,
+        depth,
+        path,
+        after,
+    })
+}
+
+/// A decoded `C2S_GIT_BLAME`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitBlameRequest<'a> {
+    pub nonce: u16,
+    pub repo_id: u16,
+    pub flags: u8,
+    /// The commit to blame from; zero = HEAD. The worktree is not
+    /// blameable (`INVALID`).
+    pub oid: GitOid,
+    /// 1-based; `0` is treated as 1. This is also how a truncated blame
+    /// resumes: re-issue with `start_line` one past the `CURSOR`'s `pos`.
+    pub start_line: u32,
+    /// `0` = to end of file, subject to the line budget.
+    pub line_count: u32,
+    pub path: &'a str,
+}
+
+pub fn msg_git_blame(req: &GitBlameRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(48 + req.path.len());
+    msg.push(C2S_GIT_BLAME);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.extend_from_slice(&req.oid);
+    msg.extend_from_slice(&req.start_line.to_le_bytes());
+    msg.extend_from_slice(&req.line_count.to_le_bytes());
+    push_str(&mut msg, req.path);
+    msg
+}
+
+pub fn parse_git_blame(msg: &[u8]) -> Option<GitBlameRequest<'_>> {
+    let mut b = body_of(msg, C2S_GIT_BLAME)?;
+    let nonce = take_u16(&mut b)?;
+    let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
+    let oid = take_oid(&mut b)?;
+    let start_line = take_u32(&mut b)?;
+    let line_count = take_u32(&mut b)?;
+    let path = take_str(&mut b)?;
+    Some(GitBlameRequest {
+        nonce,
+        repo_id,
+        flags,
+        oid,
+        start_line,
+        line_count,
+        path,
+    })
+}
+
+/// A decoded `C2S_GIT_REFLOG`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitReflogRequest<'a> {
+    pub nonce: u16,
+    pub repo_id: u16,
+    pub flags: u8,
+    /// `0` = the server default; clamped to the entry budget.
+    pub limit: u16,
+    /// Empty = `HEAD`.
+    pub ref_name: &'a str,
+    /// Entries already delivered from the end `OLDEST_FIRST` selects, so a
+    /// reflog longer than `limit` pages: re-issue with the `CURSOR`'s
+    /// `pos`. A reflog has no path to name a resume point with, and the
+    /// file is append-only, so the position is the key — subject to the
+    /// family's per-item-coherent, whole-response-best-effort contract if
+    /// entries land between pages.
+    pub after_pos: u64,
+}
+
+pub fn msg_git_reflog(req: &GitReflogRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(18 + req.ref_name.len());
+    msg.push(C2S_GIT_REFLOG);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.extend_from_slice(&req.limit.to_le_bytes());
+    msg.extend_from_slice(&req.after_pos.to_le_bytes());
+    push_str(&mut msg, req.ref_name);
+    msg
+}
+
+pub fn parse_git_reflog(msg: &[u8]) -> Option<GitReflogRequest<'_>> {
+    let mut b = body_of(msg, C2S_GIT_REFLOG)?;
+    let nonce = take_u16(&mut b)?;
+    let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
+    let limit = take_u16(&mut b)?;
+    let after_pos = take_u64(&mut b)?;
+    let ref_name = take_str(&mut b)?;
+    Some(GitReflogRequest {
+        nonce,
+        repo_id,
+        flags,
+        limit,
+        ref_name,
+        after_pos,
+    })
+}
+
+/// A decoded `C2S_GIT_FETCH`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitFetchRequest<'a> {
+    pub nonce: u16,
+    pub repo_id: u16,
+    pub flags: u8,
+    /// `0` = the server default, clamped to the server maximum.
+    pub timeout_ms: u32,
+    /// Empty = the branch's configured remote, else `origin`.
+    pub remote: &'a str,
+    /// Empty = the remote's configured refspecs.
+    pub refspecs: Vec<&'a str>,
+}
+
+pub fn msg_git_fetch(req: &GitFetchRequest<'_>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(14 + req.remote.len());
+    msg.push(C2S_GIT_FETCH);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.extend_from_slice(&req.timeout_ms.to_le_bytes());
+    push_str(&mut msg, req.remote);
+    msg.extend_from_slice(&(req.refspecs.len() as u16).to_le_bytes());
+    for spec in &req.refspecs {
+        push_str(&mut msg, spec);
+    }
+    msg
+}
+
+pub fn parse_git_fetch(msg: &[u8]) -> Option<GitFetchRequest<'_>> {
+    let mut b = body_of(msg, C2S_GIT_FETCH)?;
+    let nonce = take_u16(&mut b)?;
+    let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
+    let timeout_ms = take_u32(&mut b)?;
+    let remote = take_str(&mut b)?;
+    let n = take_u16(&mut b)? as usize;
+    let mut refspecs = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        refspecs.push(take_str(&mut b)?);
+    }
+    Some(GitFetchRequest {
+        nonce,
+        repo_id,
+        flags,
+        timeout_ms,
+        remote,
+        refspecs,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1743,22 @@ fn end_record(buf: &mut [u8], start: usize) {
     buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
 }
 
+/// Append the family-wide `CURSOR` record: where a budget-truncated
+/// response stopped, so the client can ask for the rest.
+fn push_cursor_record(buf: &mut Vec<u8>, after: &str, pos: u64) {
+    let start = begin_record(buf);
+    buf.push(GIT_RECORD_CURSOR);
+    push_str(buf, after);
+    buf.extend_from_slice(&pos.to_le_bytes());
+    end_record(buf, start);
+}
+
+fn take_cursor<'a>(b: &mut &'a [u8]) -> Option<(&'a str, u64)> {
+    let after = take_str(b)?;
+    let pos = take_u64(b)?;
+    Some((after, pos))
+}
+
 /// Pop the next framed record as `(kind, body)`. `None` on exhaustion or
 /// malformed framing.
 fn next_record<'a>(data: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
@@ -1311,12 +1784,16 @@ pub enum GitStateRecord<'a> {
         oid: GitOid,
         name: &'a str,
     },
-    /// STATE_REF 0x02: [kind:1][flags:1][oid:32][peeled:32][name_len:2][name:N]
+    /// STATE_REF 0x02: [kind:1][flags:1][oid:32][peeled:32][name_len:2][name:N][target_len:2][target:N]
+    /// `target` is the symbolic target's full ref name when `SYMBOLIC`,
+    /// else empty — so `refs/remotes/origin/HEAD` names the default branch
+    /// instead of only peeling to its oid.
     Ref {
         flags: u8,
         oid: GitOid,
         peeled: GitOid,
         name: &'a str,
+        target: &'a str,
     },
     /// OP 0x03: [kind:1][op:1][oid:32][detail_len:2][detail:N]
     /// `oid` is the operation head; an absent record means no operation.
@@ -1325,13 +1802,22 @@ pub enum GitStateRecord<'a> {
         oid: GitOid,
         detail: &'a str,
     },
-    /// STATUS 0x04: [kind:1][staged:1][unstaged:1][flags:1][old_len:2][old_path:N][path_len:2][path:N]
+    /// STATUS 0x04: [kind:1][staged:1][unstaged:1][flags:1][oid:32][old_len:2][old_path:N][path_len:2][path:N]
     /// `staged`/`unstaged` are porcelain letters (ASCII ` `AMDRTU, `?`, `!`);
     /// `old_path` is non-empty only for renames.
+    ///
+    /// `oid` is the **worktree content's** hash when the status walk read
+    /// the file, else zero. Without it a write that leaves a file's
+    /// letters unchanged — an agent editing the same file over and over —
+    /// produces a byte-identical snapshot, which the engine suppresses, so
+    /// the server knows the worktree moved and has no way to say so. With
+    /// it the existing dedupe does the right thing and no new concept is
+    /// needed.
     Status {
         staged: u8,
         unstaged: u8,
         flags: u8,
+        oid: GitOid,
         old_path: &'a str,
         path: &'a str,
     },
@@ -1354,6 +1840,19 @@ pub enum GitStateRecord<'a> {
         tz: i16,
         msg: &'a str,
     },
+    /// STATE_REMOTE 0x07: [kind:1][flags:1][name_len:2][name:N][fetch_len:2][fetch_url:N][push_len:2][push_url:N]
+    /// One per configured remote, with the `REMOTES` open flag. URLs go
+    /// out as configured, userinfo included: the caller already has a
+    /// shell and can read `.git/config`, so withholding it would only
+    /// stop them reproducing the remote. `push_url` is empty when it
+    /// equals `fetch_url`. Not a general config surface: three named
+    /// fields, no key/value access, no writes.
+    Remote {
+        flags: u8,
+        name: &'a str,
+        fetch_url: &'a str,
+        push_url: &'a str,
+    },
 }
 
 /// Append one record to an uncompressed `GIT_STATE` records buffer.
@@ -1371,12 +1870,14 @@ pub fn append_git_state_record(buf: &mut Vec<u8>, record: &GitStateRecord<'_>) {
             oid,
             peeled,
             name,
+            target,
         } => {
             buf.push(GIT_STATE_RECORD_REF);
             buf.push(*flags);
             buf.extend_from_slice(oid);
             buf.extend_from_slice(peeled);
             push_str(buf, name);
+            push_str(buf, target);
         }
         GitStateRecord::Op { op, oid, detail } => {
             buf.push(GIT_STATE_RECORD_OP);
@@ -1388,6 +1889,7 @@ pub fn append_git_state_record(buf: &mut Vec<u8>, record: &GitStateRecord<'_>) {
             staged,
             unstaged,
             flags,
+            oid,
             old_path,
             path,
         } => {
@@ -1395,6 +1897,7 @@ pub fn append_git_state_record(buf: &mut Vec<u8>, record: &GitStateRecord<'_>) {
             buf.push(*staged);
             buf.push(*unstaged);
             buf.push(*flags);
+            buf.extend_from_slice(oid);
             push_str(buf, old_path);
             push_str(buf, path);
         }
@@ -1425,6 +1928,18 @@ pub fn append_git_state_record(buf: &mut Vec<u8>, record: &GitStateRecord<'_>) {
             buf.extend_from_slice(&time.to_le_bytes());
             buf.extend_from_slice(&tz.to_le_bytes());
             push_str(buf, msg);
+        }
+        GitStateRecord::Remote {
+            flags,
+            name,
+            fetch_url,
+            push_url,
+        } => {
+            buf.push(GIT_STATE_RECORD_REMOTE);
+            buf.push(*flags);
+            push_str(buf, name);
+            push_str(buf, fetch_url);
+            push_str(buf, push_url);
         }
     }
     end_record(buf, start);
@@ -1457,11 +1972,13 @@ impl<'a> Iterator for GitStateRecordIter<'a> {
                     let oid = take_oid(&mut b)?;
                     let peeled = take_oid(&mut b)?;
                     let name = take_str(&mut b)?;
+                    let target = take_str(&mut b)?;
                     return Some(GitStateRecord::Ref {
                         flags,
                         oid,
                         peeled,
                         name,
+                        target,
                     });
                 }
                 GIT_STATE_RECORD_OP => {
@@ -1474,12 +1991,14 @@ impl<'a> Iterator for GitStateRecordIter<'a> {
                     let staged = take_u8(&mut b)?;
                     let unstaged = take_u8(&mut b)?;
                     let flags = take_u8(&mut b)?;
+                    let oid = take_oid(&mut b)?;
                     let old_path = take_str(&mut b)?;
                     let path = take_str(&mut b)?;
                     return Some(GitStateRecord::Status {
                         staged,
                         unstaged,
                         flags,
+                        oid,
                         old_path,
                         path,
                     });
@@ -1510,6 +2029,18 @@ impl<'a> Iterator for GitStateRecordIter<'a> {
                         time,
                         tz,
                         msg,
+                    });
+                }
+                GIT_STATE_RECORD_REMOTE => {
+                    let flags = take_u8(&mut b)?;
+                    let name = take_str(&mut b)?;
+                    let fetch_url = take_str(&mut b)?;
+                    let push_url = take_str(&mut b)?;
+                    return Some(GitStateRecord::Remote {
+                        flags,
+                        name,
+                        fetch_url,
+                        push_url,
                     });
                 }
                 _ => continue, // unknown kind: skip via record_len
@@ -1678,10 +2209,16 @@ pub enum GitTreeRecord<'a> {
         oid: GitOid,
         name: &'a str,
     },
+    /// CURSOR 0x7F: continue with `after` as the request's `after`.
+    Cursor { after: &'a str, pos: u64 },
 }
 
 /// Append one record to an uncompressed `GIT_TREE` records buffer.
 pub fn append_git_tree_record(buf: &mut Vec<u8>, record: &GitTreeRecord<'_>) {
+    if let GitTreeRecord::Cursor { after, pos } = record {
+        push_cursor_record(buf, after, *pos);
+        return;
+    }
     let start = begin_record(buf);
     match record {
         GitTreeRecord::Entry {
@@ -1696,6 +2233,7 @@ pub fn append_git_tree_record(buf: &mut Vec<u8>, record: &GitTreeRecord<'_>) {
             buf.extend_from_slice(oid);
             push_str(buf, name);
         }
+        GitTreeRecord::Cursor { .. } => unreachable!("handled above"),
     }
     end_record(buf, start);
 }
@@ -1728,6 +2266,10 @@ impl<'a> Iterator for GitTreeRecordIter<'a> {
                         name,
                     });
                 }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitTreeRecord::Cursor { after, pos });
+                }
                 _ => continue, // unknown kind: skip via record_len
             }
         }
@@ -1756,10 +2298,16 @@ pub enum GitDiffRecord<'a> {
     /// BASE 0x04: [kind:1][oid:32]
     /// First record when a MERGE_BASE endpoint was used: the chosen base.
     Base { oid: GitOid },
+    /// CURSOR 0x7F: continue with `after` as the request's `after`.
+    Cursor { after: &'a str, pos: u64 },
 }
 
 /// Append one record to an uncompressed `GIT_DIFF` records buffer.
 pub fn append_git_diff_record(buf: &mut Vec<u8>, record: &GitDiffRecord<'_>) {
+    if let GitDiffRecord::Cursor { after, pos } = record {
+        push_cursor_record(buf, after, *pos);
+        return;
+    }
     let start = begin_record(buf);
     match record {
         GitDiffRecord::Entry {
@@ -1788,6 +2336,7 @@ pub fn append_git_diff_record(buf: &mut Vec<u8>, record: &GitDiffRecord<'_>) {
             buf.push(GIT_DIFF_RECORD_BASE);
             buf.extend_from_slice(oid);
         }
+        GitDiffRecord::Cursor { .. } => unreachable!("handled above"),
     }
     end_record(buf, start);
 }
@@ -1834,6 +2383,10 @@ impl<'a> Iterator for GitDiffRecordIter<'a> {
                     let oid = take_oid(&mut b)?;
                     return Some(GitDiffRecord::Base { oid });
                 }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitDiffRecord::Cursor { after, pos });
+                }
                 _ => continue, // unknown kind: skip via record_len
             }
         }
@@ -1843,9 +2396,17 @@ impl<'a> Iterator for GitDiffRecordIter<'a> {
 /// One decoded record from a structured `GIT_PATCH` response payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPatchRecord<'a> {
-    /// PATCH_FILE 0x01: [kind:1][flags:1][old_len:2][old_path:N][new_len:2][new_path:N]
-    /// Begins a file section.
+    /// PATCH_FILE 0x01: [kind:1][st:1][similarity:1][flags:1]
+    /// [old_len:2][old_path:N][new_len:2][new_path:N]
+    /// Begins a file section. `st`/`similarity` lead, mirroring
+    /// `DIFF_ENTRY` field for field, so a consumer has one status alphabet
+    /// and one field order across both views — and so a binary or empty
+    /// added file, which emits no rows at all, still says whether it was
+    /// added, deleted or modified. `old_path` carries the old path whenever
+    /// there is one, not only for renames.
     File {
+        st: u8,
+        similarity: u8,
         flags: u8,
         old_path: &'a str,
         new_path: &'a str,
@@ -1868,6 +2429,10 @@ pub enum GitPatchRecord<'a> {
     Gap { old_line: u32, new_line: u32 },
     /// BASE 0x04: [kind:1][oid:32] — as in `GIT_DIFF`.
     Base { oid: GitOid },
+    /// CURSOR 0x7F: continue with `after`/`pos` as the request's
+    /// `after`/`after_pos`, so a file past the byte budget resumes
+    /// mid-hunk rather than restarting.
+    Cursor { after: &'a str, pos: u64 },
 }
 
 fn push_spans(buf: &mut Vec<u8>, spans: &[(u32, u32)]) {
@@ -1894,14 +2459,22 @@ fn take_spans(b: &mut &[u8]) -> Option<Vec<(u32, u32)>> {
 
 /// Append one record to an uncompressed `GIT_PATCH` records buffer.
 pub fn append_git_patch_record(buf: &mut Vec<u8>, record: &GitPatchRecord<'_>) {
+    if let GitPatchRecord::Cursor { after, pos } = record {
+        push_cursor_record(buf, after, *pos);
+        return;
+    }
     let start = begin_record(buf);
     match record {
         GitPatchRecord::File {
+            st,
+            similarity,
             flags,
             old_path,
             new_path,
         } => {
             buf.push(GIT_PATCH_RECORD_FILE);
+            buf.push(*st);
+            buf.push(*similarity);
             buf.push(*flags);
             push_str(buf, old_path);
             push_str(buf, new_path);
@@ -1931,6 +2504,7 @@ pub fn append_git_patch_record(buf: &mut Vec<u8>, record: &GitPatchRecord<'_>) {
             buf.push(GIT_PATCH_RECORD_BASE);
             buf.extend_from_slice(oid);
         }
+        GitPatchRecord::Cursor { .. } => unreachable!("handled above"),
     }
     end_record(buf, start);
 }
@@ -1952,10 +2526,14 @@ impl<'a> Iterator for GitPatchRecordIter<'a> {
             let (kind, mut b) = next_record(&mut self.data)?;
             match kind {
                 GIT_PATCH_RECORD_FILE => {
+                    let st = take_u8(&mut b)?;
+                    let similarity = take_u8(&mut b)?;
                     let flags = take_u8(&mut b)?;
                     let old_path = take_str(&mut b)?;
                     let new_path = take_str(&mut b)?;
                     return Some(GitPatchRecord::File {
+                        st,
+                        similarity,
                         flags,
                         old_path,
                         new_path,
@@ -1982,6 +2560,10 @@ impl<'a> Iterator for GitPatchRecordIter<'a> {
                     let new_line = take_u32(&mut b)?;
                     return Some(GitPatchRecord::Gap { old_line, new_line });
                 }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitPatchRecord::Cursor { after, pos });
+                }
                 GIT_PATCH_RECORD_BASE => {
                     let oid = take_oid(&mut b)?;
                     return Some(GitPatchRecord::Base { oid });
@@ -2006,10 +2588,16 @@ pub enum GitIndexRecord<'a> {
         oid: GitOid,
         path: &'a str,
     },
+    /// CURSOR 0x7F: continue with `after` as the request's `after`.
+    Cursor { after: &'a str, pos: u64 },
 }
 
 /// Append one record to an uncompressed `GIT_INDEX` records buffer.
 pub fn append_git_index_record(buf: &mut Vec<u8>, record: &GitIndexRecord<'_>) {
+    if let GitIndexRecord::Cursor { after, pos } = record {
+        push_cursor_record(buf, after, *pos);
+        return;
+    }
     let start = begin_record(buf);
     match record {
         GitIndexRecord::Entry {
@@ -2030,6 +2618,7 @@ pub fn append_git_index_record(buf: &mut Vec<u8>, record: &GitIndexRecord<'_>) {
             buf.extend_from_slice(oid);
             push_str(buf, path);
         }
+        GitIndexRecord::Cursor { .. } => unreachable!("handled above"),
     }
     end_record(buf, start);
 }
@@ -2068,7 +2657,371 @@ impl<'a> Iterator for GitIndexRecordIter<'a> {
                         path,
                     });
                 }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitIndexRecord::Cursor { after, pos });
+                }
                 _ => continue, // unknown kind: skip via record_len
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x90 block: discover, blame, reflog, fetch
+// ---------------------------------------------------------------------------
+
+macro_rules! records_resp {
+    ($build:ident, $parse:ident, $opcode:ident) => {
+        /// Build the response from an uncompressed records buffer.
+        pub fn $build(nonce: u16, status: u8, flags: u8, records: &[u8]) -> Vec<u8> {
+            let compressed = lz4_flex::compress_prepend_size(records);
+            let mut msg = Vec::with_capacity(5 + compressed.len());
+            msg.push($opcode);
+            msg.extend_from_slice(&nonce.to_le_bytes());
+            msg.push(status);
+            msg.push(flags);
+            msg.extend_from_slice(&compressed);
+            msg
+        }
+
+        /// Parse into `(nonce, status, flags, records)`, decompressing.
+        pub fn $parse(msg: &[u8]) -> Option<(u16, u8, u8, Vec<u8>)> {
+            let mut b = body_of(msg, $opcode)?;
+            let nonce = take_u16(&mut b)?;
+            let status = take_u8(&mut b)?;
+            let flags = take_u8(&mut b)?;
+            let records = decompress_guarded(b)?;
+            Some((nonce, status, flags, records))
+        }
+    };
+}
+
+records_resp!(
+    msg_git_discover_resp,
+    parse_git_discover_resp,
+    S2C_GIT_DISCOVER
+);
+records_resp!(msg_git_blame_resp, parse_git_blame_resp, S2C_GIT_BLAME);
+records_resp!(msg_git_reflog_resp, parse_git_reflog_resp, S2C_GIT_REFLOG);
+records_resp!(msg_git_fetch_resp, parse_git_fetch_resp, S2C_GIT_FETCH);
+
+/// One decoded record from a `GIT_DISCOVER` response payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitDiscoverRecord<'a> {
+    /// REPO_FOUND 0x01: [kind:1][flags:1][workdir_len:2][workdir:N][gitdir_len:2][gitdir:N]
+    /// Deduped by canonical gitdir — the identity `GIT_OPEN` reports and
+    /// the one that survives several paths resolving to one repository.
+    Repo {
+        flags: u8,
+        workdir: &'a str,
+        gitdir: &'a str,
+    },
+    Cursor {
+        after: &'a str,
+        pos: u64,
+    },
+}
+
+pub fn append_git_discover_record(buf: &mut Vec<u8>, record: &GitDiscoverRecord<'_>) {
+    match record {
+        GitDiscoverRecord::Cursor { after, pos } => push_cursor_record(buf, after, *pos),
+        GitDiscoverRecord::Repo {
+            flags,
+            workdir,
+            gitdir,
+        } => {
+            let start = begin_record(buf);
+            buf.push(GIT_DISCOVER_RECORD_REPO);
+            buf.push(*flags);
+            push_str(buf, workdir);
+            push_str(buf, gitdir);
+            end_record(buf, start);
+        }
+    }
+}
+
+pub struct GitDiscoverRecordIter<'a> {
+    data: &'a [u8],
+}
+
+pub fn git_discover_records(data: &[u8]) -> GitDiscoverRecordIter<'_> {
+    GitDiscoverRecordIter { data }
+}
+
+impl<'a> Iterator for GitDiscoverRecordIter<'a> {
+    type Item = GitDiscoverRecord<'a>;
+
+    fn next(&mut self) -> Option<GitDiscoverRecord<'a>> {
+        loop {
+            let (kind, mut b) = next_record(&mut self.data)?;
+            match kind {
+                GIT_DISCOVER_RECORD_REPO => {
+                    let flags = take_u8(&mut b)?;
+                    let workdir = take_str(&mut b)?;
+                    let gitdir = take_str(&mut b)?;
+                    return Some(GitDiscoverRecord::Repo {
+                        flags,
+                        workdir,
+                        gitdir,
+                    });
+                }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitDiscoverRecord::Cursor { after, pos });
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// One decoded record from a `GIT_BLAME` response payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitBlameRecord<'a> {
+    /// BLAME_RANGE 0x01: [kind:1][flags:1][commit:32][start_line:4][line_count:4][orig_start:4][orig_path_len:2][orig_path:N]
+    /// One per contiguous attributed range. Author and message are
+    /// deliberately absent: the client resolves the distinct commit oids
+    /// with one `GIT_LOG`, or finds them already in its oid-keyed cache,
+    /// which keeps a viewport blame to a few hundred bytes.
+    Range {
+        flags: u8,
+        commit: GitOid,
+        start_line: u32,
+        line_count: u32,
+        orig_start: u32,
+        /// Empty unless the range came from a different path.
+        orig_path: &'a str,
+    },
+    Cursor {
+        after: &'a str,
+        pos: u64,
+    },
+}
+
+pub fn append_git_blame_record(buf: &mut Vec<u8>, record: &GitBlameRecord<'_>) {
+    match record {
+        GitBlameRecord::Cursor { after, pos } => push_cursor_record(buf, after, *pos),
+        GitBlameRecord::Range {
+            flags,
+            commit,
+            start_line,
+            line_count,
+            orig_start,
+            orig_path,
+        } => {
+            let start = begin_record(buf);
+            buf.push(GIT_BLAME_RECORD_RANGE);
+            buf.push(*flags);
+            buf.extend_from_slice(commit);
+            buf.extend_from_slice(&start_line.to_le_bytes());
+            buf.extend_from_slice(&line_count.to_le_bytes());
+            buf.extend_from_slice(&orig_start.to_le_bytes());
+            push_str(buf, orig_path);
+            end_record(buf, start);
+        }
+    }
+}
+
+pub struct GitBlameRecordIter<'a> {
+    data: &'a [u8],
+}
+
+pub fn git_blame_records(data: &[u8]) -> GitBlameRecordIter<'_> {
+    GitBlameRecordIter { data }
+}
+
+impl<'a> Iterator for GitBlameRecordIter<'a> {
+    type Item = GitBlameRecord<'a>;
+
+    fn next(&mut self) -> Option<GitBlameRecord<'a>> {
+        loop {
+            let (kind, mut b) = next_record(&mut self.data)?;
+            match kind {
+                GIT_BLAME_RECORD_RANGE => {
+                    let flags = take_u8(&mut b)?;
+                    let commit = take_oid(&mut b)?;
+                    let start_line = take_u32(&mut b)?;
+                    let line_count = take_u32(&mut b)?;
+                    let orig_start = take_u32(&mut b)?;
+                    let orig_path = take_str(&mut b)?;
+                    return Some(GitBlameRecord::Range {
+                        flags,
+                        commit,
+                        start_line,
+                        line_count,
+                        orig_start,
+                        orig_path,
+                    });
+                }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitBlameRecord::Cursor { after, pos });
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// One decoded record from a `GIT_REFLOG` response payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitReflogRecord<'a> {
+    /// REFLOG_ENTRY 0x01: [kind:1][flags:1][old:32][new:32][time:8 i64 s][tz:2 i16 min][msg_len:2][msg:N]
+    /// Entry signatures are omitted: the message carries the operation,
+    /// which is what a caller reads.
+    Entry {
+        flags: u8,
+        old: GitOid,
+        new: GitOid,
+        time: i64,
+        tz: i16,
+        msg: &'a str,
+    },
+    Cursor {
+        after: &'a str,
+        pos: u64,
+    },
+}
+
+pub fn append_git_reflog_record(buf: &mut Vec<u8>, record: &GitReflogRecord<'_>) {
+    match record {
+        GitReflogRecord::Cursor { after, pos } => push_cursor_record(buf, after, *pos),
+        GitReflogRecord::Entry {
+            flags,
+            old,
+            new,
+            time,
+            tz,
+            msg,
+        } => {
+            let start = begin_record(buf);
+            buf.push(GIT_REFLOG_RECORD_ENTRY);
+            buf.push(*flags);
+            buf.extend_from_slice(old);
+            buf.extend_from_slice(new);
+            buf.extend_from_slice(&time.to_le_bytes());
+            buf.extend_from_slice(&tz.to_le_bytes());
+            push_str(buf, msg);
+            end_record(buf, start);
+        }
+    }
+}
+
+pub struct GitReflogRecordIter<'a> {
+    data: &'a [u8],
+}
+
+pub fn git_reflog_records(data: &[u8]) -> GitReflogRecordIter<'_> {
+    GitReflogRecordIter { data }
+}
+
+impl<'a> Iterator for GitReflogRecordIter<'a> {
+    type Item = GitReflogRecord<'a>;
+
+    fn next(&mut self) -> Option<GitReflogRecord<'a>> {
+        loop {
+            let (kind, mut b) = next_record(&mut self.data)?;
+            match kind {
+                GIT_REFLOG_RECORD_ENTRY => {
+                    let flags = take_u8(&mut b)?;
+                    let old = take_oid(&mut b)?;
+                    let new = take_oid(&mut b)?;
+                    let time = take_i64(&mut b)?;
+                    let tz = take_i16(&mut b)?;
+                    let msg = take_str(&mut b)?;
+                    return Some(GitReflogRecord::Entry {
+                        flags,
+                        old,
+                        new,
+                        time,
+                        tz,
+                        msg,
+                    });
+                }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitReflogRecord::Cursor { after, pos });
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// One decoded record from a `GIT_FETCH` response payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitFetchRecord<'a> {
+    /// FETCH_REF 0x01: [kind:1][flags:1][status:1][old:32][new:32][name_len:2][name:N][detail_len:2][detail:N]
+    /// One per ref the remote answered for. `status` is the unified table,
+    /// so "did I actually get these commits" is answerable from the reply
+    /// rather than needing a `resolve` per commit afterwards — a remote can
+    /// refuse one refspec of several and still exit zero.
+    Ref {
+        flags: u8,
+        status: u8,
+        old: GitOid,
+        new: GitOid,
+        name: &'a str,
+        detail: &'a str,
+    },
+}
+
+pub fn append_git_fetch_record(buf: &mut Vec<u8>, record: &GitFetchRecord<'_>) {
+    let start = begin_record(buf);
+    match record {
+        GitFetchRecord::Ref {
+            flags,
+            status,
+            old,
+            new,
+            name,
+            detail,
+        } => {
+            buf.push(GIT_FETCH_RECORD_REF);
+            buf.push(*flags);
+            buf.push(*status);
+            buf.extend_from_slice(old);
+            buf.extend_from_slice(new);
+            push_str(buf, name);
+            push_str(buf, detail);
+        }
+    }
+    end_record(buf, start);
+}
+
+pub struct GitFetchRecordIter<'a> {
+    data: &'a [u8],
+}
+
+pub fn git_fetch_records(data: &[u8]) -> GitFetchRecordIter<'_> {
+    GitFetchRecordIter { data }
+}
+
+impl<'a> Iterator for GitFetchRecordIter<'a> {
+    type Item = GitFetchRecord<'a>;
+
+    fn next(&mut self) -> Option<GitFetchRecord<'a>> {
+        loop {
+            let (kind, mut b) = next_record(&mut self.data)?;
+            match kind {
+                GIT_FETCH_RECORD_REF => {
+                    let flags = take_u8(&mut b)?;
+                    let status = take_u8(&mut b)?;
+                    let old = take_oid(&mut b)?;
+                    let new = take_oid(&mut b)?;
+                    let name = take_str(&mut b)?;
+                    let detail = take_str(&mut b)?;
+                    return Some(GitFetchRecord::Ref {
+                        flags,
+                        status,
+                        old,
+                        new,
+                        name,
+                        detail,
+                    });
+                }
+                _ => continue,
             }
         }
     }
@@ -2094,6 +3047,20 @@ pub struct GitRefState {
     pub oid: GitOid,
     /// Valid only with [`GIT_REF_PEELED_VALID`].
     pub peeled: GitOid,
+    /// The symbolic target's ref name, with [`GIT_REF_SYMBOLIC`]; empty
+    /// otherwise. This is how a client names the default branch instead of
+    /// guessing `main` then `master`.
+    pub target: String,
+}
+
+/// One configured remote, keyed by name in [`GitStateMirror::remotes`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitRemoteState {
+    pub flags: u8,
+    /// Userinfo-stripped: the server never emits a credential.
+    pub fetch_url: String,
+    /// Empty when it equals `fetch_url`.
+    pub push_url: String,
 }
 
 /// The in-progress operation, if any.
@@ -2110,6 +3077,9 @@ pub struct GitStatusEntry {
     pub staged: u8,
     pub unstaged: u8,
     pub flags: u8,
+    /// The worktree content hash when the status walk read the file, else
+    /// zero. A change that leaves the letters alone still moves this.
+    pub oid: GitOid,
     /// Non-empty only for renames.
     pub old_path: String,
     pub path: String,
@@ -2149,8 +3119,39 @@ pub struct GitStateMirror {
     /// Keyed by local branch ref name (joins `refs`).
     pub upstreams: BTreeMap<String, GitUpstreamState>,
     pub stashes: Vec<GitStashEntry>,
+    /// Keyed by remote name; populated with the `REMOTES` open flag.
+    pub remotes: BTreeMap<String, GitRemoteState>,
     /// The last snapshot's truncation flags (`GIT_STATE_*_TRUNCATED`).
     pub flags: u8,
+    /// Records accumulated from `PARTIAL` chunks of the snapshot in
+    /// flight. The map above is only replaced once the final chunk lands,
+    /// so a consumer never observes a half-built snapshot.
+    pending: Vec<u8>,
+    pending_state_id: u32,
+}
+
+/// What one `GIT_STATE` message did to the mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitStateApply {
+    /// The snapshot is complete and installed; acknowledge this `state_id`.
+    Complete(u32),
+    /// A `PARTIAL` chunk was buffered. Nothing to acknowledge yet — the
+    /// ack goes with the final chunk, so the one-in-flight pacing holds.
+    Partial,
+    /// Malformed; the pending buffer was dropped.
+    Malformed,
+}
+
+impl GitStateApply {
+    /// The `state_id` to acknowledge, or `None` while a chunked snapshot is
+    /// still assembling (or on a malformed message) — in both of those
+    /// cases there is nothing to ack and nothing new to render.
+    pub fn complete(self) -> Option<u32> {
+        match self {
+            GitStateApply::Complete(state_id) => Some(state_id),
+            GitStateApply::Partial | GitStateApply::Malformed => None,
+        }
+    }
 }
 
 impl GitStateMirror {
@@ -2159,15 +3160,47 @@ impl GitStateMirror {
     }
 
     /// Apply one `GIT_STATE` message (starting at the opcode byte),
-    /// replacing the whole state. Returns `Some(state_id)` to acknowledge,
-    /// `None` if malformed.
-    pub fn apply_state(&mut self, msg: &[u8]) -> Option<u32> {
-        let (_repo_id, state_id, flags, records) = parse_git_state(msg)?;
+    /// replacing the whole state. A snapshot too large for one message
+    /// arrives as several `PARTIAL` chunks sharing a `state_id`; those are
+    /// buffered and installed together.
+    pub fn apply_state(&mut self, msg: &[u8]) -> GitStateApply {
+        let Some((_repo_id, state_id, flags, records)) = parse_git_state(msg) else {
+            self.pending.clear();
+            return GitStateApply::Malformed;
+        };
+        // A chunk for a different snapshot supersedes whatever was buffered:
+        // the server only ever moves forward, so a stale partial is dead.
+        if state_id != self.pending_state_id {
+            self.pending.clear();
+            self.pending_state_id = state_id;
+        }
+        if flags & GIT_STATE_PARTIAL != 0 {
+            self.pending.extend_from_slice(&records);
+            return GitStateApply::Partial;
+        }
+        let records = if self.pending.is_empty() {
+            records
+        } else {
+            let mut whole = std::mem::take(&mut self.pending);
+            whole.extend_from_slice(&records);
+            whole
+        };
+        if self.apply_records(flags, &records) {
+            GitStateApply::Complete(state_id)
+        } else {
+            GitStateApply::Malformed
+        }
+    }
+
+    /// Install a complete records buffer as the new state. Always true
+    /// today — unknown kinds are skipped and a malformed record ends the
+    /// payload — but kept as a result so a stricter reducer can refuse.
+    fn apply_records(&mut self, flags: u8, records: &[u8]) -> bool {
         let mut next = GitStateMirror {
             flags,
             ..Default::default()
         };
-        for record in git_state_records(&records) {
+        for record in git_state_records(records) {
             match record {
                 GitStateRecord::Head { flags, oid, name } => {
                     next.head = Some(GitHead {
@@ -2181,9 +3214,17 @@ impl GitStateMirror {
                     oid,
                     peeled,
                     name,
+                    target,
                 } => {
-                    next.refs
-                        .insert(name.to_string(), GitRefState { flags, oid, peeled });
+                    next.refs.insert(
+                        name.to_string(),
+                        GitRefState {
+                            flags,
+                            oid,
+                            peeled,
+                            target: target.to_string(),
+                        },
+                    );
                 }
                 GitStateRecord::Op { op, oid, detail } => {
                     next.op = Some(GitOpState {
@@ -2196,6 +3237,7 @@ impl GitStateMirror {
                     staged,
                     unstaged,
                     flags,
+                    oid,
                     old_path,
                     path,
                 } => {
@@ -2203,6 +3245,7 @@ impl GitStateMirror {
                         staged,
                         unstaged,
                         flags,
+                        oid,
                         old_path: old_path.to_string(),
                         path: path.to_string(),
                     });
@@ -2239,10 +3282,25 @@ impl GitStateMirror {
                         message: msg.to_string(),
                     });
                 }
+                GitStateRecord::Remote {
+                    flags,
+                    name,
+                    fetch_url,
+                    push_url,
+                } => {
+                    next.remotes.insert(
+                        name.to_string(),
+                        GitRemoteState {
+                            flags,
+                            fetch_url: fetch_url.to_string(),
+                            push_url: push_url.to_string(),
+                        },
+                    );
+                }
             }
         }
         *self = next;
-        Some(state_id)
+        true
     }
 }
 
@@ -2277,29 +3335,44 @@ mod tests {
     }
 
     #[test]
-    fn git_open_from_pty_roundtrip_and_rebase() {
-        let m = msg_git_open_from_pty(1, GIT_OPEN_WATCH, 0, 0, "sub", 9);
-        assert_eq!(
-            m,
-            vec![
-                0x50, 0x01, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x73, 0x75, 0x62, 0x09,
-                0x00
-            ]
-        );
-        assert_eq!(git_open_src_pty(&m), Some(9));
-        assert_eq!(
-            git_open_src_pty(&msg_git_open(1, GIT_OPEN_WATCH, 0, 0, "sub")),
-            None
-        );
-        // parse_git_open tolerates the trailing src pty and still reads path.
-        let (_, flags, _, _, path) = parse_git_open(&m).unwrap();
-        assert_eq!(flags & GIT_OPEN_FROM_PTY, GIT_OPEN_FROM_PTY);
-        assert_eq!(path, "sub");
-        // Rebase joins cwd + path and clears FROM_PTY.
+    fn git_open_pty_context_and_rebase() {
+        let m = msg_git_open(&GitOpenRequest {
+            src_pty_id: 9,
+            ..GitOpenRequest::new(1, GIT_OPEN_WATCH, "sub")
+        });
+        let req = parse_git_open(&m).unwrap();
+        assert_eq!(req.src_pty_id, 9);
+        assert_eq!(req.parent_repo_id, GIT_OPEN_NO_CONTEXT);
+        assert_eq!(req.path, "sub");
+        // Rebase joins cwd + path and clears the pty context, leaving the
+        // plain path-based open the handler consumes.
         let reb = git_open_rebase(&m, Some("/w")).unwrap();
-        let (_, rf, _, _, rp) = parse_git_open(&reb).unwrap();
-        assert_eq!(rf & GIT_OPEN_FROM_PTY, 0);
-        assert_eq!(rp, "/w/sub");
+        let rebased = parse_git_open(&reb).unwrap();
+        assert_eq!(rebased.src_pty_id, GIT_OPEN_NO_CONTEXT);
+        assert_eq!(rebased.path, "/w/sub");
+        // A context-free open is not a rebase candidate.
+        let plain = msg_git_open(&GitOpenRequest::new(1, GIT_OPEN_WATCH, "sub"));
+        assert_eq!(git_open_rebase(&plain, Some("/w")), None);
+    }
+
+    #[test]
+    fn git_open_parent_repo_and_prefixes() {
+        // A submodule is named by (parent, path): the server resolves the
+        // gitdir, so the client never guesses where .gitmodules put it.
+        let m = msg_git_open(&GitOpenRequest {
+            parent_repo_id: 4,
+            ref_prefixes: vec!["refs/heads/", "refs/remotes/origin/"],
+            ..GitOpenRequest::new(2, GIT_OPEN_WATCH | GIT_OPEN_REMOTES, "vendor/lib")
+        });
+        let req = parse_git_open(&m).unwrap();
+        assert_eq!(req.parent_repo_id, 4);
+        assert_eq!(req.src_pty_id, GIT_OPEN_NO_CONTEXT);
+        assert_eq!(
+            req.ref_prefixes,
+            vec!["refs/heads/", "refs/remotes/origin/"]
+        );
+        assert_eq!(req.path, "vendor/lib");
+        assert_eq!(req.flags & GIT_OPEN_REMOTES, GIT_OPEN_REMOTES);
     }
 
     /// A fixture oid: `fill` repeated over the hash width, zero-padded to
@@ -2316,14 +3389,15 @@ mod tests {
 
     #[test]
     fn request_roundtrips() {
-        let msg = msg_git_open(1, GIT_OPEN_WATCH | GIT_OPEN_STATUS, 50, 500, "/repo");
-        assert_eq!(
-            parse_git_open(&msg),
-            Some((1, GIT_OPEN_WATCH | GIT_OPEN_STATUS, 50, 500, "/repo"))
-        );
+        let open = GitOpenRequest {
+            refs_latency_ms: 50,
+            status_latency_ms: 500,
+            ..GitOpenRequest::new(1, GIT_OPEN_WATCH | GIT_OPEN_STATUS, "/repo")
+        };
+        assert_eq!(parse_git_open(&msg_git_open(&open)), Some(open));
         // Empty path and zero windows (server defaults).
-        let msg = msg_git_open(0, 0, 0, 0, "");
-        assert_eq!(parse_git_open(&msg), Some((0, 0, 0, 0, "")));
+        let bare = GitOpenRequest::new(0, 0, "");
+        assert_eq!(parse_git_open(&msg_git_open(&bare)), Some(bare));
 
         assert_eq!(parse_git_close(&msg_git_close(7)), Some(7));
         assert_eq!(
@@ -2369,11 +3443,27 @@ mod tests {
             })
         );
 
-        let msg = msg_git_tree(4, 7, &oid(0xCC), "dir/%FF");
-        assert_eq!(parse_git_tree(&msg), Some((4, 7, oid(0xCC), "dir/%FF")));
+        let tree = GitTreeRequest {
+            nonce: 4,
+            repo_id: 7,
+            flags: 0,
+            oid: oid(0xCC),
+            path: "dir/%FF",
+            after: "dir/%FF/z.txt",
+        };
+        assert_eq!(parse_git_tree(&msg_git_tree(&tree)), Some(tree));
 
-        let msg = msg_git_blob(5, 7, &oid(0xDD), "", 1 << 20);
-        assert_eq!(parse_git_blob(&msg), Some((5, 7, oid(0xDD), "", 1 << 20)));
+        // A window: offset plus max_len, with WHOLE clear.
+        let blob = GitBlobRequest {
+            nonce: 5,
+            repo_id: 7,
+            flags: 0,
+            oid: oid(0xDD),
+            path: "",
+            offset: 1 << 24,
+            max_len: 1 << 20,
+        };
+        assert_eq!(parse_git_blob(&msg_git_blob(&blob)), Some(blob));
 
         let old = GitEndpoint {
             kind: GIT_ENDPOINT_COMMIT,
@@ -2383,47 +3473,41 @@ mod tests {
             kind: GIT_ENDPOINT_WORKTREE,
             oid: GIT_OID_NONE,
         };
-        let msg = msg_git_diff(6, 7, GIT_DIFF_RENAMES, old, new, "sub");
-        assert_eq!(
-            parse_git_diff(&msg),
-            Some(GitDiffRequest {
-                nonce: 6,
-                repo_id: 7,
-                flags: GIT_DIFF_RENAMES,
-                old,
-                new,
-                path: "sub",
-            })
-        );
-
-        let msg = msg_git_patch(
-            8,
-            7,
-            GIT_DIFF_RENAMES | GIT_PATCH_CHAR_SPANS,
-            5,
+        let diff = GitDiffRequest {
+            nonce: 6,
+            repo_id: 7,
+            flags: GIT_DIFF_RENAMES,
+            rename: 50,
             old,
             new,
-            "a.txt",
-            1 << 16,
-        );
-        assert_eq!(
-            parse_git_patch(&msg),
-            Some(GitPatchRequest {
-                nonce: 8,
-                repo_id: 7,
-                flags: GIT_DIFF_RENAMES | GIT_PATCH_CHAR_SPANS,
-                context: 5,
-                old,
-                new,
-                path: "a.txt",
-                max_len: 1 << 16,
-            })
-        );
+            path: "sub",
+            after: "sub/b.txt",
+        };
+        assert_eq!(parse_git_diff(&msg_git_diff(&diff)), Some(diff));
 
-        assert_eq!(
-            parse_git_index(&msg_git_index(9, 7, "sub")),
-            Some((9, 7, "sub"))
-        );
+        let patch = GitPatchRequest {
+            nonce: 8,
+            repo_id: 7,
+            flags: GIT_PATCH_RENAMES | GIT_PATCH_CHAR_SPANS,
+            context: 5,
+            rename: 0,
+            old,
+            new,
+            path: "a.txt",
+            max_len: 1 << 16,
+            after: "a.txt",
+            after_pos: 4096,
+        };
+        assert_eq!(parse_git_patch(&msg_git_patch(&patch)), Some(patch));
+
+        let index = GitIndexRequest {
+            nonce: 9,
+            repo_id: 7,
+            flags: 0,
+            path: "sub",
+            after: "",
+        };
+        assert_eq!(parse_git_index(&msg_git_index(&index)), Some(index));
         assert_eq!(parse_git_cancel(&msg_git_cancel(10)), Some(10));
 
         let oids = vec![oid(0xAA), oid(0xBB), oid(0xCC)];
@@ -2455,7 +3539,10 @@ mod tests {
         // Wrong opcode is rejected.
         assert_eq!(parse_git_close(&msg_git_cancel(1)), None);
         // Truncated message is rejected.
-        assert_eq!(parse_git_open(&msg_git_open(1, 0, 0, 0, "x")[..5]), None);
+        assert_eq!(
+            parse_git_open(&msg_git_open(&GitOpenRequest::new(1, 0, "x"))[..5]),
+            None
+        );
     }
 
     #[test]
@@ -2637,6 +3724,7 @@ mod tests {
                 oid: oid(0x02),
                 peeled: oid(0x03),
                 name: "refs/tags/v1",
+                target: "",
             },
             GitStateRecord::Op {
                 op: GIT_OP_REBASE,
@@ -2647,6 +3735,7 @@ mod tests {
                 staged: b'R',
                 unstaged: b' ',
                 flags: 0,
+                oid: GIT_OID_NONE,
                 old_path: "old.txt",
                 path: "new.txt",
             },
@@ -2654,6 +3743,7 @@ mod tests {
                 staged: b'?',
                 unstaged: b'?',
                 flags: GIT_STATUS_ENTRY_CONFLICTED,
+                oid: GIT_OID_NONE,
                 old_path: "",
                 path: "%FF.bin",
             },
@@ -2807,6 +3897,8 @@ mod tests {
         let records = vec![
             GitPatchRecord::Base { oid: oid(0x13) },
             GitPatchRecord::File {
+                st: b'M',
+                similarity: 0,
                 flags: 0,
                 old_path: "a.txt",
                 new_path: "a.txt",
@@ -2841,6 +3933,8 @@ mod tests {
                 new_line: 11,
             },
             GitPatchRecord::File {
+                st: b'M',
+                similarity: 0,
                 flags: GIT_PATCH_FILE_BINARY,
                 old_path: "img.png",
                 new_path: "img.png",
@@ -2885,13 +3979,203 @@ mod tests {
         assert_eq!(decoded, records);
     }
 
+    /// The 0x90 block round-trips, and `CURSOR` decodes in every family
+    /// that can be truncated — the whole point of the record is that one
+    /// branch works everywhere.
+    #[test]
+    fn second_block_roundtrips() {
+        let discover = GitDiscoverRequest {
+            nonce: 1,
+            flags: GIT_DISCOVER_NESTED,
+            depth: 3,
+            path: "/workspace",
+            after: "/workspace/a",
+        };
+        assert_eq!(
+            parse_git_discover(&msg_git_discover(&discover)),
+            Some(discover)
+        );
+
+        let blame = GitBlameRequest {
+            nonce: 2,
+            repo_id: 7,
+            flags: GIT_BLAME_FOLLOW_RENAMES,
+            oid: oid(0x21),
+            start_line: 100,
+            line_count: 40,
+            path: "src/a.rs",
+        };
+        assert_eq!(parse_git_blame(&msg_git_blame(&blame)), Some(blame));
+
+        let reflog = GitReflogRequest {
+            nonce: 3,
+            repo_id: 7,
+            flags: GIT_REFLOG_OLDEST_FIRST,
+            limit: 50,
+            ref_name: "",
+            after_pos: 20,
+        };
+        assert_eq!(parse_git_reflog(&msg_git_reflog(&reflog)), Some(reflog));
+
+        let fetch = GitFetchRequest {
+            nonce: 4,
+            repo_id: 7,
+            flags: GIT_FETCH_ANCHOR | GIT_FETCH_PRUNE,
+            timeout_ms: 30_000,
+            remote: "origin",
+            refspecs: vec!["refs/pull/12/head", "deadbeef"],
+        };
+        assert_eq!(parse_git_fetch(&msg_git_fetch(&fetch)), Some(fetch));
+
+        let mut records = Vec::new();
+        append_git_discover_record(
+            &mut records,
+            &GitDiscoverRecord::Repo {
+                flags: GIT_FOUND_SUBMODULE,
+                workdir: "/workspace/a",
+                gitdir: "/workspace/.git/modules/a",
+            },
+        );
+        append_git_discover_record(
+            &mut records,
+            &GitDiscoverRecord::Cursor {
+                after: "/workspace/a",
+                pos: 0,
+            },
+        );
+        assert_eq!(git_discover_records(&records).count(), 2);
+
+        let mut records = Vec::new();
+        append_git_blame_record(
+            &mut records,
+            &GitBlameRecord::Range {
+                flags: 0,
+                commit: oid(0x22),
+                start_line: 1,
+                line_count: 12,
+                orig_start: 40,
+                orig_path: "src/old.rs",
+            },
+        );
+        assert_eq!(git_blame_records(&records).count(), 1);
+
+        let mut records = Vec::new();
+        append_git_reflog_record(
+            &mut records,
+            &GitReflogRecord::Entry {
+                flags: 0,
+                old: oid(0x23),
+                new: oid(0x24),
+                time: 1_700_000_000,
+                tz: -480,
+                msg: "commit (amend): fix",
+            },
+        );
+        assert_eq!(git_reflog_records(&records).count(), 1);
+
+        let mut records = Vec::new();
+        append_git_fetch_record(
+            &mut records,
+            &GitFetchRecord::Ref {
+                flags: GIT_FETCH_REF_NEW,
+                status: GIT_STATUS_OK,
+                old: GIT_OID_NONE,
+                new: oid(0x25),
+                name: "refs/blit/fetch/origin/0",
+                detail: "",
+            },
+        );
+        assert_eq!(git_fetch_records(&records).count(), 1);
+
+        // One CURSOR shape, decoded by every truncatable family: the point
+        // of the record is that a client writes the branch once.
+        let mut buf = Vec::new();
+        append_git_tree_record(&mut buf, &GitTreeRecord::Cursor { after: "z", pos: 0 });
+        assert_eq!(
+            git_tree_records(&buf).next(),
+            Some(GitTreeRecord::Cursor { after: "z", pos: 0 })
+        );
+        let mut buf = Vec::new();
+        append_git_diff_record(&mut buf, &GitDiffRecord::Cursor { after: "z", pos: 0 });
+        assert_eq!(
+            git_diff_records(&buf).next(),
+            Some(GitDiffRecord::Cursor { after: "z", pos: 0 })
+        );
+        let mut buf = Vec::new();
+        append_git_patch_record(
+            &mut buf,
+            &GitPatchRecord::Cursor {
+                after: "z",
+                pos: 99,
+            },
+        );
+        assert_eq!(
+            git_patch_records(&buf).next(),
+            Some(GitPatchRecord::Cursor {
+                after: "z",
+                pos: 99
+            })
+        );
+        let mut buf = Vec::new();
+        append_git_index_record(&mut buf, &GitIndexRecord::Cursor { after: "z", pos: 0 });
+        assert_eq!(
+            git_index_records(&buf).next(),
+            Some(GitIndexRecord::Cursor { after: "z", pos: 0 })
+        );
+    }
+
+    /// A snapshot larger than one message arrives as `PARTIAL` chunks: the
+    /// mirror buffers them, acknowledges only the last, and never exposes a
+    /// half-built map.
+    #[test]
+    fn partial_state_chunks_install_together() {
+        let mut first = Vec::new();
+        append_git_state_record(
+            &mut first,
+            &GitStateRecord::Head {
+                flags: 0,
+                oid: oid(1),
+                name: "refs/heads/main",
+            },
+        );
+        let mut second = Vec::new();
+        append_git_state_record(
+            &mut second,
+            &GitStateRecord::Ref {
+                flags: GIT_REF_SYMBOLIC,
+                oid: oid(2),
+                peeled: GIT_OID_NONE,
+                name: "refs/remotes/origin/HEAD",
+                target: "refs/remotes/origin/trunk",
+            },
+        );
+
+        let mut mirror = GitStateMirror::new();
+        assert_eq!(
+            mirror.apply_state(&msg_git_state(1, 5, GIT_STATE_PARTIAL, &first)),
+            GitStateApply::Partial
+        );
+        // Nothing is visible yet: the snapshot is not complete.
+        assert!(mirror.head.is_none());
+        assert_eq!(
+            mirror.apply_state(&msg_git_state(1, 5, 0, &second)),
+            GitStateApply::Complete(5)
+        );
+        assert_eq!(mirror.head.as_ref().unwrap().name, "refs/heads/main");
+        assert_eq!(
+            mirror.refs["refs/remotes/origin/HEAD"].target,
+            "refs/remotes/origin/trunk"
+        );
+    }
+
     #[test]
     fn unknown_record_kind_is_skipped() {
-        // A future record kind 0x7F with 3 payload bytes, then a valid
-        // record, for every family.
+        // A future record kind with 3 payload bytes, then a valid record,
+        // for every family. 0x7F is taken (CURSOR, reserved family-wide),
+        // so an unallocated kind stands in for the next addition.
         let mut unknown = Vec::new();
         unknown.extend_from_slice(&4u32.to_le_bytes());
-        unknown.push(0x7F);
+        unknown.push(0x6E);
         unknown.extend_from_slice(&[1, 2, 3]);
 
         let mut buf = unknown.clone();
@@ -2990,7 +4274,10 @@ mod tests {
 
         let state = forged(S2C_GIT_STATE, &[1, 0, 1, 0, 0, 0, 0]);
         assert_eq!(parse_git_state(&state), None);
-        assert_eq!(GitStateMirror::new().apply_state(&state), None);
+        assert_eq!(
+            GitStateMirror::new().apply_state(&state),
+            GitStateApply::Malformed
+        );
         assert_eq!(
             parse_git_commits(&forged(S2C_GIT_COMMITS, &[1, 0, 0, 0, 0, 0])),
             None
@@ -3037,6 +4324,7 @@ mod tests {
                 oid: oid(1),
                 peeled: GIT_OID_NONE,
                 name: "refs/heads/main",
+                target: "",
             },
         );
         append_git_state_record(
@@ -3046,6 +4334,7 @@ mod tests {
                 oid: oid(2),
                 peeled: oid(3),
                 name: "refs/tags/v1",
+                target: "",
             },
         );
         append_git_state_record(
@@ -3062,6 +4351,7 @@ mod tests {
                 staged: b'M',
                 unstaged: b' ',
                 flags: 0,
+                oid: GIT_OID_NONE,
                 old_path: "",
                 path: "a.txt",
             },
@@ -3087,7 +4377,7 @@ mod tests {
             },
         );
         let msg = msg_git_state(1, 1, GIT_STATE_STATUS_TRUNCATED, &records);
-        assert_eq!(mirror.apply_state(&msg), Some(1));
+        assert_eq!(mirror.apply_state(&msg), GitStateApply::Complete(1));
         assert_eq!(
             mirror.head,
             Some(GitHead {
@@ -3116,7 +4406,7 @@ mod tests {
             },
         );
         let msg = msg_git_state(1, 2, 0, &records);
-        assert_eq!(mirror.apply_state(&msg), Some(2));
+        assert_eq!(mirror.apply_state(&msg), GitStateApply::Complete(2));
         assert_eq!(mirror.head.as_ref().unwrap().flags, GIT_HEAD_DETACHED);
         assert!(mirror.refs.is_empty());
         assert_eq!(mirror.op, None);
@@ -3126,8 +4416,11 @@ mod tests {
         assert_eq!(mirror.flags, 0);
 
         // Malformed: wrong opcode, truncated header.
-        assert_eq!(mirror.apply_state(&msg_git_closed(1, 0)), None);
-        assert_eq!(mirror.apply_state(&msg[..6]), None);
+        assert_eq!(
+            mirror.apply_state(&msg_git_closed(1, 0)),
+            GitStateApply::Malformed
+        );
+        assert_eq!(mirror.apply_state(&msg[..6]), GitStateApply::Malformed);
     }
 
     /// Byte fixtures shared with the TypeScript codecs
@@ -3142,17 +4435,25 @@ mod tests {
         let o = |fill: u8| format!("{}{zeros}", hex(&[fill; 20]));
 
         assert_eq!(
-            hex(&msg_git_open(
-                0x0102,
-                GIT_OPEN_WATCH | GIT_OPEN_STATUS,
-                50,
-                500,
-                "/repo"
-            )),
-            "500201033200f40105002f7265706f"
+            hex(&msg_git_open(&GitOpenRequest {
+                refs_latency_ms: 50,
+                status_latency_ms: 500,
+                ..GitOpenRequest::new(0x0102, GIT_OPEN_WATCH | GIT_OPEN_STATUS, "/repo")
+            })),
+            "a0020103003200f401ffffffff000005002f7265706f"
         );
-        assert_eq!(hex(&msg_git_close(7)), "510700");
-        assert_eq!(hex(&msg_git_ack(7, 0x01020304)), "52070004030201");
+        // Context ids and a prefix filter, all in the one parse shape.
+        assert_eq!(
+            hex(&msg_git_open(&GitOpenRequest {
+                parent_repo_id: 4,
+                ref_prefixes: vec!["refs/heads/"],
+                ..GitOpenRequest::new(1, GIT_OPEN_WATCH, "vendor/lib")
+            })),
+            "a00100010000000000ffff04000100\
+             0b00726566732f68656164732f0a0076656e646f722f6c6962"
+        );
+        assert_eq!(hex(&msg_git_close(7)), "a10700");
+        assert_eq!(hex(&msg_git_ack(7, 0x01020304)), "a2070004030201");
         assert_eq!(
             hex(&msg_git_log(
                 3,
@@ -3163,15 +4464,30 @@ mod tests {
                 &[oid(0xAA)],
                 &[oid(0xBB)]
             )),
-            format!("530300070001640003007372630100{}0100{}", o(0xAA), o(0xBB))
+            format!("a70300070001640003007372630100{}0100{}", o(0xAA), o(0xBB))
         );
         assert_eq!(
-            hex(&msg_git_tree(4, 7, &oid(0xCC), "dir/%FF")),
-            format!("5404000700{}07006469722f254646", o(0xCC))
+            hex(&msg_git_tree(&GitTreeRequest {
+                nonce: 4,
+                repo_id: 7,
+                flags: 0,
+                oid: oid(0xCC),
+                path: "dir/%FF",
+                after: "",
+            })),
+            format!("ab0400070000{}07006469722f2546460000", o(0xCC))
         );
         assert_eq!(
-            hex(&msg_git_blob(5, 7, &oid(0xDD), "", 1 << 20)),
-            format!("5505000700{}000000001000", o(0xDD))
+            hex(&msg_git_blob(&GitBlobRequest {
+                nonce: 5,
+                repo_id: 7,
+                flags: 0,
+                oid: oid(0xDD),
+                path: "",
+                offset: 0,
+                max_len: 1 << 20,
+            })),
+            format!("ac0500070000{}0000000000000000000000001000", o(0xDD))
         );
         let old = GitEndpoint {
             kind: GIT_ENDPOINT_COMMIT,
@@ -3182,34 +4498,56 @@ mod tests {
             oid: GIT_OID_NONE,
         };
         assert_eq!(
-            hex(&msg_git_diff(6, 7, GIT_DIFF_RENAMES, old, new, "")),
-            format!("56060007000101{}04{zero_oid}0000", o(0x11))
-        );
-        assert_eq!(
-            hex(&msg_git_patch(
-                8,
-                7,
-                GIT_DIFF_RENAMES | GIT_PATCH_CHAR_SPANS,
-                5,
+            hex(&msg_git_diff(&GitDiffRequest {
+                nonce: 6,
+                repo_id: 7,
+                flags: GIT_DIFF_RENAMES,
+                rename: 50,
                 old,
                 new,
-                "a.txt",
-                0
-            )),
+                path: "",
+                after: "",
+            })),
+            format!("ad06000700013201{}04{zero_oid}00000000", o(0x11))
+        );
+        assert_eq!(
+            hex(&msg_git_patch(&GitPatchRequest {
+                nonce: 8,
+                repo_id: 7,
+                flags: GIT_PATCH_RENAMES | GIT_PATCH_CHAR_SPANS,
+                context: 5,
+                rename: 0,
+                old,
+                new,
+                path: "a.txt",
+                max_len: 0,
+                after: "",
+                after_pos: 0,
+            })),
             format!(
-                "5708000700410501{}04{zero_oid}0500612e74787400000000",
+                "ae080007008100050001{}04{zero_oid}\
+                 0500612e7478740000000000000000000000000000",
                 o(0x11)
             )
         );
-        assert_eq!(hex(&msg_git_index(9, 7, "sub")), "58090007000300737562");
-        assert_eq!(hex(&msg_git_cancel(10)), "590a00");
+        assert_eq!(
+            hex(&msg_git_index(&GitIndexRequest {
+                nonce: 9,
+                repo_id: 7,
+                flags: 0,
+                path: "sub",
+                after: "",
+            })),
+            "af090007000003007375620000"
+        );
+        assert_eq!(hex(&msg_git_cancel(10)), "a30a00");
         assert_eq!(
             hex(&msg_git_base(11, 7, &[oid(0xAA), oid(0xBB)])),
-            format!("5a0b00070002{}{}", o(0xAA), o(0xBB))
+            format!("b00b00070002{}{}", o(0xAA), o(0xBB))
         );
         assert_eq!(
             hex(&msg_git_resolve(12, 7, "main..dev")),
-            "5b0c00070009006d61696e2e2e646576"
+            "a60c00070009006d61696e2e2e646576"
         );
         assert_eq!(
             hex(&msg_git_resolve_resp(
@@ -3218,16 +4556,16 @@ mod tests {
                 &[oid(0xCC)],
                 &[oid(0xDD)]
             )),
-            format!("5b0c00000100{}0100{}", o(0xCC), o(0xDD))
+            format!("a60c00000100{}0100{}", o(0xCC), o(0xDD))
         );
         assert_eq!(
             hex(&msg_git_log_watch(1, 7, GIT_LOG_FIRST_PARENT, 100, "main")),
-            "5c0100070001640004006d61696e"
+            "a80100070001640004006d61696e"
         );
-        assert_eq!(hex(&msg_git_log_unwatch(1, 7)), "5d01000700");
+        assert_eq!(hex(&msg_git_log_unwatch(1, 7)), "a901000700");
         assert_eq!(
             hex(&msg_git_log_ack(1, 7, 0x0102_0304)),
-            "5e0100070004030201"
+            "aa0100070004030201"
         );
         assert_eq!(
             hex(&msg_git_repo(
@@ -3239,12 +4577,12 @@ mod tests {
                 "/w",
                 "/w/.git"
             )),
-            "500201010000000802002f7707002f772f2e676974"
+            "a00201010000000802002f7707002f772f2e676974"
         );
-        assert_eq!(hex(&msg_git_closed(1, GIT_CLOSED_REPO_GONE)), "52010001");
+        assert_eq!(hex(&msg_git_closed(1, GIT_CLOSED_REPO_GONE)), "a5010001");
         assert_eq!(
             hex(&msg_git_base_resp(11, GIT_STATUS_OK, &[oid(0xAB)])),
-            format!("5a0b000001{}", o(0xAB))
+            format!("b00b000001{}", o(0xAB))
         );
 
         // Records buffers, uncompressed.
@@ -3354,6 +4692,8 @@ mod tests {
         append_git_patch_record(
             &mut patch,
             &GitPatchRecord::File {
+                st: b'M',
+                similarity: 0,
                 flags: 0,
                 old_path: "a.txt",
                 new_path: "a.txt",
@@ -3379,7 +4719,7 @@ mod tests {
         );
         assert_eq!(
             hex(&patch),
-            "1000000001000500612e7478740500612e7478742f0000000201000000010000000500000068656c6c6f0500000068616c6c6f010001000000010000000100010000000100000009000000030300000003000000"
+            "12000000014d00000500612e7478740500612e7478742f0000000201000000010000000500000068656c6c6f0500000068616c6c6f010001000000010000000100010000000100000009000000030300000003000000"
         );
 
         let mut index = Vec::new();

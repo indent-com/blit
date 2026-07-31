@@ -103,6 +103,9 @@ import {
   FS_STATUS_OK,
   FS_SYNC_CONTENT,
   FS_SYNC_CROSS_FILESYSTEM,
+  FS_SYNC_DOTIGNORE,
+  FS_SYNC_EXCLUDE_GIT,
+  FS_SYNC_GITIGNORE,
   FS_SYNC_RECURSIVE,
   FS_SYNC_SINGLE,
   FS_WRITE_CONTENT_DELTA,
@@ -157,6 +160,23 @@ import {
   GIT_CLOSED_CONNECTION_LOST,
   GIT_OPEN_IGNORED,
   GIT_OPEN_STATUS,
+  GIT_OID_NONE,
+  GIT_OPEN_REMOTES,
+  GIT_STATUS_CANCELLED,
+  GitStatusError,
+  msgGitBlame,
+  msgGitCancel,
+  msgGitDiscover,
+  msgGitFetch,
+  msgGitReflog,
+  parseGitDiscoverResp,
+  gitDiscoverRecords,
+  GIT_DISCOVER_BARE,
+  GIT_DISCOVER_NESTED,
+  GIT_DISCOVER_TRUNCATED,
+  GIT_FOUND_BARE,
+  GIT_FOUND_LINKED,
+  GIT_FOUND_SUBMODULE,
   GIT_OPEN_TRACKING,
   GIT_OPEN_UNTRACKED,
   GIT_OPEN_WATCH,
@@ -166,16 +186,22 @@ import {
   type GitLogPage,
   type GitLogSubscription,
   type GitLogWatchOptions,
+  type GitDiscoverOptions,
+  type GitFoundRepo,
   type GitOpenOptions,
   type GitRepoHandle,
   S2C_GIT_BASE,
+  S2C_GIT_BLAME,
+  S2C_GIT_DISCOVER,
   S2C_GIT_BLOB,
   S2C_GIT_CLOSED,
   S2C_GIT_COMMITS,
   S2C_GIT_DIFF,
   S2C_GIT_INDEX,
   S2C_GIT_LOG_PAGE,
+  S2C_GIT_FETCH,
   S2C_GIT_PATCH,
+  S2C_GIT_REFLOG,
   S2C_GIT_REPO,
   S2C_GIT_RESOLVE,
   S2C_GIT_STATE,
@@ -184,7 +210,9 @@ import {
   gitIndexRecords,
   gitOidHex,
   gitPatchRecords,
-  gitStatusText,
+  gitBlameRecords,
+  gitFetchRecords,
+  gitReflogRecords,
   gitTreeRecords,
   msgGitAck,
   msgGitBase,
@@ -201,13 +229,16 @@ import {
   msgGitResolve,
   msgGitTree,
   parseGitBaseResp,
+  parseGitBlameResp,
   parseGitBlobResp,
   parseGitClosed,
   parseGitCommits,
   parseGitDiffResp,
   parseGitIndexResp,
   parseGitLogPage,
+  parseGitFetchResp,
   parseGitPatchResp,
+  parseGitReflogResp,
   parseGitRepo,
   parseGitResolveResp,
   parseGitTreeResp,
@@ -556,6 +587,12 @@ export class BlitConnection {
       opcode: number;
       resolve: (msg: Uint8Array) => void;
       reject: (error: Error) => void;
+      /** Set once the caller aborted: the promise is already rejected and
+       *  the entry stays only to reserve the nonce. The wire promises
+       *  exactly one response per nonce and answers a duplicate in-flight
+       *  nonce with INVALID, so the id cannot be reused until the real
+       *  reply lands and is dropped. */
+      abandoned?: boolean;
     }
   >();
   /** Live log subscriptions keyed by client-assigned `log_id`. */
@@ -697,6 +734,7 @@ export class BlitConnection {
       supportsKv: false,
       retryCount: 0,
       bootGeneration: null,
+      serverVersion: null,
       generation: 0,
       error: null,
       sessions: [],
@@ -1165,6 +1203,22 @@ export class BlitConnection {
         "A single-file sync cannot be recursive (docs/design/fs-watch.md)",
       );
     }
+    // Exclusion narrows enumeration and a single-file sync enumerates
+    // nothing; the server refuses the pair, so say so here rather than
+    // spend a round trip on it.
+    const exclude = (options.exclude ?? []).join("\n");
+    if (
+      options.single &&
+      (options.ignore ||
+        options.gitignore ||
+        options.dotIgnore ||
+        options.excludeGit ||
+        exclude)
+    ) {
+      throw connectionError(
+        "A single-file sync cannot exclude anything (docs/design/fs-watch.md)",
+      );
+    }
     let flags = 0;
     // `single` and the recursive default are exclusive: a single-file
     // root has nothing to recurse into, and the server rejects the
@@ -1174,10 +1228,16 @@ export class BlitConnection {
     else if (options.recursive !== false) flags |= FS_SYNC_RECURSIVE;
     if (options.content) flags |= FS_SYNC_CONTENT;
     if (options.crossFilesystem) flags |= FS_SYNC_CROSS_FILESYSTEM;
+    if (options.ignore || options.gitignore) flags |= FS_SYNC_GITIGNORE;
+    if (options.ignore || options.dotIgnore) flags |= FS_SYNC_DOTIGNORE;
+    if (options.ignore || options.excludeGit) flags |= FS_SYNC_EXCLUDE_GIT;
     const srcPtyId = this.srcPtyForOpen(options.fromSessionId);
     const latencyMs = options.latencyMs ?? 0;
     const inlineMax = options.inlineMax ?? 0;
-    const key = `${flags}:${latencyMs}:${inlineMax}:${srcPtyId ?? ""}:${path}`;
+    // The pattern list is part of what the sync *is* — two opens that
+    // exclude different things mirror different trees — so it joins the
+    // coalescing key alongside the flags.
+    const key = `${flags}:${latencyMs}:${inlineMax}:${srcPtyId ?? ""}:${exclude.length}:${exclude}${path}`;
     const share = this.fsSyncsByKey.get(key);
     if (share) {
       return this.joinFsShare(share, options);
@@ -1197,7 +1257,15 @@ export class BlitConnection {
       this.pendingFsSyncs.set(nonce, entry);
       this.pendingFsSyncsByKey.set(key, entry);
       this.transport.send(
-        buildFsSyncMessage(nonce, flags, latencyMs, inlineMax, path, srcPtyId),
+        buildFsSyncMessage(
+          nonce,
+          flags,
+          latencyMs,
+          inlineMax,
+          path,
+          srcPtyId,
+          exclude,
+        ),
       );
     });
   }
@@ -1755,21 +1823,102 @@ export class BlitConnection {
     if (options.untracked || options.ignored) flags |= GIT_OPEN_UNTRACKED;
     if (options.ignored) flags |= GIT_OPEN_IGNORED;
     if (options.tracking) flags |= GIT_OPEN_TRACKING;
+    if (options.remotes) flags |= GIT_OPEN_REMOTES;
     const srcPtyId = this.srcPtyForOpen(options.fromSessionId);
     return new Promise<GitRepoHandle>((resolve, reject) => {
       const nonce = this.nextFsNonce(this.pendingGitOpens);
       this.pendingGitOpens.set(nonce, { resolve, reject, options });
       this.transport.send(
-        msgGitOpen(
+        msgGitOpen({
           nonce,
           flags,
-          options.refsLatencyMs ?? 0,
-          options.statusLatencyMs ?? 0,
-          path,
+          refsLatencyMs: options.refsLatencyMs ?? 0,
+          statusLatencyMs: options.statusLatencyMs ?? 0,
           srcPtyId,
-        ),
+          parentRepoId: options.parentRepoId,
+          refPrefixes: options.refPrefixes,
+          path,
+        }),
       );
     });
+  }
+
+  /**
+   * Repositories under `path` (docs/design/git.md `GIT_DISCOVER`): the
+   * answer to "what is checked out here" in one call, instead of a ladder
+   * of candidate paths probed with an `FS_SYNC` per level.
+   *
+   * It hangs off the connection rather than a repo handle because it
+   * allocates no repo id — an enumeration, not an open — so it cannot
+   * exhaust the per-connection repo budget.
+   *
+   * A capped walk says where it stopped, and this follows that cursor to
+   * the end by default: the caller asked what is under a path, not for one
+   * page of it. `onPage` sees each page as it lands, for a caller that
+   * wants to render progressively; `maxPages` bounds a walk over a tree
+   * that is being written to underneath it.
+   */
+  async discoverRepos(
+    path: string,
+    options: GitDiscoverOptions = {},
+  ): Promise<GitFoundRepo[]> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot discover repos while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_GIT) === 0) {
+      throw connectionError("Server does not support git introspection");
+    }
+    let flags = 0;
+    if (options.nested) flags |= GIT_DISCOVER_NESTED;
+    if (options.bare) flags |= GIT_DISCOVER_BARE;
+    const found: GitFoundRepo[] = [];
+    let after = "";
+    const maxPages = options.maxPages ?? 64;
+    for (let page = 0; page < maxPages; page++) {
+      const msg = await this.gitCall(
+        S2C_GIT_DISCOVER,
+        (nonce) =>
+          msgGitDiscover({
+            nonce,
+            flags,
+            depth: options.depth ?? 0,
+            path,
+            after,
+          }),
+        options.signal,
+        "Discover",
+      );
+      const parsed = parseGitDiscoverResp(msg);
+      if (!parsed) throw connectionError("Malformed discover from server");
+      const [, status, respFlags, records] = parsed;
+      if (status !== GIT_STATUS_OK)
+        throw new GitStatusError("Discover", status);
+      const pageRepos: GitFoundRepo[] = [];
+      let cursor: string | null = null;
+      for (const record of gitDiscoverRecords(records)) {
+        if (record.kind === "repo") {
+          pageRepos.push({
+            workdir: record.workdir,
+            gitdir: record.gitdir,
+            bare: (record.flags & GIT_FOUND_BARE) !== 0,
+            linked: (record.flags & GIT_FOUND_LINKED) !== 0,
+            submodule: (record.flags & GIT_FOUND_SUBMODULE) !== 0,
+          });
+        } else {
+          cursor = record.after;
+        }
+      }
+      found.push(...pageRepos);
+      options.onPage?.(pageRepos);
+      // Truncated with no cursor, or one that has not moved, is as far as
+      // this walk goes — paging on it again would spin.
+      if ((respFlags & GIT_DISCOVER_TRUNCATED) === 0) break;
+      if (cursor === null || cursor === after) break;
+      after = cursor;
+    }
+    return found;
   }
 
   /** One nonce-correlated git request; resolves with the raw response. */
@@ -1777,14 +1926,47 @@ export class BlitConnection {
     repoId: number,
     opcode: number,
     build: (nonce: number) => Uint8Array,
+    signal?: AbortSignal,
+    op = "Request",
+  ): Promise<Uint8Array> {
+    if (!this.gitRepos.has(repoId)) {
+      return Promise.reject(connectionError("Repo is closed"));
+    }
+    return this.gitCall(opcode, build, signal, op);
+  }
+
+  /** A nonce-correlated git request that is not scoped to an open repo —
+   *  `GIT_DISCOVER` is the only one, since it enumerates repositories
+   *  rather than using one and allocates no repo id. */
+  private gitCall(
+    opcode: number,
+    build: (nonce: number) => Uint8Array,
+    signal?: AbortSignal,
+    op = "Request",
   ): Promise<Uint8Array> {
     return new Promise<Uint8Array>((resolve, reject) => {
-      if (!this.gitRepos.has(repoId)) {
-        reject(connectionError("Repo is closed"));
+      if (signal?.aborted) {
+        reject(new GitStatusError(op, GIT_STATUS_CANCELLED));
         return;
       }
       const nonce = this.nextFsNonce(this.pendingGitRequests);
-      this.pendingGitRequests.set(nonce, { opcode, resolve, reject });
+      const entry = { opcode, resolve, reject };
+      this.pendingGitRequests.set(nonce, entry);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          const live = this.pendingGitRequests.get(nonce);
+          if (!live || live !== entry || live.abandoned) return;
+          // Tell the server to stop, hand the caller its rejection now,
+          // and keep the nonce reserved as a tombstone until the reply
+          // arrives — releasing it early would let the next request reuse
+          // an id the server still considers live.
+          this.transport.send(msgGitCancel(nonce));
+          live.abandoned = true;
+          reject(new GitStatusError(op, GIT_STATUS_CANCELLED));
+        },
+        { once: true },
+      );
       this.transport.send(build(nonce));
     });
   }
@@ -1838,9 +2020,9 @@ export class BlitConnection {
     mirror: GitStateMirror,
     notifier: Notifier,
   ): GitRepoHandle {
-    const expectOk = (status: number): void => {
+    const expectOk = (status: number, op = "Request"): void => {
       if (status !== GIT_STATUS_OK) {
-        throw connectionError(`Request failed: ${gitStatusText(status)}`);
+        throw new GitStatusError(op, status);
       }
     };
     return {
@@ -1854,79 +2036,119 @@ export class BlitConnection {
       get revision() {
         return notifier.revision;
       },
-      log: async (req = {}) => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_COMMITS, (nonce) =>
-          msgGitLog({
-            nonce,
-            repoId,
-            flags: req.flags ?? 0,
-            limit: req.limit ?? 0,
-            path: req.path ?? "",
-            tips: req.tips ?? [],
-            hides: req.hides ?? [],
-          }),
+      log: async (req = {}, opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_COMMITS,
+          (nonce) =>
+            msgGitLog({
+              nonce,
+              repoId,
+              flags: req.flags ?? 0,
+              limit: req.limit ?? 0,
+              path: req.path ?? "",
+              tips: req.tips ?? [],
+              hides: req.hides ?? [],
+            }),
+          opts.signal,
+          "Log",
         );
         const page = parseGitCommits(msg);
         if (!page) throw connectionError("Malformed commits from server");
-        expectOk(page.status);
+        expectOk(page.status, "Log");
         return page;
       },
-      tree: async (oid, path = "") => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_TREE, (nonce) =>
-          msgGitTree(nonce, repoId, oid, path),
+      tree: async (oid, path = "", opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_TREE,
+          (nonce) =>
+            msgGitTree({ nonce, repoId, oid, path, after: opts.after }),
+          opts.signal,
+          "Tree",
         );
         const parsed = parseGitTreeResp(msg);
         if (!parsed) throw connectionError("Malformed tree from server");
-        expectOk(parsed[1]);
+        expectOk(parsed[1], "Tree");
         return [...gitTreeRecords(parsed[3])];
       },
-      blob: (oid, path = "", maxLen = 0) => {
+      blob: (oid, path = "", maxLen = 0, opts = {}) => {
         const fetchBlob = async (): Promise<Uint8Array> => {
-          const msg = await this.gitRequest(repoId, S2C_GIT_BLOB, (nonce) =>
-            msgGitBlob(nonce, repoId, oid, path, maxLen),
+          const msg = await this.gitRequest(
+            repoId,
+            S2C_GIT_BLOB,
+            (nonce) =>
+              msgGitBlob({
+                nonce,
+                repoId,
+                oid,
+                path,
+                maxLen,
+                offset: opts.offset,
+                flags: opts.flags,
+              }),
+            opts.signal,
+            "Blob",
           );
           const parsed = parseGitBlobResp(msg);
           if (!parsed) throw connectionError("Malformed blob from server");
-          expectOk(parsed[1]);
+          expectOk(parsed[1], "Blob");
           return parsed[3];
         };
-        // Only a direct oid pull is content-addressed; a `path` resolves
-        // through whatever object the oid names, so it bypasses the cache.
-        if (path !== "") return fetchBlob();
+        // Only a whole-object direct oid pull is content-addressed. A `path`
+        // resolves through whatever object the oid names, and a window is a
+        // slice of the object rather than the object — both bypass the cache,
+        // which is keyed by oid alone.
+        if (path !== "" || opts.offset) return fetchBlob();
         return this.cachedGitBlob(gitOidHex(oid, info.oidFormat), fetchBlob);
       },
       diff: async (old, newEndpoint, opts = {}) => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_DIFF, (nonce) =>
-          msgGitDiff({
-            nonce,
-            repoId,
-            flags: opts.flags ?? 0,
-            old,
-            new: newEndpoint,
-            path: opts.path ?? "",
-          }),
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_DIFF,
+          (nonce) =>
+            msgGitDiff({
+              nonce,
+              repoId,
+              flags: opts.flags ?? 0,
+              rename: opts.rename,
+              old,
+              new: newEndpoint,
+              path: opts.path ?? "",
+              after: opts.after,
+            }),
+          opts.signal,
+          "Diff",
         );
         const parsed = parseGitDiffResp(msg);
         if (!parsed) throw connectionError("Malformed diff from server");
-        expectOk(parsed[1]);
+        expectOk(parsed[1], "Diff");
         return [...gitDiffRecords(parsed[3])];
       },
       patch: async (old, newEndpoint, opts = {}) => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_PATCH, (nonce) =>
-          msgGitPatch({
-            nonce,
-            repoId,
-            flags: opts.flags ?? 0,
-            context: opts.context ?? 0,
-            old,
-            new: newEndpoint,
-            path: opts.path ?? "",
-            maxLen: opts.maxLen ?? 0,
-          }),
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_PATCH,
+          (nonce) =>
+            msgGitPatch({
+              nonce,
+              repoId,
+              flags: opts.flags ?? 0,
+              context: opts.context ?? 0,
+              rename: opts.rename,
+              old,
+              new: newEndpoint,
+              path: opts.path ?? "",
+              maxLen: opts.maxLen ?? 0,
+              after: opts.after,
+              afterPos: opts.afterPos,
+            }),
+          opts.signal,
+          "Patch",
         );
         const parsed = parseGitPatchResp(msg);
         if (!parsed) throw connectionError("Malformed patch from server");
-        expectOk(parsed[1]);
+        expectOk(parsed[1], "Patch");
         const [, , flags, data] = parsed;
         return {
           flags,
@@ -1935,32 +2157,108 @@ export class BlitConnection {
           text: flags & GIT_PATCH_STRUCTURED ? new Uint8Array(0) : data,
         };
       },
-      index: async (path = "") => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_INDEX, (nonce) =>
-          msgGitIndex(nonce, repoId, path),
+      index: async (path = "", opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_INDEX,
+          (nonce) => msgGitIndex({ nonce, repoId, path, after: opts.after }),
+          opts.signal,
+          "Index",
         );
         const parsed = parseGitIndexResp(msg);
         if (!parsed) throw connectionError("Malformed index from server");
-        expectOk(parsed[1]);
+        expectOk(parsed[1], "Index");
         return [...gitIndexRecords(parsed[3])];
       },
-      mergeBase: async (oids) => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_BASE, (nonce) =>
-          msgGitBase(nonce, repoId, oids),
+      mergeBase: async (oids, opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_BASE,
+          (nonce) => msgGitBase(nonce, repoId, oids),
+          opts.signal,
+          "MergeBase",
         );
         const parsed = parseGitBaseResp(msg);
         if (!parsed) throw connectionError("Malformed base from server");
-        expectOk(parsed[1]);
+        expectOk(parsed[1], "MergeBase");
         return parsed[2];
       },
-      resolve: async (spec) => {
-        const msg = await this.gitRequest(repoId, S2C_GIT_RESOLVE, (nonce) =>
-          msgGitResolve(nonce, repoId, spec),
+      resolve: async (spec, opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_RESOLVE,
+          (nonce) => msgGitResolve(nonce, repoId, spec),
+          opts.signal,
+          "Resolve",
         );
         const parsed = parseGitResolveResp(msg);
         if (!parsed) throw connectionError("Malformed resolve from server");
-        expectOk(parsed.status);
+        expectOk(parsed.status, "Resolve");
         return { tips: parsed.tips, hides: parsed.hides };
+      },
+      blame: async (path, opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_BLAME,
+          (nonce) =>
+            msgGitBlame({
+              nonce,
+              repoId,
+              flags: opts.flags,
+              oid: opts.oid ?? GIT_OID_NONE,
+              startLine: opts.startLine,
+              lineCount: opts.lineCount,
+              path,
+            }),
+          opts.signal,
+          "Blame",
+        );
+        const parsed = parseGitBlameResp(msg);
+        if (!parsed) throw connectionError("Malformed blame from server");
+        expectOk(parsed[1], "Blame");
+        return [...gitBlameRecords(parsed[3])];
+      },
+      reflog: async (refName = "", opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_REFLOG,
+          (nonce) =>
+            msgGitReflog({
+              nonce,
+              repoId,
+              flags: opts.flags,
+              limit: opts.limit,
+              refName,
+              afterPos: opts.afterPos,
+            }),
+          opts.signal,
+          "Reflog",
+        );
+        const parsed = parseGitReflogResp(msg);
+        if (!parsed) throw connectionError("Malformed reflog from server");
+        expectOk(parsed[1], "Reflog");
+        return [...gitReflogRecords(parsed[3])];
+      },
+      fetch: async (opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_FETCH,
+          (nonce) =>
+            msgGitFetch({
+              nonce,
+              repoId,
+              flags: opts.flags,
+              timeoutMs: opts.timeoutMs,
+              remote: opts.remote,
+              refspecs: opts.refspecs,
+            }),
+          opts.signal,
+          "Fetch",
+        );
+        const parsed = parseGitFetchResp(msg);
+        if (!parsed) throw connectionError("Malformed fetch from server");
+        expectOk(parsed[1], "Fetch");
+        return [...gitFetchRecords(parsed[3])];
       },
       watchLog: (spec, opts, onUpdate) =>
         this.watchGitLog(repoId, spec, opts, onUpdate),
@@ -2337,32 +2635,12 @@ export class BlitConnection {
     if (id != null) this.store.release(id);
   }
 
-  freeze(sessionId: SessionId): void {
-    const id = this.ptyId(sessionId);
-    if (id != null) this.store.freeze(id);
-  }
-
-  thaw(sessionId: SessionId): void {
-    const id = this.ptyId(sessionId);
-    if (id != null) this.store.thaw(id);
-  }
-
-  isFrozen(sessionId: SessionId): boolean {
-    const id = this.ptyId(sessionId);
-    return id != null && this.store.isFrozen(id);
-  }
-
   addDirtyListener(sessionId: SessionId, listener: () => void): () => void {
     const id = this.ptyId(sessionId);
     if (id == null) return () => {};
     return this.store.addDirtyListener((dirtyId) => {
       if (dirtyId === id) listener();
     });
-  }
-
-  drainPending(sessionId: SessionId): boolean {
-    const id = this.ptyId(sessionId);
-    return id != null ? this.store.drainPending(id) : false;
   }
 
   getSharedRenderer() {
@@ -2924,6 +3202,18 @@ export class BlitConnection {
                 true,
               )
             : null;
+        // The server's release string was appended after the boot generation,
+        // also without a protocol bump: `[len:2][utf8:N]`.
+        let serverVersion: string | null = null;
+        if (bytes.length >= 17) {
+          const verLen = bytes[15] | (bytes[16] << 8);
+          if (bytes.length >= 17 + verLen) {
+            serverVersion =
+              verLen === 0
+                ? null
+                : new TextDecoder().decode(bytes.subarray(17, 17 + verLen));
+          }
+        }
         if (version > PROTOCOL_VERSION) {
           this.transport.close();
           return;
@@ -2973,6 +3263,7 @@ export class BlitConnection {
           supportsLsp: (features & FEATURE_LSP) !== 0,
           supportsKv: (features & FEATURE_KV) !== 0,
           bootGeneration,
+          serverVersion,
         };
         this.emit();
         this.surfaceStore.reset();
@@ -3514,11 +3805,8 @@ export class BlitConnection {
         if (!pending) return;
         this.pendingGitOpens.delete(info.nonce);
         if (info.status !== GIT_STATUS_OK) {
-          pending.reject(
-            connectionError(
-              `Open failed: ${gitStatusText(info.status)}${info.workdir ? `: ${info.workdir}` : ""}`,
-            ),
-          );
+          // GIT_REPO carries its diagnostic in `workdir` on failure.
+          pending.reject(new GitStatusError("Open", info.status, info.workdir));
           return;
         }
         const mirror = new GitStateMirror();
@@ -3584,13 +3872,19 @@ export class BlitConnection {
       case S2C_GIT_PATCH:
       case S2C_GIT_INDEX:
       case S2C_GIT_BASE:
+      case S2C_GIT_DISCOVER:
+      case S2C_GIT_BLAME:
+      case S2C_GIT_REFLOG:
+      case S2C_GIT_FETCH:
       case S2C_GIT_RESOLVE: {
         if (bytes.length < 3) return;
         const nonce = bytes[1] | (bytes[2] << 8);
         const pending = this.pendingGitRequests.get(nonce);
         if (!pending || pending.opcode !== bytes[0]) return;
         this.pendingGitRequests.delete(nonce);
-        pending.resolve(bytes);
+        // An abandoned request has already rejected; the reply only
+        // releases its nonce.
+        if (!pending.abandoned) pending.resolve(bytes);
         return;
       }
       case S2C_LSP_OPENED: {

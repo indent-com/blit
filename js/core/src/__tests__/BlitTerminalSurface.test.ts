@@ -658,6 +658,62 @@ describe("BlitTerminalSurface Android composition", () => {
       [0x74, 0x68, 0x65],
     ]);
   });
+
+  it("applies the toolbar's one-shot Ctrl to a composed letter", () => {
+    // Android keyboards keep the word in an active composition, so a letter
+    // typed after tapping Ctrl arrives as composition input and reaches
+    // neither the keydown nor the plain `input` branch that applies the
+    // modifier: Ctrl+C used to come out as a literal "c".
+    const sendInput = vi.fn();
+    const { s, input } = attachAndroid(sendInput);
+
+    input.dispatchEvent(new Event("compositionstart"));
+    s.setCtrlModifier(true);
+    fireCompositionInput(input, "c", "insertCompositionText");
+
+    expect(
+      sendInput.mock.calls.map((c) => Array.from(c[1] as Uint8Array)),
+    ).toEqual([[0x03]]);
+    // One-shot: it does not stick to the next letter.
+    expect(s.ctrlModifier).toBe(false);
+    // And the composition is abandoned, so the next letter is not read as a
+    // delta against a buffer the shell never received.
+    expect(input.value).toBe("");
+    fireCompositionInput(input, "d", "insertCompositionText");
+    expect(
+      sendInput.mock.calls.map((c) => Array.from(c[1] as Uint8Array)),
+    ).toEqual([[0x03], [0x64]]);
+  });
+
+  it("applies the toolbar's one-shot Alt to a composed letter", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attachAndroid(sendInput);
+
+    input.dispatchEvent(new Event("compositionstart"));
+    s.setAltModifier(true);
+    fireCompositionInput(input, "b", "insertCompositionText");
+
+    expect(
+      sendInput.mock.calls.map((c) => Array.from(c[1] as Uint8Array)),
+    ).toEqual([[0x1b, 0x62]]);
+    expect(s.altModifier).toBe(false);
+  });
+
+  it("applies Ctrl mid-word, to the letter that follows it", () => {
+    // The realistic sequence: type part of a command, then Ctrl+C to kill it.
+    const sendInput = vi.fn();
+    const { s, input } = attachAndroid(sendInput);
+
+    input.dispatchEvent(new Event("compositionstart"));
+    fireCompositionInput(input, "s", "insertCompositionText");
+    fireCompositionInput(input, "sl", "insertCompositionText");
+    s.setCtrlModifier(true);
+    fireCompositionInput(input, "slc", "insertCompositionText");
+
+    expect(
+      sendInput.mock.calls.map((c) => Array.from(c[1] as Uint8Array)),
+    ).toEqual([[0x73], [0x6c], [0x03]]);
+  });
 });
 
 describe("BlitTerminalSurface iPad autocorrect", () => {

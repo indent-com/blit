@@ -5,13 +5,185 @@
 //! `Hint::Rescan`. No backend behavior is client-visible; the engine
 //! verifies everything against the filesystem before emitting.
 
-use crate::{Hint, HintSender};
+use crate::{BackendHandle, Hint, HintSender};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Keeps the native watch alive; dropping it unwatches.
 pub struct WatchBackend {
-    _watcher: RecommendedWatcher,
+    /// Shared with the reconciler, which registers and retires
+    /// directories through it for the root's whole lifetime.
+    pub watches: Arc<Watches>,
+}
+
+/// Whether per-directory arming is worth it for a filtered root.
+///
+/// Only on inotify, where a recursive watch is really one descriptor per
+/// directory and skipping `node_modules` is the whole point. FSEvents
+/// covers a tree with a single stream and `ReadDirectoryChangesW` with a
+/// single handle, so there per-directory arming would cost *more* objects,
+/// not fewer — and an unfiltered root keeps the recursive watch on every
+/// platform, so nothing changes for a sync that excludes nothing.
+pub fn per_dir_watching_pays(recursive: bool, single: bool, filtered: bool) -> bool {
+    cfg!(target_os = "linux") && recursive && !single && filtered
+}
+
+/// The native watches a root holds, and the reconciler's handle on them.
+///
+/// Two kinds, tracked apart because they are retired by different rules:
+///
+/// - **tree** directories, armed one at a time when `per_dir` is set. A
+///   recursive inotify watch is a descriptor per directory whether or not
+///   the sync mirrors it, so a filtered sync of a checkout would still pay
+///   for `node_modules` and `target` — the cost the exclusion exists to
+///   avoid, and on a big tree the one that hits
+///   `fs.inotify.max_user_watches`. Arming per directory puts the
+///   reconciler in charge: it arms exactly what it indexes, in the order it
+///   indexes it, and never reaches the excluded subtrees. The
+///   arm-before-list contract holds one level down — a directory is armed
+///   before it is read — and these are disarmed as the index drops them.
+/// - **outside** directories, holding ignore sources above the root. No
+///   hint from inside the tree could ever report those, so without them a
+///   parent `.gitignore` edit is invisible for the life of the sync. They
+///   are armed once and never retired, since nothing in the index tracks
+///   them.
+pub struct Watches {
+    watcher: Mutex<RecommendedWatcher>,
+    /// Whether the tree is watched a directory at a time. When false, one
+    /// recursive watch on the root already covers it and the tree-side
+    /// calls are no-ops.
+    per_dir: bool,
+    /// Tree directories currently armed, so re-arming is a set lookup
+    /// rather than a syscall and teardown knows what to unwatch.
+    ///
+    /// Ordered, because disarming is always a *subtree*: `Path`'s
+    /// component-wise ordering puts a directory's descendants immediately
+    /// after it and before any sibling, so a range query costs the size of
+    /// the subtree rather than the size of the tree. With a hash set,
+    /// deleting one directory scanned every armed path — and `rm -rf` on a
+    /// deep tree paid that per directory it removed.
+    armed: Mutex<std::collections::BTreeSet<PathBuf>>,
+    /// Directories outside the tree, exempt from every retirement rule.
+    outside: Mutex<std::collections::BTreeSet<PathBuf>>,
+}
+
+impl Watches {
+    /// Arm a tree directory, non-recursively. `false` only when the
+    /// process is out of watch descriptors — the caller closes the root,
+    /// because a mirror with an unwatched directory in it is silently
+    /// stale. Every other failure (the directory vanished mid-scan,
+    /// permission) returns `true`: there is nothing to watch, and nothing
+    /// to mirror either.
+    pub fn add_dir(&self, dir: &Path) -> bool {
+        if !self.per_dir {
+            return true; // the recursive watch on the root covers it
+        }
+        if self.armed.lock().unwrap().contains(dir) {
+            return true;
+        }
+        match self.arm(dir) {
+            Ok(()) => {
+                self.armed.lock().unwrap().insert(dir.to_path_buf());
+                true
+            }
+            Err(e) => !is_watch_exhaustion(&e),
+        }
+    }
+
+    /// Arm a directory outside the tree because it holds an ignore source.
+    /// Failure is not fatal the way a tree directory's is: the rules were
+    /// already read, and the only loss is noticing a later edit — the
+    /// behavior every sync had before these were watched at all.
+    pub fn watch_outside(&self, dir: &Path) {
+        if self.outside.lock().unwrap().contains(dir) {
+            return;
+        }
+        if self.arm(dir).is_ok() {
+            self.outside.lock().unwrap().insert(dir.to_path_buf());
+        }
+    }
+
+    /// Whether the tree is watched a directory at a time rather than by
+    /// one recursive watch on the root.
+    pub fn is_per_dir(&self) -> bool {
+        self.per_dir
+    }
+
+    fn arm(&self, dir: &Path) -> notify::Result<()> {
+        self.watcher
+            .lock()
+            .unwrap()
+            .watch(dir, RecursiveMode::NonRecursive)
+    }
+
+    /// Disarm `dir` and everything under it — a deleted or newly excluded
+    /// subtree. inotify drops the kernel watch on deletion by itself; this
+    /// is what keeps the bookkeeping (and notify's own map) from growing
+    /// across a create/delete cycle.
+    pub fn remove_dir(&self, dir: &Path) {
+        let gone: Vec<PathBuf> = {
+            let armed = self.armed.lock().unwrap();
+            armed
+                .range(dir.to_path_buf()..)
+                .take_while(|p| p.starts_with(dir))
+                .cloned()
+                .collect()
+        };
+        self.drop_watches(gone);
+    }
+
+    /// Drop every armed tree directory `keep` rejects. Used after a full
+    /// rescan, which replaces the index wholesale and so cannot report
+    /// individual removals — the one place a whole-set pass is the right
+    /// shape, since every entry has to be reconsidered anyway.
+    pub fn retain_dirs(&self, keep: &dyn Fn(&Path) -> bool) {
+        let gone: Vec<PathBuf> = {
+            let armed = self.armed.lock().unwrap();
+            armed.iter().filter(|p| !keep(p)).cloned().collect()
+        };
+        self.drop_watches(gone);
+    }
+
+    fn drop_watches(&self, gone: Vec<PathBuf>) {
+        if gone.is_empty() {
+            return;
+        }
+        let mut watcher = self.watcher.lock().unwrap();
+        let mut armed = self.armed.lock().unwrap();
+        for dir in gone {
+            // Already gone from the kernel's side once the directory was
+            // deleted; unwatch is how notify forgets it too.
+            let _ = watcher.unwatch(&dir);
+            armed.remove(&dir);
+        }
+    }
+}
+
+impl BackendHandle for Arc<Watches> {
+    fn add_dir(&self, dir: &Path) -> bool {
+        Watches::add_dir(self, dir)
+    }
+    fn watch_outside(&self, dir: &Path) {
+        Watches::watch_outside(self, dir);
+    }
+    fn remove_dir(&self, dir: &Path) {
+        Watches::remove_dir(self, dir);
+    }
+    fn retain_dirs(&self, keep: &dyn Fn(&Path) -> bool) {
+        Watches::retain_dirs(self, keep);
+    }
+}
+
+/// Whether arming failed because the process is out of watch descriptors,
+/// as opposed to the path being gone or unreadable. `ENOSPC` is what
+/// `inotify_add_watch` returns at `max_user_watches`.
+fn is_watch_exhaustion(err: &notify::Error) -> bool {
+    match &err.kind {
+        notify::ErrorKind::MaxFilesWatch => true,
+        notify::ErrorKind::Io(e) => matches!(e.raw_os_error(), Some(23) | Some(24) | Some(28)),
+        _ => false,
+    }
 }
 
 /// Whether an event reports only that something was *read*.
@@ -74,7 +246,15 @@ pub fn watcher<F: notify::EventHandler>(handler: F) -> notify::Result<Recommende
 
 /// Arm a native watch on `root` feeding `hints`. Must be called *before*
 /// the engine's initial enumeration so nothing slips between scan and arm.
-pub fn watch(root: &Path, recursive: bool, hints: HintSender) -> notify::Result<WatchBackend> {
+/// With `per_dir` (see [`per_dir_watching_pays`]) only `root` is armed here
+/// and the reconciler arms the rest as it enumerates, so excluded subtrees
+/// never cost a descriptor.
+pub fn watch(
+    root: &Path,
+    recursive: bool,
+    per_dir: bool,
+    hints: HintSender,
+) -> notify::Result<WatchBackend> {
     let mut backend = watcher(move |res: notify::Result<notify::Event>| match res {
         Ok(event) => {
             if event.need_rescan() {
@@ -92,13 +272,20 @@ pub fn watch(root: &Path, recursive: bool, hints: HintSender) -> notify::Result<
             hints.send(Hint::Rescan);
         }
     })?;
-    let mode = if recursive {
+    let mode = if recursive && !per_dir {
         RecursiveMode::Recursive
     } else {
         RecursiveMode::NonRecursive
     };
     backend.watch(root, mode)?;
-    Ok(WatchBackend { _watcher: backend })
+    Ok(WatchBackend {
+        watches: Arc::new(Watches {
+            watcher: Mutex::new(backend),
+            per_dir,
+            armed: Mutex::new(std::collections::BTreeSet::from([root.to_path_buf()])),
+            outside: Mutex::new(Default::default()),
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +325,34 @@ mod tests {
         }
     }
 
+    /// Disarming a subtree is a range query, which is only correct
+    /// because `Path` orders component-wise: `a/b`'s descendants sort
+    /// immediately after it and before `a/b-x`, a sibling that shares its
+    /// string prefix. Byte-wise ordering would put `a/b-x` *between* them
+    /// and the range would stop early, stranding watches.
+    #[test]
+    fn disarming_a_subtree_takes_the_subtree_and_stops_at_a_sibling() {
+        let dir = std::env::temp_dir().join(format!("blit-disarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["a/b/c", "a/b-x", "a/bb"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let watch = watch(&dir, true, true, HintSender { tx }).unwrap().watches;
+        for sub in ["a", "a/b", "a/b/c", "a/b-x", "a/bb"] {
+            assert!(watch.add_dir(&dir.join(sub)));
+        }
+        watch.remove_dir(&dir.join("a/b"));
+        let armed: Vec<PathBuf> = watch.armed.lock().unwrap().iter().cloned().collect();
+        let rel: Vec<&str> = armed
+            .iter()
+            .filter_map(|p| p.strip_prefix(&dir).ok())
+            .filter_map(|p| p.to_str())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rel, ["", "a", "a/b-x", "a/bb"], "the root itself stays too");
+    }
+
     /// A watched tree reachable under two names — `real/` and a symlink to it —
     /// must report changes under the *real* one.
     ///
@@ -165,7 +380,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         // `watch` arms synchronously, so nothing can slip in before the write.
-        let _backend = watch(&dir, true, HintSender { tx }).unwrap();
+        let _backend = watch(&dir, true, false, HintSender { tx }).unwrap();
         std::fs::write(dir.join("real/inner/w.txt"), b"x").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);

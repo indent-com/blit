@@ -38,6 +38,7 @@ import {
   parseTileAssignment,
 } from "./layout";
 import { BlitTile } from "../ide/BlitTile";
+import { PaneClose } from "../PaneClose";
 import { WebPaneHost, type WebPaneHostRegistrar } from "../WebPaneHost";
 import { isTileDrag, tileDragAssignment } from "../ide/tileDrag";
 import { resolveTab, isPtyRef } from "../ide/tabRegistry";
@@ -158,6 +159,10 @@ export function BSPContainer(props: {
   registerWebPaneHost?: WebPaneHostRegistrar;
   /** Drop a dragged IDE tile assignment into a specific pane. */
   onDropTile?: (assignment: string, paneId: string) => void;
+  /** Coarse pointer — keeps each pane's ✕ visible without a hover. */
+  isMobileTouch?: boolean;
+  /** Close an IDE/web tab host-wide (Workspace owns the tab registry). */
+  onCloseTab?: (assignment: string) => void;
 }) {
   const workspace = createBlitWorkspace();
   const workspaceState = createBlitWorkspaceState(workspace);
@@ -685,6 +690,41 @@ export function BSPContainer(props: {
     props.onClearPaneAssignment?.(clearPaneAssignment);
   });
 
+  /**
+   * Close whatever occupies `paneId`. The dispatch mirrors Ctrl+Alt+Shift+Q
+   * (createKeyboardShortcuts) target for target, so the ✕ and the chord can't
+   * mean different things: a tile or web pane closes its tab host-wide, a
+   * surface closes on its own connection, a terminal closes its session.
+   *
+   * An assignment that parses as none of those is an unresolved ref (a tab id
+   * or connectionId:ptyId whose session never arrived). There is nothing to
+   * close on the server, so emptying the pane is the whole job.
+   */
+  function closePane(paneId: string) {
+    const assign = layoutState().assignments[paneId] ?? null;
+    if (assign == null) return;
+    if (isTileAssignment(assign) || isWebAssignment(assign)) {
+      clearPaneAssignment(paneId);
+      props.onCloseTab?.(assign);
+      return;
+    }
+    if (isSurfaceAssignment(assign)) {
+      const parsed = parseSurfaceAssignment(assign);
+      if (parsed) {
+        workspace.closeSurface(parsed.connectionId, parsed.surfaceId);
+        return;
+      }
+      clearPaneAssignment(paneId);
+      return;
+    }
+    const session = liveSessions().find((item) => item.id === assign);
+    if (!session) {
+      clearPaneAssignment(paneId);
+      return;
+    }
+    void workspace.closeSession(session.id);
+  }
+
   function focusPane(paneId: string) {
     setFocusedPaneId(paneId);
   }
@@ -836,7 +876,11 @@ export function BSPContainer(props: {
     get multiPane() {
       return multiPane();
     },
+    get isMobileTouch() {
+      return props.isMobileTouch;
+    },
     onFocusPane: focusPane,
+    onClosePane: closePane,
     get onCreateInPane() {
       return props.onCreateInPane;
     },
@@ -1115,6 +1159,8 @@ function LeafPane(props: {
   const surfaceId = () => surfaceParsed()?.surfaceId ?? null;
   // Highlighted while a tile drag hovers this pane (a valid drop target).
   const [tileDragOver, setTileDragOver] = createSignal(false);
+  // Reveals the ✕ on pointer devices (see PaneClose).
+  const [hovered, setHovered] = createSignal(false);
   const surfaceConnectionId = () =>
     surfaceParsed()?.connectionId ?? ctx.connectionId;
 
@@ -1206,6 +1252,8 @@ function LeafPane(props: {
       }}
       onPointerDown={() => ctx.onFocusPane(props.paneId)}
       onFocusIn={() => ctx.onFocusPane(props.paneId)}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       onDragOver={(e) => {
         if (!ctx.onDropTile || !isTileDrag(e)) return;
         e.preventDefault(); // allow the drop
@@ -1237,6 +1285,21 @@ function LeafPane(props: {
             border: `2px solid ${theme().accent}`,
             "box-sizing": "border-box",
           }}
+        />
+      </Show>
+      {/* Every occupied pane gets the ✕, whatever it holds. Gated on something
+          actually being rendered rather than on the assignment being non-null:
+          a pane still resolving a tab ref falls through to EmptyPane, which
+          offers "New terminal" and has nothing to close. */}
+      <Show
+        when={tileParsed() || webParsed() || isSurface() || session() != null}
+      >
+        <PaneClose
+          theme={theme()}
+          scale={scale()}
+          alwaysVisible={ctx.isMobileTouch ?? false}
+          hovered={hovered()}
+          onClose={() => ctx.onClosePane(props.paneId)}
         />
       </Show>
       {/* IDE tile (editor/diff/commit) overlays the pane; its value is mutually

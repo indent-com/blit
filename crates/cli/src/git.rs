@@ -7,21 +7,31 @@ use crate::fs::handshake;
 use crate::transport::{Transport, read_message, write_frame};
 use blit_remote::S2C_QUIT;
 use blit_remote::git::{
-    FEATURE_GIT, GIT_CLOSED_CLIENT_REQUEST, GIT_COMMIT_LOSSY_ENCODING, GIT_COMMITS_MORE,
-    GIT_DIFF_RENAMES, GIT_DIFF_UNTRACKED, GIT_ENDPOINT_COMMIT, GIT_ENDPOINT_EMPTY,
-    GIT_ENDPOINT_INDEX, GIT_ENDPOINT_MERGE_BASE, GIT_ENDPOINT_WORKTREE, GIT_LOG_FIRST_PARENT,
-    GIT_LOG_FOLLOW, GIT_LOG_FULL_MESSAGE, GIT_LOG_TOPO, GIT_OID_NONE, GIT_OPEN_STATUS,
-    GIT_OPEN_TRACKING, GIT_OPEN_UNTRACKED, GIT_OPEN_WATCH, GIT_OTYPE_BLOB, GIT_OTYPE_COMMIT,
-    GIT_OTYPE_TREE, GIT_PATCH_TEXT, GIT_REPO_BARE, GIT_STATUS_OK, GIT_UPSTREAM_COUNTS_VALID,
-    GitCommitRecord, GitDiffRecord, GitEndpoint, GitIndexRecord, GitOid, GitStateMirror,
-    GitTreeRecord, S2C_GIT_BASE, S2C_GIT_BLOB, S2C_GIT_CLOSED, S2C_GIT_COMMITS, S2C_GIT_DIFF,
-    S2C_GIT_INDEX, S2C_GIT_LOG_PAGE, S2C_GIT_PATCH, S2C_GIT_REPO, S2C_GIT_RESOLVE, S2C_GIT_STATE,
-    S2C_GIT_TREE, git_commit_records, git_diff_records, git_index_records, git_status_text,
-    git_tree_records, msg_git_ack, msg_git_base, msg_git_blob, msg_git_diff, msg_git_index,
-    msg_git_log, msg_git_log_ack, msg_git_log_watch, msg_git_open, msg_git_patch, msg_git_resolve,
-    msg_git_tree, parse_git_base_resp, parse_git_blob_resp, parse_git_closed, parse_git_commits,
-    parse_git_diff_resp, parse_git_index_resp, parse_git_log_page, parse_git_patch_resp,
-    parse_git_repo, parse_git_resolve_resp, parse_git_state, parse_git_tree_resp,
+    FEATURE_GIT, GIT_BLAME_FOLLOW_RENAMES, GIT_BLAME_TRUNCATED, GIT_BLOB_WHOLE,
+    GIT_CLOSED_CLIENT_REQUEST, GIT_COMMIT_LOSSY_ENCODING, GIT_COMMITS_MORE, GIT_DIFF_RENAMES,
+    GIT_DIFF_UNTRACKED, GIT_DISCOVER_BARE, GIT_DISCOVER_NESTED, GIT_DISCOVER_TRUNCATED,
+    GIT_ENDPOINT_COMMIT, GIT_ENDPOINT_EMPTY, GIT_ENDPOINT_INDEX, GIT_ENDPOINT_MERGE_BASE,
+    GIT_ENDPOINT_WORKTREE, GIT_FETCH_ANCHOR, GIT_FETCH_PRUNE, GIT_FOUND_BARE, GIT_FOUND_LINKED,
+    GIT_LOG_FIRST_PARENT, GIT_LOG_FOLLOW, GIT_LOG_FULL_MESSAGE, GIT_LOG_TOPO, GIT_OID_NONE,
+    GIT_OPEN_STATUS, GIT_OPEN_TRACKING, GIT_OPEN_UNTRACKED, GIT_OPEN_WATCH, GIT_OTYPE_BLOB,
+    GIT_OTYPE_COMMIT, GIT_OTYPE_TREE, GIT_PATCH_BINARY, GIT_PATCH_TEXT, GIT_REFLOG_OLDEST_FIRST,
+    GIT_REFLOG_TRUNCATED, GIT_REPO_BARE, GIT_STATUS_OK, GIT_UPSTREAM_COUNTS_VALID, GitBlameRecord,
+    GitBlameRequest, GitBlobRequest, GitCommitRecord, GitDiffRecord, GitDiffRequest,
+    GitDiscoverRecord, GitDiscoverRequest, GitEndpoint, GitFetchRecord, GitFetchRequest,
+    GitIndexRecord, GitIndexRequest, GitOid, GitOpenRequest, GitPatchRequest, GitReflogRecord,
+    GitReflogRequest, GitStateApply, GitStateMirror, GitTreeRecord, GitTreeRequest, S2C_GIT_BASE,
+    S2C_GIT_BLAME, S2C_GIT_BLOB, S2C_GIT_CLOSED, S2C_GIT_COMMITS, S2C_GIT_DIFF, S2C_GIT_DISCOVER,
+    S2C_GIT_FETCH, S2C_GIT_INDEX, S2C_GIT_LOG_PAGE, S2C_GIT_PATCH, S2C_GIT_REFLOG, S2C_GIT_REPO,
+    S2C_GIT_RESOLVE, S2C_GIT_STATE, S2C_GIT_TREE, git_blame_records, git_commit_records,
+    git_diff_records, git_discover_records, git_fetch_records, git_index_records,
+    git_reflog_records, git_status_text, git_tree_records, msg_git_ack, msg_git_base,
+    msg_git_blame, msg_git_blob, msg_git_diff, msg_git_discover, msg_git_fetch, msg_git_index,
+    msg_git_log, msg_git_log_ack, msg_git_log_watch, msg_git_open, msg_git_patch, msg_git_reflog,
+    msg_git_resolve, msg_git_tree, parse_git_base_resp, parse_git_blame_resp, parse_git_blob_resp,
+    parse_git_closed, parse_git_commits, parse_git_diff_resp, parse_git_discover_resp,
+    parse_git_fetch_resp, parse_git_index_resp, parse_git_log_page, parse_git_patch_resp,
+    parse_git_reflog_resp, parse_git_repo, parse_git_resolve_resp, parse_git_state,
+    parse_git_tree_resp,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -57,7 +67,7 @@ async fn open_repo<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
     mut writer: W,
     path: &str,
-    flags: u8,
+    flags: u16,
 ) -> Result<(Session<R, W>, String), String> {
     let mut fragment_buf: Vec<u8> = Vec::new();
     let features = handshake(&mut reader, &mut fragment_buf).await?;
@@ -66,7 +76,12 @@ async fn open_repo<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             "server does not support git introspection (upgrade blit on the remote)".into(),
         );
     }
-    if !write_frame(&mut writer, &msg_git_open(OPEN_NONCE, flags, 0, 0, path)).await {
+    if !write_frame(
+        &mut writer,
+        &msg_git_open(&GitOpenRequest::new(OPEN_NONCE, flags, path)),
+    )
+    .await
+    {
         return Err("connection closed".into());
     }
     loop {
@@ -155,8 +170,10 @@ pub async fn cmd_status(
         if repo_id != session.repo_id {
             continue;
         }
-        let Some(state_id) = mirror.apply_state(&data) else {
-            return Err("malformed state from server".into());
+        let GitStateApply::Complete(state_id) = mirror.apply_state(&data) else {
+            // A PARTIAL chunk is buffered, not acknowledged; anything
+            // else was malformed and there is nothing to render.
+            continue;
         };
         if !write_frame(&mut session.writer, &msg_git_ack(session.repo_id, state_id)).await {
             return Err("connection closed".into());
@@ -300,6 +317,8 @@ pub struct DiffOpts {
     pub revs: Vec<String>,
     pub staged: bool,
     pub patch: bool,
+    /// With `patch`, emit binary content as git's `GIT binary patch` block.
+    pub binary: bool,
     pub path: Option<String>,
     pub json: bool,
 }
@@ -576,6 +595,7 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
         revs,
         staged,
         patch,
+        binary,
         path,
         json,
     } = opts;
@@ -654,16 +674,21 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
     if patch {
         if !write_frame(
             &mut session.writer,
-            &msg_git_patch(
-                REQ_NONCE + 2,
-                session.repo_id,
-                flags | GIT_PATCH_TEXT,
-                3,
+            &msg_git_patch(&GitPatchRequest {
+                nonce: REQ_NONCE + 2,
+                repo_id: session.repo_id,
+                flags: u16::from(flags)
+                    | GIT_PATCH_TEXT
+                    | if binary { GIT_PATCH_BINARY } else { 0 },
+                context: 3,
+                rename: 0,
                 old,
                 new,
-                &filter,
-                0,
-            ),
+                path: &filter,
+                max_len: 0,
+                after: "",
+                after_pos: 0,
+            }),
         )
         .await
         {
@@ -696,7 +721,16 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
     // Default: the changed-file list.
     if !write_frame(
         &mut session.writer,
-        &msg_git_diff(REQ_NONCE + 1, session.repo_id, flags, old, new, &filter),
+        &msg_git_diff(&GitDiffRequest {
+            nonce: REQ_NONCE + 1,
+            repo_id: session.repo_id,
+            flags,
+            rename: 0,
+            old,
+            new,
+            path: &filter,
+            after: "",
+        }),
     )
     .await
     {
@@ -782,7 +816,15 @@ pub async fn cmd_show(
     let oid = resolve_commit(&mut session, rev).await?;
     if !write_frame(
         &mut session.writer,
-        &msg_git_blob(REQ_NONCE, session.repo_id, &oid, path, max_len),
+        &msg_git_blob(&GitBlobRequest {
+            nonce: REQ_NONCE,
+            repo_id: session.repo_id,
+            flags: GIT_BLOB_WHOLE,
+            oid,
+            path,
+            offset: 0,
+            max_len,
+        }),
     )
     .await
     {
@@ -824,7 +866,14 @@ pub async fn cmd_ls_tree(
     let oid = resolve_commit(&mut session, rev).await?;
     if !write_frame(
         &mut session.writer,
-        &msg_git_tree(REQ_NONCE, session.repo_id, &oid, path),
+        &msg_git_tree(&GitTreeRequest {
+            nonce: REQ_NONCE,
+            repo_id: session.repo_id,
+            flags: 0,
+            oid,
+            path,
+            after: "",
+        }),
     )
     .await
     {
@@ -838,12 +887,17 @@ pub async fn cmd_ls_tree(
         return Err(format!("{spec}: {}", git_status_text(status)));
     }
     for rec in git_tree_records(&records) {
+        // A CURSOR record can end a truncated listing; the CLI prints one
+        // page, so entries are all it renders.
         let GitTreeRecord::Entry {
             otype,
             mode,
             oid,
             name,
-        } = rec;
+        } = rec
+        else {
+            continue;
+        };
         // git ls-tree's column order: MODE TYPE OID<TAB>NAME.
         let kind = match otype {
             GIT_OTYPE_TREE => "tree",
@@ -921,7 +975,13 @@ pub async fn cmd_ls_files(
     let (mut session, _) = open_repo(reader, writer, &repo, 0).await?;
     if !write_frame(
         &mut session.writer,
-        &msg_git_index(REQ_NONCE, session.repo_id, &path),
+        &msg_git_index(&GitIndexRequest {
+            nonce: REQ_NONCE,
+            repo_id: session.repo_id,
+            flags: 0,
+            path: &path,
+            after: "",
+        }),
     )
     .await
     {
@@ -942,7 +1002,10 @@ pub async fn cmd_ls_files(
             oid,
             path,
             ..
-        } = rec;
+        } = rec
+        else {
+            continue;
+        };
         if json {
             println!(
                 "{}",
@@ -961,4 +1024,406 @@ pub async fn cmd_ls_files(
         }
     }
     Ok(())
+}
+
+/// `blit git blame` — one row per contiguous attributed range, which is
+/// what the server computes. Authors are deliberately not here: resolve
+/// the oids with `blit git log` when you want them.
+#[allow(clippy::too_many_arguments)] // mirrors the subcommand's flags
+pub async fn cmd_blame(
+    transport: Transport,
+    repo: String,
+    path: String,
+    rev: Option<String>,
+    start: Option<u32>,
+    lines: Option<u32>,
+    follow: bool,
+    json: bool,
+) -> Result<(), String> {
+    let (reader, writer) = transport.split();
+    let (mut session, _) = open_repo(reader, writer, &repo, 0).await?;
+    // A range spec here would silently blame one endpoint, so it is
+    // refused: resolve_commit exists for exactly that.
+    let oid = match rev {
+        Some(spec) => resolve_commit(&mut session, &spec).await?,
+        None => GIT_OID_NONE,
+    };
+    let flags = if follow { GIT_BLAME_FOLLOW_RENAMES } else { 0 };
+    let escaped = escape_filter(&path);
+    let wanted = lines.unwrap_or(0);
+    let mut next_line = start.unwrap_or(0);
+    let mut delivered = 0u32;
+    // The server caps one response at BLIT_GIT_BLAME_LINES_MAX lines and
+    // says where it stopped; a whole-file blame of something large is
+    // several of those, not a silently short answer.
+    loop {
+        let line_count = if wanted == 0 {
+            0
+        } else {
+            wanted.saturating_sub(delivered)
+        };
+        if wanted != 0 && line_count == 0 {
+            return Ok(());
+        }
+        if !write_frame(
+            &mut session.writer,
+            &msg_git_blame(&GitBlameRequest {
+                nonce: REQ_NONCE,
+                repo_id: session.repo_id,
+                flags,
+                oid,
+                start_line: next_line,
+                line_count,
+                path: &escaped,
+            }),
+        )
+        .await
+        {
+            return Err("connection closed".into());
+        }
+        let data = await_resp(&mut session, S2C_GIT_BLAME).await?;
+        let Some((_, status, resp_flags, records)) = parse_git_blame_resp(&data) else {
+            return Err("malformed blame response from server".into());
+        };
+        if status != GIT_STATUS_OK {
+            return Err(format!("blame: {}", git_status_text(status)));
+        }
+        let mut cursor = None;
+        for record in git_blame_records(&records) {
+            match record {
+                GitBlameRecord::Range {
+                    commit,
+                    start_line,
+                    line_count,
+                    orig_start,
+                    orig_path,
+                    ..
+                } => {
+                    delivered = delivered.saturating_add(line_count);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "commit": hex(&commit, 40),
+                                "start": start_line,
+                                "lines": line_count,
+                                "origStart": orig_start,
+                                "origPath": orig_path,
+                            })
+                        );
+                    } else {
+                        let end = start_line + line_count - 1;
+                        let from = if orig_path.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\t{orig_path}")
+                        };
+                        println!("{} {start_line}-{end}{from}", hex(&commit, 12));
+                    }
+                }
+                GitBlameRecord::Cursor { pos, .. } => cursor = Some(pos),
+            }
+        }
+        if resp_flags & GIT_BLAME_TRUNCATED == 0 {
+            return Ok(());
+        }
+        let Some(pos) = cursor.and_then(|pos| u32::try_from(pos).ok()) else {
+            if !json {
+                eprintln!("… (truncated, and the server named no resume point)");
+            }
+            return Ok(());
+        };
+        next_line = pos.saturating_add(1);
+    }
+}
+
+/// `blit git reflog` — including entries no ref can reach any more.
+pub async fn cmd_reflog(
+    transport: Transport,
+    repo: String,
+    ref_name: String,
+    limit: u16,
+    reverse: bool,
+    json: bool,
+) -> Result<(), String> {
+    let (reader, writer) = transport.split();
+    let (mut session, _) = open_repo(reader, writer, &repo, 0).await?;
+    let flags = if reverse { GIT_REFLOG_OLDEST_FIRST } else { 0 };
+    let label = if ref_name.is_empty() {
+        "HEAD"
+    } else {
+        &ref_name
+    };
+    // `-n` is what the caller asked for; the server's own entry budget can
+    // cut a page shorter than that, so pages are followed until the
+    // caller's count is met or the reflog runs out. The index keeps
+    // counting across pages — it is the `@{n}` a caller pastes into git.
+    let mut delivered = 0u64;
+    loop {
+        let page_limit = if limit == 0 {
+            0
+        } else {
+            limit.saturating_sub(u16::try_from(delivered).unwrap_or(u16::MAX))
+        };
+        if limit != 0 && page_limit == 0 {
+            if !json {
+                eprintln!("… (more; raise -n)");
+            }
+            return Ok(());
+        }
+        let before = delivered;
+        if !write_frame(
+            &mut session.writer,
+            &msg_git_reflog(&GitReflogRequest {
+                nonce: REQ_NONCE,
+                repo_id: session.repo_id,
+                flags,
+                limit: page_limit,
+                ref_name: &ref_name,
+                after_pos: delivered,
+            }),
+        )
+        .await
+        {
+            return Err("connection closed".into());
+        }
+        let data = await_resp(&mut session, S2C_GIT_REFLOG).await?;
+        let Some((_, status, resp_flags, records)) = parse_git_reflog_resp(&data) else {
+            return Err("malformed reflog response from server".into());
+        };
+        if status != GIT_STATUS_OK {
+            return Err(format!("reflog: {}", git_status_text(status)));
+        }
+        let mut cursor = None;
+        for record in git_reflog_records(&records) {
+            match record {
+                GitReflogRecord::Entry {
+                    old,
+                    new,
+                    msg,
+                    time,
+                    ..
+                } => {
+                    let n = delivered;
+                    delivered += 1;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "index": n,
+                                "old": hex(&old, 40),
+                                "new": hex(&new, 40),
+                                "time": time,
+                                "message": msg,
+                            })
+                        );
+                    } else {
+                        println!("{} {label}@{{{n}}}: {msg}", hex(&new, 12));
+                    }
+                }
+                GitReflogRecord::Cursor { pos, .. } => cursor = Some(pos),
+            }
+        }
+        if resp_flags & GIT_REFLOG_TRUNCATED == 0 {
+            return Ok(());
+        }
+        // The cursor is where the server says it stopped; our own count is
+        // the fallback. Either way a page that advanced nothing ends the
+        // loop rather than spinning on it.
+        let resumed = cursor.unwrap_or(delivered).max(delivered);
+        if resumed == before {
+            return Ok(());
+        }
+        delivered = resumed;
+        if limit != 0 && delivered >= u64::from(limit) {
+            if !json {
+                eprintln!("… (more; raise -n)");
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// `blit git discover` — repositories under a path, deduped by gitdir.
+pub async fn cmd_discover(
+    transport: Transport,
+    path: String,
+    depth: u8,
+    nested: bool,
+    bare: bool,
+    json: bool,
+) -> Result<(), String> {
+    // No repo to open: discovery names repositories rather than using one.
+    let (mut reader, mut writer) = transport.split();
+    let mut fragment_buf: Vec<u8> = Vec::new();
+    let features = handshake(&mut reader, &mut fragment_buf).await?;
+    if features & FEATURE_GIT == 0 {
+        return Err(
+            "server does not support git introspection (upgrade blit on the remote)".into(),
+        );
+    }
+    let mut flags = 0u8;
+    if nested {
+        flags |= GIT_DISCOVER_NESTED;
+    }
+    if bare {
+        flags |= GIT_DISCOVER_BARE;
+    }
+    // The walk is capped at BLIT_GIT_DISCOVER_MAX repositories per
+    // response and says where it stopped, so a tree with more than that
+    // takes several requests — "what is under here" is a question with one
+    // answer, not one page of one.
+    let mut after = String::new();
+    loop {
+        if !write_frame(
+            &mut writer,
+            &msg_git_discover(&GitDiscoverRequest {
+                nonce: REQ_NONCE,
+                flags,
+                depth,
+                path: &path,
+                after: &after,
+            }),
+        )
+        .await
+        {
+            return Err("connection closed".into());
+        }
+        let (resp_flags, records) = loop {
+            let Some(data) = read_message(&mut reader, &mut fragment_buf).await else {
+                return Err("connection closed".into());
+            };
+            if data.first() != Some(&S2C_GIT_DISCOVER) {
+                continue;
+            }
+            let Some((_, status, resp_flags, records)) = parse_git_discover_resp(&data) else {
+                return Err("malformed discover response from server".into());
+            };
+            if status != GIT_STATUS_OK {
+                return Err(format!("discover: {}", git_status_text(status)));
+            }
+            break (resp_flags, records);
+        };
+        let mut cursor = None;
+        for record in git_discover_records(&records) {
+            match record {
+                GitDiscoverRecord::Repo {
+                    flags,
+                    workdir,
+                    gitdir,
+                } => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "workdir": workdir,
+                                "gitdir": gitdir,
+                                "bare": flags & GIT_FOUND_BARE != 0,
+                                "linked": flags & GIT_FOUND_LINKED != 0,
+                            })
+                        );
+                    } else {
+                        println!("{workdir}\t{gitdir}");
+                    }
+                }
+                GitDiscoverRecord::Cursor { after, .. } => cursor = Some(after.to_string()),
+            }
+        }
+        if resp_flags & GIT_DISCOVER_TRUNCATED == 0 {
+            return Ok(());
+        }
+        // Truncated with no cursor, or one that has not moved, is as far as
+        // this walk goes; say so rather than stopping silently.
+        match cursor {
+            Some(cursor) if cursor != after => after = cursor,
+            _ => {
+                if !json {
+                    eprintln!("… (truncated; raise BLIT_GIT_DISCOVER_SCAN_MAX on the server)");
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// `blit git fetch` — per-ref outcomes, and a non-zero exit when any ref
+/// was refused. `git fetch` can exit 0 having refused one refspec of
+/// several, which is the trap this exists to avoid.
+#[allow(clippy::too_many_arguments)] // mirrors the subcommand's flags
+pub async fn cmd_fetch(
+    transport: Transport,
+    repo: String,
+    remote: String,
+    refspecs: Vec<String>,
+    prune: bool,
+    anchor: bool,
+    timeout: u32,
+    json: bool,
+) -> Result<i32, String> {
+    let (reader, writer) = transport.split();
+    let (mut session, _) = open_repo(reader, writer, &repo, 0).await?;
+    let mut flags = 0u8;
+    if prune {
+        flags |= GIT_FETCH_PRUNE;
+    }
+    if anchor {
+        flags |= GIT_FETCH_ANCHOR;
+    }
+    let specs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+    if !write_frame(
+        &mut session.writer,
+        &msg_git_fetch(&GitFetchRequest {
+            nonce: REQ_NONCE,
+            repo_id: session.repo_id,
+            flags,
+            timeout_ms: timeout.saturating_mul(1000),
+            remote: &remote,
+            refspecs: specs,
+        }),
+    )
+    .await
+    {
+        return Err("connection closed".into());
+    }
+    let data = await_resp(&mut session, S2C_GIT_FETCH).await?;
+    let Some((_, status, _, records)) = parse_git_fetch_resp(&data) else {
+        return Err("malformed fetch response from server".into());
+    };
+    if status != GIT_STATUS_OK {
+        return Err(format!("fetch: {}", git_status_text(status)));
+    }
+    let mut refused = false;
+    for record in git_fetch_records(&records) {
+        let GitFetchRecord::Ref {
+            status,
+            old,
+            new,
+            name,
+            detail,
+            ..
+        } = record;
+        if status != GIT_STATUS_OK {
+            refused = true;
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ref": name,
+                    "old": hex(&old, 40),
+                    "new": hex(&new, 40),
+                    "ok": status == GIT_STATUS_OK,
+                    "detail": detail,
+                })
+            );
+        } else if status == GIT_STATUS_OK {
+            println!("{} {} {name}", hex(&old, 12), hex(&new, 12));
+        } else if name.is_empty() {
+            // A whole-fetch failure has no ref to name, only git's word.
+            eprintln!("! {detail}");
+        } else {
+            eprintln!("! {name}: {detail}");
+        }
+    }
+    Ok(if refused { 1 } else { 0 })
 }

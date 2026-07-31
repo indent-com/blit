@@ -27,16 +27,19 @@ use std::{fs, io};
 use blit_remote::fs::{
     FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT,
     FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION,
-    FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_LINK_DIR,
-    FS_ENTRY_NO_CONTENT, FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_ENTRY_UNREADABLE,
-    FS_ENTRY_UNSTABLE, FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_HARDLINK,
-    FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK,
-    FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_WRITE_DURABLE, FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS,
-    FS_WRITE_NO_CAS, FsContent, FsRecord, append_fs_record, msg_fs_closed, msg_fs_done,
-    msg_fs_file, msg_fs_update,
+    FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_FILTERED,
+    FS_ENTRY_LINK_DIR, FS_ENTRY_NO_CONTENT, FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK,
+    FS_ENTRY_UNREADABLE, FS_ENTRY_UNSTABLE, FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE,
+    FS_OP_HARDLINK, FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME,
+    FS_OP_SYMLINK, FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_WRITE_DURABLE, FS_WRITE_FOLLOW_SYMLINK,
+    FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent, FsRecord, append_fs_record, msg_fs_closed,
+    msg_fs_done, msg_fs_file, msg_fs_update,
 };
 
 pub mod backend;
+pub mod ignores;
+
+pub use ignores::{IgnoreSpec, MAX_PATTERNS as MAX_IGNORE_PATTERNS};
 
 // ---------------------------------------------------------------------------
 // Options and handles
@@ -161,11 +164,29 @@ pub enum Command {
     Stop,
 }
 
-/// Registration interface a backend exposes to the reconciler so newly
-/// created directories can be watched (inotify). FSEvents/RDCW backends are
-/// naturally recursive and use the no-op default.
+/// Registration interface a backend exposes to the reconciler so the set
+/// of watched directories tracks the set of *indexed* ones (inotify, where
+/// a recursive watch is a descriptor per directory and an excluded subtree
+/// would otherwise still cost them all). FSEvents/RDCW cover a tree with
+/// one object and use the no-op default, as does any unfiltered root.
 pub trait BackendHandle: Send {
-    fn add_dir(&self, _dir: &Path) {}
+    /// Arm a watch on a directory about to be enumerated. `false` means
+    /// watch descriptors are exhausted: the caller closes the root rather
+    /// than serve a mirror with a silently stale subtree in it.
+    fn add_dir(&self, _dir: &Path) -> bool {
+        true
+    }
+    /// Arm a directory *outside* the synced tree, because it holds an
+    /// ignore source the matcher consulted. Unlike [`BackendHandle::add_dir`]
+    /// this is not covered by a recursive root watch, so every filtered
+    /// root needs it however the tree itself is watched.
+    fn watch_outside(&self, _dir: &Path) {}
+    /// Disarm a directory and everything under it — deleted, or newly
+    /// excluded.
+    fn remove_dir(&self, _dir: &Path) {}
+    /// Disarm every armed directory `keep` rejects, after a full rescan
+    /// replaces the index wholesale.
+    fn retain_dirs(&self, _keep: &dyn Fn(&Path) -> bool) {}
 }
 
 pub struct NoopBackend;
@@ -178,13 +199,18 @@ impl BackendHandle for NoopBackend {}
 
 /// Identity of a shared root. Enumeration scope is part of the identity:
 /// recursive and non-recursive syncs of the same directory index different
-/// trees and cannot share a reconciler.
+/// trees and cannot share a reconciler — and neither do two syncs that
+/// exclude different things, for exactly the same reason.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RootKey {
     /// Canonical root path (see [`validate_root`]).
     pub path: PathBuf,
     pub recursive: bool,
     pub cross_filesystem: bool,
+    /// What this root excludes from enumeration, watching, hashing, and
+    /// records (docs/design/fs-watch.md "Ignoring"). Default excludes
+    /// nothing, and an empty spec costs nothing: no matcher is built.
+    pub ignores: IgnoreSpec,
 }
 
 /// Reconciler inbox.
@@ -320,8 +346,9 @@ pub fn open_root_unwatched(key: RootKey) -> Arc<SharedRootHandle> {
 /// arms on the file's PARENT directory, non-recursive — a watch on the
 /// file itself would follow its inode and go silent after a delete or a
 /// rename-over, exactly the transitions a single-file sync must deliver.
-/// `recursive`/`cross_filesystem` do not apply (nothing is enumerated), so
-/// every SINGLE sync of one file shares a single normalized key.
+/// `recursive`/`cross_filesystem`/`ignores` do not apply (nothing is
+/// enumerated — the client named the one file it wants), so every SINGLE
+/// sync of one file shares a single normalized key.
 pub fn open_single_root(path: PathBuf) -> Result<Arc<SharedRootHandle>, (u8, String)> {
     open_root_inner(single_root_key(path), true, true)
 }
@@ -337,6 +364,7 @@ fn single_root_key(path: PathBuf) -> RootKey {
         path,
         recursive: false,
         cross_filesystem: false,
+        ignores: IgnoreSpec::default(),
     }
 }
 
@@ -407,12 +435,23 @@ fn open_root_inner(
         } else {
             (key.path.clone(), key.recursive)
         };
+        // A filtered root arms per directory so excluded subtrees cost no
+        // watch descriptors; the reconciler drives it from enumeration
+        // (backend::PerDirWatch).
+        let per_dir =
+            backend::per_dir_watching_pays(key.recursive, single, !key.ignores.is_empty());
         Some(
-            backend::watch(&watch_path, recursive, hints)
+            backend::watch(&watch_path, recursive, per_dir, hints)
                 .map_err(|e| (watch_error_status(&e), e.to_string()))?,
         )
     } else {
         None
+    };
+    // Cloned before the handle takes ownership: the reconciler registers
+    // and retires directories through it for the root's whole lifetime.
+    let registrar: Box<dyn BackendHandle> = match &backend {
+        Some(backend) => Box::new(backend.watches.clone()),
+        None => Box::new(NoopBackend),
     };
     let mut map = registry().lock().unwrap();
     map.retain(|_, weak| weak.strong_count() > 0);
@@ -436,7 +475,7 @@ fn open_root_inner(
     });
     std::thread::Builder::new()
         .name("blit-fsroot".into())
-        .spawn(move || Reconciler::new(key, single, rx, closed).run())
+        .spawn(move || Reconciler::new(key, single, rx, registrar, closed).run())
         .expect("spawn fssync reconciler");
     map.insert(reg_key, Arc::downgrade(&handle));
     Ok(handle)
@@ -785,6 +824,12 @@ pub struct NodeMeta {
     /// directory. Captured at stat time so the send path and the descent gates
     /// don't each have to re-resolve the link.
     pub link_dir: bool,
+    /// Set on a directory whose last enumeration skipped an excluded
+    /// child, and sent as `FS_ENTRY_FILTERED`. Not a property of the
+    /// inode, so `stat_meta` never sets it: only the enumeration that
+    /// applied the rules knows, and it writes the answer back onto the
+    /// parent it just listed.
+    pub filtered: bool,
 }
 
 impl NodeMeta {
@@ -864,6 +909,9 @@ fn stat_meta(path: &Path) -> io::Result<NodeMeta> {
         // One extra stat, and only for links: resolving the target is the only
         // way to know whether this entry is enumerable.
         link_dir: ft.is_symlink() && fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false),
+        // Enumeration's answer, not the inode's; filled in by whoever
+        // lists this directory's children.
+        filtered: false,
         // A symlink's "content" is its target bytes (docs/design/fs-write.md
         // "Links"), so its size is the target length, as lstat reports it.
         size: if ft.is_file() || ft.is_symlink() {
@@ -1771,6 +1819,10 @@ struct Reconciler {
     /// Scan scope from the [`RootKey`] plus env-default budgets; the
     /// per-client knobs in here (content, window…) are unused.
     opts: SyncOptions,
+    /// What this root excludes, compiled. `None` when the spec is empty —
+    /// an unfiltered sync must not pay a matcher call per entry — and
+    /// always `None` in SINGLE mode, where nothing is enumerated.
+    ignores: Option<ignores::Ignores>,
     rx: Receiver<RootMsg>,
     backend: Box<dyn BackendHandle>,
     canonical: Index,
@@ -1851,6 +1903,7 @@ impl Reconciler {
         key: RootKey,
         single: bool,
         rx: Receiver<RootMsg>,
+        backend: Box<dyn BackendHandle>,
         closed_flag: Arc<OnceLock<u8>>,
     ) -> Self {
         let opts = SyncOptions {
@@ -1858,13 +1911,19 @@ impl Reconciler {
             cross_filesystem: key.cross_filesystem,
             ..Default::default()
         };
+        // SINGLE mode enumerates nothing, so an ignore spec has nothing to
+        // filter; `single_root_key` normalizes it away, and this mirrors
+        // that so the two can never disagree.
+        let ignores = (!single && !key.ignores.is_empty())
+            .then(|| ignores::Ignores::new(&key.path, &key.ignores));
         Reconciler {
             root: key.path,
             single,
             latency: opts.latency,
             opts,
+            ignores,
             rx,
-            backend: Box::new(NoopBackend),
+            backend,
             canonical: Index::new(),
             snapshot: Arc::new(Index::new()),
             subs: Default::default(),
@@ -1880,6 +1939,17 @@ impl Reconciler {
     }
 
     fn run(mut self) {
+        // Ignore sources above the root are read once at construction and
+        // no hint from inside the tree could ever report them, so watch
+        // the directories holding them — their parents, since a watch on a
+        // file follows its inode past the rename-over an editor performs.
+        // Armed before the scan like everything else, so an edit racing
+        // the initial enumeration is not lost.
+        if let Some(ignores) = &self.ignores {
+            for dir in ignores.external_watch_dirs() {
+                self.backend.watch_outside(&dir);
+            }
+        }
         // Initial enumeration; the watcher was armed at open, so anything
         // missed during the scan is already queued as a hint.
         match self.scan_all() {
@@ -1957,6 +2027,40 @@ impl Reconciler {
         }
     }
 
+    /// Whether the entry at wire path `rel` is excluded from this root
+    /// (docs/design/fs-watch.md "Ignoring"). `is_dir` must describe a
+    /// *real* directory: git's syntax distinguishes `build` from `build/`,
+    /// and a symlink is a file to it even when it resolves to a directory.
+    fn ignored(&mut self, rel: &str, is_dir: bool) -> bool {
+        match &mut self.ignores {
+            Some(ignores) => ignores.matched(rel, is_dir),
+            None => false,
+        }
+    }
+
+    /// Whether a write to `abs` changed the rules themselves, which costs
+    /// a rebuild of the matcher and a full re-enumeration. An ignore file
+    /// under an already-excluded directory is not one — nothing ever reads
+    /// it (docs/design/fs-watch.md "Ignoring").
+    fn ignore_rules_changed(&mut self, abs: &Path, rel: &str) -> bool {
+        match &mut self.ignores {
+            Some(ignores) => ignores.source_affects_rules(abs, rel),
+            None => false,
+        }
+    }
+
+    /// Disarm every watched directory the canonical index no longer holds
+    /// as a directory. A no-op for the recursive backends.
+    fn retain_watched_dirs(&self) {
+        let root = &self.root;
+        let canonical = &self.canonical;
+        self.backend.retain_dirs(&|abs| {
+            wire_key_for(root, abs)
+                .and_then(|key| canonical.get(&key).map(|m| m.node_type == FS_ENTRY_DIR))
+                .unwrap_or(false)
+        });
+    }
+
     fn recompute_latency(&mut self) {
         self.latency = self
             .subs
@@ -2002,7 +2106,26 @@ impl Reconciler {
             Hint::Dirty(abs) => {
                 let rel = match abs.strip_prefix(&self.root) {
                     Ok(rel) => rel,
-                    Err(_) => return,
+                    // Outside the tree — except for the ignore sources
+                    // above it, whose watches exist precisely so that a
+                    // parent `.gitignore` edit re-classifies this root
+                    // instead of going unnoticed for the sync's lifetime.
+                    Err(_) => {
+                        if self
+                            .ignores
+                            .as_ref()
+                            .is_some_and(|i| i.is_external_source(&abs))
+                        {
+                            if let Some(ignores) = &mut self.ignores {
+                                ignores.invalidate();
+                            }
+                            self.full_rescan = true;
+                            if self.pending_since.is_none() {
+                                self.pending_since = Some(Instant::now());
+                            }
+                        }
+                        return;
+                    }
                 };
                 let mut wire = String::new();
                 let mut depth = 0usize;
@@ -2013,6 +2136,41 @@ impl Reconciler {
                 // Non-recursive syncs index the root and its immediate
                 // children only; deeper hints are outside the sync.
                 if !self.opts.recursive && depth > 1 {
+                    return;
+                }
+                // An ignore-source edit re-classifies entries a previous
+                // scan baked in — in both directions — so the matcher is
+                // rebuilt and the tree re-enumerated rather than trusted.
+                // Tested *before* the filter: `$GIT_DIR/info/exclude` sits
+                // inside a directory the filter itself excludes, so the
+                // other order would drop the hint that its own rules moved.
+                if self.ignore_rules_changed(&abs, &wire) {
+                    if let Some(ignores) = &mut self.ignores {
+                        ignores.invalidate();
+                    }
+                    self.full_rescan = true;
+                } else if self.ignored(&wire, false) {
+                    // Excluded: dropped here, so churn under `node_modules`
+                    // never reaches a stat, a hash, or a settle tick. A
+                    // directory-only pattern (`build/`) does not match the
+                    // path as a file, so the hint survives to `reconcile`,
+                    // which stats it and excludes it there.
+                    //
+                    // One exception: a directory reporting no hidden
+                    // children just gained one, and `FS_ENTRY_FILTERED`
+                    // has to flip. Re-list that directory once — the next
+                    // excluded child finds the flag already set and costs
+                    // nothing, so this is one listing per transition, not
+                    // per event. A parent that is itself excluded is not
+                    // in the index and never qualifies.
+                    if let Some(parent) = parent_wire(&wire)
+                        && self.canonical.get(parent).is_some_and(|m| !m.filtered)
+                    {
+                        self.dirty.insert(parent.to_string());
+                        if self.pending_since.is_none() {
+                            self.pending_since = Some(Instant::now());
+                        }
+                    }
                     return;
                 }
                 self.dirty.insert(wire);
@@ -2042,6 +2200,19 @@ impl Reconciler {
                     // diff incrementally.
                     record_merge_changed(&self.canonical, &index, &mut self.changed);
                     self.canonical = index;
+                    // A rescan re-arms everything it enumerates but reports
+                    // no removals, so directories that vanished (or became
+                    // excluded) since the last one are disarmed here.
+                    self.retain_watched_dirs();
+                    // Recompiling the rules can change which sources above
+                    // the root they read — a `.gitignore` appearing in an
+                    // ancestor that had none. Re-arming is a set lookup
+                    // per directory when nothing moved.
+                    if let Some(ignores) = &self.ignores {
+                        for dir in ignores.external_watch_dirs() {
+                            self.backend.watch_outside(&dir);
+                        }
+                    }
                 }
                 Err(reason) => return self.close(reason),
             }
@@ -2162,7 +2333,8 @@ impl Reconciler {
         root_dev: Option<u64>,
     ) -> io::Result<()> {
         let mut ancestors = Vec::new();
-        self.scan_into_inner(index, abs, rel, recurse, root_dev, &mut ancestors)
+        self.scan_into_inner(index, abs, rel, recurse, root_dev, &mut ancestors)?;
+        Ok(())
     }
 
     /// `ancestors` holds the `(dev, ino)` identity of every directory on the
@@ -2178,8 +2350,19 @@ impl Reconciler {
         recurse: bool,
         root_dev: Option<u64>,
         ancestors: &mut Vec<(u64, u64)>,
-    ) -> io::Result<()> {
+        // `true` = the entry was excluded rather than indexed, which the
+        // caller records on the parent directory as `FS_ENTRY_FILTERED`.
+    ) -> io::Result<bool> {
         let meta = stat_meta(abs)?;
+        // Excluded: not indexed, not descended, not counted against the
+        // entry budget. A symlink to a directory counts as a directory
+        // here — git would call it a file, but git also does not descend
+        // it, and this sync does: a `build/` that could not exclude a
+        // symlinked `build` would leave one hole through which a whole
+        // subtree still gets mirrored.
+        if !rel.is_empty() && self.ignored(rel, meta.enumerable_dir()) {
+            return Ok(true);
+        }
         if index.len() >= self.opts.max_entries {
             return Err(io::Error::from_raw_os_error(RESOURCE_LIMIT_ERRNO));
         }
@@ -2196,31 +2379,33 @@ impl Reconciler {
         // that can never be listed.
         let (descend_id, dev) = if node_type == FS_ENTRY_SYMLINK {
             if !link_dir {
-                return Ok(()); // dangling, or a link to a file
+                return Ok(false); // dangling, or a link to a file
             }
             let Ok(target) = fs::metadata(abs) else {
-                return Ok(());
+                return Ok(false);
             };
             let id = target_identity(&target);
             if id == (0, 0) {
                 // No usable identity means no way to detect a cycle. Report the
                 // link, but do not risk descending forever.
-                return Ok(());
+                return Ok(false);
             }
             if ancestors.contains(&id) {
-                return Ok(()); // the link points back up its own path
+                return Ok(false); // the link points back up its own path
             }
             (id, id.0)
         } else if node_type == FS_ENTRY_DIR {
             (self_id, dev)
         } else {
-            return Ok(());
+            return Ok(false);
         };
 
         ancestors.push(descend_id);
-        let result = self.scan_children(index, abs, rel, recurse, root_dev, dev, ancestors);
+        let real_dir = node_type == FS_ENTRY_DIR;
+        let result =
+            self.scan_children(index, abs, rel, recurse, root_dev, dev, real_dir, ancestors);
         ancestors.pop();
-        result
+        result.map(|()| false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2232,13 +2417,25 @@ impl Reconciler {
         recurse: bool,
         root_dev: Option<u64>,
         dev: u64,
+        // `real_dir`: a real directory, not a symlink to one. Only real
+        // directories are armed — the recursive watch never followed links
+        // either (`backend::watcher`, which explains why an aliased path
+        // gets no descriptor), and arming both an alias and its target
+        // hands inotify the same descriptor twice.
+        real_dir: bool,
         ancestors: &mut Vec<(u64, u64)>,
     ) -> io::Result<()> {
         let root_dev = root_dev.or(Some(dev));
         if !self.opts.cross_filesystem && Some(dev) != root_dev {
             return Ok(()); // report the mount point, don't descend
         }
-        self.backend.add_dir(abs);
+        // Arm before listing: an entry created in the gap is either listed
+        // by the read below or reported by the watch, never neither. Watch
+        // exhaustion closes the root — the alternative is a subtree that
+        // silently stops updating.
+        if real_dir && !self.backend.add_dir(abs) {
+            return Err(io::Error::from_raw_os_error(RESOURCE_LIMIT_ERRNO));
+        }
         if !recurse && !rel.is_empty() {
             return Ok(());
         }
@@ -2246,24 +2443,32 @@ impl Reconciler {
             Ok(e) => e,
             Err(_) => return Ok(()), // unreadable dir: node stays, children unknown
         };
+        let mut filtered = false;
         for entry in entries.flatten() {
             let name = os_to_wire(&entry.file_name());
             let child_rel = join_wire(rel, &name);
             let child_abs = entry.path();
             // Non-recursive syncs index immediate children only.
             let child_recurse = self.opts.recursive;
-            if let Err(e) = self.scan_into_inner(
+            match self.scan_into_inner(
                 index,
                 &child_abs,
                 &child_rel,
                 child_recurse,
                 root_dev,
                 ancestors,
-            ) && e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO)
-            {
-                return Err(e);
+            ) {
+                Ok(excluded) => filtered |= excluded,
+                Err(e) if e.raw_os_error() == Some(RESOURCE_LIMIT_ERRNO) => return Err(e),
+                Err(_) => {}
             }
             // Other errors: entry vanished mid-scan — fine, a hint follows.
+        }
+        // Tell the client this listing is incomplete by design. Written
+        // onto the directory *after* its children, since only the walk
+        // knows what the rules covered.
+        if filtered && let Some(dir) = index.get_mut(rel) {
+            dir.filtered = true;
         }
         Ok(())
     }
@@ -2292,8 +2497,17 @@ impl Reconciler {
     }
 
     fn index_remove(&mut self, key: &str) {
-        if self.canonical.remove(key).is_some() {
-            self.changed.insert(key.to_string());
+        let Some(meta) = self.canonical.remove(key) else {
+            return;
+        };
+        self.changed.insert(key.to_string());
+        // A directory leaving the index — deleted, replaced by a file, or
+        // newly excluded — takes its watch with it. Every removal path
+        // funnels through here, so none of them can leak one.
+        if meta.node_type == FS_ENTRY_DIR
+            && let Some(abs) = resolve_wire_path(&self.root, key)
+        {
+            self.backend.remove_dir(&abs);
         }
     }
 
@@ -2338,6 +2552,27 @@ impl Reconciler {
                 self.remove_index_subtree(rel, false);
             }
             Ok(meta) => {
+                // Newly excluded — a `.gitignore` grew a line, or a
+                // directory-only pattern that the hint stage could not
+                // settle without a stat. Whatever the index holds under
+                // it goes, so the client sees one DELETE of the subtree.
+                if self.ignored(rel, meta.enumerable_dir()) {
+                    self.remove_index_subtree(rel, false);
+                    // The parent now has a hidden child. Only a listing can
+                    // clear this again, which the next enumeration of that
+                    // directory does; setting it from one path is the
+                    // cheap half of the answer and never the wrong way
+                    // round.
+                    if let Some(parent) = parent_wire(rel)
+                        && let Some(meta) = self.canonical.get(parent)
+                        && !meta.filtered
+                    {
+                        let mut meta = meta.clone();
+                        meta.filtered = true;
+                        self.index_insert(parent.to_string(), meta);
+                    }
+                    return Ok(());
+                }
                 // Cross-filesystem exclusion (docs/fs-watch.md): mirror
                 // scan_into on the hint path. A foreign-device entry is
                 // kept only if it is the mount point itself (parent on the
@@ -2373,7 +2608,13 @@ impl Reconciler {
                     .canonical
                     .get(rel)
                     .and_then(|m| (!m.content_changed(&meta)).then_some(m.hash));
+                // `filtered` is the enumeration's answer, not the inode's,
+                // so a fresh stat knows nothing about it: carry it forward
+                // rather than clearing it on every re-verification. The
+                // listing below (or the next one) is what corrects it.
+                let was_filtered = self.canonical.get(rel).is_some_and(|m| m.filtered);
                 let mut meta = meta;
+                meta.filtered = was_filtered;
                 if let Some(h) = preserved_hash {
                     meta.hash = h;
                     self.note_racy(rel, &meta);
@@ -2431,10 +2672,19 @@ impl Reconciler {
         };
         let mut seen: std::collections::HashSet<String> = Default::default();
         let mut new_dirs: Vec<(PathBuf, String)> = Vec::new();
+        let mut filtered = false;
         for entry in entries.flatten() {
             let name = os_to_wire(&entry.file_name());
             let child_rel = join_wire(rel, &name);
             if let Ok(meta) = stat_meta(&entry.path()) {
+                // An excluded child is neither indexed nor marked seen, so
+                // whatever the index still holds under it is pruned with
+                // the vanished ones below — the transition a path makes
+                // when an ignore rule starts covering it.
+                if self.ignored(&child_rel, meta.enumerable_dir()) {
+                    filtered = true;
+                    continue;
+                }
                 let newly_dir = meta.enumerable_dir()
                     && self
                         .canonical
@@ -2446,6 +2696,9 @@ impl Reconciler {
                     .get(&child_rel)
                     .and_then(|m| (!m.content_changed(&meta)).then_some(m.hash));
                 let mut meta = meta;
+                // As in `reconcile`: a stat cannot see what a listing of
+                // *this child's* children found, so keep the last answer.
+                meta.filtered = self.canonical.get(&child_rel).is_some_and(|m| m.filtered);
                 if let Some(h) = preserved {
                     meta.hash = h;
                     self.note_racy(&child_rel, &meta);
@@ -2457,6 +2710,16 @@ impl Reconciler {
                 self.check_budget()?;
             }
             seen.insert(child_rel);
+        }
+        // This listing saw every child, so it is also the authority on
+        // whether any were excluded — including when the answer flips back
+        // to `false` because the last one was deleted or un-ignored.
+        if let Some(dir) = self.canonical.get(rel)
+            && dir.filtered != filtered
+        {
+            let mut meta = dir.clone();
+            meta.filtered = filtered;
+            self.index_insert(rel.to_string(), meta);
         }
         // Children that disappeared, with their subtrees: one range walk
         // over `rel`'s subtree keyed by first component, instead of a
@@ -2948,6 +3211,9 @@ impl SyncEngine {
         let mut entry_flags = meta.node_type & FS_ENTRY_TYPE_MASK;
         if meta.link_dir {
             entry_flags |= FS_ENTRY_LINK_DIR;
+        }
+        if meta.filtered {
+            entry_flags |= FS_ENTRY_FILTERED;
         }
         let mut hash = meta.hash;
         let mut full: Option<Arc<Vec<u8>>> = None;
@@ -3813,6 +4079,16 @@ mod tests {
             path: root.to_path_buf(),
             recursive: true,
             cross_filesystem: false,
+            ignores: IgnoreSpec::default(),
+        }
+    }
+
+    /// [`test_key`] with an ignore spec — a *different* shared root, since
+    /// the spec is part of the key.
+    fn test_key_ignoring(root: &Path, ignores: IgnoreSpec) -> RootKey {
+        RootKey {
+            ignores,
+            ..test_key(root)
         }
     }
 
@@ -3896,6 +4172,7 @@ mod tests {
             hash: 0,
             dev_ino: (1, ino),
             link_dir: false,
+            filtered: false,
         }
     }
 
@@ -3964,7 +4241,11 @@ mod tests {
     /// mirror, acking as we go. Returns (mirror, sent-log, handle, hints).
     #[cfg(unix)]
     fn drive_engine(root: &Path) -> (Arc<Mutex<Vec<Vec<u8>>>>, SyncHandle, HintSender) {
-        let shared = open_root_unwatched(test_key(root));
+        drive_engine_keyed(test_key(root))
+    }
+
+    fn drive_engine_keyed(key: RootKey) -> (Arc<Mutex<Vec<Vec<u8>>>>, SyncHandle, HintSender) {
+        let shared = open_root_unwatched(key);
         let hint_tx = shared.hint_sender();
         let sent: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
         let sent2 = sent.clone();
@@ -4087,7 +4368,30 @@ mod tests {
         what: &str,
         pred: impl Fn(&FsMirror) -> bool,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        pump_until_nudging(sent, handle, mirror, seen, what, || {}, pred)
+    }
+
+    /// `pump_until`, re-sending `nudge` on every poll.
+    ///
+    /// For the waits that hang off a *single* engine-side transition — an
+    /// excluded child re-listing its parent once, and only once, so the flag
+    /// flip costs one listing rather than one per event — a lone hint has to
+    /// win against the write becoming visible to that listing. A backend
+    /// keeps hinting as long as anything moves; these tests do not, so they
+    /// re-send rather than depend on one delivery landing in the right order.
+    /// The generous deadline is for a loaded machine (the coverage job runs
+    /// every crate's tests at once, instrumented), not for a slow engine:
+    /// when nothing is wrong these return in milliseconds.
+    fn pump_until_nudging(
+        sent: &Arc<Mutex<Vec<Vec<u8>>>>,
+        handle: &SyncHandle,
+        mirror: &mut FsMirror,
+        seen: &mut usize,
+        what: &str,
+        nudge: impl Fn(),
+        pred: impl Fn(&FsMirror) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             pump_mirror(sent, handle, mirror, seen);
             if pred(mirror) {
@@ -4098,6 +4402,7 @@ mod tests {
                 "timed out waiting for {what}; live = {:?}",
                 mirror.live.keys().collect::<Vec<_>>()
             );
+            nudge();
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -4302,6 +4607,400 @@ mod tests {
             "cross_filesystem is off: a symlink to another device must not be \
              descended, found {leaked:?}"
         );
+    }
+
+    /// A filtered root arms one watch per indexed directory instead of one
+    /// recursive watch over everything, so an excluded subtree costs no
+    /// descriptors (docs/design/fs-watch.md "Ignoring"). The risk that
+    /// buys is a lost event, so this drives the *real* backend: changes
+    /// several levels down, in directories created after the initial scan,
+    /// must still arrive — while the excluded subtree stays absent and
+    /// unarmed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_directory_watching_still_delivers_every_change() {
+        let root = temp_dir().canonicalize().unwrap();
+        fs::create_dir_all(root.join("src/deep")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::write(root.join("src/deep/seed.txt"), b"seed").unwrap();
+
+        let key = test_key_ignoring(
+            &root,
+            IgnoreSpec {
+                gitignore: true,
+                dot_ignore: true,
+                exclude_git: true,
+                patterns: Vec::new(),
+            },
+        );
+        let shared = open_root(key).expect("arm native watch");
+        assert!(
+            shared
+                ._backend
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|b| b.watches.is_per_dir()),
+            "a filtered root on Linux arms per directory"
+        );
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+        let sent2 = sent.clone();
+        let handle = start_sync(
+            &shared,
+            9,
+            SyncOptions {
+                content: true,
+                latency: Duration::from_millis(5),
+                ..Default::default()
+            },
+            Box::new(move |msg| {
+                sent2.lock().unwrap().push(msg);
+                true
+            }),
+        );
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("src/deep/seed.txt")
+        });
+
+        // A write two levels down, seen only through the watch armed on
+        // that directory during the scan.
+        fs::write(root.join("src/deep/seed.txt"), b"changed").unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "deep write", |m| {
+            m.live
+                .get("src/deep/seed.txt")
+                .is_some_and(|n| n.content.as_deref() == Some(&b"changed"[..]))
+        });
+
+        // A directory created *after* the scan has to be armed by the
+        // reconcile path, and its children reported through that new watch
+        // — the arm-before-list contract, one level down.
+        fs::create_dir(root.join("src/fresh")).unwrap();
+        fs::write(root.join("src/fresh/a.txt"), b"a").unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "fresh dir", |m| {
+            m.live.contains_key("src/fresh/a.txt")
+        });
+        fs::write(root.join("src/fresh/b.txt"), b"b").unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "fresh child", |m| {
+            m.live.contains_key("src/fresh/b.txt")
+        });
+
+        // Deleting it disarms; recreating re-arms and still delivers.
+        fs::remove_dir_all(root.join("src/fresh")).unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "dir gone", |m| {
+            !m.live.contains_key("src/fresh")
+        });
+        fs::create_dir(root.join("src/fresh")).unwrap();
+        fs::write(root.join("src/fresh/c.txt"), b"c").unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "re-armed", |m| {
+            m.live.contains_key("src/fresh/c.txt")
+        });
+
+        // Meanwhile the excluded subtree was never armed and never seen.
+        fs::write(root.join("node_modules/pkg/index.js"), b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        pump_mirror(&sent, &handle, &mut mirror, &mut seen);
+        assert!(
+            !mirror.live.keys().any(|k| k.starts_with("node_modules")),
+            "live = {:?}",
+            mirror.live.keys().collect::<Vec<_>>()
+        );
+        handle.command(Command::Stop);
+    }
+
+    /// docs/design/fs-watch.md "Ignoring": excluded paths are absent from
+    /// the mirror rather than filtered out of it, churn under them
+    /// produces no update at all, and an edit to an ignore source
+    /// re-classifies the tree in both directions.
+    #[test]
+    fn excluded_paths_never_reach_the_client() {
+        let dir = temp_dir().canonicalize().unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git/config"), b"[core]").unwrap();
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::write(dir.join("node_modules/pkg/index.js"), b"x").unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::write(dir.join("target/debug/bin"), b"x").unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), b"fn main() {}").unwrap();
+        fs::write(dir.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+
+        let key = test_key_ignoring(
+            &dir,
+            IgnoreSpec {
+                gitignore: true,
+                dot_ignore: true,
+                exclude_git: true,
+                patterns: Vec::new(),
+            },
+        );
+        let (sent, handle, hint) = drive_engine_keyed(key);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("src/a.rs")
+        });
+        assert_eq!(
+            mirror.live.keys().cloned().collect::<Vec<_>>(),
+            ["", ".gitignore", "src", "src/a.rs"],
+            "the whole checkout, and nothing the exclusions cover"
+        );
+
+        // Churn under an excluded path yields nothing; a visible write in
+        // the same batch proves the pipeline was live while it did.
+        let quiet = count_updates(&sent);
+        fs::write(dir.join("target/debug/fresh.bin"), b"y").unwrap();
+        fs::write(dir.join(".git/HEAD"), b"ref: refs/heads/main").unwrap();
+        hint.send(Hint::Dirty(dir.join("target/debug/fresh.bin")));
+        hint.send(Hint::Dirty(dir.join(".git/HEAD")));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(count_updates(&sent), quiet, "excluded churn woke the sync");
+
+        fs::write(dir.join("src/b.rs"), b"pub fn b() {}").unwrap();
+        hint.send(Hint::Dirty(dir.join("src/b.rs")));
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "src/b.rs", |m| {
+            m.live.contains_key("src/b.rs")
+        });
+        assert!(
+            !mirror
+                .live
+                .keys()
+                .any(|k| k.starts_with("target") || k.starts_with(".git/")),
+            "live = {:?}",
+            mirror.live.keys().collect::<Vec<_>>()
+        );
+
+        // A new rule arrives as a DELETE of what it now covers…
+        fs::write(dir.join(".gitignore"), "target/\nnode_modules/\nsrc/a.rs\n").unwrap();
+        hint.send(Hint::Dirty(dir.join(".gitignore")));
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "a.rs gone", |m| {
+            !m.live.contains_key("src/a.rs")
+        });
+        assert!(mirror.live.contains_key("src/b.rs"), "only the rule's path");
+
+        // …and removing it as an UPSERT of what it uncovers.
+        fs::write(dir.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        hint.send(Hint::Dirty(dir.join(".gitignore")));
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "a.rs back", |m| {
+            m.live.contains_key("src/a.rs")
+        });
+        handle.command(Command::Stop);
+    }
+
+    /// An ignore file *above* the root re-classifies the tree when it is
+    /// edited. Nothing inside the root could ever hint at it, so the
+    /// reconciler watches the directories holding those sources; without
+    /// that, a sync of `repo/crates` kept `repo/.gitignore` as it read it
+    /// at open, for the life of the sync.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_edit_to_an_ignore_file_above_the_root_reaches_the_client() {
+        let top = temp_dir().canonicalize().unwrap();
+        fs::create_dir_all(top.join(".git")).unwrap();
+        let root = top.join("crates");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(top.join(".gitignore"), "*.bak\n").unwrap();
+        fs::write(root.join("a.rs"), b"x").unwrap();
+        fs::write(root.join("old.bak"), b"x").unwrap();
+
+        let key = test_key_ignoring(
+            &root,
+            IgnoreSpec {
+                gitignore: true,
+                ..Default::default()
+            },
+        );
+        let shared = open_root(key).expect("arm native watch");
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+        let sent2 = sent.clone();
+        let handle = start_sync(
+            &shared,
+            9,
+            SyncOptions {
+                latency: Duration::from_millis(5),
+                ..Default::default()
+            },
+            Box::new(move |msg| {
+                sent2.lock().unwrap().push(msg);
+                true
+            }),
+        );
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("a.rs")
+        });
+        assert!(!mirror.live.contains_key("old.bak"), "inherited from above");
+
+        // Relax the parent rule: what it hid must come back, with no hint
+        // from inside the tree to prompt it.
+        fs::write(top.join(".gitignore"), "*.tmp\n").unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "uncovered", |m| {
+            m.live.contains_key("old.bak")
+        });
+
+        // And tighten it again, this time covering a file that was visible.
+        fs::write(top.join(".gitignore"), "*.rs\n").unwrap();
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "covered", |m| {
+            !m.live.contains_key("a.rs")
+        });
+        handle.command(Command::Stop);
+    }
+
+    /// A `build/` pattern excludes a *symlinked* directory too. This sync
+    /// enumerates through such a link (docs/design/fs-watch.md § Links),
+    /// unlike git, so treating it as git does — a file, unmatchable by a
+    /// directory-only pattern — would leave the one hole through which a
+    /// whole excluded subtree still reaches the client.
+    #[test]
+    fn a_directory_pattern_excludes_a_symlinked_directory_and_its_subtree() {
+        let dir = temp_dir().canonicalize().unwrap();
+        fs::create_dir_all(dir.join("real/inner")).unwrap();
+        fs::write(dir.join("real/inner/heavy.bin"), b"x").unwrap();
+        fs::write(dir.join("keep.txt"), b"k").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("build")).unwrap();
+
+        let key = test_key_ignoring(
+            &dir,
+            IgnoreSpec {
+                patterns: vec!["build/".into()],
+                ..Default::default()
+            },
+        );
+        let (sent, handle, _hint) = drive_engine_keyed(key);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("keep.txt")
+        });
+        assert!(
+            !mirror.live.keys().any(|k| k.starts_with("build")),
+            "the link and everything enumerated through it; live = {:?}",
+            mirror.live.keys().collect::<Vec<_>>()
+        );
+        // The real path is untouched by the pattern — only the alias matched.
+        assert!(mirror.live.contains_key("real/inner/heavy.bin"));
+        handle.command(Command::Stop);
+    }
+
+    /// An excluded path is absent, not marked, so a client cannot tell an
+    /// empty directory from a filtered one. `FS_ENTRY_FILTERED` on the
+    /// *parent* is that signal — what lets a file tree say "some items
+    /// hidden" — and it tracks the directory's real state as rules and
+    /// contents change.
+    #[test]
+    fn a_directory_reports_that_it_hid_children() {
+        let dir = temp_dir().canonicalize().unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("plain")).unwrap();
+        fs::write(dir.join("src/a.rs"), b"x").unwrap();
+        fs::write(dir.join("src/a.tmp"), b"x").unwrap();
+        fs::write(dir.join("plain/b.rs"), b"x").unwrap();
+
+        let key = test_key_ignoring(
+            &dir,
+            IgnoreSpec {
+                patterns: vec!["*.tmp".into()],
+                ..Default::default()
+            },
+        );
+        let (sent, handle, hint) = drive_engine_keyed(key);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("plain/b.rs")
+        });
+        let filtered = |m: &FsMirror, path: &str| {
+            m.live
+                .get(path)
+                .is_some_and(|n| n.entry_flags & FS_ENTRY_FILTERED != 0)
+        };
+        assert!(filtered(&mirror, "src"), "src hid a.tmp");
+        assert!(!filtered(&mirror, "plain"), "plain hid nothing");
+        assert!(!filtered(&mirror, ""), "nor did the root");
+
+        // A newly excluded child sets it on a directory that had none.
+        fs::write(dir.join("plain/c.tmp"), b"x").unwrap();
+        hint.send(Hint::Dirty(dir.join("plain/c.tmp")));
+        pump_until_nudging(
+            &sent,
+            &handle,
+            &mut mirror,
+            &mut seen,
+            "plain hides",
+            || {
+                hint.send(Hint::Dirty(dir.join("plain/c.tmp")));
+            },
+            |m| {
+                m.live
+                    .get("plain")
+                    .is_some_and(|n| n.entry_flags & FS_ENTRY_FILTERED != 0)
+            },
+        );
+
+        // …and removing the last one clears it again, on the next listing
+        // of that directory.
+        fs::remove_file(dir.join("plain/c.tmp")).unwrap();
+        hint.send(Hint::Dirty(dir.join("plain")));
+        pump_until_nudging(
+            &sent,
+            &handle,
+            &mut mirror,
+            &mut seen,
+            "plain clears",
+            || {
+                hint.send(Hint::Dirty(dir.join("plain")));
+            },
+            |m| {
+                m.live
+                    .get("plain")
+                    .is_some_and(|n| n.entry_flags & FS_ENTRY_FILTERED == 0)
+            },
+        );
+        assert!(filtered(&mirror, "src"), "src still hides a.tmp");
+        handle.command(Command::Stop);
+    }
+
+    /// Client patterns outrank the ignore files (`!keep.log` re-includes
+    /// what `*.log` hid), and the exclusion set is part of the shared
+    /// root's identity: syncs excluding different things index different
+    /// trees and cannot share one reconciler.
+    #[test]
+    fn client_patterns_outrank_ignore_files_and_key_the_root() {
+        let dir = temp_dir().canonicalize().unwrap();
+        fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(dir.join("a.log"), b"x").unwrap();
+        fs::write(dir.join("keep.log"), b"x").unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+
+        let spec = IgnoreSpec {
+            gitignore: true,
+            dot_ignore: true,
+            exclude_git: false,
+            patterns: IgnoreSpec::parse_patterns("!keep.log\nnotes.txt"),
+        };
+        let (sent, handle, _hint) = drive_engine_keyed(test_key_ignoring(&dir, spec.clone()));
+        let mut mirror = FsMirror::new();
+        let mut seen = 0usize;
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "initial", |m| {
+            m.live.contains_key("keep.log")
+        });
+        assert_eq!(
+            mirror.live.keys().cloned().collect::<Vec<_>>(),
+            ["", ".gitignore", "keep.log"]
+        );
+
+        let same = open_root_unwatched(test_key_ignoring(&dir, spec.clone()));
+        let again = open_root_unwatched(test_key_ignoring(&dir, spec));
+        assert!(Arc::ptr_eq(&same, &again), "one spec, one shared root");
+        let unfiltered = open_root_unwatched(test_key(&dir));
+        assert!(
+            !Arc::ptr_eq(&same, &unfiltered),
+            "an unfiltered sync indexes a different tree"
+        );
+        handle.command(Command::Stop);
     }
 
     /// A root whose name contains `%` survives the FS_SYNCED round trip. The

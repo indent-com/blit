@@ -5,11 +5,28 @@ import type { BlitWasmModule } from "../TerminalStore";
 import { fsCompressLiteral } from "../fs";
 import {
   C2S_GIT_BLOB,
+  C2S_GIT_DISCOVER,
   C2S_GIT_OPEN,
   FEATURE_GIT,
   GIT_CLOSED_REPO_GONE,
   GIT_COMMIT_LOSSY_ENCODING,
   GIT_DIFF_RENAMES,
+  GIT_DISCOVER_TRUNCATED,
+  GIT_FOUND_BARE,
+  S2C_GIT_DISCOVER,
+  GIT_RECORD_CURSOR,
+  GIT_REF_SYMBOLIC,
+  GIT_REMOTE_DEFAULT,
+  GIT_STATE_PARTIAL,
+  GIT_STATUS_CANCELLED,
+  GIT_STATUS_NOT_FOUND,
+  GIT_STATUS_OTHER,
+  GitStatusError,
+  gitBlameRecords,
+  gitStatusText,
+  isGitPseudoRef,
+  gitDiscoverRecords,
+  gitReflogRecords,
   GIT_ENDPOINT_COMMIT,
   GIT_ENDPOINT_WORKTREE,
   GIT_INDEX_INTENT_TO_ADD,
@@ -18,9 +35,11 @@ import {
   GIT_OPEN_STATUS,
   GIT_OPEN_WATCH,
   GIT_OID_FORMAT_SHA1,
-  GIT_STATUS_NOT_FOUND,
   S2C_GIT_BLOB,
+  S2C_GIT_INDEX,
+  S2C_GIT_PATCH,
   S2C_GIT_REPO,
+  S2C_GIT_TREE,
   GIT_PATCH_CHAR_SPANS,
   GIT_REPO_LINKED,
   GIT_STATUS_OK,
@@ -50,6 +69,7 @@ import {
   msgGitLogUnwatch,
   msgGitLogWatch,
   msgGitOpen,
+  GIT_PATCH_RENAMES,
   msgGitPatch,
   msgGitResolve,
   msgGitResolveResp,
@@ -100,15 +120,32 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
   it("builds every C2S message byte-identically", () => {
     expect(
       hex(
-        msgGitOpen(0x0102, GIT_OPEN_WATCH | GIT_OPEN_STATUS, 50, 500, "/repo"),
+        msgGitOpen({
+          nonce: 0x0102,
+          flags: GIT_OPEN_WATCH | GIT_OPEN_STATUS,
+          refsLatencyMs: 50,
+          statusLatencyMs: 500,
+          path: "/repo",
+        }),
       ),
-    ).toBe("500201033200f40105002f7265706f");
-    // FROM_PTY open (docs/ide.md Decision 3): flag bit set + trailing src pty.
-    expect(hex(msgGitOpen(1, GIT_OPEN_WATCH, 0, 0, "sub", 9))).toBe(
-      "500100210000000003007375620900",
+    ).toBe("a0020103003200f401ffffffff000005002f7265706f");
+    // Context ids and a prefix filter, all in the one parse shape.
+    expect(
+      hex(
+        msgGitOpen({
+          nonce: 1,
+          flags: GIT_OPEN_WATCH,
+          parentRepoId: 4,
+          refPrefixes: ["refs/heads/"],
+          path: "vendor/lib",
+        }),
+      ),
+    ).toBe(
+      "a00100010000000000ffff04000100" +
+        "0b00726566732f68656164732f0a0076656e646f722f6c6962",
     );
-    expect(hex(msgGitClose(7))).toBe("510700");
-    expect(hex(msgGitAck(7, 0x01020304))).toBe("52070004030201");
+    expect(hex(msgGitClose(7))).toBe("a10700");
+    expect(hex(msgGitAck(7, 0x01020304))).toBe("a2070004030201");
     expect(
       hex(
         msgGitLog({
@@ -121,13 +158,21 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
           hides: [oid(0xbb)],
         }),
       ),
-    ).toBe(`530300070001640003007372630100${o(0xaa)}0100${o(0xbb)}`);
-    expect(hex(msgGitTree(4, 7, oid(0xcc), "dir/%FF"))).toBe(
-      `5404000700${o(0xcc)}07006469722f254646`,
-    );
-    expect(hex(msgGitBlob(5, 7, oid(0xdd), "", 1 << 20))).toBe(
-      `5505000700${o(0xdd)}000000001000`,
-    );
+    ).toBe(`a70300070001640003007372630100${o(0xaa)}0100${o(0xbb)}`);
+    expect(
+      hex(msgGitTree({ nonce: 4, repoId: 7, oid: oid(0xcc), path: "dir/%FF" })),
+    ).toBe(`ab0400070000${o(0xcc)}07006469722f2546460000`);
+    expect(
+      hex(
+        msgGitBlob({
+          nonce: 5,
+          repoId: 7,
+          oid: oid(0xdd),
+          path: "",
+          maxLen: 1 << 20,
+        }),
+      ),
+    ).toBe(`ac0500070000${o(0xdd)}0000000000000000000000001000`);
     const old = { kind: GIT_ENDPOINT_COMMIT, oid: oid(0x11) };
     const worktree = { kind: GIT_ENDPOINT_WORKTREE, oid: GIT_OID_NONE };
     expect(
@@ -136,18 +181,19 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
           nonce: 6,
           repoId: 7,
           flags: GIT_DIFF_RENAMES,
+          rename: 50,
           old,
           new: worktree,
           path: "",
         }),
       ),
-    ).toBe(`56060007000101${o(0x11)}04${ZERO_OID}0000`);
+    ).toBe(`ad06000700013201${o(0x11)}04${ZERO_OID}00000000`);
     expect(
       hex(
         msgGitPatch({
           nonce: 8,
           repoId: 7,
-          flags: GIT_DIFF_RENAMES | GIT_PATCH_CHAR_SPANS,
+          flags: GIT_PATCH_RENAMES | GIT_PATCH_CHAR_SPANS,
           context: 5,
           old,
           new: worktree,
@@ -155,25 +201,30 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
           maxLen: 0,
         }),
       ),
-    ).toBe(`5708000700410501${o(0x11)}04${ZERO_OID}0500612e74787400000000`);
-    expect(hex(msgGitIndex(9, 7, "sub"))).toBe("58090007000300737562");
-    expect(hex(msgGitCancel(10))).toBe("590a00");
+    ).toBe(
+      `ae080007008100050001${o(0x11)}04${ZERO_OID}` +
+        "0500612e7478740000000000000000000000000000",
+    );
+    expect(hex(msgGitIndex({ nonce: 9, repoId: 7, path: "sub" }))).toBe(
+      "af090007000003007375620000",
+    );
+    expect(hex(msgGitCancel(10))).toBe("a30a00");
     expect(hex(msgGitBase(11, 7, [oid(0xaa), oid(0xbb)]))).toBe(
-      `5a0b00070002${o(0xaa)}${o(0xbb)}`,
+      `b00b00070002${o(0xaa)}${o(0xbb)}`,
     );
     expect(hex(msgGitResolve(12, 7, "main..dev"))).toBe(
-      "5b0c00070009006d61696e2e2e646576",
+      "a60c00070009006d61696e2e2e646576",
     );
     expect(hex(msgGitLogWatch(1, 7, GIT_LOG_FIRST_PARENT, 100, "main"))).toBe(
-      "5c0100070001640004006d61696e",
+      "a80100070001640004006d61696e",
     );
-    expect(hex(msgGitLogUnwatch(1, 7))).toBe("5d01000700");
-    expect(hex(msgGitLogAck(1, 7, 0x01020304))).toBe("5e0100070004030201");
+    expect(hex(msgGitLogUnwatch(1, 7))).toBe("a901000700");
+    expect(hex(msgGitLogAck(1, 7, 0x01020304))).toBe("aa0100070004030201");
   });
 
   it("parses the pinned S2C messages", () => {
     const repo = parseGitRepo(
-      fromHex("500201010000000802002f7707002f772f2e676974"),
+      fromHex("a00201010000000802002f7707002f772f2e676974"),
     );
     expect(repo).toEqual({
       nonce: 0x0102,
@@ -184,12 +235,12 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
       workdir: "/w",
       gitdir: "/w/.git",
     });
-    expect(hex(msgGitClosed(1, GIT_CLOSED_REPO_GONE))).toBe("52010001");
-    expect(parseGitClosed(fromHex("52010001"))).toEqual([
+    expect(hex(msgGitClosed(1, GIT_CLOSED_REPO_GONE))).toBe("a5010001");
+    expect(parseGitClosed(fromHex("a5010001"))).toEqual([
       1,
       GIT_CLOSED_REPO_GONE,
     ]);
-    const base = parseGitBaseResp(fromHex(`5a0b000001${o(0xab)}`));
+    const base = parseGitBaseResp(fromHex(`b00b000001${o(0xab)}`));
     expect(base?.[0]).toBe(11);
     expect(base?.[1]).toBe(GIT_STATUS_OK);
     expect(hex(base![2][0])).toBe(o(0xab));
@@ -197,9 +248,9 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
     // GIT_RESOLVE reply, pinned against the Rust fixture.
     expect(
       hex(msgGitResolveResp(12, GIT_STATUS_OK, [oid(0xcc)], [oid(0xdd)])),
-    ).toBe(`5b0c00000100${o(0xcc)}0100${o(0xdd)}`);
+    ).toBe(`a60c00000100${o(0xcc)}0100${o(0xdd)}`);
     const resolved = parseGitResolveResp(
-      fromHex(`5b0c00000100${o(0xcc)}0100${o(0xdd)}`),
+      fromHex(`a60c00000100${o(0xcc)}0100${o(0xdd)}`),
     );
     expect(resolved?.nonce).toBe(12);
     expect(resolved?.status).toBe(GIT_STATUS_OK);
@@ -312,12 +363,14 @@ describe("git wire fixtures (cross-checked with Rust)", () => {
     const patch = [
       ...gitPatchRecords(
         fromHex(
-          "1000000001000500612e7478740500612e7478742f0000000201000000010000000500000068656c6c6f0500000068616c6c6f010001000000010000000100010000000100000009000000030300000003000000",
+          "12000000014d00000500612e7478740500612e7478742f0000000201000000010000000500000068656c6c6f0500000068616c6c6f010001000000010000000100010000000100000009000000030300000003000000",
         ),
       ),
     ];
     expect(patch[0]).toMatchObject({
       kind: "file",
+      st: "M".charCodeAt(0),
+      similarity: 0,
       oldPath: "a.txt",
       newPath: "a.txt",
     });
@@ -363,12 +416,14 @@ describe("git state mirror", () => {
       oid: oid(1),
       peeled: GIT_OID_NONE,
       name: "refs/heads/main",
+      target: "",
     });
     appendGitStateRecord(first, {
       kind: "status",
       staged: "M".charCodeAt(0),
       unstaged: " ".charCodeAt(0),
       flags: 0,
+      oid: oid(9),
       oldPath: "",
       path: "a.txt",
     });
@@ -615,5 +670,424 @@ describe("BlitConnection git blob cache", () => {
     pushBlob(transport, blobRequests(transport).pop()!, enc("y".repeat(40)));
     expect(dec(await p)).toBe("y".repeat(40));
     conn.dispose();
+  });
+});
+
+describe("git second pass", () => {
+  it("decodes the shared CURSOR record in every truncatable family", () => {
+    // One record shape, one branch to write — the point of reserving the
+    // kind family-wide (docs/design/git.md "Continuation").
+    const buf: number[] = [];
+    buf.push(0, 0, 0, 0);
+    const start = 0;
+    buf.push(GIT_RECORD_CURSOR);
+    const path = new TextEncoder().encode("src/z.rs");
+    buf.push(path.length & 0xff, (path.length >> 8) & 0xff, ...path);
+    for (let i = 0; i < 8; i++) buf.push(i === 0 ? 42 : 0);
+    const len = buf.length - start - 4;
+    buf[0] = len & 0xff;
+    buf[1] = (len >> 8) & 0xff;
+    buf[2] = (len >> 16) & 0xff;
+    buf[3] = (len >> 24) & 0xff;
+    const bytes = new Uint8Array(buf);
+
+    for (const iter of [
+      gitTreeRecords,
+      gitDiffRecords,
+      gitPatchRecords,
+      gitIndexRecords,
+      gitBlameRecords,
+      gitReflogRecords,
+      gitDiscoverRecords,
+    ]) {
+      const [record] = [...iter(bytes)];
+      expect(record).toEqual({
+        kind: "cursor",
+        after: "src/z.rs",
+        pos: 42n,
+      });
+    }
+  });
+
+  it("assembles a PARTIAL snapshot before installing it", () => {
+    const first: number[] = [];
+    appendGitStateRecord(first, {
+      kind: "head",
+      flags: 0,
+      oid: oid(1),
+      name: "refs/heads/main",
+    });
+    const second: number[] = [];
+    appendGitStateRecord(second, {
+      kind: "ref",
+      flags: GIT_REF_SYMBOLIC,
+      oid: oid(2),
+      peeled: GIT_OID_NONE,
+      name: "refs/remotes/origin/HEAD",
+      target: "refs/remotes/origin/trunk",
+    });
+
+    const mirror = new GitStateMirror();
+    expect(
+      mirror.applyState(
+        msgGitState(1, 5, GIT_STATE_PARTIAL, new Uint8Array(first)),
+      ),
+    ).toBeNull();
+    // Nothing is visible yet: the snapshot is not complete.
+    expect(mirror.head).toBeNull();
+    expect(
+      mirror.applyState(msgGitState(1, 5, 0, new Uint8Array(second))),
+    ).toBe(5);
+    expect(mirror.head?.name).toBe("refs/heads/main");
+    // And the symbolic target names the default branch, rather than the
+    // client guessing `main` then `master`.
+    expect(mirror.refs.get("refs/remotes/origin/HEAD")?.target).toBe(
+      "refs/remotes/origin/trunk",
+    );
+  });
+
+  it("carries STATE_REMOTE urls as configured", () => {
+    const buf: number[] = [];
+    appendGitStateRecord(buf, {
+      kind: "remote",
+      flags: GIT_REMOTE_DEFAULT,
+      name: "origin",
+      fetchUrl: "https://token@example.com/o/r.git",
+      pushUrl: "",
+    });
+    const mirror = new GitStateMirror();
+    mirror.applyState(msgGitState(1, 1, 0, new Uint8Array(buf)));
+    // Not redacted: the caller has a shell and can read .git/config, so
+    // stripping it would only stop them reproducing the remote.
+    expect(mirror.remotes.get("origin")).toEqual({
+      flags: GIT_REMOTE_DEFAULT,
+      fetchUrl: "https://token@example.com/o/r.git",
+      pushUrl: "",
+    });
+  });
+
+  it("gives a rejection its status code, not just a message", () => {
+    // The gap that made a consumer revert a NOT_FOUND probe: the only
+    // available test was matching on message text.
+    const err = new GitStatusError("Resolve", GIT_STATUS_NOT_FOUND);
+    expect(err.status).toBe(GIT_STATUS_NOT_FOUND);
+    expect(err.message).toBe("Resolve failed: not found");
+    expect(err.cancelled).toBe(false);
+    expect(new GitStatusError("Patch", GIT_STATUS_CANCELLED).cancelled).toBe(
+      true,
+    );
+    const withDetail = new GitStatusError("Open", GIT_STATUS_OTHER, "boom");
+    expect(withDetail.detail).toBe("boom");
+    expect(withDetail.message).toBe("Open failed: backend error: boom");
+    // Total: OTHER and an unrecognized code must not collide.
+    expect(gitStatusText(GIT_STATUS_OTHER)).toBe("backend error");
+    expect(gitStatusText(200)).toBe("unknown status 200");
+  });
+});
+
+/**
+ * The handle is the only surface a consumer has, so an option it advertises
+ * and does not forward is the same as an option that does not exist. These
+ * drive the wire: what the client sends, and what it does with a cursor it
+ * is given back.
+ */
+describe("git handle forwards what it advertises", () => {
+  /** An S2C records response: [op][nonce:2][status:1][flags:1][lz4 records]. */
+  function recordsResp(
+    opcode: number,
+    nonce: number,
+    flags: number,
+    records: number[],
+    status = GIT_STATUS_OK,
+  ): Uint8Array {
+    const body = fsCompressLiteral(new Uint8Array(records));
+    const msg = new Uint8Array(5 + body.length);
+    msg[0] = opcode;
+    msg[1] = nonce & 0xff;
+    msg[2] = (nonce >> 8) & 0xff;
+    msg[3] = status;
+    msg[4] = flags;
+    msg.set(body, 5);
+    return msg;
+  }
+
+  /** A CURSOR record naming `after`, framed as records are on the wire. */
+  function cursorRecord(after: string): number[] {
+    const path = [...new TextEncoder().encode(after)];
+    const body = [
+      GIT_RECORD_CURSOR,
+      path.length & 0xff,
+      (path.length >> 8) & 0xff,
+      ...path,
+      ...new Array(8).fill(0),
+    ];
+    return [
+      body.length & 0xff,
+      (body.length >> 8) & 0xff,
+      (body.length >> 16) & 0xff,
+      (body.length >> 24) & 0xff,
+      ...body,
+    ];
+  }
+
+  const lastSent = (transport: MockTransport, opcode: number): Uint8Array =>
+    transport.sent.filter((m) => m[0] === opcode).pop()!;
+
+  /** The trailing length-prefixed string of a request frame. */
+  function trailingStr(msg: Uint8Array, offset: number): string {
+    const len = msg[offset] | (msg[offset + 1] << 8);
+    return new TextDecoder().decode(msg.subarray(offset + 2, offset + 2 + len));
+  }
+
+  it("round-trips a tree cursor: server says where it stopped, client resumes there", async () => {
+    const { conn, transport } = gitReadyConnection();
+    const repo = await openTestRepo(conn, transport, 1);
+
+    const first = repo.tree(oid(1));
+    const req = lastSent(transport, S2C_GIT_TREE);
+    const nonce = req[1] | (req[2] << 8);
+    // Truncated, with the cursor the family rule requires.
+    transport.push(
+      recordsResp(S2C_GIT_TREE, nonce, 1, cursorRecord("src/lib.rs")),
+    );
+    const records = await first;
+    const cursor = records.find((r) => r.kind === "cursor");
+    expect(cursor).toMatchObject({ kind: "cursor", after: "src/lib.rs" });
+
+    // Resuming with it has to reach the wire, or the cursor is decoration.
+    const second = repo.tree(oid(1), "", { after: "src/lib.rs" });
+    const resumed = lastSent(transport, S2C_GIT_TREE);
+    // [op][nonce:2][repo:2][flags:1][oid:32][path_len:2][path][after…]
+    expect(trailingStr(resumed, 38 + 2)).toBe("src/lib.rs");
+    transport.push(
+      recordsResp(S2C_GIT_TREE, resumed[1] | (resumed[2] << 8), 0, []),
+    );
+    await second;
+    conn.dispose();
+  });
+
+  it("forwards a patch's rename threshold and mid-file resume", async () => {
+    const { conn, transport } = gitReadyConnection();
+    const repo = await openTestRepo(conn, transport, 1);
+    const endpoint = { kind: GIT_ENDPOINT_COMMIT, oid: oid(2) };
+    const p = repo.patch(endpoint, endpoint, {
+      rename: 50,
+      after: "big.txt",
+      afterPos: 4096,
+      maxLen: 2048,
+    });
+    const req = lastSent(transport, S2C_GIT_PATCH);
+    // rename sits after [op][nonce:2][repo:2][flags:2][context:1].
+    expect(req[8]).toBe(50);
+    // …and the tail is [after_len:2][after][after_pos:8]. Find it from the
+    // end: the last 8 bytes are the position.
+    const posOffset = req.length - 8;
+    const view = new DataView(req.buffer, req.byteOffset);
+    expect(Number(view.getBigUint64(posOffset, true))).toBe(4096);
+    expect(trailingStr(req, posOffset - "big.txt".length - 2)).toBe("big.txt");
+    transport.push(recordsResp(S2C_GIT_PATCH, req[1] | (req[2] << 8), 1, []));
+    await p;
+    conn.dispose();
+  });
+
+  it("cancels a request through the signal it advertises", async () => {
+    const { conn, transport } = gitReadyConnection();
+    const repo = await openTestRepo(conn, transport, 1);
+    const controller = new AbortController();
+    const endpoint = { kind: GIT_ENDPOINT_COMMIT, oid: oid(3) };
+    const p = repo.patch(endpoint, endpoint, { signal: controller.signal });
+    const req = lastSent(transport, S2C_GIT_PATCH);
+    controller.abort();
+    // The caller is told at once, and the server is told to stop.
+    await expect(p).rejects.toMatchObject({
+      cancelled: true,
+      op: "Patch",
+    });
+    const cancel = transport.sent.filter((m) => m[0] === 0xa3).pop()!;
+    expect(cancel[1] | (cancel[2] << 8)).toBe(req[1] | (req[2] << 8));
+    conn.dispose();
+  });
+
+  it("labels a rejection with the read that produced it", async () => {
+    const { conn, transport } = gitReadyConnection();
+    const repo = await openTestRepo(conn, transport, 1);
+    const p = repo.index("nope/");
+    const req = lastSent(transport, S2C_GIT_INDEX);
+    transport.push(
+      recordsResp(
+        S2C_GIT_INDEX,
+        req[1] | (req[2] << 8),
+        0,
+        [],
+        GIT_STATUS_NOT_FOUND,
+      ),
+    );
+    await expect(p).rejects.toMatchObject({
+      op: "Index",
+      status: GIT_STATUS_NOT_FOUND,
+    });
+    conn.dispose();
+  });
+});
+
+/**
+ * `GIT_DISCOVER` is the one git read with no repo to hang off — it
+ * enumerates repositories rather than using one, and allocates no repo id.
+ * Without a client entry point a consumer has to hand-build the frame and
+ * correlate the nonce itself, which is the probe ladder #104 exists to
+ * delete.
+ */
+describe("discoverRepos", () => {
+  /** REPO_FOUND: [kind:1][flags:1][wd_len:2][wd][gd_len:2][gd], framed. */
+  function repoRecord(workdir: string, gitdir: string, flags = 0): number[] {
+    const enc = new TextEncoder();
+    const wd = [...enc.encode(workdir)];
+    const gd = [...enc.encode(gitdir)];
+    const body = [
+      0x01,
+      flags,
+      wd.length & 0xff,
+      (wd.length >> 8) & 0xff,
+      ...wd,
+      gd.length & 0xff,
+      (gd.length >> 8) & 0xff,
+      ...gd,
+    ];
+    return [
+      body.length & 0xff,
+      (body.length >> 8) & 0xff,
+      (body.length >> 16) & 0xff,
+      (body.length >> 24) & 0xff,
+      ...body,
+    ];
+  }
+
+  function cursor(after: string): number[] {
+    const path = [...new TextEncoder().encode(after)];
+    const body = [
+      GIT_RECORD_CURSOR,
+      path.length & 0xff,
+      (path.length >> 8) & 0xff,
+      ...path,
+      ...new Array(8).fill(0),
+    ];
+    return [
+      body.length & 0xff,
+      (body.length >> 8) & 0xff,
+      (body.length >> 16) & 0xff,
+      (body.length >> 24) & 0xff,
+      ...body,
+    ];
+  }
+
+  function discoverResp(
+    nonce: number,
+    flags: number,
+    records: number[],
+  ): Uint8Array {
+    const body = fsCompressLiteral(new Uint8Array(records));
+    const msg = new Uint8Array(5 + body.length);
+    msg[0] = S2C_GIT_DISCOVER;
+    msg[1] = nonce & 0xff;
+    msg[2] = (nonce >> 8) & 0xff;
+    msg[3] = GIT_STATUS_OK;
+    msg[4] = flags;
+    msg.set(body, 5);
+    return msg;
+  }
+
+  const lastDiscover = (transport: MockTransport): Uint8Array =>
+    transport.sent.filter((m) => m[0] === C2S_GIT_DISCOVER).pop()!;
+
+  it("follows the cursor to the end of the walk", async () => {
+    const { conn, transport } = gitReadyConnection();
+    const pages: string[][] = [];
+    const all = conn.discoverRepos("/src", {
+      depth: 3,
+      onPage: (repos) => pages.push(repos.map((r) => r.workdir)),
+    });
+
+    // Page one, capped: the server says where it stopped.
+    const first = lastDiscover(transport);
+    transport.push(
+      discoverResp(first[1] | (first[2] << 8), GIT_DISCOVER_TRUNCATED, [
+        ...repoRecord("/src/a", "/src/a/.git"),
+        ...cursor("/src/a"),
+      ]),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Page two carries the cursor, and ends the walk.
+    const second = lastDiscover(transport);
+    expect(second).not.toBe(first);
+    const afterLen = second[second.length - 8] | 0;
+    expect(afterLen).toBeGreaterThan(0);
+    transport.push(
+      discoverResp(second[1] | (second[2] << 8), 0, [
+        ...repoRecord("/src/b", "/src/b/.git", GIT_FOUND_BARE),
+      ]),
+    );
+
+    const repos = await all;
+    expect(repos.map((r) => r.workdir)).toEqual(["/src/a", "/src/b"]);
+    expect(repos[1].bare).toBe(true);
+    // Each page is handed over as it lands, for a progressive render.
+    expect(pages).toEqual([["/src/a"], ["/src/b"]]);
+    conn.dispose();
+  });
+
+  it("refuses on a server without the git family", async () => {
+    const transport = new MockTransport();
+    const conn = new BlitConnection({
+      id: "test",
+      transport,
+      wasm,
+      autoConnect: false,
+    });
+    transport.pushHello(1, 0);
+    transport.pushReady();
+    await expect(conn.discoverRepos("/src")).rejects.toThrow(
+      /does not support git/,
+    );
+    conn.dispose();
+  });
+});
+
+describe("pseudo-refs in the ref stream", () => {
+  it("are distinguishable from refs a client could check out", () => {
+    // The migration hazard: before this pass every key in the ref map began
+    // with refs/. A consumer inverting the map to decorate a log now finds
+    // ORIG_HEAD among the branches unless it filters, so the rule is one
+    // exported call rather than one each consumer rediscovers.
+    expect(isGitPseudoRef("MERGE_HEAD")).toBe(true);
+    expect(isGitPseudoRef("MERGE_HEAD#2")).toBe(true);
+    expect(isGitPseudoRef("ORIG_HEAD")).toBe(true);
+    expect(isGitPseudoRef("refs/heads/main")).toBe(false);
+    expect(isGitPseudoRef("refs/tags/v1")).toBe(false);
+    expect(isGitPseudoRef("refs/remotes/origin/HEAD")).toBe(false);
+
+    // And it holds over a real snapshot, which is where a consumer meets it.
+    const buf: number[] = [];
+    appendGitStateRecord(buf, {
+      kind: "ref",
+      flags: 0,
+      oid: oid(1),
+      peeled: GIT_OID_NONE,
+      name: "refs/heads/main",
+      target: "",
+    });
+    appendGitStateRecord(buf, {
+      kind: "ref",
+      flags: 0,
+      oid: oid(2),
+      peeled: GIT_OID_NONE,
+      name: "MERGE_HEAD",
+      target: "",
+    });
+    const mirror = new GitStateMirror();
+    mirror.applyState(msgGitState(1, 1, 0, new Uint8Array(buf)));
+    const branches = [...mirror.refs.keys()].filter((n) => !isGitPseudoRef(n));
+    expect(branches).toEqual(["refs/heads/main"]);
   });
 });

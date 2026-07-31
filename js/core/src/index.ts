@@ -48,6 +48,10 @@ export {
   FS_SYNC_RECURSIVE,
   FS_SYNC_CONTENT,
   FS_SYNC_CROSS_FILESYSTEM,
+  FS_SYNC_DOTIGNORE,
+  FS_SYNC_EXCLUDE_GIT,
+  FS_SYNC_GITIGNORE,
+  FS_SYNC_EXCLUDE,
   FS_STATUS_OK,
   FS_STATUS_NOT_FOUND,
   FS_STATUS_PERMISSION_DENIED,
@@ -68,10 +72,12 @@ export {
   FS_ENTRY_NO_CONTENT,
   FS_ENTRY_UNSTABLE,
   FS_ENTRY_LINK_DIR,
+  FS_ENTRY_FILTERED,
   FsMirror,
   applyFsDelta,
   fsCompress,
   FsConflictError,
+  FsOpenError,
 } from "./fs";
 export type {
   FsNode,

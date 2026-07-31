@@ -106,6 +106,7 @@ import { searchInputFocused } from "./ide/searchStore";
 import { ProblemsPanel } from "./ide/ProblemsPanel";
 import { BlitTile } from "./ide/BlitTile";
 import { tileDisplay } from "./ide/tileDisplay";
+import { startTileDrag, isTileDrag, tileDragAssignment } from "./ide/tileDrag";
 import {
   tabId,
   stripConn,
@@ -113,6 +114,7 @@ import {
   unregisterTab,
   resolveTab,
 } from "./ide/tabRegistry";
+import { createOpenTabs } from "./ide/openTabs";
 import {
   allServerRoots,
   hasServerRoots,
@@ -154,6 +156,7 @@ import {
 } from "./preview";
 
 import { MobileToolbar } from "./MobileToolbar";
+import { PaneClose } from "./PaneClose";
 import type { BSPAssignments, BSPLayout } from "./bsp/layout";
 import {
   loadActiveLayout,
@@ -288,16 +291,35 @@ function WorkspaceScreen(props: {
   // and a terminal are on screen together, so focus can leave the tile
   // without unmounting it — and a tile only clears its own chrome on
   // unmount, which would leave the bar showing the editor's filename and
-  // its Save/Def/Refs buttons while the user types in a terminal. Focusing
-  // a tile pane pushes a null session id, so this only fires for real
-  // terminals and never races the tile's own focus registration.
+  // its Save/Def/Refs buttons while the user types in a terminal.
   //
   // Memoized on the id, not read off the snapshot: snapshots churn on every
   // terminal frame, and clearing on each one would wipe the chrome an
   // editor had just registered.
   const focusedSessionId = createMemo(() => wsState().focusedSessionId);
+  // Focusing a tile pane pushes a null session id — but a null focus does
+  // not stay null: resolveFocusedSessionId resurrects it from the
+  // per-connection fallback on the next connection event, and a terminal
+  // title update is enough. So a truthy session id says nothing about what
+  // the user is actually looking at, and clearing on it alone dropped the
+  // chrome of an editor or diff a moment after it was focused. Gate on the
+  // focused slot's own content instead. (The document title effect below
+  // guards the same resurrection the same way.)
+  //
+  // Lazy on purpose: it reads consts declared further down, so it must not
+  // run until the effect below does — after the component body.
+  const focusedSlotHoldsTile = () => {
+    const assign = inBsp()
+      ? (layoutAssignments()?.assignments[bspFocusedPaneId() ?? ""] ?? null)
+      : activeTile();
+    return typeof assign === "string" && isTileAssignment(assign);
+  };
   createEffect(() => {
-    if (focusedSessionId()) clearTileChrome();
+    // Both read unconditionally: the effect has to re-run when focus moves
+    // between panes even while the session id sits still (it can already
+    // name the terminal the user is moving to).
+    const holdsTile = focusedSlotHoldsTile();
+    if (focusedSessionId() && !holdsTile) clearTileChrome();
   });
 
   /** The connection that owns the currently focused session (or the first). */
@@ -1032,36 +1054,83 @@ function WorkspaceScreen(props: {
         else setActiveTileRetry((n) => n + 1);
       });
   });
-  // Backgrounded IDE tiles (Ctrl+Shift+Q), most-recent first. Recoverable from
-  // the Cmd+K/expose switcher. Session-only (not persisted across reload).
-  const [backgroundTiles, setBackgroundTiles] = createSignal<string[]>([]);
-  // Auto-parking pushes one entry per file navigated past, so the list is
+  // Every tile this client has displayed, most-recent first. This is the
+  // FALLBACK ordering/source for the dock: the server registry below is the
+  // real one, but a host without FEATURE_KV contributes nothing to it, and
+  // this list keeps the dock working there exactly as it did before.
+  // Session-only; explicit closes prune it.
+  const [localTabs, setLocalTabs] = createSignal<string[]>([]);
+  // Recording pushes one entry per file navigated past, so the list is
   // LRU-capped — an unbounded dock also meant unbounded live fs syncs,
   // which is how BLIT_FS_MAX_SYNCS got exhausted in normal browsing.
   const BACKGROUND_TILES_MAX = 50;
   // Only the most recent cards render as live tiles (each live editor holds
   // a content sync of its parent dir); the rest are title-only.
   const LIVE_DOCK_PREVIEWS = 6;
-  function pushBackgroundTile(assignment: string) {
-    setBackgroundTiles((prev) =>
+  function recordLocalTab(assignment: string) {
+    setLocalTabs((prev) =>
       [assignment, ...prev.filter((a) => a !== assignment)].slice(
         0,
         BACKGROUND_TILES_MAX,
       ),
     );
   }
-  // One prev/next pass over "every open tile" serves three jobs (the union of
-  // pane assignments, the non-BSP active tile, and the background dock):
+  /** Close a tab everywhere: drop the server registry record and the local
+   *  fallback entry. The counterpart to `registerTab`, and now the ONLY thing
+   *  that unregisters — see the effect below. */
+  function closeTab(assignment: string) {
+    setLocalTabs((prev) => prev.filter((a) => a !== assignment));
+    unregisterTab(workspace, assignment);
+  }
+  // The host-wide open-tab list, mirrored from every connected server's `tabs/`
+  // prefix (docs/design/kv.md, ./ide/openTabs.ts).
+  const openTabs = createOpenTabs(workspace, () => wsState().connections);
+  /**
+   * The dock: every open tab, on every connected host, that this client is not
+   * currently displaying. DERIVED, not stored — which is the whole point:
+   * defocusing a tile can no longer lose it (it merely stops being displayed,
+   * and reappears here), and a tab opened in another frontend shows up here
+   * without this one having done anything.
+   */
+  const backgroundTiles = createMemo<string[]>(() => {
+    const displayed = new Set<string>();
+    for (const v of Object.values(layoutAssignments()?.assignments ?? {})) {
+      if (typeof v === "string") displayed.add(v);
+    }
+    const at = activeTile();
+    if (at) displayed.add(at);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const take = (a: string) => {
+      if (displayed.has(a) || seen.has(a)) return;
+      if (!isTileAssignment(a) && !isWebAssignment(a)) return;
+      seen.add(a);
+      out.push(a);
+    };
+    // Registry first (mtime order — registration is a put on every open, so
+    // newest-touched sorts first); the local list then appends anything the
+    // registry doesn't know about, which on a kv-less host is all of it.
+    for (const tab of openTabs()) take(tab.assignment);
+    for (const a of localTabs()) take(a);
+    return out.slice(0, BACKGROUND_TILES_MAX);
+  });
+  // One prev/next pass over the displayed set (pane assignments plus the
+  // non-BSP active tile) serves two jobs:
   //
-  //  - displacement: a pane reassigned tile→terminal/surface sends the tile
-  //    to the recoverable background list (tile→tile switches are left alone,
-  //    and a tile still shown elsewhere is never backgrounded);
-  //  - registration: a tile ENTERING the union is written to the server's
-  //    tabs/ registry (docs/design/kv.md) so hash refs resolve anywhere;
-  //  - deletion: a tile LEAVING the union entirely is unregistered.
+  //  - registration: a tile ENTERING the set is written to the server's tabs/
+  //    registry (docs/design/kv.md) so hash refs resolve anywhere, and
+  //    recorded in the local fallback list;
+  //  - in-place replacement: the Edit⇄Staged⇄Unstaged switcher REPLACES a tab
+  //    rather than opening a second one beside it, so the outgoing view is
+  //    closed — otherwise it would linger in the dock as a stale card.
+  //
+  // Departures are otherwise NOT unregistered. Deletion is an explicit close
+  // now, because the registry is shared: driving it from one client's
+  // displayed set let that client delete the record another client's URL
+  // hash points at, and the tile silently vanished there on reload.
   //
   // Gated on hash resolution (and the pending tile= ref) so boot churn never
-  // writes: the prev-set starts empty, so nothing is ever deleted spuriously.
+  // writes.
   // Two tiles view "the same file" when their connection + path match —
   // the in-pane Edit⇄Staged⇄Unstaged switcher. Commits never match (their
   // identity is an oid, not a file).
@@ -1090,91 +1159,66 @@ function WorkspaceScreen(props: {
     const next: Record<string, string | null | undefined> =
       la?.assignments ?? {};
     if (!resolved) return;
-    const union = new Set<string>();
+    const shown = new Set<string>();
     for (const v of Object.values(next)) {
       if (
         typeof v === "string" &&
         (isTileAssignment(v) || isWebAssignment(v))
       ) {
-        union.add(v);
+        shown.add(v);
       }
     }
     const at = activeTile();
-    if (at && (isTileAssignment(at) || isWebAssignment(at))) union.add(at);
-    for (const b of backgroundTiles()) union.add(b);
+    if (at && (isTileAssignment(at) || isWebAssignment(at))) shown.add(at);
+    // In-place view switches are the one departure that closes a tab: the
+    // switcher swapped which view of ONE file the pane holds, so the outgoing
+    // view is not a second open tab, it is the same tab in a different shape.
+    // Every other departure — displaced by a terminal, pane cleared, layout
+    // torn down, the fullscreen slot dismissed — leaves the tab registered and
+    // the dock picks it up.
     if (la) {
       for (const [paneId, prev] of Object.entries(prevPaneAssignments)) {
-        // A displaced web pane parks in the dock like a displaced tile: the
-        // location is cheap to reopen but the pane's history is not, and
-        // silently dropping it loses where you had navigated to.
-        if (typeof prev === "string" && isWebAssignment(prev)) {
-          const now = next[paneId];
-          if (now !== prev && typeof now === "string" && !union.has(prev)) {
-            pushBackgroundTile(prev);
-            union.add(prev);
-          }
-          continue;
-        }
         if (typeof prev !== "string" || !isTileAssignment(prev)) continue;
         const now = next[paneId];
-        const nowIsTile = typeof now === "string" && isTileAssignment(now);
-        // Displaced by a terminal/surface, or REPLACED by a tile of a
-        // different file (clicking a diff over an editor): park it in the
-        // dock. Same-file view switches stay in place, and a pane simply
-        // cleared (layout teardown) backgrounds nothing.
         if (
-          now !== prev &&
           typeof now === "string" &&
-          !union.has(prev) &&
-          (!nowIsTile || !sameTileFile(prev, now))
+          now !== prev &&
+          isTileAssignment(now) &&
+          !shown.has(prev) &&
+          sameTileFile(prev, now)
         ) {
-          pushBackgroundTile(prev);
-          union.add(prev); // stays open (in the dock) — do not unregister
+          closeTab(prev);
         }
       }
     }
-    // The non-BSP flavor of the same rule: a new tile replacing the active
-    // tile parks the old one (dismissal to null stays a dismissal).
+    // The non-BSP flavor of the same rule. Web panes have no file identity,
+    // so they never match and are never closed implicitly.
     if (
       prevActiveTile &&
       at &&
       at !== prevActiveTile &&
       isTileAssignment(at) &&
-      !union.has(prevActiveTile) &&
-      !sameTileFile(prevActiveTile, at)
+      !shown.has(prevActiveTile) &&
+      sameTileFile(prevActiveTile, at)
     ) {
-      pushBackgroundTile(prevActiveTile);
-      union.add(prevActiveTile);
-    }
-    // Same rule in the fullscreen slot, where either side may be a web pane.
-    if (
-      prevActiveTile &&
-      at &&
-      at !== prevActiveTile &&
-      (isWebAssignment(prevActiveTile) || isWebAssignment(at)) &&
-      isWebAssignment(prevActiveTile) &&
-      !union.has(prevActiveTile)
-    ) {
-      pushBackgroundTile(prevActiveTile);
-      union.add(prevActiveTile);
+      closeTab(prevActiveTile);
     }
     // Web panes are registered like every other tab. They used to be
     // skipped, on the belief that their URL rode in the hash — but the hash
     // writer emits `w:<conn>:<tabId>`, a *reference* to the KV record
     // (docs/design/kv.md). Skipping registration left that reference
     // dangling, so a web pane resolved to nothing and vanished on reload.
-    for (const a of union) {
-      if (!prevOpenTiles.has(a)) registerTab(workspace, a);
-    }
-    for (const a of prevOpenTiles) {
-      if (!union.has(a)) unregisterTab(workspace, a);
+    for (const a of shown) {
+      if (prevOpenTiles.has(a)) continue;
+      recordLocalTab(a);
+      registerTab(workspace, a);
     }
     prevPaneAssignments = { ...next };
-    // Remember a web pane here too, or the displacement rule below can never
-    // see one leave the fullscreen slot.
+    // Remember a web pane here too, or the rules above can never see one
+    // leave the fullscreen slot.
     prevActiveTile =
       at && (isTileAssignment(at) || isWebAssignment(at)) ? at : null;
-    prevOpenTiles = union;
+    prevOpenTiles = shown;
   });
   // "In BSP" means a genuine multi-pane layout. A single-leaf layout ("a") is
   // visually just one pane and is treated as non-BSP for tile purposes, so a
@@ -1194,6 +1238,9 @@ function WorkspaceScreen(props: {
     const onHashChange = () => {
       const fromHash = loadLayoutFromHash();
       if (fromHash && fromHash.dsl !== activeLayout()?.dsl) {
+        // A layout arriving from outside hides the fullscreen slot, same as
+        // applying one from the picker — hand the tile to the dock.
+        setActiveTile(null);
         setActiveLayout(fromHash);
       } else if (!fromHash && activeLayout()) {
         setActiveLayout(null);
@@ -1528,7 +1575,11 @@ function WorkspaceScreen(props: {
   //    records the tile it replaces; navHistory walks the per-pane stacks.
   type NavStacks = { back: string[]; forward: string[] };
   const navHistory = new Map<string, NavStacks>();
-  const NAV_NONBSP = " non-bsp"; // the non-BSP activeTile slot
+  // The non-BSP activeTile slot, keyed in navHistory alongside real pane ids
+  // (and used as a web-pane host id, same namespace). It cannot collide with a
+  // pane: ids come from enumeratePanes (js/core/src/bsp/layout.ts) as
+  // dot-joined child indices, so every real one matches /^\d+(\.\d+)*$/.
+  const NAV_NONBSP = "non-bsp";
   const navFor = (key: string): NavStacks => {
     let h = navHistory.get(key);
     if (!h) {
@@ -1553,18 +1604,10 @@ function WorkspaceScreen(props: {
     h.back.push(cur);
     h.forward.length = 0;
   };
-  // A tile shown in the main view / a pane must leave the background dock: it's
-  // foreground now, and the same file shouldn't be live in both the dock and a
-  // pane at once. (No-op ref when it wasn't parked, so opens/navigations that
-  // never touch the dock don't churn backgroundTiles subscribers.)
-  function evictFromBackground(assignment: string) {
-    setBackgroundTiles((prev) =>
-      prev.includes(assignment) ? prev.filter((a) => a !== assignment) : prev,
-    );
-  }
   // Place a tile into a pane without recording history (a history move itself).
+  // Nothing evicts it from the dock: the dock is derived as "open minus
+  // displayed", so showing a tile drops it from there by construction.
   const placeTile = (assignment: string, paneId: string | null) => {
-    evictFromBackground(assignment);
     if (navKeyFor(paneId) === NAV_NONBSP) {
       if (activeLayout()) {
         setActiveLayout(null);
@@ -1679,7 +1722,9 @@ function WorkspaceScreen(props: {
     const parsed = parseWebAssignment(assign);
     if (!parsed) return null;
     if (!assign) return null;
-    const paneId = inBsp() ? (bspFocusedPaneId() ?? "") : NAV_NONBSP;
+    // Only read when in BSP mode (retarget passes undefined otherwise), so the
+    // non-BSP slot needs no name here.
+    const paneId = bspFocusedPaneId() ?? "";
     const handle = webHandles()[assign];
     if (!handle) return null;
     return {
@@ -1714,7 +1759,6 @@ function WorkspaceScreen(props: {
   });
 
   function openTile(assignment: string) {
-    evictFromBackground(assignment);
     if (inBsp()) {
       const paneId = preferredTilePane();
       recordNav(paneId, assignment);
@@ -1730,45 +1774,51 @@ function WorkspaceScreen(props: {
     setActiveTile(assignment);
   }
 
-  // Drop a dragged tile into a specific BSP pane (records nav history there).
+  // Drop a dragged pane assignment into a specific BSP pane (records nav
+  // history there). Any assignment the panel can hold: an IDE/web tile, or a
+  // parked terminal/surface. recordNav is a no-op for the latter — it only
+  // pushes when the assignment being *replaced* is a tile, which is what makes
+  // Back return to a tile a dropped terminal displaced.
   function dropTileIntoPane(assignment: string, paneId: string) {
-    evictFromBackground(assignment);
     recordNav(paneId, assignment);
     if (moveToPaneFn) moveToPaneFn(assignment, paneId);
     else pendingTilePlacement = { assignment, paneId };
   }
 
-  // Send the currently-focused IDE or web tile to the recoverable background
-  // list (Ctrl+Shift+Q). Handles both the non-BSP focused tile and a tile
-  // occupying the focused BSP pane. Returns true if a tile was backgrounded
-  // (so the keyboard handler knows it consumed the key).
-  function backgroundFocusedTile(): boolean {
-    const tile = activeTile();
-    if (tile) {
-      pushBackgroundTile(tile);
-      setActiveTile(null);
-      return true;
-    }
-    const paneId = bspFocusedPaneId();
-    if (activeLayout() && paneId) {
-      const assign = layoutAssignments()?.assignments[paneId] ?? null;
-      if (assign && (isTileAssignment(assign) || isWebAssignment(assign))) {
-        pushBackgroundTile(assign);
-        clearPaneAssignmentFn?.(paneId);
-        return true;
-      }
-    }
-    return false;
-  }
-
   /**
-   * Close the focused tile outright — the Ctrl+Alt+Shift+Q counterpart to
-   * {@link backgroundFocusedTile}'s Ctrl+Shift+Q. Same targets (a non-BSP
-   * active tile, or an IDE/web tile in the focused BSP pane), but the
-   * assignment is dropped instead of parked in the dock, matching what the
-   * same chord does to a terminal or a surface.
+   * Drop a pane assignment onto the main view when there is no BSP layout to
+   * aim at. Single-pane mode has exactly one destination, so this does what
+   * clicking the dragged card would have done — dispatching on the assignment
+   * kind, because "the main view" means a different slot for each: activeTile
+   * for a tile, the focused surface for a surface, the focused session for a
+   * terminal. All three already dismiss the other two, so the modes can't
+   * overlap.
    */
-  function closeFocusedTile(): boolean {
+  function dropAssignmentIntoMainView(assignment: string) {
+    const surface = parseSurfaceAssignment(assignment);
+    if (surface) {
+      focusSurface(surface.surfaceId, surface.connectionId);
+      return;
+    }
+    if (isTileAssignment(assignment) || isWebAssignment(assignment)) {
+      openTile(assignment);
+      return;
+    }
+    // Everything else in the assignment namespace is a bare session id.
+    switchSession(assignment as SessionId);
+  }
+  /** Highlight shown while a drag hovers the non-BSP main view (BSP panes draw
+   *  their own, per pane). */
+  const [mainViewDragOver, setMainViewDragOver] = createSignal(false);
+  /** Reveals the main view's ✕ on pointer devices (see PaneClose). */
+  const [mainViewHover, setMainViewHover] = createSignal(false);
+
+  // Send the currently-focused IDE or web tile to the dock (Ctrl+Shift+Q).
+  // Handles both the non-BSP focused tile and a tile occupying the focused BSP
+  // pane. Returns true if a tile was backgrounded (so the keyboard handler
+  // knows it consumed the key). Stopping displaying it IS backgrounding it —
+  // the tab stays registered, and the derived dock picks it up.
+  function backgroundFocusedTile(): boolean {
     if (activeTile()) {
       setActiveTile(null);
       return true;
@@ -1784,16 +1834,67 @@ function WorkspaceScreen(props: {
     return false;
   }
 
-  // Restore a backgrounded tile: remove it from the list and re-open it in the
-  // main view / focused pane. (openTile also evicts it from the dock.)
+  /**
+   * Close the focused tile outright — the Ctrl+Alt+Shift+Q counterpart to
+   * {@link backgroundFocusedTile}'s Ctrl+Shift+Q. Same targets (a non-BSP
+   * active tile, or an IDE/web tile in the focused BSP pane), but the tab is
+   * closed rather than merely stopped being displayed, matching what the same
+   * chord does to a terminal or a surface. Closing is host-wide now: the
+   * registry record goes, so the tab leaves every frontend's dock.
+   */
+  function closeFocusedTile(): boolean {
+    const tile = activeTile();
+    if (tile) {
+      setActiveTile(null);
+      closeTab(tile);
+      return true;
+    }
+    const paneId = bspFocusedPaneId();
+    if (activeLayout() && paneId) {
+      const assign = layoutAssignments()?.assignments[paneId] ?? null;
+      if (assign && (isTileAssignment(assign) || isWebAssignment(assign))) {
+        clearPaneAssignmentFn?.(paneId);
+        closeTab(assign);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The non-BSP counterpart to BSPContainer's per-pane ✕: close whatever the
+   * single main view is showing. Same cascade as Ctrl+Alt+Shift+Q, minus the
+   * BSP-pane surface branch that can't apply here.
+   */
+  function closeFocusedPane() {
+    if (closeFocusedTile()) return;
+    const sid = focusedSurfaceId();
+    const sConnId = focusedSurfaceConnId();
+    if (sid != null && sConnId != null) {
+      workspace.closeSurface(sConnId, sid);
+      return;
+    }
+    const fid = wsState().focusedSessionId;
+    if (fid) void workspace.closeSession(fid);
+  }
+
+  /** True when the main view is holding something the ✕ can close. */
+  const mainViewClosable = () =>
+    !!activeTile() ||
+    focusedSurfaceId() != null ||
+    !!wsState().focusedSessionId;
+
+  // Restore a backgrounded tile: showing it removes it from the dock, which is
+  // derived as "open minus displayed".
   function restoreTile(assignment: string) {
     openTile(assignment);
   }
-  // Dismiss a backgrounded tile from the dock without re-opening it — the ✕ on a
-  // background-editor card. It leaves backgroundTiles, so its live dock tile
-  // unmounts (fs-sync/LSP torn down); nothing else references it.
+  // The ✕ on a background-editor card. Closes the tab host-wide (it is an
+  // explicit close, the same as Ctrl+Alt+Shift+Q on a displayed one), so its
+  // live dock tile unmounts here — fs-sync/LSP torn down — and it leaves the
+  // other frontends' docks too.
   function closeBackgroundTile(assignment: string) {
-    setBackgroundTiles((prev) => prev.filter((a) => a !== assignment));
+    closeTab(assignment);
   }
 
   // The signal updates per pointermove (live layout); the storage write —
@@ -2351,7 +2452,9 @@ function WorkspaceScreen(props: {
 
   function focusSessionFromUi(sessionId: SessionId) {
     focusSurfaceById(null);
-    setActiveTile(null); // focusing a terminal dismisses a non-BSP tile
+    // Stops DISPLAYING the non-BSP tile; the tab stays open and drops into
+    // the dock (and stays listed in every other frontend).
+    setActiveTile(null);
     if (activeLayout()) {
       focusBySessionFn?.(sessionId);
     }
@@ -2359,7 +2462,7 @@ function WorkspaceScreen(props: {
   }
 
   function focusSurface(surfaceId: number, connectionId?: ConnectionId) {
-    setActiveTile(null); // focusing a surface dismisses a non-BSP tile
+    setActiveTile(null); // stops displaying the non-BSP tile; tab stays open
     // When a BSP layout is active, place the surface into the focused pane.
     if (activeLayout() && bspFocusedPaneId()) {
       const connId =
@@ -2479,7 +2582,7 @@ function WorkspaceScreen(props: {
         ...(!command && fid && !connectionId ? { cwdFromSessionId: fid } : {}),
       });
       focusSurfaceById(null);
-      setActiveTile(null); // creating a terminal dismisses a non-BSP tile
+      setActiveTile(null); // stops displaying the non-BSP tile; tab stays open
       workspace.focusSession(session.id);
       previousFocus = null;
       closeOverlay();
@@ -2610,6 +2713,27 @@ function WorkspaceScreen(props: {
   // The same poll feeds the root-picker label (conn:cwd), so it runs whenever a
   // terminal is focused — not only when an IDE root is active.
   let lastFollowedCwd = "";
+  /**
+   * The worktree top of the repository enclosing `dir`, or null when there
+   * is none. One bare `GIT_OPEN` (no watch, no status — nothing to compute
+   * server-side) closed as soon as it has answered; asked once per `cd`,
+   * since the poll below only reaches it when the cwd has changed.
+   */
+  const repoTopOf = async (
+    connectionId: ConnectionId,
+    dir: string,
+  ): Promise<string | null> => {
+    try {
+      const handle = await workspace.openRepo(connectionId, dir, {});
+      const top = handle.workdir;
+      handle.close();
+      return top || null;
+    } catch {
+      // Not a repository, or git is unavailable on that server: either way
+      // there is no boundary here to re-root on.
+      return null;
+    }
+  };
   const pollFocusedCwd = () => {
     const fid = wsState().focusedSessionId;
     if (!fid) {
@@ -2644,6 +2768,28 @@ function WorkspaceScreen(props: {
         if (cwd === root || cwd.startsWith(`${root}/`)) {
           // Inside the current root: reveal, don't re-root.
           s.expandTo(cwd === root ? "" : cwd.slice(root.length + 1));
+          // Unless the cd crossed into a *different repository*. `cd linux`
+          // from a plain `/src` is not a subdirectory to expand — it is a
+          // project to show, and Files and Log belong to that repo rather
+          // than to the directory above it. Only a repo boundary re-roots,
+          // so cd-ing deeper inside one repo still just expands.
+          if (cwd !== root && rootSel().kind === "focused") {
+            void repoTopOf(connId, cwd).then((top) => {
+              if (!top || top === root || top === s.repoWorkdir()) return;
+              // The repo must enclose the cwd and sit inside the current
+              // root: a repo *above* the root is the outer project the user
+              // narrowed away from on purpose.
+              if (top !== cwd && !cwd.startsWith(`${top}/`)) return;
+              if (!top.startsWith(`${root}/`)) return;
+              // Root at the repo's top, not at the cwd, so `cd linux/mm`
+              // still shows the whole kernel.
+              setTermCwdOverride({
+                sessionId: fid,
+                connectionId: connId,
+                cwd: top,
+              });
+            });
+          }
         } else if (rootSel().kind === "focused") {
           // Outside it (and the dock follows the terminal, not a pinned
           // root): re-root Files + Log at the new cwd.
@@ -2942,7 +3088,61 @@ function WorkspaceScreen(props: {
                 }
               />
             </Show>
-            <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
+            <div
+              style={{ flex: 1, overflow: "hidden", position: "relative" }}
+              onMouseEnter={() => setMainViewHover(true)}
+              onMouseLeave={() => setMainViewHover(false)}
+              // Drop target for the single-pane main view. Every handler bails
+              // in BSP mode: panes are the precise targets there and they sit
+              // inside this div, so without the guard their drops would bubble
+              // up and be handled twice.
+              onDragOver={(e) => {
+                if (inBsp() && activeLayout()) return;
+                if (!isTileDrag(e)) return;
+                e.preventDefault(); // allow the drop
+                e.dataTransfer!.dropEffect = "copy";
+                if (!mainViewDragOver()) setMainViewDragOver(true);
+              }}
+              onDragLeave={(e) => {
+                // Ignore leaves into child elements; only clear when truly
+                // leaving (same rule as a BSP pane).
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+                  setMainViewDragOver(false);
+              }}
+              onDrop={(e) => {
+                setMainViewDragOver(false);
+                if (inBsp() && activeLayout()) return;
+                const assignment = tileDragAssignment(e);
+                if (!assignment) return;
+                e.preventDefault();
+                dropAssignmentIntoMainView(assignment);
+              }}
+            >
+              <Show when={mainViewDragOver()}>
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    "z-index": 5,
+                    "pointer-events": "none",
+                    background: `color-mix(in srgb, ${theme().accent} 14%, transparent)`,
+                    border: `2px solid ${theme().accent}`,
+                    "box-sizing": "border-box",
+                  }}
+                />
+              </Show>
+              {/* In BSP mode each pane carries its own ✕ (BSPContainer), so
+                  this one would be a second, ambiguous control over whichever
+                  pane happens to be focused. */}
+              <Show when={!(inBsp() && activeLayout()) && mainViewClosable()}>
+                <PaneClose
+                  theme={theme()}
+                  scale={chromeScale()}
+                  alwaysVisible={isMobileTouch()}
+                  hovered={mainViewHover()}
+                  onClose={closeFocusedPane}
+                />
+              </Show>
               <Show
                 when={inBsp() && activeLayout()}
                 fallback={
@@ -3113,8 +3313,8 @@ function WorkspaceScreen(props: {
                               onOpenTile={openTile}
                             />
                             <button
-                              onClick={() => setActiveTile(null)}
-                              title="Close"
+                              onClick={() => closeFocusedTile()}
+                              title="Close tab"
                               style={{
                                 position: "absolute",
                                 top: `${chromeScale().gap}px`,
@@ -3145,8 +3345,8 @@ function WorkspaceScreen(props: {
                           focused
                         />
                         <button
-                          onClick={() => setActiveTile(null)}
-                          title="Close"
+                          onClick={() => closeFocusedTile()}
+                          title="Close tab"
                           style={{
                             position: "absolute",
                             top: `${chromeScale().gap}px`,
@@ -3207,6 +3407,8 @@ function WorkspaceScreen(props: {
                     onOpenTile={openTile}
                     registerWebPaneHost={webPaneHosts.register}
                     onDropTile={dropTileIntoPane}
+                    isMobileTouch={isMobileTouch()}
+                    onCloseTab={closeTab}
                     onCreateInPane={(paneId, command, connectionId) => {
                       if (
                         !command &&
@@ -3264,7 +3466,14 @@ function WorkspaceScreen(props: {
                     const d = tileDisplay(assignment);
                     const web = parseWebAssignment(assignment);
                     return (
+                      // Draggable like any other tile source (an explorer row,
+                      // a commit): drop it on a BSP pane to restore it *there*
+                      // instead of the click target restoreTile would pick.
+                      // The whole card is the handle — the thumbnail below is
+                      // pointer-events:none, so a drag can only start here.
                       <div
+                        draggable={true}
+                        onDragStart={(e) => startTileDrag(e, assignment)}
                         style={{
                           "border-bottom": `1px solid ${theme().subtleBorder}`,
                           display: "flex",
@@ -3443,6 +3652,11 @@ function WorkspaceScreen(props: {
                 // focusedSurfaceId set would hide the surface from the
                 // side panel as well (offScreenSurfaces filters it out).
                 focusSurfaceById(null);
+                // Same for a non-BSP tile: entering BSP hides the fullscreen
+                // slot, so leaving activeTile set would count as "displayed"
+                // and keep it out of the dock while nothing renders it.
+                // Clearing hands it to the dock; the tab stays open.
+                setActiveTile(null);
                 setActiveLayout(l);
                 saveActiveLayout(l);
                 saveToHistory(l);
@@ -4026,6 +4240,9 @@ function Thumbnail(props: {
   theme: Theme;
   scale: UIScale;
   isMobileTouch: boolean;
+  /** The pane assignment this card carries when dragged onto a BSP pane —
+   *  a session id for a terminal, `surfaceAssignment(...)` for a surface. */
+  assignment: string;
   onFocus: () => void;
   onClose: () => void;
   closeTitle: string;
@@ -4080,7 +4297,14 @@ function Thumbnail(props: {
   }
 
   return (
+    // Draggable onto a BSP pane, like the background-tile cards above: the
+    // card is inert (see the body wrapper), so the whole thing is the handle
+    // and a drag can't be swallowed by the terminal or surface inside.
+    // Touch is unaffected — mobile browsers don't synthesize dragstart, so
+    // swipe-to-dismiss below keeps working.
     <div
+      draggable={true}
+      onDragStart={(e) => startTileDrag(e, props.assignment)}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onTouchStart={onTouchStart}
@@ -4143,7 +4367,17 @@ function Thumbnail(props: {
         style={{ overflow: "hidden", cursor: "pointer" }}
         onClick={props.onFocus}
       >
-        {props.body()}
+        {/* Parked content is inert, matching the background-tile cards.
+            `inert` takes the subtree out of hit-testing *and* the tab order:
+            a read-only BlitTerminal still attaches a keydown listener on a
+            tabindex=0 input (scroll keys work), and a preview
+            BlitSurfaceView's canvas is tabindex=0 too — so without this a
+            parked card can take focus away from the live view. The explicit
+            pointer-events keeps the click landing on the parent (restore),
+            rather than relying on how each engine hit-tests inert. */}
+        <div inert style={{ "pointer-events": "none" }}>
+          {props.body()}
+        </div>
       </div>
     </div>
   );
@@ -4166,6 +4400,8 @@ function SessionThumbnail(props: {
       theme={props.theme}
       scale={props.scale}
       isMobileTouch={props.isMobileTouch}
+      // A terminal's pane assignment is its bare session id.
+      assignment={props.session.id}
       onFocus={props.onFocus}
       onClose={props.onClose}
       closeTitle="Close terminal"
@@ -4230,6 +4466,10 @@ function SurfaceThumbnail(props: {
       theme={props.theme}
       scale={props.scale}
       isMobileTouch={props.isMobileTouch}
+      assignment={surfaceAssignment(
+        props.surface.connectionId,
+        props.surface.surfaceId,
+      )}
       onFocus={props.onFocus}
       onClose={props.onClose}
       closeTitle="Close surface"

@@ -387,7 +387,7 @@ export function ExplorerPanel(props: {
     if (!gs) return "";
     let out = "";
     for (const e of gs.status)
-      out += `${e.staged} ${e.unstaged} ${e.flags} ${e.oldPath} ${e.path}\n`;
+      out += `${e.staged}\0${e.unstaged}\0${e.flags}\0${e.oldPath}\0${e.path}\n`;
     return out;
   });
   // Reused per (path, side, fields) across rebuilds, so `<For>` keeps the
@@ -403,7 +403,7 @@ export function ExplorerPanel(props: {
     const nextCache = new Map<string, Change>();
     const out: Change[] = [];
     const push = (c: Change) => {
-      const key = `${c.path} ${c.side} ${c.x}${c.y} ${c.oldPath}`;
+      const key = `${c.path}\0${c.side}\0${c.x}${c.y}\0${c.oldPath}`;
       const row = changeCache.get(key) ?? c;
       nextCache.set(key, row);
       out.push(row);

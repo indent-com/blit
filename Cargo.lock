@@ -788,6 +788,7 @@ version = "0.40.1"
 dependencies = [
  "blake3",
  "blit-remote",
+ "ignore",
  "notify",
 ]
 
@@ -823,6 +824,7 @@ dependencies = [
  "blit-fssync",
  "blit-remote",
  "encoding_rs",
+ "flate2",
  "gix",
  "imara-diff 0.2.0",
  "notify",
@@ -2318,6 +2320,7 @@ checksum = "514c29cc879bdc0286b0cbc205585a49b252809eb86c69df4ce4f855ee75f635"
 dependencies = [
  "gix-actor",
  "gix-attributes",
+ "gix-blame",
  "gix-command",
  "gix-commitgraph",
  "gix-config",
@@ -2398,6 +2401,25 @@ version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d982fc7ef0608e669851d0d2a6141dae74c60d5a27e8daa451f2a4857bbf41e2"
 dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gix-blame"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f33ae48a0d557084199b25441745d44a3f8d0bdaa0e60f534aec305abd3b63dc"
+dependencies = [
+ "gix-commitgraph",
+ "gix-date",
+ "gix-diff",
+ "gix-hash",
+ "gix-object",
+ "gix-revwalk",
+ "gix-trace",
+ "gix-traverse",
+ "gix-worktree",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 

@@ -7,15 +7,16 @@ use crate::transport::{Transport, read_message, write_frame};
 use blit_remote::fs::{
     FEATURE_FS, FS_CLOSED_BACKEND_FAILED, FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_PERMISSION_LOST,
     FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT, FS_DONE_OK, FS_ENTRY_DIR,
-    FS_ENTRY_FILE, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_FILE_NOT_FOUND, FS_FILE_OK,
-    FS_FILE_UNREADABLE, FS_GREP_CASE_SENSITIVE, FS_GREP_FILE_IGNORED, FS_GREP_NO_IGNORE,
-    FS_GREP_REGEX, FS_GREP_TRUNCATED, FS_GREP_WORD, FS_OP_HARDLINK, FS_OP_MKDIR, FS_OP_MKPARENTS,
-    FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK, FS_STATUS_OK, FS_SYNC_CONTENT,
-    FS_SYNC_RECURSIVE, FS_UPDATE_SYNC, FS_WRITE_CONTENT_FULL, FS_WRITE_DURABLE, FS_WRITE_MKPARENTS,
-    FS_WRITE_NO_CAS, FsGrepRecord, FsMirror, FsOp, FsRecord, FsWrite, S2C_FS_CLOSED, S2C_FS_DONE,
-    S2C_FS_FILE, S2C_FS_GREP, S2C_FS_SEARCH, S2C_FS_SYNCED, S2C_FS_UPDATE, fs_done_status_text,
-    fs_grep_records, fs_records, fs_update_records, msg_fs_ack, msg_fs_fetch, msg_fs_grep,
-    msg_fs_op, msg_fs_search, msg_fs_sync, msg_fs_write, parse_fs_done, parse_fs_file,
+    FS_ENTRY_FILE, FS_ENTRY_FILTERED, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_FILE_NOT_FOUND,
+    FS_FILE_OK, FS_FILE_UNREADABLE, FS_GREP_CASE_SENSITIVE, FS_GREP_FILE_IGNORED,
+    FS_GREP_NO_IGNORE, FS_GREP_REGEX, FS_GREP_TRUNCATED, FS_GREP_WORD, FS_OP_HARDLINK, FS_OP_MKDIR,
+    FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK, FS_STATUS_OK,
+    FS_SYNC_CONTENT, FS_SYNC_DOTIGNORE, FS_SYNC_EXCLUDE_GIT, FS_SYNC_GITIGNORE, FS_SYNC_RECURSIVE,
+    FS_UPDATE_SYNC, FS_WRITE_CONTENT_FULL, FS_WRITE_DURABLE, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS,
+    FsGrepRecord, FsMirror, FsOp, FsRecord, FsWrite, S2C_FS_CLOSED, S2C_FS_DONE, S2C_FS_FILE,
+    S2C_FS_GREP, S2C_FS_SEARCH, S2C_FS_SYNCED, S2C_FS_UPDATE, fs_done_status_text, fs_grep_records,
+    fs_records, fs_update_records, msg_fs_ack, msg_fs_fetch, msg_fs_grep, msg_fs_op, msg_fs_search,
+    msg_fs_sync, msg_fs_sync_excluding, msg_fs_write, parse_fs_done, parse_fs_file,
     parse_fs_grep_result, parse_fs_search_result,
 };
 use blit_remote::{S2C_HELLO, S2C_QUIT, S2C_READY};
@@ -24,14 +25,36 @@ use tokio::io::{AsyncRead, AsyncWrite};
 const SYNC_NONCE: u16 = 1;
 const REQ_NONCE: u16 = 2;
 
-pub async fn cmd_sync(
-    transport: Transport,
-    path: String,
-    content: bool,
-    no_recursive: bool,
-    once: bool,
-    json: bool,
-) -> Result<(), String> {
+/// `blit fs sync` switches, as parsed.
+pub struct SyncArgs {
+    pub content: bool,
+    pub no_recursive: bool,
+    /// Honor `.gitignore` and git's repository-wide exclude sources.
+    pub gitignore: bool,
+    /// Honor `.ignore` files.
+    pub dot_ignore: bool,
+    /// Shorthand for all three exclusion sources at once — what most
+    /// callers mean by "ignore what the repo ignores".
+    pub ignore: bool,
+    pub exclude_git: bool,
+    /// Gitignore-syntax patterns, one per `--exclude`.
+    pub exclude: Vec<String>,
+    pub once: bool,
+    pub json: bool,
+}
+
+pub async fn cmd_sync(transport: Transport, path: String, args: SyncArgs) -> Result<(), String> {
+    let SyncArgs {
+        content,
+        no_recursive,
+        gitignore,
+        dot_ignore,
+        ignore,
+        exclude_git,
+        exclude,
+        once,
+        json,
+    } = args;
     let (mut reader, mut writer) = transport.split();
     let mut fragment_buf: Vec<u8> = Vec::new();
 
@@ -40,14 +63,27 @@ pub async fn cmd_sync(
         return Err("server does not support filesystem sync (upgrade blit on the remote)".into());
     }
 
-    let mut flags = 0u8;
+    let mut flags = 0u16;
     if !no_recursive {
         flags |= FS_SYNC_RECURSIVE;
     }
     if content {
         flags |= FS_SYNC_CONTENT;
     }
-    if !write_frame(&mut writer, &msg_fs_sync(SYNC_NONCE, flags, 0, 0, &path)).await {
+    if gitignore || ignore {
+        flags |= FS_SYNC_GITIGNORE;
+    }
+    if dot_ignore || ignore {
+        flags |= FS_SYNC_DOTIGNORE;
+    }
+    if exclude_git || ignore {
+        flags |= FS_SYNC_EXCLUDE_GIT;
+    }
+    // One `--exclude` per line: the field is a virtual `.gitignore`, so a
+    // pattern reaches the server exactly as it would read from a file.
+    let exclude = exclude.join("\n");
+    let sync = msg_fs_sync_excluding(SYNC_NONCE, flags, 0, 0, &path, &exclude);
+    if !write_frame(&mut writer, &sync).await {
         return Err("connection closed".into());
     }
 
@@ -195,6 +231,10 @@ pub(crate) async fn handshake(
 
 fn kind_char(entry_flags: u8) -> char {
     match entry_flags & FS_ENTRY_TYPE_MASK {
+        // A directory that hid something reads as `D`: excluded entries
+        // are simply absent, so without a mark a filtered listing looks
+        // like the whole truth.
+        FS_ENTRY_DIR if entry_flags & FS_ENTRY_FILTERED != 0 => 'D',
         FS_ENTRY_FILE => 'f',
         FS_ENTRY_DIR => 'd',
         FS_ENTRY_SYMLINK => 'l',
@@ -239,6 +279,11 @@ fn describe(record: &FsRecord<'_>, mirror: &FsMirror, json: bool) -> String {
                 });
                 if *hash != 0 {
                     v["hash"] = serde_json::Value::String(format!("{hash:032x}"));
+                }
+                if entry_flags & FS_ENTRY_FILTERED != 0 {
+                    // Excluded children are absent from the stream, so
+                    // say which listings are partial by design.
+                    v["filtered"] = serde_json::Value::Bool(true);
                 }
                 v.to_string()
             } else {

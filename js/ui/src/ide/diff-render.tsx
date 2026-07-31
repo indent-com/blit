@@ -41,7 +41,11 @@ export function renderHunkText(
           style={{
             color: color ?? undefined,
             background: chg ? changedBg : undefined,
-            "border-radius": chg ? "2px" : undefined,
+            // Square corners. A change span is a region of the file, and the
+            // rows of one edit have to read as one block — a 2px radius drew
+            // a notch between every pair of vertically adjacent spans. The
+            // inline background already covers the row's full height, so
+            // nothing else is needed to make them meet.
           }}
         >
           {seg}

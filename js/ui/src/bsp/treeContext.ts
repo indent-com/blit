@@ -21,7 +21,12 @@ export interface BSPTreeCtx {
   connectionId: string;
   connectionLabels?: Map<string, string>;
   multiPane: boolean;
+  /** Coarse pointer: the pane's ✕ has no hover to reveal it, so it stays up. */
+  isMobileTouch?: boolean;
   onFocusPane: (paneId: string) => void;
+  /** Close whatever the pane holds — terminal, surface, IDE tile or web pane.
+   *  Same targets, and the same order, as Ctrl+Alt+Shift+Q. */
+  onClosePane: (paneId: string) => void;
   onCreateInPane?: (
     paneId: string,
     command?: string,

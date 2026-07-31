@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 
-/// Start (or replace) a sync: [0x40][nonce:2][flags:1][latency_ms:2][inline_max:4][path_len:2][path:N]
+/// Start (or replace) a sync: [0x40][nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]
+/// then, when `FS_SYNC_EXCLUDE` is set, [exclude_len:2][exclude:M]; then,
+/// when `FS_SYNC_FROM_PTY` is set, [src_pty_id:2].
 pub const C2S_FS_SYNC: u8 = 0x40;
 /// Stop a sync: [0x41][sync_id:2]
 pub const C2S_FS_STOP: u8 = 0x41;
@@ -69,10 +71,12 @@ pub const FEATURE_FS: u32 = 1 << 6;
 /// `sync_id` reported by a failed `FS_SYNCED`.
 pub const FS_SYNC_ID_INVALID: u16 = 0xFFFF;
 
-// C2S_FS_SYNC flags.
-pub const FS_SYNC_RECURSIVE: u8 = 1 << 0;
-pub const FS_SYNC_CONTENT: u8 = 1 << 1;
-pub const FS_SYNC_CROSS_FILESYSTEM: u8 = 1 << 2;
+// C2S_FS_SYNC flags. Two bytes: the exclusion work filled the first one,
+// and a 1-byte field with no room left is a field that forces the next
+// feature into a worse encoding.
+pub const FS_SYNC_RECURSIVE: u16 = 1 << 0;
+pub const FS_SYNC_CONTENT: u16 = 1 << 1;
+pub const FS_SYNC_CROSS_FILESYSTEM: u16 = 1 << 2;
 /// The sync root is a single FILE, not a directory: the mirror holds
 /// exactly one entry — the root itself — keyed by the empty relative path
 /// "" (the same key a directory sync gives its root). Combining with
@@ -80,18 +84,57 @@ pub const FS_SYNC_CROSS_FILESYSTEM: u8 = 1 << 2;
 /// error (docs/design/fs-watch.md "Single-file sync"). Content,
 /// `inline_max`, `FS_FETCH`, and the write family behave as for any other
 /// sync, addressing path "".
-pub const FS_SYNC_SINGLE: u8 = 1 << 3;
+pub const FS_SYNC_SINGLE: u16 = 1 << 3;
 /// Resolve the sync's base directory from a pty's live cwd: a trailing
 /// `[src_pty_id:2]` names a pty and the server joins `path` onto its cwd
-/// (docs/ide.md Decision 3). Bit 5 is reserved for the documented
-/// `EXCLUDE_GIT`.
-pub const FS_SYNC_FROM_PTY: u8 = 1 << 4;
+/// (docs/ide.md Decision 3). It comes last, after any `EXCLUDE` field.
+pub const FS_SYNC_FROM_PTY: u16 = 1 << 4;
+/// Omit every entry whose final component is exactly `.git` — directory or
+/// gitfile — from enumeration, hashing, hints, and records. A pure name
+/// filter: no git data is read (docs/design/fs-watch.md "Ignoring").
+pub const FS_SYNC_EXCLUDE_GIT: u16 = 1 << 5;
+/// Honor `.gitignore` in and above the root, plus the governing
+/// repository's `$GIT_DIR/info/exclude`, the user's `core.excludesFile`,
+/// and its `core.ignorecase`. Off by default, so a sync only narrows when
+/// asked.
+pub const FS_SYNC_GITIGNORE: u16 = 1 << 6;
+/// A trailing `[exclude_len:2][exclude:M]` carries client patterns —
+/// gitignore syntax, one per line, anchored at the sync root and applied
+/// above every other rule, so `!keep` re-includes. The flag is what makes
+/// the field parseable, and what makes a server too old to filter refuse
+/// the sync outright instead of silently mirroring the whole tree.
+pub const FS_SYNC_EXCLUDE: u16 = 1 << 7;
+/// Honor `.ignore` in and above the root — ripgrep's convention, which a
+/// project uses to hide things from tooling without telling git to stop
+/// tracking them. Separate from `GITIGNORE` because the two answer
+/// different questions, and `.ignore` brings none of git's repository-wide
+/// sources with it. `FS_INDEX` and `FS_GREP` apply both together; a sync
+/// picks.
+pub const FS_SYNC_DOTIGNORE: u16 = 1 << 8;
+
+/// Bits a `C2S_FS_SYNC` may set; anything else answers with the
+/// unknown-flags refusal.
+pub const FS_SYNC_FLAGS_KNOWN: u16 = FS_SYNC_RECURSIVE
+    | FS_SYNC_CONTENT
+    | FS_SYNC_CROSS_FILESYSTEM
+    | FS_SYNC_SINGLE
+    | FS_SYNC_FROM_PTY
+    | FS_SYNC_EXCLUDE_GIT
+    | FS_SYNC_GITIGNORE
+    | FS_SYNC_EXCLUDE
+    | FS_SYNC_DOTIGNORE;
+
+/// Every exclusion flag, which is also the set `SINGLE` rejects.
+pub const FS_SYNC_EXCLUSION_FLAGS: u16 =
+    FS_SYNC_EXCLUDE_GIT | FS_SYNC_GITIGNORE | FS_SYNC_EXCLUDE | FS_SYNC_DOTIGNORE;
 
 /// `C2S_FS_SYNC` flag-combination validity: `SINGLE` syncs exactly one
 /// file, so `RECURSIVE` contradicts it and the pair is rejected at
-/// validation (docs/design/fs-watch.md "Single-file sync").
-pub fn fs_sync_flags_valid(flags: u8) -> bool {
-    flags & (FS_SYNC_SINGLE | FS_SYNC_RECURSIVE) != (FS_SYNC_SINGLE | FS_SYNC_RECURSIVE)
+/// validation (docs/design/fs-watch.md "Single-file sync"). The exclusion
+/// flags apply to enumeration, which `SINGLE` does none of, so they are
+/// rejected with it too rather than silently doing nothing.
+pub fn fs_sync_flags_valid(flags: u16) -> bool {
+    flags & FS_SYNC_SINGLE == 0 || flags & (FS_SYNC_RECURSIVE | FS_SYNC_EXCLUSION_FLAGS) == 0
 }
 
 // S2C_FS_UPDATE flags.
@@ -264,6 +307,20 @@ pub const FS_ENTRY_UNSTABLE: u8 = 1 << 4;
 /// the type alone cannot distinguish a link to a directory from one to a file,
 /// and a non-recursive sync has no children listed yet to infer it from.
 pub const FS_ENTRY_LINK_DIR: u8 = 1 << 5;
+/// Set on a directory whose enumeration skipped at least one child the
+/// sync's exclusion rules cover (docs/design/fs-watch.md "Ignoring").
+/// Excluded paths are absent rather than marked, so without this a client
+/// cannot tell an empty directory from a filtered one — a file browser
+/// needs it to say "some items hidden" instead of showing a folder that
+/// looks wrong.
+///
+/// Prompt when it goes up, lazy when it comes down: the first excluded
+/// child costs one re-listing of its directory, while the *last* one
+/// disappearing clears the flag only at that directory's next enumeration.
+/// Chasing the clear would mean re-listing on every excluded-file event,
+/// which is the cost the exclusion exists to avoid — so a client may
+/// briefly see "hidden items" on a directory that no longer has any.
+pub const FS_ENTRY_FILTERED: u8 = 1 << 6;
 
 // UPSERT content kinds.
 pub const FS_CONTENT_NONE: u8 = 0;
@@ -463,53 +520,146 @@ impl<'a> Iterator for FsRecordIter<'a> {
 // Message builders
 // ---------------------------------------------------------------------------
 
-pub fn msg_fs_sync(nonce: u16, flags: u8, latency_ms: u16, inline_max: u32, path: &str) -> Vec<u8> {
-    let pb = path.as_bytes();
-    let mut msg = Vec::with_capacity(12 + pb.len());
-    msg.push(C2S_FS_SYNC);
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.push(flags);
-    msg.extend_from_slice(&latency_ms.to_le_bytes());
-    msg.extend_from_slice(&inline_max.to_le_bytes());
-    msg.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-    msg.extend_from_slice(pb);
-    msg
+pub fn msg_fs_sync(
+    nonce: u16,
+    flags: u16,
+    latency_ms: u16,
+    inline_max: u32,
+    path: &str,
+) -> Vec<u8> {
+    msg_fs_sync_full(nonce, flags, latency_ms, inline_max, path, "", None)
+}
+
+/// Build a `C2S_FS_SYNC` carrying client exclude patterns: gitignore
+/// syntax, one per line, anchored at the sync root
+/// (docs/design/fs-watch.md "Ignoring"). Sets `FS_SYNC_EXCLUDE`; an empty
+/// `exclude` builds the plain form instead, so a caller need not special-case
+/// "no patterns".
+pub fn msg_fs_sync_excluding(
+    nonce: u16,
+    flags: u16,
+    latency_ms: u16,
+    inline_max: u32,
+    path: &str,
+    exclude: &str,
+) -> Vec<u8> {
+    msg_fs_sync_full(nonce, flags, latency_ms, inline_max, path, exclude, None)
 }
 
 /// Build a `C2S_FS_SYNC` whose base directory the server resolves from a pty's
-/// live cwd: sets `FS_SYNC_FROM_PTY` and appends `[src_pty_id:2]` after the
-/// path (docs/ide.md Decision 3). `path` is joined onto the resolved cwd
+/// live cwd: sets `FS_SYNC_FROM_PTY` and appends `[src_pty_id:2]` last
+/// (docs/ide.md Decision 3). `path` is joined onto the resolved cwd
 /// server-side (empty = the cwd itself).
 pub fn msg_fs_sync_from_pty(
     nonce: u16,
-    flags: u8,
+    flags: u16,
     latency_ms: u16,
     inline_max: u32,
     path: &str,
     src_pty_id: u16,
 ) -> Vec<u8> {
-    let mut msg = msg_fs_sync(
+    msg_fs_sync_full(
         nonce,
-        flags | FS_SYNC_FROM_PTY,
+        flags,
         latency_ms,
         inline_max,
         path,
-    );
-    msg.extend_from_slice(&src_pty_id.to_le_bytes());
+        "",
+        Some(src_pty_id),
+    )
+}
+
+/// Every `C2S_FS_SYNC` variant, in field order. The optional trailers are
+/// self-describing through their flags — `EXCLUDE` first, `FROM_PTY` last —
+/// which is what lets a parser skip one to reach the other.
+pub fn msg_fs_sync_full(
+    nonce: u16,
+    flags: u16,
+    latency_ms: u16,
+    inline_max: u32,
+    path: &str,
+    exclude: &str,
+    src_pty_id: Option<u16>,
+) -> Vec<u8> {
+    let pb = path.as_bytes();
+    let eb = exclude.as_bytes();
+    let mut flags = flags;
+    if eb.is_empty() {
+        flags &= !FS_SYNC_EXCLUDE;
+    } else {
+        flags |= FS_SYNC_EXCLUDE;
+    }
+    if src_pty_id.is_some() {
+        flags |= FS_SYNC_FROM_PTY;
+    }
+    let mut msg = Vec::with_capacity(FS_SYNC_HEADER + pb.len() + eb.len() + 4);
+    msg.push(C2S_FS_SYNC);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&flags.to_le_bytes());
+    msg.extend_from_slice(&latency_ms.to_le_bytes());
+    msg.extend_from_slice(&inline_max.to_le_bytes());
+    msg.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+    msg.extend_from_slice(pb);
+    if !eb.is_empty() {
+        msg.extend_from_slice(&(eb.len() as u16).to_le_bytes());
+        msg.extend_from_slice(eb);
+    }
+    if let Some(src) = src_pty_id {
+        msg.extend_from_slice(&src.to_le_bytes());
+    }
     msg
+}
+
+/// Fixed part of `C2S_FS_SYNC`, up to and including `path_len`.
+pub const FS_SYNC_HEADER: usize = 13;
+
+/// The `flags` field of a `C2S_FS_SYNC`, or `None` if it is truncated.
+pub fn fs_sync_flags(msg: &[u8]) -> Option<u16> {
+    if msg.first().copied() != Some(C2S_FS_SYNC) || msg.len() < FS_SYNC_HEADER {
+        return None;
+    }
+    Some(u16::from_le_bytes([msg[3], msg[4]]))
+}
+
+/// End of the `path` field, i.e. the offset of the first trailer.
+fn fs_sync_trailer_start(msg: &[u8]) -> Option<usize> {
+    if msg.first().copied() != Some(C2S_FS_SYNC) || msg.len() < FS_SYNC_HEADER {
+        return None;
+    }
+    let path_len = u16::from_le_bytes([msg[11], msg[12]]) as usize;
+    let end = FS_SYNC_HEADER.checked_add(path_len)?;
+    (end <= msg.len()).then_some(end)
+}
+
+/// Byte range of the `exclude` payload in an `EXCLUDE` `C2S_FS_SYNC`, and
+/// the offset just past it. `None` when the flag is unset or the field is
+/// truncated — the caller refuses the request rather than guessing.
+fn fs_sync_exclude_span(msg: &[u8]) -> Option<(std::ops::Range<usize>, usize)> {
+    let off = fs_sync_trailer_start(msg)?;
+    if fs_sync_flags(msg)? & FS_SYNC_EXCLUDE == 0 {
+        return Some((off..off, off));
+    }
+    let len_bytes = msg.get(off..off + 2)?;
+    let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let start = off + 2;
+    let end = start.checked_add(len)?;
+    (end <= msg.len()).then_some((start..end, end))
+}
+
+/// Client exclude patterns from a `C2S_FS_SYNC` — `""` when `EXCLUDE` is
+/// unset. `None` means malformed: a truncated field or non-UTF-8 patterns.
+pub fn fs_sync_exclude(msg: &[u8]) -> Option<&str> {
+    let (span, _) = fs_sync_exclude_span(msg)?;
+    std::str::from_utf8(&msg[span]).ok()
 }
 
 /// Extract the trailing `src_pty_id` from a `FROM_PTY` `C2S_FS_SYNC`; `None`
 /// when the flag is unset or the field is missing.
 pub fn fs_sync_src_pty(msg: &[u8]) -> Option<u16> {
-    if msg.first().copied() != Some(C2S_FS_SYNC) || msg.len() < 12 {
+    if fs_sync_flags(msg)? & FS_SYNC_FROM_PTY == 0 {
         return None;
     }
-    if msg[3] & FS_SYNC_FROM_PTY == 0 {
-        return None;
-    }
-    let path_len = u16::from_le_bytes([msg[10], msg[11]]) as usize;
-    let off = 12usize.checked_add(path_len)?;
+    let (_, off) = fs_sync_exclude_span(msg)?;
     let b = msg.get(off..off + 2)?;
     Some(u16::from_le_bytes([b[0], b[1]]))
 }
@@ -517,14 +667,17 @@ pub fn fs_sync_src_pty(msg: &[u8]) -> Option<u16> {
 /// Rebase a `FROM_PTY` `C2S_FS_SYNC` onto a resolved `cwd`: join `cwd`/`path`
 /// and clear `FROM_PTY`, producing a plain path-based sync the handler
 /// consumes unchanged. `cwd` `None` (source pty gone) keeps `path` verbatim.
+/// Any exclude field rides along — the filter is the client's, not the
+/// pty's, and dropping it here would silently widen the sync.
 pub fn fs_sync_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
     fs_sync_src_pty(msg)?;
     let nonce = u16::from_le_bytes([msg[1], msg[2]]);
-    let flags = msg[3] & !FS_SYNC_FROM_PTY;
-    let latency_ms = u16::from_le_bytes([msg[4], msg[5]]);
-    let inline_max = u32::from_le_bytes([msg[6], msg[7], msg[8], msg[9]]);
-    let path_len = u16::from_le_bytes([msg[10], msg[11]]) as usize;
-    let path = std::str::from_utf8(msg.get(12..12 + path_len)?).ok()?;
+    let flags = fs_sync_flags(msg)? & !FS_SYNC_FROM_PTY;
+    let latency_ms = u16::from_le_bytes([msg[5], msg[6]]);
+    let inline_max = u32::from_le_bytes([msg[7], msg[8], msg[9], msg[10]]);
+    let path_len = u16::from_le_bytes([msg[11], msg[12]]) as usize;
+    let path = std::str::from_utf8(msg.get(FS_SYNC_HEADER..FS_SYNC_HEADER + path_len)?).ok()?;
+    let exclude = fs_sync_exclude(msg)?;
     let joined = cwd.map(|dir| {
         std::path::Path::new(dir)
             .join(path)
@@ -532,7 +685,9 @@ pub fn fs_sync_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
             .into_owned()
     });
     let eff = joined.as_deref().unwrap_or(path);
-    Some(msg_fs_sync(nonce, flags, latency_ms, inline_max, eff))
+    Some(msg_fs_sync_full(
+        nonce, flags, latency_ms, inline_max, eff, exclude, None,
+    ))
 }
 
 pub fn msg_fs_stop(sync_id: u16) -> Vec<u8> {
@@ -1619,8 +1774,8 @@ mod tests {
         assert_eq!(
             m,
             vec![
-                0x40, 0x07, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x73, 0x75,
-                0x62, 0x2a, 0x00
+                0x40, 0x07, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x73,
+                0x75, 0x62, 0x2a, 0x00
             ]
         );
         assert_eq!(fs_sync_src_pty(&m), Some(42));
@@ -1630,16 +1785,68 @@ mod tests {
         );
         // Rebase joins cwd + path and clears FROM_PTY.
         let reb = fs_sync_rebase(&m, Some("/home/u")).unwrap();
-        assert_eq!(reb[3] & FS_SYNC_FROM_PTY, 0);
-        let plen = u16::from_le_bytes([reb[10], reb[11]]) as usize;
+        assert_eq!(fs_sync_flags(&reb).unwrap() & FS_SYNC_FROM_PTY, 0);
+        let plen = u16::from_le_bytes([reb[11], reb[12]]) as usize;
         assert_eq!(
-            std::str::from_utf8(&reb[12..12 + plen]).unwrap(),
+            std::str::from_utf8(&reb[13..13 + plen]).unwrap(),
             "/home/u/sub"
         );
         // No cwd (source pty gone) keeps path verbatim.
         let reb0 = fs_sync_rebase(&m, None).unwrap();
-        let plen0 = u16::from_le_bytes([reb0[10], reb0[11]]) as usize;
-        assert_eq!(std::str::from_utf8(&reb0[12..12 + plen0]).unwrap(), "sub");
+        let plen0 = u16::from_le_bytes([reb0[11], reb0[12]]) as usize;
+        assert_eq!(std::str::from_utf8(&reb0[13..13 + plen0]).unwrap(), "sub");
+    }
+
+    /// The two optional trailers coexist in one message, and each is
+    /// reachable past the other — the property that makes the field order
+    /// (`EXCLUDE` then `FROM_PTY`) load-bearing.
+    #[test]
+    fn fs_sync_exclude_field_roundtrips_alongside_from_pty() {
+        let plain = msg_fs_sync(1, FS_SYNC_RECURSIVE, 0, 0, "sub");
+        assert_eq!(fs_sync_flags(&plain).unwrap() & FS_SYNC_EXCLUDE, 0);
+        assert_eq!(fs_sync_exclude(&plain), Some(""));
+
+        // Empty patterns build the plain form: no field, no flag.
+        assert_eq!(
+            msg_fs_sync_excluding(1, FS_SYNC_RECURSIVE, 0, 0, "sub", ""),
+            plain
+        );
+
+        let ex = msg_fs_sync_excluding(1, FS_SYNC_RECURSIVE, 0, 0, "sub", "target\n!keep");
+        assert_ne!(fs_sync_flags(&ex).unwrap() & FS_SYNC_EXCLUDE, 0);
+        assert_eq!(fs_sync_exclude(&ex), Some("target\n!keep"));
+        assert_eq!(fs_sync_src_pty(&ex), None);
+
+        let both = msg_fs_sync_full(1, FS_SYNC_RECURSIVE, 0, 0, "sub", "target", Some(42));
+        assert_eq!(fs_sync_exclude(&both), Some("target"));
+        assert_eq!(fs_sync_src_pty(&both), Some(42), "reached past the field");
+        let reb = fs_sync_rebase(&both, Some("/home/u")).unwrap();
+        assert_eq!(fs_sync_flags(&reb).unwrap() & FS_SYNC_FROM_PTY, 0);
+        assert_ne!(fs_sync_flags(&reb).unwrap() & FS_SYNC_EXCLUDE, 0);
+        assert_eq!(fs_sync_exclude(&reb), Some("target"), "filter survives");
+        let plen = u16::from_le_bytes([reb[11], reb[12]]) as usize;
+        assert_eq!(
+            std::str::from_utf8(&reb[13..13 + plen]).unwrap(),
+            "/home/u/sub"
+        );
+
+        // A truncated field is malformed, not an empty pattern list.
+        assert_eq!(fs_sync_exclude(&ex[..ex.len() - 1]), None);
+        let mut headerless = ex.clone();
+        headerless.truncate(17);
+        assert_eq!(fs_sync_exclude(&headerless), None);
+    }
+
+    /// Exclusion narrows enumeration, and a `SINGLE` sync enumerates
+    /// nothing: the combination is a client misunderstanding, refused
+    /// rather than silently ignored.
+    #[test]
+    fn exclusion_flags_are_rejected_with_single() {
+        for flag in [FS_SYNC_EXCLUDE_GIT, FS_SYNC_GITIGNORE, FS_SYNC_EXCLUDE] {
+            assert!(fs_sync_flags_valid(flag));
+            assert!(fs_sync_flags_valid(flag | FS_SYNC_RECURSIVE));
+            assert!(!fs_sync_flags_valid(flag | FS_SYNC_SINGLE));
+        }
     }
 
     fn upsert(path: &str, content: &[u8]) -> Vec<u8> {
@@ -1733,7 +1940,20 @@ mod tests {
                 65536,
                 "/tmp/watch me"
             )),
-            "400201031900000001000d002f746d702f7761746368206d65"
+            "40020103001900000001000d002f746d702f7761746368206d65"
+        );
+        // Both optional trailers, in field order: EXCLUDE then FROM_PTY.
+        assert_eq!(
+            hex(&msg_fs_sync_full(
+                7,
+                FS_SYNC_RECURSIVE,
+                0,
+                0,
+                "sub",
+                "target",
+                Some(42)
+            )),
+            "4007009100000000000000030073756206007461726765742a00"
         );
         assert_eq!(hex(&msg_fs_stop(0x0102)), "410201");
         assert_eq!(hex(&msg_fs_ack(0x0102, 0x01020304)), "42020104030201");

@@ -5618,9 +5618,10 @@ async fn handle_fs_message(
         C2S_FS_SYNC, C2S_FS_WRITE, FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER,
         FS_DONE_PERMISSION, FS_DONE_WRONG_TYPE, FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK,
         FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT, FS_SYNC_CONTENT, FS_SYNC_CROSS_FILESYSTEM,
-        FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid, msg_fs_done,
-        msg_fs_file, msg_fs_index_result, msg_fs_search_result, msg_fs_synced, parse_fs_index,
-        parse_fs_op, parse_fs_search, parse_fs_write,
+        FS_SYNC_DOTIGNORE, FS_SYNC_EXCLUDE_GIT, FS_SYNC_FLAGS_KNOWN, FS_SYNC_GITIGNORE,
+        FS_SYNC_HEADER, FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid,
+        msg_fs_done, msg_fs_file, msg_fs_index_result, msg_fs_search_result, msg_fs_synced,
+        parse_fs_index, parse_fs_op, parse_fs_search, parse_fs_write,
     };
     match data[0] {
         C2S_FS_SEARCH => {
@@ -5790,16 +5791,16 @@ async fn handle_fs_message(
                 });
             }
         }
-        C2S_FS_SYNC if data.len() >= 12 => {
+        C2S_FS_SYNC if data.len() >= FS_SYNC_HEADER => {
             let nonce = u16::from_le_bytes([data[1], data[2]]);
-            let flags = data[3];
-            let latency_ms = u16::from_le_bytes([data[4], data[5]]);
-            let inline_max = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
-            let path_len = u16::from_le_bytes([data[10], data[11]]) as usize;
+            let flags = u16::from_le_bytes([data[3], data[4]]);
+            let latency_ms = u16::from_le_bytes([data[5], data[6]]);
+            let inline_max = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
+            let path_len = u16::from_le_bytes([data[11], data[12]]) as usize;
             let refuse = |status: u8, detail: &str| {
                 let _ = out.send(msg_fs_synced(nonce, FS_SYNC_ID_INVALID, status, detail));
             };
-            let Some(path_bytes) = data.get(12..12 + path_len) else {
+            let Some(path_bytes) = data.get(FS_SYNC_HEADER..FS_SYNC_HEADER + path_len) else {
                 refuse(FS_STATUS_OTHER, "truncated request");
                 return;
             };
@@ -5807,16 +5808,37 @@ async fn handle_fs_message(
                 refuse(FS_STATUS_OTHER, "path is not UTF-8");
                 return;
             };
-            const KNOWN: u8 =
-                FS_SYNC_RECURSIVE | FS_SYNC_CONTENT | FS_SYNC_CROSS_FILESYSTEM | FS_SYNC_SINGLE;
-            if flags & !KNOWN != 0 {
+            if flags & !FS_SYNC_FLAGS_KNOWN != 0 {
                 refuse(FS_STATUS_OTHER, "unknown flags");
                 return;
             }
             if !fs_sync_flags_valid(flags) {
-                refuse(FS_STATUS_OTHER, "single sync cannot be recursive");
+                refuse(
+                    FS_STATUS_OTHER,
+                    "single sync cannot be recursive or exclude anything",
+                );
                 return;
             }
+            // Exclusion (docs/design/fs-watch.md "Ignoring"): the client's
+            // patterns are a virtual `.gitignore` at the root, and the
+            // flags add the built-in sources. Together they form the
+            // shared root's identity, so a malformed list has to be
+            // refused here rather than silently narrowed.
+            let Some(exclude) = blit_remote::fs::fs_sync_exclude(data) else {
+                refuse(FS_STATUS_OTHER, "malformed exclude patterns");
+                return;
+            };
+            let patterns = blit_fssync::IgnoreSpec::parse_patterns(exclude);
+            if patterns.len() > blit_fssync::MAX_IGNORE_PATTERNS {
+                refuse(FS_STATUS_OTHER, "too many exclude patterns");
+                return;
+            }
+            let ignores = blit_fssync::IgnoreSpec {
+                gitignore: flags & FS_SYNC_GITIGNORE != 0,
+                dot_ignore: flags & FS_SYNC_DOTIGNORE != 0,
+                exclude_git: flags & FS_SYNC_EXCLUDE_GIT != 0,
+                patterns,
+            };
             // Reap entries whose engine exited on its own (root gone,
             // resource limit, backend failure): the client got their
             // FS_CLOSED but never sent FS_STOP, so their slots would
@@ -5849,6 +5871,7 @@ async fn handle_fs_message(
                         path: root.clone(),
                         recursive,
                         cross_filesystem,
+                        ignores,
                     })?;
                     Ok((root, shared))
                 }
@@ -6230,7 +6253,7 @@ async fn handle_git_message(
     use blit_remote::git::*;
     match data[0] {
         C2S_GIT_OPEN => {
-            let Some((nonce, flags, refs_ms, status_ms, path)) = parse_git_open(data) else {
+            let Some(open_req) = parse_git_open(data) else {
                 // A well-formed nonce with a truncated/non-UTF-8 trailing
                 // field still gets its one reply (as the git read handlers do
                 // via git_nonce), so the client promise resolves.
@@ -6247,6 +6270,20 @@ async fn handle_git_message(
                 }
                 return;
             };
+            let GitOpenRequest {
+                nonce,
+                flags,
+                refs_latency_ms: refs_ms,
+                status_latency_ms: status_ms,
+                parent_repo_id,
+                path,
+                ..
+            } = open_req;
+            let ref_prefixes: Vec<String> = open_req
+                .ref_prefixes
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect();
             let refuse = |status: u8, detail: &str| {
                 let _ = out.send(msg_git_repo(
                     nonce,
@@ -6264,13 +6301,20 @@ async fn handle_git_message(
                 refuse(GIT_STATUS_INVALID, "duplicate nonce");
                 return;
             }
-            const KNOWN: u8 = GIT_OPEN_WATCH
-                | GIT_OPEN_STATUS
-                | GIT_OPEN_UNTRACKED
-                | GIT_OPEN_IGNORED
-                | GIT_OPEN_TRACKING;
-            if flags & !KNOWN != 0 {
+            if flags & !GIT_OPEN_KNOWN != 0 {
                 refuse(GIT_STATUS_INVALID, "unknown flags");
+                return;
+            }
+            // Two ways of saying where `path` starts from, and they disagree:
+            // a parent makes it relative to that parent's worktree, a source
+            // pty makes it relative to the pty's cwd — which the rebase above
+            // has already turned into an absolute path, so a submodule open
+            // would fail deep inside as INVALID instead of here.
+            if parent_repo_id != GIT_OPEN_NO_CONTEXT && open_req.src_pty_id != GIT_OPEN_NO_CONTEXT {
+                refuse(
+                    GIT_STATUS_INVALID,
+                    "parent_repo_id and src_pty_id are mutually exclusive",
+                );
                 return;
             }
             if repos.map.len() >= GitRepos::max_repos() {
@@ -6282,9 +6326,26 @@ async fn handle_git_message(
             // messages stay ordered (GIT_REPO before the first GIT_STATE,
             // and no later GIT_* can observe a half-open repo).
             let path_owned = path.to_string();
-            let opened = tokio::task::spawn_blocking(move || blit_git::open(&path_owned))
-                .await
-                .unwrap_or_else(|_| Err((GIT_STATUS_OTHER, "open task failed".to_string())));
+            // A parent id makes `path` a submodule path: the server
+            // resolves that submodule's own gitdir rather than making the
+            // client guess where .gitmodules put its worktree.
+            let parent = if parent_repo_id == GIT_OPEN_NO_CONTEXT {
+                None
+            } else {
+                match repos.map.get(&parent_repo_id) {
+                    Some(entry) => Some(entry.handle.clone()),
+                    None => {
+                        refuse(GIT_STATUS_UNKNOWN_ID, "unknown parent repo");
+                        return;
+                    }
+                }
+            };
+            let opened = tokio::task::spawn_blocking(move || match parent {
+                Some(parent) => blit_git::open_submodule(&parent, &path_owned),
+                None => blit_git::open(&path_owned),
+            })
+            .await
+            .unwrap_or_else(|_| Err((GIT_STATUS_OTHER, "open task failed".to_string())));
             let (handle, info) = match opened {
                 Ok(opened) => opened,
                 Err((status, detail)) => {
@@ -6320,6 +6381,8 @@ async fn handle_git_message(
                     untracked: flags & (GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0,
                     ignored: flags & GIT_OPEN_IGNORED != 0,
                     tracking: flags & GIT_OPEN_TRACKING != 0,
+                    remotes: flags & GIT_OPEN_REMOTES != 0,
+                    ref_prefixes,
                     ..Default::default()
                 };
                 if refs_ms != 0 {
@@ -6406,45 +6469,80 @@ async fn handle_git_message(
             );
         }
         C2S_GIT_TREE => {
-            let Some((nonce, repo_id, oid, path)) = parse_git_tree(data) else {
+            let Some(req) = parse_git_tree(data) else {
                 if let Some(n) = git_nonce(data) {
                     let _ = out.send(msg_git_tree_resp(n, GIT_STATUS_INVALID, 0, &[]));
                 }
                 return;
             };
-            let Some(entry) = repos.map.get(&repo_id) else {
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
                 let _ = out.send(msg_git_tree_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
                 return;
             };
             let handle = entry.handle.clone();
-            let path = path.to_string();
+            let owned = (
+                req.flags,
+                req.oid,
+                req.path.to_string(),
+                req.after.to_string(),
+            );
             git_request(
                 repos,
                 nonce,
                 out,
                 move |status| msg_git_tree_resp(nonce, status, 0, &[]),
-                move |cancel| handle.tree(nonce, &oid, &path, &cancel),
+                move |cancel| {
+                    handle.tree(
+                        &GitTreeRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            oid: owned.1,
+                            path: &owned.2,
+                            after: &owned.3,
+                        },
+                        &cancel,
+                    )
+                },
             );
         }
         C2S_GIT_BLOB => {
-            let Some((nonce, repo_id, oid, path, max_len)) = parse_git_blob(data) else {
+            let Some(req) = parse_git_blob(data) else {
                 if let Some(n) = git_nonce(data) {
                     let _ = out.send(msg_git_blob_resp(n, GIT_STATUS_INVALID, 0, &[]));
                 }
                 return;
             };
-            let Some(entry) = repos.map.get(&repo_id) else {
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
                 let _ = out.send(msg_git_blob_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
                 return;
             };
             let handle = entry.handle.clone();
-            let path = path.to_string();
+            let owned = (
+                req.flags,
+                req.oid,
+                req.path.to_string(),
+                req.offset,
+                req.max_len,
+            );
             git_request(
                 repos,
                 nonce,
                 out,
                 move |status| msg_git_blob_resp(nonce, status, 0, &[]),
-                move |_cancel| handle.blob(nonce, &oid, &path, max_len),
+                move |_cancel| {
+                    handle.blob(&GitBlobRequest {
+                        nonce,
+                        repo_id: 0,
+                        flags: owned.0,
+                        oid: owned.1,
+                        path: &owned.2,
+                        offset: owned.3,
+                        max_len: owned.4,
+                    })
+                },
             );
         }
         C2S_GIT_DIFF => {
@@ -6460,7 +6558,14 @@ async fn handle_git_message(
                 return;
             };
             let handle = entry.handle.clone();
-            let owned = (req.flags, req.old, req.new, req.path.to_string());
+            let owned = (
+                req.flags,
+                req.old,
+                req.new,
+                req.path.to_string(),
+                req.rename,
+                req.after.to_string(),
+            );
             git_request(
                 repos,
                 nonce,
@@ -6472,9 +6577,11 @@ async fn handle_git_message(
                             nonce,
                             repo_id: 0,
                             flags: owned.0,
+                            rename: owned.4,
                             old: owned.1,
                             new: owned.2,
                             path: &owned.3,
+                            after: &owned.5,
                         },
                         &cancel,
                     )
@@ -6501,6 +6608,9 @@ async fn handle_git_message(
                 req.new,
                 req.path.to_string(),
                 req.max_len,
+                req.rename,
+                req.after.to_string(),
+                req.after_pos,
             );
             git_request(
                 repos,
@@ -6514,10 +6624,13 @@ async fn handle_git_message(
                             repo_id: 0,
                             flags: owned.0,
                             context: owned.1,
+                            rename: owned.6,
                             old: owned.2,
                             new: owned.3,
                             path: &owned.4,
                             max_len: owned.5,
+                            after: &owned.7,
+                            after_pos: owned.8,
                         },
                         &cancel,
                     )
@@ -6525,24 +6638,36 @@ async fn handle_git_message(
             );
         }
         C2S_GIT_INDEX => {
-            let Some((nonce, repo_id, path)) = parse_git_index(data) else {
+            let Some(req) = parse_git_index(data) else {
                 if let Some(n) = git_nonce(data) {
                     let _ = out.send(msg_git_index_resp(n, GIT_STATUS_INVALID, 0, &[]));
                 }
                 return;
             };
-            let Some(entry) = repos.map.get(&repo_id) else {
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
                 let _ = out.send(msg_git_index_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
                 return;
             };
             let handle = entry.handle.clone();
-            let path = path.to_string();
+            let owned = (req.flags, req.path.to_string(), req.after.to_string());
             git_request(
                 repos,
                 nonce,
                 out,
                 move |status| msg_git_index_resp(nonce, status, 0, &[]),
-                move |cancel| handle.index(nonce, &path, &cancel),
+                move |cancel| {
+                    handle.index(
+                        &GitIndexRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            path: &owned.1,
+                            after: &owned.2,
+                        },
+                        &cancel,
+                    )
+                },
             );
         }
         C2S_GIT_BASE => {
@@ -6648,6 +6773,163 @@ async fn handle_git_message(
             {
                 state.log_ack(log_id, update_id);
             }
+        }
+        C2S_GIT_DISCOVER => {
+            let Some(req) = parse_git_discover(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_discover_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            // No repo id: discovery is an enumeration, not an open, so it
+            // needs no handle and consumes no budget.
+            let nonce = req.nonce;
+            let owned = (
+                req.flags,
+                req.depth,
+                req.path.to_string(),
+                req.after.to_string(),
+            );
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_discover_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    blit_git::discover(
+                        &GitDiscoverRequest {
+                            nonce,
+                            flags: owned.0,
+                            depth: owned.1,
+                            path: &owned.2,
+                            after: &owned.3,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
+        C2S_GIT_BLAME => {
+            let Some(req) = parse_git_blame(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_blame_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_blame_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (
+                req.flags,
+                req.oid,
+                req.start_line,
+                req.line_count,
+                req.path.to_string(),
+            );
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_blame_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.blame(
+                        &GitBlameRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            oid: owned.1,
+                            start_line: owned.2,
+                            line_count: owned.3,
+                            path: &owned.4,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
+        C2S_GIT_REFLOG => {
+            let Some(req) = parse_git_reflog(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_reflog_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_reflog_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (
+                req.flags,
+                req.limit,
+                req.ref_name.to_string(),
+                req.after_pos,
+            );
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_reflog_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.reflog(
+                        &GitReflogRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            limit: owned.1,
+                            ref_name: &owned.2,
+                            after_pos: owned.3,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
+        C2S_GIT_FETCH => {
+            let Some(req) = parse_git_fetch(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_fetch_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_fetch_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (
+                req.flags,
+                req.timeout_ms,
+                req.remote.to_string(),
+                req.refspecs
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+            );
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_fetch_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.fetch(
+                        &GitFetchRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            timeout_ms: owned.1,
+                            remote: &owned.2,
+                            refspecs: owned.3.iter().map(String::as_str).collect(),
+                        },
+                        &cancel,
+                    )
+                },
+            );
         }
         _ => {}
     }
@@ -7237,7 +7519,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     features |= FEATURE_AUDIO;
                 }
             }
-            let _ = send_outbox(c, msg_hello(1, features, state.boot_generation));
+            let _ = send_outbox(
+                c,
+                msg_hello(
+                    1,
+                    features,
+                    state.boot_generation,
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            );
         }
         let mut initial_msgs = Vec::with_capacity(2 + sess.ptys.len() * 2);
         // Send surface-created messages BEFORE the PTY list so that
@@ -7406,11 +7696,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
         // Git introspection: same discipline as fs — connection-scoped,
         // request threads and state engines, never the session mutex.
-        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_LOG_ACK).contains(&data[0]) {
-            // FROM_PTY open (docs/ide.md Decision 3): resolve the source pty's
-            // live cwd (session state) and rebase to a plain path-based open.
+        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_FETCH).contains(&data[0]) {
+            // A pty-relative open (docs/ide.md Decision 3): resolve the
+            // source pty's live cwd (session state) and rebase to a plain
+            // path-based open.
             let msg: std::borrow::Cow<[u8]> = if data[0] == blit_remote::git::C2S_GIT_OPEN {
-                if let Some(src) = blit_remote::git::git_open_src_pty(&data) {
+                // A request naming both a source pty and a parent repo is
+                // contradictory; it is left unrebased so the handler sees
+                // both fields and refuses it, rather than being rewritten
+                // into an absolute submodule path that fails later.
+                let src = blit_remote::git::parse_git_open(&data)
+                    .filter(|r| r.parent_repo_id == blit_remote::git::GIT_OPEN_NO_CONTEXT)
+                    .map(|r| r.src_pty_id)
+                    .filter(|&id| id != blit_remote::git::GIT_OPEN_NO_CONTEXT);
+                if let Some(src) = src {
                     let cwd = {
                         let sess = state.session.lock().await;
                         sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
@@ -9102,9 +9401,13 @@ mod tests {
             1,
         );
         let rebased = blit_remote::fs::fs_sync_rebase(&sync, Some(&cwd)).expect("fs rebase");
-        assert_eq!(rebased[3] & blit_remote::fs::FS_SYNC_FROM_PTY, 0);
-        let plen = u16::from_le_bytes([rebased[10], rebased[11]]) as usize;
-        let eff = std::str::from_utf8(&rebased[12..12 + plen]).unwrap();
+        assert_eq!(
+            blit_remote::fs::fs_sync_flags(&rebased).unwrap() & blit_remote::fs::FS_SYNC_FROM_PTY,
+            0
+        );
+        let header = blit_remote::fs::FS_SYNC_HEADER;
+        let plen = u16::from_le_bytes([rebased[11], rebased[12]]) as usize;
+        let eff = std::str::from_utf8(&rebased[header..header + plen]).unwrap();
         let root = blit_fssync::validate_root(eff).expect("validate_root");
         assert_eq!(root, dir, "fs sync resolves to the terminal's cwd");
 
@@ -9116,17 +9419,18 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         if git_ok {
-            let gopen = blit_remote::git::msg_git_open_from_pty(
-                2,
-                blit_remote::git::GIT_OPEN_WATCH,
-                0,
-                0,
-                "",
-                1,
-            );
+            let gopen = blit_remote::git::msg_git_open(&blit_remote::git::GitOpenRequest {
+                src_pty_id: 1,
+                ..blit_remote::git::GitOpenRequest::new(2, blit_remote::git::GIT_OPEN_WATCH, "")
+            });
             let greb = blit_remote::git::git_open_rebase(&gopen, Some(&cwd)).expect("git rebase");
-            let (_, gflags, _, _, gpath) = blit_remote::git::parse_git_open(&greb).unwrap();
-            assert_eq!(gflags & blit_remote::git::GIT_OPEN_FROM_PTY, 0);
+            let rebased = blit_remote::git::parse_git_open(&greb).unwrap();
+            assert_eq!(
+                rebased.src_pty_id,
+                blit_remote::git::GIT_OPEN_NO_CONTEXT,
+                "rebase consumes the pty context"
+            );
+            let gpath = rebased.path;
             let (_, info) = blit_git::open(gpath).expect("git open at cwd");
             assert_eq!(
                 std::fs::canonicalize(&info.workdir).unwrap(),
@@ -9285,7 +9589,7 @@ mod tests {
 
         // A bad path refuses with the sentinel repo id.
         handle_git_message(
-            &msg_git_open(1, 0, 0, 0, "/blit-no-such-path"),
+            &msg_git_open(&GitOpenRequest::new(1, 0, "/blit-no-such-path")),
             &mut repos,
             &out,
             false,
@@ -9297,13 +9601,11 @@ mod tests {
 
         // Open with state streaming; GIT_REPO precedes the first GIT_STATE.
         handle_git_message(
-            &msg_git_open(
+            &msg_git_open(&GitOpenRequest::new(
                 2,
                 GIT_OPEN_STATUS | GIT_OPEN_UNTRACKED | GIT_OPEN_TRACKING,
-                0,
-                0,
                 dir.to_str().unwrap(),
-            ),
+            )),
             &mut repos,
             &out,
             false,
@@ -9315,7 +9617,7 @@ mod tests {
         let repo_id = info.repo_id;
         let state = wait_msg(&mut rx, S2C_GIT_STATE);
         let mut mirror = GitStateMirror::new();
-        mirror.apply_state(&state).expect("valid state");
+        mirror.apply_state(&state).complete().expect("valid state");
         assert_eq!(mirror.head.as_ref().unwrap().name, "refs/heads/main");
         let head_oid = mirror.head.as_ref().unwrap().oid;
 
@@ -9331,7 +9633,14 @@ mod tests {
         assert_eq!(page.status, GIT_STATUS_OK);
         assert_eq!(git_commit_records(&page.records).count(), 1);
         handle_git_message(
-            &msg_git_tree(11, repo_id, &head_oid, ""),
+            &msg_git_tree(&GitTreeRequest {
+                nonce: 11,
+                repo_id,
+                flags: 0,
+                oid: head_oid,
+                path: "",
+                after: "",
+            }),
             &mut repos,
             &out,
             false,
@@ -9342,7 +9651,15 @@ mod tests {
         assert_eq!(status, GIT_STATUS_OK);
         assert_eq!(git_tree_records(&records).count(), 1);
         handle_git_message(
-            &msg_git_blob(12, repo_id, &head_oid, "f.txt", 0),
+            &msg_git_blob(&GitBlobRequest {
+                nonce: 12,
+                repo_id,
+                flags: 0,
+                oid: head_oid,
+                path: "f.txt",
+                offset: 0,
+                max_len: 0,
+            }),
             &mut repos,
             &out,
             false,
@@ -9354,7 +9671,14 @@ mod tests {
 
         // Unknown repo id answers UNKNOWN_ID; unknown cancel is a no-op.
         handle_git_message(
-            &msg_git_tree(13, 999, &head_oid, ""),
+            &msg_git_tree(&GitTreeRequest {
+                nonce: 13,
+                repo_id: 999,
+                flags: 0,
+                oid: head_oid,
+                path: "",
+                after: "",
+            }),
             &mut repos,
             &out,
             false,
@@ -9469,6 +9793,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The exclusion flags and the trailing pattern list survive the wire
+    /// and narrow what the client mirrors (docs/design/fs-watch.md
+    /// "Ignoring"): without them a checkout costs `node_modules` and
+    /// `.git` too, which is what closes big syncs at the entry budget.
+    #[tokio::test]
+    async fn fs_sync_exclusion_flow() {
+        use blit_remote::fs::{
+            FS_STATUS_OK, FS_STATUS_OTHER, FS_SYNC_EXCLUDE_GIT, FS_SYNC_GITIGNORE,
+            FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, FsMirror, S2C_FS_SYNCED,
+            S2C_FS_UPDATE, msg_fs_ack, msg_fs_stop, msg_fs_sync, msg_fs_sync_excluding,
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-fs-excl-{}", std::process::id()))
+            .canonicalize_or_create();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("node_modules/dep.js"), b"x").unwrap();
+        std::fs::write(dir.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(dir.join("keep.rs"), b"fn main() {}").unwrap();
+        std::fs::write(dir.join("scratch.tmp"), b"x").unwrap();
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+
+        // Exclusion narrows enumeration; SINGLE enumerates nothing.
+        handle_fs_message(
+            &msg_fs_sync(
+                1,
+                FS_SYNC_SINGLE | FS_SYNC_GITIGNORE,
+                5,
+                0,
+                &dir.join("keep.rs").to_string_lossy(),
+            ),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = rx.try_recv().expect("synchronous refusal");
+        assert_eq!(u16::from_le_bytes([msg[3], msg[4]]), FS_SYNC_ID_INVALID);
+        assert_eq!(msg[5], FS_STATUS_OTHER);
+
+        handle_fs_message(
+            &msg_fs_sync_excluding(
+                2,
+                FS_SYNC_RECURSIVE | FS_SYNC_GITIGNORE | FS_SYNC_EXCLUDE_GIT,
+                5,
+                0,
+                &dir.to_string_lossy(),
+                "*.tmp\n",
+            ),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+        assert_eq!(msg[5], FS_STATUS_OK);
+
+        let mut mirror = FsMirror::new();
+        while !mirror.live.contains_key("keep.rs") {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPDATE {
+                let id = mirror.apply_update(&msg).expect("valid update");
+                handle_fs_message(&msg_fs_ack(sync_id, id), &mut syncs, &out, false).await;
+            }
+        }
+        assert_eq!(
+            mirror.live.keys().cloned().collect::<Vec<_>>(),
+            ["", ".gitignore", "keep.rs"],
+            "gitignored, .git, and client-excluded paths are all absent"
+        );
+
+        handle_fs_message(&msg_fs_stop(sync_id), &mut syncs, &out, false).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FS_SYNC_SINGLE end-to-end: a real file syncs as the `""` entry, the
     /// contradictory SINGLE|RECURSIVE combination refuses before any engine
     /// work, and a directory root answers the engine's refusal
@@ -9556,7 +9961,7 @@ mod tests {
         assert_eq!(msg[5], FS_STATUS_OTHER);
         assert_eq!(
             std::str::from_utf8(&msg[8..]).unwrap(),
-            "single sync cannot be recursive"
+            "single sync cannot be recursive or exclude anything"
         );
 
         // A directory root answers the engine's refusal.
