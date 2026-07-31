@@ -22,11 +22,12 @@ use blit_remote::git::{
     GIT_PATCH_IGNORE_SPACE_CHANGE, GIT_PATCH_IGNORED, GIT_PATCH_NO_SPANS, GIT_PATCH_RAW,
     GIT_PATCH_RENAMES, GIT_PATCH_STRUCTURED, GIT_PATCH_TEXT, GIT_PATCH_TRUNCATED,
     GIT_PATCH_UNTRACKED, GIT_RENAME_MAX, GIT_STATE_STATUS_TRUNCATED, GIT_STATUS_CANCELLED,
-    GIT_STATUS_ENTRY_CONFLICTED, GIT_STATUS_INVALID, GIT_STATUS_NOT_FOUND, GIT_STATUS_OK,
-    GIT_STATUS_OTHER, GIT_STATUS_TOO_LARGE, GitDiffRecord, GitDiffRequest, GitEndpoint,
-    GitIndexRecord, GitIndexRequest, GitOid, GitPatchRecord, GitPatchRequest, GitStateRecord,
-    append_git_diff_record, append_git_index_record, append_git_patch_record,
-    append_git_state_record, msg_git_diff_resp, msg_git_index_resp, msg_git_patch_resp,
+    GIT_STATUS_ENTRY_CONFLICTED, GIT_STATUS_INVALID, GIT_STATUS_NO_MERGE_BASE,
+    GIT_STATUS_NOT_FOUND, GIT_STATUS_OK, GIT_STATUS_OTHER, GIT_STATUS_TOO_LARGE, GitDiffRecord,
+    GitDiffRequest, GitEndpoint, GitIndexRecord, GitIndexRequest, GitOid, GitPatchRecord,
+    GitPatchRequest, GitStateRecord, append_git_diff_record, append_git_index_record,
+    append_git_patch_record, append_git_state_record, msg_git_diff_resp, msg_git_index_resp,
+    msg_git_patch_resp,
 };
 
 use crate::{Budgets, Cancel, RepoHandle, is_zero_oid, oid_bytes, oid_from_wire};
@@ -1182,7 +1183,7 @@ fn resolve_endpoints(
     };
     let a = oid_from_wire(repo, &old.oid);
     let base = crate::requests::bounded_merge_base(repo, memo, a, b, budget, cancel)?
-        .ok_or(GIT_STATUS_INVALID)?;
+        .ok_or(GIT_STATUS_NO_MERGE_BASE)?;
     let base_bytes = oid_bytes(base.as_ref());
     Ok((
         GitEndpoint {

@@ -140,6 +140,10 @@ pub const GIT_STATUS_OTHER: u8 = 9;
 /// request). Shares docs/design/fs-write.md's code rather than minting a
 /// synonym, so a client's status mapping stays one table.
 pub const GIT_STATUS_CONFLICT: u8 = 11;
+/// A MERGE_BASE endpoint over histories with no common ancestor. Distinct
+/// from `INVALID`: the request is well-formed, the repository just has no
+/// such base, and a client can say so instead of blaming itself.
+pub const GIT_STATUS_NO_MERGE_BASE: u8 = 12;
 
 /// Human-readable name for a `GIT_STATUS_*` code. Total: `OTHER` and an
 /// unrecognized code are distinct, so a consumer that logs this text can
@@ -157,6 +161,7 @@ pub fn git_status_text(status: u8) -> &'static str {
         GIT_STATUS_CANCELLED => "cancelled",
         GIT_STATUS_OTHER => "backend error",
         GIT_STATUS_CONFLICT => "conflict",
+        GIT_STATUS_NO_MERGE_BASE => "no merge base",
         _ => "unknown status",
     }
 }
