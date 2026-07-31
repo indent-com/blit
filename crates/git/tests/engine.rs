@@ -4260,3 +4260,104 @@ fn binary_patch_applies_with_git_apply() {
     assert_eq!(std::fs::read(apply.join("gone.bin")).unwrap(), removed);
     assert!(!apply.join("new.bin").exists(), "the add reversed");
 }
+
+/// A worktree side carries the hash `modified_status` computed for the file it
+/// read, and nothing writes that blob to the object database — so an unstaged
+/// edit exists only on disk. Reading the side by oid finds nothing, and an
+/// empty new side renders as the whole file deleted: `git diff HEAD` is the
+/// oracle, since every unstaged change in a checkout goes through this.
+#[test]
+fn worktree_patch_reads_unstaged_content_from_disk() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("append.md"), "line one\nline two\n").unwrap();
+    std::fs::write(dir.join("rewrite.md"), "before\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "seed"]);
+    std::fs::write(dir.join("append.md"), "line one\nline two\nthree\nfour\n").unwrap();
+    std::fs::write(dir.join("rewrite.md"), "after\n").unwrap();
+    std::fs::write(dir.join("fresh.md"), "untracked\n").unwrap();
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let req = GitPatchRequest {
+        nonce: 1,
+        repo_id: 0,
+        flags: GIT_PATCH_TEXT | GIT_PATCH_UNTRACKED,
+        context: 3,
+        rename: 0,
+        old: GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: rev(&dir, "HEAD"),
+        },
+        new: GitEndpoint {
+            kind: GIT_ENDPOINT_WORKTREE,
+            oid: GIT_OID_NONE,
+        },
+        path: "",
+        max_len: 0,
+        after: "",
+        after_pos: 0,
+    };
+    let (_, status, _, data) = parse_git_patch_resp(&handle.patch(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    let ours = String::from_utf8(data).expect("patch text is UTF-8");
+
+    // An append leaves its old lines as context, so their presence as `-`
+    // rows is exactly the regression this covers.
+    assert!(
+        !ours.contains("-line one"),
+        "the file's committed content read as deleted:\n{ours}"
+    );
+    for expected in [
+        "+three\n",
+        "+four\n",
+        "-before\n",
+        "+after\n",
+        "+untracked\n",
+    ] {
+        assert!(ours.contains(expected), "missing {expected:?} in:\n{ours}");
+    }
+
+    // The tracked half against git itself, oids aside: hunk headers included,
+    // since a wrong new side gets those wrong too.
+    let theirs = git_out(
+        &dir,
+        &[
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--no-color",
+            "-U3",
+            "HEAD",
+        ],
+    );
+    let mut in_untracked = false;
+    let tracked: Vec<String> = ours
+        .lines()
+        .filter(|line| {
+            if line.starts_with("diff --git ") {
+                in_untracked = line.starts_with("diff --git a/fresh.md");
+            }
+            !in_untracked
+        })
+        .map(collapse_patch_oids)
+        .collect();
+    let expected: Vec<String> = theirs.lines().map(collapse_patch_oids).collect();
+    assert_eq!(
+        tracked, expected,
+        "\n--- ours ---\n{ours}\n--- git ---\n{theirs}\n"
+    );
+}
+
+/// "index <old>..<new> [mode]" without the oids: comparing against `git diff`
+/// is about the header set and the hunks, not about abbreviation length.
+fn collapse_patch_oids(line: &str) -> String {
+    match line.strip_prefix("index ") {
+        Some(rest) => {
+            let mode = rest.split_once(' ').map(|(_, m)| m).unwrap_or("");
+            format!("index <oids> {mode}").trim_end().to_string()
+        }
+        None => line.to_string(),
+    }
+}

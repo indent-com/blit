@@ -699,8 +699,10 @@ configured program as a side effect of a read — it sets `FILTERED` and
 emits no rows, the way a binary file behaves, so a client renders
 "filtered file changed" instead of a wrong 4000-line diff.
 
-Worktree-side oids are zero unless the file's hash was already known (from
-the index). Worktree reads use the torn-read discipline of
+Worktree-side oids are zero unless the file's content hash is known — from
+the index, or because the diff itself read and hashed the file. Neither case
+means the object database holds that blob, so a worktree side's content is
+always read from disk. Worktree reads use the torn-read discipline of
 [fs-watch.md](fs-watch.md): per-file coherent, tree-wide best-effort — no
 filesystem offers more.
 
