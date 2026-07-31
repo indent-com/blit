@@ -1150,7 +1150,9 @@ fn rename_paths(change: &Change) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Resolve request endpoints, substituting `merge-base(old, new)` for a
-/// MERGE_BASE old side. Returns the endpoints plus the BASE oid to reveal.
+/// MERGE_BASE old side — with HEAD standing in for a new side that has no
+/// oid of its own (INDEX, WORKTREE). Returns the endpoints plus the BASE oid
+/// to reveal.
 fn resolve_endpoints(
     repo: &gix::Repository,
     memo: &crate::requests::MergeMemo,
@@ -1165,11 +1167,20 @@ fn resolve_endpoints(
     if old.kind != GIT_ENDPOINT_MERGE_BASE {
         return Ok((*old, *new, None));
     }
-    if new.kind != GIT_ENDPOINT_COMMIT {
-        return Err(GIT_STATUS_INVALID);
-    }
+    // The new side names the topic to fork from. INDEX and WORKTREE carry no
+    // oid, but the work they hold is committed onto HEAD, so HEAD is the
+    // topic — that is what makes "everything since the fork, committed or
+    // not" a single request against a single repository state. An unborn
+    // HEAD names no commit at all: NOT_FOUND, so a client can degrade to
+    // another view instead of reading it as a request it built wrong.
+    let b = match new.kind {
+        GIT_ENDPOINT_COMMIT => oid_from_wire(repo, &new.oid),
+        GIT_ENDPOINT_INDEX | GIT_ENDPOINT_WORKTREE => {
+            repo.head_id().map_err(|_| GIT_STATUS_NOT_FOUND)?.detach()
+        }
+        _ => return Err(GIT_STATUS_INVALID),
+    };
     let a = oid_from_wire(repo, &old.oid);
-    let b = oid_from_wire(repo, &new.oid);
     let base = crate::requests::bounded_merge_base(repo, memo, a, b, budget, cancel)?
         .ok_or(GIT_STATUS_INVALID)?;
     let base_bytes = oid_bytes(base.as_ref());

@@ -256,7 +256,11 @@ export const GIT_ENDPOINT_COMMIT = 1;
 export const GIT_ENDPOINT_TREE = 2;
 export const GIT_ENDPOINT_INDEX = 3;
 export const GIT_ENDPOINT_WORKTREE = 4;
-/** Old side only: the server substitutes `merge-base(oid, new)`. */
+/** Old side only: the server substitutes `merge-base(oid, new)`, reading
+ *  the new side as HEAD when it is {@link GIT_ENDPOINT_INDEX} or
+ *  {@link GIT_ENDPOINT_WORKTREE} — so "everything since the fork,
+ *  committed or not" is one request. EMPTY and TREE new sides have no
+ *  ancestry to fork from and are refused. */
 export const GIT_ENDPOINT_MERGE_BASE = 5;
 
 // GIT_STATE record kinds.
@@ -1797,7 +1801,9 @@ export interface GitRepoHandle extends ReactiveStore {
     maxLen?: number,
     opts?: GitRequestOptions & { offset?: number; flags?: number },
   ): Promise<Uint8Array>;
-  /** File-level diff records between two endpoints. */
+  /** File-level diff records between two endpoints. A
+   *  {@link GIT_ENDPOINT_MERGE_BASE} old side answers with a `base` record
+   *  first, and pairs with a COMMIT, INDEX or WORKTREE new side. */
   diff(
     old: GitEndpoint,
     newEndpoint: GitEndpoint,

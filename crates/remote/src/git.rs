@@ -342,7 +342,8 @@ pub const GIT_ENDPOINT_COMMIT: u8 = 1;
 pub const GIT_ENDPOINT_TREE: u8 = 2;
 pub const GIT_ENDPOINT_INDEX: u8 = 3;
 pub const GIT_ENDPOINT_WORKTREE: u8 = 4;
-/// Old side only: the server substitutes `merge-base(oid, new)`.
+/// Old side only: the server substitutes `merge-base(oid, new)`, reading
+/// the new side as HEAD when it is INDEX or WORKTREE.
 pub const GIT_ENDPOINT_MERGE_BASE: u8 = 5;
 
 /// Reserved family-wide in every records payload: the continuation point of
