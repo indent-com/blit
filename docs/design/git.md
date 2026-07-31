@@ -678,9 +678,11 @@ entries whose changes vanish under the normalization are omitted and `st`
 reflects the normalized comparison; oids still name the true blobs.
 `path` filters to a subtree. `status` as `GIT_TREE` plus `INVALID`
 (e.g. INDEX/WORKTREE on a bare repo, MERGE_BASE on the new side, against
-an EMPTY or TREE new side or over non-commits, no common ancestor —
-including an unborn HEAD standing in for an oid-less new side). Response
-`flags`: bit 0 `TRUNCATED`.
+an EMPTY or TREE new side or over non-commits, no common ancestor) and
+`NOT_FOUND` when an unborn HEAD stands in for an oid-less new side: that
+request is well-formed, the repository simply holds no commit to take the
+base against, and a client should degrade to another view rather than
+read it as a request it built wrong. Response `flags`: bit 0 `TRUNCATED`.
 
 ```text
 DIFF_ENTRY 0x03: [kind:1][st:1][similarity:1][dflags:1]
