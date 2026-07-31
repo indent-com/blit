@@ -32,7 +32,7 @@ import {
   completeFromList,
   ifNotIn,
   snippetCompletion as snip,
-  Completion,
+  type Completion,
 } from "@codemirror/autocomplete";
 
 export const parser = nixParser;

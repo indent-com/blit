@@ -84,7 +84,9 @@ export function StatusBar(props: {
   connections: readonly BlitConnectionSnapshot[];
   gatewayStatus: "connecting" | "connected" | "unavailable";
   status: ConnectionStatus;
-  onRemotes: () => void;
+  /** Opens the remotes overlay; absent when the shell has no remotes to
+   *  manage (an embedded share), which hides the chip's click affordance. */
+  onRemotes?: () => void;
   metrics: Metrics;
   palette: TerminalPalette;
   fontSize: number;
@@ -430,16 +432,19 @@ export function StatusBar(props: {
         </button>
       </Show>
 
-      {/* Connection status indicator — opens remotes overlay */}
+      {/* Connection status indicator — opens remotes overlay when the
+          shell has one to open */}
       <button
         role="status"
         aria-label={worstStatus()}
         onClick={props.onRemotes}
+        disabled={!props.onRemotes}
         style={{
           ...buttonStyle(),
           display: "flex",
           "align-items": "center",
           gap: "3px",
+          cursor: props.onRemotes ? "pointer" : "default",
         }}
       >
         <Show when={connCounts().ok > 0}>

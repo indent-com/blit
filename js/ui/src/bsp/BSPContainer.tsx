@@ -47,6 +47,7 @@ import { BSPTreeContext, useBSPTree, type BSPTreeCtx } from "./treeContext";
 import type { Theme } from "../theme";
 import { themeFor, ui, uiScale } from "../theme";
 import { t, tp } from "../i18n";
+import { shellCapabilities } from "../shellCapabilities";
 
 // The tree context lives in ./treeContext so its identity survives hot
 // reloads of this module (see that file).
@@ -161,6 +162,8 @@ export function BSPContainer(props: {
   onDropTile?: (assignment: string, paneId: string) => void;
   /** Coarse pointer — keeps each pane's ✕ visible without a hover. */
   isMobileTouch?: boolean;
+  /** Whether a session's connection is read-only (see BSPTreeCtx). */
+  isSessionReadOnly?: (sessionId: string) => boolean;
   /** Close an IDE/web tab host-wide (Workspace owns the tab registry). */
   onCloseTab?: (assignment: string) => void;
 }) {
@@ -879,6 +882,9 @@ export function BSPContainer(props: {
     get isMobileTouch() {
       return props.isMobileTouch;
     },
+    get isSessionReadOnly() {
+      return props.isSessionReadOnly;
+    },
     onFocusPane: focusPane,
     onClosePane: closePane,
     get onCreateInPane() {
@@ -1377,6 +1383,11 @@ function LeafPane(props: {
               <div style={{ width: "100%", height: "100%" }}>
                 <BlitTerminal
                   sessionId={props.sessionId}
+                  readOnly={
+                    (props.sessionId !== null &&
+                      ctx.isSessionReadOnly?.(props.sessionId)) ||
+                    false
+                  }
                   resizable={props.visible}
                   fontSize={resolveLeafFontSize(props.leaf, ctx.fontSize)}
                   fontFamily={ctx.fontFamily}
@@ -1727,7 +1738,11 @@ export function EmptyPane(props: {
                 props.onCreateInPane?.(props.paneId, command, connId);
               }
             }}
-            placeholder={t("bsp.commandPlaceholder")}
+            placeholder={t(
+              shellCapabilities().remotes
+                ? "bsp.commandPlaceholder"
+                : "bsp.commandPlaceholderNoRemotes",
+            )}
             style={{
               ...ui.input,
               display: "block",

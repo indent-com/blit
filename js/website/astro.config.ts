@@ -2,6 +2,10 @@ import { defineConfig, fontProviders } from "astro/config";
 import solidJs from "@astrojs/solid-js";
 import tailwindcss from "@tailwindcss/vite";
 import basicSsl from "@vitejs/plugin-basic-ssl";
+// The /s page mounts the full app (`@blit-sh/ui/embed`), whose Nix syntax
+// highlighting compiles a vendored Lezer grammar at build time — same
+// plugin, same reason as js/ui's own vite config.
+import { lezer } from "@lezer/generator/rollup";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 
@@ -37,6 +41,7 @@ export default defineConfig({
     plugins: [
       basicSsl(),
       tailwindcss(),
+      lezer(),
       {
         name: "inline-wasm",
         resolveId(id) {

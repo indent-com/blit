@@ -7,6 +7,7 @@ import {
   previewFrameUrl,
   type PreviewTarget,
 } from "@blit-sh/core";
+import { shellCapabilities } from "./shellCapabilities";
 
 export { looksLikeWebLocation };
 
@@ -33,6 +34,7 @@ let registration: Promise<ServiceWorkerRegistration | null> | null = null;
 /** True when previews can work at all here. */
 export function previewSupported(): boolean {
   return (
+    shellCapabilities().previews &&
     typeof navigator !== "undefined" &&
     "serviceWorker" in navigator &&
     self.isSecureContext

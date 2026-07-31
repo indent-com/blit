@@ -601,6 +601,9 @@ in
       pkgs.pnpm
       pkgs.python3
       pkgs.bun
+      # The hub's tests drive a real redis: the outage they pin (registration
+      # awaiting a dead socket) is invisible to anything that stubs it out.
+      pkgs.valkey
       pkgs.pkg-config
       pkgs.libopus
     ];
@@ -625,6 +628,10 @@ in
       echo ""
       echo "=== JS workspace tests ==="
       (cd js && pnpm --filter @blit-sh/core run test && pnpm --filter @blit-sh/react run test && pnpm --filter @blit-sh/solid run test && pnpm --filter @blit-sh/ui run test)
+
+      echo ""
+      echo "=== Hub tests (real redis) ==="
+      (cd js/hub && bun install --frozen-lockfile && bun run typecheck && bun test)
 
       export BLIT_SERVER="${blit}/bin/blit"
       echo ""

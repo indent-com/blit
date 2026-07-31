@@ -1,0 +1,83 @@
+---
+// Act III — agents. Terminals as an API: the parsed grid, not scraped bytes.
+---
+
+<section id="agents" class="border-b border-[var(--border)] bg-[var(--bg)]">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div class="max-w-2xl">
+      <div
+        class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+      >
+        Agents
+      </div>
+      <h2
+        class="mt-3 font-sans text-[clamp(1.7rem,3.4vw,2.4rem)] font-bold leading-tight tracking-[-0.02em] text-[var(--bright)]"
+      >
+        Terminals your agents can drive.
+      </h2>
+      <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
+        Every subcommand works over the <em>parsed</em> terminal grid — start a
+        process, send keystrokes, wait for a regex, read the screen as text.
+        No expect scripts, no ANSI scraping, no tmux pane math. One skill file
+        teaches any model the whole surface:
+        <code class="text-[var(--code-fg)]">read(https://install.blit.sh/SKILL.md)</code>
+      </p>
+    </div>
+
+    <div class="mt-10 grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div
+        class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--code-bg)]"
+        data-theme="dark"
+      >
+        <div
+          class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+        >
+          Drive a build
+        </div>
+        <pre
+          class="m-0 overflow-x-auto px-4 py-4 font-mono text-[13px] leading-relaxed text-[var(--code-fg)]"><code><span class="text-[var(--green)] select-none">$</span> blit terminal start -t build make -j8
+<span class="text-[var(--hl-num)]">1</span>
+<span class="text-[var(--green)] select-none">$</span> blit terminal wait 1 --pattern <span class="text-[var(--hl-str)]">'BUILD OK'</span>
+<span class="text-[var(--green)] select-none">$</span> blit terminal show 1 | tail -2
+<span class="text-[var(--dim)]">[100%] Built target app</span>
+<span class="text-[var(--green)]">BUILD OK</span>
+
+<span class="text-[var(--green)] select-none">$</span> blit terminal send 1 <span class="text-[var(--hl-str)]">"./bin/app --serve\n"</span></code></pre>
+      </div>
+
+      <div
+        class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--code-bg)]"
+        data-theme="dark"
+      >
+        <div
+          class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2"
+        >
+          <span
+            class="font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
+            >GUI apps, headless</span
+          >
+          <span
+            class="rounded border border-[var(--border-strong)] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-[var(--dim)]"
+            >Experimental · Linux</span
+          >
+        </div>
+        <pre
+          class="m-0 overflow-x-auto px-4 py-4 font-mono text-[13px] leading-relaxed text-[var(--code-fg)]"><code><span class="text-[var(--green)] select-none">$</span> blit terminal start foot
+<span class="text-[var(--hl-num)]">1</span>
+<span class="text-[var(--green)] select-none">$</span> blit surface list
+<span class="text-[var(--dim)]">1  foot — 1024x768 — av1-vaapi</span>
+<span class="text-[var(--green)] select-none">$</span> blit surface capture 1 screenshot.png
+<span class="text-[var(--green)] select-none">$</span> blit surface click 1 100 50
+<span class="text-[var(--green)] select-none">$</span> blit surface type 1 <span class="text-[var(--hl-str)]">"hello&#123;Return&#125;"</span></code></pre>
+      </div>
+    </div>
+
+    <p class="mt-6 max-w-2xl text-[13px] leading-relaxed text-[var(--dim)]">
+      Every blit terminal includes an experimental headless Wayland compositor:
+      launch a GUI app with no display, stream it as H.264/AV1, click into it,
+      type at it, screenshot it. The compositor clipboard moves bytes of any
+      MIME type between local terminals, share links, and SSH remotes with the
+      same four commands.
+    </p>
+  </div>
+</section>

@@ -12,6 +12,7 @@
     "@astrojs/solid-js": "^6.0.1",
     "@blit-sh/core": "workspace:*",
     "@blit-sh/solid": "workspace:*",
+    "@blit-sh/ui": "workspace:*",
     "astro": "^6.4.6",
     "solid-js": "^1.9.13",
     "tweetnacl": "^1.0.3"
@@ -19,6 +20,7 @@
   "devDependencies": {
     "@astrojs/check": "^0.9.9",
     "@blit-sh/browser": "file:../../crates/browser/pkg",
+    "@lezer/generator": "^1.8.0",
     "@tailwindcss/vite": "^4.3.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
     "tailwindcss": "^4.3.0",

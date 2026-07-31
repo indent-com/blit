@@ -7,7 +7,12 @@ primary_region = "iad"
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = "suspend"
+  # Stop, not suspend. A suspended machine resumes with its memory intact —
+  # including redis connections whose peers are long gone — and the hub then
+  # awaits commands that never answer. A cold start costs a few hundred ms
+  # and comes back with live sockets. This is the machine-level half of the
+  # outage the command timeouts in src/index.ts cover from inside.
+  auto_stop_machines = "stop"
   auto_start_machines = true
 
 [[http_service.checks]]

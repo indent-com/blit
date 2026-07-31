@@ -2,7 +2,10 @@
   "extends": "astro/tsconfigs/strict",
   "compilerOptions": {
     "jsx": "preserve",
-    "jsxImportSource": "solid-js"
+    "jsxImportSource": "solid-js",
+    // The /s page compiles `@blit-sh/ui` from workspace source, which uses
+    // `import.meta.hot` (vite HMR) and vite asset imports.
+    "types": ["vite/client"]
   },
   "include": ["src", "src/**/*.d.ts"]
 }

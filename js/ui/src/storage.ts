@@ -561,9 +561,16 @@ export function preferredPreviewPanelWidth(): number {
   return preferredWidth(PREVIEW_PANEL_WIDTH_KEY, 160);
 }
 
-/** Whether the IDE dock was left open. */
+/** Whether the IDE dock is open. A stored choice wins either way; first
+ *  run opens it wherever the viewport can afford the width — the dock is
+ *  the workspace's front door, and arriving at a bare terminal hid the
+ *  files/log/problems surface behind a shortcut nobody has learned yet.
+ *  On a phone it would bury the terminal instead, so it starts closed
+ *  there. */
 export function preferredLeftDockOpen(): boolean {
-  return readStorage(LEFT_DOCK_OPEN_KEY) === "1";
+  const raw = readStorage(LEFT_DOCK_OPEN_KEY);
+  if (raw != null) return raw === "1";
+  return typeof window !== "undefined" && window.innerWidth >= 768;
 }
 
 type LeftSection = "explorer" | "log" | "problems";
