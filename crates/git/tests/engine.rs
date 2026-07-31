@@ -1656,6 +1656,163 @@ fn merge_base_and_symmetric_diff_on_fork() {
     assert_eq!(status, GIT_STATUS_INVALID);
 }
 
+/// The review view of a branch still being worked on: MERGE_BASE against
+/// the index or the worktree, which carry no oid of their own, takes the
+/// base against HEAD — so one request answers "everything since the fork,
+/// committed or not". Oracle is git's own `--merge-base`.
+#[test]
+fn merge_base_pairs_with_index_and_worktree() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("shared.txt"), "base\n").unwrap();
+    std::fs::write(dir.join("staged.txt"), "staged\n").unwrap();
+    std::fs::write(dir.join("dirty.txt"), "dirty\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "base"]);
+    git(&dir, &["branch", "feature"]);
+    // main advances past the fork, so the base is neither tip.
+    std::fs::write(dir.join("shared.txt"), "main-1\n").unwrap();
+    git(&dir, &["commit", "-am", "m1"]);
+    // feature commits, stages, edits and leaves a file untracked.
+    git(&dir, &["checkout", "feature"]);
+    std::fs::write(dir.join("committed.txt"), "c\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "f1"]);
+    std::fs::write(dir.join("staged.txt"), "staged2\n").unwrap();
+    git(&dir, &["add", "staged.txt"]);
+    std::fs::write(dir.join("dirty.txt"), "dirty2\n").unwrap();
+    std::fs::write(dir.join("untracked.txt"), "u\n").unwrap();
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let cancel = Cancel::default();
+    let main_tip = rev(&dir, "main");
+    let base = rev(&dir, &git_out(&dir, &["merge-base", "main", "HEAD"]));
+    assert_ne!(base, main_tip);
+    assert_ne!(base, rev(&dir, "HEAD"));
+
+    let merge_base = GitEndpoint {
+        kind: GIT_ENDPOINT_MERGE_BASE,
+        oid: main_tip,
+    };
+    let plain = |kind| GitEndpoint {
+        kind,
+        oid: GIT_OID_NONE,
+    };
+    // git's name-status, as `(st, path)` pairs, for an oracle comparison.
+    let oracle = |args: &[&str]| -> Vec<(u8, String)> {
+        git_out(&dir, args)
+            .lines()
+            .map(|line| {
+                let (st, path) = line.split_once('\t').unwrap();
+                (st.as_bytes()[0], path.to_string())
+            })
+            .collect()
+    };
+    let entries = |nonce: u16,
+                   new: GitEndpoint,
+                   flags: u8|
+     -> (u8, Option<GitOid>, Vec<(u8, String)>) {
+        let req = GitDiffRequest {
+            nonce,
+            repo_id: 0,
+            flags,
+            rename: 0,
+            old: merge_base,
+            new,
+            path: "",
+            after: "",
+        };
+        let (_, status, _, records) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+        let mut base_oid = None;
+        let mut out = Vec::new();
+        for record in git_diff_records(&records) {
+            match record {
+                GitDiffRecord::Base { oid } => base_oid = Some(oid),
+                GitDiffRecord::Entry { st, new_path, .. } => out.push((st, new_path.to_string())),
+                _ => {}
+            }
+        }
+        out.sort();
+        (status, base_oid, out)
+    };
+
+    // Worktree: the fork's whole diff, committed and uncommitted alike.
+    let (status, base_oid, mut got) = entries(1, plain(GIT_ENDPOINT_WORKTREE), GIT_DIFF_UNTRACKED);
+    assert_eq!(status, GIT_STATUS_OK);
+    assert_eq!(base_oid, Some(base), "BASE record still names the base");
+    let untracked = (b'A', "untracked.txt".to_string());
+    assert!(got.contains(&untracked), "untracked file missing: {got:?}");
+    got.retain(|entry| *entry != untracked);
+    let mut want = oracle(&["diff", "--name-status", "--merge-base", "main"]);
+    want.sort();
+    assert_eq!(got, want, "worktree side must match git --merge-base");
+    assert!(
+        want.contains(&(b'M', "dirty.txt".into()))
+            && want.contains(&(b'A', "committed.txt".into())),
+        "fixture must mix committed and uncommitted work: {want:?}"
+    );
+
+    // Index: the same base, staged content only — dirty.txt is unstaged, so
+    // it must not appear.
+    let (status, base_oid, got) = entries(2, plain(GIT_ENDPOINT_INDEX), 0);
+    assert_eq!(status, GIT_STATUS_OK);
+    assert_eq!(base_oid, Some(base));
+    let mut want = oracle(&["diff", "--name-status", "--cached", "--merge-base", "main"]);
+    want.sort();
+    assert_eq!(got, want, "index side must match git --merge-base --cached");
+    assert!(!got.iter().any(|(_, path)| path == "dirty.txt"));
+
+    // The kinds with no ancestry to fork from stay INVALID.
+    for kind in [
+        GIT_ENDPOINT_EMPTY,
+        GIT_ENDPOINT_TREE,
+        GIT_ENDPOINT_MERGE_BASE,
+    ] {
+        let (status, _, _) = entries(3, plain(kind), 0);
+        assert_eq!(status, GIT_STATUS_INVALID, "kind {kind} must be INVALID");
+    }
+
+    // GIT_PATCH shares the resolver, and its text is git's.
+    let req = GitPatchRequest {
+        nonce: 4,
+        repo_id: 0,
+        flags: GIT_PATCH_TEXT,
+        context: 3,
+        rename: 0,
+        old: merge_base,
+        new: plain(GIT_ENDPOINT_WORKTREE),
+        path: "dirty.txt",
+        max_len: 0,
+        after: "",
+        after_pos: 0,
+    };
+    let (_, status, _, data) = parse_git_patch_resp(&handle.patch(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_OK);
+    let text = String::from_utf8(data).unwrap();
+    assert!(
+        text.contains("+dirty2") && text.contains("-dirty"),
+        "patch must read the worktree side: {text}"
+    );
+
+    // An unborn HEAD names no commit to take the base against: NOT_FOUND,
+    // not INVALID, so a client can degrade instead of blaming its request.
+    git(&dir, &["checkout", "--orphan", "fresh"]);
+    git(&dir, &["reset"]);
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let req = GitDiffRequest {
+        nonce: 5,
+        repo_id: 0,
+        flags: 0,
+        rename: 0,
+        old: merge_base,
+        new: plain(GIT_ENDPOINT_WORKTREE),
+        path: "",
+        after: "",
+    };
+    let (_, status, _, _) = parse_git_diff_resp(&handle.diff(&req, &cancel)).unwrap();
+    assert_eq!(status, GIT_STATUS_NOT_FOUND);
+}
+
 /// Criss-cross merges give two maximal merge bases: `A...B` must hide
 /// both (matching `git merge-base --all`), and `GIT_BASE` returns one of
 /// them as the best base.

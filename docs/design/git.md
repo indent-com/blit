@@ -641,6 +641,15 @@ views compose from them:
 | Unstaged                  | INDEX                 | WORKTREE       |
 | Working tree vs HEAD      | COMMIT (HEAD)         | WORKTREE       |
 | Branch vs where it forked | MERGE_BASE (upstream) | COMMIT (topic) |
+| All work since it forked  | MERGE_BASE (upstream) | WORKTREE       |
+
+A MERGE_BASE old side pairs with COMMIT, INDEX or WORKTREE. INDEX and
+WORKTREE carry no oid, so the base is taken against HEAD — the commit
+their contents are staged and edited on top of. That is the review view of
+a branch that is still being worked on: everything since the fork,
+committed or not, in one request. The other kinds stay `INVALID`: EMPTY
+names nothing to fork from and TREE has no ancestry, so neither has a
+merge base to compute.
 
 With a MERGE_BASE endpoint the response opens with a `BASE` record naming
 the chosen base (what `git merge-base` would pick), so per-file follow-ups
@@ -668,8 +677,10 @@ trailing whitespace is ignored — git's `-b`), bit 4 `IGNORE_ALL_SPACE`
 entries whose changes vanish under the normalization are omitted and `st`
 reflects the normalized comparison; oids still name the true blobs.
 `path` filters to a subtree. `status` as `GIT_TREE` plus `INVALID`
-(e.g. INDEX/WORKTREE on a bare repo, MERGE_BASE on the new side or over
-non-commits, no common ancestor). Response `flags`: bit 0 `TRUNCATED`.
+(e.g. INDEX/WORKTREE on a bare repo, MERGE_BASE on the new side, against
+an EMPTY or TREE new side or over non-commits, no common ancestor —
+including an unborn HEAD standing in for an oid-less new side). Response
+`flags`: bit 0 `TRUNCATED`.
 
 ```text
 DIFF_ENTRY 0x03: [kind:1][st:1][similarity:1][dflags:1]
