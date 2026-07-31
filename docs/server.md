@@ -14,6 +14,7 @@
 | `BLIT_CUDA_DEVICE`      | `0`                                                | CUDA device ordinal (NVENC)                                                            |
 | `BLIT_FD_CHANNEL`       | unset                                              | fd-channel file descriptor                                                             |
 | `BLIT_EXPORT_SOCK`      | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
+| `BLIT_INJECT_PATH`      | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
 | `BLIT_SURFACE_ENCODERS` | see encoder table                                  | Comma-separated encoder priority                                                       |
 | `BLIT_SURFACE_QUALITY`  | `medium`                                           | Video quality preset                                                                   |
 

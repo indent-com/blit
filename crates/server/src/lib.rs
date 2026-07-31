@@ -75,6 +75,12 @@ pub struct Config {
     /// `blit` invocations inside them target this server.  Off by default:
     /// `BLIT_*` is otherwise stripped from child environments.
     pub export_sock: bool,
+    /// Append the directory holding the running server binary to `PATH` in
+    /// spawned terminals, so `blit` is callable inside them (Unix only; the
+    /// Windows PTY inherits the server's environment wholesale).  Off by
+    /// default, and worth leaving off when the server is embedded in a host
+    /// binary whose directory holds no `blit`.
+    pub inject_path: bool,
     /// Permit relayed streams to skip TLS certificate verification
     /// (`NET_OPEN_INSECURE`). Right for a self-signed dev server on loopback,
     /// wrong for anything reached across a network.

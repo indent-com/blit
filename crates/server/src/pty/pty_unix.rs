@@ -14,6 +14,7 @@ fn build_child_env(
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
     blit_sock: Option<&str>,
+    path_dir: Option<&str>,
 ) -> Vec<CString> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
@@ -41,6 +42,25 @@ fn build_child_env(
     // exported value is always the path this server actually listens on.
     if let Some(sock) = blit_sock {
         set(&mut env, "BLIT_SOCK", sock);
+    }
+    // Opt-in (Config::inject_path): make the server's own binary reachable from
+    // spawned terminals, so an exported BLIT_SOCK has something to talk to.
+    // Appended rather than prepended because the binary can share a directory
+    // with other tools, which must not shadow what is already on PATH.
+    if let Some(dir) = path_dir {
+        let current = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        if !current.split(':').any(|entry| entry == dir) {
+            let next = if current.is_empty() {
+                dir.to_string()
+            } else {
+                format!("{current}:{dir}")
+            };
+            set(&mut env, "PATH", &next);
+        }
     }
     if let Some(wd) = wayland_display {
         let wd_path = std::path::Path::new(wd);
@@ -87,6 +107,17 @@ fn build_child_env(
     env.into_iter()
         .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
         .collect()
+}
+
+/// Directory holding the running server binary, resolved once.  `None` when the
+/// path can't be read or has no usable parent.
+fn exe_dir() -> Option<&'static str> {
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.to_str()?.to_owned())
+    })
+    .as_deref()
 }
 
 /// Resolve a program name to an absolute path by searching $PATH.
@@ -420,7 +451,14 @@ pub fn spawn_pty(
         .config
         .export_sock
         .then(|| state.config.ipc_path.as_str());
-    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote, blit_sock);
+    let path_dir = state.config.inject_path.then(exe_dir).flatten();
+    let child_env = build_child_env(
+        wayland_display,
+        pulse_server,
+        pipewire_remote,
+        blit_sock,
+        path_dir,
+    );
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -611,7 +649,14 @@ pub fn respawn_child(
         .config
         .export_sock
         .then(|| state.config.ipc_path.as_str());
-    let child_env = build_child_env(wayland_display, pulse_server, pipewire_remote, blit_sock);
+    let path_dir = state.config.inject_path.then(exe_dir).flatten();
+    let child_env = build_child_env(
+        wayland_display,
+        pulse_server,
+        pipewire_remote,
+        blit_sock,
+        path_dir,
+    );
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
@@ -777,6 +822,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
 
         assert_eq!(
@@ -797,7 +843,7 @@ mod tests {
 
     #[test]
     fn child_env_exports_blit_sock_only_when_requested() {
-        let env = child_env_map(build_child_env(None, None, None, None));
+        let env = child_env_map(build_child_env(None, None, None, None, None));
         assert!(!env.contains_key("BLIT_SOCK"));
 
         let env = child_env_map(build_child_env(
@@ -805,10 +851,46 @@ mod tests {
             None,
             None,
             Some("/tmp/blit-test.sock"),
+            None,
         ));
         assert_eq!(
             env.get("BLIT_SOCK").map(String::as_str),
             Some("/tmp/blit-test.sock")
+        );
+    }
+
+    #[test]
+    fn child_env_appends_the_binary_dir_to_path_only_when_requested() {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+
+        let env = child_env_map(build_child_env(None, None, None, None, None));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(inherited.as_str())
+        );
+
+        let env = child_env_map(build_child_env(
+            None,
+            None,
+            None,
+            None,
+            Some("/tmp/blit test/bin"),
+        ));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(format!("{inherited}:/tmp/blit test/bin").as_str())
+        );
+    }
+
+    #[test]
+    fn child_env_leaves_path_alone_when_the_binary_dir_is_already_on_it() {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        let already = inherited.split(':').next_back().unwrap_or_default();
+
+        let env = child_env_map(build_child_env(None, None, None, None, Some(already)));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(inherited.as_str())
         );
     }
 }

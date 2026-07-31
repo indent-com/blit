@@ -221,6 +221,11 @@ pub enum Command {
         #[arg(long)]
         export_sock: bool,
 
+        /// Append the server binary's directory to PATH in spawned terminals,
+        /// so `blit` is callable inside them (or set BLIT_INJECT_PATH=1)
+        #[arg(long)]
+        inject_path: bool,
+
         /// Restrict what the TCP/UDP relay may reach: host[:ports], where
         /// host is a name, a *.suffix glob, an address, a CIDR block, or *,
         /// and ports is a comma-separated list of n or n-m. Repeatable (or
