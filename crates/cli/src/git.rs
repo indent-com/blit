@@ -316,6 +316,9 @@ pub struct DiffOpts {
     /// 0, 1, or 2 revisions, or a single `A..B` / `A...B` range.
     pub revs: Vec<String>,
     pub staged: bool,
+    /// git's `--merge-base`: compare against where the old side forked,
+    /// which lets the new side be the worktree or the index.
+    pub merge_base: bool,
     pub patch: bool,
     /// With `patch`, emit binary content as git's `GIT binary patch` block.
     pub binary: bool,
@@ -594,6 +597,7 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
     let DiffOpts {
         revs,
         staged,
+        merge_base,
         patch,
         binary,
         path,
@@ -661,6 +665,23 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
             (commit(a), commit(b))
         }
         _ => return Err("git diff takes at most two revisions".into()),
+    };
+    // git's `--merge-base`: take the old side's fork point instead of its
+    // tip, which is the only spelling that reaches a worktree or index new
+    // side — `A...B` ends at a commit, in git and here alike.
+    let old = if merge_base {
+        match revs.as_slice() {
+            [] => return Err("--merge-base needs a revision".into()),
+            [one, ..] if one.contains("..") => {
+                return Err("--merge-base cannot be combined with a range".into());
+            }
+            _ => GitEndpoint {
+                kind: GIT_ENDPOINT_MERGE_BASE,
+                oid: old.oid,
+            },
+        }
+    } else {
+        old
     };
     // UNTRACKED only means something when the new side is the worktree.
     let flags = GIT_DIFF_RENAMES
@@ -751,28 +772,41 @@ pub async fn cmd_diff(transport: Transport, repo: String, opts: DiffOpts) -> Res
             return Err(format!("diff failed: {}", git_status_text(status)));
         }
         for record in git_diff_records(&records) {
-            if let GitDiffRecord::Entry {
-                st,
-                old_path,
-                new_path,
-                ..
-            } = record
-            {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "type": "entry",
-                            "status": (st as char).to_string(),
-                            "path": new_path,
-                            "old_path": if old_path.is_empty() { None } else { Some(old_path) },
-                        })
-                    );
-                } else if old_path.is_empty() || old_path == new_path {
-                    println!("{} {new_path}", st as char);
-                } else {
-                    println!("{} {old_path} -> {new_path}", st as char);
+            match record {
+                // Only a MERGE_BASE old side emits this, and it is the whole
+                // answer to what the listing is against: the base is chosen
+                // server-side, so nothing else names it.
+                GitDiffRecord::Base { oid } => {
+                    let oid = hex(&oid, 40);
+                    if json {
+                        println!("{}", serde_json::json!({ "type": "base", "oid": oid }));
+                    } else {
+                        println!("base {oid}");
+                    }
                 }
+                GitDiffRecord::Entry {
+                    st,
+                    old_path,
+                    new_path,
+                    ..
+                } => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "type": "entry",
+                                "status": (st as char).to_string(),
+                                "path": new_path,
+                                "old_path": if old_path.is_empty() { None } else { Some(old_path) },
+                            })
+                        );
+                    } else if old_path.is_empty() || old_path == new_path {
+                        println!("{} {new_path}", st as char);
+                    } else {
+                        println!("{} {old_path} -> {new_path}", st as char);
+                    }
+                }
+                _ => {}
             }
         }
         return Ok(());

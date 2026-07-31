@@ -126,6 +126,8 @@ blit git log --follow -- src/main.rs
 blit git diff                       # unstaged
 blit git diff --staged              # staged
 blit git diff main dev              # between two commits
+blit git diff main...dev            # since they diverged (from the merge base)
+blit git diff --merge-base main     # worktree vs where main forked (a `base` line names it)
 blit git diff HEAD~2 -p -- src      # with hunks, limited to a path
 blit git show HEAD:src/main.rs      # a file's bytes at a revision
 blit git show HEAD                  # the commit object itself
