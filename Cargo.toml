@@ -28,20 +28,20 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.41.1", path = "crates/remote" }
-blit-fssync = { version = "0.41.1", path = "crates/fssync" }
-blit-git = { version = "0.41.1", path = "crates/git" }
-blit-lsp = { version = "0.41.1", path = "crates/lsp" }
-blit-alacritty = { version = "0.41.1", path = "crates/alacritty-driver" }
-blit-fonts = { version = "0.41.1", path = "crates/fonts" }
-blit-webserver = { version = "0.41.1", path = "crates/webserver" }
-blit-server = { version = "0.41.1", path = "crates/server" }
-blit-gateway = { version = "0.41.1", path = "crates/gateway" }
-blit-proxy = { version = "0.41.1", path = "crates/proxy" }
-blit-webrtc-forwarder = { version = "0.41.1", path = "crates/webrtc-forwarder" }
-blit-compositor = { version = "0.41.1", path = "crates/compositor" }
-blit-sd-notify = { version = "0.41.1", path = "crates/sd-notify" }
-blit-ssh = { version = "0.41.1", path = "crates/ssh" }
+blit-remote = { version = "0.41.2", path = "crates/remote" }
+blit-fssync = { version = "0.41.2", path = "crates/fssync" }
+blit-git = { version = "0.41.2", path = "crates/git" }
+blit-lsp = { version = "0.41.2", path = "crates/lsp" }
+blit-alacritty = { version = "0.41.2", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.41.2", path = "crates/fonts" }
+blit-webserver = { version = "0.41.2", path = "crates/webserver" }
+blit-server = { version = "0.41.2", path = "crates/server" }
+blit-gateway = { version = "0.41.2", path = "crates/gateway" }
+blit-proxy = { version = "0.41.2", path = "crates/proxy" }
+blit-webrtc-forwarder = { version = "0.41.2", path = "crates/webrtc-forwarder" }
+blit-compositor = { version = "0.41.2", path = "crates/compositor" }
+blit-sd-notify = { version = "0.41.2", path = "crates/sd-notify" }
+blit-ssh = { version = "0.41.2", path = "crates/ssh" }
 
 [patch.crates-io]
 alacritty_terminal = { git = "https://github.com/indent-com/alacritty.git", branch = "blit/emoji-width-fix" }
