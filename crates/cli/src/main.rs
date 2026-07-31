@@ -537,6 +537,7 @@ async fn async_main() {
                     pathspec,
                     repo,
                     staged,
+                    merge_base,
                     patch,
                     binary,
                     json,
@@ -547,6 +548,7 @@ async fn async_main() {
                         let opts = git::DiffOpts {
                             revs,
                             staged,
+                            merge_base,
                             patch,
                             binary,
                             path: pathspec.into_iter().next(),

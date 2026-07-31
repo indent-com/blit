@@ -1285,6 +1285,8 @@ pub enum GitCommand {
     ///   blit git diff main dev       # between two commits
     ///   blit git diff main..dev      # same as: main dev
     ///   blit git diff main...dev     # since they diverged (merge base)
+    ///   blit git diff --merge-base main
+    ///                                # worktree vs where main forked
     ///   blit git diff HEAD~2 -- src  # limited to a path
     Diff {
         /// Revisions to compare: none (worktree vs index), one (that
@@ -1304,6 +1306,12 @@ pub enum GitCommand {
         /// Compare the index to HEAD (staged changes) instead of the worktree
         #[arg(long)]
         staged: bool,
+
+        /// Compare against where the revision forked, not its tip, so the
+        /// new side can be the worktree — `A...B` always ends at a commit
+        /// (git's --merge-base)
+        #[arg(long)]
+        merge_base: bool,
 
         /// Show per-file hunks, not just the changed-file list
         #[arg(short = 'p', long)]
