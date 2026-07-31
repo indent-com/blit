@@ -55,7 +55,11 @@ test.describe("Terminal", () => {
 
     await page.waitForTimeout(1000);
 
-    const inputSink = page.locator('textarea[aria-label="Terminal input"]');
+    // Every parked session keeps an input of its own, and those are readonly:
+    // the live terminal's is the writable one.
+    const inputSink = page.locator(
+      'textarea[aria-label="Terminal input"]:not([readonly])',
+    );
     await inputSink.focus();
 
     await page.keyboard.type("echo hello-e2e-test", { delay: 50 });

@@ -25,16 +25,25 @@ async function authenticate(page: Page) {
 
 async function newTerminal(page: Page) {
   const before = await page.locator("canvas").count();
-  await page.getByRole("button", { name: "New terminal" }).first().click();
+  // The button belongs to an *empty* pane, so it is gone as soon as the first
+  // session fills the view. Every session after that comes from the keyboard
+  // shortcut the help overlay documents (mod+Enter, `help.newTerminal`).
+  const button = page.getByRole("button", { name: "New terminal" }).first();
+  if (await button.isVisible()) {
+    await button.click();
+  } else {
+    await page.keyboard.press("ControlOrMeta+Enter");
+  }
   await expect
     .poll(() => page.locator("canvas").count(), { timeout: 10_000 })
     .toBeGreaterThan(before);
   await page.waitForTimeout(300);
 }
 
-/** The parked cards: draggable roots inside the preview panel. */
+/** The parked cards: draggable roots inside the preview panel. Explorer rows
+ *  and commits are draggable tile sources too, so the panel has to scope it. */
 function parkedCards(page: Page) {
-  return page.locator('[draggable="true"]');
+  return page.locator('[data-blit-preview-panel] [draggable="true"]');
 }
 
 test.describe("Parked pane drag", () => {
@@ -45,9 +54,11 @@ test.describe("Parked pane drag", () => {
     await newTerminal(page);
     await newTerminal(page);
 
-    // Exactly one session is parked (the unfocused one).
+    // Sessions outlive a page, so what is parked here is "everything the main
+    // view is not showing", not a number this test gets to fix.
     const cards = parkedCards(page);
-    await expect(cards).toHaveCount(1, { timeout: 10_000 });
+    await expect(cards.first()).toBeVisible({ timeout: 10_000 });
+    const parkedBefore = await cards.count();
     const card = cards.first();
 
     // Non-interactive while parked: the body wrapper is inert, which takes the
@@ -63,16 +74,21 @@ test.describe("Parked pane drag", () => {
     const parkedLabel = (await card.innerText()).trim();
     expect(parkedLabel.length).toBeGreaterThan(0);
 
-    // Drag it onto the main view (single-pane mode: one destination).
+    // Drag it onto the main view (single-pane mode: one destination). The
+    // terminal's own scroll surface covers the canvas, so the hit-target check
+    // would refuse the drop it is aimed at; the events still land inside the
+    // main view and bubble to its drop handler.
     const mainCanvas = page.locator("canvas").first();
-    await card.dragTo(mainCanvas);
+    await card.dragTo(mainCanvas, { force: true });
     await page.waitForTimeout(500);
 
-    // The dropped session took the main view, so the one it displaced is now
-    // the parked card: still one card, but a different session.
-    await expect(parkedCards(page)).toHaveCount(1);
-    const nowParked = (await parkedCards(page).first().innerText()).trim();
-    expect(nowParked).not.toBe(parkedLabel);
+    // A swap: the dropped session took the main view and the one it displaced is
+    // parked in its place, so the panel keeps its size and loses that label.
+    await expect(parkedCards(page)).toHaveCount(parkedBefore);
+    const nowParked = (await parkedCards(page).allInnerTexts()).map((t) =>
+      t.trim(),
+    );
+    expect(nowParked).not.toContain(parkedLabel);
   });
 
   test("a parked card drags into a specific BSP pane", async ({ page }) => {
@@ -92,14 +108,17 @@ test.describe("Parked pane drag", () => {
     const panes = page.locator("[data-blit-bsp-pane-id]");
     await expect(panes).toHaveCount(2, { timeout: 10_000 });
 
+    // Switching into a layout leaves both panes unassigned, so every session is
+    // parked; how many there are is not this test's subject — that one of them
+    // lands in the pane it was dropped on is.
     const cards = parkedCards(page);
-    await expect(cards).toHaveCount(1, { timeout: 10_000 });
+    await expect(cards.first()).toBeVisible({ timeout: 10_000 });
     const parkedLabel = (await cards.first().innerText()).trim();
 
     // Drop onto the second pane specifically.
     const target = panes.nth(1);
     const targetId = await target.getAttribute("data-blit-bsp-pane-id");
-    await cards.first().dragTo(target);
+    await cards.first().dragTo(target, { force: true });
     await page.waitForTimeout(500);
 
     // That pane now holds the dropped session, and the card is gone from the
