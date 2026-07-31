@@ -58,7 +58,7 @@ class RelayedWebSocket extends EventTarget {
   binaryType = "blob"; url = "";
   onopen = null; onmessage = null; onerror = null; onclose = null;
   #port = null; #rx = new Uint8Array(0); #handshook = false; #frag = []; #fragText = false;
-  #keepalive = null; #lastRx = 0;
+  #keepalive = null; #lastRx = 0; #closeTimer = null;
   constructor(url, protocols) {
     super();
     const abs = new URL(url, location.href);
@@ -122,20 +122,28 @@ class RelayedWebSocket extends EventTarget {
       if (quiet >= PING_MS) { try { this.#frame(0x9, new Uint8Array(0)); } catch { this.#died(1006, "relay unusable"); } }
     }, 5000);
   }
+  #stopTimers() {
+    if (this.#keepalive) { clearInterval(this.#keepalive); this.#keepalive = null; }
+    if (this.#closeTimer) { clearTimeout(this.#closeTimer); this.#closeTimer = null; }
+  }
   #died(code, reason) {
     if (this.readyState === 3) return;
-    if (this.#keepalive) { clearInterval(this.#keepalive); this.#keepalive = null; }
-    const wasConnecting = this.readyState === 0;
+    this.#stopTimers();
     this.readyState = 3;
-    if (wasConnecting) {
-      const err = new Event("error");
-      this.dispatchEvent(err); if (this.onerror) this.onerror(err);
-    }
+    // The platform fires \`error\` before an abnormal \`close\`, and every one of
+    // these is abnormal — a client that only wired onerror must hear it too.
+    const err = new Event("error");
+    this.dispatchEvent(err); if (this.onerror) this.onerror(err);
     const ev = new CloseEvent("close", { code, reason, wasClean: false });
     this.dispatchEvent(ev); if (this.onclose) this.onclose(ev);
     try { if (this.#port) this.#port.close(); } catch {}
   }
-  #fail(reason) { this.#died(1006, reason); }
+  // Never synchronous, because the constructor can fail: an app subscribes
+  // after \`new WebSocket(...)\` returns, so a close dispatched during
+  // construction is one nobody is listening for. The socket then sits at
+  // CLOSED with no event ever fired, and every reconnect-on-close client —
+  // which is every HMR client — stops reconnecting for good.
+  #fail(reason) { setTimeout(() => this.#died(1006, reason), 0); }
   #send(bytes) { if (this.#port) this.#port.postMessage(bytes, [bytes.buffer]); }
   #onBytes(chunk) {
     this.#lastRx = Date.now();
@@ -183,6 +191,7 @@ class RelayedWebSocket extends EventTarget {
   #handle(frame) {
     if (frame.opcode === 0x8) {
       const code = frame.payload.length >= 2 ? (frame.payload[0] << 8) | frame.payload[1] : 1005;
+      this.#stopTimers();
       this.readyState = 3;
       const ev = new CloseEvent("close", {
         code, reason: new TextDecoder().decode(frame.payload.subarray(2)), wasClean: true,
@@ -229,12 +238,20 @@ class RelayedWebSocket extends EventTarget {
   }
   close(code, reason) {
     if (this.readyState === 3 || this.readyState === 2) return;
+    // Closing before the upgrade landed: there is no frame stream to close
+    // yet, so a close frame here would just be garbage ahead of the response.
+    // The platform fails the connection instead, and still reports a close.
+    if (this.readyState === 0) { this.readyState = 2; this.#fail("closed while connecting"); return; }
     this.readyState = 2;
     const body = new TextEncoder().encode(reason || "");
     const payload = new Uint8Array(2 + body.length);
     const c = code || 1000;
     payload[0] = c >> 8; payload[1] = c & 0xff; payload.set(body, 2);
     this.#frame(0x8, payload);
+    // The reply may never come — a dead relay, a terminated worker, a target
+    // that does not echo — and CLOSING dispatches nothing, so an app that
+    // reconnects from onclose would wait forever. A close is owed either way.
+    this.#closeTimer = setTimeout(() => this.#died(c, reason || "close timed out"), 5000);
   }
 }
 try { window.WebSocket = RelayedWebSocket; } catch {}
