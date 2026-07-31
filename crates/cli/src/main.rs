@@ -748,6 +748,7 @@ async fn async_main() {
             #[cfg(unix)]
             fd_channel,
             export_sock,
+            inject_path,
             allow_forward,
             allow_forward_insecure,
             verbose,
@@ -807,6 +808,11 @@ async fn async_main() {
                     .unwrap_or(false),
                 export_sock: export_sock
                     || std::env::var("BLIT_EXPORT_SOCK")
+                        .ok()
+                        .map(|v| v == "1")
+                        .unwrap_or(false),
+                inject_path: inject_path
+                    || std::env::var("BLIT_INJECT_PATH")
                         .ok()
                         .map(|v| v == "1")
                         .unwrap_or(false),
