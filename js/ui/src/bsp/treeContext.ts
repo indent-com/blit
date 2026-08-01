@@ -52,7 +52,11 @@ export interface BSPTreeCtx {
   /** Open an IDE tile from within a tile (commit view → editor). */
   onOpenTile?: (assignment: string) => void;
   /** Drop a dragged IDE tile assignment into a specific pane. */
-  onDropTile?: (assignment: string, paneId: string) => void;
+  onDropTile?: (
+    assignment: string,
+    paneId: string,
+    sourcePaneId?: string,
+  ) => void;
   /** Register the visual host for a Workspace-owned persistent web pane. */
   registerWebPaneHost?: WebPaneHostRegistrar;
 }

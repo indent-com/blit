@@ -3,6 +3,7 @@ import {
   parseDiffArg,
   parseWebAssignment,
 } from "../bsp/layout";
+import { webLocationLabel } from "../preview";
 
 function baseName(p: string): string {
   const s = p.replace(/\/+$/, "");
@@ -21,13 +22,16 @@ export function tileDisplay(assignment: string): {
   // title, full URL for the subtitle.
   const web = parseWebAssignment(assignment);
   if (web) {
-    let host = web.url;
+    // The plain-iframe marker stays out of both lines; it changes how the
+    // pane loads, not what it is showing.
+    const url = webLocationLabel(web.url);
+    let host = url;
     try {
-      host = new URL(web.url).host || web.url;
+      host = new URL(url).host || url;
     } catch {
       // Not parseable; the raw value is still the best label available.
     }
-    return { kind: "web", title: host, subtitle: web.url };
+    return { kind: "web", title: host, subtitle: url };
   }
   const parsed = parseTileAssignment(assignment);
   if (!parsed) return { kind: "editor", title: assignment, subtitle: "" };

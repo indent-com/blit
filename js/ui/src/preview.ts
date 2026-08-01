@@ -104,6 +104,44 @@ export function previewIframeUrl(
   return previewFrameUrl(parsePreviewLocation(location, dest), path);
 }
 
+// --------------------------------------------------------------------------- Plain iframes ---------------------------------------------------------------------------
+
+/**
+ * Marker on a location opened as a plain iframe: the URL loads directly,
+ * no relay, no shims. That trades both ways — it works without the preview
+ * worker and for public sites the server cannot reach, but the page must
+ * allow being framed, and its cross-origin document is unreadable (title
+ * and path stay at their defaults).
+ *
+ * It rides inside the web assignment's URL slot so every pipe a web pane
+ * flows through — the dock, persistence, pane moves — carries it untouched.
+ * "plain" is not an http(s) scheme, so `normalizeLocation` leaves the
+ * string as-is rather than reading it as a relayed location.
+ */
+const PLAIN_PREFIX = "plain:";
+
+/** Mark `url` as a plain-iframe location. A bare host gets https, not the
+ *  relayed flow's http leniency: a plain iframe is for the public web, and
+ *  an http embed inside an https workspace is blocked as mixed content. */
+export function plainLocation(url: string): string {
+  const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)
+    ? url
+    : `https://${url}`;
+  return PLAIN_PREFIX + withScheme;
+}
+
+/** The URL a plain location loads, or null when it is a relayed one. */
+export function parsePlainLocation(location: string): string | null {
+  return location.startsWith(PLAIN_PREFIX)
+    ? location.slice(PLAIN_PREFIX.length)
+    : null;
+}
+
+/** A location as shown to people: the plain marker off, the URL kept. */
+export function webLocationLabel(location: string): string {
+  return parsePlainLocation(location) ?? location;
+}
+
 // --------------------------------------------------------------------------- Remembered locations ---------------------------------------------------------------------------
 
 /** One remembered location. */

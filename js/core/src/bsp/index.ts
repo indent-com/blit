@@ -12,6 +12,7 @@ export {
   enumeratePanes,
   assignSessionsToPanes,
   buildCandidateOrder,
+  assignmentsAfterDrop,
   reconcileAssignments,
   adjustWeights,
   layoutFromDSL,

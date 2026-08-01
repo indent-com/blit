@@ -574,9 +574,15 @@ export function preferredSurfaceStreaming(): boolean {
   return true;
 }
 
-function preferredWidth(key: string, fallback: number): number {
+/** The narrowest the right dock can be dragged. Wide enough for a card's
+ *  header row (grip target, truncated title, ✕) and a legible thumbnail
+ *  strip; the left dock keeps its own larger floor — its panels are trees
+ *  and lists that stop working well far sooner. */
+export const MIN_PREVIEW_PANEL_WIDTH = 80;
+
+function preferredWidth(key: string, fallback: number, min = 160): number {
   const n = parseInt(readStorage(key) ?? "", 10);
-  return Number.isFinite(n) && n >= 160 ? n : fallback;
+  return Number.isFinite(n) && n >= min ? n : fallback;
 }
 
 export function preferredLeftDockWidth(): number {
@@ -584,7 +590,7 @@ export function preferredLeftDockWidth(): number {
 }
 
 export function preferredPreviewPanelWidth(): number {
-  return preferredWidth(PREVIEW_PANEL_WIDTH_KEY, 160);
+  return preferredWidth(PREVIEW_PANEL_WIDTH_KEY, 160, MIN_PREVIEW_PANEL_WIDTH);
 }
 
 /** Whether the IDE dock is open. A stored choice wins either way; first

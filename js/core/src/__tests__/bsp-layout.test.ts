@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   enumeratePanes,
   assignSessionsToPanes,
+  assignmentsAfterDrop,
   buildCandidateOrder,
   reconcileAssignments,
   adjustWeights,
@@ -134,6 +135,72 @@ describe("buildCandidateOrder", () => {
       lruSessionIds: ["d", "b"],
     });
     expect(order).toEqual(["c", "d", "b", "a"]);
+  });
+});
+
+describe("assignmentsAfterDrop", () => {
+  const PANES = ["0", "1", "2"];
+
+  it("opens into the target when the drag has no source pane", () => {
+    const next = assignmentsAfterDrop(
+      { "0": "s1", "1": "s2", "2": null },
+      "editor:c1:/x",
+      "2",
+      undefined,
+      PANES,
+    );
+    expect(next).toEqual({ "0": "s1", "1": "s2", "2": "editor:c1:/x" });
+  });
+
+  it("swaps with the source pane: a pane drag is a move, not a copy", () => {
+    const next = assignmentsAfterDrop(
+      { "0": "surface:c1:7", "1": "s2" },
+      "surface:c1:7",
+      "1",
+      "0",
+      PANES,
+    );
+    expect(next).toEqual({ "0": "s2", "1": "surface:c1:7" });
+  });
+
+  it("moves onto an empty pane, leaving the source empty", () => {
+    const next = assignmentsAfterDrop(
+      { "0": "surface:c1:7", "1": null },
+      "surface:c1:7",
+      "1",
+      "0",
+      PANES,
+    );
+    expect(next).toEqual({ "0": null, "1": "surface:c1:7" });
+  });
+
+  it("is a no-op when dropped back on its own pane", () => {
+    expect(
+      assignmentsAfterDrop({ "0": "s1" }, "s1", "0", "0", PANES),
+    ).toBeNull();
+  });
+
+  it("does not evict the source when it no longer holds the value", () => {
+    // The layout changed mid-drag: the source pane shows something else now.
+    const next = assignmentsAfterDrop(
+      { "0": "s3", "1": "s2" },
+      "s1",
+      "1",
+      "0",
+      PANES,
+    );
+    expect(next).toEqual({ "0": "s3", "1": "s1" });
+  });
+
+  it("ignores a source pane that left the layout", () => {
+    const next = assignmentsAfterDrop(
+      { gone: "s1", "1": "s2" },
+      "s1",
+      "1",
+      "gone",
+      PANES,
+    );
+    expect(next).toEqual({ gone: "s1", "1": "s1" });
   });
 });
 

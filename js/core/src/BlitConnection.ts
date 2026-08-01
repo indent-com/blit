@@ -381,6 +381,13 @@ type FsSyncConsumer = {
   /** Callbacks held back until this consumer's opener holds its handle
    *  (`dispatchFs`); null once they run inline. */
   held: HeldFsCallback[] | null;
+  /** Hash of this consumer's most recent write per path, for self-echo
+   *  suppression (docs/design/fs-write.md "Echo and attribution"). Scoped
+   *  to the consumer, not the share: another handle's write on the same
+   *  shared sync is an external change to this one — two editors on one
+   *  file must not both swallow the echo. Entries are dropped once the
+   *  matching echo upsert is observed. */
+  lastWritten: Map<string, bigint>;
 };
 
 /** A consumer callback waiting for its opener. `mirrored` marks the ones a
@@ -398,10 +405,6 @@ type FsSyncShare = {
   mirror: FsMirror;
   /** True once any `SYNC` has been seen — the live map is coherent. */
   synced: boolean;
-  /** Hash of this client's most recent write per path, for self-echo
-   *  suppression (docs/design/fs-write.md "Echo and attribution").
-   *  Entries are dropped once the matching echo upsert is observed. */
-  lastWritten: Map<string, bigint>;
   consumers: Set<FsSyncConsumer>;
 };
 
@@ -533,8 +536,8 @@ export class BlitConnection {
       resolve: (result: FsWriteResult) => void;
       reject: (error: Error) => void;
       /** Set on `writeFile`/`mkdir` so a successful reply records the hash
-       *  in the sync's `lastWritten`; unset for remove/rename. */
-      record?: { syncId: number; path: string };
+       *  in the issuing consumer's `lastWritten`; unset for remove/rename. */
+      record?: { consumer: FsSyncConsumer; path: string };
       /** Set on a delta write: an `FS_DONE` INVALID re-sends it as a full
        *  write instead of rejecting (a pre-delta server's refusal). */
       onInvalid?: () => void;
@@ -1301,6 +1304,7 @@ export class BlitConnection {
       options,
       notifier: new Notifier(),
       held: [],
+      lastWritten: new Map<string, bigint>(),
     };
     share.consumers.add(consumer);
     const handle = this.makeFsSyncHandle(share, consumer);
@@ -1401,7 +1405,7 @@ export class BlitConnection {
       },
       fetch: (path: string) => this.fsFetch(syncId, path),
       writeFile: (path, data, options = {}) =>
-        this.fsWrite(syncId, path, data, options),
+        this.fsWrite(syncId, consumer, path, data, options),
       mkdir: (path, options = {}) =>
         this.fsOp(
           syncId,
@@ -1411,7 +1415,7 @@ export class BlitConnection {
           0n,
           options.mode ?? 0,
           options.createParents ? FS_OP_MKPARENTS : 0,
-          { syncId, path },
+          { consumer, path },
         ),
       remove: (path, options = {}) =>
         this.fsOp(
@@ -1443,7 +1447,7 @@ export class BlitConnection {
           0,
           (options.force ? FS_OP_NO_CAS : 0) |
             (options.createParents ? FS_OP_MKPARENTS : 0),
-          { syncId, path },
+          { consumer, path },
         ),
       hardlink: (source, path, options = {}) =>
         this.fsOp(
@@ -1455,9 +1459,9 @@ export class BlitConnection {
           0,
           (options.force ? FS_OP_NO_CAS : 0) |
             (options.createParents ? FS_OP_MKPARENTS : 0),
-          { syncId, path },
+          { consumer, path },
         ),
-      lastWrittenHash: (path: string) => share.lastWritten.get(path),
+      lastWrittenHash: (path: string) => consumer.lastWritten.get(path),
       stop: () => this.releaseFsConsumer(share, consumer),
     };
   }
@@ -1766,6 +1770,7 @@ export class BlitConnection {
 
   private fsWrite(
     syncId: number,
+    consumer: FsSyncConsumer,
     path: string,
     data: Uint8Array,
     options: FsWriteOptions,
@@ -1814,7 +1819,7 @@ export class BlitConnection {
         this.pendingFsWrites.set(nonce, {
           resolve,
           reject,
-          record: { syncId, path },
+          record: { consumer, path },
           onInvalid,
         });
         // Delta ops and full bytes ride the same LZ4 path: the builder
@@ -1859,7 +1864,7 @@ export class BlitConnection {
     base: bigint,
     mode: number,
     flags: number,
-    record?: { syncId: number; path: string },
+    record?: { consumer: FsSyncConsumer; path: string },
   ): Promise<FsWriteResult> {
     return new Promise<FsWriteResult>((resolve, reject) => {
       if (!this.fsSyncs.has(syncId)) {
@@ -3570,7 +3575,6 @@ export class BlitConnection {
           root: detail,
           mirror: new FsMirror(),
           synced: false,
-          lastWritten: new Map<string, bigint>(),
           consumers: new Set<FsSyncConsumer>(),
         };
         this.fsSyncs.set(syncId, share);
@@ -3582,6 +3586,7 @@ export class BlitConnection {
             // Held until the opener's continuation has run — a snapshot
             // riding this very chunk is handled before it (`dispatchFs`).
             held: [],
+            lastWritten: new Map<string, bigint>(),
           };
           share.consumers.add(consumer);
           waiter.resolve(this.makeFsSyncHandle(share, consumer));
@@ -3601,13 +3606,11 @@ export class BlitConnection {
         // One decompress + decode serves the mirror, the per-record
         // callbacks, and the echo bookkeeping; skip collection entirely
         // when nobody needs the records.
-        let wantRecords = share.lastWritten.size > 0;
-        if (!wantRecords) {
-          for (const consumer of share.consumers) {
-            if (consumer.options.onRecord) {
-              wantRecords = true;
-              break;
-            }
+        let wantRecords = false;
+        for (const consumer of share.consumers) {
+          if (consumer.options.onRecord || consumer.lastWritten.size > 0) {
+            wantRecords = true;
+            break;
           }
         }
         const records: FsRecord[] | undefined = wantRecords ? [] : undefined;
@@ -3658,17 +3661,19 @@ export class BlitConnection {
           }
         }
         // Every callback above has had its shot at self-echo suppression;
-        // consume matched entries so the map cannot grow without bound. A
-        // consumer still waiting for its handle sees this echo as external,
-        // which is what it is: the write was some other consumer's, made
-        // before this one could hold a handle to write with.
-        if (records && share.lastWritten.size > 0) {
-          for (const record of records) {
-            if (
-              record.kind === "upsert" &&
-              share.lastWritten.get(record.path) === record.hash
-            ) {
-              share.lastWritten.delete(record.path);
+        // consume matched entries so the maps cannot grow without bound.
+        // Per consumer: only the writer's own map holds the hash, so every
+        // other consumer saw this upsert as the external change it is.
+        if (records) {
+          for (const consumer of share.consumers) {
+            if (consumer.lastWritten.size === 0) continue;
+            for (const record of records) {
+              if (
+                record.kind === "upsert" &&
+                consumer.lastWritten.get(record.path) === record.hash
+              ) {
+                consumer.lastWritten.delete(record.path);
+              }
             }
           }
         }
@@ -3767,11 +3772,14 @@ export class BlitConnection {
         this.pendingFsWrites.delete(parsed.nonce);
         if (parsed.status === FS_DONE_OK) {
           // Record the hash for self-echo suppression: the writer's own
-          // UPSERT echo will carry it, and the model already holds it.
+          // UPSERT echo will carry it, and its model already holds it.
+          // Into the issuing consumer only — to every other consumer of
+          // the shared sync this write is an external change.
           if (pending.record) {
-            this.fsSyncs
-              .get(pending.record.syncId)
-              ?.lastWritten.set(pending.record.path, parsed.hash);
+            pending.record.consumer.lastWritten.set(
+              pending.record.path,
+              parsed.hash,
+            );
           }
           pending.resolve({ hash: parsed.hash, mtimeNs: parsed.mtimeNs });
         } else if (parsed.status === FS_DONE_CONFLICT) {

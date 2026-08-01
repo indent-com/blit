@@ -15,7 +15,10 @@
 import { For, Show, createSignal, onMount, type JSX } from "solid-js";
 import {
   normalizeLocation,
+  parsePlainLocation,
+  plainLocation,
   sortLocations,
+  webLocationLabel,
   withoutLocation,
   type WebLocation,
 } from "./preview";
@@ -125,11 +128,38 @@ export function WebOverlay(props: WebOverlayProps): JSX.Element {
     return { dest: props.dest, url: entry.trim() };
   };
 
-  const open = (entry: string) => {
+  const open = (entry: string, plain = false) => {
     const { dest, url } = split(entry);
     if (!url) return;
-    props.onOpen(normalizeLocation(url), dest);
+    // A remembered plain location stays plain however it is committed; the
+    // marker is re-applied (never doubled) so ⇧Enter on one is idempotent.
+    const inner = parsePlainLocation(url);
+    props.onOpen(
+      plain || inner != null
+        ? plainLocation(inner ?? url)
+        : normalizeLocation(url),
+      dest,
+    );
     props.onClose();
+  };
+
+  /** The two virtual rows under the matches: "open <draft>" (only when the
+   *  draft is not already listed) and "open <draft> as a plain iframe". */
+  const openRowVisible = () =>
+    !!draft().trim() &&
+    !matches().some((m) => m.url === normalizeLocation(draft()));
+  const plainRowVisible = () => !!draft().trim();
+  const openRowAt = () => matches().length;
+  const plainRowAt = () => matches().length + (openRowVisible() ? 1 : 0);
+  const lastIndex = () =>
+    matches().length -
+    1 +
+    (openRowVisible() ? 1 : 0) +
+    (plainRowVisible() ? 1 : 0);
+  /** What the plain row offers, as it would load. */
+  const plainDraft = () => {
+    const { url } = split(draft());
+    return url ? webLocationLabel(plainLocation(parsePlainLocation(url) ?? url)) : "";
   };
 
   /** Cycle servers with Tab — the list follows, so picking a remote shows what
@@ -194,14 +224,27 @@ export function WebOverlay(props: WebOverlayProps): JSX.Element {
       backToRemote();
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelected((i) => Math.min(i + 1, list.length));
+      setSelected((i) => Math.min(i + 1, Math.max(lastIndex(), 0)));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSelected((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const pick = list[selected()];
-      open(pick && !draft().trim() ? pick.url : draft() || pick?.url || "");
+      const i = selected();
+      if (plainRowVisible() && i === plainRowAt()) {
+        open(draft(), true);
+        return;
+      }
+      if (openRowVisible() && i === openRowAt()) {
+        open(draft(), e.shiftKey);
+        return;
+      }
+      // ⇧Enter opens whatever Enter would have, as a plain iframe.
+      const pick = list[i];
+      open(
+        pick && !draft().trim() ? pick.url : draft() || pick?.url || "",
+        e.shiftKey,
+      );
     }
   };
 
@@ -366,7 +409,10 @@ export function WebOverlay(props: WebOverlayProps): JSX.Element {
                   onClick={() => open(entry.url)}
                 >
                   <span>
-                    {entry.url}
+                    {webLocationLabel(entry.url)}
+                    <Show when={parsePlainLocation(entry.url) != null}>
+                      <span style={{ opacity: 0.5 }}> · plain iframe</span>
+                    </Show>
                     <Show when={entry.title}>
                       <span style={{ opacity: 0.5 }}> — {entry.title}</span>
                     </Show>
@@ -392,21 +438,33 @@ export function WebOverlay(props: WebOverlayProps): JSX.Element {
                 </div>
               )}
             </For>
-            <Show
-              when={
-                draft().trim() &&
-                !matches().some((m) => m.url === normalizeLocation(draft()))
-              }
-            >
+            <Show when={openRowVisible()}>
               <div
-                style={row("", "", selected() >= matches().length)}
-                onMouseEnter={() => setSelected(matches().length)}
+                style={row("", "", selected() === openRowAt())}
+                onMouseEnter={() => setSelected(openRowAt())}
                 onClick={() => open(draft())}
               >
                 <span>
                   open <strong>{normalizeLocation(draft())}</strong>
                 </span>
                 <span style={{ opacity: 0.5 }}>Enter</span>
+              </div>
+            </Show>
+            {/* The un-relayed alternative: a straight embed of the URL, for
+                the public web rather than something the server can reach.
+                Always offered while there is a draft — a remembered relayed
+                location can be reopened plain this way too. */}
+            <Show when={plainRowVisible()}>
+              <div
+                style={row("", "", selected() === plainRowAt())}
+                onMouseEnter={() => setSelected(plainRowAt())}
+                onClick={() => open(draft(), true)}
+              >
+                <span>
+                  open <strong>{plainDraft()}</strong> as a plain iframe — no
+                  relay
+                </span>
+                <span style={{ opacity: 0.5 }}>⇧Enter</span>
               </div>
             </Show>
             <Show when={!draft().trim() && props.locations.length === 0}>

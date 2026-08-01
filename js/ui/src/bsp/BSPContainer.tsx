@@ -22,6 +22,7 @@ import type { BSPAssignments, BSPLayout } from "./layout";
 import {
   adjustWeights,
   assignSessionsToPanes,
+  assignmentsAfterDrop,
   buildCandidateOrder,
   enumeratePanes,
   loadAssignmentsFromHash,
@@ -38,9 +39,13 @@ import {
   parseTileAssignment,
 } from "./layout";
 import { BlitTile } from "../ide/BlitTile";
-import { PaneClose } from "../PaneClose";
+import { PaneTools } from "../PaneTools";
 import { WebPaneHost, type WebPaneHostRegistrar } from "../WebPaneHost";
-import { isTileDrag, tileDragAssignment } from "../ide/tileDrag";
+import {
+  isTileDrag,
+  paneDragSource,
+  tileDragAssignment,
+} from "../ide/tileDrag";
 import { resolveTab, isPtyRef } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
 import { BSPTreeContext, useBSPTree, type BSPTreeCtx } from "./treeContext";
@@ -147,7 +152,9 @@ export function BSPContainer(props: {
   onMoveSessionToPane?: (
     fn: (sessionId: SessionId, targetPaneId: string) => void,
   ) => void;
-  onMoveToPane?: (fn: (value: string, targetPaneId: string) => void) => void;
+  onMoveToPane?: (
+    fn: (value: string, targetPaneId: string, fromPaneId?: string) => void,
+  ) => void;
   /** Called with a function that splits a pane, placing `value` in a new
    *  pane beside the target's current occupant (which is preserved). */
   onSplitPane?: (fn: (value: string, targetPaneId: string) => void) => void;
@@ -159,7 +166,11 @@ export function BSPContainer(props: {
   /** Register visual hosts for Workspace-owned persistent web panes. */
   registerWebPaneHost?: WebPaneHostRegistrar;
   /** Drop a dragged IDE tile assignment into a specific pane. */
-  onDropTile?: (assignment: string, paneId: string) => void;
+  onDropTile?: (
+    assignment: string,
+    paneId: string,
+    sourcePaneId?: string,
+  ) => void;
   /** Coarse pointer — keeps each pane's ✕ visible without a hover. */
   isMobileTouch?: boolean;
   /** Whether a session's connection is read-only (see BSPTreeCtx). */
@@ -585,7 +596,7 @@ export function BSPContainer(props: {
     props.onFocusBySession?.(focusBySession);
   });
 
-  function moveToPane(value: string, targetPaneId: string) {
+  function moveToPane(value: string, targetPaneId: string, fromPaneId?: string) {
     // Guard against a stale pane id (e.g. a caller still holding a pane path
     // from a previous layout): writing the tile to a non-existent pane would
     // silently render nothing. Fall back to the focused pane, then the first.
@@ -601,14 +612,14 @@ export function BSPContainer(props: {
     // on every cross-pane open (Explorer click, dock restore).
     batch(() => {
       setLayoutState((prev) => {
-        if (prev.assignments[pane] === value) return prev;
-        return {
-          ...prev,
-          assignments: {
-            ...prev.assignments,
-            [pane]: value,
-          },
-        };
+        const assignments = assignmentsAfterDrop(
+          prev.assignments,
+          value,
+          pane,
+          fromPaneId,
+          valid,
+        );
+        return assignments ? { ...prev, assignments } : prev;
       });
       setFocusedPaneId(pane);
     });
@@ -1165,7 +1176,7 @@ function LeafPane(props: {
   const surfaceId = () => surfaceParsed()?.surfaceId ?? null;
   // Highlighted while a tile drag hovers this pane (a valid drop target).
   const [tileDragOver, setTileDragOver] = createSignal(false);
-  // Reveals the ✕ on pointer devices (see PaneClose).
+  // Reveals the corner tools on pointer devices (see PaneTools).
   const [hovered, setHovered] = createSignal(false);
   const surfaceConnectionId = () =>
     surfaceParsed()?.connectionId ?? ctx.connectionId;
@@ -1276,7 +1287,11 @@ function LeafPane(props: {
         setTileDragOver(false);
         if (assignment && ctx.onDropTile) {
           e.preventDefault();
-          ctx.onDropTile(assignment, props.paneId);
+          ctx.onDropTile(
+            assignment,
+            props.paneId,
+            paneDragSource(e) ?? undefined,
+          );
         }
       }}
     >
@@ -1300,11 +1315,16 @@ function LeafPane(props: {
       <Show
         when={tileParsed() || webParsed() || isSurface() || session() != null}
       >
-        <PaneClose
+        <PaneTools
           theme={theme()}
           scale={scale()}
           alwaysVisible={ctx.isMobileTouch ?? false}
           hovered={hovered()}
+          drag={
+            props.sessionId
+              ? { assignment: props.sessionId, paneId: props.paneId }
+              : undefined
+          }
           onClose={() => ctx.onClosePane(props.paneId)}
         />
       </Show>
