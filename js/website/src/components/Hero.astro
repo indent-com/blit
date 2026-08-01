@@ -6,6 +6,26 @@ import JoinForm from "./JoinForm.tsx";
 const INSTALL_CMD = "curl -sf https://install.blit.sh | sh";
 const INSTALL_PS = "irm https://install.blit.sh/install.ps1 | iex";
 const DOCKER_CMD = "docker run --rm grab/blit-demo";
+
+/**
+ * The proof strip. One shape for every cell — a single-token value over a
+ * label — because the odd one out is what broke it: `4 transports` put a
+ * second word on the 26px value line, so at narrow widths it wrapped, that
+ * cell stood two lines tall while its neighbours stood one, and the labels
+ * stopped sharing a baseline. Kept as data so the next stat inherits the
+ * shape instead of a copy of the classes.
+ *
+ * Transports are the five in docs/transports.md.
+ */
+const STATS = [
+  { value: "1", label: "Single binary" },
+  { value: "0", label: "Required deps" },
+  {
+    value: "5",
+    label: "Transports · WS · WebTransport · WebRTC · Unix · SSH",
+  },
+  { value: "MIT", label: "Open source · Linux · macOS · Windows" },
+];
 ---
 
 <section
@@ -137,48 +157,20 @@ const DOCKER_CMD = "docker run --rm grab/blit-demo";
     <div
       class="mt-16 grid grid-cols-2 gap-y-6 border-y border-[var(--border)] py-6 sm:grid-cols-4 sm:gap-x-8"
     >
-      <div>
-        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">
-          1
-        </div>
-        <div
-          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
-        >
-          Single binary
-        </div>
-      </div>
-      <div>
-        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">
-          0
-        </div>
-        <div
-          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
-        >
-          Required deps
-        </div>
-      </div>
-      <div>
-        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">
-          4 <span class="text-[var(--dim)] text-[18px] font-medium"
-            >transports</span
-          >
-        </div>
-        <div
-          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
-        >
-          WS · WebTransport · WebRTC · Unix
-        </div>
-      </div>
-      <div>
-        <div class="font-mono text-[26px] font-bold text-[var(--bright)]">
-          MIT
-        </div>
-        <div
-          class="mt-1 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
-        >
-          Open source · Linux · macOS · Windows
-        </div>
-      </div>
+      {
+        STATS.map((stat) => (
+          <div>
+            <div
+              class="whitespace-nowrap font-mono text-[26px] font-bold leading-none text-[var(--bright)]"
+            >
+              {stat.value}
+            </div>
+            <div class="mt-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
+              {stat.label}
+            </div>
+          </div>
+        ))
+      }
     </div>
   </div>
 </section>
