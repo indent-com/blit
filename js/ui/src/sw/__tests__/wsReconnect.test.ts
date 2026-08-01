@@ -121,8 +121,7 @@ describe("relayed WebSocket after a worker restart", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(
       asked.some(
-        (m) =>
-          (m as { type?: string } | null)?.type === "blit-need-passphrase",
+        (m) => (m as { type?: string } | null)?.type === "blit-need-passphrase",
       ),
       "the worker must ask rather than fail outright",
     ).toBe(true);
