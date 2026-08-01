@@ -328,12 +328,17 @@ async function relay(
  * all the `NET` family is. The handshake bytes arrive from the shim like any
  * other payload.
  */
-async function pipeWebSocket(
+export async function pipeWebSocket(
   target: PreviewTarget,
   port: MessagePort,
 ): Promise<void> {
   let stream;
   try {
+    // A restarted worker holds no credential. `relay` self-heals by asking a
+    // page; this path must too, or an app that only speaks WebSocket once
+    // loaded — blit itself in a preview pane — reconnects into "no passphrase
+    // yet" every time and never recovers.
+    if (!pool.authenticated) await requestPassphrase();
     stream = await pool.open(target.dest, target.host, target.port, {
       tls: target.scheme === "https",
     });
