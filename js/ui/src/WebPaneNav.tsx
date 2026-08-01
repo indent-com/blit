@@ -2,11 +2,7 @@
 
 import { Show, createSignal, type JSX } from "solid-js";
 import type { WebPaneHandle } from "./WebPane";
-import {
-  normalizeLocation,
-  splitLocation,
-  webLocationLabel,
-} from "./preview";
+import { normalizeLocation, splitLocation, webLocationLabel } from "./preview";
 
 export interface WebPaneNavProps {
   /** The focused pane's handle, or null when the focus is not a web pane. */
@@ -57,7 +53,8 @@ export function WebPaneNav(props: WebPaneNavProps): JSX.Element {
   /** The full location, which is what the field edits. The plain-iframe
    *  marker stays out of it: it is not typeable, and origin comparison in
    *  `commit` runs on the URL either way. */
-  const location = () => `${webLocationLabel(props.url)}${state()?.path ?? "/"}`;
+  const location = () =>
+    `${webLocationLabel(props.url)}${state()?.path ?? "/"}`;
 
   const commit = () => {
     const text = draft().trim();
@@ -124,7 +121,9 @@ export function WebPaneNav(props: WebPaneNavProps): JSX.Element {
                 "max-width": "28em",
               }}
             >
-              <span style={{ opacity: 0.55 }}>{webLocationLabel(props.url)}</span>
+              <span style={{ opacity: 0.55 }}>
+                {webLocationLabel(props.url)}
+              </span>
               {state()?.path ?? "/"}
             </span>
           }
