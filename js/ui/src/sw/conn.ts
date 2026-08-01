@@ -211,6 +211,14 @@ export class RelayPool {
   private passphrase: string | null = null;
   private readonly conns = new Map<string, Promise<DestConnection>>();
 
+  /** `requestCredential` is consulted whenever a connection is needed and no
+   *  passphrase is held — a restarted worker asking a page for it, rather than
+   *  failing callers until one happens to re-arm it. It lives here and not
+   *  with the callers because every relayed request and socket needs it: the
+   *  one path that lacked it (relayed WebSockets) answered every reconnect of
+   *  a previewed app with "no passphrase yet" after a worker restart. */
+  constructor(private readonly requestCredential?: () => Promise<unknown>) {}
+
   setPassphrase(passphrase: string): void {
     if (passphrase && passphrase !== this.passphrase) {
       this.passphrase = passphrase;
@@ -247,6 +255,11 @@ export class RelayPool {
         // Fall through and retry once; a stale rejection must not be sticky.
       }
       this.conns.delete(dest);
+    }
+    if (!this.passphrase && this.requestCredential) {
+      // A failed ask is not an error of its own: the message below says what
+      // is actually missing.
+      await this.requestCredential().catch(() => {});
     }
     if (!this.passphrase) {
       throw new Error("no passphrase yet — open the blit UI in a tab");

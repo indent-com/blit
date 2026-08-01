@@ -21,7 +21,7 @@ import { injectIntoHtml } from "./inject";
 // The bundle runs in a worker; the app's tsconfig covers both lib sets, so name the scope explicitly rather than relying on ambient inference.
 declare const self: ServiceWorkerGlobalScope & typeof globalThis;
 
-const pool = new RelayPool();
+const pool = new RelayPool(requestPassphrase);
 /** clientId → target. Persisted, because after the bootstrap redirect the
  *  frame's own URL is `/` and no longer says what it is bound to. */
 const bindings = new Map<string, PreviewTarget>();
@@ -334,11 +334,6 @@ export async function pipeWebSocket(
 ): Promise<void> {
   let stream;
   try {
-    // A restarted worker holds no credential. `relay` self-heals by asking a
-    // page; this path must too, or an app that only speaks WebSocket once
-    // loaded — blit itself in a preview pane — reconnects into "no passphrase
-    // yet" every time and never recovers.
-    if (!pool.authenticated) await requestPassphrase();
     stream = await pool.open(target.dest, target.host, target.port, {
       tls: target.scheme === "https",
     });
