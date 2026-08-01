@@ -40,6 +40,7 @@ import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import type { IdeSession, IdeTreeRow } from "./session";
 import { isDirLike } from "./session";
+import { absolutePath } from "./paths";
 import {
   addFsMoveDrag,
   fsMovePayload,
@@ -89,6 +90,37 @@ function humanSize(n: number): string {
 
 function shortBranch(name: string): string {
   return name.replace(/^refs\/heads\//, "");
+}
+
+/**
+ * Put `text` on the clipboard, or throw.
+ *
+ * `navigator.clipboard` is unavailable in an insecure context, which a blit
+ * server reached over plain http on a LAN is — a normal way to run this. The
+ * textarea and `execCommand` are deprecated and still the only thing that
+ * works there, so they are the fallback rather than the primary path.
+ */
+async function copyToClipboard(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // Denied, or no clipboard API at all.
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  // Off-screen but focusable: execCommand copies from a real selection.
+  ta.style.position = "fixed";
+  ta.style.top = "-1000px";
+  ta.setAttribute("readonly", "");
+  document.body.appendChild(ta);
+  try {
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    if (!document.execCommand("copy")) throw new Error("copy was refused");
+  } finally {
+    ta.remove();
+  }
 }
 
 const A_CODE = "A".charCodeAt(0);
@@ -182,6 +214,16 @@ export function ExplorerPanel(props: {
       props.session?.toggleDir(m.row.relPath);
     setEditing({ kind, parentRel });
     setMenu(null);
+  };
+
+  const copyPath = () => {
+    const row = menu()?.row;
+    if (!row) return;
+    const path = absolutePath(props.session?.root() ?? null, row.relPath);
+    setMenu(null);
+    // Reuses the op-error flash: a refused clipboard is exactly the kind of
+    // silent nothing that flash exists for.
+    copyToClipboard(path).catch(flashOpError);
   };
 
   const startRename = () => {
@@ -1130,6 +1172,12 @@ export function ExplorerPanel(props: {
               onPick={() => startCreate("create-dir")}
             />
             <Show when={m().row}>
+              <MenuItem
+                label="Copy path"
+                theme={props.theme}
+                scale={props.scale}
+                onPick={copyPath}
+              />
               <MenuItem
                 label="Rename / move…"
                 theme={props.theme}
