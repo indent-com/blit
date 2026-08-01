@@ -1347,10 +1347,12 @@ export interface FsSyncHandle extends ReactiveStore {
     path: string,
     options?: FsLinkOptions,
   ): Promise<FsWriteResult>;
-  /** The hash of the most recent successful `writeFile` at `path`, for
-   *  self-echo suppression: when an incoming UPSERT's `hash` equals this,
-   *  the change is this client's own write and the editor model already
-   *  holds it (never `setValue` your own echo). The entry is dropped once
+  /** The hash of this handle's most recent successful `writeFile` at
+   *  `path`, for self-echo suppression: when an incoming UPSERT's `hash`
+   *  equals this, the change is this handle's own write and the editor
+   *  model already holds it (never `setValue` your own echo). Scoped to
+   *  the handle, not the shared sync — another handle's write on the same
+   *  file is an external change to this one. The entry is dropped once
    *  that echo has been delivered to every callback, so check it inside
    *  `onRecord` (or a subscriber), not later. */
   lastWrittenHash(path: string): bigint | undefined;

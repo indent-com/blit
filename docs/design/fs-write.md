@@ -246,8 +246,11 @@ prompt and cheap:
   (fs-watch already sends metadata alone for identical content).
 
 **Attribution is by hash, not a token.** `FS_DONE` returns the new
-hash; the client records it as `lastWrittenHash`. When the echo `UPSERT`
-arrives:
+hash; the client records it as `lastWrittenHash` — per handle, not per
+wire sync: on a shared sync only the writing handle suppresses the
+echo, and every other consumer sees the write as the external change
+it is (two editors on one file must not both swallow the echo). When
+the echo `UPSERT` arrives:
 
 - `record.hash == lastWrittenHash` → my own echo: do not re-apply to the
   editor model.

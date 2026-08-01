@@ -1495,6 +1495,54 @@ describe("BlitConnection writes", () => {
     conn.dispose();
   });
 
+  it("scopes lastWritten to the writing handle, not the shared sync", async () => {
+    const { conn, transport } = fsReadyConnection();
+    const writerPromise = conn.syncFs("/w", { content: true });
+    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
+    pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 7, 0, "/w");
+    const writer = await writerPromise;
+    await flushTimers();
+
+    // Wire-identical second open: joins the same share, no second sync.
+    const seen: Array<{ hash: bigint; suppressed: boolean }> = [];
+    let reader: FsSyncHandle | undefined;
+    const readerPromise = conn.syncFs("/w", {
+      content: true,
+      onRecord: (r) => {
+        if (r.kind === "upsert")
+          seen.push({
+            hash: r.hash,
+            suppressed: reader?.lastWrittenHash(r.path) === r.hash,
+          });
+      },
+    });
+    reader = await readerPromise;
+    await flushTimers();
+    expect(transport.sent.filter((m) => m[0] === C2S_FS_SYNC)).toHaveLength(1);
+
+    const writePromise = writer.writeFile(
+      "a.txt",
+      new TextEncoder().encode("hi"),
+    );
+    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
+    const nonce = writeMsg[1] | (writeMsg[2] << 8);
+    transport.push(buildFsDoneMessage(nonce, FS_DONE_OK, 0xabcdn, 1n));
+    await writePromise;
+
+    // Recorded on the writing handle only: to the other consumer this
+    // write is an external change, and its editor must reload on the echo.
+    expect(writer.lastWrittenHash("a.txt")).toBe(0xabcdn);
+    expect(reader.lastWrittenHash("a.txt")).toBeUndefined();
+
+    transport.push(
+      buildFsUpdateMessage(7, 1, 0, upsertWithHash("a.txt", "hi", 0xabcdn)),
+    );
+    expect(seen).toEqual([{ hash: 0xabcdn, suppressed: false }]);
+    // Consumed from the writer's map once the echo has been delivered.
+    expect(writer.lastWrittenHash("a.txt")).toBeUndefined();
+    conn.dispose();
+  });
+
   it("surfaces a read-only server's PERMISSION refusal", async () => {
     // Writes share FEATURE_FS; a BLIT_FS_WRITE=0 server answers each
     // write with FS_DONE PERMISSION instead of withholding a bit.
