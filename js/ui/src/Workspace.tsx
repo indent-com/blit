@@ -58,6 +58,7 @@ import {
   preferredSurfaceStreaming,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
+  MIN_PREVIEW_PANEL_WIDTH,
   preferredLeftDockOpen,
   preferredCollapsedSections,
   LEFT_DOCK_OPEN_KEY,
@@ -103,7 +104,14 @@ import { searchInputFocused } from "./ide/searchStore";
 import { ProblemsPanel } from "./ide/ProblemsPanel";
 import { BlitTile } from "./ide/BlitTile";
 import { tileDisplay } from "./ide/tileDisplay";
-import { startTileDrag, isTileDrag, tileDragAssignment } from "./ide/tileDrag";
+import {
+  startTileDrag,
+  isTileDrag,
+  isPaneDrag,
+  paneDragSource,
+  tileDragAssignment,
+  MAIN_PANE_SOURCE,
+} from "./ide/tileDrag";
 import {
   tabId,
   stripConn,
@@ -154,7 +162,7 @@ import {
 } from "./preview";
 
 import { MobileToolbar } from "./MobileToolbar";
-import { PaneClose } from "./PaneClose";
+import { PaneTools } from "./PaneTools";
 import type { BSPAssignments, BSPLayout } from "./bsp/layout";
 import {
   loadActiveLayout,
@@ -1801,9 +1809,13 @@ function WorkspaceScreen(props: {
   // parked terminal/surface. recordNav is a no-op for the latter — it only
   // pushes when the assignment being *replaced* is a tile, which is what makes
   // Back return to a tile a dropped terminal displaced.
-  function dropTileIntoPane(assignment: string, paneId: string) {
+  function dropTileIntoPane(
+    assignment: string,
+    paneId: string,
+    sourcePaneId?: string,
+  ) {
     recordNav(paneId, assignment);
-    if (moveToPaneFn) moveToPaneFn(assignment, paneId);
+    if (moveToPaneFn) moveToPaneFn(assignment, paneId, sourcePaneId);
     else pendingTilePlacement = { assignment, paneId };
   }
 
@@ -1832,8 +1844,75 @@ function WorkspaceScreen(props: {
   /** Highlight shown while a drag hovers the non-BSP main view (BSP panes draw
    *  their own, per pane). */
   const [mainViewDragOver, setMainViewDragOver] = createSignal(false);
-  /** Reveals the main view's ✕ on pointer devices (see PaneClose). */
+  /** Reveals the main view's ✕ on pointer devices (see PaneTools). */
   const [mainViewHover, setMainViewHover] = createSignal(false);
+
+  /** True while a pane's own content is being dragged (its grip). The dock
+   *  reveals itself as a drop-to-park target for exactly this window — it is
+   *  hidden when nothing is parked, which is precisely when a drag most needs
+   *  it. Depth-counted: dragenter/dragleave fire per element crossed. */
+  const [paneDragActive, setPaneDragActive] = createSignal(false);
+  let paneDragDepth = 0;
+  const paneDragEnter = (e: DragEvent) => {
+    if (!isPaneDrag(e)) return;
+    paneDragDepth++;
+    setPaneDragActive(true);
+  };
+  const paneDragLeave = (e: DragEvent) => {
+    if (!isPaneDrag(e)) return;
+    if (--paneDragDepth <= 0) {
+      paneDragDepth = 0;
+      setPaneDragActive(false);
+    }
+  };
+  // `dragend` fires on the source — always ours here — and `drop` anywhere;
+  // either way the window is over, whatever the enter/leave count says.
+  const paneDragDone = () => {
+    paneDragDepth = 0;
+    setPaneDragActive(false);
+  };
+  window.addEventListener("dragenter", paneDragEnter);
+  window.addEventListener("dragleave", paneDragLeave);
+  window.addEventListener("drop", paneDragDone);
+  window.addEventListener("dragend", paneDragDone);
+  onCleanup(() => {
+    window.removeEventListener("dragenter", paneDragEnter);
+    window.removeEventListener("dragleave", paneDragLeave);
+    window.removeEventListener("drop", paneDragDone);
+    window.removeEventListener("dragend", paneDragDone);
+  });
+
+  /** What the main view's grip drags: its tile or its surface. A bare
+   *  terminal stays undraggable — the dock derives "parked" from "not
+   *  displayed", and the single view always displays the focused session. */
+  const mainViewDragAssignment = (): string | null => {
+    const tile = activeTile();
+    if (tile) return tile;
+    const sid = focusedSurfaceId();
+    const connId = focusedSurfaceConnId();
+    return sid != null && connId != null ? surfaceAssignment(connId, sid) : null;
+  };
+
+  /** A grip drag landed on the dock: park the content by taking it off
+   *  screen — the dock lists exactly what is open but not displayed. */
+  function parkDraggedAssignment(assignment: string, source: string) {
+    if (source === MAIN_PANE_SOURCE) {
+      if (assignment === activeTile()) {
+        setActiveTile(null);
+        return;
+      }
+      const surface = parseSurfaceAssignment(assignment);
+      if (surface && surface.surfaceId === focusedSurfaceId()) {
+        focusSurfaceById(null);
+      }
+      return;
+    }
+    // A BSP pane: empty it, if it still holds what the drag carried — a
+    // layout change mid-drag must not evict a bystander.
+    if (layoutAssignments()?.assignments[source] === assignment) {
+      clearPaneAssignmentFn?.(source);
+    }
+  }
 
   // Send the currently-focused IDE or web tile to the dock (Ctrl+Shift+Q).
   // Handles both the non-BSP focused tile and a tile occupying the focused BSP
@@ -2419,8 +2498,9 @@ function WorkspaceScreen(props: {
   let moveSessionToPaneFn:
     | ((sessionId: SessionId, targetPaneId: string) => void)
     | null = null;
-  let moveToPaneFn: ((value: string, targetPaneId: string) => void) | null =
-    null;
+  let moveToPaneFn:
+    | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
+    | null = null;
   // A tile to drop into a freshly-created layout, flushed when BSPContainer
   // wires moveToPane on mount (no-layout file open).
   let pendingTilePlacement: { assignment: string; paneId: string } | null =
@@ -3163,11 +3243,19 @@ function WorkspaceScreen(props: {
                   this one would be a second, ambiguous control over whichever
                   pane happens to be focused. */}
               <Show when={!(inBsp() && activeLayout()) && mainViewClosable()}>
-                <PaneClose
+                <PaneTools
                   theme={theme()}
                   scale={chromeScale()}
                   alwaysVisible={isMobileTouch()}
                   hovered={mainViewHover()}
+                  drag={
+                    mainViewDragAssignment() != null
+                      ? {
+                          assignment: mainViewDragAssignment()!,
+                          paneId: MAIN_PANE_SOURCE,
+                        }
+                      : undefined
+                  }
                   onClose={closeFocusedPane}
                 />
               </Show>
@@ -3460,13 +3548,19 @@ function WorkspaceScreen(props: {
           </div>
           <Show
             when={
-              previewPanelOpen() &&
-              (offScreenSessions().length > 0 ||
-                offScreenSurfaces().length > 0 ||
-                backgroundTiles().length > 0)
+              // A grip drag reveals the dock even when it is empty or toggled
+              // off: it is the drop-to-park target, and "nothing parked yet"
+              // is exactly when a drag needs somewhere to park.
+              paneDragActive() ||
+              (previewPanelOpen() &&
+                (offScreenSessions().length > 0 ||
+                  offScreenSurfaces().length > 0 ||
+                  backgroundTiles().length > 0))
             }
           >
             <PreviewPanel
+              parkDropActive={paneDragActive()}
+              onParkDrop={parkDraggedAssignment}
               offScreenSessions={offScreenSessions()}
               surfaces={offScreenSurfaces()}
               focusedSurfaceId={focusedSurfaceId()}
@@ -4070,8 +4164,6 @@ function WorkspaceScreen(props: {
   );
 }
 
-const MIN_PANEL_WIDTH = 160;
-
 function PreviewPanel(props: {
   offScreenSessions: BlitSession[];
   surfaces: BlitSurface[];
@@ -4095,10 +4187,16 @@ function PreviewPanel(props: {
   /** Live background-editor cards (rendered by WorkspaceScreen, which owns the
    *  tile assignments), shown above the terminal/surface thumbnails. */
   backgroundEditors?: JSX.Element;
+  /** A grip drag is in flight: this panel is its drop-to-park target. */
+  parkDropActive?: boolean;
+  /** A grip drag landed here; park `assignment`, emptying `source`. */
+  onParkDrop?: (assignment: string, source: string) => void;
 }) {
   const [expandedId, setExpandedId] = createSignal<number | null>(null);
   const [resizeHover, setResizeHover] = createSignal(false);
   const [resizeActive, setResizeActive] = createSignal(false);
+  /** The grip drag is hovering the panel (parallel to a pane's highlight). */
+  const [parkOver, setParkOver] = createSignal(false);
 
   function handleResizePointerDown(e: PointerEvent) {
     e.preventDefault();
@@ -4109,14 +4207,14 @@ function PreviewPanel(props: {
     // Cap the panel at a fraction of the viewport so a touch drag can't
     // push the terminal off-screen.
     const maxWidth = Math.max(
-      MIN_PANEL_WIDTH,
+      MIN_PREVIEW_PANEL_WIDTH,
       Math.floor(window.innerWidth * 0.85),
     );
 
     const onMove = (me: PointerEvent) => {
       const delta = startX - me.clientX;
       props.onResize(
-        Math.min(maxWidth, Math.max(MIN_PANEL_WIDTH, startWidth + delta)),
+        Math.min(maxWidth, Math.max(MIN_PREVIEW_PANEL_WIDTH, startWidth + delta)),
       );
     };
 
@@ -4153,8 +4251,46 @@ function PreviewPanel(props: {
         display: "flex",
         "flex-direction": "row",
         overflow: "hidden",
+        position: "relative",
+      }}
+      onDragOver={(e) => {
+        if (!props.onParkDrop || !isPaneDrag(e)) return;
+        e.preventDefault(); // allow the drop
+        e.dataTransfer!.dropEffect = "move";
+        if (!parkOver()) setParkOver(true);
+      }}
+      onDragLeave={(e) => {
+        // Ignore leaves into child elements; only clear when truly leaving.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setParkOver(false);
+      }}
+      onDrop={(e) => {
+        setParkOver(false);
+        const assignment = tileDragAssignment(e);
+        const source = paneDragSource(e);
+        if (assignment && source && props.onParkDrop) {
+          e.preventDefault();
+          props.onParkDrop(assignment, source);
+        }
       }}
     >
+      <Show when={props.parkDropActive}>
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            "z-index": 5,
+            "pointer-events": "none",
+            "box-sizing": "border-box",
+            border: parkOver()
+              ? `2px solid ${props.theme.accent}`
+              : `2px dashed ${props.theme.subtleBorder}`,
+            background: parkOver()
+              ? `color-mix(in srgb, ${props.theme.accent} 14%, transparent)`
+              : "transparent",
+          }}
+        />
+      </Show>
       <div
         onPointerDown={handleResizePointerDown}
         onPointerEnter={() => setResizeHover(true)}

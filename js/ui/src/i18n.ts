@@ -268,6 +268,7 @@ const en: Messages = {
   "bsp.exited": "Exited",
   "bsp.restart": "Restart",
   "bsp.close": "Close",
+  "bsp.move": "Drag to move · click for another corner",
   "bsp.commandPlaceholder": "[remote>][command]",
   "bsp.commandPlaceholderNoRemotes": "[command]",
 };
@@ -429,6 +430,7 @@ const es: Messages = {
   "bsp.exited": "Finalizado",
   "bsp.restart": "Reiniciar",
   "bsp.close": "Cerrar",
+  "bsp.move": "Arrastrar para mover · clic: otra esquina",
   "bsp.commandPlaceholder": "[remoto>][comando]",
   "bsp.commandPlaceholderNoRemotes": "[comando]",
 };
@@ -583,6 +585,7 @@ const fr: Messages = {
   "bsp.exited": "Terminé",
   "bsp.restart": "Redémarrer",
   "bsp.close": "Fermer",
+  "bsp.move": "Glisser pour déplacer · clic : autre coin",
   "bsp.commandPlaceholder": "[cible>][commande]",
   "bsp.commandPlaceholderNoRemotes": "[commande]",
 };
@@ -738,6 +741,7 @@ const de: Messages = {
   "bsp.exited": "Beendet",
   "bsp.restart": "Neustart",
   "bsp.close": "Schließen",
+  "bsp.move": "Zum Verschieben ziehen · Klick: andere Ecke",
   "bsp.commandPlaceholder": "[Ziel>][Befehl]",
   "bsp.commandPlaceholderNoRemotes": "[Befehl]",
 };
@@ -890,6 +894,7 @@ const ja: Messages = {
   "bsp.exited": "終了",
   "bsp.restart": "再起動",
   "bsp.close": "閉じる",
+  "bsp.move": "ドラッグして移動 · クリックで別の隅へ",
   "bsp.commandPlaceholder": "[リモート>][コマンド]",
   "bsp.commandPlaceholderNoRemotes": "[コマンド]",
 };
@@ -1041,6 +1046,7 @@ const zh: Messages = {
   "bsp.exited": "已结束",
   "bsp.restart": "重新启动",
   "bsp.close": "关闭",
+  "bsp.move": "拖动以移动 · 点击换角",
   "bsp.commandPlaceholder": "[远程>][命令]",
   "bsp.commandPlaceholderNoRemotes": "[命令]",
 };

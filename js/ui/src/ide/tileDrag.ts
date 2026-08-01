@@ -37,6 +37,39 @@ export function isTileDrag(e: DragEvent): boolean {
   return e.dataTransfer?.types.includes(TILE_DND_MIME) ?? false;
 }
 
+/** Custom MIME naming the BSP pane a drag started from. A drag whose source
+ *  is a pane is a *move* of that pane's content, not another open: the drop
+ *  swaps the two panes' assignments, so the content lands in exactly one
+ *  place (a swap with an empty pane is a plain move). */
+export const PANE_SOURCE_DND_MIME = "application/x-blit-pane-source";
+
+/** Mark a drag as carrying a pane's own assignment: the tile payload plus
+ *  the pane it is leaving. Attach to `onDragStart`. */
+export function startPaneTileDrag(
+  e: DragEvent,
+  assignment: string,
+  sourcePaneId: string,
+): void {
+  startTileDrag(e, assignment);
+  e.dataTransfer?.setData(PANE_SOURCE_DND_MIME, sourcePaneId);
+}
+
+/** The pane a drag left, or null when the drag is not a pane's content
+ *  (readable only on `drop`). */
+export function paneDragSource(e: DragEvent): string | null {
+  return e.dataTransfer?.getData(PANE_SOURCE_DND_MIME) || null;
+}
+
+/** True if the drag is a pane's content (checked in `onDragOver`, where the
+ *  payload isn't readable — so we look at the offered types instead). */
+export function isPaneDrag(e: DragEvent): boolean {
+  return e.dataTransfer?.types.includes(PANE_SOURCE_DND_MIME) ?? false;
+}
+
+/** The `paneDragSource` of the non-BSP main view. BSP pane ids are index
+ *  paths ("0", "1.0") from enumeratePanes, so this cannot collide. */
+export const MAIN_PANE_SOURCE = "main-view";
+
 /** Custom MIME for explorer move drags: a file/dir dragged onto a directory
  *  row moves it there (docs/design/fs-write.md: rename and move are one op). */
 export const FS_MOVE_DND_MIME = "application/x-blit-fs-move";

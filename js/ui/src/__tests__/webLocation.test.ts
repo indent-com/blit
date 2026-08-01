@@ -1,7 +1,47 @@
 import { describe, expect, it } from "vitest";
-import { splitLocation } from "../preview";
+import {
+  normalizeLocation,
+  parsePlainLocation,
+  plainLocation,
+  splitLocation,
+  webLocationLabel,
+} from "../preview";
 
 const HERE = "http://localhost:3000";
+
+describe("plain-iframe locations", () => {
+  it("marks and parses back", () => {
+    expect(plainLocation("https://example.com")).toBe(
+      "plain:https://example.com",
+    );
+    expect(parsePlainLocation("plain:https://example.com")).toBe(
+      "https://example.com",
+    );
+    expect(parsePlainLocation("https://example.com")).toBeNull();
+  });
+
+  it("fills a bare host with https, not the relayed flow's http", () => {
+    expect(plainLocation("example.com")).toBe("plain:https://example.com");
+  });
+
+  it("survives normalizeLocation untouched", () => {
+    // "plain" is not an http(s) scheme, so the normalizer must treat the
+    // whole string as opaque — this is what lets the marker ride the
+    // remembered-locations list and the web assignment's URL slot.
+    expect(normalizeLocation("plain:https://example.com")).toBe(
+      "plain:https://example.com",
+    );
+  });
+
+  it("labels drop the marker and keep everything else", () => {
+    expect(webLocationLabel("plain:https://example.com")).toBe(
+      "https://example.com",
+    );
+    expect(webLocationLabel("http://localhost:3000")).toBe(
+      "http://localhost:3000",
+    );
+  });
+});
 
 describe("splitLocation", () => {
   // The status bar edits the whole location, so this decides whether a

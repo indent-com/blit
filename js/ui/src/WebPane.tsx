@@ -1,7 +1,11 @@
 /** A web pane: an iframe onto something the server can reach, served through the preview service worker (docs/design/net.md). */
 
 import { createEffect, createSignal, onCleanup, type JSX } from "solid-js";
-import { previewIframeUrl } from "./preview";
+import {
+  parsePlainLocation,
+  previewIframeUrl,
+  webLocationLabel,
+} from "./preview";
 import { forwardWebPaneCloseShortcut } from "./webPaneShortcuts";
 
 export interface WebPaneState {
@@ -54,9 +58,25 @@ export function WebPane(props: WebPaneProps): JSX.Element {
     canGoForward: false,
   });
 
+  /** A plain-iframe pane loads its URL directly — no relay, no worker. */
+  const plainUrl = () => parsePlainLocation(props.url);
+
+  /** The frame URL for a path on the pane's target, whichever kind it is. */
+  const frameUrlFor = (path: string): string => {
+    const plain = plainUrl();
+    if (plain) {
+      try {
+        return new URL(path === "/" ? "" : path, plain).href;
+      } catch {
+        return plain;
+      }
+    }
+    return previewIframeUrl(props.dest, props.url, path);
+  };
+
   const src = () => {
     try {
-      return previewIframeUrl(props.dest, props.url, props.path ?? "/");
+      return frameUrlFor(props.path ?? "/");
     } catch (err) {
       // A URL that cannot be parsed is a configuration mistake, not a load failure: say so in the pane rather than pointing the frame at nothing.
       setState((s) => ({
@@ -145,7 +165,7 @@ export function WebPane(props: WebPaneProps): JSX.Element {
         const path = state().path || "/";
         let next: string;
         try {
-          next = previewIframeUrl(props.dest, props.url, path);
+          next = frameUrlFor(path);
         } catch {
           next = src();
         }
@@ -161,7 +181,7 @@ export function WebPane(props: WebPaneProps): JSX.Element {
         try {
           frame.contentWindow!.location.assign(path);
         } catch {
-          frame.src = previewIframeUrl(props.dest, props.url, path);
+          frame.src = frameUrlFor(path);
         }
       },
     };
@@ -253,7 +273,7 @@ export function WebPane(props: WebPaneProps): JSX.Element {
           sample();
           attachFrameListeners();
         }}
-        title={state().title || props.url}
+        title={state().title || webLocationLabel(props.url)}
         style={{
           width: "100%",
           height: "100%",

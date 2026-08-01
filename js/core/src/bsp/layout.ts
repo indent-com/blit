@@ -293,6 +293,38 @@ export function buildCandidateOrder({
   return ordered;
 }
 
+/**
+ * The assignments after a dropped `value` lands in `targetPaneId`, or `null`
+ * when nothing changes.
+ *
+ * A drop that names the pane the drag left (`fromPaneId` — a pane's ✕
+ * doubling as its drag handle) is a *move*, not another open: the source
+ * pane takes what the target held, so the content lands in exactly one pane,
+ * and dropping on an empty pane is a plain move. Gated on the source still
+ * holding the dragged value — a layout change mid-drag must not evict
+ * whatever else got there since.
+ */
+export function assignmentsAfterDrop(
+  prev: Readonly<Record<string, string | null>>,
+  value: string,
+  targetPaneId: string,
+  fromPaneId: string | undefined,
+  validPaneIds: readonly string[],
+): Record<string, string | null> | null {
+  const swap =
+    fromPaneId !== undefined &&
+    fromPaneId !== targetPaneId &&
+    validPaneIds.includes(fromPaneId) &&
+    prev[fromPaneId] === value;
+  if (prev[targetPaneId] === value && !swap) return null;
+  const next: Record<string, string | null> = {
+    ...prev,
+    [targetPaneId]: value,
+  };
+  if (swap) next[fromPaneId] = prev[targetPaneId] ?? null;
+  return next;
+}
+
 export function reconcileAssignments({
   panes,
   previous,
