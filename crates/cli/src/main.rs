@@ -1106,8 +1106,13 @@ fn cmd_remote(cmd: RemoteCommand) {
             }
         }
         RemoteCommand::Add { name, uri } => {
-            if name.is_empty() || name.contains('=') || name.contains('\n') {
-                eprintln!("blit: invalid remote name '{name}'");
+            // The same rule the file parser enforces. Checking a laxer one
+            // here meant `blit remote add 'my remote' ssh:host` printed
+            // success, wrote the line, and the next read dropped it.
+            if !blit_webserver::config::valid_entry_name(&name) {
+                eprintln!(
+                    "blit: invalid remote name '{name}' — no whitespace, '=', or leading '#'"
+                );
                 std::process::exit(1);
             }
             let uri = match uri {
