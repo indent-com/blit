@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.42.0";
+  version = "0.43.0";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
@@ -221,11 +221,34 @@ let
   # Static libx264 for the glibc release build, same reasoning as libopus:
   # zig's linker rejects .so files built against a newer glibc than the
   # target version, so the library must be linked statically.
+  #
+  # Static archives dodge that version check but still carry symbol
+  # references from whatever glibc headers compiled them: nixpkgs'
+  # glibc (>= 2.38) redirects sscanf to __isoc23_sscanf under
+  # _GNU_SOURCE, which doesn't exist at the 2.31 floor and breaks the
+  # final link.  Compile with zig cc targeting the same floor instead.
+  zigTargetGnu =
+    if pkgs.stdenv.hostPlatform.isAarch64
+    then "aarch64-linux-gnu.${minGlibcVersion}"
+    else "x86_64-linux-gnu.${minGlibcVersion}";
+
+  # pkgs.zig is referenced by path, not via nativeBuildInputs: its
+  # setup hooks would take over the configure/build phases.
   gnuStaticX264 = pkgs.x264.overrideAttrs (old: {
     configureFlags =
       map (f: if f == "--enable-shared" then "--enable-static" else f)
         (old.configureFlags or [ ])
-      ++ [ "--disable-shared" ];
+      ++ [
+        "--disable-shared"
+        # zig cc promotes -Wdate-time to an error; the x264 CLI's
+        # version banner uses __DATE__.
+        "--extra-cflags=-Wno-date-time"
+      ];
+    preConfigure = (old.preConfigure or "") + ''
+      export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-global-cache
+      export ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local-cache
+      export CC="${pkgs.zig}/bin/zig cc -target ${zigTargetGnu}"
+    '';
   });
 
   commonArgsGnu = {

@@ -2,6 +2,8 @@
 mod imp;
 #[cfg(target_os = "linux")]
 mod input_region;
+// Compiled everywhere so its tests run on any host; only `imp` consumes it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod pointer_focus;
 #[cfg(target_os = "linux")]
 mod positioner;

@@ -3,7 +3,8 @@ use clap::{Args, Parser, Subcommand};
 /// Text for `blit --license`.  Mentions exactly the third-party components
 /// whose licenses affect distribution of *this* binary — nothing more.
 pub fn license_text() -> String {
-    let mut text = String::from(
+    let mut text = String::new();
+    text.push_str(
         "blit — MIT License, copyright (c) 2026 Indent Team\n\
          Full text: https://github.com/indent-com/blit/blob/main/LICENSE\n",
     );
