@@ -118,7 +118,10 @@ impl SurfaceEncoderPreference {
     /// - `H264Vaapi`: libva has no H.264 4:4:4 encode profile — the enum stops
     ///   at `VAProfileH264High422`, so there is nothing to pass to
     ///   `vaCreateConfig`.
-    /// - `H264Software`: openh264 encodes 4:2:0 only.
+    /// - `H264Software`: x264 encodes 4:4:4 (High 4:4:4 Predictive); openh264
+    ///   is 4:2:0-only.  A build without the x264 feature is structurally
+    ///   4:2:0; a build with it stays a runtime probe, since
+    ///   `BLIT_H264_SOFTWARE=openh264` can still pin the 4:2:0-only backend.
     ///
     /// `AV1Vaapi` is deliberately absent: it asks the driver for
     /// `VAProfileAV1Profile1`.  Whether a given device advertises an encode
@@ -129,7 +132,11 @@ impl SurfaceEncoderPreference {
     /// that can only ever fail, and from logging it as if the host were at
     /// fault.
     pub fn supports_444_by_encoder(self) -> bool {
-        !matches!(self, Self::H264Vaapi | Self::H264Software)
+        match self {
+            Self::H264Vaapi => false,
+            Self::H264Software => cfg!(all(target_os = "linux", feature = "x264")),
+            _ => true,
+        }
     }
 
     /// Maximum surface dimensions the encoder can handle.
@@ -2357,13 +2364,17 @@ mod tests {
         assert_eq!(av1_profile_digit(ChromaSubsampling::Cs420), 0);
     }
 
-    /// 4:4:4 is a structural non-starter for these two, so the encoder chain
-    /// must not spend a probe on them.  `AV1Vaapi` is excluded from this
-    /// list on purpose — it probes for `VAProfileAV1Profile1` at runtime.
+    /// 4:4:4 is a structural non-starter for H.264 VA-API (and for
+    /// h264-software in builds without x264), so the encoder chain must not
+    /// spend a probe on them.  `AV1Vaapi` is excluded from this list on
+    /// purpose — it probes for `VAProfileAV1Profile1` at runtime.
     #[test]
     fn encoders_without_any_444_path_are_skipped() {
         assert!(!SurfaceEncoderPreference::H264Vaapi.supports_444_by_encoder());
-        assert!(!SurfaceEncoderPreference::H264Software.supports_444_by_encoder());
+        assert_eq!(
+            SurfaceEncoderPreference::H264Software.supports_444_by_encoder(),
+            cfg!(all(target_os = "linux", feature = "x264")),
+        );
         assert!(SurfaceEncoderPreference::AV1Vaapi.supports_444_by_encoder());
         assert!(SurfaceEncoderPreference::AV1Software.supports_444_by_encoder());
         assert!(SurfaceEncoderPreference::NvencH264.supports_444_by_encoder());
