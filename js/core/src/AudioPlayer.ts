@@ -768,10 +768,9 @@ export class AudioPlayer {
       // frame so transferring doesn't detach unrelated bytes.  Opus
       // frames are ~100–300 B, so the copy is negligible.
       const copy = data.slice();
-      this.worker.postMessage(
-        { type: "opus", timestamp, data: copy },
-        [copy.buffer],
-      );
+      this.worker.postMessage({ type: "opus", timestamp, data: copy }, [
+        copy.buffer,
+      ]);
       this.decodesRequested++;
       return;
     }
