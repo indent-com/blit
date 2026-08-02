@@ -5,6 +5,7 @@
 //! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
+use crate::pointer_focus::focus_transition;
 use crate::positioner::PositionerGeometry;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -2316,13 +2317,17 @@ impl Compositor {
                     // created *after* this can be entered at the right spot
                     // rather than waiting for the next motion (`GetPointer`).
                     self.pointer_entered_local = (lx, ly);
-                    if self.pointer_entered_id.as_ref() != Some(&proto_id) {
+                    let matching_ptrs = self
+                        .pointers
+                        .iter()
+                        .filter(|p| same_client(*p, &wl_surface))
+                        .count();
+                    if let Some(change) = focus_transition(
+                        self.pointer_entered_id.as_ref(),
+                        &proto_id,
+                        matching_ptrs > 0,
+                    ) {
                         let serial = self.next_serial();
-                        let matching_ptrs = self
-                            .pointers
-                            .iter()
-                            .filter(|p| same_client(*p, &wl_surface))
-                            .count();
                         if matching_ptrs == 0 {
                             // The client has mapped a surface but has not
                             // asked for a pointer yet — Firefox routinely
@@ -2336,11 +2341,11 @@ impl Compositor {
                             );
                         }
                         // Leave old surface.
-                        if self.pointer_entered_id.is_some() {
+                        if let Some(ref leaving) = change.leave {
                             let old_wl = self
                                 .surfaces
                                 .values()
-                                .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                                .find(|s| s.wl_surface.id() == *leaving)
                                 .map(|s| s.wl_surface.clone());
                             if let Some(old_wl) = old_wl {
                                 for ptr in &self.pointers {
@@ -2356,17 +2361,12 @@ impl Compositor {
                                 ptr.enter(serial, &wl_surface, lx, ly);
                             }
                         }
-                        // Only now is the surface really entered. Latching
-                        // unconditionally is what made the mouse die outright
-                        // in a slow-starting client: with no pointer to
-                        // receive the enter, the id was still recorded, so
-                        // this branch never ran again and every later motion
-                        // went to a client that had never been told the
-                        // pointer was over it — which Wayland says to ignore.
-                        // Leaving it unset means the next motion retries.
-                        if matching_ptrs > 0 {
-                            self.pointer_entered_id = Some(proto_id);
-                        }
+                        // Whatever `focus_transition` decided — including
+                        // recording nothing when no pointer received the
+                        // enter, so the next motion retries rather than the
+                        // state machine believing the job is done. Its tests
+                        // enumerate the cases; see pointer_focus.rs.
+                        self.pointer_entered_id = change.entered;
                     }
                     for ptr in &self.pointers {
                         if same_client(ptr, &wl_surface) {
