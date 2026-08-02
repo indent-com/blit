@@ -649,6 +649,7 @@
           pkgs.pipewire
           pkgs.wireplumber
           pkgs.llvmPackages.libclang
+          pkgs.x264
         ];
 
         shellHook = ''
@@ -657,15 +658,18 @@
           fi
           export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig${
+            pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.x264.dev}/lib/pkgconfig"
+          }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           # LIBRARY_PATH is propagated by nix-direnv while LD_LIBRARY_PATH
           # is filtered out — .envrc reconstructs LD_LIBRARY_PATH from
           # LIBRARY_PATH, so anything we need at runtime has to land
-          # here.  libopus is for the Opus encoder; libpipewire-0.3 is
-          # dlopened by the server's in-process audio capture path (see
+          # here.  libopus is for the Opus encoder; libx264 for the H.264
+          # software surface encoder; libpipewire-0.3 is dlopened by the
+          # server's in-process audio capture path (see
           # crates/server/src/audio_pw.rs).
           export LIBRARY_PATH="${pkgs.libopus}/lib${
-            pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.pipewire}/lib"
+            pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.x264.lib}/lib:${pkgs.pipewire}/lib"
           }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           # Runtime dlopen: blit server loads VA-API / NVENC GPU libs
           # and libpipewire-0.3 at runtime via dlopen.  See the

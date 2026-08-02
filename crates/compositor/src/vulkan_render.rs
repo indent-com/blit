@@ -1860,7 +1860,7 @@ impl VulkanRenderer {
                     .push_next(&mut ext_info);
                 let buffer = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
                 let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-                // Prefer HOST_VISIBLE so CPU encoders (openh264 etc) can
+                // Prefer HOST_VISIBLE so CPU encoders (x264 etc) can
                 // mmap the exported DMA-BUF for their fallback read path.
                 // DEVICE_LOCAL-only memory on discrete AMD is not
                 // CPU-mappable, which silently fails the encoder's mmap

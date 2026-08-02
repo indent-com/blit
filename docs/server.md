@@ -207,7 +207,7 @@ Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the
 | `h264-nvenc`    | NVENC (GPU)        | H.264 via CUDA                     |
 | `av1-vaapi`     | VA-API (GPU)       | AV1 via libva                      |
 | `h264-vaapi`    | VA-API (GPU)       | H.264 via libva                    |
-| `h264-software` | openh264 (CPU)     | Software H.264, always available   |
+| `h264-software` | x264 (CPU)         | Software H.264, always available   |
 | `av1-software`  | rav1e (CPU)        | Software AV1                       |
 
 `BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `ultra`.

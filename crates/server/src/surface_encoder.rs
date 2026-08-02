@@ -5,9 +5,6 @@ use blit_remote::{
     CODEC_SUPPORT_AV1, CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444,
     SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_H264,
 };
-use openh264::encoder::Encoder as OpenH264Encoder;
-use openh264::formats::YUVBuffer;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SurfaceEncoderPreference {
     VulkanVideoH264,
@@ -23,7 +20,8 @@ pub enum SurfaceEncoderPreference {
 // Type alias for backwards compatibility in tests.
 pub type SurfaceH264EncoderPreference = SurfaceEncoderPreference;
 
-/// openh264 hard limit: 3840x2160 horizontal or 2160x3840 vertical.
+/// H.264 dimension cap: 3840x2160 horizontal or 2160x3840 vertical.
+/// Shared by all H.264 backends; also bounds software-encode CPU cost.
 const H264_MAX_WIDTH: u16 = 3840;
 const H264_MAX_HEIGHT: u16 = 2160;
 
@@ -375,9 +373,10 @@ impl SurfaceQuality {
         self.av1_quantizer().min(255) as u8
     }
 
-    /// openh264 target bitrate in bits/sec.  Resolution-independent
-    /// approximation — openh264 adapts internally.
-    fn openh264_bitrate(self) -> u32 {
+    /// x264 target bitrate in bits/sec.  Resolution-independent
+    /// approximation — ABR rate control adapts internally.
+    #[cfg(target_os = "linux")]
+    fn x264_bitrate(self) -> u32 {
         match self {
             Self::Low => 500_000,
             Self::Medium => 2_000_000,
@@ -708,7 +707,7 @@ impl SurfaceEncoder {
             }),
             SurfaceEncoderPreference::H264Software => {
                 if chroma.is_444() {
-                    return Err("openh264 does not support 4:4:4".into());
+                    return Err("h264-software does not support 4:4:4".into());
                 }
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
                 Ok(Self {
@@ -717,7 +716,7 @@ impl SurfaceEncoder {
                     source_width,
                     source_height,
                     kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new(
-                        quality,
+                        width, height, quality,
                     )?)),
                     chroma,
                 })
@@ -1341,8 +1340,7 @@ impl SurfaceEncoder {
         let mut result = match &mut self.kind {
             SurfaceEncoderKind::H264Software(encoder) => {
                 let yuv = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
-                let yuv_buf = YUVBuffer::from_vec(yuv, enc_w, enc_h);
-                encoder.encode_yuv(&yuv_buf, self.width, self.height)
+                encoder.encode_yuv(&yuv, self.width, self.height)
             }
             SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
                 enc.encode_bgra_padded(bgra, src_w, src_h)
@@ -1382,8 +1380,7 @@ impl SurfaceEncoder {
                 let enc_h = self.height as usize;
                 if enc_w == src_w && enc_h == src_h {
                     let yuv = nv12_to_yuv420(data, y_stride, uv_stride, src_w, src_h);
-                    let yuv_buf = YUVBuffer::from_vec(yuv, enc_w, enc_h);
-                    encoder.encode_yuv(&yuv_buf, self.width, self.height)
+                    encoder.encode_yuv(&yuv, self.width, self.height)
                 } else {
                     let pd = PixelData::Nv12 {
                         data: std::sync::Arc::new(data.to_vec()),
@@ -1877,53 +1874,159 @@ fn av1_stream_contains_keyframe(data: &[u8]) -> bool {
     false
 }
 
+/// Software H.264 encoder backed by libx264.  Linux-only: the compositor
+/// that feeds surface encoders is Linux-only, and gating the dependency
+/// keeps other platforms free of the system libx264 requirement.
+#[cfg(target_os = "linux")]
 struct SoftwareH264Encoder {
-    encoder: OpenH264Encoder,
+    enc: *mut x264_sys::x264_t,
+    pts: i64,
+    force_keyframe: bool,
 }
 
+// SAFETY: the x264 handle is not tied to the thread that created it and is
+// only accessed through &mut self.
+#[cfg(target_os = "linux")]
+unsafe impl Send for SoftwareH264Encoder {}
+
+#[cfg(target_os = "linux")]
 impl SoftwareH264Encoder {
-    fn new(quality: SurfaceQuality) -> Result<Self, String> {
-        use openh264::encoder::{BitRate, EncoderConfig, RateControlMode};
-        let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(quality.openh264_bitrate()))
-            .rate_control_mode(RateControlMode::Bitrate);
-        let encoder =
-            OpenH264Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
-                .map_err(|err| format!("failed to create OpenH264 encoder: {err:?}"))?;
-        Ok(Self { encoder })
+    fn new(width: u32, height: u32, quality: SurfaceQuality) -> Result<Self, String> {
+        use x264_sys::*;
+        unsafe {
+            let mut par: x264_param_t = std::mem::zeroed();
+            // Cheap CPU fallback: superfast + zerolatency (no B-frames, no
+            // lookahead, one frame in, one frame out).
+            if x264_param_default_preset(&mut par, c"superfast".as_ptr(), c"zerolatency".as_ptr())
+                < 0
+            {
+                return Err("x264_param_default_preset failed".into());
+            }
+            par.i_csp = X264_CSP_I420 as i32;
+            par.i_width = width as i32;
+            par.i_height = height as i32;
+            // Predictable per-surface CPU cost (zerolatency would otherwise
+            // enable sliced threads across all cores).
+            par.i_threads = 1;
+            par.i_fps_num = 30;
+            par.i_fps_den = 1;
+            // Same periodic-keyframe cadence as the AV1 software encoder.
+            par.i_keyint_max = 60;
+            par.i_log_level = X264_LOG_NONE;
+            par.rc.i_rc_method = X264_RC_ABR as i32;
+            par.rc.i_bitrate = (quality.x264_bitrate() / 1000) as i32; // kbit/s
+            // Constrained Baseline — matches the avc1.4200 codec string sent
+            // to clients.
+            if x264_param_apply_profile(&mut par, c"baseline".as_ptr()) < 0 {
+                return Err("x264_param_apply_profile failed".into());
+            }
+            let enc = x264_encoder_open(&mut par);
+            if enc.is_null() {
+                return Err(format!("x264_encoder_open failed for {width}x{height}"));
+            }
+            Ok(Self {
+                enc,
+                pts: 0,
+                force_keyframe: false,
+            })
+        }
     }
 
     fn request_keyframe(&mut self) {
-        self.encoder.force_intra_frame();
+        self.force_keyframe = true;
     }
 
     fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
         let yuv = rgba_to_yuv420(rgba, width as usize, height as usize);
-        let yuv_buf = YUVBuffer::from_vec(yuv, width as usize, height as usize);
-        self.encode_yuv(&yuv_buf, width, height)
+        self.encode_yuv(&yuv, width, height)
     }
 
-    /// Encode from a pre-built YUV buffer (avoids redundant conversion).
-    fn encode_yuv(
-        &mut self,
-        yuv_buf: &YUVBuffer,
-        width: u32,
-        height: u32,
-    ) -> Option<(Vec<u8>, bool)> {
-        let bitstream = match self.encoder.encode(yuv_buf) {
-            Ok(bs) => bs,
-            Err(e) => {
-                eprintln!("[surface-encoder] openh264 encode failed {width}x{height}: {e:?}");
-                return None;
-            }
-        };
-        let nal_data = bitstream.to_vec();
-        if nal_data.is_empty() {
-            eprintln!("[surface-encoder] openh264 produced empty NAL {width}x{height}");
+    /// Encode from a pre-built I420 buffer (avoids redundant conversion).
+    fn encode_yuv(&mut self, yuv: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
+        use x264_sys::*;
+        let w = width as usize;
+        let h = height as usize;
+        let y_len = w * h;
+        let c_len = (w / 2) * (h / 2);
+        if yuv.len() < y_len + 2 * c_len {
+            eprintln!("[surface-encoder] x264 short YUV buffer {width}x{height}");
             return None;
         }
-        let is_keyframe = h264_stream_contains_idr(&nal_data);
-        Some((nal_data, is_keyframe))
+        unsafe {
+            let mut pic_in: x264_picture_t = std::mem::zeroed();
+            x264_picture_init(&mut pic_in);
+            pic_in.img.i_csp = X264_CSP_I420 as i32;
+            pic_in.img.i_plane = 3;
+            // x264 reads but never writes the input planes.
+            let base = yuv.as_ptr() as *mut u8;
+            pic_in.img.plane[0] = base;
+            pic_in.img.plane[1] = base.add(y_len);
+            pic_in.img.plane[2] = base.add(y_len + c_len);
+            pic_in.img.i_stride[0] = w as i32;
+            pic_in.img.i_stride[1] = (w / 2) as i32;
+            pic_in.img.i_stride[2] = (w / 2) as i32;
+            pic_in.i_pts = self.pts;
+            self.pts += 1;
+            pic_in.i_type = if self.force_keyframe {
+                X264_TYPE_IDR as i32
+            } else {
+                X264_TYPE_AUTO as i32
+            };
+
+            let mut nals: *mut x264_nal_t = std::ptr::null_mut();
+            let mut num_nals = 0;
+            let mut pic_out: x264_picture_t = std::mem::zeroed();
+            let size = x264_encoder_encode(
+                self.enc,
+                &mut nals,
+                &mut num_nals,
+                &mut pic_in,
+                &mut pic_out,
+            );
+            if size < 0 {
+                eprintln!("[surface-encoder] x264 encode failed {width}x{height}");
+                return None;
+            }
+            if size == 0 || num_nals == 0 {
+                eprintln!("[surface-encoder] x264 produced no output {width}x{height}");
+                return None;
+            }
+            self.force_keyframe = false;
+            // NAL payloads are contiguous in memory starting at the first
+            // one; `size` is their total length in bytes.
+            let data = std::slice::from_raw_parts((*nals).p_payload, size as usize).to_vec();
+            Some((data, pic_out.b_keyframe != 0))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SoftwareH264Encoder {
+    fn drop(&mut self) {
+        unsafe { x264_sys::x264_encoder_close(self.enc) };
+    }
+}
+
+/// Stub for non-Linux platforms, where the compositor never runs and the
+/// x264 dependency is not built.  Construction always fails, so the other
+/// methods are unreachable.
+#[cfg(not(target_os = "linux"))]
+struct SoftwareH264Encoder;
+
+#[cfg(not(target_os = "linux"))]
+impl SoftwareH264Encoder {
+    fn new(_width: u32, _height: u32, _quality: SurfaceQuality) -> Result<Self, String> {
+        Err("h264-software (x264) is only available on Linux".into())
+    }
+
+    fn request_keyframe(&mut self) {}
+
+    fn encode(&mut self, _rgba: &[u8], _width: u32, _height: u32) -> Option<(Vec<u8>, bool)> {
+        None
+    }
+
+    fn encode_yuv(&mut self, _yuv: &[u8], _width: u32, _height: u32) -> Option<(Vec<u8>, bool)> {
+        None
     }
 }
 
@@ -2144,6 +2247,22 @@ mod tests {
     #[test]
     fn av1_empty_stream() {
         assert!(!av1_stream_contains_keyframe(&[]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x264_software_encoder_round_trip() {
+        let mut enc = SoftwareH264Encoder::new(64, 48, SurfaceQuality::Medium).unwrap();
+        let rgba = vec![128u8; 64 * 48 * 4];
+        let (data, key) = enc.encode(&rgba, 64, 48).expect("first frame encodes");
+        assert!(key, "first frame is a keyframe");
+        assert!(h264_stream_contains_idr(&data));
+        let (_, key2) = enc.encode(&rgba, 64, 48).expect("second frame encodes");
+        assert!(!key2, "steady-state frame is not a keyframe");
+        enc.request_keyframe();
+        let (data3, key3) = enc.encode(&rgba, 64, 48).expect("forced keyframe encodes");
+        assert!(key3, "request_keyframe forces an IDR");
+        assert!(h264_stream_contains_idr(&data3));
     }
 
     #[test]

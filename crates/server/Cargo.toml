@@ -36,7 +36,6 @@ regex = "1"
 memchr = "2"
 getrandom = "0.3"
 redb = "2"
-openh264 = "0.9"
 rav1e = { version = "0.8", default-features = false }
 ravif = { version = "0.13", default-features = false }
 rgb = "0.8"
@@ -45,6 +44,11 @@ png = "0.18"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 opus = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# System libx264 via pkg-config. Linux-only: the compositor that feeds the
+# software H.264 surface encoder only exists on Linux (see surface_encoder.rs).
+x264-sys = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
