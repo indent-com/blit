@@ -240,7 +240,7 @@ graph LR
         ENC -->|"OpusFrame"| RING["ring buffer<br/>10 frames"]
     end
     subgraph "Client (browser)"
-        RING -->|"S2C_AUDIO_FRAME"| DEC["WebCodecs<br/>AudioDecoder"]
+        RING -->|"S2C_AUDIO_FRAME"| DEC["decode Worker<br/>WebCodecs AudioDecoder"]
         DEC -->|"f32 PCM"| WK["AudioWorklet<br/>jitter buffer"]
         WK -->|"output"| SPK["speakers"]
     end
@@ -257,7 +257,7 @@ graph LR
 | `wireplumber`    | Minimal session manager (hardware monitors disabled)      |
 | `pipewire-pulse` | PulseAudio compatibility socket                           |
 
-Child processes inherit `PIPEWIRE_REMOTE` and `PULSE_SERVER` pointing at the private sockets. Monitor capture is handled in-process by `audio_pw::Capture` (`crates/server/src/audio_pw.rs`), which dlopens `libpipewire-0.3.so.0` at runtime and opens a capture stream directly on `blit-sink`'s monitor — no `pw-cat` subprocess, no pipe buffer, and the PipeWire quantum (~5 ms) is set from client side so we don't inherit any third-party batching. Audio availability is gated by `pipewire_available()` (checks for required binaries on PATH and for the libpipewire shared object being loadable) and can be disabled with `BLIT_AUDIO=0`.
+Child processes inherit `PIPEWIRE_REMOTE` and `PULSE_SERVER` pointing at the private sockets. Monitor capture is handled in-process by `audio_pw::Capture` (`crates/server/src/audio_pw.rs`), which dlopens `libpipewire-0.3.so.0` at runtime and opens a capture stream directly on `blit-sink`'s monitor — no `pw-cat` subprocess, no pipe buffer, and the PipeWire quantum is set from client side so we don't inherit any third-party batching. The graph quantum is pinned to 1024/48000 (~21 ms, one Opus frame): the browser client sits behind a ≥ 60 ms jitter buffer so the extra batching is invisible, and the longer cycles give the graph threads 4× more scheduling slack when video encoding saturates the CPU. The daemon config loads `libpipewire-module-rt` (RT priority, nice -11 fallback) and the capture thread loop requests `loop.rt-prio`, so graph deadlines survive encode load even without RTKit. Audio availability is gated by `pipewire_available()` (checks for required binaries on PATH and for the libpipewire shared object being loadable) and can be disabled with `BLIT_AUDIO=0`.
 
 ### Encoding
 
@@ -284,7 +284,7 @@ On subscribe, the server sends ring-buffer catch-up frames and recomputes the Op
 
 `AudioPlayer` (`js/core/src/AudioPlayer.ts`) handles decode and render in the browser:
 
-1. **Decode**: WebCodecs `AudioDecoder` with `codec: "opus"`, 48 kHz stereo. Decoded `AudioData` frames (f32 planar PCM) are transferred to the worklet via `MessagePort`.
+1. **Decode**: WebCodecs `AudioDecoder` with `codec: "opus"`, 48 kHz stereo, running in a dedicated Worker that also owns the worklet's `MessagePort` (transferred). Decoded `AudioData` frames (f32 planar PCM) go Worker → audio thread directly, so main-thread stalls from heavy video (decode callbacks, full-screen draws) can't starve the jitter buffer; the main thread only relays the tiny encoded frames. Falls back to inline main-thread decode when Workers or in-worker WebCodecs are unavailable.
 2. **Render**: An `AudioWorkletProcessor` maintains an adaptive jitter buffer — floor 60 ms / 2880 samples, grows one 20 ms frame per sustained underrun (capped at 500 ms), shrinks one frame per 3 s of underrun-free playback. Outputs silence until the buffer fills; re-enters buffering on underrun.
 3. **A/V sync**: The worklet reports its consumed-sample position. The main thread maps this to a server timestamp via a recorded timeline, computes drift against video timestamps, and steers the playback rate within +/-2% to converge. Rate changes are exponentially smoothed (alpha 0.15) to prevent audible wow/flutter.
 

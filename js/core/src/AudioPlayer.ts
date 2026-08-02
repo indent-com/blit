@@ -3,6 +3,15 @@
  * server, decodes via WebCodecs AudioDecoder, and plays through an
  * AudioContext with rate-adjusted resampling to stay in sync with video.
  *
+ * Decode runs in a dedicated Worker that also owns the worklet's
+ * MessagePort (transferred), so decoded PCM reaches the audio thread
+ * without a main-thread hop — heavy video work (decode callbacks,
+ * full-screen draws, multi-megabyte WebSocket frames) can no longer
+ * starve the jitter buffer.  The main thread only relays the ~50 tiny
+ * encoded frames per second and keeps the AudioContext lifecycle, rate
+ * servo, and health checks.  Falls back to inline (main-thread) decode
+ * when Workers or in-worker WebCodecs are unavailable.
+ *
  * Audio and video frames share a common server-side wall-clock timestamp
  * (milliseconds since compositor creation).  The worklet performs linear-
  * interpolation resampling at a variable rate (±5%) so audio can speed up
@@ -382,6 +391,137 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
 registerProcessor("blit-audio", BlitAudioProcessor);
 `;
 
+/**
+ * Inline dedicated-Worker source: owns the WebCodecs AudioDecoder AND the
+ * worklet's MessagePort (transferred in), so decoded PCM flows
+ * worker → audio thread without a main-thread hop.  This is what keeps
+ * audio smooth while the main thread is saturated by video work
+ * (multi-megabyte WebSocket frames, VideoDecoder output callbacks,
+ * full-screen drawImage): with the decoder on the main thread, every
+ * decoded frame had to wait for a main-thread task slot before reaching
+ * the worklet, and stalls longer than the jitter buffer produced audible
+ * underruns.
+ *
+ * Messages IN (from AudioPlayer):
+ *   { type: "port", port }      — worklet MessagePort to feed (transferred);
+ *                                 pending PCM is flushed into it
+ *   { type: "detach" }          — worklet torn down: drop port + pending PCM
+ *   { type: "opus", timestamp, data } — encoded frame (data transferred)
+ *   { type: "worklet-msg", data }     — forward verbatim to the worklet port
+ *   { type: "reset-decoder" }   — close the decoder; rebuilt on next frame
+ *
+ * Messages OUT (to AudioPlayer):
+ *   { type: "worklet-msg", data }  — relayed worklet message (pos/event)
+ *   { type: "stats", framesDecoded, lastDecodedAt } — decode-health
+ *                                 counters, throttled to ~2 Hz
+ *   { type: "fatal", reason }   — decoder unusable in this worker; the
+ *                                 player falls back to inline decode
+ */
+const WORKER_SRC = /* js */ `
+let decoder = null;
+let port = null;      // worklet MessagePort, when the graph is up
+let pending = [];     // decoded PCM waiting for a port
+let framesDecoded = 0;
+let lastDecodedAt = 0;
+let lastStatsAt = 0;
+
+function sendStats(now) {
+  if (now - lastStatsAt < 500) return;
+  lastStatsAt = now;
+  self.postMessage({ type: "stats", framesDecoded, lastDecodedAt });
+}
+
+function initDecoder() {
+  if (typeof AudioDecoder === "undefined") {
+    self.postMessage({ type: "fatal", reason: "no AudioDecoder in worker" });
+    return;
+  }
+  try {
+    decoder = new AudioDecoder({
+      output: onDecodedFrame,
+      error: () => { decoder = null; },
+    });
+    decoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 });
+  } catch (e) {
+    decoder = null;
+    self.postMessage({ type: "fatal", reason: String(e) });
+  }
+}
+
+function onDecodedFrame(frame) {
+  framesDecoded++;
+  const now = Date.now();
+  lastDecodedAt = now;
+  // Extract f32-planar samples: [L...L, R...R] — the worklet's format.
+  const n = frame.numberOfFrames;
+  const pcm = new Float32Array(n * 2);
+  try {
+    const left = new Float32Array(n);
+    const right = new Float32Array(n);
+    frame.copyTo(left, { planeIndex: 0, format: "f32-planar" });
+    frame.copyTo(right, { planeIndex: 1, format: "f32-planar" });
+    pcm.set(left, 0);
+    pcm.set(right, n);
+  } catch {
+    try {
+      frame.copyTo(pcm, { planeIndex: 0 });
+    } catch {
+      frame.close();
+      return;
+    }
+  }
+  frame.close();
+  if (port) {
+    port.postMessage(pcm, [pcm.buffer]);
+  } else if (pending.length < ${MAX_BUFFER_FRAMES}) {
+    pending.push(pcm);
+  }
+  sendStats(now);
+}
+
+self.onmessage = (e) => {
+  const d = e.data;
+  if (!d) return;
+  if (d.type === "opus") {
+    if (!decoder || decoder.state === "closed") initDecoder();
+    if (!decoder || decoder.state !== "configured") return;
+    try {
+      decoder.decode(new EncodedAudioChunk({
+        type: "key", // Opus frames are independently decodable
+        timestamp: d.timestamp * 1000, // ms → µs
+        data: d.data,
+      }));
+    } catch {
+      try { decoder.close(); } catch {}
+      decoder = null;
+    }
+  } else if (d.type === "port") {
+    port = d.port;
+    port.onmessage = (ev) =>
+      self.postMessage({ type: "worklet-msg", data: ev.data });
+    for (const pcm of pending) port.postMessage(pcm, [pcm.buffer]);
+    pending = [];
+  } else if (d.type === "detach") {
+    if (port) {
+      port.onmessage = null;
+      try { port.close(); } catch {}
+    }
+    port = null;
+    pending = [];
+  } else if (d.type === "worklet-msg") {
+    if (d.data === "flush") pending = [];
+    if (port) port.postMessage(d.data);
+  } else if (d.type === "reset-decoder") {
+    if (decoder && decoder.state !== "closed") {
+      try { decoder.close(); } catch {}
+    }
+    decoder = null;
+    framesDecoded = 0;
+    lastDecodedAt = 0;
+  }
+};
+`;
+
 // -- Timeline entry for mapping samples → server timestamps ----------------
 
 export class AudioPlayer {
@@ -389,6 +529,16 @@ export class AudioPlayer {
   private decoder: AudioDecoder | null = null;
   private worklet: AudioWorkletNode | null = null;
   private gain: GainNode | null = null;
+  /**
+   * Dedicated decode worker (see WORKER_SRC).  When non-null, the decoder
+   * lives in the worker and the worklet's port is transferred there, so
+   * the main thread only relays ~50 tiny Opus frames per second.  Null
+   * means inline mode: decode + worklet feed on the main thread (either
+   * Worker is unavailable, or the worker declared itself broken).
+   */
+  private worker: Worker | null = null;
+  /** Set when the worker path failed — never try it again this player. */
+  private workerBroken = false;
   private _muted = true;
   private _subscribed = false;
   private _destroyed = false;
@@ -558,7 +708,7 @@ export class AudioPlayer {
     this._subscribed = subscribed;
     if (!subscribed) {
       this.buffer = [];
-      this.worklet?.port.postMessage("flush");
+      this.postToWorklet("flush");
       this.resetSync();
     }
     this.emit();
@@ -604,14 +754,31 @@ export class AudioPlayer {
       this.ctx.resume().catch(() => {});
     }
 
+    // Prefer the worker decode path: it keeps decoded-PCM delivery to the
+    // worklet independent of main-thread load (video decode + draw), which
+    // otherwise starves the jitter buffer exactly when video is busiest.
+    if (!this.worker && !this.workerBroken && typeof Worker !== "undefined") {
+      this.initWorker();
+    }
+
+    this.framesReceived++;
+
+    if (this.worker) {
+      // `data` is a view into the transport's message buffer — copy the
+      // frame so transferring doesn't detach unrelated bytes.  Opus
+      // frames are ~100–300 B, so the copy is negligible.
+      const copy = data.slice();
+      this.worker.postMessage({ type: "opus", timestamp, data: copy }, [
+        copy.buffer,
+      ]);
+      this.decodesRequested++;
+      return;
+    }
+
     if (!this.decoder || this.decoder.state === "closed") {
       this.initDecoder();
     }
     if (!this.decoder || this.decoder.state !== "configured") return;
-
-    // Record the server timestamp for this frame (used by sync controller).
-    // The timestamp is now wall-clock ms (same epoch as video).
-    this.framesReceived++;
 
     try {
       this.decoder.decode(
@@ -636,7 +803,8 @@ export class AudioPlayer {
   reset(): void {
     this._subscribed = false;
     this.buffer = [];
-    this.worklet?.port.postMessage("flush");
+    this.postToWorklet("flush");
+    this.worker?.postMessage({ type: "reset-decoder" });
     if (this.decoder && this.decoder.state !== "closed") {
       try {
         this.decoder.close();
@@ -658,6 +826,7 @@ export class AudioPlayer {
    * intact — no re-subscribe round-trip is needed.
    */
   resetPipeline(): void {
+    this.worker?.postMessage({ type: "reset-decoder" });
     if (this.decoder && this.decoder.state !== "closed") {
       try {
         this.decoder.close();
@@ -681,6 +850,10 @@ export class AudioPlayer {
     this.stopHealthCheck();
     this.reset();
     this.teardownAudioContext();
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = null;
+    }
     this.listeners.clear();
   }
 
@@ -701,6 +874,7 @@ export class AudioPlayer {
    * full pipeline when only the decoder is broken.
    */
   private resetDecoder(): void {
+    this.worker?.postMessage({ type: "reset-decoder" });
     if (this.decoder && this.decoder.state !== "closed") {
       try {
         this.decoder.close();
@@ -763,7 +937,7 @@ export class AudioPlayer {
 
     if (this.smoothedRate !== this.currentRate) {
       this.currentRate = this.smoothedRate;
-      this.worklet?.port.postMessage({
+      this.postToWorklet({
         type: "rate",
         value: this.smoothedRate,
       });
@@ -926,6 +1100,9 @@ export class AudioPlayer {
    * needs to be rebuilt.
    */
   private teardownAudioContext(): void {
+    // The worklet's port lives in the worker (transferred) — tell it to
+    // stop feeding the dead port and drop any pending PCM.
+    this.worker?.postMessage({ type: "detach" });
     if (this.worklet) {
       try {
         this.worklet.disconnect();
@@ -947,6 +1124,9 @@ export class AudioPlayer {
   private async initAudioContext(): Promise<void> {
     if (this._destroyed || this.initializingContext) return;
     this.initializingContext = true;
+    // Decide decode mode before the worklet exists: its port can only be
+    // handed to the worker at creation time (transfer neuters the port).
+    this.initWorker();
     try {
       this.ctx = new AudioContext({ sampleRate: 48000 });
       this.gain = this.ctx.createGain();
@@ -1017,30 +1197,28 @@ export class AudioPlayer {
         if (!this._destroyed) this.resetPipeline();
       });
 
-      // Listen for position reports and buffer events from the worklet.
-      this.worklet.port.onmessage = (e: MessageEvent) => {
-        const d = e.data;
-        if (!d) return;
-        if (d.type === "pos") {
-          if (typeof d.target === "number") {
-            this.currentBufferTarget = d.target;
-          }
-          if (typeof d.buffered === "number") {
-            this.lastBufferedSamples = d.buffered;
-          }
-          this.onWorkletPosition();
-        } else if (d.type === "event") {
-          if (typeof d.target === "number") {
-            this.currentBufferTarget = d.target;
-          }
-        }
-      };
+      if (this.worker) {
+        // Hand the worklet's port to the decode worker: decoded PCM then
+        // flows worker → audio thread with no main-thread hop, and the
+        // worklet's outbound messages (pos/event) are relayed back to us
+        // by the worker.  After transfer this side's `worklet.port` is
+        // neutered — all worklet messaging goes through postToWorklet().
+        this.worker.postMessage({ type: "port", port: this.worklet.port }, [
+          this.worklet.port,
+        ]);
+      } else {
+        // Inline mode: listen for position reports and buffer events
+        // from the worklet directly.
+        this.worklet.port.onmessage = (e: MessageEvent) => {
+          this.handleWorkletMessage(e.data);
+        };
 
-      // Flush any frames that arrived before the worklet was ready.
-      for (const pcm of this.buffer) {
-        this.worklet.port.postMessage(pcm, [pcm.buffer]);
+        // Flush any frames that arrived before the worklet was ready.
+        for (const pcm of this.buffer) {
+          this.worklet.port.postMessage(pcm, [pcm.buffer]);
+        }
+        this.buffer = [];
       }
-      this.buffer = [];
     } catch {
       // Close the AudioContext if it was created — otherwise it leaks.
       // Browsers limit the number of live AudioContexts (typically 4–6);
@@ -1053,6 +1231,95 @@ export class AudioPlayer {
     } finally {
       this.initializingContext = false;
     }
+  }
+
+  /**
+   * Send a control message to the worklet processor, routing through the
+   * decode worker when it owns the worklet's (transferred) port.
+   */
+  private postToWorklet(msg: unknown): void {
+    if (this.worker) {
+      this.worker.postMessage({ type: "worklet-msg", data: msg });
+    } else if (this.worklet) {
+      this.worklet.port.postMessage(msg);
+    }
+  }
+
+  /** Handle a worklet-originated message (direct or relayed by the worker). */
+  private handleWorkletMessage(d: any): void {
+    if (!d) return;
+    if (d.type === "pos") {
+      if (typeof d.target === "number") {
+        this.currentBufferTarget = d.target;
+      }
+      if (typeof d.buffered === "number") {
+        this.lastBufferedSamples = d.buffered;
+      }
+      this.onWorkletPosition();
+    } else if (d.type === "event") {
+      if (typeof d.target === "number") {
+        this.currentBufferTarget = d.target;
+      }
+    }
+  }
+
+  /**
+   * Spawn the decode worker (idempotent).  Called from both
+   * handleAudioFrame() and initAudioContext() so that whichever runs
+   * first decides the mode before the worklet is wired up — the worklet
+   * port must be transferred at creation, not retrofitted.
+   */
+  private initWorker(): void {
+    if (
+      this.worker ||
+      this.workerBroken ||
+      this._destroyed ||
+      typeof Worker === "undefined"
+    ) {
+      return;
+    }
+    try {
+      const blob = new Blob([WORKER_SRC], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      try {
+        this.worker = new Worker(url);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    } catch {
+      this.worker = null;
+      this.workerBroken = true;
+      return;
+    }
+
+    const fail = () => {
+      if (this.worker) {
+        this.worker.terminate();
+        this.worker = null;
+      }
+      this.workerBroken = true;
+      // If the worklet port was already transferred to the dead worker,
+      // it's lost — rebuild the graph in inline mode.
+      if (!this._destroyed) this.resetPipeline();
+    };
+
+    this.worker.onerror = fail;
+    this.worker.onmessage = (e: MessageEvent) => {
+      const d = e.data;
+      if (!d) return;
+      if (d.type === "worklet-msg") {
+        this.handleWorkletMessage(d.data);
+      } else if (d.type === "stats") {
+        if (typeof d.framesDecoded === "number") {
+          this.framesDecoded = d.framesDecoded;
+        }
+        if (typeof d.lastDecodedAt === "number" && d.lastDecodedAt > 0) {
+          this.lastDecodedAt = d.lastDecodedAt;
+        }
+      } else if (d.type === "fatal") {
+        fail();
+      }
+    };
   }
 
   private initDecoder(): void {

@@ -187,17 +187,42 @@ pub struct AudioPipeline {
 }
 
 /// PipeWire configuration template.
+///
+/// Clock quanta are sized for the remote-desktop path, not local
+/// monitoring: the browser client sits behind a >= 60 ms jitter buffer,
+/// so a 21 ms graph cycle (1024/48000) adds no perceptible latency while
+/// giving the (possibly non-RT) graph threads 4x more scheduling slack
+/// per deadline than the PipeWire default under encode-saturated CPU.
+/// `min-quantum` stops any client stream from dragging the graph back
+/// down to millisecond cycles it can't reliably meet.
 const PIPEWIRE_CONF_TEMPLATE: &str = r#"
 context.properties = {
     core.daemon          = true
     core.name            = pipewire-0
     default.clock.rate   = 48000
+    default.clock.quantum     = 1024
+    default.clock.min-quantum = 1024
+    default.clock.max-quantum = 2048
 }
 context.spa-libs = {
     audio.convert.* = audioconvert/libspa-audioconvert
     support.*       = support/libspa-support
 }
 context.modules = [
+    # RT scheduling for the graph threads (falls back to nice -11 when
+    # RLIMIT_RTPRIO / RTKit aren't available).  Without this the stripped
+    # config runs the timer-driven null sink at SCHED_OTHER, and heavy
+    # video-encode load on the same host makes graph cycles miss their
+    # deadlines — audible as capture gaps baked into the Opus stream.
+    { name = libpipewire-module-rt
+        args = {
+            nice.level   = -11
+            rt.prio      = 88
+            rt.time.soft = -1
+            rt.time.hard = -1
+        }
+        flags = [ ifexists nofail ]
+    }
     { name = libpipewire-module-protocol-native }
     { name = libpipewire-module-access }
     { name = libpipewire-module-client-node }
@@ -880,7 +905,7 @@ async fn encoder_task(
         }
 
         // Receive the next capture chunk.  Chunks are whatever size
-        // PipeWire gave us (typically one quantum ≈ 5 ms at 48 kHz for
+        // PipeWire gave us (typically one quantum ≈ 21 ms at 48 kHz for
         // the latency we requested), which we accumulate until we have
         // a full 20 ms Opus frame's worth of bytes.
         let chunk = match pcm_rx.recv().await {
