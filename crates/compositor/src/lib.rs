@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 mod imp;
 #[cfg(target_os = "linux")]
+mod input_region;
 mod pointer_focus;
 #[cfg(target_os = "linux")]
 mod positioner;
