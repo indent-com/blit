@@ -376,7 +376,14 @@ let
       pkgs.pkg-config
       pkgs.libopus
     ]
-    ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.x264;
+    # x264-sys builds in the Linux-only feature-combo passes below: bindgen
+    # dlopens nix's libclang, which requires the build scripts themselves to
+    # be linked with nix's cc/glibc — a CI runner's system cc links them
+    # against an older glibc that cannot load it.
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.x264
+      pkgs.stdenv.cc
+    ];
     text = ''
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -624,7 +631,14 @@ in
       pkgs.pkg-config
       pkgs.libopus
     ]
-    ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.x264;
+    # x264-sys builds in the Linux-only feature-combo passes below: bindgen
+    # dlopens nix's libclang, which requires the build scripts themselves to
+    # be linked with nix's cc/glibc — a CI runner's system cc links them
+    # against an older glibc that cannot load it.
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.x264
+      pkgs.stdenv.cc
+    ];
     text = ''
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
