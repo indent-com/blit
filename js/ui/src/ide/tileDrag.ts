@@ -158,8 +158,15 @@ export function startTouchDrag(
   };
   // A long press is also how Android offers text selection and a context
   // menu; neither is what the finger asked for once a drag is under way.
+  // `stopPropagation` as well as `preventDefault`, for the same reason
+  // `blockTouch` needs it: preventDefault only suppresses the *browser's*
+  // menu, and an explorer row carries its own `onContextMenu` on the very
+  // element this drag started from — Android fires the event at ~500ms,
+  // inside the drag, so without this the rename/delete menu opens mid-drag.
   const blockMenu = (ev: Event) => {
-    if (dragging) ev.preventDefault();
+    if (!dragging) return;
+    ev.preventDefault();
+    ev.stopPropagation();
   };
 
   const fire = (target: EventTarget | null, type: string, ev: PointerEvent) => {
