@@ -4154,6 +4154,74 @@ mod tests {
         assert_eq!(t.title(), "resized");
     }
 
+    /// A baseline reset (fresh subscribe, PTY resize, scroll-cache miss)
+    /// makes the server diff against a blank frame. That frame is a
+    /// keyframe: it must repaint a client whose grid already holds content
+    /// at the same dimensions, where `apply_payload` does not clear cells.
+    #[test]
+    fn keyframe_clears_stale_client_grid() {
+        let style = CellStyle::default();
+
+        // Client showing stale full-width content, a stale title, and a
+        // stale wrapped-line flag at the same dimensions the keyframe uses.
+        let mut t = TerminalState::new(2, 8);
+        t.frame_mut().write_text(0, 0, "GARBAGE!", style);
+        t.frame_mut().write_text(1, 0, "LEFTOVER", style);
+        t.frame_mut().set_title("stale");
+        t.frame_mut().line_flags[0] = ROW_FLAG_WRAPPED;
+
+        // Current server frame: mostly blank, no title, no wrapped lines.
+        let mut cur = FrameState::new(2, 8);
+        cur.write_text(0, 0, "ok", style);
+
+        let msg = build_update_msg(1, &cur, &FrameState::default()).unwrap();
+        assert!(t.feed_compressed(&msg[3..]));
+        assert_eq!(t.frame().cells(), cur.cells());
+        assert_eq!(t.title(), "");
+        assert!(!t.is_wrapped(0));
+    }
+
+    /// An all-blank current frame still emits a keyframe — suppressing it
+    /// would leave a stale client grid uncorrected forever.
+    #[test]
+    fn keyframe_emitted_for_blank_frame() {
+        let style = CellStyle::default();
+        let mut t = TerminalState::new(2, 8);
+        t.frame_mut().write_text(0, 0, "GARBAGE!", style);
+
+        let cur = FrameState::new(2, 8);
+        let msg = build_update_msg(1, &cur, &FrameState::default())
+            .expect("blank keyframe must still be sent");
+        assert!(t.feed_compressed(&msg[3..]));
+        assert_eq!(t.frame().cells(), cur.cells());
+    }
+
+    /// The keyframe's leading op is a whole-grid FILL_RECT with the blank
+    /// cell — an op every deployed client already implements, so no
+    /// protocol version bump is needed.
+    #[test]
+    fn keyframe_leads_with_whole_grid_fill() {
+        let style = CellStyle::default();
+        let mut cur = FrameState::new(3, 5);
+        cur.write_text(0, 0, "hi", style);
+
+        let msg = build_update_msg(1, &cur, &FrameState::default()).unwrap();
+        let ServerMsg::Update { payload, .. } = parse_server_msg(&msg).unwrap() else {
+            panic!("expected update");
+        };
+        let decoded = decompress_size_prepended(payload).unwrap();
+        let op_count = u16::from_le_bytes([decoded[12], decoded[13]]);
+        assert_eq!(op_count, 2, "FILL_RECT + PATCH_CELLS");
+        assert_eq!(decoded[14], OP_FILL_RECT);
+        let row = u16::from_le_bytes([decoded[15], decoded[16]]);
+        let col = u16::from_le_bytes([decoded[17], decoded[18]]);
+        let rows = u16::from_le_bytes([decoded[19], decoded[20]]);
+        let cols = u16::from_le_bytes([decoded[21], decoded[22]]);
+        assert_eq!((row, col, rows, cols), (0, 0, 3, 5));
+        assert_eq!(&decoded[23..23 + CELL_SIZE], &[0u8; CELL_SIZE]);
+        assert_eq!(decoded[23 + CELL_SIZE], OP_PATCH_CELLS);
+    }
+
     #[test]
     fn build_update_msg_cursor_change() {
         let mut prev = FrameState::new(4, 10);
