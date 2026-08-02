@@ -3598,7 +3598,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 }
                             }
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
-                                let profile = if state.config.chroma.is_444() { 2 } else { 0 };
+                                let profile =
+                                    surface_encoder::av1_profile_digit(state.config.chroma);
                                 let level = surface_encoder::av1_level_for(px_w, px_h);
                                 format!("av01.{profile}.{level}M.08")
                             }

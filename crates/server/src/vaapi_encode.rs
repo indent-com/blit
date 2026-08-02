@@ -23,7 +23,10 @@ use std::ptr;
 // ---------------------------------------------------------------------------
 
 // Profiles
-const VAProfileH264High: i32 = 8;
+// From libva's `va.h` VAProfile enum.  Note the value is 7, not 8 — 8 is
+// VAProfileVC1Simple, and passing it makes vaQueryConfigEntrypoints report
+// no encode entrypoint, so H.264 VA-API silently falls back to software.
+const VAProfileH264High: i32 = 7;
 const VA_PROFILE_NONE: i32 = -1;
 
 // Entrypoints
@@ -37,6 +40,15 @@ const VA_RT_FORMAT_YUV420: u32 = 0x00000001;
 const VA_RT_FORMAT_YUV420_10: u32 = 0x00000100;
 #[allow(dead_code)]
 const VA_RT_FORMAT_YUV444: u32 = 0x00000004;
+
+// Fourcc of the image `vaDeriveImage` hands back for a 4:4:4 surface.
+// Only the planar layout is supported: it carries explicit per-plane
+// pitches and offsets, so there is no byte-order guesswork.  The packed
+// layouts (AYUV/XYUV) disagree between vendors on channel order in memory,
+// and guessing wrong yields silently colour-swapped video rather than a
+// clean failure — so an unrecognised fourcc is reported as an error and
+// the encoder chain falls back to 4:2:0.
+const VA_FOURCC_444P: u32 = 0x50343434;
 
 // Buffer types
 const VAEncCodedBufferType: i32 = 21;
@@ -189,6 +201,9 @@ const VAIMG_BUF_OFF: usize = 52;
 const VAIMG_PITCHES_OFF: usize = 68;
 const VAIMG_OFFSETS_OFF: usize = 80;
 const VAIMG_ID_OFF: usize = 0;
+/// `VAImage.format.fourcc` — `image_id` (4 bytes) then `VAImageFormat`,
+/// whose first member is the fourcc.
+const VAIMG_FOURCC_OFF: usize = 4;
 
 /// Cached result of `vaDeriveImage` on the encoder's input surface.
 /// The surface is fixed for the encoder's lifetime, so the derived image
@@ -197,10 +212,16 @@ const VAIMG_ID_OFF: usize = 0;
 struct CachedDerivedImage {
     image_id: u32,
     buf_id: u32,
+    fourcc: u32,
     y_pitch: usize,
     uv_pitch: usize,
     y_offset: usize,
     uv_offset: usize,
+    /// Third plane, only meaningful for planar 4:4:4 (`444P`), where U and V
+    /// are separate full-resolution planes.  Unused for NV12, whose chroma is
+    /// interleaved in plane 1.
+    v_pitch: usize,
+    v_offset: usize,
 }
 
 // VA-API fourcc values differ from DRM fourcc values.
@@ -1292,10 +1313,13 @@ impl VaapiDirectEncoder {
             self.cached_input_images[slot] = Some(CachedDerivedImage {
                 image_id: r32(&image, VAIMG_ID_OFF),
                 buf_id: r32(&image, VAIMG_BUF_OFF),
+                fourcc: r32(&image, VAIMG_FOURCC_OFF),
                 y_pitch: r32(&image, VAIMG_PITCHES_OFF) as usize,
                 uv_pitch: r32(&image, VAIMG_PITCHES_OFF + 4) as usize,
                 y_offset: r32(&image, VAIMG_OFFSETS_OFF) as usize,
                 uv_offset: r32(&image, VAIMG_OFFSETS_OFF + 4) as usize,
+                v_pitch: r32(&image, VAIMG_PITCHES_OFF + 8) as usize,
+                v_offset: r32(&image, VAIMG_OFFSETS_OFF + 8) as usize,
             });
         }
         self.cached_input_images[slot].as_ref()
@@ -1900,11 +1924,20 @@ impl Drop for VaapiDirectEncoder {
 // VA-API AV1 encoder
 // ---------------------------------------------------------------------------
 //
-// Intentionally minimal: all-intra, single-tile-group, profile 0,
-// 8-bit 4:2:0, no rate control. The output is AV1 low-overhead OBU stream,
-// matching the existing software AV1 path.
+// Intentionally minimal: all-intra, single-tile-group, no rate control.
+// The output is an AV1 low-overhead OBU stream, matching the existing
+// software AV1 path.
+//
+// Two chroma modes: 8-bit 4:2:0 on seq_profile 0, and 8-bit 4:4:4 on
+// seq_profile 1.  Per the AV1 spec, 8-bit 4:4:4 is Profile 1 ("High") —
+// Profile 2 ("Professional") only reaches 4:4:4 at 12-bit, so it is the
+// wrong advertisement for what we emit.
 
 const VAProfileAV1Profile0: i32 = 32;
+/// AV1 "High" profile — 8/10-bit 4:4:4.  Required for 4:4:4 encode; most
+/// shipping hardware advertises no encode entrypoint for it, in which case
+/// `try_new` fails cleanly and the encoder chain falls back to 4:2:0.
+const VAProfileAV1Profile1: i32 = 33;
 
 const VA_PADDING_LOW: usize = 4;
 const VA_PADDING_HIGH: usize = 16;
@@ -2157,6 +2190,7 @@ pub struct VaapiAv1Encoder {
     force_idr: bool,
     cur_ref_idx: usize,
     base_qindex: u8,
+    chroma: crate::surface_encoder::ChromaSubsampling,
     _verbose: bool,
     pub(crate) _drm_fd: OwnedFd,
     pub(crate) vpp: Option<VppContext>,
@@ -2180,9 +2214,13 @@ impl VaapiAv1Encoder {
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
-        if chroma.is_444() {
-            return Err("VA-API AV1 4:4:4 encoding is not yet supported".into());
-        }
+        // 8-bit 4:4:4 lives on seq_profile 1 ("High"); 4:2:0 on profile 0.
+        let is_444 = chroma.is_444();
+        let (va_profile, rt_format) = if is_444 {
+            (VAProfileAV1Profile1, VA_RT_FORMAT_YUV444)
+        } else {
+            (VAProfileAV1Profile0, VA_RT_FORMAT_YUV420)
+        };
         let va = gpu_libs::va().map_err(|e| format!("VA-API: {e}"))?;
         let va_drm = gpu_libs::va_drm().map_err(|e| format!("VA-DRM: {e}"))?;
         let drm_fd = {
@@ -2209,7 +2247,7 @@ impl VaapiAv1Encoder {
         unsafe {
             (va.vaQueryConfigEntrypoints)(
                 display,
-                VAProfileAV1Profile0,
+                va_profile,
                 entrypoints.as_mut_ptr(),
                 &mut num_ep,
             );
@@ -2223,14 +2261,18 @@ impl VaapiAv1Encoder {
             unsafe {
                 (va.vaTerminate)(display);
             }
-            return Err("AV1 encode not supported on this VA-API device".into());
+            return Err(if is_444 {
+                "AV1 4:4:4 encode (Profile 1) not supported on this VA-API device".into()
+            } else {
+                String::from("AV1 encode not supported on this VA-API device")
+            });
         };
 
         let mut config: VAConfigID = 0;
         let st = unsafe {
             (va.vaCreateConfig)(
                 display,
-                VAProfileAV1Profile0,
+                va_profile,
                 entrypoint,
                 ptr::null_mut(),
                 0,
@@ -2248,7 +2290,7 @@ impl VaapiAv1Encoder {
         let st = unsafe {
             (va.vaCreateSurfaces)(
                 display,
-                VA_RT_FORMAT_YUV420,
+                rt_format,
                 width,
                 height,
                 surfaces.as_mut_ptr(),
@@ -2311,8 +2353,9 @@ impl VaapiAv1Encoder {
 
         let level_idx = compute_level(width, height, 60);
         if verbose {
+            let profile_name = if is_444 { "Profile1 4:4:4" } else { "Profile0" };
             eprintln!(
-                "[vaapi-direct] initialized AV1 Profile0 encoder for {width}x{height} (ep={entrypoint})"
+                "[vaapi-direct] initialized AV1 {profile_name} encoder for {width}x{height} (ep={entrypoint})"
             );
         }
         // NV12 surfaces must match the encoder context's resolution (64-pixel
@@ -2320,20 +2363,29 @@ impl VaapiAv1Encoder {
         // resolution so the compositor's external-output dimension check
         // passes and the zero-copy path is used — eliminating the staging
         // readback memcpy and CPU BGRA→NV12 conversion entirely.
-        let vpp = unsafe {
-            VppContext::try_new(
-                va,
-                display,
-                width,
-                height,
-                source_width,
-                source_height,
-                drm_fd.as_raw_fd(),
-                verbose,
-            )
+        //
+        // The VPP path is NV12-only: it allocates NV12 surfaces and exports
+        // them to the compositor, which would half the chroma resolution and
+        // defeat the point of 4:4:4.  Leave it off there and take the CPU
+        // upload path, which writes full-resolution chroma.
+        let vpp = if is_444 {
+            None
+        } else {
+            unsafe {
+                VppContext::try_new(
+                    va,
+                    display,
+                    width,
+                    height,
+                    source_width,
+                    source_height,
+                    drm_fd.as_raw_fd(),
+                    verbose,
+                )
+            }
         };
 
-        Ok(Self {
+        let mut encoder = Self {
             va,
             display,
             config,
@@ -2349,11 +2401,42 @@ impl VaapiAv1Encoder {
             force_idr: false,
             cur_ref_idx: 0,
             base_qindex,
+            chroma,
             _verbose: verbose,
             _drm_fd: drm_fd,
             vpp,
             cached_input_image: None,
-        })
+        };
+
+        // Probe the input surface's actual layout now rather than per frame.
+        // A driver may accept the 4:4:4 config and still hand back a packed
+        // layout we do not write; discovering that here turns it into a clean
+        // construction failure, so the encoder chain falls back to 4:2:0
+        // instead of installing an encoder that drops every frame.
+        // `Drop` releases the context, surfaces and display on the way out.
+        if is_444 {
+            encoder.validate_444_surface_layout()?;
+        }
+
+        Ok(encoder)
+    }
+
+    /// Confirm `vaDeriveImage` reports the one 4:4:4 layout the upload path
+    /// writes.  See `VA_FOURCC_444P` for why an unknown layout is an error
+    /// rather than a best guess.
+    fn validate_444_surface_layout(&mut self) -> Result<(), String> {
+        let img = self
+            .derive_input_image()
+            .ok_or("vaDeriveImage failed on the AV1 4:4:4 input surface")?;
+        if img.fourcc == VA_FOURCC_444P {
+            return Ok(());
+        }
+        let fcc = img.fourcc.to_le_bytes();
+        Err(format!(
+            "AV1 4:4:4 input surface is {} ({:#010x}), not the supported planar 444P",
+            String::from_utf8_lossy(&fcc),
+            img.fourcc,
+        ))
     }
 
     pub fn request_keyframe(&mut self) {
@@ -2374,10 +2457,13 @@ impl VaapiAv1Encoder {
             self.cached_input_image = Some(CachedDerivedImage {
                 image_id: r32(&image, VAIMG_ID_OFF),
                 buf_id: r32(&image, VAIMG_BUF_OFF),
+                fourcc: r32(&image, VAIMG_FOURCC_OFF),
                 y_pitch: r32(&image, VAIMG_PITCHES_OFF) as usize,
                 uv_pitch: r32(&image, VAIMG_PITCHES_OFF + 4) as usize,
                 y_offset: r32(&image, VAIMG_OFFSETS_OFF) as usize,
                 uv_offset: r32(&image, VAIMG_OFFSETS_OFF + 4) as usize,
+                v_pitch: r32(&image, VAIMG_PITCHES_OFF + 8) as usize,
+                v_offset: r32(&image, VAIMG_OFFSETS_OFF + 8) as usize,
             });
         }
         self.cached_input_image.as_ref()
@@ -2435,6 +2521,9 @@ impl VaapiAv1Encoder {
         src_y_stride: usize,
         src_uv_stride: usize,
     ) -> Option<()> {
+        if self.chroma.is_444() {
+            return self.upload_nv12_as_444(y_data, uv_data, src_y_stride, src_uv_stride);
+        }
         let img = self.derive_input_image()?;
         let buf_id = img.buf_id;
         let y_pitch = img.y_pitch;
@@ -2477,7 +2566,120 @@ impl VaapiAv1Encoder {
         Some(())
     }
 
+    /// Plane layout of the 4:4:4 input surface: `(buf_id, y_pitch, y_offset,
+    /// u_pitch, u_offset, v_pitch, v_offset)`.
+    ///
+    /// The fourcc was already checked by `validate_444_surface_layout` during
+    /// construction, and the derived image is cached for the encoder's
+    /// lifetime, so the layout cannot change underneath this.
+    fn planar_444_layout(&mut self) -> Option<(u32, usize, usize, usize, usize, usize, usize)> {
+        let img = self.derive_input_image()?;
+        debug_assert_eq!(img.fourcc, VA_FOURCC_444P);
+        Some((
+            img.buf_id,
+            img.y_pitch,
+            img.y_offset,
+            img.uv_pitch,
+            img.uv_offset,
+            img.v_pitch,
+            img.v_offset,
+        ))
+    }
+
+    /// NV12 in, 4:4:4 out: the source chroma is already half-resolution, so
+    /// this duplicates each sample rather than inventing detail.  No quality
+    /// is gained over 4:2:0 — it exists so the 4:4:4 encoder still accepts
+    /// frames that arrive on the NV12 path.
+    fn upload_nv12_as_444(
+        &mut self,
+        y_data: &[u8],
+        uv_data: &[u8],
+        src_y_stride: usize,
+        src_uv_stride: usize,
+    ) -> Option<()> {
+        let (buf_id, y_pitch, y_offset, u_pitch, u_offset, v_pitch, v_offset) =
+            self.planar_444_layout()?;
+        let mut map_ptr: *mut c_void = ptr::null_mut();
+        let st = unsafe { (self.va.vaMapBuffer)(self.display, buf_id, &mut map_ptr) };
+        if st != VA_STATUS_SUCCESS {
+            return None;
+        }
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let dst = map_ptr as *mut u8;
+        unsafe {
+            for row in 0..h {
+                let src_start = row * src_y_stride;
+                let copy_len = w.min(y_data.len().saturating_sub(src_start));
+                if copy_len > 0 {
+                    ptr::copy_nonoverlapping(
+                        y_data.as_ptr().add(src_start),
+                        dst.add(y_offset + row * y_pitch),
+                        copy_len,
+                    );
+                }
+            }
+            for row in 0..h {
+                let src_row = (row / 2) * src_uv_stride;
+                let u_dst = dst.add(u_offset + row * u_pitch);
+                let v_dst = dst.add(v_offset + row * v_pitch);
+                for col in 0..w {
+                    let i = src_row + (col / 2) * 2;
+                    if i + 1 >= uv_data.len() {
+                        break;
+                    }
+                    *u_dst.add(col) = *uv_data.get_unchecked(i);
+                    *v_dst.add(col) = *uv_data.get_unchecked(i + 1);
+                }
+            }
+            (self.va.vaUnmapBuffer)(self.display, buf_id);
+        }
+        Some(())
+    }
+
+    /// BGRA in, 4:4:4 out — the path that actually buys anything: every pixel
+    /// keeps its own U and V, so coloured text and sharp UI edges stop
+    /// fringing.
+    fn upload_bgra_444(&mut self, bgra: &[u8], src_w: usize, src_h: usize) -> Option<()> {
+        let (buf_id, y_pitch, y_offset, u_pitch, u_offset, v_pitch, v_offset) =
+            self.planar_444_layout()?;
+        let mut map_ptr: *mut c_void = ptr::null_mut();
+        let st = unsafe { (self.va.vaMapBuffer)(self.display, buf_id, &mut map_ptr) };
+        if st != VA_STATUS_SUCCESS {
+            return None;
+        }
+        let enc_w = self.width as usize;
+        let enc_h = self.height as usize;
+        let dst = map_ptr as *mut u8;
+        unsafe {
+            for row in 0..enc_h {
+                let sr = row.min(src_h - 1);
+                let y_dst = dst.add(y_offset + row * y_pitch);
+                let u_dst = dst.add(u_offset + row * u_pitch);
+                let v_dst = dst.add(v_offset + row * v_pitch);
+                for col in 0..enc_w {
+                    let sc = col.min(src_w - 1);
+                    let i = (sr * src_w + sc) * 4;
+                    let r = bgra[i + 2] as i32;
+                    let g = bgra[i + 1] as i32;
+                    let b = bgra[i] as i32;
+                    let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                    let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                    let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                    *y_dst.add(col) = y.clamp(0, 255) as u8;
+                    *u_dst.add(col) = u.clamp(0, 255) as u8;
+                    *v_dst.add(col) = v.clamp(0, 255) as u8;
+                }
+            }
+            (self.va.vaUnmapBuffer)(self.display, buf_id);
+        }
+        Some(())
+    }
+
     fn upload_bgra(&mut self, bgra: &[u8], src_w: usize, src_h: usize) -> Option<()> {
+        if self.chroma.is_444() {
+            return self.upload_bgra_444(bgra, src_w, src_h);
+        }
         let img = self.derive_input_image()?;
         let buf_id = img.buf_id;
         let y_pitch = img.y_pitch;
@@ -2699,7 +2901,7 @@ impl VaapiAv1Encoder {
 
     fn create_sequence_param(&self) -> VAEncSequenceParameterBufferAV1 {
         let mut seq: VAEncSequenceParameterBufferAV1 = unsafe { std::mem::zeroed() };
-        seq.seq_profile = 0;
+        seq.seq_profile = if self.chroma.is_444() { 1 } else { 0 };
         seq.seq_level_idx = self.level_idx;
         seq.seq_tier = 0;
         seq.hierarchical_flag = 0;
@@ -2716,7 +2918,13 @@ impl VaapiAv1Encoder {
         //   bit 14-15: bit_depth_minus8 = 2 (for 10-bit)
         //   bit 17: subsampling_x = 1
         //   bit 18: subsampling_y = 1
-        seq.seq_fields = (1 << 8) | (1 << 12) | (1 << 17) | (1 << 18);
+        //
+        // 4:4:4 leaves both subsampling bits clear — chroma is full
+        // resolution in each direction.
+        seq.seq_fields = (1 << 8) | (1 << 12);
+        if !self.chroma.is_444() {
+            seq.seq_fields |= (1 << 17) | (1 << 18);
+        }
         seq
     }
 
@@ -2746,51 +2954,87 @@ impl VaapiAv1Encoder {
     }
 
     fn pack_sequence_header(&self) -> Vec<u8> {
-        let mut ret = PackedData::new();
-        ret.write(0, 3); // profile 0
-        ret.write_bool(false); // still_picture
-        ret.write_bool(false); // reduced still picture
-        ret.write_bool(false); // no timing info
-        ret.write_bool(false); // no initial display delay
-        ret.write(0, 5); // one operating point
-        ret.write(0, 12); // operating_point_idc
-        ret.write(self.level_idx as u64, 5);
-        if self.level_idx > 7 {
-            ret.write_bool(false);
-        }
-        ret.write(15, 4);
-        ret.write(15, 4);
-        ret.write((self.source_width - 1) as u64, 16);
-        ret.write((self.source_height - 1) as u64, 16);
-        ret.write_bool(false); // no frame ids
-        ret.write_bool(false); // 128x128 sb
-        ret.write_bool(false); // filter intra
-        ret.write_bool(false); // intra edge filter
-        ret.write_bool(false); // interintra compound
-        ret.write_bool(false); // masked compound
-        ret.write_bool(false); // warped motion
-        ret.write_bool(false); // dual filter
-        ret.write_bool(true); // order hint
-        ret.write_bool(false); // jnt comp
-        ret.write_bool(false); // ref frame mvs
-        ret.write_bool(true); // seq choose screen content tools
-        ret.write_bool(false); // seq choose integer mv
-        ret.write_bool(false); // force integer mv
-        ret.write(7, 3); // order_hint_bits_minus_1
-        ret.write_bool(false); // superres
-        ret.write_bool(true); // cdef
-        ret.write_bool(false); // restoration
-        ret.write_bool(false); // high bitdepth (8-bit)
-        ret.write_bool(false); // monochrome
-        ret.write_bool(false); // no color description
-        ret.write_bool(false); // no color range
-        ret.write(0, 2); // chroma sample position
-        ret.write_bool(true); // separate_uv_delta_q
-        ret.write_bool(false); // film grain
-        ret.write_bool(true); // trailing bit
-        ret.flush()
+        pack_av1_sequence_header(
+            self.chroma.is_444(),
+            self.level_idx,
+            self.source_width,
+            self.source_height,
+        )
     }
+}
 
+/// Build the AV1 sequence header OBU payload.
+///
+/// Free-standing rather than a method so the bit layout can be unit-tested
+/// without a VA-API display: this is hand-packed bitstream syntax where a
+/// single misplaced bit desynchronises everything after it, and the 4:4:4
+/// (`seq_profile` 1) and 4:2:0 (`seq_profile` 0) forms differ mid-header.
+fn pack_av1_sequence_header(
+    is_444: bool,
+    level_idx: u8,
+    source_width: u32,
+    source_height: u32,
+) -> Vec<u8> {
+    let mut ret = PackedData::new();
+    ret.write(if is_444 { 1 } else { 0 }, 3); // seq_profile
+    ret.write_bool(false); // still_picture
+    ret.write_bool(false); // reduced still picture
+    ret.write_bool(false); // no timing info
+    ret.write_bool(false); // no initial display delay
+    ret.write(0, 5); // one operating point
+    ret.write(0, 12); // operating_point_idc
+    ret.write(level_idx as u64, 5);
+    if level_idx > 7 {
+        ret.write_bool(false);
+    }
+    ret.write(15, 4);
+    ret.write(15, 4);
+    ret.write((source_width - 1) as u64, 16);
+    ret.write((source_height - 1) as u64, 16);
+    ret.write_bool(false); // no frame ids
+    ret.write_bool(false); // 128x128 sb
+    ret.write_bool(false); // filter intra
+    ret.write_bool(false); // intra edge filter
+    ret.write_bool(false); // interintra compound
+    ret.write_bool(false); // masked compound
+    ret.write_bool(false); // warped motion
+    ret.write_bool(false); // dual filter
+    ret.write_bool(true); // order hint
+    ret.write_bool(false); // jnt comp
+    ret.write_bool(false); // ref frame mvs
+    ret.write_bool(true); // seq choose screen content tools
+    ret.write_bool(false); // seq choose integer mv
+    ret.write_bool(false); // force integer mv
+    ret.write(7, 3); // order_hint_bits_minus_1
+    ret.write_bool(false); // superres
+    ret.write_bool(true); // cdef
+    ret.write_bool(false); // restoration
+    // color_config() — the syntax is profile-dependent (AV1 spec 5.5.2):
+    //   * mono_chrome is only coded when seq_profile != 1; profile 1
+    //     forbids monochrome, so the bit is inferred as 0 and must not
+    //     be written.
+    //   * subsampling_x/y are inferred from the profile (1,1 for
+    //     profile 0; 0,0 for profile 1) and never coded here.
+    //   * chroma_sample_position is only coded when both subsampling
+    //     flags are set, i.e. 4:2:0 only.
+    // Writing the 4:2:0 bit pattern under profile 1 would desynchronise
+    // every field after it, so the two cases diverge explicitly.
+    ret.write_bool(false); // high bitdepth (8-bit)
+    if !is_444 {
+        ret.write_bool(false); // monochrome
+    }
+    ret.write_bool(false); // no color description
+    ret.write_bool(false); // no color range
+    if !is_444 {
+        ret.write(0, 2); // chroma sample position
+    }
+    ret.write_bool(true); // separate_uv_delta_q
+    ret.write_bool(false); // film grain
+    ret.write_bool(true); // trailing bit
+    ret.flush()
+}
+
+impl VaapiAv1Encoder {
     fn make_picture_param(&self, is_key: bool) -> VAEncPictureParameterBufferAV1 {
         let recon_idx = if is_key {
             0
@@ -3035,5 +3279,142 @@ impl Drop for VaapiAv1Encoder {
             (self.va.vaDestroyConfig)(self.display, self.config);
             (self.va.vaTerminate)(self.display);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sequential MSB-first bit reader, mirroring `PackedData`'s writer so a
+    /// header can be parsed back field by field.
+    struct BitReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> BitReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self { data, pos: 0 }
+        }
+        fn bit(&mut self) -> u8 {
+            let byte = self.data[self.pos / 8];
+            let bit = (byte >> (7 - (self.pos % 8))) & 1;
+            self.pos += 1;
+            bit
+        }
+        fn bits(&mut self, n: usize) -> u64 {
+            let mut v = 0u64;
+            for _ in 0..n {
+                v = (v << 1) | self.bit() as u64;
+            }
+            v
+        }
+    }
+
+    /// Walk `sequence_header_obu()` syntax (AV1 spec 5.5.1 / 5.5.2) up to and
+    /// including `color_config()`, returning
+    /// `(seq_profile, max_width, max_height, separate_uv_delta_q)`.
+    ///
+    /// Parsing to the *end* is the point: `separate_uv_delta_q` sits after
+    /// `color_config()`, so reading the expected value there proves no bit
+    /// was added or dropped anywhere earlier — which is exactly the failure
+    /// mode when the 4:4:4 and 4:2:0 forms diverge.
+    fn parse_seq_header(data: &[u8], level_idx: u8) -> (u64, u64, u64, u8) {
+        let mut r = BitReader::new(data);
+        let seq_profile = r.bits(3);
+        assert_eq!(r.bit(), 0, "still_picture");
+        assert_eq!(r.bit(), 0, "reduced_still_picture_header");
+        assert_eq!(r.bit(), 0, "timing_info_present_flag");
+        assert_eq!(r.bit(), 0, "initial_display_delay_present_flag");
+        assert_eq!(r.bits(5), 0, "operating_points_cnt_minus_1");
+        assert_eq!(r.bits(12), 0, "operating_point_idc");
+        assert_eq!(r.bits(5), level_idx as u64, "seq_level_idx");
+        if level_idx > 7 {
+            assert_eq!(r.bit(), 0, "seq_tier");
+        }
+        assert_eq!(r.bits(4), 15, "frame_width_bits_minus_1");
+        assert_eq!(r.bits(4), 15, "frame_height_bits_minus_1");
+        let max_w = r.bits(16);
+        let max_h = r.bits(16);
+        assert_eq!(r.bit(), 0, "frame_id_numbers_present_flag");
+        assert_eq!(r.bit(), 0, "use_128x128_superblock");
+        assert_eq!(r.bit(), 0, "enable_filter_intra");
+        assert_eq!(r.bit(), 0, "enable_intra_edge_filter");
+        assert_eq!(r.bit(), 0, "enable_interintra_compound");
+        assert_eq!(r.bit(), 0, "enable_masked_compound");
+        assert_eq!(r.bit(), 0, "enable_warped_motion");
+        assert_eq!(r.bit(), 0, "enable_dual_filter");
+        assert_eq!(r.bit(), 1, "enable_order_hint");
+        assert_eq!(r.bit(), 0, "enable_jnt_comp");
+        assert_eq!(r.bit(), 0, "enable_ref_frame_mvs");
+        assert_eq!(r.bit(), 1, "seq_choose_screen_content_tools");
+        assert_eq!(r.bit(), 0, "seq_choose_integer_mv");
+        assert_eq!(r.bit(), 0, "seq_force_integer_mv");
+        assert_eq!(r.bits(3), 7, "order_hint_bits_minus_1");
+        assert_eq!(r.bit(), 0, "enable_superres");
+        assert_eq!(r.bit(), 1, "enable_cdef");
+        assert_eq!(r.bit(), 0, "enable_restoration");
+
+        // color_config()
+        let high_bitdepth = r.bit();
+        assert_eq!(high_bitdepth, 0, "high_bitdepth");
+        if seq_profile != 1 {
+            assert_eq!(r.bit(), 0, "mono_chrome");
+        }
+        assert_eq!(r.bit(), 0, "color_description_present_flag");
+        assert_eq!(r.bit(), 0, "color_range");
+        if seq_profile == 0 {
+            assert_eq!(r.bits(2), 0, "chroma_sample_position");
+        }
+        let separate_uv_delta_q = r.bit();
+        (seq_profile, max_w, max_h, separate_uv_delta_q)
+    }
+
+    #[test]
+    fn av1_seq_header_420_uses_profile_0() {
+        let hdr = pack_av1_sequence_header(false, 5, 1024, 902);
+        let (profile, w, h, sep_uv) = parse_seq_header(&hdr, 5);
+        assert_eq!(profile, 0);
+        assert_eq!(w, 1023);
+        assert_eq!(h, 901);
+        assert_eq!(sep_uv, 1, "separate_uv_delta_q — proves bit alignment");
+    }
+
+    /// 8-bit 4:4:4 is seq_profile 1, and profile 1 omits both `mono_chrome`
+    /// and `chroma_sample_position`.  If either were still written, the
+    /// `separate_uv_delta_q` assertion below would read a shifted bit.
+    #[test]
+    fn av1_seq_header_444_uses_profile_1_and_omits_420_only_fields() {
+        let hdr = pack_av1_sequence_header(true, 5, 1024, 902);
+        let (profile, w, h, sep_uv) = parse_seq_header(&hdr, 5);
+        assert_eq!(profile, 1);
+        assert_eq!(w, 1023);
+        assert_eq!(h, 901);
+        assert_eq!(sep_uv, 1, "separate_uv_delta_q — proves bit alignment");
+    }
+
+    /// 4:4:4 drops 3 bits relative to 4:2:0 (1 `mono_chrome` +
+    /// 2 `chroma_sample_position`) and adds none, so its payload can never be
+    /// the larger of the two once both round up to whole bytes.
+    #[test]
+    fn av1_seq_header_444_never_longer_than_420() {
+        let len_420 = pack_av1_sequence_header(false, 8, 1920, 1080).len();
+        let len_444 = pack_av1_sequence_header(true, 8, 1920, 1080).len();
+        assert!(
+            len_444 <= len_420,
+            "4:4:4 header ({len_444}B) must not exceed 4:2:0 ({len_420}B)"
+        );
+    }
+
+    #[test]
+    fn av1_seq_header_high_level_writes_seq_tier() {
+        // level_idx > 7 adds the seq_tier bit; parsing must stay aligned.
+        let hdr = pack_av1_sequence_header(true, 8, 1920, 1080);
+        let (profile, w, h, sep_uv) = parse_seq_header(&hdr, 8);
+        assert_eq!(profile, 1);
+        assert_eq!(w, 1919);
+        assert_eq!(h, 1079);
+        assert_eq!(sep_uv, 1);
     }
 }
