@@ -5,7 +5,9 @@
 //! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
-use crate::pointer_focus::{ButtonRouting, button_routing, focus_transition};
+use crate::pointer_focus::{
+    ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
+};
 use crate::positioner::PositionerGeometry;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -1227,6 +1229,16 @@ struct Compositor {
     /// therefore be swallowed too.  Delivering the release alone would hand
     /// a client a button it never saw pressed.
     popup_dismiss_button: Option<u32>,
+    /// The popup holding keyboard focus, when one does.
+    ///
+    /// Keyboard focus is otherwise a `u16` toplevel id resolved through
+    /// `toplevel_surface_ids`, and a popup is in neither — it has no surface
+    /// id at all.  So a grabbing menu could never be told it had focus, and
+    /// GTK gates menu keynav on exactly that: Escape and the arrow keys went
+    /// to the page behind the menu instead.  This overrides the toplevel for
+    /// as long as the grab lasts; `keyboard_focus_wl` is the single answer to
+    /// "who holds it".
+    kb_focus_popup: Option<ObjectId>,
 
     // -- DMA-BUF buffer hold --
     /// Buffers whose DMA-BUF content could not be eagerly snapshotted to
@@ -1283,6 +1295,99 @@ impl Compositor {
         }
     }
 
+    /// The surface that currently holds `wl_keyboard.enter`.
+    ///
+    /// A grabbing popup outranks the focused toplevel: while a menu is up it
+    /// is the thing the keyboard is talking to.
+    fn keyboard_focus_wl(&self) -> Option<WlSurface> {
+        if let Some(ref popup_id) = self.kb_focus_popup
+            && let Some(surf) = self.surfaces.get(popup_id)
+        {
+            return Some(surf.wl_surface.clone());
+        }
+        self.toplevel_surface_ids
+            .get(&self.focused_surface_id)
+            .and_then(|root| self.surfaces.get(root))
+            .map(|s| s.wl_surface.clone())
+    }
+
+    /// `wl_keyboard.leave` (and the text-input equivalent) for `wl`.
+    fn send_keyboard_leave(&mut self, wl: &WlSurface) {
+        let serial = self.next_serial();
+        for kb in &self.keyboards {
+            if same_client(kb, wl) {
+                kb.leave(serial, wl);
+            }
+        }
+        for ti in &self.text_inputs {
+            if same_client(&ti.resource, wl) {
+                ti.resource.leave(wl);
+            }
+        }
+    }
+
+    /// `wl_keyboard.enter` (and the text-input equivalent) for `wl`.
+    fn send_keyboard_enter(&mut self, wl: &WlSurface) {
+        let serial = self.next_serial();
+        for kb in &self.keyboards {
+            if same_client(kb, wl) {
+                kb.enter(serial, wl, vec![]);
+            }
+        }
+        for ti in &self.text_inputs {
+            if same_client(&ti.resource, wl) {
+                ti.resource.enter(wl);
+            }
+        }
+    }
+
+    /// Hand keyboard focus to a popup that has taken a grab.
+    ///
+    /// The menu, not the page behind it, is what the arrow keys and Escape
+    /// are meant for. Idempotent: a client that re-grabs an already-focused
+    /// popup must not be sent a second `enter` with no `leave` between —
+    /// the hazard `set_keyboard_focus` documents at length.
+    fn focus_popup(&mut self, popup_id: &ObjectId) {
+        if self.kb_focus_popup.as_ref() == Some(popup_id) {
+            return;
+        }
+        let Some(popup_wl) = self.surfaces.get(popup_id).map(|s| s.wl_surface.clone()) else {
+            return;
+        };
+        if let Some(previous) = self.keyboard_focus_wl() {
+            self.send_keyboard_leave(&previous);
+        }
+        self.kb_focus_popup = Some(popup_id.clone());
+        self.send_keyboard_enter(&popup_wl);
+        let _ = self.display_handle.flush_clients();
+    }
+
+    /// Give keyboard focus back after `popup_id` goes away.
+    ///
+    /// Back to the popup still grabbing underneath it, if the chain is nested
+    /// — closing a submenu returns to its parent menu, not past both — and to
+    /// the focused toplevel otherwise. A no-op unless that popup actually
+    /// held focus, so dismissing an unfocused chain disturbs nothing.
+    fn unfocus_popup(&mut self, popup_id: &ObjectId) {
+        // The caller has already taken this popup off the stack, so what
+        // remains is what is still grabbing beneath it.
+        let Some(next_holder) = keyboard_focus_after_popup_close(
+            popup_id,
+            self.kb_focus_popup.as_ref(),
+            &self.popup_grab_stack,
+        ) else {
+            return;
+        };
+        if let Some(going) = self.surfaces.get(popup_id).map(|s| s.wl_surface.clone()) {
+            self.send_keyboard_leave(&going);
+        }
+        self.kb_focus_popup = next_holder;
+        if let Some(next) = self.keyboard_focus_wl() {
+            self.send_keyboard_enter(&next);
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+
     /// Switch keyboard (and text_input) focus from the current surface to
     /// `new_surface_id`.  Sends `wl_keyboard.leave` to the old surface's
     /// client and `wl_keyboard.enter` to the new surface's client, which is
@@ -1309,23 +1414,17 @@ impl Compositor {
             return;
         }
 
-        // Leave the old surface.
-        if old_id != 0
-            && let Some(old_root) = self.toplevel_surface_ids.get(&old_id)
-            && let Some(old_wl) = self.surfaces.get(old_root).map(|s| s.wl_surface.clone())
+        // Leave whoever actually holds focus, which is a grabbing popup if
+        // there is one — sending the leave to the toplevel instead would
+        // leave the menu believing it still had the keyboard, and the
+        // toplevel receiving a leave it was never given.
+        if let Some(old_wl) = self.keyboard_focus_wl()
+            && (old_id != 0 || self.kb_focus_popup.is_some())
         {
-            let serial = self.next_serial();
-            for kb in &self.keyboards {
-                if same_client(kb, &old_wl) {
-                    kb.leave(serial, &old_wl);
-                }
-            }
-            for ti in &self.text_inputs {
-                if same_client(&ti.resource, &old_wl) {
-                    ti.resource.leave(&old_wl);
-                }
-            }
+            self.send_keyboard_leave(&old_wl);
         }
+        // Focus moving to a toplevel outranks any open menu's grab.
+        self.kb_focus_popup = None;
 
         self.focused_surface_id = new_surface_id;
 
@@ -1333,17 +1432,7 @@ impl Compositor {
         if let Some(root_id) = self.toplevel_surface_ids.get(&new_surface_id)
             && let Some(wl_surface) = self.surfaces.get(root_id).map(|s| s.wl_surface.clone())
         {
-            let serial = self.next_serial();
-            for kb in &self.keyboards {
-                if same_client(kb, &wl_surface) {
-                    kb.enter(serial, &wl_surface, vec![]);
-                }
-            }
-            for ti in &self.text_inputs {
-                if same_client(&ti.resource, &wl_surface) {
-                    ti.resource.enter(&wl_surface);
-                }
-            }
+            self.send_keyboard_enter(&wl_surface);
         }
     }
 
@@ -1622,24 +1711,12 @@ impl Compositor {
             // (see `set_keyboard_focus`). The leave-then-enter pair below is
             // safe: the `leave` clears the client's focus before the `enter`
             // re-establishes it.
-            if let Some(root_id) = self
-                .toplevel_surface_ids
-                .get(&self.focused_surface_id)
-                .cloned()
-                && let Some(wl) = self.surfaces.get(&root_id).map(|s| s.wl_surface.clone())
-            {
-                let serial = self.next_serial();
-                for kb in &self.keyboards {
-                    if same_client(kb, &wl) {
-                        kb.leave(serial, &wl);
-                    }
-                }
-                let serial = self.next_serial();
-                for kb in &self.keyboards {
-                    if same_client(kb, &wl) {
-                        kb.enter(serial, &wl, vec![]);
-                    }
-                }
+            // Whoever actually holds it, which is a grabbing popup when a
+            // menu is open: re-entering the toplevel instead would move
+            // focus out from under the menu on a mere scale change.
+            if let Some(wl) = self.keyboard_focus_wl() {
+                self.send_keyboard_leave(&wl);
+                self.send_keyboard_enter(&wl);
             }
             let _ = self.display_handle.flush_clients();
         }
@@ -2113,6 +2190,16 @@ impl Compositor {
                 held.release();
             }
             self.forget_pointer_focus(proto_id);
+            // A crashed client's popup takes the keyboard with it otherwise:
+            // the override would name a surface that no longer exists, and
+            // `keyboard_focus_wl` would answer None for every later event.
+            if self.kb_focus_popup.as_ref() == Some(proto_id) {
+                self.popup_grab_stack.retain(|id| id != proto_id);
+                self.kb_focus_popup = self.popup_grab_stack.last().cloned();
+                if let Some(next) = self.keyboard_focus_wl() {
+                    self.send_keyboard_enter(&next);
+                }
+            }
             if let Some(surf) = self.surfaces.remove(proto_id) {
                 // Discard any pending presentation feedbacks — the surface
                 // died before the frame was ever presented.
@@ -2198,11 +2285,10 @@ impl Compositor {
                 } else {
                     wl_keyboard::KeyState::Released
                 };
-                let focused_wl = self
-                    .toplevel_surface_ids
-                    .get(&self.focused_surface_id)
-                    .and_then(|root_id| self.surfaces.get(root_id))
-                    .map(|s| s.wl_surface.clone());
+                // Popup-aware: same client either way, so the keys already
+                // arrived — but asking the same question everywhere keeps
+                // "who has the keyboard" from having two answers.
+                let focused_wl = self.keyboard_focus_wl();
                 for kb in &self.keyboards {
                     if let Some(ref wl) = focused_wl
                         && same_client(kb, wl)
@@ -2448,6 +2534,11 @@ impl Compositor {
                             {
                                 popup.popup_done();
                             }
+                            // Pop first, then hand focus back: `unfocus_popup`
+                            // reads the stack to find what is still grabbing
+                            // underneath, and on the last iteration that is
+                            // nothing, so focus lands on the toplevel.
+                            self.unfocus_popup(&grab_wl_id);
                         }
                         let _ = self.display_handle.flush_clients();
                         dismissed = true;
@@ -3806,6 +3897,10 @@ impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
                     .popup_grab_stack
                     .retain(|id| *id != data.wl_surface_id);
                 state.popup_grab_stack.push(data.wl_surface_id.clone());
+                // A grab is the client saying this menu now owns the input
+                // it named. Keyboard focus has to follow, or the menu is on
+                // screen while the keyboard still talks to the page.
+                state.focus_popup(&data.wl_surface_id);
             }
             Request::Reposition { positioner, token } => {
                 // Recompute the popup position using the new positioner.
@@ -3873,6 +3968,12 @@ impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
                 state
                     .popup_grab_stack
                     .retain(|id| *id != data.wl_surface_id);
+                // Hand the keyboard back — a menu closed by its own client
+                // (picking an item, pressing Escape) never goes through the
+                // click-outside path, so this is the ordinary way a popup
+                // ends. Off the stack first, so what remains is what is
+                // still grabbing beneath it.
+                state.unfocus_popup(&data.wl_surface_id);
                 // Remove from parent's children list.
                 if let Some(parent_id) = state
                     .surfaces
@@ -5690,6 +5791,7 @@ fn run_compositor(
         text_input_serial: 0,
         next_activation_token: 1,
         popup_grab_stack: Vec::new(),
+        kb_focus_popup: None,
         popup_dismiss_button: None,
         held_buffers: HashMap::new(),
         cursor_rgba: HashMap::new(),

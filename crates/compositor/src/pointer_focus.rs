@@ -84,9 +84,33 @@ pub(crate) fn button_routing(
     (ButtonRouting::Deliver, swallowing)
 }
 
+/// Who should hold the keyboard once `closing` goes away.
+///
+/// `holder` is the popup that has it, if a popup does; `remaining` is the
+/// grab stack with `closing` already removed, outermost first.
+///
+/// `None` means leave focus alone — that popup was not holding it, so a
+/// menu closing elsewhere in the tree changes nothing. `Some(None)` means
+/// hand it back to the focused toplevel. `Some(Some(id))` means hand it to
+/// the popup still grabbing underneath: closing a submenu returns to its
+/// parent menu, not past both to the page.
+pub(crate) fn keyboard_focus_after_popup_close<T: Clone + PartialEq>(
+    closing: &T,
+    holder: Option<&T>,
+    remaining: &[T],
+) -> Option<Option<T>> {
+    if holder != Some(closing) {
+        return None;
+    }
+    Some(remaining.last().cloned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ButtonRouting, FocusTransition, button_routing, focus_transition};
+    use super::{
+        ButtonRouting, FocusTransition, button_routing, focus_transition,
+        keyboard_focus_after_popup_close,
+    };
 
     #[test]
     fn already_inside_is_motion_only() {
@@ -198,6 +222,32 @@ mod tests {
         assert_eq!(
             button_routing(true, BTN_LEFT, false, Some(BTN_LEFT)),
             (ButtonRouting::Deliver, None)
+        );
+    }
+
+    // A menu closing somewhere else in the tree must not yank the keyboard
+    // from whoever has it.
+    #[test]
+    fn closing_a_popup_that_lacks_focus_changes_nothing() {
+        assert_eq!(keyboard_focus_after_popup_close(&7, Some(&9), &[9]), None);
+        assert_eq!(keyboard_focus_after_popup_close(&7, None, &[]), None);
+    }
+
+    #[test]
+    fn closing_the_last_menu_returns_the_keyboard_to_the_window() {
+        assert_eq!(
+            keyboard_focus_after_popup_close(&7, Some(&7), &[]),
+            Some(None)
+        );
+    }
+
+    // Nested menus: dismissing a submenu goes back to its parent menu, not
+    // past both to the page underneath.
+    #[test]
+    fn closing_a_submenu_returns_to_the_menu_beneath_it() {
+        assert_eq!(
+            keyboard_focus_after_popup_close(&8, Some(&8), &[7]),
+            Some(Some(7))
         );
     }
 }
