@@ -131,6 +131,9 @@ impl SurfaceEncoderPreference {
     /// Checking this up front keeps the encoder chain from running a probe
     /// that can only ever fail, and from logging it as if the host were at
     /// fault.
+    // The H264Software arm is a cfg!, so clippy sees per-build literals and
+    // suggests a matches! that would bake in one feature combo's answer.
+    #[allow(clippy::match_like_matches_macro)]
     pub fn supports_444_by_encoder(self) -> bool {
         match self {
             Self::H264Vaapi => false,
