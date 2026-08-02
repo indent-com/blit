@@ -7,7 +7,7 @@ We publish a [computer agent skill](https://install.blit.sh/SKILL.md).
 Try it now — no install needed:
 
 ```bash
-docker run --rm grab/blit-demo
+docker run --rm --shm-size=1g grab/blit-demo
 ```
 
 Or install and run locally:
