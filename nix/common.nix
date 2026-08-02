@@ -9,9 +9,6 @@ let
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
-    outputHashes = {
-      "alacritty_terminal-0.26.0" = "sha256-UWI9DYXJ5zrItIYEN/20jc6YfyKE9h4wbhhuUBA4f9o=";
-    };
   };
 
   rustToolchain = pkgs.rust-bin.stable.latest.default.override {
