@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 /// whose licenses affect distribution of *this* binary — nothing more.
 pub fn license_text() -> String {
     let mut text = String::from(
-        "blit — MIT License, copyright (c) 2026 Exponent Team\n\
+        "blit — MIT License, copyright (c) 2026 Indent Team\n\
          Full text: https://github.com/indent-com/blit/blob/main/LICENSE\n",
     );
     #[cfg(all(target_os = "linux", feature = "x264"))]
