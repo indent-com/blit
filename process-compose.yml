@@ -8,6 +8,11 @@ version: "0.5"
 #   BLIT_DEV_UI_PORT    Vite UI dev-server port    (default: 10000)
 #   BLIT_DEV_GW_PORT    Gateway listen port        (default: 10001)
 #   BLIT_DEV_SITE_PORT  Astro website dev port     (default: 10002)
+#
+# BLIT_DEV_CARGO_FLAGS adds cargo flags to the blit build — e.g. put
+#   export BLIT_DEV_CARGO_FLAGS="--features x264"
+# in .env.local to compile both software H.264 encoders, then pick one at
+# runtime with BLIT_H264_SOFTWARE=x264|openh264 (see docs/server.md).
 
 processes:
   build:
@@ -29,7 +34,7 @@ processes:
       echo '/* stub */' > js/ui/dist/sw.js;
       python3 -c "import brotli, pathlib; pathlib.Path('js/ui/dist/sw.js.br').write_bytes(brotli.compress(pathlib.Path('js/ui/dist/sw.js').read_bytes()))" 2>/dev/null || cp js/ui/dist/sw.js js/ui/dist/sw.js.br;
       fi;
-      exec cargo build -p blit-cli --profile profiling
+      exec cargo build -p blit-cli --profile profiling ${BLIT_DEV_CARGO_FLAGS:-}
 
   browser-wasm:
     command: cargo watch -w crates/browser/src -w crates/remote/src -s "cd crates/browser && wasm-pack build --target web --release --out-dir pkg"

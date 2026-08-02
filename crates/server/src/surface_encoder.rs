@@ -373,10 +373,10 @@ impl SurfaceQuality {
         self.av1_quantizer().min(255) as u8
     }
 
-    /// x264 target bitrate in bits/sec.  Resolution-independent
-    /// approximation — ABR rate control adapts internally.
-    #[cfg(target_os = "linux")]
-    fn x264_bitrate(self) -> u32 {
+    /// Software H.264 target bitrate in bits/sec.  Resolution-independent
+    /// approximation — the backends' rate control adapts internally.
+    #[cfg(all(target_os = "linux", any(feature = "x264", feature = "openh264")))]
+    fn h264_bitrate(self) -> u32 {
         match self {
             Self::Low => 500_000,
             Self::Medium => 2_000_000,
@@ -740,7 +740,7 @@ impl SurfaceEncoder {
     /// for display in debug panels.  Includes chroma subsampling when 4:4:4.
     pub fn encoder_name(&self) -> &'static str {
         match (&self.kind, self.chroma) {
-            (SurfaceEncoderKind::H264Software(_), _) => "h264-software",
+            (SurfaceEncoderKind::H264Software(enc), _) => enc.name(),
             (SurfaceEncoderKind::NvencH264(_), ChromaSubsampling::Cs444) => "h264-nvenc 4:4:4",
             (SurfaceEncoderKind::NvencH264(_), _) => "h264-nvenc",
             (SurfaceEncoderKind::NvencAV1(_), ChromaSubsampling::Cs444) => "av1-nvenc 4:4:4",
@@ -1340,7 +1340,7 @@ impl SurfaceEncoder {
         let mut result = match &mut self.kind {
             SurfaceEncoderKind::H264Software(encoder) => {
                 let yuv = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
-                encoder.encode_yuv(&yuv, self.width, self.height)
+                encoder.encode_yuv(yuv, self.width, self.height)
             }
             SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
                 enc.encode_bgra_padded(bgra, src_w, src_h)
@@ -1380,7 +1380,7 @@ impl SurfaceEncoder {
                 let enc_h = self.height as usize;
                 if enc_w == src_w && enc_h == src_h {
                     let yuv = nv12_to_yuv420(data, y_stride, uv_stride, src_w, src_h);
-                    encoder.encode_yuv(&yuv, self.width, self.height)
+                    encoder.encode_yuv(yuv, self.width, self.height)
                 } else {
                     let pd = PixelData::Nv12 {
                         data: std::sync::Arc::new(data.to_vec()),
@@ -1874,11 +1874,116 @@ fn av1_stream_contains_keyframe(data: &[u8]) -> bool {
     false
 }
 
-/// Software H.264 encoder backed by libx264.  Linux-only: the compositor
-/// that feeds surface encoders is Linux-only, and gating the dependency
-/// keeps other platforms free of the system libx264 requirement.
-#[cfg(target_os = "linux")]
-struct SoftwareH264Encoder {
+// ---------------------------------------------------------------------------
+// H.264 software (x264 / openh264)
+// ---------------------------------------------------------------------------
+
+/// Software H.264 encoding, dispatching to whichever backend was compiled
+/// in.  Both backends are optional cargo features of blit-server, so a
+/// binary can carry either, both, or neither.  With neither — or off Linux,
+/// where the compositor that feeds surface encoders does not exist —
+/// construction fails and the encoder preference list moves on.
+enum SoftwareH264Encoder {
+    #[cfg(all(target_os = "linux", feature = "x264"))]
+    X264(X264Encoder),
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    OpenH264(Box<OpenH264Encoder>),
+}
+
+impl SoftwareH264Encoder {
+    /// x264 is preferred when both backends are present; openh264 is the
+    /// runtime fallback.  `BLIT_H264_SOFTWARE=x264|openh264` pins one.
+    fn new(width: u32, height: u32, quality: SurfaceQuality) -> Result<Self, String> {
+        let pinned = std::env::var("BLIT_H264_SOFTWARE").ok();
+        let pinned = pinned.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        Self::new_with_backend(pinned, width, height, quality)
+    }
+
+    #[allow(unused_mut)] // mutated only when a backend feature is enabled
+    fn new_with_backend(
+        pinned: Option<&str>,
+        width: u32,
+        height: u32,
+        quality: SurfaceQuality,
+    ) -> Result<Self, String> {
+        let mut errors: Vec<String> = Vec::new();
+        #[cfg(all(target_os = "linux", feature = "x264"))]
+        if pinned.is_none_or(|p| p == "x264") {
+            match X264Encoder::new(width, height, quality) {
+                Ok(enc) => return Ok(Self::X264(enc)),
+                Err(err) => errors.push(format!("x264: {err}")),
+            }
+        }
+        #[cfg(all(target_os = "linux", feature = "openh264"))]
+        if pinned.is_none_or(|p| p == "openh264") {
+            match OpenH264Encoder::new(quality) {
+                Ok(enc) => return Ok(Self::OpenH264(Box::new(enc))),
+                Err(err) => errors.push(format!("openh264: {err}")),
+            }
+        }
+        let _ = (width, height, quality);
+        if !errors.is_empty() {
+            Err(errors.join("; "))
+        } else if let Some(p) = pinned {
+            Err(format!(
+                "H.264 software backend {p:?} (BLIT_H264_SOFTWARE) is not in \
+                 this build (`x264`/`openh264` cargo features)"
+            ))
+        } else {
+            Err("no software H.264 encoder in this build \
+                 (`x264`/`openh264` cargo features, Linux only)"
+                .into())
+        }
+    }
+
+    /// Backend-qualified name for client debug panels.
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "x264"))]
+            Self::X264(_) => "h264-software (x264)",
+            #[cfg(all(target_os = "linux", feature = "openh264"))]
+            Self::OpenH264(_) => "h264-software (openh264)",
+            #[cfg(not(all(target_os = "linux", any(feature = "x264", feature = "openh264"))))]
+            _ => "h264-software",
+        }
+    }
+
+    fn request_keyframe(&mut self) {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "x264"))]
+            Self::X264(enc) => enc.request_keyframe(),
+            #[cfg(all(target_os = "linux", feature = "openh264"))]
+            Self::OpenH264(enc) => enc.request_keyframe(),
+            #[cfg(not(all(target_os = "linux", any(feature = "x264", feature = "openh264"))))]
+            _ => {}
+        }
+    }
+
+    fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
+        let yuv = rgba_to_yuv420(rgba, width as usize, height as usize);
+        self.encode_yuv(yuv, width, height)
+    }
+
+    /// Encode from a pre-built I420 buffer (avoids redundant conversion).
+    fn encode_yuv(&mut self, yuv: Vec<u8>, width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "x264"))]
+            Self::X264(enc) => enc.encode_yuv(&yuv, width, height),
+            #[cfg(all(target_os = "linux", feature = "openh264"))]
+            Self::OpenH264(enc) => enc.encode_yuv(yuv, width, height),
+            #[cfg(not(all(target_os = "linux", any(feature = "x264", feature = "openh264"))))]
+            _ => {
+                let _ = (yuv, width, height);
+                None
+            }
+        }
+    }
+}
+
+/// x264 backend.  System libx264 via pkg-config; GPL-2.0-or-later, which
+/// is why it is a build-time choice (see `blit --license`).
+#[cfg(all(target_os = "linux", feature = "x264"))]
+struct X264Encoder {
     enc: *mut x264_sys::x264_t,
     pts: i64,
     force_keyframe: bool,
@@ -1886,11 +1991,11 @@ struct SoftwareH264Encoder {
 
 // SAFETY: the x264 handle is not tied to the thread that created it and is
 // only accessed through &mut self.
-#[cfg(target_os = "linux")]
-unsafe impl Send for SoftwareH264Encoder {}
+#[cfg(all(target_os = "linux", feature = "x264"))]
+unsafe impl Send for X264Encoder {}
 
-#[cfg(target_os = "linux")]
-impl SoftwareH264Encoder {
+#[cfg(all(target_os = "linux", feature = "x264"))]
+impl X264Encoder {
     fn new(width: u32, height: u32, quality: SurfaceQuality) -> Result<Self, String> {
         use x264_sys::*;
         unsafe {
@@ -1914,7 +2019,7 @@ impl SoftwareH264Encoder {
             par.i_keyint_max = 60;
             par.i_log_level = X264_LOG_NONE;
             par.rc.i_rc_method = X264_RC_ABR as i32;
-            par.rc.i_bitrate = (quality.x264_bitrate() / 1000) as i32; // kbit/s
+            par.rc.i_bitrate = (quality.h264_bitrate() / 1000) as i32; // kbit/s
             // Constrained Baseline — matches the avc1.4200 codec string sent
             // to clients.
             if x264_param_apply_profile(&mut par, c"baseline".as_ptr()) < 0 {
@@ -1936,12 +2041,6 @@ impl SoftwareH264Encoder {
         self.force_keyframe = true;
     }
 
-    fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
-        let yuv = rgba_to_yuv420(rgba, width as usize, height as usize);
-        self.encode_yuv(&yuv, width, height)
-    }
-
-    /// Encode from a pre-built I420 buffer (avoids redundant conversion).
     fn encode_yuv(&mut self, yuv: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
         use x264_sys::*;
         let w = width as usize;
@@ -2000,33 +2099,52 @@ impl SoftwareH264Encoder {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for SoftwareH264Encoder {
+#[cfg(all(target_os = "linux", feature = "x264"))]
+impl Drop for X264Encoder {
     fn drop(&mut self) {
         unsafe { x264_sys::x264_encoder_close(self.enc) };
     }
 }
 
-/// Stub for non-Linux platforms, where the compositor never runs and the
-/// x264 dependency is not built.  Construction always fails, so the other
-/// methods are unreachable.
-#[cfg(not(target_os = "linux"))]
-struct SoftwareH264Encoder;
+/// openh264 backend.  BSD-2-Clause, compiled from bundled source with no
+/// system dependency.
+#[cfg(all(target_os = "linux", feature = "openh264"))]
+struct OpenH264Encoder {
+    encoder: openh264::encoder::Encoder,
+}
 
-#[cfg(not(target_os = "linux"))]
-impl SoftwareH264Encoder {
-    fn new(_width: u32, _height: u32, _quality: SurfaceQuality) -> Result<Self, String> {
-        Err("h264-software (x264) is only available on Linux".into())
+#[cfg(all(target_os = "linux", feature = "openh264"))]
+impl OpenH264Encoder {
+    fn new(quality: SurfaceQuality) -> Result<Self, String> {
+        use openh264::encoder::{BitRate, Encoder, EncoderConfig, RateControlMode};
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(quality.h264_bitrate()))
+            .rate_control_mode(RateControlMode::Bitrate);
+        let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+            .map_err(|err| format!("failed to create encoder: {err:?}"))?;
+        Ok(Self { encoder })
     }
 
-    fn request_keyframe(&mut self) {}
-
-    fn encode(&mut self, _rgba: &[u8], _width: u32, _height: u32) -> Option<(Vec<u8>, bool)> {
-        None
+    fn request_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
     }
 
-    fn encode_yuv(&mut self, _yuv: &[u8], _width: u32, _height: u32) -> Option<(Vec<u8>, bool)> {
-        None
+    fn encode_yuv(&mut self, yuv: Vec<u8>, width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
+        let yuv_buf = openh264::formats::YUVBuffer::from_vec(yuv, width as usize, height as usize);
+        let bitstream = match self.encoder.encode(&yuv_buf) {
+            Ok(bs) => bs,
+            Err(e) => {
+                eprintln!("[surface-encoder] openh264 encode failed {width}x{height}: {e:?}");
+                return None;
+            }
+        };
+        let nal_data = bitstream.to_vec();
+        if nal_data.is_empty() {
+            eprintln!("[surface-encoder] openh264 produced empty NAL {width}x{height}");
+            return None;
+        }
+        let is_keyframe = h264_stream_contains_idr(&nal_data);
+        Some((nal_data, is_keyframe))
     }
 }
 
@@ -2249,10 +2367,15 @@ mod tests {
         assert!(!av1_stream_contains_keyframe(&[]));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "x264"))]
     #[test]
     fn x264_software_encoder_round_trip() {
-        let mut enc = SoftwareH264Encoder::new(64, 48, SurfaceQuality::Medium).unwrap();
+        // The dispatcher prefers x264, so this exercises the x264 backend.
+        // (new_with_backend(None, ..) keeps the ambient BLIT_H264_SOFTWARE
+        // of whoever runs the tests from interfering.)
+        let mut enc =
+            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceQuality::Medium).unwrap();
+        assert_eq!(enc.name(), "h264-software (x264)");
         let rgba = vec![128u8; 64 * 48 * 4];
         let (data, key) = enc.encode(&rgba, 64, 48).expect("first frame encodes");
         assert!(key, "first frame is a keyframe");
@@ -2261,6 +2384,41 @@ mod tests {
         assert!(!key2, "steady-state frame is not a keyframe");
         enc.request_keyframe();
         let (data3, key3) = enc.encode(&rgba, 64, 48).expect("forced keyframe encodes");
+        assert!(key3, "request_keyframe forces an IDR");
+        assert!(h264_stream_contains_idr(&data3));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "x264", feature = "openh264"))]
+    #[test]
+    fn h264_software_backend_pin() {
+        let q = SurfaceQuality::Medium;
+        let enc = SoftwareH264Encoder::new_with_backend(Some("openh264"), 64, 48, q).unwrap();
+        assert_eq!(enc.name(), "h264-software (openh264)");
+        let enc = SoftwareH264Encoder::new_with_backend(Some("x264"), 64, 48, q).unwrap();
+        assert_eq!(enc.name(), "h264-software (x264)");
+        let enc = SoftwareH264Encoder::new_with_backend(None, 64, 48, q).unwrap();
+        assert_eq!(enc.name(), "h264-software (x264)", "x264 preferred");
+        assert!(SoftwareH264Encoder::new_with_backend(Some("nope"), 64, 48, q).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    #[test]
+    fn openh264_software_encoder_round_trip() {
+        let mut enc = OpenH264Encoder::new(SurfaceQuality::Medium).unwrap();
+        let yuv = vec![128u8; 64 * 48 * 3 / 2];
+        let (data, key) = enc
+            .encode_yuv(yuv.clone(), 64, 48)
+            .expect("first frame encodes");
+        assert!(key, "first frame is a keyframe");
+        assert!(h264_stream_contains_idr(&data));
+        let (_, key2) = enc
+            .encode_yuv(yuv.clone(), 64, 48)
+            .expect("second frame encodes");
+        assert!(!key2, "steady-state frame is not a keyframe");
+        enc.request_keyframe();
+        let (data3, key3) = enc
+            .encode_yuv(yuv, 64, 48)
+            .expect("forced keyframe encodes");
         assert!(key3, "request_keyframe forces an IDR");
         assert!(h264_stream_contains_idr(&data3));
     }

@@ -11,6 +11,17 @@ homepage.workspace = true
 name = "blit_server"
 path = "src/lib.rs"
 
+[features]
+# Software H.264 encoders for compositor surface streaming (Linux-only, see
+# surface_encoder.rs). Independent build-time choices: build with either,
+# both (x264 preferred, openh264 as runtime fallback), or neither (software
+# fallback is then AV1-only). x264 is GPL-2.0-or-later, which governs
+# distribution of binaries that include it — that's why it is off by
+# default and an explicit opt-in for releases (see `blit --license`).
+default = ["openh264"]
+x264 = ["dep:x264-sys"]
+openh264 = ["dep:openh264"]
+
 [dependencies]
 blit-remote = { workspace = true }
 blit-fssync = { workspace = true }
@@ -46,9 +57,12 @@ libc = "0.2"
 opus = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# System libx264 via pkg-config. Linux-only: the compositor that feeds the
-# software H.264 surface encoder only exists on Linux (see surface_encoder.rs).
-x264-sys = "0.2"
+# Software H.264 encoders, enabled by the features of the same names.
+# Linux-only: the compositor that feeds the software H.264 surface encoder
+# only exists on Linux (see surface_encoder.rs). x264-sys links the system
+# libx264 via pkg-config; openh264 compiles its bundled source.
+x264-sys = { version = "0.2", optional = true }
+openh264 = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -1,5 +1,28 @@
 use clap::{Args, Parser, Subcommand};
 
+/// Text for `blit --license`.  Mentions exactly the third-party components
+/// whose licenses affect distribution of *this* binary — nothing more.
+pub fn license_text() -> String {
+    let mut text = String::from(
+        "blit — MIT License, copyright (c) 2026 Exponent Team\n\
+         Full text: https://github.com/indent-com/blit/blob/main/LICENSE\n",
+    );
+    #[cfg(all(target_os = "linux", feature = "x264"))]
+    text.push_str(
+        "\nThis binary includes libx264, copyright (c) the x264 project,\n\
+         licensed under the GNU General Public License, version 2 or later.\n\
+         As a combined work, this binary as a whole is distributed under the\n\
+         terms of the GPL-2.0-or-later.  Complete corresponding source:\n\
+         https://github.com/indent-com/blit (x264: https://code.videolan.org/videolan/x264)\n",
+    );
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    text.push_str(
+        "\nThis binary includes OpenH264, copyright (c) Cisco Systems,\n\
+         licensed under the BSD-2-Clause license.\n",
+    );
+    text
+}
+
 #[derive(Parser)]
 #[command(
     name = "blit",
@@ -14,7 +37,8 @@ use clap::{Args, Parser, Subcommand};
           blit terminal start htop  Start a PTY and print its terminal ID\n  \
           blit terminal show 1      Dump current visible terminal text\n  \
           blit learn                Print the full CLI reference\n  \
-          blit --help               Show this help",
+          blit --help               Show this help\n  \
+          blit --license            Show license terms for this binary",
     subcommand_required = true,
     arg_required_else_help = true
 )]

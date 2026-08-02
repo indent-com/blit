@@ -207,10 +207,14 @@ Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the
 | `h264-nvenc`    | NVENC (GPU)        | H.264 via CUDA                     |
 | `av1-vaapi`     | VA-API (GPU)       | AV1 via libva                      |
 | `h264-vaapi`    | VA-API (GPU)       | H.264 via libva                    |
-| `h264-software` | x264 (CPU)         | Software H.264, always available   |
+| `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither |
 | `av1-software`  | rav1e (CPU)        | Software AV1                       |
 
 `BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `ultra`.
+
+`BLIT_H264_SOFTWARE`: pins the `h264-software` backend to `x264` or
+`openh264` when the binary carries both (dev builds with
+`--features x264`); unset prefers x264.
 
 ### Compositor capabilities
 

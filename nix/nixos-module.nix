@@ -116,7 +116,7 @@ in
         search path.
 
         Set to an empty list to disable hardware acceleration and use
-        only software encoders (x264, rav1e).
+        only software encoders (openh264, rav1e).
       '';
     };
 

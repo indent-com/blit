@@ -6,6 +6,8 @@
   blit,
   blit-release,
   blit-release-musl ? null,
+  blit-release-gnu-gpl ? null,
+  blit-release-musl-gpl ? null,
   webAppDist,
   websiteDist,
   rustToolchain,
@@ -373,7 +375,8 @@ let
       rustToolchain
       pkgs.pkg-config
       pkgs.libopus
-    ];
+    ]
+    ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.x264;
     text = ''
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -386,6 +389,16 @@ let
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
+    ''
+    + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+      # The software H.264 encoders are cargo features (default openh264,
+      # x264 as the GPL opt-in, none = AV1-only software fallback) — keep
+      # every combination compiling.  x264-sys needs pkg-config + bindgen.
+      export PKG_CONFIG_PATH="${pkgs.x264.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
+      export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+      export BINDGEN_EXTRA_CLANG_ARGS="-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include"
+      cargo clippy -p blit-server --all-targets --all-features -- -D warnings
+      cargo clippy -p blit-server --all-targets --no-default-features -- -D warnings
     '';
   };
   coverage = pkgs.writeShellApplication {
@@ -467,6 +480,10 @@ in
             tar --mode='u+w' -czf "$outdir/blit_${version}_${os}_${arch}.tar.gz" -C "${blit-release}" bin
             # musl tarball: single binary (needs system musl libc)
             tar --mode='u+w' -czf "$outdir/blit_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl}" bin
+            # GPL flavors: x264 software H.264 encoder instead of openh264
+            # (opt-in via `curl install.blit.sh | BLIT_GPL=1 sh`)
+            tar --mode='u+w' -czf "$outdir/blit-gpl_${version}_${os}_${arch}.tar.gz" -C "${blit-release-gnu-gpl}" bin
+            tar --mode='u+w' -czf "$outdir/blit-gpl_${version}_${os}-musl_${arch}.tar.gz" -C "${blit-release-musl-gpl}" bin
           ''
         else
           ''
@@ -606,7 +623,8 @@ in
       pkgs.valkey
       pkgs.pkg-config
       pkgs.libopus
-    ];
+    ]
+    ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.x264;
     text = ''
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -619,6 +637,17 @@ in
       echo "=== Rust tests ==="
       cargo test --workspace
       echo ""
+    ''
+    + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+      echo "=== Rust tests: blit-server with both H.264 encoder features ==="
+      export PKG_CONFIG_PATH="${pkgs.x264.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
+      export LD_LIBRARY_PATH="${pkgs.x264.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+      export BINDGEN_EXTRA_CLANG_ARGS="-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include"
+      cargo test -p blit-server --all-features
+      echo ""
+    ''
+    + ''
 
       echo "=== Setting up browser WASM package ==="
       ${setupBrowserPkg}

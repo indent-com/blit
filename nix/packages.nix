@@ -195,95 +195,116 @@
       # Linux ships two variants:
       #   glibc (blit-gnu)  — dynamically linked, dlopen works for GPU
       #   musl  (blit-musl) — all deps statically linked except musl libc
-      # macOS ships a single binary with nix-store dylibs rewritten to
-      # system paths.
+      # Each Linux variant also has a "-gpl" flavor that swaps the openh264
+      # software H.264 encoder for x264 (GPL-2.0-or-later) — a deliberate
+      # opt-in via `curl install.blit.sh | BLIT_GPL=1 sh`; see
+      # `blit --license`.  macOS ships a single binary with nix-store
+      # dylibs rewritten to system paths (no software H.264 encoder — the
+      # compositor is Linux-only).
       # ------------------------------------------------------------------
+
+      # Cargo feature flags for the GPL flavor: x264 instead of openh264.
+      gplFeatureArgs = "--no-default-features --features x264";
 
       # Linux glibc binary — all deps statically linked, only glibc is
       # dynamic (so dlopen works for GPU).  Built with cargo-zigbuild
       # targeting glibc ${minGlibcVersion} for broad distro compat.
-      blit-gnu = craneLib.buildPackage (
-        commonArgsGnu
-        // {
-          pname = "blit-gnu";
-          cargoArtifacts = cargoArtifactsGnu;
-          cargoExtraArgs = "-p blit-cli";
-          doCheck = false;
-          preBuild = copyWebAppDist;
-          buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli";
-          doNotPostBuildInstallCargoBinaries = true;
-          installPhaseCommand = ''
-            mkdir -p $out/bin
-            cp target/${rustTargetGnu}/release/blit $out/bin/
-          '';
-        }
-      );
+      mkBlitGnu =
+        pname: featureArgs:
+        craneLib.buildPackage (
+          commonArgsGnu
+          // {
+            inherit pname;
+            cargoArtifacts = cargoArtifactsGnu;
+            cargoExtraArgs = "-p blit-cli ${featureArgs}";
+            doCheck = false;
+            preBuild = copyWebAppDist;
+            buildPhaseCargoCommand = "HOME=$TMPDIR cargo zigbuild --release --target ${rustTargetGnu}.${minGlibcVersion} -p blit-cli ${featureArgs}";
+            doNotPostBuildInstallCargoBinaries = true;
+            installPhaseCommand = ''
+              mkdir -p $out/bin
+              cp target/${rustTargetGnu}/release/blit $out/bin/
+            '';
+          }
+        );
+      blit-gnu = mkBlitGnu "blit-gnu" "";
+      blit-gnu-gpl = mkBlitGnu "blit-gnu-gpl" gplFeatureArgs;
 
       # Linux musl dynamic binary — all deps statically linked except
       # musl libc.  For Alpine and other musl-based systems.
-      blit-musl = craneLibStatic.buildPackage (
-        commonArgsStatic
-        // {
-          pname = "blit-musl";
-          cargoArtifacts = cargoArtifactsStatic;
-          cargoExtraArgs = "-p blit-cli";
-          doCheck = false;
-          preBuild = copyWebAppDist;
-          dontPatchELF = true;
-          postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-            for bin in $out/bin/*; do
-              interp=$(readelf -l "$bin" 2>/dev/null \
-                | grep -oP 'Requesting program interpreter: \K[^\]]+' || true)
-              case "$(basename "$interp")" in
-                ld-musl-*) ;;
-                *) echo "FATAL: expected musl interpreter, got: $interp"; exit 1 ;;
-              esac
-              needed=$(readelf -d "$bin" 2>/dev/null \
-                | grep -oP '\(NEEDED\)\s+Shared library: \[\K[^\]]+' || true)
-              for lib in $needed; do
-                case "$lib" in
-                  libc.so) ;;
-                  *) echo "FATAL: unexpected NEEDED library: $lib"; exit 1 ;;
+      mkBlitMusl =
+        pname: featureArgs:
+        craneLibStatic.buildPackage (
+          commonArgsStatic
+          // {
+            inherit pname;
+            cargoArtifacts = cargoArtifactsStatic;
+            cargoExtraArgs = "-p blit-cli ${featureArgs}";
+            doCheck = false;
+            preBuild = copyWebAppDist;
+            dontPatchELF = true;
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              for bin in $out/bin/*; do
+                interp=$(readelf -l "$bin" 2>/dev/null \
+                  | grep -oP 'Requesting program interpreter: \K[^\]]+' || true)
+                case "$(basename "$interp")" in
+                  ld-musl-*) ;;
+                  *) echo "FATAL: expected musl interpreter, got: $interp"; exit 1 ;;
                 esac
+                needed=$(readelf -d "$bin" 2>/dev/null \
+                  | grep -oP '\(NEEDED\)\s+Shared library: \[\K[^\]]+' || true)
+                for lib in $needed; do
+                  case "$lib" in
+                    libc.so) ;;
+                    *) echo "FATAL: unexpected NEEDED library: $lib"; exit 1 ;;
+                  esac
+                done
               done
-            done
-          '';
-        }
-      );
+            '';
+          }
+        );
+      blit-musl = mkBlitMusl "blit-musl" "";
+      blit-musl-gpl = mkBlitMusl "blit-musl-gpl" gplFeatureArgs;
 
       # Assembled glibc release: single binary with system interpreter.
       # All deps are statically linked; only glibc is dynamic.
-      blit-release-gnu =
+      mkReleaseGnu =
+        name: drv:
         let
           interpreter =
             if pkgs.stdenv.hostPlatform.isAarch64
             then "/lib/ld-linux-aarch64.so.1"
             else "/lib64/ld-linux-x86-64.so.2";
         in
-        pkgs.runCommand "blit-release-gnu-${version}" {
+        pkgs.runCommand "${name}-${version}" {
           nativeBuildInputs = [ pkgs.patchelf ];
         } ''
           mkdir -p $out/bin
-          cp ${blit-gnu}/bin/blit $out/bin/blit
+          cp ${drv}/bin/blit $out/bin/blit
           chmod +w $out/bin/blit
           patchelf --set-interpreter ${interpreter} $out/bin/blit
           patchelf --remove-rpath $out/bin/blit
         '';
+      blit-release-gnu = mkReleaseGnu "blit-release-gnu" blit-gnu;
+      blit-release-gnu-gpl = mkReleaseGnu "blit-release-gnu-gpl" blit-gnu-gpl;
 
       # Assembled musl release: single binary, interpreter set to
       # system musl path.
-      blit-release-musl =
+      mkReleaseMusl =
+        name: drv:
         let
           arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
         in
-        pkgs.runCommand "blit-release-musl-${version}" {
+        pkgs.runCommand "${name}-${version}" {
           nativeBuildInputs = [ pkgs.patchelf ];
         } ''
           mkdir -p $out/bin
-          cp ${blit-musl}/bin/blit $out/bin/blit
+          cp ${drv}/bin/blit $out/bin/blit
           chmod +w $out/bin/blit
           patchelf --set-interpreter /lib/ld-musl-${arch}.so.1 $out/bin/blit
         '';
+      blit-release-musl = mkReleaseMusl "blit-release-musl" blit-musl;
+      blit-release-musl-gpl = mkReleaseMusl "blit-release-musl-gpl" blit-musl-gpl;
 
       # Default release package per platform.
       blit-release =
@@ -457,6 +478,8 @@
           rustToolchain
           ;
         blit-release-musl = if pkgs.stdenv.isLinux then blit-release-musl else null;
+        blit-release-gnu-gpl = if pkgs.stdenv.isLinux then blit-release-gnu-gpl else null;
+        blit-release-musl-gpl = if pkgs.stdenv.isLinux then blit-release-musl-gpl else null;
       };
 
       demoImage =
@@ -606,7 +629,7 @@
         default = blit;
       }
       // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-        inherit blit-release-musl;
+        inherit blit-release-musl blit-release-gnu-gpl blit-release-musl-gpl;
       }
       // tasks;
 

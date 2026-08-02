@@ -178,7 +178,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | File                                     | Role                                                                                                                  |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `crates/server/src/lib.rs`               | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration                  |
-| `crates/server/src/surface_encoder.rs`   | Surface video encoding: AV1 (rav1e), H.264 (x264, VA-API, NVENC)                                                      |
+| `crates/server/src/surface_encoder.rs`   | Surface video encoding: AV1 (rav1e), H.264 (openh264/x264, VA-API, NVENC)                                             |
 | `crates/server/src/vaapi_encode.rs`      | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                              |
 | `crates/server/src/nvenc_encode.rs`      | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                          |
 | `crates/server/src/gpu_libs.rs`          | Runtime dlopen loaders for libva, NVENC, GBM shared across encoders                                                   |
@@ -285,7 +285,7 @@ Wayland app → compositor thread → CompositorEvent::SurfaceCommit
 - **AV1 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
 - **H.264 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
 - **AV1 (rav1e)** — software, handles odd dimensions
-- **H.264 software (x264)** — software fallback, max 3840x2160
+- **H.264 software (openh264 and/or x264)** — software fallback, max 3840x2160. Both are cargo features of `blit-server` (and `blit-cli`); default is `openh264` (MIT-friendly), release `-gpl` artifacts use `x264` (GPL-2.0-or-later, better compression). Build with neither and the software fallback is AV1-only.
 
 `BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software`. `BLIT_SURFACE_QUALITY` (low/medium/high/lossless) controls rav1e speed/quantizer presets. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
 

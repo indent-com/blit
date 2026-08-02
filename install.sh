@@ -1,6 +1,12 @@
 #!/bin/sh
 # Install blit — https://blit.sh
 # Usage: curl -sf https://install.blit.sh | sh
+#
+# By default this installs an MIT-licensed binary (software H.264 via
+# openh264). Set BLIT_GPL=1 to opt into the GPL flavor instead, which
+# uses x264 (GPL-2.0-or-later) for better software H.264 — Linux only:
+#   curl -sf https://install.blit.sh | BLIT_GPL=1 sh
+# Either binary prints its exact terms with `blit --license`.
 set -eu
 
 REPO="https://install.blit.sh"
@@ -61,18 +67,33 @@ main() {
     fi
   fi
 
+  # GPL opt-in (Linux only): the blit-gpl flavor carries x264.
+  flavor="blit"
+  if [ "${BLIT_GPL:-}" = "1" ]; then
+    case "$os" in
+      linux*) flavor="blit-gpl" ;;
+      *) echo "note: BLIT_GPL only applies to Linux; installing the standard binary." ;;
+    esac
+  fi
+
   version=$(fetch "$REPO/latest") || err "failed to fetch latest version"
   version=$(echo "$version" | tr -d '[:space:]')
 
   if [ -x "$PREFIX/bin/blit" ]; then
     current=$("$PREFIX/bin/blit" --version 2>/dev/null | awk '{print $2}') || true
-    if [ "$current" = "$version" ]; then
+    # A flavor switch at the same version still needs a reinstall; the GPL
+    # flavor is recognizable by the x264 notice in `blit --license`.
+    current_flavor="blit"
+    if "$PREFIX/bin/blit" --license 2>/dev/null | grep -q libx264; then
+      current_flavor="blit-gpl"
+    fi
+    if [ "$current" = "$version" ] && [ "$current_flavor" = "$flavor" ]; then
       echo "blit ${version} already installed."
       exit 0
     fi
   fi
 
-  tarball="blit_${version}_${os}_${arch}.tar.gz"
+  tarball="${flavor}_${version}_${os}_${arch}.tar.gz"
   url="$REPO/bin/$tarball"
 
   tmp=$(mktemp -d)
