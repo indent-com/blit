@@ -170,14 +170,14 @@ BLIT_SURFACE_ENCODERS=av1-software
 BLIT_SURFACE_ENCODERS=av1-nvenc,h264-nvenc,h264-software
 ```
 
-| Value           | Codec | Backend          | Notes                                           |
-| --------------- | ----- | ---------------- | ----------------------------------------------- |
-| `av1-nvenc`     | AV1   | NVIDIA NVENC     | RTX 40+ series; fastest AV1 encode              |
-| `h264-nvenc`    | H.264 | NVIDIA NVENC     | Requires proprietary NVIDIA driver              |
-| `av1-vaapi`     | AV1   | VA-API           | Intel/AMD GPU                                   |
-| `h264-vaapi`    | H.264 | VA-API           | Intel/AMD GPU; max 3840×2160                    |
+| Value           | Codec | Backend          | Notes                                                |
+| --------------- | ----- | ---------------- | ---------------------------------------------------- |
+| `av1-nvenc`     | AV1   | NVIDIA NVENC     | RTX 40+ series; fastest AV1 encode                   |
+| `h264-nvenc`    | H.264 | NVIDIA NVENC     | Requires proprietary NVIDIA driver                   |
+| `av1-vaapi`     | AV1   | VA-API           | Intel/AMD GPU                                        |
+| `h264-vaapi`    | H.264 | VA-API           | Intel/AMD GPU; max 3840×2160                         |
 | `h264-software` | H.264 | openh264 or x264 | Max 3840×2160; build-time choice (x264 = GPL opt-in) |
-| `av1-software`  | AV1   | rav1e (software) | No resolution limit; CPU-heavy at high res      |
+| `av1-software`  | AV1   | rav1e (software) | No resolution limit; CPU-heavy at high res           |
 
 The browser automatically detects the codec from each frame and configures
 its WebCodecs decoder accordingly. Clients can also advertise which codecs
