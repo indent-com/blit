@@ -38,6 +38,21 @@ struct PwProperties {
     _priv: [u8; 0],
 }
 
+// ── spa_dict (must match C layout exactly) ────────────────────────────
+
+#[repr(C)]
+struct SpaDictItem {
+    key: *const c_char,
+    value: *const c_char,
+}
+
+#[repr(C)]
+struct SpaDict {
+    flags: u32,
+    n_items: u32,
+    items: *const SpaDictItem,
+}
+
 // ── Buffer structs (must match C layout exactly) ──────────────────────
 
 #[repr(C)]
@@ -135,7 +150,7 @@ const SPA_AUDIO_FORMAT_F32_LE: u32 = 283;
 
 type FnPwInit = unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char);
 type FnPwDeinit = unsafe extern "C" fn();
-type FnPwThreadLoopNew = unsafe extern "C" fn(*const c_char, *const c_void) -> *mut PwThreadLoop;
+type FnPwThreadLoopNew = unsafe extern "C" fn(*const c_char, *const SpaDict) -> *mut PwThreadLoop;
 type FnPwThreadLoopDestroy = unsafe extern "C" fn(*mut PwThreadLoop);
 type FnPwThreadLoopStart = unsafe extern "C" fn(*mut PwThreadLoop) -> c_int;
 type FnPwThreadLoopStop = unsafe extern "C" fn(*mut PwThreadLoop);
@@ -492,15 +507,36 @@ impl Capture {
 
         unsafe {
             let name = CString::new("blit-capture").unwrap();
-            let thread_loop = (s.pw_thread_loop_new)(name.as_ptr(), ptr::null());
+            // Ask for RT priority on the loop thread (best effort: newer
+            // libpipewire honours `loop.rt-prio`, older versions ignore
+            // unknown keys).  Without it the capture loop runs SCHED_OTHER
+            // and competes with video-encode threads for CPU.  The dict
+            // and its strings only need to outlive the _new call —
+            // libpipewire copies what it keeps.
+            let rt_key = c"loop.rt-prio";
+            let rt_val = c"88";
+            let loop_props_items = [SpaDictItem {
+                key: rt_key.as_ptr(),
+                value: rt_val.as_ptr(),
+            }];
+            let loop_props = SpaDict {
+                flags: 0,
+                n_items: loop_props_items.len() as u32,
+                items: loop_props_items.as_ptr(),
+            };
+            let thread_loop = (s.pw_thread_loop_new)(name.as_ptr(), &loop_props);
             if thread_loop.is_null() {
                 return Err("pw_thread_loop_new failed".to_string());
             }
             let loop_ = (s.pw_thread_loop_get_loop)(thread_loop);
 
-            // Build properties: monitor-capture of the named sink at a
-            // tight quantum (256 / 48000 = 5.3 ms) so RT_PROCESS fires
-            // often enough that 20 ms frames are assembled promptly.
+            // Build properties: monitor-capture of the named sink.  The
+            // 1024/48000 latency (~21 ms, one Opus frame) matches the
+            // daemon's forced quantum: fewer, larger cycles give the
+            // (possibly non-RT) graph threads 4x more scheduling slack
+            // under encode-saturated CPU than the old 5.3 ms quantum,
+            // and the client's >= 60 ms jitter buffer hides the extra
+            // batching entirely.
             let props = (s.pw_properties_new)(ptr::null());
             if props.is_null() {
                 (s.pw_thread_loop_destroy)(thread_loop);
@@ -517,7 +553,7 @@ impl Capture {
             set("stream.capture.sink", "true");
             set("target.object", target_node);
             set("node.name", "blit-capture");
-            set("node.latency", "256/48000");
+            set("node.latency", "1024/48000");
 
             // Allocate user_data (Box -> raw) for the process callback.
             // Freed in Drop after the thread-loop has stopped, so no
