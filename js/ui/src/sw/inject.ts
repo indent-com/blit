@@ -416,7 +416,13 @@ export function injectIntoHtml(
  * `<head>` matters — the shims must run before any app script.
  */
 function insertionPoint(bytes: Uint8Array): number {
-  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  // The returned index is used as a *byte* offset into the stream, so the
+  // decoding must be index-preserving: latin1 maps every byte to exactly one
+  // char. UTF-8 would not — an em dash ahead of <head> is 3 bytes but 1 char,
+  // and the resulting drift once split the tag itself, leaving the whole shim
+  // rendered as page text. The patterns below are ASCII, so matching is
+  // unaffected.
+  const text = new TextDecoder("latin1").decode(bytes);
   const head = /<head[^>]*>/i.exec(text);
   if (head) return head.index + head[0].length;
   const html = /<html[^>]*>/i.exec(text);
