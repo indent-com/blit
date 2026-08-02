@@ -58,12 +58,13 @@ async function touch(
   page: Page,
   type: "pointerdown" | "pointermove" | "pointerup",
   at: { x: number; y: number },
+  pointerType: "touch" | "pen" = "touch",
 ) {
   await page.evaluate(
-    ([type, at]) => {
+    ([type, at, pointerType]) => {
       const ev = new PointerEvent(type as string, {
         pointerId: 1,
-        pointerType: "touch",
+        pointerType: pointerType as string,
         isPrimary: true,
         clientX: (at as { x: number }).x,
         clientY: (at as { y: number }).y,
@@ -81,7 +82,7 @@ async function touch(
         window.dispatchEvent(ev);
       }
     },
-    [type, at] as const,
+    [type, at, pointerType] as const,
   );
 }
 
@@ -118,6 +119,40 @@ test.describe("Grip drag with a finger", () => {
     await expect(
       page.getByRole("button", { name: "New terminal" }).first(),
     ).toBeVisible({ timeout: 10_000 });
+  });
+
+  // Review catch on #141: the guard used to exclude only `mouse`, letting a
+  // pen through. A pen drives native drag-and-drop in Chromium, so both paths
+  // would run and this one's `dragend` would clear the in-flight count and
+  // unmount the dock underneath the native drag.
+  test("a pen is left to the native path", async ({ page }) => {
+    await authenticate(page);
+    await newTerminal(page);
+
+    const gripAt = await centerOf(page, "button[title^='Drag to move']");
+    // Aim where the dock lives. Asserted on the outcome rather than on the
+    // dock being absent: an earlier test may have left something parked, so
+    // the dock can be on screen for reasons of its own. Either way the bridge
+    // is what would reveal it and drop on it, so "nothing moved" is the
+    // signal that the pen was left alone.
+    const rightEdge = { x: 880, y: 300 };
+    await touch(page, "pointerdown", gripAt, "pen");
+    await touch(
+      page,
+      "pointermove",
+      { x: gripAt.x - 60, y: gripAt.y + 60 },
+      "pen",
+    );
+    await touch(page, "pointermove", rightEdge, "pen");
+    await touch(page, "pointerup", rightEdge, "pen");
+    await page.waitForTimeout(600);
+
+    // Still displayed: not parked, so the main view never fell back to the
+    // empty pane.
+    await expect(page.locator("canvas").first()).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "New terminal" }),
+    ).toHaveCount(0);
   });
 
   test("a tap still cycles the corner rather than dragging", async ({

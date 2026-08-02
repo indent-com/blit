@@ -70,8 +70,15 @@ export function isPaneDrag(e: DragEvent): boolean {
  *  paths ("0", "1.0") from enumeratePanes, so this cannot collide. */
 export const MAIN_PANE_SOURCE = "main-view";
 
-/** Travel before a press becomes a drag rather than a tap. Matches
- *  dragReorder's threshold — the same finger, the same slop. */
+/**
+ * Travel before a press becomes a drag rather than a tap.
+ *
+ * Deliberately looser than dragReorder's 4px, which measures a press on a
+ * whole list row. This handle is one ~24px button whose tap means something
+ * else — cycle the toolbar's corner — and a drag swallows that click, so
+ * treating a wobbling finger as a drag makes the tap look broken. Erring
+ * toward "that was a tap" is the cheaper mistake here.
+ */
 const TOUCH_DRAG_THRESHOLD_PX = 6;
 
 /**
@@ -99,7 +106,13 @@ export function startPaneTouchDrag(
   assignment: string,
   sourcePaneId: string,
 ): void {
-  if (e.pointerType === "mouse") return;
+  // Touch only, and tested positively rather than by excluding mouse: a pen
+  // drives native drag-and-drop in Chromium just as a mouse does, so letting
+  // it in here would run both paths at once — and this one's `dragend` would
+  // clear the in-flight count and unmount the dock underneath the native
+  // drag, which is the failure the enter-before-leave ordering below exists
+  // to avoid.
+  if (e.pointerType !== "touch") return;
   const handle = e.currentTarget as HTMLElement | null;
   if (!handle || typeof DataTransfer !== "function") return;
 
