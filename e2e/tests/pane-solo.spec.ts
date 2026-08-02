@@ -20,6 +20,9 @@ async function authenticate(page: Page) {
       .first()
       .or(page.locator("canvas").first()),
   ).toBeVisible({ timeout: 10_000 });
+  // With no sessions yet (a previous test may have closed them all), blit
+  // offers the Remotes dialog; it is modal and would swallow later clicks.
+  await page.keyboard.press("Escape");
   await page.waitForTimeout(500);
 }
 
