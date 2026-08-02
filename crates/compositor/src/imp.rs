@@ -5,7 +5,7 @@
 //! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
-use crate::pointer_focus::focus_transition;
+use crate::pointer_focus::{ButtonRouting, button_routing, focus_transition};
 use crate::positioner::PositionerGeometry;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -1223,6 +1223,10 @@ struct Compositor {
     /// pointer clicks outside the topmost grabbed popup we send
     /// `xdg_popup.popup_done` to dismiss the popup chain.
     popup_grab_stack: Vec<ObjectId>,
+    /// A button whose press dismissed a popup grab, and whose release must
+    /// therefore be swallowed too.  Delivering the release alone would hand
+    /// a client a button it never saw pressed.
+    popup_dismiss_button: Option<u32>,
 
     // -- DMA-BUF buffer hold --
     /// Buffers whose DMA-BUF content could not be eagerly snapshotted to
@@ -1374,9 +1378,22 @@ impl Compositor {
         // what sizes.
         for (surface_id, (width, height, log_w, log_h)) in self.pending_native_sizes.drain() {
             let prev = self.last_reported_size.get(&surface_id).copied();
-            if prev.is_none() || prev.map(|(pw, ph, _, _)| (pw, ph)) != Some((width, height)) {
-                self.last_reported_size
-                    .insert(surface_id, (width, height, log_w, log_h));
+            // Record unconditionally. The entry is not only the size the
+            // client was told; its logical half is the denominator the
+            // pointer path divides browser coordinates by
+            // (`PointerMotion`). Logical size can change while the physical
+            // size does not — an output scale change alone does exactly that
+            // — so gating the *store* on the physical size left the ratio
+            // stale and scaled every later coordinate by the wrong factor.
+            // Far enough off and the hit test lands outside the window: no
+            // hover, no cursor, clicks on nothing. Stateful, and it looks
+            // like the mouse is simply dead.
+            self.last_reported_size
+                .insert(surface_id, (width, height, log_w, log_h));
+            // The event, on the other hand, is genuinely about the size the
+            // client sees, so it stays gated — a scale change is not a
+            // resize to tell anyone about.
+            if prev.map(|(pw, ph, _, _)| (pw, ph)) != Some((width, height)) {
                 let _ = self.event_tx.send(CompositorEvent::SurfaceResized {
                     surface_id,
                     width: width as u16,
@@ -2043,6 +2060,25 @@ impl Compositor {
         }
     }
 
+    /// Forget pointer focus if it named `gone`.
+    ///
+    /// The pointer cannot be inside a surface that no longer exists, and
+    /// nothing else clears this. Buttons survive a dangling id because the
+    /// server always sends a `PointerMotion` immediately before a
+    /// `PointerButton`, and that motion re-enters; scroll gets no such
+    /// escort — `PointerAxis` arrives alone and ignores its own `surface_id`,
+    /// resolving the stale id to no surface and dropping the event. So a
+    /// dismissed context menu leaves the wheel dead until the cursor happens
+    /// to cross into another surface.
+    ///
+    /// Keyboard focus is already cleared on both destroy paths for the
+    /// equivalent reason (`focused_surface_id`); this is its pointer twin.
+    fn forget_pointer_focus(&mut self, gone: &ObjectId) {
+        if self.pointer_entered_id.as_ref() == Some(gone) {
+            self.pointer_entered_id = None;
+        }
+    }
+
     /// Remove surfaces whose underlying `WlSurface` is no longer alive.
     /// This handles the case where a Wayland client process exits or crashes
     /// without explicitly destroying its surfaces — `dispatch_clients()`
@@ -2076,6 +2112,7 @@ impl Compositor {
             if let Some(held) = self.held_buffers.remove(proto_id) {
                 held.release();
             }
+            self.forget_pointer_focus(proto_id);
             if let Some(surf) = self.surfaces.remove(proto_id) {
                 // Discard any pending presentation feedbacks — the surface
                 // died before the frame was ever presented.
@@ -2394,6 +2431,7 @@ impl Compositor {
 
                 // If a popup is grabbed and the pointer clicked outside
                 // the popup chain, dismiss the topmost grabbed popup.
+                let mut dismissed = false;
                 if pressed && !self.popup_grab_stack.is_empty() {
                     let click_on_grabbed = self.pointer_entered_id.as_ref().is_some_and(|eid| {
                         self.popup_grab_stack.iter().any(|gid| {
@@ -2412,20 +2450,29 @@ impl Compositor {
                             }
                         }
                         let _ = self.display_handle.flush_clients();
+                        dismissed = true;
                     }
                 }
 
-                let focused_wl = self
-                    .surfaces
-                    .values()
-                    .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
-                    .map(|s| s.wl_surface.clone());
-                for ptr in &self.pointers {
-                    if let Some(ref wl) = focused_wl
-                        && same_client(ptr, wl)
-                    {
-                        ptr.button(serial, time, button, state);
-                        ptr.frame();
+                // The click that closed a menu is spent on closing it; see
+                // `button_routing`, whose tests enumerate the cases.
+                let (routing, swallow) =
+                    button_routing(pressed, button, dismissed, self.popup_dismiss_button);
+                self.popup_dismiss_button = swallow;
+
+                if routing == ButtonRouting::Deliver {
+                    let focused_wl = self
+                        .surfaces
+                        .values()
+                        .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                        .map(|s| s.wl_surface.clone());
+                    for ptr in &self.pointers {
+                        if let Some(ref wl) = focused_wl
+                            && same_client(ptr, wl)
+                        {
+                            ptr.button(serial, time, button, state);
+                            ptr.frame();
+                        }
                     }
                 }
                 let _ = self.display_handle.flush_clients();
@@ -3157,6 +3204,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
                 if let Some(held) = state.held_buffers.remove(&sid) {
                     held.release();
                 }
+                state.forget_pointer_focus(&sid);
                 if let Some(parent_id) = state
                     .surfaces
                     .get(&sid)
@@ -5642,6 +5690,7 @@ fn run_compositor(
         text_input_serial: 0,
         next_activation_token: 1,
         popup_grab_stack: Vec::new(),
+        popup_dismiss_button: None,
         held_buffers: HashMap::new(),
         cursor_rgba: HashMap::new(),
     };
