@@ -1,7 +1,9 @@
 ---
 import CopyButton from "./CopyButton.tsx";
 
-const DOCKER_CMD = "docker run --rm grab/blit-demo";
+// --shm-size because the image ships firefox, whose tabs crash on Docker's
+// 64 MB /dev/shm default. Harmless for everything else in there.
+const DOCKER_CMD = "docker run --rm --shm-size=1g grab/blit-demo";
 ---
 
 <section class="relative isolate overflow-hidden border-b border-[var(--border)] bg-[var(--bg)]">

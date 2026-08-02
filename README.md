@@ -7,7 +7,7 @@ We publish a [computer agent skill](https://install.blit.sh/SKILL.md).
 Try it now — no install needed:
 
 ```bash
-docker run --rm grab/blit-demo
+docker run --rm --shm-size=1g grab/blit-demo
 ```
 
 Or install and run locally:
@@ -239,12 +239,16 @@ Building from source, running tests, dev environment setup, code conventions, an
 
 ## Docker sandbox
 
-The `grab/blit-demo` image runs unprivileged and launches `blit share` on startup. It includes `blit` itself, plus fish, busybox, htop, neovim, git, curl, jq, tree, ncdu, and Wayland GUI apps (foot, mpv, imv, zathura, wev).
+The `grab/blit-demo` image runs unprivileged and launches `blit share` on startup. It includes `blit` itself, plus fish, busybox, htop, neovim, git, curl, jq, tree, ncdu, and Wayland GUI apps (firefox, foot, mpv, imv, zathura, wev).
+
+The session starts in `/home/blit/blit`, a writable clone of this repo with its full history. The container clones it on first start and fast-forwards it on later ones, so it reflects `main` as of when you started the container, not as of when the image was built. It needs network access to GitHub; without it you still get a shell, just an empty directory.
 
 To build locally:
 
 ```bash
 nix build .#demo-image
 docker load < result
-docker run --rm grab/blit-demo
+docker run --rm --shm-size=1g grab/blit-demo
 ```
+
+Firefox wants more shared memory than Docker's default 64 MB; without `--shm-size` its tabs crash. Nothing else in the image cares.

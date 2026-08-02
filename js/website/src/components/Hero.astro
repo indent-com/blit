@@ -5,7 +5,9 @@ import JoinForm from "./JoinForm.tsx";
 
 const INSTALL_CMD = "curl -sf https://install.blit.sh | sh";
 const INSTALL_PS = "irm https://install.blit.sh/install.ps1 | iex";
-const DOCKER_CMD = "docker run --rm grab/blit-demo";
+// --shm-size because the image ships firefox, whose tabs crash on Docker's
+// 64 MB /dev/shm default. Harmless for everything else in there.
+const DOCKER_CMD = "docker run --rm --shm-size=1g grab/blit-demo";
 
 /**
  * The proof strip. One shape for every cell — a single-token value over a

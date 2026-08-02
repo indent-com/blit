@@ -471,6 +471,38 @@
           );
           passwd = pkgs.writeTextDir "etc/passwd" "blit:x:1000:1000:blit:/home/blit:/bin/fish\n";
           group = pkgs.writeTextDir "etc/group" "blit:x:1000:\n";
+
+          # Firefox draws no text without fonts, and the image has none of
+          # its own — everything else in here either ships a font or is a
+          # terminal app blit renders itself.
+          fontsConf = pkgs.writeTextDir "etc/fonts/fonts.conf" (
+            builtins.readFile (
+              pkgs.makeFontsConf {
+                fontDirectories = [
+                  pkgs.dejavu_fonts
+                  pkgs.noto-fonts-color-emoji
+                ];
+              }
+            )
+          );
+
+          # A real git repo to poke at, since a demo of a dev environment
+          # with nothing to edit is a poor demo — cloned at startup rather
+          # than baked in. Nix can only bake in a fixed revision, and a
+          # revision pinned in this file is stale the moment main moves; the
+          # clone should show what blit looks like today, not at image build
+          # time. Cost is a few seconds on first boot and a network
+          # dependency, so every step is best-effort and time-boxed: with no
+          # route to GitHub you still get your shell, just an empty repo dir.
+          demoEntrypoint = pkgs.writeShellScriptBin "demo" ''
+            repo="$HOME/blit"
+            if [ -e "$repo/.git" ]; then
+              timeout 30 git -C "$repo" pull -q --ff-only || true
+            else
+              timeout 120 git clone -q https://github.com/indent-com/blit.git "$repo" || true
+            fi
+            exec blit share "$@"
+          '';
         in
         pkgs.dockerTools.buildLayeredImage {
           name = "grab/blit-demo";
@@ -494,14 +526,19 @@
             pkgs.foot
             pkgs.wev
             pkgs.zathura
+            pkgs.firefox
             blit
+            demoEntrypoint
             fishConfig
             welcomeFile
+            fontsConf
             passwd
             group
           ];
+          # `WorkingDir` has to exist and be ours before the entrypoint can
+          # clone into it — Docker would otherwise create it as root.
           fakeRootCommands = ''
-            mkdir -p ./home/blit ./tmp
+            mkdir -p ./home/blit/blit ./tmp
             chown -R 1000:1000 ./home/blit
             chmod 1777 ./tmp
           '';
@@ -513,14 +550,11 @@
               "TERM=xterm-256color"
             ];
             User = "1000:1000";
-            WorkingDir = "/home/blit";
+            WorkingDir = "/home/blit/blit";
             ExposedPorts = {
               "3264/tcp" = { };
             };
-            Entrypoint = [
-              "blit"
-              "share"
-            ];
+            Entrypoint = [ "demo" ];
           };
         };
 
