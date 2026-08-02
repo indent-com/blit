@@ -3183,6 +3183,21 @@ fn push_wrapped_word(
 mod tests {
     use super::*;
 
+    /// `[opcode][surface_id:2][keycode:4][pressed:1]`, as the server decodes
+    /// it and `buildSurfaceInputMessage` writes it.
+    #[test]
+    fn surface_input_puts_the_surface_id_first() {
+        let mut payload = 30u32.to_le_bytes().to_vec(); // KEY_A
+        payload.push(1); // pressed
+        let msg = msg_surface_input(7, &payload);
+
+        assert_eq!(msg.len(), 8);
+        assert_eq!(msg[0], C2S_SURFACE_INPUT);
+        assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 7);
+        assert_eq!(u32::from_le_bytes([msg[3], msg[4], msg[5], msg[6]]), 30);
+        assert_eq!(msg[7], 1);
+    }
+
     #[test]
     fn hello_roundtrip_with_boot_generation() {
         let msg = msg_hello(1, 0x1234_5678, 0xfedc_ba98_7654_3210, "0.40.1");
