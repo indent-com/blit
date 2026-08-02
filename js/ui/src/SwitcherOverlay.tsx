@@ -2,6 +2,7 @@ import {
   createSignal,
   createEffect,
   createMemo,
+  on,
   onMount,
   onCleanup,
   Show,
@@ -1642,15 +1643,20 @@ export function SwitcherOverlay(props: {
   });
 
   // When the "New terminal on…" picker opens, pre-select the default remote.
-  createEffect(() => {
-    if (!newTerminalMode()) return;
-    const dflt = props.defaultRemote;
-    if (!dflt) return;
-    const idx = flatItems().findIndex(
-      (i) => i.type === "remote" && (i as RemoteItem).remoteName === dflt,
-    );
-    if (idx >= 0) setSelectedIdx(idx);
-  });
+  // `on` limits this to the open transition: flatItems rebuilds on every
+  // workspace snapshot (remote statuses), and re-running here would snap the
+  // selection back to the default while the user is arrow-keying away.
+  createEffect(
+    on(newTerminalMode, (open) => {
+      if (!open) return;
+      const dflt = props.defaultRemote;
+      if (!dflt) return;
+      const idx = flatItems().findIndex(
+        (i) => i.type === "remote" && (i as RemoteItem).remoteName === dflt,
+      );
+      if (idx >= 0) setSelectedIdx(idx);
+    }),
+  );
 
   // Scroll selected item into view and position preview panel.
   createEffect(() => {
@@ -1957,8 +1963,10 @@ export function SwitcherOverlay(props: {
       props.remotes &&
       props.remotes.length > 0
     ) {
-      setNewTerminalMode(true);
+      // Clear the query before flipping the mode: the pre-select effect fires
+      // on the mode transition and must see the unfiltered remote list.
       setQuery("");
+      setNewTerminalMode(true);
       searchRef?.focus();
       return;
     }
